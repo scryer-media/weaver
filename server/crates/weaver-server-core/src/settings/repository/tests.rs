@@ -104,13 +104,14 @@ fn config_roundtrip() {
     let db = Database::open_in_memory().unwrap();
 
     let config = Config {
+        upload_cap: Some(500_000),
         seeding: Some(crate::settings::SeedingPolicy {
-            ratio_goal: Some(2.5),
-            seed_time_goal_minutes: Some(1_440),
-            inactive_goal_minutes: None,
-            mode: crate::settings::SeedingGoalMode::All,
-            action: crate::settings::SeedingAction::Remove,
-            max_upload_bps: Some(500_000),
+            seed_time_counting: Leaf::Set(crate::settings::SeedTimeCounting::Cumulative),
+            ratio_goal: Leaf::Set(2.5),
+            seed_time_goal_minutes: Leaf::Set(1_440),
+            inactive_goal_minutes: Leaf::Off,
+            mode: Leaf::Set(crate::settings::SeedingGoalMode::All),
+            action: Leaf::Set(crate::settings::SeedingAction::Remove),
         }),
         torrent: crate::settings::TorrentConfig {
             enabled: true,
@@ -171,8 +172,9 @@ fn config_roundtrip() {
             tls_ca_cert: None,
         }],
         categories: vec![CategoryConfig {
+            upload_cap: Default::default(),
             seeding: Some(crate::settings::SeedingPolicy {
-                ratio_goal: Some(1.0),
+                ratio_goal: Leaf::Set(1.0),
                 ..Default::default()
             }),
             torrent_route: true,
@@ -372,6 +374,7 @@ fn category_crud() {
     let db = Database::open_in_memory().unwrap();
 
     let cat = CategoryConfig {
+        upload_cap: Default::default(),
         seeding: None,
         torrent_route: false,
         unpack: None,
@@ -408,6 +411,7 @@ fn next_category_id_empty() {
 fn a_database_without_torrent_settings_loads_the_defaults() {
     let db = Database::open_in_memory().unwrap();
     db.insert_category(&CategoryConfig {
+        upload_cap: Default::default(),
         id: 1,
         name: "TV".to_string(),
         dest_dir: None,
@@ -437,20 +441,34 @@ fn a_database_without_torrent_settings_loads_the_defaults() {
 fn clearing_the_global_seeding_policy_removes_it() {
     let db = Database::open_in_memory().unwrap();
     let policy = crate::settings::SeedingPolicy {
-        ratio_goal: Some(1.0),
-        inactive_goal_minutes: Some(60),
+        ratio_goal: Leaf::Set(1.0),
+        inactive_goal_minutes: Leaf::Set(60),
         ..Default::default()
     };
     db.save_seeding_policy(Some(&policy)).unwrap();
-    assert_eq!(db.load_config().unwrap().seeding, Some(policy));
+    // At the global level nothing is inherited: a goal left unset is off,
+    // and the mode and action are their defaults.
+    assert_eq!(
+        db.load_config().unwrap().seeding,
+        Some(crate::settings::SeedingPolicy {
+            seed_time_goal_minutes: Leaf::Off,
+            mode: Leaf::Set(crate::settings::SeedingGoalMode::Any),
+            action: Leaf::Set(crate::settings::SeedingAction::Stop),
+            seed_time_counting: Leaf::Set(crate::settings::SeedTimeCounting::Cumulative),
+            ..policy
+        })
+    );
 
     // Dropping one goal removes only that goal.
     let narrower = crate::settings::SeedingPolicy {
-        inactive_goal_minutes: None,
+        inactive_goal_minutes: Leaf::Off,
         ..policy
     };
     db.save_seeding_policy(Some(&narrower)).unwrap();
-    assert_eq!(db.load_config().unwrap().seeding, Some(narrower));
+    assert_eq!(
+        db.load_config().unwrap().seeding,
+        Some(narrower.at_global())
+    );
 
     db.save_seeding_policy(None).unwrap();
     assert_eq!(db.load_config().unwrap().seeding, None);
@@ -459,19 +477,22 @@ fn clearing_the_global_seeding_policy_removes_it() {
 #[test]
 fn tracker_rules_crud() {
     use crate::settings::model::TrackerRule;
-    use crate::settings::{SeedingAction, SeedingPolicy, TorrentEncryption, TrackerUploadLimit};
+    use crate::settings::{SeedingAction, SeedingPolicy, TorrentEncryption};
 
     let db = Database::open_in_memory().unwrap();
     assert!(db.list_tracker_rules().unwrap().is_empty());
     let seeding = SeedingPolicy {
-        ratio_goal: Some(1.5),
-        seed_time_goal_minutes: Some(4_320),
-        action: SeedingAction::Stop,
+        ratio_goal: Leaf::Set(1.5),
+        seed_time_goal_minutes: Leaf::Set(4_320),
+        inactive_goal_minutes: Leaf::Off,
+        action: Leaf::Set(SeedingAction::Stop),
         ..SeedingPolicy::default()
     };
     let first = db
         .insert_tracker_rule(
             &TrackerRule {
+                archive_passwords: Default::default(),
+                bound: None,
                 id: 0,
                 host_pattern: "*.example.org".into(),
                 seeding: Some(seeding),
@@ -479,9 +500,11 @@ fn tracker_rules_crud() {
                 unpack: Some(false),
                 client: Some(Client::QBittorrent),
                 torrent_route: true,
-                discovery: Some(false),
+                dht: Some(false),
+                pex: None,
+                lsd: Some(true),
                 encryption: Some(TorrentEncryption::Prefer),
-                upload_limit: Some(TrackerUploadLimit::Unlimited),
+                upload_cap: Leaf::Off,
                 forced: true,
                 ssl: None,
             },
@@ -491,6 +514,8 @@ fn tracker_rules_crud() {
     let second = db
         .insert_tracker_rule(
             &TrackerRule {
+                archive_passwords: Default::default(),
+                bound: None,
                 id: 0,
                 host_pattern: "tracker.invalid".into(),
                 seeding: None,
@@ -498,9 +523,11 @@ fn tracker_rules_crud() {
                 unpack: None,
                 client: None,
                 torrent_route: false,
-                discovery: None,
+                dht: None,
+                pex: None,
+                lsd: None,
                 encryption: None,
-                upload_limit: None,
+                upload_cap: Leaf::Inherit,
                 forced: false,
                 ssl: None,
             },
@@ -531,9 +558,11 @@ fn tracker_rules_crud() {
         unpack: Some(true),
         client: Some(Client::Transmission),
         torrent_route: false,
-        discovery: Some(true),
+        dht: None,
+        pex: Some(false),
+        lsd: Some(false),
         encryption: Some(TorrentEncryption::Require),
-        upload_limit: Some(TrackerUploadLimit::Bps(4_096)),
+        upload_cap: Leaf::Set(4_096),
         forced: false,
         ..first.clone()
     };
@@ -561,6 +590,8 @@ fn a_tracker_rules_private_key_is_encrypted_at_rest() {
     let kept = db
         .insert_tracker_rule(
             &TrackerRule {
+                archive_passwords: Default::default(),
+                bound: None,
                 id: 0,
                 host_pattern: "tracker.example".into(),
                 seeding: None,
@@ -568,9 +599,11 @@ fn a_tracker_rules_private_key_is_encrypted_at_rest() {
                 unpack: None,
                 client: None,
                 torrent_route: false,
-                discovery: None,
+                dht: None,
+                pex: None,
+                lsd: None,
                 encryption: None,
-                upload_limit: None,
+                upload_cap: Leaf::Inherit,
                 forced: false,
                 ssl: Some(issued.clone()),
             },
@@ -610,4 +643,349 @@ fn a_tracker_rules_private_key_is_encrypted_at_rest() {
     assert!(db.update_tracker_rule(&cleared, 2).unwrap());
     assert_eq!(db.list_tracker_rules().unwrap(), [cleared]);
     assert_eq!((stored("cert"), stored("key")), (None, None));
+}
+
+// A tracker file read from `text`, with an identity for `subject` when one
+// is given.
+fn tracker_file(text: &str, subject: Option<&str>) -> crate::settings::tracker_file::TrackerFile {
+    let ssl = subject.map(|subject| {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec![subject.to_owned()]).unwrap();
+        format!(
+            "[ssl]\ncertificate_pem = '''\n{}'''\nprivate_key_pem = '''\n{}'''\n",
+            params.self_signed(&key).unwrap().pem(),
+            key.serialize_pem()
+        )
+    });
+    let text = format!(
+        "version = 1\nname = \"Example Tracker\"\nhost_pattern = \"*.tracker.example\"\n{text}\n{}",
+        ssl.unwrap_or_default()
+    );
+    crate::settings::tracker_file::read(text.as_bytes(), None).unwrap()
+}
+
+// A rule a tracker file filled refuses, on the ordinary save, a change to a
+// field the file locked, naming the field and the tracker; a change to any
+// other field saves, and the rule stays bound.
+#[test]
+fn a_bound_rule_refuses_a_change_to_a_locked_field() {
+    use crate::settings::TorrentEncryption;
+
+    let db = Database::open_in_memory().unwrap();
+    let file = tracker_file(
+        "revision = \"1\"\n[required]\ndht = false\nencryption = \"require\"\n[recommended]\npex = false",
+        Some("user-1"),
+    );
+    let rule = db.apply_tracker_file(&file, 10).unwrap();
+    let bound = rule.bound.clone().unwrap();
+    assert_eq!(bound.name, "Example Tracker");
+    assert_eq!(bound.revision, "1");
+    assert_eq!(bound.imported_at_ms, 10);
+    assert_eq!(bound.locked, ["dht", "encryption", "ssl"]);
+    assert_eq!(
+        (rule.dht, rule.pex, rule.encryption),
+        (Some(false), Some(false), Some(TorrentEncryption::Require))
+    );
+    assert_eq!(rule.ssl, file.ssl);
+
+    // The ordinary input names no binding; the save keeps the rule's.
+    let unbound_input =
+        |rule: &crate::settings::model::TrackerRule| crate::settings::model::TrackerRule {
+            bound: None,
+            ..rule.clone()
+        };
+    for (changed, keeps_ssl, field) in [
+        (
+            crate::settings::model::TrackerRule {
+                dht: Some(true),
+                ..unbound_input(&rule)
+            },
+            true,
+            "dht",
+        ),
+        (
+            crate::settings::model::TrackerRule {
+                encryption: None,
+                ..unbound_input(&rule)
+            },
+            true,
+            "encryption",
+        ),
+        (
+            crate::settings::model::TrackerRule {
+                ssl: None,
+                ..unbound_input(&rule)
+            },
+            false,
+            "ssl",
+        ),
+    ] {
+        let refusal = db
+            .save_tracker_rule(Some(rule.id), changed, keeps_ssl, true, 11)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            refusal,
+            format!(
+                "{field} is locked by Example Tracker's tracker file; unbind the rule to change it."
+            )
+        );
+    }
+    assert_eq!(db.list_tracker_rules().unwrap(), [rule.clone()]);
+
+    let changed = crate::settings::model::TrackerRule {
+        pex: Some(true),
+        never_pause: true,
+        ssl: None,
+        ..unbound_input(&rule)
+    };
+    let saved = db
+        .save_tracker_rule(Some(rule.id), changed, true, true, 12)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!((saved[0].pex, saved[0].never_pause), (Some(true), true));
+    assert_eq!(saved[0].ssl, rule.ssl);
+    assert_eq!(saved[0].bound, rule.bound);
+}
+
+// A bound rule's pattern is what its file finds it by, so the ordinary save
+// refuses to move it while the binding stands; once unbound, it moves.
+#[test]
+fn a_bound_rule_refuses_a_change_to_its_host_pattern() {
+    let db = Database::open_in_memory().unwrap();
+    let file = tracker_file("revision = \"1\"\n[recommended]\npex = false", None);
+    let rule = db.apply_tracker_file(&file, 10).unwrap();
+    let moved = crate::settings::model::TrackerRule {
+        host_pattern: "*.elsewhere.example".to_owned(),
+        bound: None,
+        ..rule.clone()
+    };
+    let refusal = db
+        .save_tracker_rule(Some(rule.id), moved.clone(), true, true, 11)
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        refusal,
+        "host_pattern is locked by Example Tracker's tracker file; unbind the rule to change it."
+    );
+    assert_eq!(db.list_tracker_rules().unwrap(), [rule.clone()]);
+
+    assert!(db.unbind_tracker_rule(rule.id, 12).unwrap());
+    let saved = db
+        .save_tracker_rule(Some(rule.id), moved, true, true, 13)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].host_pattern, "*.elsewhere.example");
+    assert_eq!(saved[0].bound, None);
+}
+
+// A file whose pattern a rule has fills that rule again: its required
+// values replace the rule's, a recommendation the user left takes the new
+// one and one the user changed stays. A file for another pattern makes a
+// rule of its own.
+#[test]
+fn reimporting_a_tracker_file_replaces_required_and_keeps_edited_recommendations() {
+    let db = Database::open_in_memory().unwrap();
+    let first = tracker_file(
+        "revision = \"1\"
+[required]
+dht = false
+[recommended]
+pex = false
+lsd = false
+seeding = { ratio_goal = 1.0, seed_time_goal_minutes = 100 }",
+        None,
+    );
+    let rule = db.apply_tracker_file(&first, 1).unwrap();
+    let seeding = rule.seeding.unwrap();
+    assert_eq!(
+        (seeding.ratio_goal, seeding.seed_time_goal_minutes),
+        (Leaf::Set(1.0), Leaf::Set(100))
+    );
+
+    let edited = crate::settings::model::TrackerRule {
+        lsd: Some(true),
+        seeding: Some(crate::settings::SeedingPolicy {
+            ratio_goal: Leaf::Set(2.0),
+            ..seeding
+        }),
+        bound: None,
+        ..rule.clone()
+    };
+    db.save_tracker_rule(Some(rule.id), edited, true, true, 2)
+        .unwrap()
+        .unwrap();
+
+    let second = tracker_file(
+        "revision = \"2\"
+[required]
+dht = true
+[recommended]
+pex = true
+lsd = false
+seeding = { ratio_goal = 3.0, seed_time_goal_minutes = 200 }",
+        None,
+    );
+    let again = db.apply_tracker_file(&second, 3).unwrap();
+    assert_eq!(again.id, rule.id);
+    assert_eq!(again.dht, Some(true), "a required value is replaced");
+    assert_eq!(again.pex, Some(true), "a recommendation left as it came");
+    assert_eq!(again.lsd, Some(true), "a recommendation the user changed");
+    let seeding = again.seeding.unwrap();
+    assert_eq!(seeding.ratio_goal, Leaf::Set(2.0));
+    assert_eq!(seeding.seed_time_goal_minutes, Leaf::Set(200));
+    assert_eq!(again.bound.as_ref().unwrap().revision, "2");
+    assert_eq!(db.list_tracker_rules().unwrap(), [again.clone()]);
+
+    let other = tracker_file("revision = \"1\"", None);
+    let other = crate::settings::tracker_file::TrackerFile {
+        host_pattern: "other.example".into(),
+        ..other
+    };
+    let made = db.apply_tracker_file(&other, 4).unwrap();
+    assert_ne!(made.id, again.id);
+    assert_eq!(db.list_tracker_rules().unwrap().len(), 2);
+}
+
+// Unbinding keeps every value and the identity and lets the user change
+// them; deleting a rule takes its binding with it.
+#[test]
+fn unbinding_keeps_the_values_and_deleting_takes_the_binding() {
+    let db = Database::open_in_memory().unwrap();
+    let file = tracker_file(
+        "revision = \"1\"\n[required]\ndht = false\npex = false",
+        Some("user-1"),
+    );
+    let rule = db.apply_tracker_file(&file, 1).unwrap();
+    assert!(db.unbind_tracker_rule(rule.id, 2).unwrap());
+    assert!(!db.unbind_tracker_rule(rule.id + 1, 2).unwrap());
+    let unbound = db.list_tracker_rules().unwrap().remove(0);
+    assert_eq!(unbound.bound, None);
+    assert_eq!((unbound.dht, unbound.pex), (Some(false), Some(false)));
+    assert_eq!(unbound.ssl, file.ssl);
+
+    let changed = crate::settings::model::TrackerRule {
+        dht: Some(true),
+        ssl: None,
+        ..unbound.clone()
+    };
+    let saved = db
+        .save_tracker_rule(Some(rule.id), changed, false, true, 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!((saved[0].dht, saved[0].ssl.as_ref()), (Some(true), None));
+
+    let bound = db.apply_tracker_file(&file, 4).unwrap();
+    assert!(bound.bound.is_some());
+    assert!(db.delete_tracker_rule(bound.id).unwrap());
+    assert!(db.list_tracker_rules().unwrap().is_empty());
+    let fresh = db.apply_tracker_file(&file, 5).unwrap();
+    assert_eq!(fresh.bound.unwrap().imported_at_ms, 5);
+}
+
+// A rule's archive passwords are sealed at rest. A reimport with a list
+// replaces them, an empty list clears them, and a file naming none keeps
+// them; the editor's save keeps them unless it clears them, an unbind keeps
+// them, and none of it writes to the global list.
+#[test]
+fn a_rules_archive_passwords_are_sealed_and_follow_its_tracker_file() {
+    let db = Database::open_in_memory().unwrap();
+    db.save_archive_password_settings(Some(vec!["global".to_owned()]), None)
+        .unwrap();
+    let global = || {
+        db.global_archive_password_candidates()
+            .unwrap()
+            .iter()
+            .map(|candidate| candidate.value().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let passwords = |id: u32| {
+        db.list_tracker_rules()
+            .unwrap()
+            .into_iter()
+            .find(|rule| rule.id == id)
+            .unwrap()
+            .archive_passwords
+            .as_slice()
+            .to_vec()
+    };
+    let listed = |values: &[&str]| {
+        values
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    let file = tracker_file(
+        "revision = \"1\"\n[archive_passwords]\nvalues = [\"first secret\", \"second\"]",
+        None,
+    );
+    let rule = db.apply_tracker_file(&file, 1).unwrap();
+    assert_eq!(passwords(rule.id), listed(&["first secret", "second"]));
+    let datastore = db.datastore();
+    let args = vec![SqlArg::I64(i64::from(rule.id))];
+    let sealed = db
+        .run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT archive_passwords AS value FROM tracker_rules WHERE id = {}",
+                &args,
+            )
+            .await?
+            .expect("the rule's row");
+            row.opt_text("value")
+        })
+        .unwrap()
+        .unwrap();
+    assert!(is_encrypted(&sealed));
+    assert!(!sealed.contains("first secret"));
+
+    let replaced = tracker_file(
+        "revision = \"2\"\n[archive_passwords]\nvalues = [\"third\"]",
+        None,
+    );
+    db.apply_tracker_file(&replaced, 2).unwrap();
+    assert_eq!(passwords(rule.id), listed(&["third"]));
+    db.apply_tracker_file(&tracker_file("revision = \"3\"", None), 3)
+        .unwrap();
+    assert_eq!(passwords(rule.id), listed(&["third"]));
+
+    let edited = db.list_tracker_rules().unwrap().remove(0);
+    db.save_tracker_rule(
+        Some(rule.id),
+        TrackerRule {
+            archive_passwords: Default::default(),
+            ..edited.clone()
+        },
+        true,
+        true,
+        4,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(passwords(rule.id), listed(&["third"]));
+    assert!(db.unbind_tracker_rule(rule.id, 5).unwrap());
+    assert_eq!(passwords(rule.id), listed(&["third"]));
+    db.save_tracker_rule(
+        Some(rule.id),
+        TrackerRule {
+            archive_passwords: Default::default(),
+            ..edited
+        },
+        true,
+        false,
+        6,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(passwords(rule.id).is_empty());
+
+    db.apply_tracker_file(&replaced, 7).unwrap();
+    assert_eq!(passwords(rule.id), listed(&["third"]));
+    let cleared = tracker_file("revision = \"4\"\n[archive_passwords]\nvalues = []", None);
+    db.apply_tracker_file(&cleared, 8).unwrap();
+    assert!(passwords(rule.id).is_empty());
+    assert_eq!(global(), listed(&["global"]));
 }

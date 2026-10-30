@@ -5,6 +5,7 @@ use crate::StateError;
 use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
+use crate::settings::SeedingPolicy;
 use crate::torrents::model::{parse_file_priorities, parse_named_by};
 use crate::torrents::{
     ContentLayout, FilePriority, Infohash, TorrentCounters, TorrentIntent, TorrentRecord,
@@ -13,7 +14,7 @@ use crate::torrents::{
 
 pub(crate) const TORRENT_COLUMNS: &str = "job_id, infohash_v1, infohash_v2, name, source, metainfo, \
      category_id, added_at_ms, state, forced, completed_at_ms, storage_dir, \
-     policy_override, unpack, metadata, upload_limit, download_limit, \
+     policy_override, unpack, unpack_in_force, metadata, upload_limit, download_limit, \
      sequential, first_last_piece_first, save_path, content_layout, files_dir, seed_mode, move_to, \
      queue_position";
 
@@ -59,10 +60,11 @@ fn opt_u32(row: &SqlRow, column: &str) -> Result<Option<u32>, StateError> {
 pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError> {
     let source = row.text("source")?;
     let intent = row.text("state")?;
-    let policy_override = row
-        .opt_text("policy_override")?
-        .map(|json| serde_json::from_str(&json).map_err(|error| corrupt("policy", error)))
-        .transpose()?;
+    let policy_override = SeedingPolicy::kept(
+        row.opt_text("policy_override")?
+            .map(|json| serde_json::from_str(&json).map_err(|error| corrupt("policy", error)))
+            .transpose()?,
+    );
     let metadata = row
         .opt_text("metadata")?
         .map(|json| serde_json::from_str(&json).map_err(|error| corrupt("metadata", error)))
@@ -83,6 +85,7 @@ pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError
         storage_dir: row.opt_text("storage_dir")?,
         policy_override,
         unpack: row.opt_bool("unpack")?,
+        unpack_in_force: row.opt_bool("unpack_in_force")?,
         metadata,
         upload_limit: opt_u64(row, "upload_limit")?,
         download_limit: opt_u64(row, "download_limit")?,
@@ -301,7 +304,8 @@ impl Database {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT uploaded_bytes, downloaded_bytes, active_duration_s,
-                        last_seen_complete_ms, finished_duration_s, last_activity_ms
+                        last_seen_complete_ms, finished_duration_s, last_activity_ms,
+                        consecutive_seeding_s
                    FROM torrent_counters WHERE job_id = {}",
                 &[SqlArg::I64(job_id.0 as i64)],
             )
@@ -314,6 +318,7 @@ impl Database {
                     last_seen_complete_ms: row.opt_i64("last_seen_complete_ms")?,
                     finished_duration_s: count(&row, "finished_duration_s")?,
                     last_activity_ms: row.opt_i64("last_activity_ms")?,
+                    consecutive_seeding_s: count(&row, "consecutive_seeding_s")?,
                 })
             })
             .transpose()

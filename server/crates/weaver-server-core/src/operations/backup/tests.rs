@@ -28,6 +28,7 @@ async fn open_artifact_pool(path: &Path) -> sqlx::SqlitePool {
 
 fn sample_config() -> Config {
     Config {
+        upload_cap: None,
         seeding: None,
         torrent: Default::default(),
         data_dir: "/old/data".into(),
@@ -62,6 +63,7 @@ fn sample_config() -> Config {
             tls_ca_cert: None,
         }],
         categories: vec![CategoryConfig {
+            upload_cap: Default::default(),
             seeding: None,
             torrent_route: false,
             unpack: None,

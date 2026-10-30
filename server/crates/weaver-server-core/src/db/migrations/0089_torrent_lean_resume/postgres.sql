@@ -2,8 +2,7 @@
 -- verified bytes (a run's wasted bytes are the session's own), the upload
 -- total of the last announce (never written) and the time it was written
 -- (the service keeps that in memory). The torrent row drops whether it is
--- private (its metainfo says so) and the tracker rule it matched (its
--- trackers and the rules say so).
+-- private (its metainfo says so).
 ALTER TABLE torrent_counters
     DROP COLUMN checked_bytes,
     DROP COLUMN last_announce_uploaded_bytes,
@@ -26,5 +25,4 @@ UPDATE torrent_counters
 ALTER TABLE torrents
     DROP COLUMN peers,
     DROP COLUMN banned_peers,
-    DROP COLUMN private,
-    DROP COLUMN tracker_rule_id;
+    DROP COLUMN private;

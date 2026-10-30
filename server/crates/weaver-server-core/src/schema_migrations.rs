@@ -35,7 +35,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 93;
+const CURRENT_SCHEMA_VERSION: i64 = 96;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -1635,7 +1635,7 @@ mod tests {
         let catalog = embedded_catalog().unwrap();
         let payload = embedded_payload_bytes().unwrap();
         let temp = tempfile::tempdir().unwrap();
-        let gone_torrents = ["peers", "banned_peers", "private", "tracker_rule_id"];
+        let gone_torrents = ["peers", "banned_peers", "private"];
         let gone_counters = [
             "checked_bytes",
             "last_announce_uploaded_bytes",
@@ -1663,7 +1663,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             pragma_column_count(&pool, "torrents", &gone_torrents).await,
-            4
+            3
         );
         sqlx::query(
             "INSERT INTO torrents (job_id, infohash_v1, name, source, added_at_ms, state,

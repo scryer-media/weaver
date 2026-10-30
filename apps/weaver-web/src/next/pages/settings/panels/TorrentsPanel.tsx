@@ -5,32 +5,42 @@ import { useMemo, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router";
 import { useMutation, useQuery } from "urql";
 import {
+  APPLY_TRACKER_FILE_MUTATION,
   DELETE_TRACKER_RULE_MUTATION,
+  PREVIEW_TRACKER_FILE_MUTATION,
   SAVE_TRACKER_RULE_MUTATION,
   TORRENT_ROUTES_QUERY,
   TORRENT_SETTINGS_QUERY,
   TRACKER_HOSTS_QUERY,
   TRACKER_RULES_QUERY,
+  UNBIND_TRACKER_RULE_MUTATION,
   UPDATE_TORRENT_SETTINGS_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { UNPACK_CHOICES, routeExposureText, routeReasonText, type TorrentRouteReason, unpackChoice, unpackOf, type TorrentExposure } from "@/lib/torrents";
 import type { ResolvedBy } from "@/lib/test-via";
 import { announceHosts, patternsOf, torrentAnnounces } from "@/lib/tracker-hosts";
+import { toBase64 } from "@/lib/utils";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
-import { NumberField, SecondaryButton, Segmented, Select, TextField, Toggle } from "../../../components/controls";
+import { SecondaryButton, Segmented, Select, TextField, Toggle } from "../../../components/controls";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { Cell } from "../../../components/rows";
 import { EM_DASH } from "../../../data/format";
 import { SettingsBlocks, useDraft, usePanelState, type FieldSpec, type SettingsBlock } from "../framework";
 import {
-  EMPTY_SEEDING,
   GoalControl,
+  INHERIT,
   durationText,
+  globalUploadCapField,
+  leafFrom,
+  leafInput,
+  seedingAtGlobal,
   seedingFields,
   seedingFrom,
+  seedingInherits,
   seedingInput,
-  seedingIsEmpty,
+  uploadCapField,
+  type Leaf,
   type SeedingPolicy,
 } from "../seeding";
 
@@ -38,15 +48,15 @@ import {
  * Torrents: the global seeding policy, the tracker rules, and how the
  * torrent session connects.
  *
- * The policy and the connection save through `updateSettings`, each only
- * when it was edited. A seeding policy with no goal and no cap saves as none
- * at all. A tracker rule saves from its own editor.
+ * The seeding terms, the upload cap and the connection save through
+ * `updateSettings`, each only when it was edited. A tracker rule saves from
+ * its own editor; its terms that all inherit save as none.
  */
 
 interface TrackerRule {
   id: number;
   hostPattern: string;
-  /** Null while the rule leaves the goals to the category and the global policy. */
+  /** Null while every term inherits from the category and the global settings. */
   seeding: SeedingPolicy | null;
   neverPause: boolean;
   /** Null while the rule leaves it to the category and the global setting. */
@@ -54,22 +64,49 @@ interface TrackerRule {
   /** Null names the torrents as Weaver. */
   client: TorrentClient | null;
   torrentRoute: boolean;
-  /** Null inherits; false holds the rule's torrents to their trackers for peers. */
-  discovery: boolean | null;
+  /** Each null inherits; a private torrent uses none of the three whatever they say. */
+  dht: boolean | null;
+  pex: boolean | null;
+  lsd: boolean | null;
   /** Null inherits the global encryption. */
   encryption: TorrentEncryption | null;
-  /** Null inherits the seeding policy's cap; a null rate is unlimited. */
-  uploadLimit: TrackerUploadLimit | null;
+  /** The upload cap its torrents take in place of their category's and the global one. */
+  uploadCap: Leaf<number>;
   forced: boolean;
   /** Whether it holds a certificate for its SSL torrents; the key is never read back. */
   hasSsl: boolean;
   sslSubject: string | null;
   /** Milliseconds since the epoch. */
   sslNotAfter: number | null;
+  /** The tracker file that filled it; null when none binds it. */
+  bound: TrackerBinding | null;
+  /** How many archive passwords its tracker file gave it; the values are never read back. */
+  archivePasswordCount: number;
 }
 
-interface TrackerUploadLimit {
-  bps: number | null;
+interface TrackerBinding {
+  name: string;
+  revision: string;
+  /** Milliseconds since the epoch. */
+  importedAt: number;
+  /** The fields the file locked: dht, pex, lsd, encryption, ssl. */
+  locked: string[];
+}
+
+/** What importing a tracker file would do; it holds nothing secret. */
+interface TrackerFilePreview {
+  name: string;
+  revision: string;
+  hostPattern: string;
+  /** Null makes a new rule. */
+  ruleId: number | null;
+  changes: { field: string; locked: boolean; old: string | null; new: string | null }[];
+  hasSsl: boolean;
+  sslSubject: string | null;
+  sslNotAfter: number | null;
+  /** Null when the file names none. */
+  archivePasswordCount: number | null;
+  fingerprint: string;
 }
 
 type TorrentClient = "WEAVER" | "QBITTORRENT" | "TRANSMISSION";
@@ -82,37 +119,51 @@ const TORRENT_CLIENTS: readonly { value: TorrentClient; label: string }[] = [
 
 interface TrackerRuleForm {
   hostPattern: string;
-  seeding: SeedingPolicy | null;
+  seeding: SeedingPolicy;
   neverPause: boolean;
   unpack: boolean | null;
   client: TorrentClient | null;
   torrentRoute: boolean;
-  discovery: boolean | null;
+  dht: boolean | null;
+  pex: boolean | null;
+  lsd: boolean | null;
   encryption: TorrentEncryption | null;
-  uploadLimit: TrackerUploadLimit | null;
+  uploadCap: Leaf<number>;
   forced: boolean;
   /** A certificate and key pasted to replace the rule's; both blank keeps it. */
   certificatePem: string;
   privateKeyPem: string;
   /** The rule's certificate is to be cleared. */
   sslCleared: boolean;
+  /** The rule's archive passwords are to be cleared. */
+  passwordsCleared: boolean;
 }
 
 const NEW_TRACKER_RULE: TrackerRuleForm = {
   hostPattern: "",
-  seeding: null,
+  seeding: seedingFrom(null),
   neverPause: false,
   unpack: null,
   client: null,
   torrentRoute: false,
-  discovery: null,
+  dht: null,
+  pex: null,
+  lsd: null,
   encryption: null,
-  uploadLimit: null,
+  uploadCap: INHERIT,
   forced: false,
   certificatePem: "",
   privateKeyPem: "",
   sslCleared: false,
+  passwordsCleared: false,
 };
+
+/** The rule's peer sources beside its trackers, each switched on its own. */
+const DISCOVERY_SWITCHES = [
+  { key: "dht", label: "next.torrents.trackerRuleDht", keywords: "dht peer discovery private" },
+  { key: "pex", label: "next.torrents.trackerRulePex", keywords: "pex peer exchange private" },
+  { key: "lsd", label: "next.torrents.trackerRuleLsd", keywords: "lsd local peer discovery private" },
+] as const;
 
 /** The certificate a rule's save sends: pasted, cleared, or left out to keep the rule's. */
 function sslInput(form: TrackerRuleForm) {
@@ -122,74 +173,23 @@ function sslInput(form: TrackerRuleForm) {
   return form.sslCleared ? { ssl: null } : {};
 }
 
-/** A rule's upload cap as its editor picks it: inherited, unlimited, or a rate of its own. */
-type UploadLimitChoice = "inherit" | "unlimited" | "cap";
-
-const uploadLimitChoice = (limit: TrackerUploadLimit | null): UploadLimitChoice =>
-  limit === null ? "inherit" : limit.bps === null ? "unlimited" : "cap";
-
-/** The rate a rule's cap opens at when it is first given one. */
-const DEFAULT_RULE_UPLOAD_BPS = 10 * 1024 * 1024;
-
-/** A rule's upload cap: inherited, unlimited, or a rate in MB/s. */
-function UploadLimitControl({
-  t,
-  value,
-  onChange,
-}: {
-  t: Translate;
-  value: TrackerUploadLimit | null;
-  onChange: (next: TrackerUploadLimit | null) => void;
-}) {
-  const [last, setLast] = useState(value?.bps ?? DEFAULT_RULE_UPLOAD_BPS);
-  const label = t("next.torrents.trackerRuleUploadLimit");
-  return (
-    <div className="flex items-center gap-[10px]">
-      <Segmented<UploadLimitChoice>
-        label={label}
-        value={uploadLimitChoice(value)}
-        options={[
-          { value: "inherit", label: t("next.torrents.unpackInherit") },
-          { value: "unlimited", label: t("next.networking.unlimited") },
-          { value: "cap", label: t("next.torrents.trackerRuleUploadCap") },
-        ]}
-        onChange={(choice) =>
-          onChange(choice === "inherit" ? null : choice === "unlimited" ? { bps: null } : { bps: last })
-        }
-      />
-      {value?.bps != null ? (
-        <NumberField
-          label={label}
-          value={Math.round((value.bps / (1024 * 1024)) * 10) / 10}
-          min={0}
-          step={0.1}
-          precision={1}
-          suffix="MB/s"
-          onChange={(next) => {
-            const bps = Math.round(Math.max(0, next) * 1024 * 1024);
-            setLast(bps);
-            onChange({ bps });
-          }}
-        />
-      ) : null}
-    </div>
-  );
-}
-
 /** A rule's goals in one line, as its row shows them. */
 function goalsText(t: Translate, policy: SeedingPolicy | null): string {
   if (!policy) {
     return EM_DASH;
   }
+  const goal = (leaf: Leaf<number>, label: string, text: (value: number) => string) =>
+    leaf.state === "OFF"
+      ? `${label} ${t("next.seeding.noGoal")}`
+      : leaf.state === "SET" && leaf.value !== null
+        ? `${label} ${text(leaf.value)}`
+        : null;
+  const minutes = (value: number) => durationText(t, value);
   const goals = [
-    policy.ratioGoal === null ? null : `${t("next.seeding.ratioGoal")} ${policy.ratioGoal}`,
-    policy.seedTimeGoalMinutes === null
-      ? null
-      : `${t("next.seeding.seedTimeGoal")} ${durationText(t, policy.seedTimeGoalMinutes)}`,
-    policy.inactiveGoalMinutes === null
-      ? null
-      : `${t("next.seeding.inactiveGoal")} ${durationText(t, policy.inactiveGoalMinutes)}`,
-  ].filter((goal): goal is string => goal !== null);
+    goal(policy.ratioGoal, t("next.seeding.ratioGoal"), String),
+    goal(policy.seedTimeGoalMinutes, t("next.seeding.seedTimeGoal"), minutes),
+    goal(policy.inactiveGoalMinutes, t("next.seeding.inactiveGoal"), minutes),
+  ].filter((text): text is string => text !== null);
   return goals.length > 0 ? goals.join(" · ") : EM_DASH;
 }
 
@@ -306,6 +306,221 @@ function HostPicker({
           ) : null}
         </>
       )}
+    </div>
+  );
+}
+
+/** A preview's field names, as the editor labels them. */
+const CHANGE_LABELS: Record<string, string> = {
+  dht: "next.torrents.trackerRuleDht",
+  pex: "next.torrents.trackerRulePex",
+  lsd: "next.torrents.trackerRuleLsd",
+  encryption: "next.torrents.encryption",
+  "seeding.ratio_goal": "next.seeding.ratioGoal",
+  "seeding.seed_time_goal_minutes": "next.seeding.seedTimeGoal",
+  "seeding.inactive_goal_minutes": "next.seeding.inactiveGoal",
+  "seeding.mode": "next.seeding.mode",
+  "seeding.action": "next.seeding.action",
+};
+
+const CHANGE_VALUES: Record<string, string> = {
+  true: "next.common.on",
+  false: "next.common.off",
+  prefer: "next.torrents.encryptionPrefer",
+  require: "next.torrents.encryptionRequire",
+  any: "next.seeding.modeAny",
+  all: "next.seeding.modeAll",
+  stop: "next.seeding.actionStop",
+  remove: "next.seeding.actionRemove",
+  remove_with_data: "next.seeding.actionRemoveWithData",
+};
+
+function changeValue(t: Translate, field: string, value: string | null): string {
+  if (value === null) {
+    return EM_DASH;
+  }
+  if (field.endsWith("_minutes")) {
+    return durationText(t, Number(value));
+  }
+  const key = CHANGE_VALUES[value];
+  return key ? t(key) : value;
+}
+
+const sslText = (subject: string | null, notAfter: number | null) =>
+  [subject, notAfter === null ? null : new Date(notAfter).toLocaleDateString()].filter((part) => part).join(" · ");
+
+/**
+ * Import a tracker file: pick it and its password, preview what it would do,
+ * then apply that preview or cancel. Nothing is kept until Apply.
+ */
+function TrackerFileImport({
+  t,
+  open,
+  onDismiss,
+  onApplied,
+}: {
+  t: Translate;
+  open: boolean;
+  onDismiss: () => void;
+  onApplied: () => void;
+}) {
+  const [, previewFile] = useMutation(PREVIEW_TRACKER_FILE_MUTATION);
+  const [, applyFile] = useMutation(APPLY_TRACKER_FILE_MUTATION);
+  const [file, setFile] = useState<{ name: string; data: string } | null>(null);
+  const [password, setPassword] = useState("");
+  const [summary, setSummary] = useState<TrackerFilePreview | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const variables = () => ({ file: file?.data ?? "", password: password === "" ? null : password });
+
+  const run = async () => {
+    if (!file) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    if (summary === null) {
+      const result = await previewFile(variables());
+      setBusy(false);
+      if (result.error) {
+        setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+        return;
+      }
+      setSummary(result.data.previewTrackerFile as TrackerFilePreview);
+      return;
+    }
+    const result = await applyFile({ ...variables(), fingerprint: summary.fingerprint });
+    setBusy(false);
+    if (result.error) {
+      setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+      setSummary(null);
+      return;
+    }
+    onApplied();
+  };
+
+  return (
+    <RecordEditor
+      open={open}
+      title={t("next.torrents.trackerFileImport")}
+      error={error}
+      busy={busy}
+      saveLabel={summary === null ? t("next.torrents.trackerFilePreview") : t("next.torrents.trackerFileApply")}
+      saveDisabled={file === null}
+      onSave={() => void run()}
+      onDismiss={onDismiss}
+      sections={[
+        {
+          id: "trackerFile",
+          title: t("next.torrents.trackerFile"),
+          fields: [
+            {
+              id: "trackerFileChoose",
+              label: t("next.torrents.trackerFile"),
+              control: {
+                kind: "custom",
+                control: (
+                  <div className="flex h-[34px] min-w-0 items-center gap-3">
+                    <input
+                      ref={fileRef}
+                      type="file"
+                      accept=".toml,.7z,.zip,.rar"
+                      aria-label={t("next.torrents.trackerFile")}
+                      className="hidden"
+                      onChange={(event) => {
+                        const picked = event.target.files?.[0] ?? null;
+                        // Cleared so the same file can be chosen again.
+                        event.target.value = "";
+                        if (picked) {
+                          void picked.arrayBuffer().then((bytes) => {
+                            setFile({ name: picked.name, data: toBase64(new Uint8Array(bytes)) });
+                            setSummary(null);
+                            setError(null);
+                          });
+                        }
+                      }}
+                    />
+                    <SecondaryButton icon="chooseFile" onClick={() => fileRef.current?.click()}>
+                      {t("next.torrents.trackerRuleChooseFile")}
+                    </SecondaryButton>
+                    {file ? (
+                      <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg" title={file.name}>
+                        {file.name}
+                      </span>
+                    ) : null}
+                  </div>
+                ),
+              },
+            },
+            {
+              id: "trackerFilePassword",
+              label: t("next.torrents.trackerFilePassword"),
+              control: {
+                kind: "text",
+                type: "password",
+                secret: true,
+                value: password,
+                onChange: (next) => {
+                  setPassword(next);
+                  setSummary(null);
+                },
+              },
+            },
+          ],
+        },
+      ]}
+    >
+      {summary ? (
+        <div className="grid flex-none grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)_auto] gap-x-4 gap-y-[6px] border-t border-wv-hairline px-4 py-4 text-[12.5px] sm:px-6">
+          <span className="text-wv-secondary">{t("next.torrents.trackerFile")}</span>
+          <span className="col-span-2 min-w-0 truncate font-wv-mono text-wv-fg">
+            {summary.name} · {summary.revision}
+          </span>
+          <span className="text-wv-secondary">{t("next.torrents.trackerRuleHost")}</span>
+          <span className="min-w-0 truncate font-wv-mono text-wv-fg">{summary.hostPattern}</span>
+          <span className="font-wv-mono text-wv-muted">
+            {summary.ruleId === null ? t("next.torrents.trackerFileNewRule") : `#${summary.ruleId}`}
+          </span>
+          {summary.changes.map((change) => (
+            <div key={change.field} className="contents">
+              <span className="text-wv-secondary">{CHANGE_LABELS[change.field] ? t(CHANGE_LABELS[change.field]) : change.field}</span>
+              <span className="min-w-0 truncate font-wv-mono text-wv-fg">
+                {changeValue(t, change.field, change.old)} → {changeValue(t, change.field, change.new)}
+              </span>
+              <span className="font-wv-mono text-wv-muted">
+                {t(change.locked ? "next.torrents.trackerFileLocked" : "next.torrents.trackerFileRecommended")}
+              </span>
+            </div>
+          ))}
+          {summary.hasSsl ? (
+            <>
+              <span className="text-wv-secondary">{t("next.torrents.trackerRuleCertificate")}</span>
+              <span className="min-w-0 truncate font-wv-mono text-wv-fg">
+                {sslText(summary.sslSubject, summary.sslNotAfter)}
+              </span>
+              <span className="font-wv-mono text-wv-muted">{t("next.torrents.trackerFileLocked")}</span>
+            </>
+          ) : null}
+          {summary.archivePasswordCount === null ? null : (
+            <>
+              <span className="text-wv-secondary">{t("next.torrents.trackerFileArchivePasswords")}</span>
+              <span className="col-span-2 font-wv-mono text-wv-fg">{summary.archivePasswordCount}</span>
+            </>
+          )}
+        </div>
+      ) : null}
+    </RecordEditor>
+  );
+}
+
+/** A locked field's control, disabled, with the tracker that locked it beside it. */
+function Locked({ by, children }: { by: string; children: ReactNode }) {
+  return (
+    <div className="flex min-w-0 items-center gap-[10px]">
+      {children}
+      <span className="min-w-0 truncate font-wv-mono text-[11.5px] text-wv-muted">{by}</span>
     </div>
   );
 }
@@ -428,10 +643,14 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
   const [, deleteRule] = useMutation(DELETE_TRACKER_RULE_MUTATION);
   const [editingId, setEditingId] = useState<number | "new" | null>(null);
   const [form, setForm] = useState<TrackerRuleForm>(NEW_TRACKER_RULE);
-  const [opened, setOpened] = useState<TrackerRuleForm>(NEW_TRACKER_RULE);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<TrackerRule | null>(null);
+  const [confirmUnbind, setConfirmUnbind] = useState<TrackerRule | null>(null);
+  const [, unbindRule] = useMutation(UNBIND_TRACKER_RULE_MUTATION);
+  // Counts the import's openings, so each one starts empty; zero is closed.
+  const [importing, setImporting] = useState(0);
+  const [importOpen, setImportOpen] = useState(false);
   // Counts the editor's openings, so each one starts its host picker afresh.
   const [opening, setOpening] = useState(0);
   const [{ data: hosts }] = useQuery<{ trackerHosts: string[] }>({
@@ -443,28 +662,32 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
 
   const rules = useMemo(() => data?.trackerRules ?? [], [data?.trackerRules]);
   const editing = typeof editingId === "number" ? rules.find((rule) => rule.id === editingId) : null;
+  // The tracker that locked `field` on the rule being edited.
+  const lockedBy = (field: string) => (editing?.bound?.locked.includes(field) ? editing.bound.name : null);
 
   const open = (rule: TrackerRule | null) => {
     setError(null);
     const start = rule
       ? {
           hostPattern: rule.hostPattern,
-          seeding: rule.seeding ? seedingFrom(rule.seeding) : null,
+          seeding: seedingFrom(rule.seeding),
           neverPause: rule.neverPause,
           unpack: rule.unpack,
           client: rule.client,
           torrentRoute: rule.torrentRoute,
-          discovery: rule.discovery,
+          dht: rule.dht,
+          pex: rule.pex,
+          lsd: rule.lsd,
           encryption: rule.encryption,
-          uploadLimit: rule.uploadLimit,
+          uploadCap: leafFrom(rule.uploadCap),
           forced: rule.forced,
           certificatePem: "",
           privateKeyPem: "",
           sslCleared: false,
+          passwordsCleared: false,
         }
       : NEW_TRACKER_RULE;
     setForm(start);
-    setOpened(start);
     setOpening((count) => count + 1);
     setEditingId(rule ? rule.id : "new");
   };
@@ -475,16 +698,19 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
       id: editingId === "new" ? null : editingId,
       input: {
         hostPattern: form.hostPattern.trim(),
-        seeding: form.seeding ? seedingInput(form.seeding) : null,
+        seeding: seedingInherits(form.seeding) ? null : seedingInput(form.seeding),
         neverPause: form.neverPause,
         unpack: form.unpack,
         client: form.client,
         torrentRoute: form.torrentRoute,
-        discovery: form.discovery,
+        dht: form.dht,
+        pex: form.pex,
+        lsd: form.lsd,
         encryption: form.encryption,
-        uploadLimit: form.uploadLimit,
+        uploadCap: leafInput(form.uploadCap),
         forced: form.forced,
         ...sslInput(form),
+        clearArchivePasswords: form.passwordsCleared,
       },
     });
     setBusy(false);
@@ -508,6 +734,42 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
     void reexecute({ requestPolicy: "network-only" });
   };
 
+  const unbind = async () => {
+    if (!confirmUnbind) {
+      return;
+    }
+    setBusy(true);
+    const result = await unbindRule({ id: confirmUnbind.id });
+    setBusy(false);
+    setConfirmUnbind(null);
+    if (result.error) {
+      setError(result.error.graphQLErrors[0]?.message ?? result.error.message);
+    }
+    void reexecute({ requestPolicy: "network-only" });
+  };
+
+  const lockable = (field: string, value: string, options: readonly { value: string; label: string }[], spec: FieldSpec): FieldSpec => {
+    const by = lockedBy(field);
+    return by === null
+      ? spec
+      : {
+          ...spec,
+          control: {
+            kind: "custom",
+            control: (
+              <Locked by={by}>
+                <Segmented
+                  value={value}
+                  label={spec.label}
+                  onChange={() => undefined}
+                  options={options.map((option) => ({ ...option, disabled: true }))}
+                />
+              </Locked>
+            ),
+          },
+        };
+  };
+
   const block: SettingsBlock = {
     kind: "table",
     id: "trackerRules",
@@ -517,6 +779,17 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
     centered: [2],
     empty: t("next.torrents.trackerRulesEmpty"),
     add: { label: t("next.torrents.trackerRuleAdd"), onClick: () => open(null) },
+    footer: (
+      <SecondaryButton
+        icon="chooseFile"
+        onClick={() => {
+          setImporting((count) => count + 1);
+          setImportOpen(true);
+        }}
+      >
+        {t("next.torrents.trackerFileImport")}
+      </SecondaryButton>
+    ),
     onRowClick: (id) => {
       const rule = rules.find((entry) => String(entry.id) === id);
       if (rule) {
@@ -557,6 +830,28 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
             id: "trackerRule",
             title: t("next.torrents.trackerRule"),
             fields: [
+              ...(editing?.bound
+                ? [
+                    {
+                      id: "trackerFile",
+                      label: t("next.torrents.trackerFile"),
+                      keywords: "tracker file bound unbind",
+                      control: {
+                        kind: "custom" as const,
+                        control: (
+                          <div className="flex min-w-0 items-center gap-[10px]">
+                            <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">
+                              {editing.bound.name} · {editing.bound.revision}
+                            </span>
+                            <SecondaryButton onClick={() => setConfirmUnbind(editing)}>
+                              {t("next.torrents.trackerFileUnbind")}
+                            </SecondaryButton>
+                          </div>
+                        ),
+                      },
+                    },
+                  ]
+                : ([] as FieldSpec[])),
               {
                 id: "hostPattern",
                 label: t("next.torrents.trackerRuleHost"),
@@ -639,51 +934,40 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
                   ),
                 },
               },
-              {
-                id: "discovery",
-                label: t("next.torrents.trackerRuleDiscovery"),
-                keywords: "dht pex lsd peer discovery private",
-                control: {
-                  kind: "segmented",
-                  value: unpackChoice(form.discovery),
-                  options: UNPACK_CHOICES.map((option) => ({ ...option, label: t(option.label) })),
-                  onChange: (choice) => setForm((current) => ({ ...current, discovery: unpackOf(choice) })),
-                },
-              },
-              {
-                id: "encryption",
-                label: t("next.torrents.encryption"),
-                keywords: "encryption mse pe",
-                control: {
-                  kind: "segmented",
-                  value: form.encryption ?? "inherit",
-                  options: [
-                    { value: "inherit", label: t("next.torrents.unpackInherit") },
-                    ...ENCRYPTIONS.map((option) => ({ ...option, label: t(option.label) })),
-                  ],
-                  onChange: (encryption) =>
-                    setForm((current) => ({
-                      ...current,
-                      encryption: encryption === "inherit" ? null : (encryption as TorrentEncryption),
-                    })),
-                },
-              },
-              {
-                id: "uploadLimit",
-                label: t("next.torrents.trackerRuleUploadLimit"),
-                keywords: "upload speed limit rate",
-                control: {
-                  kind: "custom",
-                  control: (
-                    <UploadLimitControl
-                      key={opening}
-                      t={t}
-                      value={form.uploadLimit}
-                      onChange={(uploadLimit) => setForm((current) => ({ ...current, uploadLimit }))}
-                    />
-                  ),
-                },
-              },
+              ...DISCOVERY_SWITCHES.map(({ key, label, keywords }) => {
+                const options = UNPACK_CHOICES.map((option) => ({ ...option, label: t(option.label) }));
+                return lockable(key, unpackChoice(form[key]), options, {
+                  id: key,
+                  label: t(label),
+                  keywords,
+                  control: {
+                    kind: "segmented" as const,
+                    value: unpackChoice(form[key]),
+                    options,
+                    onChange: (choice: string) => setForm((current) => ({ ...current, [key]: unpackOf(choice) })),
+                  },
+                });
+              }),
+              ((options) =>
+                lockable("encryption", form.encryption ?? "inherit", options, {
+                  id: "encryption",
+                  label: t("next.torrents.encryption"),
+                  keywords: "encryption mse pe",
+                  control: {
+                    kind: "segmented",
+                    value: form.encryption ?? "inherit",
+                    options,
+                    onChange: (encryption) =>
+                      setForm((current) => ({
+                        ...current,
+                        encryption: encryption === "inherit" ? null : (encryption as TorrentEncryption),
+                      })),
+                  },
+                }))([
+                { value: "inherit", label: t("next.torrents.unpackInherit") },
+                ...ENCRYPTIONS.map((option) => ({ ...option, label: t(option.label) })),
+              ]),
+              uploadCapField(t, form.uploadCap, (uploadCap) => setForm((current) => ({ ...current, uploadCap })), "trackerRule"),
               {
                 id: "forced",
                 label: t("next.torrents.trackerRuleForced"),
@@ -694,6 +978,28 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
                   onChange: (forced) => setForm((current) => ({ ...current, forced })),
                 },
               },
+              ...(editing && editing.archivePasswordCount > 0 && !form.passwordsCleared
+                ? [
+                    {
+                      id: "archivePasswords",
+                      label: t("next.torrents.trackerFileArchivePasswords"),
+                      keywords: "archive passwords tracker",
+                      control: {
+                        kind: "custom" as const,
+                        control: (
+                          <div className="flex min-w-0 items-center gap-[10px]">
+                            <span className="font-wv-mono text-[12px] text-wv-fg">{editing.archivePasswordCount}</span>
+                            <SecondaryButton
+                              onClick={() => setForm((current) => ({ ...current, passwordsCleared: true }))}
+                            >
+                              {t("next.torrents.trackerRuleCertificateClear")}
+                            </SecondaryButton>
+                          </div>
+                        ),
+                      },
+                    },
+                  ]
+                : ([] as FieldSpec[])),
               ...(editing?.hasSsl && !form.sslCleared
                 ? [
                     {
@@ -705,15 +1011,13 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
                         control: (
                           <div className="flex min-w-0 items-center gap-[10px]">
                             <span className="min-w-0 truncate font-wv-mono text-[12px] text-wv-fg">
-                              {[
-                                editing.sslSubject,
-                                editing.sslNotAfter === null
-                                  ? null
-                                  : new Date(editing.sslNotAfter).toLocaleDateString(),
-                              ]
-                                .filter((part) => part)
-                                .join(" · ")}
+                              {sslText(editing.sslSubject, editing.sslNotAfter)}
                             </span>
+                            {lockedBy("ssl") !== null ? (
+                              <span className="min-w-0 truncate font-wv-mono text-[11.5px] text-wv-muted">
+                                {lockedBy("ssl")}
+                              </span>
+                            ) : (
                             <SecondaryButton
                               onClick={() =>
                                 setForm((current) => ({
@@ -726,12 +1030,16 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
                             >
                               {t("next.torrents.trackerRuleCertificateClear")}
                             </SecondaryButton>
+                            )}
                           </div>
                         ),
                       },
                     },
                   ]
                 : ([] as FieldSpec[])),
+              ...(lockedBy("ssl") !== null
+                ? ([] as FieldSpec[])
+                : ([
               {
                 id: "certificatePem",
                 label: t("next.torrents.trackerRuleCertificatePem"),
@@ -757,26 +1065,36 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
                   onChange: (privateKeyPem) => setForm((current) => ({ ...current, privateKeyPem })),
                 },
               },
-              {
-                id: "ownSeeding",
-                label: t("next.categories.ownSeeding"),
-                keywords: "seed seeding policy",
-                control: {
-                  kind: "toggle",
-                  value: form.seeding !== null,
-                  onChange: (on) =>
-                    setForm((current) => ({ ...current, seeding: on ? (opened.seeding ?? EMPTY_SEEDING) : null })),
-                },
-              },
-              ...(form.seeding
-                ? seedingFields(t, form.seeding, (seeding) => setForm((current) => ({ ...current, seeding })), {
-                    inherits: true,
-                    idPrefix: "trackerRuleSeeding",
-                  })
-                : ([] as FieldSpec[])),
+                ] as FieldSpec[])),
+              ...seedingFields(t, form.seeding, (seeding) => setForm((current) => ({ ...current, seeding })), {
+                inherits: true,
+                idPrefix: "trackerRuleSeeding",
+              }),
             ],
           },
         ]}
+      />
+
+      <ConfirmDialog
+        open={confirmUnbind !== null}
+        title={t("next.torrents.trackerFileUnbind")}
+        note={confirmUnbind?.bound?.name}
+        busy={busy}
+        confirmLabel={t("next.torrents.trackerFileUnbind")}
+        body={t("next.torrents.trackerFileUnbindBody")}
+        onConfirm={() => void unbind()}
+        onDismiss={() => setConfirmUnbind(null)}
+      />
+
+      <TrackerFileImport
+        key={importing}
+        t={t}
+        open={importOpen}
+        onDismiss={() => setImportOpen(false)}
+        onApplied={() => {
+          setImportOpen(false);
+          void reexecute({ requestPolicy: "network-only" });
+        }}
       />
 
       <ConfirmDialog
@@ -826,6 +1144,8 @@ interface TorrentConnection {
 
 interface TorrentForm {
   seeding: SeedingPolicy;
+  /** Each torrent's upload cap in bytes per second; null is none. */
+  uploadCap: number | null;
   torrent: TorrentConnection;
 }
 
@@ -883,7 +1203,7 @@ function connectionChanges(form: TorrentConnection, saved: TorrentConnection): P
 export function TorrentsPanel() {
   const t = useTranslate();
   const [{ data, fetching }, reexecute] = useQuery<{
-    settings: { seeding: SeedingPolicy | null; torrent: TorrentConnection | null };
+    settings: { seeding: SeedingPolicy | null; uploadCap: number | null; torrent: TorrentConnection | null };
   }>({ query: TORRENT_SETTINGS_QUERY });
   const [updateState, updateSettings] = useMutation(UPDATE_TORRENT_SETTINGS_MUTATION);
   const [status, setStatus] = useState<string | null>(null);
@@ -895,7 +1215,8 @@ export function TorrentsPanel() {
     const settings = data?.settings;
     return settings
       ? {
-          seeding: seedingFrom(settings.seeding),
+          seeding: seedingAtGlobal(seedingFrom(settings.seeding)),
+          uploadCap: settings.uploadCap ?? null,
           torrent: { ...DEFAULT_CONNECTION, ...(settings.torrent ?? {}) },
         }
       : null;
@@ -934,7 +1255,8 @@ export function TorrentsPanel() {
       setError(null);
       void updateSettings({
         input: {
-          ...(seedingChanged ? { seeding: seedingIsEmpty(seeding) ? null : seeding } : {}),
+          ...(seedingChanged ? { seeding } : {}),
+          ...(values.uploadCap !== source.uploadCap ? { uploadCap: values.uploadCap } : {}),
           ...(Object.keys(torrent).length > 0 ? { torrent } : {}),
         },
       }).then((result) => {
@@ -958,7 +1280,10 @@ export function TorrentsPanel() {
           kind: "section",
           id: "seeding",
           title: t("next.torrents.seeding"),
-          fields: seedingFields(t, values.seeding, (seeding) => draft.set({ seeding }), { inherits: false }),
+          fields: [
+            ...seedingFields(t, values.seeding, (seeding) => draft.set({ seeding }), { inherits: false }),
+            globalUploadCapField(t, values.uploadCap, (uploadCap) => draft.set({ uploadCap })),
+          ],
         },
         trackerRules.block,
         {

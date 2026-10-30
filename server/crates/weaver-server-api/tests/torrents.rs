@@ -18,7 +18,7 @@ use weaver_server_core::post_processing::model::PostProcessingSettings;
 use weaver_server_core::proxies::{
     EgressBinding, LegPath, ResolvedBy, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentScope,
 };
-use weaver_server_core::settings::{SeedingPolicy, TorrentConfig};
+use weaver_server_core::settings::{Leaf, SeedingPolicy, TorrentConfig};
 use weaver_server_core::torrents::net::LegKind;
 use weaver_server_core::torrents::service::{JobEnv, SystemClock, TorrentService, TorrentSettings};
 use weaver_server_core::torrents::sessions::{
@@ -103,6 +103,7 @@ async fn rig_on(routes: impl FnOnce(&weaver_server_core::Database) -> Arc<dyn Ro
         db,
         sessions,
         TorrentSettings {
+            upload_cap: None,
             complete_dir: complete.clone(),
             categories: Vec::new(),
             seeding: None,
@@ -260,7 +261,7 @@ async fn removing_a_private_torrent_short_of_its_goal_needs_confirmation() {
     let response = rig
         .execute(&submit(
             &metainfo("p.bin", 2000, true),
-            "seeding: { ratioGoal: 1.0 }",
+            "seeding: { ratioGoal: { state: SET, value: 1.0 } }",
         ))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
@@ -293,6 +294,7 @@ async fn the_torrent_surface_says_when_torrents_are_off() {
     // Turned on and then off, every route shows that torrents are off.
     let rig = rig().await;
     let settings = |enabled| TorrentSettings {
+        upload_cap: None,
         complete_dir: rig._dir.path().join("complete"),
         categories: Vec::new(),
         seeding: None,
@@ -339,20 +341,23 @@ async fn the_queue_names_a_torrents_phase() {
 }
 
 const DETAIL: &str = "leechers peers seeds files { path progress }
-    seedingOverride { ratioGoal } seedingPolicy { ratioGoal } seedingSource";
+    seedingOverride { ratioGoal { state value } seedTimeGoalMinutes { state value } }
+    seedingPolicy { ratioGoal seedTimeGoalMinutes mode levels { ratioGoal seedTimeGoalMinutes mode } }";
 
-// A torrent reads its leechers, each file's progress, and its seeding policy
-// with where that policy comes from.
+// A torrent reads its leechers, each file's progress, and its seeding terms
+// with the level each comes from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_torrent_reads_its_leechers_file_progress_and_seeding_policy() {
     let rig = rig().await;
     let policy = |ratio_goal| SeedingPolicy {
-        ratio_goal: Some(ratio_goal),
+        ratio_goal: Leaf::Set(ratio_goal),
         ..SeedingPolicy::default()
     };
     let mut settings = TorrentSettings {
+        upload_cap: None,
         complete_dir: rig._dir.path().join("complete"),
         categories: vec![CategoryConfig {
+            upload_cap: Default::default(),
             id: 1,
             name: "tv".into(),
             dest_dir: None,
@@ -382,23 +387,40 @@ async fn a_torrent_reads_its_leechers_file_progress_and_seeding_policy() {
     assert_eq!(torrent["files"][0]["progress"], 0.0);
     assert_eq!(torrent["seedingOverride"], Value::Null);
     assert_eq!(torrent["seedingPolicy"]["ratioGoal"], 1.5);
-    assert_eq!(torrent["seedingSource"], "GLOBAL");
+    assert_eq!(torrent["seedingPolicy"]["levels"]["ratioGoal"], "GLOBAL");
 
     let category = id(&read(submit(&metainfo("b.mkv", 3000, false), "category: \"tv\"")).await);
     let torrent = &read(detail(category)).await["torrent"];
     assert_eq!(torrent["seedingOverride"], Value::Null);
     assert_eq!(torrent["seedingPolicy"]["ratioGoal"], 3.0);
-    assert_eq!(torrent["seedingSource"], "CATEGORY");
+    assert_eq!(torrent["seedingPolicy"]["levels"]["ratioGoal"], "CATEGORY");
 
     let own = id(&read(submit(
         &metainfo("c.mkv", 3000, false),
-        "category: \"tv\" seeding: { ratioGoal: 2.0 }",
+        "category: \"tv\" seeding: { ratioGoal: { state: SET, value: 2.0 } }",
     ))
     .await);
     let torrent = &read(detail(own)).await["torrent"];
-    assert_eq!(torrent["seedingOverride"]["ratioGoal"], 2.0);
+    assert_eq!(torrent["seedingOverride"]["ratioGoal"]["state"], "SET");
+    assert_eq!(torrent["seedingOverride"]["ratioGoal"]["value"], 2.0);
+    assert_eq!(
+        torrent["seedingOverride"]["seedTimeGoalMinutes"]["state"],
+        "INHERIT"
+    );
     assert_eq!(torrent["seedingPolicy"]["ratioGoal"], 2.0);
-    assert_eq!(torrent["seedingSource"], "TORRENT");
+    assert_eq!(torrent["seedingPolicy"]["levels"]["ratioGoal"], "TORRENT");
+    assert_eq!(torrent["seedingPolicy"]["levels"]["mode"], "GLOBAL");
+
+    // A goal switched off at the torrent drops the one its category sets.
+    let off = id(&read(submit(
+        &metainfo("d.mkv", 3000, false),
+        "category: \"tv\" seeding: { ratioGoal: { state: OFF } }",
+    ))
+    .await);
+    let torrent = &read(detail(off)).await["torrent"];
+    assert_eq!(torrent["seedingOverride"]["ratioGoal"]["state"], "OFF");
+    assert_eq!(torrent["seedingPolicy"]["ratioGoal"], Value::Null);
+    assert_eq!(torrent["seedingPolicy"]["levels"]["ratioGoal"], "TORRENT");
 
     // The global policy changes and the inheriting torrent follows it.
     settings.seeding = Some(policy(4.0));
@@ -593,13 +615,13 @@ async fn a_tracker_rule_keeps_the_client_its_torrents_name_themselves_as() {
     assert!(!rig.execute(&save("", "DELUGE")).await.errors.is_empty());
 }
 
-// A tracker rule keeps its torrents' discovery, encryption, upload cap and
-// forced start; absent inherits, and an upload cap without bytes per second
-// is unlimited.
+// A tracker rule keeps its torrents' DHT, PEX and LSD, each on its own,
+// their encryption, upload cap and forced start; absent inherits, and an
+// upload cap switched off is none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tracker_rule_keeps_its_torrents_peer_terms() {
     let rig = rig().await;
-    let fields = "id discovery encryption uploadLimit { bps } forced";
+    let fields = "id dht pex lsd encryption uploadCap { state value } forced";
     let save = |id: &str, terms: &str| {
         format!(
             r#"mutation {{ saveTrackerRule({id} input: {{
@@ -611,7 +633,7 @@ async fn a_tracker_rule_keeps_its_torrents_peer_terms() {
     let response = rig
         .execute(&save(
             "",
-            "discovery: false, encryption: PREFER, uploadLimit: { bps: null }, forced: true",
+            "dht: false, pex: false, lsd: true, encryption: PREFER, uploadCap: { state: OFF }, forced: true",
         ))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
@@ -620,24 +642,24 @@ async fn a_tracker_rule_keeps_its_torrents_peer_terms() {
     assert_eq!(
         saved["saveTrackerRule"][0],
         serde_json::json!({
-            "id": id, "discovery": false, "encryption": "PREFER",
-            "uploadLimit": { "bps": null }, "forced": true,
+            "id": id, "dht": false, "pex": false, "lsd": true, "encryption": "PREFER",
+            "uploadCap": { "state": "OFF", "value": null }, "forced": true,
         })
     );
 
     for (terms, read) in [
         (
-            "discovery: true, encryption: REQUIRE, uploadLimit: { bps: 4096 }",
+            "dht: true, lsd: false, encryption: REQUIRE, uploadCap: { state: SET, value: 4096 }",
             serde_json::json!({
-                "id": id, "discovery": true, "encryption": "REQUIRE",
-                "uploadLimit": { "bps": 4096 }, "forced": false,
+                "id": id, "dht": true, "pex": null, "lsd": false, "encryption": "REQUIRE",
+                "uploadCap": { "state": "SET", "value": 4096 }, "forced": false,
             }),
         ),
         (
             "",
             serde_json::json!({
-                "id": id, "discovery": null, "encryption": null,
-                "uploadLimit": null, "forced": false,
+                "id": id, "dht": null, "pex": null, "lsd": null, "encryption": null,
+                "uploadCap": { "state": "INHERIT", "value": null }, "forced": false,
             }),
         ),
     ] {
@@ -773,8 +795,9 @@ async fn a_tracker_rule_sets_the_goals_of_the_torrents_announcing_to_its_hosts()
     let rule = |id: &str, pattern: &str| {
         format!(
             r#"mutation {{ saveTrackerRule({id} input: {{
-                hostPattern: "{pattern}", neverPause: true, seeding: {{ ratioGoal: 3 }}
-            }}) {{ id hostPattern neverPause seeding {{ ratioGoal }} }} }}"#
+                hostPattern: "{pattern}", neverPause: true,
+                seeding: {{ ratioGoal: {{ state: SET, value: 3 }} }}
+            }}) {{ id hostPattern neverPause seeding {{ ratioGoal {{ value }} }} }} }}"#
         )
     };
 
@@ -782,7 +805,7 @@ async fn a_tracker_rule_sets_the_goals_of_the_torrents_announcing_to_its_hosts()
     let saved = &saved["saveTrackerRule"][0];
     assert_eq!(saved["hostPattern"], "*.tracker.test");
     assert_eq!(saved["neverPause"], true);
-    assert_eq!(saved["seeding"]["ratioGoal"], 3.0);
+    assert_eq!(saved["seeding"]["ratioGoal"]["value"], 3.0);
     let rule_id = saved["id"].as_u64().unwrap();
     for refused in [rule("", "*.tracker.test"), rule("", "not a host")] {
         assert!(!rig.execute(&refused).await.errors.is_empty());
@@ -802,14 +825,17 @@ async fn a_tracker_rule_sets_the_goals_of_the_torrents_announcing_to_its_hosts()
         .unwrap();
     let source = || async move {
         let data = read(format!(
-            "{{ torrent(id: {id}) {{ seedingSource seedingRule seedingPolicy {{ ratioGoal }} }} }}"
+            "{{ torrent(id: {id}) {{ trackerRule seedingPolicy {{ ratioGoal levels {{ ratioGoal }} }} }} }}"
         ))
         .await;
         data["torrent"].clone()
     };
     let torrent = source().await;
-    assert_eq!(torrent["seedingSource"], "TRACKER_RULE");
-    assert_eq!(torrent["seedingRule"], "*.tracker.test");
+    assert_eq!(
+        torrent["seedingPolicy"]["levels"]["ratioGoal"],
+        "TRACKER_RULE"
+    );
+    assert_eq!(torrent["trackerRule"], "*.tracker.test");
     assert_eq!(torrent["seedingPolicy"]["ratioGoal"], 3.0);
     // No schedule pause is in force, so none is left seeding through one.
     assert_eq!(
@@ -823,8 +849,8 @@ async fn a_tracker_rule_sets_the_goals_of_the_torrents_announcing_to_its_hosts()
     .await;
     assert_eq!(left["deleteTrackerRule"], serde_json::json!([]));
     let torrent = source().await;
-    assert_eq!(torrent["seedingSource"], "GLOBAL");
-    assert_eq!(torrent["seedingRule"], Value::Null);
+    assert_eq!(torrent["seedingPolicy"]["levels"]["ratioGoal"], "GLOBAL");
+    assert_eq!(torrent["trackerRule"], Value::Null);
     assert_eq!(
         read("{ trackerRules { id } }".into()).await["trackerRules"],
         serde_json::json!([])
@@ -1180,6 +1206,7 @@ async fn the_torrent_routes_are_listed_with_their_scopes_and_reasons() {
     let rig = rig().await;
     rig.torrents
         .set_settings(TorrentSettings {
+            upload_cap: None,
             complete_dir: rig._dir.path().join("complete"),
             categories: Vec::new(),
             seeding: None,
@@ -1631,4 +1658,243 @@ async fn a_held_torrent_has_a_support_report_without_its_name() {
     assert_eq!(json["job"]["route_reason"], "leg_down");
     assert_eq!(json["job"]["private"], true);
     assert_eq!(json["job"]["pieces"]["total"], 3);
+}
+
+// A tracker file, base64: required DHT off, recommended PEX off and a ratio,
+// an identity for user-1 and one archive password, at `revision`.
+fn tracker_file(revision: &str) -> (String, String) {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "user-1");
+    params.not_after = rcgen::date_time_ymd(2031, 1, 1);
+    let text = format!(
+        "version = 1
+name = \"Example Tracker\"
+revision = \"{revision}\"
+host_pattern = \"*.tracker.test\"
+[required]
+dht = false
+[recommended]
+pex = false
+seeding = {{ ratio_goal = 1.5 }}
+[archive_passwords]
+values = [\"archive-secret-word\"]
+[ssl]
+certificate_pem = '''
+{}'''
+private_key_pem = '''
+{}'''
+",
+        params.self_signed(&key).unwrap().pem(),
+        key.serialize_pem()
+    );
+    (
+        base64::engine::general_purpose::STANDARD.encode(&text),
+        key.serialize_pem(),
+    )
+}
+
+// Importing a tracker file is previewed first, secret-free, and applied by
+// the preview's fingerprint; a file or rule changed since is a stale
+// preview. The rule it fills shows the file's name and the fields it locked,
+// and unbinding keeps every value. Only an admin may do any of it, and no
+// response carries the identity's key or a password.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tracker_file_is_previewed_then_applied_by_its_fingerprint() {
+    let rig = rig().await;
+    let (file, private_key) = tracker_file("1");
+    let secrets = [
+        private_key.trim().lines().nth(1).unwrap().to_owned(),
+        "archive-secret-word".to_owned(),
+        "upload-secret-word".to_owned(),
+    ];
+    let mut responses = Vec::new();
+    let preview_query = |file: &str| {
+        format!(
+            r#"mutation {{ previewTrackerFile(file: "{file}", password: "upload-secret-word") {{
+                name revision hostPattern ruleId hasSsl sslSubject sslNotAfter
+                archivePasswordCount fingerprint changes {{ field locked old new }}
+            }} }}"#
+        )
+    };
+    let apply_query = |file: &str, fingerprint: &str| {
+        format!(
+            r#"mutation {{ applyTrackerFile(file: "{file}", password: "upload-secret-word",
+                fingerprint: "{fingerprint}") {{
+                id hostPattern dht pex seeding {{ ratioGoal {{ state value }} }} hasSsl sslSubject
+                bound {{ name revision locked }} archivePasswordCount
+            }} }}"#
+        )
+    };
+
+    let response = rig.execute(&preview_query(&file)).await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let preview = response.data.into_json().unwrap()["previewTrackerFile"].clone();
+    responses.push(preview.to_string());
+    let fingerprint = preview["fingerprint"].as_str().unwrap().to_owned();
+    assert_eq!(
+        preview,
+        serde_json::json!({
+            "name": "Example Tracker", "revision": "1", "hostPattern": "*.tracker.test",
+            "ruleId": null, "hasSsl": true, "sslSubject": "CN=user-1",
+            "sslNotAfter": 1_924_992_000_000_i64, "archivePasswordCount": 1,
+            "fingerprint": fingerprint,
+            "changes": [
+                { "field": "dht", "locked": true, "old": null, "new": "false" },
+                { "field": "pex", "locked": false, "old": null, "new": "false" },
+                { "field": "seeding.ratio_goal", "locked": false, "old": null, "new": "1.5" },
+            ],
+        })
+    );
+
+    // A preview keeps nothing.
+    let response = rig.execute("{ trackerRules { id } }").await;
+    assert_eq!(
+        response.data.into_json().unwrap()["trackerRules"],
+        serde_json::json!([])
+    );
+
+    // A file other than the one previewed is a stale preview.
+    let (other, _) = tracker_file("2");
+    let stale = rig.execute(&apply_query(&other, &fingerprint)).await;
+    assert_eq!(stale.errors.len(), 1);
+    assert_eq!(stale.errors[0].message, "stale preview");
+    responses.push(format!("{:?}", stale.errors));
+
+    let response = rig.execute(&apply_query(&file, &fingerprint)).await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let rules = response.data.into_json().unwrap()["applyTrackerFile"].clone();
+    responses.push(rules.to_string());
+    let id = rules[0]["id"].as_u64().unwrap();
+    assert_eq!(
+        rules,
+        serde_json::json!([{
+            "id": id, "hostPattern": "*.tracker.test", "dht": false, "pex": false,
+            "seeding": { "ratioGoal": { "state": "SET", "value": 1.5 } }, "hasSsl": true, "sslSubject": "CN=user-1",
+            "bound": { "name": "Example Tracker", "revision": "1", "locked": ["dht", "ssl"] },
+            "archivePasswordCount": 1,
+        }])
+    );
+
+    // The rule changed since the preview: applying it again is stale, and a
+    // new preview names the rule.
+    let again = rig.execute(&apply_query(&file, &fingerprint)).await;
+    assert_eq!(again.errors[0].message, "stale preview");
+    let response = rig.execute(&preview_query(&file)).await;
+    let preview = response.data.into_json().unwrap()["previewTrackerFile"].clone();
+    responses.push(preview.to_string());
+    assert_eq!(preview["ruleId"], id);
+    assert_eq!(preview["changes"][0]["old"], "false");
+
+    // The ordinary save refuses a locked field.
+    let refused = rig
+        .execute(&format!(
+            r#"mutation {{ saveTrackerRule(id: {id}, input: {{
+                hostPattern: "*.tracker.test", dht: true, pex: false
+            }}) {{ id }} }}"#
+        ))
+        .await;
+    assert_eq!(
+        refused.errors[0].message,
+        "dht is locked by Example Tracker's tracker file; unbind the rule to change it."
+    );
+
+    // Only an admin previews, applies or unbinds.
+    for query in [
+        preview_query(&file),
+        apply_query(&file, &fingerprint),
+        format!("mutation {{ unbindTrackerRule(id: {id}) {{ id }} }}"),
+    ] {
+        let response = rig.execute_as_key(&query, CallerScope::Read).await;
+        assert!(
+            response
+                .errors
+                .iter()
+                .any(|error| error.message.contains("admin scope")),
+            "{query}: {:?}",
+            response.errors
+        );
+    }
+
+    let response = rig
+        .execute(&format!(
+            "mutation {{ unbindTrackerRule(id: {id}) {{ id dht pex hasSsl bound {{ name }} archivePasswordCount }} }}"
+        ))
+        .await;
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    let rules = response.data.into_json().unwrap()["unbindTrackerRule"].clone();
+    responses.push(rules.to_string());
+    assert_eq!(
+        rules,
+        serde_json::json!([{
+            "id": id, "dht": false, "pex": false, "hasSsl": true, "bound": null,
+            "archivePasswordCount": 1,
+        }])
+    );
+
+    // The editor's save keeps the rule's archive passwords, unless it clears
+    // them.
+    let save = |clear: bool| {
+        format!(
+            r#"mutation {{ saveTrackerRule(id: {id}, input: {{
+                hostPattern: "*.tracker.test", dht: false, pex: false,
+                clearArchivePasswords: {clear}
+            }}) {{ archivePasswordCount }} }}"#
+        )
+    };
+    for (clear, count) in [(false, 1), (true, 0)] {
+        let response = rig.execute(&save(clear)).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let rules = response.data.into_json().unwrap()["saveTrackerRule"].clone();
+        responses.push(rules.to_string());
+        assert_eq!(
+            rules,
+            serde_json::json!([{ "archivePasswordCount": count }])
+        );
+    }
+    let missing = rig
+        .execute(&format!(
+            "mutation {{ unbindTrackerRule(id: {}) {{ id }} }}",
+            id + 1
+        ))
+        .await;
+    assert_eq!(
+        missing.errors[0].message,
+        format!("no tracker rule {}", id + 1)
+    );
+
+    for response in &responses {
+        for secret in &secrets {
+            assert!(!response.contains(secret.as_str()), "{response}");
+        }
+    }
+}
+
+// A tracker file that cannot be read is refused in one sentence that names
+// no password, and a file past the largest is refused before it is decoded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tracker_file_that_cannot_be_read_is_refused_plainly() {
+    let rig = rig().await;
+    let preview = |file: &str| {
+        format!(
+            r#"mutation {{ previewTrackerFile(file: "{file}", password: "upload-secret-word") {{ name }} }}"#
+        )
+    };
+    let unknown = base64::engine::general_purpose::STANDARD.encode(
+        "version = 1\nname = \"T\"\nrevision = \"1\"\nhost_pattern = \"t.test\"\nclient = \"x\"\n",
+    );
+    let huge = "A".repeat(2 << 20);
+    for (file, refusal) in [
+        (unknown.as_str(), "client"),
+        ("not base64!", "The tracker file is not base64."),
+        (huge.as_str(), "The tracker file is larger than 1024 KiB."),
+    ] {
+        let response = rig.execute(&preview(file)).await;
+        assert_eq!(response.errors.len(), 1, "{:?}", response.errors);
+        let message = &response.errors[0].message;
+        assert!(message.contains(refusal), "{message}");
+        assert!(!message.contains("upload-secret-word"), "{message}");
+    }
 }

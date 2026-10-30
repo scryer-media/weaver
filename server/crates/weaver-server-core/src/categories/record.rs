@@ -4,10 +4,10 @@
 use crate::StateError;
 use crate::categories::CategoryConfig;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow};
-use crate::settings::SeedingPolicy;
+use crate::settings::{Leaf, SeedingPolicy};
 
 pub(crate) const CATEGORY_COLUMNS: &str =
-    "id, name, dest_dir, aliases, seeding, torrent_route, unpack";
+    "id, name, dest_dir, aliases, seeding, torrent_route, unpack, upload_cap";
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CategoryRecord {
@@ -18,6 +18,7 @@ pub(crate) struct CategoryRecord {
     pub seeding: Option<SeedingPolicy>,
     pub torrent_route: bool,
     pub unpack: Option<bool>,
+    pub upload_cap: Leaf<u64>,
 }
 
 impl CategoryRecord {
@@ -30,6 +31,7 @@ impl CategoryRecord {
             seeding: self.seeding,
             torrent_route: self.torrent_route,
             unpack: self.unpack,
+            upload_cap: self.upload_cap,
         }
     }
 
@@ -42,6 +44,7 @@ impl CategoryRecord {
             seeding: category.seeding,
             torrent_route: category.torrent_route,
             unpack: category.unpack,
+            upload_cap: category.upload_cap,
         }
     }
 
@@ -59,16 +62,24 @@ impl CategoryRecord {
             name: row.text("name")?,
             dest_dir: row.opt_text("dest_dir")?,
             aliases: row.text("aliases")?,
-            seeding,
+            seeding: SeedingPolicy::kept(seeding),
             torrent_route: row.bool("torrent_route")?,
             unpack: row.opt_bool("unpack")?,
+            upload_cap: {
+                let text = row.opt_text("upload_cap")?;
+                Leaf::from_text(text.as_deref()).ok_or_else(|| {
+                    StateError::Database(format!(
+                        "category upload cap {} is not valid",
+                        text.unwrap_or_default()
+                    ))
+                })?
+            },
         })
     }
 
     // Bind order matches `CATEGORY_COLUMNS`.
     pub(crate) fn into_args(self) -> Result<Vec<SqlArg>, StateError> {
-        let seeding = self
-            .seeding
+        let seeding = SeedingPolicy::kept(self.seeding)
             .map(|policy| serde_json::to_string(&policy))
             .transpose()
             .map_err(|error| StateError::Database(error.to_string()))?;
@@ -80,6 +91,7 @@ impl CategoryRecord {
             SqlArg::OptText(seeding),
             SqlArg::Bool(self.torrent_route),
             SqlArg::OptBool(self.unpack),
+            SqlArg::OptText(self.upload_cap.to_text()),
         ])
     }
 }

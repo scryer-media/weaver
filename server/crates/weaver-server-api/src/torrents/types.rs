@@ -4,9 +4,10 @@
 use async_graphql::{ComplexObject, Context, Enum, InputObject, Result, SimpleObject};
 use weaver_server_core::auth::CallerScope;
 use weaver_server_core::proxies::{TorrentRouteFault, TorrentScope};
+use weaver_server_core::settings::Seeding;
 use weaver_server_core::torrents::net::Exposure;
 use weaver_server_core::torrents::service::{
-    ScheduleSeeding, SeedingSource, TorrentRoute, TorrentView,
+    ScheduleSeeding, SeedingLevels, TorrentRoute, TorrentView,
 };
 use weaver_server_core::torrents::sessions::TorrentRouteReason;
 use weaver_server_core::torrents::sessions::{PortMapped, PortmapProtocol, PortmapTransport};
@@ -16,7 +17,10 @@ use weaver_server_core::torrents::{
 };
 
 use crate::networking::ResolvedBy;
-use crate::settings::types::{SeedingPolicyInput, SeedingPolicySettings};
+use crate::settings::types::{
+    SeedTimeCountingGql, SeedingActionGql, SeedingGoalModeGql, SeedingPolicyInput,
+    SeedingPolicySettings, SettingLevelGql,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
 #[graphql(name = "TorrentState")]
@@ -93,23 +97,59 @@ impl From<TrackerStatus> for TrackerStatusGql {
     }
 }
 
-/// Where a torrent's seeding policy comes from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
-#[graphql(name = "SeedingSource")]
-pub enum SeedingSourceGql {
-    Category,
-    Global,
-    Torrent,
-    TrackerRule,
+/// The level each of a torrent's seeding terms comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, SimpleObject)]
+#[graphql(name = "SeedingLevels")]
+pub struct SeedingLevelsGql {
+    pub ratio_goal: SettingLevelGql,
+    pub seed_time_goal_minutes: SettingLevelGql,
+    pub inactive_goal_minutes: SettingLevelGql,
+    pub mode: SettingLevelGql,
+    pub action: SettingLevelGql,
+    pub seed_time_counting: SettingLevelGql,
+    pub upload_cap: SettingLevelGql,
 }
 
-impl From<&SeedingSource> for SeedingSourceGql {
-    fn from(source: &SeedingSource) -> Self {
-        match source {
-            SeedingSource::Category => Self::Category,
-            SeedingSource::Global => Self::Global,
-            SeedingSource::Torrent => Self::Torrent,
-            SeedingSource::TrackerRule(_) => Self::TrackerRule,
+impl From<SeedingLevels> for SeedingLevelsGql {
+    fn from(levels: SeedingLevels) -> Self {
+        Self {
+            ratio_goal: levels.ratio_goal.into(),
+            seed_time_goal_minutes: levels.seed_time_goal_minutes.into(),
+            inactive_goal_minutes: levels.inactive_goal_minutes.into(),
+            mode: levels.mode.into(),
+            action: levels.action.into(),
+            seed_time_counting: levels.seed_time_counting.into(),
+            upload_cap: levels.upload_cap.into(),
+        }
+    }
+}
+
+/// The seeding terms a torrent is held to, each resolved over its levels.
+#[derive(Clone, Copy, Debug, PartialEq, SimpleObject)]
+#[graphql(name = "SeedingTerms")]
+pub struct SeedingTermsGql {
+    pub ratio_goal: Option<f32>,
+    pub seed_time_goal_minutes: Option<u32>,
+    pub inactive_goal_minutes: Option<u32>,
+    pub mode: SeedingGoalModeGql,
+    pub action: SeedingActionGql,
+    pub seed_time_counting: SeedTimeCountingGql,
+    /// The upload cap in bytes per second; absent is none.
+    pub upload_cap: Option<u64>,
+    pub levels: SeedingLevelsGql,
+}
+
+impl SeedingTermsGql {
+    fn of(seeding: Seeding, upload_cap: Option<u64>, levels: SeedingLevels) -> Self {
+        Self {
+            ratio_goal: seeding.ratio_goal,
+            seed_time_goal_minutes: seeding.seed_time_goal_minutes,
+            inactive_goal_minutes: seeding.inactive_goal_minutes,
+            mode: seeding.mode.into(),
+            action: seeding.action.into(),
+            seed_time_counting: seeding.seed_time_counting.into(),
+            upload_cap,
+            levels: levels.into(),
         }
     }
 }
@@ -535,6 +575,10 @@ pub struct Torrent {
     pub reannounce_seconds: Option<u64>,
     /// Seconds spent running in a session.
     pub active_seconds: u64,
+    /// Seconds spent complete and seeding, in all.
+    pub seeding_seconds: u64,
+    /// Seconds of the current unbroken seeding run.
+    pub consecutive_seeding_seconds: u64,
     pub download_avg_bps: u64,
     pub upload_avg_bps: u64,
     /// Bytes received and thrown away this run: pieces that failed their
@@ -557,16 +601,16 @@ pub struct Torrent {
     pub save_path: Option<String>,
     /// The seeding goal still to meet; absent once it is met.
     pub seeding_left: Option<String>,
-    /// The torrent's own seeding policy; absent when it inherits one.
+    /// The torrent's own seeding terms; absent when it inherits every one.
     pub seeding_override: Option<SeedingPolicySettings>,
-    /// The seeding policy in effect.
-    pub seeding_policy: SeedingPolicySettings,
-    pub seeding_source: SeedingSourceGql,
-    /// The host pattern of the tracker rule the policy comes from, when it
-    /// does.
-    pub seeding_rule: Option<String>,
+    /// The seeding terms in effect.
+    pub seeding_policy: SeedingTermsGql,
+    /// The host pattern of the tracker rule the torrent is under, when it is.
+    pub tracker_rule: Option<String>,
     /// Whether its archives are extracted.
     pub unpack: bool,
+    /// The torrent's own unpack; absent inherits.
+    pub unpack_override: Option<bool>,
     pub route: Option<String>,
     pub files: Vec<TorrentFileGql>,
     /// Whether its pieces are fetched in order.
@@ -622,6 +666,8 @@ impl From<TorrentView> for Torrent {
             swarm_leechers: view.swarm_leechers,
             reannounce_seconds: view.reannounce_seconds,
             active_seconds: view.active_seconds,
+            seeding_seconds: view.seeding_seconds,
+            consecutive_seeding_seconds: view.consecutive_seeding_seconds,
             download_avg_bps: view.download_avg_bps,
             upload_avg_bps: view.upload_avg_bps,
             wasted_bytes: view.wasted_bytes,
@@ -638,13 +684,14 @@ impl From<TorrentView> for Torrent {
             save_path: (!save_path.is_empty()).then_some(save_path),
             seeding_left: view.seeding_left,
             seeding_override: view.seeding_override.map(Into::into),
-            seeding_policy: view.seeding_policy.into(),
-            seeding_source: (&view.seeding_source).into(),
-            seeding_rule: match view.seeding_source {
-                SeedingSource::TrackerRule(pattern) => Some(pattern),
-                _ => None,
-            },
+            seeding_policy: SeedingTermsGql::of(
+                view.seeding_policy,
+                view.upload_cap,
+                view.seeding_levels,
+            ),
+            tracker_rule: view.tracker_rule,
             unpack: view.unpack,
+            unpack_override: view.unpack_override,
             route: view.route,
             files,
             sequential: view.sequential,

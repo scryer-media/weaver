@@ -60,14 +60,18 @@ CREATE TABLE torrent_counters (
     uploaded_bytes                BIGINT NOT NULL DEFAULT 0,
     downloaded_bytes              BIGINT NOT NULL DEFAULT 0,
     finished_duration_s           BIGINT NOT NULL DEFAULT 0,
+    -- The seconds of the current unbroken seeding run.
+    consecutive_seeding_s         BIGINT NOT NULL DEFAULT 0,
     last_activity_ms              BIGINT,
     last_announce_uploaded_bytes  BIGINT NOT NULL DEFAULT 0,
     updated_at_ms                 BIGINT NOT NULL
 );
 
--- A category's seeding policy, as JSON, and whether its torrents route
+-- A category's seeding policy, as JSON, its upload cap (`off` for none
+-- or bytes per second; NULL inherits), and whether its torrents route
 -- through their own consumer.
 ALTER TABLE categories ADD COLUMN seeding TEXT;
+ALTER TABLE categories ADD COLUMN upload_cap TEXT;
 ALTER TABLE categories ADD COLUMN torrent_route BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- What a finished job was downloaded over. Every job before this migration

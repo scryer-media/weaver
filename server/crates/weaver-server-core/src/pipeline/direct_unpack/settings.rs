@@ -126,6 +126,7 @@ mod tests {
     #[test]
     fn resolve_reads_the_config_table() {
         let mut config = Config {
+            upload_cap: None,
             seeding: None,
             torrent: Default::default(),
             data_dir: "/tmp/weaver-direct-unpack".to_string(),

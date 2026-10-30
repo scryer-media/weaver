@@ -100,9 +100,9 @@ pub use network::{SocketFactory, StreamListener};
 pub use peer_connection::PeerConnectionOptions;
 pub use piece_priority::{FilePriority, PiecePriority};
 pub use session::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, FetchPhase, IpFilter,
-    ListOnlyResponse, MetadataFetch, SUPPORTED_SCHEMES, Session, SessionLimits, SessionOptions,
-    SessionPersistenceConfig,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, DhtSessionConfig, Discovery, FetchPhase,
+    IpFilter, ListOnlyResponse, MetadataFetch, SUPPORTED_SCHEMES, Session, SessionLimits,
+    SessionOptions, SessionPersistenceConfig,
 };
 pub use ssl::SslIdentity;
 pub use stream_connect::{ConnectionKind, ConnectionOptions};

@@ -22,7 +22,9 @@ use weaver_server_core::proxies::{
     EgressBinding, LegPath, ResolvedBy, RoutingPolicy, SYSTEM_EGRESS_ID, TorrentScope,
 };
 use weaver_server_core::settings::model::{Config, SharedConfig};
-use weaver_server_core::settings::{BlocklistSource, SeedingPolicy, TorrentConfig, TorrentLimit};
+use weaver_server_core::settings::{
+    BlocklistSource, Leaf, Seeding, SeedingGoalMode, SeedingPolicy, TorrentConfig, TorrentLimit,
+};
 use weaver_server_core::torrents::identity::IDENTITY;
 use weaver_server_core::torrents::net::LegKind;
 use weaver_server_core::torrents::service::{
@@ -114,6 +116,7 @@ fn scheduler() -> SchedulerHandle {
 
 fn config(complete_dir: &std::path::Path) -> SharedConfig {
     Arc::new(RwLock::new(Config {
+        upload_cap: None,
         seeding: None,
         torrent: Default::default(),
         data_dir: complete_dir.to_string_lossy().into_owned(),
@@ -209,6 +212,7 @@ async fn rig_on(
             db.clone(),
             sessions,
             TorrentSettings {
+                upload_cap: None,
                 complete_dir: complete.clone(),
                 categories: Vec::new(),
                 seeding: None,
@@ -425,6 +429,8 @@ fn view(state: TorrentState) -> TorrentView {
         swarm_leechers: None,
         reannounce_seconds: None,
         active_seconds: 0,
+        seeding_seconds: 0,
+        consecutive_seeding_seconds: 0,
         download_avg_bps: 0,
         upload_avg_bps: 0,
         wasted_bytes: 0,
@@ -440,10 +446,12 @@ fn view(state: TorrentState) -> TorrentView {
         queue_position: None,
         seeding_left: None,
         seeding_override: None,
-        seeding_inherited: None,
-        seeding_policy: SeedingPolicy::default(),
-        seeding_source: SeedingSource::Global,
+        seeding_policy: Seeding::default(),
+        seeding_levels: Default::default(),
+        tracker_rule: None,
+        upload_cap: None,
         unpack: true,
+        unpack_override: None,
         route: None,
         files: Vec::new(),
         sequential: false,
@@ -801,12 +809,15 @@ fn an_add_reads_where_the_files_are_and_how_they_are_laid_out() {
     );
 }
 
+// A torrent's own share limits read `-2` for each it inherits, `-1` for
+// one it switched off and its value for one it set; the limits in force
+// read beside them.
 #[test]
-fn share_limits_report_the_policy_in_force_and_where_it_comes_from() {
-    let policy = SeedingPolicy {
+fn share_limits_report_the_torrents_own_and_those_in_force() {
+    let policy = Seeding {
         ratio_goal: Some(2.0),
         seed_time_goal_minutes: Some(60),
-        ..SeedingPolicy::default()
+        ..Seeding::default()
     };
     let global = info(
         &TorrentView {
@@ -820,17 +831,29 @@ fn share_limits_report_the_policy_in_force_and_where_it_comes_from() {
     assert_eq!(global["max_ratio"], 2.0);
     assert_eq!(global["max_seeding_time"], 60);
     assert_eq!(global["max_inactive_seeding_time"], -1);
+    assert_eq!(global["share_limits_mode"], "Default");
     let own = info(
         &TorrentView {
-            seeding_policy: policy,
-            seeding_source: SeedingSource::Category,
+            seeding_policy: Seeding {
+                inactive_goal_minutes: None,
+                ..policy
+            },
+            seeding_override: Some(SeedingPolicy {
+                ratio_goal: Leaf::Set(2.0),
+                inactive_goal_minutes: Leaf::Off,
+                mode: Leaf::Set(SeedingGoalMode::All),
+                ..SeedingPolicy::default()
+            }),
             ..view(TorrentState::Seeding)
         },
         CallerScope::Admin,
     );
     assert_eq!(own["ratio_limit"], 2.0);
-    assert_eq!(own["seeding_time_limit"], 60);
+    assert_eq!(own["seeding_time_limit"], -2);
     assert_eq!(own["inactive_seeding_time_limit"], -1);
+    assert_eq!(own["share_limits_mode"], "MatchAll");
+    assert_eq!(own["share_limit_action"], "Default");
+    assert_eq!(own["max_seeding_time"], 60);
     // Not yet complete: no time seeding, and last active when added.
     assert_eq!(own["seeding_time"], 0);
     assert_eq!(own["last_activity"], 1_700_000_000);
@@ -1216,8 +1239,10 @@ async fn the_dht_row_follows_the_torrents_rule_before_its_category() {
     let torrents = rig.context.inner.torrents.as_ref().unwrap();
     torrents
         .set_settings(TorrentSettings {
+            upload_cap: None,
             complete_dir: rig._dir.path().join("complete"),
             categories: vec![CategoryConfig {
+                upload_cap: Default::default(),
                 id: 7,
                 name: "tv".into(),
                 dest_dir: None,
@@ -1234,6 +1259,8 @@ async fn the_dht_row_follows_the_torrents_rule_before_its_category() {
         .db
         .insert_tracker_rule(
             &TrackerRule {
+                bound: None,
+                archive_passwords: Default::default(),
                 id: 0,
                 host_pattern: "tracker.test".into(),
                 seeding: None,
@@ -1241,9 +1268,11 @@ async fn the_dht_row_follows_the_torrents_rule_before_its_category() {
                 unpack: None,
                 client: None,
                 torrent_route: true,
-                discovery: None,
+                dht: None,
+                pex: None,
+                lsd: None,
                 encryption: None,
-                upload_limit: None,
+                upload_cap: Default::default(),
                 forced: false,
                 ssl: None,
             },
@@ -2102,7 +2131,8 @@ async fn share_limits_are_set_on_add_and_after() {
     let torrent = &rig.torrents().await[0];
     assert_eq!(torrent["ratio_limit"], 2.0);
     assert_eq!(torrent["seeding_time_limit"], 60);
-    assert_eq!(torrent["inactive_seeding_time_limit"], -1);
+    // Not given, so inherited.
+    assert_eq!(torrent["inactive_seeding_time_limit"], -2);
     let hash = torrent["hash"].as_str().unwrap().to_owned();
     let limits = |form: &str| format!("hashes={hash}&{form}");
 
@@ -2125,10 +2155,15 @@ async fn share_limits_are_set_on_add_and_after() {
     assert_eq!(torrent["ratio_limit"], -1);
     assert_eq!(torrent["seeding_time_limit"], 30);
 
-    rig.config.write().await.seeding = Some(SeedingPolicy {
-        ratio_goal: Some(1.0),
-        ..SeedingPolicy::default()
-    });
+    rig.config.write().await.seeding = Some(
+        SeedingPolicy {
+            ratio_goal: Leaf::Set(1.0),
+            seed_time_goal_minutes: Leaf::Set(90),
+            inactive_goal_minutes: Leaf::Set(45),
+            ..SeedingPolicy::default()
+        }
+        .at_global(),
+    );
     // The torrents learn of the setting the way the server hands it on.
     let settings = TorrentSettings::of(&*rig.config.read().await);
     rig.context
@@ -2138,13 +2173,46 @@ async fn share_limits_are_set_on_add_and_after() {
         .unwrap()
         .set_settings(settings)
         .await;
-    let refused = rig
+    // `-1` drops the goal the level above sets, on every limit; `-2` takes
+    // it.
+    let dropped = rig
         .post(
             "/api/v2/torrents/setShareLimits",
-            &limits("ratioLimit=-1&seedingTimeLimit=-2&inactiveSeedingTimeLimit=-2"),
+            &limits("ratioLimit=-1&seedingTimeLimit=-1&inactiveSeedingTimeLimit=-1"),
         )
         .await;
-    assert_eq!(refused.status, StatusCode::CONFLICT);
+    assert_eq!(dropped.status, StatusCode::OK);
+    let torrent = &rig.torrents().await[0];
+    for (own, in_force) in [
+        ("ratio_limit", "max_ratio"),
+        ("seeding_time_limit", "max_seeding_time"),
+        ("inactive_seeding_time_limit", "max_inactive_seeding_time"),
+    ] {
+        assert_eq!(torrent[own], -1, "{own}");
+        assert_eq!(torrent[in_force], -1, "{in_force}");
+    }
+    rig.post(
+        "/api/v2/torrents/setShareLimits",
+        &limits("ratioLimit=-2&seedingTimeLimit=-2&inactiveSeedingTimeLimit=-2"),
+    )
+    .await;
+    let torrent = &rig.torrents().await[0];
+    assert_eq!(
+        [
+            &torrent["ratio_limit"],
+            &torrent["seeding_time_limit"],
+            &torrent["inactive_seeding_time_limit"],
+        ],
+        [&json!(-2), &json!(-2), &json!(-2)]
+    );
+    assert_eq!(
+        [
+            &torrent["max_ratio"],
+            &torrent["max_seeding_time"],
+            &torrent["max_inactive_seeding_time"],
+        ],
+        [&json!(1.0), &json!(90), &json!(45)]
+    );
     let invalid = rig
         .post(
             "/api/v2/torrents/setShareLimits",
@@ -2159,15 +2227,16 @@ async fn share_limits_are_set_on_add_and_after() {
 // with no goal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cleared_share_limits_inherit_the_global_policy() {
-    use weaver_server_core::settings::{SeedingAction, SeedingGoalMode};
+    use weaver_server_core::settings::{Level, SeedingAction};
 
     let rig = rig().await;
     let global = SeedingPolicy {
-        ratio_goal: Some(1.0),
-        mode: SeedingGoalMode::All,
-        action: SeedingAction::Remove,
+        ratio_goal: Leaf::Set(1.0),
+        mode: Leaf::Set(SeedingGoalMode::All),
+        action: Leaf::Set(SeedingAction::Remove),
         ..SeedingPolicy::default()
-    };
+    }
+    .at_global();
     rig.config.write().await.seeding = Some(global);
     let torrents = rig.context.inner.torrents.as_ref().unwrap();
     torrents
@@ -2179,7 +2248,8 @@ async fn cleared_share_limits_inherit_the_global_policy() {
     )
     .await;
     let view = torrents.torrents(None).await.remove(0);
-    assert_eq!(view.seeding_source, SeedingSource::Torrent);
+    assert_eq!(view.seeding_levels.ratio_goal, Level::Torrent);
+    assert_eq!(view.seeding_levels.action, Level::Torrent);
     let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
 
     let cleared = rig
@@ -2194,8 +2264,17 @@ async fn cleared_share_limits_inherit_the_global_policy() {
     assert_eq!(cleared.status, StatusCode::OK);
     let view = torrents.torrents(None).await.remove(0);
     assert_eq!(view.seeding_override, None);
-    assert_eq!(view.seeding_source, SeedingSource::Global);
-    assert_eq!(view.seeding_policy, global);
+    assert_eq!(view.seeding_levels.ratio_goal, Level::Global);
+    assert_eq!(view.seeding_levels.action, Level::Global);
+    assert_eq!(
+        view.seeding_policy,
+        Seeding {
+            ratio_goal: Some(1.0),
+            mode: SeedingGoalMode::All,
+            action: SeedingAction::Remove,
+            ..Seeding::default()
+        }
+    );
     assert_eq!(rig.torrents().await[0]["ratio_limit"], -2);
 }
 

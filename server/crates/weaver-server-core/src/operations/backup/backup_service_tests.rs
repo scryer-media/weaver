@@ -140,6 +140,7 @@ fn sample_server(id: u32) -> crate::servers::ServerConfig {
 
 fn sample_config() -> Config {
     Config {
+        upload_cap: None,
         seeding: None,
         torrent: Default::default(),
         data_dir: "/old/data".into(),
@@ -150,6 +151,7 @@ fn sample_config() -> Config {
         servers: vec![],
         categories: vec![
             CategoryConfig {
+                upload_cap: Default::default(),
                 seeding: None,
                 torrent_route: false,
                 unpack: None,
@@ -159,6 +161,7 @@ fn sample_config() -> Config {
                 aliases: String::new(),
             },
             CategoryConfig {
+                upload_cap: Default::default(),
                 seeding: None,
                 torrent_route: false,
                 unpack: None,
@@ -1189,6 +1192,7 @@ async fn restore_requires_category_remap_for_external_paths() {
     let target_db = open_temp_db();
     target_db
         .save_config(&Config {
+            upload_cap: None,
             seeding: None,
             torrent: Default::default(),
             data_dir: "/bootstrap".into(),
@@ -1216,6 +1220,7 @@ async fn restore_requires_category_remap_for_external_paths() {
     let (target_service, _, _) = build_service(
         target_db.clone(),
         Config {
+            upload_cap: None,
             seeding: None,
             torrent: Default::default(),
             data_dir: "/bootstrap".into(),

@@ -2214,6 +2214,7 @@ fn settings_resolve_reads_the_config_table() {
     use crate::settings::DirectStoreOverrides;
 
     let mut config = crate::settings::Config {
+        upload_cap: None,
         seeding: None,
         torrent: Default::default(),
         data_dir: "/tmp/weaver-direct-store".to_string(),

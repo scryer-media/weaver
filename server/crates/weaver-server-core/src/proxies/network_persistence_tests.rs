@@ -762,6 +762,8 @@ fn a_tracker_rule_with_its_own_route_is_a_consumer() {
 
     let db = Database::open_in_memory().unwrap();
     let rule = |host_pattern: &str, torrent_route| TrackerRule {
+        archive_passwords: Default::default(),
+        bound: None,
         id: 0,
         host_pattern: host_pattern.into(),
         seeding: None,
@@ -769,9 +771,11 @@ fn a_tracker_rule_with_its_own_route_is_a_consumer() {
         unpack: None,
         client: None,
         torrent_route,
-        discovery: None,
+        dht: None,
+        pex: None,
+        lsd: None,
         encryption: None,
-        upload_limit: None,
+        upload_cap: Default::default(),
         forced: false,
         ssl: None,
     };

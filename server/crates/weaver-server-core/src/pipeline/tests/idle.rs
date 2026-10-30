@@ -25,6 +25,7 @@ async fn idle_pipeline(
     let complete_dir = temp_dir.path().join("complete");
     let db = Database::open(&temp_dir.path().join("weaver.db")).unwrap();
     let config: SharedConfig = Arc::new(RwLock::new(Config {
+        upload_cap: None,
         seeding: None,
         torrent: Default::default(),
         data_dir: data_dir.display().to_string(),

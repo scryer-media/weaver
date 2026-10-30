@@ -23,6 +23,7 @@ import {
   torrentErrorText,
   resolvedByKey,
   trackerSourceKey,
+  type SettingLevel,
   type TorrentActionError,
   type TorrentData,
   type TorrentFilePriority,
@@ -39,7 +40,7 @@ import { useNextData } from "@/next/data/next-data";
 import { LimitControl } from "@/next/features/networking/limits";
 import { informationFields, transferFields, transferNote, type TorrentField } from "@/next/features/torrents/general";
 import { countLabel } from "@/next/i18n/labels";
-import { EMPTY_SEEDING, durationText, seedingFields, seedingInput, type SeedingPolicy } from "@/next/pages/settings/seeding";
+import { durationText, seedingFields, seedingFrom, seedingInherits, seedingInput, type SeedingPolicy } from "@/next/pages/settings/seeding";
 
 const TRACKER_COLUMNS = {
   base: "minmax(0,1fr) 80px 112px max-content",
@@ -78,31 +79,48 @@ const ACTION_KEYS = {
   REMOVE_WITH_DATA: "next.seeding.actionRemoveWithData",
 } as const;
 
-function seedingRows(t: Translate, policy: SeedingPolicy): { label: string; value: string }[] {
+/** A torrent's seeding terms in force, each with the level it comes from. */
+function seedingRows(t: Translate, torrent: TorrentData): { label: string; value: string; level: SettingLevel }[] {
+  const terms = torrent.seedingPolicy;
   const minutes = (value: number | null) => (value === null ? t("next.seeding.noGoal") : durationText(t, value));
   return [
     {
       label: t("next.seeding.ratioGoal"),
-      value: policy.ratioGoal === null ? t("next.seeding.noGoal") : policy.ratioGoal.toFixed(2),
+      value: terms.ratioGoal === null ? t("next.seeding.noGoal") : terms.ratioGoal.toFixed(2),
+      level: terms.levels.ratioGoal,
     },
-    { label: t("next.seeding.seedTimeGoal"), value: minutes(policy.seedTimeGoalMinutes) },
-    { label: t("next.seeding.inactiveGoal"), value: minutes(policy.inactiveGoalMinutes) },
-    { label: t("next.seeding.mode"), value: t(policy.mode === "ALL" ? "next.seeding.modeAll" : "next.seeding.modeAny") },
-    { label: t("next.seeding.action"), value: t(ACTION_KEYS[policy.action]) },
+    { label: t("next.seeding.seedTimeGoal"), value: minutes(terms.seedTimeGoalMinutes), level: terms.levels.seedTimeGoalMinutes },
+    { label: t("next.seeding.inactiveGoal"), value: minutes(terms.inactiveGoalMinutes), level: terms.levels.inactiveGoalMinutes },
+    {
+      label: t("next.seeding.mode"),
+      value: t(terms.mode === "ALL" ? "next.seeding.modeAll" : "next.seeding.modeAny"),
+      level: terms.levels.mode,
+    },
+    { label: t("next.seeding.action"), value: t(ACTION_KEYS[terms.action]), level: terms.levels.action },
+    {
+      label: t("next.seeding.seedTimeCounting"),
+      value: t(
+        terms.seedTimeCounting === "CONSECUTIVE"
+          ? "next.seeding.countingConsecutive"
+          : "next.seeding.countingCumulative",
+      ),
+      level: terms.levels.seedTimeCounting,
+    },
     {
       label: t("next.seeding.uploadCap"),
-      value: policy.maxUploadBps === null ? EM_DASH : formatRate(policy.maxUploadBps),
+      value: terms.uploadCap === null ? EM_DASH : formatRate(terms.uploadCap),
+      level: terms.levels.uploadCap,
     },
   ];
 }
 
-/** Where the policy in effect comes from: the torrent's own override, its tracker rule, its category, or the global one. */
-function seedingSourceText(t: Translate, torrent: TorrentData): string {
-  switch (torrent.seedingSource) {
+/** Where a term in force comes from: the torrent itself, its tracker rule, its category, or the global settings. */
+function levelText(t: Translate, torrent: TorrentData, level: SettingLevel): string {
+  switch (level) {
     case "TORRENT":
       return t("next.torrent.seedingFromTorrent");
     case "TRACKER_RULE":
-      return t("next.torrent.seedingFromTrackerRule", { name: torrent.seedingRule ?? "" });
+      return t("next.torrent.seedingFromTrackerRule", { name: torrent.trackerRule ?? "" });
     case "CATEGORY":
       return t("next.torrent.seedingFromCategory", { name: torrent.category ?? "" });
     case "GLOBAL":
@@ -629,7 +647,7 @@ export function TorrentDetail({
         right={
           <button
             type="button"
-            onClick={() => setEditing(torrent.seedingOverride ?? torrent.seedingPolicy)}
+            onClick={() => setEditing(seedingFrom(torrent.seedingOverride))}
             className="cursor-pointer text-wv-dim hover:text-wv-fg"
           >
             {t("next.torrent.overrideSeeding")}
@@ -637,12 +655,17 @@ export function TorrentDetail({
         }
       >
         <div className="grid gap-x-4 gap-y-[13px]" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))" }}>
-          <Field
-            label={t("next.torrent.seedingFrom")}
-            value={seedingSourceText(t, torrent)}
-          />
-          {seedingRows(t, torrent.seedingPolicy).map((row) => (
-            <Field key={row.label} label={row.label} value={row.value} />
+          {seedingRows(t, torrent).map((row) => (
+            <Field
+              key={row.label}
+              label={row.label}
+              value={
+                <>
+                  <span>{row.value}</span>
+                  <span className="ml-[6px] text-wv-muted">{levelText(t, torrent, row.level)}</span>
+                </>
+              }
+            />
           ))}
         </div>
       </DetailBlock>
@@ -658,7 +681,7 @@ export function TorrentDetail({
         title={t("next.torrent.overrideSeeding")}
         note={torrent.name}
         busy={seedingState.fetching}
-        onSave={() => saveSeeding(editing ?? EMPTY_SEEDING)}
+        onSave={() => saveSeeding(editing === null || seedingInherits(editing) ? null : editing)}
         onDismiss={() => setEditing(null)}
         extraActions={
           <SecondaryButton

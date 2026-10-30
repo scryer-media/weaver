@@ -5,7 +5,7 @@ import { useRef, useState } from "react";
 import { useMutation } from "urql";
 import { ANALYZE_NZB_MUTATION, ANALYZE_TORRENT_MUTATION } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
-import { cn } from "@/lib/utils";
+import { cn, toBase64 } from "@/lib/utils";
 import { DetailBlock, EmptyState } from "../components/chrome";
 import { PrimaryButton, SecondaryButton, TextField } from "../components/controls";
 import { ANALYZER_ACCEPT, fileKind, isMagnet, maxBytes } from "../data/analyzer";
@@ -18,16 +18,6 @@ import {
   type SupportReport,
 } from "../data/support-report";
 import { NextShell } from "../shell/NextShell";
-
-/** Base64 in slices, since one `String.fromCharCode` call cannot take a whole NZB. */
-function toBase64(bytes: Uint8Array): string {
-  const SLICE = 0x8000;
-  let binary = "";
-  for (let start = 0; start < bytes.length; start += SLICE) {
-    binary += String.fromCharCode(...bytes.subarray(start, start + SLICE));
-  }
-  return btoa(binary);
-}
 
 type Outcome = { report: SupportReport } | { error: string };
 

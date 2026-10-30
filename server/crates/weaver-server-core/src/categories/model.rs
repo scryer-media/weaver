@@ -30,6 +30,10 @@ pub struct CategoryConfig {
     // `None` inherits.
     #[serde(default)]
     pub unpack: Option<bool>,
+    // The upload cap each of the category's torrents takes, over the global
+    // one.
+    #[serde(default, skip_serializing_if = "crate::settings::Leaf::is_inherit")]
+    pub upload_cap: crate::settings::Leaf<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -188,6 +192,7 @@ mod tests {
     #[test]
     fn configured_category_resolution_returns_the_canonical_record() {
         let categories = vec![CategoryConfig {
+            upload_cap: Default::default(),
             seeding: None,
             torrent_route: false,
             unpack: None,
@@ -216,6 +221,7 @@ mod tests {
     fn submission_resolution_canonicalizes_and_rejects_unsafe_fallbacks() {
         let categories = vec![
             CategoryConfig {
+                upload_cap: Default::default(),
                 seeding: None,
                 torrent_route: false,
                 unpack: None,
@@ -225,6 +231,7 @@ mod tests {
                 aliases: "film*".to_string(),
             },
             CategoryConfig {
+                upload_cap: Default::default(),
                 seeding: None,
                 torrent_route: false,
                 unpack: None,
@@ -260,6 +267,7 @@ mod tests {
         assert!(resolve_submission_category(&categories, Some("../../outside")).is_err());
 
         let unsafe_without_override = vec![CategoryConfig {
+            upload_cap: Default::default(),
             seeding: None,
             torrent_route: false,
             unpack: None,

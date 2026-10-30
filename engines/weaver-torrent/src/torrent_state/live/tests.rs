@@ -3689,6 +3689,110 @@ async fn a_torrent_that_takes_peers_from_trackers_only_does_not_speak_pex() {
     assert!(!h.knows("10.0.0.1:6881"));
 }
 
+// libtorrent `torrent_flags::disable_pex`: a torrent added without peer
+// exchange, in a session that runs it for its other torrents, neither
+// advertises it, nor sends a peer that speaks it our messages
+// (`ut_pex_plugin::tick` returns), nor takes peers from the peer's
+// (`ut_pex_peer_plugin::on_extended` returns). A torrent of the same session
+// added with it sends the same peer its first message once the peer has
+// been with it ten seconds.
+#[tokio::test]
+async fn a_torrent_added_without_pex_neither_advertises_sends_nor_reads_it() {
+    let add = |disable_pex| AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        disable_pex,
+        ..Default::default()
+    };
+    let opts = isolated_session_opts(false);
+    assert!(!opts.disable_pex);
+    let off = Harness::build_added("pex_off_per_torrent", PIECES, 0x00, opts, add(true)).await;
+    let on = Harness::added_to(
+        off._session.clone(),
+        TempDir::with_prefix("pex_on_per_torrent").unwrap(),
+        "pex_on_per_torrent",
+        PIECES,
+        &[0x00],
+        add(false),
+    )
+    .await;
+    tokio::time::pause();
+
+    // A peer listening on 6881 to list, and one that speaks PEX to tell.
+    let speaks_pex = |h: &Harness| {
+        let (listed, listed_rx) = h.peer("203.0.113.1:50001");
+        let mut hs = ExtendedHandshake::new();
+        hs.p = Some(6881);
+        (&listed).on_extended_handshake(&hs).unwrap();
+        let (told, told_rx) = h.peer("203.0.113.2:50002");
+        let mut hs = ExtendedHandshake::new();
+        hs.m.ut_pex = Some(1);
+        (&told).on_extended_handshake(&hs).unwrap();
+        (listed, listed_rx, told, told_rx)
+    };
+    let is_pex = |request: &WriterRequest| matches!(request, WriterRequest::UtPex(_));
+
+    let (_on_listed, _on_listed_rx, _on_told, mut on_rx) = speaks_pex(&on);
+    assert!(on.advertised(&_on_told).ut_pex.is_some());
+    loop {
+        if is_pex(&on_rx.recv().await.unwrap()) {
+            break;
+        }
+    }
+
+    let (_off_listed, _off_listed_rx, off_told, mut off_rx) = speaks_pex(&off);
+    assert!(off.advertised(&off_told).ut_pex.is_none());
+    tokio::time::advance(Duration::from_secs(120)).await;
+    while let Ok(request) = off_rx.try_recv() {
+        assert!(!is_pex(&request));
+    }
+    off_told
+        .send_pex(&pex(&["10.0.0.1:6881"], &[]))
+        .await
+        .unwrap();
+    assert!(!off.knows("10.0.0.1:6881"));
+}
+
+// BEP 27: a private torrent added with the DHT, local discovery and peer
+// exchange all left on still takes peers from its trackers alone: it
+// advertises no peer exchange, reads none, and looks on neither the DHT nor
+// the local network, as libtorrent's `create_ut_pex_plugin`,
+// `torrent::should_announce_dht` and `torrent::lsd_announce` each refuse a
+// private torrent whatever its flags.
+#[tokio::test]
+async fn a_private_torrent_added_with_every_discovery_on_does_none() {
+    let name = "private_every_discovery_on";
+    let out = TempDir::with_prefix(name).unwrap();
+    let session = Session::new_with_opts(out.path().into(), isolated_session_opts(false))
+        .await
+        .unwrap();
+    let mut torrent = TestTorrent::new(name, (PIECES * PIECE_LENGTH) as usize, PIECE_LENGTH)
+        .await
+        .unwrap();
+    torrent.torrent = crate::tests::e2e_tracker_announces::made_private(&torrent.torrent).unwrap();
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        disable_dht: false,
+        disable_lsd: false,
+        disable_pex: false,
+        ..Default::default()
+    };
+    let have = BF::from_boxed_slice(vec![0x00].into());
+    let h = Harness::adding(session, out, torrent, crate::Checkpoint::pieces(have), add).await;
+    assert!(h.live.metadata.info.info().private);
+
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    assert!(h.advertised(&peer).ut_pex.is_none());
+    peer.send_pex(&pex(&["10.0.0.1:6881"], &[])).await.unwrap();
+    assert!(!h.knows("10.0.0.1:6881"));
+    assert_eq!(
+        h.handle().discovery(),
+        crate::session::Discovery {
+            dht: false,
+            lsd: false
+        }
+    );
+}
+
 /// A handshake from a peer, with the DHT bit when `dht` holds.
 fn handshake(dht: bool) -> Handshake {
     Handshake::new(Id20::default(), Id20::new([9; 20])).offering_dht(dht)

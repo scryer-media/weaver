@@ -117,6 +117,7 @@ async fn configured_storage_merges_equal_paths_and_keeps_unavailable_paths() {
         config.intermediate_dir = Some(intermediate_dir.display().to_string());
         config.categories = vec![
             CategoryConfig {
+                upload_cap: Default::default(),
                 seeding: None,
                 torrent_route: false,
                 unpack: None,
@@ -126,6 +127,7 @@ async fn configured_storage_merges_equal_paths_and_keeps_unavailable_paths() {
                 aliases: String::new(),
             },
             CategoryConfig {
+                upload_cap: Default::default(),
                 seeding: None,
                 torrent_route: false,
                 unpack: None,
@@ -135,6 +137,7 @@ async fn configured_storage_merges_equal_paths_and_keeps_unavailable_paths() {
                 aliases: String::new(),
             },
             CategoryConfig {
+                upload_cap: Default::default(),
                 seeding: None,
                 torrent_route: false,
                 unpack: None,

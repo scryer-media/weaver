@@ -38,6 +38,7 @@ async fn rig_on(routes: Arc<dyn crate::torrents::sessions::Routes>) -> Rig {
     let dir = tempfile::TempDir::new().unwrap();
     let db = Database::open_in_memory().unwrap();
     let config = Arc::new(RwLock::new(Config {
+        upload_cap: None,
         seeding: None,
         torrent: Default::default(),
         data_dir: dir.path().display().to_string(),

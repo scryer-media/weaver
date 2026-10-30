@@ -752,6 +752,7 @@ fn build_service_with_security(
     security: RuntimeSecurityConfig,
 ) -> RssService {
     let config = Arc::new(RwLock::new(Config {
+        upload_cap: None,
         seeding: None,
         torrent: Default::default(),
         data_dir: data_dir.display().to_string(),

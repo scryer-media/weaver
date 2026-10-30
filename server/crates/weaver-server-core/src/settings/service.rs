@@ -8,8 +8,9 @@ use crate::runtime::hardware_profile::HardwareProfile;
 use crate::settings::record::SettingRecord;
 use crate::settings::{
     BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides,
-    DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides, SeedingAction,
-    SeedingGoalMode, SeedingPolicy, TorrentConfig, TorrentEncryption, TorrentPeerProtocol,
+    DirectUnpackOverrides, Leaf, MetricsConfig, PerJobSeries, RetryOverrides, SeedTimeCounting,
+    SeedingAction, SeedingGoalMode, SeedingPolicy, TorrentConfig, TorrentEncryption,
+    TorrentPeerProtocol,
 };
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 
@@ -233,6 +234,7 @@ impl Database {
         };
 
         let seeding = seeding_policy_from_settings(&settings);
+        let upload_cap = parsed_setting(&settings, SEEDING_UPLOAD_CAP);
         let mut torrent = torrent_config_from_settings(&settings);
         if !settings.contains_key(BASE_PORT_KEY) {
             torrent.base_port = self.chosen_base_port()?;
@@ -260,32 +262,33 @@ impl Database {
             hardware_profile,
             metrics,
             seeding,
+            upload_cap,
             torrent,
             config_path: None,
         })
     }
 
-    // Write the global seeding policy; `None` removes it.
+    // Write the global seeding policy; `None` removes it. A goal is kept
+    // while it is set; an inherited one is none, as nothing is above.
     pub fn save_seeding_policy(&self, policy: Option<&SeedingPolicy>) -> Result<(), StateError> {
-        let Some(policy) = policy else {
+        let Some(policy) = policy.map(|policy| policy.at_global()) else {
             for key in SEEDING_KEYS {
                 self.delete_setting(key)?;
             }
             return Ok(());
         };
         let optional = [
-            (SEEDING_RATIO_GOAL, policy.ratio_goal.map(|v| v.to_string())),
+            (
+                SEEDING_RATIO_GOAL,
+                policy.ratio_goal.set().map(|v| v.to_string()),
+            ),
             (
                 SEEDING_SEED_TIME_GOAL_MINUTES,
-                policy.seed_time_goal_minutes.map(|v| v.to_string()),
+                policy.seed_time_goal_minutes.set().map(|v| v.to_string()),
             ),
             (
                 SEEDING_INACTIVE_GOAL_MINUTES,
-                policy.inactive_goal_minutes.map(|v| v.to_string()),
-            ),
-            (
-                SEEDING_MAX_UPLOAD_BPS,
-                policy.max_upload_bps.map(|v| v.to_string()),
+                policy.inactive_goal_minutes.set().map(|v| v.to_string()),
             ),
         ];
         for (key, value) in optional {
@@ -294,9 +297,21 @@ impl Database {
                 None => self.delete_setting(key)?,
             }
         }
-        self.set_setting(SEEDING_MODE, policy.mode.as_str())?;
-        self.set_setting(SEEDING_ACTION, policy.action.as_str())?;
+        let mode = policy.mode.set().unwrap_or_default();
+        let action = policy.action.set().unwrap_or_default();
+        self.set_setting(SEEDING_MODE, mode.as_str())?;
+        self.set_setting(SEEDING_ACTION, action.as_str())?;
+        let counting = policy.seed_time_counting.set().unwrap_or_default();
+        self.set_setting(SEEDING_SEED_TIME_COUNTING, counting.as_str())?;
         Ok(())
+    }
+
+    // Write the global upload cap; `None` is none.
+    pub fn save_upload_cap(&self, cap: Option<u64>) -> Result<(), StateError> {
+        match cap {
+            Some(cap) => self.set_setting(SEEDING_UPLOAD_CAP, &cap.to_string()),
+            None => self.delete_setting(SEEDING_UPLOAD_CAP),
+        }
     }
 
     pub fn save_torrent_config(&self, torrent: &TorrentConfig) -> Result<(), StateError> {
@@ -529,6 +544,7 @@ impl Database {
         )?;
 
         self.save_seeding_policy(config.seeding.as_ref())?;
+        self.save_upload_cap(config.upload_cap)?;
         self.save_torrent_config(&config.torrent)?;
 
         self.replace_servers(&config.servers)?;
@@ -543,14 +559,16 @@ const SEEDING_SEED_TIME_GOAL_MINUTES: &str = "seeding.seed_time_goal_minutes";
 const SEEDING_INACTIVE_GOAL_MINUTES: &str = "seeding.inactive_goal_minutes";
 const SEEDING_MODE: &str = "seeding.mode";
 const SEEDING_ACTION: &str = "seeding.action";
-const SEEDING_MAX_UPLOAD_BPS: &str = "seeding.max_upload_bps";
+const SEEDING_SEED_TIME_COUNTING: &str = "seeding.seed_time_counting";
+// The global upload cap, beside the policy and not part of it.
+const SEEDING_UPLOAD_CAP: &str = "seeding.upload_cap";
 const SEEDING_KEYS: [&str; 6] = [
     SEEDING_RATIO_GOAL,
     SEEDING_SEED_TIME_GOAL_MINUTES,
     SEEDING_INACTIVE_GOAL_MINUTES,
     SEEDING_MODE,
     SEEDING_ACTION,
-    SEEDING_MAX_UPLOAD_BPS,
+    SEEDING_SEED_TIME_COUNTING,
 ];
 
 fn parsed_setting<T: std::str::FromStr>(
@@ -568,20 +586,35 @@ fn seeding_policy_from_settings(
     if !SEEDING_KEYS.iter().any(|key| settings.contains_key(*key)) {
         return None;
     }
-    Some(SeedingPolicy {
-        ratio_goal: parsed_setting(settings, SEEDING_RATIO_GOAL),
-        seed_time_goal_minutes: parsed_setting(settings, SEEDING_SEED_TIME_GOAL_MINUTES),
-        inactive_goal_minutes: parsed_setting(settings, SEEDING_INACTIVE_GOAL_MINUTES),
-        mode: settings
-            .get(SEEDING_MODE)
-            .and_then(|v| SeedingGoalMode::parse(v))
-            .unwrap_or_default(),
-        action: settings
-            .get(SEEDING_ACTION)
-            .and_then(|v| SeedingAction::parse(v))
-            .unwrap_or_default(),
-        max_upload_bps: parsed_setting(settings, SEEDING_MAX_UPLOAD_BPS),
-    })
+    Some(
+        SeedingPolicy {
+            ratio_goal: Leaf::of(parsed_setting(settings, SEEDING_RATIO_GOAL)),
+            seed_time_goal_minutes: Leaf::of(parsed_setting(
+                settings,
+                SEEDING_SEED_TIME_GOAL_MINUTES,
+            )),
+            inactive_goal_minutes: Leaf::of(parsed_setting(
+                settings,
+                SEEDING_INACTIVE_GOAL_MINUTES,
+            )),
+            mode: Leaf::of(
+                settings
+                    .get(SEEDING_MODE)
+                    .and_then(|v| SeedingGoalMode::parse(v)),
+            ),
+            action: Leaf::of(
+                settings
+                    .get(SEEDING_ACTION)
+                    .and_then(|v| SeedingAction::parse(v)),
+            ),
+            seed_time_counting: Leaf::of(
+                settings
+                    .get(SEEDING_SEED_TIME_COUNTING)
+                    .and_then(|v| SeedTimeCounting::parse(v)),
+            ),
+        }
+        .at_global(),
+    )
 }
 
 fn torrent_config_from_settings(

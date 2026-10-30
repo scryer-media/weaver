@@ -178,14 +178,17 @@ test("each queue row names its type, and a wide list draws the bars as a column 
   await page.close();
 });
 
-test("a torrent's detail names where its seeding policy comes from, and its swarm and file progress", async () => {
+test("a torrent's detail names where each seeding term comes from, and its swarm and file progress", async () => {
   const { page, errors } = await open("seeding");
   const seeding = (source) => page.getByLabel(source, { exact: true }).getByRole("region", { name: "Seeding", exact: true });
   await seeding("TORRENT").waitFor();
+  // The ratio goal comes from the level each torrent names; its five other terms from the global settings.
   assert.equal(await seeding("TORRENT").getByText("Override", { exact: true }).count(), 1);
+  assert.equal(await seeding("TORRENT").getByText("Global", { exact: true }).count(), 5);
   assert.equal(await seeding("CATEGORY").getByText("Category movies", { exact: true }).count(), 1);
-  assert.equal(await seeding("GLOBAL").getByText("Global", { exact: true }).count(), 1);
-  // The effective policy is the daemon's: the override's goal, then the category's.
+  assert.equal(await seeding("CATEGORY").getByText("Global", { exact: true }).count(), 5);
+  assert.equal(await seeding("GLOBAL").getByText("Global", { exact: true }).count(), 6);
+  // The terms in force are the daemon's: the override's goal, then the category's.
   assert.equal(await seeding("TORRENT").getByText("2.50", { exact: true }).count(), 1);
   assert.equal(await seeding("CATEGORY").getByText("1.50", { exact: true }).count(), 1);
 
@@ -203,10 +206,12 @@ test("the override dialog starts from the override, and Use inherited clears onl
   const { page, errors } = await open("seeding");
   const dialog = page.getByRole("dialog", { name: "Override seeding", exact: true });
 
-  // Inherited: the dialog starts from the policy in effect, with nothing to clear.
+  // Inherited: every term of the dialog inherits, with nothing to clear.
   await page.getByLabel("GLOBAL", { exact: true }).getByRole("button", { name: "Override seeding", exact: true }).click();
   await dialog.waitFor();
-  assert.equal(await dialog.getByRole("spinbutton", { name: "Ratio goal", exact: true }).inputValue(), "1");
+  assert.equal(await dialog.getByRole("spinbutton", { name: "Ratio goal", exact: true }).count(), 0);
+  const ratio = dialog.getByRole("radiogroup", { name: "Ratio goal", exact: true });
+  assert.equal(await ratio.getByRole("radio", { name: "Inherit", exact: true }).getAttribute("aria-checked"), "true");
   assert.equal(await dialog.getByRole("button", { name: "Use inherited", exact: true }).isDisabled(), true);
   await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
   await dialog.waitFor({ state: "detached" });

@@ -597,9 +597,9 @@ fn held_torrent(
     hash: [u8; 20],
 ) -> crate::torrents::service::TorrentSupport {
     use crate::proxies::TorrentScope;
-    use crate::settings::SeedingPolicy;
+    use crate::settings::{Level, Seeding};
     use crate::torrents::service::{
-        PeerKinds, SeedingSource, TorrentLeg, TorrentPieces, TorrentSupport, TorrentView,
+        PeerKinds, SeedingLevels, TorrentLeg, TorrentPieces, TorrentSupport, TorrentView,
     };
     use crate::torrents::sessions::TorrentRouteReason;
     use crate::torrents::{
@@ -647,6 +647,8 @@ fn held_torrent(
         swarm_leechers: None,
         reannounce_seconds: None,
         active_seconds: 120,
+        seeding_seconds: 0,
+        consecutive_seeding_seconds: 0,
         download_avg_bps: 0,
         upload_avg_bps: 0,
         wasted_bytes: 2048,
@@ -689,13 +691,18 @@ fn held_torrent(
         file_have: Vec::new(),
         metadata: Vec::new(),
         seeding_override: None,
-        seeding_inherited: None,
-        seeding_policy: SeedingPolicy {
+        seeding_policy: Seeding {
             ratio_goal: Some(2.0),
-            ..SeedingPolicy::default()
+            ..Seeding::default()
         },
-        seeding_source: SeedingSource::Category,
+        seeding_levels: SeedingLevels {
+            ratio_goal: Level::Category,
+            ..SeedingLevels::default()
+        },
+        tracker_rule: None,
+        upload_cap: None,
         unpack: true,
+        unpack_override: None,
     };
     TorrentSupport {
         view,
@@ -761,6 +768,7 @@ fn published_metrics() -> crate::torrents::metrics::TorrentMetrics {
         redundant_bytes: 1024,
         active_seconds: 120,
         seeding_seconds: 0,
+        consecutive_seeding_seconds: 0,
         download_bps: 500,
         upload_bps: 0,
         ratio: 0.5,
@@ -839,7 +847,8 @@ fn a_held_torrent_reports_what_the_service_holds() {
     assert_eq!(job["trackers"][0]["message"], "authorization");
     assert_eq!(job["trackers"][0]["last_answer_age_secs"], 30);
     assert_eq!(job["trackers"][0]["next_announce_in_secs"], 60);
-    assert_eq!(job["seeding"]["source"], "category");
+    assert_eq!(job["seeding"]["levels"]["ratio_goal"], "category");
+    assert_eq!(job["seeding"]["levels"]["mode"], "global");
     assert_eq!(job["seeding"]["ratio_left_milli"], 1500);
     assert_eq!(job["output"]["kind"], "absolute");
     assert!(

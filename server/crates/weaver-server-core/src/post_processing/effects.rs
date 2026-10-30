@@ -419,6 +419,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         for category in [
             CategoryConfig {
+                upload_cap: Default::default(),
                 seeding: None,
                 torrent_route: false,
                 unpack: None,
@@ -428,6 +429,7 @@ mod tests {
                 aliases: String::new(),
             },
             CategoryConfig {
+                upload_cap: Default::default(),
                 seeding: None,
                 torrent_route: false,
                 unpack: None,
@@ -437,6 +439,7 @@ mod tests {
                 aliases: String::new(),
             },
             CategoryConfig {
+                upload_cap: Default::default(),
                 seeding: None,
                 torrent_route: false,
                 unpack: None,
