@@ -264,6 +264,7 @@ impl Segments for Source {
 // asked to repair, and what happens between its two reads.
 #[derive(Default)]
 struct Seen {
+    report_error: bool,
     fed: Vec<Segment>,
     read: Option<Vec<u8>>,
     volume: Option<Vec<u8>>,
@@ -384,6 +385,22 @@ impl Recovery for Par {
     fn wants(&self, _: &mut Vec<Seek>) {}
 
     fn repair(&mut self, access: &mut dyn MemberAccess, _: weaver_graph::Budget) -> RepairOutcome {
+        if self.seen.lock().unwrap().report_error {
+            #[derive(Debug)]
+            struct Injected(std::io::Error);
+            impl std::fmt::Display for Injected {
+                fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("injected reconstruction failure")
+                }
+            }
+            impl std::error::Error for Injected {
+                fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                    Some(&self.0)
+                }
+            }
+            let error = Injected(std::io::Error::other("injected storage cause"));
+            access.repair_error("execute recovery", "set-a", &error);
+        }
         let mut volume = Vec::new();
         let span = ByteRange::new(0, PAR2_SIGNATURE.len() as u64);
         if access.read_volume(VolumeIndex(0), span, &mut volume) {
@@ -1396,6 +1413,160 @@ fn a_deleted_output_does_not_hide_the_surviving_committed_envelope() {
     );
 }
 
+// A return can happen while the complete source still awaits handover.
+// Its recorded coverage, not its allocated length, describes retained bytes.
+#[test]
+fn give_back_retains_the_unreplayed_leaf_without_adopting_sparse_holes() {
+    for (sparse, restored) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut job = Job::new(PLENTY);
+        let member = job.member("pack.bin", Some(12));
+        job.send(member, 0, SIGNATURE, Provenance::Fresh);
+        let owner = job.tree.child_of(NodeId::ROOT, member).unwrap();
+        let source = [SIGNATURE, b"hello"].concat();
+        let (offset, bytes) = if sparse {
+            (10, &source[10..])
+        } else {
+            (0, &source[..])
+        };
+        job.writer
+            .write_file(&job.tree, NodeId::ROOT, member, offset, bytes)
+            .unwrap();
+        let original = job.writer.files[&NodeId::ROOT].leaves[&member]
+            .path()
+            .to_path_buf();
+        let record = job
+            .tree
+            .namespace_mut(NodeId::ROOT)
+            .unwrap()
+            .get_mut(member)
+            .unwrap();
+        record
+            .coverage
+            .write(ByteRange::new(offset, 12), Provenance::Fresh);
+        record.closed = !sparse;
+        if restored {
+            let state = job.writer.file_state(NodeId::ROOT, member);
+            job.writer
+                .restore_file(&job.tree, NodeId::ROOT, member, &state)
+                .unwrap();
+            assert_eq!(
+                job.writer.files[&NodeId::ROOT].leaves[&member].folded(12),
+                None
+            );
+        }
+
+        job.writer
+            .given_back(&mut job.tree, (NodeId::ROOT, member), owner)
+            .unwrap();
+
+        let record = job
+            .tree
+            .namespace(NodeId::ROOT)
+            .unwrap()
+            .get(member)
+            .unwrap();
+        assert!(record.coverage.covered(ByteRange::new(0, HEADER)));
+        assert!(record.coverage.covered(ByteRange::new(10, 12)));
+        assert_eq!(record.coverage.covered(ByteRange::new(HEADER, 10)), !sparse);
+        assert_eq!(record.closed, !sparse);
+        let leaf = &job.writer.files[&NodeId::ROOT].leaves[&member];
+        assert_eq!(leaf.path(), original, "handover keeps the recorded source");
+        let mut actual = Vec::new();
+        leaf.read(0, 12, &mut actual).unwrap();
+        assert_eq!(&actual[..HEADER as usize], SIGNATURE);
+        assert_eq!(&actual[10..], &source[10..]);
+        if !sparse {
+            assert_eq!(actual, source);
+        }
+    }
+}
+
+#[test]
+fn give_back_does_not_retain_a_truncated_leaf_tail() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("pack.bin", Some(12));
+    job.send(member, 0, SIGNATURE, Provenance::Fresh);
+    let owner = job.tree.child_of(NodeId::ROOT, member).unwrap();
+    job.writer
+        .write_file(
+            &job.tree,
+            NodeId::ROOT,
+            member,
+            0,
+            &[SIGNATURE, b"hello"].concat(),
+        )
+        .unwrap();
+    let leaf = job
+        .writer
+        .files_mut(NodeId::ROOT)
+        .leaves
+        .get_mut(&member)
+        .unwrap();
+    leaf.close(12).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(leaf.path())
+        .unwrap()
+        .set_len(9)
+        .unwrap();
+    let record = job
+        .tree
+        .namespace_mut(NodeId::ROOT)
+        .unwrap()
+        .get_mut(member)
+        .unwrap();
+    record
+        .coverage
+        .write(ByteRange::new(0, 12), Provenance::Fresh);
+    record.closed = true;
+
+    job.writer
+        .given_back(&mut job.tree, (NodeId::ROOT, member), owner)
+        .unwrap();
+
+    let record = job
+        .tree
+        .namespace(NodeId::ROOT)
+        .unwrap()
+        .get(member)
+        .unwrap();
+    assert!(record.coverage.covered(ByteRange::new(0, 9)));
+    assert!(!record.coverage.covered(ByteRange::new(9, 12)));
+    assert!(!record.closed);
+}
+
+#[test]
+fn give_back_reports_a_missing_recorded_leaf_without_discarding_the_source_record() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("pack.bin", Some(12));
+    job.send(member, 0, SIGNATURE, Provenance::Fresh);
+    let owner = job.tree.child_of(NodeId::ROOT, member).unwrap();
+    job.writer
+        .write_file(
+            &job.tree,
+            NodeId::ROOT,
+            member,
+            0,
+            &[SIGNATURE, b"hello"].concat(),
+        )
+        .unwrap();
+    let leaf = job
+        .writer
+        .files_mut(NodeId::ROOT)
+        .leaves
+        .get_mut(&member)
+        .unwrap();
+    leaf.close(12).unwrap();
+    std::fs::remove_file(leaf.path()).unwrap();
+
+    assert!(
+        job.writer
+            .given_back(&mut job.tree, (NodeId::ROOT, member), owner)
+            .is_err()
+    );
+    assert!(job.writer.files[&NodeId::ROOT].leaves.contains_key(&member));
+}
+
 // A restore brings an envelope back as far as its file reaches, and the
 // member's coverage as far as what arrived. Given back after that, the
 // envelope is the member's file, and what it lacks is not in hand: the
@@ -1896,5 +2067,273 @@ fn a_member_failing_its_stated_checksum_is_damaged_when_a_rewrite_broke_the_fold
             "rewrote {:?}",
             String::from_utf8_lossy(again)
         );
+    }
+}
+#[test]
+fn same_path_rewrite_invalidates_repair_loan() {
+    let mut job = Job::new(PLENTY).with_set(Some(Fix {
+        name: "payload.bin",
+        read: ByteRange::new(0, 32768),
+        fix: (20000, b"OK"),
+    }));
+    let member = job.member("payload.bin", Some(32768));
+    job.send(member, 0, &vec![0x6d; 32768], Provenance::Fresh);
+    let mut lent = Inline::default();
+    let due = job.tree.recovery_nodes(NodeId::ROOT);
+    job.writer
+        .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+        .unwrap();
+    assert_eq!(lent.0.len(), 1);
+    let returned = lent
+        .0
+        .pop()
+        .unwrap()
+        .run(weaver_graph::Budget::default(), &Default::default());
+    assert!(
+        !job.writer.moved_since(&job.tree, &returned),
+        "unchanged input retains the loan"
+    );
+    let before = job.writer.files[&NodeId::ROOT].leaves[&member].revision();
+    job.send(member, 20000, b"new", Provenance::Fresh);
+    assert_ne!(
+        job.writer.files[&NodeId::ROOT].leaves[&member].revision(),
+        before
+    );
+    assert_eq!(&job.file("payload.bin")[20000..20003], b"new");
+    assert!(job.writer.moved_since(&job.tree, &returned));
+    let mut build = job.build();
+    let error = job
+        .writer
+        .returned(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            &weaver_objects::Objects::default(),
+            returned,
+            &mut job.out,
+        )
+        .unwrap_err();
+    assert!(matches!(error, WriteError::StaleRecovery { .. }));
+    assert_eq!(
+        &job.file("payload.bin")[20000..20003],
+        b"new",
+        "stale writes cannot publish without reconstruction"
+    );
+}
+
+#[test]
+fn rejected_damage_does_not_change_recovery_evidence() {
+    let mut job = Job::new(PLENTY).with_set(None);
+    let member = job.member("payload.bin", Some(8));
+    job.send(member, 0, b"repaired", Provenance::Repaired);
+    let fed = job.par.lock().unwrap().fed.len();
+    job.send(member, 2, b"BAD", Provenance::Damaged);
+    assert_eq!(job.file("payload.bin"), b"repaired");
+    assert_eq!(job.par.lock().unwrap().fed.len(), fed);
+}
+
+#[test]
+fn clipping_source_evidence_does_not_upgrade_verification() {
+    struct Unverified;
+    impl Segments for Unverified {
+        fn segments_for(&self, _: NodeId, _: VolumeIndex, _: ByteRange, out: &mut Vec<Segment>) {
+            out.push(Segment {
+                range: ByteRange::new(0, 8),
+                crc32: 0,
+                verified: false,
+            });
+        }
+    }
+    let mut job = Job::new(PLENTY).with_set(None);
+    let member = job.member("payload.bin", Some(8));
+    let mut build = job.build();
+    let arrival = Arrival {
+        node: NodeId::ROOT,
+        member,
+        offset: 2,
+        bytes: Bytes::from_static(b"data"),
+        provenance: Provenance::Fresh,
+    };
+    job.writer
+        .deliver(
+            &mut job.tree,
+            &mut build,
+            &Unverified,
+            arrival,
+            &mut job.out,
+        )
+        .unwrap();
+    let seen = job.par.lock().unwrap();
+    assert_eq!(
+        seen.fed.last(),
+        Some(&Segment {
+            range: ByteRange::new(2, 6),
+            crc32: crc32(b"data"),
+            verified: false,
+        })
+    );
+}
+
+#[test]
+fn unrelated_candidate_and_shared_scratch_activity_do_not_invalidate_repair_loan() {
+    for resident_limit in [u64::MAX, 0] {
+        let mut job = Job::new(HoldBudgets {
+            resident_limit,
+            ..PLENTY
+        })
+        .with_set(Some(Fix {
+            name: "payload.bin",
+            read: ByteRange::new(0, 32768),
+            fix: (20000, b"OK"),
+        }));
+        let member = job.member("payload.bin", Some(32768));
+        let other = job.member("other.pending", Some(32768));
+        job.send(member, 0, &vec![0x6d; 32768], Provenance::Fresh);
+        job.send(other, 20000, b"old", Provenance::Fresh);
+        let before = job.writer.files[&NodeId::ROOT].leaves[&member].revision();
+        let mut lent = Inline::default();
+        let due = job.tree.recovery_nodes(NodeId::ROOT);
+        job.writer
+            .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+            .unwrap();
+        let returned = lent
+            .0
+            .pop()
+            .unwrap()
+            .run(weaver_graph::Budget::default(), &Default::default());
+        assert!(
+            !job.writer
+                .keep_held(NodeId::ROOT, other, 25000, Bytes::from_static(b"held"))
+                .unwrap()
+        );
+        job.send(other, 20000, b"new", Provenance::Fresh);
+        assert_eq!(
+            job.writer.files[&NodeId::ROOT].leaves[&member].revision(),
+            before
+        );
+        assert!(
+            !job.writer.moved_since(&job.tree, &returned),
+            "unconsumed candidate activity cannot stale the repair"
+        );
+    }
+}
+
+#[test]
+fn replacement_of_a_borrowed_hold_invalidates_repair_loan() {
+    for resident_limit in [u64::MAX, 0] {
+        let mut job = Job::new(HoldBudgets {
+            resident_limit,
+            ..PLENTY
+        })
+        .with_set(Some(Fix {
+            name: "payload.bin",
+            read: ByteRange::new(0, 8),
+            fix: (2, b"OK"),
+        }));
+        let member = job.member("payload.bin", Some(8));
+        assert!(
+            !job.writer
+                .keep_held(NodeId::ROOT, member, 0, Bytes::from_static(b"original"))
+                .unwrap()
+        );
+        job.tree
+            .namespace_mut(NodeId::ROOT)
+            .unwrap()
+            .get_mut(member)
+            .unwrap()
+            .coverage
+            .write(ByteRange::new(0, 8), Provenance::Fresh);
+        let mut lent = Inline::default();
+        let due = job.tree.recovery_nodes(NodeId::ROOT);
+        job.writer
+            .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+            .unwrap();
+        let returned = lent
+            .0
+            .pop()
+            .unwrap()
+            .run(weaver_graph::Budget::default(), &Default::default());
+        assert_eq!(
+            job.par.lock().unwrap().read.as_deref(),
+            Some(b"original".as_slice())
+        );
+        assert!(!job.writer.moved_since(&job.tree, &returned));
+        assert!(
+            !job.writer
+                .keep_held(NodeId::ROOT, member, 2, Bytes::from_static(b"new"))
+                .unwrap()
+        );
+        assert!(
+            job.writer.moved_since(&job.tree, &returned),
+            "borrowed RAM and scratch sources keep their own identities"
+        );
+    }
+}
+
+#[test]
+fn worker_diagnostics_are_published_only_for_current_acknowledgment() {
+    use crate::pipeline::graph::hardware::Shutdown;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for mode in 0..3 {
+        let mut job = Job::new(PLENTY).with_set(Some(Fix {
+            name: "payload.bin",
+            read: ByteRange::new(0, 32768),
+            fix: (20000, b"OK"),
+        }));
+        let member = job.member("payload.bin", Some(32768));
+        job.send(member, 0, &vec![0x6d; 32768], Provenance::Fresh);
+        job.par.lock().unwrap().report_error = true;
+        let stop = Arc::new(AtomicBool::new(false));
+        if mode == 2 {
+            let stop = Arc::clone(&stop);
+            job.par.lock().unwrap().between =
+                Some(Box::new(move || stop.store(true, Ordering::Release)));
+        }
+        let mut lent = Inline::default();
+        let due = job.tree.recovery_nodes(NodeId::ROOT);
+        job.writer
+            .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+            .unwrap();
+        let returned = lent
+            .0
+            .pop()
+            .unwrap()
+            .run(weaver_graph::Budget::default(), &Shutdown::of(stop));
+        assert_eq!(
+            returned.diagnostics.len(),
+            1,
+            "the worker captured the injected error"
+        );
+        if mode == 1 {
+            job.send(member, 20000, b"new", Provenance::Fresh);
+        }
+        let mut build = job.build();
+        let result = job.writer.returned(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            &weaver_objects::Objects::default(),
+            returned,
+            &mut job.out,
+        );
+        if mode == 1 {
+            assert!(matches!(result, Err(WriteError::StaleRecovery { .. })));
+        } else {
+            result.unwrap();
+        }
+        if mode == 0 {
+            let [diagnostic] = job.writer.diagnostics.as_slice() else {
+                panic!("one accepted diagnostic");
+            };
+            assert_eq!(diagnostic.operation, "execute recovery");
+            assert_eq!(diagnostic.context, "set-a");
+            assert_eq!(diagnostic.error, "injected reconstruction failure");
+            assert_eq!(diagnostic.causes, ["injected storage cause"]);
+        } else {
+            assert!(
+                job.writer.diagnostics.is_empty(),
+                "stale or stopped work cannot log a current failure"
+            );
+        }
     }
 }

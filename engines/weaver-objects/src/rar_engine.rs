@@ -52,17 +52,15 @@ impl Format for Rar {
         front: Option<&RarVolumeFacts>,
         _length: Option<u64>,
     ) -> Option<Placed> {
-        let held = bound
-            .iter()
-            .map(|(index, holding)| {
-                let held = Held {
-                    facts: holding.front,
-                    successor: None,
-                };
-                (*index, held)
-            })
-            .collect();
-        claim::place(front?, &held)
+        claim::place(front?, &held(bound))
+    }
+
+    fn judged(
+        bound: &BTreeMap<u32, Holding<'_, RarVolumeFacts>>,
+        front: Option<&RarVolumeFacts>,
+        _length: Option<u64>,
+    ) -> bool {
+        front.is_some_and(|front| claim::judged(front, &held(bound)))
     }
 
     fn run(password: Option<String>) -> Box<dyn Extraction> {
@@ -71,6 +69,22 @@ impl Format for Rar {
 }
 
 pub type RarEngine = EngineObject<Rar>;
+
+fn held<'a>(bound: &BTreeMap<u32, Holding<'a, RarVolumeFacts>>) -> BTreeMap<u32, Held<'a>> {
+    bound
+        .iter()
+        .filter_map(|(index, holding)| {
+            let facts = holding.front;
+            (!facts.is_some_and(|facts| claim::misplaced(VolumeIndex(*index), facts))).then_some((
+                *index,
+                Held {
+                    facts,
+                    successor: None,
+                },
+            ))
+        })
+        .collect()
+}
 
 #[cfg(test)]
 mod tests;

@@ -219,6 +219,8 @@ pub struct Namespace {
     // The members posted more than once whose own posting ended. Such a
     // member closes once its own posting and every further one have.
     ended: BTreeSet<MemberId>,
+    // Transport supplied order rather than independently positioned lengths.
+    uncertain_lengths: BTreeSet<MemberId>,
 }
 
 // What arrived of a member's first FIRST_BYTES, and how: bytes past a
@@ -237,6 +239,14 @@ pub const FIRST_BYTES: usize = 16 * 1024;
 impl Namespace {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn mark_length_uncertain(&mut self, member: MemberId) {
+        self.uncertain_lengths.insert(self.resolve(member));
+    }
+
+    pub fn length_uncertain(&self, member: MemberId) -> bool {
+        self.uncertain_lengths.contains(&self.resolve(member))
     }
 
     // A member the producer announced. Its output name is the tree's to
@@ -373,6 +383,9 @@ impl Namespace {
         if self.members.get(&into).is_some_and(|record| record.closed) {
             self.ended.insert(into);
         }
+        if self.uncertain_lengths.remove(&copy) {
+            self.uncertain_lengths.insert(into);
+        }
         self.copies.insert(copy, into);
         true
     }
@@ -446,12 +459,7 @@ impl Namespace {
         range: ByteRange,
         provenance: Provenance,
     ) -> (MemberId, Vec<ByteRange>) {
-        let member = self.resolve(posting);
-        let taken = if provenance.is_verified() {
-            vec![range]
-        } else {
-            gaps(range, &self.standing(posting, member, range, provenance))
-        };
+        let (member, taken) = self.taking(posting, range, provenance);
         if posting != member
             && let Some(copy) = self.members.get_mut(&posting)
         {
@@ -462,6 +470,22 @@ impl Namespace {
                 record.coverage.write(*part, provenance);
             }
         }
+        (member, taken)
+    }
+
+    // The same acceptance decision used by arrive, before evidence is fed.
+    pub fn taking(
+        &self,
+        posting: MemberId,
+        range: ByteRange,
+        provenance: Provenance,
+    ) -> (MemberId, Vec<ByteRange>) {
+        let member = self.resolve(posting);
+        let taken = if provenance.is_verified() {
+            vec![range]
+        } else {
+            gaps(range, &self.standing(posting, member, range, provenance))
+        };
         (member, taken)
     }
 

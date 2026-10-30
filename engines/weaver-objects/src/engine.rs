@@ -65,6 +65,17 @@ pub trait Format: Send + Sync {
     ) -> Option<Placed> {
         None
     }
+
+    // Whether a placement also judges membership across conflicting set
+    // names. Formats whose headers only state a position must distinguish
+    // that from evidence linking the candidate to the bound volumes.
+    fn judged(
+        _bound: &BTreeMap<u32, Holding<'_, Self::Front>>,
+        _front: Option<&Self::Front>,
+        _length: Option<u64>,
+    ) -> bool {
+        true
+    }
     fn run(password: Option<String>) -> Box<dyn Extraction>;
 
     fn reserve() -> u64 {
@@ -77,6 +88,13 @@ pub trait Format: Send + Sync {
 pub struct Holding<'a, T> {
     pub front: Option<&'a T>,
     pub length: Option<u64>,
+}
+
+// Engine volumes hold no parsed output. Only their existing placement
+// evidence travels when a corrected name gives one back for reoffering.
+pub(crate) struct CarriedVolume<T> {
+    pub(crate) front: Option<T>,
+    length: Option<u64>,
 }
 
 // A volume's name as its set numbers it.
@@ -165,6 +183,15 @@ impl<F: Format> EngineObject<F> {
     // outranks it. A place bound already is answered all the same: the
     // volume posted again is that volume.
     fn placed(&self, name: &str, first_bytes: &[u8], length: Option<u64>) -> Option<Placed> {
+        self.placed_front(name, F::front(first_bytes).as_ref(), length)
+    }
+
+    fn placed_front(
+        &self,
+        name: &str,
+        front: Option<&F::Front>,
+        length: Option<u64>,
+    ) -> Option<Placed> {
         let bound = self
             .bound
             .iter()
@@ -176,10 +203,17 @@ impl<F: Format> EngineObject<F> {
                 (*volume, holding)
             })
             .collect();
-        let front = F::front(first_bytes);
-        let stated = front.as_ref().is_some_and(F::states_place);
-        let placed = F::place(&bound, front.as_ref(), length);
-        let named = F::parse(name)
+        let stated = front.is_some_and(F::states_place);
+        let wanted = F::parse(name);
+        let elsewhere = wanted.as_ref().is_some_and(|candidate| {
+            self.names
+                .values()
+                .next()
+                .is_some_and(|first| !first.same_set(candidate))
+        });
+        let placed = F::place(&bound, front, length)
+            .filter(|_| !elsewhere || F::judged(&bound, front, length));
+        let named = wanted
             .filter(|candidate| {
                 self.names
                     .values()
@@ -187,11 +221,7 @@ impl<F: Format> EngineObject<F> {
                     .is_some_and(|first| first.same_set(candidate))
             })
             .and_then(|candidate| candidate.slot(&self.names))
-            .filter(|index| {
-                !front
-                    .as_ref()
-                    .is_some_and(|front| F::misplaced(front, *index))
-            });
+            .filter(|index| !front.is_some_and(|front| F::misplaced(front, *index)));
         match (placed, named) {
             (Some(placed), _) if stated => Some(placed),
             (_, Some(named)) => Some(Placed::At(VolumeIndex(named))),
@@ -294,13 +324,62 @@ impl<F: Format + 'static> Object for EngineObject<F> {
     }
 
     // The name a recovery set gave the volume is the set's numbering now.
-    fn renamed(&mut self, volume: VolumeIndex, name: &str, _out: &mut Vec<Emit>) {
+    fn renamed(&mut self, volume: VolumeIndex, name: &str, out: &mut Vec<Emit>) {
         self.names.remove(&volume.0);
         let first = self.names.values().next();
-        if let Some(parsed) = F::parse(name)
-            && first.is_none_or(|first| first.same_set(&parsed))
-        {
+        let parsed = F::parse(name);
+        let elsewhere = parsed
+            .as_ref()
+            .is_some_and(|parsed| first.is_some_and(|first| !first.same_set(parsed)));
+        if !elsewhere && let Some(parsed) = parsed {
             self.names.insert(volume.0, parsed);
+        }
+        let corrected = self.placed_front(
+            name,
+            self.fronts.get(&volume.0),
+            self.lengths.get(&volume.0).copied(),
+        );
+        if matches!(corrected, Some(Placed::At(at)) if at != volume)
+            || (elsewhere && corrected.is_none())
+        {
+            out.push(Emit::GiveBack(volume));
+        }
+    }
+
+    fn give_back(&mut self, volume: VolumeIndex) -> Option<weaver_graph::Carried> {
+        self.bound.remove(&volume.0).then(|| {
+            self.names.remove(&volume.0);
+            Box::new(CarriedVolume {
+                front: self.fronts.remove(&volume.0),
+                length: self.lengths.remove(&volume.0),
+            }) as weaver_graph::Carried
+        })
+    }
+
+    fn reclaim(
+        &self,
+        name: &str,
+        front: &[u8],
+        length: Option<u64>,
+        carried: &(dyn std::any::Any + Send + Sync),
+    ) -> Option<VolumeIndex> {
+        let carried = carried.downcast_ref::<CarriedVolume<F::Front>>()?;
+        let parsed = F::front(front);
+        self.placed_front(
+            name,
+            carried.front.as_ref().or(parsed.as_ref()),
+            carried.length.or(length),
+        )?
+        .claimed(self.gone, Placed::past(self.bound.last().copied()))
+    }
+
+    fn adopt(&mut self, volume: VolumeIndex, name: &str, carried: weaver_graph::Carried) {
+        let Ok(carried) = carried.downcast::<CarriedVolume<F::Front>>() else {
+            return;
+        };
+        self.bound(volume, name, &[], carried.length);
+        if let Some(front) = carried.front {
+            self.fronts.insert(volume.0, front);
         }
     }
 

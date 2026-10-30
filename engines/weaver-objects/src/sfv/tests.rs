@@ -65,6 +65,137 @@ fn members_whose_names_differ_only_by_case_bind_to_nothing() {
 }
 
 #[test]
+fn changed_accepted_bytes_invalidate_sfv_ruling() {
+    let original = payload(13, 5000);
+    let mut job = job(&sfv_text(&[("one.bin", crc32(&original))]));
+    let member = job.member("one.bin", &original);
+    bind(&mut job);
+    let unchanged = segments(0, &original, 700, 700, true);
+    job.object.feed(member, &unchanged);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
+    job.object.feed(member, &unchanged);
+    assert_eq!(
+        job.object.outcome(),
+        Some(RepairOutcome::Clean),
+        "proven unchanged replay retains the ruling"
+    );
+    job.object
+        .feed(weaver_graph::MemberId(u32::MAX), &unchanged);
+    assert_eq!(
+        job.object.outcome(),
+        Some(RepairOutcome::Clean),
+        "unbound input cannot invalidate this listing"
+    );
+    let mut replacement = original;
+    replacement[2000] ^= 0x5a;
+    job.store.members.insert(member, replacement.clone());
+    job.object
+        .feed(member, &segments(0, &replacement, 700, 700, true));
+    assert_eq!(
+        job.object.outcome(),
+        None,
+        "changed accepted bytes must become due again"
+    );
+    let mut verdicts = Vec::new();
+    job.object.verdicts(member, &mut verdicts);
+    assert_eq!(verdicts, [SliceVerdict::Damaged]);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Impossible {
+            damaged: 1,
+            reachable: 0
+        }
+    );
+}
+
+#[test]
+fn acknowledged_sfv_proof_retains_its_ruling() {
+    let original = payload(14, 5000);
+    let mut job = job(&sfv_text(&[("one.bin", crc32(&original))]));
+    let member = job.member("one.bin", &original);
+    bind(&mut job);
+    job.object
+        .feed(member, &segments(0, &original, 700, 700, false));
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
+    assert!(
+        job.store.reads > 0,
+        "readback establishes the unverified source proof"
+    );
+    job.object
+        .feed_proven(member, &segments(0, &original, 700, 700, true));
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Clean));
+}
+
+#[test]
+fn missing_source_invalidates_restored_sfv_proof() {
+    let original = payload(15, 5000);
+    let mut job = job(&sfv_text(&[("one.bin", crc32(&original))]));
+    let member = job.member("one.bin", &original);
+    bind(&mut job);
+    job.object
+        .feed(member, &segments(0, &original, 700, 700, true));
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
+    let mut restored: Sfv = job.object.facts().read(Kind::Sfv).unwrap();
+    assert_eq!(restored.outcome(), Some(RepairOutcome::Clean));
+    restored.uncovered(member, ByteRange::new(0, original.len() as u64));
+    assert_eq!(restored.outcome(), None);
+    job.store
+        .holes
+        .insert(member, vec![ByteRange::new(0, original.len() as u64)]);
+    assert_eq!(
+        restored.repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Impossible {
+            damaged: 1,
+            reachable: 0
+        }
+    );
+}
+
+#[test]
+fn changed_complete_length_invalidates_sfv_ruling() {
+    let original = payload(16, 5000);
+    let mut job = job(&sfv_text(&[("one.bin", crc32(&original))]));
+    let member = job.member("one.bin", &original);
+    bind(&mut job);
+    job.object
+        .feed(member, &segments(0, &original, 700, 700, true));
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
+    job.store.members.get_mut(&member).unwrap().push(1);
+    let record = job.namespace.get_mut(member).unwrap();
+    record.length = Some(original.len() as u64 + 1);
+    record
+        .coverage
+        .write(ByteRange::at(original.len() as u64, 1), Provenance::Fresh);
+    bind(&mut job);
+    assert_eq!(job.object.outcome(), None);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Impossible {
+            damaged: 1,
+            reachable: 0
+        }
+    );
+}
+
+#[test]
 fn sfv_verifies_fed_members_without_reading_them() {
     let one = payload(1, 5000);
     let two = payload(2, 3000);

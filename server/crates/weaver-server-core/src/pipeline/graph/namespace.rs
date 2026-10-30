@@ -48,6 +48,10 @@ use crate::pipeline::extraction::ExtractionFailure;
 // a numbering every namespace has. A source answers for the namespace it
 // delivered into and leaves every other one without.
 pub(crate) trait Segments {
+    fn length_uncertain(&self, _node: NodeId, _volume: VolumeIndex) -> bool {
+        false
+    }
+
     fn segments_for(
         &self,
         node: NodeId,
@@ -79,6 +83,8 @@ pub(crate) enum WriteError {
     Leaf(#[from] LeafError),
     #[error("member {member:?} of node {node:?} is not in its namespace")]
     UnknownMember { node: NodeId, member: MemberId },
+    #[error("recovery {set:?} changed inputs and its original snapshot could not be restored")]
+    StaleRecovery { set: NodeId },
     // The job's extraction budget refused it; nothing more of the job is
     // written.
     #[error(transparent)]
@@ -141,6 +147,10 @@ pub(crate) struct NamespaceWriter {
     // The latest checkpoint the database has committed.
     committed: u64,
     segments: Vec<Segment>,
+    // Only this set's certified writes retain its settled ruling.
+    acknowledging: Option<NodeId>,
+    #[cfg(test)]
+    diagnostics: Vec<weaver_graph::recovery::RepairDiagnostic>,
     placements: Vec<Placement>,
     // Where the time a member write takes on disk is published, when the
     // job runs in a pipeline.
@@ -171,6 +181,9 @@ impl NamespaceWriter {
             left: BTreeMap::new(),
             committed: 0,
             segments: Vec::new(),
+            acknowledging: None,
+            #[cfg(test)]
+            diagnostics: Vec::new(),
             placements: Vec::new(),
             metrics: None,
         }
@@ -261,7 +274,27 @@ impl NamespaceWriter {
         arrival: Arrival,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
-        self.feed(tree, segments, &arrival);
+        if segments.length_uncertain(arrival.node, VolumeIndex(arrival.member.0))
+            && let Some(namespace) = tree.namespace_mut(arrival.node)
+        {
+            namespace.mark_length_uncertain(arrival.member);
+        }
+        let accepted = tree
+            .namespace(arrival.node)
+            .map(|namespace| namespace.taking(arrival.member, arrival.range(), arrival.provenance));
+        if let Some((member, ranges)) = accepted {
+            for range in ranges {
+                let from = index(range.start - arrival.offset);
+                let accepted = Arrival {
+                    node: arrival.node,
+                    member: arrival.member,
+                    offset: range.start,
+                    bytes: arrival.bytes.slice(from..from + index(range.len())),
+                    provenance: arrival.provenance,
+                };
+                self.feed(tree, segments, &accepted, member);
+            }
+        }
         self.route(tree, builder, segments, arrival, out)
     }
 
@@ -935,12 +968,14 @@ impl NamespaceWriter {
 
     // A member its object gave back is a leaf, and its file is what the
     // object kept of it, its envelope, which was always at the volume's own
-    // offsets: the envelope's file is moved to the member's name, never
-    // copied. An envelope nothing was written to is no file, as a member
+    // offsets. Usually that file moves to the member's name. During a
+    // reentrant handover a source leaf may still await replay: keep its
+    // bytes and merge the returned envelope into it before releasing either.
+    // An envelope nothing was written to is no file, as a member
     // none of whose bytes were written has none. What the object never
     // placed is still held for the member and goes into that file as held
-    // bytes go into any leaf's. The member's coverage is then what that
-    // envelope and its holds hold. Until an object
+    // bytes go into any leaf's. The member retains only the coverage backed
+    // by that file and its holds. Until an object
     // claims it, the tree holds its parse beside it, which is what withholds
     // it; the claim that takes it reads the file in place, as it reads any
     // leaf's.
@@ -959,10 +994,41 @@ impl NamespaceWriter {
             if kept.coverage.bytes_covered() == 0 {
                 self.discard(kept.into_leaf())?;
             } else {
-                self.uncover_unkept(tree, (node, member), &kept.coverage);
-                if let Some(stale) = self.files_mut(node).leaves.insert(member, kept.into_leaf()) {
-                    self.discard(stale)?;
+                let mut retained = kept.coverage.clone();
+                let envelope = kept.into_leaf();
+                if let Some(leaf) = self.files_mut(node).leaves.get_mut(&member) {
+                    let length = leaf.len()?;
+                    // A leaf awaiting replay owns the member's recorded
+                    // ranges, including after restore without a CRC fold.
+                    // Its allocated length never supplies new coverage.
+                    let prior: Vec<_> = tree
+                        .namespace(node)
+                        .and_then(|namespace| namespace.get(member))
+                        .into_iter()
+                        .flat_map(|record| record.coverage.runs())
+                        .filter_map(|run| run.range.intersect(ByteRange::new(0, length)))
+                        .collect();
+                    // Only this transfer reads the returned envelope. The
+                    // unreplayed source stays in place, including its tail.
+                    let mut bytes = Vec::new();
+                    for run in retained.runs() {
+                        let mut at = run.range.start;
+                        while at < run.range.end {
+                            let take = (run.range.end - at).min(READ_BACK);
+                            bytes.clear();
+                            envelope.read(at, index(take), &mut bytes)?;
+                            leaf.write(at, &bytes, None)?;
+                            at += take;
+                        }
+                    }
+                    for range in prior {
+                        retained.write(range, Provenance::Fresh);
+                    }
+                    self.discard(envelope)?;
+                } else {
+                    self.files_mut(node).leaves.insert(member, envelope);
                 }
+                self.uncover_unkept(tree, (node, member), &retained);
                 self.intend(node, member, &output_name);
             }
         }

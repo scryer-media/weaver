@@ -63,10 +63,39 @@ pub struct SetRuling {
     pub read: bool,
 }
 
-// The namespace's face toward a recovery object: read a member's bytes and
-// write repaired ones. Positional, in member coordinates. The namespace
-// resolves where the bytes actually live through the owner's inverse map.
+// A worker's ephemeral operation failure, separate from its durable ruling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepairDiagnostic {
+    pub operation: String,
+    pub context: String,
+    pub error: String,
+    pub causes: Vec<String>,
+}
+
+impl RepairDiagnostic {
+    pub fn capture(operation: &str, context: &str, error: &dyn std::error::Error) -> Self {
+        let mut causes = Vec::new();
+        let mut source = error.source();
+        while let Some(error) = source {
+            causes.push(error.to_string());
+            source = error.source();
+        }
+        Self {
+            operation: operation.to_owned(),
+            context: context.to_owned(),
+            error: error.to_string(),
+            causes,
+        }
+    }
+}
+
+// The namespace's face toward a recovery object: positional member reads
+// and staged repair writes, resolved through the owner's inverse map.
 pub trait MemberAccess {
+    // Ephemeral worker diagnostics. The owner publishes them only when it
+    // accepts the current attempt; they never change the serialized ruling.
+    fn repair_error(&mut self, _operation: &str, _context: &str, _error: &dyn std::error::Error) {}
+
     fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool;
     fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]);
     // A range the object proved bad and could not rebuild. The namespace
@@ -138,6 +167,15 @@ pub trait Recovery {
     // Evidence as bytes pass: the namespace calls this for every covered
     // member on every delivery and every repair.
     fn feed(&mut self, member: MemberId, segments: &[Segment]);
+
+    // Evidence published while acknowledging this object's own repair.
+    // It establishes the ruling's new input rather than invalidating it.
+    fn feed_proven(&mut self, member: MemberId, segments: &[Segment]) {
+        self.feed(member, segments);
+    }
+
+    // A recorded source span could not be restored or has been replaced.
+    fn uncovered(&mut self, _member: MemberId, _range: ByteRange) {}
 
     // The block sizes at whose boundaries `feed`'s checksums have to be cut
     // for this object to vouch for a block without reading it back. A

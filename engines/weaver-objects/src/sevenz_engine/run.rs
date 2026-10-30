@@ -32,6 +32,13 @@ impl Run {
 
 impl Extraction for Run {
     fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, sink: &mut Sink<'_>, budget: Budget) {
+        let volumes = match super::geometry::resolve(volumes) {
+            Ok(volumes) => volumes,
+            Err(_) => {
+                sink(Emit::Refuse(weaver_graph::Why::InvalidArchive));
+                return;
+            }
+        };
         let input = Joined::new(volumes);
         let failed = input.failure();
         let password = self

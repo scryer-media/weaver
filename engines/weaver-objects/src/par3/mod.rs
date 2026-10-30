@@ -189,6 +189,9 @@ pub struct Par3 {
     // its files were bound to then. The ruling stands while they are; only
     // a set that waited or could not rebuild is tried again.
     settled: BTreeMap<String, Settled>,
+    // Bounded, transient evidence for unchanged accepted replay. A restore
+    // with no evidence revalidates its cached ruling on the first feed.
+    input: crate::grid::Grid,
     // The repair's decoder allowance when the owner grants it none.
     memory_limit: u64,
     // The namespace's damage as the object was shown it, and the whole
@@ -211,6 +214,7 @@ impl Par3 {
             last: None,
             ruled: Vec::new(),
             settled: BTreeMap::new(),
+            input: crate::grid::Grid::default(),
             memory_limit: REPAIR_MEMORY_LIMIT,
             shown: Shown::default(),
             refused_blocks: 0,
@@ -783,7 +787,31 @@ impl Recovery for Par3 {
         self.bound.values().any(|bound| *bound == member)
     }
 
-    fn feed(&mut self, _member: MemberId, _segments: &[Segment]) {}
+    fn feed(&mut self, member: MemberId, segments: &[Segment]) {
+        if self.covers(member) && !self.input.matches(member, segments) {
+            self.last = None;
+            self.settled
+                .retain(|_, settled| !settled.members.contains(&Some(member)));
+            self.ruled.clear();
+        }
+        self.feed_proven(member, segments);
+    }
+
+    fn feed_proven(&mut self, member: MemberId, segments: &[Segment]) {
+        for segment in segments {
+            self.input.offer(member, crate::grid::WHOLE, segment);
+        }
+    }
+
+    fn uncovered(&mut self, member: MemberId, _range: ByteRange) {
+        self.input.forget(member);
+        if self.covers(member) {
+            self.last = None;
+            self.settled
+                .retain(|_, settled| !settled.members.contains(&Some(member)));
+            self.ruled.clear();
+        }
+    }
 
     // Kept for every member of the namespace, bound or not: a bind later
     // counts what was refused before.

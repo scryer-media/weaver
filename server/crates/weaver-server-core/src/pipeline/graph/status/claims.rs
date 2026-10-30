@@ -229,15 +229,15 @@ impl Delivery {
     // beside a set that extracted whole may have been a copy of one of its
     // volumes, and the job completes when it can; beside the post's own
     // files alone it is a file the post lacks. The feed giving the post up
-    // words a failure and rules nothing: a delivery nothing is short of is
-    // complete.
+    // words a failure and rules nothing: a delivery with a whole usable
+    // output and nothing short is complete.
     pub(crate) fn status(&self, failure: Option<&Failure>) -> JobStatus {
         let extracted = self.files.iter().any(|file| file.whole && file.depth > 0);
         let short = !(self.damaged.is_empty()
             && self.unrepaired.is_empty()
             && self.withheld.is_empty()
             && (self.unnamed.is_empty() || extracted));
-        if !short && failure.is_none_or(|failure| failure.from_feed) {
+        if !self.whole.is_empty() && !short && failure.is_none_or(|failure| failure.from_feed) {
             return JobStatus::Complete;
         }
         if !self.whole.is_empty() {

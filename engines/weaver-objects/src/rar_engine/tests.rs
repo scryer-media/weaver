@@ -445,6 +445,77 @@ fn claim_names_the_volumes_of_its_own_set_only() {
     assert_eq!(old.claim("set.rar", b"", None), Some(VolumeIndex(0)));
 }
 
+#[test]
+fn number_alone_does_not_join_different_named_rar_sets() {
+    let held = [
+        rar5::start(Some(2)),
+        rar5::file(
+            "first.bin",
+            rar5::SPLIT_BEFORE | rar5::SPLIT_AFTER,
+            b"held",
+            12,
+            None,
+        ),
+        rar5::end(true),
+    ]
+    .concat();
+    let candidate = [
+        rar5::start(Some(0)),
+        rar5::file("second.bin", rar5::SPLIT_AFTER, b"next", 12, None),
+        rar5::end(true),
+    ]
+    .concat();
+    let mut store = crate::rar_store::RarStore::new();
+    store.bound(
+        VolumeIndex(2),
+        "first.part03.rar",
+        &held,
+        Some(held.len() as u64),
+    );
+    assert_eq!(
+        store.claim(
+            "second.part01.rar",
+            &candidate,
+            Some(candidate.len() as u64)
+        ),
+        None,
+        "the streaming store uses the same membership boundary"
+    );
+    let mut engine = RarEngine::new();
+    engine.bound(
+        VolumeIndex(2),
+        "first.part03.rar",
+        &held,
+        Some(held.len() as u64),
+    );
+    assert_eq!(
+        engine.claim("first.part01.rar", &candidate, Some(candidate.len() as u64)),
+        Some(VolumeIndex(0)),
+        "a matching set name places an earlier volume"
+    );
+    assert_eq!(
+        engine.claim(
+            "second.part01.rar",
+            &candidate,
+            Some(candidate.len() as u64)
+        ),
+        None,
+        "an unjudged number cannot join another named set"
+    );
+}
+
+#[test]
+fn linked_headers_can_join_different_posted_rar_names() {
+    let volumes = two_volumes();
+    let mut engine = RarEngine::new();
+    engine.bound(VolumeIndex(1), "first.part02.rar", &volumes[1], None);
+    assert_eq!(
+        engine.claim("second.part01.rar", &volumes[0], None),
+        Some(VolumeIndex(0)),
+        "the held continuation judges membership across posted labels"
+    );
+}
+
 // Names that number nothing of a RAR set: each volume is placed by what its
 // headers state beside the fronts of the volumes bound, as the store that
 // gave the set up placed them.

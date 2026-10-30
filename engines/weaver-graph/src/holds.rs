@@ -401,6 +401,20 @@ impl HoldLedger {
         self.namespace
     }
 
+    // Source-local identities at a worker transition. Cuts and page-outs
+    // retain their ages; replacement bytes always get a new age.
+    pub fn revisions(&self, volume: VolumeIndex, range: ByteRange) -> Vec<(ByteRange, u64)> {
+        self.volumes
+            .get(&volume)
+            .map(|holds| {
+                holds
+                    .values()
+                    .filter_map(|hold| Some((hold.range.intersect(range)?, hold.age)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     // Hold `bytes` of `volume` at `offset`, replacing any hold they overlap.
     //
     // RAM first. When RAM is short, this namespace's oldest resident holds

@@ -536,6 +536,28 @@ fn a_delivery_ends_complete_partial_or_failed_by_its_short_files() {
     );
 }
 
+#[test]
+fn an_empty_delivery_cannot_complete() {
+    assert_eq!(
+        Delivery::default().status(None),
+        JobStatus::Failed {
+            error: "no file was delivered whole; 0 short: ".to_string(),
+        }
+    );
+}
+
+#[test]
+fn an_empty_delivery_preserves_the_feed_failure() {
+    let mut failure = failed("the source ended without usable output");
+    failure.from_feed = true;
+    assert_eq!(
+        Delivery::default().status(Some(&failure)),
+        JobStatus::Failed {
+            error: failure.message,
+        }
+    );
+}
+
 // A posted file none of whose bytes arrived is what its name says it was.
 // Another posting of a volume a file that arrived is named into is no file
 // at all. One whose name says nothing may have been anything: beside a

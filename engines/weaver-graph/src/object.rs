@@ -282,6 +282,9 @@ pub struct Beside<'a> {
 pub trait Object: Send + Sync {
     fn kind(&self) -> Kind;
 
+    // The source supplied an inferred decoded length for this volume.
+    fn length_uncertain(&mut self, _volume: VolumeIndex) {}
+
     // Bytes of one of my volumes. Say what they were into `out`, which the
     // caller reuses between calls. `read` hands back what one of my
     // placements holds, as it does for `posted`: an object that deciphers

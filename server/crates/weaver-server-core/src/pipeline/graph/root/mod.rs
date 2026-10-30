@@ -155,6 +155,10 @@ impl ArticleRoot {
 // namespace write path, which calls this with every delivery it feeds to a
 // recovery object. Root coordinates: member M is volume M.
 impl Segments for ArticleRoot {
+    fn length_uncertain(&self, node: NodeId, volume: VolumeIndex) -> bool {
+        node == NodeId::ROOT && self.map.ordered_only(volume.0 as usize)
+    }
+
     fn segments_for(
         &self,
         node: NodeId,

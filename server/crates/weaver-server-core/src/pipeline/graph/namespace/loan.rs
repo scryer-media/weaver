@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use weaver_graph::holds::Location;
-use weaver_graph::recovery::{MemberAccess, RepairOutcome};
+use weaver_graph::recovery::{MemberAccess, RepairDiagnostic, RepairOutcome};
 use weaver_graph::{
     ByteRange, Coverage, MemberId, NodeId, Object, Placement, Posting, Tree, VolumeIndex,
 };
@@ -56,7 +56,19 @@ pub(crate) struct Returned {
     pub(crate) repaired: Repaired,
     // Ranges the object proved bad and could not rebuild.
     pub(crate) found: Vec<(MemberId, ByteRange)>,
+    pub(crate) diagnostics: Vec<RepairDiagnostic>,
     read: Read,
+    inputs: Vec<Input>,
+}
+
+struct Input {
+    node: NodeId,
+    member: MemberId,
+    length: Option<u64>,
+    coverage: Coverage,
+    bound: Option<(NodeId, VolumeIndex)>,
+    source: bool,
+    held_basis: Vec<(ByteRange, u64)>,
 }
 
 impl std::fmt::Debug for Returned {
@@ -78,7 +90,7 @@ impl std::fmt::Debug for Returned {
 // it read may have been cut short.
 struct Read {
     shelves: Vec<(Arc<Shelf>, u64)>,
-    leaves: Vec<(NodeId, MemberId, PathBuf)>,
+    leaves: Vec<(NodeId, MemberId, PathBuf, (u64, u64))>,
     stopped: bool,
 }
 
@@ -108,10 +120,36 @@ impl Loan {
         if let Some(dir) = &access.scratch {
             super::remove_scratch(dir);
         }
+        let usage = access.usage.into_inner();
         let leaves = access
             .members
             .iter()
-            .filter_map(|((node, member), taken)| Some((*node, *member, taken.path.clone()?)))
+            .filter_map(|((node, member), taken)| {
+                if !usage
+                    .members
+                    .get(&(*node, *member))
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    return None;
+                }
+                Some((*node, *member, taken.path.clone()?, taken.revision?))
+            })
+            .collect();
+        let inputs = access
+            .members
+            .into_iter()
+            .filter_map(|((node, member), taken)| {
+                Some(Input {
+                    node,
+                    member,
+                    length: taken.length,
+                    coverage: taken.coverage,
+                    bound: taken.bound,
+                    source: *usage.members.get(&(node, member))?,
+                    held_basis: taken.held_basis,
+                })
+            })
             .collect();
         Returned {
             set: self.set,
@@ -121,8 +159,15 @@ impl Loan {
             reads: access.reads,
             repaired: access.repaired,
             found: access.found,
+            diagnostics: access.diagnostics,
+            inputs,
             read: Read {
-                shelves: access.shelves.into_values().collect(),
+                shelves: access
+                    .shelves
+                    .into_iter()
+                    .filter(|(node, _)| usage.shelves.contains(node))
+                    .map(|(_, shelf)| shelf)
+                    .collect(),
                 leaves,
                 stopped,
             },
@@ -137,13 +182,50 @@ struct Taken {
     path: Option<PathBuf>,
     revision: Option<(u64, u64)>,
     scratch_revision: Option<(u64, u64)>,
+    held_basis: Vec<(ByteRange, u64)>,
     // The bytes held for it, in offset order.
     held: Vec<(ByteRange, Location)>,
     scratch: Option<File>,
     bound: Option<(NodeId, VolumeIndex)>,
 }
 
+#[derive(Default)]
+struct Usage {
+    // True for byte/coverage sources, false for length/binding queries only.
+    members: BTreeMap<(NodeId, MemberId), bool>,
+    shelves: BTreeSet<NodeId>,
+}
+
 impl Lent {
+    fn note(&self, at: (NodeId, MemberId), source: bool) {
+        if !self.defer_holds {
+            *self.usage.borrow_mut().members.entry(at).or_default() |= source;
+        }
+    }
+
+    // A cached ruling still depends on its covered inputs even if the
+    // worker need not read their bytes again. Expand only those inputs'
+    // backing namespaces here, once at the loan transition.
+    fn require(&self, at: (NodeId, MemberId)) {
+        let mut pending = vec![at];
+        let mut seen = BTreeSet::new();
+        while let Some(at) = pending.pop() {
+            if !seen.insert(at) {
+                continue;
+            }
+            self.note(at, true);
+            if let Some((child, _)) = self.members.get(&at).and_then(|taken| taken.bound)
+                && self.usage.borrow_mut().shelves.insert(child)
+            {
+                pending.extend(
+                    self.members
+                        .range((child, MemberId(0))..=(child, MemberId(u32::MAX)))
+                        .map(|(at, _)| *at),
+                );
+            }
+        }
+    }
+
     // The pipeline began shutting down, or the job's working directory was
     // released: the repair reads and writes nothing more.
     fn stopped(&self) -> bool {
@@ -164,6 +246,7 @@ struct Lent {
     // job's working directory was released under the repair.
     internal: PathBuf,
     members: BTreeMap<(NodeId, MemberId), Taken>,
+    usage: RefCell<Usage>,
     postings: BTreeMap<NodeId, Box<dyn Posting>>,
     shelves: BTreeMap<NodeId, (Arc<Shelf>, u64)>,
     // The set's own volumes: the member each is, in the namespace it was
@@ -176,6 +259,7 @@ struct Lent {
     reads: u64,
     repaired: Repaired,
     found: Vec<(MemberId, ByteRange)>,
+    diagnostics: Vec<RepairDiagnostic>,
     scratch: Option<PathBuf>,
     // The pipeline's shutdown: once it starts, no read is answered.
     shutdown: Shutdown,
@@ -288,6 +372,7 @@ impl NamespaceWriter {
             defer_holds: false,
             internal: self.working_dir.join(weaver_graph::names::INTERNAL_DIR),
             members: BTreeMap::new(),
+            usage: RefCell::default(),
             postings: BTreeMap::new(),
             shelves: BTreeMap::new(),
             volumes: BTreeMap::new(),
@@ -296,6 +381,7 @@ impl NamespaceWriter {
             reads: 0,
             repaired: Repaired::new(&self.working_dir, namespace, set)?,
             found: Vec::new(),
+            diagnostics: Vec::new(),
             scratch: None,
             shutdown: Shutdown::default(),
         };
@@ -309,6 +395,20 @@ impl NamespaceWriter {
             for (volume, member) in volumes {
                 access.volumes.insert(volume, (parent, member));
                 self.take_member(tree, parent, member, &mut access, &mut seen);
+            }
+        }
+        for &at in access.volumes.values() {
+            access.require(at);
+        }
+        if let Some(recovery) = tree.recovery(set) {
+            for member in tree
+                .namespace(namespace)
+                .into_iter()
+                .flat_map(|namespace| namespace.members())
+            {
+                if recovery.covers(member.id) {
+                    access.require((namespace, member.id));
+                }
             }
         }
         let state = self.state(tree, namespace, set);
@@ -336,19 +436,42 @@ impl NamespaceWriter {
     // Whether the loop moved anything the repair read: a shelf whose
     // generation moved on, which it does when what it holds is replaced or
     // goes away, or a file that is no longer where it was.
-    pub(crate) fn moved_since(&self, returned: &Returned) -> bool {
+    pub(crate) fn moved_since(&self, tree: &Tree, returned: &Returned) -> bool {
+        let changed = returned.inputs.iter().any(|input| {
+            let files = self.files.get(&input.node);
+            let held = files
+                .map(|files| files.holds.revisions(held_volume(input.member), ALL))
+                .unwrap_or_default();
+            let bound = tree
+                .child_of(input.node, input.member)
+                .filter(|(child, _)| !tree.recovers(*child));
+            (input.source && held != input.held_basis)
+                || bound != input.bound
+                || tree
+                    .namespace(input.node)
+                    .and_then(|namespace| namespace.get(input.member))
+                    .is_none_or(|record| {
+                        record.length != input.length
+                            || (input.source && record.coverage != input.coverage)
+                    })
+        });
         let shelves = returned
             .read
             .shelves
             .iter()
             .any(|(shelf, generation)| shelf.generation() != *generation);
-        shelves
-            || returned.read.leaves.iter().any(|(node, member, path)| {
-                self.files
-                    .get(node)
-                    .and_then(|files| files.leaves.get(member))
-                    .is_none_or(|leaf| leaf.path() != path)
-            })
+        changed
+            || shelves
+            || returned
+                .read
+                .leaves
+                .iter()
+                .any(|(node, member, path, revision)| {
+                    self.files
+                        .get(node)
+                        .and_then(|files| files.leaves.get(member))
+                        .is_none_or(|leaf| leaf.path() != path || leaf.revision() != *revision)
+                })
     }
 
     fn take_namespace(
@@ -422,6 +545,9 @@ impl NamespaceWriter {
                 scratch_revision: files
                     .and_then(|files| files.scratch.as_ref())
                     .map(Leaf::revision),
+                held_basis: files
+                    .map(|files| files.holds.revisions(held_volume(member), ALL))
+                    .unwrap_or_default(),
                 held,
                 scratch: files
                     .and_then(|files| files.scratch.as_ref())
@@ -500,6 +626,7 @@ impl Lent {
 
 impl Source for Lent {
     fn bound(&self, node: NodeId, member: MemberId) -> Option<(NodeId, VolumeIndex)> {
+        self.note((node, member), true);
         self.members.get(&(node, member))?.bound
     }
 
@@ -527,12 +654,18 @@ impl Source for Lent {
         read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         into: &mut Vec<u8>,
     ) -> bool {
+        if !self.defer_holds {
+            self.usage.borrow_mut().shelves.insert(child);
+        }
         self.postings
             .get(&child)
             .is_some_and(|posting| posting.posted(volume, range, read, into))
     }
 
     fn envelope(&self, child: NodeId, envelope: u32, range: ByteRange, into: &mut Vec<u8>) -> bool {
+        if !self.defer_holds {
+            self.usage.borrow_mut().shelves.insert(child);
+        }
         match self.shelves.get(&child) {
             Some((shelf, _)) => shelf.read(envelope, range, into),
             None => range.is_empty(),
@@ -592,6 +725,11 @@ impl Source for Lent {
 }
 
 impl MemberAccess for Lent {
+    fn repair_error(&mut self, operation: &str, context: &str, error: &dyn std::error::Error) {
+        self.diagnostics
+            .push(RepairDiagnostic::capture(operation, context, error));
+    }
+
     fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
         if self.stopped() {
             return false;
@@ -617,10 +755,12 @@ impl MemberAccess for Lent {
     }
 
     fn length(&self, member: MemberId) -> Option<u64> {
+        self.note((self.namespace, member), false);
         self.members.get(&(self.namespace, member))?.length
     }
 
     fn arrived(&self, member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {
+        self.note((self.namespace, member), true);
         let Some(taken) = self.members.get(&(self.namespace, member)) else {
             return;
         };

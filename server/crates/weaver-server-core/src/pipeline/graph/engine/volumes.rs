@@ -171,6 +171,10 @@ impl RunVolumes {
 }
 
 impl Volumes for RunVolumes {
+    fn uncertain_lengths(&self) -> bool {
+        self.shelf.lock().uncertain_lengths
+    }
+
     fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>> {
         let Some(from) = after.map_or(Some(0), |after| after.0.checked_add(1)) else {
             return Ok(None);

@@ -134,7 +134,7 @@ impl Replay {
                     .members
                     .iter()
                     .filter_map(|((node, member), taken)| {
-                        Some((*node, *member, taken.path.clone()?))
+                        Some((*node, *member, taken.path.clone()?, taken.revision?))
                     })
                     .collect(),
                 stopped,
@@ -204,6 +204,7 @@ impl NamespaceWriter {
                 defer_holds: true,
                 internal: self.working_dir.join(weaver_graph::names::INTERNAL_DIR),
                 members: BTreeMap::new(),
+                usage: RefCell::default(),
                 postings: BTreeMap::new(),
                 shelves: BTreeMap::new(),
                 volumes: volumes
@@ -215,6 +216,7 @@ impl NamespaceWriter {
                 reads: 0,
                 repaired: Repaired::new(&self.working_dir, namespace, node)?,
                 found: Vec::new(),
+                diagnostics: Vec::new(),
                 scratch: None,
                 shutdown: Shutdown::default(),
             };
@@ -284,12 +286,16 @@ impl NamespaceWriter {
             .shelves
             .iter()
             .any(|(shelf, generation)| shelf.generation() != *generation)
-            || replayed.read.leaves.iter().any(|(node, member, path)| {
-                self.files
-                    .get(node)
-                    .and_then(|files| files.leaves.get(member))
-                    .is_none_or(|leaf| leaf.path() != path)
-            });
+            || replayed
+                .read
+                .leaves
+                .iter()
+                .any(|(node, member, path, revision)| {
+                    self.files
+                        .get(node)
+                        .and_then(|files| files.leaves.get(member))
+                        .is_none_or(|leaf| leaf.path() != path || leaf.revision() != *revision)
+                });
         if replayed.read.stopped || changed || moved {
             if !replayed.read.stopped {
                 self.queue_rechecks(vec![(replayed.node, replayed.ranges.clone())]);

@@ -736,8 +736,15 @@ impl Object for RarStore {
         _length: Option<u64>,
         carried: &(dyn std::any::Any + Send + Sync),
     ) -> Option<VolumeIndex> {
-        self.reclaim_volume(name, front, carried.downcast_ref::<Volume>()?)?
-            .claimed(self.gone, self.past())
+        let placed = match carried.downcast_ref::<Volume>() {
+            Some(given) => self.reclaim_volume(name, front, given),
+            None => {
+                let given = carried
+                    .downcast_ref::<crate::engine::CarriedVolume<unrar_rs::RarVolumeFacts>>()?;
+                self.reclaim_front(name, front, given.front.as_ref())
+            }
+        };
+        placed?.claimed(self.gone, self.past())
     }
 
     // The volume as its giver read it: its headers walked, its bytes kept,

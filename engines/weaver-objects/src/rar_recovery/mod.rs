@@ -501,9 +501,10 @@ impl Recovery for RarRecovery {
             })
             .map(|(index, _)| *index)
             .collect();
-        // A ruling is on the members bound, not on how whole they were: a
-        // volume its own repair made whole leaves it standing.
-        if bound != self.bound {
+        // A repair's acknowledged writes can only add whole volumes. A
+        // loss takes back that proof even when the bound member IDs stand.
+        let acknowledged_growth = repaired && self.whole.is_subset(&whole);
+        if bound != self.bound || (whole != self.whole && !acknowledged_growth) {
             self.last = None;
         }
         self.reference = names.values().next().cloned();
@@ -546,6 +547,15 @@ impl Recovery for RarRecovery {
                 Some(Ruling::Short { .. } | Ruling::Reached(RepairOutcome::Impossible { .. }))
             )
         {
+            self.last = None;
+        }
+    }
+
+    fn uncovered(&mut self, member: MemberId, range: ByteRange) {
+        if !range.is_empty()
+            && let Some((&index, _)) = self.bound.iter().find(|(_, bound)| **bound == member)
+        {
+            self.whole.remove(&index);
             self.last = None;
         }
     }

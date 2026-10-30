@@ -195,6 +195,43 @@ fn the_set_binds_by_its_naming_and_names_the_volumes_no_member_carries() {
 }
 
 #[test]
+fn rev_clean_is_revoked_when_bound_source_loses_coverage() {
+    let mut job = job();
+    rev(
+        &mut job,
+        "lantern.part1.rev",
+        &rev5(3, 1, 3, &[300, 300, 300]),
+    );
+    let first = data(&mut job, "lantern.part01.rar");
+    data(&mut job, "lantern.part02.rar");
+    data(&mut job, "lantern.part03.rar");
+    bind(&mut job);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
+    bind(&mut job);
+    assert_eq!(
+        job.object.outcome(),
+        Some(RepairOutcome::Clean),
+        "stable input retains its proof"
+    );
+    job.namespace
+        .get_mut(first)
+        .unwrap()
+        .coverage
+        .write(ByteRange::new(32, 64), Provenance::Damaged);
+    bind(&mut job);
+    assert_eq!(job.object.missing(), 1);
+    assert_eq!(
+        job.object.outcome(),
+        None,
+        "same member IDs cannot preserve a proof after coverage loss"
+    );
+}
+
+#[test]
 fn a_set_rules_on_how_many_volumes_are_missing_against_its_recovery_volumes() {
     let mut job = job();
     rev(
@@ -235,6 +272,67 @@ fn a_set_rules_on_how_many_volumes_are_missing_against_its_recovery_volumes() {
     let mut verdicts = Vec::new();
     job.object.verdicts(whole, &mut verdicts);
     assert_eq!(verdicts, vec![SliceVerdict::Intact]);
+}
+
+#[test]
+fn acknowledged_rev_growth_retains_repaired_proof_but_later_loss_revokes_it() {
+    let mut job = job();
+    rev(&mut job, "lantern.part1.rev", &rev5(2, 1, 2, &[300, 300]));
+    let first = data(&mut job, "lantern.part01.rar");
+    data(&mut job, "lantern.part02.rar");
+    job.namespace
+        .get_mut(first)
+        .unwrap()
+        .coverage
+        .write(ByteRange::new(32, 64), Provenance::Damaged);
+    bind(&mut job);
+    let repaired = RepairOutcome::Repaired { slices: 1 };
+    job.object.last = Some(Ruling::Reached(repaired));
+    let segment = Segment {
+        range: ByteRange::new(32, 64),
+        crc32: 0,
+        verified: true,
+    };
+    job.object.feed_proven(first, &[segment]);
+    job.namespace
+        .get_mut(first)
+        .unwrap()
+        .coverage
+        .write(segment.range, Provenance::Repaired);
+    bind(&mut job);
+    assert_eq!(job.object.outcome(), Some(repaired));
+    bind(&mut job);
+    job.object.feed(first, &[segment]);
+    assert_eq!(
+        job.object.outcome(),
+        Some(repaired),
+        "stable binding and unchanged replay stay settled"
+    );
+    job.namespace
+        .get_mut(first)
+        .unwrap()
+        .coverage
+        .write(segment.range, Provenance::Damaged);
+    bind(&mut job);
+    assert_eq!(job.object.outcome(), None);
+}
+
+#[test]
+fn missing_replayed_source_revokes_restored_rev_proof() {
+    let mut job = job();
+    rev(&mut job, "lantern.part1.rev", &rev5(2, 1, 2, &[300, 300]));
+    let first = data(&mut job, "lantern.part01.rar");
+    data(&mut job, "lantern.part02.rar");
+    bind(&mut job);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
+    let mut restored: RarRecovery = job.object.facts().read(Kind::RarRecovery).unwrap();
+    restored.uncovered(first, ByteRange::new(32, 64));
+    assert_eq!(restored.missing(), 1);
+    assert_eq!(restored.outcome(), None);
 }
 
 // A data volume none of whose bytes came, booked longer than the size the
