@@ -44,7 +44,8 @@ impl Format for SevenZip {
     }
 
     // A piece with no front of its own is placed by its length, as the
-    // store places it, among the places the first piece measures.
+    // store places it, among the places the first piece measures, held or
+    // not: the tree judges a held place by fronts.
     fn place(
         bound: &BTreeMap<u32, Holding<'_, u64>>,
         front: Option<&u64>,
@@ -53,9 +54,7 @@ impl Format for SevenZip {
         let first = bound.get(&0)?;
         match front {
             Some(front) => (first.front == Some(front)).then_some(Placed::At(VolumeIndex(0))),
-            None => crate::sevenz_store::fits(first.length?, *first.front?, length?, |at| {
-                !bound.contains_key(&at.0)
-            }),
+            None => crate::sevenz_store::fits(first.length?, *first.front?, length?),
         }
     }
 

@@ -952,15 +952,14 @@ async fn restored_post_processing_that_already_finished_archives_as_complete() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(31238);
-    let spec = JobSpec {
-        name: "completed-post-processing".to_string(),
-        password: None,
-        files: vec![],
-        total_bytes: 0,
-        category: None,
-        metadata: vec![],
-    };
-    insert_active_job(&mut pipeline, job_id, spec).await;
+    insert_delivered_job(
+        &mut pipeline,
+        job_id,
+        "completed-post-processing",
+        "payload.mkv",
+        b"payload",
+    )
+    .await;
     pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::PostProcessing;
     pipeline
         .db
@@ -1270,15 +1269,8 @@ async fn failed_final_move_marks_job_failed_instead_of_complete() {
     let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(10068);
     let job_name = "Silver Horizon Broken Final Move";
-    let spec = JobSpec {
-        name: job_name.to_string(),
-        password: None,
-        files: vec![],
-        total_bytes: 0,
-        category: None,
-        metadata: vec![],
-    };
-    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
+    let working_dir =
+        insert_delivered_job(&mut pipeline, job_id, job_name, "payload.mkv", b"payload").await;
     // Nothing is left to deliver from when the move runs.
     std::fs::remove_dir_all(&working_dir).unwrap();
     hear_graph_mail(&mut pipeline, job_id).await;

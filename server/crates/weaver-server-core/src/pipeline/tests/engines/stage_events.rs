@@ -73,7 +73,8 @@ fn landed(outcome: &Outcome) -> Vec<(String, u64)> {
 // damaged: every posted file lands once, at its posted size. The member
 // streams out of the store volumes as they arrive, so no extraction stage
 // is said; the repair of the damaged slice follows, and is said complete as
-// the job ends.
+// it comes back. Work is still lent out after that return, so the job
+// verifies once before it ends.
 #[tokio::test]
 async fn a_repaired_store_set_says_each_file_and_each_stage() {
     let body = payload(7 * ARTICLE + 13, 91);
@@ -101,7 +102,15 @@ async fn a_repaired_store_set_says_each_file_and_each_stage() {
         (0, 0, 0),
         "the job leaves no verify, repair or extract lane held"
     );
-    assert_eq!(stages(&graph), ["RepairStarted", "RepairComplete"]);
+    assert_eq!(
+        stages(&graph),
+        [
+            "RepairStarted",
+            "RepairComplete",
+            "JobVerificationStarted",
+            "JobVerificationComplete true"
+        ]
+    );
 }
 
 // A coded 7z the engine reads after it lands: the job enters extraction and

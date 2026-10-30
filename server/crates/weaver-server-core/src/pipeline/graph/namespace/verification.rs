@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use super::*;
 use crate::pipeline::graph::hardware::Shutdown;
 use crate::pipeline::graph::leaf::read_exact_at;
+use weaver_graph::Digest;
 
 #[derive(Debug)]
 pub(crate) struct Verification {
@@ -144,16 +145,52 @@ impl NamespaceWriter {
         );
     }
 
+    // Whether an obligation can still be met or still waits to be: a check
+    // of it can be lent now, or its namespace has not ended, so what keeps
+    // it from a check (still open, short, or damaged) may yet clear. One of
+    // an ended namespace no check can be lent for is met by nothing: the
+    // census reads its member damaged or short, and a member whose file an
+    // object took over is that object's to read.
+    pub(crate) fn verifications_due(&self, tree: &Tree, payload_waiting: bool) -> bool {
+        self.verifications
+            .iter()
+            .any(|&(node, member)| self.owed(tree, payload_waiting, node, member))
+    }
+
+    // The namespace ended: its obligations nothing can meet are dropped.
+    pub(crate) fn drop_unmet_verifications(&mut self, tree: &Tree, payload_waiting: bool) {
+        let unmet: Vec<(NodeId, MemberId)> = self
+            .verifications
+            .iter()
+            .copied()
+            .filter(|&(node, member)| !self.owed(tree, payload_waiting, node, member))
+            .collect();
+        for key in unmet {
+            self.verifications.remove(&key);
+        }
+    }
+
+    fn owed(&self, tree: &Tree, payload_waiting: bool, node: NodeId, member: MemberId) -> bool {
+        !self.ended(tree, node, payload_waiting) || self.verification(tree, node, member).is_some()
+    }
+
+    // The member's stated CRC and length, when its bytes can be checked:
+    // closed, every byte in, none damaged.
+    fn checkable(&self, tree: &Tree, node: NodeId, member: MemberId) -> Option<(u32, u64)> {
+        let record = tree.namespace(node)?.get(member)?;
+        let (stated, length) = (record.crc32?, record.length?);
+        let whole = ByteRange::new(0, length);
+        let checkable =
+            record.closed && record.coverage.covered(whole) && !record.coverage.damaged(whole);
+        checkable.then_some((stated, length))
+    }
+
     // No filesystem call: the worker opens the recorded path. A closed
     // member's bytes may still be rewritten; its return validates both the
     // file revision and the graph's verdict before using even an IO error.
     fn verification(&self, tree: &Tree, node: NodeId, member: MemberId) -> Option<Verification> {
+        let (stated, length) = self.checkable(tree, node, member)?;
         let record = tree.namespace(node)?.get(member)?;
-        let (stated, length) = (record.crc32?, record.length?);
-        let whole = ByteRange::new(0, length);
-        if !record.closed || !record.coverage.covered(whole) || record.coverage.damaged(whole) {
-            return None;
-        }
         let leaf = self.files.get(&node)?.leaves.get(&member)?;
         Some(Verification {
             node,
@@ -163,7 +200,9 @@ impl NamespaceWriter {
             length,
             stated,
             coverage: record.coverage.clone(),
-            folded: leaf.folded(length),
+            folded: leaf
+                .folded(length, Algorithm::Crc32)
+                .map(|folded| folded as u32),
             stop: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             barrier: None,
@@ -172,14 +211,12 @@ impl NamespaceWriter {
 
     // Admission permits one outstanding loan per job. Do not remove its
     // obligation here: a checkpoint taken during the read must retain it.
-    pub(crate) fn take_verification(&mut self, tree: &Tree) -> Option<Verification> {
-        while let Some(&(node, member)) = self.verifications.first() {
-            if let Some(check) = self.verification(tree, node, member) {
-                return Some(check);
-            }
-            self.verifications.remove(&(node, member));
-        }
-        None
+    // One that cannot be checked yet stays too: a later arrival may clean
+    // its member, and only a verdict or the namespace's end settles it.
+    pub(crate) fn take_verification(&self, tree: &Tree) -> Option<Verification> {
+        self.verifications
+            .iter()
+            .find_map(|&(node, member)| self.verification(tree, node, member))
     }
 
     pub(crate) fn verified(
@@ -195,8 +232,9 @@ impl NamespaceWriter {
         if !self.verifications.contains(&key) || check.stop.load(Ordering::Relaxed) {
             return Ok(());
         }
+        // A member that can no longer be checked keeps its obligation for
+        // when it can, as a stale read does for its next check.
         let Some(current) = self.verification(tree, check.node, check.member) else {
-            self.verifications.remove(&key);
             return Ok(());
         };
         if current.revision != check.revision
@@ -214,12 +252,12 @@ impl NamespaceWriter {
             .leaves
             .get_mut(&check.member)
             .expect("the current backing was checked above")
-            .fold_passed(check.length, actual);
+            .fold_passed(check.length, Digest::crc32(actual));
         self.verifications.remove(&key);
         if actual != check.stated {
             let mut effects = Vec::new();
             tree.checksum_failed(check.node, check.member, &mut effects);
-            self.apply_each(tree, builder, segments, effects, out)?;
+            self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
         }
         Ok(())
     }

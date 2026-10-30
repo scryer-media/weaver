@@ -864,20 +864,80 @@ async fn reposted_solid_sevenz_after_crash_has_one_output_incarnation() {
             .keys()
             .all(|name| name.ends_with("/part0.bin")
                 || name.ends_with("/part1.bin")
-                || name.ends_with("/part2.bin")
-                || name.ends_with("/000000000000000000000000d1c70003")),
-        "no second extracted incarnation: {:?}",
+                || name.ends_with("/part2.bin")),
+        "no second extracted incarnation and no leaf of a reposted volume: {:?}",
         restored.files.keys().collect::<Vec<_>>()
     );
-    if let Some(opaque) = restored
-        .files
-        .get("lantern beacon/000000000000000000000000d1c70003")
-    {
+    for index in 0..3 {
+        let expected: Vec<u8> = (0..8193)
+            .map(|n| ((n * 7 + n / 251 + index * 13) % 253) as u8)
+            .collect();
         assert!(
-            opaque == pieces[1],
-            "unclaimed opaque posting stays byte-exact"
+            restored
+                .files
+                .get(&format!("lantern beacon/part{index}.bin"))
+                == Some(&expected),
+            "part{index}.bin is byte-exact"
         );
     }
+}
+
+// A solid 7z set posted twice. Its first posting is part extracted when the
+// job restarts; the second posting of each volume comes after, with every
+// byte. Each is another posting of the volume it copies: one extractor, one
+// name per member.
+#[tokio::test]
+async fn a_restored_repost_of_a_solid_set_spawns_no_second_incarnation() {
+    let archive = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/extraction_profiles/sevenz_solid.7z"
+    ));
+    let cut = archive.len().div_ceil(2);
+    let pieces = [&archive[..cut], &archive[cut..]];
+    let posts = [0, 1, 0, 1]
+        .into_iter()
+        .enumerate()
+        .map(|(index, piece)| {
+            Post::plain(
+                &format!("{:032x}", 0xd1c8_0000_u128 + index as u128),
+                pieces[piece].to_vec(),
+            )
+        })
+        .collect();
+    let scenario = Scenario::new(posts).framed(cut.div_ceil(2));
+    let order = [
+        (0, 0),
+        (0, 1),
+        (1, 0),
+        (1, 1),
+        (2, 0),
+        (2, 1),
+        (3, 0),
+        (3, 1),
+    ];
+    let restored = explicit_crash(&scenario, &order, 3).await;
+    assert_eq!(
+        restored.status,
+        Some(JobStatus::Complete),
+        "delivery={:?}, rulings={:?}",
+        restored.graph.delivery,
+        restored.graph.rulings
+    );
+    assert!(
+        restored.graph.delivery.damaged.is_empty(),
+        "nothing delivered damaged: {:?}",
+        restored.graph.delivery
+    );
+    let names: Vec<_> = restored.files.keys().cloned().collect();
+    assert!(
+        names.iter().all(|name| !name.contains(" (1)")),
+        "no second extracted incarnation: {names:?}"
+    );
+    assert_eq!(
+        names,
+        ["part0.bin", "part1.bin", "part2.bin"].map(|name| format!("lantern beacon/{name}")),
+        "one extraction, nothing beside it"
+    );
     for index in 0..3 {
         let expected: Vec<u8> = (0..8193)
             .map(|n| ((n * 7 + n / 251 + index * 13) % 253) as u8)
@@ -1067,6 +1127,11 @@ async fn recovered_reposts_with_no_original_front_have_one_usable_archive() {
         "delivery={:?}, names={:?}",
         outcome.graph.delivery,
         outcome.files.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        outcome.graph.delivery.damaged.is_empty(),
+        "no reposted volume stays a damaged leaf: {:?}",
+        outcome.graph.delivery
     );
     for index in 0..3 {
         let expected: Vec<_> = (0..8193)

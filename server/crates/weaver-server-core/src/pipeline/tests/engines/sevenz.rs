@@ -1024,7 +1024,7 @@ async fn live_stores_replay_checksum_rejected_members_after_repair() {
                         && member
                             .coverage
                             .runs()
-                            .any(|run| run.provenance == weaver_graph::Provenance::Damaged)
+                            .any(|run| run.provenance == weaver_graph::Provenance::Refuted)
                 }),
                 "the output checksum must fail before repair"
             );
@@ -1149,7 +1149,7 @@ async fn parent_repair_does_not_override_a_still_failing_member_checksum() {
         tree.namespace(store).unwrap().members().any(|member| member
             .coverage
             .runs()
-            .any(|run| run.provenance == weaver_graph::Provenance::Damaged)),
+            .any(|run| run.provenance == weaver_graph::Provenance::Refuted)),
         "fixture must be checksum-rejected"
     );
     serve_posts(&mut pipeline, &scenario, 1..scenario.posts.len() as u32).await;

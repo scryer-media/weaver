@@ -100,7 +100,6 @@ struct Volume {
     named_blocks: Option<u64>,
     // The name it was bound under, which a later volume of the set continues.
     name: Option<String>,
-    name_only: bool,
 }
 
 impl Volume {
@@ -307,11 +306,7 @@ impl Par3 {
                 // brings is not known.
                 _ if !volume.closed && volume.arrived.runs().next().is_none() => None,
                 Some(blocks) => Some(blocks),
-                // Legacy facts lack binding names. A damaged front cannot
-                // prove that such a carrier has no later recovery packets.
-                None if volume.name.is_some() && volume.closed && !volume.shows_recovery() => {
-                    Some(0)
-                }
+                None if volume.closed && !volume.shows_recovery() => Some(0),
                 None => None,
             })
             .sum()
@@ -547,9 +542,6 @@ impl Object for Par3 {
         _out: &mut Vec<Emit>,
     ) {
         let volume = self.volume(delivery.volume);
-        if !delivery.bytes.is_empty() {
-            volume.name_only = false;
-        }
         volume.arrived.write(delivery.range(), delivery.provenance);
         let Ok(offset) = usize::try_from(delivery.offset) else {
             return;
@@ -611,12 +603,7 @@ impl Object for Par3 {
     // By the magic its bytes open with, or, before any bytes, by a name
     // that continues the set's: the stem of a volume already held, then a
     // `.vol` name ending in `.par3`.
-    fn claim(
-        &mut self,
-        name: &str,
-        first_bytes: &[u8],
-        _length: Option<u64>,
-    ) -> Option<VolumeIndex> {
+    fn claim(&mut self, name: &str, first_bytes: &[u8], _length: Option<u64>) -> Vec<VolumeIndex> {
         let ours = if first_bytes.is_empty() {
             self.volumes
                 .iter()
@@ -627,6 +614,8 @@ impl Object for Par3 {
         };
         (ours && self.volumes.len() < MAX_CARRIERS)
             .then_some(VolumeIndex(self.volumes.len() as u32))
+            .into_iter()
+            .collect()
     }
 
     // An impossible verdict counted the blocks of the volumes bound then,
@@ -634,9 +623,8 @@ impl Object for Par3 {
     // may bring more of either, so the object is tried again. Without this
     // the verdict would depend on whether a volume's front decided before
     // or after the damage arrived.
-    fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8], _length: Option<u64>) {
+    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
         let found = self.volume(volume);
-        found.name_only = front.is_empty();
         found.named_blocks = recovery_volume::named_blocks(name, ".par3");
         found.name = Some(name.to_owned());
         if matches!(
@@ -652,12 +640,6 @@ impl Object for Par3 {
 
     fn recovery(&self) -> Option<&dyn Recovery> {
         Some(self)
-    }
-
-    fn name_only(&self, volume: VolumeIndex) -> bool {
-        self.volumes
-            .get(volume.0 as usize)
-            .is_some_and(|held| held.name_only)
     }
 
     fn recovery_mut(&mut self) -> Option<&mut dyn Recovery> {
@@ -813,19 +795,7 @@ impl Recovery for Par3 {
     }
 
     fn feed_proven(&mut self, member: MemberId, segments: &[Segment]) {
-        for segment in segments {
-            self.input.offer(member, crate::grid::WHOLE, segment);
-        }
-    }
-
-    fn uncovered(&mut self, member: MemberId, _range: ByteRange) {
-        self.input.forget(member);
-        if self.covers(member) {
-            self.last = None;
-            self.settled
-                .retain(|_, settled| !settled.members.contains(&Some(member)));
-            self.ruled.clear();
-        }
+        self.input.offer_all(member, crate::grid::WHOLE, segments);
     }
 
     // Kept for every member of the namespace, bound or not: a bind later

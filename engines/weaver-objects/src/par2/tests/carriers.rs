@@ -18,7 +18,7 @@ fn post(
         weaver_graph::Delivery {
             volume,
             offset,
-            bytes,
+            bytes: &weaver_graph::Evidenced::from(bytes.to_vec()),
             provenance,
         },
         &mut |_, _| false,
@@ -60,46 +60,43 @@ fn fixture() -> (Par2, Vec<u8>, ByteRange, ByteRange) {
     (object, bytes, first, hole)
 }
 
-#[test]
-fn closing_a_known_carrier_steps_over_only_absent_bytes() {
-    let (mut object, bytes, first, hole) = fixture();
-    object.sized(VolumeIndex(1), bytes.len() as u64, &mut Vec::new());
+// The two sides of a hole in a carrier: what the walk reads around it.
+fn around(object: &mut dyn Object, bytes: &[u8], hole: ByteRange, provenance: Provenance) {
     post(
-        &mut object,
+        object,
         VolumeIndex(1),
         0,
         &bytes[..hole.start as usize],
-        Provenance::Damaged,
+        provenance,
     );
     post(
-        &mut object,
+        object,
         VolumeIndex(1),
         hole.end,
         &bytes[hole.end as usize..],
-        Provenance::Damaged,
+        provenance,
     );
-    assert_eq!(
-        rows(&object),
-        0,
-        "an open out-of-order carrier waits for its missing bytes"
-    );
-    assert!(object.volumes[1].lost.is_empty());
-    object.volume_closed(VolumeIndex(1), &mut Vec::new());
+}
+
+#[test]
+fn a_hole_the_root_states_lost_is_stepped_over_and_only_it() {
+    let (mut object, bytes, first, hole) = fixture();
+    object.sized(VolumeIndex(1), bytes.len() as u64, &mut Vec::new());
+    around(&mut object, &bytes, hole, Provenance::Damaged);
+    assert_eq!(rows(&object), 0, "a carrier waits on bytes not stated lost");
+    object.volume_lost(VolumeIndex(1), hole, &mut Vec::new());
     assert_eq!(
         rows(&object),
         3,
-        "three intact packets beyond the absent range remain usable despite transport damage"
+        "the packets past the lost range are read, damaged in transport or not"
     );
     assert_eq!(
         object.volumes[1].lost.iter().copied().collect::<Vec<_>>(),
         vec![hole]
     );
     object.volume_closed(VolumeIndex(1), &mut Vec::new());
-    assert_eq!(
-        rows(&object),
-        3,
-        "repeated closure does not count packets twice"
-    );
+    object.volume_lost(VolumeIndex(1), hole, &mut Vec::new());
+    assert_eq!(rows(&object), 3, "a loss told again counts nothing twice");
     object.unposted(VolumeIndex(1), first);
     assert!(!object.volumes[1].closed);
     assert!(object.volumes[1].lost.is_empty());
@@ -111,56 +108,28 @@ fn closing_a_known_carrier_steps_over_only_absent_bytes() {
         Provenance::Repaired,
     );
     object.volume_closed(VolumeIndex(1), &mut Vec::new());
-    assert_eq!(
-        rows(&object),
-        4,
-        "rewriting the lost packet uses the existing unposted/rewalk path"
-    );
+    assert_eq!(rows(&object), 4, "the packet that came again is read");
 }
 
 #[test]
-fn an_unknown_carrier_end_is_not_guessed_when_it_closes() {
+fn a_carrier_infers_no_hole_of_its_own() {
     let (mut object, bytes, _, hole) = fixture();
-    post(
-        &mut object,
-        VolumeIndex(1),
-        0,
-        &bytes[..hole.start as usize],
-        Provenance::Fresh,
-    );
-    post(
-        &mut object,
-        VolumeIndex(1),
-        hole.end,
-        &bytes[hole.end as usize..],
-        Provenance::Fresh,
-    );
+    around(&mut object, &bytes, hole, Provenance::Fresh);
     object.volume_closed(VolumeIndex(1), &mut Vec::new());
-    assert_eq!(rows(&object), 0);
-    assert!(object.volumes[1].lost.is_empty());
     let facts = object.facts();
     object.sized(VolumeIndex(1), bytes.len() as u64, &mut Vec::new());
     assert_eq!(
         rows(&object),
-        3,
-        "authoritative length arriving after closure establishes the absent range"
+        0,
+        "neither its close nor its length says the hole is lost"
     );
+    assert!(object.volumes[1].lost.is_empty());
+    object.volume_lost(VolumeIndex(1), hole, &mut Vec::new());
+    assert_eq!(rows(&object), 3);
     let mut restored = crate::restore(&facts, weaver_graph::Budget::default()).unwrap();
     restored.sized(VolumeIndex(1), bytes.len() as u64, &mut Vec::new());
-    post(
-        &mut *restored,
-        VolumeIndex(1),
-        0,
-        &bytes[..hole.start as usize],
-        Provenance::Fresh,
-    );
-    post(
-        &mut *restored,
-        VolumeIndex(1),
-        hole.end,
-        &bytes[hole.end as usize..],
-        Provenance::Fresh,
-    );
+    around(&mut *restored, &bytes, hole, Provenance::Fresh);
+    restored.volume_lost(VolumeIndex(1), hole, &mut Vec::new());
     restored.volume_closed(VolumeIndex(1), &mut Vec::new());
     let mut sets = Vec::new();
     restored.recovery().unwrap().sets(&mut sets);

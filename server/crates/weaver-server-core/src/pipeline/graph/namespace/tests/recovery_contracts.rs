@@ -5,7 +5,9 @@ use super::*;
 use crate::pipeline::graph::hardware::Shutdown;
 use std::sync::atomic::AtomicBool;
 
-fn carriers(body: &[u8]) -> Vec<(String, Vec<u8>)> {
+// A PAR3 set over `body` as `payload.bin`: `recovery` blocks of 512 bytes,
+// at most `per_volume` to a volume, the index first.
+fn carriers(body: &[u8], recovery: u64, per_volume: u64) -> Vec<(String, Vec<u8>)> {
     use par3_rs::creation::{CreationOptions, CreationPlan, CreationSource, VolumeLayout};
     use par3_rs::source::{MemorySourceAccess, SourceId};
     let mut sources = MemorySourceAccess::default();
@@ -18,8 +20,8 @@ fn carriers(body: &[u8]) -> Vec<(String, Vec<u8>)> {
         }],
         CreationOptions {
             block_size: 512,
-            recovery_count: 4,
-            volumes: VolumeLayout::Uniform(4),
+            recovery_count: recovery,
+            volumes: VolumeLayout::Uniform(per_volume),
             ..Default::default()
         },
     )
@@ -67,7 +69,7 @@ fn deliver(job: &mut Job, member: MemberId, offset: u64, bytes: &[u8]) {
                 node: NodeId::ROOT,
                 member,
                 offset,
-                bytes: Bytes::copy_from_slice(bytes),
+                bytes: Bytes::copy_from_slice(bytes).into(),
                 provenance: Provenance::Fresh,
             },
             &mut job.out,
@@ -114,7 +116,7 @@ fn cancelled_and_stale_par3_returns_keep_damaged_carriers_repairable() {
         let body: Vec<_> = (0u32..4096)
             .map(|n| ((n.wrapping_mul(1664525).wrapping_add(n * n * 31)) >> 8) as u8)
             .collect();
-        let files = carriers(&body);
+        let files = carriers(&body, 4, 4);
         let mut job = Job::new(PLENTY);
         let mut set = None;
         for (name, mut bytes) in files {
@@ -185,4 +187,88 @@ fn cancelled_and_stale_par3_returns_keep_damaged_carriers_repairable() {
         accept(&mut job, returned);
         assert_eq!(job.file("payload.bin"), body);
     }
+}
+
+// Where the second `PAR REC` packet of a PAR3 volume lies.
+fn second_block(volume: &[u8]) -> (u64, u64) {
+    let mut at = 0;
+    let mut blocks = Vec::new();
+    while at + 48 <= volume.len() {
+        let length = u64::from_le_bytes(volume[at + 24..at + 32].try_into().unwrap()) as usize;
+        if &volume[at + 40..at + 48] == b"PAR REC\0" {
+            blocks.push((at as u64, (at + length) as u64));
+        }
+        at += length;
+    }
+    blocks[1]
+}
+
+// A PAR3 set of two recovery blocks in one volume, the second still to come
+// when a repair that needs one block is lent: the block lands while the
+// repair is out. The repair read none of it, so its ruling stands, on the
+// one block it had.
+#[test]
+fn a_par3_ruling_stands_when_its_own_volume_grows_while_the_repair_is_out() {
+    let body: Vec<_> = (0u32..4096)
+        .map(|n| ((n.wrapping_mul(1664525).wrapping_add(n * n * 31)) >> 8) as u8)
+        .collect();
+    let mut job = Job::new(PLENTY);
+    let mut set = None;
+    let mut withheld = None;
+    for (name, bytes) in carriers(&body, 2, 2) {
+        let member = announce(&mut job, &name, &bytes);
+        if name.contains(".vol") {
+            let (from, to) = second_block(&bytes);
+            deliver(&mut job, member, 0, &bytes[..from as usize]);
+            if (to as usize) < bytes.len() {
+                deliver(&mut job, member, to, &bytes[to as usize..]);
+            }
+            withheld = Some((member, from, bytes[from as usize..to as usize].to_vec()));
+        } else {
+            deliver(&mut job, member, 0, &bytes);
+            close(&mut job, member);
+        }
+        let child = job.tree.child_of(NodeId::ROOT, member).unwrap().0;
+        assert_eq!(*set.get_or_insert(child), child);
+    }
+    let set = set.unwrap();
+    let mut wrong = body.clone();
+    wrong[1200] ^= 0x55;
+    let member = announce(&mut job, "payload.bin", &wrong);
+    deliver(&mut job, member, 0, &wrong);
+    close(&mut job, member);
+    job.writer
+        .bind_recoveries(
+            &mut job.tree,
+            &mut weaver_objects::Objects::default(),
+            &Source,
+            NodeId::ROOT,
+            &mut job.out,
+        )
+        .unwrap();
+    job.tree.refuse(set, member, ByteRange::new(1024, 1536));
+    let returned = lend(&mut job, set).run(weaver_graph::Budget::default(), &Shutdown::default());
+    assert_eq!(
+        returned.outcome,
+        Some(RepairOutcome::Repaired { slices: 1 }),
+        "{returned:?}"
+    );
+    let (volume, from, block) = withheld.unwrap();
+    deliver(&mut job, volume, from, &block);
+    close(&mut job, volume);
+    assert!(
+        !job.writer.moved_since(&job.tree, &returned),
+        "a block the repair never read leaves its ruling standing"
+    );
+    accept(&mut job, returned);
+    let mut rulings = Vec::new();
+    job.writer.rulings(&job.tree, set, &mut rulings);
+    assert_eq!(
+        rulings
+            .iter()
+            .map(|ruling| (ruling.outcome, ruling.blocks_reachable))
+            .collect::<Vec<_>>(),
+        vec![(Some(RepairOutcome::Repaired { slices: 1 }), 1)]
+    );
+    assert_eq!(job.file("payload.bin"), body);
 }

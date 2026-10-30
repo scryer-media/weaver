@@ -229,7 +229,7 @@ fn a_spanned_set_streams_with_its_volumes_out_of_order() {
     // The `.zip` said it is disk 2: nothing numbered follows it.
     assert_eq!(
         weaver_graph::Object::claim(&mut owner.object, "alpha.z03", b"", None),
-        None
+        Vec::<VolumeIndex>::new()
     );
     no_trouble(&owner);
     streamed(&owner);
@@ -247,22 +247,22 @@ fn the_last_volume_follows_every_numbered_one_and_takes_nothing_of_another_set()
     let mut zip = Zip::new();
     zip.bound(VolumeIndex(0), "Alpha.Z01", &[], None);
     use weaver_graph::Object;
-    assert_eq!(zip.claim("alpha.z02", b"", None), Some(VolumeIndex(1)));
+    assert_eq!(zip.claim("alpha.z02", b"", None), vec![VolumeIndex(1)]);
     zip.bound(VolumeIndex(1), "alpha.z02", &[], None);
     assert_eq!(
         zip.claim("alpha.zip", b"", None),
-        Some(VolumeIndex(u32::MAX))
+        vec![VolumeIndex(u32::MAX)]
     );
     zip.bound(VolumeIndex(u32::MAX), "alpha.zip", &[], None);
     assert_eq!(
         zip.claim("alpha.z03", b"", None),
-        Some(VolumeIndex(2)),
+        vec![VolumeIndex(2)],
         "a numbered volume takes its number until the last says its disk"
     );
-    assert_eq!(zip.claim("beta.z03", b"", None), None);
+    assert_eq!(zip.claim("beta.z03", b"", None), Vec::<VolumeIndex>::new());
     assert_eq!(
         zip.claim("alpha.z02", b"", None),
-        Some(VolumeIndex(1)),
+        vec![VolumeIndex(1)],
         "a volume posted again is that volume"
     );
 
@@ -270,7 +270,7 @@ fn the_last_volume_follows_every_numbered_one_and_takes_nothing_of_another_set()
     lone.bound(VolumeIndex(0), "alpha.zip", &[], None);
     assert_eq!(
         lone.claim("alpha.z01", b"", None),
-        None,
+        Vec::<VolumeIndex>::new(),
         "a lone zip has no siblings"
     );
 }
@@ -639,4 +639,98 @@ fn a_file_carries_its_directory_checksum() {
             "{name}"
         );
     }
+}
+
+// Three entries ahead of one longer than the tail the store reads first, so
+// the directory can be read while the payload ahead of it has yet to come.
+fn ahead_of_the_tail() -> Vec<(&'static str, Vec<u8>)> {
+    let mut files = files();
+    files.push(("delta.bin", payload(4, records::TAIL as usize)));
+    files
+}
+
+// An archive with its directory's records for two entries swapped: the same
+// bytes, the members numbered the other way.
+fn swapped_directory(single: &[u8], first: usize, second: usize) -> Vec<u8> {
+    let end = records::find_end(single).unwrap();
+    let start = end.offset as usize;
+    let directory = &single[start..start + end.size as usize];
+    let mut centrals: Vec<Vec<u8>> = records::directory(directory, end.entries)
+        .unwrap()
+        .into_iter()
+        .map(|central| directory[central.span].to_vec())
+        .collect();
+    centrals.swap(first, second);
+    let mut swapped = single.to_vec();
+    swapped[start..start + end.size as usize].copy_from_slice(&centrals.concat());
+    swapped
+}
+
+// A directory repaired into another order over bytes the store already
+// routed: the store moves them to the members the new directory gives, from
+// the bytes it routed, and asks for nothing twice.
+#[test]
+fn a_repaired_zip_directory_remaps_routed_payload_without_an_engine() {
+    let files = ahead_of_the_tail();
+    let entries: Vec<_> = files
+        .iter()
+        .map(|(name, bytes)| Entry::File(name, bytes, stored()))
+        .collect();
+    let before = write(&entries);
+    let after = swapped_directory(&before, 1, 2);
+    let end = records::find_end(&before).unwrap();
+    let directory = ByteRange::at(end.offset, end.size);
+    let beta = &files[1].1;
+    let beta_at = before
+        .windows(beta.len())
+        .position(|bytes| bytes == beta.as_slice())
+        .unwrap() as u64;
+    let cut = beta_at + 2_000;
+    let total = before.len() as u64;
+    let tail = total - records::TAIL;
+    assert!(cut < tail, "beta lies ahead of the tail");
+    let mut owner = Owner::single(Zip::new(), before.clone());
+    // Nothing is brought forward: what the store asks for is only recorded.
+    owner.pull = Pull::Moved(0);
+    // The tail with the directory, then alpha whole and beta in part.
+    owner.deliver(0, ByteRange::new(tail, total));
+    owner.deliver(0, ByteRange::new(0, cut));
+    assert!(owner.member("alpha.bin").closed);
+    assert_eq!(member_id(&owner, "beta.bin"), MemberId(1));
+    // The repair writes the directory in its other order.
+    owner.deliver_as(
+        0,
+        directory,
+        Provenance::Repaired,
+        Some(&after[directory.start as usize..directory.end as usize]),
+    );
+    assert!(owner.replays > 0, "routed bytes come again");
+    assert!(has(&owner, &Emit::Retract(MemberId(1))));
+    assert!(has(&owner, &Emit::Retract(MemberId(2))));
+    assert!(!has(&owner, &Emit::Retract(MemberId(0))), "alpha stays");
+    assert!(!has(&owner, &Emit::Retract(MemberId(3))), "delta stays");
+    // The rest of the payload.
+    owner.deliver(0, ByteRange::new(cut, tail));
+    owner.close(0);
+    assert!(
+        !owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::NeedsEngine(_) | Emit::Refuse(_))),
+        "{:?}",
+        owner.said
+    );
+    assert_eq!(member_id(&owner, "gamma.bin"), MemberId(1));
+    assert_eq!(member_id(&owner, "beta.bin"), MemberId(2));
+    assert_eq!(owner.members.len(), files.len());
+    for (name, bytes) in &files {
+        let got = owner.member(name);
+        assert_eq!(got.length, Some(bytes.len() as u64), "{name}");
+        assert!(got.closed, "{name} closed");
+        assert!(got.coverage.verified(ByteRange::new(0, bytes.len() as u64)));
+        assert_eq!(&got.bytes, bytes, "{name}");
+    }
+    assert_eq!(owner.held(), 0);
+    assert!(owner.refetched.is_empty(), "{:?}", owner.refetched);
+    assert_eq!(owner.posted(0).as_deref(), Some(after.as_slice()));
 }

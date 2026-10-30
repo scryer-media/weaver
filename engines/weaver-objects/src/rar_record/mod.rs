@@ -301,8 +301,8 @@ impl Object for RarRecord {
         _name: &str,
         _first_bytes: &[u8],
         _length: Option<u64>,
-    ) -> Option<VolumeIndex> {
-        None
+    ) -> Vec<VolumeIndex> {
+        Vec::new()
     }
 
     fn bound(&mut self, _volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {

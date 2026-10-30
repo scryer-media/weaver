@@ -73,10 +73,22 @@ impl ArticleRoot {
     }
 
     // A decoded article: record where it landed and what it was, and hand
-    // back the delivery for the namespace.
-    pub(crate) fn receive(&mut self, decoded: Decoded) -> Arrival {
+    // back the delivery for the namespace. The first intact copy of an
+    // article stands: a further copy, however it decoded, brings nothing
+    // until a seek sends the article back for another.
+    pub(crate) fn receive(&mut self, decoded: Decoded) -> Option<Arrival> {
+        if self.map.holds_intact(decoded.volume, decoded.ordinal) {
+            return None;
+        }
+        let decoded = decoded.declared();
         let range = decoded.range();
-        self.map.arrived(decoded.volume, decoded.ordinal, range);
+        self.map.arrived(
+            decoded.volume,
+            decoded.ordinal,
+            range,
+            decoded.declared_end,
+            decoded.intact,
+        );
         if let Some(length) = decoded.length {
             self.map.set_length(decoded.volume, length);
         }
@@ -87,7 +99,7 @@ impl ArticleRoot {
             // could be credited to the wrong bytes.
             self.map.set_ordered_only(decoded.volume);
         }
-        decoded.into_arrival()
+        Some(decoded.into_arrival())
     }
 
     // Answer one round of seeks. A deferred seek parks; a recovery seek is

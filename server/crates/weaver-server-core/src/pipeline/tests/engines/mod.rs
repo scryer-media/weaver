@@ -76,6 +76,7 @@ mod depth;
 mod embedded;
 mod encrypted_hex;
 pub(in crate::pipeline) mod harness;
+mod lent_handed;
 mod lifecycle;
 mod lines;
 mod nesting;

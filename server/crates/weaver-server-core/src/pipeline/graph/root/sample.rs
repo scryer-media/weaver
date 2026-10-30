@@ -18,8 +18,6 @@
 // first volumes of each set are bid into the window at once. The payload
 // follows in posted order.
 
-use std::collections::BTreeMap;
-
 use weaver_graph::{ByteRange, MemberId, NodeId, Tree, VERDICT_BYTES, VolumeIndex, Weight};
 use weaver_model::files::FileRole;
 
@@ -56,40 +54,64 @@ pub(crate) const BOOTSTRAP_VOLUMES: usize = 4;
 
 // Bid the leading volumes of every set still being fetched: from its first
 // volume on, past the ones already in hand, stopping at the first volume no
-// member has been bound to yet.
+// member has been bound to yet. Only the root volumes still waited on are
+// asked which set and place they are; a volume in hand is passed by its
+// place alone.
 pub(crate) fn bootstrap(tree: &Tree, map: &ArticleMap, window: &mut Window) {
     let Some(root) = tree.namespace(NodeId::ROOT) else {
         return;
     };
-    let mut sets: BTreeMap<NodeId, BTreeMap<VolumeIndex, VolumeIndex>> = BTreeMap::new();
-    for member in root.members() {
-        if let Some((child, volume)) = tree.child_of(NodeId::ROOT, member.id) {
-            sets.entry(child)
-                .or_default()
-                .insert(volume, root_volume(member.id));
-        }
-    }
-    for (set, volumes) in sets {
+    // A further posting of a member is the member's, not a volume of its own.
+    let mut waiting: Vec<(NodeId, VolumeIndex, VolumeIndex)> = map
+        .waiting_volumes()
+        .filter_map(|volume| {
+            let member = MemberId(volume.0);
+            if root.get(member).is_none() || root.copy_of(member).is_some() {
+                return None;
+            }
+            let (set, place) = tree.child_of(NodeId::ROOT, member)?;
+            Some((set, place, volume))
+        })
+        .collect();
+    waiting.sort_unstable();
+    for leading in waiting.chunk_by(|one, other| one.0 == other.0) {
+        let set = leading[0].0;
         if tree.recovers(set) {
             continue;
         }
-        let mut asked = 0;
-        for (expected, (volume, root)) in volumes.iter().enumerate() {
-            if volume.0 as usize != expected || asked == BOOTSTRAP_VOLUMES {
-                break;
-            }
-            if !map.volume_waiting(*root) {
-                continue;
-            }
+        let unbound = first_unbound(tree, set);
+        for (_, _, volume) in leading
+            .iter()
+            .take_while(|(_, place, _)| *place < unbound)
+            .take(BOOTSTRAP_VOLUMES)
+        {
             window.bid(Bid {
-                volume: *root,
+                volume: *volume,
                 range: ByteRange::new(0, u64::MAX),
                 weight: Weight::FIRST,
                 bidder: set,
                 in_order: tree.reads_in_order(set),
             });
-            asked += 1;
         }
+    }
+}
+
+// The first place of the set no member is bound at. Places are distinct, so
+// when the last is one short of how many there are they run from the first
+// without a gap, and only a set with a gap is walked to it.
+fn first_unbound(tree: &Tree, set: NodeId) -> VolumeIndex {
+    let Some((_, bound)) = tree.volumes(set) else {
+        return VolumeIndex(0);
+    };
+    match bound.keys().next_back() {
+        Some(last) if last.0 as usize + 1 == bound.len() => VolumeIndex(last.0 + 1),
+        _ => VolumeIndex(
+            bound
+                .keys()
+                .zip(0u32..)
+                .take_while(|(place, expected)| place.0 == *expected)
+                .count() as u32,
+        ),
     }
 }
 

@@ -15,6 +15,7 @@
 // refuses the member to a leaf (`Why::HoldsBreached`) and keeps downloading.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Bound;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
@@ -555,6 +556,16 @@ impl HoldLedger {
             .get(&volume)
             .map(|holds| holds.values().map(|hold| hold.range).collect())
             .unwrap_or_default()
+    }
+
+    // The first volume after `after` that holds anything, in volume order,
+    // or the first of them when `after` is none.
+    pub fn next_held_volume(&self, after: Option<VolumeIndex>) -> Option<VolumeIndex> {
+        let from = after.map_or(Bound::Unbounded, Bound::Excluded);
+        self.volumes
+            .range((from, Bound::Unbounded))
+            .find(|(_, holds)| !holds.is_empty())
+            .map(|(volume, _)| *volume)
     }
 
     pub fn total_held(&self) -> u64 {

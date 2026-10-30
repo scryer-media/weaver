@@ -1093,6 +1093,30 @@ impl DecodedChunk {
         }
     }
 
+    // The decoded bytes as one view, adopting a single buffer rather than
+    // copying it: a pooled slot goes back to its pool when the last view of
+    // it drops, and a shared body stays shared. Only output the decoder left
+    // in several batches is joined, and a part that declares its length is
+    // never left in several.
+    pub(super) fn into_bytes(self) -> Bytes {
+        match self {
+            Self::Contiguous(bytes) => bytes,
+            Self::Pooled(buffer) => Bytes::from_owner(buffer),
+            Self::Shared(body) => match &body.data {
+                Self::Contiguous(bytes) => bytes.clone(),
+                Self::Pooled(buffer) => Bytes::from_owner(buffer.clone()),
+                data => data.joined(),
+            },
+            data @ Self::Batches { .. } => data.joined(),
+        }
+    }
+
+    fn joined(&self) -> Bytes {
+        let mut bytes = bytes::BytesMut::with_capacity(self.len_bytes());
+        self.for_each_slice(|slice| bytes.extend_from_slice(slice));
+        bytes.freeze()
+    }
+
     pub(super) fn for_each_slice<F>(&self, mut f: F)
     where
         F: FnMut(&[u8]),
@@ -1309,7 +1333,7 @@ pub struct Pipeline {
     // In-flight article download count per file.
     pub(super) active_downloads_by_file: HashMap<NzbFileId, usize>,
     // In-flight decode task count per job.
-    pub(super) active_decodes_by_job: HashMap<JobId, usize>,
+    pub(super) active_decodes_by_job: decode::ActiveDecodes,
     // In-flight decode task count per file.
     pub(super) active_decodes_by_file: HashMap<NzbFileId, usize>,
     // Raw article bytes reserved until the actor consumes each decode result.

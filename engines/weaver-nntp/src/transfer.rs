@@ -482,8 +482,14 @@ pub struct ServerTransferControl {
     rate_changed: Condvar,
     // False while quota metering is suspended.
     quota_metering: AtomicBool,
+    // Whether the quota turns work away, as a snapshot says it. Every change
+    // to what decides it publishes it again under the state lock, so the
+    // per-article presentation reads it without taking that lock.
+    quota_blocked: AtomicBool,
     #[cfg(test)]
     path_counters: TransferPathCounters,
+    #[cfg(test)]
+    snapshot_locks: AtomicU64,
     #[cfg(test)]
     rate_reserve_pause: Mutex<Option<RateReservePause>>,
 }
@@ -579,8 +585,11 @@ impl ServerTransferControl {
             rate_wait_lock: Mutex::new(()),
             rate_changed: Condvar::new(),
             quota_metering: AtomicBool::new(true),
+            quota_blocked: AtomicBool::new(false),
             #[cfg(test)]
             path_counters: TransferPathCounters::default(),
+            #[cfg(test)]
+            snapshot_locks: AtomicU64::new(0),
             #[cfg(test)]
             rate_reserve_pause: Mutex::new(None),
         }
@@ -606,6 +615,7 @@ impl ServerTransferControl {
             let mut state = self.state.lock().expect("server transfer state poisoned");
             state.quota_saturated = false;
             state.capacity_revision = state.capacity_revision.wrapping_add(1).max(1);
+            self.publish_quota_blocked(&state);
             state.capacity_revision
         };
         self.publish_capacity_change(revision);
@@ -657,6 +667,7 @@ impl ServerTransferControl {
                 Ordering::Release,
             );
             state.capacity_revision = state.capacity_revision.wrapping_add(1).max(1);
+            self.publish_quota_blocked(&state);
             (state.capacity_revision, rate_changed)
         };
         if rate_changed {
@@ -705,6 +716,7 @@ impl ServerTransferControl {
         let mut state = self.state.lock().expect("server transfer state poisoned");
         let rejection = self.quota_rejection_locked(&state, requested_body_bytes);
         state.quota_saturated = rejection.is_some();
+        self.publish_quota_blocked(&state);
         rejection
     }
 
@@ -777,6 +789,7 @@ impl ServerTransferControl {
                 // away, which the strict `used >= limit` check misses under
                 // conservative (estimate-then-reconcile) reservation.
                 state.quota_saturated = true;
+                self.publish_quota_blocked(&state);
                 return Err(rejection);
             }
             if state.config.quota.is_some() {
@@ -787,6 +800,7 @@ impl ServerTransferControl {
                 // Admitting a reservation means the server is taking work again.
                 state.quota_saturated = false;
             }
+            self.publish_quota_blocked(&state);
         }
 
         Ok(BodyTransferPermit {
@@ -801,8 +815,39 @@ impl ServerTransferControl {
     }
 
     pub fn snapshot(&self) -> ServerTransferSnapshot {
+        #[cfg(test)]
+        self.snapshot_locks.fetch_add(1, Ordering::Relaxed);
         let state = self.state.lock().expect("server transfer state poisoned");
         self.snapshot_locked(&state)
+    }
+
+    // How many times the state lock was taken for a snapshot.
+    #[cfg(test)]
+    pub(crate) fn snapshot_lock_count(&self) -> u64 {
+        self.snapshot_locks.load(Ordering::Relaxed)
+    }
+
+    // Whether the quota turns work away, exactly as [`Self::snapshot`] says
+    // it, read without the state lock.
+    pub fn quota_blocked(&self) -> bool {
+        self.quota_blocked.load(Ordering::Acquire)
+    }
+
+    // Called at the end of every change to the quota's state, under its lock.
+    fn publish_quota_blocked(&self, state: &TransferState) {
+        self.quota_blocked
+            .store(self.quota_blocked_locked(state), Ordering::Release);
+    }
+
+    fn quota_blocked_locked(&self, state: &TransferState) -> bool {
+        let projected = state
+            .quota_used_bytes
+            .saturating_add(state.quota_reserved_bytes);
+        self.quota_metering.load(Ordering::Acquire)
+            && state
+                .config
+                .quota
+                .is_some_and(|quota| projected >= quota.limit_bytes || state.quota_saturated)
     }
 
     #[cfg(test)]
@@ -909,8 +954,7 @@ impl ServerTransferControl {
             } else {
                 u64::MAX
             },
-            quota_blocked: self.quota_metering.load(Ordering::Acquire)
-                && quota.is_some_and(|_| projected >= limit || state.quota_saturated),
+            quota_blocked: self.quota_blocked_locked(state),
             quota_generation: quota.map_or(0, |value| value.generation),
             capacity_revision: state.capacity_revision,
             retry_at: quota.and_then(|value| value.retry_at),
@@ -1194,6 +1238,7 @@ impl ServerTransferControl {
         } else {
             None
         };
+        self.publish_quota_blocked(&state);
         drop(state);
         if let Some(revision) = revision {
             self.publish_capacity_change(revision);
@@ -1542,6 +1587,41 @@ mod tests {
         // A dispatch the server can take clears the latch without a reset.
         assert!(control.quota_rejection_for_dispatch(200).is_none());
         assert!(!control.snapshot().quota_blocked);
+    }
+
+    // The published bit is the snapshot's answer after every kind of change:
+    // admission, refusal, a dispatch skip, settlement, metering, a new window.
+    #[test]
+    fn published_quota_blocked_follows_every_change_the_snapshot_sees() {
+        let registry = ServerTransferRegistry::with_scope(TransferScope::Egress);
+        let id = StableServerId(15);
+        let control = registry.configure(id, quota(1_000, 1));
+        let agrees = |control: &ServerTransferControl| {
+            assert_eq!(control.quota_blocked(), control.snapshot().quota_blocked);
+            control.quota_blocked()
+        };
+        assert!(!agrees(&control));
+        let mut in_flight = control.try_reserve(800).unwrap();
+        assert!(!agrees(&control));
+        assert!(control.try_reserve(250).is_err());
+        assert!(agrees(&control));
+        in_flight.record_blocking(300);
+        drop(in_flight);
+        assert!(!agrees(&control));
+        assert!(control.quota_rejection_for_dispatch(900).is_some());
+        assert!(agrees(&control));
+        registry.set_quota_metering_for(id, false);
+        assert!(!agrees(&control));
+        registry.set_quota_metering_for(id, true);
+        assert!(!agrees(&control));
+        let permit = control.try_reserve(700).unwrap();
+        drop(permit);
+        assert!(control.try_reserve(800).is_err());
+        assert!(agrees(&control));
+        registry.configure(id, quota(1_000, 2));
+        assert!(!agrees(&control));
+        registry.configure(id, quota(0, 2));
+        assert!(agrees(&control));
     }
 
     #[test]

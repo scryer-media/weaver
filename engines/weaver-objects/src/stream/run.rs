@@ -5,9 +5,7 @@
 // waiting for bytes still on their way. A decode that fails ends the member:
 // what was said of it is retracted and the stream refused. Its decoder's
 // checks speak of what the stream reads out, never of the volume's bytes,
-// so a failed decode marks nothing in the volume. A stream whose decoder
-// does nothing to its bytes reads on past bytes that will never come: the
-// member holds them as a gap marked damaged, at the same offsets.
+// so a failed decode marks nothing in the volume.
 
 use std::io::{self, Read};
 use std::marker::PhantomData;
@@ -28,17 +26,14 @@ pub(super) struct Run<D> {
     decoder: PhantomData<fn() -> D>,
     name: String,
     window: u64,
-    // The stream is its first volume alone.
-    single: bool,
 }
 
 impl<D: Decoder> Run<D> {
-    pub(super) fn new(name: String, window: u64, single: bool) -> Self {
+    pub(super) fn new(name: String, window: u64) -> Self {
         Self {
             decoder: PhantomData,
             name,
             window,
-            single,
         }
     }
 }
@@ -57,8 +52,8 @@ impl<D: Decoder> Extraction for Run<D> {
     ) {
         // Asked before anything is read, so a volume still growing is
         // never waited on for its tail.
-        let closed = self.single && volumes.len(weaver_graph::VolumeIndex(0)).is_some();
-        let mut input = Front::new(Arc::clone(&volumes));
+        let closed = volumes.len(weaver_graph::VolumeIndex(0)).is_some();
+        let input = Front::new(Arc::clone(&volumes));
         let failed = input.failure();
         let announced = sink(Emit::Member {
             member: MEMBER,
@@ -68,12 +63,8 @@ impl<D: Decoder> Extraction for Run<D> {
         if !announced {
             return;
         }
-        let pumped = if D::IDENTITY {
-            pump(&mut input, sink, Front::bridge)
-        } else {
-            D::open_with(input, self.window, budget, closed)
-                .and_then(|mut reader| pump(&mut *reader, sink, |_, _| None))
-        };
+        let pumped = D::open_with(input, self.window, budget, closed)
+            .and_then(|mut reader| pump(&mut *reader, sink));
         let error = match pumped {
             Ok(Ended::Whole) => {
                 sink(Emit::MemberClosed(MEMBER));
@@ -93,34 +84,18 @@ impl<D: Decoder> Extraction for Run<D> {
 // Decoded bytes to the sink a whole chunk at a time, however little each
 // read of the decoder gives, until the stream ends or fails or the owner
 // stops listening: every emit is a step of the owner's, so only the last is
-// short. What decoded before a failure is said before it. A failure `bridge`
-// reads on past is a gap of the length it gives, said as damaged bytes.
-fn pump<R: Read + ?Sized>(
-    reader: &mut R,
-    sink: &mut Sink<'_>,
-    bridge: impl Fn(&mut R, &io::Error) -> Option<u64>,
-) -> io::Result<Ended> {
+// short. What decoded before a failure is said before it.
+fn pump<R: Read + ?Sized>(reader: &mut R, sink: &mut Sink<'_>) -> io::Result<Ended> {
     let mut buffer = vec![0u8; CHUNK];
     let mut offset = 0u64;
     loop {
         let (filled, failed) = fill(&mut *reader, &mut buffer);
-        if !say(sink, offset, &buffer[..filled], Provenance::Fresh) {
+        if !say(sink, offset, &buffer[..filled]) {
             return Ok(Ended::Stopped);
         }
         offset += filled as u64;
         match failed {
-            Some(error) => {
-                let len = bridge(&mut *reader, &error).ok_or(error)?;
-                let gap = vec![0u8; CHUNK];
-                let end = offset + len;
-                while offset < end {
-                    let part = usize::try_from(end - offset).map_or(CHUNK, |rest| rest.min(CHUNK));
-                    if !say(sink, offset, &gap[..part], Provenance::Damaged) {
-                        return Ok(Ended::Stopped);
-                    }
-                    offset += part as u64;
-                }
-            }
+            Some(error) => return Err(error),
             None if filled < buffer.len() => return Ok(Ended::Whole),
             None => {}
         }
@@ -129,13 +104,13 @@ fn pump<R: Read + ?Sized>(
 
 // Bytes of the member to the sink, nothing for none; `false` once the owner
 // stopped listening.
-fn say(sink: &mut Sink<'_>, offset: u64, bytes: &[u8], provenance: Provenance) -> bool {
+fn say(sink: &mut Sink<'_>, offset: u64, bytes: &[u8]) -> bool {
     bytes.is_empty()
         || sink(Emit::Bytes {
             member: MEMBER,
             offset,
-            bytes: Bytes::copy_from_slice(bytes),
-            provenance,
+            bytes: Bytes::copy_from_slice(bytes).into(),
+            provenance: Provenance::Fresh,
         })
 }
 

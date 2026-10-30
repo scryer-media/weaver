@@ -12,8 +12,8 @@ use weaver_graph::{
 use weaver_graph::holds::ScratchHold;
 
 use super::{
-    CheckpointError, FileState, HoldRecord, Pending, Snapshot, envelope_rows, hold_rows, node_rows,
-    part_rows, root_row, snapshot,
+    CheckpointError, FileState, HoldRecord, Pending, Snapshot, envelope_rows, hold_rows,
+    member_rows_built, node_rows, part_rows, root_row, snapshot,
 };
 use crate::jobs::graph_checkpoint::{Delta, GraphCheckpoint, PartRow, Row};
 use crate::pipeline::graph::envelope::durable::KeptRecord;
@@ -41,6 +41,7 @@ fn member(id: u32, name: &str) -> MemberRecord {
         buried: false,
         undecided: false,
         copy_of: None,
+        fronted: false,
     }
 }
 
@@ -583,4 +584,153 @@ fn a_row_no_build_could_have_written_is_refused() {
     let mut checkpoint = rows(&full());
     checkpoint.coverage[0].end = -4;
     assert!(snapshot(&checkpoint).is_err());
+}
+
+// A post of fifty files of two 64-byte articles each, every first article
+// in.
+fn fifty_members() -> (GraphJob, tempfile::TempDir, Vec<RootFile>) {
+    let files: Vec<RootFile> = (0..50)
+        .map(|index| file(&format!("member{index:02}.bin"), &[64, 64]))
+        .collect();
+    let (mut job, dir, _) = job_with(&files, Vec::new());
+    for volume in 0..50 {
+        arrive(&mut job, volume, 0);
+    }
+    (job, dir, files)
+}
+
+// The article `ordinal` of file `volume` arrives.
+fn arrive(job: &mut GraphJob, volume: u32, ordinal: u32) {
+    let offset = u64::from(ordinal) * 64;
+    job.intake(
+        decoded(volume, ordinal, offset, &[volume as u8; 64], Some(128)),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
+}
+
+// The root member the file `volume` was posted as.
+fn root_member(job: &GraphJob, volume: u32) -> i64 {
+    let name = format!("member{volume:02}.bin");
+    let namespace = job.tree().namespace(NodeId::ROOT).unwrap();
+    let member = namespace
+        .records()
+        .find(|record| record.name == name)
+        .unwrap();
+    i64::from(member.id.0)
+}
+
+// One article for one member of fifty: the checkpoint builds that member's
+// rows and no other's, and writes only its rows beside the root's facts.
+#[test]
+fn a_step_builds_and_writes_only_the_member_it_changed() {
+    let (mut job, _dir, _) = fifty_members();
+    let pending = Pending::default();
+    assert!(pending.put(&job, Vec::new()));
+    assert!(pending.take().0.unwrap().whole);
+
+    arrive(&mut job, 49, 1);
+    let built = member_rows_built();
+    assert!(pending.put(&job, Vec::new()));
+    assert_eq!(
+        member_rows_built() - built,
+        1,
+        "one member's rows are built"
+    );
+
+    let step = pending.take().0.unwrap();
+    let member = root_member(&job, 49);
+    let root = i64::from(NodeId::ROOT.0);
+    assert!(
+        !step.members.is_empty() && !step.coverage.is_empty(),
+        "{step:?}"
+    );
+    assert!(
+        step.members.keys().all(|key| *key == (root, member)),
+        "{:?}",
+        step.members.keys()
+    );
+    assert!(
+        step.coverage
+            .keys()
+            .all(|(node, of, _)| (*node, *of) == (root, member)),
+        "{:?}",
+        step.coverage.keys()
+    );
+    assert!(step.nodes.is_empty(), "{:?}", step.nodes.keys());
+    assert!(step.envelopes.is_empty() && step.crypt.is_empty() && step.holds.is_empty());
+    assert!(
+        step.parts.keys().all(|(node, _)| *node == root),
+        "only the root's facts parts: {:?}",
+        step.parts.keys()
+    );
+}
+
+// Three steps, each one member's, written over the whole job: the rows read
+// back are a fresh checkpoint's, and the job restored from them has every
+// one of the fifty members as the job does.
+#[test]
+fn a_restore_after_single_member_steps_has_every_member() {
+    use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
+
+    use crate::operations::disk::CapacityReader;
+    use crate::pipeline::graph::engine::RunMail;
+    use crate::pipeline::graph::job::Storage;
+    use crate::pipeline::graph::limits::Caps;
+
+    let (mut job, dir, files) = fifty_members();
+    let pending = Pending::default();
+    assert!(pending.put(&job, Vec::new()));
+    let mut database = pending.take().0.unwrap();
+    for volume in [49, 7, 23] {
+        arrive(&mut job, volume, 1);
+        assert!(pending.put(&job, Vec::new()));
+        database.absorb(pending.take().0.unwrap());
+    }
+    let read = snapshot(&held(&database)).unwrap();
+    let fresh = Pending::default();
+    assert!(fresh.put(&job, Vec::new()));
+    assert_eq!(read, snapshot(&held(&fresh.take().0.unwrap())).unwrap());
+
+    let mail = RunMail::default();
+    let restored = GraphJob::restore(
+        &read,
+        &files,
+        2,
+        Storage {
+            working_dir: dir.path().to_owned(),
+            accountant: Arc::new(HoldsAccountant::new(HoldBudgets {
+                resident_limit: u64::MAX,
+                scratch_total: u64::MAX,
+                scratch_ceiling: u64::MAX,
+                disk_reserve: 0,
+            })),
+            free_disk: CapacityReader::unknown(),
+            slots: 1,
+            mail: mail.sender(),
+            passwords: Vec::new(),
+            caps: Caps::unbounded(),
+            nesting: u32::MAX,
+            hardware: Default::default(),
+            metrics: None,
+        },
+        0,
+    )
+    .unwrap();
+    let members = |job: &GraphJob| {
+        let record = job.tree().record(NodeId::ROOT).unwrap();
+        (record.members, record.coverage)
+    };
+    let (now, coverage) = members(&job);
+    assert_eq!(now.len(), 50);
+    assert_eq!(members(&restored.job), (now, coverage));
+    for volume in 0..50 {
+        let member = MemberId(root_member(&job, volume) as u32);
+        assert_eq!(
+            restored.job.writer().file_state(NodeId::ROOT, member),
+            job.writer().file_state(NodeId::ROOT, member),
+            "member {volume}"
+        );
+    }
 }

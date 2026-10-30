@@ -39,6 +39,12 @@ pub(super) struct Owner {
     delivered: BTreeMap<u32, Coverage>,
     bound: Vec<bool>,
     next: u32,
+    // What came from outside, by volume: delivered, or a seek's answer.
+    fetched: BTreeMap<u32, Coverage>,
+    // Seeks answered over bytes that had come already.
+    pub refetched: Vec<(VolumeIndex, ByteRange)>,
+    // Runs read back and delivered again.
+    pub replays: usize,
 }
 
 impl Owner {
@@ -55,6 +61,9 @@ impl Owner {
             delivered: BTreeMap::new(),
             bound: vec![false; count],
             next: 0,
+            fetched: BTreeMap::new(),
+            refetched: Vec::new(),
+            replays: 0,
         };
         let (name, bytes) = &owner.volumes[0];
         let (front, length) = (&bytes[..bytes.len().min(32)], Some(bytes.len() as u64));
@@ -85,7 +94,7 @@ impl Owner {
         let (name, bytes) = &self.volumes[volume];
         let (first, length) = (&bytes[..bytes.len().min(32)], Some(bytes.len() as u64));
         let index = VolumeIndex(volume as u32);
-        assert_eq!(self.object.claim(name, first, length), Some(index));
+        assert_eq!(self.object.claim(name, first, length), vec![index]);
         self.object.bound(index, name, first, length);
         self.bound[volume] = true;
         self.size(volume);
@@ -104,8 +113,28 @@ impl Owner {
         bytes: Option<&[u8]>,
     ) {
         self.bind(volume);
+        self.fetch(VolumeIndex(volume as u32), range);
         self.push(VolumeIndex(volume as u32), range, provenance, bytes);
         self.settle();
+    }
+
+    // Bytes from outside.
+    fn fetch(&mut self, volume: VolumeIndex, range: ByteRange) {
+        self.fetched
+            .entry(volume.0)
+            .or_default()
+            .write(range, Provenance::Fresh);
+    }
+
+    // A seek over a range that had come already asks for it twice.
+    fn asked(&mut self, seek: &Seek) {
+        if self
+            .fetched
+            .get(&seek.volume.0)
+            .is_some_and(|fetched| fetched.overlapping(seek.range).next().is_some())
+        {
+            self.refetched.push((seek.volume, seek.range));
+        }
     }
 
     fn push(
@@ -132,7 +161,7 @@ impl Owner {
             Delivery {
                 volume,
                 offset: range.start,
-                bytes: &bytes,
+                bytes: &weaver_graph::Evidenced::from(bytes.to_vec()),
                 provenance,
             },
             &mut read,
@@ -166,10 +195,12 @@ impl Owner {
             changed |= seeks != self.seeks;
             self.seeks.clone_from(&seeks);
             for seek in seeks {
+                self.asked(&seek);
                 let mut out = Vec::new();
                 self.object.pulled(seek, self.pull, &mut out);
                 self.apply(out);
                 if matches!(self.pull, Pull::Moved(moved) if moved > 0) {
+                    self.fetch(seek.volume, seek.range);
                     self.push(seek.volume, seek.range, Provenance::Fresh, None);
                 }
             }
@@ -269,8 +300,11 @@ impl Owner {
                     name,
                     length,
                 } => {
-                    assert_eq!(member.0, self.next, "members are announced in id order");
-                    self.next += 1;
+                    // A new member takes the next id; one retracted is
+                    // announced again under its own.
+                    assert!(member.0 <= self.next, "members are announced in id order");
+                    assert!(!self.members.contains_key(&member.0), "announced once");
+                    self.next = self.next.max(member.0 + 1);
                     self.members.insert(
                         member.0,
                         Got {
@@ -302,44 +336,48 @@ impl Owner {
                 }
                 Emit::Retract(member) => {
                     self.members.remove(&member.0);
-                    self.next = self.next.min(member.0);
                     self.said.push(Emit::Retract(member));
                 }
                 other => self.said.push(other),
             }
         }
-        for (volume, range) in again {
-            self.again(volume, range);
+        if !again.is_empty() {
+            self.again(&again);
         }
     }
 
-    // A range asked for again, as the tree answers it: what of it was
-    // delivered is read back as the store rebuilds it, every member it
-    // reached is open again, and the bytes come again as they came.
-    fn again(&mut self, volume: VolumeIndex, range: ByteRange) {
-        let runs: Vec<(ByteRange, Provenance)> = self
-            .delivered
-            .get(&volume.0)
-            .map(|coverage| {
-                coverage
-                    .overlapping(range)
-                    .filter_map(|run| Some((run.range.intersect(range)?, run.provenance)))
-                    .collect()
-            })
-            .unwrap_or_default();
+    // Ranges asked for again, as the tree answers them: what of each was
+    // delivered is read back, every range while the store still stands as
+    // it said them all, every member they reached is open again, and the
+    // bytes come again as they came.
+    fn again(&mut self, ranges: &[(VolumeIndex, ByteRange)]) {
         let mut read_back = Vec::new();
-        for (piece, provenance) in runs {
-            let members = &self.members;
-            let mut read =
-                |placement: &Placement, into: &mut Vec<u8>| read_member(members, placement, into);
-            let mut bytes = Vec::new();
-            if self.object.posted(volume, piece, &mut read, &mut bytes) {
-                read_back.push((piece, provenance, bytes));
+        for &(volume, range) in ranges {
+            let runs: Vec<(ByteRange, Provenance)> = self
+                .delivered
+                .get(&volume.0)
+                .map(|coverage| {
+                    coverage
+                        .overlapping(range)
+                        .filter_map(|run| Some((run.range.intersect(range)?, run.provenance)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (piece, provenance) in runs {
+                let (members, object) = (&self.members, &self.object);
+                let mut read = |placement: &Placement, into: &mut Vec<u8>| {
+                    read_posted(members, object, placement, into)
+                };
+                let mut bytes = Vec::new();
+                if self.object.posted(volume, piece, &mut read, &mut bytes) {
+                    read_back.push((volume, piece, provenance, bytes));
+                }
             }
         }
-        for (piece, _, _) in &read_back {
+        for (volume, piece, _, _) in &read_back {
             let mut placements = Vec::new();
-            self.object.locate(volume, *piece, &mut placements);
+            self.object.unposted(*volume, *piece);
+            self.object.locate(*volume, *piece, &mut placements);
             for placement in placements {
                 if let Placement::Member { member, range } = placement
                     && let Some(got) = self.members.get_mut(&member.0)
@@ -348,9 +386,9 @@ impl Owner {
                     got.closed = false;
                 }
             }
-            self.object.unposted(volume, *piece);
         }
-        for (piece, provenance, bytes) in read_back {
+        for (volume, piece, provenance, bytes) in read_back {
+            self.replays += 1;
             self.push(volume, piece, provenance, Some(&bytes));
         }
     }
@@ -368,19 +406,7 @@ impl Owner {
     pub fn posted(&self, volume: usize) -> Option<Vec<u8>> {
         let length = self.volumes[volume].1.len() as u64;
         let mut read = |placement: &Placement, into: &mut Vec<u8>| -> bool {
-            match placement {
-                Placement::Member { .. } => read_member(&self.members, placement, into),
-                Placement::Envelope { envelope, range } => {
-                    match self.object.envelope(*envelope, *range) {
-                        Some(bytes) => {
-                            into.extend_from_slice(&bytes);
-                            true
-                        }
-                        None => false,
-                    }
-                }
-                Placement::Held { .. } => false,
-            }
+            read_posted(&self.members, &self.object, placement, into)
         };
         let mut into = Vec::new();
         self.object
@@ -391,6 +417,26 @@ impl Owner {
                 &mut into,
             )
             .then_some(into)
+    }
+}
+
+// What a placement holds: a member's bytes or the store's envelope.
+fn read_posted(
+    members: &BTreeMap<u32, Got>,
+    object: &SevenZipStore,
+    placement: &Placement,
+    into: &mut Vec<u8>,
+) -> bool {
+    match placement {
+        Placement::Member { .. } => read_member(members, placement, into),
+        Placement::Envelope { envelope, range } => match object.envelope(*envelope, *range) {
+            Some(bytes) => {
+                into.extend_from_slice(&bytes);
+                true
+            }
+            None => false,
+        },
+        Placement::Held { .. } => false,
     }
 }
 

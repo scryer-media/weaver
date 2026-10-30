@@ -14,19 +14,21 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
-use weaver_graph::{ByteRange, Emit, MemberId, Placement, Provenance, SliceVerdict, VolumeIndex};
+use weaver_graph::{
+    Algorithm, ByteRange, Coverage, Emit, Evidenced, MemberId, Placement, Provenance, SliceVerdict,
+    VolumeIndex,
+};
 
 use super::{Lock, RarStore};
 use crate::grid::crc32;
-use crate::runs::gate;
+use crate::runs::{CrcRuns, gate};
 
 impl RarStore {
     pub(super) fn route(
         &mut self,
         volume: VolumeIndex,
         range: ByteRange,
-        bytes: &[u8],
+        bytes: &Evidenced,
         provenance: Provenance,
         read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
@@ -50,9 +52,14 @@ impl RarStore {
             else {
                 continue;
             };
-            let slice =
-                &bytes[(part.start - range.start) as usize..(part.end - range.start) as usize];
-            self.check_part(id, piece, part, slice, provenance, out);
+            let mut slice =
+                bytes.slice((part.start - range.start) as usize..(part.end - range.start) as usize);
+            // A stored file's packed bytes are its member's: the part's CRC
+            // and the file's fold the same digests, hashed here at most once.
+            if matches!(self.entries[id].lock, Lock::Plain) {
+                slice.fill(Algorithm::Crc32);
+            }
+            self.check_part(id, piece, (part, stream), &slice, provenance, read, out);
             let entry = &mut self.entries[id];
             let mut plains = Vec::new();
             match &mut entry.lock {
@@ -65,15 +72,17 @@ impl RarStore {
                         read(&Placement::Member { member, range }, buffer)
                     };
                     let (coverage, padding) = (&said.coverage, &mut said.padding);
-                    let arrival = (stream.start, slice, provenance);
+                    let arrival = (stream.start, &slice[..], provenance);
                     cbc.deliver(coverage, padding, arrival, &mut plain, &mut plains);
+                    // Deciphered bytes carry no evidence: nothing hashed them.
                     for plain in plains {
-                        self.record(id, plain.offset, &plain.bytes, plain.provenance, out);
+                        let bytes = Evidenced::from(plain.bytes);
+                        self.record(id, (plain.offset, bytes, plain.provenance), read, out);
                     }
                     continue;
                 }
             }
-            self.record(id, stream.start, slice, provenance, out);
+            self.record(id, (stream.start, slice, provenance), read, out);
         }
     }
 
@@ -108,14 +117,18 @@ impl RarStore {
         }
     }
 
-    // A part's packed bytes, against the part's own CRC.
+    // A part's packed bytes, against the part's own CRC. A stored file's
+    // packed bytes are its member's, so what a repair cut from the runs is
+    // read back from the member; another's are not, and stay unfed.
+    #[allow(clippy::too_many_arguments)]
     fn check_part(
         &mut self,
         id: usize,
         piece: usize,
-        part: ByteRange,
-        bytes: &[u8],
+        (part, stream): (ByteRange, ByteRange),
+        bytes: &Evidenced,
         provenance: Provenance,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
     ) {
         let entry = &mut self.entries[id];
@@ -127,7 +140,13 @@ impl RarStore {
         };
         let hash_key = entry.hash_key.as_deref();
         let runs = entry.parts.entry(piece).or_default();
-        runs.feed(part.shift(-(data.start as i64)), crc32(bytes), provenance);
+        let local = part.shift(-(data.start as i64));
+        let gaps = runs.feed(local, crc(bytes), provenance);
+        if matches!(entry.lock, Lock::Plain) {
+            let at = stream.start - local.start;
+            let member = (MemberId(id as u32), at, &entry.out.coverage);
+            refeed(runs, gaps, member, read);
+        }
         if let (SliceVerdict::Damaged, crc) = gate(runs, data.len(), expected, uses_mac, hash_key) {
             self.say_damaged(volume, data, crc, out);
         }
@@ -136,21 +155,26 @@ impl RarStore {
     fn record(
         &mut self,
         id: usize,
-        offset: u64,
-        bytes: &[u8],
-        provenance: Provenance,
+        (offset, mut bytes, provenance): (u64, Evidenced, Provenance),
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
     ) {
         let member = MemberId(id as u32);
         let entry = &mut self.entries[id];
         let range = ByteRange::at(offset, bytes.len() as u64);
+        // What no level above proved, deciphered bytes among them, is
+        // hashed here once and handed down with the bytes.
+        bytes.fill(Algorithm::Crc32);
+        let digest = crc(&bytes);
         out.push(Emit::Bytes {
             member,
             offset,
-            bytes: Bytes::copy_from_slice(bytes),
+            bytes,
             provenance,
         });
-        entry.plain_runs.feed(range, crc32(bytes), provenance);
+        let gaps = entry.plain_runs.feed(range, digest, provenance);
+        let said = (member, 0, &entry.out.coverage);
+        refeed(&mut entry.plain_runs, gaps, said, read);
         let plain_len = entry.plain_len();
         let said = Arc::make_mut(&mut entry.out);
         said.coverage.write(range, provenance);
@@ -166,7 +190,7 @@ impl RarStore {
             return;
         };
         let hash_key = entry.hash_key.as_deref();
-        let (SliceVerdict::Damaged, crc) = gate(
+        let (SliceVerdict::Damaged, _) = gate(
             &entry.plain_runs,
             length,
             expected,
@@ -180,15 +204,39 @@ impl RarStore {
         // bytes.
         if let Some(candidate) = entry.trial {
             self.wrong_key = Some(candidate);
-            return;
-        }
-        let parts: Vec<(VolumeIndex, ByteRange)> = entry
-            .pieces
-            .iter()
-            .map(|piece| (piece.volume, piece.data))
-            .collect();
-        for (volume, data) in parts {
-            self.say_damaged(volume, data, crc, out);
         }
     }
+}
+
+// What a rewrite cut from a member's runs and did not cover came out of the
+// member already: it is read back from the member's own bytes, each piece
+// as it came, and fed again, so the runs tile again and nothing is fetched
+// twice. `at` is where the runs' offset zero lies in the member.
+fn refeed(
+    runs: &mut CrcRuns,
+    gaps: Vec<ByteRange>,
+    (member, at, coverage): (MemberId, u64, &Coverage),
+    read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+) {
+    let mut buffer = Vec::new();
+    for gap in gaps {
+        let gap = gap.shift(at as i64);
+        for run in coverage.overlapping(gap) {
+            let Some(range) = run.range.intersect(gap) else {
+                continue;
+            };
+            buffer.clear();
+            if read(&Placement::Member { member, range }, &mut buffer) {
+                let local = range.shift(-(at as i64));
+                let cut = runs.feed(local, crc32(&buffer), run.provenance);
+                debug_assert!(cut.is_empty(), "a gap holds no run to cut");
+            }
+        }
+    }
+}
+
+// The CRC32 the runs fold, from the evidence the bytes came with, hashing
+// only what no level above proved.
+fn crc(bytes: &Evidenced) -> u32 {
+    bytes.digest(Algorithm::Crc32).value as u32
 }

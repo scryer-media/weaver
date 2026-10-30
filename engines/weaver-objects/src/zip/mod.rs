@@ -64,12 +64,18 @@ pub struct Zip {
     geometry: Geometry,
     kept: Kept,
     map: Option<Map>,
+    // The map a directory read again gives, while the bytes it moves are
+    // asked for again under the one that placed them; it takes over at the
+    // next input.
+    next: Option<Map>,
     // Reading the local headers from the front, not the directory.
     walking: bool,
     // Container ranges the directory read needs: the tail, the zip64
     // records, the directory itself.
     directory: Vec<ByteRange>,
-    // The bytes the map was built on, by range and checksum.
+    // The bytes the map was built on, by range and checksum; none once any
+    // of them changed under a map held against its directory, until the
+    // directory is read again.
     basis: Vec<(ByteRange, u32)>,
     members: Vec<Out>,
     grid: Grid,
@@ -89,7 +95,9 @@ impl Durable for Zip {
     // 4: the grid shelved by chunk of blocks, kept apart from the bytes.
     // 5: a sealed value encodes as nothing, numbered by its owner's walk.
     // 6: every entry keeps one record's header until the other agrees.
-    const VERSION: u16 = 6;
+    // 7: what each entry's member is said as, and the map a directory read
+    //    again gives, until it takes over.
+    const VERSION: u16 = 7;
 
     fn parts(&self, take: &mut Take) -> Result<(), String> {
         self.grid.parts(take)
@@ -101,16 +109,22 @@ impl Durable for Zip {
 
     // A member said is an entry of the map, and every entry's member is one.
     fn impossible(&self) -> Option<&'static str> {
-        let mapped = self.map.as_ref().map_or(self.members.is_empty(), |map| {
-            map.members.len() == self.members.len()
-                && map.members.iter().all(|entry| *entry < map.entries.len())
+        let sound = |map: &Map| {
+            map.members.iter().all(|entry| *entry < map.entries.len())
                 && map
                     .entries
                     .iter()
                     .filter_map(|entry| entry.member)
                     .all(|member| map.members.get(member.0 as usize).is_some())
+        };
+        let mapped = self.map.as_ref().map_or(self.members.is_empty(), |map| {
+            map.members.len() == self.members.len() && sound(map)
         });
-        (!mapped || !self.kept.sound()).then_some("members no map gives")
+        let next = self
+            .next
+            .as_ref()
+            .is_none_or(|next| self.map.is_some() && sound(next));
+        (!mapped || !next || !self.kept.sound()).then_some("members no map gives")
     }
 }
 
@@ -292,14 +306,15 @@ impl Zip {
         if self.walking {
             self.walk(out);
             if !self.gone
-                && self
-                    .map
-                    .as_ref()
-                    .is_some_and(|map| map.end.is_some() && !map.checked)
+                && (self.rereading()
+                    || self
+                        .map
+                        .as_ref()
+                        .is_some_and(|map| map.end.is_some() && !map.checked))
             {
                 self.read_directory(out);
             }
-        } else if self.map.is_none() {
+        } else if self.map.is_none() || self.rereading() {
             self.read_directory(out);
         }
         if !self.walking && self.map.is_some() && !self.gone {
@@ -322,15 +337,18 @@ impl Zip {
         self.settle(out);
     }
 
-    // A changed directory or local header revokes the structural basis,
-    // but the old placements still own the input bytes. Preserve their
-    // inverse map until the engine handoff materialises the container.
+    // A changed directory or local header: the map stands until the
+    // directory is read again, and the store moves what it routed then. A
+    // walk that has not reached the directory has nothing to read again: it
+    // gives its container up.
     fn rebuild_if_changed(&mut self, range: ByteRange, out: &mut Vec<Emit>) {
-        if self.map.is_none()
-            || !self
-                .basis
-                .iter()
-                .any(|(basis, _)| basis.intersect(range).is_some())
+        let Some(map) = &self.map else {
+            return;
+        };
+        if !self
+            .basis
+            .iter()
+            .any(|(basis, _)| basis.intersect(range).is_some())
         {
             return;
         }
@@ -342,7 +360,10 @@ impl Zip {
         if same {
             return;
         }
-        self.give_up(Emit::NeedsEngine(Why::Unmapped), out);
+        if !map.checked {
+            return self.give_up(Emit::NeedsEngine(Why::Unmapped), out);
+        }
+        self.basis.clear();
     }
 
     // Whether the range is one the directory read needs, before the map.
@@ -369,6 +390,7 @@ impl Object for Zip {
         if self.gone {
             return;
         }
+        self.install(out);
         self.decide_last(&delivery, read, out);
         if self.gone {
             return;
@@ -400,6 +422,9 @@ impl Object for Zip {
     }
 
     fn volume_closed(&mut self, _volume: VolumeIndex, out: &mut Vec<Emit>) {
+        if !self.gone {
+            self.install(out);
+        }
         self.stale = true;
         self.settle(out);
     }
@@ -408,6 +433,7 @@ impl Object for Zip {
         if self.gone {
             return;
         }
+        self.install(out);
         let Some(range) = self.global(volume, range) else {
             return;
         };
@@ -426,6 +452,7 @@ impl Object for Zip {
         if self.gone {
             return;
         }
+        self.install(out);
         if let Some(why) =
             crate::quiet::damaged(standing).or_else(|| crate::quiet::unplaced(standing))
         {
@@ -458,7 +485,11 @@ impl Object for Zip {
     // A range brought forward, or one not located yet and asked for again
     // next round, is waited for.
     fn pulled(&mut self, seek: Seek, pull: Pull, out: &mut Vec<Emit>) {
-        if self.gone || matches!(pull, Pull::Moved(_) | Pull::Unlocated) {
+        if self.gone {
+            return;
+        }
+        self.install(out);
+        if matches!(pull, Pull::Moved(_) | Pull::Unlocated) {
             return;
         }
         let Some(range) = self.global(seek.volume, seek.range) else {
@@ -490,6 +521,9 @@ impl Object for Zip {
     }
 
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {
+        if !self.gone {
+            self.install(out);
+        }
         let Some(disk) = self.disk(volume) else {
             self.last_length = Some(length);
             return;
@@ -529,12 +563,18 @@ impl Object for Zip {
         }
     }
 
-    fn claim(
-        &mut self,
-        name: &str,
-        _first_bytes: &[u8],
-        _length: Option<u64>,
-    ) -> Option<VolumeIndex> {
+    fn claim(&mut self, name: &str, _first_bytes: &[u8], _length: Option<u64>) -> Vec<VolumeIndex> {
+        self.volume_of(name).into_iter().collect()
+    }
+
+    fn facts(&self) -> Facts {
+        Facts::of(Kind::Zip, self)
+    }
+}
+
+impl Zip {
+    // The place a volume's name gives it in the set.
+    fn volume_of(&self, name: &str) -> Option<VolumeIndex> {
         let candidate = ZipFormat::parse(name)?;
         // The member that founds the store binds at its own name's index,
         // the `.zip` at the symbolic last.
@@ -548,10 +588,6 @@ impl Object for Zip {
             .then(|| candidate.slot(&self.names))??;
         let before_last = index == LAST || self.last_disk.is_none_or(|last| index < last);
         before_last.then_some(VolumeIndex(index))
-    }
-
-    fn facts(&self) -> Facts {
-        Facts::of(Kind::Zip, self)
     }
 }
 

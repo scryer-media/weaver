@@ -58,9 +58,9 @@ impl GraphError {
                 ExtractionError::from_io(message, source)
             }
             WriteError::Refused(failure) => ExtractionError::rejected(failure.clone()),
-            WriteError::UnknownMember { .. } | WriteError::StaleRecovery { .. } => {
-                ExtractionError::terminal(message)
-            }
+            WriteError::UnknownMember { .. }
+            | WriteError::StaleRecovery { .. }
+            | WriteError::ProofUnreadable { .. } => ExtractionError::terminal(message),
         }
     }
 }
@@ -104,6 +104,11 @@ pub(crate) struct GraphJob {
     mail_owed: Option<u64>,
     // What the job did since the pipeline last asked, for its events.
     notes: Vec<Note>,
+    // What the steps brought the engines' shelves up to.
+    fed: runs::Fed,
+    // Where root members were last asked whether the sets proved them;
+    // `None` before the first.
+    sealed_at: Option<repair::Sealed>,
 }
 
 // Something a step of the job did that the job's events say.
@@ -111,6 +116,8 @@ pub(crate) struct GraphJob {
 pub(crate) enum Note {
     // Every article of a posted file was fetched or lost.
     Landed(VolumeIndex),
+    // A set's repair came back and was applied, rebuilding these slices.
+    Repaired(u64),
 }
 
 // A root member as the post lists it.
@@ -196,6 +203,8 @@ impl GraphJob {
             pending: Pending::default(),
             mail_owed: None,
             notes: Vec::new(),
+            fed: runs::Fed::default(),
+            sealed_at: None,
         }
     }
 
@@ -302,7 +311,14 @@ impl GraphJob {
     // Completion waits for every worker's acknowledgment and for replays
     // or checks queued behind admission, not just actual recovery work.
     pub(crate) fn work_pending(&self) -> bool {
-        self.loans.out() || self.writer.rechecks_waiting() || self.writer.verifications_waiting()
+        self.loans.out() || self.writer.rechecks_waiting() || self.verifications_due()
+    }
+
+    // A checksum obligation something can still meet: one an ended
+    // namespace can no longer check is not work.
+    fn verifications_due(&self) -> bool {
+        self.writer
+            .verifications_due(&self.tree, self.payload_waiting())
     }
 
     #[cfg(test)]
@@ -331,23 +347,26 @@ impl GraphJob {
     // off the tree. Stable.
     pub(crate) fn phase(&self) -> RootPhase {
         let extracting = phase::extracting(&self.tree) || self.runs.live();
-        let phase = RootPhase::derive(self.payload_waiting(), self.activity(), extracting);
-        if phase == RootPhase::Done && self.work_pending() {
-            // Replaying input or folding a checksum settles the file; it
-            // does not extract another member. Keep the reported stage,
-            // including a Done restored from an already completed repair.
-            // Completion still waits for the worker's acknowledgment.
-            self.reported.unwrap_or(RootPhase::Downloading)
-        } else {
-            phase
-        }
+        RootPhase::derive(self.payload_waiting(), self.activity(), extracting)
     }
 
     // What the recovery sets are doing: repairing while a repair run is out
-    // over damage a set covers, which a run that only checks is not.
+    // over damage a set covers, which a run that only checks is not. With
+    // nothing else at work, a replay or checksum still to settle, or a
+    // worker's answer not yet acknowledged, is verifying what the job holds.
     fn activity(&self) -> Activity {
         let repairing = self.repair_out() && self.writer.damage_covered(&self.tree);
-        phase::activity(self.writer.outcomes(&self.tree), repairing)
+        match phase::activity(self.writer.outcomes(&self.tree), repairing) {
+            Activity::Idle if self.work_pending() => Activity::Verifying,
+            activity => activity,
+        }
+    }
+
+    // The volumes and articles the root's readers looked at since the last
+    // call.
+    #[cfg(test)]
+    pub(crate) fn article_visits(&self) -> (usize, usize) {
+        self.root.map.visits()
     }
 
     // Whether the root keeps decoder checksums for the member's volume.
@@ -552,16 +571,19 @@ impl GraphJob {
     // that asks or frees a run follows, and a repair the step lends asks
     // `slots` under it. The runs step before the lend, so a run the step
     // starts counts as reading when the walk asks whether a set is due.
+    // True when the root took the article; false for a copy it dropped.
     pub(crate) fn intake(
         &mut self,
         decoded: Decoded,
         slots: &mut RepairSlots,
         limit: usize,
-    ) -> Result<(), GraphError> {
+    ) -> Result<bool, GraphError> {
         let volume = decoded.volume;
         let member = MemberId(volume.0);
         let length = decoded.length;
-        let arrival = self.root.receive(decoded);
+        let Some(arrival) = self.root.receive(decoded) else {
+            return Ok(false);
+        };
         let mut out = Vec::new();
         if let Some(length) = length {
             self.writer.length_learned(
@@ -583,7 +605,8 @@ impl GraphJob {
         self.mark_damage()?;
         self.after_member(volume)?;
         self.step_runs(Vec::new(), limit)?;
-        self.lend(slots, limit)
+        self.lend(slots, limit)?;
+        Ok(true)
     }
 
     // Every server failed the article; nothing will fetch it again.
@@ -638,13 +661,16 @@ impl GraphJob {
     // anything could name it, holds nothing back. Recovery volumes are left
     // out: what a repair asks of them is the repair's. Root members are
     // numbered as the volumes they are; a further posting of a member is
-    // a volume of its own whose articles are the member's.
+    // a volume of its own whose articles are the member's. Only the volumes
+    // with such an article are asked.
     fn payload_waiting(&self) -> bool {
-        self.namespace().records().any(|member| {
-            !self
-                .writer
-                .carries_recovery(&self.tree, NodeId::ROOT, member.id)
-                && self.to_come(VolumeIndex(member.id.0))
+        let root = self.namespace();
+        self.root.map.coming().any(|volume| {
+            let member = MemberId(volume.0);
+            root.get(member).is_some()
+                && !self
+                    .writer
+                    .carries_recovery(&self.tree, NodeId::ROOT, member)
         })
     }
 

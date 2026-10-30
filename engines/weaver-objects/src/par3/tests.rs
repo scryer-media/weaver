@@ -206,7 +206,7 @@ fn par3_short_of_blocks_waits_until_a_volume_is_in_hand() {
             Delivery {
                 volume,
                 offset: index as u64 * 700,
-                bytes: piece,
+                bytes: &weaver_graph::Evidenced::from(piece.to_vec()),
                 provenance: Provenance::Fresh,
             },
             &mut |_, _| false,
@@ -243,7 +243,7 @@ fn a_recovery_volume_whose_head_holds_only_the_index_is_deferred() {
             Delivery {
                 volume,
                 offset: 0,
-                bytes: &bytes[..HEAD as usize],
+                bytes: &weaver_graph::Evidenced::from(bytes[..HEAD as usize].to_vec()),
                 provenance: Provenance::Fresh,
             },
             &mut |_, _| false,
@@ -436,7 +436,9 @@ fn a_hole_in_a_volume_costs_only_the_blocks_it_cuts() {
             Delivery {
                 volume: at,
                 offset: range.start,
-                bytes: &volume.1[range.start as usize..range.end as usize],
+                bytes: &weaver_graph::Evidenced::from(
+                    volume.1[range.start as usize..range.end as usize].to_vec(),
+                ),
                 provenance: Provenance::Fresh,
             },
             &mut |_, _| false,
@@ -643,7 +645,9 @@ fn deliver(job: &mut Job<Par3>, volume: VolumeIndex, bytes: &[u8], range: ByteRa
         Delivery {
             volume,
             offset: range.start,
-            bytes: &bytes[range.start as usize..range.end as usize],
+            bytes: &weaver_graph::Evidenced::from(
+                bytes[range.start as usize..range.end as usize].to_vec(),
+            ),
             provenance: Provenance::Fresh,
         },
         &mut |_, _| false,

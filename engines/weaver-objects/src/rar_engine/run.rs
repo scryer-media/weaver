@@ -361,7 +361,7 @@ impl Walk<'_, '_> {
             self.say(Emit::Bytes {
                 member,
                 offset: offset as u64,
-                bytes: bytes.slice(offset..end),
+                bytes: bytes.slice(offset..end).into(),
                 provenance: Provenance::Fresh,
             })?;
             offset = end;
@@ -715,7 +715,7 @@ impl Write for Out<'_, '_> {
         let heard = (self.sink)(Emit::Bytes {
             member: self.member,
             offset: self.offset,
-            bytes: Bytes::copy_from_slice(bytes),
+            bytes: Bytes::copy_from_slice(bytes).into(),
             provenance: Provenance::Fresh,
         });
         if !heard {

@@ -11,7 +11,7 @@ use super::*;
 
 use std::path::{Path, PathBuf};
 
-pub(in crate::pipeline::tests) mod scenarios;
+pub(in crate::pipeline) mod scenarios;
 
 mod tests {
     mod par2_schedules;
@@ -30,7 +30,7 @@ fn yenc_declared_bytes(decoded_len: u32) -> u32 {
 // Non-final parts carry the packed CRC32 of *their* bytes (the RAR5 spec's
 // rule for split files); the final part carries the whole-member CRC32. That
 // is exactly what the two integrity layers read.
-pub(in crate::pipeline::tests) fn single_member_store_set(
+pub(in crate::pipeline) fn single_member_store_set(
     member_name: &str,
     payload: &[u8],
     volume_count: usize,

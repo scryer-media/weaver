@@ -67,12 +67,15 @@ pub(crate) struct Kept {
     // The length, once its member closed, and whether nothing more will
     // come at all, not even a repair: what is missing then is lost.
     pub(crate) closed: Option<u64>,
+    // The length the volume last closed at, kept across a reopen: a run
+    // that read past the volume built on it until it closes at another.
+    pub(crate) closed_at: Option<u64>,
     pub(crate) settled: bool,
     // How far the run has read, which a repair behind it invalidates.
     pub(crate) reached: u64,
-    // A successful closed-length observation is also a run dependency,
-    // even before any payload byte of this volume was read.
-    pub(crate) length_read: bool,
+    // The closed length the run read, a dependency even before any payload
+    // byte of this volume was read. Only another closed length breaks it.
+    pub(crate) length_read: Option<u64>,
 }
 
 impl Kept {
@@ -82,36 +85,6 @@ impl Kept {
 
     pub(crate) fn into_leaf(self) -> Leaf {
         self.leaf
-    }
-
-    // Only previously covered bytes below the reader's mark can replace
-    // observed input. A footer read does not make sparse holes observed.
-    fn changes_read(&self, range: ByteRange, bytes: &[u8]) -> Result<bool, LeafError> {
-        const COMPARE: u64 = 64 << 10;
-        let observed = ByteRange::new(range.start, range.end.min(self.reached));
-        let mut previous = Vec::new();
-        for run in self.coverage.overlapping(observed) {
-            if !run.provenance.is_verified() {
-                continue;
-            }
-            let Some(part) = run.range.intersect(observed) else {
-                continue;
-            };
-            let mut at = part.start;
-            while at < part.end {
-                let end = part.end.min(at.saturating_add(COMPARE));
-                let len = usize::try_from(end - at).expect("a comparison chunk fits memory");
-                previous.clear();
-                self.leaf.read(at, len, &mut previous)?;
-                let start =
-                    usize::try_from(at - range.start).expect("a piece fits its source bytes");
-                if previous != bytes[start..start + len] {
-                    return Ok(true);
-                }
-                at = end;
-            }
-        }
-        Ok(false)
     }
 }
 
@@ -168,9 +141,10 @@ impl Envelopes {
     }
 
     // Keep `bytes` at `offset` of an envelope, replacing what they overlap:
-    // a repaired header replaces the damaged one. A repair, newly verified
-    // damage, or a differing verified copy behind what a run already read
-    // stops that run, since its output used superseded input.
+    // a repaired header replaces the damaged one. A repair, or a clean copy
+    // mending damage, behind what a run already read stops that run, since
+    // its output used superseded input. A further clean copy of clean bytes
+    // never reaches here: the first copy stands.
     pub(crate) fn keep(
         &mut self,
         node: NodeId,
@@ -188,15 +162,9 @@ impl Envelopes {
         shelf.update(|state| {
             let kept = shelf.kept(state, envelope)?;
             let mends = provenance.is_verified() && kept.coverage.damaged(range);
-            let changed = provenance == Provenance::Fresh
-                && !mends
-                && range.start < kept.reached
-                && kept.changes_read(range, bytes)?;
             kept.leaf.write(offset, bytes, None)?;
             kept.coverage.write(range, provenance);
-            if (provenance == Provenance::Repaired || mends || changed)
-                && range.start < kept.reached
-            {
+            if (provenance == Provenance::Repaired || mends) && range.start < kept.reached {
                 state.generation += 1;
             }
             Ok(())
@@ -236,10 +204,9 @@ impl Envelopes {
         let kept = shelf.update(|state| {
             // Removing a volume changes the order already-read input used.
             // The run barrier also retracts its acknowledged derived output.
-            let read_after = state
-                .kept
-                .range(envelope..)
-                .any(|(index, kept)| kept.reached > 0 || (*index == envelope && kept.length_read));
+            let read_after = state.kept.range(envelope..).any(|(index, kept)| {
+                kept.reached > 0 || (*index == envelope && kept.length_read.is_some())
+            });
             let kept = state.kept.remove(&envelope)?;
             if read_after {
                 state.generation += 1;
@@ -298,8 +265,17 @@ impl Drop for Envelopes {
     }
 }
 
+// The shelves this thread locked, by node, for a test to read back.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LOCKED: std::cell::RefCell<Vec<NodeId>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl Shelf {
     pub(crate) fn lock(&self) -> MutexGuard<'_, Shelved> {
+        #[cfg(test)]
+        LOCKED.with_borrow_mut(|locked| locked.push(self.node));
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -347,9 +323,10 @@ impl Shelf {
                     leaf,
                     coverage: Coverage::new(),
                     closed: None,
+                    closed_at: None,
                     settled: false,
                     reached: 0,
-                    length_read: false,
+                    length_read: None,
                 }))
             }
         }
@@ -401,7 +378,7 @@ impl Shelf {
         self.update(|state| {
             for kept in state.kept.values_mut() {
                 kept.reached = 0;
-                kept.length_read = false;
+                kept.length_read = None;
             }
             state.generation
         })

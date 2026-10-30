@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 
 use weaver_graph::holds::{Reserve, ScratchHold};
-use weaver_graph::{ByteRange, MemberId, NodeId, Tree};
+use weaver_graph::{Algorithm, ByteRange, Digest, MemberId, NodeId, Tree};
 
 use super::{NamespaceWriter, WriteError, scratch_name};
 use crate::pipeline::graph::checkpoint::{FileState, HoldRecord};
@@ -42,6 +42,27 @@ impl NamespaceWriter {
     // The namespaces whose members' states changed since generation `at`.
     pub(crate) fn files_changed_since(&self, at: u64) -> impl Iterator<Item = NodeId> + '_ {
         self.files.marks().since(at)
+    }
+
+    // The generation of the files of the node's members: a change to a
+    // member's file, or to why it is a leaf, marks the member under a later
+    // one.
+    pub(crate) fn member_files_generation(&self, node: NodeId) -> u64 {
+        self.files
+            .get(&node)
+            .map_or(0, |files| files.leaves.marks().at())
+    }
+
+    // The node's members whose files changed since generation `at`.
+    pub(crate) fn member_files_changed_since(
+        &self,
+        node: NodeId,
+        at: u64,
+    ) -> impl Iterator<Item = MemberId> + '_ {
+        self.files
+            .get(&node)
+            .into_iter()
+            .flat_map(move |files| files.leaves.marks().since(at))
     }
 
     // The holds the node's namespace has on scratch, once the job has paged
@@ -165,17 +186,19 @@ impl NamespaceWriter {
             let mut leaf =
                 self.restored_leaf(node, member, &record.output_name, state.on_disk.as_deref());
             if let Some(stated) = record.crc32 {
-                match record.length {
-                    Some(length)
-                        if !self.verifications.contains(&(node, member))
-                            && record.closed
+                let pending = self.verifications.contains(&(node, member));
+                match (pending, record.length) {
+                    // The worker reads it back, off the pipeline thread.
+                    (true, _) => {}
+                    (false, Some(length))
+                        if record.closed
                             && record.coverage.covered(ByteRange::new(0, length))
                             && !record.coverage.damaged(ByteRange::new(0, length)) =>
                     {
-                        leaf.fold_passed(length, stated);
+                        leaf.fold_passed(length, Digest::crc32(stated));
                     }
-                    _ if self.verifications.contains(&(node, member)) => {}
-                    _ => leaf.fold_back(
+                    (false, _) => leaf.fold_back(
+                        Algorithm::Crc32,
                         record
                             .coverage
                             .runs()
@@ -187,7 +210,7 @@ impl NamespaceWriter {
             self.caps.restore(tree, node, member);
         }
         if let Some(why) = state.refused {
-            self.files_mut(node).refused.insert(member, why);
+            self.files_mut(node).refuse(member, why);
         }
         Ok(())
     }

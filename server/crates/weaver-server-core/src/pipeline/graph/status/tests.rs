@@ -102,6 +102,7 @@ impl RootJob for Prepared {
 // A member: its name, its length, and the runs it holds with how each came.
 type MemberRuns<'a> = (&'a str, u64, &'a [(u64, u64, Provenance)]);
 
+// A settled namespace: every member closed.
 fn namespace(members: &[MemberRuns]) -> Namespace {
     let mut namespace = Namespace::new();
     for (name, length, runs) in members {
@@ -112,6 +113,7 @@ fn namespace(members: &[MemberRuns]) -> Namespace {
                 .coverage
                 .write(ByteRange::new(*start, *end), *provenance);
         }
+        member.closed = true;
     }
     namespace
 }
@@ -328,6 +330,10 @@ fn claims_read_complete_damaged_and_missing_off_the_namespace() {
     assert_eq!(Claim::of(member(&names, 1)), Claim::Complete);
     assert_eq!(Claim::of(member(&names, 2)), Claim::Damaged { bytes: 40 });
     assert_eq!(Claim::of(member(&names, 3)), Claim::Missing { bytes: 70 });
+    // Every byte in and clean, but never closed: nothing checked it whole.
+    let mut open = namespace(&[("ember.open", 100, &[(0, 100, Provenance::Fresh)])]);
+    open.get_mut(MemberId(0)).unwrap().closed = false;
+    assert_eq!(Claim::of(member(&open, 0)), Claim::Damaged { bytes: 0 });
 
     let mut unknown = Namespace::new();
     unknown.announce("ember.unknown", None);
@@ -541,7 +547,7 @@ fn an_empty_delivery_cannot_complete() {
     assert_eq!(
         Delivery::default().status(None),
         JobStatus::Failed {
-            error: "no file was delivered whole; 0 short: ".to_string(),
+            error: "no file was delivered whole".to_string(),
         }
     );
 }
@@ -575,7 +581,7 @@ fn a_posted_file_that_never_arrived_is_what_its_name_says() {
         .collect();
     let arrival = weaver_graph::Posted {
         offset: 0,
-        bytes: bytes::Bytes::from(vec![b'e'; 64]),
+        bytes: bytes::Bytes::from(vec![b'e'; 64]).into(),
         provenance: Provenance::Fresh,
     };
     tree.deliver(
@@ -730,7 +736,7 @@ fn a_broken_7z_is_refused_and_no_usable_file() {
             let member = tree.announce_root(name, Some(600), &mut effects);
             let arrival = weaver_graph::Posted {
                 offset: 0,
-                bytes: bytes.clone(),
+                bytes: bytes.clone().into(),
                 provenance: Provenance::Fresh,
             };
             tree.deliver(NodeId::ROOT, member, arrival, &mut objects, &mut effects);

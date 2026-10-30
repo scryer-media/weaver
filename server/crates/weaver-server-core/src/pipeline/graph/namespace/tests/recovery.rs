@@ -70,6 +70,48 @@ fn a_set_lives_in_the_namespace_of_the_members_it_describes() {
     assert_eq!(job.writer.set_name(&job.tree, set), Some("set.par2"));
 }
 
+// Six hundred members the set covers, and one obfuscated member it does not
+// yet: the front that names it binds the set again, which keeps the names
+// of the members not yet covered alone, that one and the set's own volume,
+// and covers it by its content as before.
+#[test]
+fn a_bind_keeps_only_the_names_of_members_not_yet_covered() {
+    use crate::pipeline::graph::namespace::recovery::NAMES_KEPT;
+    let mut job = Job::new(PLENTY).with_set(None);
+    let covered: Vec<MemberId> = (0..600)
+        .map(|index| job.member(&format!("part{index}.bin"), Some(4)))
+        .collect();
+    let late = job.member("3f9a.bin", Some(4));
+    let sets = job.tree.recovery_nodes(NodeId::ROOT);
+    let set = job.set_node();
+    assert_eq!(job.writer.covering(&job.tree, &sets, late).count(), 0);
+    NAMES_KEPT.with(|kept| kept.set(0));
+    job.send(late, 0, b"data", Provenance::Fresh);
+    assert_eq!(
+        NAMES_KEPT.with(std::cell::Cell::get),
+        2,
+        "the late member's name and the set's own volume's"
+    );
+    let own = job.root().find_by_name("set.par2").expect("own volume").id;
+    assert_eq!(
+        job.writer
+            .covering(&job.tree, &sets, late)
+            .collect::<Vec<_>>(),
+        vec![set],
+        "the late member is covered"
+    );
+    assert_eq!(job.root().get(late).unwrap().name, "show.mkv");
+    assert_eq!(job.writer.covering(&job.tree, &sets, own).count(), 0);
+    for member in covered {
+        assert_eq!(
+            job.writer
+                .covering(&job.tree, &sets, member)
+                .collect::<Vec<_>>(),
+            vec![set]
+        );
+    }
+}
+
 #[test]
 fn a_sets_own_volume_carries_recovery_and_a_member_it_covers_does_not() {
     let mut job = Job::new(PLENTY).with_set(None);
@@ -216,11 +258,15 @@ fn pending_map_job(budgets: HoldBudgets) -> (Job, MemberId) {
             &mut job.tree,
             &mut build,
             &Source,
+            crate::pipeline::graph::namespace::Write::New {
+                entered: NodeId::ROOT,
+                posting: member,
+            },
             Arrival {
                 node: NodeId::ROOT,
                 member,
                 offset: map_at().start,
-                bytes: Bytes::from_static(MAP),
+                bytes: Bytes::from_static(MAP).into(),
                 provenance: Provenance::Repaired,
             },
             &mut job.out,
@@ -263,11 +309,15 @@ fn a_new_map_reads_pending_custody_before_the_batch_releases_it() {
                 &mut job.tree,
                 &mut build,
                 &Source,
+                crate::pipeline::graph::namespace::Write::New {
+                    entered: NodeId::ROOT,
+                    posting: member,
+                },
                 Arrival {
                     node: NodeId::ROOT,
                     member,
                     offset: body().start + 1,
-                    bytes: Bytes::from_static(b"a"),
+                    bytes: Bytes::from_static(b"a").into(),
                     provenance: Provenance::Fresh,
                 },
                 &mut job.out,
@@ -351,7 +401,13 @@ fn failed_pending_custody_cannot_fall_back_to_an_older_derived_copy() {
         .coverage
         .write(ByteRange::new(0, body().len()), Provenance::Fresh);
     job.writer
-        .write_file(&job.tree, child, MemberId(0), 0, b"stale")
+        .write_file(
+            &job.tree,
+            child,
+            MemberId(0),
+            0,
+            &weaver_graph::Evidenced::from(&b"stale"[..]),
+        )
         .unwrap();
     job.writer
         .files

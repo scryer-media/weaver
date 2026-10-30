@@ -922,7 +922,8 @@ fn tls_lane_reads_single_body_response(backend: NntpTlsBackend) {
 // permanently zero. Decoded batches must now reach the callback as they
 // are produced, in order, and concatenate to the buffered article.
 fn tls_lane_delivers_decoded_batches_to_chunk_callback(backend: NntpTlsBackend) {
-    // Two full 512 KiB batches plus a remainder.
+    // Past two fixed 512 KiB targets; the part declares its length, so it
+    // arrives as one batch of that length.
     let original: Vec<u8> = (0..(2 * 512 * 1024 + 123))
         .map(|i| (i % 251) as u8)
         .collect();
@@ -941,12 +942,10 @@ fn tls_lane_delivers_decoded_batches_to_chunk_callback(backend: NntpTlsBackend) 
         })
         .unwrap();
 
-    assert_eq!(delivered.len(), 3, "batch lengths {:?}", {
+    assert_eq!(delivered.len(), 1, "batch lengths {:?}", {
         delivered.iter().map(Vec::len).collect::<Vec<_>>()
     });
-    assert_eq!(delivered[0].len(), 512 * 1024);
-    assert_eq!(delivered[1].len(), 512 * 1024);
-    assert_eq!(delivered[2].len(), 123);
+    assert_eq!(delivered[0].len(), original.len());
 
     let streamed: Vec<u8> = delivered.concat();
     assert_eq!(streamed, original);

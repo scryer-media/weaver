@@ -160,7 +160,7 @@ impl Write for Out<'_, '_> {
         let heard = (self.sink)(Emit::Bytes {
             member: self.member,
             offset: self.offset,
-            bytes: Bytes::copy_from_slice(bytes),
+            bytes: Bytes::copy_from_slice(bytes).into(),
             provenance: Provenance::Fresh,
         });
         if !heard {

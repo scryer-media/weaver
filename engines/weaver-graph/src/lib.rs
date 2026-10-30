@@ -28,6 +28,7 @@
 
 pub mod deliver;
 pub mod engine;
+pub mod evidence;
 pub mod facts;
 pub mod holds;
 pub mod marks;
@@ -45,6 +46,7 @@ mod wire;
 
 pub use deliver::{Delivery, Emit, Handed, Posted, Provenance, RecoveryKind, Why};
 pub use engine::{Budget, Engine, Extraction, Lost, Pool, Sink, Volumes};
+pub use evidence::{Algorithm, Digest, Evidence, Evidenced};
 pub use facts::{
     Change, Durable, Facts, Give, Part, Restore, RestoreError, Sealed, Shelf, Take, Taken,
     decode_parts, encode_parts, encode_since,

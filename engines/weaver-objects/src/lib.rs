@@ -26,6 +26,7 @@ pub mod sevenz_engine;
 pub mod sevenz_store;
 pub mod sfv;
 mod split;
+pub mod split_store;
 pub mod stream;
 pub mod tar;
 mod verdict;
@@ -68,7 +69,7 @@ pub fn build(kind: Kind, id: ObjectId, budget: Budget) -> Option<Box<dyn Object>
         Kind::Zstd => Some(Box::new(stream::ZstdStream::new().within(budget))),
         Kind::Brotli => Some(Box::new(stream::BrotliStream::new().within(budget))),
         Kind::Deflate => Some(Box::new(stream::DeflateStream::new().within(budget))),
-        Kind::Split => Some(Box::new(stream::SplitStream::new().within(budget))),
+        Kind::Split => Some(Box::new(split_store::SplitStore::new())),
         Kind::Zip => Some(Box::new(zip::Zip::new())),
         Kind::ZipEngine => Some(Box::new(zip_engine::ZipEngine::new())),
     }
@@ -109,7 +110,7 @@ pub fn restore(facts: &Facts, budget: Budget) -> Result<Box<dyn Object>, Restore
         Kind::Zstd => streamed::<stream::Zstd>(facts, budget),
         Kind::Brotli => streamed::<stream::Brotli>(facts, budget),
         Kind::Deflate => streamed::<stream::Deflate>(facts, budget),
-        Kind::Split => streamed::<stream::Pieces>(facts, budget),
+        Kind::Split => back::<split_store::SplitStore>(facts),
         Kind::Zip => back::<zip::Zip>(facts),
         Kind::ZipEngine => back::<zip_engine::ZipEngine>(facts),
     }

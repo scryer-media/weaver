@@ -10,23 +10,6 @@ use crate::zip_engine::ZipEngine;
 
 const PASSWORD: &str = "a-test-passphrase";
 
-#[test]
-fn legacy_engine_facts_do_not_turn_missing_authority_into_a_name_only_binding() {
-    let mut engine = SevenZipEngine::new();
-    engine.bound(VolumeIndex(0), "archive.7z.001", &[], None);
-    assert!(engine.name_only(VolumeIndex(0)));
-    let mut facts = engine.facts();
-    facts.bytes = rmp_serde::to_vec(&(
-        &engine.names,
-        &engine.fronts,
-        &engine.lengths,
-        &engine.bound,
-    ))
-    .unwrap();
-    let restored = crate::restore(&facts, weaver_graph::Budget::default()).unwrap();
-    assert!(!restored.name_only(VolumeIndex(0)));
-}
-
 // Two volumes bound, the run past the first, a password offered: restored,
 // the engine claims and bids alike, and its facts hold no password. `last`
 // is the index the set's last name binds at, which a set whose last volume
@@ -41,7 +24,7 @@ fn restored(engine: Box<dyn Object>, names: [&str; 3], last: u32) {
     assert!(!contains(&facts.bytes, PASSWORD.as_bytes()));
     let claim = |object: &mut Box<dyn Object>| object.claim(names[1], &[], None);
     assert_eq!(claim(&mut live), claim(&mut again));
-    assert_eq!(claim(&mut live), Some(VolumeIndex(1)));
+    assert_eq!(claim(&mut live), vec![VolumeIndex(1)]);
     let bids = |object: &mut Box<dyn Object>| {
         let mut out: Vec<Seek> = Vec::new();
         object.wants(&mut out);

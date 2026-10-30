@@ -116,6 +116,7 @@ impl Refusing {
                     intact: true,
                     positioned: true,
                     length: Some(bytes.len() as u64),
+                    declared_end: None,
                     segments: Vec::new(),
                 },
                 &mut RepairSlots::default(),

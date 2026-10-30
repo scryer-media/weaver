@@ -241,7 +241,7 @@ impl Owner {
             Delivery {
                 volume: VolumeIndex(0),
                 offset: range.start,
-                bytes: &bytes,
+                bytes: &weaver_graph::Evidenced::from(bytes.to_vec()),
                 provenance,
             },
             &mut |_, _| false,

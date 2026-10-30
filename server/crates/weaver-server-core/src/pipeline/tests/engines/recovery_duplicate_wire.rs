@@ -25,7 +25,6 @@ const ARTICLE: usize = 768;
 #[derive(Clone, Copy)]
 enum Protection {
     Par2,
-    ObservedFresh,
     Par2Many {
         tail: bool,
     },
@@ -115,7 +114,7 @@ impl Fixture {
             })
             .collect();
         posts.extend(match protection {
-            Protection::Par2 | Protection::ObservedFresh => par2(&posts, 2),
+            Protection::Par2 => par2(&posts, 2),
             Protection::Par2WrongFinal => par2(&posts, 0),
             Protection::Par2Many { tail } => {
                 let mut touched = BTreeSet::new();
@@ -210,8 +209,7 @@ impl Fixture {
             Protection::Par2WrongFinal => file == 3 && article == 31,
             Protection::Par2Transport { .. }
             | Protection::Par2PositionedTransport { .. }
-            | Protection::TruncatedCarrier
-            | Protection::ObservedFresh => false,
+            | Protection::TruncatedCarrier => false,
         }
     }
 
@@ -647,9 +645,15 @@ async fn article_copies(
                 .unwrap()
                 .get(weaver_graph::MemberId(file))
                 .unwrap();
+            // Its header declared where the part ends: the absent suffix is
+            // lost, told as a lost article's bytes are, at once.
             assert!(
-                !record.coverage.covered(gap),
-                "the settled article's absent suffix remains objectively uncovered: {:?}",
+                record.coverage.covered(gap)
+                    && record
+                        .coverage
+                        .overlapping(gap)
+                        .all(|run| run.provenance == weaver_graph::Provenance::Damaged),
+                "the settled article's absent suffix is stated lost: {:?}",
                 record.coverage
             );
             observed.holes.insert((file, ordinal));
@@ -675,58 +679,6 @@ async fn article_copies(
             observed.graph_damaged.insert((file, ordinal));
         }
     }
-}
-
-async fn consume_bad_piece_before_replacement(
-    pipeline: &mut Pipeline,
-    fixture: &Fixture,
-    observed: &mut TransportSeen,
-) {
-    use crate::pipeline::graph::engine::ReadStep;
-    use weaver_graph::{ByteRange, Kind, MemberId, NodeId, VolumeIndex};
-    article_copies(pipeline, fixture, 0, 0, observed, &[true]).await;
-    let graph = &pipeline.graph_jobs[&JOB];
-    let (node, volume) = graph
-        .tree()
-        .child_of(NodeId::ROOT, MemberId(0))
-        .expect("the bad front is owned by its numbered Pieces set");
-    assert_eq!(graph.tree().kind(node), Some(Kind::Split));
-    let range = ByteRange::new(0, fixture.posts[0].bytes.len() as u64);
-    let mut gate = graph
-        .runs()
-        .gate_read(node, volume, range)
-        .expect("the real Pieces worker is running and waits for the open piece");
-    assert_eq!(gate.key.scope, graph.runs().scope());
-    assert_eq!(gate.key.node, node);
-    assert_eq!(gate.key.volume, VolumeIndex(0));
-    assert_eq!(gate.key.range, range);
-    for ordinal in 1..32 {
-        article_copies(pipeline, fixture, 0, ordinal, observed, &[false]).await;
-    }
-    let ReadStep::Ready(key) = gate.next().await else {
-        panic!("the owned read pauses before touching its admitted bytes");
-    };
-    assert_eq!(key, gate.key);
-    gate.release();
-    let ReadStep::Completed(key, bytes) = gate.next().await else {
-        panic!("the same read reports its actual bytes");
-    };
-    assert_eq!(key, gate.key);
-    let mut expected = fixture.posts[0].bytes.clone();
-    expected[..ARTICLE]
-        .iter_mut()
-        .for_each(|byte| *byte ^= 0x5a);
-    assert!(
-        bytes.unwrap() == expected,
-        "the real worker read the known bad incarnation, not a reached watermark"
-    );
-    assert!(gate.generation_is_current());
-    article_copies(pipeline, fixture, 0, 0, observed, &[false]).await;
-    assert!(
-        !gate.generation_is_current(),
-        "corrected Fresh invalidates the actual worker that completed the old read"
-    );
-    gate.release();
 }
 
 async fn witness(protection: Protection, batches: &[u32]) {
@@ -764,9 +716,6 @@ async fn witness(protection: Protection, batches: &[u32]) {
     insert_active_job(&mut pipeline, JOB, spec.clone()).await;
     let mut trace = Vec::new();
     let mut observed = TransportSeen::default();
-    if matches!(protection, Protection::ObservedFresh) {
-        consume_bad_piece_before_replacement(&mut pipeline, &fixture, &mut observed).await;
-    }
     for &file in batches {
         for ordinal in 0..32 {
             if fixture.absent(file, ordinal) {
@@ -1019,9 +968,4 @@ async fn twelve_silent_rar5_articles_across_three_volumes_are_repaired() {
 #[tokio::test]
 async fn replacement_header_handoff_does_not_publish_a_wrong_final_payload() {
     witness(Protection::Par2WrongFinal, &[2, 0, 3, 3, 1]).await;
-}
-
-#[tokio::test]
-async fn a_real_pieces_worker_that_consumed_a_bad_copy_restarts_before_publishing() {
-    witness(Protection::ObservedFresh, &[1, 2, 3]).await;
 }

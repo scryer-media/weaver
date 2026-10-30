@@ -25,15 +25,14 @@ use bytes::Bytes;
 use weaver_graph::holds::Location;
 use weaver_graph::recovery::{MemberAccess, RepairDiagnostic, RepairOutcome};
 use weaver_graph::{
-    ByteRange, Coverage, MemberId, NodeId, Object, Placement, Posting, Tree, VolumeIndex,
+    ByteRange, Coverage, MemberId, NodeId, Object, Placement, Posting, Provenance, Tree,
+    VolumeIndex,
 };
 
 use super::super::envelope::Shelf;
 use super::super::hardware::Shutdown;
 use super::super::leaf::{Leaf, LeafError, read_exact_at};
-use super::{
-    ALL, NamespaceWriter, READ_BACK, SetState, Source, held_volume, index, read_member, read_pieces,
-};
+use super::{ALL, NamespaceWriter, READ_BACK, SetState, Source, held_volume, index, read_member};
 
 // A set's repair, ready to run anywhere.
 pub(crate) struct Loan {
@@ -67,8 +66,32 @@ struct Input {
     length: Option<u64>,
     coverage: Coverage,
     bound: Option<(NodeId, VolumeIndex)>,
-    source: bool,
+    // The ranges the repair read of the member: the only bytes of it its
+    // ruling stands on.
+    read: Coverage,
     held_basis: Vec<(ByteRange, u64)>,
+    // The member's file, at the path and revision the repair found it.
+    leaf: Option<(PathBuf, (u64, u64))>,
+}
+
+// The held revisions of a member within `range`, as `Holds::revisions`
+// answers them.
+fn clipped(held: &[(ByteRange, u64)], range: ByteRange) -> Vec<(ByteRange, u64)> {
+    held.iter()
+        .filter_map(|(held, age)| Some((held.intersect(range)?, *age)))
+        .collect()
+}
+
+// Whether two coverages say the same of `range`: the same bytes, with the
+// same provenance.
+fn same_runs(now: &Coverage, then: &Coverage, range: ByteRange) -> bool {
+    let within = |coverage: &Coverage| {
+        coverage
+            .overlapping(range)
+            .filter_map(|run| Some((run.range.intersect(range)?, run.provenance)))
+            .collect::<Vec<_>>()
+    };
+    within(now) == within(then)
 }
 
 impl std::fmt::Debug for Returned {
@@ -85,12 +108,10 @@ impl std::fmt::Debug for Returned {
 }
 
 // What the repair read that the loop may move: every shelf with the
-// generation it stood at, and every file at the path it had, and whether
-// the pipeline began shutting down before the repair was done, so that what
-// it read may have been cut short.
+// generation it stood at, and whether the pipeline began shutting down
+// before the repair was done, so that what it read may have been cut short.
 struct Read {
     shelves: Vec<(Arc<Shelf>, u64)>,
-    leaves: Vec<(NodeId, MemberId, PathBuf, (u64, u64))>,
     stopped: bool,
 }
 
@@ -120,22 +141,7 @@ impl Loan {
         if let Some(dir) = &access.scratch {
             super::remove_scratch(dir);
         }
-        let usage = access.usage.into_inner();
-        let leaves = access
-            .members
-            .iter()
-            .filter_map(|((node, member), taken)| {
-                if !usage
-                    .members
-                    .get(&(*node, *member))
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    return None;
-                }
-                Some((*node, *member, taken.path.clone()?, taken.revision?))
-            })
-            .collect();
+        let mut usage = access.usage.into_inner();
         let inputs = access
             .members
             .into_iter()
@@ -146,8 +152,9 @@ impl Loan {
                     length: taken.length,
                     coverage: taken.coverage,
                     bound: taken.bound,
-                    source: *usage.members.get(&(node, member))?,
+                    read: usage.members.remove(&(node, member))?,
                     held_basis: taken.held_basis,
+                    leaf: taken.path.zip(taken.revision),
                 })
             })
             .collect();
@@ -168,7 +175,6 @@ impl Loan {
                     .filter(|(node, _)| usage.shelves.contains(node))
                     .map(|(_, shelf)| shelf)
                     .collect(),
-                leaves,
                 stopped,
             },
         }
@@ -191,39 +197,30 @@ struct Taken {
 
 #[derive(Default)]
 struct Usage {
-    // True for byte/coverage sources, false for length/binding queries only.
-    members: BTreeMap<(NodeId, MemberId), bool>,
+    // Each member the repair asked of, and the ranges of it it read: none
+    // for one it only asked the length or binding of.
+    members: BTreeMap<(NodeId, MemberId), Coverage>,
     shelves: BTreeSet<NodeId>,
 }
 
 impl Lent {
-    fn note(&self, at: (NodeId, MemberId), source: bool) {
-        if !self.defer_holds {
-            *self.usage.borrow_mut().members.entry(at).or_default() |= source;
+    fn note(&self, at: (NodeId, MemberId), read: Option<ByteRange>) {
+        if self.defer_holds {
+            return;
+        }
+        let mut usage = self.usage.borrow_mut();
+        let ranges = usage.members.entry(at).or_default();
+        if let Some(range) = read {
+            ranges.write(range, Provenance::Fresh);
         }
     }
 
     // A cached ruling still depends on its covered inputs even if the
-    // worker need not read their bytes again. Expand only those inputs'
-    // backing namespaces here, once at the loan transition.
+    // worker need not read their bytes again: on their length and where
+    // they are bound. Bytes said of them while it is out reach the set
+    // through `feed` when it is back.
     fn require(&self, at: (NodeId, MemberId)) {
-        let mut pending = vec![at];
-        let mut seen = BTreeSet::new();
-        while let Some(at) = pending.pop() {
-            if !seen.insert(at) {
-                continue;
-            }
-            self.note(at, true);
-            if let Some((child, _)) = self.members.get(&at).and_then(|taken| taken.bound)
-                && self.usage.borrow_mut().shelves.insert(child)
-            {
-                pending.extend(
-                    self.members
-                        .range((child, MemberId(0))..=(child, MemberId(u32::MAX)))
-                        .map(|(at, _)| *at),
-                );
-            }
-        }
+        self.note(at, None);
     }
 
     // The pipeline began shutting down, or the job's working directory was
@@ -433,45 +430,48 @@ impl NamespaceWriter {
         }))
     }
 
-    // Whether the loop moved anything the repair read: a shelf whose
-    // generation moved on, which it does when what it holds is replaced or
-    // goes away, or a file that is no longer where it was.
+    // Whether the loop moved anything the repair read: a member's length or
+    // binding, a byte of a range it read held, covered or written otherwise
+    // than it found it, a file that is no longer where it was, or a shelf
+    // whose generation moved on, which it does when what it holds is
+    // replaced or goes away. Bytes past what it read leave it standing.
     pub(crate) fn moved_since(&self, tree: &Tree, returned: &Returned) -> bool {
         let changed = returned.inputs.iter().any(|input| {
             let files = self.files.get(&input.node);
-            let held = files
-                .map(|files| files.holds.revisions(held_volume(input.member), ALL))
-                .unwrap_or_default();
             let bound = tree
                 .child_of(input.node, input.member)
                 .filter(|(child, _)| !tree.recovers(*child));
-            (input.source && held != input.held_basis)
-                || bound != input.bound
-                || tree
-                    .namespace(input.node)
-                    .and_then(|namespace| namespace.get(input.member))
-                    .is_none_or(|record| {
-                        record.length != input.length
-                            || (input.source && record.coverage != input.coverage)
-                    })
+            let Some(record) = tree
+                .namespace(input.node)
+                .and_then(|namespace| namespace.get(input.member))
+            else {
+                return true;
+            };
+            bound != input.bound
+                || record.length != input.length
+                || input.read.runs().any(|run| {
+                    let range = run.range;
+                    let held = files
+                        .map(|files| files.holds.revisions(held_volume(input.member), range))
+                        .unwrap_or_default();
+                    held != clipped(&input.held_basis, range)
+                        || !same_runs(&record.coverage, &input.coverage, range)
+                        || input.leaf.as_ref().is_some_and(|(path, seen)| {
+                            files
+                                .and_then(|files| files.leaves.get(&input.member))
+                                .is_none_or(|leaf| {
+                                    leaf.path() != path
+                                        || leaf.changed_since(*seen, range.start, range.end)
+                                })
+                        })
+                })
         });
         let shelves = returned
             .read
             .shelves
             .iter()
             .any(|(shelf, generation)| shelf.generation() != *generation);
-        changed
-            || shelves
-            || returned
-                .read
-                .leaves
-                .iter()
-                .any(|(node, member, path, revision)| {
-                    self.files
-                        .get(node)
-                        .and_then(|files| files.leaves.get(member))
-                        .is_none_or(|leaf| leaf.path() != path || leaf.revision() != *revision)
-                })
+        changed || shelves
     }
 
     fn take_namespace(
@@ -626,7 +626,7 @@ impl Lent {
 
 impl Source for Lent {
     fn bound(&self, node: NodeId, member: MemberId) -> Option<(NodeId, VolumeIndex)> {
-        self.note((node, member), true);
+        self.note((node, member), None);
         self.members.get(&(node, member))?.bound
     }
 
@@ -673,6 +673,7 @@ impl Source for Lent {
     }
 
     fn leaf(&self, node: NodeId, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
+        self.note((node, member), Some(range));
         let Some(taken) = self.members.get(&(node, member)) else {
             return range.is_empty();
         };
@@ -682,8 +683,8 @@ impl Source for Lent {
         taken.coverage.covered(range) && self.read_file((node, member), path, range, into)
     }
 
-    fn held_ranges(&self, node: NodeId, member: MemberId, range: ByteRange) -> Vec<ByteRange> {
-        self.note((node, member), true);
+    fn held(&self, node: NodeId, member: MemberId, range: ByteRange) -> Vec<(ByteRange, Location)> {
+        self.note((node, member), Some(range));
         let Some(taken) = self.members.get(&(node, member)) else {
             return Vec::new();
         };
@@ -691,20 +692,6 @@ impl Source for Lent {
             .held
             .partition_point(|(held, _)| held.end <= range.start);
         taken.held[from..]
-            .iter()
-            .take_while(|(held, _)| held.start < range.end)
-            .filter_map(|(held, _)| held.intersect(range))
-            .collect()
-    }
-
-    fn held(&self, node: NodeId, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
-        let Some(taken) = self.members.get(&(node, member)) else {
-            return range.is_empty();
-        };
-        let from = taken
-            .held
-            .partition_point(|(held, _)| held.end <= range.start);
-        let pieces: Vec<(ByteRange, Location)> = taken.held[from..]
             .iter()
             .take_while(|(held, _)| held.start < range.end)
             .filter_map(|(held, location)| {
@@ -721,24 +708,31 @@ impl Source for Lent {
                 };
                 Some((inside, location))
             })
-            .collect();
-        read_pieces(
-            pieces.iter().map(|(piece, location)| (*piece, location)),
-            range,
-            into,
-            |offset, len, into| {
-                let Some(file) = &taken.scratch else {
-                    return false;
-                };
-                let start = into.len();
-                into.resize(start + index(len), 0);
-                if read_exact_at(file, offset, &mut into[start..]).is_err() {
-                    into.truncate(start);
-                    return false;
-                }
-                true
-            },
-        )
+            .collect()
+    }
+
+    fn scratch(
+        &self,
+        node: NodeId,
+        member: MemberId,
+        offset: u64,
+        len: u64,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        let Some(file) = self
+            .members
+            .get(&(node, member))
+            .and_then(|taken| taken.scratch.as_ref())
+        else {
+            return false;
+        };
+        let start = into.len();
+        into.resize(start + index(len), 0);
+        if read_exact_at(file, offset, &mut into[start..]).is_err() {
+            into.truncate(start);
+            return false;
+        }
+        true
     }
 }
 
@@ -773,12 +767,12 @@ impl MemberAccess for Lent {
     }
 
     fn length(&self, member: MemberId) -> Option<u64> {
-        self.note((self.namespace, member), false);
+        self.note((self.namespace, member), None);
         self.members.get(&(self.namespace, member))?.length
     }
 
     fn arrived(&self, member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {
-        self.note((self.namespace, member), true);
+        self.note((self.namespace, member), Some(range));
         let Some(taken) = self.members.get(&(self.namespace, member)) else {
             return;
         };

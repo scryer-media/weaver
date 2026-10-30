@@ -7,10 +7,13 @@
 // when the header keys it.
 //
 // The runs are kept exactly as they were fed, never merged, so any sub-range
-// that starts and ends on a run boundary can be composed. An identical run
-// does not advance the composition twice. New verified bytes replace the
-// evidence they overlap, whether repaired or a newer source copy. Parts of
-// those runs outside it are covered by nothing until fed again. A range the
+// that starts and ends on a run boundary can be composed. The first clean
+// copy of bytes stands: a run that overlaps one already recorded is a
+// duplicate and is ignored, so the same bytes never advance the composition
+// twice, whatever boundaries they come again with. A repaired run is the
+// opposite: the bytes changed, so it replaces every run it overlaps, and so
+// do clean bytes over damaged ones. Parts of the runs it replaces outside it
+// are covered by nothing until fed again. A range the
 // runs do not tile exactly has no reference value, which is a refusal, never
 // a pass. The bytes held are counted as runs come and go, so a whole is
 // composed once, when every byte of it is in, and not at every delivery.
@@ -47,20 +50,34 @@ impl Run {
 }
 
 impl CrcRuns {
-    // Verified deliveries are the current word on their bytes, including a
-    // later source copy whose transport checksum passed on different bytes.
-    pub(crate) fn feed(&mut self, range: ByteRange, crc: u32, provenance: Provenance) {
+    // Record delivered bytes: a repair rewrites what it covers, and so do
+    // clean bytes over damaged ones, whoever brings them; anything else is
+    // a new run or a duplicate of the copy that stands. Returns the parts of
+    // the runs a rewrite cut that it does not cover, which hold nothing until
+    // they are fed again.
+    pub(crate) fn feed(
+        &mut self,
+        range: ByteRange,
+        crc: u32,
+        provenance: Provenance,
+    ) -> Vec<ByteRange> {
+        let first = self.runs.partition_point(|run| run.end() <= range.start);
+        let mends = provenance.is_verified()
+            && self.runs[first..]
+                .iter()
+                .take_while(|run| run.start < range.end)
+                .any(|run| !run.verified);
         match provenance {
-            Provenance::Fresh | Provenance::Repaired => {
-                self.overwrite(range.start, range.len(), crc);
-            }
-            Provenance::Damaged => {
+            Provenance::Repaired => self.overwrite(range, crc),
+            Provenance::Fresh if mends => self.overwrite(range, crc),
+            Provenance::Fresh | Provenance::Damaged | Provenance::Refuted => {
                 self.insert(Run {
                     start: range.start,
                     len: range.len(),
                     crc,
                     verified: provenance.is_verified(),
                 });
+                Vec::new()
             }
         }
     }
@@ -93,14 +110,14 @@ impl CrcRuns {
         self.held
     }
 
-    // Replaces every run overlapping `[start, start + len)` with a single,
-    // verified run for the rewritten span, and returns the sub-ranges of the
-    // discarded runs that fall outside it: the stale gaps.
-    pub(crate) fn overwrite(&mut self, start: u64, len: u64, crc: u32) -> Vec<(u64, u64)> {
+    // Replaces every run overlapping `range` with a single, verified run for
+    // the rewritten span, and returns the sub-ranges of the discarded runs
+    // that fall outside it: the stale gaps.
+    fn overwrite(&mut self, range: ByteRange, crc: u32) -> Vec<ByteRange> {
+        let (start, len, end) = (range.start, range.len(), range.end);
         if len == 0 {
             return Vec::new();
         }
-        let end = start.saturating_add(len);
         let first = self.runs.partition_point(|run| run.end() <= start);
         let after = first + self.runs[first..].partition_point(|run| run.start < end);
         let replacement = Run {
@@ -117,10 +134,10 @@ impl CrcRuns {
         for run in &self.runs[first..after] {
             self.held -= run.len;
             if run.start < start {
-                gaps.push((run.start, start));
+                gaps.push(ByteRange::new(run.start, start));
             }
             if run.end() > end {
-                gaps.push((end, run.end()));
+                gaps.push(ByteRange::new(end, run.end()));
             }
         }
         self.runs.splice(first..after, [replacement]);

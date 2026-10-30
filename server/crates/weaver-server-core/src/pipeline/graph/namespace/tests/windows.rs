@@ -56,7 +56,8 @@ impl Object for Carrier {
             out.push(Emit::Bytes {
                 member: MemberId(0),
                 offset: part.start - BODY.start,
-                bytes: Bytes::copy_from_slice(&delivery.bytes[start..start + part.len() as usize]),
+                bytes: Bytes::copy_from_slice(&delivery.bytes[start..start + part.len() as usize])
+                    .into(),
                 provenance: delivery.provenance,
             });
         }
@@ -270,7 +271,7 @@ impl Carried {
             node: NodeId::ROOT,
             member: self.member,
             offset: start as u64,
-            bytes: Bytes::copy_from_slice(&volume()[start..end]),
+            bytes: Bytes::copy_from_slice(&volume()[start..end]).into(),
             provenance: Provenance::Fresh,
         };
         let job = &mut self.job;

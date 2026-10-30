@@ -70,7 +70,7 @@ impl Owner {
                 Delivery {
                     volume: VolumeIndex(volume),
                     offset,
-                    bytes,
+                    bytes: &weaver_graph::Evidenced::from(bytes.to_vec()),
                     provenance: Provenance::Fresh,
                 },
                 &mut |placement, into| read(&self.written, placement, into),
@@ -119,7 +119,7 @@ impl Owner {
             Delivery {
                 volume,
                 offset,
-                bytes,
+                bytes: &weaver_graph::Evidenced::from(bytes.to_vec()),
                 provenance: Provenance::Fresh,
             },
             &mut |placement, into| read(&self.written, placement, into),

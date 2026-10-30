@@ -8,17 +8,16 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-use bytes::Bytes;
-
+use crate::evidence::Evidenced;
 use crate::member::MemberId;
 use crate::object::Kind;
 use crate::volume::{ByteRange, VolumeIndex};
 
-// Bytes posted for a member: where they start, what they are, and how
-// they came.
+// Bytes posted for a member: where they start, what they are, with what
+// was proved of them, and how they came.
 pub struct Posted {
     pub offset: u64,
-    pub bytes: Bytes,
+    pub bytes: Evidenced,
     pub provenance: Provenance,
 }
 
@@ -33,6 +32,11 @@ pub enum Provenance {
     Damaged,
     // Produced by a repair. Replaces whatever was there before.
     Repaired,
+    // Arrived, and then a checksum over them failed: an object's over its
+    // own volume or member, or a recovery set's over its slices. Damaged
+    // as `Damaged` is, and a verdict on bytes in hand: only proof displaces
+    // it, never the same bytes, or another copy of them, arriving again.
+    Refuted,
 }
 
 impl Provenance {
@@ -42,18 +46,40 @@ impl Provenance {
         matches!(self, Provenance::Fresh | Provenance::Repaired)
     }
 
+    // Whether the bytes are held as damage: what clean bytes over them
+    // would mend, and what a decoder refuses to consume.
+    pub fn is_damaged(self) -> bool {
+        matches!(self, Provenance::Damaged | Provenance::Refuted)
+    }
+
     // Whether a record of bytes with this provenance already answers the
-    // same bytes arriving again with `later`, and stands: damage never takes
-    // back a repair. Any other later arrival is the newer word on its bytes.
+    // same bytes arriving again with `later`, and stands: a repair stands
+    // against everything but a repair. A posting's own bytes coming again
+    // are the same bytes, read back or released from a hold, and are taken
+    // again; a further posting's copy is answered by what the member holds
+    // first, clean or refuted, not by this.
     pub(crate) fn answers(self, later: Provenance) -> bool {
-        matches!((self, later), (Provenance::Repaired, Provenance::Damaged))
+        self == Provenance::Repaired && later != Provenance::Repaired
+    }
+
+    // What bytes arriving with `later` are once they land where the record
+    // says `self`. A checksum's verdict stands over the bytes it judged,
+    // whether they came before it, come after it, or come again: only a
+    // repair displaces it. Anything else lands as it came.
+    pub(crate) fn landing(self, later: Provenance) -> Provenance {
+        match self {
+            Provenance::Refuted if later != Provenance::Repaired => Provenance::Refuted,
+            _ => later,
+        }
     }
 }
 
+// Bytes of one of an object's volumes. The object emits its members' bytes
+// as slices of these, which copy nothing and cut the evidence with them.
 pub struct Delivery<'a> {
     pub volume: VolumeIndex,
     pub offset: u64,
-    pub bytes: &'a [u8],
+    pub bytes: &'a Evidenced,
     pub provenance: Provenance,
 }
 
@@ -229,11 +255,12 @@ pub enum Emit {
         name: String,
         length: Option<u64>,
     },
-    // "These bytes belong to member M at this offset."
+    // "These bytes belong to member M at this offset", with the evidence of
+    // them that came with them or that the object computed.
     Bytes {
         member: MemberId,
         offset: u64,
-        bytes: Bytes,
+        bytes: Evidenced,
         provenance: Provenance,
     },
     // "My headers say member M's bytes have this CRC32": said once the

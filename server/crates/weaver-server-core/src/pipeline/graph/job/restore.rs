@@ -127,6 +127,8 @@ impl GraphJob {
             pending: Pending::default(),
             mail_owed: None,
             notes: Vec::new(),
+            fed: super::runs::Fed::default(),
+            sealed_at: None,
         };
         for (node, index) in &snapshot.passwords {
             job.offer_again(*node, *index)?;
@@ -293,7 +295,7 @@ impl GraphJob {
     fn deliver_again(&mut self, read: ReadBack) -> Result<(), GraphError> {
         for (range, bytes, provenance) in read.pieces {
             let mut out = Vec::new();
-            self.writer.deliver(
+            self.writer.deliver_again(
                 &mut self.tree,
                 &mut *self.builder,
                 &self.root,
@@ -301,7 +303,7 @@ impl GraphJob {
                     node: NodeId::ROOT,
                     member: MemberId(read.volume.0),
                     offset: range.start,
-                    bytes,
+                    bytes: bytes.into(),
                     provenance,
                 },
                 &mut out,

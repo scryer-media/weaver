@@ -7,6 +7,9 @@
 // and tells the tree how far each run has read, so its object bids for what
 // comes next. What a run says is applied here, at the node it speaks for.
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use weaver_graph::tree::Mark;
 use weaver_graph::{Emit, Engine, MemberId, NodeId, Why};
 
 use super::{GraphError, GraphJob};
@@ -146,7 +149,7 @@ impl GraphJob {
         }
         let mut out = Vec::new();
         let objects = self.runs.hardware();
-        self.writer.returned(
+        let rebuilt = self.writer.returned(
             &mut self.tree,
             &mut *self.builder,
             &self.root,
@@ -154,6 +157,9 @@ impl GraphJob {
             returned,
             &mut out,
         )?;
+        if let Some(slices) = rebuilt {
+            self.notes.push(super::Note::Repaired(slices));
+        }
         self.heard(out)?;
         self.step_runs(Vec::new(), limit)?;
         self.lend(slots, limit)
@@ -163,17 +169,19 @@ impl GraphJob {
     // pipeline reads now, and start every run that may: those `admitted`
     // already, and those each step admits in turn. A start can free a slot
     // (a run refused, or turned away for memory), and whoever that admits
-    // starts in the same step, so nothing waits beside a free slot.
+    // starts in the same step, so nothing waits beside a free slot. Only an
+    // engine something it reads changed for is brought up; every run
+    // reading tells the tree how far it read, which nothing marks.
     pub(super) fn step_runs(
         &mut self,
         mut admitted: Vec<NodeId>,
         limit: usize,
     ) -> Result<(), GraphError> {
         loop {
-            let engines = self.tree.engines();
-            admitted.extend(self.runs.forget_gone(&engines, limit));
-            for node in engines {
-                self.feed(node)?;
+            let (engines, gone) = self.touched_engines();
+            admitted.extend(self.runs.forget(gone, limit));
+            for (&node, &facts) in &engines {
+                self.feed(node, facts)?;
                 let shelf = self.writer.shelf(node);
                 let asks = match self.runs.generation(node) {
                     Some(generation) if generation != shelf.generation() => {
@@ -190,7 +198,11 @@ impl GraphJob {
                 if asks {
                     admitted.extend(self.runs.ask(node, limit));
                 }
-                if let Some((volume, _)) = shelf.reached() {
+            }
+            let mut reached: BTreeSet<NodeId> = engines.into_keys().collect();
+            reached.extend(self.runs.running());
+            for node in reached {
+                if let Some((volume, _)) = self.writer.shelf(node).reached() {
                     self.tree.run_reached(node, volume);
                 }
             }
@@ -255,22 +267,126 @@ impl GraphJob {
             .unwrap_or_default()
     }
 
+    // The engines a step brings up, each with what its parent tells it, and
+    // the touched nodes whose runs are gone with the engines they ran. An
+    // engine is brought up when anything it reads changed since the last
+    // step: its own node, its kept envelopes, an offer to it or its run, a
+    // member of its parent that is one of its volumes, or what its parent
+    // tells every engine bound in it, which brings every one of them. A
+    // node is marked from its first change on, so a job's first step
+    // brings every engine up.
+    fn touched_engines(&mut self) -> (BTreeMap<NodeId, Facts>, Vec<NodeId>) {
+        let at = self.fed.at.unwrap_or_default();
+        self.fed.at = Some(FedAt {
+            tree: self.tree.generation(),
+            kept: self.writer.kept_generation(),
+            offered: self.passwords.generation(),
+            runs: self.runs.marked_at(),
+        });
+        let mut touched = BTreeSet::new();
+        for mark in self.tree.marked_since(at.tree) {
+            match mark {
+                Mark::Node(node) => {
+                    touched.insert(node);
+                }
+                Mark::Members(parent) => {
+                    let Some(namespace) = self.tree.namespace(parent) else {
+                        self.fed.members.remove(&parent);
+                        continue;
+                    };
+                    let read = self
+                        .fed
+                        .members
+                        .insert(parent, namespace.generation())
+                        .unwrap_or(0);
+                    touched.extend(
+                        namespace
+                            .changed_since(read)
+                            .filter_map(|member| self.tree.child_of(parent, member))
+                            .map(|(child, _)| child),
+                    );
+                }
+            }
+        }
+        touched.extend(self.writer.kept_changed_since(at.kept));
+        touched.extend(self.passwords.changed_since(at.offered));
+        touched.extend(self.runs.changed_since(at.runs));
+        let mut waiting = None;
+        let mut engines = BTreeMap::new();
+        let mut parents = BTreeMap::new();
+        let mut gone = Vec::new();
+        for node in touched {
+            let Some((parent, _)) = self.tree.volumes(node).filter(|_| self.is_engine(node)) else {
+                if self.runs.has(node) {
+                    gone.push(node);
+                }
+                continue;
+            };
+            let facts = *parents
+                .entry(parent)
+                .or_insert_with(|| self.facts(parent, &mut waiting));
+            engines.insert(node, facts);
+        }
+        let told: BTreeSet<NodeId> = self
+            .fed
+            .told
+            .keys()
+            .chain(parents.keys())
+            .copied()
+            .collect();
+        for parent in told {
+            if self.tree.namespace(parent).is_none() {
+                self.fed.told.remove(&parent);
+                continue;
+            }
+            let facts = match parents.get(&parent) {
+                Some(facts) => *facts,
+                None => self.facts(parent, &mut waiting),
+            };
+            if self.fed.told.insert(parent, facts) == Some(facts) {
+                continue;
+            }
+            for child in self.tree.namespaces_below(parent) {
+                if self.is_engine(child) {
+                    engines.insert(child, facts);
+                }
+            }
+        }
+        (engines, gone)
+    }
+
+    fn is_engine(&self, node: NodeId) -> bool {
+        self.tree.is_live(node) && self.tree.engine(node).is_some()
+    }
+
+    // What the parent tells every engine bound in it. `waiting` is whether
+    // the payload is still to come, asked once a step and only when a
+    // parent's sets have all ruled.
+    fn facts(&self, parent: NodeId, waiting: &mut Option<bool>) -> Facts {
+        let ended = self.writer.ruled(&self.tree, parent)
+            && !*waiting.get_or_insert_with(|| self.payload_waiting());
+        // A volume can still join while a member's front has yet to decide
+        // its owner, and while anything more can come: a recovery object yet
+        // to rule may rebuild a volume never posted.
+        Facts {
+            ended,
+            deciding: !ended || self.tree.deciding(parent),
+        }
+    }
+
     // Bring the node's shelf up to what the tree knows of its volumes: how
     // many there are, which are closed and how long, which will receive
-    // nothing more, and whether any more can join. A shelf already there is
-    // left as it is, and its run is not woken to find nothing new.
-    fn feed(&mut self, node: NodeId) -> Result<(), GraphError> {
+    // nothing more, and whether any more can join, as its parent's `facts`
+    // say. A shelf already there is left as it is, and its run is not woken
+    // to find nothing new.
+    fn feed(&mut self, node: NodeId, facts: Facts) -> Result<(), GraphError> {
         let Some((parent, volumes)) = self.tree.volumes(node) else {
             return Ok(());
         };
         let Some(namespace) = self.tree.namespace(parent) else {
             return Ok(());
         };
-        // A volume can still join while a member's front has yet to decide
-        // its owner, and while anything more can come: a recovery object yet
-        // to rule may rebuild a volume never posted.
-        let ended = self.ended(parent);
-        let deciding = !ended || self.tree.deciding(parent);
+        let Facts { ended, deciding } = facts;
         let complete = ended && !deciding;
         let bound = volumes.keys().map(|volume| volume.0);
         let uncertain = volumes
@@ -301,14 +417,24 @@ impl GraphJob {
                     // past it, built on the wrong offsets and starts over,
                     // as it does when repaired bytes land behind it. One
                     // that reopens, as a restore reopens a volume to
-                    // refetch it, has moved nothing yet.
-                    let moved = kept.closed.zip(closed).is_some_and(|(was, now)| was != now);
-                    // A layout may have consumed only the closed length.
-                    // Reopening or changing that observed boundary makes
-                    // its decision stale before any payload was reached.
-                    let observed = kept.length_read && kept.closed != closed;
+                    // refetch it, has moved nothing yet: the length it last
+                    // closed at stays the one it is held to.
+                    let moved = kept
+                        .closed_at
+                        .zip(closed)
+                        .is_some_and(|(was, now)| was != now);
+                    if closed.is_some() {
+                        kept.closed_at = closed;
+                    }
+                    // A layout may have consumed only the closed length. It
+                    // goes stale when the volume closes at another length,
+                    // even across a reopen; a reopen alone moves nothing.
+                    let observed = kept
+                        .length_read
+                        .zip(closed)
+                        .is_some_and(|(read, now)| read != now);
                     if observed {
-                        kept.length_read = false;
+                        kept.length_read = None;
                     }
                     kept.closed = closed;
                     kept.settled = settled;
@@ -326,127 +452,37 @@ impl GraphJob {
             })
             .map_err(|error| GraphError::Write(WriteError::Leaf(error)))
     }
+}
 
-    // Nothing more will come for the namespace's members, not even a
-    // repair: the payload is in, and the namespace's sets have ruled. One
-    // that has not may cover a member yet, since it binds what it covers as
-    // its own volumes arrive, and those can come after the member closed,
-    // or rebuild a member that never came at all.
-    fn ended(&self, parent: NodeId) -> bool {
-        !self.payload_waiting() && self.writer.ruled(&self.tree, parent)
-    }
+// What a parent tells every engine bound in it of its volumes: whether
+// nothing more comes to them, not even a repair, and whether a volume may
+// still join.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Facts {
+    ended: bool,
+    deciding: bool,
+}
+
+// What the steps brought the engines up to: the generations of the tree,
+// the kept envelopes, the offers and the runs the last step read up to,
+// the member generation of each namespace it read, and, by parent, what the
+// last step told every engine bound in it. A job made or restored starts
+// with none, and its first step brings every engine up.
+#[derive(Default)]
+pub(super) struct Fed {
+    at: Option<FedAt>,
+    members: BTreeMap<NodeId, u64>,
+    told: BTreeMap<NodeId, Facts>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct FedAt {
+    tree: u64,
+    kept: u64,
+    offered: u64,
+    runs: u64,
 }
 
 #[cfg(test)]
-mod length_tests {
-    use super::*;
-    use crate::operations::disk::CapacityReader;
-    use crate::pipeline::graph::engine::{RunMail, RunVolumes, Runs, echo::Echoes};
-    use crate::pipeline::graph::namespace::NamespaceWriter;
-    use crate::pipeline::graph::root::tests::{decoded, file};
-    use crate::pipeline::graph::status::RepairSlots;
-    use std::sync::Arc;
-    use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
-    use weaver_graph::{VolumeIndex, Volumes};
-
-    #[tokio::test]
-    async fn only_a_changed_observed_closed_length_invalidates_the_run() {
-        for (observe, initially_closed, change, invalidated) in [
-            (false, true, true, false),
-            (true, true, false, false),
-            (true, true, true, true),
-            (true, false, true, false),
-        ] {
-            let files = [file("set.part1.rar", &[48]), file("set.part2.rar", &[48])];
-            let directory = tempfile::tempdir().unwrap();
-            let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
-                resident_limit: u64::MAX,
-                scratch_total: u64::MAX,
-                scratch_ceiling: u64::MAX,
-                disk_reserve: 0,
-            }));
-            let writer = NamespaceWriter::new(
-                1,
-                directory.path().to_owned(),
-                Arc::clone(&accountant),
-                CapacityReader::unknown(),
-            );
-            let mail = RunMail::default();
-            let runs = Runs::new(1, 0, mail.sender(), accountant);
-            let mut job = GraphJob::new(
-                &files,
-                Box::new(Echoes {
-                    volumes: 2,
-                    ..Default::default()
-                }),
-                writer,
-                runs,
-                u32::MAX,
-            );
-            for volume in 0..2 {
-                let mut bytes = vec![0x80; 48];
-                if volume == 0 {
-                    bytes[..8].copy_from_slice(crate::pipeline::graph::engine::echo::SIGNATURE);
-                }
-                job.intake(
-                    decoded(volume, 0, 0, &bytes, Some(48)),
-                    &mut RepairSlots::default(),
-                    1,
-                )
-                .unwrap();
-            }
-            let node = job.tree.engines()[0];
-            job.feed(node).unwrap();
-            job.runs.request_stop();
-            let shelf = job.writer.shelf(node);
-            if !initially_closed {
-                shelf.update(|state| state.kept.get_mut(&1).unwrap().closed = None);
-            }
-            let reader = RunVolumes::new(Arc::clone(&shelf), shelf.begin());
-            if observe {
-                assert_eq!(reader.len(VolumeIndex(1)), initially_closed.then_some(48));
-            }
-            assert_eq!(shelf.reached(), None, "no payload byte was read");
-            if change {
-                job.tree.namespace_mut(NodeId::ROOT).unwrap().recognise(
-                    MemberId(1),
-                    "set.part2.rar",
-                    47,
-                );
-            }
-            job.feed(node).unwrap();
-            assert_eq!(
-                reader.current(),
-                !invalidated,
-                "observed={observe}, initially_closed={initially_closed}, changed={change}"
-            );
-            if observe && initially_closed && !change {
-                let before = shelf.generation();
-                job.tree
-                    .namespace_mut(NodeId::ROOT)
-                    .unwrap()
-                    .get_mut(MemberId(1))
-                    .unwrap()
-                    .closed = false;
-                job.feed(node).unwrap();
-                assert!(!reader.current(), "the observed boundary became unknown");
-                assert_eq!(shelf.generation(), before + 1);
-                job.feed(node).unwrap();
-                job.tree
-                    .namespace_mut(NodeId::ROOT)
-                    .unwrap()
-                    .get_mut(MemberId(1))
-                    .unwrap()
-                    .closed = true;
-                job.feed(node).unwrap();
-                assert_eq!(
-                    shelf.generation(),
-                    before + 1,
-                    "the consumed observation cannot invalidate repeatedly"
-                );
-                let current = RunVolumes::new(Arc::clone(&shelf), shelf.begin());
-                assert!(current.current());
-            }
-        }
-    }
-}
+#[path = "runs_tests.rs"]
+mod tests;

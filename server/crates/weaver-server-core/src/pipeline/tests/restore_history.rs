@@ -942,15 +942,15 @@ async fn job_completed_event_publishes_after_history_archive_commits() {
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let mut events = pipeline.event_tx.subscribe();
     let job_id = JobId(30040);
-    // A job with no article left to account for.
-    let spec = JobSpec {
-        files: Vec::new(),
-        ..standalone_job_spec(
-            "Durable Completion Event",
-            &[("durable-completion.mkv".to_string(), 123)],
-        )
-    };
-    insert_active_job(&mut pipeline, job_id, spec).await;
+    // A job with no article left to account for: its one file was delivered.
+    insert_delivered_job(
+        &mut pipeline,
+        job_id,
+        "Durable Completion Event",
+        "durable-completion.mkv",
+        b"durable completion payload",
+    )
+    .await;
 
     let release = hold_database_writer(&pipeline);
     pipeline.complete_job_after_terminal_post_processing(job_id);

@@ -51,7 +51,7 @@ mod cancel_batch;
 mod control_lifecycle;
 mod core;
 mod decode_stage;
-mod direct_store;
+pub(in crate::pipeline) mod direct_store;
 mod download_dispatch;
 pub(in crate::pipeline) mod engines;
 mod full_file_names;
@@ -1745,6 +1745,54 @@ async fn insert_active_job_with_persisted_nzb_named(
     pipeline.activate_job_articles(job_id, &HashSet::new(), None, None, Vec::new());
     pipeline.job_order.push(job_id);
     pipeline.report_all_for_test();
+    working_dir
+}
+
+// A job of one plain file, `filename`, whose one article carries all of
+// `payload`, inserted and then delivered as a lane delivers it: the article
+// comes back from the server, is decoded, and the graph hears it. The file is
+// whole when this returns, so the job has something usable to complete with.
+pub(in crate::pipeline) async fn insert_delivered_job(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    name: &str,
+    filename: &str,
+    payload: &[u8],
+) -> PathBuf {
+    let spec = standalone_job_spec(name, &[(filename.to_string(), payload.len() as u32)]);
+    let working_dir = insert_active_job(pipeline, job_id, spec).await;
+    let work = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
+    let segment_id = work.segment_id;
+    let raw = encode_article_part(filename, payload, 1, 1, 1, payload.len() as u64);
+    // Lane 0 holds the article, as a dispatched lease would book it.
+    pipeline.hold_test_lane_works(vec![work], false);
+    pipeline
+        .handle_download_done(DownloadResult {
+            lane_id: 0,
+            job_id,
+            runtime_generation: 0,
+            segment_id,
+            data: Ok(DownloadPayload::Raw(raw)),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            exclude_servers: Vec::new(),
+            release_connection_slot: true,
+        })
+        .await;
+    drain_decode_results(pipeline, 1).await;
+    hear_graph_mail(pipeline, job_id).await;
     working_dir
 }
 

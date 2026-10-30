@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use par2_rs::checksum::md5;
 use par2_rs::{FileId, Packet, Par2FileSet};
 use serde::{Deserialize, Serialize};
 use weaver_graph::recovery::RepairOutcome;
@@ -51,6 +52,9 @@ pub(super) struct SetState {
     // checksums, folded with `whole`: equal checksums are equal bytes, so
     // each holds the others' bytes.
     alike: BTreeMap<SliceKey, Vec<(FileId, u64)>>,
+    // The described files by the hash of their front, folded with `whole`:
+    // what a member's front digest finds its file by.
+    fronts: BTreeMap<Front, Vec<FileId>>,
     // Recovery packets by exponent: the first copy found is the one kept.
     pub(super) recovery: BTreeMap<u32, Location>,
     // Which member each described file is bound to: by its front, its
@@ -75,6 +79,7 @@ impl SetState {
             checksummed: false,
             whole: BTreeMap::new(),
             alike: BTreeMap::new(),
+            fronts: BTreeMap::new(),
             recovery: BTreeMap::new(),
             members: BTreeMap::new(),
             unnamed: Vec::new(),
@@ -95,6 +100,7 @@ impl SetState {
         self.index = index_of(&self.packets.get().0, output_limit);
         self.whole = whole_of(self.index.as_ref());
         self.alike = alike_of(self.index.as_ref());
+        self.fronts = fronts_of(self.index.as_ref());
         self.index_changed();
         self.last = None;
     }
@@ -127,6 +133,7 @@ impl SetState {
         let mut state = Self {
             whole: whole_of(index.as_ref()),
             alike: alike_of(index.as_ref()),
+            fronts: fronts_of(index.as_ref()),
             index,
             packets,
             hashes,
@@ -165,6 +172,11 @@ impl SetState {
             .and_then(|index| slice_key(index, file, slice))
             .and_then(|key| self.alike.get(&key))
             .map_or(&[], Vec::as_slice)
+    }
+
+    // The described files whose front is `front`, in file order.
+    pub(super) fn fronted(&self, front: &Front) -> &[FileId] {
+        self.fronts.get(front).map_or(&[], Vec::as_slice)
     }
 
     pub(super) fn members(&self) -> &BTreeMap<FileId, MemberId> {
@@ -292,7 +304,6 @@ pub(super) struct Volume {
     pub(super) sets: BTreeSet<[u8; 16]>,
     // The name it was bound under, which a later volume of the set continues.
     pub(super) name: Option<String>,
-    pub(super) name_only: bool,
 }
 
 impl Volume {
@@ -408,6 +419,53 @@ fn alike_of(index: Option<&Par2FileSet>) -> BTreeMap<SliceKey, Vec<(FileId, u64)
     }
     alike.retain(|_, slices| slices.len() > 1);
     alike
+}
+
+// PAR2 identifies a file by the MD5 of at most this much of its front.
+const HASH_WINDOW: u64 = 16 * 1024;
+
+// A front as PAR2 names a file by it: the MD5 of its first bytes, up to
+// HASH_WINDOW, with how many there were. A front shorter than the window
+// answers only for a file of its own length, since a longer front would
+// already contradict a shorter file, and a full one for every file at least
+// the window long: one front answers for every description it could be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct Front {
+    window: u64,
+    md5: [u8; 16],
+}
+
+impl Front {
+    // The front of a member's first bytes; none until one arrived.
+    pub(super) fn of(first_bytes: &[u8]) -> Option<Self> {
+        let window = HASH_WINDOW.min(first_bytes.len() as u64);
+        (window > 0).then(|| Self {
+            window,
+            md5: md5(&first_bytes[..window as usize]),
+        })
+    }
+
+    // The front a description states for its file.
+    fn described(length: u64, hash_16k: [u8; 16]) -> Self {
+        Self {
+            window: length.min(HASH_WINDOW),
+            md5: hash_16k,
+        }
+    }
+}
+
+fn fronts_of(index: Option<&Par2FileSet>) -> BTreeMap<Front, Vec<FileId>> {
+    let mut fronts: BTreeMap<Front, Vec<FileId>> = BTreeMap::new();
+    for description in index.into_iter().flat_map(|index| index.files.values()) {
+        fronts
+            .entry(Front::described(description.length, description.hash_16k))
+            .or_default()
+            .push(description.file_id);
+    }
+    for files in fronts.values_mut() {
+        files.sort();
+    }
+    fronts
 }
 
 // Admit declared geometry before anything is built on it.

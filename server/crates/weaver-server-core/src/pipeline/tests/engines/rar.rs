@@ -955,6 +955,45 @@ async fn a_rar5_record_and_par2_due_in_the_same_step_repair_the_volume_once() {
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
 }
 
+// The PAR2 set is posted ahead of the volumes, and the volume served damaged
+// is posted last, so every volume is in before its record can go out: the
+// record and the set over both volumes come due in the same step, whichever
+// volume it is. The record covers less, so it rules first and repairs its
+// volume; the set then finds both whole.
+#[tokio::test]
+async fn a_record_inside_a_volume_rules_before_the_par2_set_over_it_whatever_volume_closes_last() {
+    let body = body();
+    for damaged in 0..2 {
+        let mut posts = with_par2(protected_store_set(MEMBER, &body, 2, 1));
+        posts.rotate_right(2);
+        if damaged == 0 {
+            posts.swap(2, 3);
+        }
+        let graph = run(&Scenario::new(posts).damaged(3, 2)).await;
+        assert_delivers(&graph, MEMBER, &body);
+        let mut rulings = graph.graph().rulings.clone();
+        rulings.sort_by_key(|(kind, outcome)| {
+            (
+                kind.clone(),
+                !matches!(outcome, Some(RepairOutcome::Repaired { .. })),
+            )
+        });
+        assert_eq!(
+            rulings,
+            vec![
+                ("par2".to_string(), Some(RepairOutcome::Clean)),
+                (
+                    "rar_record".to_string(),
+                    Some(RepairOutcome::Repaired { slices: 1 })
+                ),
+                ("rar_record".to_string(), Some(RepairOutcome::Clean)),
+            ],
+            "volume {damaged} closed last"
+        );
+        assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    }
+}
+
 // One volume whose record of one parity unit cannot rebuild the two units
 // damaged in it, beside a PAR2 set that can. The set repairs the volume
 // whole and the job completes; the record never writes, ruling past repair

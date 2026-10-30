@@ -69,7 +69,7 @@ impl Object for Wrap {
             out.push(Emit::Bytes {
                 member: MemberId(0),
                 offset: delivery.offset + skip as u64 - self.header(),
-                bytes: Bytes::copy_from_slice(&delivery.bytes[skip..]),
+                bytes: Bytes::copy_from_slice(&delivery.bytes[skip..]).into(),
                 provenance: delivery.provenance,
             });
         }
@@ -127,7 +127,7 @@ impl Extraction for Idle {
     fn run(self: Box<Self>, _: Arc<dyn Volumes>, _: &mut Sink<'_>, _: crate::Budget) {}
 }
 
-struct Objects;
+pub(crate) struct Objects;
 
 impl Builder for Objects {
     fn build(&mut self, kind: Kind, _: ObjectId) -> Option<Box<dyn Object>> {
@@ -157,7 +157,7 @@ impl Restore for Objects {
 // Root, an xz wrapper below it, a gzip wrapper below that: three levels,
 // with a root leaf that takes the name the deepest member wants, so the
 // ledger's suffix has to come back too, and damage in the coverage.
-fn three_levels() -> (Tree, MemberId) {
+pub(crate) fn three_levels() -> (Tree, MemberId) {
     let mut tree = Tree::new();
     let mut effects = Vec::new();
     let leaf = tree.announce_root("leaf.bin", Some(4), &mut effects);
@@ -168,7 +168,7 @@ fn three_levels() -> (Tree, MemberId) {
             member,
             Posted {
                 offset,
-                bytes: Bytes::copy_from_slice(bytes),
+                bytes: Bytes::copy_from_slice(bytes).into(),
                 provenance,
             },
             &mut Objects,
@@ -227,7 +227,7 @@ fn a_rebuilt_tree_takes_the_replay_as_the_live_one_does() {
             archive,
             Posted {
                 offset: 18,
-                bytes: Bytes::from_static(b" more"),
+                bytes: Bytes::from_static(b" more").into(),
                 provenance: Provenance::Fresh,
             },
             &mut Objects,

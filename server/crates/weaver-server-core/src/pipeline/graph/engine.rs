@@ -23,11 +23,7 @@ mod volumes;
 #[cfg(test)]
 pub(crate) mod echo;
 #[cfg(test)]
-mod read_gate;
-#[cfg(test)]
 mod tests;
-#[cfg(test)]
-pub(crate) use read_gate::{ReadGate, ReadStep};
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -35,11 +31,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use weaver_graph::holds::{HoldsAccountant, HoldsNamespace, Reserve};
 use weaver_graph::slots::{Admissions, Asked, AskerId, Slots, Ticket};
-use weaver_graph::{Emit, Extraction, NodeId, Why};
+use weaver_graph::{Emit, Extraction, Marks, NodeId, Why};
 
-#[cfg(test)]
-pub(super) use self::volumes::RunVolumes;
-#[cfg(not(test))]
 use self::volumes::RunVolumes;
 use super::envelope::Shelf;
 use super::hardware::Hardware;
@@ -224,29 +217,15 @@ pub(crate) struct Runs {
     slots: Slots,
     accountant: Arc<HoldsAccountant>,
     runs: BTreeMap<NodeId, Run>,
+    // The nodes whose run came, went, or moved on in its life, each under
+    // the generation of its latest change: a step reads again only the
+    // nodes marked since the one it read at.
+    marks: Marks<NodeId>,
     // What a run is granted as it starts, and the job's repairs too.
     hardware: Hardware,
 }
 
 impl Runs {
-    #[cfg(test)]
-    pub(crate) fn gate_read(
-        &self,
-        node: NodeId,
-        volume: weaver_graph::VolumeIndex,
-        range: weaver_graph::ByteRange,
-    ) -> Option<ReadGate> {
-        let run = self.runs.get(&node)?;
-        if !matches!(run.life, Life::Running { .. }) {
-            return None;
-        }
-        Some(
-            run.volumes
-                .as_ref()?
-                .gate_read(self.scope, node, volume, range),
-        )
-    }
-
     pub(crate) fn new(
         scope: u64,
         slots: usize,
@@ -259,6 +238,7 @@ impl Runs {
             slots: Slots::new(slots),
             accountant,
             runs: BTreeMap::new(),
+            marks: Marks::default(),
             hardware: Hardware::default(),
         }
     }
@@ -325,6 +305,25 @@ impl Runs {
             .collect()
     }
 
+    // The generation of the latest change to any run's life.
+    pub(crate) fn marked_at(&self) -> u64 {
+        self.marks.at()
+    }
+
+    // The nodes whose run's life changed since `at`, one forgotten among
+    // them.
+    pub(crate) fn changed_since(&self, at: u64) -> impl Iterator<Item = NodeId> + '_ {
+        self.marks.since(at)
+    }
+
+    // The nodes whose runs are reading, in node order.
+    pub(crate) fn running(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.runs
+            .iter()
+            .filter(|(_, run)| matches!(run.life, Life::Running { .. }))
+            .map(|(node, _)| *node)
+    }
+
     // The generation the node's run started under, once it started.
     pub(crate) fn generation(&self, node: NodeId) -> Option<u64> {
         match self.runs.get(&node)?.life {
@@ -348,6 +347,7 @@ impl Runs {
     pub(crate) fn ask(&mut self, node: NodeId, limit: usize) -> Vec<NodeId> {
         let mut admitted = self.follow(limit);
         admitted.extend(self.wake());
+        self.marks.mark(node);
         let run = self.runs.entry(node).or_insert(Run {
             life: Life::Queued,
             ticket: None,
@@ -388,6 +388,7 @@ impl Runs {
         run.life = Life::Starved {
             resident: self.accountant.usage().resident,
         };
+        self.marks.mark(node);
         let admissions = run
             .ticket
             .take()
@@ -409,6 +410,7 @@ impl Runs {
         };
         let generation = shelf.begin();
         run.life = Life::Running { generation };
+        self.marks.mark(node);
         let volumes = Arc::new(RunVolumes::new(shelf, generation));
         run.volumes = Some(Arc::clone(&volumes));
         let budget = self.hardware.grant().run;
@@ -454,23 +456,11 @@ impl Runs {
         let mut admitted = self.follow(limit);
         if let Some(run) = self.runs.get_mut(&node) {
             run.life = Life::Ended { generation };
+            self.marks.mark(node);
             admitted.extend(self.free(node));
         }
         admitted.extend(self.wake());
         admitted
-    }
-
-    // Forget the runs of nodes no longer among `engines`, which are in node
-    // order: refused, retracted or unbound. Their slots and their memory go
-    // to whoever waits; returns the nodes that may start now.
-    pub(crate) fn forget_gone(&mut self, engines: &[NodeId], limit: usize) -> Vec<NodeId> {
-        let gone = self
-            .runs
-            .keys()
-            .filter(|node| engines.binary_search(node).is_err())
-            .copied()
-            .collect();
-        self.forget(gone, limit)
     }
 
     // Stop every run where it stands: the job is going down. What a run read
@@ -490,6 +480,7 @@ impl Runs {
         for node in all {
             self.free(node);
             if let Some(run) = self.runs.get_mut(&node) {
+                self.marks.mark(node);
                 run.life = match run.life {
                     Life::Queued | Life::Starved { .. } => Life::Stopped { generation: None },
                     Life::Running { generation } => Life::Stopped {
@@ -509,11 +500,13 @@ impl Runs {
         }
     }
 
-    // Forget the runs of `gone`, whose threads may still be out: what they
-    // say is under a generation no run holds, and is not heard. Their slots
-    // and their memory go to whoever waits; returns the nodes that may
-    // start now.
-    fn forget(&mut self, gone: Vec<NodeId>, limit: usize) -> Vec<NodeId> {
+    // Forget the runs of `gone`, nodes no longer engines: refused,
+    // retracted or unbound. Their threads may still be out: what they say
+    // is under a generation no run holds, and is not heard. Their slots and
+    // their memory go to whoever waits; returns the nodes that may start
+    // now, as a raised limit or released memory admits them even when
+    // nothing is gone.
+    pub(crate) fn forget(&mut self, gone: Vec<NodeId>, limit: usize) -> Vec<NodeId> {
         let mut admitted = self.follow(limit);
         // Out of the queue first, so a slot one of them frees cannot go to
         // another of them.
@@ -522,7 +515,9 @@ impl Runs {
         }
         for node in gone {
             admitted.extend(self.free(node));
-            self.runs.remove(&node);
+            if self.runs.remove(&node).is_some() {
+                self.marks.mark(node);
+            }
         }
         admitted.extend(self.wake());
         admitted
@@ -558,6 +553,7 @@ impl Runs {
     fn queue(&mut self, node: NodeId) -> Option<NodeId> {
         let run = self.runs.get_mut(&node)?;
         run.life = Life::Queued;
+        self.marks.mark(node);
         match self.slots.ask(asker(node)) {
             Asked::Admitted(ticket) => {
                 run.ticket = Some(ticket);

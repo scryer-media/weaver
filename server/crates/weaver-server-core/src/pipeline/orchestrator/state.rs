@@ -88,10 +88,9 @@ impl Pipeline {
 
     pub(crate) fn publish_active_stage_metrics(&self) {
         self.metrics.set_active_downloads(self.active_downloads);
-        self.metrics.active_decodes.store(
-            self.active_decodes_by_job.values().sum::<usize>(),
-            Ordering::Relaxed,
-        );
+        self.metrics
+            .active_decodes
+            .store(self.active_decodes_by_job.total(), Ordering::Relaxed);
     }
 
     pub(crate) fn clear_job_write_backlog(&mut self, job_id: JobId) {

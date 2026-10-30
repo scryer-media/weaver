@@ -4,34 +4,6 @@
 use super::*;
 
 #[test]
-fn corrected_fresh_bytes_replace_the_checksum_of_an_earlier_copy() {
-    for version in [Version::Rar4, Version::Rar5] {
-        for unposted in [false, true] {
-            let body = payload(127, 1024);
-            let volumes = write(
-                &[Item::File("member.bin", body.clone())],
-                &Options::new(version),
-            );
-            let start = find(&volumes[0], &body);
-            let whole = ByteRange::new(0, volumes[0].len() as u64);
-            let piece = ByteRange::new(start as u64 + 200, start as u64 + 400);
-            let mut wrong = body[200..400].to_vec();
-            wrong[17] ^= 1;
-            let mut owner = Owner::named(store(), volumes);
-            owner.deliver(0, ByteRange::new(0, piece.start));
-            owner.deliver_as(0, piece, Provenance::Fresh, Some(&wrong));
-            if unposted {
-                owner.object.unposted(VolumeIndex(0), piece);
-            }
-            owner.deliver(0, piece);
-            owner.deliver(0, ByteRange::new(piece.end, whole.end));
-            assert_eq!(owner.member("member.bin").bytes, body);
-            no_trouble(&owner);
-        }
-    }
-}
-
-#[test]
 fn a_recovery_name_corrects_an_ended_but_unnumbered_rar4_volume() {
     let mut options = Options::new(Version::Rar4);
     options.split = Some(512);
@@ -58,6 +30,13 @@ fn a_recovery_name_corrects_an_ended_but_unnumbered_rar4_volume() {
         owner.object.carried(VolumeIndex(1)).is_some(),
         "unmapped source can travel"
     );
+    let mut carriable = Vec::new();
+    owner.object.carriable(&mut carriable);
+    assert_eq!(carriable, vec![VolumeIndex(1)], "the mapped first stays");
+    let restored = crate::restore(&owner.object.facts(), weaver_graph::Budget::default()).unwrap();
+    let mut again = Vec::new();
+    restored.carriable(&mut again);
+    assert_eq!(again, carriable, "a restore keeps what can travel");
     let mut out = Vec::new();
     owner
         .object
@@ -99,7 +78,7 @@ fn a_canonical_name_places_a_volume_when_held_labels_cannot_number_the_set() {
                     &foreign[1],
                     Some(foreign[1].len() as u64)
                 ),
-                None,
+                Vec::<VolumeIndex>::new(),
                 "{version:?}, engine={engine}: a name cannot invent membership across incompatible continuations"
             );
             let mut out = Vec::new();
@@ -113,7 +92,7 @@ fn a_canonical_name_places_a_volume_when_held_labels_cannot_number_the_set() {
                     &volumes[2],
                     Some(volumes[2].len() as u64)
                 ),
-                Some(VolumeIndex(2)),
+                vec![VolumeIndex(2)],
                 "{version:?}, engine={engine}, first_name={first_name}"
             );
             object.bound(
@@ -192,12 +171,12 @@ fn another_named_sets_ordinal_is_not_positive_membership_evidence() {
                 &other[2][..64],
                 Some(other[2].len() as u64)
             ),
-            None,
+            Vec::<VolumeIndex>::new(),
             "restored={restored}: a slot number cannot link different named sets"
         );
         assert_eq!(
             object.claim("first.part03.rar", &one[2][..64], Some(one[2].len() as u64)),
-            Some(VolumeIndex(2)),
+            vec![VolumeIndex(2)],
             "the same-name placement remains available"
         );
     }

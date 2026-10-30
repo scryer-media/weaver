@@ -4,17 +4,18 @@
 // The job as a checkpoint takes it: the tree's records, the root's facts
 // with the job's count of repair reads and the phase it last reported, the
 // writer's files, kept envelopes and holds on scratch, and which candidate
-// each node was offered last. A node is read on its own, so a checkpoint
-// reads only the nodes the tree, the writer, its envelopes or an offer
-// marked since the generations it read at.
+// each node was offered last. A node's own record and each of its members
+// are read on their own, so a checkpoint reads only what the tree, the
+// writer, its envelopes or an offer marked since the generations it read at.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use weaver_graph::holds::ScratchHold;
-use weaver_graph::{MemberId, NodeId, NodeRecord};
+use weaver_graph::tree::Mark;
+use weaver_graph::{CoverageRecord, MemberId, MemberRecord, NodeId, NodeRecord};
 
 use super::GraphJob;
-use crate::pipeline::graph::checkpoint::{FileState, Generations};
+use crate::pipeline::graph::checkpoint::{FileState, Generations, MemberGenerations, Touched};
 use crate::pipeline::graph::envelope::durable::KeptRecord;
 use crate::pipeline::graph::namespace::WriteError;
 use crate::pipeline::graph::root::facts::{Encoded, Encoding};
@@ -29,20 +30,88 @@ impl GraphJob {
         }
     }
 
-    // The nodes the tree, the writer, its envelopes or an offer changed
-    // since `at`: with `at` the generations nothing was read at, every node
-    // the job ever had.
-    pub(crate) fn changed_since(&self, at: Generations) -> BTreeSet<NodeId> {
-        self.tree
-            .changed_since(at.tree)
-            .chain(self.writer.files_changed_since(at.files))
-            .chain(self.writer.kept_changed_since(at.kept))
-            .chain(self.passwords.changed_since(at.offered))
-            .collect()
+    // What the tree, the writer, its envelopes or an offer changed of each
+    // node since `at`: with `at` the generations nothing was read at, every
+    // node the job ever had.
+    pub(crate) fn touched_since(&self, at: Generations) -> BTreeMap<NodeId, Touched> {
+        let mut out: BTreeMap<NodeId, Touched> = BTreeMap::new();
+        for mark in self.tree.marked_since(at.tree) {
+            match mark {
+                Mark::Node(node) => out.entry(node).or_default().own = true,
+                Mark::Members(node) => out.entry(node).or_default().members = true,
+            }
+        }
+        for node in self.writer.files_changed_since(at.files) {
+            out.entry(node).or_default().files = true;
+        }
+        for node in self.writer.kept_changed_since(at.kept) {
+            out.entry(node).or_default().kept = true;
+        }
+        for node in self.passwords.changed_since(at.offered) {
+            out.entry(node).or_default().own = true;
+        }
+        out
+    }
+
+    // The node's own record, its members left out, and the candidate it
+    // was offered last; `None` for a node the tree no longer has.
+    pub(crate) fn own_record(&self, node: NodeId) -> Option<(NodeRecord, Option<usize>)> {
+        Some((self.tree.own_record(node)?, self.last_offered(node)))
+    }
+
+    // The generations of the node's members: of its namespace, and of the
+    // writer's files of them.
+    pub(crate) fn member_generations(&self, node: NodeId) -> MemberGenerations {
+        MemberGenerations {
+            namespace: self
+                .tree
+                .namespace(node)
+                .map_or(0, |namespace| namespace.generation()),
+            files: self.writer.member_files_generation(node),
+        }
+    }
+
+    // The node's members its namespace or the writer's files of them
+    // changed since `at`; every member it has when `at` is `None`, or when
+    // a generation went back, as no live node's does. `None` for a node the
+    // tree no longer has.
+    pub(crate) fn members_changed(
+        &self,
+        node: NodeId,
+        at: Option<MemberGenerations>,
+        touched: Touched,
+    ) -> Option<BTreeSet<MemberId>> {
+        let namespace = self.tree.namespace(node)?;
+        let now = self.member_generations(node);
+        match at {
+            Some(at) if at.namespace <= now.namespace && at.files <= now.files => {
+                let mut out = BTreeSet::new();
+                if touched.members {
+                    out.extend(namespace.changed_since(at.namespace));
+                }
+                if touched.files {
+                    out.extend(self.writer.member_files_changed_since(node, at.files));
+                }
+                Some(out)
+            }
+            _ => Some(namespace.records().map(|member| member.id).collect()),
+        }
+    }
+
+    // One member's record, its coverage and what the writer holds of it;
+    // `None` for a member the node does not have.
+    pub(crate) fn member(
+        &self,
+        node: NodeId,
+        member: MemberId,
+    ) -> Option<(MemberRecord, Vec<CoverageRecord>, FileState)> {
+        let (record, coverage) = self.tree.member_record(node, member)?;
+        Some((record, coverage, self.writer.file_state(node, member)))
     }
 
     // One node's record, and what the writer holds of each of its members
     // it holds anything of; `None` for a node the tree no longer has.
+    #[cfg(test)]
     pub(crate) fn node(&self, node: NodeId) -> Option<(NodeRecord, BTreeMap<MemberId, FileState>)> {
         let record = self.tree.record(node)?;
         let files = record

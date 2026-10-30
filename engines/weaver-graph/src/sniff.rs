@@ -8,9 +8,10 @@
 // Bytes decide wherever a kind has a signature, so a member keeps its kind
 // under an obfuscated name. A name decides only once the bytes have ruled
 // out every signature: tar, bzip2 and zip by their extensions too, and raw
-// deflate, brotli and SFV, which have no signature, by theirs alone, as is
-// any numbered piece of a file split into pieces, whichever piece it is: a
-// piece whose first never came is no file of its own.
+// deflate, brotli and SFV, which have no signature, by theirs alone. The one
+// name that outranks a signature is a numbered piece's, `name.001` onward,
+// whichever piece it is and whatever its bytes open: the pieces join into
+// one file, and that file's own front says what it is.
 //
 // Bytes read before a verdict, per kind:
 //
@@ -42,10 +43,10 @@ pub enum Sniff {
 
 pub fn sniff(name: &str, first_bytes: &[u8], length: Option<u64>) -> Sniff {
     // A name never outvotes bytes that might still turn out to be a signature.
+    // A numbered piece's name outvotes any they open: the piece is a slice
+    // of a file, and what that file is, its own front says once joined.
     match signed(first_bytes, length) {
-        Sniff::Object(
-            Kind::Xz | Kind::Gzip | Kind::Bzip2 | Kind::Zstd | Kind::Brotli | Kind::Deflate,
-        ) if numbered_piece(trimmed(name)) => Sniff::Object(Kind::Split),
+        Sniff::Object(_) if numbered_piece(trimmed(name)) => Sniff::Object(Kind::Split),
         Sniff::Leaf => named(name)
             .or_else(|| sevenz_by_name(name, first_bytes))
             .map_or(Sniff::Leaf, Sniff::Object),
@@ -342,6 +343,13 @@ pub fn names_recovery(name: &str) -> bool {
 // found: its index does.
 pub fn recovery_by_name(name: &str) -> Option<Kind> {
     names_recovery(name).then(|| named(name)).flatten()
+}
+
+// Whether an object may claim a member by its posted name before its bytes
+// say what it is, its first article lost or not yet come: a recovery
+// volume's name, or a numbered piece's.
+pub fn names_claimable(name: &str) -> bool {
+    names_recovery(name) || numbered_piece(trimmed(name))
 }
 
 // A piece of a file split into numbered pieces, `name.001`, `name.002`, …:
@@ -729,10 +737,21 @@ mod tests {
         let mut continuation = vec![0x37, 0x7A, 0x00, 0x00, 0x00, 0x00];
         continuation.extend(plain(600));
         assert_eq!(sniff("a.7z.002", &continuation, None), object(Kind::Split));
-        assert_eq!(
-            sniff("a.7z.001", &seven_z(), None),
-            object(Kind::SevenZipStore)
-        );
+        assert_eq!(sniff("a.7z.001", &seven_z(), None), object(Kind::Split));
+    }
+
+    // The first piece opens what the joined file is, and the name outranks
+    // it: the pieces join, and the joined file's front founds its kind.
+    // A format's own volume names are not numbered pieces.
+    #[test]
+    fn a_numbered_piece_is_a_split_whatever_its_bytes_open() {
+        assert_eq!(sniff("a.rar.001", RAR5, None), object(Kind::Split));
+        assert_eq!(sniff("a.rar.001", RAR4, None), object(Kind::Split));
+        assert_eq!(sniff("a.zip.001", b"PK\x03\x04", None), object(Kind::Split));
+        assert_eq!(sniff("a.rar.001", b"Rar!", None), Sniff::Pending);
+        assert_eq!(sniff("a.part1.rar", RAR5, None), object(Kind::RarStore));
+        assert_eq!(sniff("a.r00", RAR4, None), object(Kind::RarStore));
+        assert_eq!(sniff("a.rar", RAR4, None), object(Kind::RarStore));
     }
 
     // Whichever piece comes, and whatever its number: its first may never

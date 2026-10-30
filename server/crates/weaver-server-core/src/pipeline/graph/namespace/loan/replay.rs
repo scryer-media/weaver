@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use weaver_graph::{Builder, Effect, Posted, Provenance};
 
-use super::super::{Segments, WriteError};
+use super::super::{Segments, Write, WriteError};
 use super::*;
 
 pub(crate) struct Replay {
@@ -36,6 +36,7 @@ struct Backing {
     node: NodeId,
     member: MemberId,
     bound: Option<(NodeId, VolumeIndex)>,
+    path: Option<PathBuf>,
     leaf: Option<(u64, u64)>,
     scratch: Option<(u64, u64)>,
     coverage: Coverage,
@@ -122,6 +123,7 @@ impl Replay {
                     node: *node,
                     member: *member,
                     bound: taken.bound,
+                    path: taken.path.clone(),
                     leaf: taken.revision,
                     scratch: taken.scratch_revision,
                     coverage: taken.coverage.clone(),
@@ -130,13 +132,6 @@ impl Replay {
                 .collect(),
             read: Read {
                 shelves: access.shelves.into_values().collect(),
-                leaves: access
-                    .members
-                    .iter()
-                    .filter_map(|((node, member), taken)| {
-                        Some((*node, *member, taken.path.clone()?, taken.revision?))
-                    })
-                    .collect(),
                 stopped,
             },
             bytes: access.repaired,
@@ -261,9 +256,9 @@ impl NamespaceWriter {
                 .is_some_and(|before| tree.record(node).as_ref() != Some(before))
         }) || replayed.backing.iter().any(|backing| {
             let files = self.files.get(&backing.node);
-            let leaf = files
-                .and_then(|files| files.leaves.get(&backing.member))
-                .map(Leaf::revision);
+            let held = files.and_then(|files| files.leaves.get(&backing.member));
+            let leaf = held.map(Leaf::revision);
+            let path = held.map(Leaf::path);
             let scratch = files
                 .and_then(|files| files.scratch.as_ref())
                 .map(Leaf::revision);
@@ -277,6 +272,7 @@ impl NamespaceWriter {
                     record.length != backing.length || record.coverage != backing.coverage
                 });
             leaf != backing.leaf
+                || path != backing.path.as_deref()
                 || scratch != backing.scratch
                 || bound != backing.bound
                 || verdict_changed
@@ -285,17 +281,7 @@ impl NamespaceWriter {
             .read
             .shelves
             .iter()
-            .any(|(shelf, generation)| shelf.generation() != *generation)
-            || replayed
-                .read
-                .leaves
-                .iter()
-                .any(|(node, member, path, revision)| {
-                    self.files
-                        .get(node)
-                        .and_then(|files| files.leaves.get(member))
-                        .is_none_or(|leaf| leaf.path() != path || leaf.revision() != *revision)
-                });
+            .any(|(shelf, generation)| shelf.generation() != *generation);
         if replayed.read.stopped || changed || moved {
             if !replayed.read.stopped {
                 self.queue_rechecks(vec![(replayed.node, replayed.ranges.clone())]);
@@ -312,7 +298,7 @@ impl NamespaceWriter {
                 VolumeIndex(volume.0),
                 ByteRange::at(*offset, range.len()),
             );
-            if *provenance == Provenance::Damaged {
+            if provenance.is_damaged() {
                 tree.recheck(node, volume, range);
             } else {
                 // Verified replacement bytes must face the member's own
@@ -329,14 +315,14 @@ impl NamespaceWriter {
                 VolumeIndex(volume.0),
                 Posted {
                     offset,
-                    bytes: bytes?,
+                    bytes: bytes?.into(),
                     provenance: *provenance,
                 },
                 &mut self.placing(builder),
                 &mut effects,
             );
             let mut applied = Vec::new();
-            self.apply_each(tree, builder, segments, effects, &mut applied)?;
+            self.apply_each(tree, builder, segments, effects, Write::Again, &mut applied)?;
             // The job answers password requests; payload effects have
             // already reached disk and must not accumulate across chunks.
             out.extend(

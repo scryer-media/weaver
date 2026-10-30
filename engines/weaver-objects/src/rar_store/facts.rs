@@ -54,11 +54,9 @@ struct VolumeFacts {
     headers: Option<RarVolumeFacts>,
     ended: bool,
     locked: Option<RarVolumeHeaderEncryption>,
-    // The binding's parsed front can precede the walk's first header read.
-    #[serde(default)]
+    // What the front stated when it was bound, which can precede the walk's
+    // first header read.
     front: Option<RarVolumeFacts>,
-    #[serde(default)]
-    name_only: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -75,25 +73,6 @@ pub(super) struct EntryFacts {
     padding: Padding,
     // An open cipher's blocks, never its key.
     chain: Option<Chain>,
-}
-
-#[cfg(test)]
-#[test]
-fn legacy_volume_facts_keep_missing_front_and_authority_unknown() {
-    let bytes = rmp_serde::to_vec(&(
-        VolumeIndex(0),
-        Option::<String>::None,
-        Option::<u64>::None,
-        true,
-        Kept::default(),
-        Option::<RarVolumeFacts>::None,
-        false,
-        Option::<RarVolumeHeaderEncryption>::None,
-    ))
-    .unwrap();
-    let volume: VolumeFacts = rmp_serde::from_slice(&bytes).unwrap();
-    assert!(volume.front.is_none());
-    assert!(!volume.name_only);
 }
 
 #[derive(Serialize, Deserialize)]
@@ -123,7 +102,8 @@ impl From<MemberKeying> for KeyTuple {
 }
 
 impl Durable for StoreFacts {
-    const VERSION: u16 = 1;
+    // 2: the front each volume stated when it was bound.
+    const VERSION: u16 = 2;
 
     fn impossible(&self) -> Option<&'static str> {
         let indices: BTreeSet<_> = self.volumes.iter().map(|volume| volume.index).collect();
@@ -158,7 +138,6 @@ pub(super) fn of(store: &RarStore) -> Facts {
             ended: volume.walk.ended,
             locked: volume.walk.locked,
             front: volume.front.clone(),
-            name_only: volume.name_only,
         })
         .collect();
     let entries = store
@@ -214,12 +193,13 @@ pub(crate) fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
     let mut store = RarStore::new();
     for found in kept.volumes {
         let mut volume = Volume::new();
-        volume.name = found.name;
+        if let Some(name) = &found.name {
+            volume.name_as(name);
+        }
         volume.length = found.length;
         volume.closed = found.closed;
         volume.kept = found.kept;
         volume.front = found.front;
-        volume.name_only = found.name_only;
         volume.walk.blocks = found.headers.as_ref().map_or_else(Vec::new, |headers| {
             headers
                 .members
@@ -233,16 +213,19 @@ pub(crate) fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
         volume.walk.ended = found.ended;
         volume.walk.locked = found.locked;
         store.volumes.insert(found.index, volume);
+        // The walk reads the kept headers again at the look below.
+        store.file(found.index);
+        store.touch(found.index);
     }
     let keyings: Vec<_> = kept.entries.iter().map(|entry| entry.keying).collect();
     store.entries = kept.entries.into_iter().map(entry).collect();
+    store.remap();
     store.damage_said = kept.damage_said.into_iter().collect();
     store.recovery_said = kept.recovery_said;
     store.gaps_said = kept.gaps_said;
     store.gone = kept.gone;
     // The walk reads the kept headers again; what it says now was said
     // before the checkpoint, so it goes nowhere.
-    store.stale = !store.gone;
     store.settle(None, &mut Vec::new());
     // Nor is a question it asked while no password was on hand yet: the
     // server offers the winning one again, and one never asked is asked

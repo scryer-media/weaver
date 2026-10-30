@@ -350,7 +350,10 @@ impl Pipeline {
         let counted = |counts: &HashMap<JobId, usize>| counts.get(&job_id).is_some_and(|n| *n > 0);
         counted(&self.active_downloads_by_job)
             || counted(&self.pending_released_download_results_by_job)
-            || counted(&self.active_decodes_by_job)
+            || self
+                .active_decodes_by_job
+                .get(&job_id)
+                .is_some_and(|n| *n > 0)
             || self
                 .pending_decode
                 .iter()

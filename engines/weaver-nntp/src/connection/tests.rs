@@ -1784,7 +1784,7 @@ async fn stream_yenc_article_reauthenticates_on_mid_session_480() {
 }
 
 #[tokio::test]
-async fn stream_yenc_article_batches_large_decoded_output() {
+async fn stream_yenc_article_hands_a_large_sized_part_over_as_one_batch() {
     let mut original = Vec::with_capacity(FUSED_YENC_OUTPUT_BATCH_TARGET + 123);
     for idx in 0..(FUSED_YENC_OUTPUT_BATCH_TARGET + 123) {
         original.push((idx % 251) as u8);
@@ -1825,9 +1825,11 @@ async fn stream_yenc_article_batches_large_decoded_output() {
         .unwrap();
 
     assert_eq!(article.to_data(), original);
+    // The part declares its length, so it is one batch of that length past
+    // the fixed target: the writer adopts it without joining pieces.
     let chunk_lens: Vec<usize> = delivered.iter().map(Vec::len).collect();
-    assert_eq!(chunk_lens, vec![FUSED_YENC_OUTPUT_BATCH_TARGET, 123]);
-    assert_eq!(article.stats.output_batches, 2);
+    assert_eq!(chunk_lens, vec![FUSED_YENC_OUTPUT_BATCH_TARGET + 123]);
+    assert_eq!(article.stats.output_batches, 1);
     // The callback sees the same bytes as the buffered article, in order.
     assert_eq!(delivered.concat(), article.to_data());
 }

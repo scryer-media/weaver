@@ -178,6 +178,36 @@ async fn pump_decode_queue_respects_decode_thread_limit() {
     );
 }
 
+// The active-decode gauge is published on every decode start and finish, so
+// it reads the kept sum instead of walking every job's count each time.
+#[tokio::test]
+async fn the_active_decode_gauge_reads_the_kept_sum_without_walking_jobs() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let segment = |job: u64, segment_number: u32| SegmentId {
+        file_id: NzbFileId {
+            job_id: JobId(job),
+            file_index: 0,
+        },
+        segment_number,
+    };
+
+    let walks = pipeline.active_decodes_by_job.walks();
+    for (job, segment_number) in [(20041, 0), (20041, 1), (20042, 0)] {
+        pipeline.note_decode_started(segment(job, segment_number), 64);
+    }
+    assert_eq!(pipeline.metrics.active_decodes.load(Ordering::Relaxed), 3);
+    pipeline.active_decodes_by_job.remove(&JobId(20041));
+    pipeline.publish_active_stage_metrics();
+    assert_eq!(pipeline.metrics.active_decodes.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        pipeline.active_decodes_by_job.walks(),
+        walks,
+        "publishing the gauge must not walk the per-job counts"
+    );
+    assert_eq!(pipeline.active_decodes_by_job.values().sum::<usize>(), 1);
+}
+
 #[tokio::test]
 async fn hard_decode_pressure_latches_until_soft_watermark() {
     let temp_dir = tempfile::tempdir().unwrap();

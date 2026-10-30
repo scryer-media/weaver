@@ -3,38 +3,13 @@
 
 use super::*;
 
-#[test]
-fn unposting_does_not_revert_byte_authority_to_a_name_only_binding() {
-    let body = payload(114, 1024);
-    let files = par3_set("authority", &[("payload.bin", &body)], 512, 1);
-    let (name, bytes) = &files[0];
-    let mut object = Par3::new(OWN);
-    object.bound(VolumeIndex(0), name, &[], Some(bytes.len() as u64));
-    assert!(object.name_only(VolumeIndex(0)));
-    object.deliver(
-        Delivery {
-            volume: VolumeIndex(0),
-            offset: 0,
-            bytes,
-            provenance: Provenance::Fresh,
-        },
-        &mut |_, _| false,
-        &mut Vec::new(),
-    );
-    object.unposted(VolumeIndex(0), ByteRange::new(0, bytes.len() as u64));
-    assert!(!object.name_only(VolumeIndex(0)));
-    let mut restored = crate::restore(&object.facts(), weaver_graph::Budget::default()).unwrap();
-    restored.unposted(VolumeIndex(0), ByteRange::new(0, bytes.len() as u64));
-    assert!(!restored.name_only(VolumeIndex(0)));
-}
-
 fn replay(job: &mut Job<Par3>) {
     for (&volume, bytes) in &job.store.volumes {
         job.object.deliver(
             Delivery {
                 volume,
                 offset: 0,
-                bytes,
+                bytes: &weaver_graph::Evidenced::from(bytes.to_vec()),
                 provenance: Provenance::Fresh,
             },
             &mut |_, _| false,
@@ -60,7 +35,7 @@ fn damaged_front_job(files: &[(String, Vec<u8>)]) -> Job<Par3> {
 fn damaged_carrier_fronts_repair_equally_after_reconstruction() {
     let body = payload(105, 4096);
     let files = par3_set("carrier", &[("payload.bin", &body)], 512, 4);
-    for reconstruction in 0..3 {
+    for reconstruction in 0..2 {
         let mut job = damaged_front_job(&files);
         let mut wrong = body.clone();
         wrong[1200] ^= 0x55;
@@ -68,13 +43,6 @@ fn damaged_carrier_fronts_repair_equally_after_reconstruction() {
         bind(&mut job);
         Recovery::refused(&mut job.object, member, ByteRange::new(1024, 1536));
         if reconstruction > 0 {
-            if reconstruction == 2 {
-                // Legacy facts omitted every binding name and capacity.
-                for volume in &mut job.object.volumes {
-                    volume.name = None;
-                    volume.named_blocks = None;
-                }
-            }
             job.object = super::super::facts::par3(&job.object.facts()).unwrap();
             replay(&mut job);
             bind(&mut job);

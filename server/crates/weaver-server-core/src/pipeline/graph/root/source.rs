@@ -13,7 +13,9 @@
 
 mod durable;
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Bound;
 
 use weaver_graph::{ByteRange, Marks, Pull, VolumeIndex};
 
@@ -70,10 +72,84 @@ struct Article {
     encoded_start: u64,
     state: State,
     class: Class,
+    // The copy in hand passed its own checksum. An arrival says so; for an
+    // article an earlier run brought, the decoder's checksums kept for its
+    // range say so. An article placed by order alone keeps none, so the
+    // arrival is its only word.
+    intact: bool,
 }
 
+// The articles not in hand, by volume, filed on the one path that changes a
+// state: a reader asks the volumes that hold them, never walks the articles
+// of every volume. Derived from the states, so a restore rebuilds it by
+// laying the states down again and nothing of it is kept.
 #[derive(Debug, Default)]
+struct Open {
+    // The articles still waited on, by index. A volume with none has no
+    // entry.
+    waiting: BTreeMap<VolumeIndex, BTreeSet<usize>>,
+    // The articles every server failed, by index. A volume with none has no
+    // entry.
+    lost: BTreeMap<VolumeIndex, BTreeSet<usize>>,
+    // The volumes holding a lost article or a short tail not yet told.
+    untold: BTreeSet<VolumeIndex>,
+    // The volumes and articles the readers looked at, for the tests that
+    // hold them to the ones still open.
+    #[cfg(test)]
+    visits: [std::sync::atomic::AtomicUsize; 2],
+}
+
+impl Open {
+    fn file(&mut self, volume: VolumeIndex, index: usize, state: State) {
+        file_in(&mut self.waiting, volume, index, state == State::Waiting);
+        file_in(
+            &mut self.lost,
+            volume,
+            index,
+            matches!(state, State::Lost { .. }),
+        );
+        if state == (State::Lost { damaged: false }) {
+            self.untold.insert(volume);
+        }
+    }
+
+    fn visit(&self, _volumes: usize, _articles: usize) {
+        #[cfg(test)]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            self.visits[0].fetch_add(_volumes, Relaxed);
+            self.visits[1].fetch_add(_articles, Relaxed);
+        }
+    }
+}
+
+fn file_in(
+    sets: &mut BTreeMap<VolumeIndex, BTreeSet<usize>>,
+    volume: VolumeIndex,
+    index: usize,
+    held: bool,
+) {
+    match (sets.entry(volume), held) {
+        (Entry::Vacant(entry), true) => {
+            entry.insert(BTreeSet::from([index]));
+        }
+        (Entry::Occupied(mut entry), true) => {
+            entry.get_mut().insert(index);
+        }
+        (Entry::Occupied(mut entry), false) => {
+            entry.get_mut().remove(&index);
+            if entry.get().is_empty() {
+                entry.remove();
+            }
+        }
+        (Entry::Vacant(_), false) => {}
+    }
+}
+
+#[derive(Debug)]
 struct Volume {
+    // Where the volume is in the post.
+    at: VolumeIndex,
     // In ordinal order.
     articles: Vec<Article>,
     encoded_len: u64,
@@ -99,12 +175,18 @@ struct Volume {
     // The ordinals of the articles arrived at each decoded start. The last
     // of them holds the segments from that start to the next one.
     starts: BTreeMap<u64, BTreeSet<u32>>,
+    // The articles that arrived short of where the bytes after them start,
+    // whose missing tail went to the tree as lost. Not kept: a restored
+    // root tells it again, as it tells every lost article again.
+    cut: BTreeSet<usize>,
+    // The tails found short since the damage was last taken.
+    cuts: Vec<ByteRange>,
     // The chunks of the volume's facts each change touched.
     marks: Marks<Chunk>,
 }
 
 impl Volume {
-    fn new(sizes: &[(u32, u32)]) -> Self {
+    fn new(at: VolumeIndex, sizes: &[(u32, u32)]) -> Self {
         let mut sizes = sizes.to_vec();
         sizes.sort_unstable_by_key(|(ordinal, _)| *ordinal);
         let mut encoded = 0;
@@ -116,12 +198,14 @@ impl Volume {
                     encoded_start: encoded,
                     state: State::Waiting,
                     class: Class::Ordinary,
+                    intact: false,
                 };
                 encoded += u64::from(*bytes);
                 article
             })
             .collect();
         Self {
+            at,
             articles,
             encoded_len: encoded,
             settled_bytes: 0,
@@ -131,14 +215,16 @@ impl Volume {
             parked: BTreeSet::new(),
             ordered_only: false,
             starts: BTreeMap::new(),
+            cut: BTreeSet::new(),
+            cuts: Vec::new(),
             marks: Marks::default(),
         }
     }
 
-    // The one way an article's state changes: its chunk is marked, and a
-    // start it gains or loses moves segments between chunks, so the chunk
-    // they leave and the one they join are marked too.
-    fn set_state(&mut self, index: usize, state: State) {
+    // The one way an article's state changes: it is filed in `open`, its
+    // chunk is marked, and a start it gains or loses moves segments between
+    // chunks, so the chunk they leave and the one they join are marked too.
+    fn set_state(&mut self, open: &mut Open, index: usize, state: State) {
         let Article {
             ordinal,
             state: was,
@@ -147,6 +233,8 @@ impl Volume {
         if was == state {
             return;
         }
+        // Another copy, or none: what its tail lacked is asked again.
+        self.cut.remove(&index);
         if (was == State::Waiting) != (state == State::Waiting) {
             let size = self.encoded_at(index + 1) - self.encoded_at(index);
             self.settled_bytes = match state {
@@ -155,6 +243,7 @@ impl Volume {
             };
         }
         self.articles[index].state = state;
+        open.file(self.at, index, state);
         self.file_parkable(index);
         self.marks.mark(Chunk::Articles(of_ordinal(ordinal)));
         let (from, to) = (start_of(was), start_of(state));
@@ -349,39 +438,30 @@ impl Volume {
         front
     }
 
-    fn waiting(&self) -> bool {
-        self.articles
-            .iter()
-            .any(|article| article.state == State::Waiting)
-    }
-
-    // Whether an article the queue fetches unasked can still arrive.
-    fn to_come(&self) -> bool {
-        self.articles
-            .iter()
-            .any(|article| article.state == State::Waiting && article.class != Class::Parked)
-    }
-
     // Runs of lost articles whose range can now be told: both edges are
     // known, or nothing else in the volume can arrive to tell them better,
     // in which case the run takes its widest bound. In a volume placed only
     // in order, every article after a lost one sits where the order put it,
     // short of the bytes the loss took, so the run's damage reaches the
-    // volume's end, which is told once nothing else can arrive.
-    fn take_damage(&mut self, out: &mut Vec<ByteRange>) {
-        let settled = !self.waiting();
-        let mut index = 0;
-        while index < self.articles.len() {
-            if !matches!(self.articles[index].state, State::Lost { .. }) {
-                index += 1;
-                continue;
+    // volume's end, which is told once nothing else can arrive. The runs are
+    // read off the lost articles `open` files, and the volume leaves the
+    // untold ones once none of its runs waits to be told.
+    fn take_damage(&mut self, open: &mut Open, out: &mut Vec<ByteRange>) {
+        let settled = !open.waiting.contains_key(&self.at);
+        let mut runs = Vec::new();
+        if let Some(lost) = open.lost.get(&self.at) {
+            let mut lost = lost.iter().copied().peekable();
+            while let Some(start) = lost.next() {
+                let mut index = start + 1;
+                while lost.next_if_eq(&index).is_some() {
+                    index += 1;
+                }
+                runs.push((start, index));
             }
-            let start = index;
-            while index < self.articles.len()
-                && matches!(self.articles[index].state, State::Lost { .. })
-            {
-                index += 1;
-            }
+        }
+        let mut untold = false;
+        for (start, index) in runs {
+            open.visit(0, index - start);
             let fresh = self.articles[start..index]
                 .iter()
                 .any(|article| article.state == State::Lost { damaged: false });
@@ -392,7 +472,11 @@ impl Volume {
             let told = !self.ordered_only
                 && self.known.contains_key(&start)
                 && self.known.contains_key(&end);
-            if !fresh || !(told || settled) {
+            if !fresh {
+                continue;
+            }
+            if !(told || settled) {
+                untold = true;
                 continue;
             }
             let range = ByteRange::new(self.bounds(start).0, self.bounds(end).1);
@@ -400,8 +484,40 @@ impl Volume {
                 out.push(range);
             }
             for at in start..index {
-                self.set_state(at, State::Lost { damaged: true });
+                self.set_state(open, at, State::Lost { damaged: true });
             }
+        }
+        out.append(&mut self.cuts);
+        if !untold {
+            open.untold.remove(&self.at);
+        }
+    }
+
+    // The tail of an article that arrived short: one whose bytes end before
+    // the boundary after it, which its own header, the next article's
+    // begin or the file's declared end tells, lost the bytes between, and
+    // they are told as a lost article's are, for every recovery kind and
+    // every store alike. Told once both edges are in hand; a volume placed
+    // only in order has no edge but its order, so nothing there is short of
+    // anything.
+    fn cut_after(&mut self, open: &mut Open, index: usize) {
+        if self.ordered_only || self.cut.contains(&index) {
+            return;
+        }
+        let Some(State::Arrived(Some(range))) =
+            self.articles.get(index).map(|article| article.state)
+        else {
+            return;
+        };
+        if let Some(end) = self
+            .known
+            .get(&(index + 1))
+            .copied()
+            .filter(|end| *end > range.end)
+        {
+            self.cuts.push(ByteRange::new(range.end, end));
+            self.cut.insert(index);
+            open.untold.insert(self.at);
         }
     }
 }
@@ -409,30 +525,70 @@ impl Volume {
 #[derive(Debug, Default)]
 pub(crate) struct ArticleMap {
     volumes: Vec<Volume>,
+    open: Open,
     moves: Vec<Move>,
 }
 
 impl ArticleMap {
     // One entry per volume, in volume order: each article's ordinal and the
-    // encoded size the post declares for it.
+    // encoded size the post declares for it. Every article waits.
     pub(crate) fn new(volumes: &[Vec<(u32, u32)>]) -> Self {
+        let volumes: Vec<Volume> = volumes
+            .iter()
+            .zip(0u32..)
+            .map(|(sizes, at)| Volume::new(VolumeIndex(at), sizes))
+            .collect();
+        let waiting = volumes
+            .iter()
+            .filter(|found| !found.articles.is_empty())
+            .map(|found| (found.at, (0..found.articles.len()).collect()))
+            .collect();
         Self {
-            volumes: volumes.iter().map(|sizes| Volume::new(sizes)).collect(),
+            volumes,
+            open: Open {
+                waiting,
+                ..Open::default()
+            },
             moves: Vec::new(),
         }
     }
 
-    // An article was decoded and placed at `range`.
-    pub(crate) fn arrived(&mut self, volume: VolumeIndex, ordinal: u32, range: ByteRange) {
+    // The volumes and articles the readers looked at since the last call.
+    #[cfg(test)]
+    pub(crate) fn visits(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let [volumes, articles] = &self.open.visits;
+        (volumes.swap(0, Relaxed), articles.swap(0, Relaxed))
+    }
+
+    // An article was decoded and placed at `range`, `intact` when it passed
+    // its own checksum. Where the next one begins is what its header
+    // declares, never where its bytes ended: a damaged body can decode
+    // longer or shorter than its part.
+    pub(crate) fn arrived(
+        &mut self,
+        volume: VolumeIndex,
+        ordinal: u32,
+        range: ByteRange,
+        declared_end: Option<u64>,
+        intact: bool,
+    ) {
         let Some(found) = self.volumes.get_mut(volume.0 as usize) else {
             return;
         };
         let Some(index) = found.index(ordinal) else {
             return;
         };
-        found.set_state(index, State::Arrived(Some(range)));
+        found.articles[index].intact = intact;
+        found.set_state(&mut self.open, index, State::Arrived(Some(range)));
         found.know(index, range.start);
-        found.know(index + 1, range.end);
+        if let Some(end) = declared_end {
+            found.know(index + 1, end);
+        }
+        if let Some(before) = index.checked_sub(1) {
+            found.cut_after(&mut self.open, before);
+        }
+        found.cut_after(&mut self.open, index);
     }
 
     // The file's decoded length, which the first decoded article declares.
@@ -440,6 +596,9 @@ impl ArticleMap {
         if let Some(found) = self.volumes.get_mut(volume.0 as usize) {
             let end = found.articles.len();
             found.know(end, length);
+            if let Some(last) = end.checked_sub(1) {
+                found.cut_after(&mut self.open, last);
+            }
         }
     }
 
@@ -447,6 +606,17 @@ impl ArticleMap {
         if let Some(found) = self.volumes.get_mut(volume.0 as usize) {
             found.ordered_only = true;
         }
+    }
+
+    // Whether this run holds an intact copy of the article that no seek has
+    // sent back for: that copy stands, and a further one brings nothing.
+    pub(crate) fn holds_intact(&self, volume: VolumeIndex, ordinal: u32) -> bool {
+        self.volumes.get(volume.0 as usize).is_some_and(|found| {
+            found.index(ordinal).is_some_and(|index| {
+                let article = found.articles[index];
+                article.intact && matches!(article.state, State::Arrived(Some(_)))
+            })
+        })
     }
 
     // Every server failed the article.
@@ -457,7 +627,7 @@ impl ArticleMap {
         if let Some(index) = found.index(ordinal)
             && found.articles[index].state == State::Waiting
         {
-            found.set_state(index, State::Lost { damaged: false });
+            found.set_state(&mut self.open, index, State::Lost { damaged: false });
         }
     }
 
@@ -468,7 +638,7 @@ impl ArticleMap {
             for at in 0..found.articles.len() {
                 let article = found.articles[at];
                 if article.state == State::Waiting && !queued(volume, article.ordinal) {
-                    found.set_state(at, State::Arrived(None));
+                    found.set_state(&mut self.open, at, State::Arrived(None));
                 }
             }
         }
@@ -487,13 +657,12 @@ impl ArticleMap {
     // Every article every server failed, with the encoded size the post
     // declares for it.
     pub(crate) fn lost_articles(&self) -> impl Iterator<Item = (VolumeIndex, u32, u64)> + '_ {
-        self.volumes.iter().zip(0u32..).flat_map(|(found, volume)| {
-            (0..found.articles.len())
-                .filter(|at| matches!(found.articles[*at].state, State::Lost { .. }))
-                .map(move |at| {
-                    let size = found.encoded_at(at + 1) - found.encoded_at(at);
-                    (VolumeIndex(volume), found.articles[at].ordinal, size)
-                })
+        self.open.lost.iter().flat_map(|(volume, lost)| {
+            let found = &self.volumes[volume.0 as usize];
+            lost.iter().map(move |at| {
+                let size = found.encoded_at(at + 1) - found.encoded_at(*at);
+                (*volume, found.articles[*at].ordinal, size)
+            })
         })
     }
 
@@ -549,39 +718,75 @@ impl ArticleMap {
     }
 
     pub(crate) fn volume_waiting(&self, volume: VolumeIndex) -> bool {
-        self.volumes
-            .get(volume.0 as usize)
-            .is_some_and(Volume::waiting)
+        self.open.visit(1, 0);
+        self.open.waiting.contains_key(&volume)
     }
 
     // Whether every article of the volume is in hand: none waits and every
     // server failed none.
     pub(crate) fn volume_whole(&self, volume: VolumeIndex) -> bool {
-        self.volumes.get(volume.0 as usize).is_some_and(|found| {
-            found
-                .articles
-                .iter()
-                .all(|article| matches!(article.state, State::Arrived(_)))
-        })
+        self.open.visit(1, 0);
+        (volume.0 as usize) < self.volumes.len()
+            && !self.open.waiting.contains_key(&volume)
+            && !self.open.lost.contains_key(&volume)
     }
 
+    // Whether an article the queue fetches unasked can still arrive: one
+    // waits that is not parked.
     pub(crate) fn volume_to_come(&self, volume: VolumeIndex) -> bool {
+        self.open
+            .waiting
+            .get(&volume)
+            .is_some_and(|waiting| self.to_come(volume, waiting))
+    }
+
+    // The volumes with an article the queue fetches unasked still to come,
+    // in volume order.
+    pub(crate) fn coming(&self) -> impl Iterator<Item = VolumeIndex> + '_ {
+        self.open
+            .waiting
+            .iter()
+            .filter(|(volume, waiting)| self.to_come(**volume, waiting))
+            .map(|(volume, _)| *volume)
+    }
+
+    // The volumes with an article still waited on, parked or not, in
+    // volume order.
+    pub(crate) fn waiting_volumes(&self) -> impl Iterator<Item = VolumeIndex> + '_ {
+        self.open
+            .waiting
+            .keys()
+            .inspect(|_| self.open.visit(1, 0))
+            .copied()
+    }
+
+    // Parked articles are waiting ones, so the volume has one to come
+    // unasked when it waits on more than it parked.
+    fn to_come(&self, volume: VolumeIndex, waiting: &BTreeSet<usize>) -> bool {
+        self.open.visit(1, 0);
         self.volumes
             .get(volume.0 as usize)
-            .is_some_and(Volume::to_come)
+            .is_some_and(|found| waiting.len() > found.parked.len())
     }
 
-    // The ranges of lost articles that can now be marked damaged.
+    // The ranges of lost articles that can now be marked damaged: only the
+    // volumes holding one not yet told are visited.
     pub(crate) fn take_damage(&mut self, out: &mut Vec<(VolumeIndex, ByteRange)>) {
         let mut ranges = Vec::new();
-        for (index, found) in self.volumes.iter_mut().enumerate() {
+        let mut next = self.open.untold.first().copied();
+        while let Some(volume) = next {
+            self.open.visit(1, 0);
             ranges.clear();
-            found.take_damage(&mut ranges);
-            out.extend(
-                ranges
-                    .iter()
-                    .map(|range| (VolumeIndex(index as u32), *range)),
-            );
+            if let Some(found) = self.volumes.get_mut(volume.0 as usize) {
+                found.take_damage(&mut self.open, &mut ranges);
+            }
+            out.extend(ranges.iter().map(|range| (volume, *range)));
+            next = self
+                .open
+                .untold
+                .range((Bound::Excluded(volume), Bound::Unbounded))
+                .next()
+                .copied();
         }
     }
 

@@ -50,15 +50,17 @@ impl Object for Based {
             self.base = name.strip_suffix(".rar").map(str::to_owned);
         }
     }
-    fn claim(&mut self, name: &str, _: &[u8], _: Option<u64>) -> Option<VolumeIndex> {
-        let (base, extension) = name.rsplit_once('.')?;
+    fn claim(&mut self, name: &str, _: &[u8], _: Option<u64>) -> Vec<VolumeIndex> {
+        let Some((base, extension)) = name.rsplit_once('.') else {
+            return Vec::new();
+        };
         if Some(base) != self.base.as_deref() {
-            return None;
+            return Vec::new();
         }
         match extension {
-            "r00" => Some(VolumeIndex(1)),
-            "r01" => Some(VolumeIndex(2)),
-            _ => None,
+            "r00" => vec![VolumeIndex(1)],
+            "r01" => vec![VolumeIndex(2)],
+            _ => Vec::new(),
         }
     }
 }
@@ -82,7 +84,7 @@ fn post(tree: &mut Tree, name: &str, bytes: &'static [u8]) -> MemberId {
         member,
         Posted {
             offset: 0,
-            bytes: Bytes::from_static(bytes),
+            bytes: Bytes::from_static(bytes).into(),
             provenance: Provenance::Fresh,
         },
         &mut Stores,

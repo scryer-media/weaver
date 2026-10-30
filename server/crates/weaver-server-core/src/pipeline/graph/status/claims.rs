@@ -21,7 +21,7 @@ const EVIDENCE_PERCENT: u64 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Claim {
-    // Covered at its length, every byte clean.
+    // Whole: closed at its length, every byte clean.
     Complete,
     // Every byte is accounted for and some of it is damaged. Delivered as
     // it stands.
@@ -31,10 +31,12 @@ pub(crate) enum Claim {
 }
 
 impl Claim {
+    // Only a whole member is usable: one covered and clean that nothing
+    // closed, neither its producer nor a set's proof, was never checked.
     pub(crate) fn of(member: &Member) -> Self {
         let damaged = damaged_bytes(member);
         match member.length {
-            Some(_) if member.is_complete() && damaged == 0 => Self::Complete,
+            Some(_) if member.is_whole() => Self::Complete,
             Some(_) if member.is_complete() => Self::Damaged { bytes: damaged },
             length => Self::Missing {
                 bytes: length
@@ -256,11 +258,13 @@ impl Delivery {
                     .chain(&self.unnamed)
                     .map(String::as_str)
                     .collect();
-                format!(
-                    "no file was delivered whole; {} short: {}",
-                    short.len(),
-                    short.join(", ")
-                )
+                match short.len() {
+                    0 => "no file was delivered whole".to_owned(),
+                    count => format!(
+                        "no file was delivered whole; {count} short: {}",
+                        short.join(", ")
+                    ),
+                }
             }
         };
         JobStatus::Failed { error }

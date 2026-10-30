@@ -128,7 +128,7 @@ fn deliver(tree: &mut Tree, member: MemberId, offset: u64, bytes: &[u8]) {
         member,
         Posted {
             offset,
-            bytes: Bytes::copy_from_slice(bytes),
+            bytes: Bytes::copy_from_slice(bytes).into(),
             provenance: Provenance::Fresh,
         },
         &mut Sets,
@@ -147,7 +147,7 @@ fn store_on(tree: &mut Tree, show: MemberId) -> NodeId {
 }
 
 // A set posted at the root under `name`.
-pub(super) fn posted(tree: &mut Tree, name: &str) -> NodeId {
+fn posted(tree: &mut Tree, name: &str) -> NodeId {
     let member = tree.announce_root(name, None, &mut Vec::new());
     // A PAR2 packet header stating its own length, followed by nothing.
     let mut header = b"PAR2\0PKT".to_vec();
@@ -200,7 +200,7 @@ fn every_namespace_lists_the_sets_a_walk_finds_after_each_change() {
 
     // The store's member starts over: the store and both windows go, and
     // the set is homed where it was posted again.
-    tree.retract(NodeId::ROOT, show, &mut Sets, &mut Vec::new());
+    tree.retract(NodeId::ROOT, show, &mut Vec::new());
     listed_as_walked(&tree);
     assert_eq!(tree.recovery_nodes(NodeId::ROOT), vec![set]);
 
@@ -228,4 +228,54 @@ fn a_rebuilt_tree_lists_its_sets_again() {
     let rebuilt = Tree::rebuild(&tree.records(), &Sets).expect("the tree rebuilds");
     listed_as_walked(&rebuilt);
     assert_eq!(rebuilt.recovery_nodes(NodeId::ROOT), vec![set, inside]);
+}
+
+// A set's marks say what changed, not what was asked. A question changes
+// nothing and marks nothing; what the set is told marks its own row and
+// leaves its home alone unless a member there changed; a volume filed marks
+// both.
+#[test]
+fn a_set_is_marked_where_it_changes_not_where_it_is_asked() {
+    let mut tree = Tree::new();
+    let leaf = tree.announce_root("show.bin", None, &mut Vec::new());
+    deliver(&mut tree, leaf, 0, b"plain bytes, no signature");
+    let set = posted(&mut tree, "show.par2");
+    let marked = |tree: &Tree, at: u64| tree.marked_since(at).collect::<BTreeSet<Mark>>();
+
+    let at = tree.generation();
+    let covered = tree.consult_recovery(set, |recovery, namespace| {
+        namespace
+            .members()
+            .filter(|member| recovery.covers(member.id))
+            .count()
+    });
+    assert_eq!(covered, Some(0));
+    assert_eq!(
+        marked(&tree, at),
+        BTreeSet::new(),
+        "a question marks nothing"
+    );
+
+    let at = tree.generation();
+    tree.with_recovery(set, |recovery, _| recovery.feed(leaf, &[]));
+    assert_eq!(
+        marked(&tree, at),
+        BTreeSet::from([Mark::Node(set)]),
+        "told something, the set alone is marked"
+    );
+
+    let at = tree.generation();
+    let (home, volumes) = tree.volumes(set).expect("the set is bound");
+    let volume = volumes[&VolumeIndex(0)];
+    assert_eq!(home, NodeId::ROOT);
+    deliver(&mut tree, volume, 64, &[0; 16]);
+    let after = marked(&tree, at);
+    assert!(
+        after.contains(&Mark::Node(set)),
+        "a volume filed marks the set: {after:?}"
+    );
+    assert!(
+        after.contains(&Mark::Members(NodeId::ROOT)),
+        "and its home: {after:?}"
+    );
 }

@@ -14,16 +14,15 @@
 // member posted more than once answers for it: the member is every file
 // one of its postings is.
 
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 
-use par2_rs::checksum::md5;
 use par2_rs::{FileDescription, FileId, Par2FileSet};
 use weaver_graph::{Member, MemberId, Namespace, ObjectId};
 
-use super::sets::Length;
-
-// PAR2 identifies a file by the MD5 of at most this much of its front.
-const HASH_WINDOW: u64 = 16 * 1024;
+use super::sets::{Front, Length, SetState};
 
 // One member as the rules see it.
 struct Candidate<'a> {
@@ -34,10 +33,15 @@ struct Candidate<'a> {
     // The furthest byte seen so far.
     seen: u64,
     first_bytes: &'a [u8],
+    // Its front as PAR2 names files: the one kept for the same front, or
+    // hashed once, when a set first asks.
+    front: OnceCell<Option<Front>>,
+    #[cfg(test)]
+    hashed: Cell<usize>,
 }
 
 impl<'a> Candidate<'a> {
-    fn of(member: &'a Member, first_bytes: &'a [u8]) -> Self {
+    fn of(member: &'a Member, first_bytes: &'a [u8], kept: Option<Option<Front>>) -> Self {
         Self {
             name: &member.name,
             complete: member
@@ -61,6 +65,9 @@ impl<'a> Candidate<'a> {
                 .max()
                 .unwrap_or(0),
             first_bytes,
+            front: kept.map(OnceCell::from).unwrap_or_default(),
+            #[cfg(test)]
+            hashed: Cell::new(0),
         }
     }
 
@@ -72,27 +79,52 @@ impl<'a> Candidate<'a> {
         }
     }
 
-    // The MD5 of the description's hash window, if the front reaches it.
-    fn window_hash(&self, length: u64) -> Option<[u8; 16]> {
-        let window = usize::try_from(length.min(HASH_WINDOW)).ok()?;
-        (window > 0 && self.first_bytes.len() >= window).then(|| md5(&self.first_bytes[..window]))
+    fn front(&self) -> Option<Front> {
+        *self.front.get_or_init(|| {
+            #[cfg(test)]
+            self.hashed
+                .set(self.hashed.get() + usize::from(!self.first_bytes.is_empty()));
+            Front::of(self.first_bytes)
+        })
     }
 }
 
 // The members a set's index named, by file.
 type Bindings = BTreeMap<FileId, MemberId>;
 
-// The bindings of each set over the namespace, and each complete member no
-// set matched, with the length it has of its own: one whose front could not
-// name it, which a repair may still know by its slices or by elimination.
+// Each posting's front as PAR2 names files, under the stamp of the front
+// it was hashed from.
+pub(super) type Fronts = BTreeMap<MemberId, (u64, Option<Front>)>;
+
+// What binding the sets over the namespace came to.
+pub(super) struct Bound {
+    // Each set's bindings, in the order the sets were given.
+    pub(super) sets: Vec<Bindings>,
+    // Each complete member no set matched, with the length it has of its
+    // own: one whose front could not name it, which a repair may still
+    // know by its slices or by elimination.
+    pub(super) unnamed: Vec<(MemberId, Length)>,
+    // How many fronts the binding hashed.
+    #[cfg(test)]
+    pub(super) digests: usize,
+}
+
+// Bind each set over the namespace: a set whose index is not usable binds
+// nothing. `fronts` is what the last binding hashed: a front whose stamp
+// is unchanged is not hashed again, and what this binding hashed replaces
+// it.
 pub(super) fn bind_sets(
-    indexes: &[&Par2FileSet],
+    sets: &[&SetState],
     namespace: &Namespace,
     own: ObjectId,
-) -> (Vec<Bindings>, Vec<(MemberId, Length)>) {
+    fronts: &mut Fronts,
+) -> Bound {
     let mut claims: Vec<BTreeMap<FileId, Vec<(MemberId, bool)>>> =
-        vec![BTreeMap::new(); indexes.len()];
+        vec![BTreeMap::new(); sets.len()];
     let mut complete = BTreeMap::new();
+    let last = std::mem::take(fronts);
+    #[cfg(test)]
+    let mut digests = 0;
     for posting in namespace.records() {
         let member = namespace.resolve(posting.id);
         if namespace
@@ -101,15 +133,20 @@ pub(super) fn bind_sets(
         {
             continue;
         }
-        let candidate = Candidate::of(posting, namespace.first_bytes(posting.id));
+        let (stamp, first_bytes) = namespace.stamped_front(posting.id);
+        let kept = last
+            .get(&posting.id)
+            .filter(|(hashed, _)| *hashed == stamp)
+            .map(|(_, front)| *front);
+        let candidate = Candidate::of(posting, first_bytes, kept);
         if member == posting.id
             && let Some(length) = candidate.complete
         {
             complete.insert(member, length);
         }
         let mut first = None;
-        for (at, index) in indexes.iter().enumerate() {
-            if let Some((file, content)) = match_member(index, &candidate) {
+        for (at, state) in sets.iter().enumerate() {
+            if let Some((file, content)) = match_member(state, &candidate) {
                 if content {
                     first = Some((at, (file, content)));
                     break;
@@ -124,6 +161,13 @@ pub(super) fn bind_sets(
             } else {
                 claimants.push((member, content));
             }
+        }
+        if let Some(front) = candidate.front.get() {
+            fronts.insert(posting.id, (stamp, *front));
+        }
+        #[cfg(test)]
+        {
+            digests += candidate.hashed.get();
         }
     }
     let bound: Vec<Bindings> = claims
@@ -152,12 +196,18 @@ pub(super) fn bind_sets(
     }
     // A conflicting name did not identify the member. Keep it available
     // for slice verification and elimination alongside unmatched members.
-    (bound, complete.into_iter().collect())
+    Bound {
+        sets: bound,
+        unnamed: complete.into_iter().collect(),
+        #[cfg(test)]
+        digests,
+    }
 }
 
 // The file the member is, by its content first and its name after.
-fn match_member(index: &Par2FileSet, candidate: &Candidate<'_>) -> Option<(FileId, bool)> {
-    match by_content(index, candidate) {
+fn match_member(state: &SetState, candidate: &Candidate<'_>) -> Option<(FileId, bool)> {
+    let index = state.usable()?;
+    match by_content(state, index, candidate) {
         ContentMatch::Unique(file) => return Some((file, true)),
         ContentMatch::Ambiguous(files) => {
             let mut named = files.into_iter().filter(|file| {
@@ -214,16 +264,25 @@ enum ContentMatch {
     Ambiguous(Vec<FileId>),
 }
 
-fn by_content(index: &Par2FileSet, candidate: &Candidate<'_>) -> ContentMatch {
-    let matches = described(index, |description| {
-        !candidate.contradicts(description.length)
-            && !is_split_fragment_of(candidate.name, &description.filename)
-            && candidate.window_hash(description.length) == Some(description.hash_16k)
-    });
+fn by_content(state: &SetState, index: &Par2FileSet, candidate: &Candidate<'_>) -> ContentMatch {
+    let Some(front) = candidate.front() else {
+        return ContentMatch::Inconclusive;
+    };
+    let matches: Vec<FileId> = state
+        .fronted(&front)
+        .iter()
+        .copied()
+        .filter(|file| {
+            index.file_description(file).is_some_and(|description| {
+                !candidate.contradicts(description.length)
+                    && !is_split_fragment_of(candidate.name, &description.filename)
+            })
+        })
+        .collect();
     match matches.as_slice() {
-        [(file, _)] => ContentMatch::Unique(*file),
+        [file] => ContentMatch::Unique(*file),
         [] => ContentMatch::Inconclusive,
-        _ => ContentMatch::Ambiguous(matches.into_iter().map(|(file, _)| file).collect()),
+        _ => ContentMatch::Ambiguous(matches),
     }
 }
 
@@ -246,4 +305,78 @@ fn is_split_fragment_of(candidate_name: &str, described_name: &str) -> bool {
         .is_some_and(|extension| {
             !extension.is_empty() && extension.as_bytes().iter().all(u8::is_ascii_digit)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use weaver_graph::{MemberId, ObjectId, Provenance, Recovery};
+
+    use super::super::Par2;
+    use crate::testing::{Job, par2_set, payload};
+
+    const OWN: ObjectId = ObjectId(7);
+    const FILES: usize = 50;
+
+    // The described name of the file a set bound `member` to.
+    fn bound_name(job: &Job<Par2>, member: MemberId) -> Option<String> {
+        job.object.sets.values().find_map(|state| {
+            let file = state.bound(member)?;
+            Some(state.usable()?.file_description(&file)?.filename.clone())
+        })
+    }
+
+    // Fifty files of one length, posted under names that are not theirs:
+    // only their fronts can bind them, and no length rules any out. Each
+    // front is hashed once, not once per description, and not again by a
+    // later bind while it stands.
+    #[test]
+    fn a_bind_hashes_each_front_once() {
+        let files: Vec<(String, Vec<u8>)> = (0..FILES)
+            .map(|at| (format!("file{at:02}.bin"), payload(at as u64 + 1, 2048)))
+            .collect();
+        let described: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+            .collect();
+        let mut job = Job::new(Par2::new(OWN), OWN);
+        for (name, bytes) in par2_set("set", &described, 512, 1, 1) {
+            job.volume(&name, &bytes, 700, false);
+        }
+        let members: Vec<_> = files
+            .iter()
+            .enumerate()
+            .map(|(at, (_, bytes))| job.member(&format!("posted{at:02}.dat"), bytes))
+            .collect();
+        for call in 1..=2 {
+            job.object.bind(&mut job.namespace, &mut Vec::new());
+            assert_eq!(job.object.digests, FILES, "bind call {call}");
+        }
+        for (member, (name, _)) in members.iter().zip(&files) {
+            assert!(job.object.covers(*member));
+            assert_eq!(&job.namespace.get(*member).unwrap().name, name);
+        }
+    }
+
+    // A repair that writes a front again is a new front, even over an
+    // earlier repair of the same range: it is hashed again, once, and the
+    // member is the file its new front says.
+    #[test]
+    fn a_repaired_front_is_hashed_again_once() {
+        let (a, b) = (payload(1, 2048), payload(2, 2048));
+        let mut job = Job::new(Par2::new(OWN), OWN);
+        for (name, bytes) in par2_set("set", &[("a.bin", &a), ("b.bin", &b)], 512, 1, 1) {
+            job.volume(&name, &bytes, 700, false);
+        }
+        let member = job.member("posted.dat", &a);
+        let bind = |job: &mut Job<Par2>| {
+            job.object.bind(&mut job.namespace, &mut Vec::new());
+            (job.object.digests, bound_name(job, member))
+        };
+        assert_eq!(bind(&mut job), (1, Some("a.bin".to_owned())));
+        job.arrive(member, 0, &b, Provenance::Repaired);
+        assert_eq!(bind(&mut job), (2, Some("b.bin".to_owned())));
+        job.arrive(member, 0, &a, Provenance::Repaired);
+        assert_eq!(bind(&mut job), (3, Some("a.bin".to_owned())));
+        assert_eq!(bind(&mut job), (3, Some("a.bin".to_owned())));
+    }
 }

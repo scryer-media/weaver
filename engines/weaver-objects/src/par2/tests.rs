@@ -3,6 +3,7 @@
 
 mod carriers;
 mod facts;
+mod per_call;
 mod recovery_contracts;
 
 use weaver_graph::recovery::RepairOutcome;
@@ -127,7 +128,7 @@ fn delayed_slice_checksums_repair_with_only_the_needed_blocks() {
                 weaver_graph::Delivery {
                     volume: volumes[index],
                     offset: 0,
-                    bytes: &bytes[..end],
+                    bytes: &weaver_graph::Evidenced::from(bytes[..end].to_vec()),
                     provenance: Provenance::Fresh,
                 },
                 &mut |_, _| false,
@@ -152,7 +153,7 @@ fn delayed_slice_checksums_repair_with_only_the_needed_blocks() {
             weaver_graph::Delivery {
                 volume: volumes[delayed],
                 offset: boundary as u64,
-                bytes: &checksums,
+                bytes: &weaver_graph::Evidenced::from(checksums.to_vec()),
                 provenance: Provenance::Fresh,
             },
             &mut |_, _| false,
@@ -788,7 +789,7 @@ fn a_volume_bound_after_an_unread_ruling_reopens_the_set() {
             weaver_graph::Delivery {
                 volume,
                 offset: at as u64 * ARTICLE,
-                bytes: piece,
+                bytes: &weaver_graph::Evidenced::from(piece.to_vec()),
                 provenance: Provenance::Fresh,
             },
             &mut |_, _| false,
@@ -839,7 +840,7 @@ fn a_short_set_waits_until_the_blocks_it_needs_are_in_hand() {
             weaver_graph::Delivery {
                 volume,
                 offset: index as u64 * ARTICLE,
-                bytes: piece,
+                bytes: &weaver_graph::Evidenced::from(piece.to_vec()),
                 provenance: Provenance::Fresh,
             },
             &mut |_, _| false,
@@ -882,7 +883,7 @@ fn an_object_with_no_sets_rules_unread_once_a_volume_is_read_through() {
         weaver_graph::Delivery {
             volume,
             offset: 0,
-            bytes: header,
+            bytes: &weaver_graph::Evidenced::from(header.to_vec()),
             provenance: Provenance::Fresh,
         },
         &mut |_, _| false,
@@ -915,6 +916,7 @@ fn a_lost_article_inside_a_volume_keeps_the_packets_past_it() {
     let volume = job
         .object
         .claim(name, &bytes[..64], None)
+        .pop()
         .expect("a PAR2 volume");
     let lost = ByteRange::at(ARTICLE, ARTICLE);
     let mut out = Vec::new();
@@ -927,7 +929,7 @@ fn a_lost_article_inside_a_volume_keeps_the_packets_past_it() {
             weaver_graph::Delivery {
                 volume,
                 offset,
-                bytes: piece,
+                bytes: &weaver_graph::Evidenced::from(piece.to_vec()),
                 provenance: Provenance::Fresh,
             },
             &mut |_, _| false,
@@ -1374,7 +1376,7 @@ fn head(job: &mut Job<Par2>, file: &(String, Vec<u8>)) -> weaver_graph::VolumeIn
         weaver_graph::Delivery {
             volume,
             offset: 0,
-            bytes: &file.1[..end],
+            bytes: &weaver_graph::Evidenced::from(file.1[..end].to_vec()),
             provenance: Provenance::Fresh,
         },
         &mut |_, _| false,
@@ -1537,7 +1539,7 @@ fn deliver_articles(
             weaver_graph::Delivery {
                 volume,
                 offset,
-                bytes: &piece,
+                bytes: &weaver_graph::Evidenced::from(piece.to_vec()),
                 provenance,
             },
             &mut |_, _| false,
@@ -1579,7 +1581,9 @@ fn redeliver(object: &mut Par2, volume: weaver_graph::VolumeIndex, bytes: &[u8],
         weaver_graph::Delivery {
             volume,
             offset: range.start,
-            bytes: &bytes[range.start as usize..range.end as usize],
+            bytes: &weaver_graph::Evidenced::from(
+                bytes[range.start as usize..range.end as usize].to_vec(),
+            ),
             provenance: Provenance::Fresh,
         },
         &mut |_, _| false,
@@ -2133,13 +2137,94 @@ fn changed_input_invalidates_clean_par2_ruling() {
     job.object
         .feed_proven(member, &segments(0, &data, ARTICLE, BLOCK, true));
     assert_eq!(job.object.outcome(), repaired);
-    job.object
-        .uncovered(member, ByteRange::new(BLOCK, 2 * BLOCK));
+    feed(&mut job, member, &data, None);
+    assert_eq!(
+        job.object.outcome(),
+        repaired,
+        "the bytes it proved, said again, keep the proof"
+    );
+    feed(
+        &mut job,
+        member,
+        &data,
+        Some(ByteRange::new(BLOCK, 2 * BLOCK)),
+    );
     assert_eq!(
         job.object.outcome(),
         None,
-        "missing replay cannot revive a proof"
+        "a range said again damaged takes the proof back"
     );
+}
+
+// A set under the tree that repaired a member, as a restart finds it: the
+// set's node, the member, and its bytes as the repair left them.
+fn repaired_under_tree() -> (weaver_graph::Tree, weaver_graph::NodeId, MemberId, Vec<u8>) {
+    use bytes::Bytes;
+    use weaver_graph::{NodeId, Posted, Tree};
+    let data = payload(97, 4 * BLOCK as usize);
+    let mut tree = Tree::new();
+    let mut effects = Vec::new();
+    let mut store = crate::testing::Store::default();
+    let mut post = |tree: &mut Tree, name: &str, bytes: &[u8]| {
+        let member = tree.announce_root(name, Some(bytes.len() as u64), &mut effects);
+        tree.deliver(
+            NodeId::ROOT,
+            member,
+            Posted {
+                offset: 0,
+                bytes: Bytes::copy_from_slice(bytes).into(),
+                provenance: Provenance::Fresh,
+            },
+            &mut crate::Objects::default(),
+            &mut effects,
+        );
+        member
+    };
+    let mut set = None;
+    for (name, bytes) in &par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1) {
+        let volume = post(&mut tree, name, bytes);
+        let (node, index) = tree.child_of(NodeId::ROOT, volume).expect("a set volume");
+        set = Some(node);
+        store.volumes.insert(index, bytes.clone());
+    }
+    let set = set.expect("a set");
+    let mut wrong = data.clone();
+    wrong[BLOCK as usize + 3] ^= 0x5a;
+    let member = post(&mut tree, "payload.bin", &wrong);
+    store.members.insert(member, wrong.clone());
+    tree.with_recovery(set, |recovery, namespace| {
+        recovery.bind(namespace, &mut Vec::new());
+    });
+    let bad = ByteRange::new(0, ARTICLE);
+    let mut pieces = segments(0, &wrong, ARTICLE, BLOCK, true);
+    for piece in &mut pieces {
+        piece.verified = piece.range.intersect(bad).is_none();
+    }
+    tree.feed(set, member, &pieces);
+    assert_eq!(
+        tree.with_recovery(set, |recovery, _| {
+            recovery.repair(&mut store, weaver_graph::Budget::default())
+        }),
+        Some(RepairOutcome::Repaired { slices: 1 })
+    );
+    assert_eq!(store.members[&member], data);
+    tree.feed_proven(set, member, &segments(0, &data, ARTICLE, BLOCK, true));
+    (tree, set, member, data)
+}
+
+#[test]
+fn a_restore_that_says_its_posted_bytes_again_keeps_the_par2_ruling_it_applied() {
+    let (mut tree, set, member, data) = repaired_under_tree();
+    let repaired = Some(RepairOutcome::Repaired { slices: 1 });
+    let outcome = |tree: &weaver_graph::Tree| tree.recovery(set).and_then(|set| set.outcome());
+    tree.uncover(
+        weaver_graph::NodeId::ROOT,
+        VolumeIndex(member.0),
+        ByteRange::new(0, data.len() as u64),
+    );
+    assert_eq!(outcome(&tree), repaired, "unknown input says nothing");
+    tree.feed(set, member, &segments(0, &data, ARTICLE, BLOCK, true));
+    assert_eq!(outcome(&tree), repaired, "the same bytes said again");
 }
 
 #[test]

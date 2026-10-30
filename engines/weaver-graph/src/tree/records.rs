@@ -9,9 +9,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{Binding, Node, NodeId, Nodes, Tree};
+use super::{Binding, Mark, Node, NodeId, Nodes, Tree};
+use crate::deliver::Handed;
 use crate::facts::{Restore, RestoreError};
-use crate::member::{Coverage, Member};
+use crate::member::{Coverage, Member, MemberId};
 use crate::records::{CoverageRecord, MemberRecord, NodeRecord, NodeState, TreeRecord};
 use crate::volume::{ByteRange, VolumeIndex};
 
@@ -37,6 +38,14 @@ impl Tree {
 
     // The nodes changed since generation `at`, a node gone since among them.
     pub fn changed_since(&self, at: u64) -> impl Iterator<Item = NodeId> + '_ {
+        self.nodes.changed_since(at).map(|mark| match mark {
+            Mark::Node(node) | Mark::Members(node) => node,
+        })
+    }
+
+    // What changed since generation `at`: a node's own record, or which of
+    // its members its namespace names since the generation it gave last.
+    pub fn marked_since(&self, at: u64) -> impl Iterator<Item = Mark> + '_ {
         self.nodes.changed_since(at)
     }
 
@@ -45,13 +54,44 @@ impl Tree {
         Some(self.node_record(node, self.nodes.get(&node)?))
     }
 
+    // One node's own record, its members and their coverage left out.
+    pub fn own_record(&self, node: NodeId) -> Option<NodeRecord> {
+        Some(self.own_node_record(node, self.nodes.get(&node)?))
+    }
+
+    // One member's record and its coverage, `None` for a member the node
+    // does not have.
+    pub fn member_record(
+        &self,
+        node: NodeId,
+        member: MemberId,
+    ) -> Option<(MemberRecord, Vec<CoverageRecord>)> {
+        let found = self.nodes.get(&node)?;
+        let member = found.namespace.get(member)?;
+        Some((
+            self.member_of(node, found, member),
+            coverage_of(member).collect(),
+        ))
+    }
+
     pub fn next_node(&self) -> u32 {
         self.next_node
     }
 
     fn node_record(&self, node: NodeId, found: &Node) -> NodeRecord {
-        let binding = found.binding.as_ref();
         let namespace = &found.namespace;
+        NodeRecord {
+            members: namespace
+                .records()
+                .map(|member| self.member_of(node, found, member))
+                .collect(),
+            coverage: namespace.records().flat_map(coverage_of).collect(),
+            ..self.own_node_record(node, found)
+        }
+    }
+
+    fn own_node_record(&self, node: NodeId, found: &Node) -> NodeRecord {
+        let binding = found.binding.as_ref();
         NodeRecord {
             node,
             parent: binding.map(|binding| binding.parent),
@@ -72,51 +112,35 @@ impl Tree {
                 .as_ref()
                 .map(|object| object.facts())
                 .or_else(|| self.lent_facts(node).cloned()),
-            members: namespace
-                .records()
-                .map(|member| MemberRecord {
-                    member: member.id,
-                    name: member.name.clone(),
-                    output_name: member.output_name.clone(),
-                    length: member.length,
-                    closed: member.closed,
-                    crc32: member.crc32,
-                    bound_to: member.bound_to,
-                    owner: found.children.get(&member.id).copied(),
-                    given_up: self
-                        .nodes
-                        .retired()
-                        .get(&(node, member.id))
-                        .copied()
-                        .flatten(),
-                    buried: self
-                        .nodes
-                        .retired()
-                        .get(&(node, member.id))
-                        .is_some_and(Option::is_none),
-                    // A member given back with its parse waits to be
-                    // offered again, and the parse lives only in memory:
-                    // a restore offers it again from its front, as it does
-                    // a member whose owner was never decided.
-                    undecided: found.undecided.contains(&member.id)
-                        || self.given.contains_key(&(node, member.id)),
-                    copy_of: namespace.copy_of(member.id),
-                })
-                .collect(),
-            coverage: namespace
-                .records()
-                .flat_map(|member| {
-                    member.coverage.runs().map(|run| CoverageRecord {
-                        member: member.id,
-                        start: run.range.start,
-                        end: run.range.end,
-                        provenance: run.provenance,
-                    })
-                })
-                .collect(),
+            members: Vec::new(),
+            coverage: Vec::new(),
             // Envelope bytes and cipher seeds live in the objects' facts.
             envelopes: Vec::new(),
             crypt: Vec::new(),
+        }
+    }
+
+    fn member_of(&self, node: NodeId, found: &Node, member: &Member) -> MemberRecord {
+        let retired = self.nodes.retired().get(&(node, member.id));
+        MemberRecord {
+            member: member.id,
+            name: member.name.clone(),
+            output_name: member.output_name.clone(),
+            length: member.length,
+            closed: member.closed,
+            crc32: member.crc32,
+            bound_to: member.bound_to,
+            owner: found.children.get(&member.id).copied(),
+            given_up: retired.copied().flatten(),
+            buried: retired.is_some_and(Option::is_none),
+            // A member given back with its parse waits to be offered again,
+            // and the parse lives only in memory: a restore offers it again
+            // from its front, as it does a member whose owner was never
+            // decided.
+            undecided: found.undecided.contains(&member.id)
+                || self.given.contains_key(&(node, member.id)),
+            copy_of: found.namespace.copy_of(member.id),
+            fronted: member.fronted,
         }
     }
 
@@ -210,10 +234,11 @@ impl Tree {
                 coverage: Coverage::new(),
                 closed: member.closed,
                 crc32: member.crc32,
+                fronted: member.fronted,
             });
             if member.undecided {
                 // Its front comes again with the replay.
-                node.undecided.insert(member.member);
+                node.undecide(member.member);
             }
         }
         for member in &record.members {
@@ -232,15 +257,19 @@ impl Tree {
                 return Err(refuse("a coverage run is empty or inverted"));
             }
             let range = ByteRange::new(run.start, run.end);
-            let coverage = node
+            let member = node
                 .namespace
                 .get_mut(run.member)
-                .map(|member| &mut member.coverage)
                 .ok_or(refuse("coverage of a member it does not have"))?;
-            if coverage.overlapping(range).next().is_some() {
+            if member.coverage.overlapping(range).next().is_some() {
                 return Err(refuse("coverage runs overlap"));
             }
-            coverage.write(range, run.provenance);
+            member.coverage.write(range, run.provenance);
+            // Clean bytes at its front are a front that came, for a record
+            // that keeps no word of it.
+            if run.start == 0 && !run.provenance.is_damaged() {
+                member.fronted = true;
+            }
         }
         self.nodes.insert(record.node, node);
         self.rehome(record.node);
@@ -282,6 +311,9 @@ impl Tree {
             window: record.window,
             // A checkpoint is taken between passes, when no hand-over is owed.
             awaiting: BTreeSet::new(),
+            // What was handed is never kept: the owner, rebuilt beside it,
+            // hands it again as it opens.
+            handed: Handed::default(),
         }))
     }
 
@@ -307,7 +339,7 @@ impl Tree {
                     return Err(refuse("a member's owner does not bind it"));
                 }
                 if let Some(found) = self.nodes.get_mut(&record.node) {
-                    found.children.insert(member.member, (child, volume));
+                    found.own(member.member, (child, volume));
                 }
             }
             if member.buried && member.given_up.is_some() {
@@ -328,5 +360,14 @@ impl Tree {
     }
 }
 
+fn coverage_of(member: &Member) -> impl Iterator<Item = CoverageRecord> + '_ {
+    member.coverage.runs().map(|run| CoverageRecord {
+        member: member.id,
+        start: run.range.start,
+        end: run.range.end,
+        provenance: run.provenance,
+    })
+}
+
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

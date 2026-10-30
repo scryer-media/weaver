@@ -20,6 +20,8 @@ use std::fs::File;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
+use weaver_graph::{Algorithm, Digest, Evidenced};
+
 use crate::pipeline::graph::sparse::{PlatformMarker, create_sparse};
 
 #[derive(Debug, thiserror::Error)]
@@ -55,21 +57,29 @@ pub(crate) struct Leaf {
     // Open while bytes are still arriving; dropped when the member is
     // covered, and reopened only for a repair.
     file: Option<File>,
-    // The CRC32 of what was written, by contiguous run keyed by its start,
-    // folded as the writes land so the member's own CRC is known without
-    // reading the file back.
+    // What was written, by contiguous run keyed by its start, with the
+    // digest of the run of the kind the member's check states, folded as the
+    // writes land so the member's own digest is known without reading the
+    // file back.
     written: BTreeMap<u64, Written>,
+    // The bytes that changed after they were written, by start and the
+    // revision that changed them, to where they end: what a write replaced,
+    // a close cut off or a start over emptied. A byte written for the first
+    // time changes nothing anyone read.
+    changed: BTreeMap<(u64, u64), u64>,
 }
 
 // How much of a file is read back at a time when its CRC is not in the fold.
 const READ_BACK: u64 = 1 << 20;
 static NEXT_LEAF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-// A contiguous run of written bytes and their CRC32.
+// A contiguous run of written bytes, and their digest when every write in
+// the run was folded. A write of a member that states no check folds
+// nothing, and a run it reaches has no digest.
 #[derive(Clone, Copy, Debug)]
 struct Written {
     end: u64,
-    crc32: u32,
+    digest: Option<Digest>,
 }
 
 impl Leaf {
@@ -85,11 +95,37 @@ impl Leaf {
             directory: Self::is_directory(output_name),
             file: None,
             written: BTreeMap::new(),
+            changed: BTreeMap::new(),
         }
     }
 
     pub(crate) fn revision(&self) -> (u64, u64) {
         (self.identity, self.revision)
+    }
+
+    // Whether a byte of `start..end` changed since the leaf stood at `seen`,
+    // or the leaf is another file than the one seen then.
+    pub(crate) fn changed_since(&self, seen: (u64, u64), start: u64, end: u64) -> bool {
+        seen.0 != self.identity
+            || self
+                .changed
+                .range(..(end, 0))
+                .any(|(&(from, revision), &to)| revision > seen.1 && to > start && from < end)
+    }
+
+    // `start..end` changed at this revision; what it changed before, within
+    // it, is answered by it.
+    fn change(&mut self, start: u64, end: u64) {
+        let within: Vec<(u64, u64)> = self
+            .changed
+            .range((start, 0)..(end, 0))
+            .filter(|(_, to)| **to <= end)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in within {
+            self.changed.remove(&key);
+        }
+        self.changed.insert((start, self.revision), end);
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -121,7 +157,8 @@ impl Leaf {
         std::fs::create_dir_all(&self.path).map_err(LeafError::io(&self.path))
     }
 
-    // Write `bytes` at `offset`. The first write creates the file, marked
+    // Write `bytes` at `offset`, folding nothing: a file whose bytes no
+    // check is stated for. The first write creates the file, marked
     // sparse, and sizes it to `length` when the length is known, so the
     // blocks are reserved in one step instead of growing write by write.
     pub(crate) fn write(
@@ -130,76 +167,135 @@ impl Leaf {
         bytes: &[u8],
         length: Option<u64>,
     ) -> Result<(), LeafError> {
+        self.put(offset, bytes, None, length)
+    }
+
+    // Write `bytes` at `offset` and fold their `algorithm` digest, from the
+    // evidence they came with: only bytes no level above proved are hashed.
+    pub(crate) fn write_folding(
+        &mut self,
+        offset: u64,
+        bytes: &Evidenced,
+        algorithm: Algorithm,
+        length: Option<u64>,
+    ) -> Result<(), LeafError> {
+        self.put(offset, bytes, Some((algorithm, bytes)), length)
+    }
+
+    fn put(
+        &mut self,
+        offset: u64,
+        bytes: &[u8],
+        fold: Option<(Algorithm, &Evidenced)>,
+        length: Option<u64>,
+    ) -> Result<(), LeafError> {
         self.revision += 1;
         self.open(length)?;
-        let replaced = self.replaced(offset, bytes.len() as u64)?;
+        let span = (offset, offset + bytes.len() as u64);
+        let overlapped = self.overlapped(span);
+        for (from, to) in &overlapped {
+            self.change(*from, *to);
+        }
+        let replaced = self.replaced(&overlapped, fold.map(|(algorithm, _)| algorithm))?;
         let file = self.file.as_ref().expect("opened above");
         write_all_at(file, offset, bytes).map_err(LeafError::io(&self.path))?;
-        self.wrote(offset, bytes, &replaced);
+        self.wrote(span, fold, &overlapped, &replaced);
         Ok(())
     }
 
-    // The bytes a write over `offset..offset + len` replaces, of each run
-    // it overlaps, in order: what the fold needs to keep those runs, and no
-    // more than the write itself puts down.
-    fn replaced(&self, offset: u64, len: u64) -> Result<Vec<(u64, Vec<u8>)>, LeafError> {
-        let end = offset + len;
-        let mut replaced = Vec::new();
-        for (start, run) in self
+    // Where a write over `offset..end` lands on runs already written, in
+    // order.
+    fn overlapped(&self, (offset, end): (u64, u64)) -> Vec<(u64, u64)> {
+        let mut overlapped: Vec<(u64, u64)> = self
             .written
             .range(..end)
             .rev()
             .take_while(|(_, run)| run.end > offset)
-        {
-            let from = (*start).max(offset);
-            let mut old = Vec::new();
-            self.read(from, index(run.end.min(end) - from), &mut old)?;
-            replaced.push((from, old));
+            .map(|(start, run)| ((*start).max(offset), run.end.min(end)))
+            .collect();
+        overlapped.reverse();
+        overlapped
+    }
+
+    // The digest of what a folded write replaces in each folded run it
+    // overlaps, read back: what the fold needs to keep those runs, and no
+    // more than the write itself puts down. A run without a digest, or a
+    // write that folds nothing, reads nothing back.
+    fn replaced(
+        &self,
+        overlapped: &[(u64, u64)],
+        fold: Option<Algorithm>,
+    ) -> Result<Vec<Option<u64>>, LeafError> {
+        let mut replaced = Vec::with_capacity(overlapped.len());
+        for (from, to) in overlapped {
+            let (_, run) = self
+                .written
+                .range(..=*from)
+                .next_back()
+                .expect("an overlapped range lies in a run");
+            let digest = match (fold, run.digest) {
+                (Some(algorithm), Some(digest)) if digest.algorithm == algorithm => {
+                    let mut old = Vec::new();
+                    self.read(*from, index(to - from), &mut old)?;
+                    Some(algorithm.hash(&old).value)
+                }
+                _ => None,
+            };
+            replaced.push(digest);
         }
-        replaced.reverse();
         Ok(replaced)
     }
 
-    // Fold a write into the runs. A run the write overlaps keeps its span:
-    // CRC32 is linear, so the bytes it replaced give way to the bytes that
-    // replace them by the CRC of the two, carried past the run's bytes
-    // behind them. What of the write no run held is a run of its own, and
-    // runs that now abut are joined.
-    fn wrote(&mut self, offset: u64, bytes: &[u8], replaced: &[(u64, Vec<u8>)]) {
-        if bytes.is_empty() {
+    // Fold a write into the runs. A folded run the write overlaps keeps its
+    // span: the bytes it replaced give way to the bytes that replace them,
+    // carried past the run's bytes behind them. A run a write that cannot
+    // fold reaches loses its digest. What of the write no run held is a run
+    // of its own, and runs that now abut are joined.
+    fn wrote(
+        &mut self,
+        (offset, end): (u64, u64),
+        fold: Option<(Algorithm, &Evidenced)>,
+        overlapped: &[(u64, u64)],
+        replaced: &[Option<u64>],
+    ) {
+        if offset == end {
             return;
         }
-        let end = offset + bytes.len() as u64;
-        let of = |from: u64, to: u64| &bytes[index(from - offset)..index(to - offset)];
+        let digest_of = |from: u64, to: u64| {
+            fold.map(|(algorithm, bytes)| {
+                bytes
+                    .slice(index(from - offset)..index(to - offset))
+                    .digest(algorithm)
+            })
+        };
         let mut at = offset;
-        for (from, old) in replaced {
-            let to = from + old.len() as u64;
+        for ((from, to), old) in overlapped.iter().zip(replaced) {
             if at < *from {
-                self.written.insert(
-                    at,
-                    Written {
-                        end: *from,
-                        crc32: crc32(of(at, *from)),
-                    },
-                );
+                let digest = digest_of(at, *from);
+                self.written.insert(at, Written { end: *from, digest });
             }
+            let new = digest_of(*from, *to);
             let (_, run) = self
                 .written
                 .range_mut(..=*from)
                 .next_back()
-                .expect("a replaced range lies in a run");
+                .expect("an overlapped range lies in a run");
             let behind = run.end - to;
-            run.crc32 ^= combine(crc32(old), 0, behind) ^ combine(crc32(of(*from, to)), 0, behind);
-            at = to;
+            run.digest = match (run.digest, old, new) {
+                (Some(whole), Some(old), Some(new)) => whole
+                    .algorithm
+                    .replace(whole.value, *old, new.value, behind)
+                    .map(|value| Digest {
+                        algorithm: whole.algorithm,
+                        value,
+                    }),
+                _ => None,
+            };
+            at = *to;
         }
         if at < end {
-            self.written.insert(
-                at,
-                Written {
-                    end,
-                    crc32: crc32(of(at, end)),
-                },
-            );
+            let digest = digest_of(at, end);
+            self.written.insert(at, Written { end, digest });
         }
         self.join(offset, end);
     }
@@ -225,7 +321,7 @@ impl Leaf {
                     from,
                     Written {
                         end: run.end,
-                        crc32: combine(prior.crc32, run.crc32, run.end - start),
+                        digest: joined_digest(prior.digest, run.digest, run.end - start),
                     },
                 )),
                 Some((from, prior)) => {
@@ -244,6 +340,11 @@ impl Leaf {
     // keeps the CRC of what stays, the bytes it loses undone from it, read
     // before they go.
     fn cut(&mut self, length: u64) -> Result<(), LeafError> {
+        if let Some((_, last)) = self.written.iter().next_back()
+            && last.end > length
+        {
+            self.change(length, last.end);
+        }
         let past: Vec<u64> = self
             .written
             .range(length..)
@@ -258,17 +359,23 @@ impl Leaf {
         if run.end <= length {
             return Ok(());
         }
-        let mut lost = Vec::new();
-        self.read(length, index(run.end - length), &mut lost)?;
-        let kept =
-            crc_turbo::CrcCombine::new(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, run.end - length)
-                .uncombine(u64::from(run.crc32), u64::from(crc32(&lost)))
-                .expect("CRC32 has an x^0 term") as u32;
+        let digest = match run.digest {
+            Some(whole) => {
+                let mut lost = Vec::new();
+                self.read(length, index(run.end - length), &mut lost)?;
+                let algorithm = whole.algorithm;
+                let lost = algorithm.hash(&lost).value;
+                algorithm
+                    .head_of(whole.value, lost, run.end - length)
+                    .map(|value| Digest { algorithm, value })
+            }
+            None => None,
+        };
         self.written.insert(
             start,
             Written {
                 end: length,
-                crc32: kept,
+                digest,
             },
         );
         Ok(())
@@ -278,37 +385,50 @@ impl Leaf {
     // whose bytes passed its stated CRC folds to that CRC; any other folds
     // what of `ranges` its file holds, read back from it. A range the file
     // does not hold is left out of the fold.
-    pub(crate) fn fold_passed(&mut self, length: u64, crc32: u32) {
+    pub(crate) fn fold_passed(&mut self, length: u64, digest: Digest) {
         self.written.clear();
         if length > 0 {
-            self.written.insert(0, Written { end: length, crc32 });
+            self.written.insert(
+                0,
+                Written {
+                    end: length,
+                    digest: Some(digest),
+                },
+            );
         }
     }
 
-    pub(crate) fn fold_back(&mut self, ranges: impl IntoIterator<Item = (u64, u64)>) {
-        let mut chunk = Vec::new();
+    pub(crate) fn fold_back(
+        &mut self,
+        algorithm: Algorithm,
+        ranges: impl IntoIterator<Item = (u64, u64)>,
+    ) {
         for (start, end) in ranges {
             let mut at = start;
             while at < end {
                 let take = (end - at).min(READ_BACK);
-                chunk.clear();
+                let mut chunk = Vec::new();
                 if self.read(at, index(take), &mut chunk).is_err() {
                     break;
                 }
-                self.wrote(at, &chunk, &[]);
+                let chunk = Evidenced::from(chunk);
+                self.wrote((at, at + take), Some((algorithm, &chunk)), &[], &[]);
                 at += take;
             }
         }
     }
 
-    // The CRC32 of the member's `length` bytes as the fold holds them,
-    // when one run covers exactly them.
-    pub(crate) fn folded(&self, length: u64) -> Option<u32> {
+    // The `algorithm` digest of the member's `length` bytes as the fold
+    // holds them, when one folded run covers exactly them.
+    pub(crate) fn folded(&self, length: u64, algorithm: Algorithm) -> Option<u64> {
         if length == 0 {
-            return Some(0);
+            return Some(algorithm.empty().value);
         }
         match self.written.iter().next() {
-            Some((0, run)) if self.written.len() == 1 && run.end == length => Some(run.crc32),
+            Some((0, run)) if self.written.len() == 1 && run.end == length => run
+                .digest
+                .filter(|digest| digest.algorithm == algorithm)
+                .map(|digest| digest.value),
             _ => None,
         }
     }
@@ -379,6 +499,7 @@ impl Leaf {
     pub(crate) fn truncate(&mut self) -> Result<(), LeafError> {
         self.revision += 1;
         self.written.clear();
+        self.change(0, u64::MAX);
         if self.file.is_none() && !self.path.exists() {
             return Ok(());
         }
@@ -520,22 +641,19 @@ pub(crate) fn read_exact_at(file: &File, offset: u64, out: &mut [u8]) -> io::Res
     }
 }
 
-fn crc32(bytes: &[u8]) -> u32 {
-    crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32
-}
-
 fn index(len: u64) -> usize {
     usize::try_from(len).expect("a leaf range fits in memory")
 }
 
-// The CRC32 of `first` followed by `len_second` bytes whose CRC32 is `second`.
-fn combine(first: u32, second: u32, len_second: u64) -> u32 {
-    crc_turbo::checksum_combine(
-        crc_turbo::CrcAlgorithm::Crc32IsoHdlc,
-        u64::from(first),
-        u64::from(second),
-        len_second,
-    ) as u32
+// The digest of two abutting runs, when both were folded of one kind.
+fn joined_digest(first: Option<Digest>, second: Option<Digest>, len_second: u64) -> Option<Digest> {
+    let (first, second) = (first?, second?);
+    let algorithm = first.algorithm;
+    if second.algorithm != algorithm {
+        return None;
+    }
+    let value = algorithm.join(first.value, second.value, len_second)?;
+    Some(Digest { algorithm, value })
 }
 
 #[cfg(test)]
@@ -548,10 +666,16 @@ mod tests {
             .collect()
     }
 
-    fn file_crc(leaf: &Leaf, length: u64) -> u32 {
+    fn file_crc(leaf: &Leaf, length: u64) -> u64 {
         let mut all = Vec::new();
         leaf.read(0, index(length), &mut all).unwrap();
-        crc32(&all)
+        Algorithm::Crc32.hash(&all).value
+    }
+
+    fn folding(leaf: &mut Leaf, offset: u64, bytes: Vec<u8>) {
+        let bytes = Evidenced::from(bytes);
+        leaf.write_folding(offset, &bytes, Algorithm::Crc32, None)
+            .unwrap();
     }
 
     // A write over bytes already written, a close that cuts the file short
@@ -561,24 +685,25 @@ mod tests {
     fn the_fold_answers_for_the_file_through_rewrites_cuts_and_restores() {
         let dir = tempfile::tempdir().unwrap();
         let mut leaf = Leaf::at(dir.path(), "lantern.bin");
-        leaf.write(0, &bytes(4096, 1), None).unwrap();
-        leaf.write(6000, &bytes(2192, 2), None).unwrap();
+        folding(&mut leaf, 0, bytes(4096, 1));
+        folding(&mut leaf, 6000, bytes(2192, 2));
         // Over the end of one run, the gap and the start of the next.
-        leaf.write(3000, &bytes(4000, 3), None).unwrap();
+        folding(&mut leaf, 3000, bytes(4000, 3));
         // Inside one run, with other bytes, and with the same bytes.
-        leaf.write(100, &bytes(50, 4), None).unwrap();
-        leaf.write(100, &bytes(50, 4), None).unwrap();
-        assert_eq!(leaf.folded(8192), Some(file_crc(&leaf, 8192)));
+        folding(&mut leaf, 100, bytes(50, 4));
+        folding(&mut leaf, 100, bytes(50, 4));
+        let crc = Algorithm::Crc32;
+        assert_eq!(leaf.folded(8192, crc), Some(file_crc(&leaf, 8192)));
         leaf.close(7000).unwrap();
-        assert_eq!(leaf.folded(7000), Some(file_crc(&leaf, 7000)));
+        assert_eq!(leaf.folded(7000, crc), Some(file_crc(&leaf, 7000)));
 
         let mut restored = Leaf::at(dir.path(), "lantern.bin");
-        assert_eq!(restored.folded(7000), None);
-        restored.fold_back([(0, 3000), (3000, 7000)]);
-        assert_eq!(restored.folded(7000), Some(file_crc(&leaf, 7000)));
+        assert_eq!(restored.folded(7000, crc), None);
+        restored.fold_back(crc, [(0, 3000), (3000, 7000)]);
+        assert_eq!(restored.folded(7000, crc), Some(file_crc(&leaf, 7000)));
         // A range the file does not hold stays out of the fold.
         let mut short = Leaf::at(dir.path(), "lantern.bin");
-        short.fold_back([(0, 9000)]);
-        assert_eq!(short.folded(7000), None);
+        short.fold_back(crc, [(0, 9000)]);
+        assert_eq!(short.folded(7000, crc), None);
     }
 }

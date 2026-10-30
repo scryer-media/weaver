@@ -1115,6 +1115,55 @@ async fn egress_quota_block_outranks_server_quota_and_yields_to_a_pause() {
     );
 }
 
+// The pipeline refreshes the quota presentation on every article it takes.
+// With no egress block standing, clearing it again takes no lock; a real
+// change still takes it and lays the block as before.
+#[tokio::test]
+async fn refreshing_the_quota_presentation_without_an_egress_block_takes_no_lock() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let locks = || pipeline.shared_state.egress_quota_block_lock_count();
+
+    let before = locks();
+    for _ in 0..3 {
+        pipeline.refresh_server_quota_block_presentation();
+    }
+    assert_eq!(locks(), before, "no egress lock per article");
+    assert_eq!(pipeline.shared_state.egress_quota_block(), None);
+
+    let block = crate::jobs::handle::EgressQuotaBlock {
+        egress_id: 5,
+        egress_name: "Egress A".to_string(),
+        used_bytes: 1_000,
+        limit_bytes: 1_000,
+        remaining_bytes: 0,
+        window_starts_at_epoch_ms: None,
+        window_ends_at_epoch_ms: None,
+        timezone_name: "UTC".to_string(),
+    };
+    pipeline
+        .shared_state
+        .set_egress_quota_block(Some(block.clone()));
+    assert_eq!(locks(), before + 1);
+    assert_eq!(
+        pipeline.shared_state.download_block().kind,
+        crate::jobs::handle::DownloadBlockKind::EgressQuota
+    );
+    pipeline.refresh_server_quota_block_presentation();
+    assert_eq!(
+        locks(),
+        before + 2,
+        "a standing block is cleared under the lock"
+    );
+    assert_eq!(pipeline.shared_state.egress_quota_block(), None);
+    assert_eq!(
+        pipeline.shared_state.download_block().kind,
+        crate::jobs::handle::DownloadBlockKind::None
+    );
+    pipeline.refresh_server_quota_block_presentation();
+    assert_eq!(locks(), before + 2);
+}
+
 // Dispatch never sends work to a server that is out of quota, so queued work
 // behind an exhausted pool never parks. The block still has to say why it
 // cannot move, as soon as the queue holds it.

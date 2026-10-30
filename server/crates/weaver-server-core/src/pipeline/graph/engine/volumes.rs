@@ -55,8 +55,6 @@ pub(crate) struct RunVolumes {
     // The lost spans reads failed on that the run has not read on past.
     lost: Mutex<BTreeSet<(u32, u64, u64)>>,
     stopped: AtomicBool,
-    #[cfg(test)]
-    read_gate: Mutex<Option<super::read_gate::ReadPause>>,
 }
 
 impl std::fmt::Debug for RunVolumes {
@@ -77,31 +75,7 @@ impl RunVolumes {
             files: Mutex::default(),
             lost: Mutex::default(),
             stopped: AtomicBool::new(false),
-            #[cfg(test)]
-            read_gate: Mutex::default(),
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn gate_read(
-        &self,
-        scope: u64,
-        node: weaver_graph::NodeId,
-        volume: VolumeIndex,
-        range: ByteRange,
-    ) -> super::ReadGate {
-        let key = super::read_gate::ReadKey {
-            scope,
-            node,
-            generation: self.generation,
-            volume,
-            range,
-        };
-        let (pause, gate) = super::read_gate::ReadPause::new(key, Arc::clone(&self.shelf));
-        let mut pending = self.read_gate.lock().unwrap();
-        assert!(pending.is_none(), "one read gate per running instance");
-        *pending = Some(pause);
-        gate
     }
 
     // The run's owner stops it where it stands: its next read fails, and
@@ -232,7 +206,7 @@ impl Volumes for RunVolumes {
         }
         let kept = state.kept.get_mut(&volume.0)?;
         let length = kept.closed?;
-        kept.length_read = true;
+        kept.length_read = Some(length);
         Some(length)
     }
 
@@ -257,39 +231,12 @@ impl Volumes for RunVolumes {
             return Ok(0);
         };
         let len = usize::try_from(len).expect("a read fits the buffer it fills");
-        #[cfg(test)]
-        let gate = {
-            let mut pending = self.read_gate.lock().unwrap();
-            let range = ByteRange::at(offset, len as u64);
-            if pending
-                .as_ref()
-                .is_some_and(|gate| gate.matches(self.generation, volume, range))
-            {
-                pending.take()
-            } else {
-                None
-            }
-        };
-        #[cfg(test)]
-        if let Some(gate) = &gate {
-            gate.ready();
-        }
         let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
         let file = match files.entry(volume.0) {
             std::collections::btree_map::Entry::Occupied(found) => found.into_mut(),
             std::collections::btree_map::Entry::Vacant(slot) => slot.insert(File::open(path)?),
         };
-        let read = read_exact_at(file, offset, &mut into[..len]);
-        #[cfg(test)]
-        if let Some(gate) = gate {
-            drop(files);
-            gate.completed(
-                read.as_ref()
-                    .map(|_| into[..len].to_vec())
-                    .map_err(ToString::to_string),
-            );
-        }
-        read?;
+        read_exact_at(file, offset, &mut into[..len])?;
         Ok(len)
     }
 

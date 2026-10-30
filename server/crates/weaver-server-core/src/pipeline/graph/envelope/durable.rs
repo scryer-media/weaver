@@ -89,9 +89,12 @@ impl Envelopes {
                     leaf,
                     coverage,
                     closed: record.closed,
+                    // No run has read past a restored volume yet, and the
+                    // first to read one starts from its recorded length.
+                    closed_at: record.closed,
                     settled: record.settled,
                     reached: 0,
-                    length_read: false,
+                    length_read: None,
                 },
             );
         });

@@ -76,6 +76,12 @@ pub struct SharedPipelineState {
     shutdown_started: Arc<AtomicBool>,
     // The egress whose download quota holds work back, while one does.
     egress_quota_block: Arc<RwLock<Option<EgressQuotaBlock>>>,
+    // Whether `egress_quota_block` holds one, written with it under its
+    // write lock: clearing a block that is not there, which the pipeline
+    // asks on every article, takes no lock.
+    egress_quota_blocked: Arc<AtomicBool>,
+    #[cfg(test)]
+    egress_quota_block_locks: Arc<AtomicU64>,
     proxy_runtime: Arc<RwLock<Option<Arc<crate::proxies::ProxyRuntime>>>>,
     server_transfer_policy:
         Arc<RwLock<Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>>>,
@@ -124,6 +130,9 @@ impl SharedPipelineState {
             server_quota_blocked: Arc::new(AtomicBool::new(false)),
             shutdown_started: Arc::new(AtomicBool::new(false)),
             egress_quota_block: Arc::new(RwLock::new(None)),
+            egress_quota_blocked: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            egress_quota_block_locks: Arc::new(AtomicU64::new(0)),
             proxy_runtime: Arc::new(RwLock::new(None)),
             server_transfer_policy: Arc::new(RwLock::new(None)),
             nntp_pool: Arc::new(RwLock::new(None)),
@@ -420,6 +429,12 @@ impl SharedPipelineState {
     // Record which egress quota, if any, holds work back, and re-lay the
     // published block state over it.
     pub fn set_egress_quota_block(&self, block: Option<EgressQuotaBlock>) {
+        if block.is_none() && !self.egress_quota_blocked.load(Ordering::Acquire) {
+            return;
+        }
+        #[cfg(test)]
+        self.egress_quota_block_locks
+            .fetch_add(1, Ordering::Relaxed);
         if *self.egress_quota_block.read().unwrap() == block {
             return;
         }
@@ -429,9 +444,17 @@ impl SharedPipelineState {
             if *current == block {
                 return;
             }
+            self.egress_quota_blocked
+                .store(block.is_some(), Ordering::Release);
             *current = block;
         }
         self.apply_quota_blocks(&mut state);
+    }
+
+    // How many times setting the egress block took its lock.
+    #[cfg(test)]
+    pub(crate) fn egress_quota_block_lock_count(&self) -> u64 {
+        self.egress_quota_block_locks.load(Ordering::Relaxed)
     }
 
     // Memory one conventional 7z extraction may hold. `u64::MAX` when no

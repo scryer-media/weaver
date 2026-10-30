@@ -1118,11 +1118,7 @@ impl NntpClient {
                 continue;
             }
             saw_fill = true;
-            if !self
-                .pool
-                .server_transfer_control(ServerId(idx))
-                .is_some_and(|control| control.snapshot().quota_blocked)
-            {
+            if !self.pool.server_quota_blocked(ServerId(idx)) {
                 return false;
             }
         }

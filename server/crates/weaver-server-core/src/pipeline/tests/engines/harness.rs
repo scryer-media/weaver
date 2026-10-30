@@ -496,6 +496,13 @@ pub(in crate::pipeline::tests) struct Scenario {
     // whole. A scenario with any has both servers, and an ask that excludes
     // the primary is the backup's.
     pub(in crate::pipeline::tests) corrupt_primary: Vec<(u32, u32)>,
+    // Articles that decode this many bytes short of the part end their
+    // header declares, as a server that cut the body off serves them.
+    pub(in crate::pipeline::tests) short: Vec<(u32, u32, usize)>,
+    // Articles served whole under a checksum that disagrees with them.
+    pub(in crate::pipeline::tests) crc_wrong: Vec<(u32, u32)>,
+    // Posts whose every article declares this file size, not the post's.
+    pub(in crate::pipeline::tests) declares: Vec<(u32, u64)>,
     pub(in crate::pipeline::tests) password: Option<String>,
     pub(in crate::pipeline::tests) global_passwords: Vec<String>,
     // The decoded size of every article but each post's last; PAR2 slices
@@ -532,6 +539,9 @@ impl Scenario {
             lost: Vec::new(),
             refused: Vec::new(),
             corrupt_primary: Vec::new(),
+            short: Vec::new(),
+            crc_wrong: Vec::new(),
+            declares: Vec::new(),
             password: None,
             global_passwords: Vec::new(),
             article: ARTICLE,
@@ -659,6 +669,24 @@ impl Scenario {
 
     pub(in crate::pipeline::tests) fn lost(mut self, file: u32, ordinal: u32) -> Self {
         self.lost.push((file, ordinal));
+        self
+    }
+
+    // The article decodes `by` bytes short of the part end it declares.
+    pub(in crate::pipeline::tests) fn short(mut self, file: u32, ordinal: u32, by: usize) -> Self {
+        self.short.push((file, ordinal, by));
+        self
+    }
+
+    // The article's bytes are whole and its checksum is wrong.
+    pub(in crate::pipeline::tests) fn crc_wrong(mut self, file: u32, ordinal: u32) -> Self {
+        self.crc_wrong.push((file, ordinal));
+        self
+    }
+
+    // Every article of the post declares a file of `size` bytes.
+    pub(in crate::pipeline::tests) fn declares(mut self, file: u32, size: u64) -> Self {
+        self.declares.push((file, size));
         self
     }
 
@@ -1289,7 +1317,8 @@ async fn serve_from(
         .unwrap();
     // The checksum the article declares is the posted one, so damaged bytes
     // disagree with it.
-    let crc = par2_rs::checksum::crc32(posted);
+    let crc_wrong = scenario.crc_wrong.contains(&(file, ordinal));
+    let crc = par2_rs::checksum::crc32(posted) ^ u32::from(crc_wrong);
     let mut body = posted.to_vec();
     if !intact {
         body.iter_mut().take(8).for_each(|byte| *byte ^= 0x5a);
@@ -1337,7 +1366,19 @@ async fn serve_from(
             .await;
         return;
     }
+    // The part end the header declares is the posted one, whatever of it
+    // decoded.
+    let declared = body.len() as u64;
+    if let Some((.., by)) = scenario
+        .short
+        .iter()
+        .find(|(at, number, _)| (*at, *number) == (file, ordinal))
+    {
+        body.truncate(body.len().saturating_sub(*by));
+    }
     let len = body.len() as u64;
+    let truncated = len < declared;
+    let intact = intact && !truncated && !crc_wrong;
     // The decoder checksums the bytes it decoded, cut at the block
     // boundaries of the plan the article was leased under: its lease's, or
     // what the job knows now when it was handed out alone.
@@ -1354,16 +1395,20 @@ async fn serve_from(
                 raw_size: len,
                 encoding: SegmentEncoding::Yenc,
                 yenc_layout: YencLayoutAssertions {
-                    file_size: post.bytes.len() as u64,
+                    file_size: scenario
+                        .declares
+                        .iter()
+                        .find(|(at, _)| *at == file)
+                        .map_or(post.bytes.len() as u64, |(_, size)| *size),
                     part: Some(ordinal + 1),
                     total: Some(post.articles(scenario.article).count() as u32),
                     begin: Some(offset as u64 + 1),
-                    end: Some(offset as u64 + len),
+                    end: Some(offset as u64 + declared),
                 },
                 crc_valid: intact,
                 part_crc_verified: intact,
                 part_crc: crc,
-                truncation_suspected: false,
+                truncation_suspected: truncated,
                 expected_file_crc: None,
                 data: DecodedChunk::from(body),
                 yenc_name: post.name.clone(),
@@ -1429,7 +1474,7 @@ pub(in crate::pipeline::tests) fn observe(
             .map(|member| {
                 (
                     member.name.clone(),
-                    writer.proven_whole(tree, weaver_graph::NodeId::ROOT, member.id),
+                    writer.proven_whole(tree, (weaver_graph::NodeId::ROOT, &sets), member.id),
                     job.checksums_held(member.id),
                 )
             })
@@ -1454,15 +1499,20 @@ pub(in crate::pipeline::tests) fn observe(
         .iter()
         .zip(0u32..)
         .filter(|(file, _)| file.role.counts_toward_health())
-        .filter_map(|(_, index)| namespace.get(weaver_graph::MemberId(index)))
-        .map(|member| {
+        // A posting folded into the member it repeats claims what that
+        // member holds: its own record keeps only what the member took of it.
+        .filter_map(|(_, index)| {
+            let posting = namespace.get(weaver_graph::MemberId(index))?;
+            Some((posting, namespace.get(namespace.resolve(posting.id))?))
+        })
+        .map(|(posting, member)| {
             let damaged = member.coverage.damaged_ranges().next().is_some();
             let claim = match member.length {
                 Some(_) if member.is_complete() && !damaged => Claim::Complete,
                 Some(_) if member.is_complete() => Claim::Damaged,
                 _ => Claim::Missing,
             };
-            (member.output_name.clone(), claim)
+            (posting.output_name.clone(), claim)
         })
         .collect();
     let summary = job.recovery_summary();
