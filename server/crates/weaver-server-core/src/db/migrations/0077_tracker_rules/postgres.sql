@@ -8,9 +8,13 @@ CREATE TABLE tracker_rules (
     -- A seeding policy, as JSON, in the shape a category's takes.
     seeding        TEXT,
     never_pause    BOOLEAN NOT NULL DEFAULT FALSE,
+    -- The tracker file that filled the rule: its name, revision and
+    -- import time, the fields it locked and the values it recommended,
+    -- as JSON; NULL when no file binds the rule.
+    bound          TEXT,
+    -- The archive passwords that file carried, sealed with the
+    -- database's key; NULL for none.
+    archive_passwords TEXT,
     created_at_ms  BIGINT NOT NULL,
     updated_at_ms  BIGINT NOT NULL
 );
-
--- The rule a torrent's trackers matched, if any.
-ALTER TABLE torrents ADD COLUMN tracker_rule_id BIGINT REFERENCES tracker_rules(id) ON DELETE SET NULL;
