@@ -1464,7 +1464,9 @@ const TRACKER_RULE_FIELDS = `
     unpack
     client
     torrentRoute
-    discovery
+    dht
+    pex
+    lsd
     encryption
     uploadLimit {
       bps

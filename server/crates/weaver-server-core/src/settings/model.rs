@@ -447,7 +447,7 @@ pub fn resolve_seeding_policy(
 // names: goals that sit between the torrent's own and its category's, and
 // whether the schedule's torrent pause may stop the torrent while they are
 // unmet.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct TrackerRule {
     pub id: u32,
     // A host, or `*.` and a host, which names that host and every host
@@ -464,10 +464,15 @@ pub struct TrackerRule {
     // The rule's torrents route through `torrent:tracker:<id>` instead of
     // their category's route or `torrent:default`.
     pub torrent_route: bool,
-    // Whether its torrents look for peers beyond their trackers: on the
-    // DHT, the local network and by peer exchange. `Some(false)` holds
-    // them to their trackers as a private torrent is held; `None` inherits.
-    pub discovery: Option<bool>,
+    // Whether its torrents look for peers on the DHT, on the local network
+    // and by peer exchange, each on its own as libtorrent's per-torrent
+    // `disable_dht`, `disable_lsd` and `disable_pex` flags are; `None`
+    // inherits. A private torrent does none of the three whatever these
+    // say. All three `Some(false)` holds the torrents to their trackers as
+    // a private torrent is held.
+    pub dht: Option<bool>,
+    pub pex: Option<bool>,
+    pub lsd: Option<bool>,
     // The encryption its torrents' connections are made under, over the
     // global one; `None` inherits.
     pub encryption: Option<TorrentEncryption>,
@@ -625,9 +630,13 @@ impl TrackerRule {
         Ok(self)
     }
 
-    // Whether its torrents take peers from their trackers alone.
+    // Whether its torrents take peers from their trackers alone: they look
+    // for none on the DHT, the local network or by peer exchange, and so
+    // announce to no tracker but their own.
     pub fn trackers_only(&self) -> bool {
-        self.discovery == Some(false)
+        [self.dht, self.pex, self.lsd]
+            .iter()
+            .all(|on| *on == Some(false))
     }
 
     // The pattern as a rule keeps it: trimmed and lower case, without a
@@ -1211,7 +1220,9 @@ mod tests {
             unpack: None,
             client: None,
             torrent_route: false,
-            discovery: None,
+            dht: None,
+            pex: None,
+            lsd: None,
             encryption: None,
             upload_limit: None,
             forced: false,

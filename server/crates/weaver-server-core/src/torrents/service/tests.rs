@@ -880,7 +880,9 @@ async fn a_torrent_url_is_asked_for_as_the_client_its_rule_names() {
             unpack: None,
             client: Some(Client::QBittorrent),
             torrent_route: false,
-            discovery: None,
+            dht: None,
+            pex: None,
+            lsd: None,
             encryption: None,
             upload_limit: None,
             forced: false,
@@ -1106,7 +1108,9 @@ async fn url_route(category: Option<&str>, matched: bool) {
                 unpack: None,
                 client: None,
                 torrent_route: true,
-                discovery: None,
+                dht: None,
+                pex: None,
+                lsd: None,
                 encryption: None,
                 upload_limit: None,
                 forced: false,
@@ -4181,7 +4185,9 @@ async fn a_tracker_rules_client_names_its_torrents() {
                 unpack: None,
                 client: Some(Client::QBittorrent),
                 torrent_route: false,
-                discovery: None,
+                dht: None,
+                pex: None,
+                lsd: None,
                 encryption: None,
                 upload_limit: None,
                 forced: false,
@@ -4292,7 +4298,9 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
                 unpack: None,
                 client: None,
                 torrent_route: false,
-                discovery: None,
+                dht: None,
+                pex: None,
+                lsd: None,
                 encryption: None,
                 upload_limit: None,
                 forced: false,
@@ -4648,7 +4656,9 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         unpack: None,
         client: None,
         torrent_route: false,
-        discovery: None,
+        dht: None,
+        pex: None,
+        lsd: None,
         encryption: None,
         upload_limit: None,
         forced: false,
@@ -4707,7 +4717,9 @@ fn a_torrents_route_is_its_rules_then_its_categorys_then_the_default() {
         unpack: None,
         client: None,
         torrent_route: true,
-        discovery: None,
+        dht: None,
+        pex: None,
+        lsd: None,
         encryption: None,
         upload_limit: None,
         forced: false,
@@ -4747,7 +4759,9 @@ async fn a_tracker_rules_route_carries_its_torrents_ahead_of_their_categorys() {
                 unpack: None,
                 client: None,
                 torrent_route: true,
-                discovery: None,
+                dht: None,
+                pex: None,
+                lsd: None,
                 encryption: None,
                 upload_limit: None,
                 forced: false,
@@ -4787,7 +4801,9 @@ async fn a_tracker_rules_route_carries_its_torrents_ahead_of_their_categorys() {
         .update_tracker_rule(
             &TrackerRule {
                 torrent_route: false,
-                discovery: None,
+                dht: None,
+                pex: None,
+                lsd: None,
                 encryption: None,
                 upload_limit: None,
                 forced: false,
@@ -5342,7 +5358,9 @@ async fn empty_seeding_terms_inherit_the_chain() {
                 unpack: None,
                 client: None,
                 torrent_route: false,
-                discovery: None,
+                dht: None,
+                pex: None,
+                lsd: None,
                 encryption: None,
                 upload_limit: None,
                 forced: false,
@@ -5435,7 +5453,9 @@ async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
                 unpack: None,
                 client: None,
                 torrent_route: false,
-                discovery: Some(false),
+                dht: Some(false),
+                pex: Some(false),
+                lsd: Some(false),
                 encryption: Some(TorrentEncryption::Prefer),
                 upload_limit: Some(TrackerUploadLimit::Unlimited),
                 forced: true,
@@ -5475,7 +5495,9 @@ async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
     rig.db
         .update_tracker_rule(
             &TrackerRule {
-                discovery: None,
+                dht: None,
+                pex: None,
+                lsd: None,
                 encryption: Some(TorrentEncryption::Require),
                 upload_limit: Some(TrackerUploadLimit::Bps(1_000)),
                 ..rule
@@ -5492,6 +5514,82 @@ async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
     assert_eq!(again.ratelimits().upload_bps, bps(1_000));
     assert!(Arc::ptr_eq(&other, &handle_of(&rig.service, unruled).await));
     assert_eq!(other.ratelimits().upload_bps, bps(2_000));
+    rig.service.stop().await;
+}
+
+// Each of a tracker rule's DHT, peer exchange and local discovery switches
+// reaches its torrents on its own: one turned off holds them off that one
+// source, one unset leaves it on, and a torrent with any source left is not
+// held to its trackers. A change reaches the running torrent at the next
+// tick, through its session again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tracker_rules_dht_pex_and_lsd_each_reach_its_torrents() {
+    use weaver_torrent::Discovery;
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let rule = rig
+        .db
+        .insert_tracker_rule(
+            &TrackerRule {
+                host_pattern: "*.example-tracker.test".into(),
+                dht: Some(false),
+                pex: Some(false),
+                lsd: None,
+                ..TrackerRule::default()
+            },
+            EPOCH_MS,
+        )
+        .unwrap();
+    rig.service.reload_tracker_rules().await.unwrap();
+    let ruled = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(announcing(
+                &plain("ruled", 1),
+                "http://tracker.example-tracker.test/announce",
+            )))
+        })
+        .await
+        .unwrap();
+
+    let handle = handle_of(&rig.service, ruled).await;
+    assert!(!handle.takes_peers_from_trackers_only());
+    assert_eq!(
+        handle.discovery(),
+        Discovery {
+            dht: false,
+            lsd: true
+        }
+    );
+    assert!(!handle.speaks_pex());
+
+    rig.db
+        .update_tracker_rule(
+            &TrackerRule {
+                dht: None,
+                pex: Some(true),
+                lsd: Some(false),
+                ..rule
+            },
+            EPOCH_MS,
+        )
+        .unwrap();
+    rig.service.reload_tracker_rules().await.unwrap();
+    rig.service.tick().await;
+    let again = handle_of(&rig.service, ruled).await;
+    assert!(!Arc::ptr_eq(&handle, &again));
+    assert!(!again.takes_peers_from_trackers_only());
+    assert_eq!(
+        again.discovery(),
+        Discovery {
+            dht: true,
+            lsd: false
+        }
+    );
+    assert!(again.speaks_pex());
     rig.service.stop().await;
 }
 
@@ -5869,7 +5967,9 @@ async fn the_rule_a_tracker_edit_picks_is_the_one_a_restart_reads() {
                 unpack: None,
                 client: None,
                 torrent_route: false,
-                discovery: None,
+                dht: None,
+                pex: None,
+                lsd: None,
                 encryption: None,
                 upload_limit: None,
                 forced: false,

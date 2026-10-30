@@ -16,7 +16,7 @@ use crate::servers::ServerConfig;
 #[cfg(test)]
 use crate::settings::Config;
 
-const TRACKER_RULE_COLUMNS: &str = "id, host_pattern, seeding, never_pause, unpack, client, torrent_route, discovery, encryption, upload_limit, forced, ssl_certificate, ssl_private_key";
+const TRACKER_RULE_COLUMNS: &str = "id, host_pattern, seeding, never_pause, unpack, client, torrent_route, dht, pex, lsd, encryption, upload_limit, forced, ssl_certificate, ssl_private_key";
 
 fn tracker_rule_from_row(
     row: &SqlRow,
@@ -47,7 +47,9 @@ fn tracker_rule_from_row(
             })
             .transpose()?,
         torrent_route: row.bool("torrent_route")?,
-        discovery: row.opt_bool("discovery")?,
+        dht: row.opt_bool("dht")?,
+        pex: row.opt_bool("pex")?,
+        lsd: row.opt_bool("lsd")?,
         encryption: row
             .opt_text("encryption")?
             .map(|encryption| {
@@ -115,7 +117,9 @@ fn tracker_rule_args(
         SqlArg::OptBool(rule.unpack),
         SqlArg::OptText(rule.client.map(|client| client.as_str().to_owned())),
         SqlArg::Bool(rule.torrent_route),
-        SqlArg::OptBool(rule.discovery),
+        SqlArg::OptBool(rule.dht),
+        SqlArg::OptBool(rule.pex),
+        SqlArg::OptBool(rule.lsd),
         SqlArg::OptText(
             rule.encryption
                 .map(|encryption| encryption.as_str().to_owned()),
@@ -179,7 +183,7 @@ impl Database {
                     tx.execute(
                         &format!(
                             "INSERT INTO tracker_rules ({TRACKER_RULE_COLUMNS}, created_at_ms, updated_at_ms)
-                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
+                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
                         ),
                         &values,
                     )
@@ -201,7 +205,7 @@ impl Database {
                 datastore.read_exec(),
                 "UPDATE tracker_rules
                     SET host_pattern = {}, seeding = {}, never_pause = {}, unpack = {}, client = {}, torrent_route = {},
-                        discovery = {}, encryption = {}, upload_limit = {}, forced = {},
+                        dht = {}, pex = {}, lsd = {}, encryption = {}, upload_limit = {}, forced = {},
                         ssl_certificate = {}, ssl_private_key = {}, updated_at_ms = {}
                   WHERE id = {}",
                 &args,

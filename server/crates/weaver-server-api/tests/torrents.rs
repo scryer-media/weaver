@@ -593,13 +593,13 @@ async fn a_tracker_rule_keeps_the_client_its_torrents_name_themselves_as() {
     assert!(!rig.execute(&save("", "DELUGE")).await.errors.is_empty());
 }
 
-// A tracker rule keeps its torrents' discovery, encryption, upload cap and
-// forced start; absent inherits, and an upload cap without bytes per second
+// A tracker rule keeps its torrents' DHT, PEX and LSD, each on its own,
+// their encryption, upload cap and forced start; absent inherits, and an upload cap without bytes per second
 // is unlimited.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tracker_rule_keeps_its_torrents_peer_terms() {
     let rig = rig().await;
-    let fields = "id discovery encryption uploadLimit { bps } forced";
+    let fields = "id dht pex lsd encryption uploadLimit { bps } forced";
     let save = |id: &str, terms: &str| {
         format!(
             r#"mutation {{ saveTrackerRule({id} input: {{
@@ -611,7 +611,7 @@ async fn a_tracker_rule_keeps_its_torrents_peer_terms() {
     let response = rig
         .execute(&save(
             "",
-            "discovery: false, encryption: PREFER, uploadLimit: { bps: null }, forced: true",
+            "dht: false, pex: false, lsd: true, encryption: PREFER, uploadLimit: { bps: null }, forced: true",
         ))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
@@ -620,23 +620,23 @@ async fn a_tracker_rule_keeps_its_torrents_peer_terms() {
     assert_eq!(
         saved["saveTrackerRule"][0],
         serde_json::json!({
-            "id": id, "discovery": false, "encryption": "PREFER",
+            "id": id, "dht": false, "pex": false, "lsd": true, "encryption": "PREFER",
             "uploadLimit": { "bps": null }, "forced": true,
         })
     );
 
     for (terms, read) in [
         (
-            "discovery: true, encryption: REQUIRE, uploadLimit: { bps: 4096 }",
+            "dht: true, lsd: false, encryption: REQUIRE, uploadLimit: { bps: 4096 }",
             serde_json::json!({
-                "id": id, "discovery": true, "encryption": "REQUIRE",
+                "id": id, "dht": true, "pex": null, "lsd": false, "encryption": "REQUIRE",
                 "uploadLimit": { "bps": 4096 }, "forced": false,
             }),
         ),
         (
             "",
             serde_json::json!({
-                "id": id, "discovery": null, "encryption": null,
+                "id": id, "dht": null, "pex": null, "lsd": null, "encryption": null,
                 "uploadLimit": null, "forced": false,
             }),
         ),

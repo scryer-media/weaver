@@ -54,8 +54,10 @@ interface TrackerRule {
   /** Null names the torrents as Weaver. */
   client: TorrentClient | null;
   torrentRoute: boolean;
-  /** Null inherits; false holds the rule's torrents to their trackers for peers. */
-  discovery: boolean | null;
+  /** Each null inherits; a private torrent uses none of the three whatever they say. */
+  dht: boolean | null;
+  pex: boolean | null;
+  lsd: boolean | null;
   /** Null inherits the global encryption. */
   encryption: TorrentEncryption | null;
   /** Null inherits the seeding policy's cap; a null rate is unlimited. */
@@ -87,7 +89,9 @@ interface TrackerRuleForm {
   unpack: boolean | null;
   client: TorrentClient | null;
   torrentRoute: boolean;
-  discovery: boolean | null;
+  dht: boolean | null;
+  pex: boolean | null;
+  lsd: boolean | null;
   encryption: TorrentEncryption | null;
   uploadLimit: TrackerUploadLimit | null;
   forced: boolean;
@@ -105,7 +109,9 @@ const NEW_TRACKER_RULE: TrackerRuleForm = {
   unpack: null,
   client: null,
   torrentRoute: false,
-  discovery: null,
+  dht: null,
+  pex: null,
+  lsd: null,
   encryption: null,
   uploadLimit: null,
   forced: false,
@@ -113,6 +119,13 @@ const NEW_TRACKER_RULE: TrackerRuleForm = {
   privateKeyPem: "",
   sslCleared: false,
 };
+
+/** The rule's peer sources beside its trackers, each switched on its own. */
+const DISCOVERY_SWITCHES = [
+  { key: "dht", label: "next.torrents.trackerRuleDht", keywords: "dht peer discovery private" },
+  { key: "pex", label: "next.torrents.trackerRulePex", keywords: "pex peer exchange private" },
+  { key: "lsd", label: "next.torrents.trackerRuleLsd", keywords: "lsd local peer discovery private" },
+] as const;
 
 /** The certificate a rule's save sends: pasted, cleared, or left out to keep the rule's. */
 function sslInput(form: TrackerRuleForm) {
@@ -454,7 +467,9 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
           unpack: rule.unpack,
           client: rule.client,
           torrentRoute: rule.torrentRoute,
-          discovery: rule.discovery,
+          dht: rule.dht,
+          pex: rule.pex,
+          lsd: rule.lsd,
           encryption: rule.encryption,
           uploadLimit: rule.uploadLimit,
           forced: rule.forced,
@@ -480,7 +495,9 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
         unpack: form.unpack,
         client: form.client,
         torrentRoute: form.torrentRoute,
-        discovery: form.discovery,
+        dht: form.dht,
+        pex: form.pex,
+        lsd: form.lsd,
         encryption: form.encryption,
         uploadLimit: form.uploadLimit,
         forced: form.forced,
@@ -639,17 +656,17 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
                   ),
                 },
               },
-              {
-                id: "discovery",
-                label: t("next.torrents.trackerRuleDiscovery"),
-                keywords: "dht pex lsd peer discovery private",
+              ...DISCOVERY_SWITCHES.map(({ key, label, keywords }) => ({
+                id: key,
+                label: t(label),
+                keywords,
                 control: {
-                  kind: "segmented",
-                  value: unpackChoice(form.discovery),
+                  kind: "segmented" as const,
+                  value: unpackChoice(form[key]),
                   options: UNPACK_CHOICES.map((option) => ({ ...option, label: t(option.label) })),
-                  onChange: (choice) => setForm((current) => ({ ...current, discovery: unpackOf(choice) })),
+                  onChange: (choice: string) => setForm((current) => ({ ...current, [key]: unpackOf(choice) })),
                 },
-              },
+              })),
               {
                 id: "encryption",
                 label: t("next.torrents.encryption"),

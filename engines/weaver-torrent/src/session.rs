@@ -597,6 +597,21 @@ pub struct AddTorrentOptions {
     /// Off by default; a private torrent is held to it either way.
     #[serde(default)]
     pub trackers_only: bool,
+    /// Neither announce the torrent on the DHT nor take peers from it,
+    /// while the session runs it for others (libtorrent
+    /// `torrent_flags::disable_dht`). Off by default.
+    #[serde(default)]
+    pub disable_dht: bool,
+    /// Neither announce the torrent on the local network nor take peers
+    /// found there (libtorrent `torrent_flags::disable_lsd`). Off by
+    /// default.
+    #[serde(default)]
+    pub disable_lsd: bool,
+    /// Neither advertise peer exchange to the torrent's peers, nor send
+    /// them its messages, nor read theirs (libtorrent
+    /// `torrent_flags::disable_pex`). Off by default.
+    #[serde(default)]
+    pub disable_pex: bool,
     /// Seed the files where the storage has them without checking them
     /// first: every piece is taken as had, whatever [`Self::checkpoint`]
     /// says, and each is checked the first time a peer asks for it. A piece
@@ -667,6 +682,9 @@ impl Default for AddTorrentOptions {
             disable_v1_hashes: v1_hashes_disabled_by_default(),
             super_seeding: false,
             trackers_only: false,
+            disable_dht: false,
+            disable_lsd: false,
+            disable_pex: false,
             seed_mode: false,
             seed_verified: None,
             ssl_identity: None,
@@ -1172,6 +1190,46 @@ fn own_tracker_tiers(opts: &AddTorrentOptions) -> Option<Vec<Vec<Tracker>>> {
 /// exchange, nor announces to any tracker but its own.
 pub(crate) const fn trackers_only(private: bool, added_trackers_only: bool) -> bool {
     private || added_trackers_only
+}
+
+/// Where a torrent looks for peers beside its trackers, as each of
+/// libtorrent's per-torrent flags leaves it: the DHT unless
+/// `torrent_flags::disable_dht` (`torrent::should_announce_dht`), the local
+/// network unless `disable_lsd` (`torrent::lsd_announce`). A torrent that
+/// takes peers from its trackers alone looks at neither, whatever its
+/// flags say: a private torrent is never announced on either
+/// (`should_announce_dht` and `lsd_announce` both return on `priv()`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Discovery {
+    pub dht: bool,
+    pub lsd: bool,
+}
+
+impl Discovery {
+    pub(crate) const fn of(trackers_only: bool, disable_dht: bool, disable_lsd: bool) -> Self {
+        Self {
+            dht: !trackers_only && !disable_dht,
+            lsd: !trackers_only && !disable_lsd,
+        }
+    }
+
+    /// Under `opts`, for a torrent `private` or not.
+    pub(crate) const fn added(private: bool, opts: &AddTorrentOptions) -> Self {
+        Self::of(
+            trackers_only(private, opts.trackers_only),
+            opts.disable_dht,
+            opts.disable_lsd,
+        )
+    }
+}
+
+/// Whether a torrent speaks peer exchange: the session runs it, the torrent
+/// was not added with `disable_pex`, and it takes peers from more than its
+/// trackers. libtorrent's `create_ut_pex_plugin` adds no plugin to a
+/// private torrent, and `ut_pex_plugin::tick` and
+/// `ut_pex_peer_plugin::on_extended` return while `disable_pex` is set.
+pub(crate) const fn speaks_pex(session_pex: bool, trackers_only: bool, disable_pex: bool) -> bool {
+    session_pex && !trackers_only && !disable_pex
 }
 
 /// Where a magnet's metadata fetch asks for peers. Until its metadata says
@@ -2538,6 +2596,11 @@ impl Session {
                 opts.force_tracker_interval,
                 opts.initial_peers.clone().unwrap_or_default(),
                 trackers_only(private, opts.trackers_only),
+                Discovery::of(
+                    trackers_only(private, opts.trackers_only),
+                    opts.disable_dht,
+                    opts.disable_lsd,
+                ),
                 dht_announce.subscribe(),
                 None,
                 trackers,
@@ -2563,7 +2626,9 @@ impl Session {
                 // The DHT and local discovery, when the session runs either
                 // and the torrent was not added to take peers from its
                 // trackers alone.
-                let discovery = !opts.trackers_only && (self.dht.is_some() || self.lsd.is_some());
+                let sources = Discovery::added(false, &opts);
+                let discovery =
+                    (sources.dht && self.dht.is_some()) || (sources.lsd && self.lsd.is_some());
                 if self.disable_trackers
                     && !discovery
                     && opts.initial_peers.as_ref().is_none_or(Vec::is_empty)
@@ -2618,7 +2683,7 @@ impl Session {
                         )
                         .await;
                         session
-                            .discovery_peers(info_hashes, false, dht_announce, None)
+                            .discovery_peers(info_hashes, false, dht_announce, None, sources)
                             .unwrap_or_else(|| futures::stream::empty().boxed())
                     }
                     .flatten_stream()
@@ -2809,6 +2874,9 @@ impl Session {
                     super_seeding: opts.super_seeding,
                     sequential: opts.sequential.into(),
                     trackers_only: opts.trackers_only,
+                    disable_dht: opts.disable_dht,
+                    disable_lsd: opts.disable_lsd,
+                    disable_pex: opts.disable_pex,
                     seed: if opts.seed_mode {
                         SeedMode::over(
                             metadata.info.lengths().total_pieces(),
@@ -3004,6 +3072,7 @@ impl Session {
             t.shared().options.force_tracker_interval,
             t.shared().options.initial_peers.clone(),
             t.takes_peers_from_trackers_only(),
+            t.discovery(),
             t.shared().dht_announce.subscribe(),
             t.shared().ssl.as_ref(),
             None,
@@ -3137,6 +3206,7 @@ impl Session {
         force_tracker_interval: Option<Duration>,
         initial_peers: Vec<SocketAddr>,
         trackers_only: bool,
+        discovery: Discovery,
         dht_announce: tokio::sync::watch::Receiver<()>,
         ssl: Option<&Arc<SslTorrent>>,
         trackers: Option<TrackerTask>,
@@ -3145,11 +3215,8 @@ impl Session {
         if ssl.is_some_and(|ssl| !ssl.has_identity()) {
             return None;
         }
-        let discovery_rx = if trackers_only {
-            None
-        } else {
-            self.discovery_peers(info_hashes, announce, dht_announce, ssl)
-        };
+        let discovery_rx =
+            self.discovery_peers(info_hashes, announce, dht_announce, ssl, discovery);
 
         let (tracker_rx, trackers) = trackers
             .or_else(|| {
@@ -3184,13 +3251,15 @@ impl Session {
     }
 
     // The peers the DHT and local discovery name, under every hash the
-    // torrent goes by; None when the session runs neither.
+    // torrent goes by, each only where `discovery` looks; None when it
+    // looks at neither the session runs.
     fn discovery_peers(
         self: &Arc<Self>,
         info_hashes: InfoHashes,
         announce: bool,
         dht_announce: tokio::sync::watch::Receiver<()>,
         ssl: Option<&Arc<SslTorrent>>,
+        discovery: Discovery,
     ) -> Option<PeerStream> {
         // The port the torrent's peers are told to reach it at: an SSL
         // torrent's is the SSL listener's.
@@ -3198,7 +3267,7 @@ impl Session {
             Some(_) => self.ssl_port.subscribe(),
             None => self.announce_port.subscribe(),
         };
-        let dht_rx = self.dht.as_ref().map(|dht| {
+        let dht_rx = self.dht.as_ref().filter(|_| discovery.dht).map(|dht| {
             futures::stream::select_all(info_hashes.ids20().map(|info_hash| {
                 dht_peers(
                     dht.clone(),
@@ -3218,7 +3287,7 @@ impl Session {
         // streams, the LSD by registering here (libtorrent
         // `torrent::start_announcing` runs only after `files_checked`, never
         // while paused).
-        let lsd_rx = self.lsd.as_ref().map(|lsd| {
+        let lsd_rx = self.lsd.as_ref().filter(|_| discovery.lsd).map(|lsd| {
             // Local peers reach the listen port itself.
             let port = if !announce {
                 None
@@ -3657,9 +3726,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        AddTorrent, AddTorrentOptions, AddTorrentResponse, IpFilter, Session, SessionOptions,
-        TorrentIdOrHash, Tracker, is_bare_info_hash, merge_tracker_tiers, metainfo_tracker_tiers,
-        torrent_file_from_info_bytes, torrent_from_bytes,
+        AddTorrent, AddTorrentOptions, AddTorrentResponse, Discovery, IpFilter,
+        ManagedTorrentHandle, Session, SessionOptions, TorrentIdOrHash, Tracker, is_bare_info_hash,
+        merge_tracker_tiers, metainfo_tracker_tiers, torrent_file_from_info_bytes,
+        torrent_from_bytes,
     };
 
     fn url(s: &str) -> url::Url {
@@ -4043,6 +4113,120 @@ mod tests {
             session.announce_tiers(public.shared().tracker_tiers(), false),
             with_session
         );
+
+        session.stop().await;
+    }
+
+    // libtorrent `torrent_flags::disable_dht` and `disable_lsd`: a torrent
+    // added without the DHT or the local network looks for peers on neither,
+    // while the session runs them for its other torrents. A private torrent
+    // looks on neither whatever it was added with
+    // (`torrent::should_announce_dht`, `torrent::lsd_announce`), and neither
+    // does one added to take peers from its trackers alone.
+    #[tokio::test]
+    async fn test_a_torrent_looks_for_peers_only_where_it_was_added_to() {
+        use crate::lsd::RecordingSocket;
+
+        let dir = TempDir::new().unwrap();
+        let (sent_tx, _sent) = tokio::sync::mpsc::unbounded_channel();
+        let session = Session::new_with_opts(
+            dir.path().to_owned(),
+            SessionOptions {
+                dht: None,
+                disable_local_service_discovery: false,
+                lsd_socket: Some(Box::new(RecordingSocket(sent_tx))),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(session.lsd.is_some());
+
+        let add = |name: &'static str, private: bool, opts: AddTorrentOptions| {
+            let session = session.clone();
+            let output_folder = dir.path().join(name).to_str().unwrap().to_owned();
+            async move {
+                session
+                    .add_torrent(
+                        AddTorrent::from_bytes(torrent_bytes(name, private)),
+                        Some(AddTorrentOptions {
+                            paused: true,
+                            output_folder: Some(output_folder),
+                            ..opts
+                        }),
+                    )
+                    .await
+                    .unwrap()
+                    .into_handle()
+                    .unwrap()
+            }
+        };
+        let everywhere = Discovery {
+            dht: true,
+            lsd: true,
+        };
+        let nowhere = Discovery {
+            dht: false,
+            lsd: false,
+        };
+
+        let public = add("public", false, AddTorrentOptions::default()).await;
+        assert_eq!(public.discovery(), everywhere);
+        let no_dht = add(
+            "no_dht",
+            false,
+            AddTorrentOptions {
+                disable_dht: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(
+            no_dht.discovery(),
+            Discovery {
+                dht: false,
+                lsd: true
+            }
+        );
+        let neither = add(
+            "neither",
+            false,
+            AddTorrentOptions {
+                disable_dht: true,
+                disable_lsd: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(neither.discovery(), nowhere);
+        let private = add("private", true, AddTorrentOptions::default()).await;
+        assert_eq!(private.discovery(), nowhere);
+        let trackers_only = add(
+            "trackers_only",
+            false,
+            AddTorrentOptions {
+                trackers_only: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(trackers_only.discovery(), nowhere);
+
+        // The session runs local discovery: a torrent that looks there is
+        // handed its peers, one that looks nowhere is handed none.
+        let peers = |t: &ManagedTorrentHandle| {
+            session.discovery_peers(
+                t.info_hashes(),
+                false,
+                tokio::sync::watch::channel(()).1,
+                None,
+                t.discovery(),
+            )
+        };
+        assert!(peers(&public).is_some());
+        assert!(peers(&no_dht).is_some());
+        assert!(peers(&neither).is_none());
+        assert!(peers(&private).is_none());
 
         session.stop().await;
     }

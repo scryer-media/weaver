@@ -5543,10 +5543,20 @@ type TrackerRule {
 	"""
 	torrentRoute: Boolean!
 	"""
-	Whether its torrents look for peers beyond their trackers; absent
-	inherits.
+	Whether its torrents look for peers on the DHT; absent inherits. A
+	private torrent does not, whatever this says.
 	"""
-	discovery: Boolean
+	dht: Boolean
+	"""
+	Whether its torrents exchange peers with their peers (PEX); absent
+	inherits. A private torrent does not, whatever this says.
+	"""
+	pex: Boolean
+	"""
+	Whether its torrents look for peers on the local network (LSD);
+	absent inherits. A private torrent does not, whatever this says.
+	"""
+	lsd: Boolean
 	"""
 	The encryption its torrents' connections are made under; absent
 	inherits.
@@ -5582,7 +5592,9 @@ input TrackerRuleInput {
 	unpack: Boolean
 	client: TorrentClient
 	torrentRoute: Boolean! = false
-	discovery: Boolean
+	dht: Boolean
+	pex: Boolean
+	lsd: Boolean
 	encryption: TorrentEncryption
 	uploadLimit: TrackerUploadLimitInput
 	forced: Boolean! = false

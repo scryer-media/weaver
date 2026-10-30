@@ -1281,3 +1281,20 @@ kind = "sql"
 file = "migrations/0096_torrent_seed_verified/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 97
+description = "a tracker rule's peer discovery splits into the DHT, peer exchange and local discovery"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0097_tracker_rule_discovery_split/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0097_tracker_rule_discovery_split/postgres.sql"
+engine = "postgres"
+scope = "all"

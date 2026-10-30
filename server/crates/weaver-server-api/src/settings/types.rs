@@ -1240,9 +1240,15 @@ pub struct TrackerRule {
     pub client: Option<TorrentClientGql>,
     /// Whether its torrents route through their own consumer.
     pub torrent_route: bool,
-    /// Whether its torrents look for peers beyond their trackers; absent
-    /// inherits.
-    pub discovery: Option<bool>,
+    /// Whether its torrents look for peers on the DHT; absent inherits. A
+    /// private torrent does not, whatever this says.
+    pub dht: Option<bool>,
+    /// Whether its torrents exchange peers with their peers (PEX); absent
+    /// inherits. A private torrent does not, whatever this says.
+    pub pex: Option<bool>,
+    /// Whether its torrents look for peers on the local network (LSD);
+    /// absent inherits. A private torrent does not, whatever this says.
+    pub lsd: Option<bool>,
     /// The encryption its torrents' connections are made under; absent
     /// inherits.
     pub encryption: Option<TorrentEncryptionGql>,
@@ -1296,7 +1302,9 @@ impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
             unpack: rule.unpack,
             client: rule.client.map(Into::into),
             torrent_route: rule.torrent_route,
-            discovery: rule.discovery,
+            dht: rule.dht,
+            pex: rule.pex,
+            lsd: rule.lsd,
             encryption: rule.encryption.map(Into::into),
             upload_limit: rule.upload_limit.map(Into::into),
             forced: rule.forced,
@@ -1317,7 +1325,9 @@ pub struct TrackerRuleInput {
     pub client: Option<TorrentClientGql>,
     #[graphql(default)]
     pub torrent_route: bool,
-    pub discovery: Option<bool>,
+    pub dht: Option<bool>,
+    pub pex: Option<bool>,
+    pub lsd: Option<bool>,
     pub encryption: Option<TorrentEncryptionGql>,
     pub upload_limit: Option<TrackerUploadLimitGql>,
     #[graphql(default)]
@@ -1343,7 +1353,9 @@ impl TrackerRuleInput {
             unpack: self.unpack,
             client: self.client.map(Into::into),
             torrent_route: self.torrent_route,
-            discovery: self.discovery,
+            dht: self.dht,
+            pex: self.pex,
+            lsd: self.lsd,
             encryption: self.encryption.map(Into::into),
             upload_limit: self.upload_limit.map(Into::into),
             forced: self.forced,

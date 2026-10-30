@@ -203,19 +203,28 @@ impl TorrentSettings {
 }
 
 // What a torrent's session holds its peers to under its tracker rule:
-// whether it takes them from its trackers alone, and the encryption its
-// connections are made under over the session's. A change of either takes
+// whether it takes them from its trackers alone, whether it looks for them
+// on the DHT, on the local network and by peer exchange, and the encryption
+// its connections are made under over the session's. A change of any takes
 // the torrent through its session again.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PeerTerms {
     trackers_only: bool,
+    disable_dht: bool,
+    disable_pex: bool,
+    disable_lsd: bool,
     encryption: Option<TorrentEncryption>,
 }
 
 impl PeerTerms {
+    // A switch the rule leaves unset inherits the session's, which runs
+    // each for every torrent it is not turned off for.
     fn of(rule: Option<&TrackerRule>) -> Self {
         rule.map_or_else(Self::default, |rule| Self {
             trackers_only: rule.trackers_only(),
+            disable_dht: rule.dht == Some(false),
+            disable_pex: rule.pex == Some(false),
+            disable_lsd: rule.lsd == Some(false),
             encryption: rule.encryption,
         })
     }
@@ -223,6 +232,9 @@ impl PeerTerms {
     // `options` under these terms.
     fn apply(self, options: &mut AddTorrentOptions) {
         options.trackers_only = self.trackers_only;
+        options.disable_dht = self.disable_dht;
+        options.disable_pex = self.disable_pex;
+        options.disable_lsd = self.disable_lsd;
         options.peer_opts = self.encryption.map(|encryption| PeerConnectionOptions {
             encryption: Some(encryption_policy(encryption)),
             ..Default::default()

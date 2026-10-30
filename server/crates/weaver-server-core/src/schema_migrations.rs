@@ -1878,6 +1878,56 @@ mod tests {
         pool.close().await;
     }
 
+    // Migration 97 splits a tracker rule's one discovery switch into the
+    // DHT, peer exchange and local discovery, each taking the switch's
+    // value, and drops the switch.
+    #[tokio::test]
+    async fn sqlite_migration_97_splits_a_rules_discovery_into_three() {
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("pre-discovery-split.db");
+        let pool = open_test_pool(&db_path).await;
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(96), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            pragma_column_count(&pool, "tracker_rules", &["discovery"]).await,
+            1
+        );
+        sqlx::query(
+            "INSERT INTO tracker_rules (id, host_pattern, discovery, created_at_ms, updated_at_ms)
+             VALUES (1, 'off.example', 0, 1, 1), (2, 'on.example', 1, 1, 1),
+                    (3, 'inherit.example', NULL, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        assert_eq!(
+            pragma_column_count(&pool, "tracker_rules", &["discovery"]).await,
+            0
+        );
+        let rows: Vec<(i64, Option<bool>, Option<bool>, Option<bool>)> =
+            sqlx::query_as("SELECT id, dht, pex, lsd FROM tracker_rules ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            [
+                (1, Some(false), Some(false), Some(false)),
+                (2, Some(true), Some(true), Some(true)),
+                (3, None, None, None),
+            ]
+        );
+        pool.close().await;
+    }
+
     // Migration 78 keeps each tracker's place in the announce list and drops
     // the announce columns, which the session answers instead.
     #[tokio::test]
