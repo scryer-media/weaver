@@ -209,6 +209,9 @@ pub struct TorrentRecord {
     pub seed_mode: bool,
     // The directory it moves under once complete; None when it stays.
     pub move_to: Option<String>,
+    // Where it stands in the download queue, the lowest first (libtorrent
+    // `torrent::queue_position`). A seed keeps the place it had.
+    pub queue_position: i64,
 }
 
 impl TorrentRecord {

@@ -35,6 +35,7 @@ fn torrent(job_id: u64, v1: Option<[u8; 20]>, v2: Option<[u8; 32]>) -> TorrentRe
         files_dir: None,
         seed_mode: false,
         move_to: None,
+        queue_position: job_id as i64,
     }
 }
 

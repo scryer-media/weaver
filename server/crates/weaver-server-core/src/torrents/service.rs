@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
@@ -569,6 +569,9 @@ pub struct TorrentView {
     /// Where its files sit when they were placed outside its storage
     /// directory, with no folder of their own.
     pub files_dir: Option<String>,
+    /// Its place among the torrents still downloading, from 1; None while
+    /// it seeds.
+    pub queue_position: Option<u32>,
     pub seeding_left: Option<String>,
     /// The torrent's own seeding policy, when it sets one, and what it
     /// would have without it.
@@ -1002,6 +1005,10 @@ struct Live {
     // takes the next change.
     run_error: Option<String>,
     queued: bool,
+    // Its place among the torrents still downloading, from 1, as the queue
+    // was last applied; None while it seeds (qBittorrent
+    // `TorrentImpl::queuePosition`).
+    queue_rank: Option<u32>,
     // Who holds it stopped, while a hold does.
     paused_by: Option<HoldOrigin>,
     // The operator's level for each file, as stored.
@@ -1106,6 +1113,7 @@ impl Live {
             engine: Engine::Absent,
             run_error: None,
             queued: false,
+            queue_rank: None,
             paused_by: None,
             levels: Vec::new(),
             speeds: (0, 0),
@@ -1652,6 +1660,9 @@ struct Inner {
     // publish from an action never waits on a session that is opening.
     sessions_read: Mutex<Vec<SessionSeries>>,
     counters: Counters,
+    // The place in the download queue the next torrent added takes: past
+    // every one kept (libtorrent puts a new torrent last in the queue).
+    next_queue_position: AtomicI64,
 }
 
 #[derive(Clone)]
@@ -1689,6 +1700,7 @@ impl TorrentService {
                 published: watch::channel(Arc::default()).0,
                 sessions_read: Mutex::default(),
                 counters: Counters::default(),
+                next_queue_position: AtomicI64::new(0),
             }),
         }
     }
@@ -2937,6 +2949,7 @@ impl TorrentService {
             files_dir: None,
             seed_mode: false,
             move_to,
+            queue_position: self.inner.next_queue_position.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -4171,9 +4184,9 @@ impl TorrentService {
         Ok(())
     }
 
-    /// A queue action on a torrent. The top priority, or a move to the top,
-    /// forces it past the download queue; any other priority, or a move to
-    /// the bottom, leaves it to the queue.
+    /// A queue action on a torrent. A move changes its place in the
+    /// download queue; the top priority forces it past the queue, and any
+    /// other leaves it to the queue.
     pub async fn act(&self, job_id: JobId, action: QueueAction) -> Result<(), ActionError> {
         match action {
             QueueAction::Pause => self.pause(job_id).await,
@@ -4183,12 +4196,80 @@ impl TorrentService {
                 self.remove(job_id, delete_files, false).await
             }
             QueueAction::Update(update) => self.update(job_id, update).await,
-            QueueAction::Move(QueueMoveTarget::Top) => self.set_forced(job_id, true).await,
-            QueueAction::Move(QueueMoveTarget::Bottom) => self.set_forced(job_id, false).await,
-            QueueAction::Move(QueueMoveTarget::Offset(_)) => Err(ActionError::Invalid(
-                "a torrent moves to the top or the bottom of the queue".into(),
-            )),
+            QueueAction::Move(target) => self.reorder(&[job_id], target).await,
         }
+    }
+
+    /// Moves `job_ids` in the download queue as qBittorrent's queue actions
+    /// do (`SessionImpl::increaseTorrentsQueuePos` and the others): of the
+    /// torrents named, those still downloading, taken in queue order, each
+    /// move one place up for a negative offset, starting with the first, or
+    /// one down for a positive one, starting with the last; to the top
+    /// starting with the last, so they keep their order there; to the bottom
+    /// starting with the first. A seed has no place to move (libtorrent
+    /// `torrent::finished` takes it out of the queue). Nothing moves a
+    /// torrent past the queue: forcing does that.
+    pub async fn reorder(
+        &self,
+        job_ids: &[JobId],
+        target: QueueMoveTarget,
+    ) -> Result<(), ActionError> {
+        {
+            let mut live = self.inner.live.lock().await;
+            if let Some(&missing) = job_ids.iter().find(|job_id| !live.contains_key(job_id)) {
+                return Err(ActionError::NotFound(missing));
+            }
+            let mut order: Vec<&Live> = live.values().filter(|torrent| !torrent.seeding()).collect();
+            order.sort_by_key(|torrent| (torrent.record.queue_position, torrent.record.job_id));
+            let mut order: Vec<JobId> = order.iter().map(|torrent| torrent.record.job_id).collect();
+            let named: Vec<JobId> = order
+                .iter()
+                .copied()
+                .filter(|job_id| job_ids.contains(job_id))
+                .collect();
+            let first_first = match target {
+                QueueMoveTarget::Top => false,
+                QueueMoveTarget::Bottom => true,
+                QueueMoveTarget::Offset(offset) => offset < 0,
+            };
+            let moving: Box<dyn Iterator<Item = &JobId>> = if first_first {
+                Box::new(named.iter())
+            } else {
+                Box::new(named.iter().rev())
+            };
+            for &job_id in moving {
+                // Named and still downloading, so in the order.
+                let _ = crate::jobs::handle::splice_job_order(&mut order, job_id, target);
+            }
+            // The torrents still downloading take the places they held among
+            // themselves, in their new order; a seed keeps its own.
+            let mut places: Vec<i64> = order
+                .iter()
+                .map(|job_id| live[job_id].record.queue_position)
+                .collect();
+            places.sort_unstable();
+            let moved: Vec<(JobId, i64)> = order
+                .iter()
+                .zip(places)
+                .filter(|(job_id, place)| live[*job_id].record.queue_position != *place)
+                .map(|(job_id, place)| (*job_id, place))
+                .collect();
+            if moved.is_empty() {
+                return Ok(());
+            }
+            self.inner
+                .db
+                .set_torrent_queue_positions(&moved)
+                .map_err(|error| ActionError::State(state_error(error)))?;
+            for (job_id, place) in moved {
+                if let Some(torrent) = live.get_mut(&job_id) {
+                    torrent.record.queue_position = place;
+                }
+            }
+        }
+        self.apply_queue().await;
+        self.publish().await;
+        Ok(())
     }
 
     async fn update(&self, job_id: JobId, update: JobUpdate) -> Result<(), ActionError> {
@@ -4224,6 +4305,11 @@ impl TorrentService {
         self.load_rules()?;
         let records = self.inner.db.list_torrents().map_err(state_error)?;
         let now = self.inner.clock.now_ms();
+        if let Some(last) = records.iter().map(|record| record.queue_position).max() {
+            self.inner
+                .next_queue_position
+                .fetch_max(last + 1, Ordering::Relaxed);
+        }
         for record in records {
             let job_id = record.job_id;
             let counters = self
@@ -4277,12 +4363,18 @@ impl TorrentService {
         let holds = self.holds();
         let mut live = self.inner.live.lock().await;
         let mut order: Vec<&Live> = live.values().collect();
-        order.sort_by_key(|torrent| (torrent.record.added_at_ms, torrent.record.job_id));
+        order.sort_by_key(|torrent| (torrent.record.queue_position, torrent.record.job_id));
         let queue: Vec<Queued> = order
             .iter()
             .map(|torrent| queued(&settings, &rules, torrent, now))
             .collect();
         let active = status::active(&queue, settings.torrent.max_active_downloads, &holds);
+        let ranks: BTreeMap<JobId, u32> = queue
+            .iter()
+            .filter(|torrent| !torrent.seeding)
+            .zip(1..)
+            .map(|(torrent, rank)| (torrent.job_id, rank))
+            .collect();
         let targets: BTreeMap<JobId, _> = queue
             .iter()
             .map(|torrent| (torrent.job_id, torrent.target()))
@@ -4290,6 +4382,7 @@ impl TorrentService {
         for torrent in live.values_mut() {
             let job_id = torrent.record.job_id;
             let active = active.contains(&job_id);
+            torrent.queue_rank = ranks.get(&job_id).copied();
             torrent.settle(now);
             torrent.paused_by = torrent
                 .resumed()
@@ -4843,6 +4936,7 @@ impl TorrentService {
             completed_at_ms: record.completed_at_ms,
             storage_dir: record.storage_dir.clone(),
             files_dir: record.files_dir.clone(),
+            queue_position: torrent.queue_rank,
             seeding_left: status::goal_left(policy.as_ref(), counters, total, now),
             seeding_override: record.policy_override,
             seeding_inherited: settings.inherited(record, rule),

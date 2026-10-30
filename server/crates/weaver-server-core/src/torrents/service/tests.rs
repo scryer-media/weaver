@@ -396,20 +396,20 @@ async fn the_queues_actions_reach_a_torrent() {
         Err(crate::SchedulerError::InvalidInput(_))
     ));
 
+    // A move changes its place in the queue and never forces it.
     queue
         .reorder_job(job_id, QueueMoveTarget::Top)
         .await
         .unwrap();
-    assert!(record(&rig).forced);
     queue
         .reorder_jobs(vec![(job_id, QueueMoveTarget::Bottom)])
         .await
         .unwrap();
+    queue
+        .reorder_job(job_id, QueueMoveTarget::Offset(1))
+        .await
+        .unwrap();
     assert!(!record(&rig).forced);
-    assert!(matches!(
-        queue.reorder_job(job_id, QueueMoveTarget::Offset(1)).await,
-        Err(crate::SchedulerError::InvalidInput(_))
-    ));
 
     queue.cancel_job_keeping_files(job_id).await.unwrap();
     assert_eq!(rig.db.get_torrent(job_id).unwrap(), None);
@@ -474,6 +474,7 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         completed_at_ms: None,
         storage_dir: None,
         files_dir: None,
+        queue_position: None,
         seeding_left: None,
         route: None,
         files: Vec::new(),
@@ -4488,6 +4489,115 @@ async fn the_download_limit_counts_downloading_torrents_as_it_is_set() {
     assert_eq!(queued().await, [false, false, false, false]);
 }
 
+// The torrents still downloading keep their own order, kept with them: the
+// first in it download up to the limit, a forced one runs past it, a seed
+// stands outside it, and a move takes the torrents named as qBittorrent's
+// queue actions do, keeping their order among themselves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_download_queue_keeps_its_order_and_moves_as_qbittorrent_does() {
+    use crate::jobs::handle::QueueMoveTarget;
+
+    let rig = rig(set_clock());
+    // No session is built while the route is down.
+    rig.routes.set_down(Some("down"));
+    rig.service.open().await.unwrap();
+    let mut ids = Vec::new();
+    for seed in 1..=5 {
+        ids.push(
+            rig.service
+                .add(request(AddSource::Metainfo(plain(
+                    &format!("set{seed}"),
+                    seed,
+                ))))
+                .await
+                .unwrap(),
+        );
+    }
+    let [a, b, c, d, e] = ids[..] else {
+        unreachable!()
+    };
+    rig.service
+        .inner
+        .live
+        .lock()
+        .await
+        .get_mut(&e)
+        .unwrap()
+        .record
+        .completed_at_ms = Some(EPOCH_MS);
+    let mut settings = rig.service.settings();
+    settings.torrent.max_active_downloads = 1;
+    rig.service.set_settings(settings).await;
+
+    let queued = || async {
+        let live = rig.service.inner.live.lock().await;
+        ids.iter().map(|id| live[id].queued).collect::<Vec<_>>()
+    };
+    let places = || async {
+        let mut places = Vec::new();
+        for id in &ids {
+            places.push(rig.service.torrent(*id).await.unwrap().queue_position);
+        }
+        places
+    };
+    // The order a restart would bring back, the seed's place left as it was.
+    let kept = || {
+        let mut kept: Vec<(i64, JobId)> = ids
+            .iter()
+            .map(|id| (rig.db.get_torrent(*id).unwrap().unwrap().queue_position, *id))
+            .collect();
+        kept.sort();
+        kept.into_iter().map(|(_, id)| id).collect::<Vec<_>>()
+    };
+
+    assert_eq!(queued().await, [false, true, true, true, false]);
+    assert_eq!(places().await, [Some(1), Some(2), Some(3), Some(4), None]);
+
+    rig.service.reorder(&[c], QueueMoveTarget::Top).await.unwrap();
+    assert_eq!(kept(), [c, a, b, d, e]);
+    assert_eq!(queued().await, [true, true, false, true, false]);
+    assert_eq!(places().await, [Some(2), Some(3), Some(1), Some(4), None]);
+
+    // Up one each, the first first, so the two keep their order.
+    rig.service
+        .reorder(&[b, a], QueueMoveTarget::Offset(-1))
+        .await
+        .unwrap();
+    assert_eq!(kept(), [a, b, c, d, e]);
+    // Down one each, the last first.
+    rig.service
+        .reorder(&[a, b], QueueMoveTarget::Offset(1))
+        .await
+        .unwrap();
+    assert_eq!(kept(), [c, a, b, d, e]);
+    // To the bottom the first first, to the top the last first.
+    rig.service
+        .reorder(&[a, c], QueueMoveTarget::Bottom)
+        .await
+        .unwrap();
+    assert_eq!(kept(), [b, d, c, a, e]);
+    rig.service
+        .reorder(&[a, c], QueueMoveTarget::Top)
+        .await
+        .unwrap();
+    assert_eq!(kept(), [c, a, b, d, e]);
+
+    // A seed has no place to move to.
+    rig.service.reorder(&[e], QueueMoveTarget::Top).await.unwrap();
+    assert_eq!(kept(), [c, a, b, d, e]);
+    assert!(matches!(
+        rig.service
+            .reorder(&[JobId(9_999)], QueueMoveTarget::Top)
+            .await,
+        Err(ActionError::NotFound(JobId(9_999)))
+    ));
+
+    // A forced torrent runs past the limit and keeps its place.
+    rig.service.set_forced(d, true).await.unwrap();
+    assert_eq!(queued().await, [true, true, false, false, false]);
+    assert_eq!(places().await, [Some(2), Some(3), Some(1), Some(4), None]);
+}
+
 #[test]
 fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_default() {
     let mut record = TorrentRecord {
@@ -4515,6 +4625,7 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         files_dir: None,
         seed_mode: false,
         move_to: None,
+        queue_position: 0,
     };
     let mut rules = vec![TrackerRule {
         id: 1,

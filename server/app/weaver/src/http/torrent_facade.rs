@@ -27,7 +27,8 @@ use weaver_server_core::categories::{
     CategoryConfig, completion_parent, validate_category_path_component,
 };
 use weaver_server_core::ingest::{Kind, classify};
-use weaver_server_core::jobs::{HoldOrigin, HoldOwner};
+use weaver_server_core::jobs::ids::JobId;
+use weaver_server_core::jobs::{HoldOrigin, HoldOwner, QueueMoveTarget};
 use weaver_server_core::operations::probe_disk_space;
 use weaver_server_core::proxies::{Bandwidth, ResolvedBy, TorrentScope};
 use weaver_server_core::proxies::{DiscoveredInterface, InterfaceSource, SystemInterfaceSource};
@@ -948,9 +949,12 @@ async fn torrents(
         "downloadLimit" => rate_limits(ctx, params, |view| view.download_limit).await,
         "setUploadLimit" => set_rate_limit(ctx, params, Direction::Upload).await,
         "setDownloadLimit" => set_rate_limit(ctx, params, Direction::Download).await,
-        "increasePrio" | "decreasePrio" | "topPrio" | "bottomPrio" => {
-            text(StatusCode::CONFLICT, "Torrent queueing must be enabled")
-        }
+        // qBittorrent `increasePrioAction` and the others: up is toward the
+        // front of the download queue.
+        "increasePrio" => move_in_queue(ctx, params, QueueMoveTarget::Offset(-1)).await,
+        "decreasePrio" => move_in_queue(ctx, params, QueueMoveTarget::Offset(1)).await,
+        "topPrio" => move_in_queue(ctx, params, QueueMoveTarget::Top).await,
+        "bottomPrio" => move_in_queue(ctx, params, QueueMoveTarget::Bottom).await,
         "setLocation" => set_location(ctx, params, "hashes", "location").await,
         "setSavePath" => set_location(ctx, params, "id", "path").await,
         // A torrent is written where it is saved: no download path is
@@ -1272,8 +1276,9 @@ pub(super) fn info(view: &TorrentView, scope: CallerScope) -> Value {
         ),
         ("dlspeed", json!(view.download_bps)),
         ("upspeed", json!(view.upload_bps)),
-        // Queueing is off: no torrent has a place in a queue.
-        ("priority", json!(0)),
+        // Its place in the download queue from 1, and 0 for a seed, which
+        // has none (qBittorrent `serialize_torrent.cpp`, `adjustQueuePosition`).
+        ("priority", json!(view.queue_position.unwrap_or(0))),
         ("num_seeds", json!(view.seeds)),
         (
             "num_complete",
@@ -2445,6 +2450,29 @@ where
     each_of(ctx, ctx.targets(params).await, action).await
 }
 
+// The torrents `hashes` names moved in the download queue together, as
+// qBittorrent moves them (see `TorrentService::reorder`).
+async fn move_in_queue(
+    ctx: &TorrentFacadeContext,
+    params: &Params,
+    target: QueueMoveTarget,
+) -> Response {
+    let Some(torrents) = &ctx.inner.torrents else {
+        return ok();
+    };
+    let job_ids: Vec<JobId> = ctx
+        .targets(params)
+        .await
+        .iter()
+        .map(|view| view.job_id)
+        .collect();
+    match torrents.reorder(&job_ids, target).await {
+        Ok(()) | Err(ActionError::NotFound(_)) => ok(),
+        Err(error @ ActionError::Invalid(_)) => text(StatusCode::CONFLICT, error.to_string()),
+        Err(error) => internal(error),
+    }
+}
+
 // `action` on each of `views`, as `each` does it.
 async fn each_of<F, Fut>(ctx: &TorrentFacadeContext, views: Vec<TorrentView>, action: F) -> Response
 where
@@ -2591,7 +2619,7 @@ pub(super) fn preferences(config: &Config, dht: bool) -> Value {
         "temp_path_enabled": false,
         "temp_path": "",
         "auto_tmm_enabled": false,
-        "queueing_enabled": false,
+        "queueing_enabled": true,
         "max_active_downloads": torrent.max_active_downloads,
         "max_active_uploads": -1,
         "max_active_torrents": -1,

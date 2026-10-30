@@ -1247,3 +1247,20 @@ kind = "sql"
 file = "migrations/0094_torrent_placed_files/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 95
+description = "a torrent keeps its place in the download queue"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0095_torrent_queue_position/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0095_torrent_queue_position/postgres.sql"
+engine = "postgres"
+scope = "all"
