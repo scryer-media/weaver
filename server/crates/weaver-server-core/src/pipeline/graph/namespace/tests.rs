@@ -1413,6 +1413,160 @@ fn a_deleted_output_does_not_hide_the_surviving_committed_envelope() {
     );
 }
 
+// A return can happen while the complete source still awaits handover.
+// Its recorded coverage, not its allocated length, describes retained bytes.
+#[test]
+fn give_back_retains_the_unreplayed_leaf_without_adopting_sparse_holes() {
+    for (sparse, restored) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut job = Job::new(PLENTY);
+        let member = job.member("pack.bin", Some(12));
+        job.send(member, 0, SIGNATURE, Provenance::Fresh);
+        let owner = job.tree.child_of(NodeId::ROOT, member).unwrap();
+        let source = [SIGNATURE, b"hello"].concat();
+        let (offset, bytes) = if sparse {
+            (10, &source[10..])
+        } else {
+            (0, &source[..])
+        };
+        job.writer
+            .write_file(&job.tree, NodeId::ROOT, member, offset, bytes)
+            .unwrap();
+        let original = job.writer.files[&NodeId::ROOT].leaves[&member]
+            .path()
+            .to_path_buf();
+        let record = job
+            .tree
+            .namespace_mut(NodeId::ROOT)
+            .unwrap()
+            .get_mut(member)
+            .unwrap();
+        record
+            .coverage
+            .write(ByteRange::new(offset, 12), Provenance::Fresh);
+        record.closed = !sparse;
+        if restored {
+            let state = job.writer.file_state(NodeId::ROOT, member);
+            job.writer
+                .restore_file(&job.tree, NodeId::ROOT, member, &state)
+                .unwrap();
+            assert_eq!(
+                job.writer.files[&NodeId::ROOT].leaves[&member].folded(12),
+                None
+            );
+        }
+
+        job.writer
+            .given_back(&mut job.tree, (NodeId::ROOT, member), owner)
+            .unwrap();
+
+        let record = job
+            .tree
+            .namespace(NodeId::ROOT)
+            .unwrap()
+            .get(member)
+            .unwrap();
+        assert!(record.coverage.covered(ByteRange::new(0, HEADER)));
+        assert!(record.coverage.covered(ByteRange::new(10, 12)));
+        assert_eq!(record.coverage.covered(ByteRange::new(HEADER, 10)), !sparse);
+        assert_eq!(record.closed, !sparse);
+        let leaf = &job.writer.files[&NodeId::ROOT].leaves[&member];
+        assert_eq!(leaf.path(), original, "handover keeps the recorded source");
+        let mut actual = Vec::new();
+        leaf.read(0, 12, &mut actual).unwrap();
+        assert_eq!(&actual[..HEADER as usize], SIGNATURE);
+        assert_eq!(&actual[10..], &source[10..]);
+        if !sparse {
+            assert_eq!(actual, source);
+        }
+    }
+}
+
+#[test]
+fn give_back_does_not_retain_a_truncated_leaf_tail() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("pack.bin", Some(12));
+    job.send(member, 0, SIGNATURE, Provenance::Fresh);
+    let owner = job.tree.child_of(NodeId::ROOT, member).unwrap();
+    job.writer
+        .write_file(
+            &job.tree,
+            NodeId::ROOT,
+            member,
+            0,
+            &[SIGNATURE, b"hello"].concat(),
+        )
+        .unwrap();
+    let leaf = job
+        .writer
+        .files_mut(NodeId::ROOT)
+        .leaves
+        .get_mut(&member)
+        .unwrap();
+    leaf.close(12).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(leaf.path())
+        .unwrap()
+        .set_len(9)
+        .unwrap();
+    let record = job
+        .tree
+        .namespace_mut(NodeId::ROOT)
+        .unwrap()
+        .get_mut(member)
+        .unwrap();
+    record
+        .coverage
+        .write(ByteRange::new(0, 12), Provenance::Fresh);
+    record.closed = true;
+
+    job.writer
+        .given_back(&mut job.tree, (NodeId::ROOT, member), owner)
+        .unwrap();
+
+    let record = job
+        .tree
+        .namespace(NodeId::ROOT)
+        .unwrap()
+        .get(member)
+        .unwrap();
+    assert!(record.coverage.covered(ByteRange::new(0, 9)));
+    assert!(!record.coverage.covered(ByteRange::new(9, 12)));
+    assert!(!record.closed);
+}
+
+#[test]
+fn give_back_reports_a_missing_recorded_leaf_without_discarding_the_source_record() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("pack.bin", Some(12));
+    job.send(member, 0, SIGNATURE, Provenance::Fresh);
+    let owner = job.tree.child_of(NodeId::ROOT, member).unwrap();
+    job.writer
+        .write_file(
+            &job.tree,
+            NodeId::ROOT,
+            member,
+            0,
+            &[SIGNATURE, b"hello"].concat(),
+        )
+        .unwrap();
+    let leaf = job
+        .writer
+        .files_mut(NodeId::ROOT)
+        .leaves
+        .get_mut(&member)
+        .unwrap();
+    leaf.close(12).unwrap();
+    std::fs::remove_file(leaf.path()).unwrap();
+
+    assert!(
+        job.writer
+            .given_back(&mut job.tree, (NodeId::ROOT, member), owner)
+            .is_err()
+    );
+    assert!(job.writer.files[&NodeId::ROOT].leaves.contains_key(&member));
+}
+
 // A restore brings an envelope back as far as its file reaches, and the
 // member's coverage as far as what arrived. Given back after that, the
 // envelope is the member's file, and what it lacks is not in hand: the
