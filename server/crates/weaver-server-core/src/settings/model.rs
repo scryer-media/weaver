@@ -520,6 +520,9 @@ pub struct TrackerRule {
     // their peers and in their HTTPS announces; `None` leaves an SSL torrent
     // under the rule waiting for one.
     pub ssl: Option<TrackerCertificate>,
+    // The tracker file that filled the rule, while it binds it; `None` once
+    // unbound or when none did.
+    pub bound: Option<super::tracker_file::Binding>,
 }
 
 // An identity a tracker issued: a certificate chain and its private key,
@@ -1206,6 +1209,7 @@ mod tests {
 
     fn rule(id: u32, host_pattern: &str) -> TrackerRule {
         TrackerRule {
+            bound: None,
             id,
             host_pattern: TrackerRule::pattern(host_pattern).unwrap(),
             seeding: None,

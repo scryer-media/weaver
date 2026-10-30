@@ -1257,6 +1257,7 @@ async fn the_dht_row_follows_the_torrents_rule_before_its_category() {
         .db
         .insert_tracker_rule(
             &TrackerRule {
+                bound: None,
                 id: 0,
                 host_pattern: "tracker.test".into(),
                 seeding: None,

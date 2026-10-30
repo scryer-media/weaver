@@ -210,11 +210,11 @@ values = ["first", " inner space ", "first", "   ", ""]
     assert_eq!(
         file.recommended.seeding,
         Some(SeedingTerms {
-            ratio_goal: Some(1.0),
-            seed_time_goal_minutes: Some(4320),
-            inactive_goal_minutes: Some(60),
-            mode: Some(SeedingGoalMode::All),
-            action: Some(SeedingAction::Stop),
+            ratio_goal: Leaf::Set(1.0),
+            seed_time_goal_minutes: Leaf::Set(4320),
+            inactive_goal_minutes: Leaf::Set(60),
+            mode: Leaf::Set(SeedingGoalMode::All),
+            action: Leaf::Set(SeedingAction::Stop),
         })
     );
     assert_eq!(

@@ -1419,6 +1419,7 @@ impl TrackerRuleInput {
     ) -> async_graphql::Result<weaver_server_core::settings::model::TrackerRule> {
         use weaver_server_core::settings::model::{TrackerCertificate, TrackerRule};
         TrackerRule {
+            bound: None,
             id,
             host_pattern: self.host_pattern,
             seeding: self

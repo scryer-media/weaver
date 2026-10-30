@@ -19,8 +19,11 @@ use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use serde::{Deserialize, Serialize};
+
 use super::model::{
-    SeedingAction, SeedingGoalMode, TorrentEncryption, TrackerCertificate, TrackerRule,
+    Leaf, SeedingAction, SeedingGoalMode, SeedingPolicy, TorrentEncryption, TrackerCertificate,
+    TrackerRule,
 };
 
 // The largest upload accepted, in bytes.
@@ -83,7 +86,8 @@ impl std::fmt::Debug for TrackerFile {
 }
 
 // The rule fields one section of a tracker file sets; `None` is not set.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Terms {
     pub dht: Option<bool>,
     pub pex: Option<bool>,
@@ -94,14 +98,16 @@ pub struct Terms {
     pub seeding: Option<SeedingTerms>,
 }
 
-// The seeding leaves a tracker may recommend, each `None` when not set.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+// The seeding leaves a tracker may recommend, as a rule's seeding policy
+// holds them: each inherits while the file does not set it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SeedingTerms {
-    pub ratio_goal: Option<f32>,
-    pub seed_time_goal_minutes: Option<u32>,
-    pub inactive_goal_minutes: Option<u32>,
-    pub mode: Option<SeedingGoalMode>,
-    pub action: Option<SeedingAction>,
+    pub ratio_goal: Leaf<f32>,
+    pub seed_time_goal_minutes: Leaf<u32>,
+    pub inactive_goal_minutes: Leaf<u32>,
+    pub mode: Leaf<SeedingGoalMode>,
+    pub action: Leaf<SeedingAction>,
 }
 
 // The fields of a rule a tracker file can lock or recommend, by the names a
@@ -124,6 +130,138 @@ impl Terms {
         .into_iter()
         .filter_map(|(field, set)| set.then_some(field))
         .collect()
+    }
+}
+
+// What a rule remembers of the tracker file that filled it: whose and
+// which, when, the fields the file locked, and the values it recommended as
+// it recommended them, so a later file can tell a recommendation the user
+// left from one the user changed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Binding {
+    pub name: String,
+    pub revision: String,
+    pub imported_at_ms: i64,
+    pub locked: Vec<String>,
+    #[serde(default)]
+    pub recommended: Terms,
+}
+
+impl Binding {
+    pub fn locks(&self, field: &str) -> bool {
+        self.locked.iter().any(|locked| locked == field)
+    }
+}
+
+impl TrackerFile {
+    // The rule this file makes of `rule`, or of no rule when there is none
+    // for its host pattern. A required value overwrites and is locked; a
+    // recommended one overwrites only a value still as the last file
+    // recommended it, so one the user changed stays. An identity in the
+    // file replaces the rule's and is locked; a file without one leaves the
+    // rule's as it is.
+    pub fn apply(&self, rule: Option<&TrackerRule>, now_ms: i64) -> TrackerRule {
+        let mut applied = rule.cloned().unwrap_or_else(|| TrackerRule {
+            host_pattern: self.host_pattern.clone(),
+            ..TrackerRule::default()
+        });
+        let before = rule
+            .and_then(|rule| rule.bound.as_ref())
+            .map(|bound| bound.recommended)
+            .unwrap_or_default();
+        let (required, recommended) = (&self.required, &self.recommended);
+        let take = |value: &mut Option<_>, required: Option<_>, recommended, before| {
+            *value = required.or(recommend(*value, recommended, before).or(*value));
+        };
+        take(&mut applied.dht, required.dht, recommended.dht, before.dht);
+        take(&mut applied.pex, required.pex, recommended.pex, before.pex);
+        take(&mut applied.lsd, required.lsd, recommended.lsd, before.lsd);
+        let encryption = recommend(
+            applied.encryption,
+            recommended.encryption,
+            before.encryption,
+        );
+        applied.encryption = required.encryption.or(encryption).or(applied.encryption);
+        // Each seeding leaf the file recommends is taken while the rule's
+        // leaf is still what the last file recommended.
+        if let Some(seeding) = recommended.seeding {
+            let before = before.seeding.unwrap_or_default();
+            let mut policy = applied.seeding.unwrap_or_default();
+            recommend_leaf(
+                &mut policy.ratio_goal,
+                seeding.ratio_goal,
+                before.ratio_goal,
+            );
+            recommend_leaf(
+                &mut policy.seed_time_goal_minutes,
+                seeding.seed_time_goal_minutes,
+                before.seed_time_goal_minutes,
+            );
+            recommend_leaf(
+                &mut policy.inactive_goal_minutes,
+                seeding.inactive_goal_minutes,
+                before.inactive_goal_minutes,
+            );
+            recommend_leaf(&mut policy.mode, seeding.mode, before.mode);
+            recommend_leaf(&mut policy.action, seeding.action, before.action);
+            applied.seeding = SeedingPolicy::kept(Some(policy));
+        }
+        if let Some(ssl) = &self.ssl {
+            applied.ssl = Some(ssl.clone());
+        }
+        let mut locked: Vec<String> = required.fields().into_iter().map(str::to_owned).collect();
+        if self.ssl.is_some() {
+            locked.push(FIELD_SSL.to_owned());
+        }
+        applied.bound = Some(Binding {
+            name: self.name.clone(),
+            revision: self.revision.clone(),
+            imported_at_ms: now_ms,
+            locked,
+            recommended: *recommended,
+        });
+        applied
+    }
+}
+
+// The recommendation, when the value is still what the last file recommended
+// (nothing, when no file did).
+fn recommend<T: PartialEq + Copy>(
+    current: Option<T>,
+    recommended: Option<T>,
+    before: Option<T>,
+) -> Option<T> {
+    recommended.filter(|_| current == before)
+}
+
+// A recommended leaf replaces `leaf` while `leaf` is still what the last file
+// recommended.
+fn recommend_leaf<T: PartialEq + Copy>(leaf: &mut Leaf<T>, recommended: Leaf<T>, before: Leaf<T>) {
+    if !recommended.is_inherit() && *leaf == before {
+        *leaf = recommended;
+    }
+}
+
+// Refuses a change `changed` makes to a field the tracker file bound to
+// `rule` locked, naming the field and the tracker.
+pub fn check_locks(rule: &TrackerRule, changed: &TrackerRule) -> Result<(), String> {
+    let Some(bound) = &rule.bound else {
+        return Ok(());
+    };
+    let differs = |field: &str| match field {
+        FIELD_DHT => rule.dht != changed.dht,
+        FIELD_PEX => rule.pex != changed.pex,
+        FIELD_LSD => rule.lsd != changed.lsd,
+        FIELD_ENCRYPTION => rule.encryption != changed.encryption,
+        FIELD_SSL => rule.ssl != changed.ssl,
+        _ => false,
+    };
+    match bound.locked.iter().find(|field| differs(field)) {
+        Some(field) => Err(format!(
+            "{field} is locked by {}'s tracker file; unbind the rule to change it.",
+            bound.name
+        )),
+        None => Ok(()),
     }
 }
 
@@ -758,11 +896,11 @@ fn seeding(value: &toml::Value, path: &str) -> Result<SeedingTerms, String> {
         })
         .transpose()?;
     Ok(SeedingTerms {
-        ratio_goal,
-        seed_time_goal_minutes: minutes("seed_time_goal_minutes")?,
-        inactive_goal_minutes: minutes("inactive_goal_minutes")?,
-        mode,
-        action,
+        ratio_goal: Leaf::of(ratio_goal),
+        seed_time_goal_minutes: Leaf::of(minutes("seed_time_goal_minutes")?),
+        inactive_goal_minutes: Leaf::of(minutes("inactive_goal_minutes")?),
+        mode: Leaf::of(mode),
+        action: Leaf::of(action),
     })
 }
 

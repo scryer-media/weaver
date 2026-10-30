@@ -599,34 +599,12 @@ impl SettingsMutation {
     ) -> Result<Vec<crate::settings::types::TrackerRule>> {
         // An input naming no certificate keeps the rule's.
         let keeps_ssl = input.ssl.is_undefined();
-        let mut rule = input.into_rule(id.unwrap_or(0))?;
+        let rule = input.into_rule(id.unwrap_or(0))?;
         let db = ctx.data::<Database>()?.clone();
         let _guard = SETTINGS_MUTATION_GUARD.lock().await;
         let rules = tokio::task::spawn_blocking(move || {
-            let rules = db.list_tracker_rules()?;
-            if keeps_ssl {
-                rule.ssl = rules
-                    .iter()
-                    .find(|other| Some(other.id) == id)
-                    .and_then(|other| other.ssl.clone());
-            }
-            if rules
-                .iter()
-                .any(|other| other.host_pattern == rule.host_pattern && Some(other.id) != id)
-            {
-                return Ok(Err(format!("a rule for {} exists", rule.host_pattern)));
-            }
             let now = chrono::Utc::now().timestamp_millis();
-            match id {
-                Some(_) if !db.update_tracker_rule(&rule, now)? => {
-                    return Ok(Err(format!("no tracker rule {}", rule.id)));
-                }
-                Some(_) => {}
-                None => {
-                    db.insert_tracker_rule(&rule, now)?;
-                }
-            }
-            db.list_tracker_rules().map(Ok)
+            db.save_tracker_rule(id, rule, keeps_ssl, now)
         })
         .await??
         .map_err(async_graphql::Error::new)?;

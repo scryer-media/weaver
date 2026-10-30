@@ -489,6 +489,7 @@ fn tracker_rules_crud() {
     let first = db
         .insert_tracker_rule(
             &TrackerRule {
+                bound: None,
                 id: 0,
                 host_pattern: "*.example.org".into(),
                 seeding: Some(seeding),
@@ -510,6 +511,7 @@ fn tracker_rules_crud() {
     let second = db
         .insert_tracker_rule(
             &TrackerRule {
+                bound: None,
                 id: 0,
                 host_pattern: "tracker.invalid".into(),
                 seeding: None,
@@ -584,6 +586,7 @@ fn a_tracker_rules_private_key_is_encrypted_at_rest() {
     let kept = db
         .insert_tracker_rule(
             &TrackerRule {
+                bound: None,
                 id: 0,
                 host_pattern: "tracker.example".into(),
                 seeding: None,
@@ -635,4 +638,212 @@ fn a_tracker_rules_private_key_is_encrypted_at_rest() {
     assert!(db.update_tracker_rule(&cleared, 2).unwrap());
     assert_eq!(db.list_tracker_rules().unwrap(), [cleared]);
     assert_eq!((stored("cert"), stored("key")), (None, None));
+}
+
+// A tracker file read from `text`, with an identity for `subject` when one
+// is given.
+fn tracker_file(text: &str, subject: Option<&str>) -> crate::settings::tracker_file::TrackerFile {
+    let ssl = subject.map(|subject| {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec![subject.to_owned()]).unwrap();
+        format!(
+            "[ssl]\ncertificate_pem = '''\n{}'''\nprivate_key_pem = '''\n{}'''\n",
+            params.self_signed(&key).unwrap().pem(),
+            key.serialize_pem()
+        )
+    });
+    let text = format!(
+        "version = 1\nname = \"Example Tracker\"\nhost_pattern = \"*.tracker.example\"\n{text}\n{}",
+        ssl.unwrap_or_default()
+    );
+    crate::settings::tracker_file::read(text.as_bytes(), None).unwrap()
+}
+
+// A rule a tracker file filled refuses, on the ordinary save, a change to a
+// field the file locked, naming the field and the tracker; a change to any
+// other field saves, and the rule stays bound.
+#[test]
+fn a_bound_rule_refuses_a_change_to_a_locked_field() {
+    use crate::settings::TorrentEncryption;
+
+    let db = Database::open_in_memory().unwrap();
+    let file = tracker_file(
+        "revision = \"1\"\n[required]\ndht = false\nencryption = \"require\"\n[recommended]\npex = false",
+        Some("user-1"),
+    );
+    let rule = db.apply_tracker_file(&file, 10).unwrap();
+    let bound = rule.bound.clone().unwrap();
+    assert_eq!(bound.name, "Example Tracker");
+    assert_eq!(bound.revision, "1");
+    assert_eq!(bound.imported_at_ms, 10);
+    assert_eq!(bound.locked, ["dht", "encryption", "ssl"]);
+    assert_eq!(
+        (rule.dht, rule.pex, rule.encryption),
+        (Some(false), Some(false), Some(TorrentEncryption::Require))
+    );
+    assert_eq!(rule.ssl, file.ssl);
+
+    // The ordinary input names no binding; the save keeps the rule's.
+    let unbound_input =
+        |rule: &crate::settings::model::TrackerRule| crate::settings::model::TrackerRule {
+            bound: None,
+            ..rule.clone()
+        };
+    for (changed, keeps_ssl, field) in [
+        (
+            crate::settings::model::TrackerRule {
+                dht: Some(true),
+                ..unbound_input(&rule)
+            },
+            true,
+            "dht",
+        ),
+        (
+            crate::settings::model::TrackerRule {
+                encryption: None,
+                ..unbound_input(&rule)
+            },
+            true,
+            "encryption",
+        ),
+        (
+            crate::settings::model::TrackerRule {
+                ssl: None,
+                ..unbound_input(&rule)
+            },
+            false,
+            "ssl",
+        ),
+    ] {
+        let refusal = db
+            .save_tracker_rule(Some(rule.id), changed, keeps_ssl, 11)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            refusal,
+            format!(
+                "{field} is locked by Example Tracker's tracker file; unbind the rule to change it."
+            )
+        );
+    }
+    assert_eq!(db.list_tracker_rules().unwrap(), [rule.clone()]);
+
+    let changed = crate::settings::model::TrackerRule {
+        pex: Some(true),
+        never_pause: true,
+        ssl: None,
+        ..unbound_input(&rule)
+    };
+    let saved = db
+        .save_tracker_rule(Some(rule.id), changed, true, 12)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.len(), 1);
+    assert_eq!((saved[0].pex, saved[0].never_pause), (Some(true), true));
+    assert_eq!(saved[0].ssl, rule.ssl);
+    assert_eq!(saved[0].bound, rule.bound);
+}
+
+// A file whose pattern a rule has fills that rule again: its required
+// values replace the rule's, a recommendation the user left takes the new
+// one and one the user changed stays. A file for another pattern makes a
+// rule of its own.
+#[test]
+fn reimporting_a_tracker_file_replaces_required_and_keeps_edited_recommendations() {
+    let db = Database::open_in_memory().unwrap();
+    let first = tracker_file(
+        "revision = \"1\"
+[required]
+dht = false
+[recommended]
+pex = false
+lsd = false
+seeding = { ratio_goal = 1.0, seed_time_goal_minutes = 100 }",
+        None,
+    );
+    let rule = db.apply_tracker_file(&first, 1).unwrap();
+    let seeding = rule.seeding.unwrap();
+    assert_eq!(
+        (seeding.ratio_goal, seeding.seed_time_goal_minutes),
+        (Leaf::Set(1.0), Leaf::Set(100))
+    );
+
+    let edited = crate::settings::model::TrackerRule {
+        lsd: Some(true),
+        seeding: Some(crate::settings::SeedingPolicy {
+            ratio_goal: Leaf::Set(2.0),
+            ..seeding
+        }),
+        bound: None,
+        ..rule.clone()
+    };
+    db.save_tracker_rule(Some(rule.id), edited, true, 2)
+        .unwrap()
+        .unwrap();
+
+    let second = tracker_file(
+        "revision = \"2\"
+[required]
+dht = true
+[recommended]
+pex = true
+lsd = false
+seeding = { ratio_goal = 3.0, seed_time_goal_minutes = 200 }",
+        None,
+    );
+    let again = db.apply_tracker_file(&second, 3).unwrap();
+    assert_eq!(again.id, rule.id);
+    assert_eq!(again.dht, Some(true), "a required value is replaced");
+    assert_eq!(again.pex, Some(true), "a recommendation left as it came");
+    assert_eq!(again.lsd, Some(true), "a recommendation the user changed");
+    let seeding = again.seeding.unwrap();
+    assert_eq!(seeding.ratio_goal, Leaf::Set(2.0));
+    assert_eq!(seeding.seed_time_goal_minutes, Leaf::Set(200));
+    assert_eq!(again.bound.as_ref().unwrap().revision, "2");
+    assert_eq!(db.list_tracker_rules().unwrap(), [again.clone()]);
+
+    let other = tracker_file("revision = \"1\"", None);
+    let other = crate::settings::tracker_file::TrackerFile {
+        host_pattern: "other.example".into(),
+        ..other
+    };
+    let made = db.apply_tracker_file(&other, 4).unwrap();
+    assert_ne!(made.id, again.id);
+    assert_eq!(db.list_tracker_rules().unwrap().len(), 2);
+}
+
+// Unbinding keeps every value and the identity and lets the user change
+// them; deleting a rule takes its binding with it.
+#[test]
+fn unbinding_keeps_the_values_and_deleting_takes_the_binding() {
+    let db = Database::open_in_memory().unwrap();
+    let file = tracker_file(
+        "revision = \"1\"\n[required]\ndht = false\npex = false",
+        Some("user-1"),
+    );
+    let rule = db.apply_tracker_file(&file, 1).unwrap();
+    assert!(db.unbind_tracker_rule(rule.id, 2).unwrap());
+    assert!(!db.unbind_tracker_rule(rule.id + 1, 2).unwrap());
+    let unbound = db.list_tracker_rules().unwrap().remove(0);
+    assert_eq!(unbound.bound, None);
+    assert_eq!((unbound.dht, unbound.pex), (Some(false), Some(false)));
+    assert_eq!(unbound.ssl, file.ssl);
+
+    let changed = crate::settings::model::TrackerRule {
+        dht: Some(true),
+        ssl: None,
+        ..unbound.clone()
+    };
+    let saved = db
+        .save_tracker_rule(Some(rule.id), changed, false, 3)
+        .unwrap()
+        .unwrap();
+    assert_eq!((saved[0].dht, saved[0].ssl.as_ref()), (Some(true), None));
+
+    let bound = db.apply_tracker_file(&file, 4).unwrap();
+    assert!(bound.bound.is_some());
+    assert!(db.delete_tracker_rule(bound.id).unwrap());
+    assert!(db.list_tracker_rules().unwrap().is_empty());
+    let fresh = db.apply_tracker_file(&file, 5).unwrap();
+    assert_eq!(fresh.bound.unwrap().imported_at_ms, 5);
 }

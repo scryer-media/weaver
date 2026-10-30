@@ -876,6 +876,7 @@ async fn a_torrent_url_is_asked_for_as_the_client_its_rule_names() {
 
     db.insert_tracker_rule(
         &TrackerRule {
+            bound: None,
             id: 0,
             host_pattern: "127.0.0.1".into(),
             seeding: None,
@@ -1099,6 +1100,7 @@ async fn url_route(category: Option<&str>, matched: bool) {
     let rule = db
         .insert_tracker_rule(
             &TrackerRule {
+                bound: None,
                 id: 0,
                 host_pattern: if matched {
                     "127.0.0.1"
@@ -4180,6 +4182,7 @@ async fn a_tracker_rules_client_names_its_torrents() {
     rig.db
         .insert_tracker_rule(
             &TrackerRule {
+                bound: None,
                 id: 0,
                 host_pattern: "*.test".into(),
                 seeding: None,
@@ -4290,6 +4293,7 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
         .db
         .insert_tracker_rule(
             &TrackerRule {
+                bound: None,
                 id: 0,
                 host_pattern: "*.test".into(),
                 seeding: Some(SeedingPolicy {
@@ -4654,6 +4658,7 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         queue_position: 0,
     };
     let mut rules = vec![TrackerRule {
+        bound: None,
         id: 1,
         host_pattern: "tracker.test".into(),
         seeding: None,
@@ -4743,6 +4748,7 @@ fn chain() -> (TorrentRecord, TrackerRule, TorrentSettings) {
         upload_cap: Leaf::Inherit,
         forced: false,
         ssl: None,
+        bound: None,
     };
     let settings = TorrentSettings {
         upload_cap: None,
@@ -4929,6 +4935,7 @@ fn a_torrents_route_is_its_rules_then_its_categorys_then_the_default() {
         torrent: TorrentConfig::default(),
     };
     let mut rule = TrackerRule {
+        bound: None,
         id: 3,
         host_pattern: "tracker.test".into(),
         seeding: None,
@@ -4971,6 +4978,7 @@ async fn a_tracker_rules_route_carries_its_torrents_ahead_of_their_categorys() {
         .db
         .insert_tracker_rule(
             &TrackerRule {
+                bound: None,
                 id: 0,
                 host_pattern: "*.test".into(),
                 seeding: None,
@@ -5583,6 +5591,7 @@ async fn empty_seeding_terms_inherit_the_chain() {
     rig.db
         .insert_tracker_rule(
             &TrackerRule {
+                bound: None,
                 id: 0,
                 host_pattern: "*.test".into(),
                 seeding: Some(ruled),
@@ -5684,6 +5693,7 @@ async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
         .db
         .insert_tracker_rule(
             &TrackerRule {
+                bound: None,
                 id: 0,
                 host_pattern: "*.example-tracker.test".into(),
                 seeding: None,
@@ -6198,6 +6208,7 @@ async fn the_rule_a_tracker_edit_picks_is_the_one_a_restart_reads() {
         .db
         .insert_tracker_rule(
             &TrackerRule {
+                bound: None,
                 id: 0,
                 host_pattern: "b.invalid".into(),
                 seeding: None,

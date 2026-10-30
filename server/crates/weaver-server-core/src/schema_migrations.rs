@@ -2035,6 +2035,40 @@ mod tests {
         pool.close().await;
     }
 
+    // Migration 99 gives a rule room for the tracker file that binds it and
+    // that file's archive passwords; a rule kept before it is bound by none.
+    #[tokio::test]
+    async fn sqlite_migration_99_leaves_every_rule_unbound() {
+        let catalog = embedded_catalog().unwrap();
+        let payload = embedded_payload_bytes().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("pre-binding.db");
+        let pool = open_test_pool(&db_path).await;
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(98), true)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO tracker_rules (id, host_pattern, dht, created_at_ms, updated_at_ms)
+             VALUES (1, 'kept.example', 0, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        run_embedded_migrations_on_path_blocking(&db_path).unwrap();
+
+        let pool = open_test_pool(&db_path).await;
+        let rows: Vec<(i64, Option<bool>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT id, dht, bound, archive_passwords FROM tracker_rules ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, [(1, Some(false), None, None)]);
+        pool.close().await;
+    }
+
     // Migration 78 keeps each tracker's place in the announce list and drops
     // the announce columns, which the session answers instead.
     #[tokio::test]

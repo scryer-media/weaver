@@ -16,7 +16,7 @@ use crate::servers::ServerConfig;
 #[cfg(test)]
 use crate::settings::Config;
 
-const TRACKER_RULE_COLUMNS: &str = "id, host_pattern, seeding, never_pause, unpack, client, torrent_route, dht, pex, lsd, encryption, upload_cap, forced, ssl_certificate, ssl_private_key";
+const TRACKER_RULE_COLUMNS: &str = "id, host_pattern, seeding, never_pause, unpack, client, torrent_route, dht, pex, lsd, encryption, upload_cap, forced, ssl_certificate, ssl_private_key, bound";
 
 fn tracker_rule_from_row(
     row: &SqlRow,
@@ -80,6 +80,14 @@ fn tracker_rule_from_row(
             }),
             _ => None,
         },
+        bound: row
+            .opt_text("bound")?
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|error| {
+                    StateError::Database(format!("tracker rule binding is not valid: {error}"))
+                })
+            })
+            .transpose()?,
     })
 }
 
@@ -133,6 +141,13 @@ fn tracker_rule_args(
                 .map(|ssl| seal_private_key(key, &ssl.private_key_pem))
                 .transpose()?,
         ),
+        SqlArg::OptText(
+            rule.bound
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| StateError::Database(error.to_string()))?,
+        ),
     ])
 }
 
@@ -183,7 +198,7 @@ impl Database {
                     tx.execute(
                         &format!(
                             "INSERT INTO tracker_rules ({TRACKER_RULE_COLUMNS}, created_at_ms, updated_at_ms)
-                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
+                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
                         ),
                         &values,
                     )
@@ -206,7 +221,7 @@ impl Database {
                 "UPDATE tracker_rules
                     SET host_pattern = {}, seeding = {}, never_pause = {}, unpack = {}, client = {}, torrent_route = {},
                         dht = {}, pex = {}, lsd = {}, encryption = {}, upload_cap = {}, forced = {},
-                        ssl_certificate = {}, ssl_private_key = {}, updated_at_ms = {}
+                        ssl_certificate = {}, ssl_private_key = {}, bound = {}, updated_at_ms = {}
                   WHERE id = {}",
                 &args,
             )
@@ -224,6 +239,82 @@ impl Database {
                 datastore.read_exec(),
                 "DELETE FROM tracker_rules WHERE id = {}",
                 &[SqlArg::I64(i64::from(id))],
+            )
+            .await?;
+            Ok(changed > 0)
+        })
+    }
+
+    // Add `rule`, or replace the rule `id` names, and return every rule. A
+    // rule `keeps_ssl` keeps its identity. A rule a tracker file binds stays
+    // bound, and a change to a field the file locked is refused, as is a
+    // second rule for one pattern; the refusal is the inner error.
+    pub fn save_tracker_rule(
+        &self,
+        id: Option<u32>,
+        mut rule: TrackerRule,
+        keeps_ssl: bool,
+        now_ms: i64,
+    ) -> Result<Result<Vec<TrackerRule>, String>, StateError> {
+        let rules = self.list_tracker_rules()?;
+        let existing = id.and_then(|id| rules.iter().find(|other| other.id == id));
+        if keeps_ssl {
+            rule.ssl = existing.and_then(|other| other.ssl.clone());
+        }
+        rule.bound = existing.and_then(|other| other.bound.clone());
+        if let Some(existing) = existing
+            && let Err(refusal) = super::tracker_file::check_locks(existing, &rule)
+        {
+            return Ok(Err(refusal));
+        }
+        if rules
+            .iter()
+            .any(|other| other.host_pattern == rule.host_pattern && Some(other.id) != id)
+        {
+            return Ok(Err(format!("a rule for {} exists", rule.host_pattern)));
+        }
+        match id {
+            Some(_) if !self.update_tracker_rule(&rule, now_ms)? => {
+                return Ok(Err(format!("no tracker rule {}", rule.id)));
+            }
+            Some(_) => {}
+            None => {
+                self.insert_tracker_rule(&rule, now_ms)?;
+            }
+        }
+        self.list_tracker_rules().map(Ok)
+    }
+
+    // Fill the rule whose pattern is the file's, or a new one, from `file`,
+    // and return the rule.
+    pub fn apply_tracker_file(
+        &self,
+        file: &super::tracker_file::TrackerFile,
+        now_ms: i64,
+    ) -> Result<TrackerRule, StateError> {
+        let rules = self.list_tracker_rules()?;
+        let existing = rules
+            .iter()
+            .find(|rule| rule.host_pattern == file.host_pattern);
+        let rule = file.apply(existing, now_ms);
+        match existing {
+            Some(_) => {
+                self.update_tracker_rule(&rule, now_ms)?;
+                Ok(rule)
+            }
+            None => self.insert_tracker_rule(&rule, now_ms),
+        }
+    }
+
+    // Release the rule `id` names from the tracker file that filled it,
+    // keeping every value it holds. Returns whether the rule exists.
+    pub fn unbind_tracker_rule(&self, id: u32, now_ms: i64) -> Result<bool, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            let changed = SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE tracker_rules SET bound = NULL, updated_at_ms = {} WHERE id = {}",
+                &[SqlArg::I64(now_ms), SqlArg::I64(i64::from(id))],
             )
             .await?;
             Ok(changed > 0)
