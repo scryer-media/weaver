@@ -5551,7 +5551,7 @@
     {
       "path": "testdata/par2-ignorable-deficit/release.par2",
       "size": 26400,
-      "blake3": "8193b500dfacd48431c40deacb140a2677c0882272f155b419ad9dc4c87167ec",
+      "blake3": "754cef06aa4f32aa8c663ad5ec6fa3314e368e8912c3fde7b9b40cb8b7785d29",
       "format": "par2",
       "source": {
         "kind": "generated",
@@ -5569,7 +5569,7 @@
     {
       "path": "testdata/par2-ignorable-deficit/release.vol0+3.par2",
       "size": 65184,
-      "blake3": "f6af9512277a4e7368a9a8f5efc5c0e967b79e107a6a0d4dc9050af0e1df8a87",
+      "blake3": "58be1e7c50bec81748b43dd5e879dad64b24198e85239ccf357cffd82aa8d65d",
       "format": "par2",
       "source": {
         "kind": "generated",
@@ -5587,7 +5587,7 @@
     {
       "path": "testdata/par2-ignorable-deficit/test-media.mkv",
       "size": 5242880,
-      "blake3": "bd8b3991787e2bc03ae0f47bda585f1b9dbd831448493fe3c4a9118f4f947cf2",
+      "blake3": "04470afc2f344de23ef8dfdc93f6d4daaeeb78ec840f6815adb806ce694a2c87",
       "format": "mkv",
       "source": {
         "kind": "generated",
