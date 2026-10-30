@@ -48,6 +48,10 @@ use crate::pipeline::extraction::ExtractionFailure;
 // a numbering every namespace has. A source answers for the namespace it
 // delivered into and leaves every other one without.
 pub(crate) trait Segments {
+    fn length_uncertain(&self, _node: NodeId, _volume: VolumeIndex) -> bool {
+        false
+    }
+
     fn segments_for(
         &self,
         node: NodeId,
@@ -79,6 +83,8 @@ pub(crate) enum WriteError {
     Leaf(#[from] LeafError),
     #[error("member {member:?} of node {node:?} is not in its namespace")]
     UnknownMember { node: NodeId, member: MemberId },
+    #[error("recovery {set:?} changed inputs and its original snapshot could not be restored")]
+    StaleRecovery { set: NodeId },
     // The job's extraction budget refused it; nothing more of the job is
     // written.
     #[error(transparent)]
@@ -141,6 +147,10 @@ pub(crate) struct NamespaceWriter {
     // The latest checkpoint the database has committed.
     committed: u64,
     segments: Vec<Segment>,
+    // Only this set's certified writes retain its settled ruling.
+    acknowledging: Option<NodeId>,
+    #[cfg(test)]
+    diagnostics: Vec<weaver_graph::recovery::RepairDiagnostic>,
     placements: Vec<Placement>,
     // Where the time a member write takes on disk is published, when the
     // job runs in a pipeline.
@@ -171,6 +181,9 @@ impl NamespaceWriter {
             left: BTreeMap::new(),
             committed: 0,
             segments: Vec::new(),
+            acknowledging: None,
+            #[cfg(test)]
+            diagnostics: Vec::new(),
             placements: Vec::new(),
             metrics: None,
         }
@@ -261,7 +274,27 @@ impl NamespaceWriter {
         arrival: Arrival,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
-        self.feed(tree, segments, &arrival);
+        if segments.length_uncertain(arrival.node, VolumeIndex(arrival.member.0))
+            && let Some(namespace) = tree.namespace_mut(arrival.node)
+        {
+            namespace.mark_length_uncertain(arrival.member);
+        }
+        let accepted = tree
+            .namespace(arrival.node)
+            .map(|namespace| namespace.taking(arrival.member, arrival.range(), arrival.provenance));
+        if let Some((member, ranges)) = accepted {
+            for range in ranges {
+                let from = index(range.start - arrival.offset);
+                let accepted = Arrival {
+                    node: arrival.node,
+                    member: arrival.member,
+                    offset: range.start,
+                    bytes: arrival.bytes.slice(from..from + index(range.len())),
+                    provenance: arrival.provenance,
+                };
+                self.feed(tree, segments, &accepted, member);
+            }
+        }
         self.route(tree, builder, segments, arrival, out)
     }
 

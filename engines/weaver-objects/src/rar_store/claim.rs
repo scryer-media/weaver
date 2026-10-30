@@ -194,6 +194,15 @@ impl RarStore {
             .as_ref()
             .filter(|_| given.walk.in_set().is_some())
             .or(given.front.as_ref());
+        self.reclaim_front(name, front, facts)
+    }
+
+    pub(super) fn reclaim_front(
+        &self,
+        name: &str,
+        front: &[u8],
+        facts: Option<&RarVolumeFacts>,
+    ) -> Option<Placed> {
         match facts {
             Some(facts) if facts.is_volume => {
                 self.claim_as(name, facts.archive_format(), Some(facts))
@@ -312,7 +321,7 @@ impl RarStore {
 // again its bytes say, which the tree compares; or one beside it had its
 // headers read. A volume that states no position is placed only by the held
 // volumes its members link it to, which judged it so.
-fn judged(facts: &RarVolumeFacts, held: &BTreeMap<u32, Held<'_>>) -> bool {
+pub(crate) fn judged(facts: &RarVolumeFacts, held: &BTreeMap<u32, Held<'_>>) -> bool {
     Nameless { facts }.position().is_none_or(|stated| {
         held.contains_key(&stated)
             || [stated.checked_sub(1), stated.checked_add(1)]

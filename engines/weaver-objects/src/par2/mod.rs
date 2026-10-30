@@ -685,6 +685,47 @@ impl Recovery for Par2 {
     }
 
     fn feed(&mut self, member: MemberId, segments: &[Segment]) {
+        if !self
+            .grids()
+            .into_iter()
+            .any(|block| self.grid.matches_on(member, block, segments))
+        {
+            for state in self.sets.values_mut() {
+                if let Some(file) = state.bound(member)
+                    && state
+                        .usable()
+                        .and_then(|index| index.file_description(&file))
+                        .is_none_or(|description| {
+                            segments.iter().any(|segment| {
+                                segment.range.start < description.length
+                                    && !segment.range.is_empty()
+                            })
+                        })
+                {
+                    state.last = None;
+                }
+            }
+        }
+        self.feed_proven(member, segments);
+    }
+
+    fn uncovered(&mut self, member: MemberId, _range: ByteRange) {
+        self.grid.forget(member);
+        let keys: Vec<_> = self
+            .sets
+            .iter_mut()
+            .filter_map(|(key, state)| {
+                state.bound(member)?;
+                state.last = None;
+                Some(*key)
+            })
+            .collect();
+        for key in keys {
+            self.fold_set(key);
+        }
+    }
+
+    fn feed_proven(&mut self, member: MemberId, segments: &[Segment]) {
         for block in self.grids() {
             for segment in segments {
                 self.grid.offer(member, block, segment);

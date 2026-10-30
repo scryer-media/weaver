@@ -234,6 +234,8 @@ pub struct SevenZipStore {
     stale: bool,
     // The object gave its container up; it says nothing more.
     gone: bool,
+    #[serde(skip)]
+    uncertain_length: bool,
 }
 
 impl Durable for SevenZipStore {
@@ -318,6 +320,7 @@ impl SevenZipStore {
             recovery_said: false,
             stale: true,
             gone: false,
+            uncertain_length: false,
         }
     }
 
@@ -420,6 +423,9 @@ impl SevenZipStore {
     // A header range failed its checksum: say so once for each version of
     // its bytes, then wait for a repair to deliver it again.
     fn say_damaged(&mut self, range: ByteRange, crc: u32, out: &mut Vec<Emit>) {
+        if self.uncertain_length {
+            return self.give_up(Emit::NeedsEngine(Why::OrderUnknown), out);
+        }
         if !self.damage_said.insert((range.start, range.end, crc)) {
             return;
         }
@@ -502,6 +508,9 @@ impl SevenZipStore {
         for (volume, length) in &self.lengths {
             if geometry.agrees(*volume, *length) || !self.lengths_said.insert(*volume) {
                 continue;
+            }
+            if self.uncertain_length {
+                return self.give_up(Emit::NeedsEngine(Why::OrderUnknown), out);
             }
             out.push(Emit::Damaged {
                 volume: *volume,
@@ -665,6 +674,10 @@ impl SevenZipStore {
 }
 
 impl Object for SevenZipStore {
+    fn length_uncertain(&mut self, _volume: VolumeIndex) {
+        self.uncertain_length = true;
+    }
+
     fn kind(&self) -> Kind {
         Kind::SevenZipStore
     }

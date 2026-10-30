@@ -2008,3 +2008,206 @@ fn a_file_refused_whole_is_copied_from_the_file_holding_its_slices() {
     assert!(job.store.members[&again] == data);
     assert!(job.store.members[&first] == data);
 }
+#[test]
+fn staged_copy_remains_a_readable_rs_donor() {
+    use weaver_graph::recovery::MemberAccess;
+    struct Staged {
+        original: crate::testing::Store,
+        writes: Vec<(MemberId, u64, Vec<u8>)>,
+    }
+    impl MemberAccess for Staged {
+        fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
+            self.original.read(member, range, into)
+        }
+        fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
+            self.writes.push((member, offset, bytes.to_vec()));
+        }
+        fn length(&self, member: MemberId) -> Option<u64> {
+            self.original.length(member)
+        }
+        fn arrived(&self, member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {
+            self.original.arrived(member, range, out);
+        }
+        fn read_volume(
+            &mut self,
+            volume: VolumeIndex,
+            range: ByteRange,
+            into: &mut Vec<u8>,
+        ) -> bool {
+            self.original.read_volume(volume, range, into)
+        }
+    }
+    let twin = payload(91, BLOCK as usize);
+    let distinct = payload(92, BLOCK as usize);
+    let data = [twin.as_slice(), twin.as_slice(), distinct.as_slice()].concat();
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 1, 1);
+    let mut job = job(&files);
+    let mut wrong = data.clone();
+    wrong[BLOCK as usize..].fill(0);
+    let member = job.member("payload.bin", &wrong);
+    bind(&mut job);
+    job.store
+        .holes
+        .insert(member, vec![ByteRange::new(BLOCK, 3 * BLOCK)]);
+    let mut access = Staged {
+        original: job.store,
+        writes: Vec::new(),
+    };
+    assert_eq!(
+        job.object
+            .repair(&mut access, weaver_graph::Budget::default()),
+        RepairOutcome::Repaired { slices: 2 }
+    );
+    assert_eq!(
+        access.original.members[&member], wrong,
+        "writes remain staged"
+    );
+    for (member, offset, bytes) in access.writes {
+        access.original.write_repaired(member, offset, &bytes);
+    }
+    assert_eq!(access.original.members[&member], data);
+}
+
+#[test]
+fn changed_input_invalidates_clean_par2_ruling() {
+    let data = payload(93, 4 * BLOCK as usize);
+    let mut job = job(&par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1));
+    let member = job.member("payload.bin", &data);
+    bind(&mut job);
+    feed(&mut job, member, &data, None);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
+    feed(&mut job, member, &data, None);
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Clean));
+    job.object.feed(
+        member,
+        &segments(
+            BLOCK,
+            &data[BLOCK as usize..2 * BLOCK as usize],
+            ARTICLE,
+            BLOCK,
+            true,
+        ),
+    );
+    assert_eq!(
+        job.object.outcome(),
+        Some(RepairOutcome::Clean),
+        "aligned duplicate retains existing slice evidence"
+    );
+    job.store
+        .members
+        .get_mut(&member)
+        .unwrap()
+        .extend_from_slice(b"tail");
+    job.object.feed(
+        member,
+        &[weaver_graph::Segment {
+            range: ByteRange::at(data.len() as u64, 4),
+            crc32: crate::grid::crc32(b"tail"),
+            verified: true,
+        }],
+    );
+    assert_eq!(
+        job.object.outcome(),
+        Some(RepairOutcome::Clean),
+        "a changed suffix does not retract the described prefix proof"
+    );
+    let mut wrong = data.clone();
+    wrong[BLOCK as usize + 3] ^= 0x5a;
+    job.store.members.insert(member, wrong.clone());
+    feed(&mut job, member, &wrong, None);
+    assert!(verdicts(&job, member).contains(&SliceVerdict::Damaged));
+    assert_ne!(job.object.outcome(), Some(RepairOutcome::Clean));
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Repaired { slices: 1 }
+    );
+    assert_eq!(job.store.members[&member], data);
+    let repaired = job.object.outcome();
+    job.object
+        .feed_proven(member, &segments(0, &data, ARTICLE, BLOCK, true));
+    assert_eq!(job.object.outcome(), repaired);
+    job.object
+        .uncovered(member, ByteRange::new(BLOCK, 2 * BLOCK));
+    assert_eq!(
+        job.object.outcome(),
+        None,
+        "missing replay cannot revive a proof"
+    );
+}
+
+#[test]
+fn execution_error_reports_its_operation_and_original_cause() {
+    use weaver_graph::recovery::{MemberAccess, RepairDiagnostic};
+    struct Unreadable {
+        store: crate::testing::Store,
+        diagnostics: Vec<RepairDiagnostic>,
+        fail_reads: bool,
+    }
+    impl MemberAccess for Unreadable {
+        fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
+            !self.fail_reads && self.store.read(member, range, into)
+        }
+        fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
+            self.store.write_repaired(member, offset, bytes);
+        }
+        fn length(&self, member: MemberId) -> Option<u64> {
+            self.store.length(member)
+        }
+        fn arrived(&self, member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {
+            self.store.arrived(member, range, out);
+        }
+        fn read_volume(
+            &mut self,
+            volume: VolumeIndex,
+            range: ByteRange,
+            into: &mut Vec<u8>,
+        ) -> bool {
+            let read = self.store.read_volume(volume, range, into);
+            // Parity is fetched after verification. Inject failure into
+            // subsequent source reads, in execution rather than planning.
+            self.fail_reads = true;
+            read
+        }
+        fn repair_error(&mut self, operation: &str, context: &str, error: &dyn std::error::Error) {
+            self.diagnostics
+                .push(RepairDiagnostic::capture(operation, context, error));
+        }
+    }
+    let data = payload(95, 4 * BLOCK as usize);
+    let mut job = job(&par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1));
+    let mut wrong = data;
+    wrong[BLOCK as usize + 3] ^= 0x5a;
+    let member = job.member("payload.bin", &wrong);
+    bind(&mut job);
+    feed(
+        &mut job,
+        member,
+        &wrong,
+        Some(ByteRange::new(BLOCK, 2 * BLOCK)),
+    );
+    let mut access = Unreadable {
+        store: job.store,
+        diagnostics: Vec::new(),
+        fail_reads: false,
+    };
+    let outcome = job
+        .object
+        .repair(&mut access, weaver_graph::Budget::default());
+    assert!(matches!(outcome, RepairOutcome::Impossible { .. }));
+    let [diagnostic] = access.diagnostics.as_slice() else {
+        panic!("one execution diagnostic");
+    };
+    assert_eq!(diagnostic.operation, "execute repair");
+    assert!(!diagnostic.context.is_empty());
+    assert!(
+        std::iter::once(&diagnostic.error)
+            .chain(&diagnostic.causes)
+            .any(|message| message.contains("the namespace could not read the member")),
+        "{diagnostic:?}"
+    );
+}

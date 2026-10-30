@@ -2322,6 +2322,16 @@ impl Tree {
         });
         match carried {
             Some(carried) => {
+                // A completed earlier refusal is no longer this member's
+                // disposition: its current owner explicitly gave it back.
+                if self
+                    .nodes
+                    .retired()
+                    .get(&(parent, member))
+                    .is_some_and(Option::is_none)
+                {
+                    self.nodes.unretire(&(parent, member));
+                }
                 self.given.insert((parent, member), carried);
                 true
             }
@@ -2575,6 +2585,20 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
+        let uncertain = self.volumes(node).is_some_and(|(parent, volumes)| {
+            volumes.get(&arrived.volume).is_some_and(|member| {
+                self.namespace(parent)
+                    .is_some_and(|namespace| namespace.length_uncertain(*member))
+            })
+        });
+        if uncertain
+            && let Some(object) = self
+                .nodes
+                .get_mut(&node)
+                .and_then(|node| node.object.as_mut())
+        {
+            object.length_uncertain(arrived.volume);
+        }
         if let Some(lent) = self
             .nodes
             .get_mut(&node)
@@ -3406,7 +3430,11 @@ impl Tree {
             return;
         };
         let member = found.namespace.uncover(member, range);
-        let Some((child, volume)) = found.children.get(&member).copied() else {
+        let child = found.children.get(&member).copied();
+        for set in self.recovery_nodes(node) {
+            self.uncover_input(set, member, range);
+        }
+        let Some((child, volume)) = child else {
             return;
         };
         if let Some(object) = self

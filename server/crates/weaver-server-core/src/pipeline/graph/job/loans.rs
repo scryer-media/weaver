@@ -89,6 +89,13 @@ impl Loans {
             .and_then(|out| out.state)
     }
 
+    #[cfg(test)]
+    pub(super) fn current_repair(&self, set: NodeId, serial: u64) -> bool {
+        self.out
+            .as_ref()
+            .is_some_and(|out| out.kind == Work::Repair && out.set == set && out.serial == serial)
+    }
+
     // The repair numbered `serial` came back to the set: it is no longer
     // out. `false` for anything else, which is not heard.
     pub(crate) fn returned(&mut self, set: NodeId, serial: u64) -> bool {

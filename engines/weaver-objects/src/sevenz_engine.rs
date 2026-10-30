@@ -5,6 +5,7 @@
 // still growing, through sevenz-turbo. The run and the naming are its own;
 // the object is the shared engine object.
 
+mod geometry;
 pub mod naming;
 mod run;
 

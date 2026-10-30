@@ -3,6 +3,54 @@
 
 mod facts;
 
+#[test]
+fn changed_source_invalidates_both_par3_rulings() {
+    use weaver_graph::recovery::Segment;
+    let body = payload(103, 9_001);
+    let files = par3_set("generation", &[("member.bin", &body)], BLOCK, 3);
+    let mut job = job(&files);
+    let member = job.member("member.bin", &body);
+    bind(&mut job);
+    let evidence = |bytes: &[u8]| {
+        [Segment {
+            range: ByteRange::new(0, bytes.len() as u64),
+            crc32: crate::grid::crc32(bytes),
+            verified: true,
+        }]
+    };
+    job.object.feed(member, &evidence(&body));
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
+    assert!(!job.object.settled.is_empty());
+    job.object.feed(member, &evidence(&body));
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Clean));
+    let mut changed = body.clone();
+    changed[5_000] ^= 0x42;
+    job.arrive(member, 0, &changed, Provenance::Fresh);
+    job.store.members.insert(member, changed.clone());
+    job.object.feed(member, &evidence(&changed));
+    bind(&mut job);
+    assert!(job.object.settled.is_empty());
+    assert_ne!(job.object.outcome(), Some(RepairOutcome::Clean));
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
+    assert!(
+        matches!(outcome, RepairOutcome::Repaired { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(job.store.members[&member], body);
+    job.object.feed_proven(member, &evidence(&body));
+    assert_eq!(
+        job.object.outcome(),
+        Some(outcome),
+        "acknowledged repair retains its proof"
+    );
+}
+
 use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::{
     ByteRange, Delivery, MemberId, Object, ObjectId, Provenance, Recovery, Seek, VolumeIndex,

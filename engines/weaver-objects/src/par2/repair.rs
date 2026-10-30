@@ -105,7 +105,8 @@ pub(super) fn repair_set(
             (*file, valid)
         })
         .collect();
-    let copied = copy_held(state, index, &mut validity, access);
+    let mut donors = BTreeMap::new();
+    let copied = copy_held(state, index, &mut validity, access, &mut donors);
     proven.retain(|(member, range)| {
         !copied.iter().any(|(into, slice)| {
             into == member && slice.start <= range.start && range.end <= slice.end
@@ -175,7 +176,14 @@ pub(super) fn repair_set(
             Err(Par2Error::InsufficientRecoveryData { deficit, .. }) => {
                 wanted = available + u64::from(deficit);
             }
-            Err(_) => return short(available, access),
+            Err(error) => {
+                access.repair_error(
+                    "plan repair",
+                    &format!("{:02x?}", set.recovery_set_id),
+                    &error,
+                );
+                return short(available, access);
+            }
         }
     };
     let available = set.recovery_slices.len() as u64;
@@ -184,12 +192,18 @@ pub(super) fn repair_set(
         access: RefCell::new(access),
         members: &members,
         set: &set,
+        donors: &donors,
     };
     let options = RepairOptions {
         memory_limit: Some(memory_limit),
         ..Default::default()
     };
-    if execute_repair_with_options(&plan, &set, &mut files, &options).is_err() {
+    if let Err(error) = execute_repair_with_options(&plan, &set, &mut files, &options) {
+        files.access.get_mut().repair_error(
+            "execute repair",
+            &format!("{:02x?}", set.recovery_set_id),
+            &error,
+        );
         return short(available, files.access.into_inner());
     }
     SetRepair {
@@ -212,6 +226,7 @@ fn copy_held(
     index: &Par2FileSet,
     validity: &mut [(FileId, Vec<bool>)],
     access: &mut dyn MemberAccess,
+    donors: &mut BTreeMap<(FileId, u64), (MemberId, ByteRange)>,
 ) -> Vec<(MemberId, ByteRange)> {
     let intact = |validity: &[(FileId, Vec<bool>)], file: FileId, slice: u64| {
         validity
@@ -258,6 +273,9 @@ fn copy_held(
         buffer.resize(target.len() as usize, 0);
         access.write_repaired(into, target.start, &buffer);
         validity[at].1[slice as usize] = true;
+        // The destination remains staged until acknowledgment. Keep the
+        // original verified source for any later Reed-Solomon reads.
+        donors.insert((file, slice), (holder, source));
         copied.push((into, target));
     }
     copied
@@ -585,6 +603,7 @@ struct Files<'a> {
     access: RefCell<&'a mut dyn MemberAccess>,
     members: &'a BTreeMap<FileId, MemberId>,
     set: &'a Par2FileSet,
+    donors: &'a BTreeMap<(FileId, u64), (MemberId, ByteRange)>,
 }
 
 impl Files<'_> {
@@ -596,8 +615,10 @@ impl Files<'_> {
     }
 
     fn length(&self, file: &FileId) -> Option<u64> {
-        let member = self.member(file).ok()?;
-        self.access.borrow().length(member)
+        self.member(file).ok()?;
+        self.set
+            .file_description(file)
+            .map(|description| description.length)
     }
 }
 
@@ -611,15 +632,39 @@ impl FileAccess for Files<'_> {
         if offset >= end {
             return Ok(bytes);
         }
-        if self
-            .access
-            .borrow_mut()
-            .read(member, ByteRange::new(offset, end), &mut bytes)
-        {
-            Ok(bytes)
-        } else {
-            Err(io::Error::other("the namespace could not read the member"))
+        let mut access = self.access.borrow_mut();
+        let mut append = |source, range: ByteRange, length| {
+            let before = bytes.len();
+            if !range.is_empty()
+                && (!access.read(source, range, &mut bytes)
+                    || bytes.len() - before != range.len() as usize)
+            {
+                return Err(io::Error::other("the namespace could not read the member"));
+            }
+            bytes.resize(before + length as usize, 0);
+            Ok(())
+        };
+        let mut at = offset;
+        let first = (*file, offset / self.set.slice_size);
+        let last = (*file, (end - 1) / self.set.slice_size);
+        // Visit only copied slices. Ordinary source spans stay contiguous,
+        // including a request with no donor or donors outside its range.
+        for (&(_, slice), &(source, range)) in self.donors.range(first..=last) {
+            let base = slice * self.set.slice_size;
+            let start = at.max(base);
+            if at < start {
+                append(member, ByteRange::new(at, start), start - at)?;
+            }
+            let until = end.min(base.saturating_add(self.set.slice_size));
+            let from = range.start + (start - base).min(range.len());
+            let to = range.start + (until - base).min(range.len());
+            append(source, ByteRange::new(from, to), until - start)?;
+            at = until;
         }
+        if at < end {
+            append(member, ByteRange::new(at, end), end - at)?;
+        }
+        Ok(bytes)
     }
 
     fn file_exists(&self, file: &FileId) -> bool {
@@ -653,5 +698,197 @@ impl FileAccess for Files<'_> {
                 .write_repaired(member, offset, &data[..take]);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::par2::Par2;
+    use crate::testing::{Job, Store, par2_set, payload};
+    use weaver_graph::{Budget, ObjectId, Recovery, VolumeIndex};
+
+    const BLOCK: u64 = 512;
+
+    struct Staged {
+        original: Store,
+        writes: Vec<(MemberId, u64, Vec<u8>)>,
+    }
+
+    impl Staged {
+        fn publish(&mut self) {
+            for (member, offset, bytes) in std::mem::take(&mut self.writes) {
+                self.original.write_repaired(member, offset, &bytes);
+            }
+        }
+    }
+
+    impl MemberAccess for Staged {
+        fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
+            self.original.read(member, range, into)
+        }
+        fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
+            self.writes.push((member, offset, bytes.to_vec()));
+        }
+        fn length(&self, member: MemberId) -> Option<u64> {
+            self.original.length(member)
+        }
+        fn arrived(&self, member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {
+            self.original.arrived(member, range, out);
+        }
+        fn read_volume(
+            &mut self,
+            volume: VolumeIndex,
+            range: ByteRange,
+            into: &mut Vec<u8>,
+        ) -> bool {
+            self.original.read_volume(volume, range, into)
+        }
+    }
+
+    fn fixture(files: &[(String, Vec<u8>)], wrong: &[u8]) -> (Job<Par2>, MemberId) {
+        let id = ObjectId(7);
+        let mut job = Job::new(Par2::new(id), id);
+        for (name, bytes) in files {
+            job.volume(name, bytes, 700, false);
+        }
+        let member = job.member("payload.bin", wrong);
+        job.object.bind(&mut job.namespace, &mut Vec::new());
+        // The copied twin is physically readable, with old wrong bytes.
+        // Only the distinct block is unavailable to source reads.
+        job.store
+            .holes
+            .insert(member, vec![ByteRange::new(2 * BLOCK, 3 * BLOCK)]);
+        (job, member)
+    }
+
+    #[test]
+    fn source_reads_split_only_at_donors_in_the_requested_range() {
+        let data = payload(98, 32 * BLOCK as usize);
+        let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 1, 1);
+        for donor_slice in [None, Some(24), Some(8)] {
+            let (mut job, member) = fixture(&files, &data);
+            job.store.holes.clear();
+            job.store.reads = 0;
+            let state = job.object.sets.values().next().unwrap();
+            let set = state.usable().unwrap();
+            let file = set.recovery_file_ids[0];
+            let members = state.members();
+            let mut donors = BTreeMap::new();
+            if let Some(slice) = donor_slice {
+                donors.insert((file, slice), (member, ByteRange::new(0, BLOCK)));
+            }
+            let offset = 97;
+            let end = 16 * BLOCK + 19;
+            let actual = Files {
+                access: RefCell::new(&mut job.store),
+                members,
+                set,
+                donors: &donors,
+            }
+            .read_file_range(&file, offset, end - offset)
+            .unwrap();
+            let mut expected = data[offset as usize..end as usize].to_vec();
+            if donor_slice == Some(8) {
+                let into = (8 * BLOCK - offset) as usize;
+                expected[into..into + BLOCK as usize].copy_from_slice(&data[..BLOCK as usize]);
+            }
+            assert_eq!(actual, expected);
+            assert_eq!(job.store.reads, if donor_slice == Some(8) { 3 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn readable_old_copy_target_never_becomes_an_rs_source() {
+        let twin = payload(96, BLOCK as usize);
+        let distinct = payload(97, BLOCK as usize);
+        let data = [twin.as_slice(), twin.as_slice(), distinct.as_slice()].concat();
+        let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 1, 1);
+        let mut wrong = data.clone();
+        wrong[BLOCK as usize..].fill(0);
+
+        // Keep the repair plan and staged writes identical. Clearing only
+        // the original donor map recreates the old readable source view.
+        for use_donors in [false, true] {
+            let (mut job, member) = fixture(&files, &wrong);
+            let state = job.object.sets.values_mut().next().unwrap();
+            let index = state.usable().unwrap().clone();
+            let file = index.recovery_file_ids[0];
+            let mut access = Staged {
+                original: job.store,
+                writes: Vec::new(),
+            };
+            let mut read = false;
+            let mut proven = Vec::new();
+            let valid = slice_validity(
+                &index,
+                state,
+                &job.object.grid,
+                file,
+                &mut access,
+                &mut read,
+                &mut proven,
+            );
+            assert_eq!(valid, [true, false, false]);
+            let mut validity = vec![(file, valid)];
+            let mut donors = BTreeMap::new();
+            let copied = copy_held(state, &index, &mut validity, &mut access, &mut donors);
+            assert_eq!(copied, [(member, ByteRange::new(BLOCK, 2 * BLOCK))]);
+            assert_eq!(validity[0].1, [true, true, false]);
+            let mut old_target = Vec::new();
+            assert!(access.read(member, copied[0].1, &mut old_target));
+            assert_ne!(
+                old_target, twin,
+                "the readable destination still contains old bytes"
+            );
+            let mut set = index;
+            set.recovery_slices.clear();
+            spend(state, BLOCK, 1, &mut set.recovery_slices, &mut access);
+            assert_eq!(set.recovery_slices.len(), 1);
+            let verified = verification(&set, &validity, 1);
+            let plan = plan_repair_with_memory_limit(&set, &verified, None).unwrap();
+            let members = state.members().clone();
+            if !use_donors {
+                donors.clear();
+            }
+            let executed = {
+                let mut view = Files {
+                    access: RefCell::new(&mut access),
+                    members: &members,
+                    set: &set,
+                    donors: &donors,
+                };
+                execute_repair_with_options(&plan, &set, &mut view, &RepairOptions::default())
+            };
+            access.publish();
+            if use_donors {
+                executed.unwrap();
+                assert_eq!(access.original.members[&member], data);
+            } else {
+                executed
+                    .expect("old readable donor arithmetic must complete for this counterfactual");
+                assert_ne!(
+                    access.original.members[&member], data,
+                    "successful old arithmetic must expose wrong reconstructed bytes"
+                );
+            }
+        }
+
+        // Exercise the production entry with the same readable wrong twin.
+        let (mut job, member) = fixture(&files, &wrong);
+        let mut access = Staged {
+            original: job.store,
+            writes: Vec::new(),
+        };
+        assert_eq!(
+            job.object.repair(&mut access, Budget::default()),
+            RepairOutcome::Repaired { slices: 2 }
+        );
+        assert_eq!(
+            access.original.members[&member], wrong,
+            "publication remains actor-owned"
+        );
+        access.publish();
+        assert_eq!(access.original.members[&member], data);
     }
 }

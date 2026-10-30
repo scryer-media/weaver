@@ -46,6 +46,7 @@ pub(crate) struct Shelf {
 
 #[derive(Debug, Default)]
 pub(crate) struct Shelved {
+    pub(crate) uncertain_lengths: bool,
     pub(crate) kept: BTreeMap<u32, Kept>,
     // The volumes bound to the object, by index, and whether any more can
     // join. An index orders them; a gap is not a volume.
@@ -193,7 +194,19 @@ impl Envelopes {
     // the object kept of the volume. Nothing is read or copied.
     pub(crate) fn take(&mut self, node: NodeId, envelope: u32) -> Option<Kept> {
         let shelf = self.shelves.get(&node)?;
-        let kept = shelf.update(|state| state.kept.remove(&envelope))?;
+        let kept = shelf.update(|state| {
+            // Removing a volume changes the order already-read input used.
+            // The run barrier also retracts its acknowledged derived output.
+            let read_after = state
+                .kept
+                .range(envelope..)
+                .any(|(_, kept)| kept.reached > 0);
+            let kept = state.kept.remove(&envelope)?;
+            if read_after {
+                state.generation += 1;
+            }
+            Some(kept)
+        })?;
         self.marks.mark(node);
         Some(kept)
     }

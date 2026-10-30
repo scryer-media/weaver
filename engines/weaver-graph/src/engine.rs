@@ -51,6 +51,10 @@ pub trait Volumes: Send + Sync {
     // The volume's length, once it is closed.
     fn len(&self, volume: VolumeIndex) -> Option<u64>;
 
+    fn uncertain_lengths(&self) -> bool {
+        false
+    }
+
     // Whether no read of the volume waits: it is closed, and every byte of
     // it is in or will never come. Work on a lent pool reads only such
     // volumes. A view that cannot tell says no.

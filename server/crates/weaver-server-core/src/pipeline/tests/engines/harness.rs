@@ -466,7 +466,7 @@ fn scenario_client(servers: usize, port: u16) -> weaver_nntp::client::NntpClient
 // it has answered. A batch every server has answered for is ruled on as it
 // is seated, so the round can end there, and only a round still out after
 // the seating waits for the next answer.
-async fn hear_probe(pipeline: &mut Pipeline) {
+pub(super) async fn hear_probe(pipeline: &mut Pipeline) {
     loop {
         pipeline.seat_waiting_probes(
             &mut std::collections::HashMap::new(),

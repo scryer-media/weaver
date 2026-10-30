@@ -273,6 +273,57 @@ impl Grid {
         let block = self.files.get(&(member, block_size))?.block(index)?;
         fold_tiling(block.values(), range)
     }
+
+    // A replay can retain a ruling only where the retained evidence proves
+    // the same accepted bytes. Missing or coalesced-away evidence is unknown.
+    pub(crate) fn matches(&self, member: MemberId, segments: &[Segment]) -> bool {
+        self.matches_on(member, WHOLE, segments)
+    }
+
+    pub(crate) fn matches_on(&self, member: MemberId, block: u64, segments: &[Segment]) -> bool {
+        let mut at = 0;
+        while let Some(first) = segments.get(at) {
+            let index = first.range.start / block;
+            let mut range = first.range;
+            let mut crc = first.crc32;
+            let mut verified = first.verified;
+            at += 1;
+            while let Some(segment) = segments
+                .get(at)
+                .filter(|segment| segment.range.start / block == index)
+            {
+                if range.end != segment.range.start {
+                    return false;
+                }
+                crc = crc32_combine(crc, segment.crc32, segment.range.len());
+                verified &= segment.verified;
+                range.end = segment.range.end;
+                at += 1;
+            }
+            if range.is_empty()
+                || (range.end - 1) / block != index
+                || self
+                    .fold(member, block, index, range)
+                    .is_none_or(|was| was.crc32 != crc || was.verified != verified)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    pub(crate) fn forget(&mut self, member: MemberId) {
+        let keys: Vec<_> = self
+            .files
+            .range((member, 0)..=(member, u64::MAX))
+            .map(|(key, _)| *key)
+            .collect();
+        for key in keys {
+            if let Some(file) = self.files.remove(&key) {
+                self.load.sub(file.load);
+            }
+        }
+    }
 }
 
 // Compare a fold over a slice's real bytes with the CRC the set wrote for

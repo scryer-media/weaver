@@ -740,6 +740,7 @@ async fn a_volume_the_run_read_closing_at_another_length_restarts_the_run() {
     let mut echoing = echoing(3);
     echoing.deliver(0);
     echoing.until_closed(0).await;
+    assert_eq!(echoing.echoed(0), body(0));
     let engine = echoing.engine();
     let before = echoing.job.runs().generation(engine);
     assert!(before.is_some(), "the run is live");
@@ -749,4 +750,40 @@ async fn a_volume_the_run_read_closing_at_another_length_restarts_the_run() {
     namespace.recognise(MemberId(0), &name, length - 1);
     echoing.deliver(1);
     assert_ne!(echoing.job.runs().generation(engine), before);
+    assert!(!echoing.closed(0), "accepted old output must be retracted");
+    assert!(!echoing.dir.path().join("echo-0.bin").exists());
+}
+
+#[test]
+fn giving_back_read_input_stops_its_worker_but_unread_later_input_does_not() {
+    for (read, give_back, stopped) in [(0, 2, false), (2, 2, true), (2, 1, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let node = NodeId(1);
+        let mut envelopes = Envelopes::new(dir.path().to_path_buf());
+        for volume in 0..3 {
+            envelopes
+                .keep(node, volume, 0, b"source", Provenance::Fresh)
+                .unwrap();
+        }
+        let shelf = envelopes.shelf(node);
+        shelf.update(|state| state.volumes.extend(0..3));
+        let generation = shelf.begin();
+        let worker = RunVolumes::new(Arc::clone(&shelf), generation);
+        assert_eq!(
+            worker.read_at(VolumeIndex(read), 0, &mut [0; 6]).unwrap(),
+            6
+        );
+        envelopes.take(node, give_back).unwrap();
+        assert_eq!(worker.current(), !stopped);
+        assert_eq!(shelf.generation(), generation + u64::from(stopped));
+        if stopped {
+            assert_eq!(
+                worker
+                    .read_at(VolumeIndex(0), 0, &mut [0; 6])
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+        }
+    }
 }

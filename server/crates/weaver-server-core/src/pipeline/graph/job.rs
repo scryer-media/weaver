@@ -58,7 +58,9 @@ impl GraphError {
                 ExtractionError::from_io(message, source)
             }
             WriteError::Refused(failure) => ExtractionError::rejected(failure.clone()),
-            WriteError::UnknownMember { .. } => ExtractionError::terminal(message),
+            WriteError::UnknownMember { .. } | WriteError::StaleRecovery { .. } => {
+                ExtractionError::terminal(message)
+            }
         }
     }
 }
@@ -216,6 +218,11 @@ impl GraphJob {
     #[cfg(test)]
     pub(crate) fn runs(&self) -> &Runs {
         &self.runs
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_repair(&self, said: &Said) -> bool {
+        said.scope == self.runs.scope() && self.loans.current_repair(said.node, said.generation)
     }
 
     // Whether something of the job is out on a thread and will speak

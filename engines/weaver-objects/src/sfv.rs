@@ -300,7 +300,7 @@ impl Recovery for Sfv {
             .into_iter()
             .filter_map(|(basename, member)| Some((member?, *entries.get(&basename)?)))
             .collect();
-        self.lengths = bound
+        let lengths = bound
             .keys()
             .filter_map(|member| {
                 let record = namespace.get(*member)?;
@@ -310,9 +310,10 @@ impl Recovery for Sfv {
                     .map(|length| (*member, length))
             })
             .collect();
-        if bound != self.bound {
+        if bound != self.bound || lengths != self.lengths {
             self.outcome = None;
         }
+        self.lengths = lengths;
         self.bound = bound;
     }
 
@@ -326,8 +327,22 @@ impl Recovery for Sfv {
     }
 
     fn feed(&mut self, member: MemberId, segments: &[Segment]) {
+        if self.covers(member) && !self.grid.matches(member, segments) {
+            self.outcome = None;
+        }
+        self.feed_proven(member, segments);
+    }
+
+    fn feed_proven(&mut self, member: MemberId, segments: &[Segment]) {
         for segment in segments {
             self.grid.offer(member, WHOLE, segment);
+        }
+    }
+
+    fn uncovered(&mut self, member: MemberId, _range: ByteRange) {
+        self.grid.forget(member);
+        if self.covers(member) {
+            self.outcome = None;
         }
     }
 

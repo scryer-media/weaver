@@ -79,8 +79,13 @@ pub(super) enum Told {
     Fed {
         member: MemberId,
         evidence: Vec<Segment>,
+        proven: bool,
     },
     Refused {
+        member: MemberId,
+        range: ByteRange,
+    },
+    Uncovered {
         member: MemberId,
         range: ByteRange,
     },
@@ -186,12 +191,36 @@ impl Tree {
 
     // Segment evidence for a member the recovery object at `set` covers.
     pub fn feed(&mut self, set: NodeId, member: MemberId, evidence: &[Segment]) {
+        self.feed_input(set, member, evidence, false);
+    }
+
+    pub fn feed_proven(&mut self, set: NodeId, member: MemberId, evidence: &[Segment]) {
+        self.feed_input(set, member, evidence, true);
+    }
+
+    fn feed_input(&mut self, set: NodeId, member: MemberId, evidence: &[Segment], proven: bool) {
         let waiting = Waiting::Told(Told::Fed {
             member,
             evidence: evidence.to_vec(),
+            proven,
         });
         if self.wait(set, waiting).is_some() {
-            self.with_recovery(set, |recovery, _| recovery.feed(member, evidence));
+            self.with_recovery(set, |recovery, _| {
+                if proven {
+                    recovery.feed_proven(member, evidence);
+                } else {
+                    recovery.feed(member, evidence);
+                }
+            });
+        }
+    }
+
+    pub(super) fn uncover_input(&mut self, set: NodeId, member: MemberId, range: ByteRange) {
+        if self
+            .wait(set, Waiting::Told(Told::Uncovered { member, range }))
+            .is_some()
+        {
+            self.with_recovery(set, |recovery, _| recovery.uncovered(member, range));
         }
     }
 
@@ -285,14 +314,27 @@ impl Tree {
                 Told::Lost { volume, range } => object.volume_lost(volume, range, &mut emits),
                 Told::Renamed { volume, name } => object.renamed(volume, &name, &mut emits),
                 Told::Pulled { seek, pull } => object.pulled(seek, pull, &mut emits),
-                Told::Fed { member, evidence } => {
+                Told::Fed {
+                    member,
+                    evidence,
+                    proven,
+                } => {
                     if let Some(recovery) = object.recovery_mut() {
-                        recovery.feed(member, &evidence);
+                        if proven {
+                            recovery.feed_proven(member, &evidence);
+                        } else {
+                            recovery.feed(member, &evidence);
+                        }
                     }
                 }
                 Told::Refused { member, range } => {
                     if let Some(recovery) = object.recovery_mut() {
                         recovery.refused(member, range);
+                    }
+                }
+                Told::Uncovered { member, range } => {
+                    if let Some(recovery) = object.recovery_mut() {
+                        recovery.uncovered(member, range);
                     }
                 }
             }
