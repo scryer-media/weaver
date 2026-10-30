@@ -1359,6 +1359,9 @@ pub struct TrackerRule {
     pub ssl_not_after: Option<i64>,
     /// The tracker file that filled it; absent when none binds it.
     pub bound: Option<TrackerBinding>,
+    /// How many archive passwords it holds for its torrents. The values are
+    /// never returned.
+    pub archive_password_count: u32,
 }
 
 /// The tracker file a rule was filled from.
@@ -1478,6 +1481,7 @@ impl From<weaver_server_core::settings::model::TrackerRule> for TrackerRule {
             ssl_subject: summary.as_ref().map(|summary| summary.subject.clone()),
             ssl_not_after: summary.map(|summary| summary.not_after_ms),
             bound: rule.bound.map(Into::into),
+            archive_password_count: u32::try_from(rule.archive_passwords.len()).unwrap_or(u32::MAX),
         }
     }
 }
@@ -1502,6 +1506,9 @@ pub struct TrackerRuleInput {
     pub forced: bool,
     /// Absent keeps the rule's certificate; null clears it.
     pub ssl: MaybeUndefined<TrackerCertificateInput>,
+    /// True clears the rule's archive passwords; false keeps them.
+    #[graphql(default)]
+    pub clear_archive_passwords: bool,
 }
 
 impl TrackerRuleInput {
@@ -1511,6 +1518,7 @@ impl TrackerRuleInput {
     ) -> async_graphql::Result<weaver_server_core::settings::model::TrackerRule> {
         use weaver_server_core::settings::model::{TrackerCertificate, TrackerRule};
         TrackerRule {
+            archive_passwords: Default::default(),
             bound: None,
             id,
             host_pattern: self.host_pattern,

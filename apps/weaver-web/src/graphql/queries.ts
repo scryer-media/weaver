@@ -1495,6 +1495,7 @@ const TRACKER_RULE_FIELDS = `
     hasSsl
     sslSubject
     sslNotAfter
+    archivePasswordCount
     bound {
       name
       revision

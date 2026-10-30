@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use serde::{Deserialize, Serialize};
 
 use super::model::{
-    Leaf, SeedingAction, SeedingGoalMode, SeedingPolicy, TorrentEncryption, TrackerCertificate,
-    TrackerRule,
+    ArchivePasswords, Leaf, SeedingAction, SeedingGoalMode, SeedingPolicy, TorrentEncryption,
+    TrackerCertificate, TrackerRule,
 };
 
 // The largest upload accepted, in bytes.
@@ -46,9 +46,6 @@ const MAX_7Z_KDF_ROUNDS: u64 = 1 << 25;
 // The tracker's name and revision as it states them.
 const MAX_NAME_BYTES: usize = 128;
 const MAX_REVISION_BYTES: usize = 64;
-// The archive passwords a tracker file may carry.
-pub const MAX_ARCHIVE_PASSWORDS: usize = 10;
-pub const MAX_ARCHIVE_PASSWORD_BYTES: usize = 64 * 1024;
 
 // What a tracker file says, checked.
 #[derive(Clone, PartialEq)]
@@ -62,7 +59,7 @@ pub struct TrackerFile {
     // Values the rule takes until the user changes them.
     pub recommended: Terms,
     // `None` when the file says nothing of them; an empty list clears.
-    pub archive_passwords: Option<Vec<String>>,
+    pub archive_passwords: Option<ArchivePasswords>,
     // Always locked when present.
     pub ssl: Option<TrackerCertificate>,
 }
@@ -78,7 +75,7 @@ impl std::fmt::Debug for TrackerFile {
             .field("recommended", &self.recommended)
             .field(
                 "archive_passwords",
-                &self.archive_passwords.as_ref().map(Vec::len),
+                &self.archive_passwords.as_ref().map(ArchivePasswords::len),
             )
             .field("ssl", &self.ssl.is_some())
             .finish()
@@ -208,6 +205,11 @@ impl TrackerFile {
         }
         if let Some(ssl) = &self.ssl {
             applied.ssl = Some(ssl.clone());
+        }
+        // A list replaces the rule's, an empty one clears it, and a file
+        // that names none leaves it.
+        if let Some(passwords) = &self.archive_passwords {
+            applied.archive_passwords = passwords.clone();
         }
         let mut locked: Vec<String> = required.fields().into_iter().map(str::to_owned).collect();
         if self.ssl.is_some() {
@@ -405,7 +407,7 @@ impl TrackerFile {
             changes,
             has_ssl: self.ssl.is_some(),
             ssl: self.ssl.as_ref().and_then(TrackerCertificate::summary),
-            archive_passwords: self.archive_passwords.as_ref().map(Vec::len),
+            archive_passwords: self.archive_passwords.as_ref().map(ArchivePasswords::len),
             fingerprint,
         }
     }
@@ -432,6 +434,10 @@ pub fn fingerprint(bytes: &[u8], rule: Option<&TrackerRule>) -> String {
         if let Some(ssl) = &rule.ssl {
             hasher.update(ssl.certificate_pem.as_bytes());
             hasher.update(ssl.private_key_pem.as_bytes());
+        }
+        for password in rule.archive_passwords.as_slice() {
+            hasher.update(&(password.len() as u64).to_le_bytes());
+            hasher.update(password.as_bytes());
         }
     }
     hasher.finalize().to_hex().to_string()
@@ -1078,7 +1084,7 @@ fn seeding(value: &toml::Value, path: &str) -> Result<SeedingTerms, String> {
 
 // The archive passwords in the order given, blanks and repeats dropped, each
 // kept exactly as written.
-fn archive_passwords(table: &toml::Table) -> Result<Option<Vec<String>>, String> {
+fn archive_passwords(table: &toml::Table) -> Result<Option<ArchivePasswords>, String> {
     let Some(section) = section(table, "archive_passwords")? else {
         return Ok(None);
     };
@@ -1091,27 +1097,16 @@ fn archive_passwords(table: &toml::Table) -> Result<Option<Vec<String>>, String>
     let toml::Value::Array(values) = values else {
         return Err("archive_passwords.values must be a list of text.".to_owned());
     };
-    let mut passwords: Vec<String> = Vec::new();
-    for value in values {
-        let toml::Value::String(password) = value else {
-            return Err("archive_passwords.values must be a list of text.".to_owned());
-        };
-        if !password.trim().is_empty() && !passwords.contains(password) {
-            passwords.push(password.clone());
-        }
-    }
-    if passwords.len() > MAX_ARCHIVE_PASSWORDS {
-        return Err(format!(
-            "archive_passwords.values holds more than {MAX_ARCHIVE_PASSWORDS} passwords."
-        ));
-    }
-    if passwords.iter().map(String::len).sum::<usize>() > MAX_ARCHIVE_PASSWORD_BYTES {
-        return Err(format!(
-            "archive_passwords.values is larger than {} KiB.",
-            MAX_ARCHIVE_PASSWORD_BYTES / 1024
-        ));
-    }
-    Ok(Some(passwords))
+    let passwords = values
+        .iter()
+        .map(|value| match value {
+            toml::Value::String(password) => Ok(password.clone()),
+            _ => Err("archive_passwords.values must be a list of text.".to_owned()),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    ArchivePasswords::new(passwords)
+        .map(Some)
+        .map_err(|refusal| format!("archive_passwords.values {refusal}"))
 }
 
 // The identity the tracker issued, inline or as two members of the archive,

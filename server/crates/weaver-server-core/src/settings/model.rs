@@ -523,6 +523,56 @@ pub struct TrackerRule {
     // The tracker file that filled the rule, while it binds it; `None` once
     // unbound or when none did.
     pub bound: Option<super::tracker_file::Binding>,
+    // The passwords its torrents' archives are tried with, before the
+    // global list; kept sealed with the database's key.
+    pub archive_passwords: ArchivePasswords,
+}
+
+// A tracker's archive passwords, in the order they are tried: blanks and
+// repeats dropped, the first of a repeat kept, each kept exactly as given.
+// The values are secrets: Debug says how many.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ArchivePasswords(Vec<String>);
+
+impl std::fmt::Debug for ArchivePasswords {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ArchivePasswords({})", self.0.len())
+    }
+}
+
+impl ArchivePasswords {
+    // The most a rule holds, by count and by bytes in all.
+    pub const MAX: usize = 10;
+    pub const MAX_BYTES: usize = 64 * 1024;
+
+    // The list `values` makes; an error past either bound, saying which.
+    pub fn new(values: impl IntoIterator<Item = String>) -> Result<Self, String> {
+        let mut kept: Vec<String> = Vec::new();
+        for value in values {
+            if !value.trim().is_empty() && !kept.contains(&value) {
+                kept.push(value);
+            }
+        }
+        if kept.len() > Self::MAX {
+            return Err(format!("holds more than {} passwords.", Self::MAX));
+        }
+        if kept.iter().map(String::len).sum::<usize>() > Self::MAX_BYTES {
+            return Err(format!("is larger than {} KiB.", Self::MAX_BYTES / 1024));
+        }
+        Ok(Self(kept))
+    }
+
+    pub fn as_slice(&self) -> &[String] {
+        &self.0
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 // An identity a tracker issued: a certificate chain and its private key,
@@ -1209,6 +1259,7 @@ mod tests {
 
     fn rule(id: u32, host_pattern: &str) -> TrackerRule {
         TrackerRule {
+            archive_passwords: Default::default(),
             bound: None,
             id,
             host_pattern: TrackerRule::pattern(host_pattern).unwrap(),

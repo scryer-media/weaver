@@ -600,12 +600,15 @@ impl SettingsMutation {
     ) -> Result<Vec<crate::settings::types::TrackerRule>> {
         // An input naming no certificate keeps the rule's.
         let keeps_ssl = input.ssl.is_undefined();
+        // Archive passwords come only from a tracker file; the editor may
+        // clear them, never set them.
+        let keeps_passwords = !input.clear_archive_passwords;
         let rule = input.into_rule(id.unwrap_or(0))?;
         let db = ctx.data::<Database>()?.clone();
         let _guard = SETTINGS_MUTATION_GUARD.lock().await;
         let rules = tokio::task::spawn_blocking(move || {
             let now = chrono::Utc::now().timestamp_millis();
-            db.save_tracker_rule(id, rule, keeps_ssl, now)
+            db.save_tracker_rule(id, rule, keeps_ssl, keeps_passwords, now)
         })
         .await??
         .map_err(async_graphql::Error::new)?;

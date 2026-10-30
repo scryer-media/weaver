@@ -489,6 +489,7 @@ fn tracker_rules_crud() {
     let first = db
         .insert_tracker_rule(
             &TrackerRule {
+                archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
                 host_pattern: "*.example.org".into(),
@@ -511,6 +512,7 @@ fn tracker_rules_crud() {
     let second = db
         .insert_tracker_rule(
             &TrackerRule {
+                archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
                 host_pattern: "tracker.invalid".into(),
@@ -586,6 +588,7 @@ fn a_tracker_rules_private_key_is_encrypted_at_rest() {
     let kept = db
         .insert_tracker_rule(
             &TrackerRule {
+                archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
                 host_pattern: "tracker.example".into(),
@@ -716,7 +719,7 @@ fn a_bound_rule_refuses_a_change_to_a_locked_field() {
         ),
     ] {
         let refusal = db
-            .save_tracker_rule(Some(rule.id), changed, keeps_ssl, 11)
+            .save_tracker_rule(Some(rule.id), changed, keeps_ssl, true, 11)
             .unwrap()
             .unwrap_err();
         assert_eq!(
@@ -735,7 +738,7 @@ fn a_bound_rule_refuses_a_change_to_a_locked_field() {
         ..unbound_input(&rule)
     };
     let saved = db
-        .save_tracker_rule(Some(rule.id), changed, true, 12)
+        .save_tracker_rule(Some(rule.id), changed, true, true, 12)
         .unwrap()
         .unwrap();
     assert_eq!(saved.len(), 1);
@@ -777,7 +780,7 @@ seeding = { ratio_goal = 1.0, seed_time_goal_minutes = 100 }",
         bound: None,
         ..rule.clone()
     };
-    db.save_tracker_rule(Some(rule.id), edited, true, 2)
+    db.save_tracker_rule(Some(rule.id), edited, true, true, 2)
         .unwrap()
         .unwrap();
 
@@ -835,7 +838,7 @@ fn unbinding_keeps_the_values_and_deleting_takes_the_binding() {
         ..unbound.clone()
     };
     let saved = db
-        .save_tracker_rule(Some(rule.id), changed, false, 3)
+        .save_tracker_rule(Some(rule.id), changed, false, true, 3)
         .unwrap()
         .unwrap();
     assert_eq!((saved[0].dht, saved[0].ssl.as_ref()), (Some(true), None));
@@ -846,4 +849,109 @@ fn unbinding_keeps_the_values_and_deleting_takes_the_binding() {
     assert!(db.list_tracker_rules().unwrap().is_empty());
     let fresh = db.apply_tracker_file(&file, 5).unwrap();
     assert_eq!(fresh.bound.unwrap().imported_at_ms, 5);
+}
+
+// A rule's archive passwords are sealed at rest. A reimport with a list
+// replaces them, an empty list clears them, and a file naming none keeps
+// them; the editor's save keeps them unless it clears them, an unbind keeps
+// them, and none of it writes to the global list.
+#[test]
+fn a_rules_archive_passwords_are_sealed_and_follow_its_tracker_file() {
+    let db = Database::open_in_memory().unwrap();
+    db.save_archive_password_settings(Some(vec!["global".to_owned()]), None)
+        .unwrap();
+    let global = || {
+        db.global_archive_password_candidates()
+            .unwrap()
+            .iter()
+            .map(|candidate| candidate.value().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let passwords = |id: u32| {
+        db.list_tracker_rules()
+            .unwrap()
+            .into_iter()
+            .find(|rule| rule.id == id)
+            .unwrap()
+            .archive_passwords
+            .as_slice()
+            .to_vec()
+    };
+    let listed = |values: &[&str]| {
+        values
+            .iter()
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    let file = tracker_file(
+        "revision = \"1\"\n[archive_passwords]\nvalues = [\"first secret\", \"second\"]",
+        None,
+    );
+    let rule = db.apply_tracker_file(&file, 1).unwrap();
+    assert_eq!(passwords(rule.id), listed(&["first secret", "second"]));
+    let datastore = db.datastore();
+    let args = vec![SqlArg::I64(i64::from(rule.id))];
+    let sealed = db
+        .run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT archive_passwords AS value FROM tracker_rules WHERE id = {}",
+                &args,
+            )
+            .await?
+            .expect("the rule's row");
+            row.opt_text("value")
+        })
+        .unwrap()
+        .unwrap();
+    assert!(is_encrypted(&sealed));
+    assert!(!sealed.contains("first secret"));
+
+    let replaced = tracker_file(
+        "revision = \"2\"\n[archive_passwords]\nvalues = [\"third\"]",
+        None,
+    );
+    db.apply_tracker_file(&replaced, 2).unwrap();
+    assert_eq!(passwords(rule.id), listed(&["third"]));
+    db.apply_tracker_file(&tracker_file("revision = \"3\"", None), 3)
+        .unwrap();
+    assert_eq!(passwords(rule.id), listed(&["third"]));
+
+    let edited = db.list_tracker_rules().unwrap().remove(0);
+    db.save_tracker_rule(
+        Some(rule.id),
+        TrackerRule {
+            archive_passwords: Default::default(),
+            ..edited.clone()
+        },
+        true,
+        true,
+        4,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(passwords(rule.id), listed(&["third"]));
+    assert!(db.unbind_tracker_rule(rule.id, 5).unwrap());
+    assert_eq!(passwords(rule.id), listed(&["third"]));
+    db.save_tracker_rule(
+        Some(rule.id),
+        TrackerRule {
+            archive_passwords: Default::default(),
+            ..edited
+        },
+        true,
+        false,
+        6,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(passwords(rule.id).is_empty());
+
+    db.apply_tracker_file(&replaced, 7).unwrap();
+    assert_eq!(passwords(rule.id), listed(&["third"]));
+    let cleared = tracker_file("revision = \"4\"\n[archive_passwords]\nvalues = []", None);
+    db.apply_tracker_file(&cleared, 8).unwrap();
+    assert!(passwords(rule.id).is_empty());
+    assert_eq!(global(), listed(&["global"]));
 }

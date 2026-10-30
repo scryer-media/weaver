@@ -6,7 +6,8 @@ use crate::persistence::Database;
 use crate::persistence::encryption::{EncryptionKey, decrypt_value, encrypt_value, is_encrypted};
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime};
 use crate::settings::model::{
-    Client, Leaf, SeedingPolicy, TorrentEncryption, TrackerCertificate, TrackerRule,
+    ArchivePasswords, Client, Leaf, SeedingPolicy, TorrentEncryption, TrackerCertificate,
+    TrackerRule,
 };
 
 #[cfg(test)]
@@ -16,7 +17,7 @@ use crate::servers::ServerConfig;
 #[cfg(test)]
 use crate::settings::Config;
 
-const TRACKER_RULE_COLUMNS: &str = "id, host_pattern, seeding, never_pause, unpack, client, torrent_route, dht, pex, lsd, encryption, upload_cap, forced, ssl_certificate, ssl_private_key, bound";
+const TRACKER_RULE_COLUMNS: &str = "id, host_pattern, seeding, never_pause, unpack, client, torrent_route, dht, pex, lsd, encryption, upload_cap, forced, ssl_certificate, ssl_private_key, bound, archive_passwords";
 
 fn tracker_rule_from_row(
     row: &SqlRow,
@@ -88,6 +89,48 @@ fn tracker_rule_from_row(
                 })
             })
             .transpose()?,
+        archive_passwords: match row.opt_text("archive_passwords")? {
+            Some(sealed) => open_archive_passwords(key, &sealed)?,
+            None => ArchivePasswords::default(),
+        },
+    })
+}
+
+// A rule's archive passwords as they are kept: one JSON list sealed with the
+// database's key, or nothing for none.
+fn seal_archive_passwords(
+    key: Option<&EncryptionKey>,
+    passwords: &ArchivePasswords,
+) -> Result<Option<String>, StateError> {
+    if passwords.is_empty() {
+        return Ok(None);
+    }
+    let key = key.ok_or_else(|| StateError::Conflict("encryption key required".into()))?;
+    let json = serde_json::to_string(passwords.as_slice())
+        .map_err(|error| StateError::Database(error.to_string()))?;
+    encrypt_value(key, &json).map(Some).map_err(|_| {
+        StateError::Conflict("could not encrypt a tracker rule's archive passwords".into())
+    })
+}
+
+fn open_archive_passwords(
+    key: Option<&EncryptionKey>,
+    sealed: &str,
+) -> Result<ArchivePasswords, StateError> {
+    let key = key.ok_or_else(|| StateError::Conflict("encryption key required".into()))?;
+    if !is_encrypted(sealed) {
+        return Err(StateError::Conflict(
+            "a tracker rule's archive passwords are not encrypted".into(),
+        ));
+    }
+    let json = decrypt_value(key, sealed).map_err(|_| {
+        StateError::Conflict("could not decrypt a tracker rule's archive passwords".into())
+    })?;
+    let values: Vec<String> = serde_json::from_str(&json).map_err(|_| {
+        StateError::Database("a tracker rule's archive passwords are not valid".into())
+    })?;
+    ArchivePasswords::new(values).map_err(|refusal| {
+        StateError::Database(format!("a tracker rule's archive passwords {refusal}"))
     })
 }
 
@@ -148,6 +191,7 @@ fn tracker_rule_args(
                 .transpose()
                 .map_err(|error| StateError::Database(error.to_string()))?,
         ),
+        SqlArg::OptText(seal_archive_passwords(key, &rule.archive_passwords)?),
     ])
 }
 
@@ -198,7 +242,7 @@ impl Database {
                     tx.execute(
                         &format!(
                             "INSERT INTO tracker_rules ({TRACKER_RULE_COLUMNS}, created_at_ms, updated_at_ms)
-                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
+                             VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
                         ),
                         &values,
                     )
@@ -221,7 +265,8 @@ impl Database {
                 "UPDATE tracker_rules
                     SET host_pattern = {}, seeding = {}, never_pause = {}, unpack = {}, client = {}, torrent_route = {},
                         dht = {}, pex = {}, lsd = {}, encryption = {}, upload_cap = {}, forced = {},
-                        ssl_certificate = {}, ssl_private_key = {}, bound = {}, updated_at_ms = {}
+                        ssl_certificate = {}, ssl_private_key = {}, bound = {}, archive_passwords = {},
+                        updated_at_ms = {}
                   WHERE id = {}",
                 &args,
             )
@@ -246,7 +291,8 @@ impl Database {
     }
 
     // Add `rule`, or replace the rule `id` names, and return every rule. A
-    // rule `keeps_ssl` keeps its identity. A rule a tracker file binds stays
+    // rule `keeps_ssl` keeps its identity, and one `keeps_passwords` its
+    // archive passwords. A rule a tracker file binds stays
     // bound, and a change to a field the file locked is refused, as is a
     // second rule for one pattern; the refusal is the inner error.
     pub fn save_tracker_rule(
@@ -254,12 +300,18 @@ impl Database {
         id: Option<u32>,
         mut rule: TrackerRule,
         keeps_ssl: bool,
+        keeps_passwords: bool,
         now_ms: i64,
     ) -> Result<Result<Vec<TrackerRule>, String>, StateError> {
         let rules = self.list_tracker_rules()?;
         let existing = id.and_then(|id| rules.iter().find(|other| other.id == id));
         if keeps_ssl {
             rule.ssl = existing.and_then(|other| other.ssl.clone());
+        }
+        if keeps_passwords {
+            rule.archive_passwords = existing
+                .map(|other| other.archive_passwords.clone())
+                .unwrap_or_default();
         }
         rule.bound = existing.and_then(|other| other.bound.clone());
         if let Some(existing) = existing

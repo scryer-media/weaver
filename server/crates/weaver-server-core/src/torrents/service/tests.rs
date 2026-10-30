@@ -876,6 +876,7 @@ async fn a_torrent_url_is_asked_for_as_the_client_its_rule_names() {
 
     db.insert_tracker_rule(
         &TrackerRule {
+            archive_passwords: Default::default(),
             bound: None,
             id: 0,
             host_pattern: "127.0.0.1".into(),
@@ -1100,6 +1101,7 @@ async fn url_route(category: Option<&str>, matched: bool) {
     let rule = db
         .insert_tracker_rule(
             &TrackerRule {
+                archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
                 host_pattern: if matched {
@@ -4182,6 +4184,7 @@ async fn a_tracker_rules_client_names_its_torrents() {
     rig.db
         .insert_tracker_rule(
             &TrackerRule {
+                archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
                 host_pattern: "*.test".into(),
@@ -4293,6 +4296,7 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
         .db
         .insert_tracker_rule(
             &TrackerRule {
+                archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
                 host_pattern: "*.test".into(),
@@ -4658,6 +4662,7 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         queue_position: 0,
     };
     let mut rules = vec![TrackerRule {
+        archive_passwords: Default::default(),
         bound: None,
         id: 1,
         host_pattern: "tracker.test".into(),
@@ -4749,6 +4754,7 @@ fn chain() -> (TorrentRecord, TrackerRule, TorrentSettings) {
         forced: false,
         ssl: None,
         bound: None,
+        archive_passwords: Default::default(),
     };
     let settings = TorrentSettings {
         upload_cap: None,
@@ -4935,6 +4941,7 @@ fn a_torrents_route_is_its_rules_then_its_categorys_then_the_default() {
         torrent: TorrentConfig::default(),
     };
     let mut rule = TrackerRule {
+        archive_passwords: Default::default(),
         bound: None,
         id: 3,
         host_pattern: "tracker.test".into(),
@@ -4978,6 +4985,7 @@ async fn a_tracker_rules_route_carries_its_torrents_ahead_of_their_categorys() {
         .db
         .insert_tracker_rule(
             &TrackerRule {
+                archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
                 host_pattern: "*.test".into(),
@@ -5591,6 +5599,7 @@ async fn empty_seeding_terms_inherit_the_chain() {
     rig.db
         .insert_tracker_rule(
             &TrackerRule {
+                archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
                 host_pattern: "*.test".into(),
@@ -5693,6 +5702,7 @@ async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
         .db
         .insert_tracker_rule(
             &TrackerRule {
+                archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
                 host_pattern: "*.example-tracker.test".into(),
@@ -6208,6 +6218,7 @@ async fn the_rule_a_tracker_edit_picks_is_the_one_a_restart_reads() {
         .db
         .insert_tracker_rule(
             &TrackerRule {
+                archive_passwords: Default::default(),
                 bound: None,
                 id: 0,
                 host_pattern: "b.invalid".into(),
@@ -8085,5 +8096,224 @@ async fn a_seed_mode_add_of_complete_files_announces_nothing_downloaded() {
     assert!(request.contains("&left=0&"), "{request}");
     next.write_all(answer.as_bytes()).await.unwrap();
     assert_eq!(std::fs::read(save.join("placed/a.bin")).unwrap(), data);
+    rig.service.stop().await;
+}
+
+// A rule for torrents announcing under `host`, holding `passwords`.
+fn password_rule(host: &str, passwords: &[&str]) -> TrackerRule {
+    TrackerRule {
+        archive_passwords: crate::settings::model::ArchivePasswords::new(
+            passwords.iter().map(|value| (*value).to_owned()),
+        )
+        .unwrap(),
+        bound: None,
+        id: 0,
+        host_pattern: host.into(),
+        seeding: None,
+        never_pause: false,
+        unpack: None,
+        client: None,
+        torrent_route: false,
+        dht: None,
+        pex: None,
+        lsd: None,
+        encryption: None,
+        upload_cap: Default::default(),
+        forced: false,
+        ssl: None,
+    }
+}
+
+fn values(values: &[&str]) -> Vec<String> {
+    values.iter().map(|value| (*value).to_owned()).collect()
+}
+
+// The candidates the graph of torrent `job_id` holds.
+async fn graph_passwords(service: &TorrentService, job_id: JobId) -> Vec<String> {
+    let job = service.inner.live.lock().await[&job_id]
+        .job
+        .clone()
+        .unwrap();
+    job.with(|job| job.password_candidates().to_vec())
+}
+
+// A torrent under no rule tries exactly the global list; one under a rule
+// tries that rule's passwords first, then the global list, a value in both
+// tried once where the rule puts it; one under another rule never sees
+// them. A graph already built keeps its list; one restored after a restart
+// takes the current one, and an unbound rule's passwords still go to its
+// torrents alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrents_archive_passwords_are_its_rules_then_the_global_list() {
+    let rig = rig(set_clock());
+    rig.routes.set_down(Some("down"));
+    rig.service.open().await.unwrap();
+    rig.db
+        .save_archive_password_settings(Some(values(&["shared", "global"])), None)
+        .unwrap();
+    let a = rig
+        .db
+        .insert_tracker_rule(&password_rule("*.a.test", &["a-first", "shared"]), EPOCH_MS)
+        .unwrap();
+    rig.db
+        .insert_tracker_rule(&password_rule("*.b.test", &["b-only"]), EPOCH_MS)
+        .unwrap();
+    rig.service.reload_tracker_rules().await.unwrap();
+    let add = |name: &'static str, seed: u8, url: Option<&'static str>| {
+        let service = rig.service.clone();
+        async move {
+            let bytes = plain(name, seed);
+            let bytes = match url {
+                Some(url) => announcing(&bytes, url),
+                None => bytes,
+            };
+            service
+                .add(request(AddSource::Metainfo(bytes)))
+                .await
+                .unwrap()
+        }
+    };
+    let under_a = add("under-a", 1, Some("http://tracker.a.test/announce")).await;
+    let under_b = add("under-b", 2, Some("http://tracker.b.test/announce")).await;
+    let under_none = add("under-none", 3, None).await;
+
+    let global: Vec<String> = rig
+        .db
+        .global_archive_password_candidates()
+        .unwrap()
+        .iter()
+        .map(|candidate| candidate.value().to_owned())
+        .collect();
+    assert_eq!(graph_passwords(&rig.service, under_none).await, global);
+    assert_eq!(
+        graph_passwords(&rig.service, under_a).await,
+        values(&["a-first", "shared", "global"])
+    );
+    assert_eq!(
+        graph_passwords(&rig.service, under_b).await,
+        values(&["b-only", "shared", "global"])
+    );
+
+    rig.db
+        .save_archive_password_settings(Some(values(&["later"])), None)
+        .unwrap();
+    assert_eq!(
+        graph_passwords(&rig.service, under_a).await,
+        values(&["a-first", "shared", "global"])
+    );
+    rig.service
+        .save_checkpoints([under_a, under_none].into())
+        .await;
+    assert!(rig.db.unbind_tracker_rule(a.id, EPOCH_MS).unwrap());
+    rig.service.stop().await;
+
+    let restarted = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&restarted).await;
+    assert_eq!(
+        graph_passwords(&restarted, under_a).await,
+        values(&["a-first", "shared", "later"])
+    );
+    assert_eq!(
+        graph_passwords(&restarted, under_b).await,
+        values(&["b-only", "later"])
+    );
+    assert_eq!(
+        graph_passwords(&restarted, under_none).await,
+        values(&["later"])
+    );
+    restarted.stop().await;
+}
+
+// A tracker rule's passwords never reach an NZB job's harvest: the harvest
+// takes no tracker candidate a job could carry, and no stored label reads
+// back as one.
+#[test]
+fn an_nzb_harvest_takes_no_tracker_password() {
+    use crate::jobs::model::{ArchivePasswordCandidate, ArchivePasswordSource};
+    let carried = [
+        ArchivePasswordCandidate::new(ArchivePasswordSource::Tracker, "tracker".to_owned()),
+        ArchivePasswordCandidate::new(ArchivePasswordSource::NzbMeta, "nzb".to_owned()),
+    ];
+    let global = [ArchivePasswordCandidate::new(
+        ArchivePasswordSource::Settings,
+        "global".to_owned(),
+    )];
+    let harvest =
+        crate::pipeline::assemble_archive_password_candidates(Some("spec"), &carried, &global);
+    assert_eq!(
+        harvest
+            .iter()
+            .map(|candidate| (candidate.source(), candidate.value()))
+            .collect::<Vec<_>>(),
+        [
+            (ArchivePasswordSource::Explicit, "spec"),
+            (ArchivePasswordSource::NzbMeta, "nzb"),
+            (ArchivePasswordSource::Settings, "global"),
+        ]
+    );
+    assert_eq!(
+        ArchivePasswordSource::from_label(ArchivePasswordSource::Tracker.as_str()),
+        None
+    );
+}
+
+// The list a torrent takes: its rule's passwords, then the global list,
+// each value once where it first appears; under no rule, the global list
+// alone.
+#[test]
+fn a_torrents_password_list_is_its_rules_then_the_global_list_once_each() {
+    use crate::jobs::model::{ArchivePasswordCandidate, ArchivePasswordSource};
+    let global = [
+        ArchivePasswordCandidate::new(ArchivePasswordSource::Settings, "shared".to_owned()),
+        ArchivePasswordCandidate::new(ArchivePasswordSource::PasswordFile, "file".to_owned()),
+    ];
+    let listed = |rule: Option<&TrackerRule>| {
+        torrent_archive_passwords(rule, &global)
+            .iter()
+            .map(|candidate| (candidate.source(), candidate.value().to_owned()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        listed(None),
+        [
+            (ArchivePasswordSource::Settings, "shared".to_owned()),
+            (ArchivePasswordSource::PasswordFile, "file".to_owned()),
+        ]
+    );
+    let rule = password_rule("*.a.test", &["first", "shared"]);
+    assert_eq!(
+        listed(Some(&rule)),
+        [
+            (ArchivePasswordSource::Tracker, "first".to_owned()),
+            (ArchivePasswordSource::Tracker, "shared".to_owned()),
+            (ArchivePasswordSource::PasswordFile, "file".to_owned()),
+        ]
+    );
+}
+
+// A restored torrent's nodes retry its current list from the top: the
+// position each checkpoint kept goes back to the first candidate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restored_torrent_retries_its_passwords_from_the_top() {
+    let rig = rig(set_clock());
+    rig.routes.set_down(Some("down"));
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    let job = rig.service.inner.live.lock().await[&job_id]
+        .job
+        .clone()
+        .unwrap();
+    let mut snapshot = job.with(|job| job.snapshot());
+    snapshot.passwords.insert(weaver_graph::NodeId(1), 3);
+    snapshot.passwords.insert(weaver_graph::NodeId(2), 0);
+    retry_passwords_from_top(&mut snapshot);
+    assert_eq!(
+        snapshot.passwords.into_iter().collect::<Vec<_>>(),
+        [(weaver_graph::NodeId(1), 0), (weaver_graph::NodeId(2), 0)]
+    );
     rig.service.stop().await;
 }

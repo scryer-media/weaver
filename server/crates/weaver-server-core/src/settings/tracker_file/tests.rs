@@ -218,8 +218,10 @@ values = ["first", " inner space ", "first", "   ", ""]
         })
     );
     assert_eq!(
-        file.archive_passwords,
-        Some(vec!["first".to_owned(), " inner space ".to_owned()])
+        file.archive_passwords
+            .as_ref()
+            .map(ArchivePasswords::as_slice),
+        Some(&["first".to_owned(), " inner space ".to_owned()][..])
     );
     assert_eq!(file.ssl, Some(ssl));
 
@@ -232,7 +234,7 @@ values = ["first", " inner space ", "first", "   ", ""]
     assert_eq!(bare.archive_passwords, None);
     assert_eq!(bare.ssl, None);
     let cleared = read(with("[archive_passwords]\nvalues = []").as_bytes(), None).unwrap();
-    assert_eq!(cleared.archive_passwords, Some(Vec::new()));
+    assert_eq!(cleared.archive_passwords, Some(ArchivePasswords::default()));
 }
 
 // Every key the file may not set is refused by name, as is a loosening, a
@@ -303,7 +305,7 @@ fn a_tracker_file_refuses_what_it_may_not_set() {
         assert!(error.contains(named), "{text}: {error}");
     }
 
-    let many: Vec<String> = (0..=MAX_ARCHIVE_PASSWORDS)
+    let many: Vec<String> = (0..=ArchivePasswords::MAX)
         .map(|n| format!("\"password-{n}\""))
         .collect();
     let error = refused(
@@ -315,7 +317,7 @@ fn a_tracker_file_refuses_what_it_may_not_set() {
         None,
     );
     assert!(error.contains("more than 10 passwords"), "{error}");
-    let long = format!("\"{}\"", "p".repeat(MAX_ARCHIVE_PASSWORD_BYTES + 1));
+    let long = format!("\"{}\"", "p".repeat(ArchivePasswords::MAX_BYTES + 1));
     let error = refused(
         with(&format!("[archive_passwords]\nvalues = [{long}]")).as_bytes(),
         None,

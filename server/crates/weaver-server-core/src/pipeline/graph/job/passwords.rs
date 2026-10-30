@@ -82,6 +82,12 @@ impl Passwords {
 }
 
 impl<R: Root> GraphJob<R> {
+    // The candidates, in the order they are tried.
+    #[cfg(test)]
+    pub(crate) fn password_candidates(&self) -> &[String] {
+        &self.passwords.candidates
+    }
+
     // How many candidates each node has been offered, by node.
     #[cfg(test)]
     pub(crate) fn passwords_offered(&self) -> std::collections::BTreeMap<NodeId, usize> {

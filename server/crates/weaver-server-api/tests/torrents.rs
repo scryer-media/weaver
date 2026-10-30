@@ -1724,7 +1724,7 @@ async fn a_tracker_file_is_previewed_then_applied_by_its_fingerprint() {
             r#"mutation {{ applyTrackerFile(file: "{file}", password: "upload-secret-word",
                 fingerprint: "{fingerprint}") {{
                 id hostPattern dht pex seeding {{ ratioGoal {{ state value }} }} hasSsl sslSubject
-                bound {{ name revision locked }}
+                bound {{ name revision locked }} archivePasswordCount
             }} }}"#
         )
     };
@@ -1774,6 +1774,7 @@ async fn a_tracker_file_is_previewed_then_applied_by_its_fingerprint() {
             "id": id, "hostPattern": "*.tracker.test", "dht": false, "pex": false,
             "seeding": { "ratioGoal": { "state": "SET", "value": 1.5 } }, "hasSsl": true, "sslSubject": "CN=user-1",
             "bound": { "name": "Example Tracker", "revision": "1", "locked": ["dht", "ssl"] },
+            "archivePasswordCount": 1,
         }])
     );
 
@@ -1819,7 +1820,7 @@ async fn a_tracker_file_is_previewed_then_applied_by_its_fingerprint() {
 
     let response = rig
         .execute(&format!(
-            "mutation {{ unbindTrackerRule(id: {id}) {{ id dht pex hasSsl bound {{ name }} }} }}"
+            "mutation {{ unbindTrackerRule(id: {id}) {{ id dht pex hasSsl bound {{ name }} archivePasswordCount }} }}"
         ))
         .await;
     assert!(response.errors.is_empty(), "{:?}", response.errors);
@@ -1827,8 +1828,32 @@ async fn a_tracker_file_is_previewed_then_applied_by_its_fingerprint() {
     responses.push(rules.to_string());
     assert_eq!(
         rules,
-        serde_json::json!([{ "id": id, "dht": false, "pex": false, "hasSsl": true, "bound": null }])
+        serde_json::json!([{
+            "id": id, "dht": false, "pex": false, "hasSsl": true, "bound": null,
+            "archivePasswordCount": 1,
+        }])
     );
+
+    // The editor's save keeps the rule's archive passwords, unless it clears
+    // them.
+    let save = |clear: bool| {
+        format!(
+            r#"mutation {{ saveTrackerRule(id: {id}, input: {{
+                hostPattern: "*.tracker.test", dht: false, pex: false,
+                clearArchivePasswords: {clear}
+            }}) {{ archivePasswordCount }} }}"#
+        )
+    };
+    for (clear, count) in [(false, 1), (true, 0)] {
+        let response = rig.execute(&save(clear)).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let rules = response.data.into_json().unwrap()["saveTrackerRule"].clone();
+        responses.push(rules.to_string());
+        assert_eq!(
+            rules,
+            serde_json::json!([{ "archivePasswordCount": count }])
+        );
+    }
     let missing = rig
         .execute(&format!(
             "mutation {{ unbindTrackerRule(id: {}) {{ id }} }}",

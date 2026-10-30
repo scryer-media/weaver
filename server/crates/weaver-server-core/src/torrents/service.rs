@@ -34,8 +34,8 @@ use crate::jobs::handle::{
     SchedulerHandle, TorrentRate,
 };
 use crate::jobs::model::{
-    FieldUpdate, JobStatus, JobUpdate, PRIORITY_ATTRIBUTE_KEY, Protocol,
-    job_status_from_persisted_str,
+    ArchivePasswordCandidate, ArchivePasswordSource, FieldUpdate, JobStatus, JobUpdate,
+    PRIORITY_ATTRIBUTE_KEY, Protocol, job_status_from_persisted_str,
 };
 use crate::jobs::phase_progress::{JobPhase, JobPhaseProgress};
 use crate::jobs::report::JobReport;
@@ -416,6 +416,42 @@ fn ssl_identity(ssl: Option<&TrackerCertificate>) -> Option<SslIdentity> {
             None
         }
     })
+}
+
+// The one place a torrent's archive passwords are chosen: the passwords of
+// the rule it is under, then the global list, a value already in the list
+// skipped so its first copy keeps its place. Only this reads a rule's
+// passwords, and it hands them to the graph of a torrent under that rule
+// alone: an NZB job's harvest reads no rule, a torrent under another rule or
+// none gets only the global list, and nothing writes a rule's passwords to
+// the global list.
+fn torrent_archive_passwords(
+    rule: Option<&TrackerRule>,
+    global: &[ArchivePasswordCandidate],
+) -> Vec<ArchivePasswordCandidate> {
+    let tracker = rule
+        .into_iter()
+        .flat_map(|rule| rule.archive_passwords.as_slice())
+        .map(|value| ArchivePasswordCandidate::new(ArchivePasswordSource::Tracker, value.clone()));
+    let mut candidates: Vec<ArchivePasswordCandidate> = Vec::new();
+    for candidate in tracker.chain(global.iter().cloned()) {
+        if candidates
+            .iter()
+            .all(|kept| kept.value() != candidate.value())
+        {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+// A torrent's checkpoint names the candidate each node was offered last by
+// its place in the list, and the list may have changed since: each node is
+// offered the first candidate again, so it retries the list from the top.
+fn retry_passwords_from_top(snapshot: &mut checkpoint::Snapshot) {
+    for index in snapshot.passwords.values_mut() {
+        *index = 0;
+    }
 }
 
 // The tracker rule of id `id`, while it stands.
@@ -2558,7 +2594,31 @@ impl TorrentService {
         }
     }
 
-    fn storage(&self, dir: Dirs, layout: &PieceLayout, unpack: bool) -> Storage {
+    // The archive passwords a graph built for `torrent` now takes. One
+    // already extracting keeps the list it started with.
+    fn archive_passwords(&self, torrent: &Live) -> Vec<String> {
+        let job_id = torrent.record.job_id;
+        let global = self
+            .inner
+            .db
+            .global_archive_password_candidates()
+            .unwrap_or_else(|error| {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not load global archive passwords");
+                Vec::new()
+            });
+        torrent_archive_passwords(torrent.rule(&self.rules()), &global)
+            .into_iter()
+            .map(|candidate| candidate.value().to_owned())
+            .collect()
+    }
+
+    fn storage(
+        &self,
+        dir: Dirs,
+        layout: &PieceLayout,
+        unpack: bool,
+        passwords: Vec<String>,
+    ) -> Storage {
         let policy = self
             .inner
             .db
@@ -2577,7 +2637,7 @@ impl TorrentService {
             free_disk: env.free_disk.clone(),
             slots: env.slots,
             mail: env.mail.clone(),
-            passwords: Vec::new(),
+            passwords,
             caps: Caps::new(Arc::clone(&env.limits), policy, declared),
             nesting: limits::NESTING,
             unpack,
@@ -2592,6 +2652,7 @@ impl TorrentService {
         dir: Dirs,
         layout: &Arc<PieceLayout>,
         unpack: bool,
+        passwords: Vec<String>,
     ) -> FromCheckpoint {
         let loaded = self.inner.db.load_graph_checkpoint(job_id);
         self.inner
@@ -2604,12 +2665,13 @@ impl TorrentService {
         };
         let restored = checkpoint::snapshot(&rows)
             .map_err(|error| error.to_string())
-            .and_then(|snapshot| {
+            .and_then(|mut snapshot| {
+                retry_passwords_from_top(&mut snapshot);
                 GraphJob::restore_torrent(
                     &snapshot,
                     Arc::clone(layout),
                     job_id.0,
-                    self.storage(dir, layout, unpack),
+                    self.storage(dir, layout, unpack, passwords),
                     self.inner.env.slots,
                 )
                 .map_err(|error| error.to_string())
@@ -2661,6 +2723,7 @@ impl TorrentService {
         dir: Dirs,
         layout: &Arc<PieceLayout>,
         unpack: bool,
+        passwords: Vec<String>,
         checkpoint: FromCheckpoint,
     ) -> GraphJob<PieceRoot> {
         match checkpoint {
@@ -2690,7 +2753,7 @@ impl TorrentService {
         GraphJob::for_torrent(
             job_id.0,
             Arc::clone(layout),
-            self.storage(dir, layout, unpack),
+            self.storage(dir, layout, unpack, passwords),
         )
     }
 
@@ -2737,8 +2800,15 @@ impl TorrentService {
     fn give_metainfo(&self, torrent: &mut Live, parsed: &Parsed) {
         self.describe(torrent, parsed);
         let (job_id, dir, unpack) = (torrent.record.job_id, dirs(torrent), unpacks(torrent));
-        let checkpoint = self.restored(job_id, dir.clone(), &parsed.layout, unpack);
-        let job = self.graph_job(job_id, dir, &parsed.layout, unpack, checkpoint);
+        let passwords = self.archive_passwords(torrent);
+        let checkpoint = self.restored(
+            job_id,
+            dir.clone(),
+            &parsed.layout,
+            unpack,
+            passwords.clone(),
+        );
+        let job = self.graph_job(job_id, dir, &parsed.layout, unpack, passwords, checkpoint);
         self.give_job(torrent, job);
     }
 
@@ -2816,17 +2886,19 @@ impl TorrentService {
                         dirs(torrent),
                         Arc::clone(torrent.layout.as_ref()?),
                         unpacks(torrent),
+                        self.archive_passwords(torrent),
                     ))
                 })
         };
-        let Some((dir, layout, unpack)) = waiting else {
+        let Some((dir, layout, unpack, passwords)) = waiting else {
             return;
         };
         let restoring = {
             let (service, dir, layout) = (self.clone(), dir.clone(), Arc::clone(&layout));
+            let passwords = passwords.clone();
             tokio::task::spawn_blocking(move || {
                 let checkpoint = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    service.restored(job_id, dir, &layout, unpack)
+                    service.restored(job_id, dir, &layout, unpack, passwords)
                 }))
                 .unwrap_or_else(|_| FromCheckpoint::Failed("the restore panicked".to_string()));
                 (guard, checkpoint)
@@ -2836,7 +2908,7 @@ impl TorrentService {
         let Ok((_restoring, checkpoint)) = restoring.await else {
             return;
         };
-        let job = self.graph_job(job_id, dir, &layout, unpack, checkpoint);
+        let job = self.graph_job(job_id, dir, &layout, unpack, passwords, checkpoint);
         if let Some(torrent) = self
             .inner
             .live

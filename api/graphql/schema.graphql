@@ -5822,6 +5822,11 @@ type TrackerRule {
 	The tracker file that filled it; absent when none binds it.
 	"""
 	bound: TrackerBinding
+	"""
+	How many archive passwords it holds for its torrents. The values are
+	never returned.
+	"""
+	archivePasswordCount: Int!
 }
 
 input TrackerRuleInput {
@@ -5844,6 +5849,10 @@ input TrackerRuleInput {
 	Absent keeps the rule's certificate; null clears it.
 	"""
 	ssl: TrackerCertificateInput
+	"""
+	True clears the rule's archive passwords; false keeps them.
+	"""
+	clearArchivePasswords: Boolean! = false
 }
 
 """

@@ -80,6 +80,8 @@ interface TrackerRule {
   sslNotAfter: number | null;
   /** The tracker file that filled it; null when none binds it. */
   bound: TrackerBinding | null;
+  /** How many archive passwords its tracker file gave it; the values are never read back. */
+  archivePasswordCount: number;
 }
 
 interface TrackerBinding {
@@ -133,6 +135,8 @@ interface TrackerRuleForm {
   privateKeyPem: string;
   /** The rule's certificate is to be cleared. */
   sslCleared: boolean;
+  /** The rule's archive passwords are to be cleared. */
+  passwordsCleared: boolean;
 }
 
 const NEW_TRACKER_RULE: TrackerRuleForm = {
@@ -151,6 +155,7 @@ const NEW_TRACKER_RULE: TrackerRuleForm = {
   certificatePem: "",
   privateKeyPem: "",
   sslCleared: false,
+  passwordsCleared: false,
 };
 
 /** The rule's peer sources beside its trackers, each switched on its own. */
@@ -679,6 +684,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
           certificatePem: "",
           privateKeyPem: "",
           sslCleared: false,
+          passwordsCleared: false,
         }
       : NEW_TRACKER_RULE;
     setForm(start);
@@ -704,6 +710,7 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
         uploadCap: leafInput(form.uploadCap),
         forced: form.forced,
         ...sslInput(form),
+        clearArchivePasswords: form.passwordsCleared,
       },
     });
     setBusy(false);
@@ -971,6 +978,28 @@ function useTrackerRules(t: Translate): { block: SettingsBlock; overlays: ReactN
                   onChange: (forced) => setForm((current) => ({ ...current, forced })),
                 },
               },
+              ...(editing && editing.archivePasswordCount > 0 && !form.passwordsCleared
+                ? [
+                    {
+                      id: "archivePasswords",
+                      label: t("next.torrents.trackerFileArchivePasswords"),
+                      keywords: "archive passwords tracker",
+                      control: {
+                        kind: "custom" as const,
+                        control: (
+                          <div className="flex min-w-0 items-center gap-[10px]">
+                            <span className="font-wv-mono text-[12px] text-wv-fg">{editing.archivePasswordCount}</span>
+                            <SecondaryButton
+                              onClick={() => setForm((current) => ({ ...current, passwordsCleared: true }))}
+                            >
+                              {t("next.torrents.trackerRuleCertificateClear")}
+                            </SecondaryButton>
+                          </div>
+                        ),
+                      },
+                    },
+                  ]
+                : ([] as FieldSpec[])),
               ...(editing?.hasSsl && !form.sslCleared
                 ? [
                     {
