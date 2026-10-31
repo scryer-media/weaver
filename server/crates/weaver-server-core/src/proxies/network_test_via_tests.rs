@@ -529,6 +529,8 @@ async fn an_ssh_test_without_a_target_says_how_its_endpoint_was_resolved() {
         port: ssh.port(),
         timeout_seconds: 300,
         host_key_fingerprint: Some(HOST_KEY_FINGERPRINT.into()),
+        natpmp: false,
+        forwarded_port: None,
         ..proxy()
     };
     profile.secrets.username = Some("operator".into());

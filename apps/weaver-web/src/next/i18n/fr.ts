@@ -837,6 +837,8 @@ export const nextFr: LocaleDictionary = {
   "next.proxies.mtuHelp": "Vide utilise {{value}}.",
   "next.proxies.keepalive": "Keepalive",
   "next.proxies.keepaliveHelp": "Vide utilise {{seconds}} secondes ; 0 le désactive.",
+  "next.proxies.natpmp": "Redirection de port NAT-PMP",
+  "next.proxies.forwardedPort": "Port redirigé",
   "next.proxies.username": "Nom d'utilisateur",
   "next.proxies.password": "Mot de passe",
   "next.proxies.sshKeyHelp": "Clés Ed25519 uniquement.",

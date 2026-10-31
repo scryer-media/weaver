@@ -490,18 +490,21 @@ pub(crate) const fn encryption_policy(
     }
 }
 
-/// How a session takes and reaches peers: the transports `torrent` asks
-/// for. uTP rides the listener's socket, so a session that does not listen
-/// has none; one left with neither fails to build, and its route holds
-/// closed.
-fn transports(torrent: &TorrentConfig) -> (ListenerMode, bool) {
+/// How a session on a leg of `shape` takes and reaches peers: the
+/// transports `torrent` asks for that the leg carries, and whether it listens
+/// at all. uTP rides the listener's socket, so a session that does not
+/// listen, or whose leg carries no uTP, has none; one left with neither
+/// fails to build, and its route holds closed.
+fn transports(torrent: &TorrentConfig, shape: Shape) -> (Option<ListenerMode>, bool) {
     let protocol = torrent.peer_protocol;
-    let mode = match (protocol.tcp(), protocol.utp()) {
-        (true, true) => ListenerMode::TcpAndUtp,
-        (false, true) => ListenerMode::UtpOnly,
-        _ => ListenerMode::TcpOnly,
+    let utp = protocol.utp() && shape.utp;
+    let mode = match (protocol.tcp(), utp) {
+        (true, true) => Some(ListenerMode::TcpAndUtp),
+        (false, true) => Some(ListenerMode::UtpOnly),
+        (true, false) => Some(ListenerMode::TcpOnly),
+        (false, false) => None,
     };
-    (mode, protocol.tcp())
+    (mode.filter(|_| shape.listen), protocol.tcp())
 }
 
 /// The limits `torrent` holds a session to, no limit as libtorrent counts
@@ -539,7 +542,7 @@ pub fn session_options(
 ) -> SessionOptions {
     let shape = leg.shape;
     let listen_ip = leg.kind.listen_ip().unwrap_or_else(|| unspecified(binds));
-    let (mode, enable_tcp) = transports(torrent);
+    let (mode, enable_tcp) = transports(torrent, shape);
     let limits = session_limits(torrent);
     let mut options = SessionOptions {
         dht: shape.dht.then(|| DhtSessionConfig {
@@ -555,7 +558,7 @@ pub fn session_options(
         fastresume: false,
         persistence: None,
         identity: Some(opener.same_client()),
-        listen: shape.listen.then(|| ListenerOptions {
+        listen: mode.map(|mode| ListenerOptions {
             mode,
             listen_addr: SocketAddr::new(listen_ip, port),
             enable_upnp_port_forwarding: shape.upnp && torrent.upnp,

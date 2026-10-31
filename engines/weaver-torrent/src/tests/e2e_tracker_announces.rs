@@ -234,6 +234,190 @@ async fn test_announced_port_is_the_one_the_session_listens_on() -> anyhow::Resu
     Ok(())
 }
 
+/// A transport that forwards a port to the session's peer listener, and
+/// tells the listener so with the reports it was made with; every other
+/// listener and dial is a plain loopback socket.
+struct Forwarding(std::sync::Mutex<Option<crate::upnp::PortMapReceiver>>);
+
+struct ForwardedListener {
+    listener: TcpListener,
+    reports: std::sync::Mutex<Option<crate::upnp::PortMapReceiver>>,
+}
+
+impl crate::network::StreamListener for ForwardedListener {
+    fn local_addr(&self) -> SocketAddr {
+        self.listener.local_addr().unwrap()
+    }
+
+    fn accept<'a>(
+        &'a self,
+    ) -> crate::network::BoxFuture<
+        'a,
+        std::io::Result<(
+            SocketAddr,
+            crate::network::BoxAsyncReadVectored,
+            crate::network::BoxAsyncWrite,
+        )>,
+    > {
+        Box::pin(async move {
+            let (stream, peer) = self.listener.accept().await?;
+            let (read, write) = stream.into_split();
+            Ok((
+                peer,
+                Box::new(read) as crate::network::BoxAsyncReadVectored,
+                Box::new(write) as crate::network::BoxAsyncWrite,
+            ))
+        })
+    }
+
+    fn port_mappings(&self) -> Option<crate::upnp::PortMapReceiver> {
+        self.reports.lock().unwrap().take()
+    }
+}
+
+impl Forwarding {
+    fn listener(
+        reports: Option<crate::upnp::PortMapReceiver>,
+        addr: SocketAddr,
+    ) -> crate::network::BoxFuture<'static, std::io::Result<Box<dyn crate::network::StreamListener>>>
+    {
+        Box::pin(async move {
+            let listener =
+                TcpListener::bind(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), addr.port())).await?;
+            Ok(Box::new(ForwardedListener {
+                listener,
+                reports: std::sync::Mutex::new(reports),
+            }) as Box<dyn crate::network::StreamListener>)
+        })
+    }
+}
+
+impl crate::network::SocketFactory for Forwarding {
+    fn connect_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> crate::network::BoxFuture<
+        'a,
+        std::io::Result<(
+            crate::network::BoxAsyncReadVectored,
+            crate::network::BoxAsyncWrite,
+        )>,
+    > {
+        Box::pin(async move {
+            let (read, write) = TcpStream::connect(addr).await?.into_split();
+            Ok((
+                Box::new(read) as crate::network::BoxAsyncReadVectored,
+                Box::new(write) as crate::network::BoxAsyncWrite,
+            ))
+        })
+    }
+
+    fn listen_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> crate::network::BoxFuture<'a, std::io::Result<Box<dyn crate::network::StreamListener>>>
+    {
+        Self::listener(None, addr)
+    }
+
+    fn listen_peers_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> crate::network::BoxFuture<'a, std::io::Result<Box<dyn crate::network::StreamListener>>>
+    {
+        Self::listener(self.0.lock().unwrap().take(), addr)
+    }
+
+    fn bind_udp<'a>(
+        &'a self,
+        _addr: SocketAddr,
+    ) -> crate::network::BoxFuture<
+        'a,
+        std::io::Result<std::sync::Arc<dyn crate::network::DatagramSocket>>,
+    > {
+        Box::pin(async {
+            let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+            Ok(std::sync::Arc::new(socket) as std::sync::Arc<dyn crate::network::DatagramSocket>)
+        })
+    }
+}
+
+/// A session whose peer listener's transport forwards a port announces
+/// that port, as it does one its own NAT-PMP mapper got, in place of the
+/// configured one; when the transport stops forwarding, the configured port
+/// is announced again.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_listener_whose_transport_forwards_a_port_announces_it() -> anyhow::Result<()> {
+    use crate::upnp::{PortMapped, PortmapProtocol, PortmapTransport};
+    setup_test_logging();
+    const FORWARDED: u16 = 50002;
+    // The fixture listens on loopback, which announces no port of its own;
+    // the configured port stands in for the listener's.
+    const CONFIGURED: u16 = 6881;
+    let (reports, received) = tokio::sync::mpsc::unbounded_channel();
+    reports.send(PortMapped {
+        transport: PortmapTransport::NatPmp,
+        protocol: PortmapProtocol::Tcp,
+        local_port: FORWARDED,
+        external_port: Some(FORWARDED),
+        external_ip: None,
+        error: None,
+    })?;
+    let opts = SessionOptions {
+        listen: Some(ListenerOptions {
+            mode: ListenerMode::TcpOnly,
+            listen_addr: (Ipv4Addr::UNSPECIFIED, 0).into(),
+            announce_port: Some(CONFIGURED),
+            ..Default::default()
+        }),
+        socket_factory: Some(std::sync::Arc::new(Forwarding(std::sync::Mutex::new(
+            Some(received),
+        )))),
+        ..tracker_session_opts()?
+    };
+    let t = TestTorrent::new("test_forwarded_port", 2048, 1024).await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+    let out = TempDir::with_prefix("test_forwarded_port_out")?;
+    let session = Session::new_with_opts(out.path().into(), opts).await?;
+    let mut announced = session.announce_port_changes();
+    announced
+        .wait_for(|port| *port == Some(FORWARDED))
+        .await
+        .context("the session stopped")?;
+    session
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                trackers: Some(vec![url]),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "port"), Some(FORWARDED.to_string().as_str()));
+    respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    assert_ne!(session.listen_addr().map(|a| a.port()), Some(FORWARDED));
+
+    // A report that the transport stopped forwarding hands the port back.
+    reports.send(PortMapped {
+        transport: PortmapTransport::NatPmp,
+        protocol: PortmapProtocol::Tcp,
+        local_port: 0,
+        external_port: None,
+        external_ip: None,
+        error: Some("the gateway did not answer NAT-PMP".into()),
+    })?;
+    announced
+        .wait_for(|port| *port == Some(CONFIGURED))
+        .await
+        .context("the session stopped")?;
+    Ok(())
+}
+
 /// The query of the `started` announce a session makes for a torrent that
 /// takes its peers from its trackers alone.
 async fn trackers_only_started_query(opts: SessionOptions) -> anyhow::Result<String> {

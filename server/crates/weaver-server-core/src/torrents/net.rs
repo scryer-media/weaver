@@ -4,8 +4,9 @@
 //! The sockets a torrent session uses, for the one leg of its route.
 //!
 //! A leg's path decides whether the session dials with its own kernel
-//! sockets or through the leg's dialer, and whether it can listen. Whether it
-//! may use UDP at all (DHT, UDP trackers, uTP) is the dialer's to say.
+//! sockets or through the leg's dialer. Whether it may use UDP at all (DHT,
+//! UDP trackers) and whether it can listen are the dialer's to say: a ladder
+//! leg listens inside its tunnel when it ends in a WireGuard hop.
 
 use std::future::Future;
 use std::io::{self, IoSliceMut};
@@ -19,13 +20,15 @@ use weaver_torrent::network::{
     AsyncReadVectored, AsyncReadVectoredIntoCompat, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture,
     DatagramSocket, Resolved, Resolver,
 };
-use weaver_torrent::upnp::PortMapped;
+use weaver_torrent::upnp::{PortMapReceiver, PortMapped, PortmapProtocol, PortmapTransport};
 use weaver_torrent::{
     Egress, HttpClients, HttpTarget, Session, SocketFactory, StreamListener, route_to,
 };
 use weaver_tunnel::bridge::{Bridge, ConnectionOutcome};
 use weaver_tunnel::endpoint::{DatagramSocket as TunnelSocket, DatagramTransport};
-use weaver_tunnel::pipe::{DialedStream, Dialer, Purpose, Resolution, Target};
+use weaver_tunnel::pipe::{
+    DialedStream, Dialer, InboundListener as Listening, Purpose, Resolution, Target,
+};
 
 use crate::proxies::{EgressBinding, LegPath, ResolvedBy};
 
@@ -70,6 +73,7 @@ impl LegKind {
                 dht: true,
                 upnp: true,
                 listen: true,
+                utp: true,
                 datagrams: true,
             },
             Self::Interface(_) => Shape {
@@ -77,6 +81,7 @@ impl LegKind {
                 dht: true,
                 upnp: false,
                 listen: true,
+                utp: true,
                 datagrams: true,
             },
             Self::SourceAddress(_) => Shape {
@@ -84,6 +89,7 @@ impl LegKind {
                 dht: true,
                 upnp: false,
                 listen: true,
+                utp: true,
                 datagrams: true,
             },
             Self::Ladder => {
@@ -92,7 +98,8 @@ impl LegKind {
                     own_sockets: false,
                     dht: datagrams,
                     upnp: false,
-                    listen: false,
+                    listen: dialer.is_some_and(|dialer| Arc::clone(dialer).inbound().is_some()),
+                    utp: false,
                     datagrams,
                 }
             }
@@ -126,6 +133,9 @@ pub struct Shape {
     pub upnp: bool,
     /// Incoming peer connections.
     pub listen: bool,
+    /// uTP beside TCP on the listener's port. A tunnel's datagram socket
+    /// cannot be polled for a send, which uTP needs.
+    pub utp: bool,
     /// UDP of any kind: UDP trackers, uTP and DHT.
     pub datagrams: bool,
 }
@@ -149,6 +159,38 @@ impl LegSockets {
             dialer,
             source: kind.listen_ip(),
         }
+    }
+
+    // A listener on `addr`'s port: on the pinned source address, else inside
+    // the leg's tunnel, where the `forwarded` one takes the port the tunnel's
+    // provider forwards.
+    fn listen<'a>(
+        &'a self,
+        addr: SocketAddr,
+        forwarded: bool,
+    ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
+        if let Some(ip) = self.source {
+            return Box::pin(async move {
+                let listener =
+                    tokio::net::TcpListener::bind(SocketAddr::new(ip, addr.port())).await?;
+                Ok(Box::new(Listener(listener)) as Box<dyn StreamListener>)
+            });
+        }
+        let Some(inbound) = Arc::clone(&self.dialer).inbound() else {
+            return Box::pin(async move {
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "this leg cannot listen",
+                ))
+            });
+        };
+        shared(async move {
+            let listener = inbound
+                .listen(addr.port(), forwarded)
+                .await
+                .map_err(io::Error::other)?;
+            Ok(Box::new(Arriving(listener)) as Box<dyn StreamListener>)
+        })
     }
 
     // The datagrams the session's UDP rides, when not the source address.
@@ -254,13 +296,14 @@ impl SocketFactory for LegSockets {
         &'a self,
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
-        Box::pin(async move {
-            let ip = self.source.ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Unsupported, "this leg cannot listen")
-            })?;
-            let listener = tokio::net::TcpListener::bind(SocketAddr::new(ip, addr.port())).await?;
-            Ok(Box::new(Listener(listener)) as Box<dyn StreamListener>)
-        })
+        self.listen(addr, false)
+    }
+
+    fn listen_peers_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
+        self.listen(addr, true)
     }
 
     fn bind_udp<'a>(
@@ -319,8 +362,7 @@ impl DatagramSocket for Carried {
         })
     }
 
-    // Only uTP polls a send, and only on a leg that listens; a ladder leg
-    // never does.
+    // Only uTP polls a send, and a ladder leg runs no uTP.
     fn poll_send_to(
         &self,
         _cx: &mut std::task::Context<'_>,
@@ -387,6 +429,57 @@ impl StreamListener for Listener {
                 Box::new(read) as BoxAsyncReadVectored,
                 Box::new(write) as BoxAsyncWrite,
             ))
+        })
+    }
+}
+
+// A listener inside the leg's tunnel. The leg counts the bytes each
+// connection it accepts reads, as it counts those of the ones it dials.
+struct Arriving(Box<dyn Listening>);
+
+impl StreamListener for Arriving {
+    fn local_addr(&self) -> SocketAddr {
+        self.0.local_addr()
+    }
+
+    // Each word of the leg's gateway on the port it forwards, as a NAT-PMP
+    // mapper's TCP report, until the listener goes.
+    fn port_mappings(&self) -> Option<PortMapReceiver> {
+        let mut mapping = self.0.mapping()?;
+        let (reports, received) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while mapping.changed().await.is_ok() {
+                let now = mapping.borrow_and_update().clone();
+                let report = PortMapped {
+                    transport: PortmapTransport::NatPmp,
+                    protocol: PortmapProtocol::Tcp,
+                    local_port: now.external_port.unwrap_or(0),
+                    external_port: now.external_port,
+                    external_ip: now.external_ip,
+                    error: now.error,
+                };
+                if reports.send(report).is_err() {
+                    return;
+                }
+            }
+        });
+        Some(received)
+    }
+
+    fn accept<'a>(
+        &'a self,
+    ) -> BoxFuture<'a, io::Result<(SocketAddr, BoxAsyncReadVectored, BoxAsyncWrite)>> {
+        shared(async move {
+            let accepted = self.0.accept().await.map_err(io::Error::other)?;
+            let peer = accepted
+                .peer
+                .unwrap_or_else(|| SocketAddr::from(([0, 0, 0, 0], 0)));
+            let (read, write) = halves(accepted.stream);
+            let read = Counted {
+                read,
+                outcome: accepted.outcome,
+            };
+            Ok((peer, Box::new(read) as BoxAsyncReadVectored, write))
         })
     }
 }
@@ -862,6 +955,284 @@ mod tests {
             .await
             .unwrap();
         peer.accept().await.unwrap();
+    }
+
+    // A ladder whose last hop takes connections, here on a loopback
+    // listener standing in for one inside a tunnel.
+    #[derive(Default)]
+    struct Accepting(Arc<std::sync::atomic::AtomicUsize>);
+    struct LoopbackInbound(Arc<std::sync::atomic::AtomicUsize>);
+    struct LoopbackListener(tokio::net::TcpListener, Arc<std::sync::atomic::AtomicUsize>);
+    #[async_trait::async_trait]
+    impl weaver_tunnel::pipe::Inbound for LoopbackInbound {
+        async fn listen(
+            &self,
+            port: u16,
+            _: bool,
+        ) -> Result<Box<dyn Listening>, weaver_tunnel::TunnelError> {
+            let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port)))
+                .await
+                .map_err(|error| weaver_tunnel::TunnelError::Engine(error.to_string()))?;
+            Ok(Box::new(LoopbackListener(listener, self.0.clone())))
+        }
+    }
+    #[async_trait::async_trait]
+    impl Listening for LoopbackListener {
+        fn local_addr(&self) -> SocketAddr {
+            self.0.local_addr().unwrap()
+        }
+        async fn accept(&self) -> Result<weaver_tunnel::pipe::Dialed, weaver_tunnel::TunnelError> {
+            let (stream, peer) = self
+                .0
+                .accept()
+                .await
+                .map_err(|error| weaver_tunnel::TunnelError::Engine(error.to_string()))?;
+            let outcome = Arc::new(ConnectionOutcome::default());
+            let reads = self.1.clone();
+            outcome.on_read(move |bytes| {
+                reads.fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+            });
+            Ok(weaver_tunnel::pipe::Dialed {
+                stream: DialedStream::Socket(stream),
+                outcome,
+                path: weaver_tunnel::pipe::DialPath::default(),
+                peer: Some(peer),
+                source: Some(self.local_addr()),
+                setup: None,
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl Dialer for Accepting {
+        async fn dial(
+            &self,
+            _: &Target,
+        ) -> Result<weaver_tunnel::pipe::Dialed, weaver_tunnel::pipe::DialError> {
+            Err(weaver_tunnel::pipe::DialError::Skipped(
+                "takes connections only".into(),
+            ))
+        }
+        fn inbound(self: Arc<Self>) -> Option<Arc<dyn weaver_tunnel::pipe::Inbound>> {
+            Some(Arc::new(LoopbackInbound(self.0.clone())))
+        }
+        fn budget(&self) -> std::time::Duration {
+            std::time::Duration::from_secs(1)
+        }
+        fn describe(&self) -> String {
+            "accepting".into()
+        }
+    }
+
+    // A ladder leg whose last hop takes connections listens through it, and
+    // runs no uTP; one whose last hop does not, never listens.
+    #[test]
+    fn a_ladder_leg_listens_exactly_when_its_last_hop_takes_connections() {
+        let accepting: Arc<dyn Dialer> = Arc::new(Accepting::default());
+        let shape = LegKind::Ladder.shape(Some(&accepting));
+        assert!(shape.listen && !shape.utp && !shape.upnp && !shape.own_sockets);
+        for dialer in [loopback_egress(), carrying()] {
+            assert!(!LegKind::Ladder.shape(Some(&dialer)).listen);
+        }
+        assert!(!LegKind::Ladder.shape(None).listen);
+        for kind in [
+            LegKind::System,
+            LegKind::Interface("en1".into()),
+            LegKind::SourceAddress("192.0.2.4".parse().unwrap()),
+        ] {
+            assert!(kind.shape(None).utp, "{kind:?}");
+        }
+    }
+
+    // A peer that connects in through the leg reaches the session, which
+    // sees its address, the port it listens on, and counts what it reads.
+    #[tokio::test]
+    async fn a_ladder_leg_takes_peers_through_its_last_hop_and_counts_their_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let accepting = Arc::new(Accepting::default());
+        let sockets = LegSockets::new(accepting.clone(), &LegKind::Ladder);
+        let listener = sockets
+            .listen_tcp(SocketAddr::from(([0, 0, 0, 0], 0)))
+            .await
+            .unwrap();
+        let local = listener.local_addr();
+        assert_eq!(local.ip(), IpAddr::from([127, 0, 0, 1]));
+        let (accepted, peer) =
+            tokio::join!(listener.accept(), tokio::net::TcpStream::connect(local));
+        let (from, mut read, mut write) = accepted.unwrap();
+        let mut peer = peer.unwrap();
+        assert_eq!(from, peer.local_addr().unwrap());
+        peer.write_all(b"interested").await.unwrap();
+        let mut heard = [0u8; 10];
+        read.read_exact(&mut heard).await.unwrap();
+        assert_eq!(&heard, b"interested");
+        assert_eq!(accepting.0.load(std::sync::atomic::Ordering::SeqCst), 10);
+        write.write_all(b"unchoke").await.unwrap();
+        let mut answer = [0u8; 7];
+        peer.read_exact(&mut answer).await.unwrap();
+        assert_eq!(&answer, b"unchoke");
+    }
+
+    // One WireGuard hop of a chain, as the runtime builds it: over the
+    // loopback egress for the first hop, else inside the hop beneath.
+    fn wireguard_hop(
+        id: u32,
+        spec: weaver_tunnel::WireGuardSpec,
+        beneath: Option<&Arc<weaver_tunnel::pipe::SessionHop>>,
+        forwarding: weaver_tunnel::pipe::PortForwarding,
+    ) -> Arc<weaver_tunnel::pipe::SessionHop> {
+        let egress = Arc::new(weaver_tunnel::pipe::Egress::new(
+            4,
+            weaver_tunnel::egress::SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
+            std::time::Duration::from_secs(30),
+        ));
+        let provider = weaver_tunnel::WireGuardTunnelProvider::new(
+            spec,
+            Arc::new(weaver_tunnel::NoopTunnelObserver),
+        );
+        let (provider, inner, proxies): (_, Arc<dyn Dialer>, Vec<u32>) = match beneath {
+            None => (provider.with_udp_factory(egress.clone()), egress, vec![]),
+            Some(beneath) => (
+                provider.with_datagram_transport(
+                    beneath
+                        .clone()
+                        .datagrams()
+                        .expect("a WireGuard hop carries datagrams"),
+                ),
+                beneath.clone(),
+                [beneath.path.proxies.clone(), vec![beneath.id]].concat(),
+            ),
+        };
+        let provider = Arc::new(provider);
+        Arc::new(weaver_tunnel::pipe::SessionHop {
+            capacity: weaver_tunnel::pipe::SessionCapacity::new(Arc::new(
+                tokio::sync::Semaphore::new(1),
+            )),
+            activity: Default::default(),
+            id,
+            provider: provider.clone(),
+            inner,
+            transport: None,
+            path: weaver_tunnel::pipe::DialPath {
+                egress: 4,
+                proxies,
+                ..Default::default()
+            },
+            endpoint: None,
+            timeout: std::time::Duration::from_secs(30),
+            naming: weaver_tunnel::pipe::Naming::proxy_servers(vec![
+                weaver_tunnel::test_support::TEST_PEER_ADDRESS.into(),
+            ]),
+            resolver: Some(provider),
+            forwarding,
+            failure: Default::default(),
+        })
+    }
+
+    // A ladder leg whose one rung is a chain of three WireGuard hops, each
+    // carried inside the one before, listens on the chain's last hop and
+    // announces the port that hop's gateway forwards over NAT-PMP; a peer
+    // beyond the last hop connects in on that port.
+    #[tokio::test]
+    async fn a_ladder_leg_over_a_three_hop_wireguard_chain_listens_on_its_last_hop() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use weaver_tunnel::pipe::PortForwarding;
+        use weaver_tunnel::test_support::{
+            TEST_CLIENT_ADDRESS, TEST_PEER_ADDRESS, WireGuardTestPeer, WireGuardTestPeerOptions,
+            natpmp::{NatPmpGateway, PUBLIC_ADDRESS},
+            test_key,
+        };
+        const CHAINED_PORT: u16 = 51820;
+        const MAPPED: u16 = 47002;
+        let gateway = NatPmpGateway::start(MAPPED).await;
+        let exit = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
+            private_key: test_key(53),
+            udp_forward: Some((5351, gateway.address())),
+            ..WireGuardTestPeerOptions::default()
+        })
+        .await;
+        let middle = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
+            private_key: test_key(52),
+            udp_forward: Some((CHAINED_PORT, exit.endpoint())),
+            ..WireGuardTestPeerOptions::default()
+        })
+        .await;
+        let entry = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
+            private_key: test_key(51),
+            udp_forward: Some((CHAINED_PORT, middle.endpoint())),
+            ..WireGuardTestPeerOptions::default()
+        })
+        .await;
+        let chained = |peer: &WireGuardTestPeer, id: &str| weaver_tunnel::WireGuardSpec {
+            endpoint_host: TEST_PEER_ADDRESS.to_string(),
+            endpoint_port: CHAINED_PORT,
+            ..peer.client_spec(id)
+        };
+        let first = wireguard_hop(1, entry.client_spec("1"), None, PortForwarding::None);
+        let second = wireguard_hop(2, chained(&middle, "2"), Some(&first), PortForwarding::None);
+        let last = wireguard_hop(
+            3,
+            chained(&exit, "3"),
+            Some(&second),
+            PortForwarding::NatPmp {
+                gateway: weaver_tunnel::pipe::gateway_of(TEST_CLIENT_ADDRESS),
+            },
+        );
+        let rung: Arc<dyn Dialer> = last;
+        let leg: Arc<dyn Dialer> = Arc::new(weaver_tunnel::pipe::Revocable::new(Arc::new(
+            weaver_tunnel::pipe::Fallback::new(vec![rung]),
+        )));
+
+        let shape = LegKind::Ladder.shape(Some(&leg));
+        assert!(shape.listen && !shape.utp);
+
+        let sockets = LegSockets::new(leg, &LegKind::Ladder);
+        let listener = sockets
+            .listen_peers_tcp(SocketAddr::from(([0, 0, 0, 0], 0)))
+            .await
+            .unwrap();
+        assert_eq!(listener.local_addr().ip(), IpAddr::V4(TEST_CLIENT_ADDRESS));
+        let mut reports = listener
+            .port_mappings()
+            .expect("the last hop's gateway forwards a port");
+        let report = reports.recv().await.unwrap();
+        assert_eq!(report.transport, PortmapTransport::NatPmp);
+        assert_eq!(report.protocol, PortmapProtocol::Tcp);
+        assert_eq!(report.external_port, Some(MAPPED));
+        assert_eq!(report.external_ip, Some(IpAddr::V4(PUBLIC_ADDRESS)));
+        assert_eq!(report.error, None);
+
+        // The listener moves to the forwarded port on its next accept; the
+        // peer dials once it says it listens there.
+        let (accepted, peer) = tokio::join!(listener.accept(), async {
+            while listener.local_addr().port() != MAPPED {
+                tokio::task::yield_now().await;
+            }
+            exit.dial_client(MAPPED).await
+        });
+        let (from, mut read, mut write) = accepted.unwrap();
+        let mut peer = peer.unwrap();
+        assert_eq!(from.ip(), IpAddr::V4(TEST_PEER_ADDRESS));
+        peer.write_all(b"interested").await.unwrap();
+        let mut heard = [0u8; 10];
+        read.read_exact(&mut heard).await.unwrap();
+        assert_eq!(&heard, b"interested");
+        write.write_all(b"unchoke").await.unwrap();
+        let mut answer = [0u8; 7];
+        peer.read_exact(&mut answer).await.unwrap();
+        assert_eq!(&answer, b"unchoke");
+
+        // The outer hops' far sides find nothing on that port.
+        assert!(entry.dial_client(MAPPED).await.is_err());
+        assert!(middle.dial_client(MAPPED).await.is_err());
+
+        // The SSL listener is not the one peers reach through the forwarded
+        // port: it listens where it asked and reports no mapping.
+        let other = sockets
+            .listen_tcp(SocketAddr::from(([0, 0, 0, 0], 0)))
+            .await
+            .unwrap();
+        assert_ne!(other.local_addr().port(), MAPPED);
+        assert!(other.port_mappings().is_none());
     }
 
     // A dialer whose naming rule answers one address, or hands names on.

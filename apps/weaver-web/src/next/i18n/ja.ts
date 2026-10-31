@@ -837,6 +837,8 @@ export const nextJa: LocaleDictionary = {
   "next.proxies.mtuHelp": "空欄なら {{value}} を使います。",
   "next.proxies.keepalive": "キープアライブ",
   "next.proxies.keepaliveHelp": "空欄なら {{seconds}} 秒を使います。0 でオフになります。",
+  "next.proxies.natpmp": "NAT-PMP ポート転送",
+  "next.proxies.forwardedPort": "転送ポート",
   "next.proxies.username": "ユーザー名",
   "next.proxies.password": "パスワード",
   "next.proxies.sshKeyHelp": "Ed25519 鍵のみ。",

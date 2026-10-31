@@ -152,6 +152,10 @@ pub struct ProxyProfileGql {
     pub keepalive_seconds: Option<u16>,
     pub timeout_seconds: u32,
     pub host_key_fingerprint: Option<String>,
+    /// WireGuard: the gateway forwards a port over NAT-PMP.
+    pub natpmp: bool,
+    /// WireGuard: the port the provider forwards, always the same one.
+    pub forwarded_port: Option<u16>,
     pub has_username: bool,
     pub has_password: bool,
     pub has_private_key: bool,
@@ -181,6 +185,8 @@ impl From<ProxyProfile> for ProxyProfileGql {
             keepalive_seconds: p.keepalive_seconds,
             timeout_seconds: p.timeout_seconds,
             host_key_fingerprint: p.host_key_fingerprint,
+            natpmp: p.natpmp,
+            forwarded_port: p.forwarded_port,
             has_username: p.secrets.username.is_some(),
             has_password: p.secrets.password.is_some(),
             has_private_key: p.secrets.private_key.is_some(),
@@ -210,6 +216,9 @@ pub struct ProxyProfileInput {
     pub keepalive_seconds: Option<u16>,
     #[graphql(default = 30)]
     pub timeout_seconds: u32,
+    #[graphql(default)]
+    pub natpmp: bool,
+    pub forwarded_port: Option<u16>,
     pub username: MaybeUndefined<String>,
     pub password: MaybeUndefined<String>,
     pub private_key: MaybeUndefined<String>,
@@ -271,6 +280,12 @@ impl ProxyProfileInput {
             keepalive_seconds: self.keepalive_seconds,
             timeout_seconds: self.timeout_seconds,
             host_key_fingerprint: existing.and_then(|p| p.host_key_fingerprint.clone()),
+            // Only a WireGuard tunnel takes a forwarded port; with NAT-PMP the
+            // gateway picks it.
+            natpmp: self.kind == ProxyKind::WireGuard && self.natpmp,
+            forwarded_port: self
+                .forwarded_port
+                .filter(|port| *port != 0 && self.kind == ProxyKind::WireGuard && !self.natpmp),
             revision: existing.map_or(Ok(1), |p| {
                 p.revision.checked_add(1).ok_or("proxy revision exhausted")
             })?,

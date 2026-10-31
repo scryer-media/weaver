@@ -120,6 +120,63 @@ async fn a_save_without_a_resolver_keeps_how_the_proxy_resolved() {
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
 
+// A WireGuard proxy keeps NAT-PMP or a forwarded port, never both; NAT-PMP
+// wins. Any other proxy keeps neither, and a forwarded port of 0 is none.
+#[tokio::test]
+async fn a_wireguard_proxy_keeps_nat_pmp_or_a_forwarded_port() {
+    let h = harness().await;
+    let save = |kind: &str, forwarding: &str| {
+        let wireguard = if kind == "WIRE_GUARD" {
+            r#", tunnelAddresses: ["10.2.0.2/32"],
+        peerPublicKey: "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI=",
+        privateKey: "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=", dnsServers: ["10.2.0.1"]"#
+        } else {
+            ""
+        };
+        format!(
+            r#"mutation {{ saveProxyProfile(input: {{
+        name: "forwarding-{kind}", kind: {kind}, resolver: PROXY, enabled: true, host: "127.0.0.1",
+        port: 1080{wireguard}{forwarding}
+    }}) {{ natpmp forwardedPort }} }}"#
+        )
+    };
+    let saved = |result: &async_graphql::Response| {
+        assert_no_errors(result);
+        let data = response_data(result);
+        (
+            data["saveProxyProfile"]["natpmp"].as_bool().unwrap(),
+            data["saveProxyProfile"]["forwardedPort"].as_u64(),
+        )
+    };
+    let cases = [
+        ("WIRE_GUARD", "", (false, None)),
+        ("WIRE_GUARD", ", forwardedPort: 51413", (false, Some(51413))),
+        ("WIRE_GUARD", ", forwardedPort: 0", (false, None)),
+        ("WIRE_GUARD", ", natpmp: true", (true, None)),
+        (
+            "WIRE_GUARD",
+            ", natpmp: true, forwardedPort: 51413",
+            (true, None),
+        ),
+        (
+            "SOCKS5",
+            ", natpmp: true, forwardedPort: 51413",
+            (false, None),
+        ),
+    ];
+    for (kind, forwarding, expected) in cases {
+        assert_eq!(
+            saved(&h.execute(&save(kind, forwarding)).await),
+            expected,
+            "{kind}{forwarding}"
+        );
+    }
+    let stored = h.db.list_proxy_profiles().unwrap();
+    assert_eq!(stored[1].forwarded_port, Some(51413));
+    assert!(stored[3].natpmp);
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
+
 #[tokio::test]
 async fn an_ssh_profile_is_refused_a_password() {
     let h = harness().await;

@@ -63,6 +63,8 @@ interface ProxyForm {
   peerPublicKey: string;
   mtu: string;
   keepaliveSeconds: string;
+  natpmp: boolean;
+  forwardedPort: string;
   timeoutSeconds: number;
   /** A string replaces the stored secret, `null` clears it, absent keeps it. */
   secrets: Partial<Record<SecretKey, string | null>>;
@@ -112,6 +114,8 @@ const NEW_PROXY: ProxyForm = {
   peerPublicKey: "",
   mtu: "",
   keepaliveSeconds: "",
+  natpmp: false,
+  forwardedPort: "",
   timeoutSeconds: 30,
   secrets: {},
 };
@@ -151,6 +155,8 @@ function formFor(profile: ProxyProfile): ProxyForm {
     peerPublicKey: profile.peerPublicKey ?? "",
     mtu: profile.mtu ? String(profile.mtu) : "",
     keepaliveSeconds: profile.keepaliveSeconds == null ? "" : String(profile.keepaliveSeconds),
+    natpmp: profile.natpmp,
+    forwardedPort: profile.forwardedPort == null ? "" : String(profile.forwardedPort),
     timeoutSeconds: profile.timeoutSeconds,
     secrets: {},
   };
@@ -229,6 +235,11 @@ function proxyInput(form: ProxyForm) {
     peerPublicKey: form.peerPublicKey || null,
     mtu: Number(form.mtu || MTU_DEFAULT),
     keepaliveSeconds: Number(form.keepaliveSeconds || KEEPALIVE_DEFAULT),
+    natpmp: form.kind === "WIRE_GUARD" && form.natpmp,
+    forwardedPort:
+      form.kind === "WIRE_GUARD" && !form.natpmp && form.forwardedPort
+        ? Number(form.forwardedPort)
+        : null,
     timeoutSeconds: form.timeoutSeconds,
     ...secrets,
   };
@@ -778,6 +789,27 @@ export function ProxyEditor({
             onChange: (next) => patch({ keepaliveSeconds: next }),
           },
         },
+        {
+          id: "natpmp",
+          label: t("next.proxies.natpmp"),
+          control: { kind: "toggle", value: form.natpmp, onChange: (next) => patch({ natpmp: next }) },
+        },
+        // The gateway picks the port under NAT-PMP: there is none to give.
+        ...(form.natpmp
+          ? []
+          : [
+              {
+                id: "forwardedPort",
+                label: t("next.proxies.forwardedPort"),
+                control: {
+                  kind: "text" as const,
+                  value: form.forwardedPort,
+                  className: "w-[110px]",
+                  onChange: (next: string) =>
+                    patch({ forwardedPort: digits(next, []).slice(0, 5) }),
+                },
+              },
+            ]),
       ]
     : [
         {

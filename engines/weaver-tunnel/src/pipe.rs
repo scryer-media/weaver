@@ -7,6 +7,11 @@ mod revocable;
 pub use revocable::Revocable;
 #[path = "pipe_datagram.rs"]
 mod datagram;
+#[path = "pipe_inbound.rs"]
+mod inbound;
+#[path = "pipe_natpmp.rs"]
+mod natpmp;
+pub use inbound::{Inbound, InboundListener, PortForwarding, PortMapping, gateway_of};
 
 #[cfg(test)]
 #[path = "pipe_tests.rs"]
@@ -534,6 +539,12 @@ pub trait Dialer: Send + Sync {
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
         None
     }
+    // Stream connections arriving through this stage, for a session that
+    // listens on it. Only a WireGuard stage takes them: the hop at the top of
+    // a path, so a chain listens at its last hop and only when that is one.
+    fn inbound(self: Arc<Self>) -> Option<Arc<dyn Inbound>> {
+        None
+    }
     // The first proxy hop on this stage's path, counted from the egress,
     // whose own last attempt failed.
     fn failing_hop(&self) -> Option<FailingHop> {
@@ -1025,6 +1036,8 @@ pub struct SessionHop {
     pub timeout: Duration,
     pub naming: Naming,
     pub resolver: Option<Arc<crate::WireGuardTunnelProvider>>,
+    // How the provider at a WireGuard hop's far end forwards a port to it.
+    pub forwarding: PortForwarding,
     pub failure: HopFailure,
 }
 
@@ -1233,6 +1246,11 @@ impl Dialer for SessionHop {
             .is_some()
             .then(|| Arc::new(datagram::SessionDatagrams::new(self)) as Arc<dyn DatagramTransport>)
     }
+    fn inbound(self: Arc<Self>) -> Option<Arc<dyn Inbound>> {
+        self.resolver
+            .is_some()
+            .then(|| Arc::new(inbound::SessionInbound::new(self)) as Arc<dyn Inbound>)
+    }
     fn budget(&self) -> Duration {
         self.inner
             .budget()
@@ -1397,6 +1415,11 @@ impl Dialer for Fallback {
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
         let index = (0..self.rungs.len()).find(|index| self.allows_rung(*index, false))?;
         Arc::clone(&self.rungs[index]).datagrams()
+    }
+    // The inbound connections of the first rung a dial would try.
+    fn inbound(self: Arc<Self>) -> Option<Arc<dyn Inbound>> {
+        let index = (0..self.rungs.len()).find(|index| self.allows_rung(*index, false))?;
+        Arc::clone(&self.rungs[index]).inbound()
     }
     fn budget(&self) -> Duration {
         self.rungs.iter().fold(Duration::ZERO, |sum, rung| {

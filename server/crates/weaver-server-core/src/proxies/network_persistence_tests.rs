@@ -45,6 +45,8 @@ fn profile(id: u32) -> ProxyProfile {
         keepalive_seconds: None,
         timeout_seconds: 30,
         host_key_fingerprint: None,
+        natpmp: false,
+        forwarded_port: None,
         revision: 1,
         secrets: ProxySecrets::default(),
     }

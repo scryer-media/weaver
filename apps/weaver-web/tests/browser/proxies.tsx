@@ -24,13 +24,13 @@ const SECRETS = ["username", "password", "privateKey", "passphrase", "presharedK
 type Stored = {
   id: number; name: string; kind: ProxyKind; enabled: boolean; host: string; port: number;
   resolver: ProxyResolver; dnsServers: string[]; tunnelAddresses: string[]; peerPublicKey: string | null; mtu: number;
-  keepaliveSeconds: number | null; timeoutSeconds: number; hostKeyFingerprint: string | null;
+  keepaliveSeconds: number | null; timeoutSeconds: number; hostKeyFingerprint: string | null; natpmp: boolean; forwardedPort: number | null;
   secrets: Partial<Record<(typeof SECRETS)[number], string>>;
 };
 const stored = (id: number, name: string, kind: ProxyKind, port: number, extra: Partial<Stored> = {}): Stored => ({
   id, name, kind, enabled: true, host: `${name.toLowerCase()}.fixture.invalid`, port,
   resolver: kind === "WIRE_GUARD" ? "WEAVER" : "PROXY", dnsServers: [], tunnelAddresses: [], peerPublicKey: null, mtu: 1280, keepaliveSeconds: 25, timeoutSeconds: 30,
-  hostKeyFingerprint: null, secrets: {}, ...extra,
+  hostKeyFingerprint: null, natpmp: false, forwardedPort: null, secrets: {}, ...extra,
 });
 const profiles: Stored[] = [
   stored(1, "Amsterdam", "WIRE_GUARD", 51820, {
@@ -73,7 +73,8 @@ function graphql(name: string, variables: Record<string, unknown>) {
       dnsServers: input.dnsServers as string[],
       tunnelAddresses: input.tunnelAddresses as string[], peerPublicKey: input.peerPublicKey as string | null,
       mtu: input.mtu as number, keepaliveSeconds: input.keepaliveSeconds as number,
-      timeoutSeconds: input.timeoutSeconds as number, hostKeyFingerprint: existing?.hostKeyFingerprint ?? null, secrets,
+      timeoutSeconds: input.timeoutSeconds as number, hostKeyFingerprint: existing?.hostKeyFingerprint ?? null,
+      natpmp: input.natpmp as boolean, forwardedPort: input.forwardedPort as number | null, secrets,
     };
     if (existing) Object.assign(existing, saved);
     else profiles.push(saved);

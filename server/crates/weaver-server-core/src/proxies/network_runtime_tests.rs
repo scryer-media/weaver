@@ -19,6 +19,8 @@ fn proxy() -> ProxyProfile {
         keepalive_seconds: None,
         timeout_seconds: 1,
         host_key_fingerprint: None,
+        natpmp: false,
+        forwarded_port: None,
         revision: 1,
         secrets: Default::default(),
     }

@@ -96,7 +96,7 @@ const DETAILS = ["Endpoint", "Port", "Private key", "Peer public key", "Preshare
 const FILLED = {
   kind: "WIRE_GUARD", enabled: true, host: "vpn.fixture.invalid", port: 51999, resolver: "PROXY", dnsServers: ["10.6.0.1"],
   tunnelAddresses: ["10.6.0.2/32", "fd00::2/128"], peerPublicKey: KEY("b"), mtu: 1380, keepaliveSeconds: 0,
-  timeoutSeconds: 30, privateKey: KEY("a"), presharedKey: KEY("c"),
+  natpmp: false, forwardedPort: null, timeoutSeconds: 30, privateKey: KEY("a"), presharedKey: KEY("c"),
 };
 async function filled(editor) {
   // What the file carried that a tunnel has no use for is said, not dropped in silence.

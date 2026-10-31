@@ -837,6 +837,8 @@ export const nextZh: LocaleDictionary = {
   "next.proxies.mtuHelp": "留空则使用 {{value}}。",
   "next.proxies.keepalive": "保活",
   "next.proxies.keepaliveHelp": "留空则使用 {{seconds}} 秒;0 表示关闭。",
+  "next.proxies.natpmp": "NAT-PMP 端口转发",
+  "next.proxies.forwardedPort": "转发端口",
   "next.proxies.username": "用户名",
   "next.proxies.password": "密码",
   "next.proxies.sshKeyHelp": "仅支持 Ed25519 密钥。",
