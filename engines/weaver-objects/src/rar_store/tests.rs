@@ -369,6 +369,25 @@ fn a_far_volume_joins_only_the_set_its_name_numbers() {
     );
 }
 
+// A volume a store gave back is claimed by an engine by its name and front,
+// as one offered fresh: another posting of a volume the engine holds is
+// answered at that volume's place, so it folds into the one there.
+#[test]
+fn an_engine_claims_a_volume_a_store_gave_back_as_one_offered_fresh() {
+    let set = write(&items(), &split(Version::Rar5));
+    let front = |volume: &Vec<u8>| volume[..4096.min(volume.len())].to_vec();
+    let mut engine = crate::rar_engine::RarEngine::new();
+    engine.bound(VolumeIndex(0), "alpha.part1.rar", &front(&set[0]), None);
+    engine.bound(VolumeIndex(1), "alpha.part2.rar", &front(&set[1]), None);
+    let name = "0000000000000000000000000000beef";
+    let mut giver = store();
+    giver.bound(VolumeIndex(0), name, &front(&set[1]), None);
+    let given = giver.give_back(VolumeIndex(0)).expect("an unmapped volume");
+    let fresh = engine.claim(name, &front(&set[1]), None);
+    assert_eq!(fresh, vec![VolumeIndex(1)]);
+    assert_eq!(engine.reclaim(name, &front(&set[1]), None, &*given), fresh);
+}
+
 // A volume posted again under another set's name, its front so far only
 // the main header that states its number: the store cannot judge it yet.
 // It answers the same whether the volume is offered fresh or given back

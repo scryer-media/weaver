@@ -351,8 +351,10 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         length: Option<u64>,
         carried: &(dyn std::any::Any + Send + Sync),
     ) -> Claim {
+        // A volume another kind of object parsed carries nothing the engine
+        // reads: it is claimed by its name and front, as a new one is.
         let Some(carried) = carried.downcast_ref::<CarriedVolume<F::Front>>() else {
-            return Claim::default();
+            return self.placed(name, front, length).into_iter().collect();
         };
         let parsed = F::front(front);
         self.placed_front(
@@ -366,7 +368,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
 
     fn adopt(&mut self, volume: VolumeIndex, name: &str, carried: weaver_graph::Carried) {
         let Ok(carried) = carried.downcast::<CarriedVolume<F::Front>>() else {
-            return;
+            return self.bound(volume, name, &[], None);
         };
         self.bound(volume, name, &[], carried.length);
         if let Some(front) = carried.front {
