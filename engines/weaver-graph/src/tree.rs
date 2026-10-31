@@ -818,7 +818,11 @@ impl Tree {
     // A restore tells every object the close of each of its volumes
     // again, as it tells every loss again: an object lent out when the
     // checkpoint was taken comes back as it was when it left, and a close
-    // that reached it meanwhile went down with the run.
+    // that reached it meanwhile went down with the run. A closed member no
+    // object owns whose front has not said what it is hears its close
+    // again too, as `close` first told it: it ended before its front could
+    // say, as one a checkpoint names undecided because an object gave it
+    // back did, whose front the restore cannot bring again.
     pub fn close_again(&mut self, builder: &mut dyn Builder, effects: &mut Vec<Effect>) {
         for node in self.live() {
             let closed: Vec<MemberId> = self.nodes.get(&node).map_or_else(Vec::new, |found| {
@@ -833,6 +837,9 @@ impl Tree {
                 self.closed_at(node, member, builder, effects);
                 for window in self.windows_on(node, member) {
                     self.close_window(window, builder, effects);
+                }
+                if self.is_undecided(node, member) {
+                    effects.push(Effect::Closed { node, member });
                 }
             }
         }
