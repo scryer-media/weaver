@@ -377,9 +377,10 @@ fn hold_rows_come_back_as_the_holds_a_restore_adopts() {
 // A restore keeps in the working directory what its checkpoint names, and
 // nothing else: a step's file whose checkpoint never committed, a member's
 // file a committed checkpoint stopped naming, a recovery's scratch and its
-// repaired file go; every member's file, at the name it sits at and the
-// name it waits for, every envelope, holds scratch and spooled part the
-// rows name stays, and so do the directory's marker and the run's cache.
+// repaired file go, and so does a file at the name a member waits for while
+// the member's own file still sits where it sat; every member's file, every
+// envelope, holds scratch and spooled part the rows name stays, and so do
+// the directory's marker and the run's cache.
 #[test]
 fn a_restore_removes_what_its_checkpoint_does_not_name() {
     use weaver_graph::names::{CACHE_DIR, INTERNAL_DIR};
@@ -396,7 +397,6 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
         format!("{INTERNAL_DIR}/held-0-1.uu"),
         crate::jobs::working_dir::WORKING_DIR_MARKER.to_owned(),
         "inner/inner.bin".to_owned(),
-        "set.par2".to_owned(),
     ];
     let unnamed = [
         format!("{INTERNAL_DIR}/graph-envelope-1-2"),
@@ -405,6 +405,7 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
         format!("{INTERNAL_DIR}/graph-recovery-0-3/set.par2"),
         format!("{INTERNAL_DIR}/graph-waiting-0-2"),
         "inner/stray.bin".to_owned(),
+        "set.par2".to_owned(),
         "set.part1.rar".to_owned(),
         "stray/deeper/file.bin".to_owned(),
     ];
@@ -441,6 +442,43 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
     left.sort();
     assert_eq!(left, named);
     assert!(!dir.path().join("stray").exists());
+}
+
+// A member's file the checkpoint says waits to move, gone from where it sat
+// and found at the name it wants, moved before the checkpoint that would
+// have said so: the restore keeps it there, opens it there, and the name it
+// sat at stays empty.
+#[test]
+fn a_restore_keeps_a_file_that_moved_before_its_checkpoint_said_so() {
+    use weaver_graph::names::INTERNAL_DIR;
+    let dir = tempfile::tempdir().unwrap();
+    let taken = full();
+    let waiting = format!("{INTERNAL_DIR}/graph-waiting-0-1");
+    std::fs::write(dir.path().join("set.par2"), b"bytes").unwrap();
+    let rows = rows(&taken);
+    let restored = snapshot(&rows).unwrap();
+    assert_eq!(
+        crate::pipeline::graph::namespace::restored_at(
+            dir.path(),
+            "set.par2",
+            Some(waiting.as_str())
+        ),
+        "set.par2"
+    );
+    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts);
+    assert!(dir.path().join("set.par2").exists());
+    assert!(!dir.path().join(&waiting).exists());
+
+    std::fs::create_dir_all(dir.path().join(INTERNAL_DIR)).unwrap();
+    std::fs::write(dir.path().join(&waiting), b"bytes").unwrap();
+    assert_eq!(
+        crate::pipeline::graph::namespace::restored_at(
+            dir.path(),
+            "set.par2",
+            Some(waiting.as_str())
+        ),
+        waiting
+    );
 }
 
 #[test]

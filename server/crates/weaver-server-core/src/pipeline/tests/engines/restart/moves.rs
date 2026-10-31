@@ -24,8 +24,51 @@ enum Stop {
     // so never committed.
     Moved(&'static str),
     // As `Committed`, and the job comes back to a directory it never wrote
-    // at `.0`, the name the file wants, so the move fails.
+    // and cannot remove at `.0`, the name the file wants, so the move fails.
     Blocked(&'static str),
+}
+
+// A directory the job never wrote that holds a file it cannot remove while
+// this lives: the restore cannot sweep it, and a move onto its name fails.
+struct Unremovable {
+    #[cfg(unix)]
+    dir: std::path::PathBuf,
+    #[cfg(windows)]
+    _held: std::fs::File,
+}
+
+impl Unremovable {
+    fn at(dir: std::path::PathBuf) -> Self {
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("kept");
+        std::fs::write(&file, b"kept").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            Self { dir }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let _held = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&file)
+                .unwrap();
+            Self { _held }
+        }
+    }
+}
+
+impl Drop for Unremovable {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(0o755));
+        }
+    }
 }
 
 // The job's rows as they stand once every queued write has committed.
@@ -96,6 +139,7 @@ async fn run_stopping(scenario: &Scenario, stop: Stop) -> (Restarted, GraphCheck
     let mut quiet = 0;
     let mut restored = None;
     let mut seen = BTreeMap::new();
+    let mut blocker = None;
     loop {
         while let Some(work) = next_work(&mut pipeline, scenario) {
             let article = (
@@ -118,8 +162,16 @@ async fn run_stopping(scenario: &Scenario, stop: Stop) -> (Restarted, GraphCheck
                 // The article this step wrote is described by no
                 // checkpoint that commits: it is fetched again.
                 owed.insert(article);
-                let (down, rows) =
-                    go_down(&temp_dir, pipeline, scenario, stop, was, &mut owed).await;
+                let (down, rows) = go_down(
+                    &temp_dir,
+                    pipeline,
+                    scenario,
+                    stop,
+                    was,
+                    &mut owed,
+                    &mut blocker,
+                )
+                .await;
                 pipeline = down;
                 restored = Some(rows);
                 in_memory.extend(owed.iter().copied());
@@ -147,8 +199,16 @@ async fn run_stopping(scenario: &Scenario, stop: Stop) -> (Restarted, GraphCheck
             pipeline.graph_run_said(said);
             observe(&pipeline, &mut graph, &mut reads);
             if let Some(was) = was.filter(|_| renamed(&pipeline, &mut seen)) {
-                let (down, rows) =
-                    go_down(&temp_dir, pipeline, scenario, stop, was, &mut owed).await;
+                let (down, rows) = go_down(
+                    &temp_dir,
+                    pipeline,
+                    scenario,
+                    stop,
+                    was,
+                    &mut owed,
+                    &mut blocker,
+                )
+                .await;
                 pipeline = down;
                 restored = Some(rows);
                 in_memory.extend(owed.iter().copied());
@@ -231,6 +291,7 @@ async fn go_down(
     stop: Stop,
     was: GraphCheckpoint,
     owed: &mut BTreeSet<(u32, u32)>,
+    blocker: &mut Option<Unremovable>,
 ) -> (Pipeline, GraphCheckpoint) {
     let working_dir = pipeline.jobs[&JOB].working_dir.clone();
     match stop {
@@ -240,7 +301,7 @@ async fn go_down(
         }
         Stop::Blocked(name) => {
             pipeline.db.flush_write_queue().await.unwrap();
-            std::fs::create_dir_all(working_dir.join(name).join("kept")).unwrap();
+            *blocker = Some(Unremovable::at(working_dir.join(name)));
         }
         Stop::Moved(name) => {
             let recorded = rows(&pipeline).await;
@@ -326,7 +387,8 @@ async fn a_rename_committed_but_not_moved_is_opened_where_the_file_sat() {
 }
 
 // Down after the checkpoint that records the name committed, and back to a
-// directory at the name the file wants: the restore runs the move as it
+// directory the restore cannot remove at the name the file wants: the
+// restore runs the move as it
 // comes back, the move fails, and the job fails with it rather than wait
 // on a move that never runs.
 #[tokio::test]

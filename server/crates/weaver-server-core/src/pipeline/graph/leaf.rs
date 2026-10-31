@@ -83,13 +83,18 @@ struct Written {
 }
 
 impl Leaf {
+    // Where the leaf for `output_name` under `dir` lies.
+    pub(crate) fn path_at(dir: &Path, output_name: &str) -> PathBuf {
+        dir.join(relative_path(output_name))
+    }
+
     // The leaf for `output_name` under `dir`. Nothing is created until the
     // first byte arrives.
     pub(crate) fn at(dir: &Path, output_name: &str) -> Self {
         Self {
             identity: NEXT_LEAF.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             revision: 0,
-            path: dir.join(relative_path(output_name)),
+            path: Self::path_at(dir, output_name),
             name: output_name.to_owned(),
             wants: None,
             directory: Self::is_directory(output_name),
