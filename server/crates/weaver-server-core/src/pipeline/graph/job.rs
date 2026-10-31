@@ -660,6 +660,9 @@ impl GraphJob {
     fn after_member(&mut self, volume: VolumeIndex) -> Result<(), GraphError> {
         let member = MemberId(volume.0);
         if !self.root.map.volume_waiting(volume) && !self.closed(member) {
+            if let Some(end) = self.root.map.reached(volume) {
+                self.tree.reached(NodeId::ROOT, member, end);
+            }
             let mut out = Vec::new();
             self.writer.close(
                 &mut self.tree,

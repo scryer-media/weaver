@@ -687,6 +687,30 @@ impl ArticleMap {
         front
     }
 
+    // How far the volume's articles reached: where its last article's bytes
+    // ended, or, when every server failed it, the file's declared end. A
+    // volume whose length nothing declared reaches only as far as its
+    // place is proven: the sizes a post declares are encoded sizes, longer
+    // than the bytes. A tail past an article that arrived short is lost to
+    // the tree as well, but no article reached into it. `None` when the
+    // last article came in an earlier run, whose placement this run never
+    // saw.
+    pub(crate) fn reached(&self, volume: VolumeIndex) -> Option<u64> {
+        let found = self.volumes.get(volume.0 as usize)?;
+        let end = found.articles.len();
+        match found.articles.last()?.state {
+            State::Arrived(Some(range)) => Some(range.end),
+            State::Lost { .. } => Some(
+                found
+                    .known
+                    .get(&end)
+                    .copied()
+                    .unwrap_or_else(|| found.bounds(end).0),
+            ),
+            State::Waiting | State::Arrived(None) => None,
+        }
+    }
+
     // The class the article is fetched under now.
     pub(crate) fn class(&self, volume: VolumeIndex, ordinal: u32) -> Option<Class> {
         let found = self.volumes.get(volume.0 as usize)?;

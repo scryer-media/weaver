@@ -53,10 +53,19 @@ fn sized(object: &mut dyn Object, volume: u32, length: u64) -> Vec<Emit> {
     out
 }
 
-fn closed(object: &mut dyn Object, volume: u32, length: u64) -> Vec<Emit> {
+// A piece closes as the tree closes it: at its length, the one its articles
+// declared or longer when its bytes reached past that, then how far its
+// bytes reached, arrived or lost.
+fn closed_at(object: &mut dyn Object, volume: u32, length: u64, reached: u64) -> Vec<Emit> {
     let mut out = sized(object, volume, length);
+    object.volume_reached(VolumeIndex(volume), reached, &mut out);
     object.volume_closed(VolumeIndex(volume), &mut out);
     out
+}
+
+// A piece that closes at the length it reached.
+fn closed(object: &mut dyn Object, volume: u32, length: u64) -> Vec<Emit> {
+    closed_at(object, volume, length, length)
 }
 
 fn locate(object: &dyn Object, volume: u32, range: ByteRange) -> Vec<Placement> {
@@ -192,7 +201,7 @@ fn a_piece_that_closes_longer_than_it_declared_moves_every_later_piece() {
             },
         ]
     );
-    let out = closed(&mut *object, 1, 100);
+    let out = closed(&mut *object, 1, 120);
     assert_eq!(
         out.iter()
             .filter(|emit| matches!(emit, Emit::Again { .. }))
@@ -277,10 +286,11 @@ fn a_length_proven_after_a_piece_closed_moves_every_later_piece() {
     assert!(out.contains(&Emit::MemberClosed(MEMBER)));
 }
 
-// A piece that closes short moves the next one back, onto bytes the piece
-// after it goes to: the old place of an earlier piece, starting before the
-// later one's. The later piece's bytes wait until the moved bytes came
-// again, then go where they go.
+// A piece that closes short, its articles declaring more than they hold,
+// moves the next one back, onto bytes the piece after it goes to: the old
+// place of an earlier piece, starting before the later one's. The later
+// piece's bytes wait until the moved bytes came again, then go where they
+// go.
 #[test]
 fn a_piece_waits_for_an_earlier_piece_still_sitting_where_it_goes() {
     let mut object = set(&["vessel.bin.001", "vessel.bin.002", "vessel.bin.003"]);
@@ -289,7 +299,7 @@ fn a_piece_waits_for_an_earlier_piece_still_sitting_where_it_goes() {
     }
     deliver(&mut *object, 1, 0, &[2; 100]);
     deliver(&mut *object, 0, 0, &[1; 80]);
-    let out = closed(&mut *object, 0, 100);
+    let out = closed_at(&mut *object, 0, 100, 80);
     assert!(out.contains(&Emit::Again {
         volume: VolumeIndex(1),
         range: ByteRange::new(0, 100),
@@ -327,7 +337,7 @@ fn a_moved_piece_waits_for_its_own_bytes_still_sitting_where_it_goes() {
     }
     deliver(&mut *object, 1, 0, &[2; 60]);
     deliver(&mut *object, 0, 0, &[1; 80]);
-    let out = closed(&mut *object, 0, 100);
+    let out = closed_at(&mut *object, 0, 100, 80);
     assert!(out.contains(&Emit::Again {
         volume: VolumeIndex(1),
         range: ByteRange::new(0, 60),
@@ -348,6 +358,40 @@ fn a_moved_piece_waits_for_its_own_bytes_still_sitting_where_it_goes() {
         vec![Placement::Member {
             member: MEMBER,
             range: ByteRange::at(140, 40),
+        }]
+    );
+}
+
+// A piece whose last article was lost closes at the length its articles
+// declared: the loss reaches it as its bytes would have, so the next piece
+// stays where it was placed and nothing is asked for again. The member
+// closes at the declared lengths, the lost range a hole for a repair.
+#[test]
+fn a_piece_whose_tail_was_lost_closes_at_its_declared_length() {
+    let mut object = set(&["vessel.bin.001", "vessel.bin.002"]);
+    sized(&mut *object, 0, 100);
+    sized(&mut *object, 1, 100);
+    assert_eq!(
+        placed(&deliver(&mut *object, 0, 0, &[1; 60])),
+        vec![(0, 60)]
+    );
+    assert_eq!(
+        placed(&deliver(&mut *object, 1, 0, &[2; 100])),
+        vec![(100, 100)]
+    );
+    let out = closed_at(&mut *object, 0, 100, 100);
+    assert!(
+        !out.iter().any(|emit| matches!(emit, Emit::Again { .. })),
+        "{out:?}"
+    );
+    assert!(lengths(&out).is_empty(), "{out:?}");
+    let out = closed(&mut *object, 1, 100);
+    assert!(out.contains(&Emit::MemberClosed(MEMBER)), "{out:?}");
+    assert_eq!(
+        locate(&*object, 1, ByteRange::at(0, 100)),
+        vec![Placement::Member {
+            member: MEMBER,
+            range: ByteRange::at(100, 100),
         }]
     );
 }
@@ -383,7 +427,7 @@ fn a_length_proven_down_to_what_a_closed_piece_placed_closes_the_member() {
     closed(&mut *object, 0, 100);
     let out = deliver(&mut *object, 1, 0, &[2; 120]);
     assert_eq!(placed(&out), vec![(100, 100)]);
-    let out = closed(&mut *object, 1, 100);
+    let out = closed(&mut *object, 1, 120);
     assert!(!out.contains(&Emit::MemberClosed(MEMBER)), "{out:?}");
     let out = sized(&mut *object, 1, 100);
     assert_eq!(lengths(&out), vec![Some(200)]);
@@ -409,7 +453,7 @@ fn a_piece_placed_past_an_article_still_held_is_not_whole() {
     closed(&mut *object, 3, 100);
     let out = deliver(&mut *object, 0, 0, &[1; 120]);
     assert_eq!(placed(&out), vec![(0, 100)]);
-    let out = closed(&mut *object, 0, 100);
+    let out = closed(&mut *object, 0, 120);
     assert!(out.contains(&Emit::Again {
         volume: VolumeIndex(3),
         range: ByteRange::new(0, 100),
@@ -457,7 +501,7 @@ fn a_set_restored_mid_move_reads_back_where_it_was_and_closes_once_whole() {
     closed(&mut *object, 0, 100);
     deliver(&mut *object, 1, 0, &[2; 100]);
     deliver(&mut *object, 1, 100, &[2; 20]);
-    let out = closed(&mut *object, 1, 100);
+    let out = closed(&mut *object, 1, 120);
     assert!(out.iter().any(|emit| matches!(emit, Emit::Again { .. })));
     let mut object = crate::restore(&object.facts(), Budget::default()).unwrap();
     assert_eq!(

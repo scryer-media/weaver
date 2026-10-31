@@ -73,8 +73,6 @@ struct Piece {
     // it closed, and what its member is given anew after. A piece is never
     // empty, so none is said as none.
     declared: Option<u64>,
-    // How far its bytes and its losses reached before it closed.
-    reached: u64,
     // The bytes it was handed and could not place, which its owner holds
     // and hands again once they can be: in order, none touching another.
     held: Vec<ByteRange>,
@@ -372,7 +370,8 @@ impl Durable for SplitStore {
     // came.
     // 9: that length gone again: a piece's length is the one it holds; and
     // what each piece holds unplaced, where it kept how far it was handed.
-    const VERSION: u16 = 9;
+    // 10: how far each piece reached gone: its close says so.
+    const VERSION: u16 = 10;
 }
 
 impl Object for SplitStore {
@@ -404,12 +403,6 @@ impl Object for SplitStore {
             && range.start < awaited.until
         {
             awaited.from = None;
-        }
-        let Some(piece) = self.pieces.get_mut(&index) else {
-            return;
-        };
-        if !piece.closed {
-            piece.reached = piece.reached.max(range.end);
         }
         self.say_member(out);
         let placeable = self.placeable(index);
@@ -448,28 +441,30 @@ impl Object for SplitStore {
         }
     }
 
-    // A piece that closes at another length than it declared is that
-    // length: what it reached, its bytes and its losses alike.
     fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
         let Some(piece) = self.pieces.get_mut(&volume.0) else {
             return;
         };
-        if !piece.closed {
-            piece.closed = true;
-            let reached = piece.reached;
-            self.resize(volume.0, reached, out);
-        }
+        piece.closed = true;
         self.close_member(out);
     }
 
-    // The member is marked through the piece's place, as any store's is.
-    fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, _out: &mut Vec<Emit>) {
-        if let Some(piece) = self.pieces.get_mut(&volume.0)
-            && !piece.closed
+    // A piece closes at what it reached, its bytes and its losses alike: a
+    // lost tail keeps the length its articles declared, and only a length
+    // declared past every article it holds is cut back. A close told again
+    // changes nothing.
+    fn volume_reached(&mut self, volume: VolumeIndex, reached: u64, out: &mut Vec<Emit>) {
+        if self
+            .pieces
+            .get(&volume.0)
+            .is_some_and(|piece| !piece.closed)
         {
-            piece.reached = piece.reached.max(range.end);
+            self.resize(volume.0, reached, out);
         }
     }
+
+    // The member is marked through the piece's place, as any store's is.
+    fn volume_lost(&mut self, _volume: VolumeIndex, _range: ByteRange, _out: &mut Vec<Emit>) {}
 
     // A set missing a number, or its first piece, is no file of its own:
     // what was placed of it is forgotten and its pieces go back. A member

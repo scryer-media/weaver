@@ -349,6 +349,12 @@ pub trait Object: Send + Sync {
     // again. A close told again is the one already heard.
     fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>);
 
+    // How far my closing volume reached: the end of the last of its bytes
+    // that arrived or was lost, short of its length when its articles
+    // declared more than they hold. Told just before every close, after its
+    // length.
+    fn volume_reached(&mut self, _volume: VolumeIndex, _reached: u64, _out: &mut Vec<Emit>) {}
+
     // This range of my volume will never arrive and no recovery covers it.
     // A range may be told again, alone or inside a wider run: a restore tells
     // every loss again, and a quiet job tells its data objects every loss
