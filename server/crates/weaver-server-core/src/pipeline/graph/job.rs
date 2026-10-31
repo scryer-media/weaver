@@ -30,7 +30,7 @@ use super::checkpoint::Pending;
 use super::engine::{Runs, Said};
 use super::leaf::LeafError;
 use super::limits::Caps;
-use super::namespace::{NamespaceWriter, SetState, WriteError};
+use super::namespace::{Coming, NamespaceWriter, SetState, WriteError};
 use super::root::intake::Decoded;
 use super::root::phase::{self, Activity, RootPhase};
 use super::root::sample;
@@ -317,8 +317,7 @@ impl GraphJob {
     // A checksum obligation something can still meet: one an ended
     // namespace can no longer check is not work.
     fn verifications_due(&self) -> bool {
-        self.writer
-            .verifications_due(&self.tree, self.payload_waiting())
+        self.writer.verifications_due(&self.tree, &self.coming())
     }
 
     #[cfg(test)]
@@ -678,19 +677,21 @@ impl GraphJob {
     // article comes only when something asks for it, so a volume nothing
     // will ask for, such as one whose opening article was lost before
     // anything could name it, holds nothing back. Recovery volumes are left
-    // out: what a repair asks of them is the repair's. Root members are
+    // out: they hold back only their own set's ruling. Root members are
     // numbered as the volumes they are; a further posting of a member is
-    // a volume of its own whose articles are the member's. Only the volumes
-    // with such an article are asked.
+    // a volume of its own whose articles are the member's.
     fn payload_waiting(&self) -> bool {
-        let root = self.namespace();
-        self.root.map.coming().any(|volume| {
-            let member = MemberId(volume.0);
-            root.get(member).is_some()
-                && !self
-                    .writer
-                    .carries_recovery(&self.tree, NodeId::ROOT, member)
-        })
+        self.coming().payload
+    }
+
+    // What the root still fetches unasked, payload and the sets whose own
+    // volumes are still arriving. Only the volumes with such an article are
+    // asked.
+    fn coming(&self) -> Coming {
+        self.writer.coming(
+            &self.tree,
+            self.root.map.coming().map(|volume| MemberId(volume.0)),
+        )
     }
 
     // Whether the volume has articles the queue fetches unasked still to

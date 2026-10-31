@@ -125,10 +125,10 @@ fn a_check_stated_after_proven_bytes_landed_finds_their_fold() {
 #[test]
 fn an_obligation_whose_file_an_object_took_is_not_due_once_its_namespace_ended() {
     let (mut job, member, _) = pending();
-    assert!(job.writer.verifications_due(&job.tree, false));
+    assert!(job.writer.verifications_due(&job.tree, &Coming::default()));
     job.writer.files_mut(NodeId::ROOT).leaves.remove(&member);
     assert!(job.writer.take_verification(&job.tree).is_none());
-    assert!(!job.writer.verifications_due(&job.tree, false));
+    assert!(!job.writer.verifications_due(&job.tree, &Coming::default()));
 }
 
 // A repair slice fills a gap and closes the member before a later slice of

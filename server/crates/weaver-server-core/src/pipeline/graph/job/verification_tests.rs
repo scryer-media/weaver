@@ -231,7 +231,7 @@ fn an_ineligible_obligation_in_an_ended_namespace_is_not_pending_work() {
     job.writer.restore_verifications(&[(0, 0)]);
     let mail = RunMail::default();
     job.loans = Loans::new(1, mail.sender(), job.runs.hardware());
-    assert!(job.writer.ruled(&job.tree, NodeId::ROOT));
+    assert!(job.writer.ruled(&job.tree, NodeId::ROOT, &job.coming()));
 
     assert!(!job.work_pending());
     assert_ne!(job.phase(), RootPhase::Verifying);

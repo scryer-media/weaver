@@ -151,27 +151,27 @@ impl NamespaceWriter {
     // an ended namespace no check can be lent for is met by nothing: the
     // census reads its member damaged or short, and a member whose file an
     // object took over is that object's to read.
-    pub(crate) fn verifications_due(&self, tree: &Tree, payload_waiting: bool) -> bool {
+    pub(crate) fn verifications_due(&self, tree: &Tree, coming: &Coming) -> bool {
         self.verifications
             .iter()
-            .any(|&(node, member)| self.owed(tree, payload_waiting, node, member))
+            .any(|&(node, member)| self.owed(tree, coming, node, member))
     }
 
     // The namespace ended: its obligations nothing can meet are dropped.
-    pub(crate) fn drop_unmet_verifications(&mut self, tree: &Tree, payload_waiting: bool) {
+    pub(crate) fn drop_unmet_verifications(&mut self, tree: &Tree, coming: &Coming) {
         let unmet: Vec<(NodeId, MemberId)> = self
             .verifications
             .iter()
             .copied()
-            .filter(|&(node, member)| !self.owed(tree, payload_waiting, node, member))
+            .filter(|&(node, member)| !self.owed(tree, coming, node, member))
             .collect();
         for key in unmet {
             self.verifications.remove(&key);
         }
     }
 
-    fn owed(&self, tree: &Tree, payload_waiting: bool, node: NodeId, member: MemberId) -> bool {
-        !self.ended(tree, node, payload_waiting) || self.verification(tree, node, member).is_some()
+    fn owed(&self, tree: &Tree, coming: &Coming, node: NodeId, member: MemberId) -> bool {
+        !self.ended(tree, node, coming) || self.verification(tree, node, member).is_some()
     }
 
     // The member's stated CRC and length, when its bytes can be checked:

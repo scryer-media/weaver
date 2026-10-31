@@ -80,7 +80,7 @@ impl GraphJob {
         self.seal_proven();
         // An ended namespace's obligations nothing can check end here.
         self.writer
-            .drop_unmet_verifications(&self.tree, self.payload_waiting());
+            .drop_unmet_verifications(&self.tree, &self.coming());
         if !self.writer.rechecks_waiting() && !self.writer.verifications_waiting() {
             return Ok(());
         }
@@ -205,14 +205,16 @@ impl GraphJob {
     }
 
     // The payload is in, no run is reading, no repair is out, and every
-    // namespace's sets have ruled on something other than waiting.
+    // namespace's sets have ruled on something other than waiting, none
+    // with a volume of its own still arriving.
     fn quiet(&self) -> bool {
-        !self.payload_waiting()
+        let coming = self.coming();
+        !coming.payload
             && !self.runs.live()
             && !self.loans.out()
             && !self.writer.rechecks_waiting()
             && !self.verifications_due()
-            && self.writer.all_ruled(&self.tree)
+            && self.writer.all_ruled(&self.tree, &coming)
     }
 
     // Ranges of lost articles go to the root namespace as soon as they can

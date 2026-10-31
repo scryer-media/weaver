@@ -532,13 +532,63 @@ fn an_index_that_covers_nothing_is_due_once_its_volume_closes() {
 fn a_namespace_without_sets_has_ruled_and_one_with_an_unruled_set_has_not() {
     let mut job = Job::new(PLENTY);
     job.member("video.mkv", Some(4));
-    assert!(job.writer.ruled(&job.tree, NodeId::ROOT));
-    assert!(job.writer.all_ruled(&job.tree));
+    assert!(
+        job.writer
+            .ruled(&job.tree, NodeId::ROOT, &Coming::default())
+    );
+    assert!(job.writer.all_ruled(&job.tree, &Coming::default()));
 
     let mut job = Job::new(PLENTY).with_set(None);
     job.member("video.mkv", Some(4));
-    assert!(!job.writer.ruled(&job.tree, NodeId::ROOT));
+    assert!(
+        !job.writer
+            .ruled(&job.tree, NodeId::ROOT, &Coming::default())
+    );
     assert_eq!(job.writer.outcomes(&job.tree), vec![None]);
+}
+
+// A set rules on what it has read. While an article of its own volume is
+// still to come, what it said of the first part is not its last word, so
+// the namespace has not ruled and the job cannot go quiet on it; payload
+// still to come is named apart and leaves the set's ruling standing.
+#[test]
+fn a_set_whose_own_volume_has_an_article_to_come_has_not_ruled() {
+    let mut job = Job::new(PLENTY).with_set(None);
+    let own = an_index_covering_nothing(&mut job);
+    let other = job.root().find_by_name("other.mkv").expect("payload").id;
+    job.close(own);
+    job.rule(false);
+    assert_eq!(
+        job.writer.outcomes(&job.tree),
+        vec![Some(RepairOutcome::Clean)]
+    );
+    assert!(
+        job.writer
+            .ruled(&job.tree, NodeId::ROOT, &Coming::default())
+    );
+
+    let coming = job.writer.coming(&job.tree, [own].into_iter());
+    assert_eq!(
+        coming,
+        Coming {
+            payload: false,
+            sets: BTreeSet::from([job.set_node()]),
+        }
+    );
+    assert!(!job.writer.ruled(&job.tree, NodeId::ROOT, &coming));
+    assert!(!job.writer.all_ruled(&job.tree, &coming));
+    assert!(!job.writer.ended(&job.tree, NodeId::ROOT, &coming));
+
+    let coming = job.writer.coming(&job.tree, [other].into_iter());
+    assert_eq!(
+        coming,
+        Coming {
+            payload: true,
+            sets: BTreeSet::new(),
+        }
+    );
+    assert!(job.writer.ruled(&job.tree, NodeId::ROOT, &coming));
+    assert!(!job.writer.ended(&job.tree, NodeId::ROOT, &coming));
 }
 
 #[test]

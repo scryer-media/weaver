@@ -21,7 +21,9 @@
 // completes with that damage tolerated, as a damaged article does.
 
 use bytes::Bytes;
-use weaver_graph::{Builder, ByteRange, Effect, MemberId, NodeId, Placement, Provenance, Tree};
+use weaver_graph::{
+    Builder, ByteRange, Coverage, Effect, MemberId, NodeId, Placement, Provenance, Tree,
+};
 
 use super::{Arrival, NamespaceWriter, READ_BACK, Segments, Write, WriteError};
 
@@ -155,13 +157,68 @@ impl NamespaceWriter {
             if matches!(placement, Placement::Held { .. }) {
                 continue;
             }
-            let mut into = Vec::new();
-            let posted = object.posted(volume, piece, &mut read, &mut into)
-                && into.len() as u64 == piece.len();
-            pieces.push((piece, posted.then(|| Bytes::from(into))));
+            // Each part the placement's source holds is posted on its own,
+            // so a gap in the source costs that gap, not the piece around it.
+            let mut skip = 0;
+            for kept in self.kept(tree, retired, placement) {
+                if kept.start > skip {
+                    pieces.push((
+                        ByteRange::new(piece.start + skip, piece.start + kept.start),
+                        None,
+                    ));
+                }
+                let part = kept.shift(piece.start as i64);
+                let mut into = Vec::new();
+                let posted = object.posted(volume, part, &mut read, &mut into)
+                    && into.len() as u64 == part.len();
+                pieces.push((part, posted.then(|| Bytes::from(into))));
+                skip = kept.end;
+            }
+            if skip < piece.len() {
+                pieces.push((ByteRange::new(piece.start + skip, piece.end), None));
+            }
         }
         tree.put_object(retired, object);
         pieces
+    }
+
+    // The parts of a placement its source holds, as offsets into the
+    // placement, in order: what the envelope kept, or what reached the
+    // member. Only those can be posted again.
+    fn kept(&self, tree: &Tree, retired: NodeId, placement: &Placement) -> Vec<ByteRange> {
+        let held = |coverage: &Coverage, range: ByteRange| {
+            let mut parts: Vec<ByteRange> = Vec::new();
+            for run in coverage.overlapping(range) {
+                let Some(part) = run.range.intersect(range) else {
+                    continue;
+                };
+                let part = part.shift(-(range.start as i64));
+                match parts.last_mut() {
+                    Some(last) if last.end == part.start => last.end = part.end,
+                    _ => parts.push(part),
+                }
+            }
+            parts
+        };
+        match placement {
+            Placement::Member { member, range } => tree
+                .namespace(retired)
+                .and_then(|namespace| namespace.get(*member))
+                .map(|record| held(&record.coverage, *range))
+                .unwrap_or_default(),
+            Placement::Envelope { envelope, range } => self
+                .envelopes
+                .shelf_of(retired)
+                .and_then(|shelf| {
+                    let state = shelf.lock();
+                    state
+                        .kept
+                        .get(envelope)
+                        .map(|kept| held(&kept.coverage, *range))
+                })
+                .unwrap_or_default(),
+            Placement::Held { .. } => Vec::new(),
+        }
     }
 
     // Every byte held anywhere under the retired node goes to its member's
