@@ -433,7 +433,7 @@ impl Pipeline {
                     return;
                 }
             };
-            let Some((segment_number, data)) = next else {
+            let Some((segment_number, facts, data)) = next else {
                 break;
             };
             let released = DecodeResult {
@@ -443,12 +443,10 @@ impl Pipeline {
                 },
                 raw_size: data.len_bytes() as u64,
                 // Damage and the end marker were folded into the file's state
-                // when this part first arrived; replaying them here would be
-                // harmless but redundant.
-                encoding: SegmentEncoding::Uu(crate::pipeline::UuSegmentFacts {
-                    damaged: false,
-                    ended: false,
-                }),
+                // when this part first arrived; they are said again here, as
+                // the part arrived, so its bytes stand as clean or damaged as
+                // they decoded.
+                encoding: SegmentEncoding::Uu(facts),
                 yenc_layout: YencLayoutAssertions {
                     file_size: 0,
                     part: None,
@@ -456,7 +454,7 @@ impl Pipeline {
                     begin: None,
                     end: None,
                 },
-                crc_valid: true,
+                crc_valid: facts.clean(),
                 part_crc_verified: false,
                 part_crc: 0,
                 truncation_suspected: false,
@@ -566,7 +564,7 @@ impl Pipeline {
                         // download layer already counts it as delivered.
                         drop(_cpu_scope);
                         let displaced = match self
-                            .park_uu_segment(file_id, segment_id.segment_number, data)
+                            .park_uu_segment(file_id, segment_id.segment_number, facts, data)
                             .await
                         {
                             Ok(displaced) => displaced,
@@ -1044,7 +1042,7 @@ impl Pipeline {
             .flat_map(|(file_id, uu)| {
                 uu.parked
                     .iter()
-                    .filter_map(move |(ordinal, entry)| match entry {
+                    .filter_map(move |(ordinal, part)| match &part.bytes {
                         ParkedBytes::Memory(data) => Some((*file_id, *ordinal, data.len_bytes())),
                         ParkedBytes::Spilled { .. } => None,
                     })
@@ -1054,7 +1052,10 @@ impl Pipeline {
             if !self.admit_spool_bytes(bytes) {
                 continue;
             }
-            let Some(ParkedBytes::Memory(data)) = self
+            let Some(ParkedUu {
+                bytes: ParkedBytes::Memory(data),
+                facts,
+            }) = self
                 .uu_files
                 .get_mut(&file_id)
                 .and_then(|uu| uu.parked.remove(&ordinal))
@@ -1069,7 +1070,13 @@ impl Pipeline {
             };
             self.note_uu_spooled(bytes, 1);
             if let Some(uu) = self.uu_files.get_mut(&file_id) {
-                uu.parked.insert(ordinal, spilled);
+                uu.parked.insert(
+                    ordinal,
+                    ParkedUu {
+                        bytes: spilled,
+                        facts,
+                    },
+                );
             }
         }
         let unanchored: Vec<(NzbFileId, u32, usize)> = self
@@ -1135,6 +1142,7 @@ impl Pipeline {
         &mut self,
         file_id: NzbFileId,
         segment_number: u32,
+        facts: UuSegmentFacts,
         data: DecodedChunk,
     ) -> Result<Vec<u32>, SegmentWriteError> {
         let max_pending = self.uu_park_max_segments;
@@ -1165,7 +1173,13 @@ impl Pipeline {
             return Ok(Vec::new());
         };
 
-        let replacement = uu.parked.insert(segment_number, entry);
+        let replacement = uu.parked.insert(
+            segment_number,
+            ParkedUu {
+                bytes: entry,
+                facts,
+            },
+        );
         let mut displaced = Vec::new();
         let mut displaced_entries = Vec::new();
         while uu.parked.len() > max_pending {
@@ -1179,7 +1193,7 @@ impl Pipeline {
                 .remove(&highest)
                 .expect("UU park contained its selected farthest ordinal");
             displaced.push(highest);
-            displaced_entries.push(entry);
+            displaced_entries.push(entry.bytes);
         }
 
         if inserted_spilled {
@@ -1189,7 +1203,7 @@ impl Pipeline {
         }
         self.note_uu_parked_segment();
         if let Some(entry) = replacement {
-            self.release_uu_parked_entry(entry);
+            self.release_uu_parked_entry(entry.bytes);
         }
         for entry in displaced_entries {
             self.release_uu_parked_entry(entry);
@@ -1538,7 +1552,7 @@ impl Pipeline {
     async fn take_next_ready_uu_segment(
         &mut self,
         file_id: NzbFileId,
-    ) -> Result<Option<(u32, DecodedChunk)>, SegmentWriteError> {
+    ) -> Result<Option<(u32, UuSegmentFacts, DecodedChunk)>, SegmentWriteError> {
         let next = self.uu_files.get_mut(&file_id).and_then(|uu| {
             let index = uu.next_index;
             uu.parked.remove(&index).map(|entry| (index, entry))
@@ -1547,8 +1561,8 @@ impl Pipeline {
             return Ok(None);
         };
         self.release_uu_parked_segment();
-        let data = self.take_parked_bytes(file_id, entry).await?;
-        Ok(Some((index, data)))
+        let data = self.take_parked_bytes(file_id, entry.bytes).await?;
+        Ok(Some((index, entry.facts, data)))
     }
 
     // A held part's bytes, out of memory or read back from the spool, with

@@ -157,6 +157,12 @@ impl GraphJob {
             returned,
             &mut out,
         )?;
+        self.writer.refused_after_return(
+            &mut self.tree,
+            &mut *self.builder,
+            &self.root,
+            &mut out,
+        )?;
         if let Some(slices) = rebuilt {
             self.notes.push(super::Note::Repaired(slices));
         }

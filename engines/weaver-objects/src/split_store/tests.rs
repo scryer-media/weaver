@@ -23,13 +23,23 @@ fn set(names: &[&str]) -> Box<dyn Object> {
 }
 
 fn deliver(object: &mut dyn Object, volume: u32, offset: u64, bytes: &[u8]) -> Vec<Emit> {
+    deliver_as(object, volume, offset, bytes, Provenance::Fresh)
+}
+
+fn deliver_as(
+    object: &mut dyn Object,
+    volume: u32,
+    offset: u64,
+    bytes: &[u8],
+    provenance: Provenance,
+) -> Vec<Emit> {
     let mut out = Vec::new();
     object.deliver(
         Delivery {
             volume: VolumeIndex(volume),
             offset,
             bytes: &weaver_graph::Evidenced::from(bytes.to_vec()),
-            provenance: Provenance::Fresh,
+            provenance,
         },
         &mut |_, _| false,
         &mut out,
@@ -710,6 +720,35 @@ fn a_piece_is_judged_once() {
     sized(&mut *object, 1, 100);
     assert!(deliver(&mut *object, 1, 0, &front(RAR5, 100)).contains(&Emit::Refuted));
     assert!(!deliver(&mut *object, 1, 0, &front(RAR5, 100)).contains(&Emit::Refuted));
+}
+
+// Damaged bytes judge no front: a later piece whose first article was lost
+// arrives with nothing where its head stood, and the repair that brings
+// the head back refutes the set, whether one slice or several bring it.
+#[test]
+fn a_front_mended_by_a_repair_is_judged_on_the_mended_bytes() {
+    let piece = front(RAR5, 100);
+    let lost = front(&[], 100);
+
+    let mut object = set(&["vessel.bin.001", "vessel.bin.002"]);
+    sized(&mut *object, 1, 100);
+    let out = deliver_as(&mut *object, 1, 0, &lost, Provenance::Damaged);
+    assert!(!out.contains(&Emit::Refuted));
+    let out = deliver_as(&mut *object, 1, 0, &piece, Provenance::Repaired);
+    assert!(out.contains(&Emit::Refuted));
+
+    let mut object = set(&["vessel.bin.001", "vessel.bin.002"]);
+    sized(&mut *object, 1, 100);
+    deliver_as(&mut *object, 1, 0, &lost, Provenance::Refuted);
+    let mut out = deliver_as(&mut *object, 1, 0, &piece[..4], Provenance::Repaired);
+    out.extend(deliver_as(
+        &mut *object,
+        1,
+        4,
+        &piece[4..],
+        Provenance::Repaired,
+    ));
+    assert_eq!(out.iter().filter(|emit| **emit == Emit::Refuted).count(), 1);
 }
 
 // The first piece opens the joined file, so its front never refutes,

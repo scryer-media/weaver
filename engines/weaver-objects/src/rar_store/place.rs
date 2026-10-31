@@ -93,41 +93,6 @@ fn held_or_kept(found: &Volume, envelope: u32, range: ByteRange, out: &mut Vec<P
     }
 }
 
-// A volume read but not yet linked: its file data waits for the layout, and
-// everything else its headers place is envelope.
-fn place_unlinked(found: &Volume, envelope: u32, range: ByteRange, out: &mut Vec<Placement>) {
-    let mut blocks: Vec<ByteRange> = found
-        .walk
-        .blocks
-        .iter()
-        .filter_map(|block| block.data.intersect(range))
-        .collect();
-    blocks.sort_by_key(|data| data.start);
-    let mut cursor = range.start;
-    for data in blocks {
-        if data.start > cursor {
-            push(
-                out,
-                Placement::Envelope {
-                    envelope,
-                    range: ByteRange::new(cursor, data.start),
-                },
-            );
-        }
-        push(out, Placement::Held { range: data });
-        cursor = cursor.max(data.end);
-    }
-    if cursor < range.end {
-        push(
-            out,
-            Placement::Envelope {
-                envelope,
-                range: ByteRange::new(cursor, range.end),
-            },
-        );
-    }
-}
-
 // The parts of `range` outside `cut`, in order.
 fn outside(range: ByteRange, cut: ByteRange) -> impl Iterator<Item = ByteRange> {
     let before = ByteRange::new(range.start, range.end.min(cut.start).max(range.start));
@@ -194,12 +159,79 @@ impl RarStore {
                 Some(layout) if layout.has_volume(volume.0) => {
                     self.place_mapped(layout, volume, below, out);
                 }
-                _ => place_unlinked(found, envelope, below, out),
+                _ => self.place_unlinked(found, volume, below, out),
             }
         }
         if range.end > reach {
             let above = ByteRange::new(range.start.max(reach), range.end);
             held_or_kept(found, envelope, above, out);
+        }
+    }
+
+    // A volume read but not linked: everything its headers place but file
+    // data is envelope, and its file data is held until the layout links it,
+    // save the parts an entry holds already. A layout laid afresh may reach
+    // less far than the one before, and what it placed then stays where it
+    // went, so it reads back from there.
+    fn place_unlinked(
+        &self,
+        found: &Volume,
+        volume: VolumeIndex,
+        range: ByteRange,
+        out: &mut Vec<Placement>,
+    ) {
+        let envelope = volume.0;
+        let mut blocks: Vec<ByteRange> = found
+            .walk
+            .blocks
+            .iter()
+            .filter_map(|block| block.data.intersect(range))
+            .collect();
+        blocks.sort_by_key(|data| data.start);
+        let parts = self.parts_in(volume, range);
+        let mut cursor = range.start;
+        for data in blocks {
+            if data.start > cursor {
+                push(
+                    out,
+                    Placement::Envelope {
+                        envelope,
+                        range: ByteRange::new(cursor, data.start),
+                    },
+                );
+            }
+            let mut at = data.start.max(cursor);
+            for &(id, part, stream) in &parts {
+                let Some(within) = part.intersect(ByteRange::new(at, data.end)) else {
+                    continue;
+                };
+                push(
+                    out,
+                    Placement::Held {
+                        range: ByteRange::new(at, within.start),
+                    },
+                );
+                let stream =
+                    ByteRange::at(stream.start + (within.start - part.start), within.len());
+                self.place_member(volume, id, stream, within.start, out);
+                at = within.end;
+            }
+            push(
+                out,
+                Placement::Held {
+                    range: ByteRange::new(at, data.end),
+                },
+            );
+            cursor = cursor.max(data.end);
+        }
+        if cursor < range.end {
+            push(
+                out,
+                Placement::Envelope {
+                    envelope,
+                    range: ByteRange::new(cursor, range.end),
+                },
+            );
         }
     }
 
@@ -281,7 +313,8 @@ impl RarStore {
         }
     }
 
-    // The member runs of a volume range, as the layout maps them: the
+    // The member runs of a volume range, as the layout maps them, or as the
+    // entries' parts placed them in a volume the layout does not reach: the
     // member, the volume range and the packed-stream range it is. Nothing
     // past where the volume's headers reach is anyone's yet.
     pub(super) fn linked(
@@ -289,25 +322,55 @@ impl RarStore {
         volume: VolumeIndex,
         range: ByteRange,
     ) -> Vec<(usize, ByteRange, ByteRange)> {
-        let (Some(layout), Some(reach)) = (
-            self.layout
-                .as_ref()
-                .filter(|layout| layout.has_volume(volume.0)),
-            self.volumes
-                .get(&volume)
-                .and_then(|found| found.walk.reach()),
-        ) else {
+        let Some(below) = self
+            .volumes
+            .get(&volume)
+            .and_then(|found| found.walk.reach())
+            .and_then(|reach| range.intersect(ByteRange::new(0, reach)))
+        else {
             return Vec::new();
         };
-        let Some(below) = range.intersect(ByteRange::new(0, reach)) else {
-            return Vec::new();
-        };
-        mapped(layout, volume, below)
-            .filter_map(|(part, run)| match run {
-                Run::Member { id, stream } => Some((id, part, stream)),
-                Run::Envelope | Run::Held => None,
+        match self
+            .layout
+            .as_ref()
+            .filter(|layout| layout.has_volume(volume.0))
+        {
+            Some(layout) => mapped(layout, volume, below)
+                .filter_map(|(part, run)| match run {
+                    Run::Member { id, stream } => Some((id, part, stream)),
+                    Run::Envelope | Run::Held => None,
+                })
+                .collect(),
+            None => self.parts_in(volume, below),
+        }
+    }
+
+    // The parts the entries hold in a volume range, in volume order: the
+    // member, the volume range and the packed-stream range it is.
+    fn parts_in(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+    ) -> Vec<(usize, ByteRange, ByteRange)> {
+        let mut parts: Vec<(usize, ByteRange, ByteRange)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .flat_map(|(id, entry)| {
+                entry
+                    .pieces
+                    .iter()
+                    .filter(move |piece| piece.volume == volume)
+                    .filter_map(move |piece| {
+                        let part = piece.data.intersect(range)?;
+                        let stream =
+                            ByteRange::at(piece.at + (part.start - piece.data.start), part.len());
+                        Some((id, part, stream))
+                    })
             })
-            .collect()
+            .collect();
+        parts.sort_by_key(|(_, part, _)| part.start);
+        parts
     }
 
     // A member's bytes, by what the store knows of its key.

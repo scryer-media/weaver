@@ -2801,7 +2801,12 @@ impl Tree {
                             .get(child)
                             .and_then(|found| found.object.as_ref())
                             .is_some_and(|object| {
-                                object.provisional(volume, prefix, self.given.get(&(node, member)))
+                                object.provisional(
+                                    volume,
+                                    &name,
+                                    prefix,
+                                    self.given.get(&(node, member)),
+                                )
                             })
                 {
                     open.push((volume, Taking::Yields(into)));
@@ -5922,7 +5927,13 @@ mod tests {
         fn bound(&mut self, volume: VolumeIndex, name: &str, _: &[u8], _length: Option<u64>) {
             self.held.insert(volume, name.to_owned());
         }
-        fn provisional(&self, volume: VolumeIndex, front: &[u8], _: Option<&Carried>) -> bool {
+        fn provisional(
+            &self,
+            volume: VolumeIndex,
+            _: &str,
+            front: &[u8],
+            _: Option<&Carried>,
+        ) -> bool {
             front == b"stat"
                 && self
                     .held

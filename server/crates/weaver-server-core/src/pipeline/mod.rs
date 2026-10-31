@@ -885,6 +885,16 @@ pub(super) struct UuSegmentFacts {
     pub(super) ended: bool,
 }
 
+impl UuSegmentFacts {
+    // Whether the part decoded clean. uuencode carries no checksum, so the
+    // only thing that says a part is bad is a line that did not decode
+    // whole, as one cut short does; a part with no such line is "not known
+    // bad", which is different from having checked and passed.
+    pub(super) fn clean(self) -> bool {
+        !self.damaged
+    }
+}
+
 impl SegmentEncoding {
     // uuencode segments cannot be placed from the article itself, so they are
     // assembled sequentially rather than by declared offset.
@@ -927,6 +937,13 @@ impl ParkedBytes {
     }
 }
 
+// A uuencode part held ahead of its file's cursor, with what its decode
+// found, so it is placed as it arrived.
+pub(super) struct ParkedUu {
+    pub(super) bytes: ParkedBytes,
+    pub(super) facts: UuSegmentFacts,
+}
+
 // An article that declared no usable start, held until the ordinal before
 // it is placed. Its decoded bytes are in `bytes`; `result` keeps everything
 // else it decoded to, with no data of its own.
@@ -954,7 +971,7 @@ pub(super) struct UuFileAssembly {
     //
     // Bounded by the same per-file limit the write reorder buffer uses; see
     // the admission check at the placement seam for what happens on overflow.
-    parked: BTreeMap<u32, ParkedBytes>,
+    parked: BTreeMap<u32, ParkedUu>,
     // A part decoded with damage, or a gap was closed by shifting later parts
     // down over a part that never arrived.
     pub(super) damaged: bool,

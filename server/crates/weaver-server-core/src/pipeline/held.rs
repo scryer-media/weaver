@@ -224,7 +224,7 @@ impl Pipeline {
             .flat_map(|(file_id, uu)| {
                 uu.parked
                     .iter()
-                    .filter_map(move |(ordinal, bytes)| row(*file_id, *ordinal, bytes, None))
+                    .filter_map(move |(ordinal, part)| row(*file_id, *ordinal, &part.bytes, None))
             });
         let unanchored = self
             .unanchored_parked
@@ -269,7 +269,18 @@ impl Pipeline {
                     if uu.parked.contains_key(&ordinal) {
                         continue;
                     }
-                    uu.parked.insert(ordinal, bytes);
+                    // The spool keeps a part's bytes, not what its decode
+                    // found: a part taken back is placed as clean.
+                    uu.parked.insert(
+                        ordinal,
+                        ParkedUu {
+                            bytes,
+                            facts: crate::pipeline::UuSegmentFacts {
+                                damaged: false,
+                                ended: false,
+                            },
+                        },
+                    );
                     self.note_uu_spooled(part.decoded_bytes, 1);
                     self.note_uu_parked_segment();
                 }

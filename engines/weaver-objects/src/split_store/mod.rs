@@ -174,9 +174,14 @@ impl SplitStore {
     // later piece whose front opens on a signature that stands only at a
     // file's head is a file of its own, and so is the set. Judged once, on
     // the front its deliveries gather from offset zero, however its
-    // articles cut it and whichever piece came first. The first piece is
-    // never judged (`bound`).
+    // articles cut it and whichever piece came first. Only bytes that passed
+    // a checksum gather it: damaged bytes are not what was posted, and the
+    // front waits for the bytes that mend them. The first piece is never
+    // judged (`bound`).
     fn refutes(&mut self, index: u32, delivery: &Delivery<'_>) -> bool {
+        if !delivery.provenance.is_verified() {
+            return false;
+        }
         let Some(piece) = self.pieces.get_mut(&index) else {
             return false;
         };
