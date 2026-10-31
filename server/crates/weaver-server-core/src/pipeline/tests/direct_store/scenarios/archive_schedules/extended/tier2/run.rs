@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The tier-two runner: one post, one profile, one schedule.
+// The tier-two runner: one post, one schedule, one graph job.
 //
 // A schedule names four slots. Tier two posts more articles than that, so
 // the data articles, in file order, are cut into four contiguous groups and
@@ -15,19 +15,23 @@
 // Every article reaches the pipeline as wire bytes through the production
 // fused decoder, from a provider of one server: an article that fails to
 // decode has nowhere else to come from and is given up for repair at once.
+// After each article the pipeline moves as an orchestrator turn moves it,
+// through the archive matrix's graph driver.
+use super::super::super::graph::{Answers, Turns, fingerprint, restore};
 use super::post::{Post, Role};
 use super::*;
+use crate::history::HistoryFailureKind;
+use crate::pipeline::tests::engines::harness::{JOB, finished};
 
 // What one run left behind.
 pub(in super::super) struct Ran {
     pub status: Option<JobStatus>,
+    // What the history row says failed the job, when it failed.
+    pub failure_kind: Option<HistoryFailureKind>,
     // Each expected path, as the output directory holds it.
     pub files: BTreeMap<String, Option<Vec<u8>>>,
     pub published: BTreeSet<String>,
     pub leftovers: BTreeSet<String>,
-    pub finalized: usize,
-    pub chase_armed: u64,
-    pub chase_consumed: u64,
     pub trace: Vec<String>,
 }
 
@@ -50,18 +54,6 @@ fn one_server(pipeline: &mut Pipeline) {
         max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
     }));
-    pin_disk_reserve(pipeline);
-}
-
-// The disk reserve is otherwise a share of the host's filesystem, so a
-// nearly full disk would refuse a fixture's few kilobytes and the outcome
-// would depend on the machine. Fixtures are tiny: reserve nothing.
-fn pin_disk_reserve(pipeline: &mut Pipeline) {
-    use crate::pipeline::direct_store::{DirectStoreSettings, wiring::DirectStoreRuntime};
-    pipeline.direct_store = DirectStoreRuntime::with_settings(DirectStoreSettings {
-        holds_disk_reserve_bytes: 0,
-        ..pipeline.direct_store.settings()
-    });
 }
 
 // The data articles cut into the four groups a schedule's slots name.
@@ -99,37 +91,13 @@ pub(in super::super) fn lost_articles(
     lost
 }
 
-// Whether the downloader would start a fetch for the job: the statuses its
-// dispatch admits.
-fn dispatchable(pipeline: &Pipeline, job: JobId) -> bool {
-    pipeline.jobs.get(&job).is_some_and(|state| {
-        matches!(
-            state.status,
-            JobStatus::Queued
-                | JobStatus::Downloading
-                | JobStatus::Checking
-                | JobStatus::Verifying
-                | JobStatus::QueuedRepair
-                | JobStatus::Repairing
-                | JobStatus::QueuedExtract
-                | JobStatus::Extracting
-        )
-    })
-}
-
-fn terminal(pipeline: &Pipeline, job: JobId) -> bool {
-    matches!(
-        job_status_for_assert(pipeline, job),
-        Some(JobStatus::Complete | JobStatus::Failed { .. })
-    )
-}
-
 // Answers one request for an article with what the post has for it.
-async fn deliver(pipeline: &mut Pipeline, job: JobId, post: &Post, file: u32, article: u32) {
+async fn deliver(pipeline: &mut Pipeline, turns: &mut Turns, post: &Post, file: u32, article: u32) {
     use weaver_nntp::client::{DecodedBody, DecodedBodyTrace};
+    let job = JOB;
     retire_schedule_article(pipeline, job, file, article);
     for body in post.files[file as usize].wire_copies(article) {
-        if !pipeline.jobs.contains_key(&job) || terminal(pipeline, job) {
+        if !pipeline.jobs.contains_key(&job) || finished(pipeline) {
             return;
         }
         let segment = SegmentId {
@@ -141,13 +109,22 @@ async fn deliver(pipeline: &mut Pipeline, job: JobId, post: &Post, file: u32, ar
         };
         let raw = super::post::on_the_wire(&body);
         let mut decoder = weaver_nntp::fused_yenc::FusedYencArticleDecoder::new();
-        decoder.set_checkpoint_plan(pipeline.par2_checkpoint_plan(job));
+        decoder.set_checkpoint_plan(checkpoint_plan(pipeline, job));
         let mut input = bytes::BytesMut::from(raw.as_slice());
         let source = || SegmentSource {
             source_server_idx: Some(0),
             exclude_servers: Vec::new(),
         };
-        match decoder.decode_available(&mut input) {
+        // A body that does not decode reaches the decode stage as a failed
+        // decode, as a lane hands it over.
+        let failed = |error: String| DecodeDone::Failed {
+            segment_id: segment,
+            raw_size: raw.len() as u64,
+            error,
+            source_server_idx: Some(0),
+            exclude_servers: Vec::new(),
+        };
+        let done = match decoder.decode_available(&mut input) {
             Ok(Some(decoded)) => {
                 let trace = DecodedBodyTrace {
                     attempts: Vec::new(),
@@ -161,71 +138,59 @@ async fn deliver(pipeline: &mut Pipeline, job: JobId, post: &Post, file: u32, ar
                 };
                 let (payload, _, _) = Pipeline::download_data_from_decoded_trace(segment, trace);
                 match payload {
-                    Ok(DownloadPayload::Decoded(result)) => {
-                        pipeline.handle_decode_success(result, source()).await;
-                    }
-                    Err(DownloadError::Decode { error, .. }) => {
-                        pipeline.handle_decode_failure(segment, &error, &[], Some(0));
-                    }
+                    Ok(DownloadPayload::Decoded(result)) => DecodeDone::Success {
+                        result,
+                        source: source(),
+                    },
+                    Err(DownloadError::Decode { error, .. }) => failed(error),
                     _ => panic!("a fused decode yields a decoded payload or a decode error"),
                 }
             }
-            Ok(None) => pipeline.handle_decode_failure(
-                segment,
-                "article ended before its terminator",
-                &[],
-                Some(0),
-            ),
-            Err(error) => pipeline.handle_decode_failure(segment, &error.to_string(), &[], Some(0)),
-        }
-        settle_direct_verification_read(pipeline, job).await;
-        settle_direct_demotion_work(pipeline).await;
+            Ok(None) => failed("article ended before its terminator".to_string()),
+            Err(error) => failed(error.to_string()),
+        };
+        // The decode stage settles the article and, when it was the job's
+        // last, ends the download pass.
+        pipeline.note_decode_started(segment, raw.len() as u64);
+        pipeline.handle_decode_done(done).await;
+        turns.turn(pipeline).await;
     }
 }
 
-// Every article the job has queued, from both queues, left queued.
-fn queued(pipeline: &mut Pipeline, job: JobId) -> Vec<(u32, u32)> {
-    let Some(state) = pipeline.jobs.get_mut(&job) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for queue in [&mut state.download_queue, &mut state.recovery_queue] {
-        let work = queue.drain_all();
-        for item in work {
-            out.push((
-                item.segment_id.file_id.file_index,
-                item.segment_id.segment_number,
-            ));
-            queue.push(item);
-        }
+// Books an article the one server does not have, as the downloader does
+// once every server has answered 430.
+async fn unavailable(pipeline: &mut Pipeline, turns: &mut Turns, file: u32, article: u32) {
+    retire_schedule_article(pipeline, JOB, file, article);
+    if !pipeline.jobs.contains_key(&JOB) {
+        return;
     }
-    out.sort_unstable();
-    out.dedup();
-    out
-}
-
-// Books a queued article the one server does not have, as the downloader
-// does once every server has answered 430.
-fn unavailable(pipeline: &mut Pipeline, job: JobId, file: u32, article: u32) {
-    retire_schedule_article(pipeline, job, file, article);
     pipeline.book_failed_segment(SegmentId {
         file_id: NzbFileId {
-            job_id: job,
+            job_id: JOB,
             file_index: file,
         },
         segment_number: article,
     });
-    pipeline.maybe_finish_download_pass(job);
+    pipeline.maybe_finish_download_pass(JOB);
+    turns.turn(pipeline).await;
 }
 
 // Runs `post` under one schedule.
 pub(in super::super) async fn run(
     post: &Post,
-    profile: ExtractionProfile,
     order: &[(u32, u32)],
-    interruption: Interruption,
+    (interruption, answers): (Interruption, Answers),
+) -> Ran {
+    Box::pin(drive(post, order, (interruption, answers))).await
+}
+
+async fn drive(
+    post: &Post,
+    order: &[(u32, u32)],
+    (interruption, answers): (Interruption, Answers),
 ) -> Ran {
     enable_schedule_trace();
+    let mut turns = Turns::new(answers);
     let spec = post.spec();
     let groups = groups(post);
     let lost = lost_articles(post, interruption);
@@ -243,110 +208,59 @@ pub(in super::super) async fn run(
             || is_lost(file, article)
             || (starved && posted.role == Role::Recovery))
     };
+    // One article as the one server answers it.
+    let serve = async |pipeline: &mut Pipeline, turns: &mut Turns, file: u32, article: u32| {
+        if available(file, article) {
+            deliver(pipeline, turns, post, file, article).await;
+        } else {
+            unavailable(pipeline, turns, file, article).await;
+        }
+    };
     let root = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete) = new_direct_pipeline(&root).await;
     one_server(&mut pipeline);
-    profile.configure(&mut pipeline);
-    let job = JobId(42300);
     let output = complete.join(crate::jobs::working_dir::sanitize_dirname(&spec.name));
     let index_first = interruption.loss().is_some_and(|(_, first)| first);
     let indices = post.index_of(Role::Index);
-    let mut chase_armed = 0;
-    let mut chase_consumed = 0;
-    let mut finalized = 0;
     let mut retired = None;
     let mut trace = vec![];
-    insert_active_job(&mut pipeline, job, spec.clone()).await;
-    let deliver_index = async |pipeline: &mut Pipeline| {
+    insert_active_job(&mut pipeline, JOB, spec.clone()).await;
+    // The schedule delivers what the server has; what it lacks is answered
+    // when the job asks for it.
+    let deliver_index = async |pipeline: &mut Pipeline, turns: &mut Turns| {
         for &file in &indices {
             for article in 0..post.files[file].articles() {
                 if available(file as u32, article) {
-                    deliver(pipeline, job, post, file as u32, article).await;
+                    deliver(pipeline, turns, post, file as u32, article).await;
                 }
             }
         }
     };
     if index_first {
-        deliver_index(&mut pipeline).await;
+        deliver_index(&mut pipeline, &mut turns).await;
     }
     for (step, action, arrives) in interruption.boundaries(order.len()) {
         match action {
-            BoundaryAction::Demote => {
-                if profile == ExtractionProfile::DirectStore {
-                    let sets = pipeline.direct_store.sets_for(job).len();
-                    let (set, reason) = scheduled_demotion(order, step, sets);
-                    pipeline.demote_direct_set(job, set, reason).await;
-                }
-                pipeline.direct_unpack_abort_job(
-                    job,
-                    "schedule withdraws speculative extraction",
-                    AbortLatch::Permanent,
-                    ChaseDemotion::MemoryYielded,
-                );
-                settle_direct_post_repair_work(&mut pipeline).await;
-                trace.push(format!("demote at {step}"));
-            }
+            BoundaryAction::None => {}
             action @ (BoundaryAction::Restart | BoundaryAction::Crash) => {
+                turns.release(&mut pipeline).await;
                 if action == BoundaryAction::Restart {
-                    pipeline
-                        .demand_direct_store_barriers_for_all_jobs(BarrierDemand::Shutdown)
-                        .await;
+                    pipeline.drain().await;
                 }
-                let counters = pipeline.direct_unpack.counters();
-                chase_armed += counters.armed;
-                chase_consumed += counters.consumed;
-                finalized += pipeline.direct_store.finalized_sets;
-                let status = job_status_for_assert(&pipeline, job);
-                pipeline.direct_unpack_shutdown("schedule restart").await;
-                retire_pipeline_database(pipeline).await;
-                settle_direct_output_removals(root.path()).await;
-                (pipeline, _, _) = new_direct_pipeline(&root).await;
-                one_server(&mut pipeline);
-                profile.configure(&mut pipeline);
-                let recovered = pipeline.db.load_active_jobs().unwrap().remove(&job);
-                let recovered = recovered.filter(|recovered| {
-                    !matches!(
-                        recovered.status.as_str(),
-                        "complete" | "failed" | "cancelled"
-                    )
-                });
+                let status = job_status_for_assert(&pipeline, JOB);
                 trace.push(format!("{action:?} at {step}: status={status:?}"));
-                let Some(recovered) = recovered else {
+                retire_pipeline_database(pipeline).await;
+                let restored;
+                (pipeline, restored) = restore(&root, &spec, &mut trace).await;
+                one_server(&mut pipeline);
+                if !restored {
                     retired = Some(status);
                     break;
-                };
-                use crate::jobs::model::{DownloadState, PostState, RunState};
-                pipeline
-                    .restore_job(RestoreJobRequest {
-                        job_id: job,
-                        job_hash: recovered.nzb_hash,
-                        spec: spec.clone(),
-                        complete_files: recovered.complete_files,
-                        file_progress: recovered.file_progress,
-                        detected_archives: recovered.detected_archives,
-                        file_identities: recovered.file_identities,
-                        extracted_members: recovered.extracted_members,
-                        status: crate::jobs::model::job_status_from_persisted_str(
-                            &recovered.status,
-                            recovered.error.as_deref(),
-                        ),
-                        download_state: recovered
-                            .download_state
-                            .as_deref()
-                            .and_then(DownloadState::parse),
-                        post_state: recovered.post_state.as_deref().and_then(PostState::parse),
-                        run_state: recovered.run_state.as_deref().and_then(RunState::parse),
-                        queued_repair_at_epoch_ms: recovered.queued_repair_at_epoch_ms,
-                        queued_extract_at_epoch_ms: recovered.queued_extract_at_epoch_ms,
-                        paused_resume_status: None,
-                        paused_resume_download_state: None,
-                        paused_resume_post_state: None,
-                        working_dir: recovered.output_dir,
-                    })
-                    .await
-                    .unwrap();
+                }
+                // What the restored job lends out speaks before the next
+                // article, or is held behind it.
+                turns.turn(&mut pipeline).await;
             }
-            BoundaryAction::None => {}
         }
         if !arrives {
             continue;
@@ -356,126 +270,93 @@ pub(in super::super) async fn run(
         };
         let slot = (file * 2 + article) as usize;
         for &(file, article) in &groups[slot] {
-            if !dispatchable(&pipeline, job) {
+            if finished(&pipeline) {
                 break;
             }
             if available(file, article) {
-                deliver(&mut pipeline, job, post, file, article).await;
+                deliver(&mut pipeline, &mut turns, post, file, article).await;
             }
         }
-        trace.push(format!(
-            "arrive slot {slot}: {:?}",
-            pipeline.direct_store.sets_for(job)
-        ));
+        trace.push(format!("arrive slot {slot}"));
     }
     if !index_first && retired.is_none() {
-        deliver_index(&mut pipeline).await;
+        deliver_index(&mut pipeline, &mut turns).await;
     }
-    // Every wait below is for a registered operation; the bound is a count of
-    // rounds, never a time.
-    let mut idle = 0;
-    for _ in 0..256 {
-        if retired.is_some() || !pipeline.jobs.contains_key(&job) {
-            break;
-        }
-        drain_rar_refreshes(&mut pipeline).await;
-        pump_pipeline_runtime_queues(&mut pipeline).await;
-        if terminal(&pipeline, job) {
-            break;
-        }
-        let requested = queued(&mut pipeline, job);
-        if !requested.is_empty() && dispatchable(&pipeline, job) {
-            let (answer, refuse): (Vec<_>, Vec<_>) = requested
-                .into_iter()
-                .partition(|&(file, article)| available(file, article));
-            if !refuse.is_empty() {
-                trace.push(format!("unavailable {refuse:?}"));
-            }
-            for (file, article) in refuse {
-                unavailable(&mut pipeline, job, file, article);
-            }
-            if !answer.is_empty() {
-                trace.push(format!("requested {answer:?}"));
-            }
-            // One connection: each fetch is of an article the job still
-            // wants when the fetch starts.
-            for (file, article) in answer {
-                if !dispatchable(&pipeline, job) {
-                    break;
-                }
-                if !queued(&mut pipeline, job).contains(&(file, article)) {
-                    continue;
-                }
-                deliver(&mut pipeline, job, post, file, article).await;
-            }
-            continue;
-        }
-        pipeline.flush_quiescent_write_backlog().await;
-        pipeline.check_job_completion(job).await;
-        pump_pipeline_runtime_queues(&mut pipeline).await;
-        if terminal(&pipeline, job) || !pipeline.jobs.contains_key(&job) {
-            break;
-        }
-        if dispatchable(&pipeline, job) && !queued(&mut pipeline, job).is_empty() {
-            continue;
-        }
-        if pipeline
-            .inflight_extractions
-            .get(&job)
-            .is_some_and(|sets| !sets.is_empty())
-            || pipeline.has_active_rar_workers(job)
+    // Once the schedule is spent, every article the job asks for is served
+    // until nothing is queued, scheduled or running. A round in which
+    // nothing moved twice over is a stall, never a wait for time.
+    let mut stalled = None;
+    while retired.is_none() {
+        while let Some(work) = pipeline
+            .jobs
+            .get_mut(&JOB)
+            .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
         {
-            let done = pipeline
-                .extract_done_rx
+            let (file, article) = (
+                work.segment_id.file_id.file_index,
+                work.segment_id.segment_number,
+            );
+            trace.push(format!("requested {file}:{article}"));
+            serve(&mut pipeline, &mut turns, file, article).await;
+        }
+        if turns.release(&mut pipeline).await {
+            continue;
+        }
+        if finished(&pipeline) {
+            break;
+        }
+        let before = fingerprint(&pipeline);
+        if pipeline.jobs.contains_key(&JOB) {
+            pipeline.check_job_completion(JOB).await;
+        }
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+        if finished(&pipeline) {
+            break;
+        }
+        // A run or a repair out on a thread speaks through the run mail:
+        // what it says is the job's next move.
+        if pipeline
+            .graph_jobs
+            .get(&JOB)
+            .is_some_and(|job| job.awaits_mail())
+        {
+            let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+            pipeline.graph_run_said(said);
+            continue;
+        }
+        // A retry the worker scheduled is sent once its backoff ends.
+        if pipeline
+            .pending_retries_by_job
+            .get(&JOB)
+            .is_some_and(|pending| *pending > 0)
+        {
+            let retry = pipeline
+                .retry_rx
                 .recv()
                 .await
-                .expect("registered extraction receipt");
-            pipeline.handle_extraction_done(done).await;
-        } else if pipeline.job_has_pending_rar_refresh_for_current_sets(job) {
-            drain_rar_refreshes(&mut pipeline).await;
-        } else if pipeline
-            .par3_runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.has_worker_in_flight(job))
-        {
-            settle_par3_work(&mut pipeline, job).await;
-        } else {
-            idle += 1;
-            if idle > 8 {
-                break;
-            }
+                .expect("a scheduled retry is sent");
+            pipeline.receive_retry_work(retry);
+            continue;
+        }
+        let after = fingerprint(&pipeline);
+        if before == after && stalled.replace(after.clone()) == Some(after.clone()) {
+            // What the job's graph holds when nothing moves: its phase and
+            // what each recovery set has ruled.
+            let graph = pipeline
+                .graph_jobs
+                .get(&JOB)
+                .map(|job| (job.phase(), job.recovery_summary()));
+            panic!("tier-two run stalled at {after}: graph={graph:?} trace={trace:?}");
         }
     }
-    let status = retired.unwrap_or_else(|| job_status_for_assert(&pipeline, job));
-    let still_queued = if pipeline.jobs.contains_key(&job) {
-        queued(&mut pipeline, job)
-    } else {
-        Vec::new()
-    };
-    trace.push(format!(
-        "terminal: {}; analyses={} repairs={}; par2={:?}; queued={:?}",
-        if pipeline.jobs.contains_key(&job) {
-            debug_job_state(&pipeline, job)
-        } else {
-            "retired".to_string()
-        },
-        pipeline.par2_repairer_analyze_calls,
-        pipeline.par2_repairer_execute_calls,
-        pipeline
-            .par2_set(job)
-            .map(|set| (set.files.len(), set.recovery_slices.len())),
-        still_queued,
-    ));
+    let status = retired.unwrap_or_else(|| job_status_for_assert(&pipeline, JOB));
     let files = post
         .expected
         .iter()
-        .map(|(name, _)| (name.clone(), std::fs::read(output.join(name)).ok()))
+        .map(|(name, _)| name)
+        .chain(post.allowed.iter().map(|allowed| &allowed.name))
+        .map(|name| (name.clone(), std::fs::read(output.join(name)).ok()))
         .collect();
-    settle_direct_output_removals(root.path()).await;
-    let counters = pipeline.direct_unpack.counters();
-    chase_armed += counters.armed;
-    chase_consumed += counters.consumed;
-    finalized += pipeline.direct_store.finalized_sets;
     let mut published = files_under(&output);
     published.remove(crate::jobs::working_dir::OUTPUT_DIR_MARKER);
     let mut leftovers: BTreeSet<String> = files_under(&pipeline.intermediate_dir)
@@ -503,16 +384,22 @@ pub(in super::super) async fn run(
         })
         .collect();
     trace.push(format!(
-        "profile={profile:?}; chase_armed={chase_armed}; chase_consumed={chase_consumed}; published (name, size, posted size)={sizes:?}"
+        "terminal {status:?}; published (name, size, posted size)={sizes:?}"
     ));
+    pipeline.db.flush_write_queue().await.unwrap();
+    let failure_kind = pipeline
+        .db
+        .nzbget_history_states(&[JOB.0])
+        .unwrap()
+        .get(&JOB.0)
+        .and_then(|state| state.failure_kind);
+    retire_pipeline_database(pipeline).await;
     Ran {
         status,
+        failure_kind,
         files,
         published,
         leftovers,
-        finalized,
-        chase_armed,
-        chase_consumed,
         trace,
     }
 }
@@ -522,24 +409,67 @@ pub(in super::super) async fn run(
 pub(in super::super) enum Verdict {
     // Every expected file published, byte for byte.
     Completes,
-    // A named failure that publishes none of the expected files.
+    // The recovery cannot mend what the post lost: the job does not
+    // complete. It fails, named, publishing none of the expected files, or
+    // it ends partial with the files it could deliver whole.
     Fails,
-    // Either of the above; the oracle cannot tell which the bytes allow.
+    // Any of the above; the oracle cannot tell which the bytes allow.
     Either,
 }
 
 impl Ran {
     // Holds the run to its verdict and to the invariants every run keeps:
-    // it settles, a complete job published exactly the source bytes and
-    // nothing unexpected, a failed job is named and published none of them.
+    // it settles; a complete job published exactly the source bytes; a
+    // partial job delivered at least one expected file whole; a failed job
+    // is named and published none of them; a job that delivered anything
+    // left nothing outside its output directory and published only the
+    // expected files, the files it may publish, and the post's own files,
+    // and on a partial job the container joined from the post's numbered
+    // pieces as well, which an unpack that ended short leaves beside what it
+    // delivered; and a starved recovery set that leaves nothing delivered
+    // fails the job as a repair.
     pub(in super::super) fn assert(
         &self,
         post: &Post,
-        profile: ExtractionProfile,
         verdict: Verdict,
+        starved_recovery: bool,
         context: &str,
     ) {
         let trace = &self.trace;
+        let whole: Vec<&String> = post
+            .expected
+            .iter()
+            .filter(|(name, bytes)| self.files[name].as_deref() == Some(bytes.as_slice()))
+            .map(|(name, _)| name)
+            .collect();
+        let delivered = |partial: bool| {
+            let joined = post
+                .files
+                .iter()
+                .filter(|_| partial)
+                .filter_map(|posted| {
+                    crate::pipeline::tests::archive_output_contract::joined_container(&posted.name)
+                })
+                .map(str::to_owned);
+            let allowed: BTreeSet<String> = post
+                .expected
+                .iter()
+                .map(|(name, _)| name.clone())
+                .chain(post.allowed.iter().map(|allowed| allowed.name.clone()))
+                .chain(post.files.iter().map(|posted| posted.name.clone()))
+                .chain(joined)
+                .collect();
+            let unexpected: Vec<_> = self.published.difference(&allowed).collect();
+            assert!(
+                unexpected.is_empty(),
+                "{context}: published {unexpected:?} besides the source: {trace:?}"
+            );
+            assert!(
+                self.leftovers.is_empty(),
+                "{context}: left {:?} behind: {trace:?}",
+                self.leftovers
+            );
+        };
         match &self.status {
             Some(JobStatus::Complete) => {
                 for (name, bytes) in &post.expected {
@@ -550,26 +480,32 @@ impl Ran {
                         bytes.len()
                     );
                 }
-                let allowed: BTreeSet<String> = post
-                    .expected
-                    .iter()
-                    .map(|(name, _)| name.clone())
-                    .chain(post.allowed.iter().cloned())
-                    .collect();
-                let unexpected: Vec<_> = self.published.difference(&allowed).collect();
-                assert!(
-                    unexpected.is_empty(),
-                    "{context}: published {unexpected:?} besides the source: {trace:?}"
-                );
-                assert!(
-                    self.leftovers.is_empty(),
-                    "{context}: left {:?} behind: {trace:?}",
-                    self.leftovers
-                );
+                delivered(false);
                 assert_ne!(
                     verdict,
                     Verdict::Fails,
                     "{context}: completed with source bytes where it must fail: {trace:?}"
+                );
+            }
+            Some(JobStatus::Partial) => {
+                // An allowed file counts as usable only when it is one a user
+                // can open and holds its bytes whole; a container or
+                // furniture never does, whatever is on disk.
+                let allowed_whole = post.allowed.iter().any(|allowed| {
+                    allowed
+                        .usable
+                        .as_deref()
+                        .is_some_and(|bytes| self.files[&allowed.name].as_deref() == Some(bytes))
+                });
+                assert!(
+                    !whole.is_empty() || allowed_whole,
+                    "{context}: partial with no expected or allowed file whole: {trace:?}"
+                );
+                delivered(true);
+                assert_ne!(
+                    verdict,
+                    Verdict::Completes,
+                    "{context}: partial where it must complete, whole {whole:?}: {trace:?}"
                 );
             }
             Some(JobStatus::Failed { error }) => {
@@ -582,10 +518,6 @@ impl Ran {
                     !error.trim().is_empty(),
                     "{context}: an unnamed failure: {trace:?}"
                 );
-                assert_eq!(
-                    self.finalized, 0,
-                    "{context}: a failed job finalized a set: {trace:?}"
-                );
                 let leaked: Vec<_> = post
                     .expected
                     .iter()
@@ -596,18 +528,15 @@ impl Ran {
                     leaked.is_empty(),
                     "{context}: a failed job published {leaked:?}: {trace:?}"
                 );
+                if starved_recovery {
+                    assert_eq!(
+                        self.failure_kind,
+                        Some(HistoryFailureKind::Repair),
+                        "{context}: the starved set fails the job as a repair: {trace:?}"
+                    );
+                }
             }
             other => panic!("{context}: never settled: {other:?}: {trace:?}"),
-        }
-        if profile != ExtractionProfile::DirectStore {
-            assert_eq!(self.finalized, 0, "{context}: {trace:?}");
-        }
-        if profile == ExtractionProfile::Conventional {
-            assert_eq!(
-                self.chase_armed + self.chase_consumed,
-                0,
-                "{context}: {trace:?}"
-            );
         }
     }
 }

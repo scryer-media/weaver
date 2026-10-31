@@ -111,7 +111,9 @@ test("E07 taking an interface down moves its share to the other leg and the egre
   const b = await world.egress("b");
   const linkB = await ifaceFor(request, egressAddress("b"));
   const server = await world.server({ connections: 4, route: { legs: [directLeg(a.id, 50), directLeg(b.id, 50)] } });
-  const download = await world.pacedDownload("e07-paced");
+  // Retain the original watchdog regression: a BODY receives bytes steadily
+  // for longer than five minutes before the article can finish.
+  const download = await world.pacedDownload("e07-paced", { slowMs: 1500 });
   await flowAfter(request, await flowMark(request), sample => {
     const legs = [legOn(sample, serverKey(server), a.id), legOn(sample, serverKey(server), b.id)];
     return legs.every(leg => leg && leg.open === leg.target && leg.target === 2);
@@ -223,7 +225,10 @@ test("E13 interface binding without NET_RAW follows the kernel rule and System c
   if (unprivilegedBind) {
     await flowAfter(request, mark, sample => legOn(sample, serverKey(server), bound.id)?.state === "UP", "bound leg Up on a 5.7+ kernel");
   } else {
-    const flow = await flowAfter(request, mark, sample => legOn(sample, serverKey(server), bound.id)?.state === "DOWN", "bound leg Down after two bind failures");
+    const flow = await flowAfter(request, mark, sample => {
+      const down = legOn(sample, serverKey(server), bound.id);
+      return down?.state === "DOWN" && down.target === 0 && legOn(sample, serverKey(server), 0)?.target === 4;
+    }, "bound leg's allocation parked after bind failures and the default leg holding the full cap");
     expect(legOn(flow, serverKey(server), bound.id)?.reason).toContain("interface binding needs Linux 5.7 or CAP_NET_RAW");
     expect(legOn(flow, serverKey(server), 0)?.target).toBe(4);
   }

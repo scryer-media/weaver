@@ -33,17 +33,12 @@ pub struct BodyStreamStats {
     pub throttle_wait: Duration,
 }
 
-// The budget check against a clock reading the read turn already took.
-fn ensure_active_transfer_budget_at(
-    budget: Option<&ActiveTransferBudget>,
-    now: Instant,
-) -> Result<()> {
-    if let Some(budget) = budget
-        && budget.remaining_at(now).is_zero()
-    {
-        return Err(active_transfer_timeout(budget));
+// Marks progress on the BODY's inactivity budget, against a clock reading
+// the read turn already took.
+fn note_transfer_progress(budget: Option<&mut ActiveTransferBudget>, now: Instant) {
+    if let Some(budget) = budget {
+        budget.progress_at(now);
     }
-    Ok(())
 }
 
 async fn await_active_transfer<F, T>(budget: Option<&ActiveTransferBudget>, future: F) -> Result<T>
@@ -509,8 +504,12 @@ impl NntpConnection {
 
         match greeting.code.raw() {
             200 | 201 => {} // posting allowed / no posting — both fine for readers
-            400 => return Err(NntpError::ServiceUnavailable),
-            502 => return Err(NntpError::from_status(greeting.code, &greeting.message)),
+            400 | 502 => {
+                return Err(NntpError::from_login_status(
+                    greeting.code,
+                    &greeting.message,
+                ));
+            }
             _ => return Err(NntpError::unexpected(greeting.code, &greeting.message)),
         }
 
@@ -674,7 +673,10 @@ impl NntpConnection {
                 // Password required — continue.
             }
             _ => {
-                return Err(NntpError::from_status(user_resp.code, &user_resp.message));
+                return Err(NntpError::from_login_status(
+                    user_resp.code,
+                    &user_resp.message,
+                ));
             }
         }
 
@@ -687,9 +689,10 @@ impl NntpConnection {
                 debug!("authentication successful");
                 Ok(())
             }
-            481 => Err(NntpError::AuthenticationFailed),
-            482 => Err(NntpError::AuthenticationRejected),
-            _ => Err(NntpError::from_status(pass_resp.code, &pass_resp.message)),
+            _ => Err(NntpError::from_login_status(
+                pass_resp.code,
+                &pass_resp.message,
+            )),
         }
     }
 
@@ -1540,6 +1543,7 @@ impl NntpConnection {
             self.abort_active_body();
             return Err(NntpError::unexpected(initial.code, &initial.message));
         }
+        self.note_body_answered();
 
         self.codec.set_streaming_multiline(true);
         self.codec.set_raw_multiline(raw);
@@ -1557,26 +1561,21 @@ impl NntpConnection {
                 };
                 let payload_bytes = self.codec.last_multiline_payload_bytes();
                 add_cpu_delta(&mut stats.raw_decode_cpu, cpu_started);
-                // One clock read per turn: the budget check and the read
+                // One clock read per turn: the progress mark and the read
                 // timeout derived below both key off it; only an actual
-                // throttle wait refreshes it.
+                // throttle wait refreshes it. Every turn follows bytes
+                // arriving (the status line or a read), so the transfer
+                // made progress now.
                 let mut now = Instant::now();
+                note_transfer_progress(budget.as_deref_mut(), now);
                 match decoded? {
                     Some(StreamChunk::Data(data)) => {
                         stats.bytes += data.len() as u64;
-                        if let Err(error) = ensure_active_transfer_budget_at(budget.as_deref(), now)
-                        {
-                            self.charge_active_body_without_wait(payload_bytes);
-                            return Err(error);
-                        }
                         let waited = self.charge_active_body(payload_bytes).await;
                         if !waited.is_zero() {
                             stats.throttle_wait = stats.throttle_wait.saturating_add(waited);
-                            if let Some(budget) = budget.as_deref_mut() {
-                                budget.exclude_wait(waited);
-                            }
                             now = Instant::now();
-                            ensure_active_transfer_budget_at(budget.as_deref(), now)?;
+                            note_transfer_progress(budget.as_deref_mut(), now);
                         }
                         if let Err(err) = on_chunk(&data) {
                             self.poisoned = true;
@@ -1587,7 +1586,6 @@ impl NntpConnection {
                         continue;
                     }
                     Some(StreamChunk::End) => {
-                        ensure_active_transfer_budget_at(budget.as_deref(), now)?;
                         return Ok::<BodyStreamStats, NntpError>(stats);
                     }
                     None => {}
@@ -1783,6 +1781,7 @@ impl NntpConnection {
                 return Err(error);
             }
         };
+        self.note_body_answered();
         decoder.set_profile_cpu(profile_cpu);
         decoder.set_checkpoint_plan(self.checkpoint_plan.clone());
         let mut read_calls = 0u64;
@@ -1803,22 +1802,18 @@ impl NntpConnection {
                 let payload_delta = decoder
                     .body_payload_bytes_consumed()
                     .saturating_sub(payload_before);
-                // One clock read per turn: the budget check and the read
+                // One clock read per turn: the progress mark and the read
                 // timeout derived below both key off it; only an actual
-                // throttle wait refreshes it.
+                // throttle wait refreshes it. Every turn follows bytes
+                // arriving (the status line or a read), so the transfer
+                // made progress now.
                 let mut now = Instant::now();
-                if let Err(error) = ensure_active_transfer_budget_at(budget.as_deref(), now) {
-                    self.charge_active_body_without_wait(payload_delta as usize);
-                    return Err(error.into());
-                }
+                note_transfer_progress(budget.as_deref_mut(), now);
                 let waited = self.charge_active_body(payload_delta as usize).await;
                 if !waited.is_zero() {
                     throttle_wait = throttle_wait.saturating_add(waited);
-                    if let Some(budget) = budget.as_deref_mut() {
-                        budget.exclude_wait(waited);
-                    }
                     now = Instant::now();
-                    ensure_active_transfer_budget_at(budget.as_deref(), now)?;
+                    note_transfer_progress(budget.as_deref_mut(), now);
                 }
                 match decoded? {
                     Some(mut article) => {
@@ -2105,6 +2100,14 @@ impl NntpConnection {
                 .transport
                 .as_mut()
                 .is_none_or(NntpTransport::idle_terminal)
+    }
+
+    // The BODY was answered with its 2xx status line. See
+    // [`crate::recovery::ConnectionHealth::answered`].
+    fn note_body_answered(&self) {
+        if let Some(lease) = &self.health_lease {
+            lease.0.answered();
+        }
     }
 
     pub(crate) fn accepts_new_work(&self) -> bool {

@@ -272,7 +272,7 @@ pub(crate) fn parse_test_nzb(body: &[u8]) -> Result<Vec<TestArticle>, String> {
         .flat_map(|file| {
             let groups: Arc<[String]> = file.groups.into();
             file.segments.into_iter().map(move |segment| TestArticle {
-                message_id: segment.message_id,
+                message_id: segment.message_id().to_string(),
                 groups: groups.clone(),
                 bytes: segment.bytes,
             })

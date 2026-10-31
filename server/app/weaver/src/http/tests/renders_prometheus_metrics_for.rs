@@ -90,7 +90,7 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
     assert!(rendered.contains("weaver_pipeline_download_scheduler_scan_items_skipped_total 205"));
     assert!(rendered.contains("weaver_pipeline_download_scheduler_scan_no_match_total 206"));
     assert!(rendered.contains(
-        "weaver_pipeline_download_scheduler_hot_blocked_total{clause=\"sweep_held\"} 207"
+        "weaver_pipeline_download_scheduler_hot_blocked_total{clause=\"server_exclusion\"} 207"
     ));
     assert!(
         rendered.contains("weaver_pipeline_body_proof_events_total{event=\"trial_success\"} 46")
@@ -142,21 +142,6 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
 
     // Deprecated families announce their replacement in HELP.
     assert!(rendered.contains("(deprecated: use weaver_pipeline_decode_rate_bytes_per_second)"));
-
-    // Direct-store counters were collected but never exported.
-    for event in [
-        "admitted",
-        "demoted",
-        "finalized_direct",
-        "repaired_while_direct",
-    ] {
-        assert!(
-            rendered.contains(&format!(
-                "weaver_direct_store_sets_total{{event=\"{event}\"}}"
-            )),
-            "missing direct-store event {event}"
-        );
-    }
 
     assert!(rendered.contains("weaver_build_info{version=\"test-version\",commit="));
     // The two runtime-resolved choices that decide how fast this build can go
@@ -227,10 +212,6 @@ fn renders_prometheus_download_observed_limiter_states() {
         uu_spooled_bytes: 0,
         uu_spooled_segments: 0,
         direct_write_evictions: 0,
-        direct_sets_admitted: 0,
-        direct_sets_demoted: 0,
-        direct_sets_finalized_direct: 0,
-        direct_sets_repaired_while_direct: 0,
         deobfuscated_members_renamed: 0,
         decode_pressure_soft_limit_bytes: 100,
         decode_pressure_hard_limit_bytes: 200,
@@ -613,24 +594,13 @@ fn rendered_label_sets_cover_every_snapshot_counter() {
         &[
             "propagation",
             "retention",
-            "direct_store",
-            "sweep_held",
             "server_exclusion",
             "backfill",
-            "par2_bootstrap",
+            "recovery_metadata_bootstrap",
+            "provider_priority",
             "uu_cursor",
             "checkpoint",
-        ],
-    );
-    assert_label_set(
-        &rendered,
-        "weaver_direct_store_sets_total",
-        "event",
-        &[
-            "admitted",
-            "demoted",
-            "finalized_direct",
-            "repaired_while_direct",
+            "activation",
         ],
     );
     assert_label_set(

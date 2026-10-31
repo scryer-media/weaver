@@ -1,0 +1,24 @@
+{
+  "slug": "adv-zip-named-par2",
+  "title": "E2E.Adversarial.Zip.Named.Par2.2026-TESTGRP",
+  "description": "zip-unencrypted's archive posted under a .par2 name. The graph recognizes ZIP content and the existing final rename policy names the decoded media after the job.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "fixtureAssets": [
+    "zip-unencrypted/archive.zip::adversarial.par2"
+  ],
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "requiredOutputs": [
+      "E2E Adversarial Zip Named Par2.mkv"
+    ],
+    "requiredObjectKinds": ["zip"],
+    "forbiddenOutputs": [
+      "adversarial.par2"
+    ]
+  },
+  "expectedOutputBLAKE3": {
+    "E2E Adversarial Zip Named Par2.mkv": "8139650c53be5684ab9cf20e34996fcfb510f118ee652ad7b949c32e8cb8b08a"
+  }
+}

@@ -48,6 +48,10 @@ async-graphql = { workspace = true }
 async-graphql-axum = { workspace = true, default-features = false }
 reqwest = { workspace = true }
 quick-xml = { workspace = true, default-features = false }
+# The diagnostics filter: one automaton over its stand-in table, and the
+# SHA-256 fingerprint a provider's pinned TLS certificate is written as.
+aho-corasick = { workspace = true }
+sha2 = { workspace = true }
 libc = { workspace = true }
 rayon = { workspace = true, default-features = false }
 rust-embed = { workspace = true, default-features = false }

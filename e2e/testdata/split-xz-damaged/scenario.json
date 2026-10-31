@@ -1,0 +1,14 @@
+{
+  "slug": "split-xz-damaged",
+  "title": "E2E.Test.split.xz.damaged.2026-TESTGRP",
+  "description": "One corrupted byte in a numbered stream must retain the joined compressed bytes and fail without a usable output.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "expectedRetainedOutputBLAKE3": {
+    "灯火.bin.xz": "151298ba7fa5b2261be3b5b8b66c2e8f8d81b5566ddf5c7a2b41272a4289d484"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks",
+    "灯火.bin"
+  ]
+}

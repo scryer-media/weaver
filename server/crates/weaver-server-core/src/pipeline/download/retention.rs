@@ -57,7 +57,17 @@ impl Pipeline {
         let posted_at = self
             .jobs
             .get(&job_id)
-            .and_then(|state| Self::job_posted_at_epoch(&state.spec))?;
+            .and_then(|state| Self::job_posted_at_epoch(&state.spec))
+            .or_else(|| {
+                self.shared_state.queue.read(|inner| {
+                    let row = inner.jobs.iter().find(|row| row.id == job_id)?;
+                    row.admission
+                        .as_ref()
+                        .map(|job| &job.spec)
+                        .or_else(|| row.intents.restore.as_ref().map(|job| &job.spec))
+                        .and_then(Self::job_posted_at_epoch)
+                })
+            })?;
         let now_epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_secs())
@@ -120,7 +130,7 @@ impl Pipeline {
         excludes
     }
 
-    fn compute_job_retention_excludes(&self, job_id: JobId) -> Vec<usize> {
+    pub(in crate::pipeline) fn compute_job_retention_excludes(&self, job_id: JobId) -> Vec<usize> {
         let retention_days = self.nntp.pool().server_retention_days();
         if retention_days.iter().all(|days| *days == 0) {
             return Vec::new();
@@ -153,12 +163,18 @@ impl Pipeline {
         second: &[usize],
     ) -> Vec<usize> {
         let mut merged = first.to_vec();
-        for idx in second {
+        Self::extend_exclude_servers(&mut merged, second);
+        merged
+    }
+
+    // [`Self::union_exclude_servers`] into a list the caller already owns,
+    // so a result that owns its work's ledger reuses that ledger's buffer.
+    pub(in crate::pipeline) fn extend_exclude_servers(merged: &mut Vec<usize>, more: &[usize]) {
+        for idx in more {
             if !merged.contains(idx) {
                 merged.push(*idx);
             }
         }
-        merged
     }
 
     // Union of a work item's failure exclusions and the job's retention
@@ -215,6 +231,10 @@ impl Pipeline {
     // hold the post within its retention, and must not be refusing this
     // pool's credentials. A refusal is a verdict, like the other two; a
     // quarantine for transport or capacity is a wait and keeps the server.
+    // A backfill server may serve the article only once every fill server
+    // is excluded for it or out of its retention: backfill fills what the
+    // fill servers lack, and a fill server refusing the credentials does not
+    // lack the article, so it never opens backfill.
     pub(in crate::pipeline) fn server_may_serve(
         pool: &weaver_nntp::NntpPool,
         idx: usize,
@@ -224,6 +244,8 @@ impl Pipeline {
         !failure_excludes.contains(&idx)
             && !retention_excludes.contains(&idx)
             && !pool.refuses_credentials(idx)
+            && (!pool.is_backfill(idx)
+                || pool.backfill_open_for(failure_excludes, retention_excludes))
     }
 
     // Whether an article carrying `failure_excludes` has no server left
@@ -268,6 +290,11 @@ impl Pipeline {
         exclude_servers: &[usize],
         warn_per_article: bool,
     ) -> Vec<usize> {
+        // The id in use failed on every server it may use. When the NZB gave
+        // the part another id, the article moves to it instead of being booked.
+        if self.spend_message_id(segment_id) {
+            return Vec::new();
+        }
         let job_id = segment_id.file_id.job_id;
         let retention = self.job_retention_excludes(job_id);
         let pool = self.nntp.pool();
@@ -303,7 +330,14 @@ impl Pipeline {
             .articles_not_found
             .fetch_add(1, Ordering::Relaxed);
         self.send_segment_event(|| PipelineEvent::ArticleNotFound { segment_id });
-        if self.book_failed_segment(segment_id) {
+        // A server that refuses the credentials never said the article is
+        // gone, so the post's health does not count it.
+        let state = if refused_by.is_empty() {
+            SegmentTerminalState::Missing
+        } else {
+            SegmentTerminalState::Unservable
+        };
+        if self.book_terminal_segment(segment_id, state) {
             self.note_gap_servers_support_fact(job_id, exclude_servers);
         }
         refused_by
@@ -322,11 +356,15 @@ impl Pipeline {
             Self::unavailable_server_count_from_excludes(&pool, &work.exclude_servers, &retention)
                 >= server_count
         };
-        let Some(state) = self.jobs.get_mut(&job_id) else {
+        let Some(active) = self
+            .jobs
+            .get_mut(&job_id)
+            .and_then(|state| state.articles.active_mut())
+        else {
             return 0;
         };
-        let mut retired = state.download_queue.extract_matching(unservable);
-        retired.extend(state.recovery_queue.extract_matching(unservable));
+        let mut retired = active.download_queue.extract_matching(unservable);
+        retired.extend(active.recovery_queue.extract_matching(unservable));
         if retired.is_empty() {
             return 0;
         }

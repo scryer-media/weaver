@@ -57,6 +57,7 @@ pub mod fused_yenc;
 pub mod health;
 pub mod plan_timing;
 pub mod pool;
+pub mod provider_policy;
 pub mod recovery;
 pub mod response;
 pub mod revocation;

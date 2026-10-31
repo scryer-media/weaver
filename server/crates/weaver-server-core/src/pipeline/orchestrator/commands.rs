@@ -35,9 +35,13 @@ impl Pipeline {
         self.reset_owned_download_lanes();
         self.drop_held_download_refills();
         self.clear_retention_exclude_cache();
-        for state in self.jobs.values_mut() {
-            state.download_queue.clear_exclude_servers();
-            state.recovery_queue.clear_exclude_servers();
+        for active in self
+            .jobs
+            .values_mut()
+            .filter_map(|state| state.articles.active_mut())
+        {
+            active.download_queue.clear_exclude_servers();
+            active.recovery_queue.clear_exclude_servers();
         }
         self.metrics
             .nntp_generation_recovery_requeues
@@ -90,36 +94,9 @@ impl Pipeline {
                 .active_decodes_by_job
                 .get(&job_id)
                 .is_some_and(|n| *n > 0)
-            || self
-                .direct_barrier_flights
-                .keys()
-                .any(|(id, _)| *id == job_id)
-            || self
-                .direct_placement_lanes
-                .keys()
-                .any(|(id, _)| *id == job_id)
-            || self
-                .direct_rearm_in_flight
-                .iter()
-                .any(|(id, _)| *id == job_id)
-            || self.direct_post_repair_in_flight.contains_key(&job_id)
-            || self.direct_tolerated_in_flight.contains_key(&job_id)
-            || self.direct_demotion_in_flight.contains_key(&job_id)
-            || self.par2_analysis_in_flight.contains_key(&job_id)
-            || self.inflight_extractions.contains_key(&job_id)
-            || self.has_active_rar_workers(job_id)
             || self.inflight_terminal_post_processing.contains(&job_id)
             || self.added_script_holds.contains(&job_id)
             || self.inflight_moves.contains(&job_id)
-            || self.direct_unpack.has_job_work_in_flight(job_id)
-            || self
-                .par3_runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.has_worker_in_flight(job_id))
-            || self
-                .rar_refresh_state
-                .iter()
-                .any(|((id, _), state)| *id == job_id && state.in_flight.is_some())
         {
             return false;
         }
@@ -139,7 +116,6 @@ impl Pipeline {
         if new_dir == old_dir {
             return true;
         }
-        crate::pipeline::close_cached_write_handles_under(&old_dir).await;
         let root = self.intermediate_dir.clone();
         let source = old_dir.clone();
         let result = self
@@ -156,17 +132,8 @@ impl Pipeline {
                 return false;
             }
         };
-        self.direct_store
-            .relocate_working_dir(job_id, &old_dir, &new_dir);
         if let Some(cache) = self.repeated_articles.get(&job_id) {
             cache.relocate_working_dir(&old_dir, &new_dir);
-        }
-        self.invalidate_par2_session_for_identity_rebind(job_id);
-        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
-            for set in runtime.sets.values_mut() {
-                set.scan_carry = None;
-                set.scan_carry_exclusions.clear();
-            }
         }
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.working_dir = new_dir;
@@ -183,12 +150,6 @@ impl Pipeline {
         // Deletion scripts still need this cwd after archival. A cancelled
         // queue run must also leave its process group before files disappear.
         crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0).await?;
-        // A re-added job may reuse either path, so release cached handles before
-        // removing its previous working and direct-store staging directories.
-        crate::pipeline::close_cached_write_handles_under(working_dir).await;
-        if let Some(staging) = staging_dir {
-            crate::pipeline::close_cached_write_handles_under(staging).await;
-        }
         if let Err(error) = tokio::fs::remove_dir_all(working_dir).await
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -232,10 +193,9 @@ impl Pipeline {
 
 // What a cancelled job's directory cleanup waits for and removes, carried
 // from the turn that takes the cancel to the turn that handles its archive.
-struct CancelledJobCleanup {
+pub(in crate::pipeline) struct CancelledJobCleanup {
     job_id: JobId,
     post_processing_done: Option<tokio::sync::watch::Receiver<bool>>,
-    extraction_cleanup_wait: Option<Arc<JobExtractionBudget>>,
     working_dir: PathBuf,
     staging_dir: Option<PathBuf>,
 }
@@ -264,6 +224,7 @@ impl Pipeline {
         for job_id in job_ids {
             match self.begin_cancel_job(job_id, origin) {
                 Ok((row, cleanup)) => {
+                    self.cancel_graph_checkpoint_retries(job_id);
                     archives.push((job_id, row));
                     cleanups.push(cleanup);
                 }
@@ -284,7 +245,7 @@ impl Pipeline {
                 // Nothing was archived: every job stays live and recoverable,
                 // and a further cancel needs a new intent.
                 tracing::error!(error = %error, "failed to queue cancelled job archives");
-                self.release_cancel_intents(&ids);
+                self.release_cancel_intents(&ids, false);
                 return;
             }
         };
@@ -326,7 +287,7 @@ impl Pipeline {
         } = done;
         let mut failed = Vec::new();
         let mut cancelled = Vec::new();
-        for mut cleanup in cleanups {
+        for cleanup in cleanups {
             let job_id = cleanup.job_id;
             let failure = match &archived {
                 Ok(errors) => errors.get(&job_id).cloned(),
@@ -337,61 +298,78 @@ impl Pipeline {
                 failed.push(job_id);
                 continue;
             }
-            if let Some(state) = self.purge_cancelled_job_runtime(job_id) {
-                cleanup.working_dir = state.working_dir;
-                cleanup.staging_dir = state.staging_dir;
+            self.retire_graph_job(job_id);
+            if self.retiring_graph_jobs.contains_key(&job_id) {
+                // Archival commits the cancellation, but workers still own
+                // their files. Keep the queue row retiring until their ACKs.
+                self.pending_graph_terminals.insert(
+                    job_id,
+                    super::super::health::PendingGraphTerminal::Cancelled {
+                        cleanup,
+                        keep_files,
+                    },
+                );
+            } else {
+                self.pending_graph_terminals.remove(&job_id);
+                cancelled.push(cleanup);
             }
-            cancelled.push(cleanup);
         }
-        self.release_cancel_intents(&failed);
-        if cancelled.is_empty() {
-            return;
+        self.release_cancel_intents(&failed, archived.is_ok());
+        for cleanup in cancelled {
+            self.finish_cancelled_job(cleanup, keep_files);
+        }
+    }
+
+    pub(in crate::pipeline) fn finish_cancelled_job(
+        &mut self,
+        mut cleanup: CancelledJobCleanup,
+        keep_files: bool,
+    ) {
+        let job_id = cleanup.job_id;
+        if let Some(state) = self.purge_cancelled_job_runtime(job_id) {
+            cleanup.working_dir = state.working_dir;
+            cleanup.staging_dir = state.staging_dir;
         }
         // Same boundary as a job that completed or failed: the cancelled
         // jobs' article pages are free and unwanted, so hand them back rather
         // than holding a job-sized working set until the purge clock runs out.
         crate::runtime::thread_release::release_job_completion_memory();
         let queue = self.shared_state.queue.clone();
-        for cleanup in cancelled {
-            let job_id = cleanup.job_id;
-            let delete_history = queue.write(|inner| {
-                let delete_history = inner
-                    .jobs
-                    .iter()
-                    .any(|row| row.id == job_id && row.intents.delete_history_after_cancel);
-                if !keep_files {
-                    inner.pending_cleanup.insert(job_id);
-                }
-                inner.jobs.retain(|row| row.id != job_id);
-                let _ = self.event_tx.send(PipelineEvent::JobCancelled { job_id });
-                crate::pipeline::queue::Change::changed(delete_history)
-            });
-            if delete_history {
-                let history = queue.clone();
-                tokio::spawn(async move {
-                    let result = history
-                        .delete_history(BTreeSet::from([job_id]), false)
-                        .await
-                        .and_then(|mut outcome| {
-                            outcome.refused.remove(&job_id).map_or(Ok(()), Err)
-                        });
-                    if let Err(error) = result {
-                        tracing::error!(job_id = job_id.0, %error, "failed to finish requested history deletion after cancellation");
-                    }
-                });
-            }
-            // A cancel that keeps the files schedules nothing.
+        let delete_history = queue.write(|inner| {
+            let delete_history = inner
+                .jobs
+                .iter()
+                .any(|row| row.id == job_id && row.intents.delete_history_after_cancel);
             if !keep_files {
-                let cleanup_db = self.db.clone();
-                let queue = queue.clone();
-                tokio::spawn(async move {
-                    Self::cleanup_cancelled_job(cleanup_db, cleanup).await;
-                    queue.write(|inner| {
-                        inner.pending_cleanup.remove(&job_id);
-                        crate::pipeline::queue::Change::changed(())
-                    });
-                });
+                inner.pending_cleanup.insert(job_id);
             }
+            inner.retain_jobs(|row| row.id != job_id);
+            let _ = self.event_tx.send(PipelineEvent::JobCancelled { job_id });
+            crate::pipeline::queue::Change::changed(delete_history)
+        });
+        if delete_history {
+            let history = queue.clone();
+            tokio::spawn(async move {
+                let result = history
+                    .delete_history(BTreeSet::from([job_id]), false)
+                    .await
+                    .and_then(|mut outcome| outcome.refused.remove(&job_id).map_or(Ok(()), Err));
+                if let Err(error) = result {
+                    tracing::error!(job_id = job_id.0, %error, "failed to finish requested history deletion after cancellation");
+                }
+            });
+        }
+        // A cancel that keeps the files schedules nothing.
+        if !keep_files {
+            let cleanup_db = self.db.clone();
+            let queue = queue.clone();
+            tokio::spawn(async move {
+                Self::cleanup_cancelled_job(cleanup_db, cleanup).await;
+                queue.write(|inner| {
+                    inner.pending_cleanup.remove(&job_id);
+                    crate::pipeline::queue::Change::changed(())
+                });
+            });
         }
     }
 
@@ -399,7 +377,7 @@ impl Pipeline {
     // visible again in the same write that withdraws the cancel, and a
     // further cancel needs a new intent. Whatever the job finished while it
     // waited is judged now.
-    fn release_cancel_intents(&mut self, ids: &[JobId]) {
+    fn release_cancel_intents(&mut self, ids: &[JobId], checkpoint_order_drained: bool) {
         if ids.is_empty() {
             return;
         }
@@ -412,27 +390,25 @@ impl Pipeline {
             crate::pipeline::queue::Change::changed(())
         });
         for &job_id in ids {
-            self.restore_after_failed_cancellation(job_id);
+            self.restore_after_failed_cancellation(job_id, checkpoint_order_drained);
             self.report_job(job_id);
         }
     }
 
     // The archive did not commit, so future work belongs to a live job again.
-    // Tokens already handed to workers stay cancelled. Discard their read-only
-    // analysis tickets and retained sessions so neither a late verdict nor a
-    // cached session can reintroduce the cancelled token into the next pass.
-    fn restore_after_failed_cancellation(&mut self, job_id: JobId) {
-        self.forget_par2_analysis_work(job_id);
-        if let Some(runtime) = self.par2_runtime.get_mut(&job_id) {
-            runtime.scan_budget = None;
-            for set in runtime.sets.values_mut() {
-                set.session = None;
-                set.session_last_used = None;
-                set.session_evidence_file_ids.clear();
-            }
-        }
-        self.par2_cancellations.remove(&job_id);
+    // Tokens already handed to workers stay cancelled.
+    fn restore_after_failed_cancellation(&mut self, job_id: JobId, checkpoint_order_drained: bool) {
         self.shared_state.clear_job_cancellations(job_id);
+        if !self.retiring_graph_jobs.contains_key(&job_id)
+            && let Some(super::super::health::PendingGraphTerminal::Failed(failure)) =
+                self.pending_graph_terminals.remove(&job_id)
+        {
+            self.continue_job_failure(job_id, failure);
+            return;
+        }
+        if checkpoint_order_drained {
+            self.recover_cancelled_graph_checkpoint(job_id);
+        }
         self.schedule_job_completion_check(job_id);
     }
 
@@ -486,31 +462,10 @@ impl Pipeline {
             .get(&job_id)
             .is_some_and(|sender| sender.send(true).is_ok());
         let executor_cancelled = self.terminal_post_processing_executor.cancel_job(job_id.0);
-        let par2_cancelled = if let Some(cancellation) = self.par2_cancellations.get(&job_id) {
-            cancellation.cancel();
-            true
-        } else {
-            false
-        };
-        let extraction_cleanup_wait = self.extraction_budgets.get(&job_id).cloned();
-        let extraction_cancelled = if let Some(budget) = &extraction_cleanup_wait {
-            budget.cancel();
-            true
-        } else {
-            false
-        };
         if pipeline_cancelled || executor_cancelled {
             tracing::debug!(
                 job_id = job_id.0,
                 "requested cancellation of active post-processing"
-            );
-        }
-        if par2_cancelled || extraction_cancelled {
-            tracing::debug!(
-                job_id = job_id.0,
-                par2_cancelled,
-                extraction_cancelled,
-                "requested cancellation of active repair or extraction"
             );
         }
         // Ahead of the archive, which copies them from the active row: a job
@@ -525,7 +480,7 @@ impl Pipeline {
         let created_at = now - elapsed_secs;
         let total = state.spec.total_bytes;
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
-            state.assembly.optional_recovery_bytes();
+            state.optional_recovery_bytes();
         let health = health_milli(total, state.failed_bytes);
         let row = crate::JobHistoryRow {
             job_id: job_id.0,
@@ -563,7 +518,6 @@ impl Pipeline {
             CancelledJobCleanup {
                 job_id,
                 post_processing_done,
-                extraction_cleanup_wait,
                 working_dir: state.working_dir.clone(),
                 staging_dir: state.staging_dir.clone(),
             },
@@ -572,14 +526,16 @@ impl Pipeline {
 
     // Drops a cancelled job's runtime state once its archive has committed.
     fn purge_cancelled_job_runtime(&mut self, job_id: JobId) -> Option<JobState> {
+        self.release_job_articles(job_id);
         let state = self.jobs.remove(&job_id)?;
+        self.post_probes.forget(job_id);
+        self.pipeline_failure_stages.remove(&job_id);
+        self.metrics.post_state_left(state.post_state);
         self.retire_stalled_download_lanes(job_id);
         self.job_order.retain(|id| *id != job_id);
         self.remove_pending_completion_check(job_id);
         self.update_queue_metrics();
 
-        self.clear_par2_runtime_state(job_id);
-        self.clear_job_extraction_runtime(job_id);
         self.active_download_passes.remove(&job_id);
         self.jobs_finalizing_download.remove(&job_id);
         self.active_download_connections_by_job.remove(&job_id);
@@ -590,19 +546,13 @@ impl Pipeline {
             .retain(|file_id, _| file_id.job_id != job_id);
         self.active_decode_bytes
             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
-        self.pending_retries_by_job.remove(&job_id);
-        self.pending_retries_by_segment
-            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
-        self.transport_failure_streaks
-            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
-        self.cancel_infrastructure_retries_for_job(job_id);
         self.download_wait_by_job.remove(&job_id);
         self.segment_terminal_states
             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+        self.given_up.remove(&job_id);
         self.rate_limit_reservations
             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
         self.job_last_download_activity.remove(&job_id);
-        self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
         self.clear_job_progress_floor_runtime(job_id);
         self.clear_job_phase_progress_runtime(job_id);
@@ -629,12 +579,6 @@ impl Pipeline {
         // completion handler once that run has ended.
         if let Some(mut post_processing_done) = cleanup.post_processing_done {
             while post_processing_done.changed().await.is_ok() {}
-        }
-        if let Some(extraction_budget) = cleanup.extraction_cleanup_wait {
-            let _ = tokio::task::spawn_blocking(move || {
-                extraction_budget.wait_for_idle();
-            })
-            .await;
         }
         if let Err(error) = Self::cleanup_cancelled_job_directories(
             &db,

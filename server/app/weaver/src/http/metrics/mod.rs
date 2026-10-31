@@ -612,7 +612,9 @@ pub(super) fn job_is_exported(status: &weaver_server_core::JobStatus, mode: PerJ
         // series would never change again but would be scraped forever.
         PerJobSeries::Active => !matches!(
             status,
-            weaver_server_core::JobStatus::Complete | weaver_server_core::JobStatus::Failed { .. }
+            weaver_server_core::JobStatus::Complete
+                | weaver_server_core::JobStatus::Partial
+                | weaver_server_core::JobStatus::Failed { .. }
         ),
     }
 }

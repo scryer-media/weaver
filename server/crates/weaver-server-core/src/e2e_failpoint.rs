@@ -9,22 +9,24 @@ pub const STATUS_ENTER_VERIFYING: &str = "status.enter_verifying";
 pub const STATUS_ENTER_REPAIRING: &str = "status.enter_repairing";
 pub const STATUS_ENTER_QUEUED_REPAIR: &str = "status.enter_queued_repair";
 pub const STATUS_ENTER_QUEUED_EXTRACT: &str = "status.enter_queued_extract";
+// A graph job is extracting: an engine run, on its blocking thread, still
+// producing members once every volume it reads is in. Held there, it stops
+// that one run and nothing else.
+pub const STATUS_ENTER_EXTRACTING: &str = "status.enter_extracting";
 
-// Direct-store coverage barrier step boundaries. One name per
-// step so a container crash test can budget exactly one run each and assert
-// that floors are published only after the checkpoint is durable. The sync hook
-// trips *after* a destination is synced, so it reproduces a mid-sync crash —
-// one file durable, the next not — rather than a crash before any sync.
-pub const DIRECT_STORE_BARRIER_DRAIN: &str = "direct_store.barrier.drain";
-pub const DIRECT_STORE_BARRIER_SYNC: &str = "direct_store.barrier.sync";
-pub const DIRECT_STORE_BARRIER_PERSIST: &str = "direct_store.barrier.persist";
-pub const DIRECT_STORE_BARRIER_PUBLISH: &str = "direct_store.barrier.publish";
+// An engine run over an object's volumes, on its blocking thread, as it
+// finds each member.
+pub const EXTRACT_MEMBER_START: &str = "extract.member_start";
+// A member's file has moved to the name a committed checkpoint recorded for
+// it, and the checkpoint that says it moved has not yet been written.
+pub const EXTRACT_AFTER_RENAME_BEFORE_RECORD: &str = "extract.after_rename_before_record";
+// A recovery set's repair, on its blocking thread, before it reads anything.
+pub const REPAIR_TASK_START: &str = "repair.task_start";
 
-// A segment batch's disk write on the owner thread, before any byte lands.
-pub const DISK_WRITE: &str = "download.disk_write";
-
-// A PAR2 repair on its blocking worker, before the session reads anything.
-pub const PAR2_REPAIR_RUN: &str = "repair.par2_run";
+// After a recovery set's repair has ruled and before the job's delivery
+// moves anything, off the pipeline's loop, so a held job stands still while the
+// queue keeps moving.
+pub const DIRECT_STORE_POST_REPAIR_VERIFY: &str = "direct_store.post_repair_verify";
 
 struct ConfiguredFailpoint {
     name: String,
@@ -163,6 +165,28 @@ pub fn maybe_delay(name: &str) {
     std::thread::sleep(std::time::Duration::from_millis(configured.millis));
 }
 
+// Whether a delay, a hold or a failpoint names `name` and has yet to fire,
+// for a hook whose own condition costs something to read.
+pub fn armed(name: &str) -> bool {
+    let unfired =
+        |configured: &str, fired: &AtomicBool| configured == name && !fired.load(Ordering::SeqCst);
+    configured_delay()
+        .as_ref()
+        .is_some_and(|configured| unfired(&configured.name, &configured.fired))
+        || configured_shutdown_hold()
+            .as_ref()
+            .is_some_and(|configured| unfired(&configured.name, &configured.fired))
+        || configured_failpoint()
+            .as_ref()
+            .is_some_and(|configured| unfired(&configured.name, &configured.fired))
+}
+
+// The delay or hold, then the failpoint, that `name` names.
+pub fn fire(name: &str) {
+    maybe_delay(name);
+    maybe_trip(name);
+}
+
 pub fn maybe_trip(name: &str) {
     let Some(configured) = configured_failpoint().as_ref() else {
         return;
@@ -182,71 +206,41 @@ pub fn maybe_trip(name: &str) {
     std::process::abort();
 }
 
-// A test holds a named point for every caller whose path lies under one
-// root, until it releases it. Keyed by root so a hold reaches only the test
-// that installed it. Compiled only into tests.
-#[cfg(test)]
-pub(crate) struct Hold {
-    name: &'static str,
-    root: std::path::PathBuf,
-    released: std::sync::Mutex<bool>,
-    wake: std::sync::Condvar,
-    arrived: tokio::sync::Notify,
-}
-
-#[cfg(test)]
-static HOLDS: std::sync::Mutex<Vec<std::sync::Arc<Hold>>> = std::sync::Mutex::new(Vec::new());
-
-#[cfg(test)]
-impl Hold {
-    pub(crate) fn install(name: &'static str, root: &std::path::Path) -> std::sync::Arc<Self> {
-        let hold = std::sync::Arc::new(Self {
-            name,
-            root: root.to_path_buf(),
-            released: std::sync::Mutex::new(false),
-            wake: std::sync::Condvar::new(),
-            arrived: tokio::sync::Notify::new(),
-        });
-        HOLDS
-            .lock()
-            .expect("hold registry poisoned")
-            .push(std::sync::Arc::clone(&hold));
-        hold
-    }
-
-    // Resolves once a caller has reached the point and is parked there.
-    pub(crate) async fn arrived(&self) {
-        self.arrived.notified().await;
-    }
-
-    pub(crate) fn release(self: &std::sync::Arc<Self>) {
-        HOLDS
-            .lock()
-            .expect("hold registry poisoned")
-            .retain(|hold| !std::sync::Arc::ptr_eq(hold, self));
-        *self.released.lock().expect("hold poisoned") = true;
-        self.wake.notify_all();
-    }
-}
-
-// Parks the caller while a test holds `name` for a root above `path`.
-pub fn maybe_hold(name: &str, path: &std::path::Path) {
-    #[cfg(test)]
+// A rename crash can select exact destinations after `@`, separated by `|`.
+// Unrelated recovery-volume moves must not consume a payload crash hook.
+pub fn fire_rename(destination: &str) {
+    if let Some(configured) = configured_failpoint().as_ref()
+        && rename_target_matches(&configured.name, destination)
     {
-        let hold = HOLDS
-            .lock()
-            .expect("hold registry poisoned")
-            .iter()
-            .find(|hold| hold.name == name && path.starts_with(&hold.root))
-            .cloned();
-        if let Some(hold) = hold {
-            hold.arrived.notify_one();
-            let mut released = hold.released.lock().expect("hold poisoned");
-            while !*released {
-                released = hold.wake.wait(released).expect("hold poisoned");
-            }
-        }
+        fire(&configured.name);
     }
-    #[cfg(not(test))]
-    let _ = (name, path);
+    fire(EXTRACT_AFTER_RENAME_BEFORE_RECORD);
+}
+
+fn rename_target_matches(configured: &str, destination: &str) -> bool {
+    configured
+        .strip_prefix(EXTRACT_AFTER_RENAME_BEFORE_RECORD)
+        .and_then(|suffix| suffix.strip_prefix('@'))
+        .is_some_and(|targets| targets.split('|').any(|target| target == destination))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rename_crash_selects_only_the_requested_payloads() {
+        let configured =
+            format!("{EXTRACT_AFTER_RENAME_BEFORE_RECORD}@lantern.bin|beacon.bin|beacon (1).bin");
+        for name in ["lantern.bin", "beacon.bin", "beacon (1).bin"] {
+            assert!(rename_target_matches(&configured, name));
+        }
+        for name in ["set.vol0+4.par3", "00-keep.bin", "lantern.bin.par3"] {
+            assert!(!rename_target_matches(&configured, name));
+        }
+        assert!(!rename_target_matches(
+            EXTRACT_AFTER_RENAME_BEFORE_RECORD,
+            "lantern.bin"
+        ));
+    }
 }

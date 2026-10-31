@@ -15,7 +15,7 @@ import "@/next/theme.css";
 
 let settings = {
   dataDir: "/data", intermediateDir: "", completeDir: "", cleanupAfterExtract: true, maxRetries: 3,
-  propagationDelaySecs: 0, enableSrrdbLookup: false,
+  propagationDelaySecs: 0, maxConcurrentNzbs: 10, enableSrrdbLookup: false,
   duplicatePolicy: {
     strictActiveOrSuccess: "BLOCK", strictFailedOrCancelled: "WARN", articleLayoutActiveOrSuccess: "PAUSE",
     articleLayoutFailedOrCancelled: "WARN", articleSet: "WARN", normalizedName: "WARN",

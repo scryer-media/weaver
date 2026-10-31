@@ -5,6 +5,7 @@ package weaver
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
@@ -32,15 +33,10 @@ const (
 )
 
 const (
-	restartExtractDelayEnv = "WEAVER_E2E_DELAY=extract.member_start=20000"
+	// An archive's engine still producing members once every volume it reads
+	// is in: the job is extracting, so it cannot terminalize.
+	restartExtractDelayEnv = "WEAVER_E2E_DELAY=status.enter_extracting=20000"
 	restartPar2AliasSet    = "a31f592e0b874d3ea8c44161b77f3049"
-	// restartClassicExtractEnv keeps the classic RAR extraction path in play for
-	// the cases whose restart points are seams inside it: the member-start delay
-	// hook, the per-volume checkpoint and the finalize-after-rename trip point.
-	// Direct unpack installs members straight out of the chase and never enters
-	// those seams, so with the gate at its default a case written against them
-	// simply watches the job complete and never reaches its restart point.
-	restartClassicExtractEnv = "WEAVER_DIRECT_UNPACK=0"
 )
 
 type restartClassification string
@@ -187,7 +183,7 @@ func cmdRestartTest(args []string) {
 }
 
 func restartCases() []restartCase {
-	return []restartCase{
+	cases := append([]restartCase{
 		{
 			Name:        "download_completed_file_survives_restart",
 			Description: "Completed archive files should survive a crash/restart without redownloading",
@@ -246,10 +242,10 @@ func restartCases() []restartCase {
 		},
 		{
 			Name:        "rar_finalize_rediscovers_after_rename",
-			Description: "Finalize-after-rename may be retried, but restart should rediscover durable archive files and complete",
-			Slugs:       []string{"rar5-multi-member"},
+			Description: "A file moved to the name its committed checkpoint recorded before the move itself was recorded: restart should adopt it there, fetch nothing it held, and complete",
+			Slugs:       []string{renameRestartSlug},
 			Timeout:     20 * time.Minute,
-			Run:         runRarFinalizeReconcilesAfterRename,
+			Run:         runRenamedFileAdoptedAfterRestart,
 		},
 		{
 			Name:        "stale_active_extracted_rows_validate_after_restart",
@@ -279,11 +275,11 @@ func restartCases() []restartCase {
 			Run:         runConventional7zDamagedBlockRepairsOnce,
 		},
 		{
-			Name:        "early_gap_restart_refetches_only_the_gap",
-			Description: "A restart after an early missing article keeps every covered ordinal past it and fetches only what the checkpoint did not cover",
+			Name:        "early_gap_restart_preserves_bytes_and_refusal",
+			Description: "A restart keeps healthy durable bytes past an early missing article and preserves its definitive refusal",
 			Slugs:       []string{"single-mkv"},
 			Timeout:     15 * time.Minute,
-			Run:         runEarlyGapRestartRefetchesOnlyTheGap,
+			Run:         runEarlyGapRestartPreservesBytesAndRefusal,
 		},
 		{
 			Name:        "interrupt_during_verifying_refetches_nothing",
@@ -341,7 +337,11 @@ func restartCases() []restartCase {
 			Timeout:     10 * time.Minute,
 			Run:         runRepairDataWaitReadsFetchingRepairData,
 		},
-	}
+	}, graphRestartCases()...)
+	cases = append(cases, heldPartRestartCases()...)
+	cases = append(cases, feedVerdictRestartCases()...)
+	cases = append(cases, namespaceRestartCases()...)
+	return append(cases, probeLaneRestartCases()...)
 }
 
 func selectRestartCases(requested []string) []restartCase {
@@ -570,6 +570,9 @@ func ensureRestartFixturesSeeded(slugs []string) error {
 
 func ensureRestartInfrastructure() {
 	log.Println("starting restart-suite infrastructure with fresh NNTP build...")
+	if err := ensureNNTPHealthBinary(); err != nil {
+		log.Fatalf("build NNTP healthcheck for restart suite: %v", err)
+	}
 	if err := ensureNyuuImageBuilt(); err != nil {
 		log.Fatalf("build nyuu image for restart suite: %v", err)
 	}
@@ -1026,6 +1029,10 @@ func fetchNntpConnectionMetricsFrom(host, port string) (weaverReleaseNntpConnect
 	if err != nil {
 		return weaverReleaseNntpConnections{}, err
 	}
+	return decodeNntpConnectionMetrics(resp)
+}
+
+func decodeNntpConnectionMetrics(resp string) (weaverReleaseNntpConnections, error) {
 	if !strings.HasPrefix(resp, "290 ") {
 		return weaverReleaseNntpConnections{}, fmt.Errorf("unexpected connection metrics response: %s", resp)
 	}
@@ -1041,7 +1048,8 @@ func fetchNntpConnectionMetricsFrom(host, port string) (weaverReleaseNntpConnect
 const nntpConnectionDrainBudget = 60 * time.Second
 
 // waitForFreeNntpConnectionMetrics reads the provider's connection counters
-// once it has a slot to spare for the read itself.
+// once every previous NNTP session has drained. Control sessions consume
+// admission capacity but are excluded from the active and peak metrics.
 //
 // A capped round ends with every slot held by Weaver's lanes, and stopping
 // Weaver does not hand them back at once: the provider goes on seeing those
@@ -1053,16 +1061,18 @@ func waitForFreeNntpConnectionMetrics(host, port string) (weaverReleaseNntpConne
 	deadline := time.Now().Add(nntpConnectionDrainBudget)
 	for {
 		metrics, err := fetchNntpConnectionMetricsFrom(host, port)
-		if err == nil {
+		if err == nil && metrics.Active == 0 {
 			return metrics, nil
 		}
 		// Only a saturated cap is worth waiting out. Anything else is the
 		// provider itself being wrong, and sitting on it for a minute would
 		// only delay the report.
-		if !errors.Is(err, errNntpConnectionsSaturated) || !time.Now().Before(deadline) {
+		if err != nil && !errors.Is(err, errNntpConnectionsSaturated) {
 			return weaverReleaseNntpConnections{}, err
 		}
-		time.Sleep(500 * time.Millisecond)
+		if !time.Now().Before(deadline) {
+			return metrics, fmt.Errorf("provider sessions did not drain: active=%d: %v", metrics.Active, err)
+		}
 	}
 }
 
@@ -1171,11 +1181,12 @@ func captureRestartDBSnapshot(dbPath string) (restartDBSnapshot, error) {
 	}
 
 	type aggregateSpec struct {
+		table string
 		query string
 		apply func(*restartJobMetrics, int64, int64)
 	}
-	// A file's restart checkpoint is a coverage blob (migration 65), so its
-	// bytes are summed here from the decoded runs rather than in SQL.
+	// A posted file's restart checkpoint is its member of the graph's article
+	// root: the decoded runs on disk, and whole once they cover its length.
 	coverage, err := readFileCoverageRows(db, datastore)
 	if err != nil {
 		return snapshot, err
@@ -1183,33 +1194,31 @@ func captureRestartDBSnapshot(dbPath string) (restartDBSnapshot, error) {
 	for _, row := range coverage {
 		metrics := snapshot.JobMetrics[row.JobID]
 		metrics.Segments++
-		if row.Err == nil {
-			metrics.SegmentBytes += row.Coverage.CoveredBytes()
-			metrics.FileProgressBytes += row.Coverage.CoveredBytes()
+		metrics.SegmentBytes += row.Coverage.CoveredBytes()
+		metrics.FileProgressBytes += row.Coverage.CoveredBytes()
+		if row.Whole() {
+			metrics.Files++
 		}
 		snapshot.JobMetrics[row.JobID] = metrics
 	}
 
 	aggregates := []aggregateSpec{
 		{
-			query: `SELECT job_id, COUNT(*), 0 FROM active_files GROUP BY job_id`,
-			apply: func(m *restartJobMetrics, count, _ int64) {
-				m.Files = int(count)
-			},
-		},
-		{
+			table: "active_par2_files",
 			query: `SELECT job_id, COUNT(*), 0 FROM active_par2_files GROUP BY job_id`,
 			apply: func(m *restartJobMetrics, count, _ int64) {
 				m.Par2Files = int(count)
 			},
 		},
 		{
+			table: "active_extraction_chunks",
 			query: `SELECT job_id, COUNT(*), 0 FROM active_extraction_chunks GROUP BY job_id`,
 			apply: func(m *restartJobMetrics, count, _ int64) {
 				m.ExtractionChunks = int(count)
 			},
 		},
 		{
+			table: "active_extracted",
 			query: `SELECT job_id, COUNT(*), 0 FROM active_extracted GROUP BY job_id`,
 			apply: func(m *restartJobMetrics, count, _ int64) {
 				m.Extracted = int(count)
@@ -1217,6 +1226,12 @@ func captureRestartDBSnapshot(dbPath string) (restartDBSnapshot, error) {
 		},
 	}
 	for _, aggregate := range aggregates {
+		// A table the graph-engine migration dropped reads as empty.
+		if present, err := weaverStateTableExists(db, datastore, aggregate.table); err != nil {
+			return snapshot, err
+		} else if !present {
+			continue
+		}
 		rows, err := db.Query(rebindWeaverSQL(datastore, aggregate.query))
 		if err != nil {
 			return snapshot, err
@@ -1242,6 +1257,12 @@ func captureRestartDBSnapshot(dbPath string) (restartDBSnapshot, error) {
 		rows.Close()
 	}
 
+	if present, err := weaverStateTableExists(db, datastore, "active_extraction_chunks"); err != nil || !present {
+		if err != nil {
+			return snapshot, err
+		}
+		return readRestartExtractedMembers(db, datastore, snapshot)
+	}
 	rows, err = db.Query(rebindWeaverSQL(datastore, `
 		SELECT job_id, set_name, member_name, volume_index, bytes_written, temp_path, start_offset, end_offset, verified, appended
 		FROM active_extraction_chunks
@@ -1272,8 +1293,11 @@ func captureRestartDBSnapshot(dbPath string) (restartDBSnapshot, error) {
 	if err := rows.Err(); err != nil {
 		return snapshot, err
 	}
+	return readRestartExtractedMembers(db, datastore, snapshot)
+}
 
-	rows, err = db.Query(rebindWeaverSQL(datastore, `SELECT job_id, member_name, output_path FROM active_extracted ORDER BY job_id, member_name`))
+func readRestartExtractedMembers(db *sql.DB, datastore weaverDatastore, snapshot restartDBSnapshot) (restartDBSnapshot, error) {
+	rows, err := db.Query(rebindWeaverSQL(datastore, `SELECT job_id, member_name, output_path FROM active_extracted ORDER BY job_id, member_name`))
 	if err != nil {
 		return snapshot, err
 	}
@@ -1525,36 +1549,43 @@ func capturePar2AliasState(dbPath string, jobID int) (restartPar2AliasState, err
 	}
 	sort.Strings(state.ClassificationSets)
 
-	factRows, err := db.Query(rebindWeaverSQL(datastore, `
-		SELECT set_name, COUNT(*)
-		FROM active_rar_volume_facts
-		WHERE job_id = ?
-		GROUP BY set_name
-		ORDER BY set_name
-	`), jobID)
+	// The graph-engine migration drops the facts and chunk tables; a
+	// database without them holds none.
+	factsPresent, err := weaverStateTableExists(db, datastore, "active_rar_volume_facts")
 	if err != nil {
 		return state, err
 	}
-	for factRows.Next() {
-		var setName string
-		var count int
-		if err := factRows.Scan(&setName, &count); err != nil {
-			factRows.Close()
+	if factsPresent {
+		factRows, err := db.Query(rebindWeaverSQL(datastore, `SELECT set_name, COUNT(*) FROM active_rar_volume_facts WHERE job_id = ? GROUP BY set_name ORDER BY set_name`), jobID)
+		if err != nil {
 			return state, err
 		}
-		state.FactSets[setName] = count
-	}
-	if err := factRows.Close(); err != nil {
-		return state, err
-	}
-	if err := factRows.Err(); err != nil {
-		return state, err
+		for factRows.Next() {
+			var setName string
+			var count int
+			if err := factRows.Scan(&setName, &count); err != nil {
+				factRows.Close()
+				return state, err
+			}
+			state.FactSets[setName] = count
+		}
+		if err := factRows.Close(); err != nil {
+			return state, err
+		}
+		if err := factRows.Err(); err != nil {
+			return state, err
+		}
 	}
 
 	for table, destination := range map[string]*int{
 		"active_extracted":         &state.ActiveExtracted,
 		"active_extraction_chunks": &state.ExtractionChunks,
 	} {
+		if present, err := weaverStateTableExists(db, datastore, table); err != nil {
+			return state, err
+		} else if !present {
+			continue
+		}
 		query := rebindWeaverSQL(datastore, fmt.Sprintf("SELECT COUNT(*) FROM %s WHERE job_id = ?", table))
 		if err := db.QueryRow(query, jobID).Scan(destination); err != nil {
 			return state, err
@@ -1725,10 +1756,13 @@ func (ctx *restartCaseContext) submitSlug(slug string) (int, error) {
 	return submitOneNZB(ctx.weaverURL, ctx.Scenarios[slug])
 }
 
+// submitSlugNTimes submits the slug count times, every one forced: a case
+// that asks for N jobs of one post gets N jobs whatever the history already
+// holds, including a finished copy of the same post.
 func (ctx *restartCaseContext) submitSlugNTimes(slug string, count int) ([]int, error) {
 	ids := make([]int, 0, count)
 	for i := 0; i < count; i++ {
-		id, err := submitOneNZBWithOptions(ctx.weaverURL, ctx.Scenarios[slug], submitNZBOptions{force: i > 0})
+		id, err := submitOneNZBWithOptions(ctx.weaverURL, ctx.Scenarios[slug], submitNZBOptions{force: true})
 		if err != nil {
 			return ids, err
 		}
@@ -1884,7 +1918,7 @@ func (ctx *restartCaseContext) waitForAllTerminal(jobIDs []int, timeout time.Dur
 		for _, jobID := range jobIDs {
 			status := ctx.pollJobOnce(jobID)
 			statuses[jobID] = status
-			if status != "COMPLETE" && status != "FAILED" {
+			if !facadeTerminalStatus(status) {
 				complete = false
 			}
 		}
@@ -2231,7 +2265,7 @@ func classifyRestartResult(profile restartProfile, pass bool, passSummary string
 }
 
 func runDownloadCompletedFileSurvivesRestart(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv, restartClassicExtractEnv); err != nil {
+	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug("rar5-multi-member")
@@ -2239,7 +2273,7 @@ func runDownloadCompletedFileSurvivesRestart(ctx *restartCaseContext) (restartCa
 		return restartCaseResult{}, err
 	}
 
-	// The restart point is the member-extraction delay hook, not "the database
+	// The restart point is the extracting-phase delay hook, not "the database
 	// has a row and the job is not terminal yet". The case asserts that nothing
 	// is refetched after the restart, which only holds once every article is
 	// already durable; and a bare "not terminal yet" predicate matches the
@@ -2247,8 +2281,10 @@ func runDownloadCompletedFileSurvivesRestart(ctx *restartCaseContext) (restartCa
 	// terminal status while the pre-crash evidence is still being captured, and
 	// the case silently turns into a check of what survives in history. Parking
 	// the process inside the extraction delay pins both ends: downloads are
-	// complete and the job provably cannot terminalize before the kill.
-	if _, err := waitForDelayHookRestartPoint(ctx, []int{jobID}, "extract.member_start", 3*time.Minute); err != nil {
+	// complete and the job provably cannot terminalize before the kill. An
+	// archive's engine starts reading while its volumes still arrive, so the
+	// hook fires once every volume it reads is in, not at the engine's start.
+	if _, err := waitForDelayHookRestartPoint(ctx, []int{jobID}, "status.enter_extracting", 3*time.Minute); err != nil {
 		return restartCaseResult{}, fmt.Errorf("wait for completed-download restart point: %w", err)
 	}
 	if err := ctx.killWeaverForRestart(); err != nil {
@@ -2260,7 +2296,7 @@ func runDownloadCompletedFileSurvivesRestart(ctx *restartCaseContext) (restartCa
 	}
 	preCompletedFiles := preDB.JobMetrics[jobID].Files
 
-	if err := ctx.restartWeaverWithEnv(restartClassicExtractEnv); err != nil {
+	if err := ctx.restartWeaver(); err != nil {
 		return restartCaseResult{}, err
 	}
 	postFacade, err := ctx.waitForFacade(jobID, 2*time.Minute, func(snapshot facadeItemSnapshot) bool {
@@ -2291,14 +2327,37 @@ func runDownloadCompletedFileSurvivesRestart(ctx *restartCaseContext) (restartCa
 }
 
 func runDownloadProgressFloorSurvivesRestart(ctx *restartCaseContext) (restartCaseResult, error) {
+	const slug = "rar5-multi-member"
 	const checkpointBytes = 4 * 1024 * 1024
 	const checkpointEnv = "WEAVER_E2E_DOWNLOAD_RESTART_CHECKPOINT_BYTES=4194304"
-	const checkpointDelayEnv = "WEAVER_E2E_DELAY=download.after_progress_floor_flush=20000"
 
-	if err := ctx.startWeaverWithOptions("", 8, checkpointEnv, checkpointDelayEnv); err != nil {
+	// The post's last article is held on the news server, so the job cannot
+	// finish downloading before the checkpoint covers the floor and the
+	// process is killed: the restart point is reached on what the checkpoint
+	// says, whatever the machine's speed.
+	segments, err := nzbSegments(slug)
+	if err != nil {
 		return restartCaseResult{}, err
 	}
-	jobID, err := ctx.submitSlug("rar5-multi-member")
+	if len(segments) == 0 {
+		return restartCaseResult{}, fmt.Errorf("%s has no segments", slug)
+	}
+	held := segments[len(segments)-1].MessageID
+
+	if err := ctx.startWeaverWithOptions("", 8, checkpointEnv); err != nil {
+		return restartCaseResult{}, err
+	}
+	// Weaver's start resets the server's chaos, so the hold is set after it.
+	if err := setNntpChaosOnServer(nntpHost(), nntpPort(), "hold_ids="+held); err != nil {
+		return restartCaseResult{}, err
+	}
+	released := false
+	defer func() {
+		if !released {
+			_ = setNntpChaosOnServer(nntpHost(), nntpPort(), "off")
+		}
+	}()
+	jobID, err := ctx.submitSlug(slug)
 	if err != nil {
 		return restartCaseResult{}, err
 	}
@@ -2378,6 +2437,10 @@ func runDownloadProgressFloorSurvivesRestart(ctx *restartCaseContext) (restartCa
 	if err := ctx.killWeaverForRestart(); err != nil {
 		return restartCaseResult{}, err
 	}
+	if err := setNntpChaosOnServer(nntpHost(), nntpPort(), "off"); err != nil {
+		return restartCaseResult{}, err
+	}
+	released = true
 	if err := ctx.restartWeaver(); err != nil {
 		return restartCaseResult{}, err
 	}
@@ -2474,14 +2537,14 @@ func runQueuedRepairSurvivesAndKeepsPlace(ctx *restartCaseContext) (restartCaseR
 }
 
 func runQueuedExtractSurvivesAndKeepsPlace(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv, restartClassicExtractEnv); err != nil {
+	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobIDs, err := ctx.submitSlugNTimes("rar5-multi-member", 2)
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	preDB, err := waitForDelayHookRestartPoint(ctx, jobIDs, "extract.member_start", 2*time.Minute)
+	preDB, err := waitForDelayHookRestartPoint(ctx, jobIDs, "status.enter_extracting", 2*time.Minute)
 	if err != nil {
 		return restartCaseResult{}, fmt.Errorf("wait for extract restart point: %w", err)
 	}
@@ -2493,7 +2556,7 @@ func runQueuedExtractSurvivesAndKeepsPlace(ctx *restartCaseContext) (restartCase
 		return restartCaseResult{}, err
 	}
 
-	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv, restartClassicExtractEnv); err != nil {
+	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv); err != nil {
 		return restartCaseResult{}, err
 	}
 	postDB, err := ctx.waitForDB(2*time.Minute, func(snapshot restartDBSnapshot) bool {
@@ -2682,8 +2745,12 @@ func runVerifyingRestartsCleanly(ctx *restartCaseContext) (restartCaseResult, er
 	), nil
 }
 
+// The process dies as a recovery set's repair starts, before it reads
+// anything. A repair of a few slices is over in milliseconds, so the case
+// arms the repair's own start instead of waiting to sample the job as
+// repairing.
 func runRepairingRestartsCleanly(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaver("status.enter_repairing"); err != nil {
+	if err := ctx.startWeaver("repair.task_start"); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug("par2-small-repair")
@@ -2713,30 +2780,84 @@ func runRepairingRestartsCleanly(ctx *restartCaseContext) (restartCaseResult, er
 	), nil
 }
 
+// rar5MultiMemberMembers are the members the rar5-multi-member archive holds,
+// by their paths inside it.
+var rar5MultiMemberMembers = []string{
+	"tmp/episodes/Test.Show.S01E01.1080p.mkv",
+	"tmp/episodes/Test.Show.S01E02.1080p.mkv",
+	"tmp/episodes/Test.Show.S01E03.1080p.mkv",
+}
+
+func assertRar5MultiMemberBytes(dbPath string, jobID int) error {
+	_, digest, err := singleMKVSource()
+	if err != nil {
+		return err
+	}
+	expected := map[string]string{}
+	for _, member := range rar5MultiMemberMembers {
+		expected[member] = digest
+	}
+	return assertOutputBLAKE3(dbPath, jobID, expected)
+}
+
+// missingMembers lists the members the snapshot's complete tree lacks.
+func missingMembers(snapshot restartFilesystemSnapshot, members []string) []string {
+	var missing []string
+	for _, member := range members {
+		if !completeSnapshotContainsMember(snapshot, member) {
+			missing = append(missing, member)
+		}
+	}
+	return missing
+}
+
+// archiveCheckpointAtCrash reads, once the process is gone, which of the
+// slug's articles have both healthy coverage and a recorded direct backing
+// file. Coverage alone, or an unrecorded envelope on disk, is not durability.
+func archiveCheckpointAtCrash(ctx *restartCaseContext, jobID int, segments []nzbSegmentRef, ranges map[string]decodedRange) (map[string]bool, error) {
+	evidence, err := readCheckpointEvidence(caseDBPath(ctx), jobID)
+	if err != nil {
+		return nil, err
+	}
+	writeRestartJSON(filepath.Join(ctx.CaseDir, "pre_crash_coverage.json"), evidence.Coverage)
+	writeRestartJSON(filepath.Join(ctx.CaseDir, "pre_crash_checkpoint.json"), evidence)
+	return directDurableArticles(segments, ranges, evidence), nil
+}
+
+// The process dies as the archive's engine run finds its first member: the
+// run reads while its volumes may still arrive, and nothing of the run itself
+// is kept. There may be no committed durable articles at this boundary.
+// The restart must reconstruct every output; proven direct inputs are also
+// checked for refetch without claiming durability for uncommitted scratch.
 func runRarExtractionResumesFromCheckpoint(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("extract.after_volume_checkpoint", 8, restartClassicExtractEnv); err != nil {
+	const slug = "rar5-multi-member"
+	segments, err := nzbSegments(slug)
+	if err != nil {
 		return restartCaseResult{}, err
 	}
-	jobID, err := ctx.submitSlug("rar5-multi-member")
+	ranges, err := segmentDecodedRanges(nntpHost(), nntpPort(), segments)
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	if err := ctx.startWeaverWithOptions("extract.member_start", 8); err != nil {
+		return restartCaseResult{}, err
+	}
+	jobID, err := ctx.submitSlug(slug)
 	if err != nil {
 		return restartCaseResult{}, err
 	}
 	if err := ctx.waitForCrash(10*time.Minute, jobID); err != nil {
 		return restartCaseResult{}, err
 	}
-	_, preFS, preMetrics, err := ctx.captureEvidence("pre_crash", "")
+	_, _, preMetrics, err := ctx.captureEvidence("pre_crash", "")
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	memberName, partialPath, partialSize, ok := stagingMemberFromSnapshot(preFS, jobID, true)
-	if !ok {
-		return restartCaseResult{}, fmt.Errorf("no staged partial member found before crash")
+	covered, err := archiveCheckpointAtCrash(ctx, jobID, segments, ranges)
+	if err != nil {
+		return restartCaseResult{}, err
 	}
-	if partialSize <= 0 {
-		return restartCaseResult{}, fmt.Errorf("staged partial member %s was empty before restart", partialPath)
-	}
-
-	if err := ctx.restartWeaverWithEnv(restartClassicExtractEnv); err != nil {
+	if err := ctx.restartWeaver(); err != nil {
 		return restartCaseResult{}, err
 	}
 	statuses, err := ctx.waitForAllTerminal([]int{jobID}, ctx.Timeout)
@@ -2747,71 +2868,123 @@ func runRarExtractionResumesFromCheckpoint(ctx *restartCaseContext) (restartCase
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	refetchedIDs, refetchedBodies := bodyFetchesSinceRestartPoint(preMetrics, metrics)
-	memberPresent := completeSnapshotContainsMember(postFS, memberName)
-	pass := statuses[jobID] == "COMPLETE" && memberPresent && refetchedIDs == 0
+	fetchedAfter, _ := bodyFetchesSinceRestartPoint(preMetrics, metrics)
+	refetched := refetchedArticles(covered, preMetrics, metrics)
+	missing := missingMembers(postFS, rar5MultiMemberMembers)
+	if err := waitForJobArchived(caseDBPath(ctx), jobID); err != nil {
+		return restartCaseResult{}, err
+	}
+	digestErr := assertRar5MultiMemberBytes(caseDBPath(ctx), jobID)
+	detail := fmt.Sprintf("covered_at_crash=%d of %d articles fetched_after_restart=%d refetched_covered=%d missing=%v output=%v final=%s",
+		len(covered), len(segments), fetchedAfter, len(refetched), missing, digestErr, statuses[jobID])
+	pass := statuses[jobID] == "COMPLETE" && len(missing) == 0 && len(refetched) == 0 && digestErr == nil
 	return classifyRestartResult(
 		ctx.Profile,
 		pass,
-		fmt.Sprintf("lossy extraction restart retried from durable archive files and completed %s (partial=%s size=%d refetched articles %d bodies %d)", memberName, partialPath, partialSize, refetchedIDs, refetchedBodies),
+		"extraction restart ran the engine again over the checkpoint's articles and delivered every member: "+detail,
 		false,
 		"",
-		fmt.Sprintf("lossy extraction restart failed (member=%s present=%v refetched articles %d bodies %d final=%s)", memberName, memberPresent, refetchedIDs, refetchedBodies, statuses[jobID]),
+		fmt.Sprintf("extraction restart: %s refetched covered ids: %v", detail, refetched),
 	), nil
 }
 
-func runRarFinalizeReconcilesAfterRename(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("extract.after_finalize_rename_before_record", 8, restartClassicExtractEnv); err != nil {
+// renameRestartSlug posts one payload under a bare hex name beside the PAR3
+// set that names it. The set recognises the file by the bytes that have
+// arrived of it, so the file is on disk under the hex name when the set
+// renames it, and moves to the set's name, renameRestartTarget. The name has
+// no numbered suffix: a numbered piece is held by a split and is born under
+// the set's name, so nothing would move.
+const renameRestartSlug = "par3-obfuscated-plain-name"
+
+const renameRestartTarget = "indigo.vale.s01e08.mkv"
+
+// The process dies right after the file moved to the name a committed
+// checkpoint recorded for it, before the checkpoint that says it moved. The
+// restart finds the file at that name and adopts it: the job completes, the
+// fixture's expected output is delivered, and no article the checkpoint held
+// whole is fetched again.
+func runRenamedFileAdoptedAfterRestart(ctx *restartCaseContext) (restartCaseResult, error) {
+	segments, err := nzbSegments(renameRestartSlug)
+	if err != nil {
 		return restartCaseResult{}, err
 	}
-	jobID, err := ctx.submitSlug("rar5-multi-member")
+	ranges, err := segmentDecodedRanges(nntpHost(), nntpPort(), segments)
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	if err := ctx.startWeaverWithOptions("extract.after_rename_before_record@"+renameRestartTarget, 8); err != nil {
+		return restartCaseResult{}, err
+	}
+	jobID, err := ctx.submitSlug(renameRestartSlug)
 	if err != nil {
 		return restartCaseResult{}, err
 	}
 	if err := ctx.waitForCrash(12*time.Minute, jobID); err != nil {
 		return restartCaseResult{}, err
 	}
-	_, preFS, preMetrics, err := ctx.captureEvidence("pre_crash", "")
+	_, _, preMetrics, err := ctx.captureEvidence("pre_crash", "")
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	memberName, stagedPath, stagedSize, ok := stagingMemberFromSnapshot(preFS, jobID, false)
-	if !ok {
-		return restartCaseResult{}, fmt.Errorf("no staged finalized member found before crash")
+	covered, err := archiveCheckpointAtCrash(ctx, jobID, segments, ranges)
+	if err != nil {
+		return restartCaseResult{}, err
 	}
-	if stagedSize <= 0 {
-		return restartCaseResult{}, fmt.Errorf("staged finalized member %s was empty before restart", stagedPath)
+	if len(covered) == 0 {
+		return restartCaseResult{}, fmt.Errorf("the checkpoint held no whole article when the file moved")
 	}
 
-	if err := ctx.restartWeaverWithEnv(restartClassicExtractEnv); err != nil {
+	if err := ctx.restartWeaver(); err != nil {
 		return restartCaseResult{}, err
 	}
 	statuses, err := ctx.waitForAllTerminal([]int{jobID}, ctx.Timeout)
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	_, postFS, metrics, err := ctx.captureEvidence("post_restart", "")
+	dbPath := caseDBPath(ctx)
+	if err := waitForJobArchived(dbPath, jobID); err != nil {
+		return restartCaseResult{}, err
+	}
+	_, _, metrics, err := ctx.captureEvidence("post_restart", "")
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	refetchedIDs, refetchedBodies := bodyFetchesSinceRestartPoint(preMetrics, metrics)
-	memberPresent := completeSnapshotContainsMember(postFS, memberName)
-	pass := statuses[jobID] == "COMPLETE" && memberPresent && refetchedIDs == 0
+	fetchedAfter, _ := bodyFetchesSinceRestartPoint(preMetrics, metrics)
+	refetched := refetchedArticles(covered, preMetrics, metrics)
+	digestErr := assertOutputBLAKE3(dbPath, jobID, ctx.Scenarios[renameRestartSlug].ExpectedOutputBLAKE3)
+	detail := fmt.Sprintf("covered_at_crash=%d of %d articles fetched_after_restart=%d refetched_covered=%d output=%v final=%s",
+		len(covered), len(segments), fetchedAfter, len(refetched), digestErr, statuses[jobID])
+	pass := statuses[jobID] == "COMPLETE" && digestErr == nil && len(refetched) == 0
 	return classifyRestartResult(
 		ctx.Profile,
 		pass,
-		fmt.Sprintf("finalize-after-rename restart rediscovered durable archive files and completed %s (staged=%s size=%d refetched articles %d bodies %d)", memberName, stagedPath, stagedSize, refetchedIDs, refetchedBodies),
+		"restart after a file moved ahead of its record adopted it and delivered the expected output: "+detail,
 		false,
 		"",
-		fmt.Sprintf("finalize-after-rename restart failed (member=%s present=%v refetched articles %d bodies %d final=%s)", memberName, memberPresent, refetchedIDs, refetchedBodies, statuses[jobID]),
+		fmt.Sprintf("restart after a file moved ahead of its record: %s refetched covered ids: %v", detail, refetched),
 	), nil
 }
 
+// The process dies as the archive's engine run finds its first member, and
+// before the restart a completed-member marker is planted for a member whose
+// output is not there, with the job's runtime forced back to downloading. The
+// graph restores from its own checkpoint and never trusts the marker: the
+// restart delivers every member, fetches none of the checkpoint's articles
+// again, and the marker goes with the job.
 func runStaleActiveExtractedRowsClearAfterRestart(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("extract.after_volume_checkpoint", 8, restartClassicExtractEnv); err != nil {
+	const slug = "rar5-multi-member"
+	segments, err := nzbSegments(slug)
+	if err != nil {
 		return restartCaseResult{}, err
 	}
-	jobID, err := ctx.submitSlug("rar5-multi-member")
+	ranges, err := segmentDecodedRanges(nntpHost(), nntpPort(), segments)
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	if err := ctx.startWeaverWithOptions("extract.member_start", 8); err != nil {
+		return restartCaseResult{}, err
+	}
+	jobID, err := ctx.submitSlug(slug)
 	if err != nil {
 		return restartCaseResult{}, err
 	}
@@ -2820,22 +2993,15 @@ func runStaleActiveExtractedRowsClearAfterRestart(ctx *restartCaseContext) (rest
 	}
 
 	dbPath := filepath.Join(ctx.CaseDir, "weaver.db")
-	_, preFS, _, err := ctx.captureEvidence("pre_crash", "")
+	covered, err := archiveCheckpointAtCrash(ctx, jobID, segments, ranges)
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-
-	memberName, partialPath, partialSize, ok := stagingMemberFromSnapshot(preFS, jobID, true)
-	if !ok {
-		return restartCaseResult{}, fmt.Errorf("no staged partial member found before crash")
-	}
-	if partialSize <= 0 {
-		return restartCaseResult{}, fmt.Errorf("staged partial member %s was empty before restart", partialPath)
-	}
+	memberName := rar5MultiMemberMembers[0]
 	staleMember := restartExtractedMember{
 		JobID:      jobID,
 		MemberName: memberName,
-		OutputPath: completeRootPath(strings.TrimSuffix(partialPath, ".partial")),
+		OutputPath: completeRootPath(memberName),
 	}
 	if err := removeFileIfExists(staleMember.OutputPath); err != nil {
 		return restartCaseResult{}, fmt.Errorf("remove stale extracted output %s: %w", staleMember.OutputPath, err)
@@ -2868,45 +3034,9 @@ func runStaleActiveExtractedRowsClearAfterRestart(ctx *restartCaseContext) (rest
 		return restartCaseResult{}, err
 	}
 
-	if err := ctx.restartWeaverWithEnv(restartClassicExtractEnv); err != nil {
+	if err := ctx.restartWeaver(); err != nil {
 		return restartCaseResult{}, err
 	}
-
-	clearedWhileActive := false
-	recoveredWhileActive := false
-	recoveredStagePath := filepath.ToSlash(
-		filepath.Join(".weaver-staging", strconv.Itoa(jobID), "tmp", staleMember.MemberName),
-	)
-	observeDeadline := time.Now().Add(90 * time.Second)
-	for time.Now().Before(observeDeadline) {
-		snapshot, snapErr := captureRestartDBSnapshot(dbPath)
-		if snapErr == nil {
-			fsSnapshot := captureRestartFilesystemSnapshot()
-			count, countErr := countActiveExtractedMembers(dbPath, jobID)
-			if countErr == nil && count == 0 {
-				if status := jobStatusFromDB(snapshot, jobID); !dbStatusTerminal(status) {
-					clearedWhileActive = true
-				}
-				break
-			}
-			if status := jobStatusFromDB(snapshot, jobID); !dbStatusTerminal(status) {
-				for _, entry := range fsSnapshot.Complete {
-					if entry.Path == recoveredStagePath {
-						recoveredWhileActive = true
-						break
-					}
-				}
-				if recoveredWhileActive {
-					break
-				}
-			}
-			if allJobsTerminalInSnapshot(snapshot, []int{jobID}) {
-				break
-			}
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
-
 	statuses, err := ctx.waitForAllTerminal([]int{jobID}, ctx.Timeout)
 	if err != nil {
 		return restartCaseResult{}, err
@@ -2923,23 +3053,19 @@ func runStaleActiveExtractedRowsClearAfterRestart(ctx *restartCaseContext) (rest
 		return restartCaseResult{}, err
 	}
 
-	refetchedIDs, refetchedBodies := bodyFetchesSinceRestartPoint(preMetrics, metrics)
-	memberPresent := completeSnapshotContainsMember(postFS, staleMember.MemberName)
-	pass := statuses[jobID] == "COMPLETE" && postCount == 0 && memberPresent && refetchedIDs == 0
+	refetched := refetchedArticles(covered, preMetrics, metrics)
+	missing := missingMembers(postFS, rar5MultiMemberMembers)
+	digestErr := assertRar5MultiMemberBytes(dbPath, jobID)
+	detail := fmt.Sprintf("stale_member=%s covered_at_crash=%d of %d articles refetched_covered=%d missing=%v post_count=%d output=%v final=%s",
+		staleMember.MemberName, len(covered), len(segments), len(refetched), missing, postCount, digestErr, statuses[jobID])
+	pass := statuses[jobID] == "COMPLETE" && postCount == 0 && len(missing) == 0 && len(refetched) == 0 && digestErr == nil
 	return classifyRestartResult(
 		ctx.Profile,
 		pass,
-		fmt.Sprintf(
-			"stale extracted-member marker for %s was ignored until output validation succeeded (cleared_while_active=%v recovered_while_active=%v refetched articles %d bodies %d)",
-			staleMember.MemberName,
-			clearedWhileActive,
-			recoveredWhileActive,
-			refetchedIDs,
-			refetchedBodies,
-		),
+		"a stale completed-member marker changed nothing and went with the job: "+detail,
 		false,
 		"",
-		fmt.Sprintf("stale active_extracted validation failed (member=%s present=%v post_count=%d refetched articles %d bodies %d final=%s cleared_while_active=%v recovered_while_active=%v)", staleMember.MemberName, memberPresent, postCount, refetchedIDs, refetchedBodies, statuses[jobID], clearedWhileActive, recoveredWhileActive),
+		fmt.Sprintf("stale active_extracted restart: %s refetched covered ids: %v", detail, refetched),
 	), nil
 }
 
@@ -3022,10 +3148,22 @@ func runVerificationReconcilesStaleExtractingRuntime(ctx *restartCaseContext) (r
 	), nil
 }
 
+// runDirectStorePar2AliasClaimantCompletesAfterRestart kills the process as
+// the job enters verification, with one connection so the late-sorted,
+// extensionless PAR2 index arrives after every archive volume. The restart
+// resumes from the graph checkpoint: it fetches none of the articles the
+// checkpoint held whole, names the volumes from what is on disk, and
+// completes with the expected output.
 func runDirectStorePar2AliasClaimantCompletesAfterRestart(ctx *restartCaseContext) (restartCaseResult, error) {
 	const slug = "direct-store-par2-alias-restart"
-	// One connection makes the extensionless, late-sorted PAR2 index arrive only
-	// after all four archive volumes have established their canonical RAR facts.
+	segments, err := nzbSegments(slug)
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	ranges, err := segmentDecodedRanges(nntpHost(), nntpPort(), segments)
+	if err != nil {
+		return restartCaseResult{}, err
+	}
 	if err := ctx.startWeaverWithConnections("status.enter_verifying", 1); err != nil {
 		return restartCaseResult{}, err
 	}
@@ -3041,7 +3179,7 @@ func runDirectStorePar2AliasClaimantCompletesAfterRestart(ctx *restartCaseContex
 	}
 
 	dbPath := filepath.Join(ctx.CaseDir, "weaver.db")
-	_, preFS, preMetrics, err := ctx.captureEvidence("pre_crash", "")
+	_, _, preMetrics, err := ctx.captureEvidence("pre_crash", "")
 	if err != nil {
 		return restartCaseResult{}, err
 	}
@@ -3050,44 +3188,12 @@ func runDirectStorePar2AliasClaimantCompletesAfterRestart(ctx *restartCaseContex
 		return restartCaseResult{}, fmt.Errorf("capture PAR2 alias state: %w", err)
 	}
 	writeRestartJSON(filepath.Join(ctx.CaseDir, "pre_crash_par2_alias_state.json"), aliasState)
-
-	expectedCurrent := []string{
-		"archive.part1.rar",
-		"archive.part2.rar",
-		"archive.part3.rar",
-		"archive.part4.rar",
+	covered, err := archiveCheckpointAtCrash(ctx, jobID, segments, ranges)
+	if err != nil {
+		return restartCaseResult{}, err
 	}
-	expectedCanonical := make([]string, 0, len(expectedCurrent))
-	for index := 1; index <= len(expectedCurrent); index++ {
-		expectedCanonical = append(expectedCanonical, fmt.Sprintf("%s.part%d.rar", restartPar2AliasSet, index))
-	}
-	sort.Strings(expectedCurrent)
-	sort.Strings(expectedCanonical)
-	current := append([]string(nil), aliasState.CurrentFilenames...)
-	canonical := append([]string(nil), aliasState.CanonicalFilenames...)
-	sort.Strings(current)
-	sort.Strings(canonical)
-	stagedPath, stagedSize, staged := directStorePartialFromSnapshot(preFS, jobID, 0)
-	exactFailureShape := aliasState.IdentityCount == 4 &&
-		aliasState.AliasClaimants == 4 &&
-		len(aliasState.ClassificationSets) == 1 &&
-		aliasState.ClassificationSets[0] == restartPar2AliasSet &&
-		strings.Join(current, "\x00") == strings.Join(expectedCurrent, "\x00") &&
-		strings.Join(canonical, "\x00") == strings.Join(expectedCanonical, "\x00") &&
-		len(aliasState.FactSets) == 1 &&
-		aliasState.FactSets["archive"] == 4 &&
-		len(aliasState.ExistingVolumePaths) == 0 &&
-		aliasState.ActiveExtracted == 0 &&
-		aliasState.ExtractionChunks == 0 &&
-		staged && stagedSize == 24<<20
-	if !exactFailureShape {
-		return restartCaseResult{}, fmt.Errorf(
-			"fixture did not reach the job-11809 failure shape (state=%+v staged=%v staged_path=%s staged_size=%d)",
-			aliasState,
-			staged,
-			stagedPath,
-			stagedSize,
-		)
+	if len(covered) == 0 {
+		return restartCaseResult{}, fmt.Errorf("the checkpoint held no whole article when the job entered verification")
 	}
 
 	if err := ctx.restartWeaver(); err != nil {
@@ -3095,7 +3201,7 @@ func runDirectStorePar2AliasClaimantCompletesAfterRestart(ctx *restartCaseContex
 	}
 	statuses, err := ctx.waitForAllTerminal([]int{jobID}, 3*time.Minute)
 	if err != nil {
-		return restartCaseResult{}, fmt.Errorf("PAR2 alias claimant did not leave the completion loop after restart: %w", err)
+		return restartCaseResult{}, fmt.Errorf("PAR2 alias job did not reach a terminal state after restart: %w", err)
 	}
 	if err := waitForJobArchived(dbPath, jobID); err != nil {
 		return restartCaseResult{}, err
@@ -3104,26 +3210,24 @@ func runDirectStorePar2AliasClaimantCompletesAfterRestart(ctx *restartCaseContex
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	refetchedIDs, refetchedBodies := bodyFetchesSinceRestartPoint(preMetrics, metrics)
+	fetchedAfter, _ := bodyFetchesSinceRestartPoint(preMetrics, metrics)
+	refetched := refetchedArticles(covered, preMetrics, metrics)
 	digestErr := assertOutputBLAKE3(dbPath, jobID, ctx.Scenarios[slug].ExpectedOutputBLAKE3)
-	logData, _ := os.ReadFile(ctx.caseLogPath)
-	retirementLoops := strings.Count(
-		stripANSIEscapeSequences(string(logData)),
-		"retired a stale archive set — no on-disk volumes and no live file claims its names",
-	)
-
-	pass := statuses[jobID] == "COMPLETE" && digestErr == nil && refetchedIDs == 0 && retirementLoops <= 1
 	digestFailure := ""
 	if digestErr != nil {
 		digestFailure = digestErr.Error()
 	}
+	detail := fmt.Sprintf("covered_at_crash=%d of %d articles fetched_after_restart=%d refetched_covered=%d final=%s",
+		len(covered), len(segments), fetchedAfter, len(refetched), statuses[jobID])
+
+	pass := statuses[jobID] == "COMPLETE" && digestErr == nil && len(refetched) == 0
 	return classifyRestartResult(
 		ctx.Profile,
 		pass,
-		fmt.Sprintf("consumed canonical RAR set absorbed its unmaterialized PAR2 alias after restart (refetched articles %d bodies %d retirement_loops=%d)", refetchedIDs, refetchedBodies, retirementLoops),
+		"PAR2 alias job resumed from the checkpoint after a restart in verification and completed: "+detail,
 		false,
 		"",
-		fmt.Sprintf("PAR2 alias restart failed (final=%s refetched articles %d bodies %d retirement_loops=%d digest=%s)", statuses[jobID], refetchedIDs, refetchedBodies, retirementLoops, digestFailure),
+		fmt.Sprintf("PAR2 alias restart failed: %s digest=%s refetched covered ids: %v", detail, digestFailure, refetched),
 	), nil
 }
 
@@ -3134,49 +3238,13 @@ func runDirectStorePar2AliasClaimantCompletesAfterRestart(ctx *restartCaseContex
 // strong-decode claim, and the conventional decode is what finds the damage.
 const conventional7zRepairSlug = "direct-unpack-repair-unvouched"
 
-// conventional7zRepairLog is what one job's log says about the path it took
-// through a damaged block found by extraction.
-type conventional7zRepairLog struct {
-	// SkippedAuthoritativeVerify: the set was settled clean on the
-	// strong-decode claim, without an authoritative PAR2 pass.
-	SkippedAuthoritativeVerify bool
-	// DataErrorAfterSkip: a full-set extraction then failed with an error
-	// worded as a block data error, the wording that keeps the set for the
-	// recovery data instead of ending the job.
-	DataErrorAfterSkip bool
-	// Failed: the job was failed.
-	Failed bool
-}
-
-func readConventional7zRepairLog(logText string, jobID int) conventional7zRepairLog {
-	job := fmt.Sprintf(" job_id=%d ", jobID)
-	var shape conventional7zRepairLog
-	for _, line := range strings.Split(stripANSIEscapeSequences(logText), "\n") {
-		if !strings.Contains(line+" ", job) || isWeaverDebugRingReplay(line) {
-			continue
-		}
-		switch {
-		case strings.Contains(line, "skipping authoritative PAR2 verify for clean exhausted strong-decode job"):
-			shape.SkippedAuthoritativeVerify = true
-		case strings.Contains(line, "set extraction failed") &&
-			strings.Contains(line, "error=7z block data error: "):
-			if shape.SkippedAuthoritativeVerify {
-				shape.DataErrorAfterSkip = true
-			}
-		case strings.Contains(line, " job failed"+job):
-			shape.Failed = true
-		}
-	}
-	return shape
-}
-
-// runConventional7zDamagedBlockRepairsOnce drives the conventional path with
-// the chase off, so the set reaches extraction the way a set the chase could
-// not take does. The contract: the strong-decode skip settles the set, the
-// extraction's block data error reopens the verdict, one repair rebuilds the
-// volume, and the job completes with the expected output, never failing.
+// runConventional7zDamagedBlockRepairsOnce submits a split 7z with one
+// damaged volume and recovery that covers it. The contract is what the job
+// ends as: complete, with the expected output, after exactly one repair. The
+// path the engine takes to find the damage is its own; the case reads only
+// the terminal status, the output digest and the job's repair events.
 func runConventional7zDamagedBlockRepairsOnce(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("", 8, restartClassicExtractEnv); err != nil {
+	if err := ctx.startWeaverWithOptions("", 8); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug(conventional7zRepairSlug)
@@ -3199,16 +3267,10 @@ func runConventional7zDamagedBlockRepairsOnce(ctx *restartCaseContext) (restartC
 			repairs++
 		}
 	}
-	logData, _ := os.ReadFile(ctx.caseLogPath)
-	shape := readConventional7zRepairLog(string(logData), jobID)
-
 	pass := statuses[jobID] == "COMPLETE" &&
 		digestErr == nil &&
 		eventsErr == nil &&
-		repairs == 1 &&
-		shape.SkippedAuthoritativeVerify &&
-		shape.DataErrorAfterSkip &&
-		!shape.Failed
+		repairs == 1
 	digestFailure := ""
 	if digestErr != nil {
 		digestFailure = digestErr.Error()
@@ -3220,12 +3282,12 @@ func runConventional7zDamagedBlockRepairsOnce(ctx *restartCaseContext) (restartC
 	return classifyRestartResult(
 		ctx.Profile,
 		pass,
-		"strong-decode settled 7z set repaired once after its extraction hit a damaged block, and completed",
+		"damaged 7z set repaired once and completed with the expected output",
 		false,
 		"",
 		fmt.Sprintf(
-			"conventional 7z damaged-block case failed (final=%s repairs=%d log=%+v digest=%s events=%s)",
-			statuses[jobID], repairs, shape, digestFailure, eventsFailure,
+			"conventional 7z damaged-block case failed (final=%s repairs=%d digest=%s events=%s)",
+			statuses[jobID], repairs, digestFailure, eventsFailure,
 		),
 	), nil
 }

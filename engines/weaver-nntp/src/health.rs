@@ -11,6 +11,7 @@
 // - **Disabled** — temporarily taken out of rotation (auth failure or too many consecutive errors)
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // The current operational state of a server.
@@ -384,8 +385,12 @@ impl ServerHealth {
     // back to Degraded. A separate gate admits one fresh demanded connection;
     // cached stragglers cannot decide the recovery outcome.
     pub fn check_reenable(&mut self) {
+        self.check_reenable_at(Instant::now());
+    }
+
+    fn check_reenable_at(&mut self, now: Instant) {
         match self.state {
-            ServerState::Disabled { until, .. } if Instant::now() >= until => {
+            ServerState::Disabled { until, .. } if now >= until => {
                 let probe_failures = 0;
                 self.consecutive_failures = probe_failures;
                 self.state = ServerState::Degraded {
@@ -396,7 +401,7 @@ impl ServerHealth {
                 until,
                 resume_degraded,
                 ..
-            } if Instant::now() >= until => {
+            } if now >= until => {
                 self.state = match resume_degraded {
                     Some(consecutive_failures) => ServerState::Degraded {
                         consecutive_failures,
@@ -471,6 +476,18 @@ impl ServerHealth {
         self.state = ServerState::Disabled { until, reason };
     }
 
+    // A lifted gate with the recovery still pending here is a probe that was
+    // answered (see [`crate::recovery::ConnectionHealth::answered`]): the
+    // server is up from that answer, whatever the outcome being recorded now.
+    fn settle_answered_recovery(&mut self) {
+        if self.recovery_pending && !self.recovery.quarantined() {
+            self.recovery_pending = false;
+            self.recovery_attempts = 0;
+            self.state = ServerState::Healthy;
+            self.ratio_window_started = None;
+        }
+    }
+
     pub(crate) fn record_connection_outcome(
         &mut self,
         ticket: &crate::recovery::ConnectionHealth,
@@ -490,13 +507,10 @@ impl ServerHealth {
             return;
         }
         if success {
-            if ticket.complete_recovery() || (self.recovery_pending && !self.recovery.quarantined())
-            {
-                self.recovery_pending = false;
-                self.recovery_attempts = 0;
-                self.state = ServerState::Healthy;
-                self.ratio_window_started = None;
-            }
+            ticket.complete_recovery();
+        }
+        self.settle_answered_recovery();
+        if success {
             self.record_success();
         } else {
             if ticket.probing() {
@@ -515,10 +529,73 @@ impl ServerHealth {
     }
 }
 
+// Each server's availability as the tracker last decided it, readable
+// without the tracker's lock.
+//
+// The tracker writes a server's entry whenever that server's state changes,
+// and the entry carries the instant an unavailable state ends. Reading it at
+// any later instant gives the answer [`HealthTracker::is_available`] would
+// give then, re-enable included, so a reader never has to wait for the lock
+// or ask again because someone else held it.
+#[derive(Debug)]
+pub(crate) struct AvailabilityBoard {
+    origin: Instant,
+    // Zero while the server is available; otherwise one more than the
+    // nanoseconds from `origin` at which its cooldown or disable ends.
+    until: Vec<AtomicU64>,
+    #[cfg(test)]
+    clock: std::sync::Mutex<Option<Instant>>,
+}
+
+impl AvailabilityBoard {
+    fn new(server_count: usize) -> Self {
+        Self {
+            origin: Instant::now(),
+            until: (0..server_count).map(|_| AtomicU64::new(0)).collect(),
+            #[cfg(test)]
+            clock: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn publish(&self, idx: usize, state: &ServerState) {
+        let raw = match state {
+            ServerState::Healthy | ServerState::Degraded { .. } => 0,
+            ServerState::CoolingDown { until, .. } | ServerState::Disabled { until, .. } => {
+                u64::try_from(until.saturating_duration_since(self.origin).as_nanos())
+                    .unwrap_or(u64::MAX - 1)
+                    .saturating_add(1)
+            }
+        };
+        if let Some(slot) = self.until.get(idx) {
+            slot.store(raw, Ordering::Release);
+        }
+    }
+
+    // Whether the server accepts work now.
+    pub(crate) fn is_available(&self, idx: usize) -> bool {
+        let raw = self
+            .until
+            .get(idx)
+            .map_or(0, |slot| slot.load(Ordering::Acquire));
+        raw == 0 || self.now() >= self.origin + Duration::from_nanos(raw - 1)
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = *self.clock.lock().unwrap() {
+            return now;
+        }
+        Instant::now()
+    }
+}
+
 // Manages health state for multiple servers.
 #[derive(Debug)]
 pub struct HealthTracker {
     servers: Vec<ServerHealth>,
+    board: Arc<AvailabilityBoard>,
+    #[cfg(test)]
+    reenable_clock: Option<Instant>,
     // Backfill flag per server, parallel to `servers`. Failure-ratio trips
     // only fire when another FILL server can absorb the shifted load;
     // backfill servers never count (health never unlocks backfill, so
@@ -535,6 +612,16 @@ impl HealthTracker {
         self.servers[idx].recovery = gate;
     }
 
+    // The lock-free view of every server's availability this tracker keeps
+    // current.
+    pub(crate) fn availability(&self) -> Arc<AvailabilityBoard> {
+        Arc::clone(&self.board)
+    }
+
+    fn publish(&self, idx: usize) {
+        self.board.publish(idx, self.servers[idx].state());
+    }
+
     pub(crate) fn record_connection_outcome(
         &mut self,
         server_idx: usize,
@@ -546,6 +633,7 @@ impl HealthTracker {
         let probing = !success && ticket.probing();
         let failures_before = self.servers[server_idx].failure_count;
         self.servers[server_idx].record_connection_outcome(ticket, success, auth, allow_ratio_trip);
+        self.publish(server_idx);
         // A ticket reports only its first failure, so the count moves once.
         if probing && self.servers[server_idx].failure_count != failures_before {
             Self::warn_probe_failed(server_idx, &self.servers[server_idx]);
@@ -575,6 +663,7 @@ impl HealthTracker {
             self.servers[idx].failure_count += 1;
             return;
         }
+        self.servers[idx].settle_answered_recovery();
         if ticket.probing() {
             Self::warn_probe_failed(idx, &self.servers[idx]);
             self.servers[idx].recovery_pending = true;
@@ -603,7 +692,13 @@ impl HealthTracker {
         let servers = (0..server_count)
             .map(|_| ServerHealth::new(config.clone()))
             .collect();
-        Self { servers, backfill }
+        Self {
+            servers,
+            board: Arc::new(AvailabilityBoard::new(server_count)),
+            backfill,
+            #[cfg(test)]
+            reenable_clock: None,
+        }
     }
 
     // Whether a failure-ratio trip on `server_idx` has somewhere to shift
@@ -624,31 +719,54 @@ impl HealthTracker {
     // Record a successful operation for the given server.
     pub fn record_success(&mut self, server_idx: usize) {
         self.servers[server_idx].record_success();
+        self.publish(server_idx);
     }
 
     // Record a failed operation for the given server.
     pub fn record_failure(&mut self, server_idx: usize, is_auth: bool) {
         let allow_ratio_trip = self.ratio_trip_allowed(server_idx);
         self.servers[server_idx].record_failure_gated(is_auth, allow_ratio_trip);
+        self.publish(server_idx);
     }
 
     // Record a short-lived cooldown-worthy failure for the given server.
     pub fn record_cooldown(&mut self, server_idx: usize, reason: CooldownReason) {
         let allow_ratio_trip = self.ratio_trip_allowed(server_idx);
         self.servers[server_idx].record_cooldown_gated(reason, allow_ratio_trip);
+        self.publish(server_idx);
     }
 
     // Whether the given server is available for work.
     pub fn is_available(&mut self, server_idx: usize) -> bool {
-        self.servers[server_idx].check_reenable();
+        let now = self.reenable_now();
+        self.servers[server_idx].check_reenable_at(now);
+        self.publish(server_idx);
         self.servers[server_idx].is_available()
     }
 
     // Check all disabled servers and re-enable any whose backoff has expired.
     pub fn check_reenable_all(&mut self) {
+        let now = self.reenable_now();
         for server in &mut self.servers {
-            server.check_reenable();
+            server.check_reenable_at(now);
         }
+        for idx in 0..self.servers.len() {
+            self.publish(idx);
+        }
+    }
+
+    fn reenable_now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(now) = self.reenable_clock {
+            return now;
+        }
+        Instant::now()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_reenable_clock(&mut self, now: Instant) {
+        self.reenable_clock = Some(now);
+        *self.board.clock.lock().unwrap() = Some(now);
     }
 
     // Return server indices ordered by health: Healthy first, Degraded second,

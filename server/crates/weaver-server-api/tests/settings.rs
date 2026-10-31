@@ -7,6 +7,43 @@ use common::{BlockingDbOperation, TestHarness, assert_no_errors, local_request, 
 use weaver_server_core::auth::CallerScope;
 
 #[tokio::test]
+async fn nzb_limit_defaults_to_ten_and_accepts_only_positive_integers() {
+    let h = TestHarness::new().await;
+    let response = h.execute("{ settings { maxConcurrentNzbs } }").await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["settings"]["maxConcurrentNzbs"],
+        10
+    );
+    for value in ["0", "-1", "1.5", "2147483648"] {
+        let response = h.execute(&format!(
+            "mutation {{ updateSettings(input: {{ maxConcurrentNzbs: {value} }}) {{ maxConcurrentNzbs }} }}"
+        )).await;
+        assert!(!response.errors.is_empty(), "{value} must be rejected");
+        assert_eq!(h.db.load_config().unwrap().max_concurrent_nzbs(), 10);
+    }
+    let response = h
+        .execute(
+            "mutation { updateSettings(input: { maxConcurrentNzbs: 3 }) { maxConcurrentNzbs } }",
+        )
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["updateSettings"]["maxConcurrentNzbs"],
+        3
+    );
+    assert_eq!(h.db.load_config().unwrap().max_concurrent_nzbs(), 3);
+    let response = h
+        .execute("mutation { updateSettings(input: { maxRetries: 4 }) { maxConcurrentNzbs } }")
+        .await;
+    assert_no_errors(&response);
+    assert_eq!(
+        response_data(&response)["updateSettings"]["maxConcurrentNzbs"],
+        3
+    );
+}
+
+#[tokio::test]
 async fn create_schedule_refuses_a_client_supplied_id_and_generates_one() {
     let h = TestHarness::new().await;
     let data_dir = std::path::PathBuf::from(&h.config.read().await.data_dir);

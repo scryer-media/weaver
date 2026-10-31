@@ -226,6 +226,29 @@ fn random_read_iops_update_changes_future_extraction_admission_limit() {
     assert_eq!(tuner.max_concurrent_extractions(), 1);
 }
 
+// Slow writes hold slow storage to one extraction even when reads would
+// allow two; an unmeasured write figure does not.
+#[test]
+fn slow_sequential_writes_admit_one_extraction_on_slow_storage() {
+    let mut profile = hdd_profile(4);
+    profile.disk.random_read_iops = 800.0;
+    let mut tuner = RuntimeTuner::with_connection_limit(profile, 8);
+    tuner.max_concurrent_extractions_override = None;
+
+    tuner.set_sequential_write_mbps(150.0);
+    assert_eq!(tuner.max_concurrent_extractions(), 2);
+
+    tuner.set_sequential_write_mbps(60.0);
+    assert_eq!(tuner.max_concurrent_extractions(), 1);
+
+    tuner.set_sequential_write_mbps(0.0);
+    assert_eq!(
+        tuner.max_concurrent_extractions(),
+        2,
+        "an unmeasured write figure is no evidence of a slow disk"
+    );
+}
+
 #[test]
 fn a_new_profile_moves_every_limit_and_keeps_the_connection_limit() {
     use crate::runtime::hardware_profile::HardwareProfile;

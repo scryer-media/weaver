@@ -23,10 +23,21 @@
 // connect the server could have served. A race loser that merely timed out
 // is not booked as a failure: it was slower than the winner, not broken.
 //
-// When a race finds no address at all and nothing is pinned, connects dial
-// the known candidates one at a time for [`FAILED_RACE_HOLDOFF`] instead of
-// racing again, so a server that is down does not start a burst of race
-// threads on every reconnect attempt.
+// When a race finds no address at all, connects dial the known candidates
+// one at a time, the kept pin first when there is one, for
+// [`FAILED_RACE_HOLDOFF`] instead of racing again, so a server that is down
+// does not start a burst of race threads on every reconnect attempt. That
+// holds when the pin keeps refusing too: the race just found every address
+// refusing, so the pin's next refusals tell it nothing new, and the race the
+// suspicion asks for runs once the holdoff has passed.
+//
+// A dial that finds an address's network unreachable (no route to any host
+// of that address family from here) marks the whole family unreachable for
+// this leg, and races and dials leave that family's addresses out from then
+// on: on a host with no IPv6 route, every IPv6 address of every server fails
+// the same way, at once, on every attempt. An address of a marked family is
+// still dialled when the leg has no other kind left, and a connect on one
+// clears the family's mark.
 //
 // A race measures handshakes, and the address that shakes hands fastest is
 // not always the one that delivers articles fastest. So while the pin is
@@ -58,6 +69,7 @@ use crate::candidate_plan::{CandidatePlan, Next};
 type PlanState = CandidatePlan<SocketAddr>;
 use std::io;
 use std::net::{IpAddr, SocketAddr, TcpStream};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
@@ -71,8 +83,9 @@ use tracing::{debug, info};
 // this often.
 pub const ADDRESS_REPLAN_INTERVAL: Duration = Duration::from_mins(10);
 
-// How long after a race in which no address answered, with nothing pinned,
-// connects dial the known candidates one after another instead of racing.
+// How long after a race in which no address answered connects dial the
+// known candidates one after another instead of racing, whether or not the
+// race kept a pin.
 // A race dials each candidate on its own thread, each held for up to
 // [`ADDRESS_ATTEMPT_LIMIT`]; against a server that is down, racing on every
 // reconnect attempt would keep those threads blocked for nothing. A
@@ -289,6 +302,9 @@ pub struct AddressPlan {
     label: String,
     state: Mutex<PlanState>,
     race_finished: Condvar,
+    // The address families a dial on this leg found unreachable, one bit per
+    // family (see [`family_bit`]). Kept for the life of the leg.
+    unreachable_families: AtomicU8,
     // A clock the tests hold still and move by hand, so nothing they assert
     // depends on how fast the machine runs them.
     #[cfg(test)]
@@ -301,9 +317,51 @@ impl AddressPlan {
             label,
             state: Mutex::new(PlanState::default()),
             race_finished: Condvar::new(),
+            unreachable_families: AtomicU8::new(0),
             #[cfg(test)]
             frozen_clock: Mutex::new(None),
         }
+    }
+
+    // `addrs` without the addresses of a family this leg found unreachable,
+    // or all of them when that would leave none.
+    fn reachable(&self, addrs: &[SocketAddr]) -> Vec<SocketAddr> {
+        let unreachable = self.unreachable_families.load(Ordering::Relaxed);
+        let reachable: Vec<SocketAddr> = addrs
+            .iter()
+            .copied()
+            .filter(|addr| unreachable & family_bit(*addr) == 0)
+            .collect();
+        if reachable.is_empty() {
+            addrs.to_vec()
+        } else {
+            reachable
+        }
+    }
+
+    // Dial one address and book what it says about the address's family: an
+    // unreachable network marks the family, a connect clears its mark.
+    fn dial_one<D: AddressDialer>(&self, dialer: &D, addr: SocketAddr) -> io::Result<D::Stream> {
+        let result = dialer.dial(addr);
+        let bit = family_bit(addr);
+        match &result {
+            Ok(_) => {
+                self.unreachable_families.fetch_and(!bit, Ordering::Relaxed);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NetworkUnreachable => {
+                let before = self.unreachable_families.fetch_or(bit, Ordering::Relaxed);
+                if before & bit == 0 {
+                    info!(
+                        server = %self.label,
+                        address = %addr,
+                        error = %error,
+                        "address family unreachable from this host; leaving its addresses out of this server's connects"
+                    );
+                }
+            }
+            Err(_) => {}
+        }
+        result
     }
 
     // Plain data behind the lock, so a panic elsewhere must not stop every
@@ -373,9 +431,9 @@ impl AddressPlan {
         order: &[SocketAddr],
     ) -> io::Result<(D::Stream, SocketAddr)> {
         let mut last_error = None;
-        for &addr in order {
+        for addr in self.reachable(order) {
             let started = Instant::now();
-            match dialer.dial(addr) {
+            match self.dial_one(dialer, addr) {
                 Ok(stream) => {
                     self.record_connect(addr, Some(started.elapsed()));
                     return Ok((stream, addr));
@@ -421,6 +479,7 @@ impl AddressPlan {
         } else {
             resolved.clone()
         };
+        let candidates = self.reachable(&candidates);
         if candidates.is_empty() {
             let error = io::Error::other(weaver_tunnel::pipe::ResolutionFailed);
             ticket.finish(Err(&error), None, Vec::new());
@@ -444,7 +503,7 @@ impl AddressPlan {
                     .name("nntp-address-race".into())
                     .spawn(move || {
                         let started = Instant::now();
-                        let result = dialer.dial(addr);
+                        let result = plan.dial_one(dialer.as_ref(), addr);
                         let elapsed = started.elapsed();
                         match &result {
                             Ok(_) => plan.record_connect(addr, Some(elapsed)),
@@ -713,12 +772,11 @@ impl RaceTicket<'_> {
             Err(error) => {
                 state.races_failed += 1;
                 state.last_race_error = Some((error.kind(), error.to_string()));
+                state.last_race_failed_at = Some(now);
                 if previous.is_some() {
                     // Keep the old pin, and do not race again on age alone
                     // straight away.
                     state.chosen_at = Some(now);
-                } else {
-                    state.last_race_failed_at = Some(now);
                 }
                 let candidates = state.candidates.len();
                 drop(state);
@@ -743,6 +801,11 @@ impl Drop for RaceTicket<'_> {
             self.finish(Err(&error), None, Vec::new());
         }
     }
+}
+
+// The bit [`AddressPlan::unreachable_families`] keeps for `addr`'s family.
+fn family_bit(addr: SocketAddr) -> u8 {
+    if addr.is_ipv4() { 1 } else { 2 }
 }
 
 // A connect that ran out of time rather than being turned away.

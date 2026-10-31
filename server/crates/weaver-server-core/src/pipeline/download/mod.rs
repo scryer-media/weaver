@@ -5,7 +5,6 @@ use super::*;
 
 pub(super) mod owned_lane;
 pub mod queue;
-mod rar_unlock;
 pub(crate) mod repeated;
 mod retention;
 pub(in crate::pipeline) mod scheduler;
@@ -18,10 +17,11 @@ pub(in crate::pipeline) use worker::lane_acquire_failure_for_work;
 pub(super) use worker::HeldDownloadRefill;
 #[cfg(test)]
 pub(in crate::pipeline) use worker::{
-    DOWNLOAD_DISPATCH_STALL_KICK_AFTER, DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER,
+    DISPATCH_INELIGIBLE_LOG_INTERVAL, DOWNLOAD_DISPATCH_STALL_KICK_AFTER,
+    DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER,
 };
 pub(crate) use worker::{
-    DOWNLOAD_STALL_RECOVERY_ENV, DispatchStallWatch, JobLogThrottle, KeyedLogThrottle,
+    DOWNLOAD_STALL_RECOVERY_ENV, DispatchStallWatch, JobLogThrottle,
     download_stall_recovery_from_env_value,
 };
 

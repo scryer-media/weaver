@@ -1,0 +1,13 @@
+{
+  "slug": "adv-zip-directory-memory-lie",
+  "title": "E2E.Adversarial.Zip.Directory.Memory.Lie.2026-TESTGRP",
+  "description": "An oversized central directory reports a one-byte size. The graph must reject the inconsistent archive without extracting its members.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "adversarial": {
+    "group": "default",
+    "outcome": "failed",
+    "errorContains": "no file was delivered whole",
+    "forbiddenOutputs": ["f000", "f001", "f143"]
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "slug": "adv-zip-declared-huge",
+  "title": "E2E.Adversarial.Zip.Declared.Huge.2026-TESTGRP",
+  "description": "A stored member of a few dozen bytes whose headers declare almost 4 GiB, run with the member cap at 32 MiB. Whatever the verdict, nothing past the posted bytes is extracted.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "adversarial": {
+    "group": "tight",
+    "outcome": "settles",
+    "extractsNothing": true
+  }
+}

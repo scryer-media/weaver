@@ -4,6 +4,11 @@
 use super::*;
 
 impl Pipeline {
+    // The job's root says which of its articles it waits on.
+    pub(crate) fn segment_is_completion_critical(&self, segment_id: SegmentId) -> bool {
+        self.graph_article_waited_on(segment_id).unwrap_or(false)
+    }
+
     pub(crate) fn note_retry_scheduled(&mut self, segment_id: SegmentId) {
         let job_id = segment_id.file_id.job_id;
         *self.pending_retries_by_job.entry(job_id).or_default() += 1;
@@ -115,49 +120,68 @@ impl Pipeline {
         retry_count: u32,
         exclude_servers: Vec<usize>,
     ) -> bool {
-        let job_id = segment_id.file_id.job_id;
-        let file_idx = segment_id.file_id.file_index as usize;
-        let completion_critical = self.segment_is_completion_critical(segment_id);
-        let Some(state) = self.jobs.get_mut(&job_id) else {
+        // Built as a retry is: park/restore drops any rotation hint, which
+        // is advisory, and the next transport failure recomputes it.
+        let Some(work) = self.download_retry_work(segment_id, retry_count, exclude_servers) else {
             return false;
         };
-        let Some(file_spec) = state.spec.files.get(file_idx) else {
-            return false;
-        };
-        let Some(seg_spec) = file_spec
-            .segments
-            .iter()
-            .find(|seg| seg.ordinal == segment_id.segment_number)
-        else {
-            return false;
-        };
-        let work = DownloadWork {
-            counters: None,
-            segment_id,
-            message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
-            groups: std::sync::Arc::from(file_spec.groups.as_slice()),
-            priority: file_spec.role.download_priority(),
-            byte_estimate: seg_spec.bytes,
-            retry_count,
-            is_recovery: file_spec.role.is_recovery(),
-            completion_critical,
-            exclude_servers,
-            // Park/restore drops any rotation hint: it is advisory, and the
-            // next transport failure recomputes it.
-            avoid_server: None,
-        };
-        if work.is_recovery && !work.completion_critical {
-            state.recovery_queue.push(work);
-        } else {
-            state.download_queue.push(work);
-        }
+        self.enqueue_download_work(work);
         self.update_queue_metrics();
         true
     }
 
+    // The article's id in use is spent: it failed on every server it may use,
+    // or arrived and failed to decode. When the NZB gave the part another id,
+    // the article moves to it and is queued afresh; false when every id is
+    // spent and the article is lost.
+    pub(in crate::pipeline) fn spend_message_id(&mut self, segment_id: SegmentId) -> bool {
+        let moved = self
+            .jobs
+            .get_mut(&segment_id.file_id.job_id)
+            .and_then(|state| {
+                state
+                    .spec
+                    .files
+                    .get_mut(segment_id.file_id.file_index as usize)
+            })
+            .and_then(|file| {
+                file.segments
+                    .iter_mut()
+                    .find(|segment| segment.ordinal == segment_id.segment_number)
+            })
+            .is_some_and(|segment| segment.message_ids.spend());
+        let Some(work) = moved
+            .then(|| self.download_retry_work(segment_id, 0, Vec::new()))
+            .flatten()
+        else {
+            return false;
+        };
+        self.enqueue_download_work(work);
+        self.update_queue_metrics();
+        true
+    }
+
+    // Whether the NZB gave `segment_id`'s part an id behind the one in use.
+    pub(in crate::pipeline) fn message_id_left(&self, segment_id: SegmentId) -> bool {
+        self.jobs
+            .get(&segment_id.file_id.job_id)
+            .and_then(|state| state.spec.files.get(segment_id.file_id.file_index as usize))
+            .and_then(|file| {
+                file.segments
+                    .iter()
+                    .find(|segment| segment.ordinal == segment_id.segment_number)
+            })
+            .is_some_and(|segment| segment.message_ids.has_next())
+    }
+
+    // The download block names the server quota whenever queued work cannot
+    // move because every normal fill server is out of quota. Queued work is
+    // what the queues hold plus what a quota rejection parked; dispatch never
+    // sends to a blocked server, so most of it never parks at all.
     pub(in crate::pipeline) fn refresh_server_quota_block_presentation(&self) {
-        let blocked = !self.server_quota_parked.is_empty()
-            && self.nntp.all_normal_fill_servers_quota_blocked();
+        let queued = !self.server_quota_parked.is_empty()
+            || self.metrics.download_queue_depth.load(Ordering::Relaxed) != 0;
+        let blocked = queued && self.nntp.all_normal_fill_servers_quota_blocked();
         self.shared_state.set_server_quota_blocked(blocked);
         self.shared_state
             .set_egress_quota_block(self.parked_egress_quota_block());
@@ -206,7 +230,7 @@ impl Pipeline {
         })
     }
 
-    fn download_retry_work(
+    pub(in crate::pipeline) fn download_retry_work(
         &self,
         segment_id: SegmentId,
         retry_count: u32,
@@ -224,7 +248,7 @@ impl Pipeline {
         Some(DownloadWork {
             counters: None,
             segment_id,
-            message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
+            message_id: crate::jobs::ids::MessageId::new(seg_spec.message_ids.in_use()),
             groups: std::sync::Arc::from(file_spec.groups.as_slice()),
             priority: file_spec.role.download_priority(),
             byte_estimate: seg_spec.bytes,
@@ -418,6 +442,7 @@ impl Pipeline {
     pub(crate) fn release_download_result(&mut self, result: &DownloadResult) -> bool {
         if !self.accept_lane_work(result.lane_id, result.segment_id) {
             let bytes = match &result.data {
+                #[cfg(test)]
                 Ok(DownloadPayload::Raw(raw)) => raw.len() as u64,
                 Ok(DownloadPayload::Decoded(decoded)) => decoded.raw_size,
                 Err(DownloadError::Decode { raw_size, .. }) => *raw_size,
@@ -483,6 +508,7 @@ impl Pipeline {
         self.note_download_activity(result.job_id);
         self.publish_active_stage_metrics();
         let actual_raw_bytes = match &result.data {
+            #[cfg(test)]
             Ok(DownloadPayload::Raw(raw)) => Some(raw.len() as u64),
             Ok(DownloadPayload::Decoded(decoded)) => Some(decoded.raw_size),
             Err(DownloadError::Decode { raw_size, .. } | DownloadError::Local { raw_size, .. }) => {
@@ -505,6 +531,7 @@ impl Pipeline {
 
     pub(crate) fn released_download_result_lead_bytes(result: &DownloadResult) -> u64 {
         match &result.data {
+            #[cfg(test)]
             Ok(DownloadPayload::Raw(bytes)) => bytes.len() as u64,
             Ok(DownloadPayload::Decoded(decoded)) => decoded.data.len_bytes() as u64,
             Err(_) => 0,
@@ -592,11 +619,7 @@ impl Pipeline {
 
     async fn process_download_done_inner(&mut self, result: DownloadResult) {
         let job_id = result.job_id;
-        if self
-            .jobs
-            .get(&job_id)
-            .is_none_or(|state| is_terminal_status(&state.status))
-        {
+        if !self.job_takes_results(job_id) {
             debug!(
                 job_id = job_id.0,
                 segment = %result.segment_id,
@@ -734,6 +757,7 @@ impl Pipeline {
         }
 
         match result.data {
+            #[cfg(test)]
             Ok(DownloadPayload::Raw(raw)) => {
                 // Empty unless something is failing: skip the hash per article.
                 if !self.transport_failure_streaks.is_empty() {
@@ -855,7 +879,7 @@ impl Pipeline {
                         error = %failure.message,
                         "NNTP BODY fetch failed"
                     );
-                    crate::runtime::job_debug_ring::dump(job_id.0, "NNTP BODY fetch failed");
+                    self.dump_job_debug_ring(job_id, "NNTP BODY fetch failed");
                 }
                 if failure.kind == DownloadFailureKind::ServerQuota {
                     let mut retry_after = failure.retry_after;
@@ -1062,8 +1086,8 @@ impl Pipeline {
                                 error = %failure.message,
                                 "downloads waiting: local BODY lane capacity is saturated; a server is eligible and the work retries as lanes free"
                             );
-                            crate::runtime::job_debug_ring::dump(
-                                job_id.0,
+                            self.dump_job_debug_ring(
+                                job_id,
                                 "downloads waiting: local BODY lane capacity is saturated",
                             );
                         }
@@ -1082,8 +1106,8 @@ impl Pipeline {
                             error = %failure.message,
                             "downloads waiting: no eligible news server (cooling down, disabled, or outside retention); check server health and credentials"
                         );
-                        crate::runtime::job_debug_ring::dump(
-                            job_id.0,
+                        self.dump_job_debug_ring(
+                            job_id,
                             "downloads waiting: no eligible news server",
                         );
                     }
@@ -1175,18 +1199,16 @@ impl Pipeline {
                     };
                 let source_not_found = failure.kind == DownloadFailureKind::ArticleNotFound
                     && article_not_found_server_idx.is_some();
-                // A server refusing the credentials has answered for the
-                // article just as a 430 does: it leaves the article's
-                // candidates, and the retry goes to a server that may still
-                // serve it, if one remains.
+                // A server refusing the credentials leaves the article's
+                // candidates through the pool's refusal, not through the
+                // article's exclusions: those record servers that lack the
+                // article, and a fill server listed there would open the
+                // backfill tier to an article no fill server has missed.
                 let retry_exclude_servers = match failure.kind {
                     DownloadFailureKind::ArticleNotFound => Self::decode_retry_exclude_servers(
                         &excluded_servers,
                         article_not_found_server_idx,
                     ),
-                    DownloadFailureKind::Auth => {
-                        Self::decode_retry_exclude_servers(&excluded_servers, source_server_idx)
-                    }
                     _ => excluded_servers.clone(),
                 };
                 // A 430 from a server the article already excluded taught
@@ -1257,14 +1279,18 @@ impl Pipeline {
                 };
 
                 if article_not_found_exhausted {
-                    self.metrics
-                        .articles_not_found
-                        .fetch_add(1, Ordering::Relaxed);
-                    self.send_segment_event(|| PipelineEvent::ArticleNotFound {
-                        segment_id: result.segment_id,
-                    });
-                    if self.book_failed_segment(result.segment_id) {
-                        self.note_gap_servers_support_fact(job_id, &retry_exclude_servers);
+                    // Every server is missing the id in use: the article moves
+                    // to its next id, or with every id spent is booked missing.
+                    if !self.spend_message_id(result.segment_id) {
+                        self.metrics
+                            .articles_not_found
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.send_segment_event(|| PipelineEvent::ArticleNotFound {
+                            segment_id: result.segment_id,
+                        });
+                        if self.book_failed_segment(result.segment_id) {
+                            self.note_gap_servers_support_fact(job_id, &retry_exclude_servers);
+                        }
                     }
                 } else if credentials_exhausted {
                     self.book_unservable_segment(result.segment_id, &retry_exclude_servers);
@@ -1330,7 +1356,9 @@ impl Pipeline {
                             let work = DownloadWork {
                                 counters: None,
                                 segment_id: seg_id,
-                                message_id: crate::jobs::ids::MessageId::new(&seg_spec.message_id),
+                                message_id: crate::jobs::ids::MessageId::new(
+                                    seg_spec.message_ids.in_use(),
+                                ),
                                 groups: std::sync::Arc::from(file_spec.groups.as_slice()),
                                 priority,
                                 byte_estimate: seg_spec.bytes,

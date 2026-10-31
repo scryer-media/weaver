@@ -103,7 +103,7 @@ fn job(status: JobStatus) -> JobInfo {
             weaver_server_core::RunState::Active,
             None,
         ),
-        JobStatus::Complete => (
+        JobStatus::Complete | JobStatus::Partial => (
             weaver_server_core::DownloadState::Complete,
             weaver_server_core::PostState::Completed,
             weaver_server_core::RunState::Active,
@@ -144,6 +144,7 @@ fn job(status: JobStatus) -> JobInfo {
         total_files: 0,
         completed_files: 0,
         remaining_par_files: 0,
+        file_remaining_bytes: Vec::new(),
         password: None,
         category: None,
         metadata: Vec::new(),

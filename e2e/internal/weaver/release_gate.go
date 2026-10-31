@@ -82,6 +82,16 @@ type weaverReleaseFlowSpec struct {
 }
 
 var weaverReleaseFlowSpecs = []weaverReleaseFlowSpec{
+	// The flow queue is drained in table order, so the slowest flows lead: the
+	// advanced networking partitions each bring up their own proxy and tunnel
+	// stacks and run longest, and starting them first keeps the tail of a run
+	// short instead of leaving one of them running alone at the end.
+	advancedNetworkingPartition("egress", []string{"network-egress.spec.ts", "network-legs.spec.ts", "network-reload.spec.ts"}, true),
+	advancedNetworkingPartition("routes", []string{"network-ladders.spec.ts", "network-sessions.spec.ts", "network-rss.spec.ts"}, false),
+	advancedNetworkingPartition("pools", []string{"network-pools.spec.ts"}, false),
+	advancedNetworkingPartition("pool-reselection", []string{"network-pools.spec.ts"}, false),
+	advancedNetworkingNoNetRawReleaseFlow(),
+	advancedNetworkingExtendedReleaseFlow(),
 	browserReleaseFlow("ui-settings-crud", 6*time.Minute),
 	browserReleaseFlow("ui-security", 6*time.Minute),
 	ingressReleaseFlow(),
@@ -157,13 +167,7 @@ var weaverReleaseFlowSpecs = []weaverReleaseFlowSpec{
 		Artifacts:  []string{"flow.log", "status.json", "fake-nntp-counters.json"},
 		Timeout:    12 * time.Minute,
 	},
-	advancedNetworkingPartition("egress", []string{"network-egress.spec.ts", "network-legs.spec.ts", "network-reload.spec.ts"}, true),
-	advancedNetworkingPartition("routes", []string{"network-ladders.spec.ts", "network-sessions.spec.ts", "network-rss.spec.ts"}, false),
-	advancedNetworkingPartition("pools", []string{"network-pools.spec.ts"}, false),
-	advancedNetworkingPartition("pool-reselection", []string{"network-pools.spec.ts"}, false),
 	speedTestReleaseFlow(),
-	advancedNetworkingNoNetRawReleaseFlow(),
-	advancedNetworkingExtendedReleaseFlow(),
 	eventScriptsReleaseFlow(),
 	postProcessingScriptsReleaseFlow(),
 	schedulingReleaseFlow(),
@@ -217,7 +221,6 @@ func defaultWeaverReleaseArtifacts() []string {
 		"fake-nntp-counters.json",
 		"html-report",
 		"trace.zip",
-		"failure-video",
 		"screenshots",
 	}
 }
@@ -2383,7 +2386,7 @@ func runWeaverReleasePlaywright(ctx context.Context, script string) error {
 const weaverReleaseFlowDeadlineEnv = "E2E_WEAVER_RELEASE_FLOW_DEADLINE"
 
 // weaverReleaseFlowWindup is what a flow needs after Playwright stops:
-// Playwright writing traces, videos and its report, the container exiting,
+// Playwright writing traces and its report, the container exiting,
 // and the flow capturing diagnostics and tearing its stack down.
 const weaverReleaseFlowWindup = 90 * time.Second
 
@@ -2394,7 +2397,7 @@ const weaverPlaywrightBudgetEnv = "E2E_WEAVER_PLAYWRIGHT_BUDGET_MS"
 
 // weaverReleasePlaywrightBudget is how long Playwright may run so that the
 // flow still winds up before the gate's kill. A killed Playwright leaves no
-// trace, video or report, so a stuck test must end through Playwright's own
+// trace or report, so a stuck test must end through Playwright's own
 // timeouts instead. ok is false when no deadline was passed down.
 func weaverReleasePlaywrightBudget(now time.Time, getenv func(string) string) (budget time.Duration, ok bool, err error) {
 	value := strings.TrimSpace(getenv(weaverReleaseFlowDeadlineEnv))

@@ -1,0 +1,14 @@
+{
+  "slug": "adv-par2-lie-length-long",
+  "title": "E2E.Adversarial.Par2.Lie.Length.Long.2026-TESTGRP",
+  "description": "An intact payload beside a PAR2 set with a false long length. Delivery, including PARTIAL after rejected recovery metadata, must preserve the exact payload bytes; FAILED must name the refusal and publish none.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "default",
+    "outcome": "settles"
+  },
+  "expectedOutputBLAKE3": {
+    "lie-payload.bin": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c"
+  }
+}

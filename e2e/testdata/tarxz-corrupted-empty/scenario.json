@@ -1,0 +1,14 @@
+{
+  "slug": "tarxz-corrupted-empty",
+  "title": "E2E.Test.tarxz.corrupted.empty.2026-TESTGRP",
+  "description": "Valid XZ wraps a TAR with its first header damaged. No usable file exists, so the outcome must be Failed.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "expectedRetainedOutputBLAKE3": {
+    "bundle.tar": "cf6428b6c8fb21416d279f44f4665311af9ae64e608faaae2eb552244afc7464"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks",
+    "second.bin"
+  ]
+}

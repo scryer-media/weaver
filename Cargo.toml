@@ -9,6 +9,8 @@ members = [
     "engines/weaver-tunnel",
     "engines/weaver-nzb",
     "engines/weaver-yenc",
+    "engines/weaver-graph",
+    "engines/weaver-objects",
 ]
 exclude = ["fuzz"]
 resolver = "2"
@@ -85,6 +87,7 @@ rand = { version = "0.10", default-features = false, features = ["std", "std_rng
 regex = { version = "1.13", default-features = false, features = ["std", "perf", "unicode"] }
 ipnet = { version = "2.12", default-features = false, features = ["std"] }
 unicode-normalization = { version = "0.1.25", default-features = false }
+aho-corasick = { version = "1.1.5", default-features = false, features = ["std", "perf-literal"] }
 tar = { version = "0.4", default-features = false }
 cap-std = { version = "4", default-features = false }
 cap-fs-ext = { version = "4", default-features = false, features = ["std"] }
@@ -115,7 +118,7 @@ windows-sys = { version = "0.61", default-features = false }
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
 # Authenticated recovery scanning and source-change handling.
-par2-rs = { version = "=0.10.13", default-features = false, features = ["crypto-aws-lc"] }
+par2-rs = { version = "=0.11.0", default-features = false, features = ["crypto-aws-lc"] }
 # Native PAR3 verification and repair; shares CPU arithmetic with PAR2.
 # 0.4.1 is a floor, not just a preference: before it, a session alone on the
 # budget that could not fit its own admitted packets was reported as peer
@@ -160,7 +163,11 @@ par3-rs = { version = "=0.8.1", default-features = false }
 # router clones a member's key where it hands one on.
 # 0.14.1, with par2-rs 0.10.13, hashes through crc-turbo and drops crc-fast and
 # the `RARPAR_CRC32_VPCLMUL` override; `CRC_TURBO_TIER` pins the tier instead.
-unrar-rs = { version = "0.14.1", default-features = false, features = ["crypto-aws-lc"] }
+# 0.14.3 states a split member's checksum only once its final part's header
+# has been read, and an extraction merges the continuation headers it read.
+# 0.15.0 states a RAR5 member's hash-MAC flag, opens `rar rc`-rebuilt RAR4 -hp
+# volumes, and chains continuation volumes by split header, not by name.
+unrar-rs = { version = "0.15.0", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]
@@ -268,8 +275,10 @@ opt-level = 3
 [profile.matrix]
 inherits = "test"
 opt-level = 3
-debug-assertions = true
-overflow-checks = true
+debug-assertions = false
+overflow-checks = false
+codegen-units = 2
+lto = "thin"
 
 # Rarpar crates normally use crates.io; the PAR2 revision above is a temporary
 # pin to the authenticated-scanner and source-change fixes.

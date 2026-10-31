@@ -30,6 +30,7 @@ pub use context::{
     SchemaContext, SystemRuntimeContext, WeaverSchema, build_schema, export_schema_sdl,
 };
 pub use history::types::*;
+pub use jobs::release_display::release_display_names;
 pub use jobs::scheduled_resume::{ScheduledResumeCoordinator, ScheduledResumeError};
 pub use jobs::types::*;
 pub use observability::{TestDbTaskHookGuard, install_test_db_task_hook};

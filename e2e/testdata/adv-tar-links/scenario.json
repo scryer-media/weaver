@@ -1,0 +1,21 @@
+{
+  "slug": "adv-tar-links",
+  "title": "E2E.Adversarial.Tar.Links.2026-TESTGRP",
+  "description": "A ustar archive with a symlink and a hardlink pointing outside the root, a directory symlink to /tmp, and a regular file written through the directory symlink's name. Links are skipped, so the file lands in a real directory under the output and no link is delivered.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "escapeNames": [
+      "../../../../adv-symlink-target.txt"
+    ],
+    "escapePaths": [
+      "/tmp/adv-through-link.txt"
+    ]
+  },
+  "expectedOutputBLAKE3": {
+    "links/dir-link/adv-through-link.txt": "79cdca8161fd945fdb3fb47df8996ef6032e9956cc251cbabfafb5c0f78dc9ca",
+    "links/payload.txt": "d756864f4f1dac0f4b3c8bdcea50b917b43520fc0f945f74598dd3173fae3483"
+  }
+}

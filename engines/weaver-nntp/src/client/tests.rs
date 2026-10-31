@@ -8,6 +8,8 @@ use crate::test_support::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+mod strict_priority;
+
 struct ScriptStep {
     expect_prefix: Option<&'static str>,
     response: &'static [u8],
@@ -25,44 +27,6 @@ impl ScriptedStep for ScriptStep {
 
 async fn spawn_scripted_server(steps: Vec<ScriptStep>) -> u16 {
     spawn_shared_scripted_server(steps, Duration::ZERO).await
-}
-
-async fn spawn_trickling_body_server(line_delay: Duration) -> u16 {
-    const LINE: &[u8] = b"kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\r\n";
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        socket.write_all(b"200 ready\r\n").await.unwrap();
-
-        let capabilities = read_command_line(&mut socket).await;
-        assert!(capabilities.starts_with("CAPABILITIES"));
-        socket
-            .write_all(b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n")
-            .await
-            .unwrap();
-
-        let body = read_command_line(&mut socket).await;
-        assert!(body.starts_with("BODY "));
-        socket
-            .write_all(b"222 1 <trickle@example.com>\r\n=ybegin line=128 size=2560 name=x\r\n")
-            .await
-            .unwrap();
-        socket.flush().await.unwrap();
-
-        // The body never ends: only the client's soft timeout can end the
-        // read, however slowly the client runs.
-        loop {
-            tokio::time::sleep(line_delay).await;
-            if socket.write_all(LINE).await.is_err() || socket.flush().await.is_err() {
-                return;
-            }
-        }
-    });
-
-    port
 }
 
 // Answers a BODY with nothing at all, holding the session open until the
@@ -1009,6 +973,70 @@ async fn all_async_fetch_families_keep_capacity_rejections_out_of_health() {
     server.abort();
 }
 
+// A dial the provider declined is paced by the holdoff alone. A lane asked
+// for on that server inside the window learns it is over its limit, not
+// that it is recovering, and nothing dials it again.
+#[tokio::test]
+async fn declined_dial_holds_blocking_lanes_on_the_holdoff() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accepted_by_server = Arc::clone(&accepted);
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            accepted_by_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let _ = socket.write_all(b"502 Too Many Connections\r\n").await;
+            });
+        }
+    });
+    let client = NntpClient::new(NntpClientConfig::single(
+        ServerConfig {
+            host: "127.0.0.1".into(),
+            port,
+            tls: false,
+            ..Default::default()
+        },
+        4,
+    ));
+
+    assert!(matches!(
+        client.pool().acquire(ServerId(0)).await,
+        Err(NntpError::TooManyConnections)
+    ));
+    assert!(client.pool().is_over_limit(ServerId(0)));
+    assert!(matches!(
+        client.pool().acquire(ServerId(0)).await,
+        Err(NntpError::ServerOverLimit { .. })
+    ));
+    let client = tokio::task::spawn_blocking(move || {
+        for _ in 0..4 {
+            let Err(error) = client.try_acquire_blocking_body_lane(&[], &[]) else {
+                panic!("a held-off server must not open a lane");
+            };
+            assert!(
+                matches!(
+                    error,
+                    BlockingBodyLaneAcquireError::ProviderCapacity(
+                        NntpError::ServerOverLimit { .. }
+                    )
+                ),
+                "{error:?}"
+            );
+        }
+        client
+    })
+    .await
+    .unwrap();
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        client.pool().health().lock().await.server(0).failure_count,
+        0
+    );
+    server.abort();
+}
+
 #[tokio::test]
 async fn blocking_tls_capacity_rejection_parks_connects_without_health_poisoning() {
     let client = NntpClient::new(NntpClientConfig {
@@ -1215,6 +1243,7 @@ fn multi_server_client(server_count: usize) -> NntpClient {
 
     NntpClient {
         pool: Arc::new(pool),
+        work_guard: None,
         max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
     }
@@ -1726,6 +1755,38 @@ async fn quota_blocked_fill_does_not_unlock_or_report_locked_backfill() {
     assert!(selection.quota_blocked.is_none());
 }
 
+// The pipeline asks this on every article it takes, so it reads what each
+// quota published and never takes a quota's lock; the answer is the one the
+// quotas' snapshots give.
+#[tokio::test]
+async fn all_fill_quota_blocked_reads_published_state_without_locking() {
+    let client = quota_selection_client(&[false, false, true], &[(0, None), (1, None)]);
+    let controls: Vec<_> = (0..2)
+        .map(|idx| client.pool.server_transfer_control(ServerId(idx)).unwrap())
+        .collect();
+    let locks_before: Vec<u64> = controls
+        .iter()
+        .map(|control| control.snapshot_lock_count())
+        .collect();
+
+    assert!(client.all_normal_fill_servers_quota_blocked());
+
+    let locks_after: Vec<u64> = controls
+        .iter()
+        .map(|control| control.snapshot_lock_count())
+        .collect();
+    assert_eq!(locks_after, locks_before, "no quota lock per article");
+    assert!(
+        controls
+            .iter()
+            .all(|control| control.snapshot().quota_blocked)
+    );
+
+    // One fill with room left: not every fill is blocked.
+    let client = quota_selection_client(&[false, false], &[(0, None)]);
+    assert!(!client.all_normal_fill_servers_quota_blocked());
+}
+
 #[tokio::test]
 async fn backfill_server_absent_from_ordinary_order() {
     let client = tiered_client(&[false, false, true]);
@@ -1777,12 +1838,10 @@ async fn cooling_fill_server_keeps_backfill_locked_and_order_empty() {
     );
 }
 
-// A `Disabled` fill server never produces the 430 that would put it in
-// `exclude`, so backfill has to unlock on the health state instead.
-// Without this, an article the remaining fill servers do not have is
-// pinned out of backfill for as long as the auth failure lasts.
+// A fill server refusing this pool's credentials is not one that lacks the
+// article: backfill stays locked, and the article waits for the fill tier.
 #[tokio::test]
-async fn disabled_fill_server_unlocks_backfill() {
+async fn credentials_refusing_fill_server_keeps_backfill_locked() {
     let client = tiered_client(&[false, false, true]);
 
     // Server 0: auth failure => Disabled { AuthFailure }.
@@ -1791,12 +1850,8 @@ async fn disabled_fill_server_unlocks_backfill() {
     // Server 1: missed the article, so it is on the exclusion ladder.
     let order = client.build_server_order(&[1]).await;
     assert!(
-        order.contains(&2),
-        "an auth-disabled fill server must unlock backfill: {order:?}"
-    );
-    assert!(
-        !order.contains(&0),
-        "the disabled server itself must not be ordered: {order:?}"
+        order.is_empty(),
+        "a fill server refusing credentials must not unlock backfill: {order:?}"
     );
 }
 
@@ -1856,9 +1911,10 @@ async fn cooling_fill_server_keeps_backfill_locked_with_peers_excluded() {
     );
 }
 
-// The owned blocking lane runs the same tiering rule off a `try_lock`.
+// The owned blocking lane runs the same tiering rule: a fill server refusing
+// credentials or cooling down never opens the backfill tier.
 #[tokio::test]
-async fn blocking_selection_unlocks_backfill_for_a_disabled_fill_server() {
+async fn blocking_selection_keeps_backfill_locked_for_an_unavailable_fill_server() {
     let client = tiered_client(&[false, false, true]);
 
     client.pool.health().lock().await.record_failure(0, true);
@@ -1866,10 +1922,10 @@ async fn blocking_selection_unlocks_backfill_for_a_disabled_fill_server() {
     let selection = client
         .try_blocking_body_server_selection(&[1], 0, QuotaCheck::Dispatch)
         .expect("the health state is uncontended in this test");
-    assert_eq!(
-        selection.eligible,
-        vec![ServerId(2)],
-        "owned lane must reach backfill when the fill tier is disabled"
+    assert!(
+        selection.eligible.is_empty(),
+        "owned lane must not spill a credentials refusal onto backfill: {:?}",
+        selection.eligible
     );
 
     let cooling = tiered_client(&[false, false, true]);
@@ -2238,68 +2294,7 @@ async fn deliberate_rate_wait_does_not_trip_decoded_soft_timeout_or_health() {
 }
 
 #[tokio::test]
-async fn remote_trickle_consumes_active_budget_and_fails_over() {
-    let primary_port = spawn_trickling_body_server(Duration::from_millis(20)).await;
-    let mut backup_response =
-        b"222 1 <trickle@example.com>\r\n=ybegin line=128 size=128 name=x\r\n".to_vec();
-    backup_response.extend(std::iter::repeat_n(b'k', 128));
-    backup_response.extend_from_slice(b"\r\n=yend size=128\r\n.\r\n");
-    let backup_response: &'static [u8] = Box::leak(backup_response.into_boxed_slice());
-    let backup_port = spawn_scripted_server(vec![
-        ScriptStep {
-            expect_prefix: None,
-            response: b"200 ready\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("CAPABILITIES"),
-            response: b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n",
-        },
-        ScriptStep {
-            expect_prefix: Some("BODY "),
-            response: backup_response,
-        },
-    ])
-    .await;
-
-    let client = NntpClient::new(NntpClientConfig {
-        servers: vec![
-            scripted_server(primary_port, 0),
-            scripted_server(backup_port, 1),
-        ],
-        max_idle_age: Duration::from_secs(300),
-        max_retries_per_server: 0,
-        soft_timeout: Duration::from_millis(75),
-    });
-
-    let trace = client
-        .fetch_body_decoded_with_groups_traced("<trickle@example.com>", &[])
-        .await;
-    let decoded = trace.result.expect("backup should satisfy the BODY fetch");
-    assert_eq!(decoded.decoded.concat(), vec![b'A'; 128]);
-    assert_eq!(trace.attempts.len(), 2);
-    assert_eq!(
-        trace.attempts[0].outcome,
-        FetchAttemptOutcome::TransientFailure
-    );
-    assert!(
-        trace.attempts[0]
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("soft timeout"))
-    );
-    assert_eq!(trace.attempts[1].outcome, FetchAttemptOutcome::Success);
-    let health = client.pool.health().lock().await;
-    let primary = health.server(0);
-    assert!(matches!(
-        primary.state(),
-        crate::health::ServerState::Healthy
-    ));
-    assert_eq!(primary.failure_count, 1);
-    assert_eq!(primary.consecutive_failures, 1);
-}
-
-#[tokio::test]
-async fn delayed_body_initial_consumes_active_budget_and_fails_over() {
+async fn delayed_body_initial_consumes_active_budget_without_unlocking_a_healthy_lower_group() {
     let primary_port = spawn_delayed_body_initial_server().await;
     let backup_port = spawn_scripted_server(vec![
         ScriptStep {
@@ -2330,19 +2325,21 @@ async fn delayed_body_initial_consumes_active_budget_and_fails_over() {
         .fetch_body_decoded_with_groups_traced("<delayed@example.com>", &[])
         .await;
 
-    assert_eq!(trace.result.unwrap().decoded.concat(), vec![b'A']);
-    assert_eq!(trace.attempts.len(), 2);
+    assert!(matches!(
+        trace.result,
+        Err(DecodedBodyError::Nntp(NntpError::SoftTimeout(_)))
+    ));
+    assert_eq!(trace.attempts.len(), 1);
     assert!(
         trace.attempts[0]
             .error
             .as_deref()
             .is_some_and(|error| error.contains("soft timeout"))
     );
-    assert_eq!(trace.attempts[1].outcome, FetchAttemptOutcome::Success);
 }
 
 #[tokio::test]
-async fn delayed_reauth_consumes_active_budget_and_fails_over() {
+async fn delayed_reauth_consumes_active_budget_without_unlocking_a_healthy_lower_group() {
     let primary_port = spawn_delayed_reauth_server().await;
     let backup_port = spawn_scripted_server(vec![
         ScriptStep {
@@ -2373,15 +2370,17 @@ async fn delayed_reauth_consumes_active_budget_and_fails_over() {
         .fetch_body_decoded_with_groups_traced("<reauth@example.com>", &[])
         .await;
 
-    assert_eq!(trace.result.unwrap().decoded.concat(), vec![b'A']);
-    assert_eq!(trace.attempts.len(), 2);
+    assert!(matches!(
+        trace.result,
+        Err(DecodedBodyError::Nntp(NntpError::SoftTimeout(_)))
+    ));
+    assert_eq!(trace.attempts.len(), 1);
     assert!(
         trace.attempts[0]
             .error
             .as_deref()
             .is_some_and(|error| error.contains("soft timeout"))
     );
-    assert_eq!(trace.attempts[1].outcome, FetchAttemptOutcome::Success);
 }
 
 #[tokio::test]
@@ -2432,8 +2431,8 @@ async fn raw_timeout_cleanup_preserves_rate_debt_without_waiting() {
         )
         .await;
 
-    assert_eq!(trace.result.unwrap().as_ref(), b"backup\r\n");
-    assert_eq!(trace.attempts.len(), 2);
+    assert!(matches!(trace.result, Err(NntpError::SoftTimeout(_))));
+    assert_eq!(trace.attempts.len(), 1);
     assert!(
         trace.attempts[0]
             .error
@@ -2820,6 +2819,7 @@ async fn build_server_order_keeps_backfill_after_primary_group() {
 
     let client = NntpClient {
         pool: Arc::new(pool),
+        work_guard: None,
         max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
     };
@@ -2857,6 +2857,7 @@ async fn build_server_order_prefers_ready_servers_within_same_group() {
 
     let client = NntpClient {
         pool: Arc::new(pool),
+        work_guard: None,
         max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
     };

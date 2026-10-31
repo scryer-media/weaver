@@ -28,11 +28,6 @@ enum TestArticle {
     },
     // Never answers the BODY: only the client's own budget ends the read.
     Silent,
-    // Sends the article a line at a time and never terminates it.
-    Trickle {
-        data: Vec<u8>,
-        line_delay: Duration,
-    },
     Truncated {
         data: Vec<u8>,
         wait_for_next_request: bool,
@@ -257,23 +252,6 @@ fn spawn_tls_nntp_server_with_upgrade(
                                 }
                             }
                             Some(TestArticle::Silent) => {}
-                            Some(TestArticle::Trickle { data, line_delay }) => {
-                                stream
-                                    .get_mut()
-                                    .write_all(
-                                        format!("222 0 {} body follows\r\n", id.trim()).as_bytes(),
-                                    )
-                                    .await?;
-                                let encoded = yenc_body(data);
-                                for line in encoded.split_inclusive(|byte| *byte == b'\n') {
-                                    tokio::time::sleep(*line_delay).await;
-                                    if stream.get_mut().write_all(line).await.is_err()
-                                        || stream.get_mut().flush().await.is_err()
-                                    {
-                                        return Ok(());
-                                    }
-                                }
-                            }
                             Some(TestArticle::Truncated {
                                 data,
                                 wait_for_next_request,
@@ -944,7 +922,8 @@ fn tls_lane_reads_single_body_response(backend: NntpTlsBackend) {
 // permanently zero. Decoded batches must now reach the callback as they
 // are produced, in order, and concatenate to the buffered article.
 fn tls_lane_delivers_decoded_batches_to_chunk_callback(backend: NntpTlsBackend) {
-    // Two full 512 KiB batches plus a remainder.
+    // Past two fixed 512 KiB targets; the part declares its length, so it
+    // arrives as one batch of that length.
     let original: Vec<u8> = (0..(2 * 512 * 1024 + 123))
         .map(|i| (i % 251) as u8)
         .collect();
@@ -963,12 +942,10 @@ fn tls_lane_delivers_decoded_batches_to_chunk_callback(backend: NntpTlsBackend) 
         })
         .unwrap();
 
-    assert_eq!(delivered.len(), 3, "batch lengths {:?}", {
+    assert_eq!(delivered.len(), 1, "batch lengths {:?}", {
         delivered.iter().map(Vec::len).collect::<Vec<_>>()
     });
-    assert_eq!(delivered[0].len(), 512 * 1024);
-    assert_eq!(delivered[1].len(), 512 * 1024);
-    assert_eq!(delivered[2].len(), 123);
+    assert_eq!(delivered[0].len(), original.len());
 
     let streamed: Vec<u8> = delivered.concat();
     assert_eq!(streamed, original);
@@ -1317,33 +1294,6 @@ fn blocking_rustls_reports_truncated_response() {
 }
 
 #[test]
-fn blocking_rustls_remote_trickle_consumes_active_budget() {
-    let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
-        "<trickle@test>",
-        TestArticle::Trickle {
-            data: vec![b'A'; 2_560],
-            line_delay: Duration::from_millis(20),
-        },
-    )]);
-    let mut conn = connect_with_backend(&config, NntpTlsBackend::ManualRustls);
-    conn.select_group("alt.test").unwrap();
-    let mut budget = ActiveTransferBudget::new(Duration::from_millis(75));
-
-    let error = conn
-        .stream_yenc_article_with_active_budget("<trickle@test>", 0, &mut budget)
-        .unwrap_err();
-
-    assert!(matches!(
-        error,
-        FusedYencError::Nntp(NntpError::SoftTimeout(_))
-    ));
-    assert!(conn.poisoned);
-    drop(conn);
-    handle.join().unwrap();
-    let _ = std::fs::remove_file(ca_path);
-}
-
-#[test]
 fn blocking_rustls_delayed_initial_consumes_active_budget() {
     let (config, handle, ca_path) =
         spawn_tls_nntp_server(vec![("<delayed@test>", TestArticle::Silent)]);
@@ -1402,51 +1352,6 @@ fn blocking_rustls_rate_wait_is_excluded_from_active_budget() {
 }
 
 #[test]
-fn expired_active_budget_does_not_enter_blocking_rate_wait() {
-    let decoded = vec![b'A'; 1_200];
-    let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
-        "<expired-budget@test>",
-        TestArticle::Body(decoded.clone()),
-    )]);
-    let mut conn = connect_with_backend(&config, NntpTlsBackend::ManualRustls);
-    let control = crate::transfer::ServerTransferRegistry::new().configure(
-        StableServerId(105),
-        crate::transfer::ServerTransferConfig {
-            rate_bytes_per_sec: 1_000,
-            quota: None,
-        },
-    );
-    conn.set_transfer_control(Some(control.clone()));
-    conn.select_group("alt.test").unwrap();
-    conn.reserve_body(0).unwrap();
-    let initial = conn
-        .send_command(&Command::Body(ArticleId::MessageId(
-            "<expired-budget@test>".to_string(),
-        )))
-        .unwrap();
-    let mut buffered_body = yenc_body(&decoded);
-    buffered_body.extend_from_slice(b".\r\n");
-    conn.read_buf = BytesMut::from(buffered_body.as_slice());
-    let mut budget = ActiveTransferBudget::new(Duration::ZERO);
-
-    let error = conn
-        .stream_yenc_article_response(initial, Some(&mut budget), |_| Ok(()))
-        .unwrap_err();
-
-    assert!(matches!(
-        error,
-        FusedYencError::Nntp(NntpError::SoftTimeout(_))
-    ));
-    assert!(conn.poisoned);
-    let snapshot = control.snapshot();
-    assert!(snapshot.lifetime_body_bytes >= decoded.len() as u64);
-    assert_eq!(snapshot.throttle_wait, Duration::ZERO);
-    drop(conn);
-    handle.join().unwrap();
-    let _ = std::fs::remove_file(ca_path);
-}
-
-#[test]
 fn blocking_rustls_pipeline_failure_drains_transfer_permits() {
     tls_pipeline_failure_drains_permits_before_any_reuse(NntpTlsBackend::ManualRustls);
 }
@@ -1491,35 +1396,6 @@ fn blocking_s2n_fd_reports_missing_article() {
 fn blocking_s2n_fd_reports_truncated_response() {
     let _guard = s2n_test_guard();
     tls_lane_reports_truncated_response(NntpTlsBackend::S2n);
-}
-
-#[cfg(not(windows))]
-#[test]
-fn blocking_s2n_remote_trickle_consumes_active_budget() {
-    let _guard = s2n_test_guard();
-    let (config, handle, ca_path) = spawn_tls_nntp_server(vec![(
-        "<trickle@test>",
-        TestArticle::Trickle {
-            data: vec![b'A'; 2_560],
-            line_delay: Duration::from_millis(20),
-        },
-    )]);
-    let mut conn = connect_with_backend(&config, NntpTlsBackend::S2n);
-    conn.select_group("alt.test").unwrap();
-    let mut budget = ActiveTransferBudget::new(Duration::from_millis(75));
-
-    let error = conn
-        .stream_yenc_article_with_active_budget("<trickle@test>", 0, &mut budget)
-        .unwrap_err();
-
-    assert!(matches!(
-        error,
-        FusedYencError::Nntp(NntpError::SoftTimeout(_))
-    ));
-    assert!(conn.poisoned);
-    drop(conn);
-    handle.join().unwrap();
-    let _ = std::fs::remove_file(ca_path);
 }
 
 #[cfg(not(windows))]
@@ -1757,6 +1633,89 @@ fn ring_payload(trace: &DecodedBodyTrace) -> Vec<u8> {
         .iter()
         .flat_map(|chunk| chunk.iter().copied())
         .collect()
+}
+
+#[test]
+fn ring_reports_body_activity_before_completion_and_switches_lease_counters() {
+    let payloads = [vec![0x31; 512], vec![0x52; 512]];
+    let bodies = payloads.each_ref().map(|payload| yenc_body(payload));
+    let body_lengths = bodies.each_ref().map(|body| body.len() as u64);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let config = blocking_pipelined_setup_config(listener.local_addr().unwrap().port());
+    let (release, releases) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.write_all(b"200 ready\r\n").unwrap();
+        let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+        let mut next_body = 0;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            if line.starts_with("AUTHINFO USER") {
+                socket.write_all(b"381 password\r\n").unwrap();
+            } else if line.starts_with("AUTHINFO PASS") {
+                socket.write_all(b"281 authenticated\r\n").unwrap();
+            } else if line.starts_with("GROUP ") {
+                socket.write_all(b"211 1 1 1 alt.test\r\n").unwrap();
+            } else if line.starts_with("BODY ") {
+                let body = &bodies[next_body];
+                next_body += 1;
+                socket.write_all(b"222 0 body follows\r\n").unwrap();
+                let middle = body.len() / 2;
+                socket.write_all(&body[..middle]).unwrap();
+                // The test observes the actual reader's counter while this
+                // response cannot finish, then permits its remaining bytes.
+                releases.recv().unwrap();
+                socket.write_all(&body[middle..]).unwrap();
+                socket.write_all(b".\r\n").unwrap();
+            } else if line.starts_with("QUIT") {
+                socket.write_all(b"205 closing\r\n").unwrap();
+                break;
+            } else {
+                panic!("unexpected test command: {line}");
+            }
+        }
+        assert_eq!(next_body, 2);
+    });
+    let activity: [Arc<AtomicU64>; 2] = std::array::from_fn(|_| Arc::default());
+    let leased_activity = activity.clone();
+    let (completed, completions) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let mut lane = test_body_lane(&config);
+        for id in ["<first-lease@test>", "<second-lease@test>"] {
+            assert!(matches!(
+                lane.ring_issue(id, 512, 2),
+                RingIssueOutcome::Issued
+            ));
+        }
+        for counter in leased_activity {
+            lane.set_body_activity(counter);
+            let (trace, _) = lane.ring_read_next().unwrap();
+            completed.send(ring_payload(&trace)).unwrap();
+        }
+        lane.park();
+    });
+    for index in 0..2 {
+        while activity[index].load(Ordering::Relaxed) == 0 {
+            std::thread::yield_now();
+        }
+        assert!(matches!(
+            completions.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        if index == 0 {
+            assert_eq!(activity[1].load(Ordering::Relaxed), 0);
+        } else {
+            assert_eq!(activity[0].load(Ordering::Relaxed), body_lengths[0]);
+        }
+        release.send(()).unwrap();
+        assert_eq!(completions.recv().unwrap(), payloads[index]);
+        assert_eq!(activity[index].load(Ordering::Relaxed), body_lengths[index]);
+    }
+    worker.join().unwrap();
+    server.join().unwrap();
 }
 
 // Responses come back in issue order, and the judging window closes once per

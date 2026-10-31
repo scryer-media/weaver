@@ -216,11 +216,9 @@ async fn phase_end_removes_only_the_ended_phase_snapshot() {
     let job_id = JobId(99);
 
     pipeline.shared_state.queue.write(|inner| {
-        inner
-            .jobs
-            .push(crate::pipeline::queue::JobRow::new(finished_job_info(
-                job_id,
-            )));
+        inner.push_job(crate::pipeline::queue::JobRow::new(finished_job_info(
+            job_id,
+        )));
         crate::pipeline::queue::Change::changed(())
     });
     let repairing = pipeline.phase_begin(job_id, JobPhase::Repairing, Some(100));
@@ -257,135 +255,6 @@ async fn phase_end_removes_only_the_ended_phase_snapshot() {
             .unwrap()
             .phase_progress
             .is_empty()
-    );
-}
-
-#[tokio::test]
-async fn phase_end_extracting_if_idle_preserves_sibling_inflight_set() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(100);
-
-    pipeline.phase_begin(job_id, JobPhase::Extracting, Some(200));
-    pipeline
-        .inflight_extractions
-        .entry(job_id)
-        .or_default()
-        .insert("sibling-set".to_string());
-
-    pipeline.phase_end_extracting_if_idle(job_id);
-
-    assert!(
-        pipeline
-            .phase_progress
-            .contains_key(&(job_id, JobPhase::Extracting)),
-        "job-level extracting phase must stay live while any set is inflight"
-    );
-
-    pipeline.inflight_extractions.remove(&job_id);
-    pipeline.phase_end_extracting_if_idle(job_id);
-
-    assert!(
-        !pipeline
-            .phase_progress
-            .contains_key(&(job_id, JobPhase::Extracting)),
-        "extracting phase should end once all set and member work is idle"
-    );
-}
-
-#[tokio::test]
-async fn final_volume_refresh_heals_encrypted_multivolume_member_span_before_scheduling() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(40103);
-    let set_name = "video";
-    let member_name = "test_clip.mkv";
-    let files = vec![
-        (
-            "video.part001.rar".to_string(),
-            rar5_fixture_bytes("rar5_enc_mv_video.part1.rar"),
-        ),
-        (
-            "video.part002.rar".to_string(),
-            rar5_fixture_bytes("rar5_enc_mv_video.part2.rar"),
-        ),
-        (
-            "video.part003.rar".to_string(),
-            rar5_fixture_bytes("rar5_enc_mv_video.part3.rar"),
-        ),
-        (
-            "video.part004.rar".to_string(),
-            rar5_fixture_bytes("rar5_enc_mv_video.part4.rar"),
-        ),
-        (
-            "video.part005.rar".to_string(),
-            rar5_fixture_bytes("rar5_enc_mv_video.part5.rar"),
-        ),
-    ];
-    let mut spec = rar_job_spec("RAR Facts Heal Encrypted Fixture Span", &files);
-    spec.password = Some("testpass123".to_string());
-
-    insert_active_job(&mut pipeline, job_id, spec.clone()).await;
-
-    for (file_index, (filename, bytes)) in files.iter().enumerate().take(4) {
-        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
-            .await;
-    }
-
-    let cached_headers = pipeline
-        .load_rar_snapshot(job_id, set_name)
-        .expect("partial encrypted snapshot should exist after four volumes");
-    let mut cached = serde_json::to_value(
-        rmp_serde::from_slice::<unrar_rs::CachedArchiveHeaders>(&cached_headers).unwrap(),
-    )
-    .unwrap();
-    let members = cached["members"].as_array_mut().unwrap();
-    let clip = members
-        .iter_mut()
-        .find(|member| member["name"] == member_name)
-        .expect("cached snapshot should contain the encrypted clip member");
-    let first_segment = clip["segments"]
-        .as_array()
-        .and_then(|segments| segments.first())
-        .cloned()
-        .expect("encrypted clip should retain its first segment in the snapshot");
-    clip["segments"] = serde_json::json!([first_segment]);
-    clip["split_after"] = serde_json::json!(false);
-
-    let stale_headers = rmp_serde::to_vec(
-        &serde_json::from_value::<unrar_rs::CachedArchiveHeaders>(cached).unwrap(),
-    )
-    .unwrap();
-
-    pipeline
-        .rar_sets
-        .get_mut(&(job_id, set_name.to_string()))
-        .expect("RAR set state should exist after partial arrival")
-        .cached_headers = Some(stale_headers.clone());
-    pipeline
-        .db
-        .save_archive_headers(job_id, set_name, &stale_headers)
-        .unwrap();
-
-    write_and_complete_rar_volume(&mut pipeline, job_id, 4, &files[4].0, &files[4].1).await;
-
-    assert_eq!(
-        member_span(&pipeline, job_id, set_name, member_name),
-        Some((0, 4))
-    );
-
-    let volume_paths = pipeline.volume_paths_for_rar_set(job_id, set_name);
-    let selected = pipeline.volume_paths_for_rar_members(
-        job_id,
-        set_name,
-        &[member_name.to_string()],
-        &volume_paths,
-        true,
-        false,
-    );
-    assert_eq!(
-        selected.keys().copied().collect::<Vec<_>>(),
-        vec![0, 1, 2, 3, 4]
     );
 }
 
@@ -465,9 +334,9 @@ async fn active_job_recovers_from_provider_cap_and_live_80_to_20_generation_chan
         .handle
         .add_job(
             job_id,
-            spec,
+            spec.clone(),
             PathBuf::from("capacity-recovery.nzb"),
-            Vec::new(),
+            nzb_zstd_for(&spec),
         )
         .await
         .unwrap();
@@ -599,16 +468,50 @@ async fn held_off_server_stops_reconnecting_inside_the_holdoff_window() {
     .unwrap();
     let harness = TestHarness::new_with_nntp(client, CONNECTIONS).await;
     let job_id = JobId(80_021);
-    let spec = segmented_job_spec("held off provider", "held-off.bin", &vec![1024_u32; 64]);
+    const SEGMENTS: usize = 64;
+    let spec = segmented_job_spec(
+        "held off provider",
+        "held-off.bin",
+        &vec![1024_u32; SEGMENTS],
+    );
+    let leased_before = harness
+        .handle
+        .get_live_metrics()
+        .download_lane_lease_items_total;
 
     harness
         .handle
-        .add_job(job_id, spec, PathBuf::from("held-off.nzb"), Vec::new())
+        .add_job(
+            job_id,
+            spec.clone(),
+            PathBuf::from("held-off.nzb"),
+            nzb_zstd_for(&spec),
+        )
         .await
         .unwrap();
 
-    // The scheduler also keeps the queued workload off the held-off provider.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // Wait for this job's activated queue, then cross another actor turn.
+    // A held provider offers no fresh seats, so there must be no refused
+    // handouts to wait for: those were the dispatch spin this test guards.
+    loop {
+        let snapshot = harness.handle.pipeline_diagnostics().await.unwrap();
+        if snapshot
+            .jobs
+            .iter()
+            .any(|job| job.job_id == job_id.0 && job.download_queue_len == SEGMENTS)
+        {
+            break;
+        }
+    }
+    harness.handle.pipeline_diagnostics().await.unwrap();
+    assert_eq!(
+        harness
+            .handle
+            .get_live_metrics()
+            .download_lane_lease_items_total,
+        leased_before,
+        "a held-off provider must not receive and return leases"
+    );
     assert_eq!(
         accepted.load(Ordering::SeqCst),
         1,
@@ -738,40 +641,6 @@ async fn move_to_complete_uses_unique_destination_for_duplicate_job_names() {
 }
 
 #[tokio::test]
-async fn failed_final_move_marks_job_failed_instead_of_complete() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(10068);
-    let job_name = "Silver Horizon Broken Final Move";
-    let missing_working_dir = intermediate_dir.join("missing");
-
-    pipeline.jobs.insert(
-        job_id,
-        minimal_job_state(job_id, job_name, missing_working_dir),
-    );
-    pipeline.job_order.push(job_id);
-    pipeline.report_all_for_test();
-    pipeline.check_job_completion(job_id).await;
-    settle_inflight_moves(&mut pipeline).await;
-    settle_inflight_moves(&mut pipeline).await;
-    settle_inflight_moves(&mut pipeline).await;
-    settle_inflight_moves(&mut pipeline).await;
-    settle_inflight_moves(&mut pipeline).await;
-
-    let status = job_status_for_assert(&pipeline, job_id).unwrap();
-    assert!(matches!(status, JobStatus::Failed { .. }));
-    let JobStatus::Failed { error } = &status else {
-        unreachable!();
-    };
-    assert!(error.contains("no delivery source exists"));
-    assert!(
-        !complete_dir
-            .join(crate::jobs::working_dir::sanitize_dirname(job_name))
-            .exists()
-    );
-}
-
-#[tokio::test]
 async fn completion_check_during_post_processing_does_not_finalize_again() {
     for status in [JobStatus::QueuedPostProcessing, JobStatus::PostProcessing] {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -864,335 +733,6 @@ async fn unacceptable_extension_rejection_never_starts_a_final_move_or_scripts()
         working_dir.exists(),
         "the rejected source was never published"
     );
-}
-
-#[tokio::test]
-async fn tiny_write_budget_evicts_out_of_order_segments_and_job_completes() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 1,
-            medium_count: 1,
-            large_count: 1,
-        },
-        4,
-    )
-    .await;
-    let job_id = JobId(20001);
-    let filename = "episode.bin";
-    let payload_size =
-        (crate::runtime::buffers::BufferTier::Small.size_bytes() + 256 * 1024) as u32;
-    let spec = segmented_job_spec(
-        "Write Backlog Budget",
-        filename,
-        &[payload_size, payload_size, payload_size],
-    );
-    insert_active_job(&mut pipeline, job_id, spec).await;
-    pipeline.write_backlog_budget_bytes = payload_size as usize;
-
-    let total_size = payload_size as u64 * 3;
-    for segment_number in [1u32, 2u32] {
-        let payload = vec![segment_number as u8 + 1; payload_size as usize];
-        let raw = encode_article_part(
-            filename,
-            &payload,
-            segment_number + 1,
-            3,
-            segment_number as u64 * payload_size as u64 + 1,
-            total_size,
-        );
-        let segment_id = SegmentId {
-            file_id: NzbFileId {
-                job_id,
-                file_index: 0,
-            },
-            segment_number,
-        };
-
-        pipeline.active_downloads += 1;
-        pipeline
-            .handle_download_done(DownloadResult {
-                lane_id: 0,
-                job_id: segment_id.file_id.job_id,
-                runtime_generation: 0,
-                segment_id,
-                data: Ok(DownloadPayload::Raw(raw)),
-                attempts: Vec::new(),
-                lane_observation: None,
-                source_server_idx: None,
-                origin: DownloadResultOrigin::NormalPrimary,
-                retry_count: 0,
-                exclude_servers: Vec::new(),
-                release_connection_slot: true,
-            })
-            .await;
-    }
-
-    drain_decode_results(&mut pipeline, 2).await;
-
-    assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
-    assert!(
-        pipeline
-            .metrics
-            .direct_write_evictions
-            .load(Ordering::Relaxed)
-            >= 1,
-        "tiny write budget should degrade to direct writes"
-    );
-    assert!(
-        pipeline
-            .metrics
-            .write_buffered_bytes
-            .load(Ordering::Relaxed)
-            <= payload_size as u64
-    );
-
-    let payload = vec![1u8; payload_size as usize];
-    let raw = encode_article_part(filename, &payload, 1, 3, 1, total_size);
-    pipeline.active_downloads += 1;
-    pipeline
-        .handle_download_done(DownloadResult {
-            lane_id: 0,
-            job_id,
-            runtime_generation: 0,
-            segment_id: SegmentId {
-                file_id: NzbFileId {
-                    job_id,
-                    file_index: 0,
-                },
-                segment_number: 0,
-            },
-            data: Ok(DownloadPayload::Raw(raw)),
-            attempts: Vec::new(),
-            lane_observation: None,
-            source_server_idx: None,
-            origin: DownloadResultOrigin::NormalPrimary,
-            retry_count: 0,
-            exclude_servers: Vec::new(),
-            release_connection_slot: true,
-        })
-        .await;
-    drain_decode_results(&mut pipeline, 1).await;
-
-    // Eviction can write an owned article while a pooled one remains buffered.
-    // Closing the gap is what releases every writer-owned pool slot.
-    wait_until(|| {
-        pipeline
-            .buffers
-            .available(crate::runtime::buffers::BufferTier::Medium)
-            == 1
-    })
-    .await;
-    assert_eq!(
-        pipeline
-            .buffers
-            .available(crate::runtime::buffers::BufferTier::Medium),
-        1
-    );
-
-    assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
-    assert_eq!(pipeline.write_buffered_bytes, 0);
-    assert_eq!(pipeline.write_buffered_segments, 0);
-    assert_eq!(
-        pipeline
-            .metrics
-            .write_buffered_bytes
-            .load(Ordering::Relaxed),
-        0
-    );
-    assert!(matches!(
-        job_status_for_assert(&pipeline, job_id),
-        Some(JobStatus::Complete)
-    ));
-}
-
-#[tokio::test]
-async fn in_order_segments_keep_write_cursor_until_file_completes() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        4,
-    )
-    .await;
-    let job_id = JobId(20007);
-    let segment_count = 6u32;
-    let payload_size = 128u32;
-    let total_size = segment_count * payload_size;
-    let filename = "cursor.bin";
-    let spec = JobSpec {
-        name: "Write Cursor".to_string(),
-        password: None,
-        total_bytes: total_size as u64,
-        category: None,
-        metadata: vec![],
-        files: vec![FileSpec {
-            filename: filename.to_string(),
-            role: FileRole::Standalone,
-            groups: vec!["alt.binaries.test".to_string()],
-            posted_at_epoch: None,
-            segments: (0..segment_count)
-                .map(|number| {
-                    segment_spec! {
-                        number: number,
-                        bytes: payload_size,
-                        message_id: format!("cursor-{number}@example.com"),
-                    }
-                })
-                .collect(),
-        }],
-    };
-    insert_active_job(&mut pipeline, job_id, spec).await;
-
-    for segment_number in 0..segment_count {
-        let payload = vec![segment_number as u8 + 1; payload_size as usize];
-        let raw = encode_article_part(
-            filename,
-            &payload,
-            segment_number + 1,
-            segment_count,
-            segment_number as u64 * payload_size as u64 + 1,
-            total_size as u64,
-        );
-        let segment_id = SegmentId {
-            file_id: NzbFileId {
-                job_id,
-                file_index: 0,
-            },
-            segment_number,
-        };
-
-        pipeline.active_downloads += 1;
-        pipeline
-            .handle_download_done(DownloadResult {
-                lane_id: 0,
-                job_id: segment_id.file_id.job_id,
-                runtime_generation: 0,
-                segment_id,
-                data: Ok(DownloadPayload::Raw(raw)),
-                attempts: Vec::new(),
-                lane_observation: None,
-                source_server_idx: None,
-                origin: DownloadResultOrigin::NormalPrimary,
-                retry_count: 0,
-                exclude_servers: Vec::new(),
-                release_connection_slot: true,
-            })
-            .await;
-    }
-
-    drain_decode_results(&mut pipeline, segment_count as usize).await;
-
-    assert_eq!(pipeline.write_buffered_bytes, 0);
-    assert_eq!(pipeline.write_buffered_segments, 0);
-    assert!(!pipeline.write_buffers.contains_key(&NzbFileId {
-        job_id,
-        file_index: 0,
-    }));
-    assert_eq!(
-        pipeline.metrics.segments_committed.load(Ordering::Relaxed),
-        segment_count as u64
-    );
-    assert!(matches!(
-        job_status_for_assert(&pipeline, job_id),
-        Some(JobStatus::Complete)
-    ));
-}
-
-#[tokio::test]
-async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(20009);
-    let filename = "sparse.bin";
-    let payload_size = 128u32;
-    let total_size = payload_size as u64 * 3;
-    let spec = JobSpec {
-        name: "Sparse Segment Ordinals".to_string(),
-        password: None,
-        total_bytes: total_size,
-        category: None,
-        metadata: vec![],
-        files: vec![FileSpec {
-            filename: filename.to_string(),
-            role: FileRole::Standalone,
-            groups: vec!["alt.binaries.test".to_string()],
-            posted_at_epoch: None,
-            segments: vec![
-                segment_spec! {
-                    ordinal: 0,
-                    article_number: 1,
-                    bytes: payload_size,
-                    message_id: "sparse-0@example.com".to_string(),
-                },
-                segment_spec! {
-                    ordinal: 1,
-                    article_number: 4,
-                    bytes: payload_size,
-                    message_id: "sparse-1@example.com".to_string(),
-                },
-                segment_spec! {
-                    ordinal: 2,
-                    article_number: 6,
-                    bytes: payload_size,
-                    message_id: "sparse-2@example.com".to_string(),
-                },
-            ],
-        }],
-    };
-    insert_active_job(&mut pipeline, job_id, spec).await;
-
-    for segment_number in 0..3u32 {
-        let payload = vec![segment_number as u8 + 1; payload_size as usize];
-        let raw = encode_article_part(
-            filename,
-            &payload,
-            segment_number + 1,
-            3,
-            segment_number as u64 * payload_size as u64 + 1,
-            total_size,
-        );
-
-        pipeline.active_downloads += 1;
-        pipeline
-            .handle_download_done(DownloadResult {
-                lane_id: 0,
-                job_id,
-                runtime_generation: 0,
-                segment_id: SegmentId {
-                    file_id: NzbFileId {
-                        job_id,
-                        file_index: 0,
-                    },
-                    segment_number,
-                },
-                data: Ok(DownloadPayload::Raw(raw)),
-                attempts: Vec::new(),
-                lane_observation: None,
-                source_server_idx: None,
-                origin: DownloadResultOrigin::NormalPrimary,
-                retry_count: 0,
-                exclude_servers: Vec::new(),
-                release_connection_slot: true,
-            })
-            .await;
-    }
-
-    drain_decode_results(&mut pipeline, 3).await;
-
-    assert_eq!(
-        pipeline.metrics.segments_committed.load(Ordering::Relaxed),
-        3
-    );
-    assert!(matches!(
-        job_status_for_assert(&pipeline, job_id),
-        Some(JobStatus::Complete)
-    ));
 }
 
 #[tokio::test]
@@ -1296,7 +836,7 @@ async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
     insert_active_job(&mut pipeline, job_id, spec).await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
     }
 
     let make_work = || DownloadWork {
@@ -1327,6 +867,9 @@ async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .expect("stale retry should still requeue");
@@ -1347,6 +890,9 @@ async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .expect("same-generation retry should requeue");
@@ -1354,109 +900,6 @@ async fn delayed_retry_drops_stale_exclusions_after_pool_rebuild() {
         queued.exclude_servers,
         vec![0],
         "current-generation exclusions must be preserved"
-    );
-}
-
-#[tokio::test]
-async fn stale_extracted_member_checkpoint_is_discarded_during_completion_reconcile() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(30085);
-    let files = build_multifile_multivolume_rar_set();
-    let _working_dir = insert_active_job(
-        &mut pipeline,
-        job_id,
-        rar_job_spec("RAR Discard Stale Extracted Member", &files),
-    )
-    .await;
-    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
-
-    for (file_index, (filename, bytes)) in files.iter().enumerate() {
-        write_and_complete_rar_volume(&mut pipeline, job_id, file_index as u32, filename, bytes)
-            .await;
-    }
-
-    let member_name = "E01.mkv".to_string();
-    let staging_dir = pipeline.extraction_staging_dir(job_id);
-    let (out_path, partial_path) = Pipeline::member_output_paths(&staging_dir, &member_name);
-    let chunk_dir = Pipeline::member_chunk_dir(&staging_dir, "show", &member_name);
-    std::fs::create_dir_all(&chunk_dir).unwrap();
-    std::fs::write(&partial_path, b"episode-a-payload").unwrap();
-
-    pipeline
-        .extracted_members
-        .entry(job_id)
-        .or_default()
-        .insert(member_name.clone());
-
-    pipeline
-        .db
-        .replace_member_chunks(
-            job_id,
-            "show",
-            &member_name,
-            &[crate::ExtractionChunk {
-                member_name: member_name.clone(),
-                volume_index: 0,
-                bytes_written: b"episode-a-payload".len() as u64,
-                temp_path: partial_path.to_string_lossy().to_string(),
-                start_offset: 0,
-                end_offset: b"episode-a-payload".len() as u64,
-                verified: true,
-                appended: false,
-            }],
-        )
-        .unwrap();
-
-    let reconciled = pipeline
-        .reconcile_extracted_outputs_for_completion(job_id)
-        .await;
-
-    assert!(reconciled);
-    assert!(!out_path.exists());
-    assert!(partial_path.exists());
-    assert!(
-        pipeline
-            .db
-            .get_extraction_chunks(job_id, "show")
-            .unwrap()
-            .into_iter()
-            .all(|chunk| chunk.member_name != member_name)
-    );
-    assert!(!pipeline.extracted_members.contains_key(&job_id));
-}
-
-#[tokio::test]
-async fn completion_reconciliation_clears_missing_extracted_outputs() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(31234);
-    let spec = JobSpec {
-        name: "missing-output".to_string(),
-        password: None,
-        files: vec![],
-        total_bytes: 0,
-        category: None,
-        metadata: vec![],
-    };
-    let _working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
-
-    pipeline
-        .extracted_members
-        .insert(job_id, ["missing.mkv".to_string()].into_iter().collect());
-
-    assert!(
-        pipeline
-            .reconcile_extracted_outputs_for_completion(job_id)
-            .await
-    );
-
-    assert!(!pipeline.extracted_members.contains_key(&job_id));
-    let recovered = pipeline.db.load_active_jobs().unwrap();
-    assert!(
-        recovered
-            .get(&job_id)
-            .is_some_and(|job| job.extracted_members.is_empty())
     );
 }
 
@@ -1489,6 +932,7 @@ async fn restored_post_processing_is_interrupted_without_rerunning_scripts() {
     pipeline.schedule_job_completion_check(job_id);
 
     assert!(pipeline.recover_restored_terminal_post_processing(job_id));
+    settle_failed_releases(&mut pipeline).await;
 
     assert!(!pipeline.pending_completion_checks.contains(&job_id));
     assert!(!pipeline.jobs.contains_key(&job_id));
@@ -1508,15 +952,14 @@ async fn restored_post_processing_that_already_finished_archives_as_complete() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(31238);
-    let spec = JobSpec {
-        name: "completed-post-processing".to_string(),
-        password: None,
-        files: vec![],
-        total_bytes: 0,
-        category: None,
-        metadata: vec![],
-    };
-    insert_active_job(&mut pipeline, job_id, spec).await;
+    insert_delivered_job(
+        &mut pipeline,
+        job_id,
+        "completed-post-processing",
+        "payload.mkv",
+        b"payload",
+    )
+    .await;
     pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::PostProcessing;
     pipeline
         .db
@@ -1574,7 +1017,12 @@ async fn download_lanes_send_bracketed_message_ids_on_the_wire() {
 
     harness
         .handle
-        .add_job(job_id, spec, PathBuf::from("wire-frame.nzb"), Vec::new())
+        .add_job(
+            job_id,
+            spec.clone(),
+            PathBuf::from("wire-frame.nzb"),
+            nzb_zstd_for(&spec),
+        )
         .await
         .unwrap();
 
@@ -1672,7 +1120,7 @@ async fn cancel_mid_download_archives_then_cleans_up() {
             id,
             segmented_job_spec("Held download", "payload.bin", &[100]),
             PathBuf::from("held.nzb"),
-            sample_nzb_zstd(),
+            nzb_zstd_for(&(segmented_job_spec("Held download", "payload.bin", &[100]))),
         )
         .await
         .unwrap();
@@ -1769,11 +1217,16 @@ async fn repeated_article_case(uuencode: bool) {
             .collect::<Vec<_>>(),
     );
     for file in &mut spec.files {
-        file.segments[0].message_id = "shared@example.com".to_string();
+        file.segments[0].message_ids = "shared@example.com".into();
     }
     harness
         .handle
-        .add_job(id, spec, PathBuf::from("repeat.nzb"), sample_nzb_zstd())
+        .add_job(
+            id,
+            spec.clone(),
+            PathBuf::from("repeat.nzb"),
+            nzb_zstd_for(&spec),
+        )
         .await
         .unwrap();
     let status = loop {
@@ -1808,4 +1261,132 @@ async fn repeated_article_case(uuencode: bool) {
         wire_bytes, expected_wire,
         "cached placements must not count as new network transfers"
     );
+}
+
+#[tokio::test]
+async fn failed_final_move_marks_job_failed_instead_of_complete() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(10068);
+    let job_name = "Silver Horizon Broken Final Move";
+    let working_dir =
+        insert_delivered_job(&mut pipeline, job_id, job_name, "payload.mkv", b"payload").await;
+    // Nothing is left to deliver from when the move runs.
+    std::fs::remove_dir_all(&working_dir).unwrap();
+    hear_graph_mail(&mut pipeline, job_id).await;
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    let status = job_status_for_assert(&pipeline, job_id).unwrap();
+    assert!(matches!(status, JobStatus::Failed { .. }), "{status:?}");
+    let JobStatus::Failed { error } = &status else {
+        unreachable!();
+    };
+    assert!(error.contains("no delivery source exists"), "{error}");
+    assert!(
+        !complete_dir
+            .join(crate::jobs::working_dir::sanitize_dirname(job_name))
+            .exists()
+    );
+}
+
+#[tokio::test]
+async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20009);
+    let filename = "sparse.bin";
+    let payload_size = 128u32;
+    let total_size = payload_size as u64 * 3;
+    let spec = JobSpec {
+        name: "Sparse Segment Ordinals".to_string(),
+        password: None,
+        total_bytes: total_size,
+        category: None,
+        metadata: vec![],
+        files: vec![FileSpec {
+            filename: filename.to_string(),
+            role: FileRole::Standalone,
+            groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
+            segments: vec![
+                segment_spec! {
+                    ordinal: 0,
+                    article_number: 1,
+                    bytes: payload_size,
+                    message_id: "sparse-0@example.com".to_string(),
+                },
+                segment_spec! {
+                    ordinal: 1,
+                    article_number: 4,
+                    bytes: payload_size,
+                    message_id: "sparse-1@example.com".to_string(),
+                },
+                segment_spec! {
+                    ordinal: 2,
+                    article_number: 6,
+                    bytes: payload_size,
+                    message_id: "sparse-2@example.com".to_string(),
+                },
+            ],
+        }],
+    };
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    for _ in 0..3u32 {
+        // Each article is fetched as dispatch hands it out.
+        let work = pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .pop()
+            .unwrap();
+        let segment_number = work.segment_id.segment_number;
+        let payload = vec![segment_number as u8 + 1; payload_size as usize];
+        let raw = encode_article_part(
+            filename,
+            &payload,
+            segment_number + 1,
+            3,
+            segment_number as u64 * payload_size as u64 + 1,
+            total_size,
+        );
+
+        pipeline.active_downloads += 1;
+        pipeline
+            .handle_download_done(DownloadResult {
+                lane_id: 0,
+                job_id,
+                runtime_generation: 0,
+                segment_id: work.segment_id,
+                data: Ok(DownloadPayload::Raw(raw)),
+                attempts: Vec::new(),
+                lane_observation: None,
+                source_server_idx: None,
+                origin: DownloadResultOrigin::NormalPrimary,
+                retry_count: 0,
+                exclude_servers: Vec::new(),
+                release_connection_slot: true,
+            })
+            .await;
+    }
+
+    drain_decode_results(&mut pipeline, 3).await;
+    // The graph job's runs and its completion check settle it.
+    hear_graph_mail(&mut pipeline, job_id).await;
+    pipeline.check_job_completion(job_id).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    assert_eq!(
+        pipeline.metrics.segments_committed.load(Ordering::Relaxed),
+        3
+    );
+    assert!(matches!(
+        job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Complete)
+    ));
 }

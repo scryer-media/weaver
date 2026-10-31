@@ -28,6 +28,7 @@ impl Pipeline {
             .download_lane_owners
             .entry(lease.lane_id)
             .or_insert_with(|| DownloadLaneOwner {
+                body_activity: Vec::new(),
                 job_id: lease.job_id,
                 mode: lease.lane_mode,
                 completion_critical: lease.completion_critical,
@@ -36,6 +37,14 @@ impl Pipeline {
                 outstanding: HashMap::new(),
             });
         owner.mode = lease.lane_mode;
+        owner
+            .body_activity
+            .retain(|(_, _, bytes)| bytes.strong_count() != 0);
+        owner.body_activity.push((
+            lease.job_id,
+            lease.runtime_generation,
+            Arc::downgrade(&lease.body_activity),
+        ));
         owner.completion_critical = lease.completion_critical;
         self.hold_lane_works(lease.lane_id, lease.works.iter().cloned());
     }
@@ -94,6 +103,7 @@ impl Pipeline {
         self.download_lane_owners
             .entry(0)
             .or_insert_with(|| DownloadLaneOwner {
+                body_activity: Vec::new(),
                 job_id,
                 mode: DownloadLaneMode::Sequential,
                 completion_critical,
@@ -292,6 +302,11 @@ impl Pipeline {
     // the scheduler names, so it stays up, cached connection and all, rather
     // than dying with the job it last served.
     pub(in crate::pipeline) fn retire_stalled_download_lanes(&mut self, job_id: JobId) -> usize {
+        // A hot lane can survive this attempt. Its old response contexts
+        // must not refresh the watchdog after this job is resumed or retried.
+        for owner in self.download_lane_owners.values_mut() {
+            owner.body_activity.retain(|(job, _, _)| *job != job_id);
+        }
         let ids: Vec<_> = self
             .download_lane_owners
             .iter()

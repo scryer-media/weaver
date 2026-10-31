@@ -1,0 +1,13 @@
+{
+  "slug": "zstd-corrupted",
+  "title": "E2E.Test.zstd.corrupted.2026-TESTGRP",
+  "description": "A damaged lone zstd stream must fail and retain its posted compressed bytes.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "expectedRetainedOutputBLAKE3": {
+    "灯火.bin.zst": "3814e630ea11ad96a5072317ac7c3a6de24f5da5b2f85b0761930c3b74765370"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks"
+  ]
+}

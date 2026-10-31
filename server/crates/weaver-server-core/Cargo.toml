@@ -28,6 +28,8 @@ application-updater = { git = "https://github.com/scryer-media/application-updat
 artifact-trust = { git = "https://github.com/scryer-media/artifact-trust", tag = "v0.1.3", default-features = false, features = [
     "verification",
 ] }
+weaver-graph = { path = "../../../engines/weaver-graph" }
+weaver-objects = { path = "../../../engines/weaver-objects" }
 weaver-model = { path = "../../../shared/crates/weaver-model", default-features = false }
 weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false }
 weaver-nzb = { path = "../../../engines/weaver-nzb", default-features = false }
@@ -106,6 +108,8 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 weaver-nntp = { path = "../../../engines/weaver-nntp", default-features = false, features = ["test-support"] }
+weaver-graph = { path = "../../../engines/weaver-graph", features = ["test-support"] }
+weaver-objects = { path = "../../../engines/weaver-objects", features = ["test-support"] }
 weaver-tunnel = { path = "../../../engines/weaver-tunnel", features = ["test-support"] }
 serde_json = { workspace = true }
 # `test-util` for the paused clock: the health-probe reclaim tests assert on

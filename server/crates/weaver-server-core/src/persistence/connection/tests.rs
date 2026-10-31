@@ -3,7 +3,7 @@
 
 use super::*;
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -634,12 +634,6 @@ fn is_boolean_column(table: &str, column: &str) -> bool {
             | ("servers", "backfill")
             | ("servers", "download_quota_enabled")
             | ("active_jobs", "normalization_retried")
-            | ("active_par2_files", "promoted")
-            | ("active_extraction_chunks", "verified")
-            | ("active_extraction_chunks", "appended")
-            | ("active_volume_status", "extracted")
-            | ("active_volume_status", "par2_clean")
-            | ("active_volume_status", "deleted")
             | ("rss_feeds", "enabled")
             | ("rss_rules", "enabled")
     )
@@ -1043,6 +1037,8 @@ async fn flush_write_queue_succeeds_without_raw_sqlite_connection() {
     db.flush_write_queue().await.unwrap();
 }
 
+mod checkpoint;
+
 #[test]
 fn writer_task_does_not_retain_database_sender() {
     let db = Database::open_in_memory().unwrap();
@@ -1165,6 +1161,87 @@ async fn try_queue_write_full_queue_resend_is_covered_by_flush() {
         total,
         "flush_write_queue did not cover writes queued through the Full re-send path"
     );
+}
+
+// A write queued while earlier writes wait for room in the full queue runs
+// after them, even though the queue has room again by the time it is queued.
+// That holds for a job's archive and its events too. The writer runs on the
+// runtime's workers, so the test may block on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_never_overtakes_the_writes_waiting_for_room_in_a_full_queue() {
+    let db = Database::open_in_memory().unwrap();
+    let order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let job_id = crate::jobs::ids::JobId(7171);
+    // What the last waiting write saw of the job's archive and events.
+    let seen_by_last = std::sync::Arc::new(std::sync::Mutex::new(None));
+
+    // The first op holds the writer until it is released, so the queue
+    // fills and the rest wait for room.
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    db.try_queue_write("gate", move |_db| {
+        let _ = release_rx.lock().unwrap().recv();
+        Ok(())
+    })
+    .unwrap();
+    let (first_ran_tx, first_ran_rx) = std::sync::mpsc::channel::<()>();
+    let total = 400usize;
+    for i in 0..total {
+        let order = order.clone();
+        let first_ran = (i == 0).then(|| first_ran_tx.clone());
+        let seen = (i + 1 == total).then(|| seen_by_last.clone());
+        db.try_queue_write("waiting", move |db| {
+            order.lock().unwrap().push(i);
+            if let Some(seen) = seen {
+                *seen.lock().unwrap() = Some((
+                    db.get_job_history(job_id.0).unwrap().is_some(),
+                    db.get_job_events(job_id.0).unwrap().len(),
+                ));
+            }
+            if let Some(first_ran) = first_ran {
+                let _ = first_ran.send(());
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    // The writer takes the first waiting write off the queue, so the queue
+    // has room while the writes past its end still wait for it.
+    release_tx.send(()).unwrap();
+    first_ran_rx.recv().unwrap();
+    let late = order.clone();
+    db.try_queue_write("late", move |_db| {
+        late.lock().unwrap().push(total);
+        Ok(())
+    })
+    .unwrap();
+    db.queue_archive_job(job_id, postgres_sample_history(job_id))
+        .await
+        .unwrap();
+    db.queue_job_events(vec![JobEvent {
+        job_id: job_id.0,
+        timestamp: 1,
+        kind: "late".to_string(),
+        message: "queued behind the waiting writes".to_string(),
+        file_id: None,
+    }])
+    .await
+    .unwrap();
+
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(
+        *order.lock().unwrap(),
+        (0..=total).collect::<Vec<_>>(),
+        "every write ran in the order it was queued"
+    );
+    assert_eq!(
+        *seen_by_last.lock().unwrap(),
+        Some((false, 0)),
+        "the archive and the events queued behind the waiting writes ran after them"
+    );
+    assert!(db.get_job_history(job_id.0).unwrap().is_some());
+    assert_eq!(db.get_job_events(job_id.0).unwrap().len(), 1);
 }
 
 // Drives the Postgres lane writer directly. The ops below never touch the
@@ -1700,23 +1777,6 @@ async fn postgres_bulk_hot_paths_when_configured() {
     db.create_active_job_with_file_identities(&postgres_sample_job(job_id), &file_identities)
         .unwrap();
 
-    let high_progress = (0..325)
-        .map(|file_index| ActiveFileProgress {
-            job_id,
-            file_index,
-            coverage: coverage_of(2048 + u64::from(file_index)),
-        })
-        .collect::<Vec<_>>();
-    let low_progress = (0..325)
-        .map(|file_index| ActiveFileProgress {
-            job_id,
-            file_index,
-            coverage: coverage_of(1024),
-        })
-        .collect::<Vec<_>>();
-    // Coverage rows are replaced: the last barrier's is the one that stands.
-    db.upsert_file_progress_batch(&low_progress).unwrap();
-    db.upsert_file_progress_batch(&high_progress).unwrap();
     db.complete_file(job_id, 0, "archive.rar", &[0x44; 16])
         .unwrap();
 
@@ -1742,54 +1802,12 @@ async fn postgres_bulk_hot_paths_when_configured() {
         .collect::<Vec<_>>();
     db.insert_integration_events(&integration_events).unwrap();
 
-    db.replace_failed_extractions(
-        job_id,
-        &HashSet::from(["bad-a.mkv".to_string(), "bad-b.mkv".to_string()]),
-    )
-    .unwrap();
-    db.replace_member_chunks(
-        job_id,
-        "set",
-        "movie.mkv",
-        &[
-            ExtractionChunk {
-                member_name: "movie.mkv".to_string(),
-                volume_index: 0,
-                bytes_written: 111,
-                temp_path: "/tmp/chunk0".to_string(),
-                start_offset: 0,
-                end_offset: 111,
-                verified: true,
-                appended: false,
-            },
-            ExtractionChunk {
-                member_name: "movie.mkv".to_string(),
-                volume_index: 1,
-                bytes_written: 222,
-                temp_path: "/tmp/chunk1".to_string(),
-                start_offset: 111,
-                end_offset: 333,
-                verified: true,
-                appended: false,
-            },
-        ],
-    )
-    .unwrap();
-
     let jobs = db.load_active_jobs().unwrap();
     let job = jobs.get(&job_id).unwrap();
     assert_eq!(job.file_identities.len(), 2);
     assert_eq!(job.file_identities.get(&0), Some(&file_identities[0]));
     assert_eq!(job.file_identities.get(&1), Some(&file_identities[1]));
     assert_eq!(job.complete_files.len(), 1);
-    assert_eq!(job.file_progress.len(), 324);
-    assert!(!job.file_progress.contains_key(&0));
-    assert_eq!(
-        job.file_progress
-            .get(&324)
-            .map(crate::jobs::assembly::FileCoverage::covered_bytes),
-        Some(2048 + 324)
-    );
     assert_eq!(db.get_job_events(job_id.0).unwrap().len(), 250);
     assert_eq!(
         db.list_integration_events_after(None, None, Some(300))
@@ -1797,12 +1815,6 @@ async fn postgres_bulk_hot_paths_when_configured() {
             .len(),
         250
     );
-    assert_eq!(
-        db.load_failed_extractions(job_id).unwrap(),
-        HashSet::from(["bad-a.mkv".to_string(), "bad-b.mkv".to_string()])
-    );
-    assert_eq!(db.get_extraction_chunks(job_id, "set").unwrap().len(), 2);
-
     drop(db);
     execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
     admin_pool.close().await;
@@ -1828,7 +1840,6 @@ async fn postgres_converted_autocommit_ops_roundtrip_when_configured() {
     db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
 
     let job_id = crate::jobs::ids::JobId(720);
-    let set_name = "setA";
 
     // --- create_active_job_with_file_identities ---------------------------
     let identities = vec![
@@ -1929,169 +1940,6 @@ async fn postgres_converted_autocommit_ops_roundtrip_when_configured() {
         "vol0.part01.rar"
     );
 
-    // --- add_extracted_members (bulk + absent-job guard no-op) ------------
-    let extract_dir = tempfile::TempDir::new().unwrap();
-    let member_a = extract_dir.path().join("movie-a.mkv");
-    let member_b = extract_dir.path().join("movie-b.mkv");
-    std::fs::write(&member_a, b"aaaaa").unwrap();
-    std::fs::write(&member_b, b"bbbbbbb").unwrap();
-
-    // Absent job: the pg guard (FOR KEY SHARE CTE the INSERT selects FROM) must
-    // no-op even though the output files exist on disk.
-    let absent_job = crate::jobs::ids::JobId(999_720);
-    db.add_extracted_members(absent_job, &[("movie-a.mkv".to_string(), member_a.clone())])
-        .unwrap();
-    assert_eq!(
-        fetch_i64(
-            &db,
-            "SELECT COUNT(*) AS value FROM active_extracted WHERE job_id = {}",
-            vec![SqlArg::I64(absent_job.0 as i64)],
-        ),
-        0
-    );
-
-    db.add_extracted_members(
-        job_id,
-        &[
-            ("movie-a.mkv".to_string(), member_a.clone()),
-            ("movie-b.mkv".to_string(), member_b.clone()),
-        ],
-    )
-    .unwrap();
-    assert_eq!(
-        fetch_i64(
-            &db,
-            "SELECT COUNT(*) AS value FROM active_extracted WHERE job_id = {}",
-            vec![SqlArg::I64(job_id.0 as i64)],
-        ),
-        2
-    );
-    // output_size must equal the on-disk byte length ("aaaaa" == 5).
-    assert_eq!(
-        fetch_i64(
-            &db,
-            "SELECT output_size AS value FROM active_extracted
-              WHERE job_id = {} AND member_name = {}",
-            vec![
-                SqlArg::I64(job_id.0 as i64),
-                SqlArg::Text("movie-a.mkv".to_string()),
-            ],
-        ),
-        5
-    );
-
-    // --- set_volume_status ------------------------------------------------
-    db.set_volume_status(job_id, set_name, 0, true, true, false)
-        .unwrap();
-    db.set_volume_status(job_id, set_name, 1, true, false, true)
-        .unwrap();
-    assert_eq!(
-        fetch_i64(
-            &db,
-            "SELECT COUNT(*) AS value FROM active_volume_status WHERE job_id = {}",
-            vec![SqlArg::I64(job_id.0 as i64)],
-        ),
-        2
-    );
-    // The deleted volume must be visible via the typed reader.
-    assert_eq!(
-        db.load_deleted_volume_statuses(job_id).unwrap(),
-        vec![(set_name.to_string(), 1_u32)]
-    );
-
-    // --- insert_extraction_chunk (guard folded into FOR KEY SHARE CTE) ----
-    for volume_index in 0..2u32 {
-        db.insert_extraction_chunk(&crate::jobs::record::ActiveExtractionChunk {
-            job_id,
-            set_name: set_name.to_string(),
-            member_name: "movie-a.mkv".to_string(),
-            volume_index,
-            bytes_written: 100 + u64::from(volume_index),
-            temp_path: format!("/tmp/chunk-{volume_index}"),
-            start_offset: u64::from(volume_index) * 100,
-            end_offset: u64::from(volume_index) * 100 + 100,
-        })
-        .unwrap();
-    }
-    let chunks = db.get_extraction_chunks(job_id, set_name).unwrap();
-    assert_eq!(chunks.len(), 2);
-    assert!(
-        chunks
-            .iter()
-            .all(|chunk| !chunk.verified && !chunk.appended)
-    );
-
-    // --- mark_chunk_verified + mark_chunk_appended (UPDATE..FROM guard) ---
-    db.mark_chunk_verified(job_id, set_name, "movie-a.mkv", 0)
-        .unwrap();
-    db.mark_chunk_appended(job_id, set_name, "movie-a.mkv", 0)
-        .unwrap();
-    let chunks = db.get_extraction_chunks(job_id, set_name).unwrap();
-    let chunk0 = chunks
-        .iter()
-        .find(|chunk| chunk.volume_index == 0)
-        .expect("volume 0 chunk present");
-    let chunk1 = chunks
-        .iter()
-        .find(|chunk| chunk.volume_index == 1)
-        .expect("volume 1 chunk present");
-    assert!(
-        chunk0.verified && chunk0.appended,
-        "volume 0 should be flagged"
-    );
-    assert!(
-        !chunk1.verified && !chunk1.appended,
-        "volume 1 should be untouched"
-    );
-
-    // --- set_active_job_normalization_retried (plain autocommit UPDATE) ---
-    db.set_active_job_normalization_retried(job_id, true)
-        .unwrap();
-    assert_eq!(
-        fetch_i64(
-            &db,
-            "SELECT COUNT(*) AS value FROM active_jobs
-              WHERE job_id = {} AND normalization_retried",
-            vec![SqlArg::I64(job_id.0 as i64)],
-        ),
-        1
-    );
-
-    // --- converted delete/clear ops --------------------------------------
-    db.delete_file_identity(job_id, 1).unwrap();
-    assert_eq!(
-        fetch_i64(
-            &db,
-            "SELECT COUNT(*) AS value FROM active_file_identities WHERE job_id = {}",
-            vec![SqlArg::I64(job_id.0 as i64)],
-        ),
-        1
-    );
-
-    db.clear_extracted_members(job_id).unwrap();
-    assert_eq!(
-        fetch_i64(
-            &db,
-            "SELECT COUNT(*) AS value FROM active_extracted WHERE job_id = {}",
-            vec![SqlArg::I64(job_id.0 as i64)],
-        ),
-        0
-    );
-
-    db.clear_volume_status_for_set(job_id, set_name).unwrap();
-    assert_eq!(
-        fetch_i64(
-            &db,
-            "SELECT COUNT(*) AS value FROM active_volume_status WHERE job_id = {}",
-            vec![SqlArg::I64(job_id.0 as i64)],
-        ),
-        0
-    );
-
-    db.clear_member_chunks(job_id, set_name, "movie-a.mkv")
-        .unwrap();
-    assert_eq!(db.get_extraction_chunks(job_id, set_name).unwrap().len(), 0);
-
     // --- insert_api_key (execute_returning) -------------------------------
     let api_key_id = db
         .insert_api_key("converted-ops", &[0x5a; 32], "integration")
@@ -2187,108 +2035,6 @@ async fn postgres_converted_autocommit_ops_roundtrip_when_configured() {
         0
     );
 
-    // --- mark_file_incomplete (three deletes ride one statement) ----------
-    db.upsert_file_progress_batch(&[ActiveFileProgress {
-        job_id,
-        file_index: 1,
-        coverage: coverage_of(77),
-    }])
-    .unwrap();
-    db.mark_file_incomplete(job_id, 1).unwrap();
-    for (table, count_sql) in [
-        (
-            "active_files",
-            "SELECT COUNT(*) AS value FROM active_files WHERE job_id = {} AND file_index = {}",
-        ),
-        (
-            "active_file_progress",
-            "SELECT COUNT(*) AS value FROM active_file_progress WHERE job_id = {} AND file_index = {}",
-        ),
-        (
-            "active_detected_archives",
-            "SELECT COUNT(*) AS value FROM active_detected_archives WHERE job_id = {} AND file_index = {}",
-        ),
-    ] {
-        assert_eq!(
-            fetch_i64(
-                &db,
-                count_sql,
-                vec![SqlArg::I64(job_id.0 as i64), SqlArg::I64(1)],
-            ),
-            0,
-            "{table} row should be gone after mark_file_incomplete"
-        );
-    }
-
-    drop(db);
-    execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
-    admin_pool.close().await;
-}
-
-#[tokio::test]
-async fn postgres_waiting_active_write_noops_after_delete_when_configured() {
-    let Some((admin_pool, schema, target_url)) =
-        create_postgres_test_schema("postgres_active_write_lock").await
-    else {
-        return;
-    };
-
-    let db = Database::open_target(DatabaseTarget::PostgresUrl(target_url.clone())).unwrap();
-    let job_id = crate::jobs::ids::JobId(501);
-    db.create_active_job(&postgres_sample_job(job_id)).unwrap();
-
-    let lock_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect(&target_url)
-        .await
-        .unwrap();
-    let mut lock_tx = lock_pool.begin().await.unwrap();
-    sqlx::query("SELECT 1 FROM active_jobs WHERE job_id = $1 FOR UPDATE")
-        .bind(job_id.0 as i64)
-        .execute(&mut *lock_tx)
-        .await
-        .unwrap();
-
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let writer_db = db.clone();
-    std::thread::spawn(move || {
-        let result = writer_db.upsert_file_progress_batch(&[ActiveFileProgress {
-            job_id,
-            file_index: 0,
-            coverage: coverage_of(123),
-        }]);
-        let _ = done_tx.send(result);
-    });
-
-    std::thread::sleep(Duration::from_millis(200));
-    assert!(
-        done_rx.try_recv().is_err(),
-        "active-state writer should wait for the parent row lock"
-    );
-
-    sqlx::query("DELETE FROM active_file_progress WHERE job_id = $1")
-        .bind(job_id.0 as i64)
-        .execute(&mut *lock_tx)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM active_jobs WHERE job_id = $1")
-        .bind(job_id.0 as i64)
-        .execute(&mut *lock_tx)
-        .await
-        .unwrap();
-    lock_tx.commit().await.unwrap();
-    lock_pool.close().await;
-
-    done_rx.recv().unwrap().unwrap();
-    assert_eq!(
-        fetch_i64(
-            &db,
-            "SELECT COUNT(*) AS value FROM active_file_progress WHERE job_id = {}",
-            vec![SqlArg::I64(job_id.0 as i64)],
-        ),
-        0
-    );
-
     drop(db);
     execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
     admin_pool.close().await;
@@ -2309,12 +2055,7 @@ async fn postgres_archive_and_delete_wait_on_active_job_lock_when_configured() {
         (crate::jobs::ids::JobId(602), "delete"),
     ] {
         db.create_active_job(&postgres_sample_job(job_id)).unwrap();
-        db.upsert_file_progress_batch(&[ActiveFileProgress {
-            job_id,
-            file_index: 0,
-            coverage: coverage_of(1),
-        }])
-        .unwrap();
+        db.complete_file(job_id, 0, "f.rar", &[0; 16]).unwrap();
 
         let lock_pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
@@ -2361,7 +2102,7 @@ async fn postgres_archive_and_delete_wait_on_active_job_lock_when_configured() {
         assert_eq!(
             fetch_i64(
                 &db,
-                "SELECT COUNT(*) AS value FROM active_file_progress WHERE job_id = {}",
+                "SELECT COUNT(*) AS value FROM active_files WHERE job_id = {}",
                 vec![SqlArg::I64(job_id.0 as i64)],
             ),
             0
@@ -2651,10 +2392,10 @@ async fn postgres_runtime_smoke_when_configured() {
         max_download_speed: Some(12_345),
         cleanup_after_extract: Some(false),
         propagation_delay_secs: Some(0),
+        max_concurrent_nzbs: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: None,
-        direct_unpack: None,
         delivery_naming: None,
         metrics: Default::default(),
         config_path: None,
@@ -2840,12 +2581,6 @@ async fn postgres_runtime_smoke_when_configured() {
         supplied_password_candidates: Vec::new(),
     })
     .unwrap();
-    db.upsert_file_progress_batch(&[ActiveFileProgress {
-        job_id,
-        file_index: 0,
-        coverage: coverage_of(123),
-    }])
-    .unwrap();
     assert_eq!(db.load_active_jobs().unwrap().len(), 1);
 
     db.archive_job(
@@ -2899,50 +2634,6 @@ async fn postgres_runtime_smoke_when_configured() {
     let portable = Database::open(backup_path.path()).unwrap();
     assert!(portable.get_job_history(job_id.0).unwrap().is_some());
     drop(portable);
-
-    drop(db);
-    execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
-    admin_pool.close().await;
-}
-
-// The direct-store coverage checkpoint is one replaced row per
-// archive set. This is the Postgres twin of the sqlite roundtrip in
-// `jobs::repository::tests`, so both engines are proven to upsert, read back
-// and delete through the same three statements.
-#[tokio::test]
-async fn postgres_direct_coverage_roundtrip_when_configured() {
-    let Some((admin_pool, schema, target_url)) =
-        create_postgres_test_schema("postgres_direct_coverage").await
-    else {
-        return;
-    };
-
-    let db = Database::open_target(DatabaseTarget::PostgresUrl(target_url)).unwrap();
-    let job_id = crate::jobs::ids::JobId(4242);
-    db.create_active_job(&postgres_sample_job(job_id)).unwrap();
-
-    db.save_direct_coverage(job_id, "Silver.Horizon.S01", &[1, 2, 3])
-        .unwrap();
-    db.save_direct_coverage(job_id, "Amber.Circuit", &[4, 5])
-        .unwrap();
-    let coverage = db.load_direct_coverage(job_id).unwrap();
-    assert_eq!(coverage.len(), 2);
-    assert_eq!(coverage["Silver.Horizon.S01"], vec![1, 2, 3]);
-
-    db.save_direct_coverage(job_id, "Silver.Horizon.S01", &[9, 9, 9, 9])
-        .unwrap();
-    let coverage = db.load_direct_coverage(job_id).unwrap();
-    assert_eq!(coverage.len(), 2, "a barrier replaces, it never appends");
-    assert_eq!(coverage["Silver.Horizon.S01"], vec![9, 9, 9, 9]);
-
-    db.delete_direct_coverage(job_id, "Silver.Horizon.S01")
-        .unwrap();
-    let coverage = db.load_direct_coverage(job_id).unwrap();
-    assert_eq!(coverage.len(), 1);
-    assert!(coverage.contains_key("Amber.Circuit"));
-
-    db.delete_active_job(job_id).unwrap();
-    assert!(db.load_direct_coverage(job_id).unwrap().is_empty());
 
     drop(db);
     execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
@@ -3212,14 +2903,4 @@ async fn execute_schema_ddl(pool: &sqlx::PgPool, sql: String) {
 fn postgres_url_for_schema(base_url: &str, schema: &str) -> String {
     let separator = if base_url.contains('?') { '&' } else { '?' };
     format!("{base_url}{separator}options=-csearch_path%3D{schema}")
-}
-
-// A coverage checkpoint of one run from offset zero, `bytes` long.
-fn coverage_of(bytes: u64) -> crate::jobs::assembly::FileCoverage {
-    crate::jobs::assembly::FileCoverage::from_ordered_runs([crate::jobs::assembly::CoverageRun {
-        first_ordinal: 0,
-        ordinals: 1,
-        start: 0,
-        end: bytes,
-    }])
 }

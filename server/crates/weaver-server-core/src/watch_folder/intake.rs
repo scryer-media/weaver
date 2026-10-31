@@ -308,6 +308,11 @@ fn extract_zip_nzbs(path: &Path, limit: u64) -> Result<IntakeOutput, IntakeError
     let file = File::open(path).map_err(transient_io)?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|error| IntakeError::Permanent(format!("failed to read zip archive: {error}")))?;
+    // A zip whose local headers name other files than its directory lists
+    // shows each reader something else; none of it is taken.
+    archive
+        .validate_header_consistency()
+        .map_err(|error| IntakeError::Permanent(format!("failed to read zip archive: {error}")))?;
     let mut output = IntakeOutput::default();
 
     for i in 0..archive.len() {
@@ -985,6 +990,33 @@ mod tests {
         assert_eq!(output.nzbs.len(), 2);
         assert_eq!(output.nzbs[0].filename, "one.nzb");
         assert_eq!(output.nzbs[1].filename, "two.nzb");
+    }
+
+    #[test]
+    fn rejects_a_zip_whose_local_header_names_another_member() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cloaked.zip");
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("one.nzb", options).unwrap();
+        zip.write_all(&minimal_nzb("one")).unwrap();
+        zip.start_file("two.nzb", options).unwrap();
+        zip.write_all(&minimal_nzb("two")).unwrap();
+        let mut bytes = zip.finish().unwrap().into_inner();
+        // The directory's name for the second entry, not its local header's.
+        let central = bytes
+            .windows(7)
+            .rposition(|window| window == b"two.nzb")
+            .unwrap();
+        bytes[central..central + 7].copy_from_slice(b"t0o.nzb");
+        std::fs::write(&path, bytes).unwrap();
+
+        let error = read_nzbs_from_path(&path).unwrap_err();
+
+        assert!(
+            error.to_string().contains("header inconsistency"),
+            "{error}"
+        );
     }
 
     #[test]

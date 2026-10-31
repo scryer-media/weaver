@@ -579,7 +579,7 @@ func realUsenetCompose(root, subnet, relayIP string, store weaverDatastore, port
 			return nil, fmt.Errorf("cannot initialize isolated databases")
 		}
 		services["postgres"] = map[string]any{
-			"image":       "postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280",
+			"image":       "public.ecr.aws/docker/library/postgres:18@sha256:979bccfde35445db618c65107d27d08c6c21339d8dc3ad4c830c6633947be0e4",
 			"environment": map[string]string{"POSTGRES_USER": "fixture", "POSTGRES_PASSWORD": "fixture", "POSTGRES_DB": "fixture"},
 			"networks":    map[string]any{"private": map[string]any{}},
 			"volumes":     []string{initPath + ":/docker-entrypoint-initdb.d/databases.sql:ro"},

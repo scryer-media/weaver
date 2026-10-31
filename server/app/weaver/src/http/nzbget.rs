@@ -1974,9 +1974,10 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
             (
                 queue_item_from_job(job),
                 reported_category(job.category.as_deref(), &job.metadata),
+                implied_failure_kind(job),
             )
         })
-        .filter(|(item, _)| {
+        .filter(|(item, _, _)| {
             matches!(
                 item.state,
                 QueueItemState::Completed | QueueItemState::Failed
@@ -1985,7 +1986,7 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
         .collect::<Vec<_>>();
     let terminal_ids = terminal_items
         .iter()
-        .map(|(item, _)| item.id)
+        .map(|(item, _, _)| item.id)
         .collect::<Vec<_>>();
     let db = ctx.db.clone();
     let (rows, facade_states) = tokio::task::spawn_blocking(move || {
@@ -2027,7 +2028,7 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
     .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?;
     let ids: Vec<u64> = terminal_items
         .iter()
-        .map(|(item, _)| item.id)
+        .map(|(item, _, _)| item.id)
         .chain(rows.iter().map(|row| row.job_id))
         .collect();
     let db = ctx.db.clone();
@@ -2041,9 +2042,16 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
     let mut seen_terminal_ids = HashSet::with_capacity(terminal_items.len());
     let mut items = terminal_items
         .iter()
-        .filter(|(item, _)| !persisted_ids.contains(&item.id) && seen_terminal_ids.insert(item.id))
-        .map(|(item, category)| {
-            nzbget_history_queue_item(item, category, history_timings(stage_bounds.get(&item.id)))
+        .filter(|(item, _, _)| {
+            !persisted_ids.contains(&item.id) && seen_terminal_ids.insert(item.id)
+        })
+        .map(|(item, category, kept)| {
+            nzbget_history_queue_item(
+                item,
+                category,
+                *kept,
+                history_timings(stage_bounds.get(&item.id)),
+            )
         })
         .collect::<Vec<_>>();
 
@@ -2312,6 +2320,14 @@ fn failure_kind_for(
     failed.then(|| kept.unwrap_or_else(|| HistoryFailureKind::derive(None, None, error, health, 0)))
 }
 
+// The kind a terminal job's own status names before its history row holds
+// one: a partial delivery's is the unpack it fell short in.
+fn implied_failure_kind(job: &weaver_server_core::JobInfo) -> Option<HistoryFailureKind> {
+    job.status.shortfall_stage().map(|stage| {
+        HistoryFailureKind::derive(Some(stage), None, job.error.as_deref(), job.health, 0)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn nzbget_history_entry(
     id: u64,
@@ -2411,7 +2427,12 @@ fn nzbget_history_item(
     )
 }
 
-fn nzbget_history_queue_item(item: &QueueItem, category: &str, timings: HistoryTimings) -> Value {
+fn nzbget_history_queue_item(
+    item: &QueueItem,
+    category: &str,
+    kept: Option<HistoryFailureKind>,
+    timings: HistoryTimings,
+) -> Value {
     let failed = item.state == QueueItemState::Failed;
     nzbget_history_entry(
         item.id,
@@ -2426,7 +2447,7 @@ fn nzbget_history_queue_item(item: &QueueItem, category: &str, timings: HistoryT
         item.created_at.timestamp(),
         history_statuses(
             false,
-            failure_kind_for(failed, None, item.error.as_deref(), item.health),
+            failure_kind_for(failed, kept, item.error.as_deref(), item.health),
         ),
         timings,
         item.health,
@@ -3336,15 +3357,13 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
     for info in targets {
         let job_id = info.job_id;
         let db = ctx.db.clone();
-        let loaded = tokio::task::spawn_blocking(move || {
-            let nzb = db.load_active_job_persisted_nzb(job_id)?;
-            let runtime = db.load_active_file_runtime(job_id)?;
-            Ok::<_, weaver_server_core::StateError>((nzb, runtime))
-        })
-        .await
-        .map_err(|error| RpcError::invalid_parameter(format!("listfiles failed: {error}")))?
-        .map_err(|error| RpcError::invalid_parameter(format!("listfiles failed: {error}")))?;
-        let (persisted, (progress, complete)) = loaded;
+        let persisted =
+            tokio::task::spawn_blocking(move || db.load_active_job_persisted_nzb(job_id))
+                .await
+                .map_err(|error| RpcError::invalid_parameter(format!("listfiles failed: {error}")))?
+                .map_err(|error| {
+                    RpcError::invalid_parameter(format!("listfiles failed: {error}"))
+                })?;
         let Some((_, Some(nzb_zstd))) = persisted else {
             continue;
         };
@@ -3361,16 +3380,21 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
         let paused = item.state == QueueItemState::Paused;
         let output_dir = item.output_dir.clone().unwrap_or_default();
         for (index, file) in nzb.files.iter().enumerate() {
-            let index_u32 = index as u32;
             let total: u64 = file
                 .segments
                 .iter()
                 .map(|segment| segment.bytes as u64)
                 .sum();
-            let remaining = if job_done || complete.contains(&index_u32) {
+            // The job's snapshot says what of each file is still to come; a
+            // file it says nothing of has all of it to come.
+            let remaining = if job_done {
                 0
             } else {
-                total.saturating_sub(progress.get(&index_u32).copied().unwrap_or(0))
+                info.file_remaining_bytes
+                    .get(index)
+                    .copied()
+                    .unwrap_or(total)
+                    .min(total)
             };
             let (file_lo, file_hi) = size_parts(total);
             let (remaining_lo, remaining_hi) = size_parts(remaining);

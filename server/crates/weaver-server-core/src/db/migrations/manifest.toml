@@ -744,3 +744,227 @@ kind = "sql"
 file = "migrations/0065_file_coverage_checkpoint/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 66
+description = "every job is stamped with the engine that runs it"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0066_job_engine_stamp/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0066_job_engine_stamp/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 67
+description = "a graph job's tree is checkpointed as rows a restart rebuilds it from"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0067_graph_checkpoint/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0067_graph_checkpoint/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 68
+description = "a graph checkpoint keeps which given-up members were buried"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0068_graph_member_buried/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0068_graph_member_buried/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 69
+description = "a graph checkpoint keeps each sealed part of a node's facts as its own row"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0069_graph_facts_parts/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0069_graph_facts_parts/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 70
+description = "a graph checkpoint keeps which member each further posting of one was folded into"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0070_graph_member_copy_of/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0070_graph_member_copy_of/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 71
+description = "a graph checkpoint no longer records members carrying recovery data nothing reads"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0071_graph_member_unusable_dropped/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0071_graph_member_unusable_dropped/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 72
+description = "a graph checkpoint records where each hold paged to scratch lies in its scratch file"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0072_graph_holds_scratch_offset/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0072_graph_holds_scratch_offset/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 73
+description = "durable NZB concurrency admission"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0073_nzb_admission/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0073_nzb_admission/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 74
+description = "every job runs on the graph engine"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0074_graph_engine/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0074_graph_engine/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 75
+description = "a graph checkpoint keeps each member's checksum"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0075_graph_member_crc32/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0075_graph_member_crc32/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 76
+description = "a graph checkpoint keeps the parts that arrived and wait to be placed"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0076_graph_held_parts/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0076_graph_held_parts/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 77
+description = "a graph checkpoint keeps where a member's or an envelope's file sits"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0077_graph_file_on_disk/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0077_graph_file_on_disk/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 78
+description = "persist server feed verdicts with graph refusals"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0078_feed_verdict/schema.sql"
+scope = "all"
+
+[[migration]]
+version = 79
+description = "a graph checkpoint keeps the kind a member's own bytes refuted"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0079_graph_member_refuted/schema.sql"
+scope = "all"

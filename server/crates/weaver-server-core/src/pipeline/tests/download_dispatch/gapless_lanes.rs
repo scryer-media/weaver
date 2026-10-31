@@ -10,6 +10,7 @@
 // be booked under.
 
 use super::*;
+use crate::pipeline::tests::new_scheduler_pipeline as new_direct_pipeline;
 
 // Retag the queue so every remaining item sits at `head_priority`, and drop
 // one item at `lane_priority` — the shape a direct-store volume boundary
@@ -21,7 +22,12 @@ fn split_queue_priorities(
     head_priority: u32,
 ) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    let mut works = state.download_queue.drain_all();
+    let mut works = state
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .drain_all();
     assert!(
         works.len() >= 2,
         "the boundary case needs a queue with work on both sides"
@@ -32,7 +38,12 @@ fn split_queue_priorities(
         work.priority = head_priority;
     }
     for work in works {
-        state.download_queue.push(work);
+        state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .push(work);
     }
 }
 
@@ -64,6 +75,7 @@ fn book_connected_lane(pipeline: &mut Pipeline, job_id: JobId, completion_critic
     pipeline.download_lane_owners.insert(
         lane_id,
         DownloadLaneOwner {
+            body_activity: Vec::new(),
             job_id,
             mode: DownloadLaneMode::Sequential,
             completion_critical,
@@ -102,7 +114,15 @@ async fn lane_refill_crosses_a_priority_boundary_instead_of_parking() {
     .await;
 
     split_queue_priorities(&mut pipeline, job_id, 10, 11);
-    let queued_before = pipeline.jobs.get(&job_id).unwrap().download_queue.len();
+    let queued_before = pipeline
+        .jobs
+        .get(&job_id)
+        .unwrap()
+        .articles
+        .active()
+        .unwrap()
+        .download_queue
+        .len();
     let parked_before = pipeline
         .metrics
         .download_lane_refill_parked_total
@@ -128,7 +148,18 @@ async fn lane_refill_crosses_a_priority_boundary_instead_of_parking() {
         parked_before,
         "a lane must never park while the job has work it can serve"
     );
-    assert!(pipeline.jobs.get(&job_id).unwrap().download_queue.len() < queued_before);
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len()
+            < queued_before
+    );
 }
 
 // Work another server failed is still this lane's to fetch, and the lease it
@@ -169,14 +200,24 @@ async fn lane_refill_takes_head_work_its_own_server_can_serve() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        let mut works = state.download_queue.drain_all();
+        let mut works = state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .drain_all();
         works.pop().unwrap();
         for work in &mut works {
             // Another server failed these; server 0 — this lane — still may.
             work.exclude_servers = vec![1];
         }
         for work in works {
-            state.download_queue.push(work);
+            state
+                .articles
+                .active_mut()
+                .unwrap()
+                .download_queue
+                .push(work);
         }
     }
 
@@ -328,7 +369,12 @@ async fn lane_depth_gauges_never_wrap_below_zero() {
 // the ordinary heap the rest.
 fn split_queue_classes(pipeline: &mut Pipeline, job_id: JobId, critical: usize) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    let mut works = state.download_queue.drain_all();
+    let mut works = state
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .drain_all();
     assert!(
         works.len() > critical,
         "the class split needs work left over for the payload lane"
@@ -337,7 +383,12 @@ fn split_queue_classes(pipeline: &mut Pipeline, job_id: JobId, critical: usize) 
         work.completion_critical = true;
     }
     for work in works {
-        state.download_queue.push(work);
+        state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .push(work);
     }
 }
 
@@ -476,6 +527,9 @@ async fn a_refill_on_a_lane_of_a_job_that_is_not_hot_is_answered_from_the_hot_jo
         .jobs
         .get(&other_job_id)
         .unwrap()
+        .articles
+        .active()
+        .unwrap()
         .download_queue
         .len();
 
@@ -494,6 +548,9 @@ async fn a_refill_on_a_lane_of_a_job_that_is_not_hot_is_answered_from_the_hot_jo
         pipeline
             .jobs
             .get(&other_job_id)
+            .unwrap()
+            .articles
+            .active()
             .unwrap()
             .download_queue
             .len(),
@@ -599,7 +656,18 @@ async fn a_saturated_refill_waits_for_the_lane_to_drain_below_its_share() {
             .load(Ordering::Relaxed),
         parked_before
     );
-    assert_eq!(pipeline.jobs.get(&next).unwrap().download_queue.len(), 600);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&next)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        600
+    );
 
     // Servicing the hold while the lane still holds its share changes
     // nothing; the ask stays held past any idle deadline because the lane is

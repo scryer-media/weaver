@@ -8,13 +8,10 @@ fn handle(pipeline: &Pipeline) -> SchedulerHandle {
 }
 
 async fn add(handle: &SchedulerHandle, id: JobId) {
+    let spec = segmented_job_spec("queue fixture", "payload.bin", &[100]);
+    let nzb_zstd = nzb_zstd_for(&spec);
     handle
-        .add_job(
-            id,
-            segmented_job_spec("queue fixture", "payload.bin", &[100]),
-            PathBuf::from("queue-fixture.nzb"),
-            sample_nzb_zstd(),
-        )
+        .add_job(id, spec, PathBuf::from("queue-fixture.nzb"), nzb_zstd)
         .await
         .unwrap();
 }
@@ -114,7 +111,7 @@ async fn duplicate_admission_and_unknown_mutations_refuse_synchronously() {
             id,
             segmented_job_spec("duplicate", "payload.bin", &[100]),
             PathBuf::from("duplicate.nzb"),
-            sample_nzb_zstd(),
+            nzb_zstd_for(&(segmented_job_spec("duplicate", "payload.bin", &[100]))),
         )
         .await
         .unwrap_err();
@@ -135,7 +132,15 @@ async fn pause_and_semantic_cancel_refuse_post_processing_without_an_actor_turn(
     let id = JobId(9010);
     add(&handle, id).await;
     pipeline.apply_queue_intents().await;
-    pipeline.jobs.get_mut(&id).unwrap().download_queue = DownloadQueue::new();
+    activate_job(&mut pipeline, id).await;
+    pipeline
+        .jobs
+        .get_mut(&id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue = DownloadQueue::new();
     for status in [JobStatus::Extracting, JobStatus::Repairing] {
         pipeline.jobs.get_mut(&id).unwrap().status = status;
         pipeline.report_job(id);
@@ -287,6 +292,90 @@ async fn retry_waits_for_cancelled_directory_cleanup_before_readmission() {
 }
 
 #[tokio::test]
+async fn an_explicit_redownload_clears_the_committed_feed_verdict() {
+    redownload_clears_the_committed_feed_verdict(false).await;
+}
+
+#[tokio::test]
+async fn a_cancelled_dead_post_redownload_clears_the_committed_feed_verdict() {
+    redownload_clears_the_committed_feed_verdict(true).await;
+}
+
+async fn redownload_clears_the_committed_feed_verdict(cancel: bool) {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let handle = handle(&pipeline);
+    let id = JobId(9012);
+    add(&handle, id).await;
+    pipeline.apply_queue_intents().await;
+    activate_job(&mut pipeline, id).await;
+    pipeline.db.flush_write_queue().await.unwrap();
+    let mut verdict = crate::jobs::feed_verdict::FeedVerdict::new("fixture feed refusal".into());
+    verdict.abandoned_files.insert(0);
+    pipeline
+        .db
+        .save_graph_checkpoint(
+            id,
+            Arc::new(crate::jobs::graph_checkpoint::Delta {
+                feed_verdict: Some(verdict.clone()),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+    pipeline
+        .post_probes
+        .restore_verdict(id, Some(verdict.clone()));
+    assert_eq!(
+        pipeline
+            .db
+            .load_graph_checkpoint(id)
+            .unwrap()
+            .unwrap()
+            .feed_verdict,
+        Some(verdict)
+    );
+
+    if cancel {
+        handle.cancel_job_keeping_files(id).await.unwrap();
+        pipeline.apply_queue_intents().await;
+        finish_cancel_jobs(&mut pipeline).await;
+        while pipeline.retiring_graph_jobs.contains_key(&id) {
+            hear_graph_mail(&mut pipeline, id).await;
+        }
+    } else {
+        pipeline.fail_job(id, "fixture feed refusal".into());
+        settle_failed_releases(&mut pipeline).await;
+    }
+    pipeline.db.flush_write_queue().await.unwrap();
+    assert!(pipeline.db.get_job_history(id.0).unwrap().is_some());
+    handle.redownload_job(id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    activate_job(&mut pipeline, id).await;
+    pipeline.db.flush_write_queue().await.unwrap();
+    assert!(!pipeline.post_probes.verdicts.contains_key(&id));
+    assert!(!pipeline.post_probes.dead.contains_key(&id));
+    assert!(
+        pipeline
+            .db
+            .load_graph_checkpoint(id)
+            .unwrap()
+            .unwrap()
+            .feed_verdict
+            .is_none()
+    );
+    assert_eq!(
+        pipeline.jobs[&id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        1
+    );
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
 async fn metadata_intents_preserve_later_script_parameters_and_merge_per_key() {
     let temp = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
@@ -362,7 +451,7 @@ async fn shutdown_settles_recorded_cancel_and_refuses_new_admission() {
                 JobId(9012),
                 segmented_job_spec("late", "payload.bin", &[100]),
                 PathBuf::from("late.nzb"),
-                sample_nzb_zstd()
+                nzb_zstd_for(&(segmented_job_spec("late", "payload.bin", &[100])))
             )
             .await,
         Err(SchedulerError::ChannelClosed)
@@ -412,7 +501,8 @@ async fn superseded_admission_never_installs_a_queue_row() {
         panic!("initial candidate must be admitted");
     };
     let mut replacement = spec.clone();
-    replacement.files[0].segments[0].message_id = "replacement@fixture.invalid".into();
+    replacement.files[0].segments[0].message_ids =
+        crate::jobs::MessageIds::new(vec!["replacement@fixture.invalid".into()]);
     assert!(matches!(
         pipeline
             .db
@@ -490,127 +580,4 @@ async fn final_delete_archives_before_the_event_and_erases_history_after_cleanup
     pipeline.report_all_for_test();
     assert!(handle.get_job(id).is_err());
     assert!(pipeline.db.get_job_history(id.0).unwrap().is_none());
-}
-
-// A fake provider on one listener: the first BODY it is asked for is the one
-// article of the job under test; every later BODY is left unanswered until
-// the client hangs up, so a second job stays mid-download without a timer.
-async fn spawn_one_article_server(payload: Vec<u8>) -> u16 {
-    use std::sync::atomic::AtomicBool;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let mut article = Vec::new();
-    weaver_yenc::encode(&payload, &mut article, 128, "payload.bin").unwrap();
-    if !article.ends_with(b"\r\n") {
-        article.extend_from_slice(b"\r\n");
-    }
-    let article = Arc::new(article);
-    let served = Arc::new(AtomicBool::new(false));
-    tokio::spawn(async move {
-        loop {
-            let (socket, _) = listener.accept().await.unwrap();
-            let article = Arc::clone(&article);
-            let served = Arc::clone(&served);
-            tokio::spawn(async move {
-                let (reader, mut writer) = socket.into_split();
-                if writer.write_all(b"200 fixture ready\r\n").await.is_err() {
-                    return;
-                }
-                let mut lines = BufReader::new(reader).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let reply: Vec<u8> = if line == "CAPABILITIES" {
-                        b"101 capabilities\r\nVERSION 2\r\nREADER\r\n.\r\n".to_vec()
-                    } else if line.starts_with("GROUP ") {
-                        b"211 1 1 1 alt.binaries.test\r\n".to_vec()
-                    } else if line.starts_with("BODY ") {
-                        if served.swap(true, Ordering::SeqCst) {
-                            // Held: answered by nothing until the client goes.
-                            while let Ok(Some(_)) = lines.next_line().await {}
-                            return;
-                        }
-                        let mut body = b"222 0 <article> body follows\r\n".to_vec();
-                        body.extend_from_slice(&article);
-                        body.extend_from_slice(b".\r\n");
-                        body
-                    } else if line == "QUIT" {
-                        let _ = writer.write_all(b"205 closing\r\n").await;
-                        return;
-                    } else {
-                        b"500 unsupported\r\n".to_vec()
-                    };
-                    if writer.write_all(&reply).await.is_err() {
-                        return;
-                    }
-                }
-            });
-        }
-    });
-    port
-}
-
-// One job's disk write is held on the pipeline thread. Another job is
-// added, paused and cancelled meanwhile: each intent is recorded at once,
-// without a pipeline turn, and once the write lands the pipeline acts on
-// every one of them and the held job completes.
-#[tokio::test]
-async fn held_segment_write_leaves_other_jobs_commands_answered() {
-    let port = spawn_one_article_server(vec![b'x'; 100]).await;
-    let server = weaver_nntp::ServerConfig {
-        host: "127.0.0.1".to_string(),
-        port,
-        tls: false,
-        // Far beyond any run: the held BODY must never time out into a retry.
-        connect_timeout: Duration::from_secs(3600),
-        command_timeout: Duration::from_secs(3600),
-        ..Default::default()
-    };
-    let harness =
-        TestHarness::new_with_nntp(NntpClient::new(NntpClientConfig::single(server, 1)), 1).await;
-    let hold = crate::e2e_failpoint::Hold::install(
-        crate::e2e_failpoint::DISK_WRITE,
-        &harness._temp_dir.path().join("intermediate"),
-    );
-    let handle = &harness.handle;
-    let mut events = handle.subscribe_events();
-    let a = JobId(9101);
-    let b = JobId(9102);
-    handle
-        .add_job(
-            a,
-            segmented_job_spec("held write", "payload.bin", &[100]),
-            PathBuf::from("held-write.nzb"),
-            sample_nzb_zstd(),
-        )
-        .await
-        .unwrap();
-    hold.arrived().await;
-
-    let watermark = handle.job_revision();
-    add(handle, b).await;
-    assert!(handle.job_revision() > watermark);
-    let watermark = handle.job_revision();
-    handle.pause_job(b).await.unwrap();
-    assert!(handle.job_revision() > watermark);
-    let watermark = handle.job_revision();
-    handle.cancel_job(b).await.unwrap();
-    assert!(handle.job_revision() > watermark);
-    assert!(
-        handle
-            .get_job(a)
-            .is_ok_and(|job| job.status != JobStatus::Complete)
-    );
-
-    hold.release();
-    let mut cancelled = false;
-    let mut completed = false;
-    while !(cancelled && completed) {
-        match events.recv().await.unwrap() {
-            PipelineEvent::JobCancelled { job_id } if job_id == b => cancelled = true,
-            PipelineEvent::JobCompleted { job_id, .. } if job_id == a => completed = true,
-            _ => {}
-        }
-    }
-    assert!(handle.list_jobs().iter().all(|job| job.job_id != b));
-    assert_eq!(handle.get_job(a).unwrap().status, JobStatus::Complete);
 }

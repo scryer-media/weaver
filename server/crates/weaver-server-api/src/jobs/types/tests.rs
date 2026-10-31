@@ -79,7 +79,7 @@ fn base_job(status: JobStatus) -> weaver_server_core::JobInfo {
             weaver_server_core::RunState::Active,
             None,
         ),
-        JobStatus::Complete => (
+        JobStatus::Complete | JobStatus::Partial => (
             weaver_server_core::DownloadState::Complete,
             weaver_server_core::PostState::Completed,
             weaver_server_core::RunState::Active,
@@ -120,6 +120,7 @@ fn base_job(status: JobStatus) -> weaver_server_core::JobInfo {
         total_files: 0,
         completed_files: 0,
         remaining_par_files: 0,
+        file_remaining_bytes: Vec::new(),
         password: None,
         category: Some("movies".to_string()),
         metadata: vec![
@@ -166,6 +167,16 @@ fn queue_item_collapses_internal_waiting_states() {
     assert_eq!(
         extract.wait_reason,
         Some(QueueWaitReason::ExtractionCapacity)
+    );
+}
+
+#[test]
+fn a_partial_job_reads_as_failed() {
+    let item = queue_item_from_job(&base_job(JobStatus::Partial));
+    assert_eq!(item.state, QueueItemState::Failed);
+    assert_eq!(
+        JobStatusGql::from(&JobStatus::Partial),
+        JobStatusGql::Failed
     );
 }
 

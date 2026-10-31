@@ -1,0 +1,13 @@
+{
+  "slug": "bzip2-corrupted",
+  "title": "E2E.Test.bzip2.corrupted.2026-TESTGRP",
+  "description": "A damaged lone bzip2 stream must fail and retain its posted compressed bytes.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "expectedRetainedOutputBLAKE3": {
+    "灯火.bin.bz2": "111b59a3d815560af5659070a1bd12829e5d8ddd0e363e5f25cff43d66a31d01"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks"
+  ]
+}

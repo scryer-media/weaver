@@ -140,12 +140,11 @@ pub(super) fn cells() -> Vec<DamageCell> {
     cells
 }
 
-// Schedules each (cell, profile) unit samples from the matrix's smoke
-// schedules.
+// Schedules each cell samples from the matrix's smoke schedules.
 const PER_UNIT: usize = 283;
 
-// 15,840 possible cells under three profiles, 283 schedules each.
-pub(super) const TOTAL: usize = 4_482_720;
+// 5,280 possible cells, 283 schedules each.
+pub(super) const TOTAL: usize = 1_494_240;
 
 pub(super) fn family() -> Family<DamageCell> {
     let cells = cells();
@@ -154,11 +153,7 @@ pub(super) fn family() -> Family<DamageCell> {
         units: cells
             .into_iter()
             .enumerate()
-            .flat_map(|(index, cell)| {
-                PROFILES
-                    .into_iter()
-                    .map(move |profile| (cell, profile, Pool::Smoke, PER_UNIT, index))
-            })
+            .map(|(index, cell)| (cell, Pool::Smoke, PER_UNIT, index))
             .collect(),
     }
 }
@@ -447,8 +442,11 @@ impl Cell for DamageCell {
     }
 }
 
+// The graph has no schedule-driven demotion: a crash, which loses what the
+// job held only in memory and refetches it, is the boundary that makes the
+// job reassess a source it already saw.
 #[tokio::test]
-async fn par3_demotion_refetch_reassesses_changed_source() {
+async fn par3_crash_refetch_reassesses_changed_source() {
     run_cell(
         DamageCell {
             kind: Damage::CrcWrong,
@@ -457,13 +455,9 @@ async fn par3_demotion_refetch_reassesses_changed_source() {
             recovery: Recovery::Par3,
             container: Container::Rar5,
         },
-        ExtractionProfile::DirectStore,
         vec![(
             516269,
-            (
-                vec![(0, 0), (0, 1), (1, 0), (1, 1)],
-                Interruption::Demote(1),
-            ),
+            (vec![(0, 0), (0, 1), (1, 0), (1, 1)], Interruption::Crash(1)),
         )],
     )
     .await;
@@ -479,7 +473,6 @@ async fn encrypted_par3_readback_crosses_missing_member_boundary() {
             recovery: Recovery::Par3,
             container: Container::Rar5Encrypted,
         },
-        ExtractionProfile::DirectStore,
         vec![(
             2014677,
             (vec![(0, 0), (0, 1), (1, 0), (1, 1)], Interruption::None),
@@ -498,7 +491,6 @@ async fn encrypted_par3_duplicate_restart_settles() {
             recovery: Recovery::Par3,
             container: Container::Rar5Encrypted,
         },
-        ExtractionProfile::DirectStore,
         vec![(
             3542957,
             (
@@ -520,7 +512,6 @@ async fn swapped_encrypted_headers_repaired_after_restart() {
             recovery: Recovery::Par2(Margin::With),
             container: Container::Rar5Encrypted,
         },
-        ExtractionProfile::DirectStore,
         vec![(
             0,
             (
@@ -577,7 +568,6 @@ async fn par3_restart_retains_the_decoded_prefix_as_repair_input() {
             recovery: Recovery::Par3,
             container: Container::SevenZip,
         },
-        ExtractionProfile::DirectStore,
         vec![(
             491760,
             (
@@ -591,31 +581,24 @@ async fn par3_restart_retains_the_decoded_prefix_as_repair_input() {
 
 #[tokio::test]
 async fn encrypted_par3_restart_retains_the_first_volume() {
-    for profile in [
-        ExtractionProfile::DirectStore,
-        ExtractionProfile::Chase,
-        ExtractionProfile::Conventional,
-    ] {
-        for at in [2, 3] {
-            run_cell(
-                DamageCell {
-                    kind: Damage::Swapped,
-                    location: Location::RecoveryVolume,
-                    pattern: Pattern::MemberAbsent,
-                    recovery: Recovery::Par3,
-                    container: Container::Rar5Encrypted,
-                },
-                profile,
-                vec![(
-                    0,
-                    (
-                        vec![(1, 0), (1, 1), (0, 1), (0, 0)],
-                        Interruption::Restart(at),
-                    ),
-                )],
-            )
-            .await;
-        }
+    for at in [2, 3] {
+        run_cell(
+            DamageCell {
+                kind: Damage::Swapped,
+                location: Location::RecoveryVolume,
+                pattern: Pattern::MemberAbsent,
+                recovery: Recovery::Par3,
+                container: Container::Rar5Encrypted,
+            },
+            vec![(
+                0,
+                (
+                    vec![(1, 0), (1, 1), (0, 1), (0, 0)],
+                    Interruption::Restart(at),
+                ),
+            )],
+        )
+        .await;
     }
 }
 
@@ -647,7 +630,7 @@ mod combined_damage_loss_smoke {
     }
 }
 
-// The campaign: 4,500 shards of about a thousand cases.
+// The campaign: 4,500 shards of about three hundred cases.
 mod combined_damage {
     use super::*;
 

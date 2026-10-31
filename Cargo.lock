@@ -3392,9 +3392,9 @@ dependencies = [
 
 [[package]]
 name = "par2-rs"
-version = "0.10.13"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f79a1a5151a773c595f156d322236c3689404d622e5a85dc3188a06503529fc"
+checksum = "e6572ee40d3b7dca8bc76bbf9ee58fd60ee293074e2de5f89acaa2729778ea42"
 dependencies = [
  "bytes",
  "cap-std",
@@ -5764,9 +5764,9 @@ dependencies = [
 
 [[package]]
 name = "unrar-rs"
-version = "0.14.1"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2821acdbd624de10b9d9fed6a959dfe7e911087f01e4b20449ecc6ee8ddfb47"
+checksum = "32877a1ea1bbb266cc0039f682ff826782b1dc29c205776c4b6558d13a100b62"
 dependencies = [
  "aws-lc-rs",
  "blake2s_simd",
@@ -5981,6 +5981,7 @@ dependencies = [
 name = "weaver"
 version = "0.16.5"
 dependencies = [
+ "aho-corasick",
  "application-updater",
  "async-graphql",
  "async-graphql-axum",
@@ -6012,6 +6013,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sevenz-turbo",
+ "sha2 0.11.1",
  "tar",
  "tempfile",
  "tikv-jemalloc-sys",
@@ -6035,6 +6037,19 @@ dependencies = [
  "windows-sys 0.61.2",
  "zip",
  "zstd 0.13.3",
+]
+
+[[package]]
+name = "weaver-graph"
+version = "0.16.5"
+dependencies = [
+ "bytes",
+ "crc-turbo",
+ "rmp-serde",
+ "serde",
+ "thiserror 2.0.21",
+ "unicase",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -6078,12 +6093,38 @@ name = "weaver-nzb"
 version = "0.16.5"
 dependencies = [
  "blake3",
+ "html-escape",
  "quick-xml",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tracing",
  "weaver-model",
+]
+
+[[package]]
+name = "weaver-objects"
+version = "0.16.5"
+dependencies = [
+ "aws-lc-rs",
+ "brotli 8.0.4",
+ "bytes",
+ "bzip2",
+ "crc-turbo",
+ "flate2",
+ "lzma-turbo",
+ "par2-rs",
+ "par3-rs",
+ "rmp-serde",
+ "serde",
+ "sevenz-turbo",
+ "tempfile",
+ "thiserror 2.0.21",
+ "unrar-rs",
+ "weaver-graph",
+ "zeroize",
+ "zip",
+ "zstd 0.13.3",
 ]
 
 [[package]]
@@ -6182,9 +6223,11 @@ dependencies = [
  "unicode-normalization",
  "unrar-rs",
  "url",
+ "weaver-graph",
  "weaver-model",
  "weaver-nntp",
  "weaver-nzb",
+ "weaver-objects",
  "weaver-tunnel",
  "weaver-yenc",
  "windows-sys 0.61.2",

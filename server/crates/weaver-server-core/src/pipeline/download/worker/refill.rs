@@ -206,6 +206,15 @@ impl Pipeline {
             });
             return;
         }
+        // A health probe batch waits for a seat on this server and has none
+        // free anywhere it may go. The lane is given no more articles: it
+        // finishes the ones it holds and parks keeping its connection, and
+        // the next dispatch pass seats the batch there. The batch never
+        // shares the lane with articles in flight.
+        if self.probe_waits_for_seat_on(server_idx) {
+            self.park_download_lane_refill(request, LaneParkReason::ProbeYield, held_since, now);
+            return;
+        }
 
         let pressure = self.refresh_download_pressure();
         let lane_mode = self.download_lane_mode_for_server(
@@ -350,11 +359,9 @@ impl Pipeline {
             }
         }
         let mut returned = 0;
-        if let Some(state) = self.jobs.get_mut(&job_id) {
-            for work in works {
-                state.download_queue.push(work);
-                returned += 1;
-            }
+        for work in works {
+            self.enqueue_download_work(work);
+            returned += 1;
         }
         if returned > 0 {
             self.update_queue_metrics();
@@ -362,11 +369,20 @@ impl Pipeline {
         if reserved.is_empty() {
             return None;
         }
+        // The handout was cut for `server_idx` alone, so the lease is pinned
+        // there and no article in it may have failed on that server.
+        debug_assert!(
+            reserved
+                .iter()
+                .all(|work| !work.exclude_servers.contains(&server_idx)),
+            "a lease holds an article already excluded from the server it is pinned to"
+        );
         let completion_critical = reserved.iter().any(|work| work.completion_critical);
         let dial_exclude_servers = (0..self.nntp.pool().server_count())
             .filter(|idx| *idx != server_idx)
             .collect();
         Some(DownloadBatchLease {
+            body_activity: Arc::default(),
             lane_id,
             job_id,
             runtime_generation: self.pool_generation,
@@ -375,7 +391,12 @@ impl Pipeline {
             completion_critical,
             effective_exclude_servers: self.effective_exclude_servers(job_id, &[]),
             dial_exclude_servers,
-            checkpoint_plan: self.par2_checkpoint_plan(job_id),
+            checkpoint_plan: self
+                .graph_jobs
+                .get(&job_id)
+                .map_or(weaver_yenc::CheckpointPlan::None, |graph| {
+                    weaver_yenc::CheckpointPlan::from_slice_sizes(graph.block_sizes()).plan
+                }),
             pressure_clear: pressure.state == DownloadPressureState::Clear,
             works: reserved,
         })
@@ -452,7 +473,7 @@ impl Pipeline {
             queued = self
                 .jobs
                 .values()
-                .map(|state| state.download_queue.len())
+                .map(|state| state.articles.queued_download_len())
                 .sum::<usize>(),
             "download lane refill denied; lane parking"
         );

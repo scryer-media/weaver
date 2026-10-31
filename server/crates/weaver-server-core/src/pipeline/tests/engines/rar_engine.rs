@@ -1,0 +1,693 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+// Compressed and solid RAR: real RARLAB archives, which
+// the store cannot stream, so the graph hands their volumes to the RAR
+// engine and reads its members out of a run over the growing files.
+
+use super::harness::{
+    ARTICLE, Claim, Outcome, Post, Scenario, assert_fetched_once, kinds, payload, run,
+};
+use super::rar::{delivered, posts, with_par2};
+use crate::history::failure_kind::HistoryFailureKind;
+use crate::jobs::model::JobStatus;
+use crate::pipeline::tests::direct_store::obfuscate_volumes;
+use crate::pipeline::tests::direct_store::scenarios::{HeaderCheck, header_encrypted_store_set};
+use crate::pipeline::tests::rar5_fixture_bytes;
+
+const MIXED: &str = "rar5_multifile_lz.rar";
+
+fn mixed() -> Scenario {
+    Scenario::new(vec![Post::plain("mixed.rar", rar5_fixture_bytes(MIXED))])
+}
+
+// The engine object ran: the graph bound a RAR engine to the volumes.
+fn assert_engine_ran(graph: &Outcome) {
+    assert!(
+        graph.graph().kinds.contains("rar_engine"),
+        "{:?}",
+        graph.graph().kinds
+    );
+}
+
+fn assert_mixed_members(outcome: &Outcome) {
+    assert!(
+        outcome.completed(),
+        "{:?} {:?}",
+        outcome.status,
+        outcome.failure
+    );
+    let names: Vec<_> = outcome.files.keys().cloned().collect();
+    assert_eq!(
+        names,
+        ["hello.txt", "second.txt", "zeros_64k.bin"]
+            .map(delivered)
+            .to_vec(),
+        "",
+    );
+    assert!(
+        outcome.files[&delivered("zeros_64k.bin")] == vec![0u8; 64 * 1024],
+        "the compressed member",
+    );
+}
+
+#[tokio::test]
+async fn a_compressed_rar5_volume_delivers_every_member_through_the_engine() {
+    let graph = run(&mixed()).await;
+    assert_mixed_members(&graph);
+    assert_engine_ran(&graph);
+    assert_fetched_once(&graph);
+}
+
+// The same archive cut into articles of every size from the whole file down
+// to a byte (4 KiB is the whole 235-byte file again): one outcome and one
+// set of files.
+#[tokio::test]
+async fn a_compressed_rar5_volume_delivers_alike_in_every_frame_size() {
+    let mut seen = None;
+    for size in [usize::MAX, 4096, 64, 1] {
+        let graph = run(&mixed().framed(size)).await;
+        assert_mixed_members(&graph);
+        assert_engine_ran(&graph);
+        assert_fetched_once(&graph);
+        let files = seen.get_or_insert_with(|| graph.files.clone());
+        assert_eq!(*files, graph.files, "frames of {size} bytes");
+    }
+}
+
+// The same frames served last article first, as a crowd of workers may:
+// every article but the first is in hand before the store learns from the
+// headers that the volume needs the engine.
+#[tokio::test]
+async fn a_compressed_rar5_volume_served_last_article_first_delivers_alike_in_every_frame_size() {
+    let mut seen = None;
+    for size in [usize::MAX, 4096, 64, 1] {
+        let graph = run(&mixed().framed(size).backwards()).await;
+        assert_mixed_members(&graph);
+        assert_engine_ran(&graph);
+        assert_fetched_once(&graph);
+        let files = seen.get_or_insert_with(|| graph.files.clone());
+        assert_eq!(*files, graph.files, "frames of {size} bytes");
+    }
+}
+
+const VIDEO: &str = "test_clip.mkv";
+const VIDEO_SECRET: &str = "testpass123";
+// The video set is a quarter of a megabyte a volume: cut at 4 KiB, not at
+// ARTICLE, so a row is a few hundred articles. PAR2 slices stay at ARTICLE.
+const VIDEO_FRAME: usize = 4096;
+
+// The five RARLAB volumes, named as their set numbers them.
+fn video_set() -> Vec<(String, Vec<u8>)> {
+    (1..=5)
+        .map(|part| {
+            (
+                format!("clip.part{part}.rar"),
+                rar5_fixture_bytes(&format!("rar5_enc_mv_video.part{part}.rar")),
+            )
+        })
+        .collect()
+}
+
+fn video(posts: Vec<Post>) -> Scenario {
+    Scenario::new(posts).framed(VIDEO_FRAME)
+}
+
+fn assert_video(outcome: &Outcome) {
+    assert!(
+        outcome.completed(),
+        "{:?} {:?}",
+        outcome.status,
+        outcome.failure
+    );
+    assert_eq!(
+        outcome.files.keys().cloned().collect::<Vec<_>>(),
+        vec![delivered(VIDEO)],
+        "",
+    );
+}
+
+#[tokio::test]
+async fn the_encrypted_five_volume_set_with_its_password_up_front_delivers() {
+    let scenario = video(posts(video_set())).password(VIDEO_SECRET);
+    let graph = run(&scenario).await;
+    assert_video(&graph);
+    assert_eq!(kinds(&graph), ["rar_store"]);
+    assert_fetched_once(&graph);
+}
+
+// The password reaches the store only as a candidate the job offers once
+// the store asks, as rar.rs's two-volume candidate row has it for a stored
+// set, and the member is delivered.
+#[tokio::test]
+async fn the_encrypted_five_volume_set_opened_by_a_password_candidate_delivers() {
+    let scenario = video(posts(video_set())).global_password(VIDEO_SECRET);
+    let graph = run(&scenario).await;
+    assert_video(&graph);
+    assert_eq!(kinds(&graph), ["rar_store"]);
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    let offered: Vec<_> = graph.graph().offered.values().copied().collect();
+    assert_eq!(offered, [1], "one try for the one candidate");
+}
+
+// A wrong candidate and then the right one: the store refutes the first by
+// the member's password check and asks again, and each candidate is offered
+// once, and the member is delivered.
+#[tokio::test]
+async fn the_encrypted_five_volume_set_tries_a_wrong_candidate_once_then_the_right_one() {
+    let scenario = video(posts(video_set()))
+        .global_password("cinder-wrong-guess")
+        .global_password(VIDEO_SECRET);
+    let graph = run(&scenario).await;
+    assert_video(&graph);
+    assert_eq!(kinds(&graph), ["rar_store"]);
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    let offered: Vec<_> = graph.graph().offered.values().copied().collect();
+    assert_eq!(offered, [2], "one try for each of the two candidates");
+}
+
+// What nothing opened is withheld: the job fails at unpacking, naming the
+// volumes and the password they need, so its history says a password
+// failed it, with nothing whole, nothing short and nothing in the complete
+// directory.
+fn assert_needs_password(graph: &Outcome, volumes: &[(String, Vec<u8>)]) {
+    let names: Vec<String> = volumes.iter().map(|(name, _)| name.clone()).collect();
+    assert_eq!(
+        graph.failure,
+        Some(format!(
+            "WEAVER_PASSWORD_REQUIRED: {} needs a password and none was given",
+            names.join(", ")
+        )),
+        "{:?}",
+        graph.status
+    );
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Password));
+    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    let delivery = &graph.graph().delivery;
+    assert!(delivery.whole.is_empty(), "{delivery:?}");
+    assert!(delivery.damaged.is_empty(), "{delivery:?}");
+    assert!(delivery.files.is_empty(), "{delivery:?}");
+    let withheld: Vec<String> = delivery
+        .withheld
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    assert_eq!(withheld, names);
+}
+
+// No password and no candidate: the store asks, nothing answers, and once
+// the whole set is in it gives the volumes back withheld.
+#[tokio::test]
+async fn the_encrypted_five_volume_set_with_no_password_fails_naming_the_password() {
+    let scenario = video(posts(video_set()));
+    let graph = run(&scenario).await;
+    assert_needs_password(&graph, &video_set());
+    assert_eq!(kinds(&graph), ["rar_store"]);
+}
+
+// The headers enciphered too, with no password. With a password check the
+// store asks and refuses the set itself; without one it hands the set to
+// the engine, which asks and is refused. Either way one wording.
+#[tokio::test]
+async fn a_header_encrypted_set_with_no_password_fails_naming_the_password() {
+    let body = payload(7 * ARTICLE + 13, 51);
+    for (check, kind) in [
+        (HeaderCheck::For(VIDEO_SECRET), "rar_store"),
+        (HeaderCheck::Absent, "rar_engine"),
+    ] {
+        let volumes = header_encrypted_store_set("beacon.bin", &body, 2, VIDEO_SECRET, check);
+        let scenario = Scenario::new(posts(volumes.clone()));
+        let graph = run(&scenario).await;
+        assert_needs_password(&graph, &volumes);
+        assert!(kinds(&graph).contains(&kind), "{:?}", kinds(&graph));
+    }
+}
+
+// A wrong candidate only: offered once, refuted by the member's password
+// check, and with none left the store gives the volumes back withheld, in
+// the same words.
+#[tokio::test]
+async fn the_encrypted_five_volume_set_with_only_a_wrong_candidate_fails_naming_the_password() {
+    let scenario = video(posts(video_set())).global_password("cinder-wrong-guess");
+    let graph = run(&scenario).await;
+    assert_needs_password(&graph, &video_set());
+    let offered: Vec<_> = graph.graph().offered.values().copied().collect();
+    assert_eq!(offered, [1], "one try for the one candidate");
+}
+
+// The first article of each volume, in the order it was asked for.
+fn heads(outcome: &Outcome) -> Vec<u32> {
+    outcome
+        .order
+        .iter()
+        .filter(|(_, ordinal)| *ordinal == 0)
+        .map(|(file, _)| *file)
+        .collect()
+}
+
+// The set out of order. The graph's root samples every member's head first,
+// in posted order, whatever the names say. The set is stored (encrypted
+// store), so the graph streams it through the store and the engine object's
+// claim, bound and wants never run on it.
+async fn order_row(volumes: Vec<(String, Vec<u8>)>) {
+    let scenario = video(posts(volumes)).password(VIDEO_SECRET);
+    let graph = run(&scenario).await;
+    assert_video(&graph);
+    assert_eq!(kinds(&graph), ["rar_store"]);
+    assert_eq!(heads(&graph), [0, 1, 2, 3, 4], "graph");
+    assert_fetched_once(&graph);
+}
+
+// Posted p2 p3 p4 p5 p1.
+#[tokio::test]
+async fn the_encrypted_five_volume_set_posted_first_volume_last_is_asked_for_in_post_order() {
+    let mut volumes = video_set();
+    volumes.rotate_left(1);
+    order_row(volumes).await;
+}
+
+#[tokio::test]
+async fn the_encrypted_five_volume_set_posted_backwards_is_asked_for_in_post_order() {
+    let mut volumes = video_set();
+    volumes.reverse();
+    order_row(volumes).await;
+}
+
+// Nameless: no name says a volume's place until its bytes do, so both
+// engines ask for the heads in post order.
+#[tokio::test]
+async fn the_nameless_encrypted_five_volume_set_posted_backwards_is_asked_for_in_post_order() {
+    let mut volumes = obfuscate_volumes(&video_set());
+    volumes.reverse();
+    order_row(volumes).await;
+}
+
+// Nameless volumes beside a PAR2 set that names them: renamed by PAR2,
+// then streamed by the store. Nothing is asked for twice; the graph
+// samples the recovery volume's head.
+#[tokio::test]
+async fn the_nameless_encrypted_five_volume_set_beside_par2_delivers() {
+    let set = video_set();
+    let files: Vec<(&str, &[u8])> = set
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let mut out = posts(obfuscate_volumes(&set));
+    out.extend(super::harness::par2_set("clip", &files, 2));
+    let scenario = video(out).password(VIDEO_SECRET);
+    let graph = run(&scenario).await;
+    assert_video(&graph);
+    assert!(graph.graph().kinds.contains("par2"), "{:?}", kinds(&graph));
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+// The second and third volumes posted under each other's names beside a
+// PAR2 set that names them: the engine reads each by its own headers, the
+// set binds each by content and the namespace puts the names back.
+fn swapped_with_par2() -> Vec<Post> {
+    let set = video_set();
+    let files: Vec<(&str, &[u8])> = set
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let recovery = super::harness::par2_set("clip", &files, 2);
+    let mut swapped = set.clone();
+    swapped.swap(1, 2);
+    let mut out: Vec<Post> = set
+        .iter()
+        .zip(swapped)
+        .map(|((name, _), (_, bytes))| Post::plain(name, bytes))
+        .collect();
+    out.extend(recovery);
+    out
+}
+
+#[tokio::test]
+async fn the_set_with_two_volumes_posted_swapped_beside_par2_delivers() {
+    let graph = run(&video(swapped_with_par2()).password(VIDEO_SECRET)).await;
+    assert_video(&graph);
+}
+
+// The same swap with every article of the recovery volume gone: the set
+// has its index and no block, and the volumes are whole, so the member is
+// delivered all the same.
+#[tokio::test]
+async fn the_set_with_two_volumes_posted_swapped_and_its_recovery_volume_gone_delivers() {
+    let posts = swapped_with_par2();
+    let recovery = posts.len() as u32 - 1;
+    let articles = posts[recovery as usize].bytes.len().div_ceil(VIDEO_FRAME) as u32;
+    let scenario = (0..articles).fold(video(posts).password(VIDEO_SECRET), |scenario, ordinal| {
+        scenario.lost(recovery, ordinal)
+    });
+    let graph = run(&scenario).await;
+    assert_video(&graph);
+}
+
+// The fixture's shape scaled to the video set's frame: slices of 41856 of
+// every 65536 bytes an article holds, fifteen recovery blocks over four
+// volumes, the index ahead of the volumes, the second and third volumes
+// posted under each other's names, and every article of the four recovery
+// volumes gone. The volumes are whole, so the set finds both swapped ones
+// clean once each is bound by its content, and the member is delivered.
+#[tokio::test]
+async fn the_swapped_set_beside_an_index_whose_four_recovery_volumes_are_gone_delivers() {
+    let set = video_set();
+    let files: Vec<(&str, &[u8])> = set
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let slice = (VIDEO_FRAME * 41856 / 65536) as u64;
+    let recovery = super::harness::par2_volumes_sliced("clip", &files, slice, 15, 4);
+    assert_eq!(recovery.len(), 5, "an index and four volumes");
+    let mut swapped = set.clone();
+    swapped.swap(1, 2);
+    let mut recovery = recovery.into_iter();
+    let mut posts: Vec<Post> = recovery.next().into_iter().collect();
+    posts.extend(
+        set.iter()
+            .zip(swapped)
+            .map(|((name, _), (_, bytes))| Post::plain(name, bytes)),
+    );
+    posts.extend(recovery);
+    let lost: Vec<(u32, u32)> = posts
+        .iter()
+        .enumerate()
+        .skip(1 + set.len())
+        .flat_map(|(file, post)| {
+            (0..post.bytes.len().div_ceil(VIDEO_FRAME))
+                .map(move |ordinal| (file as u32, ordinal as u32))
+        })
+        .collect();
+    let scenario = lost.into_iter().fold(
+        video(posts).password(VIDEO_SECRET),
+        |scenario, (file, ordinal)| scenario.lost(file, ordinal),
+    );
+    let graph = run(&scenario).await;
+    assert_video(&graph);
+}
+
+// One article of the middle volume damaged, PAR2 beside: the graph repairs
+// it in the stream and delivers the member, as posted, with no refetch.
+// The set rewrites the one slice that was bad and vouches for the rest of
+// the damaged article, so no mark of damage is left on clip.part3.rar or
+// the member and the job is Complete.
+#[tokio::test]
+async fn the_encrypted_set_damaged_mid_volume_beside_par2_is_repaired_in_the_stream() {
+    let scenario = video(with_par2(video_set()))
+        .password(VIDEO_SECRET)
+        .damaged(2, 10);
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        vec![delivered(VIDEO)]
+    );
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    assert!(graph.reads > 0, "the repair read its slices");
+    let clean = run(&video(posts(video_set())).password(VIDEO_SECRET)).await;
+    assert!(graph.files == clean.files, "the member as posted");
+}
+
+// One article of the middle volume damaged with no PAR2. The store's CRC
+// refutes the one member and it refuses the set: none of the five
+// volumes is whole, since they are the set's, not deliveries of their
+// own. The member is not delivered and the job fails.
+#[tokio::test]
+async fn the_encrypted_set_damaged_mid_volume_without_par2_delivers_the_volumes() {
+    let scenario = video(posts(video_set()))
+        .password(VIDEO_SECRET)
+        .damaged(2, 10);
+    let graph = run(&scenario).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert!(
+        graph.graph().delivery.whole.is_empty(),
+        "{:?}",
+        graph.graph().delivery
+    );
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    assert!(!graph.files.contains_key(&delivered(VIDEO)));
+    for (name, _) in video_set() {
+        let claim = match name.as_str() {
+            "clip.part3.rar" => Claim::Damaged,
+            _ => Claim::Complete,
+        };
+        assert_eq!(graph.graph().claims.get(&name), Some(&claim), "{name}");
+    }
+}
+
+// The archive in 16-byte articles, so article 13 lies inside the compressed
+// member's stream and touches no header. PAR2 slices stay at 64 bytes.
+const COMPRESSED_ARTICLE: u32 = 13;
+
+fn mixed_with_par2() -> Scenario {
+    Scenario::new(with_par2(vec![(
+        "mixed.rar".into(),
+        rar5_fixture_bytes(MIXED),
+    )]))
+    .framed(16)
+}
+
+// The compressed member's article damaged, PAR2 beside: repaired in the
+// stream before the engine reads it, and the three members are delivered.
+#[tokio::test]
+async fn the_compressed_member_damaged_beside_par2_is_repaired_in_the_stream() {
+    let scenario = mixed_with_par2().damaged(0, COMPRESSED_ARTICLE);
+    let graph = run(&scenario).await;
+    assert_mixed_members(&graph);
+    assert_engine_ran(&graph);
+    assert!(graph.graph().kinds.contains("par2"), "{:?}", kinds(&graph));
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    assert!(graph.reads > 0, "the repair read its slices");
+}
+
+// The same article lost on every server: repaired in the stream, and the
+// three members delivered with no refetch.
+#[tokio::test]
+async fn the_compressed_member_lost_beside_par2_is_repaired() {
+    let scenario = mixed_with_par2().lost(0, COMPRESSED_ARTICLE);
+    let graph = run(&scenario).await;
+    assert_mixed_members(&graph);
+    assert_engine_ran(&graph);
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    assert!(graph.reads > 0, "the repair read its slices");
+}
+
+// The compressed member's stream damaged with no PAR2. The engine's run
+// fails the member's CRC after the two stored members closed whole; the
+// partial-extraction invariant (2026-10-18) wants those two delivered
+// under the job's names, the compressed member the only one damaged or
+// missing, and the job not Failed. Once quiet, `GraphJob::refuse_unrepaired`
+// refuses the engine's namespace for its damaged leaf; the refusal reads
+// mixed.rar back as posted in place of the member the engine had not closed
+// whole, and the two it had stay delivered.
+#[tokio::test]
+async fn the_compressed_member_damaged_without_par2_delivers_the_members_it_closed() {
+    let scenario = mixed().framed(16).damaged(0, COMPRESSED_ARTICLE);
+    let graph = run(&scenario).await;
+    assert_engine_ran(&graph);
+    assert!(
+        !matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    let clean = run(&mixed()).await;
+    for name in ["hello.txt", "second.txt"] {
+        assert!(
+            graph.files.get(&delivered(name)) == clean.files.get(&delivered(name)),
+            "{name}: closed before the failure, delivered whole"
+        );
+    }
+    assert!(
+        graph.files.get(&delivered("zeros_64k.bin"))
+            != clean.files.get(&delivered("zeros_64k.bin")),
+        "the failing member is not delivered as posted"
+    );
+    // The refusal puts the archive as posted in place of what the engine had
+    // not closed whole, beside the two it had.
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        [
+            delivered("hello.txt"),
+            delivered("mixed.rar"),
+            delivered("second.txt")
+        ]
+    );
+    assert_eq!(
+        graph.files[&delivered("mixed.rar")].len(),
+        rar5_fixture_bytes(MIXED).len(),
+        "the archive as posted"
+    );
+    assert_eq!(graph.graph().claims.get("mixed.rar"), Some(&Claim::Damaged));
+}
+
+// A solid RARLAB archive in 1 MiB articles: the store cannot stream a
+// solid member, so the graph hands the volume to the engine, which
+// delivers the three members with no refetch.
+async fn solid_row(path: &str) -> Outcome {
+    let scenario =
+        Scenario::new(vec![Post::plain("solid.rar", rar5_fixture_bytes(path))]).framed(1 << 20);
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        ["file1.txt", "file2.txt", "sample.mkv"]
+            .map(delivered)
+            .to_vec()
+    );
+    assert_engine_ran(&graph);
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    graph
+}
+
+#[tokio::test]
+async fn a_solid_rar5_archive_delivers_its_members_through_the_engine() {
+    solid_row("rar5_solid.rar").await;
+}
+
+// The RAR4 fixture packs the same three files: both formats' deliveries
+// agree byte for byte.
+#[tokio::test]
+async fn a_solid_rar4_archive_delivers_what_the_rar5_one_does() {
+    let rar4 = solid_row("../rar4/rar4_solid.rar").await;
+    let rar5 = solid_row("rar5_solid.rar").await;
+    assert!(rar4.files == rar5.files, "the same members");
+}
+
+// A byte of the solid archive's first member, in its packed data, flipped
+// in the post itself, which goes up under a nameless name: every article
+// arrives intact, so nothing marks the volume, and the engine's run alone
+// finds the damage, when the member's CRC fails. It retracts the member it
+// left open and says its volume is damaged; with no PAR2 nothing repairs
+// it. Once the job is quiet the engine hears its volume's damage, which
+// nothing repaired, and is refused for it (`Why::Unrepairable`): the volume
+// is handed back damaged, as it stands in its place, with no file at any
+// length for the member.
+const SOLID_CORRUPTED_AT: usize = 10 << 20;
+
+fn corrupted_solid() -> (String, Vec<u8>) {
+    let mut bytes = rar5_fixture_bytes("rar5_solid.rar");
+    bytes[SOLID_CORRUPTED_AT] ^= 0x01;
+    obfuscate_volumes(&[("solid.rar".into(), bytes)])
+        .pop()
+        .expect("one volume")
+}
+
+fn corrupted_solid_scenario() -> Scenario {
+    let (name, bytes) = corrupted_solid();
+    Scenario::new(vec![Post::plain(&name, bytes)])
+}
+
+fn assert_hands_back_the_volume(graph: &Outcome) {
+    let (name, bytes) = corrupted_solid();
+    assert_engine_ran(graph);
+    assert!(!graph.completed(), "{:?}", graph.status);
+    assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+    let delivery = &graph.graph().delivery;
+    assert!(delivery.whole.is_empty(), "{delivery:?}");
+    assert_eq!(
+        delivery.damaged,
+        std::slice::from_ref(&name),
+        "the volume delivered as it stands"
+    );
+    assert!(delivery.withheld.is_empty(), "{delivery:?}");
+    assert_eq!(graph.graph().claims.get(&name), Some(&Claim::Damaged));
+    for (path, delivered_bytes) in &graph.files {
+        assert_eq!(*path, delivered(&name), "only the volume is a file");
+        assert_eq!(
+            delivered_bytes.len(),
+            bytes.len(),
+            "the volume at its length"
+        );
+    }
+}
+
+// Nothing of the payload is whole and the engine's verdict marks the whole
+// volume damaged, so no byte of it is delivery evidence: the job fails and
+// nothing moves to the complete directory.
+#[tokio::test]
+async fn a_compressed_rar5_member_corrupted_without_par2_hands_back_its_volume() {
+    let scenario = corrupted_solid_scenario().framed(1 << 20);
+    let graph = run(&scenario).await;
+    assert_hands_back_the_volume(&graph);
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
+}
+
+// The same post in articles of 768000 bytes, every batch arriving last
+// article first: whatever order the bytes come in, the member the engine
+// left open is no file, and the volume is what is handed back.
+#[tokio::test]
+async fn a_compressed_rar5_member_corrupted_without_par2_and_posted_backwards_hands_back_its_volume()
+ {
+    let scenario = corrupted_solid_scenario().framed(768_000).backwards();
+    let graph = run(&scenario).await;
+    assert_hands_back_the_volume(&graph);
+}
+
+// A compressed volume beside an index and two recovery volumes whose first
+// articles never arrive: nothing names those volumes, so the rest of their
+// articles stay parked, never fetched. The volume is whole and the set finds
+// it clean while the engine's run is still reading it, and the job waits
+// for the run before it delivers every member.
+#[tokio::test]
+async fn a_compressed_volume_whose_recovery_volumes_lost_their_heads_waits_for_its_run() {
+    let bytes = rar5_fixture_bytes(MIXED);
+    let recovery = super::harness::par2_volumes("mixed", &[("mixed.rar", &bytes)], 4, 2);
+    assert_eq!(recovery.len(), 3, "an index and two volumes");
+    let mut posts = vec![Post::plain("mixed.rar", bytes)];
+    posts.extend(recovery);
+    let scenario = mixed_framed_posts(posts).lost(2, 0).lost(3, 0);
+    let graph = run(&scenario).await;
+    assert_mixed_members(&graph);
+    assert_engine_ran(&graph);
+}
+
+fn mixed_framed_posts(posts: Vec<Post>) -> Scenario {
+    Scenario::new(posts).framed(64)
+}
+
+// A compressed RAR4 member split over four volumes reaches the naming
+// plan's lookup with the CRC32 its final part's header states, which is the
+// CRC32 of the bytes delivered, not the first part's packed-bytes CRC.
+#[tokio::test]
+async fn a_split_compressed_members_checksum_reaches_the_naming_plan() {
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/extraction_profiles"
+    );
+    let volumes: Vec<(String, Vec<u8>)> = (1..=4)
+        .map(|part| {
+            let bytes = std::fs::read(format!("{dir}/rar4_lz_four.part0{part}.rar")).unwrap();
+            (format!("silver.horizon.part{part}.rar"), bytes)
+        })
+        .collect();
+    let graph = run(&Scenario::new(posts(volumes))).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert_engine_ran(&graph);
+    let member = delivered("compressible.txt");
+    let expected =
+        crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, &graph.files[&member]) as u32;
+    let by_path =
+        crate::pipeline::completion::finalize::member_crc32_by_path(&graph.graph().delivery.files);
+    assert_eq!(
+        by_path.get("compressible.txt"),
+        Some(&expected),
+        "{by_path:?} from {:?}",
+        graph.graph().delivery.files
+    );
+}

@@ -21,21 +21,21 @@ pub(in crate::pipeline) fn lane_acquire_failure_for_work(
 // leaves by.
 //
 // This is the single, deliberate exception to "no clock reads on a
-// per-segment path". `perf_probe::scope` already pays an unconditional
-// `Instant::now()` when the task starts; this guard adds the matching read at
-// the end and feeds the *same* `Duration` to both the profile bucket and the
-// histogram, so profiling on or off the cost is one extra clock read per
-// decode task — one per decoded article, roughly one per 750 KB of work, not
-// one per byte. Everything else on this path stays `Relaxed`-atomic only.
+// per-segment path": the decode-task histogram needs the task's wall time
+// whether profiling is on or not, so the timer reads the clock when the task
+// starts and once more when it leaves, and feeds the *same* `Duration` to both
+// the histogram and the profile bucket — two reads per decoded article,
+// roughly one per 750 KB of work, not one per byte. Everything else on this
+// path stays `Relaxed`-atomic only.
 struct DecodeTaskTimer {
-    scope: Option<crate::runtime::perf_probe::Scope>,
+    started: Instant,
     metrics: Arc<crate::operations::metrics::PipelineMetrics>,
 }
 
 impl DecodeTaskTimer {
     fn start(metrics: Arc<crate::operations::metrics::PipelineMetrics>) -> Self {
         Self {
-            scope: Some(crate::runtime::perf_probe::scope("download.decode.task")),
+            started: Instant::now(),
             metrics,
         }
     }
@@ -43,11 +43,11 @@ impl DecodeTaskTimer {
 
 impl Drop for DecodeTaskTimer {
     fn drop(&mut self) {
-        if let Some(scope) = self.scope.take() {
-            self.metrics
-                .pipeline_histograms
-                .observe_decode_task(scope.finish());
-        }
+        let elapsed = self.started.elapsed();
+        crate::runtime::perf_probe::record("download.decode.task", elapsed);
+        self.metrics
+            .pipeline_histograms
+            .observe_decode_task(elapsed);
     }
 }
 
@@ -321,15 +321,11 @@ impl Pipeline {
 
         let mut remaining = VecDeque::with_capacity(self.pending_decode.len());
         let decode_limit = self.tuner.params().decode_thread_count.max(1);
-        let active_decodes = self.active_decodes_by_job.values().sum::<usize>();
+        let active_decodes = self.active_decodes_by_job.total();
         let mut available_decode_slots = decode_limit.saturating_sub(active_decodes);
         while let Some(work) = self.pending_decode.pop_front() {
             let job_id = work.segment_id.file_id.job_id;
-            if self
-                .jobs
-                .get(&job_id)
-                .is_none_or(|state| is_terminal_status(&state.status))
-            {
+            if !self.job_takes_results(job_id) {
                 self.metrics
                     .note_decode_work_released(work.raw.len() as u64);
                 debug!(
@@ -395,6 +391,7 @@ impl Pipeline {
         // reset returns the leases it reclaims.
         if let Err(lease) = self.owned_download_lane_pool.submit(
             Arc::clone(&self.nntp),
+            self.shared_state.clone(),
             self.owned_download_lane_event_tx.clone(),
             self.download_refill_tx.clone(),
             self.download_lane_parked_tx.clone(),

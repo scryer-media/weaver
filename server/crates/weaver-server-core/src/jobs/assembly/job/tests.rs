@@ -43,8 +43,6 @@ fn par3_recovery_is_optional_only_alongside_payload() {
         1,
     );
     assert_eq!(assembly.optional_recovery_bytes(), (0, 0));
-    assert_eq!(assembly.data_file_count(), 1);
-    assert_eq!(assembly.complete_data_file_count(), 1);
     add_file(
         &mut assembly,
         2,
@@ -54,8 +52,6 @@ fn par3_recovery_is_optional_only_alongside_payload() {
         0,
     );
     assert_eq!(assembly.optional_recovery_bytes(), (50, 20));
-    assert_eq!(assembly.data_file_count(), 2);
-    assert_eq!(assembly.complete_data_file_count(), 1);
 }
 
 #[test]

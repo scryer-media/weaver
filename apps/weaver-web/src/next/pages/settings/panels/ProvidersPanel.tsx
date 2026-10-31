@@ -165,7 +165,7 @@ function transportLabel(t: Translate, server: Server): string {
 
 function roleLabel(t: Translate, server: Server): string {
   if (server.backfill) {
-    return t("next.providers.blockAccount");
+    return t("next.providers.backfillServer");
   }
   return server.priority === 0
     ? t("next.providers.primary")
@@ -623,8 +623,8 @@ export function ProvidersPanel() {
             },
             {
               id: "backfill",
-              label: t("next.providers.blockAccount"),
-              help: t("next.providers.blockAccountHelp"),
+              label: t("next.providers.backfillServer"),
+              help: t("next.providers.backfillServerHelp"),
               control: {
                 kind: "toggle",
                 value: values.backfill,
@@ -762,35 +762,35 @@ export function ProvidersPanel() {
         ) : null}
         {testResult ? (
           <div className="flex flex-none flex-col gap-1.5 border-t border-wv-hairline px-4 sm:px-6 py-4">
-            {adoptable ? (
-              // A certificate on offer is the whole story: say whose certificate
-              // it is instead of repeating the server's failure above it.
-              <div className="flex items-start gap-[9px] text-[13px] leading-[1.45]">
-                <Square color={WV.warn} className="mt-[6px] flex-none" />
-                <span className="text-wv-warn">
-                  {adoptable.names.length
-                    ? t("next.providers.certIssuedFor", {
-                        names: formatHostnames(adoptable.names),
-                        host: values?.host.trim() ?? "",
-                      })
-                    : t("next.providers.certMismatch")}
+            <div
+              role="status"
+              className={`flex items-center gap-3 px-[12px] py-[11px] text-wv-on-accent ${
+                adoptable ? "bg-wv-warn" : testResult.success ? "bg-wv-accent" : "bg-wv-error"
+              }`}
+            >
+              <Icon name={adoptable ? "trust" : "test"} size={22} className="flex-none self-start" />
+              <span className="flex min-w-0 flex-col gap-[5px]">
+                <span className="text-[13.5px] leading-[1.35] font-semibold tracking-[-0.005em]">
+                  {adoptable
+                    ? // A certificate on offer is the whole story: say whose certificate
+                      // it is instead of repeating the server's failure above it.
+                      adoptable.names.length
+                      ? t("next.providers.certIssuedFor", {
+                          names: formatHostnames(adoptable.names),
+                          host: values?.host.trim() ?? "",
+                        })
+                      : t("next.providers.certMismatch")
+                    : testResult.message}
                 </span>
-              </div>
-            ) : (
-              <div className="flex items-center gap-[9px] text-[13px]">
-                <Square color={testResult.success ? WV.green : WV.error} />
-                <span className={testResult.success ? "text-wv-fg" : "text-wv-error-text"}>
-                  {testResult.message}
-                </span>
-              </div>
-            )}
-            {testResult.latencyMs === null ? null : (
-              <div className="font-wv-mono text-[11.5px] text-wv-muted">
-                {formatLatency(testResult.latencyMs)}
-                {testResult.supportsPipelining ? ` · ${t("next.providers.pipelining")}` : ""}
-                {testResult.tlsCipherSuite ? ` · ${shortCipher(testResult.tlsCipherSuite)}` : ""}
-              </div>
-            )}
+                {testResult.latencyMs === null ? null : (
+                  <span className="font-wv-mono text-[11px] leading-none">
+                    {formatLatency(testResult.latencyMs)}
+                    {testResult.supportsPipelining ? ` · ${t("next.providers.pipelining")}` : ""}
+                    {testResult.tlsCipherSuite ? ` · ${shortCipher(testResult.tlsCipherSuite)}` : ""}
+                  </span>
+                )}
+              </span>
+            </div>
             {adoptable ? (
               <div className="flex flex-col gap-2 pt-1.5">
                 <span className="font-wv-mono text-[11px] break-all text-wv-muted">

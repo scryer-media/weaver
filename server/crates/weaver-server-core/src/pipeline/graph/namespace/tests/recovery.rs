@@ -1,0 +1,729 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+// The namespace's rules for its recovery sets: which members a set covers,
+// when it rules, and what the namespace holds for an index still to come.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use super::super::super::hardware::Shutdown;
+use super::*;
+
+const VIDEO_FIX: Fix = Fix {
+    name: "video.mkv",
+    read: ByteRange { start: 0, end: 8 },
+    fix: (2, b"OK"),
+};
+
+impl Job {
+    // Ask the namespace to rule the root's sets, its source `reading` or
+    // done.
+    fn rule(&mut self, reading: bool) {
+        let mut build = self.build();
+        let mut lent = Inline::default();
+        self.writer
+            .rule(
+                &mut self.tree,
+                &mut build,
+                &Source,
+                (NodeId::ROOT, &|_| reading),
+                &mut lent,
+                &mut self.out,
+            )
+            .expect("rule");
+        self.run_lent(&mut build, lent);
+    }
+
+    fn set_node(&self) -> NodeId {
+        self.writer.sets(&self.tree)[0].1
+    }
+}
+
+// A damaged member the set fixes, all its bytes in but not closed.
+fn damaged_member(job: &mut Job) -> MemberId {
+    let member = job.member("video.mkv", Some(8));
+    job.send(member, 0, b"go", Provenance::Fresh);
+    job.send(member, 2, b"XX", Provenance::Damaged);
+    job.send(member, 4, b"good", Provenance::Fresh);
+    member
+}
+
+#[test]
+fn a_set_lives_in_the_namespace_of_the_members_it_describes() {
+    let mut job = Job::new(PLENTY).with_set(None);
+    let video = job.member("video.mkv", Some(4));
+    let other = job.member("other.mkv", Some(4));
+    let set = job.set_node();
+    assert_eq!(job.writer.sets(&job.tree), vec![(NodeId::ROOT, set)]);
+    let sets = job.tree.recovery_nodes(NodeId::ROOT);
+    assert_eq!(
+        job.writer
+            .covering(&job.tree, &sets, video)
+            .collect::<Vec<_>>(),
+        vec![set]
+    );
+    assert_eq!(
+        job.writer.covering(&job.tree, &sets, other).count(),
+        0,
+        "a member the set does not describe has no set"
+    );
+    assert_eq!(job.writer.set_name(&job.tree, set), Some("set.par2"));
+}
+
+// Six hundred members the set covers, and one obfuscated member it does not
+// yet: the front that names it binds the set again, which keeps the names
+// of the members not yet covered alone, that one and the set's own volume,
+// and covers it by its content as before.
+#[test]
+fn a_bind_keeps_only_the_names_of_members_not_yet_covered() {
+    use crate::pipeline::graph::namespace::recovery::NAMES_KEPT;
+    let mut job = Job::new(PLENTY).with_set(None);
+    let covered: Vec<MemberId> = (0..600)
+        .map(|index| job.member(&format!("part{index}.bin"), Some(4)))
+        .collect();
+    let late = job.member("3f9a.bin", Some(4));
+    let sets = job.tree.recovery_nodes(NodeId::ROOT);
+    let set = job.set_node();
+    assert_eq!(job.writer.covering(&job.tree, &sets, late).count(), 0);
+    NAMES_KEPT.with(|kept| kept.set(0));
+    job.send(late, 0, b"data", Provenance::Fresh);
+    assert_eq!(
+        NAMES_KEPT.with(std::cell::Cell::get),
+        2,
+        "the late member's name and the set's own volume's"
+    );
+    let own = job.root().find_by_name("set.par2").expect("own volume").id;
+    assert_eq!(
+        job.writer
+            .covering(&job.tree, &sets, late)
+            .collect::<Vec<_>>(),
+        vec![set],
+        "the late member is covered"
+    );
+    assert_eq!(job.root().get(late).unwrap().name, "show.mkv");
+    assert_eq!(job.writer.covering(&job.tree, &sets, own).count(), 0);
+    for member in covered {
+        assert_eq!(
+            job.writer
+                .covering(&job.tree, &sets, member)
+                .collect::<Vec<_>>(),
+            vec![set]
+        );
+    }
+}
+
+#[test]
+fn a_sets_own_volume_carries_recovery_and_a_member_it_covers_does_not() {
+    let mut job = Job::new(PLENTY).with_set(None);
+    let own = job.root().find_by_name("set.par2").expect("own volume").id;
+    let video = job.member("video.mkv", Some(4));
+    assert!(job.writer.carries_recovery(&job.tree, NodeId::ROOT, own));
+    assert!(!job.writer.carries_recovery(&job.tree, NodeId::ROOT, video));
+}
+
+#[test]
+fn a_set_does_not_rule_while_a_member_it_covers_is_open() {
+    let mut job = Job::new(PLENTY).with_set(Some(VIDEO_FIX));
+    let member = damaged_member(&mut job);
+    assert!(!job.root().get(member).unwrap().closed);
+    job.rule(false);
+    assert!(job.par.lock().unwrap().read.is_none(), "no repair ran");
+    assert_eq!(job.file("video.mkv"), b"goXXgood");
+}
+
+#[test]
+fn a_set_does_not_rule_while_its_namespace_may_still_announce_members() {
+    let mut job = Job::new(PLENTY).with_set(Some(VIDEO_FIX));
+    let member = damaged_member(&mut job);
+    job.close(member);
+    job.rule(true);
+    assert!(job.par.lock().unwrap().read.is_none(), "no repair ran");
+    assert_eq!(job.file("video.mkv"), b"goXXgood");
+}
+
+#[test]
+fn a_set_rules_once_every_member_it_covers_is_closed_and_known() {
+    let mut job = Job::new(PLENTY).with_set(Some(VIDEO_FIX));
+    let member = damaged_member(&mut job);
+    job.close(member);
+    job.rule(false);
+    assert_eq!(
+        job.par.lock().unwrap().read.as_deref(),
+        Some(&b"goXXgood"[..])
+    );
+    assert_eq!(job.file("video.mkv"), b"goOKgood");
+}
+
+// What a repair rebuilds waits on disk while the loan is out, past any
+// memory budget the job has, and lands byte for byte when it returns; the
+// output file goes with it.
+#[test]
+fn a_repairs_output_waits_on_disk_past_the_memory_budget_and_lands_whole() {
+    const REBUILT: &[u8] = b"OKOKOK";
+    let mut job = Job::new(HoldBudgets {
+        resident_limit: 2,
+        ..PLENTY
+    })
+    .with_set(Some(Fix {
+        name: "video.mkv",
+        read: ByteRange { start: 0, end: 8 },
+        fix: (1, REBUILT),
+    }));
+    let member = damaged_member(&mut job);
+    job.close(member);
+    let set = job.set_node();
+    let mut lent = Inline::default();
+    job.writer
+        .repair(&mut job.tree, NodeId::ROOT, &[set], &mut lent)
+        .expect("lent");
+    let Ok([loan]) = <[Loan; 1]>::try_from(lent.0) else {
+        panic!("one loan");
+    };
+    let returned = loan.run(weaver_graph::Budget::default(), &Default::default());
+    assert!(REBUILT.len() as u64 > job.accountant.budgets().resident_limit);
+    let output = job.dir.path().join(format!(
+        "{}/graph-recovery-{}-{}.repaired",
+        weaver_graph::names::INTERNAL_DIR,
+        NodeId::ROOT.0,
+        set.0
+    ));
+    assert_eq!(
+        std::fs::read(&output).expect("the repair's output on disk"),
+        REBUILT
+    );
+    assert_eq!(job.accountant.usage().resident, 0);
+    let mut build = job.build();
+    job.writer
+        .returned(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            &weaver_objects::Objects::default(),
+            returned,
+            &mut job.out,
+        )
+        .expect("returned");
+    assert_eq!(job.file("video.mkv"), b"gOKOKOKd");
+    assert!(!output.exists(), "the output goes with the repair");
+}
+
+// A set that rebuilds a store's map lets the store place the body it held
+// behind it, and the set's proof of that body reaches the member: the held
+// bytes go down before the proof is read back through the map, so what came
+// marked damaged is marked repaired in the namespace below.
+#[test]
+fn a_rebuilt_map_lets_the_sets_proof_reach_the_bytes_it_held() {
+    let mut job = Job::new(PLENTY).with_set(Some(Fix {
+        name: "a.7z",
+        read: body(),
+        fix: (map_at().start, MAP),
+    }));
+    let member = job.member("a.7z", Some(map_at().end));
+    job.send(member, 0, &seven_z(), Provenance::Fresh);
+    job.send(member, body().start, b"hello", Provenance::Damaged);
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len());
+    job.close(member);
+    let set = job.set_node();
+    let mut lent = Inline::default();
+    job.writer
+        .repair(&mut job.tree, NodeId::ROOT, &[set], &mut lent)
+        .expect("lent");
+    let mut build = job.build();
+    let ruled = job.run_lent(&mut build, lent);
+    assert_eq!(ruled, vec![(set, RepairOutcome::Repaired { slices: 1 })]);
+
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
+    assert_eq!(job.file("inner.bin"), b"hello");
+    let (late, _) = job.tree.child_of(NodeId::ROOT, member).expect("a 7z");
+    let below = job.tree.namespace(late).expect("its namespace");
+    assert_eq!(
+        below.damaged_ranges().collect::<Vec<_>>(),
+        Vec::new(),
+        "the set proved the body it held"
+    );
+}
+
+fn pending_map_job(budgets: HoldBudgets) -> (Job, MemberId) {
+    let mut job = Job::new(budgets).with_set(Some(Fix {
+        name: "a.7z",
+        read: ByteRange::new(0, map_at().end),
+        fix: (map_at().start, MAP),
+    }));
+    let member = job.member("a.7z", Some(map_at().end));
+    job.send(member, 0, &seven_z(), Provenance::Fresh);
+    job.send(member, body().start, b"hello", Provenance::Damaged);
+    let mut build = job.build();
+    job.writer
+        .arrive(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            crate::pipeline::graph::namespace::Write::New {
+                entered: NodeId::ROOT,
+                posting: member,
+            },
+            Arrival {
+                node: NodeId::ROOT,
+                member,
+                offset: map_at().start,
+                bytes: Bytes::from_static(MAP).into(),
+                provenance: Provenance::Repaired,
+            },
+            &mut job.out,
+        )
+        .unwrap();
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len());
+    (job, member)
+}
+
+#[test]
+fn a_new_map_reads_pending_custody_before_the_batch_releases_it() {
+    for resident_limit in [0, u64::MAX] {
+        let (mut job, member) = pending_map_job(HoldBudgets {
+            resident_limit,
+            ..PLENTY
+        });
+        let mut build = job.build();
+        let mut read = Vec::new();
+        assert!(job.writer.access(&job.tree).read_at(
+            NodeId::ROOT,
+            member,
+            ByteRange::new(0, map_at().end),
+            &mut read,
+        ));
+        assert_eq!(read, [seven_z().as_slice(), b"hello", MAP].concat());
+        let mut durable = Vec::new();
+        assert!(
+            !Access {
+                writer: &job.writer,
+                tree: &job.tree,
+                held: false
+            }
+            .read_at(NodeId::ROOT, member, body(), &mut durable,)
+        );
+        assert!(durable.is_empty());
+        // A later placed copy removes just its overlap from pending custody;
+        // reads combine its new byte with the still-held neighbours.
+        job.writer
+            .arrive(
+                &mut job.tree,
+                &mut build,
+                &Source,
+                crate::pipeline::graph::namespace::Write::New {
+                    entered: NodeId::ROOT,
+                    posting: member,
+                },
+                Arrival {
+                    node: NodeId::ROOT,
+                    member,
+                    offset: body().start + 1,
+                    bytes: Bytes::from_static(b"a").into(),
+                    provenance: Provenance::Fresh,
+                },
+                &mut job.out,
+            )
+            .unwrap();
+        assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len() - 1);
+        let mut replaced = Vec::new();
+        assert!(job.writer.access(&job.tree).read_at(
+            NodeId::ROOT,
+            member,
+            ByteRange::new(0, map_at().end),
+            &mut replaced
+        ));
+        assert_eq!(replaced, [seven_z().as_slice(), b"hallo", MAP].concat());
+        job.writer
+            .release_held(&mut job.tree, &mut build, &Source, &mut job.out)
+            .unwrap();
+        assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
+        let mut released = Vec::new();
+        assert!(
+            job.writer
+                .access(&job.tree)
+                .read_at(NodeId::ROOT, member, body(), &mut released)
+        );
+        assert_eq!(released, b"hallo");
+    }
+}
+
+#[test]
+fn a_lent_read_keeps_pending_custody_when_the_live_copy_changes() {
+    let (mut job, member) = pending_map_job(HoldBudgets {
+        resident_limit: 0,
+        ..PLENTY
+    });
+    let set = job.set_node();
+    let loan = job
+        .writer
+        .lend(&mut job.tree, NodeId::ROOT, set)
+        .unwrap()
+        .unwrap();
+    job.send(member, body().start + 1, b"a", Provenance::Fresh);
+    let returned = loan.run(weaver_graph::Budget::default(), &Default::default());
+    assert_eq!(
+        job.par.lock().unwrap().read,
+        Some([seven_z().as_slice(), b"hello", MAP].concat())
+    );
+    let mut build = job.build();
+    let result = job.writer.returned(
+        &mut job.tree,
+        &mut build,
+        &Source,
+        &weaver_objects::Objects::default(),
+        returned,
+        &mut job.out,
+    );
+    assert!(matches!(result, Err(WriteError::StaleRecovery { set: stale }) if stale == set));
+    let mut current = Vec::new();
+    assert!(
+        job.writer
+            .access(&job.tree)
+            .read_at(NodeId::ROOT, member, body(), &mut current)
+    );
+    assert_eq!(
+        current, b"hallo",
+        "stale proof must not overwrite the newer placed copy"
+    );
+}
+
+#[test]
+fn failed_pending_custody_cannot_fall_back_to_an_older_derived_copy() {
+    let (mut job, member) = pending_map_job(HoldBudgets {
+        resident_limit: 0,
+        ..PLENTY
+    });
+    let (child, _) = job.tree.child_of(NodeId::ROOT, member).unwrap();
+    job.tree
+        .namespace_mut(child)
+        .unwrap()
+        .get_mut(MemberId(0))
+        .unwrap()
+        .coverage
+        .write(ByteRange::new(0, body().len()), Provenance::Fresh);
+    job.writer
+        .write_file(
+            &job.tree,
+            child,
+            MemberId(0),
+            0,
+            &weaver_graph::Evidenced::from(&b"stale"[..]),
+        )
+        .unwrap();
+    job.writer
+        .files
+        .get_mut(&NodeId::ROOT)
+        .unwrap()
+        .scratch
+        .as_mut()
+        .unwrap()
+        .close(0)
+        .unwrap();
+    let mut read = b"prefix".to_vec();
+    assert!(
+        !job.writer
+            .access(&job.tree)
+            .read_at(NodeId::ROOT, member, body(), &mut read)
+    );
+    assert_eq!(read, b"prefix");
+    let mut durable = Vec::new();
+    assert!(
+        Access {
+            writer: &job.writer,
+            tree: &job.tree,
+            held: false
+        }
+        .read_at(NodeId::ROOT, member, body(), &mut durable)
+    );
+    assert_eq!(durable, b"stale");
+}
+
+// An output that refuses the repair's write fails the repair with that
+// refusal, and nothing it rebuilt reaches the member.
+#[test]
+fn a_repair_whose_output_refuses_a_write_fails_and_applies_nothing() {
+    let mut job = Job::new(PLENTY).with_set(Some(Fix {
+        name: "video.mkv",
+        read: ByteRange { start: 0, end: 8 },
+        fix: (1, b"OKOKOK"),
+    }));
+    let member = damaged_member(&mut job);
+    job.close(member);
+    let set = job.set_node();
+    let before = job.file("video.mkv");
+    let heard = job.out.len();
+    let mut lent = Inline::default();
+    job.writer
+        .repair(&mut job.tree, NodeId::ROOT, &[set], &mut lent)
+        .expect("lent");
+    let Ok([loan]) = <[Loan; 1]>::try_from(lent.0) else {
+        panic!("one loan");
+    };
+    // A directory where the output file goes: the first write cannot make it.
+    let output = job.dir.path().join(format!(
+        "{}/graph-recovery-{}-{}.repaired",
+        weaver_graph::names::INTERNAL_DIR,
+        NodeId::ROOT.0,
+        set.0
+    ));
+    std::fs::create_dir_all(&output).unwrap();
+    let returned = loan.run(weaver_graph::Budget::default(), &Default::default());
+    let mut build = job.build();
+    let error = job
+        .writer
+        .returned(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            &weaver_objects::Objects::default(),
+            returned,
+            &mut job.out,
+        )
+        .expect_err("the repair failed");
+    let WriteError::Leaf(LeafError::Io { path, .. }) = &error else {
+        panic!("the output's refusal: {error:?}");
+    };
+    assert_eq!(path, &output);
+    assert_eq!(job.file("video.mkv"), before);
+    assert_eq!(job.out.len(), heard);
+}
+
+// Beside the set only a member it does not describe: the index covers
+// nothing, and its own volume is still open.
+fn an_index_covering_nothing(job: &mut Job) -> MemberId {
+    let other = job.member("other.mkv", Some(4));
+    job.send(other, 0, b"body", Provenance::Fresh);
+    job.close(other);
+    assert_eq!(
+        job.writer
+            .covering(&job.tree, &job.tree.recovery_nodes(NodeId::ROOT), other)
+            .count(),
+        0
+    );
+    job.root().find_by_name("set.par2").expect("own volume").id
+}
+
+#[test]
+fn an_index_that_covers_nothing_and_has_no_volume_in_is_not_due() {
+    let mut job = Job::new(PLENTY).with_set(None);
+    let own = an_index_covering_nothing(&mut job);
+    assert!(!job.root().get(own).unwrap().closed);
+    job.rule(false);
+    assert!(
+        job.par.lock().unwrap().volume.is_none(),
+        "no repair was lent"
+    );
+    assert_eq!(job.writer.outcomes(&job.tree), vec![None]);
+}
+
+#[test]
+fn an_index_that_covers_nothing_is_due_once_its_volume_closes() {
+    let mut job = Job::new(PLENTY).with_set(None);
+    let own = an_index_covering_nothing(&mut job);
+    job.close(own);
+    job.rule(false);
+    assert_eq!(
+        job.par.lock().unwrap().volume.as_deref(),
+        Some(PAR2_SIGNATURE),
+        "the repair was lent and read the set's own volume"
+    );
+}
+
+#[test]
+fn a_namespace_without_sets_has_ruled_and_one_with_an_unruled_set_has_not() {
+    let mut job = Job::new(PLENTY);
+    job.member("video.mkv", Some(4));
+    assert!(
+        job.writer
+            .ruled(&job.tree, NodeId::ROOT, &Coming::default())
+    );
+    assert!(job.writer.all_ruled(&job.tree, &Coming::default()));
+
+    let mut job = Job::new(PLENTY).with_set(None);
+    job.member("video.mkv", Some(4));
+    assert!(
+        !job.writer
+            .ruled(&job.tree, NodeId::ROOT, &Coming::default())
+    );
+    assert_eq!(job.writer.outcomes(&job.tree), vec![None]);
+}
+
+// A set rules on what it has read. While an article of its own volume is
+// still to come, what it said of the first part is not its last word, so
+// the namespace has not ruled and the job cannot go quiet on it; payload
+// still to come is named apart and leaves the set's ruling standing.
+#[test]
+fn a_set_whose_own_volume_has_an_article_to_come_has_not_ruled() {
+    let mut job = Job::new(PLENTY).with_set(None);
+    let own = an_index_covering_nothing(&mut job);
+    let other = job.root().find_by_name("other.mkv").expect("payload").id;
+    job.close(own);
+    job.rule(false);
+    assert_eq!(
+        job.writer.outcomes(&job.tree),
+        vec![Some(RepairOutcome::Clean)]
+    );
+    assert!(
+        job.writer
+            .ruled(&job.tree, NodeId::ROOT, &Coming::default())
+    );
+
+    let coming = job.writer.coming(&job.tree, [own].into_iter());
+    assert_eq!(
+        coming,
+        Coming {
+            payload: false,
+            sets: BTreeSet::from([job.set_node()]),
+        }
+    );
+    assert!(!job.writer.ruled(&job.tree, NodeId::ROOT, &coming));
+    assert!(!job.writer.all_ruled(&job.tree, &coming));
+    assert!(!job.writer.ended(&job.tree, NodeId::ROOT, &coming));
+
+    let coming = job.writer.coming(&job.tree, [other].into_iter());
+    assert_eq!(
+        coming,
+        Coming {
+            payload: true,
+            sets: BTreeSet::new(),
+        }
+    );
+    assert!(job.writer.ruled(&job.tree, NodeId::ROOT, &coming));
+    assert!(!job.writer.ended(&job.tree, NodeId::ROOT, &coming));
+}
+
+#[test]
+fn the_coordinator_holds_only_for_declared_indexes_still_to_come() {
+    use crate::pipeline::graph::metadata::{MetadataState, RecoveryFormat, RecoveryMetadata};
+    let arrived = MemberId(1);
+    let mut metadata = RecoveryMetadata::default();
+    for member in [MemberId(0), arrived, MemberId(2)] {
+        metadata.observe(
+            member,
+            RecoveryFormat::Par2,
+            if member == arrived {
+                MetadataState::Ready
+            } else {
+                MetadataState::Unresolved
+            },
+        );
+    }
+    assert_eq!(
+        metadata.bootstrap_files(),
+        Some(vec![MemberId(0), MemberId(2)])
+    );
+    let mut settled = RecoveryMetadata::default();
+    settled.observe(arrived, RecoveryFormat::Par2, MetadataState::Ready);
+    assert_eq!(
+        settled.bootstrap_files(),
+        None,
+        "nothing is held once every index is in"
+    );
+}
+
+// The set's one loan, lent out of the job.
+fn lend_one(job: &mut Job, set: NodeId) -> Loan {
+    let mut lent = Inline::default();
+    job.writer
+        .repair(&mut job.tree, NodeId::ROOT, &[set], &mut lent)
+        .expect("lent");
+    let Ok([loan]) = <[Loan; 1]>::try_from(lent.0) else {
+        panic!("one loan");
+    };
+    loan
+}
+
+// A repair the shutdown reaches while it is running reads nothing more:
+// the read after it is refused, and the repair comes back stopped with
+// nothing it came to applied.
+#[test]
+fn a_shutdown_that_starts_mid_repair_refuses_the_next_read_and_applies_nothing() {
+    let mut job = Job::new(PLENTY).with_set(Some(VIDEO_FIX));
+    let member = damaged_member(&mut job);
+    job.close(member);
+    let set = job.set_node();
+    let loan = lend_one(&mut job, set);
+    let started = Arc::new(AtomicBool::new(false));
+    let flip = Arc::clone(&started);
+    job.par.lock().unwrap().between = Some(Box::new(move || flip.store(true, Ordering::Release)));
+    let returned = loan.run(weaver_graph::Budget::default(), &Shutdown::of(started));
+    let seen = job.par.lock().unwrap();
+    assert!(seen.volume.is_some(), "the repair ran before the shutdown");
+    assert!(
+        seen.read.is_none(),
+        "the read after the shutdown is refused"
+    );
+    drop(seen);
+    assert!(returned.stopped());
+    let mut build = job.build();
+    job.writer
+        .returned(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            &weaver_objects::Objects::default(),
+            returned,
+            &mut job.out,
+        )
+        .expect("returned");
+    assert!(!job.tree.lent(set));
+    assert_eq!(job.file("video.mkv"), b"goXXgood");
+}
+
+// A job failed while its repair is out has its working directory released
+// under the repair: the repair reads and writes nothing more, and nothing
+// it does makes the directory again.
+#[test]
+fn a_repair_out_when_its_job_fails_never_makes_the_working_directory_again() {
+    let mut job = Job::new(PLENTY).with_set(Some(VIDEO_FIX));
+    let member = damaged_member(&mut job);
+    job.close(member);
+    let set = job.set_node();
+    let loan = lend_one(&mut job, set);
+    let working_dir = job.dir.path().to_path_buf();
+    let released = working_dir.clone();
+    job.par.lock().unwrap().between = Some(Box::new(move || {
+        std::fs::remove_dir_all(&released).expect("released");
+    }));
+    let returned = loan.run(weaver_graph::Budget::default(), &Shutdown::default());
+    assert!(
+        job.par.lock().unwrap().read.is_none(),
+        "the read after the release is refused"
+    );
+    assert!(returned.stopped());
+    assert!(!working_dir.exists(), "the working directory stays gone");
+}
+
+// A repair that goes out as the pipeline shuts down reads nothing and
+// applies nothing: the set takes its object back unruled and repairs on its
+// next ruling, as the restored job rules it.
+#[test]
+fn a_repair_stopped_by_shutdown_reads_nothing_applies_nothing_and_rules_again() {
+    let mut job = Job::new(PLENTY).with_set(Some(VIDEO_FIX));
+    let member = damaged_member(&mut job);
+    job.close(member);
+    let set = job.set_node();
+    let loan = lend_one(&mut job, set);
+    let shutdown = Shutdown::of(Arc::new(AtomicBool::new(true)));
+    let returned = loan.run(weaver_graph::Budget::default(), &shutdown);
+    assert!(
+        job.par.lock().unwrap().read.is_none(),
+        "the stopped repair read nothing"
+    );
+    assert!(returned.stopped());
+    let mut build = job.build();
+    job.writer
+        .returned(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            &weaver_objects::Objects::default(),
+            returned,
+            &mut job.out,
+        )
+        .expect("returned");
+    assert!(!job.tree.lent(set));
+    assert_eq!(job.file("video.mkv"), b"goXXgood");
+
+    job.rule(false);
+    assert_eq!(job.file("video.mkv"), b"goOKgood");
+}

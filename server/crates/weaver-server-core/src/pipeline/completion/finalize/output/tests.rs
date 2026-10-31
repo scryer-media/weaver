@@ -4,45 +4,6 @@
 use super::*;
 
 #[test]
-fn member_crc_map_preserves_paths_and_rejects_conflicting_values() {
-    let mut by_path = HashMap::new();
-    let mut ambiguous_paths = HashSet::new();
-
-    record_member_crc32_value(
-        &mut by_path,
-        &mut ambiguous_paths,
-        "disc-one\\payload.mkv",
-        0x1111_1111,
-    );
-    record_member_crc32_value(
-        &mut by_path,
-        &mut ambiguous_paths,
-        "disc-two/payload.mkv",
-        0x2222_2222,
-    );
-
-    assert_eq!(by_path["disc-one/payload.mkv"], 0x1111_1111);
-    assert_eq!(by_path["disc-two/payload.mkv"], 0x2222_2222);
-
-    record_member_crc32_value(
-        &mut by_path,
-        &mut ambiguous_paths,
-        "disc-one/payload.mkv",
-        0x3333_3333,
-    );
-    record_member_crc32_value(
-        &mut by_path,
-        &mut ambiguous_paths,
-        "disc-one/payload.mkv",
-        0x1111_1111,
-    );
-
-    assert!(!by_path.contains_key("disc-one/payload.mkv"));
-    assert!(ambiguous_paths.contains("disc-one/payload.mkv"));
-    assert_eq!(by_path["disc-two/payload.mkv"], 0x2222_2222);
-}
-
-#[test]
 fn safe_move_uses_rename_without_copy_on_the_same_filesystem() {
     let temp = tempfile::tempdir().unwrap();
     let src = temp.path().join("source.bin");
@@ -534,6 +495,35 @@ async fn a_disabled_rename_pass_places_the_obfuscated_names_untouched() {
     assert!(dest.join("Yb5drZSkNi20UCMkb.mkv").is_file());
 }
 
+// The chunk workspace is scratch the job wrote beside its output; once the
+// output is published, the working directory goes, the workspace with it.
+#[tokio::test]
+async fn final_move_removes_the_working_directory_with_its_chunk_workspace() {
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    let dest = temp.path().join("complete");
+    std::fs::create_dir_all(working.join(".weaver-chunks")).unwrap();
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::write(working.join("payload.bin"), b"payload").unwrap();
+    std::fs::write(working.join(".weaver-chunks/scratch-0"), b"scratch").unwrap();
+
+    run_move_to_complete(
+        JobId(1),
+        working.clone(),
+        None,
+        dest.clone(),
+        Arc::new(PhaseCounters::default()),
+        None,
+        DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(std::fs::read(dest.join("payload.bin")).unwrap(), b"payload");
+    assert!(!dest.join(".weaver-chunks").exists());
+    assert!(!working.exists());
+}
+
 #[test]
 fn prepublication_scan_checks_both_delivery_roots() {
     let temp = tempfile::tempdir().unwrap();
@@ -599,26 +589,6 @@ fn prepublication_scan_refuses_symlinked_directories() {
 
     let error = validate_delivery_sources(&working, None, &settings).unwrap_err();
     assert!(error.contains("link or reparse point"));
-}
-
-#[test]
-fn prepublication_scan_counts_sparse_files_without_reading_them() {
-    use crate::pipeline::direct_store::sparse::{SparseMarker, SparseMarking};
-    let temp = tempfile::tempdir().unwrap();
-    let working = temp.path().join("working");
-    std::fs::create_dir_all(&working).unwrap();
-    let payload = std::fs::File::create(working.join("payload.mkv")).unwrap();
-    SparseMarking::Platform.mark_sparse(&payload).unwrap();
-    payload.set_len(200 * 1024 * 1024 * 1024).unwrap();
-
-    let validation =
-        validate_delivery_sources(&working, None, &PostProcessingSettings::default()).unwrap();
-
-    assert_eq!(validation.total_bytes, 200 * 1024 * 1024 * 1024);
-    assert_eq!(
-        validation.root_entry_bytes[&working.join("payload.mkv")],
-        200 * 1024 * 1024 * 1024
-    );
 }
 
 #[test]

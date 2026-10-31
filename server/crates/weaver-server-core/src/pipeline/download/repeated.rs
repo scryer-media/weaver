@@ -241,18 +241,24 @@ struct Reply {
 }
 
 impl RepeatedArticles {
+    // The index of a job whose articles are being built, charged as it
+    // stands and never refused, like everything else built then.
     pub(crate) fn new(
         spec: &crate::jobs::JobSpec,
         root: &Path,
         memory: Arc<ProcessMemoryBudget>,
     ) -> Result<Option<Arc<Self>>, String> {
         let count: usize = spec.files.iter().map(|file| file.segments.len()).sum();
-        let scratch = memory.try_reserve_retained((count as u64).saturating_mul(48))?;
+        let scratch = memory.charge_retained((count as u64).saturating_mul(48));
         let mut counts = HashMap::<&str, bool>::new();
         for file in &spec.files {
-            for segment in &file.segments {
+            for id in file
+                .segments
+                .iter()
+                .flat_map(|segment| segment.message_ids.all())
+            {
                 counts
-                    .entry(&segment.message_id)
+                    .entry(id)
                     .and_modify(|repeated| *repeated = true)
                     .or_insert(false);
             }
@@ -266,14 +272,16 @@ impl RepeatedArticles {
             .filter(|(_, repeated)| **repeated)
             .map(|(id, _)| id.len() as u64 + 512)
             .sum();
-        let index_memory = memory.try_reserve_retained(bytes)?;
+        let index_memory = memory.charge_retained(bytes);
         let entries = counts
             .into_iter()
             .filter(|(_, repeated)| *repeated)
             .map(|(id, _)| (MessageId::new(id), Arc::new(tokio::sync::Mutex::new(None))))
             .collect();
         drop(scratch);
-        let scratch_root = root.join(".weaver-chunks");
+        // Beside the job's own files, not among them: the cache is this
+        // process's, and no checkpoint names it.
+        let scratch_root = root.join(weaver_graph::names::CACHE_DIR);
         match std::fs::create_dir(&scratch_root) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -308,6 +316,7 @@ impl RepeatedArticles {
         self.root.relocate(old, new);
     }
 
+    #[cfg(test)]
     async fn fetch(
         self: &Arc<Self>,
         work: &DownloadWork,
@@ -315,10 +324,37 @@ impl RepeatedArticles {
         nntp: &NntpClient,
         generation: u64,
     ) -> Reply {
+        self.fetch_guarded(work, excludes, nntp, generation, || true)
+            .await
+    }
+
+    async fn fetch_guarded(
+        self: &Arc<Self>,
+        work: &DownloadWork,
+        excludes: &[usize],
+        nntp: &NntpClient,
+        generation: u64,
+        ready: impl Fn() -> bool,
+    ) -> Reply {
+        let obsolete = || Reply {
+            data: Err(DownloadError::Fetch(DownloadFailure::new(
+                DownloadFailureKind::Unrequested,
+                "duplicate article reservation became obsolete",
+            ))),
+            attempts: Vec::new(),
+            source: None,
+            excludes: work.exclude_servers.clone(),
+        };
+        if !ready() {
+            return obsolete();
+        }
         let Some(entry) = self.entries.get(&work.message_id) else {
             return Self::fetch_uncached(work, excludes, nntp).await;
         };
         let mut state = entry.clone().lock_owned().await;
+        if !ready() {
+            return obsolete();
+        }
         match state.as_mut() {
             Some(Entry::Body(body))
                 if body.generation == generation
@@ -450,6 +486,7 @@ impl RepeatedArticles {
                     _memory: Some(reservation),
                 }));
             }
+            #[cfg(test)]
             Ok(DownloadPayload::Raw(_)) => unreachable!("fused BODY fetch returns decoded data"),
         }
         reply
@@ -489,28 +526,13 @@ impl RepeatedArticles {
 }
 
 impl Pipeline {
-    pub(crate) fn install_repeated_articles(
-        &mut self,
-        state: &crate::jobs::JobState,
-    ) -> Result<(), crate::SchedulerError> {
-        if let Some(cache) = RepeatedArticles::new(
-            &state.spec,
-            &state.working_dir,
-            self.process_memory_budget.for_job(state.job_id.0),
-        )
-        .map_err(crate::SchedulerError::InvalidInput)?
-        {
-            self.repeated_articles.insert(state.job_id, cache);
-        }
-        Ok(())
-    }
-
     pub(in crate::pipeline::download) fn spawn_repeated_download_batch(
         &self,
         lease: DownloadBatchLease,
         cache: Arc<RepeatedArticles>,
     ) {
         let nntp = self.nntp.clone();
+        let state = self.shared_state.clone();
         let tx = self.download_done_tx.clone();
         let parked = self.download_lane_parked_tx.clone();
         tokio::spawn(async move {
@@ -521,12 +543,56 @@ impl Pipeline {
                 // from the work: fetching on the lease's set alone re-asks a
                 // server this article has already been refused by, and the
                 // result then reports a set that never grows.
-                let excludes = Pipeline::union_exclude_servers(
+                let article_excludes = Pipeline::union_exclude_servers(
                     &work.exclude_servers,
                     &lease.effective_exclude_servers,
                 );
+                let excludes =
+                    Pipeline::union_exclude_servers(&article_excludes, &lease.dial_exclude_servers);
+                let guard_state = state.clone();
+                let guard_pool = Arc::clone(nntp.pool());
+                let guard_excludes = article_excludes.clone();
+                let job_id = lease.job_id;
+                let generation = lease.runtime_generation;
+                let estimate = Pipeline::bandwidth_reservation_estimate(work.byte_estimate);
+                let guarded = nntp.with_work_guard(move |server| {
+                    super::owned_lane::job_work_is_current(&guard_state, job_id, generation)
+                        && matches!(
+                            guard_pool.provider_policy().eligibility(
+                                server.0,
+                                &guard_excludes,
+                                &[],
+                                estimate
+                            ),
+                            weaver_nntp::provider_policy::ArticleEligibility::Eligible(_)
+                        )
+                });
                 let reply = cache
-                    .fetch(&work, &excludes, &nntp, lease.runtime_generation)
+                    .fetch_guarded(&work, &excludes, &guarded, lease.runtime_generation, || {
+                        super::owned_lane::job_work_is_current(
+                            &state,
+                            lease.job_id,
+                            lease.runtime_generation,
+                        ) && {
+                            let policy = nntp.pool().provider_policy();
+                            (0..nntp.pool().server_count()).any(|server| {
+                                !lease.dial_exclude_servers.contains(&server)
+                                    && matches!(
+                                        policy.eligibility(
+                                            server,
+                                            &article_excludes,
+                                            &[],
+                                            Pipeline::bandwidth_reservation_estimate(
+                                                work.byte_estimate
+                                            )
+                                        ),
+                                        weaver_nntp::provider_policy::ArticleEligibility::Eligible(
+                                            _
+                                        )
+                                    )
+                            })
+                        }
+                    })
                     .await;
                 let _ = tx
                     .send(DownloadResult {
@@ -661,7 +727,9 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let old = base.path().join("old name");
         let new = base.path().join("new name");
-        let dir = old.join(".weaver-chunks").join("article-cache-test");
+        let dir = old
+            .join(weaver_graph::names::CACHE_DIR)
+            .join("article-cache-test");
         std::fs::create_dir_all(&dir).unwrap();
         let memory = Arc::new(ProcessMemoryBudget::new(1 << 20));
         let cache = RepeatedArticles {
@@ -678,7 +746,9 @@ mod tests {
         std::fs::rename(&old, &new).unwrap();
         cache.relocate_working_dir(&old, &new);
 
-        let moved = new.join(".weaver-chunks").join("article-cache-test");
+        let moved = new
+            .join(weaver_graph::names::CACHE_DIR)
+            .join("article-cache-test");
         assert_eq!(cache.root.path(), moved);
         assert_eq!(body.path().parent(), Some(moved.as_path()));
         let restored = body.read(id, &memory).unwrap();
@@ -707,13 +777,16 @@ mod tests {
         let DecodedChunk::Shared(body) = &replayed.data else {
             panic!("a stored body replays shared")
         };
-        let pieces = replayed.data.pieces();
-        let inner = body.data.pieces();
+        let mut pieces = Vec::new();
+        replayed
+            .data
+            .for_each_slice(|piece| pieces.push((piece.as_ptr(), piece.to_vec())));
+        let mut inner = Vec::new();
+        body.data.for_each_slice(|piece| inner.push(piece.as_ptr()));
         assert_eq!(pieces.len(), 1);
-        assert_eq!(pieces[0].as_ref(), bytes.as_slice());
+        assert_eq!(pieces[0].1, bytes);
         assert_eq!(
-            pieces[0].as_ptr(),
-            inner[0].as_ptr(),
+            pieces[0].0, inner[0],
             "a shared article hands out the body's own buffer, never a copy"
         );
     }

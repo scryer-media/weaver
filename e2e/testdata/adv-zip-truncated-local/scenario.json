@@ -1,0 +1,11 @@
+{
+  "slug": "adv-zip-truncated-local",
+  "title": "E2E.Adversarial.Zip.Truncated.Local.2026-TESTGRP",
+  "description": "A zip cut twenty bytes into its first local header. The job settles with a named verdict.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "adversarial": {
+    "group": "default",
+    "outcome": "settles"
+  }
+}

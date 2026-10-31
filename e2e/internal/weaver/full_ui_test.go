@@ -418,6 +418,9 @@ func TestFullPhaseContextsIncludeContainerAndManagedRestarts(t *testing.T) {
 		{name: "Functional Postgres", command: "test-all", datastore: "postgres"},
 		{name: "NNTP Chaos", command: "chaos-test", datastore: "sqlite"},
 		{name: "TCP Chaos", command: "tcp-chaos", datastore: "sqlite"},
+		{name: "TLS NNTP", command: "tls-test", datastore: "sqlite"},
+		{name: "Adaptive Dispatch", command: "adaptive-dispatch", datastore: "sqlite"},
+		{name: "Adversarial Archives", command: "adversarial", datastore: "sqlite"},
 		{name: "Container Restart", command: "container-restart", datastore: "sqlite", skipSeed: true},
 		{name: "Restart SQLite", command: "restart-all", datastore: "sqlite"},
 		{name: "Restart Postgres", command: "restart-all", datastore: "postgres"},
@@ -831,6 +834,9 @@ func TestFullPhasesHaveIsolatedPortsAndProfiles(t *testing.T) {
 		"functional-postgres": "functional",
 		"nntp-chaos":          "chaos",
 		"tcp-chaos":           "tcp-chaos",
+		"tls-nntp":            "functional",
+		"adaptive-dispatch":   "tcp-chaos",
+		"adversarial":         "adversarial",
 		"restart-sqlite":      "restart",
 		"restart-postgres":    "restart",
 	} {
@@ -968,6 +974,81 @@ func TestFullPhaseJobsBoundsTheRequestedWidth(t *testing.T) {
 				t.Fatalf("fullPhaseJobs(%d) = %d, want %d", tt.phaseCount, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestFullPhaseJobsCountsTheGateSlot(t *testing.T) {
+	phaseCount := len(fullPhaseDefinitions)
+	tests := []struct {
+		value       string
+		wantSuites  int
+		wantGeneral int
+	}{
+		{value: "", wantSuites: defaultFullPhaseJobs, wantGeneral: defaultFullPhaseJobs - 1},
+		{value: "1", wantSuites: 1, wantGeneral: 1},
+		{value: "2", wantSuites: 2, wantGeneral: 1},
+		{value: "3", wantSuites: 3, wantGeneral: 2},
+		{value: "8", wantSuites: 8, wantGeneral: 7},
+	}
+	for _, tt := range tests {
+		t.Run("E2E_FULL_PHASE_JOBS="+tt.value, func(t *testing.T) {
+			t.Setenv("E2E_FULL_PHASE_JOBS", tt.value)
+			if got := fullPhaseJobs(phaseCount); got != tt.wantSuites {
+				t.Fatalf("fullPhaseJobs(%d) = %d, want %d", phaseCount, got, tt.wantSuites)
+			}
+			if got := fullGeneralPhaseJobs(phaseCount); got != tt.wantGeneral {
+				t.Fatalf("fullGeneralPhaseJobs(%d) = %d, want %d", phaseCount, got, tt.wantGeneral)
+			}
+			slots := newFullPhaseSlots(phaseCount)
+			if got := cap(slots.general); got != tt.wantGeneral {
+				t.Fatalf("general slots = %d, want %d", got, tt.wantGeneral)
+			}
+			if got := cap(slots.gate); got != 1 {
+				t.Fatalf("gate slots = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestFullPhaseSlotsRunTheGateBesideThreeSuites(t *testing.T) {
+	t.Setenv("E2E_FULL_PHASE_JOBS", "")
+	slots := newFullPhaseSlots(len(fullPhaseDefinitions))
+
+	gate := &fullPhaseContext{Name: "Product Behavior Gate", Command: "release-gate"}
+	first := &fullPhaseContext{Name: "Functional SQLite", Command: "test-all"}
+	second := &fullPhaseContext{Name: "NNTP Chaos", Command: "chaos-test"}
+	third := &fullPhaseContext{Name: "TCP Chaos", Command: "tcp-chaos"}
+	fourth := &fullPhaseContext{Name: "TLS NNTP", Command: "tls-test"}
+
+	tryTake := func(phase *fullPhaseContext) bool {
+		select {
+		case slots.slotFor(phase) <- struct{}{}:
+			return true
+		default:
+			return false
+		}
+	}
+
+	if !tryTake(first) || !tryTake(second) || !tryTake(third) {
+		t.Fatal("three suites must start together under the default width")
+	}
+	if tryTake(fourth) {
+		t.Fatal("a fourth suite started while three held the general slots")
+	}
+	if !tryTake(gate) {
+		t.Fatal("the gate waited behind the suites instead of taking its own slot")
+	}
+	if got := len(slots.general); got != 3 {
+		t.Fatalf("general slots held = %d after the gate started, want 3", got)
+	}
+	if tryTake(gate) {
+		t.Fatal("the gate's slot admitted a second gate")
+	}
+
+	// The first suite finishes and frees its slot; the fourth takes it.
+	<-slots.slotFor(first)
+	if !tryTake(fourth) {
+		t.Fatal("the fourth suite did not start after a general slot came free")
 	}
 }
 

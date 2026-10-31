@@ -1,0 +1,1790 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use bytes::Bytes;
+use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
+use weaver_graph::{
+    Builder, ByteRange, Delivery, Emit, Extent, Kind, Located, MemberId, NodeId, Object, ObjectId,
+    Placement, Provenance, Pull, Seek, Standing, VolumeIndex, Weight, Why,
+};
+use weaver_model::files::FileRole;
+
+use super::intake::Decoded;
+use super::phase::{self, Activity, RootPhase};
+use super::seams::apply_moves;
+use super::source::{Class, Move};
+use super::window::{WINDOW_IN_ORDER_VOLUMES, WINDOW_VOLUMES};
+use super::{ArticleRoot, Ask};
+use crate::jobs::ids::{JobId, SegmentId};
+use crate::jobs::model::{FileSpec, JobSpec, JobStatus, SegmentSpec};
+use crate::operations::disk::CapacityReader;
+use crate::pipeline::graph::checkpoint;
+use crate::pipeline::graph::engine::{RunMail, Runs};
+use crate::pipeline::graph::job::{GraphJob, RootFile};
+use crate::pipeline::graph::namespace::NamespaceWriter;
+use crate::pipeline::graph::status::RepairSlots;
+use crate::pipeline::tests::{
+    activate_job, insert_active_job, new_direct_pipeline, nzb_zstd_for, retire_pipeline_database,
+    segment_id,
+};
+use crate::pipeline::{
+    DecodeResult, DecodedChunk, SegmentEncoding, SegmentSource, SegmentTerminalState,
+    YencLayoutAssertions,
+};
+use weaver_graph::recovery::RepairOutcome;
+
+const ZIP_FRONT: &[u8] = b"PK\x03\x04";
+
+// A stand-in for a format's object: it asks for what it was told to until
+// it is answered, and remembers the answers.
+struct Probe {
+    wants: Vec<Seek>,
+    answers: Arc<Mutex<Vec<Pull>>>,
+}
+
+impl Object for Probe {
+    // It keeps no record of what it said of its posted bytes.
+    fn unposted(&mut self, _: weaver_graph::VolumeIndex, _: weaver_graph::ByteRange) {}
+
+    fn kind(&self) -> Kind {
+        Kind::Zip
+    }
+    fn deliver(
+        &mut self,
+        _: Delivery<'_>,
+        _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        _: &mut Vec<Emit>,
+    ) {
+    }
+    // Its whole volume in, the probe announces one member it never closes,
+    // the way an object still at work on its last bytes looks.
+    fn volume_closed(&mut self, _: VolumeIndex, out: &mut Vec<Emit>) {
+        out.push(Emit::Member {
+            member: MemberId(0),
+            name: "inner.bin".to_string(),
+            length: None,
+        });
+    }
+    fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
+    // Quiet with the member it announced still open, the probe refuses
+    // itself as a format object would: it never mapped what it named.
+    fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
+        if standing.unplaced() {
+            out.push(Emit::Refuse(Why::Unmapped));
+        }
+    }
+    fn wants(&self, out: &mut Vec<Seek>) {
+        out.extend_from_slice(&self.wants);
+    }
+    // A seek answered is wanted no more.
+    fn pulled(&mut self, seek: Seek, pull: Pull, _: &mut Vec<Emit>) {
+        self.wants.retain(|want| *want != seek);
+        self.answers.lock().unwrap().push(pull);
+    }
+    fn locate(&self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Placement>) {}
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
+    fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
+        None
+    }
+}
+
+struct Probes {
+    wants: Vec<Seek>,
+    answers: Arc<Mutex<Vec<Pull>>>,
+}
+
+impl Builder for Probes {
+    fn build(&mut self, kind: Kind, _: ObjectId) -> Option<Box<dyn Object>> {
+        (kind == Kind::Zip).then(|| {
+            Box::new(Probe {
+                wants: std::mem::take(&mut self.wants),
+                answers: Arc::clone(&self.answers),
+            }) as Box<dyn Object>
+        })
+    }
+
+    fn read(
+        &self,
+        _: &weaver_graph::Tree,
+        _: weaver_graph::NodeId,
+        _: weaver_graph::VolumeIndex,
+        _: &weaver_graph::Placement,
+        _: &mut Vec<u8>,
+    ) -> bool {
+        false
+    }
+}
+
+pub(in crate::pipeline::graph) fn file(name: &str, sizes: &[u32]) -> RootFile {
+    RootFile {
+        name: name.to_string(),
+        articles: sizes
+            .iter()
+            .enumerate()
+            .map(|(ordinal, bytes)| (ordinal as u32, *bytes))
+            .collect(),
+    }
+}
+
+// A job whose files go to a fresh directory, kept for as long as the
+// returned handle lives.
+pub(in crate::pipeline::graph) fn job_with(
+    files: &[RootFile],
+    wants: Vec<Seek>,
+) -> (GraphJob, tempfile::TempDir, Arc<Mutex<Vec<Pull>>>) {
+    let answers = Arc::new(Mutex::new(Vec::new()));
+    let builder = Probes {
+        wants,
+        answers: Arc::clone(&answers),
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
+        resident_limit: u64::MAX,
+        scratch_total: u64::MAX,
+        scratch_ceiling: u64::MAX,
+        disk_reserve: 0,
+    }));
+    let writer = NamespaceWriter::new(
+        1,
+        dir.path().to_path_buf(),
+        Arc::clone(&accountant),
+        CapacityReader::unknown(),
+    );
+    let runs = Runs::new(1, 1, RunMail::default().sender(), accountant);
+    let job = GraphJob::new(files, Box::new(builder), writer, runs, u32::MAX);
+    (job, dir, answers)
+}
+
+pub(in crate::pipeline::graph) fn decoded(
+    volume: u32,
+    ordinal: u32,
+    offset: u64,
+    bytes: &[u8],
+    length: Option<u64>,
+) -> Decoded {
+    Decoded {
+        volume: VolumeIndex(volume),
+        ordinal,
+        offset,
+        bytes: Bytes::copy_from_slice(bytes),
+        intact: true,
+        positioned: true,
+        length,
+        // A whole part ends where it declares.
+        declared_end: Some(offset + bytes.len() as u64),
+        segments: Vec::new(),
+    }
+}
+
+// The front of a zip member, padded to `len`.
+fn zip_front(len: usize) -> Vec<u8> {
+    let mut bytes = ZIP_FRONT.to_vec();
+    bytes.resize(len, 0);
+    bytes
+}
+
+fn damaged_ranges(job: &GraphJob, member: u32) -> Vec<ByteRange> {
+    job.tree()
+        .namespace(NodeId::ROOT)
+        .and_then(|namespace| namespace.get(MemberId(member)))
+        .map(|member| member.coverage.damaged_ranges().collect())
+        .unwrap_or_default()
+}
+
+fn data_bid(volume: u32, weight: u32, bidder: u32, in_order: bool) -> Ask {
+    Ask {
+        seek: Seek::data(VolumeIndex(volume), ByteRange::new(0, 100), Weight(weight)),
+        bidder: NodeId(bidder),
+        in_order,
+    }
+}
+
+fn windowed(moves: &[Move]) -> Vec<u32> {
+    let mut volumes: Vec<u32> = moves
+        .iter()
+        .filter(|found| matches!(found.class, Class::Window(_)))
+        .map(|found| found.volume.0)
+        .collect();
+    volumes.dedup();
+    volumes
+}
+
+fn spec(name: &str, files: Vec<(String, FileRole, u32)>) -> JobSpec {
+    JobSpec {
+        name: name.to_string(),
+        password: None,
+        total_bytes: files
+            .iter()
+            .map(|(_, _, segments)| u64::from(*segments) * 64)
+            .sum(),
+        category: None,
+        metadata: vec![],
+        files: files
+            .into_iter()
+            .enumerate()
+            .map(|(index, (filename, role, segments))| FileSpec {
+                filename,
+                role,
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: (0..segments)
+                    .map(|ordinal| SegmentSpec {
+                        ordinal,
+                        article_number: ordinal,
+                        bytes: 64,
+                        message_ids: crate::jobs::MessageIds::new(vec![format!(
+                            "lantern-{index}-{ordinal}@example.com"
+                        )]),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+fn recovery_role() -> FileRole {
+    FileRole::Par2 {
+        is_index: false,
+        recovery_block_count: 4,
+    }
+}
+
+#[test]
+fn the_phase_is_the_first_state_that_holds() {
+    for activity in [
+        Activity::Idle,
+        Activity::Verifying,
+        Activity::Fetching,
+        Activity::Repairing,
+    ] {
+        for extracting in [false, true] {
+            assert_eq!(
+                RootPhase::derive(true, activity, extracting),
+                RootPhase::Downloading
+            );
+        }
+    }
+    for extracting in [false, true] {
+        assert_eq!(
+            RootPhase::derive(false, Activity::Repairing, extracting),
+            RootPhase::Repairing
+        );
+        assert_eq!(
+            RootPhase::derive(false, Activity::Verifying, extracting),
+            RootPhase::Verifying
+        );
+        assert_eq!(
+            RootPhase::derive(false, Activity::Fetching, extracting),
+            RootPhase::Downloading
+        );
+    }
+    assert_eq!(
+        RootPhase::derive(false, Activity::Idle, true),
+        RootPhase::Extracting
+    );
+    assert_eq!(
+        RootPhase::derive(false, Activity::Idle, false),
+        RootPhase::Done
+    );
+    assert_eq!(phase::activity([], false), Activity::Idle);
+    assert_eq!(
+        phase::activity([Some(RepairOutcome::Clean), None], false),
+        Activity::Verifying
+    );
+    assert_eq!(
+        phase::activity([None, Some(RepairOutcome::Waiting)], false),
+        Activity::Fetching
+    );
+    assert_eq!(
+        phase::activity([None, Some(RepairOutcome::Waiting)], true),
+        Activity::Repairing
+    );
+    assert_eq!(RootPhase::Done.job_status(), None);
+    assert_eq!(
+        RootPhase::Extracting.job_status(),
+        Some(JobStatus::Extracting)
+    );
+    assert!(!RootPhase::may_replace(&JobStatus::Paused));
+}
+
+#[test]
+fn a_graph_job_reports_each_phase_as_its_tree_moves() {
+    // inner.zip in two articles, the second held back. The zip object
+    // announces its member from the first; with bytes still to fetch the
+    // root reports downloading, since that phase wins over extracting.
+    let files = [file("inner.zip", &[100, 100]), file("plain.bin", &[100])];
+    let (mut job, _dir, _) = job_with(&files, Vec::new());
+    assert_eq!(job.phase_change(), Some(RootPhase::Downloading));
+    assert_eq!(job.phase_change(), None);
+
+    job.intake(
+        decoded(1, 0, 0, &[7; 90], Some(90)),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
+    assert_eq!(job.phase(), RootPhase::Downloading);
+
+    job.intake(
+        decoded(0, 0, 0, &zip_front(90), Some(180)),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
+    assert_eq!(job.phase(), RootPhase::Downloading);
+
+    // Every volume in and the probe never closes the member it announced:
+    // the object refuses itself as unmapped once the job is quiet, in the
+    // settle that closes the last volume, and the job is done.
+    job.intake(
+        decoded(0, 1, 90, &[0; 90], Some(180)),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
+    assert_eq!(job.phase(), RootPhase::Done);
+    assert_eq!(
+        job.writer().refused(NodeId::ROOT, MemberId(0)),
+        Some(Why::Unmapped)
+    );
+
+    let (mut plain, _plain_dir, _) = job_with(&[file("plain.bin", &[100])], Vec::new());
+    plain
+        .intake(
+            decoded(0, 0, 0, &[7; 90], Some(90)),
+            &mut RepairSlots::default(),
+            1,
+        )
+        .unwrap();
+    assert_eq!(plain.phase(), RootPhase::Done);
+}
+
+#[test]
+fn a_data_seek_moves_the_articles_that_cover_it_into_the_window() {
+    let wants = vec![Seek::data(
+        VolumeIndex(0),
+        ByteRange::new(150, 160),
+        Weight(1),
+    )];
+    let (mut job, _dir, answers) = job_with(&[file("inner.zip", &[100, 100, 100])], wants);
+    // The first article binds the zip object and says how long the file is,
+    // which pins where the second article's bytes can lie.
+    job.intake(
+        decoded(0, 0, 0, &zip_front(90), Some(270)),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
+
+    let moves = job.seek_round(|_| true).unwrap();
+
+    // The seek moves its article; the bootstrap leads the bound set's
+    // first volume, so the rest of it follows into the window.
+    assert_eq!(
+        moves,
+        vec![
+            Move {
+                volume: VolumeIndex(0),
+                ordinal: 1,
+                class: Class::Window(0),
+            },
+            Move {
+                volume: VolumeIndex(0),
+                ordinal: 2,
+                class: Class::Window(0),
+            }
+        ]
+    );
+    assert_eq!(*answers.lock().unwrap(), vec![Pull::Moved(1)]);
+}
+
+#[test]
+fn the_window_holds_eight_volumes_and_four_for_an_in_order_reader() {
+    let volumes: Vec<RootFile> = (0..12)
+        .map(|volume| file(&format!("part{volume}.bin"), &[100]))
+        .collect();
+
+    let mut root = ArticleRoot::new(&volumes);
+    let asks: Vec<Ask> = (0..12)
+        .map(|volume| data_bid(volume, volume + 1, 1, false))
+        .collect();
+    let answers = root.answer(&asks, |_| true);
+    assert_eq!(windowed(&root.map.take_moves()), (0..8).collect::<Vec<_>>());
+    assert_eq!(
+        answers
+            .iter()
+            .filter(|pull| **pull == Pull::Moved(1))
+            .count(),
+        WINDOW_VOLUMES
+    );
+
+    let mut root = ArticleRoot::new(&volumes);
+    let asks: Vec<Ask> = (0..6)
+        .map(|volume| data_bid(volume, volume + 1, 1, true))
+        .collect();
+    root.answer(&asks, |_| true);
+    assert_eq!(
+        windowed(&root.map.take_moves()).len(),
+        WINDOW_IN_ORDER_VOLUMES
+    );
+
+    // A volume with nothing queued (all of it in flight) takes no place.
+    let mut root = ArticleRoot::new(&volumes);
+    let asks: Vec<Ask> = (0..12)
+        .map(|volume| data_bid(volume, volume + 1, 1, false))
+        .collect();
+    root.answer(&asks, |volume| volume != VolumeIndex(2));
+    assert_eq!(
+        windowed(&root.map.take_moves()),
+        vec![0, 1, 3, 4, 5, 6, 7, 8]
+    );
+}
+
+#[test]
+fn a_bid_the_full_window_had_no_room_for_is_drawn_when_asked_again_once_a_place_frees() {
+    let volumes: Vec<RootFile> = (0..12)
+        .map(|volume| file(&format!("part{volume}.bin"), &[100]))
+        .collect();
+    let mut root = ArticleRoot::new(&volumes);
+    let asks: Vec<Ask> = (0..12)
+        .map(|volume| data_bid(volume, volume + 1, 1, false))
+        .collect();
+    root.answer(&asks, |_| true);
+    assert_eq!(windowed(&root.map.take_moves()), (0..8).collect::<Vec<_>>());
+
+    // The window keeps no bid: a round that asks nothing draws nothing.
+    root.answer(&[], |volume| volume.0 >= 8);
+    assert!(windowed(&root.map.take_moves()).is_empty());
+
+    // The bidder asks again, and the volumes that were drawn have nothing
+    // left queued: the rest take their places.
+    root.answer(&asks, |volume| volume.0 >= 8);
+    assert_eq!(windowed(&root.map.take_moves()), vec![8, 9, 10, 11]);
+}
+
+#[tokio::test]
+async fn a_recovery_seek_lands_in_the_promoted_class() {
+    // Past the 60 bytes that arrived: the second article holds it.
+    let wants = vec![Seek::recovery(
+        VolumeIndex(0),
+        ByteRange::new(64, 65),
+        Weight(1),
+    )];
+    let (mut job, _dir, answers) = job_with(
+        // A recovery volume by its name, not an index the root asks for
+        // first.
+        &[
+            file("inner.zip", &[64, 64]),
+            file("blocks.vol0+1.par2", &[64]),
+        ],
+        wants,
+    );
+    job.intake(
+        decoded(0, 0, 0, &zip_front(60), Some(120)),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
+    let moves = job.seek_round(|_| true).unwrap();
+    assert_eq!(*answers.lock().unwrap(), vec![Pull::Moved(1)]);
+    assert!(!moves.is_empty());
+    assert!(moves.iter().all(|found| found.class == Class::Recovery));
+
+    // In the queue, a promoted article leaves wherever the recovery volume
+    // waited and leads everything else.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(91_001);
+    let spec = spec(
+        "lantern promoted",
+        vec![
+            ("lantern.bin".to_string(), FileRole::Standalone, 4),
+            ("lantern.vol0+4.par2".to_string(), recovery_role(), 2),
+        ],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    let parked = segment_id(job_id, 1, 1);
+    let waiting = |state: &crate::jobs::model::JobState| {
+        state
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .count_matching(|work| work.segment_id == parked)
+            + state
+                .articles
+                .active()
+                .unwrap()
+                .recovery_queue
+                .count_matching(|work| work.segment_id == parked)
+    };
+    assert_eq!(waiting(state), 1);
+    apply_moves(
+        state,
+        &[Move {
+            volume: VolumeIndex(1),
+            ordinal: 1,
+            class: Class::Recovery,
+        }],
+    );
+    assert_eq!(waiting(state), 1);
+    let first = state
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
+    assert_eq!(first.segment_id, parked);
+    assert!(first.completion_critical && first.is_recovery);
+}
+
+#[tokio::test]
+async fn a_window_move_leads_the_ordinary_articles_of_other_files() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(91_002);
+    let files = (0..3)
+        .map(|index| (format!("lantern.{index:03}"), FileRole::Unknown, 3))
+        .collect();
+    insert_active_job(&mut pipeline, job_id, spec("lantern window", files)).await;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    apply_moves(
+        state,
+        &[2, 1].map(|ordinal| Move {
+            volume: VolumeIndex(2),
+            ordinal,
+            class: Class::Window(0),
+        }),
+    );
+    let mut order = Vec::new();
+    while let Some(work) = state.articles.active_mut().unwrap().download_queue.pop() {
+        if work.segment_id.segment_number > 0 {
+            order.push(work.segment_id);
+        }
+    }
+    assert_eq!(
+        &order[..2],
+        &[segment_id(job_id, 2, 1), segment_id(job_id, 2, 2)]
+    );
+}
+
+#[tokio::test]
+async fn the_first_article_of_every_member_is_requested_before_ordinary_articles() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(91_003);
+    // More members than the policy sample takes, and a recovery volume.
+    let mut files: Vec<(String, FileRole, u32)> = (0..40)
+        .map(|index| {
+            (
+                format!("lantern.part{index:02}.bin"),
+                FileRole::Standalone,
+                3,
+            )
+        })
+        .collect();
+    files.push(("lantern.vol0+4.par2".to_string(), recovery_role(), 3));
+    let members = files.len();
+    insert_active_job(&mut pipeline, job_id, spec("lantern sample", files)).await;
+
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    let leading: Vec<SegmentId> = (0..members)
+        .map(|_| {
+            state
+                .articles
+                .active_mut()
+                .unwrap()
+                .download_queue
+                .pop()
+                .unwrap()
+                .segment_id
+        })
+        .collect();
+    assert!(leading.iter().all(|id| id.segment_number == 0));
+    let sampled: HashSet<u32> = leading.iter().map(|id| id.file_id.file_index).collect();
+    assert_eq!(sampled.len(), members);
+    assert_ne!(
+        state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .pop()
+            .unwrap()
+            .segment_id
+            .segment_number,
+        0
+    );
+}
+
+// Every file role, in an order no ranking by role would keep.
+fn ranked_roles() -> Vec<(String, FileRole, u32)> {
+    vec![
+        ("lantern.vol0+4.par2".to_string(), recovery_role(), 2),
+        ("lantern.bin".to_string(), FileRole::Unknown, 2),
+        (
+            "lantern.part2.rar".to_string(),
+            FileRole::RarVolume { volume_number: 1 },
+            2,
+        ),
+        (
+            "lantern.part1.rar".to_string(),
+            FileRole::RarVolume { volume_number: 0 },
+            3,
+        ),
+        ("lantern.7z".to_string(), FileRole::SevenZipArchive, 2),
+        (
+            "lantern.par2".to_string(),
+            FileRole::Par2 {
+                is_index: true,
+                recovery_block_count: 0,
+            },
+            1,
+        ),
+    ]
+}
+
+#[test]
+fn a_job_is_queued_in_posted_order_at_one_neutral_priority() {
+    let job_id = JobId(91_010);
+    let files = ranked_roles();
+    let posted: Vec<SegmentId> = files
+        .iter()
+        .enumerate()
+        .flat_map(|(index, (_, _, segments))| {
+            (0..*segments).map(move |ordinal| segment_id(job_id, index as u32, ordinal))
+        })
+        .collect();
+    let (_, mut download_queue) = crate::pipeline::Pipeline::build_job_assembly(
+        job_id,
+        &spec("lantern posted", files),
+        &HashSet::new(),
+        &HashSet::new(),
+    );
+
+    // Nothing is ranked by its role: the recovery volume waits in the
+    // queue with everything else, and nothing marks it recovery.
+    let mut queued = Vec::new();
+    while let Some(work) = download_queue.pop() {
+        assert_eq!(work.priority, crate::pipeline::graph::NEUTRAL_PRIORITY);
+        assert!(!work.is_recovery);
+        assert!(!work.completion_critical);
+        queued.push(work.segment_id);
+    }
+    assert_eq!(queued, posted);
+}
+
+#[tokio::test]
+async fn a_requeued_graph_article_comes_back_at_the_roots_priority_not_its_roles() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(91_011);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        spec("lantern requeued", ranked_roles()),
+    )
+    .await;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    while state
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .is_some()
+    {}
+
+    // The first RAR volume's role ranks it ahead of everything, and a
+    // retry rebuilt from the post says so; the root holds it ordinary.
+    let first_volume = segment_id(job_id, 3, 1);
+    let retry = pipeline
+        .download_retry_work(first_volume, 1, Vec::new())
+        .unwrap();
+    assert_eq!(
+        retry.priority,
+        FileRole::RarVolume { volume_number: 0 }.download_priority()
+    );
+    pipeline.enqueue_download_work(retry);
+
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    let requeued = state
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
+    assert_eq!(requeued.segment_id, first_volume);
+    assert_eq!(requeued.priority, crate::pipeline::graph::NEUTRAL_PRIORITY);
+    assert!(
+        state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .pop()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn a_lost_article_marks_its_range_damaged() {
+    // Both edges known: the range is exact.
+    let (mut job, _dir, _) = job_with(&[file("plain.bin", &[100, 100, 100])], Vec::new());
+    job.intake(
+        decoded(0, 0, 0, &[7; 90], Some(270)),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
+    job.intake(
+        decoded(0, 2, 180, &[7; 90], Some(270)),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
+    job.lost(VolumeIndex(0), 1, &mut RepairSlots::default(), 1)
+        .unwrap();
+    assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(90, 180)]);
+
+    // An unknown end: once nothing else can arrive, the widest bound.
+    let (mut job, _dir, _) = job_with(&[file("plain.bin", &[100, 100])], Vec::new());
+    job.intake(
+        decoded(0, 0, 0, &[7; 90], None),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
+    job.lost(VolumeIndex(0), 1, &mut RepairSlots::default(), 1)
+        .unwrap();
+    assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(90, 190)]);
+
+    // A seek into a lost range is answered Lost.
+    let mut root = ArticleRoot::new(&[file("plain.bin", &[100, 100, 100])]);
+    root.receive(decoded(0, 0, 0, &[7; 90], Some(270)));
+    root.receive(decoded(0, 2, 180, &[7; 90], Some(270)));
+    root.map.lost(VolumeIndex(0), 1);
+    assert_eq!(
+        root.map.seek(
+            VolumeIndex(0),
+            ByteRange::new(100, 120),
+            Some(Class::Critical)
+        ),
+        Pull::Lost
+    );
+
+    // Through the download path: every server failing it is the edge. The
+    // second file keeps the job healthy, so the loss does not fail it.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(91_004);
+    let spec = spec(
+        "lantern lost",
+        vec![
+            ("lantern.bin".to_string(), FileRole::Standalone, 1),
+            ("lantern.dat".to_string(), FileRole::Standalone, 19),
+        ],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.book_terminal_segment(segment_id(job_id, 0, 0), SegmentTerminalState::Missing);
+    assert_eq!(
+        damaged_ranges(&pipeline.graph_jobs[&job_id], 0),
+        vec![ByteRange::new(0, 64)]
+    );
+}
+
+// An article that decoded short of where the bytes after it begin, or of
+// the file's declared end for the last, lost the bytes between: they are
+// damage told as a lost article's are, in whichever order the edges came.
+#[test]
+fn a_short_article_loses_its_missing_tail() {
+    let intake = |job: &mut GraphJob, article: Decoded| {
+        job.intake(article, &mut RepairSlots::default(), 1).unwrap();
+    };
+    // Bytes that end `short` of the part `[offset, end)` the header declares.
+    let cut = |ordinal: u32, offset: u64, end: u64, short: u64, length: u64| {
+        let mut article = decoded(
+            0,
+            ordinal,
+            offset,
+            &vec![7; (end - offset - short) as usize],
+            Some(length),
+        );
+        article.intact = false;
+        article.declared_end = Some(end);
+        article
+    };
+    // The last article, short of the declared end.
+    let (mut job, _dir, _) = job_with(&[file("carrier.bin", &[100, 100])], Vec::new());
+    intake(&mut job, decoded(0, 0, 0, &[7; 100], Some(200)));
+    intake(&mut job, cut(1, 100, 200, 40, 200));
+    assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(100, 200)]);
+    // The same, the end declared by the first to arrive.
+    let (mut job, _dir, _) = job_with(&[file("carrier.bin", &[100, 100])], Vec::new());
+    intake(&mut job, cut(1, 100, 200, 40, 200));
+    assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(100, 200)]);
+    intake(&mut job, decoded(0, 0, 0, &[7; 100], Some(200)));
+    assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(100, 200)]);
+    // A middle article, before and after the one beyond it.
+    for next_first in [false, true] {
+        let (mut job, _dir, _) = job_with(&[file("carrier.bin", &[100, 100, 100])], Vec::new());
+        let short = cut(0, 0, 100, 40, 300);
+        let next = decoded(0, 1, 100, &[7; 100], Some(300));
+        if next_first {
+            intake(&mut job, next);
+            intake(&mut job, short);
+        } else {
+            intake(&mut job, short);
+            intake(&mut job, next);
+        }
+        intake(&mut job, decoded(0, 2, 200, &[7; 100], Some(300)));
+        assert_eq!(
+            damaged_ranges(&job, 0),
+            vec![ByteRange::new(0, 100)],
+            "next_first={next_first}"
+        );
+    }
+}
+
+// A damaged article that decoded 97 bytes past the part end its header
+// declares: those bytes are not its own. The article after it begins where
+// the header said, its bytes stand fresh, and the damage stays inside the
+// damaged article's part, in either order of arrival.
+#[test]
+fn an_overlong_damaged_article_does_not_move_the_next_article() {
+    for next_first in [false, true] {
+        let overlong = {
+            let mut article = decoded(0, 0, 0, &[7; 1097], Some(2000));
+            article.intact = false;
+            article.declared_end = Some(1000);
+            article
+        };
+        let next = decoded(0, 1, 1000, &[9; 1000], Some(2000));
+        let articles = match next_first {
+            true => [next.clone(), overlong.clone()],
+            false => [overlong.clone(), next.clone()],
+        };
+        let mut root = ArticleRoot::new(&[file("carrier.bin", &[1000, 1000])]);
+        let (mut job, _dir, _) = job_with(&[file("carrier.bin", &[1000, 1000])], Vec::new());
+        for article in articles {
+            root.receive(article.clone());
+            job.intake(article, &mut RepairSlots::default(), 1).unwrap();
+        }
+        assert!(
+            root.map.known_in(0, 0).contains(&(1, 1000)),
+            "next_first={next_first}: {:?}",
+            root.map.known_in(0, 0)
+        );
+        assert_eq!(
+            root.map.arrived_ranges(VolumeIndex(0)),
+            vec![
+                (0, ByteRange::new(0, 1000)),
+                (1, ByteRange::new(1000, 2000))
+            ],
+            "next_first={next_first}"
+        );
+        let namespace = job.tree().namespace(NodeId::ROOT).unwrap();
+        let member = namespace.get(MemberId(0)).unwrap();
+        let fresh: Vec<_> = member
+            .coverage
+            .overlapping(ByteRange::new(1000, 2000))
+            .map(|run| (run.range, run.provenance))
+            .collect();
+        assert_eq!(
+            fresh,
+            vec![(ByteRange::new(1000, 2000), Provenance::Fresh)],
+            "next_first={next_first}"
+        );
+        assert_eq!(
+            damaged_ranges(&job, 0),
+            vec![ByteRange::new(0, 1000)],
+            "next_first={next_first}"
+        );
+    }
+}
+
+// A damaged article that decoded 100 bytes short still says, by its
+// header, where the next article begins.
+#[test]
+fn a_short_damaged_article_still_declares_where_the_next_one_starts() {
+    let mut article = decoded(0, 0, 0, &[7; 900], Some(2000));
+    article.intact = false;
+    article.declared_end = Some(1000);
+    let mut root = ArticleRoot::new(&[file("carrier.bin", &[1000, 1000])]);
+    root.receive(article);
+    assert!(
+        root.map.known_in(0, 0).contains(&(1, 1000)),
+        "{:?}",
+        root.map.known_in(0, 0)
+    );
+}
+
+#[tokio::test]
+async fn a_damaged_yenc_article_is_delivered_as_damaged() {
+    let (mut job, dir, _) = job_with(&[file("plain.bin", &[100])], Vec::new());
+    let mut article = decoded(0, 0, 0, &[7; 90], Some(90));
+    article.intact = false;
+    job.intake(article, &mut RepairSlots::default(), 1).unwrap();
+    assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(0, 90)]);
+    assert_eq!(
+        std::fs::read(dir.path().join("plain.bin")).unwrap(),
+        vec![7; 90],
+        "damaged bytes are written all the same"
+    );
+
+    // Through the decode path: a checksum mismatch is damage.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(91_005);
+    let spec = spec(
+        "lantern damaged",
+        vec![("lantern.bin".to_string(), FileRole::Standalone, 1)],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let body = vec![3u8; 64];
+    pipeline
+        .handle_decode_success(
+            DecodeResult {
+                segment_id: segment_id(job_id, 0, 0),
+                raw_size: 64,
+                encoding: SegmentEncoding::Yenc,
+                yenc_layout: YencLayoutAssertions {
+                    file_size: 64,
+                    part: Some(1),
+                    total: None,
+                    begin: Some(1),
+                    end: Some(64),
+                },
+                crc_valid: false,
+                part_crc_verified: false,
+                part_crc: par2_rs::checksum::crc32(&body),
+                truncation_suspected: false,
+                expected_file_crc: None,
+                data: DecodedChunk::from(body),
+                yenc_name: "lantern.bin".to_string(),
+                checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+                segments: Vec::new(),
+            },
+            SegmentSource {
+                source_server_idx: Some(0),
+                exclude_servers: Vec::new(),
+            },
+        )
+        .await;
+    assert_eq!(
+        damaged_ranges(&pipeline.graph_jobs[&job_id], 0),
+        vec![ByteRange::new(0, 64)]
+    );
+}
+
+// The decoder's article in the lane's shape: one buffer, and its checksums
+// at a block boundary inside it.
+fn lane_article() -> (DecodedChunk, *const u8, Vec<weaver_yenc::Segment>) {
+    let body: Box<[u8]> = (0..700u32).map(|i| (i % 251) as u8).collect();
+    let buffer = body.as_ptr();
+    let checksums = vec![
+        weaver_yenc::Segment {
+            file_offset: 0,
+            len: 400,
+            crc32: 0x0a,
+        },
+        weaver_yenc::Segment {
+            file_offset: 400,
+            len: 300,
+            crc32: 0x0b,
+        },
+    ];
+    (DecodedChunk::from(vec![body]), buffer, checksums)
+}
+
+fn checksum(start: u64, end: u64, crc32: u32, verified: bool) -> weaver_graph::Segment {
+    weaver_graph::Segment {
+        range: ByteRange::new(start, end),
+        crc32,
+        verified,
+    }
+}
+
+// The root delivers the decoder's own buffer: no article is copied on its
+// way in, and the checksums are refiled in the list they came in.
+#[test]
+fn a_decoded_article_reaches_the_root_in_the_decoder_s_buffer() {
+    let (data, buffer, checksums) = lane_article();
+    let list = checksums.as_ptr() as usize;
+    let article = super::seams::decoded(
+        segment_id(JobId(1), 0, 0),
+        0,
+        data,
+        true,
+        true,
+        700,
+        Some(700),
+        checksums,
+    );
+    assert_eq!(article.bytes.as_ptr(), buffer, "the buffer was copied");
+    assert_eq!(
+        article.segments.as_ptr() as usize,
+        list,
+        "the checksums were collected into a new list"
+    );
+
+    let mut root = ArticleRoot::new(&[file("plain.bin", &[700])]);
+    let arrival = root.receive(article).expect("the first copy stands");
+    assert_eq!(arrival.bytes.as_ptr(), buffer);
+    assert_eq!(arrival.bytes.len(), 700);
+    assert_eq!(arrival.provenance, Provenance::Fresh);
+    assert_eq!(
+        kept_checksums(&root, ByteRange::new(0, 700)),
+        vec![checksum(0, 400, 0x0a, true), checksum(400, 700, 0x0b, true)]
+    );
+}
+
+// Bytes past the declared end are cut off as a shorter view of the same
+// buffer, with the checksum that reaches them.
+#[test]
+fn a_declared_end_cuts_the_decoder_s_buffer_without_a_copy() {
+    let (data, buffer, checksums) = lane_article();
+    let article = super::seams::decoded(
+        segment_id(JobId(1), 0, 0),
+        0,
+        data,
+        true,
+        true,
+        700,
+        Some(500),
+        checksums,
+    );
+    let mut root = ArticleRoot::new(&[file("plain.bin", &[700])]);
+    let arrival = root.receive(article).expect("the first copy stands");
+    assert_eq!(arrival.bytes.as_ptr(), buffer, "the cut copied the buffer");
+    assert_eq!(arrival.bytes.len(), 500);
+    assert_eq!(arrival.provenance, Provenance::Damaged);
+    assert_eq!(
+        kept_checksums(&root, ByteRange::new(0, 700)),
+        vec![checksum(0, 400, 0x0a, false)]
+    );
+}
+
+// The checksums the root keeps for a volume's range.
+fn kept_checksums(root: &ArticleRoot, range: ByteRange) -> Vec<weaver_graph::Segment> {
+    use crate::pipeline::graph::namespace::Segments;
+
+    let mut out = Vec::new();
+    root.checksums
+        .segments_for(NodeId::ROOT, VolumeIndex(0), range, &mut out);
+    out
+}
+
+// Two copies of the middle article, both passing their own checksums, with
+// different bytes: the first stands, and the second brings nothing.
+#[tokio::test]
+async fn a_second_valid_copy_of_an_accepted_article_is_not_delivered() {
+    let middle = ByteRange::new(90, 180);
+    let (first, second) = (vec![1u8; 90], vec![2u8; 90]);
+    let copy = |bytes: &[u8], crc32: u32| {
+        with_segments(decoded(0, 1, 90, bytes, Some(270)), &[(90, 180, crc32)])
+    };
+
+    let mut root = ArticleRoot::new(&[file("plain.bin", &[100, 100, 100])]);
+    assert!(root.receive(copy(&first, 1)).is_some());
+    assert!(root.receive(copy(&second, 2)).is_none(), "no arrival for B");
+    let kept = kept_checksums(&root, middle);
+    assert_eq!(kept.len(), 1);
+    assert_eq!((kept[0].range, kept[0].crc32), (middle, 1));
+
+    let (mut job, dir, _) = job_with(&[file("plain.bin", &[100, 100, 100])], Vec::new());
+    for article in [
+        decoded(0, 0, 0, &[7; 90], Some(270)),
+        copy(&first, 1),
+        copy(&second, 2),
+        decoded(0, 2, 180, &[9; 90], Some(270)),
+    ] {
+        job.intake(article, &mut RepairSlots::default(), 1).unwrap();
+    }
+    let written = std::fs::read(dir.path().join("plain.bin")).unwrap();
+    assert_eq!(&written[90..180], first.as_slice());
+    assert!(damaged_ranges(&job, 0).is_empty());
+}
+
+// A restart keeps the first intact copy standing: the root's facts say the
+// article arrived and its checksums passed, so a second copy brings
+// nothing, as before the restart. A copy that failed its checksums still
+// stands only until an intact one.
+#[test]
+fn a_duplicate_after_restart_is_dropped_as_before_it() {
+    use super::facts::{Encoded, Parts, decode};
+    let files = [file("plain.bin", &[100, 100, 100])];
+    let copy = |ordinal: u32, byte: u8, crc32: u32, intact: bool| {
+        let offset = u64::from(ordinal) * 90;
+        let mut article = decoded(0, ordinal, offset, &[byte; 90], Some(270));
+        article.intact = intact;
+        article.segments = vec![weaver_graph::Segment {
+            range: ByteRange::at(offset, 90),
+            crc32,
+            verified: intact,
+        }];
+        article
+    };
+    let restarted = |root: &ArticleRoot| {
+        let encoding = root.encode(&mut Encoded::default(), 9, 0, None, Vec::new());
+        let Parts::All(parts) = encoding.parts else {
+            panic!("a fresh encoding is whole");
+        };
+        let facts = decode(encoding.version, &encoding.bytes, &parts).unwrap();
+        ArticleRoot::restore(&files, &facts).unwrap()
+    };
+
+    let mut root = ArticleRoot::new(&files);
+    assert!(root.receive(copy(1, 1, 1, true)).is_some());
+    assert!(root.receive(copy(2, 3, 3, false)).is_some());
+    let mut root = restarted(&root);
+    assert!(
+        root.receive(copy(1, 2, 2, true)).is_none(),
+        "no arrival for B"
+    );
+    let kept = kept_checksums(&root, ByteRange::new(90, 180));
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].crc32, 1, "the checksums stay A's");
+    let arrival = root
+        .receive(copy(2, 4, 4, true))
+        .expect("an intact copy replaces a damaged one");
+    assert_eq!(arrival.bytes.as_ref(), &[4u8; 90][..]);
+}
+
+// An article fetched again after a seek sent it back: the copy that comes
+// is admitted, with its own checksums.
+#[test]
+fn a_resought_article_replaces_the_rejected_copy() {
+    let middle = ByteRange::new(90, 180);
+    let copy = |byte: u8, crc32: u32| {
+        with_segments(
+            decoded(0, 1, 90, &[byte; 90], Some(270)),
+            &[(90, 180, crc32)],
+        )
+    };
+    let mut root = ArticleRoot::new(&[file("plain.bin", &[100, 100, 100])]);
+    assert!(root.receive(copy(1, 1)).is_some());
+    assert!(root.receive(copy(2, 2)).is_none());
+    root.map.unarrive(VolumeIndex(0), 1);
+    let arrival = root.receive(copy(2, 2)).expect("the copy fetched again");
+    assert_eq!(arrival.bytes.as_ref(), &[2u8; 90][..]);
+    let kept = kept_checksums(&root, middle);
+    assert_eq!(kept.len(), 1);
+    assert_eq!((kept[0].range, kept[0].crc32), (middle, 2));
+    // A copy that failed its own checksum stands only until an intact one.
+    let mut damaged = copy(3, 3);
+    damaged.ordinal = 2;
+    damaged.offset = 180;
+    damaged.segments.clear();
+    damaged.intact = false;
+    assert!(root.receive(damaged).is_some());
+    let mut intact = copy(4, 4);
+    intact.ordinal = 2;
+    intact.offset = 180;
+    intact.segments.clear();
+    assert!(root.receive(intact).is_some());
+}
+
+#[test]
+fn a_uu_root_answers_only_for_its_front() {
+    let mut root = ArticleRoot::new(&[file("plain.bin", &[100, 100, 100])]);
+    let mut article = decoded(0, 0, 0, &[7; 60], None);
+    article.positioned = false;
+    root.receive(article);
+    assert_eq!(
+        root.map
+            .seek(VolumeIndex(0), ByteRange::new(0, 40), Some(Class::Critical)),
+        Pull::Moved(0)
+    );
+    assert_eq!(
+        root.map.seek(
+            VolumeIndex(0),
+            ByteRange::new(150, 160),
+            Some(Class::Critical)
+        ),
+        Pull::Unseekable
+    );
+    assert!(root.map.take_moves().is_empty());
+}
+
+// Settled means in hand or lost for good. An article the root does not
+// hold, of a volume or an ordinal the post never listed or of a job that has
+// gone, has settled nothing, so a damaged copy of it is not dropped as late.
+#[tokio::test]
+async fn only_an_article_the_root_holds_in_hand_or_lost_is_settled() {
+    let mut root = ArticleRoot::new(&[file("plain.bin", &[100, 100, 100])]);
+    root.receive(decoded(0, 0, 0, &[7; 90], Some(270)));
+    root.map.lost(VolumeIndex(0), 1);
+    assert!(root.map.article_settled(VolumeIndex(0), 0), "in hand");
+    assert!(root.map.article_settled(VolumeIndex(0), 1), "lost");
+    assert!(
+        !root.map.article_settled(VolumeIndex(0), 2),
+        "still to come"
+    );
+    assert!(
+        !root.map.article_settled(VolumeIndex(0), 9),
+        "no such ordinal"
+    );
+    assert!(
+        !root.map.article_settled(VolumeIndex(4), 0),
+        "no such volume"
+    );
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(91_005);
+    let spec = spec(
+        "lantern settled",
+        vec![
+            ("lantern.bin".to_string(), FileRole::Standalone, 6),
+            ("lantern.dat".to_string(), FileRole::Standalone, 6),
+        ],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.book_terminal_segment(segment_id(job_id, 0, 0), SegmentTerminalState::Missing);
+    assert!(
+        pipeline.graph_article_settled(segment_id(job_id, 0, 0)),
+        "lost"
+    );
+    assert!(
+        !pipeline.graph_article_settled(segment_id(job_id, 0, 1)),
+        "to come"
+    );
+    assert!(
+        !pipeline.graph_article_settled(segment_id(job_id, 0, 7)),
+        "no such ordinal"
+    );
+    assert!(
+        !pipeline.graph_article_settled(segment_id(job_id, 5, 0)),
+        "no such file"
+    );
+    assert!(
+        !pipeline.graph_article_settled(segment_id(JobId(91_006), 0, 0)),
+        "no such job"
+    );
+}
+
+// A step that landed a file and then failed: the file is said to have
+// landed before the job fails, as one whose download ended.
+#[tokio::test]
+async fn a_file_landed_by_a_step_that_errs_is_still_said() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(91_007);
+    let spec = spec(
+        "lantern errs",
+        vec![
+            ("lantern.bin".to_string(), FileRole::Standalone, 1),
+            ("lantern.dat".to_string(), FileRole::Standalone, 2),
+        ],
+    );
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let mut events = pipeline.event_tx.subscribe();
+    pipeline
+        .graph_jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .intake(
+            decoded(0, 0, 0, &[7; 90], Some(90)),
+            &mut RepairSlots::default(),
+            1,
+        )
+        .unwrap();
+    let failed = crate::pipeline::graph::job::GraphError::Write(
+        crate::pipeline::graph::namespace::WriteError::UnknownMember {
+            node: NodeId::ROOT,
+            member: MemberId(9),
+        },
+    );
+    pipeline.after_graph_result(job_id, Err(failed));
+    let mut landed = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        if let crate::events::model::PipelineEvent::FileComplete { filename, .. } = event {
+            landed.push(filename);
+        }
+    }
+    assert_eq!(landed, ["lantern.bin"]);
+    assert!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .is_none_or(|state| matches!(state.status, JobStatus::Failed { .. })),
+        "the step's error failed the job"
+    );
+}
+
+type Held = std::collections::BTreeMap<u64, Arc<[u8]>>;
+
+fn held(parts: Vec<weaver_graph::Part>) -> Held {
+    parts
+        .into_iter()
+        .map(|part| (part.key, part.bytes))
+        .collect()
+}
+
+// The root encoded into `encoded`, its parts brought up to date in `held`,
+// and both the same as a fresh encoding of the whole root.
+fn encodes_whole(
+    root: &ArticleRoot,
+    encoded: &mut super::facts::Encoded,
+    held: &mut Held,
+    step: usize,
+) {
+    use super::facts::{Encoded, Parts};
+    let encoding = root.encode(encoded, 9, 2, Some(RootPhase::Done), Vec::new());
+    match encoding.parts {
+        Parts::All(parts) => *held = self::held(parts),
+        Parts::Changed(parts) => {
+            for part in parts {
+                match part.bytes {
+                    Some(bytes) => held.insert(part.key, bytes),
+                    None => held.remove(&part.key),
+                };
+            }
+        }
+    }
+    let whole = root.encode(
+        &mut Encoded::default(),
+        9,
+        2,
+        Some(RootPhase::Done),
+        Vec::new(),
+    );
+    assert_eq!(
+        (encoding.version, &encoding.bytes),
+        (whole.version, &whole.bytes),
+        "step {step}"
+    );
+    let Parts::All(parts) = whole.parts else {
+        panic!("a fresh encoding is whole");
+    };
+    assert_eq!(*held, self::held(parts), "step {step}");
+}
+
+fn with_segments(mut article: Decoded, segments: &[(u64, u64, u32)]) -> Decoded {
+    article.segments = segments
+        .iter()
+        .map(|(start, end, crc32)| weaver_graph::Segment {
+            range: ByteRange::new(*start, *end),
+            crc32: *crc32,
+            verified: false,
+        })
+        .collect();
+    article
+}
+
+// Reading only the chunks the root marked gives the encoding of the whole
+// root after every kind of change: arrivals out of order, one fetched again at
+// another start, two at one start and one of them taken back, checksums
+// that replace others, losses, damage, raises, a length, and a volume
+// placed only in order.
+#[test]
+fn an_encoding_of_what_changed_is_the_encoding_of_the_whole() {
+    let sizes = [70; 40];
+    let mut root = ArticleRoot::new(&[file("a.bin", &sizes), file("b.bin", &sizes)]);
+    let mut encoded = super::facts::Encoded::default();
+    let mut held = Held::new();
+    let a = VolumeIndex(0);
+    encodes_whole(&root, &mut encoded, &mut held, 0);
+    type Step<'a> = Box<dyn Fn(&mut ArticleRoot) + 'a>;
+    let steps: Vec<Step<'_>> = vec![
+        Box::new(|root| {
+            root.receive(with_segments(
+                decoded(0, 5, 300, &[1; 60], None),
+                &[(300, 330, 1), (330, 360, 2)],
+            ));
+        }),
+        Box::new(|root| {
+            root.receive(with_segments(
+                decoded(0, 20, 1200, &[2; 60], None),
+                &[(1200, 1260, 3)],
+            ));
+        }),
+        Box::new(|root| {
+            root.receive(with_segments(
+                decoded(0, 17, 1000, &[3; 60], None),
+                &[(1000, 1060, 4)],
+            ));
+        }),
+        Box::new(move |root| {
+            root.map.unarrive(a, 20);
+            root.receive(with_segments(
+                decoded(0, 20, 1100, &[4; 60], None),
+                &[(1100, 1160, 5)],
+            ));
+        }),
+        Box::new(|root| {
+            root.receive(with_segments(
+                decoded(0, 33, 300, &[5; 60], None),
+                &[(300, 360, 6)],
+            ));
+        }),
+        Box::new(move |root| root.map.lost(a, 2)),
+        Box::new(move |root| root.map.lost(a, 3)),
+        Box::new(|root| {
+            root.map.seek(
+                VolumeIndex(1),
+                ByteRange::new(0, 500),
+                Some(Class::Critical),
+            );
+        }),
+        Box::new(|root| {
+            root.damage();
+        }),
+        Box::new(move |root| root.map.unarrive(a, 33)),
+        Box::new(|root| {
+            root.receive(with_segments(
+                decoded(1, 0, 0, &[6; 60], Some(2_400)),
+                &[(0, 30, 7), (30, 60, 8)],
+            ));
+        }),
+        Box::new(|root| {
+            let mut article = decoded(1, 1, 60, &[7; 60], None);
+            article.positioned = false;
+            root.receive(article);
+        }),
+        Box::new(|root| {
+            root.map.sample();
+            root.map
+                .seek(a, ByteRange::new(2_000, u64::MAX), Some(Class::Parked));
+            root.map.queue(a, ByteRange::new(0, 2_000));
+        }),
+        Box::new(|root| root.map.arrived_before(|_, ordinal| ordinal % 2 == 0)),
+    ];
+    for (step, change) in steps.iter().enumerate() {
+        change(&mut root);
+        encodes_whole(&root, &mut encoded, &mut held, step + 1);
+    }
+}
+
+// One arrival costs an encoding the parts it touched, whatever the size of
+// the job.
+#[test]
+fn an_arrival_changes_the_same_parts_of_a_small_job_and_a_large_one() {
+    use super::facts::{Encoded, Parts};
+    let changed = |articles: usize| {
+        let mut root = ArticleRoot::new(&[file("a.bin", &vec![70; articles])]);
+        let mut encoded = Encoded::default();
+        root.encode(&mut encoded, 9, 2, None, Vec::new());
+        root.receive(with_segments(
+            decoded(0, 5, 300, &[1; 60], None),
+            &[(300, 330, 1), (330, 360, 2)],
+        ));
+        let Parts::Changed(parts) = root.encode(&mut encoded, 9, 2, None, Vec::new()).parts else {
+            panic!("an encoding after the first is of what changed");
+        };
+        parts
+    };
+    let small = changed(40);
+    assert!(!small.is_empty() && small.len() <= 3, "{small:?}");
+    assert_eq!(changed(400), small);
+}
+
+// Fifty zip volumes of twenty articles each, every article of the first
+// forty-nine in hand and the first of the last.
+fn forty_nine_in_hand() -> (GraphJob, tempfile::TempDir) {
+    let files: Vec<RootFile> = (0..50)
+        .map(|volume| file(&format!("part{volume:02}.zip"), &[100; 20]))
+        .collect();
+    let (mut job, dir, _) = job_with(&files, Vec::new());
+    for volume in 0..49 {
+        for ordinal in 0..20 {
+            job.intake(
+                part_article(volume, ordinal),
+                &mut RepairSlots::default(),
+                1,
+            )
+            .unwrap();
+        }
+    }
+    job.intake(part_article(49, 0), &mut RepairSlots::default(), 1)
+        .unwrap();
+    job.seek_round(|_| true).unwrap();
+    (job, dir)
+}
+
+fn part_article(volume: u32, ordinal: u32) -> Decoded {
+    let bytes = match ordinal {
+        0 => zip_front(90),
+        _ => vec![0; 90],
+    };
+    decoded(
+        volume,
+        ordinal,
+        u64::from(ordinal) * 90,
+        &bytes,
+        Some(20 * 90),
+    )
+}
+
+// An arrival asks the root what is still to come, what lost range can be
+// told and which sets to lead, and each is answered from the volumes still
+// open: the forty-nine in hand are never looked at, nor any article.
+#[test]
+fn an_arrival_reads_only_the_volumes_still_open() {
+    let (mut job, _dir) = forty_nine_in_hand();
+    job.article_visits();
+
+    job.intake(part_article(49, 1), &mut RepairSlots::default(), 1)
+        .unwrap();
+    job.seek_round(|_| true).unwrap();
+
+    // The last volume, once each: whether it still waits once the article
+    // is in, whether the payload is still to come for the step's quiet and
+    // for its lend, and which set it leads. No damage is untold.
+    assert_eq!(job.article_visits(), (4, 0));
+}
+
+// A lost article is told from its own volume: the walk for damage visits
+// that volume and reads that article, and once told visits nothing. A
+// restored root files its open articles from the states it is restored
+// with, before anything asks: it tells the loss again, as a restored root
+// tells every loss, and knows which volumes are in hand.
+#[test]
+fn a_lost_article_is_told_from_its_own_volume_alone() {
+    use super::facts::{Encoded, Parts, decode};
+    let files: Vec<RootFile> = (0..50)
+        .map(|volume| file(&format!("part{volume:02}.bin"), &[100; 20]))
+        .collect();
+    let mut root = ArticleRoot::new(&files);
+    for volume in 0..49 {
+        for ordinal in 0..20 {
+            root.receive(part_article(volume, ordinal));
+        }
+    }
+    root.receive(part_article(49, 4));
+    root.receive(part_article(49, 6));
+    root.map.visits();
+
+    root.map.lost(VolumeIndex(49), 5);
+    assert_eq!(
+        root.damage(),
+        vec![(VolumeIndex(49), ByteRange::new(450, 540))]
+    );
+    assert_eq!(root.map.visits(), (1, 1));
+
+    assert_eq!(root.damage(), Vec::new());
+    assert_eq!(root.map.visits(), (0, 0));
+
+    let encoding = root.encode(&mut Encoded::default(), 9, 0, None, Vec::new());
+    let Parts::All(parts) = encoding.parts else {
+        panic!("a fresh encoding is whole");
+    };
+    let facts = decode(encoding.version, &encoding.bytes, &parts).unwrap();
+    let mut restored = ArticleRoot::restore(&files, &facts).unwrap();
+    assert_eq!(
+        restored.map.coming().collect::<Vec<_>>(),
+        vec![VolumeIndex(49)]
+    );
+    assert!(restored.map.volume_whole(VolumeIndex(48)));
+    assert!(!restored.map.volume_waiting(VolumeIndex(48)));
+    assert!(!restored.map.volume_whole(VolumeIndex(49)));
+    assert!(restored.map.volume_waiting(VolumeIndex(49)));
+    restored.map.visits();
+    assert_eq!(
+        restored.damage(),
+        vec![(VolumeIndex(49), ByteRange::new(450, 540))]
+    );
+    assert_eq!(restored.map.visits(), (1, 1));
+}
+
+// Every job becomes a graph job when its articles are built, and not before.
+#[tokio::test]
+async fn a_job_becomes_a_graph_job_when_its_articles_are_built() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(91_008);
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let resources = pipeline.admission_resources();
+    let lantern = spec(
+        "lantern default",
+        vec![("lantern.bin".to_string(), FileRole::Standalone, 2)],
+    );
+    let prepared = crate::pipeline::Pipeline::prepare_add(
+        &resources,
+        job_id,
+        lantern.clone(),
+        PathBuf::from("lantern-default.nzb"),
+        nzb_zstd_for(&lantern),
+        crate::jobs::AddJobOptions::default(),
+    )
+    .await
+    .unwrap();
+    pipeline.install_prepared_add(job_id, prepared);
+    assert!(!pipeline.graph_jobs.contains_key(&job_id));
+    activate_job(&mut pipeline, job_id).await;
+    assert!(pipeline.graph_jobs.contains_key(&job_id));
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
+async fn a_restored_job_keeps_its_graph_job_and_root_phase() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(91_006);
+    let restored_id = JobId(91_007);
+    let lantern = spec(
+        "lantern stamp",
+        vec![("lantern.bin".to_string(), FileRole::Standalone, 2)],
+    );
+    let working_dir: PathBuf = {
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        pipeline
+            .add_job(
+                job_id,
+                lantern.clone(),
+                PathBuf::from("lantern-stamp.nzb"),
+                nzb_zstd_for(&lantern),
+                crate::jobs::AddJobOptions::default(),
+            )
+            .await
+            .unwrap();
+        activate_job(&mut pipeline, job_id).await;
+        assert!(pipeline.graph_jobs.contains_key(&job_id));
+
+        // A row with the checkpoint its admission took.
+        let working_dir = insert_active_job(&mut pipeline, restored_id, lantern.clone()).await;
+        let (admitted, _files, _) = job_with(&[file("lantern.bin", &[64, 64])], Vec::new());
+        let pending = checkpoint::Pending::default();
+        assert!(pending.put(&admitted, Vec::new()));
+        pipeline
+            .db
+            .save_graph_checkpoint(restored_id, Arc::new(pending.take().0.unwrap()))
+            .unwrap();
+        retire_pipeline_database(pipeline).await;
+        working_dir
+    };
+
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline
+        .restore_job(crate::RestoreJobRequest {
+            job_id: restored_id,
+            job_hash: [0; 32],
+            spec: lantern,
+            detected_archives: Default::default(),
+            file_identities: Default::default(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+        })
+        .await
+        .unwrap();
+    assert!(pipeline.graph_jobs.contains_key(&restored_id));
+    pipeline.db.flush_write_queue().await.unwrap();
+    assert_eq!(
+        pipeline
+            .db
+            .load_active_job_root_phase(restored_id)
+            .unwrap()
+            .as_deref(),
+        Some("downloading")
+    );
+}
+
+// A deferral lowers only articles still in the normal order: one already
+// raised keeps its class, a later raise takes a parked one, and a deferral
+// over a lost article or a missing volume is never Lost to the asker.
+#[test]
+fn a_deferral_never_lowers_a_raised_article_and_is_never_lost() {
+    let mut root = ArticleRoot::new(&[file("plain.bin", &[100, 100, 100, 100])]);
+    let volume = VolumeIndex(0);
+    // The first article gives the positions of the rest.
+    root.receive(decoded(0, 0, 0, &[7; 100], Some(400)));
+    assert_eq!(
+        root.map
+            .seek(volume, ByteRange::new(100, 200), Some(Class::Recovery)),
+        Pull::Moved(1)
+    );
+    assert_eq!(
+        root.map
+            .seek(volume, ByteRange::new(0, u64::MAX), Some(Class::Parked)),
+        Pull::Moved(2)
+    );
+    assert_eq!(root.map.class(volume, 1), Some(Class::Recovery));
+    for ordinal in 2..4 {
+        assert_eq!(root.map.class(volume, ordinal), Some(Class::Parked));
+    }
+    assert_eq!(
+        root.map
+            .seek(volume, ByteRange::new(200, 300), Some(Class::Recovery)),
+        Pull::Moved(1)
+    );
+    assert_eq!(root.map.class(volume, 2), Some(Class::Recovery));
+
+    root.map.lost(volume, 3);
+    assert_eq!(
+        root.map
+            .seek(volume, ByteRange::new(0, u64::MAX), Some(Class::Parked)),
+        Pull::Moved(0)
+    );
+    assert_eq!(
+        root.map
+            .seek(VolumeIndex(9), ByteRange::new(0, 100), Some(Class::Parked)),
+        Pull::Moved(0)
+    );
+}
+
+#[test]
+fn pending_verification_changes_only_the_small_root_record() {
+    use super::facts::{Encoded, Parts, decode};
+    let root = ArticleRoot::new(&[file("payload.bin", &vec![70; 400])]);
+    let mut encoded = Encoded::default();
+    let first = root.encode(&mut encoded, 9, 0, None, Vec::new());
+    let Parts::All(parts) = first.parts else {
+        panic!("first encoding is whole");
+    };
+    let pending = vec![(3, 7), (9, 2)];
+    let check = root.encode(&mut encoded, 9, 0, None, pending.clone());
+    assert!(matches!(&check.parts, Parts::Changed(changes) if changes.is_empty()));
+    assert_eq!(
+        decode(check.version, &check.bytes, &parts)
+            .unwrap()
+            .pending_verifications,
+        pending
+    );
+    let same = root.encode(&mut encoded, 9, 0, None, pending);
+    assert_eq!(same.bytes, check.bytes);
+    assert!(matches!(&same.parts, Parts::Changed(changes) if changes.is_empty()));
+    let done = root.encode(&mut encoded, 9, 0, None, Vec::new());
+    assert!(matches!(&done.parts, Parts::Changed(changes) if changes.is_empty()));
+    assert_eq!(done.bytes, first.bytes);
+}
+
+// Facts the version before the root row kept its outstanding checks are
+// refused, not read with none outstanding.
+#[test]
+fn facts_of_the_previous_version_are_refused() {
+    use super::facts::{Encoded, Parts, RootFactsError, decode};
+    let root = ArticleRoot::new(&[file("payload.bin", &[70])]);
+    let mut encoded = Encoded::default();
+    let encoding = root.encode(&mut encoded, 9, 0, None, vec![(3, 7)]);
+    let Parts::All(parts) = encoding.parts else {
+        panic!("first encoding is whole");
+    };
+    assert!(decode(encoding.version, &encoding.bytes, &parts).is_ok());
+    // Version four was the same MessagePack tuple without the trailing list.
+    let mut previous = root
+        .encode(&mut Encoded::default(), 9, 0, None, Vec::new())
+        .bytes;
+    assert_eq!(previous[0], 0x96);
+    assert_eq!(previous.pop(), Some(0x90));
+    previous[0] = 0x95;
+    assert_eq!(
+        decode(4, &previous, &parts),
+        Err(RootFactsError::Version(4))
+    );
+}

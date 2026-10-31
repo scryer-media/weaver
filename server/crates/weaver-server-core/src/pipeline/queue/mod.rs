@@ -66,7 +66,11 @@ impl<T> Change<T> {
 #[derive(Default)]
 pub struct QueueInner {
     pub globals: Globals,
+    // Rows are added, removed and reordered only through `push_job`,
+    // `retain_jobs` and `reindex_jobs`, which keep `job_positions` in step.
     pub jobs: Vec<JobRow>,
+    // Each row's position in `jobs`, so a lookup by id is one probe.
+    job_positions: HashMap<JobId, usize>,
     pub history_summary: crate::operations::metrics_store::JobStatusCounts,
     pub(crate) admissions: std::collections::HashSet<JobId>,
     pub(crate) history_operations: std::collections::HashSet<JobId>,
@@ -91,10 +95,12 @@ pub struct Globals {
     pub speed_limit: u64,
     pub scheduled_speed_limit: Option<u64>,
     pub propagation_delay: std::time::Duration,
+    pub max_concurrent_nzbs: Option<std::num::NonZeroU32>,
     pub hardware_profile: Option<crate::runtime::HardwareProfile>,
     pub hardware_profile_in_force: Option<crate::jobs::handle::HardwareProfileInForce>,
     pub scheduled_hardware_profile: Option<crate::runtime::HardwareProfile>,
     pub random_read_iops: Option<f64>,
+    pub sequential_write_mbps: Option<f64>,
     pub runtime_paths: Option<RuntimePaths>,
     pub nntp_generation: u64,
     pub nntp_active: Option<crate::jobs::handle::NntpRuntimeActivation>,
@@ -135,6 +141,8 @@ pub struct Intents {
 
 pub struct Report {
     pub job: JobInfo,
+    // Published only from the actor's durable admission ledger.
+    pub nzb_admitted: bool,
     pub seen_intent_seq: u64,
     pub retiring: bool,
     pub restoring: bool,
@@ -181,6 +189,7 @@ impl JobRow {
             id: job.job_id,
             intents: Intents::default(),
             report: Report {
+                nzb_admitted: false,
                 download_active: job.download_state == crate::DownloadState::Downloading,
                 download_work_pending: false,
                 job,
@@ -282,15 +291,46 @@ impl QueueInner {
     pub fn visible_jobs(&self) -> impl Iterator<Item = JobInfo> + '_ {
         self.jobs.iter().map(|row| row.info(&self.globals))
     }
+
+    // The row for `id`, found through the position index.
+    pub(crate) fn job(&self, id: JobId) -> Option<&JobRow> {
+        let row = self.jobs.get(*self.job_positions.get(&id)?)?;
+        debug_assert_eq!(row.id, id, "the queue's position index is out of step");
+        (row.id == id).then_some(row)
+    }
+
+    pub(crate) fn push_job(&mut self, row: JobRow) {
+        self.job_positions.insert(row.id, self.jobs.len());
+        self.jobs.push(row);
+    }
+
+    pub(crate) fn retain_jobs(&mut self, keep: impl FnMut(&JobRow) -> bool) {
+        self.jobs.retain(keep);
+        self.reindex_jobs();
+    }
+
+    // Rebuilds the position index after `jobs` was replaced or reordered.
+    pub(crate) fn reindex_jobs(&mut self) {
+        self.job_positions = self
+            .jobs
+            .iter()
+            .enumerate()
+            .map(|(position, row)| (row.id, position))
+            .collect();
+    }
 }
 
 impl Queue {
     pub fn new(jobs: Vec<JobInfo>) -> Self {
         Self {
             history: std::sync::RwLock::default(),
-            inner: Mutex::new(QueueInner {
-                jobs: jobs.into_iter().map(JobRow::new).collect(),
-                ..QueueInner::default()
+            inner: Mutex::new({
+                let mut inner = QueueInner {
+                    jobs: jobs.into_iter().map(JobRow::new).collect(),
+                    ..QueueInner::default()
+                };
+                inner.reindex_jobs();
+                inner
             }),
             revision: watch::channel(0).0,
             intent_wake: tokio::sync::Notify::new(),
@@ -367,17 +407,6 @@ impl Queue {
         self.intent_wake.notified().await;
     }
 
-    // Resolves once shutdown has been signalled. It watches the revision,
-    // which every write moves, so it takes no wake from the actor's loop.
-    pub(crate) async fn shutdown_requested(&self) {
-        let mut revision = self.subscribe();
-        while !self.read(|inner| inner.globals.shutting_down) {
-            if revision.changed().await.is_err() {
-                std::future::pending::<()>().await;
-            }
-        }
-    }
-
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.revision.subscribe()
     }
@@ -395,7 +424,7 @@ impl Queue {
             }
             for id in ids {
                 if let Some(job) = reports.remove(&id) {
-                    inner.jobs.push(JobRow::new(job));
+                    inner.push_job(JobRow::new(job));
                 }
             }
             Change::changed(())
@@ -431,6 +460,7 @@ mod label_tests {
             total_files: 1,
             completed_files: 0,
             remaining_par_files: 0,
+            file_remaining_bytes: Vec::new(),
             password: None,
             category: None,
             metadata: Vec::new(),

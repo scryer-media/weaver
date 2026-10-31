@@ -270,15 +270,8 @@ impl JobsQuery {
         let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
 
         let mut items: Vec<QueueItem> = handle
-            .list_jobs()
+            .queue_jobs()
             .into_iter()
-            .filter(|info| {
-                !matches!(
-                    info.status,
-                    weaver_server_core::JobStatus::Complete
-                        | weaver_server_core::JobStatus::Failed { .. }
-                )
-            })
             .map(|info| queue_item_from_job(&info))
             .filter(|item| matches_queue_filter_prepared(item, prepared_filter.as_ref()))
             .skip(offset)
@@ -295,17 +288,7 @@ impl JobsQuery {
         // Capture before reading the scheduler so events produced while this page
         // is assembled remain eligible for replay by queueEvents(after: ...).
         let latest_cursor = replay.latest_cursor().await;
-        let mut all_jobs: Vec<weaver_server_core::JobInfo> = handle
-            .list_jobs()
-            .into_iter()
-            .filter(|info| {
-                !matches!(
-                    info.status,
-                    weaver_server_core::JobStatus::Complete
-                        | weaver_server_core::JobStatus::Failed { .. }
-                )
-            })
-            .collect();
+        let mut all_jobs = handle.queue_jobs();
         let categories = all_jobs
             .iter()
             .filter_map(|job| job.category.clone())
@@ -343,14 +326,11 @@ impl JobsQuery {
     #[graphql(guard = "ReadGuard")]
     async fn queue_item(&self, ctx: &Context<'_>, id: u64) -> Result<Option<QueueItem>> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        let Some(info) = handle.list_jobs().into_iter().find(|info| {
-            info.job_id.0 == id
-                && !matches!(
-                    info.status,
-                    weaver_server_core::JobStatus::Complete
-                        | weaver_server_core::JobStatus::Failed { .. }
-                )
-        }) else {
+        let Some(info) = handle
+            .queue_jobs()
+            .into_iter()
+            .find(|info| info.job_id.0 == id)
+        else {
             return Ok(None);
         };
         let mut item = queue_item_from_job(&info);
@@ -366,15 +346,8 @@ impl JobsQuery {
     async fn queue_summary(&self, ctx: &Context<'_>) -> Result<QueueSummary> {
         let handle = ctx.data::<SchedulerHandle>()?;
         let items: Vec<QueueItem> = handle
-            .list_jobs()
+            .queue_jobs()
             .into_iter()
-            .filter(|info| {
-                !matches!(
-                    info.status,
-                    weaver_server_core::JobStatus::Complete
-                        | weaver_server_core::JobStatus::Failed { .. }
-                )
-            })
             .map(|info| queue_item_from_job(&info))
             .collect();
         Ok(queue_summary(&items, &handle.get_metrics()))
@@ -392,15 +365,8 @@ impl JobsQuery {
         let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
 
         let mut items: Vec<QueueItem> = handle
-            .list_jobs()
+            .queue_jobs()
             .into_iter()
-            .filter(|info| {
-                !matches!(
-                    info.status,
-                    weaver_server_core::JobStatus::Complete
-                        | weaver_server_core::JobStatus::Failed { .. }
-                )
-            })
             .map(|info| queue_item_from_job(&info))
             .filter(|item| matches_queue_filter_prepared(item, prepared_filter.as_ref()))
             .collect();

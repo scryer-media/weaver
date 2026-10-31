@@ -7,7 +7,6 @@ use crate::pipeline::download::transport::{RungChange, ServerPipelineExplorer};
 use weaver_nntp::client::FetchAttemptOutcome;
 
 mod completion;
-mod direct_store;
 mod eligibility;
 mod lanes;
 mod leases;
@@ -23,7 +22,8 @@ pub(in crate::pipeline) use refill::HeldDownloadRefill;
 pub(in crate::pipeline) use spawn::lane_acquire_failure_for_work;
 
 enum DispatchAttempt {
-    Dispatched,
+    // A lease for this job went to a worker.
+    Dispatched(JobId),
     NoWork,
     StopAll,
 }
@@ -37,8 +37,6 @@ struct DownloadPipelineBacklog {
     released_results: usize,
     released_result_bytes: u64,
     pending_decodes: usize,
-    buffered_write_segments: usize,
-    buffered_write_bytes: u64,
 }
 
 const DOWNLOAD_PRESSURE_SOFT_PERCENT: u64 = 70;
@@ -55,7 +53,7 @@ const OWNED_LANE_ACQUIRE_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60
 // every one of them. Unthrottled that is hundreds of identical lines a second
 // for as long as the phase lasts, written synchronously on the pipeline actor
 // thread, which is the same thread the stall itself needs to get work moving.
-const DISPATCH_INELIGIBLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const DISPATCH_INELIGIBLE_LOG_INTERVAL: Duration = Duration::from_secs(60);
 // How often a dispatch pass re-asks for its first server ranking while the
 // health lock is held by a lane worker, and how long it waits between asks.
 // The critical sections behind that lock are microseconds long, so the whole
@@ -108,7 +106,7 @@ impl<K: std::hash::Hash + Eq + Copy> KeyedLogThrottle<K> {
         self.admit_at(job_id, interval, Instant::now())
     }
 
-    fn admit_at(&mut self, job_id: K, interval: Duration, now: Instant) -> Option<u64> {
+    pub(crate) fn admit_at(&mut self, job_id: K, interval: Duration, now: Instant) -> Option<u64> {
         match self.windows.get_mut(&job_id) {
             Some(window) if now.duration_since(window.emitted_at) < interval => {
                 window.suppressed = window.suppressed.saturating_add(1);
@@ -317,15 +315,7 @@ impl Pipeline {
         headroom_at_pass_start: &mut HashMap<usize, usize>,
         ranked_this_pass: &mut Option<Vec<usize>>,
     ) -> DispatchAttempt {
-        let mut idle_by_server: HashMap<usize, usize> = HashMap::new();
-        for server in self
-            .owned_download_lane_pool
-            .idle_lane_servers()
-            .into_iter()
-            .flatten()
-        {
-            *idle_by_server.entry(server).or_default() += 1;
-        }
+        let idle_by_server = self.idle_download_lanes_by_server();
         let backfill_flags = self.nntp.pool().server_backfill_flags();
         let mut servers: Vec<usize> = match self.rank_servers_for_pass(ranked_this_pass.is_none()) {
             Some(order) => {
@@ -367,21 +357,12 @@ impl Pipeline {
             }
         }
         servers.retain(|server| {
-            let idle = idle_by_server.get(server).copied().unwrap_or(0);
-            let (available, _) = self.nntp.pool().server_load(*server);
-            // The seat count is read once per server per pass, the first time
-            // the pass looks at it and so before it has sent anything there.
-            // Re-reading it would charge each lease twice: once as a lease in
-            // `sent`, and again as the permit its lane has meanwhile taken —
-            // the lane worker runs on its own thread, so how much of that has
-            // happened by the next iteration is a matter of thread scheduling.
-            // A pass that measured itself that way stopped around half its
-            // configured capacity, and stopped at a different place each run.
-            let seats = *headroom_at_pass_start
-                .entry(*server)
-                .or_insert(idle + available);
-            let sent = sent_this_pass.get(server).copied().unwrap_or(0);
-            seats > sent
+            self.pass_has_seat(
+                *server,
+                &idle_by_server,
+                sent_this_pass,
+                headroom_at_pass_start,
+            )
         });
         for server_idx in servers {
             let spill_in_flight = self.spill_job_in_flight_on(server_idx);
@@ -411,36 +392,100 @@ impl Pipeline {
             else {
                 return DispatchAttempt::NoWork;
             };
-            let job_id = lease.job_id;
             let activation_items = Self::activation_items(&lease);
             self.activate_download_batch_lease(&lease, &activation_items, true);
             if let Some(owner) = self.download_lane_owners.get_mut(&lane_id) {
                 owner.server_idx = Some(server_idx);
             }
+            let job_id = lease.job_id;
             self.spawn_download_batch(lease);
             *sent_this_pass.entry(server_idx).or_default() += 1;
-            self.warm_idle_download_lanes_for_barrier(job_id);
-            return DispatchAttempt::Dispatched;
+            return DispatchAttempt::Dispatched(job_id);
         }
         DispatchAttempt::NoWork
     }
 
+    // The servers of the connections idle workers are keeping, and how many
+    // each keeps.
+    pub(in crate::pipeline) fn idle_download_lanes_by_server(&self) -> HashMap<usize, usize> {
+        let mut idle_by_server: HashMap<usize, usize> = HashMap::new();
+        for server in self
+            .owned_download_lane_pool
+            .idle_lane_servers()
+            .into_iter()
+            .flatten()
+        {
+            *idle_by_server.entry(server).or_default() += 1;
+        }
+        idle_by_server
+    }
+
+    // Whether `server` can still seat one more connection this pass: an idle
+    // connection or a free permit beyond what the pass has already sent it.
+    pub(in crate::pipeline) fn pass_has_seat(
+        &self,
+        server: usize,
+        idle_by_server: &HashMap<usize, usize>,
+        sent_this_pass: &HashMap<usize, usize>,
+        headroom_at_pass_start: &mut HashMap<usize, usize>,
+    ) -> bool {
+        let idle = idle_by_server.get(&server).copied().unwrap_or(0);
+        // A server holding new connections back (a quarantine waiting on
+        // its one probe, or the delay after a failed dial) seats only the
+        // connections it already has, and one whose probe is due seats
+        // one more, the probe. A lease past those would only come back
+        // refused, and every refusal would put the work back for the next
+        // pass to send again. The work waits in its queue instead, and the
+        // run loop wakes dispatch on the server's recovery or on the
+        // hold's deadline.
+        let available = self.nntp.pool().new_connection_seats(server);
+        // The seat count is read once per server per pass, the first time
+        // the pass looks at it and so before it has sent anything there.
+        // Re-reading it would charge each lease twice: once as a lease in
+        // `sent`, and again as the permit its lane has meanwhile taken —
+        // the lane worker runs on its own thread, so how much of that has
+        // happened by the next iteration is a matter of thread scheduling.
+        // A pass that measured itself that way stopped around half its
+        // configured capacity, and stopped at a different place each run.
+        let seats = *headroom_at_pass_start
+            .entry(server)
+            .or_insert(idle + available);
+        let sent = sent_this_pass.get(&server).copied().unwrap_or(0);
+        seats > sent
+    }
+
     // Open the connections a barred job is about to need, while it is barred.
     //
-    // A job whose first wave is held behind a barrier — the PAR2 index
-    // bootstrap is the standing case — may only lease the barrier's own work,
-    // so dispatch cuts one batch and stops. Nothing in the barrier requires
-    // the *connections* to wait: without this, the moment the grid publishes
-    // and payload leases go out, each lane pays a TCP, TLS, greeting and
-    // authentication exchange before its first BODY, one after another, on a
-    // job that has been waiting on exactly those bytes.
+    // A job whose first wave is held behind a barrier, the recovery index
+    // bootstrap being the standing case, may only lease the barrier's own
+    // work, so dispatch cuts one batch and stops. Nothing in the barrier
+    // requires the connections to wait: without this, the moment payload
+    // leases go out, each lane pays a TCP, TLS, greeting and authentication
+    // exchange before its first BODY, one after another, on a job that has
+    // been waiting on exactly those bytes.
+    //
+    // The warm is the job's share and no more. It never exceeds the free
+    // connections, the job's even split of the connection capacity across
+    // admitted NZBs, or the payload articles it has queued, since a warm
+    // connection no lease will claim is a socket held open for nothing.
+    //
+    // A warm only ever fills a seat no demanded work has claimed. The pass's
+    // own seat ledger says which: a server's seats at pass start, less what
+    // the pass handed out there, less the idle connections holding seats now.
+    // A lease handed to a worker has claimed its seat whether or not the
+    // worker has dialed yet. Each warm is held to one such seat, and is
+    // entered in the same ledger so a second barred job cannot claim it too.
     //
     // A warm lane is idle, not active: it is counted in no connection gauge,
-    // and if the barrier never lifts it parks with the rest of the pool. The
-    // dial is asked for after the lease has been handed to a worker, and each
+    // and if the barrier never lifts it parks with the rest of the pool. Each
     // warm runs on its own worker thread, so nothing already leased waits on
     // one.
-    fn warm_idle_download_lanes_for_barrier(&mut self, job_id: JobId) {
+    fn warm_idle_download_lanes_for_barrier(
+        &mut self,
+        job_id: JobId,
+        sent_this_pass: &mut HashMap<usize, usize>,
+        headroom_at_pass_start: &mut HashMap<usize, usize>,
+    ) {
         let capacity = self
             .effective_download_connection_capacity(self.tuner.params().max_concurrent_downloads);
         let free = capacity.saturating_sub(self.active_download_connections);
@@ -449,27 +494,71 @@ impl Pipeline {
         }
         // Only while the job is actually holding work back. Ordinary dispatch
         // needs no help: it leases into every free connection itself.
-        if self.par2_metadata_bootstrap_files(job_id).is_none() {
+        if self.recovery_metadata_bootstrap_files(job_id).is_none() {
             return;
         }
-        // Sized for a payload article, falling back to the barrier's own
-        // class when the payload queue has not been built yet.
-        let Some(byte_estimate) = self.jobs.get(&job_id).and_then(|state| {
-            state
-                .download_queue
-                .peek_in_class(false)
-                .or_else(|| state.download_queue.peek_in_class(true))
-                .map(|work| work.byte_estimate)
-        }) else {
+        let share = capacity.div_ceil(self.nzb_admitted.len().max(1));
+        // Sized for a payload article. A job with no payload queued has
+        // nothing for a warm connection to carry.
+        let Some((queued, byte_estimate)) = self
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.articles.download_queue())
+            .and_then(|queue| {
+                queue
+                    .peek_in_class(false)
+                    .map(|work| (queue.len_in_class(false), work.byte_estimate))
+            })
+        else {
             return;
         };
-        let exclude_servers: Arc<[usize]> = Arc::from(self.effective_exclude_servers(job_id, &[]));
-        let warmed = self.owned_download_lane_pool.warm(
-            &self.nntp,
-            exclude_servers,
-            Self::bandwidth_reservation_estimate(byte_estimate),
-            free,
+        let limit = free.min(share).min(queued);
+        if limit == 0 {
+            return;
+        }
+        let exclude_servers = self.effective_exclude_servers(job_id, &[]);
+        // The servers a lease for this job could be routed to, best first.
+        // Provider policy is asked again at the dial.
+        let Some(order) = self.nntp.blocking_body_server_order(&exclude_servers) else {
+            return;
+        };
+        let order: Vec<usize> = order.into_iter().map(|server| server.0).collect();
+        let mut idle_by_server: HashMap<usize, usize> = HashMap::new();
+        for server in self
+            .owned_download_lane_pool
+            .idle_lane_servers()
+            .into_iter()
+            .flatten()
+        {
+            *idle_by_server.entry(server).or_default() += 1;
+        }
+        for server in &order {
+            let idle = idle_by_server.get(server).copied().unwrap_or(0);
+            let (available, _) = self.nntp.pool().server_load(*server);
+            headroom_at_pass_start
+                .entry(*server)
+                .or_insert(idle + available);
+        }
+        let seats = Self::unclaimed_warm_seats(
+            &order,
+            headroom_at_pass_start,
+            sent_this_pass,
+            &idle_by_server,
+            limit,
         );
+        let exclude_servers: Arc<[usize]> = Arc::from(exclude_servers);
+        let mut warmed = 0;
+        for (server, count) in seats {
+            let asked = self.owned_download_lane_pool.warm(
+                &self.nntp,
+                Arc::clone(&exclude_servers),
+                Self::bandwidth_reservation_estimate(byte_estimate),
+                weaver_nntp::pool::ServerId(server),
+                count,
+            );
+            *sent_this_pass.entry(server).or_default() += asked;
+            warmed += asked;
+        }
         if warmed > 0 {
             debug!(
                 job_id = job_id.0,
@@ -477,6 +566,37 @@ impl Pipeline {
                 "warming idle download lanes behind a job barrier"
             );
         }
+    }
+
+    // How many warms each server in `order` may take, at most `limit` in
+    // all: its seats at pass start, less what the pass has handed out there,
+    // less the idle connections holding seats now.
+    fn unclaimed_warm_seats(
+        order: &[usize],
+        headroom_at_pass_start: &HashMap<usize, usize>,
+        sent_this_pass: &HashMap<usize, usize>,
+        idle_by_server: &HashMap<usize, usize>,
+        limit: usize,
+    ) -> Vec<(usize, usize)> {
+        let mut remaining = limit;
+        let mut seats = Vec::new();
+        for server in order {
+            if remaining == 0 {
+                break;
+            }
+            let unclaimed = headroom_at_pass_start
+                .get(server)
+                .copied()
+                .unwrap_or(0)
+                .saturating_sub(sent_this_pass.get(server).copied().unwrap_or(0))
+                .saturating_sub(idle_by_server.get(server).copied().unwrap_or(0));
+            let count = unclaimed.min(remaining);
+            if count > 0 {
+                seats.push((*server, count));
+                remaining -= count;
+            }
+        }
+        seats
     }
 
     fn mark_download_pass_started(&mut self, job_id: JobId) {
@@ -521,7 +641,7 @@ impl Pipeline {
             // Optional recovery files remain parked in `recovery_queue` until
             // explicitly promoted, so they must not keep a download pass open
             // once all dispatchable work has drained.
-            !state.download_queue.is_empty()
+            state.articles.has_queued_download_work()
         }) || self
             .pending_retries_by_job
             .get(&job_id)
@@ -530,16 +650,6 @@ impl Pipeline {
             > 0;
 
         if in_flight == 0 && !has_remaining_work {
-            // No more bytes are coming for this job. A chase whose parts all
-            // finished runs on to the end; one still missing a part would park
-            // forever, so it is ended here.
-            //
-            // A health probe still in flight is in the same position: its
-            // estimate has been overtaken by the job's own terminal states, and
-            // leaving it running only holds the job in `Checking` — and the
-            // completion checkpoint with it — until the probe times out.
-            self.retire_health_probe_if_download_pipeline_drained(job_id);
-            self.settle_direct_unpack_after_download(job_id);
             self.emit_download_finished_if_active(job_id);
             self.schedule_job_completion_check(job_id);
         }
@@ -563,7 +673,9 @@ impl Pipeline {
     // One dispatch pass at `now`, the instant the pass's timers and the stall
     // watchdog measure against.
     pub(crate) fn dispatch_downloads_at(&mut self, now: Instant) {
+        self.download_pass_provider_policy = Some(Arc::new(self.nntp.pool().provider_policy()));
         self.dispatch_download_pass(now);
+        self.download_pass_provider_policy = None;
         self.report_changed_dispatch_holds();
         #[cfg(test)]
         self.audit_lane_holdings();
@@ -594,6 +706,13 @@ impl Pipeline {
         if self.nntp_handoff_draining {
             return;
         }
+        // The pass's seat ledger. Health probe batches are seated first: a
+        // batch is a few round trips on a seat and asks for no bytes, so byte
+        // pressure does not hold it back, and a seat it takes is one no lease
+        // below may take as well.
+        let mut sent_this_pass: HashMap<usize, usize> = HashMap::new();
+        let mut headroom_at_pass_start: HashMap<usize, usize> = HashMap::new();
+        self.seat_waiting_probes(&mut sent_this_pass, &mut headroom_at_pass_start);
         let pressure = self.refresh_download_pressure();
         if pressure.is_hard() {
             self.update_queue_metrics();
@@ -641,57 +760,26 @@ impl Pipeline {
         // Eligibility changes only through job state, which every path that
         // changes it follows with a turn of its own; work that is eligible
         // but could not be placed is retried on the tick.
-        self.download_dispatch_retry = !eligible.is_empty();
+        // A probe batch still waiting for a seat is retried the same way.
+        self.download_dispatch_retry = !eligible.is_empty() || !self.post_probes.waiting.is_empty();
         if eligible.is_empty() && self.active_downloads == 0 {
-            let mut drained_parked_recovery_jobs = Vec::new();
             // Collected rather than logged in place: the warning is throttled
             // per job, and the throttle needs `&mut self` while this walk
             // borrows `job_order`.
             let mut ineligible_jobs = Vec::new();
             for (i, jid) in self.job_order.iter().enumerate() {
                 if let Some(s) = self.jobs.get(jid) {
-                    let parked_recovery_only =
-                        s.download_queue.is_empty() && !s.recovery_queue.is_empty();
                     let status_allows_dispatch = Self::status_allows_download_dispatch(&s.status);
-                    let extraction_only_idle = parked_recovery_only
-                        && matches!(s.status, JobStatus::QueuedExtract | JobStatus::Extracting);
-                    let download_pipeline_draining = s.download_queue.is_empty()
+                    let download_pipeline_draining = !s.articles.has_queued_download_work()
                         && status_allows_dispatch
                         && self.job_has_pending_download_pipeline_work(*jid);
-                    let should_schedule_completion = parked_recovery_only
-                        && status_allows_dispatch
-                        && !self.job_has_pending_download_pipeline_work(*jid);
-                    if extraction_only_idle {
+                    if download_pipeline_draining {
                         debug!(
                             job_id = jid.0,
                             idx = i,
                             status = ?s.status,
-                            queue_len = s.download_queue.len(),
-                            recovery_len = s.recovery_queue.len(),
-                            parked_recovery_only,
-                            status_allows_dispatch,
-                            "dispatch idle: extraction-only recovery queued"
-                        );
-                    } else if should_schedule_completion {
-                        debug!(
-                            job_id = jid.0,
-                            idx = i,
-                            status = ?s.status,
-                            queue_len = s.download_queue.len(),
-                            recovery_len = s.recovery_queue.len(),
-                            parked_recovery_only,
-                            status_allows_dispatch,
-                            "dispatch idle: parked recovery queued; scheduling completion check"
-                        );
-                        drained_parked_recovery_jobs.push(*jid);
-                    } else if download_pipeline_draining {
-                        debug!(
-                            job_id = jid.0,
-                            idx = i,
-                            status = ?s.status,
-                            queue_len = s.download_queue.len(),
-                            recovery_len = s.recovery_queue.len(),
-                            parked_recovery_only,
+                            queue_len = s.articles.queued_download_len(),
+                            recovery_len = s.articles.queued_recovery_len(),
                             status_allows_dispatch,
                             "dispatch idle: download pipeline draining"
                         );
@@ -702,12 +790,15 @@ impl Pipeline {
                             job_id = jid.0,
                             idx = i,
                             status = ?s.status,
-                            queue_len = s.download_queue.len(),
+                            queue_len = s.articles.queued_download_len(),
                             "dispatch idle: waiting for scripts that run when a job is added"
                         );
                     } else if matches!(
                         s.status,
-                        JobStatus::Paused | JobStatus::Complete | JobStatus::Failed { .. }
+                        JobStatus::Paused
+                            | JobStatus::Complete
+                            | JobStatus::Partial
+                            | JobStatus::Failed { .. }
                     ) {
                         // A job someone paused, or one that is already over, is
                         // not dispatching because it was told not to. Warning
@@ -717,29 +808,12 @@ impl Pipeline {
                             job_id = jid.0,
                             idx = i,
                             status = ?s.status,
-                            queue_len = s.download_queue.len(),
-                            recovery_len = s.recovery_queue.len(),
-                            parked_recovery_only,
+                            queue_len = s.articles.queued_download_len(),
+                            recovery_len = s.articles.queued_recovery_len(),
                             status_allows_dispatch,
                             "dispatch idle: job not eligible by status"
                         );
-                    } else if parked_recovery_only && !status_allows_dispatch {
-                        // Recovery parked behind a phase that dispatches
-                        // nothing — moving the output, say — is waiting for
-                        // that phase, not stalled. The phase ends it.
-                        debug!(
-                            job_id = jid.0,
-                            idx = i,
-                            status = ?s.status,
-                            queue_len = s.download_queue.len(),
-                            recovery_len = s.recovery_queue.len(),
-                            parked_recovery_only,
-                            status_allows_dispatch,
-                            "dispatch idle: parked recovery behind a non-dispatching phase"
-                        );
-                    } else if !status_allows_dispatch
-                        || (s.download_queue.is_empty() && s.recovery_queue.is_empty())
-                    {
+                    } else if !status_allows_dispatch || !s.articles.has_queued_download_work() {
                         // A job with nothing queued to fetch — its download is
                         // done and it is verifying, extracting or moving its
                         // output, or its last articles are still settling — is
@@ -750,9 +824,8 @@ impl Pipeline {
                             job_id = jid.0,
                             idx = i,
                             status = ?s.status,
-                            queue_len = s.download_queue.len(),
-                            recovery_len = s.recovery_queue.len(),
-                            parked_recovery_only,
+                            queue_len = s.articles.queued_download_len(),
+                            recovery_len = s.articles.queued_recovery_len(),
                             status_allows_dispatch,
                             "dispatch idle: nothing for dispatch to hand out"
                         );
@@ -761,28 +834,21 @@ impl Pipeline {
                             *jid,
                             i,
                             s.status.clone(),
-                            s.download_queue.len(),
-                            s.recovery_queue.len(),
-                            parked_recovery_only,
+                            s.articles.queued_download_len(),
+                            s.articles.queued_recovery_len(),
                             status_allows_dispatch,
                         ));
                     }
                 }
             }
-            for (
-                job_id,
-                idx,
-                status,
-                queue_len,
-                recovery_len,
-                parked_recovery_only,
-                status_allows_dispatch,
-            ) in ineligible_jobs
+            for (job_id, idx, status, queue_len, recovery_len, status_allows_dispatch) in
+                ineligible_jobs
             {
-                let Some(suppressed_since_last) = self
-                    .dispatch_ineligible_log_throttle
-                    .admit(job_id, DISPATCH_INELIGIBLE_LOG_INTERVAL)
-                else {
+                let Some(suppressed_since_last) = self.dispatch_ineligible_log_throttle.admit_at(
+                    job_id,
+                    DISPATCH_INELIGIBLE_LOG_INTERVAL,
+                    now,
+                ) else {
                     continue;
                 };
                 warn!(
@@ -791,18 +857,11 @@ impl Pipeline {
                     status = ?status,
                     queue_len,
                     recovery_len,
-                    parked_recovery_only,
                     status_allows_dispatch,
                     suppressed_since_last,
                     "dispatch stall: job not eligible"
                 );
-                crate::runtime::job_debug_ring::dump(job_id.0, "dispatch stall: job not eligible");
-            }
-            for job_id in drained_parked_recovery_jobs {
-                self.schedule_job_completion_check_if_download_pipeline_drained(
-                    job_id,
-                    "parked_recovery_idle",
-                );
+                self.dump_job_debug_ring(job_id, "dispatch stall: job not eligible");
             }
         }
 
@@ -825,9 +884,8 @@ impl Pipeline {
             return;
         }
         let active_connections_before_dispatch = self.active_download_connections;
-        let mut sent_this_pass: HashMap<usize, usize> = HashMap::new();
-        let mut headroom_at_pass_start: HashMap<usize, usize> = HashMap::new();
         let mut ranked_this_pass: Option<Vec<usize>> = None;
+        let mut leased_jobs: Vec<JobId> = Vec::new();
         while self.active_download_connections < max
             && !self.rate_limiter.should_wait()
             && dispatch_budget > 0
@@ -841,10 +899,24 @@ impl Pipeline {
             // Handouts outside a dispatch attempt rank the servers themselves.
             self.download_pass_fill_servers = None;
             match attempt {
-                DispatchAttempt::Dispatched => dispatch_budget = dispatch_budget.saturating_sub(1),
+                DispatchAttempt::Dispatched(job_id) => {
+                    dispatch_budget = dispatch_budget.saturating_sub(1);
+                    if !leased_jobs.contains(&job_id) {
+                        leased_jobs.push(job_id);
+                    }
+                }
                 DispatchAttempt::NoWork => break,
                 DispatchAttempt::StopAll => return,
             }
+        }
+        // Warms come after the pass, once every lease it cut has claimed its
+        // seat, so a warm can only take a seat the pass left unclaimed.
+        for job_id in leased_jobs {
+            self.warm_idle_download_lanes_for_barrier(
+                job_id,
+                &mut sent_this_pass,
+                &mut headroom_at_pass_start,
+            );
         }
         if active_connections_before_dispatch == 0 && self.active_download_connections == 0 {
             if self.watch_download_dispatch_stall(now, pressure, max, eligible_count) {
@@ -858,6 +930,44 @@ impl Pipeline {
         self.log_download_retry_storm(now);
         self.log_download_lanes_under_cap(now, max);
         self.update_queue_metrics();
+    }
+}
+
+#[cfg(test)]
+mod warm_seat_tests {
+    use super::*;
+
+    // A pass that hands a lease to a server's last seat leaves that server
+    // nothing to warm; the warm goes to the next server with a free seat.
+    #[test]
+    fn a_lease_on_the_last_seat_leaves_no_warm_for_that_server() {
+        let order = [0, 1];
+        let headroom = HashMap::from([(0, 1), (1, 2)]);
+        let sent = HashMap::from([(0, 1)]);
+        let idle = HashMap::new();
+
+        let seats = Pipeline::unclaimed_warm_seats(&order, &headroom, &sent, &idle, 8);
+
+        assert_eq!(seats, vec![(1, 2)], "no warm is sent to server 0");
+    }
+
+    // A lease served by an idle connection used the seat that connection
+    // held, so the server's permits are still free to warm.
+    #[test]
+    fn idle_connections_hold_their_seats_until_a_lease_takes_them() {
+        let order = [0];
+        let headroom = HashMap::from([(0, 3)]);
+        let idle = HashMap::from([(0, 1)]);
+
+        assert_eq!(
+            Pipeline::unclaimed_warm_seats(&order, &headroom, &HashMap::new(), &idle, 8),
+            vec![(0, 2)]
+        );
+        assert_eq!(
+            Pipeline::unclaimed_warm_seats(&order, &headroom, &HashMap::new(), &idle, 1),
+            vec![(0, 1)],
+            "never more than the job's share"
+        );
     }
 }
 

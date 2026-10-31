@@ -632,12 +632,22 @@ impl ServerTransferPolicyRegistry {
             .expect("server policy maintenance gate poisoned");
         let resets = self.advance_windows();
         self.persist_window_resets(resets)?;
-        for (scope, usage, changed) in self.usage_rows() {
-            if !changed {
-                continue;
+        let changed = self
+            .usage_rows()
+            .into_iter()
+            .filter_map(|(scope, usage, changed)| changed.then_some((scope, usage)))
+            .collect::<Vec<_>>();
+        let mut server = Vec::new();
+        let mut egress = Vec::new();
+        for (scope, usage) in &changed {
+            match scope {
+                TransferScope::Server => server.push(usage.clone()),
+                TransferScope::Egress => egress.push(usage.clone()),
             }
-            self.store_usage(scope, &usage)?;
-            self.record_flushed(scope, &usage);
+        }
+        self.db.store_download_usage(&server, &egress)?;
+        for (scope, usage) in &changed {
+            self.record_flushed(*scope, usage);
         }
         Ok(())
     }
@@ -857,6 +867,49 @@ mod tests {
         registry.reset_usage(7).unwrap();
 
         assert!(!registry.quota_rejection_is_current(&rejection));
+    }
+
+    #[test]
+    fn one_flush_stores_server_and_egress_usage_together() {
+        let db = Database::open_in_memory().unwrap();
+        let egress = db
+            .create_egress_interface(&crate::proxies::EgressInterface {
+                id: 0,
+                name: "Metered link".into(),
+                binding: crate::proxies::EgressBinding::SourceAddress {
+                    address: "127.0.0.1".parse().unwrap(),
+                },
+                enabled: true,
+                max_download_speed: 0,
+                download_quota: quota(ServerDownloadQuotaPeriod::OneTime),
+            })
+            .unwrap();
+        let server = quota_server(egress.id);
+        db.insert_server(&server).unwrap();
+        let registry = ServerTransferPolicyRegistry::new(db.clone(), &[server]).unwrap();
+        registry
+            .reconfigure_egresses(std::slice::from_ref(&egress))
+            .unwrap();
+        for control in [
+            registry
+                .transfer_registry()
+                .control(StableServerId(egress.id)),
+            registry
+                .egress_transfer_registry()
+                .control(StableServerId(egress.id)),
+        ] {
+            let mut permit = control.try_reserve(400).unwrap();
+            permit.record_blocking(400);
+            permit.finish();
+        }
+
+        registry.flush_usage().unwrap();
+
+        let server_usage = db.server_download_usage(egress.id).unwrap().unwrap();
+        assert_eq!(server_usage.lifetime_bytes, 400);
+        let egress_usage = db.egress_download_usage(egress.id).unwrap().unwrap();
+        assert_eq!(egress_usage.lifetime_bytes, 400);
+        assert!(!registry.usage_changed_since_flush());
     }
 
     #[test]

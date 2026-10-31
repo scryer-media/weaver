@@ -12,7 +12,7 @@ use crate::jobs::assembly::{DetectedArchiveIdentity, JobAssembly};
 use crate::jobs::ids::JobId;
 use crate::jobs::record::ActiveFileIdentity;
 use crate::jobs::server_attribution::JobServerAttribution;
-use crate::pipeline::download::queue::{DownloadQueue, DownloadWork};
+use crate::pipeline::download::queue::DownloadQueue;
 use weaver_model::files::FileRole;
 
 // Why a payload file left the delivery accounting entirely.
@@ -158,9 +158,11 @@ pub struct JobSpec {
 }
 
 impl JobSpec {
-    // Conservative admission estimate for the spec, queue entries, assembly
-    // indexes, and their cloned strings. Count placements even when message
-    // IDs repeat: each placement still owns scheduling and output state.
+    // Conservative estimate of everything a running job holds: the spec's
+    // article lists, queue entries, assembly indexes, and their cloned
+    // strings. Count placements even when message IDs repeat: each placement
+    // still owns scheduling and output state. Charged when the job's articles
+    // are built and held until it leaves the pipeline.
     pub(crate) fn scheduling_memory_estimate(&self) -> u64 {
         let per_file = (8 * std::mem::size_of::<crate::jobs::assembly::FileAssembly>()
             + 4 * std::mem::size_of::<FileSpec>()) as u64;
@@ -175,11 +177,39 @@ impl JobSpec {
             file.segments
                 .iter()
                 .fold(total.saturating_add(file_bytes), |bytes, segment| {
-                    bytes
-                        .saturating_add(per_segment)
-                        .saturating_add((segment.message_id.len() as u64).saturating_mul(4))
+                    bytes.saturating_add(per_segment).saturating_add(
+                        segment.message_ids.all().iter().fold(0u64, |ids, id| {
+                            ids.saturating_add((id.len() as u64).saturating_mul(4))
+                        }),
+                    )
                 })
         })
+    }
+
+    // Takes every file's article list out of the spec, leaving what a job
+    // waiting its turn keeps, and returns what the lists held, with none of
+    // their articles in hand.
+    pub fn drop_article_lists(&mut self) -> FileSummaries {
+        self.drop_article_lists_with_in_hand(|_, _| false)
+    }
+
+    // As `drop_article_lists`, counting as still to fetch only the articles
+    // `in_hand` does not hold, by file index and ordinal.
+    pub fn drop_article_lists_with_in_hand(
+        &mut self,
+        in_hand: impl Fn(u32, u32) -> bool,
+    ) -> FileSummaries {
+        FileSummaries(
+            self.files
+                .iter_mut()
+                .zip(0u32..)
+                .map(|(file, file_index)| {
+                    let summary = FileSummary::left(file, |ordinal| in_hand(file_index, ordinal));
+                    file.segments = Vec::new();
+                    summary
+                })
+                .collect(),
+        )
     }
 
     // Total bytes of PAR2 recovery files in this spec.
@@ -309,8 +339,54 @@ pub struct SegmentSpec {
     pub article_number: u32,
     // Expected decoded size in bytes.
     pub bytes: u32,
-    // NNTP message-id (without angle brackets).
-    pub message_id: String,
+    // Every NNTP message-id the NZB gave this part.
+    pub message_ids: MessageIds,
+}
+
+// The message-ids (without angle brackets) the NZB gave one part, in NZB
+// order, and the one the article is fetched by. The article moves to the next
+// id only when the one in use is spent; a part listed once holds one id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageIds {
+    ids: Vec<String>,
+    in_use: usize,
+}
+
+impl MessageIds {
+    // `ids` must not be empty.
+    pub fn new(ids: Vec<String>) -> Self {
+        assert!(!ids.is_empty(), "a part has at least one message-id");
+        Self { ids, in_use: 0 }
+    }
+
+    // The id the article is fetched by.
+    pub fn in_use(&self) -> &str {
+        &self.ids[self.in_use]
+    }
+
+    // Every id, in NZB order.
+    pub fn all(&self) -> &[String] {
+        &self.ids
+    }
+
+    // Whether an id remains behind the one in use.
+    pub fn has_next(&self) -> bool {
+        self.in_use + 1 < self.ids.len()
+    }
+
+    // Spend the id in use: move to the next one, or answer false when every
+    // id is spent.
+    pub fn spend(&mut self) -> bool {
+        let next = self.has_next();
+        self.in_use += usize::from(next);
+        next
+    }
+}
+
+impl From<&str> for MessageIds {
+    fn from(id: &str) -> Self {
+        Self::new(vec![id.to_string()])
+    }
 }
 
 // Status of a job in the scheduler.
@@ -331,11 +407,24 @@ pub enum JobStatus {
     QueuedPostProcessing,
     PostProcessing,
     Complete,
+    // Delivered with what extracted; at least one member is damaged or
+    // missing. Terminal like Complete; clients see it as failed.
+    Partial,
     Failed { error: String },
     Paused,
 }
 
 impl JobStatus {
+    // Whether the job is still being worked through: queued, downloading,
+    // or verifying, repairing or extracting what came. A pause, a failure or
+    // anything after that work is done belongs to whoever set it.
+    pub(crate) fn in_progress(&self) -> bool {
+        matches!(
+            self,
+            Self::Queued | Self::Downloading | Self::Verifying | Self::Repairing | Self::Extracting
+        )
+    }
+
     pub fn persisted_status(&self) -> &'static str {
         match self {
             Self::AwaitingQueueScripts => "awaiting_queue_scripts",
@@ -351,9 +440,18 @@ impl JobStatus {
             Self::QueuedPostProcessing => "queued_post_processing",
             Self::PostProcessing => "post_processing",
             Self::Complete => "complete",
+            Self::Partial => "partial",
             Self::Failed { .. } => "failed",
             Self::Paused => "paused",
         }
+    }
+
+    // The stage a terminal status names as failed by itself, when no step
+    // recorded one: a partial delivery left members short, which every
+    // reader outside the engine takes for a failed unpack.
+    pub fn shortfall_stage(&self) -> Option<crate::post_processing::model::PipelineFailureStage> {
+        matches!(self, Self::Partial)
+            .then_some(crate::post_processing::model::PipelineFailureStage::Extract)
     }
 }
 
@@ -535,6 +633,7 @@ pub fn job_status_from_persisted_str(status: &str, error: Option<&str>) -> JobSt
         "queued_post_processing" => JobStatus::QueuedPostProcessing,
         "post_processing" => JobStatus::PostProcessing,
         "complete" => JobStatus::Complete,
+        "partial" => JobStatus::Partial,
         "failed" => JobStatus::Failed {
             error: error.unwrap_or("unknown error").to_string(),
         },
@@ -604,7 +703,7 @@ pub fn runtime_lanes_from_status_snapshot(
             PostState::PostProcessing,
             RunState::Active,
         ),
-        JobStatus::Complete => (
+        JobStatus::Complete | JobStatus::Partial => (
             DownloadState::Complete,
             PostState::Completed,
             RunState::Active,
@@ -612,57 +711,6 @@ pub fn runtime_lanes_from_status_snapshot(
         JobStatus::Failed { .. } => (DownloadState::Failed, PostState::Failed, RunState::Active),
         JobStatus::Paused => (DownloadState::Queued, PostState::Idle, RunState::Paused),
     }
-}
-
-// Why a job's health failure is being held back rather than acted on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HealthDeferralKind {
-    // A loaded recovery set may still cover the damage.
-    Par2Recovery,
-    // A probe round is still running and may yet revise the estimate.
-    ProbeConfirmation,
-    // The first-article sample still has articles outstanding and can still
-    // rule the post dead, which is the diagnosis the failure should carry.
-    FirstArticleSample,
-}
-
-impl HealthDeferralKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Par2Recovery => "par2_recovery",
-            Self::ProbeConfirmation => "probe_confirmation",
-            Self::FirstArticleSample => "first_article_sample",
-        }
-    }
-}
-
-// A spell of deferring a job's health failure, and how long it ran for.
-//
-// The condition holds for as long as a damaged job keeps booking terminal
-// segments, so a line per deferral is a line per failed segment — on a badly
-// damaged release, hundreds of thousands of them. The spell announces itself
-// once when it starts and once when it ends, carrying the count it swallowed
-// in between.
-#[derive(Debug, Clone, Default)]
-pub struct HealthDeferral {
-    pub kind: Option<HealthDeferralKind>,
-    pub deferrals: u64,
-}
-
-// Fingerprints of the periodic checkpoint lines a job has already announced.
-//
-// The completion checkpoint is re-entered on a timer for as long as a job is
-// waiting, and a waiting job re-enters it with the same answer every time.
-// Holding the last announced content lets the announcement follow the state
-// rather than the timer: a line whose fingerprint is unchanged has nothing to
-// add and drops to the diagnostic level. They live in the job's state, so a
-// job leaving the pipeline takes them with it.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct AnnouncedCheckpoints {
-    // The RAR completion checkpoint's whole payload, bar its timestamp.
-    pub rar_completion: Option<u64>,
-    // Which demoted direct-store file is holding PAR2 settlement up, and why.
-    pub demoted_materialization: Option<u64>,
 }
 
 // Internal state for a running job.
@@ -676,9 +724,10 @@ pub struct JobState {
     pub download_state: DownloadState,
     pub post_state: PostState,
     pub run_state: RunState,
-    pub assembly: JobAssembly,
-    // Number of nested archive extraction passes already performed.
-    pub extraction_depth: u32,
+    // The job's per-article state, by where the job is in its run: nothing
+    // per article while it waits its turn, everything once it is first handed
+    // work. See [`JobArticles`].
+    pub articles: JobArticles,
     pub created_at: std::time::Instant,
     // Wall-clock creation time (Unix epoch milliseconds).
     pub created_at_epoch_ms: f64,
@@ -717,70 +766,18 @@ pub struct JobState {
     // This is only used for reporting after restart and must not affect scheduling.
     pub restored_download_floor_bytes: u64,
     // Bytes from segments that are permanently lost (430 / max retries
-    // exhausted). See [`JobState::probe_projected_failed_bytes`] for the
-    // estimate that is deliberately kept out of it.
+    // exhausted).
     //
     // Derived state: the sum of the *declared* sizes of the segments holding a
     // terminal state. Only the pipeline's single terminal-state transition
     // moves it, and nothing may add to it directly.
     pub failed_bytes: u64,
-    // What the last conclusive health-probe round estimated was already dead,
-    // extrapolated from its sample across the whole payload.
-    //
-    // Deliberately not folded into `failed_bytes`: it is an estimate over a
-    // sample rather than a per-segment fact, and mixing the two is what once
-    // let a job book more failed bytes than the job contained. Only the health
-    // policy reads it, and only to fail a dead release early.
-    pub probe_projected_failed_bytes: u64,
     // Total bytes of PAR2 recovery files, cached from spec at job creation.
     pub par2_bytes: u64,
-    // Whether health probes have been dispatched for this job.
-    pub health_probing: bool,
-    // The health-failure deferral currently in force, if any, and how many
-    // times it has deferred since it began.
-    pub health_deferral: HealthDeferral,
-    // What the recurring checkpoint lines last announced for this job, so a
-    // repeat with nothing new to say is not announced again.
-    pub announced_checkpoints: AnnouncedCheckpoints,
-    // Probe activation counter used to rotate sampled segments across rounds.
-    pub health_probe_round: u32,
-    // How many files had already lost a segment when the last probe round was
-    // armed.
-    //
-    // A round is armed on a state change, not on every terminal segment: the
-    // failed-byte watermark below, or a file that had not failed before. The
-    // tenth dead article in a volume nobody posted tells the policy nothing
-    // the first one did not.
-    pub health_probe_failing_files: usize,
-    // Indexes of the health-counted files this job has lost at least one
-    // segment of, kept on the booking edge alongside `failed_bytes`.
-    //
-    // The probe policy reads its file count on every terminal segment; a
-    // count derived by walking the terminal-state ledger there would be a
-    // scan of every failure per failure, quadratic on exactly the release
-    // the probe exists to abandon quickly.
-    pub health_failing_files: std::collections::HashSet<u32>,
-    // Recovery blocks early promotion has already asked the queues for.
-    //
-    // Promotion walks the parked and queued recovery work to select blocks,
-    // so it runs only when the shortfall has grown past this figure, not on
-    // every failure that leaves it unchanged.
-    pub early_recovery_requested_blocks: u32,
-    // Highest failed-byte watermark that has already been health-probed.
-    pub last_health_probe_failed_bytes: u64,
-    // Minimum failed-byte watermark required before arming another probe round.
-    pub next_health_probe_failed_bytes: u64,
     // Persisted probe facts used for pre-extraction classification.
     pub detected_archives: std::collections::HashMap<u32, DetectedArchiveIdentity>,
     // Mutable file identity used by runtime/archive logic after rename/classification.
     pub file_identities: std::collections::HashMap<u32, ActiveFileIdentity>,
-    // Segments pulled from queues while health probe runs. Restored on
-    // probe pass, dropped on probe fail.
-    pub held_segments: Vec<DownloadWork>,
-    // Primary download queue (data files, PAR2 index, RAR volumes).
-    pub download_queue: DownloadQueue,
-    // Recovery download queue (PAR2 repair blocks, spare bandwidth).
-    pub recovery_queue: DownloadQueue,
     // Staging directory for extraction output (under complete_dir).
     // Extraction writes chunks and assembled files here instead of
     // working_dir, keeping local storage usage low for NFS setups.
@@ -805,7 +802,199 @@ pub struct JobState {
     pub nzb_password_candidates: std::sync::OnceLock<Vec<ArchivePasswordCandidate>>,
 }
 
+// One file of a job as a job waiting its turn knows it: how many articles
+// it has, what they add up to, and how many of them are still to fetch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileSummary {
+    pub articles: u32,
+    pub bytes: u64,
+    pub remaining: u32,
+}
+
+impl FileSummary {
+    // A file with none of its articles in hand.
+    pub fn of(file: &FileSpec) -> Self {
+        Self::left(file, |_| false)
+    }
+
+    // A file holding in hand the articles `in_hand` names by ordinal.
+    pub fn left(file: &FileSpec, in_hand: impl Fn(u32) -> bool) -> Self {
+        Self {
+            articles: file.segments.len() as u32,
+            bytes: file
+                .segments
+                .iter()
+                .map(|segment| u64::from(segment.bytes))
+                .sum(),
+            remaining: file
+                .segments
+                .iter()
+                .filter(|segment| !in_hand(segment.ordinal))
+                .count() as u32,
+        }
+    }
+
+    // Whether two summaries describe the same article list, whatever of it
+    // is in hand.
+    pub fn same_list(&self, other: &Self) -> bool {
+        self.articles == other.articles && self.bytes == other.bytes
+    }
+}
+
+// The summary of every file of a job, in the spec's file order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileSummaries(pub Vec<FileSummary>);
+
+// Everything a job holds per article, built in one place when the job is
+// first handed work and dropped with the job.
+pub struct ActiveArticles {
+    pub assembly: JobAssembly,
+    // Primary download queue (data files, PAR2 index, RAR volumes).
+    pub download_queue: DownloadQueue,
+    // Recovery download queue (PAR2 repair blocks, spare bandwidth).
+    pub recovery_queue: DownloadQueue,
+}
+
+// Where a job is in its run, as far as its articles go.
+//
+// A job waits its turn holding nothing per article: its spec keeps every
+// file's name and identity, its article lists are empty, and these summaries
+// say what the lists held. When the scheduler first reaches it the job is
+// activating while its article lists are read back from the stored NZB, off
+// the pipeline thread. Once they are in, the job is active and holds its
+// article lists, assembly and queues while it runs. A paused job goes back to
+// waiting, holding its summaries again, and is activated afresh from its
+// stored NZB and checkpoint when it is next reached.
+pub enum JobArticles {
+    Queued(FileSummaries),
+    // The number tells this read from any earlier one of the same job: only
+    // the reply that carries it builds the job's articles.
+    Activating(FileSummaries, u64),
+    Active(Box<ActiveArticles>),
+}
+
+impl JobArticles {
+    pub fn active(&self) -> Option<&ActiveArticles> {
+        match self {
+            Self::Active(active) => Some(active),
+            Self::Queued(_) | Self::Activating(..) => None,
+        }
+    }
+
+    pub fn active_mut(&mut self) -> Option<&mut ActiveArticles> {
+        match self {
+            Self::Active(active) => Some(active),
+            Self::Queued(_) | Self::Activating(..) => None,
+        }
+    }
+
+    // The job's primary queue, or nothing while the job holds no articles.
+    pub fn download_queue(&self) -> Option<&DownloadQueue> {
+        self.active().map(|active| &active.download_queue)
+    }
+
+    pub fn download_queue_mut(&mut self) -> Option<&mut DownloadQueue> {
+        self.active_mut().map(|active| &mut active.download_queue)
+    }
+
+    pub fn recovery_queue(&self) -> Option<&DownloadQueue> {
+        self.active().map(|active| &active.recovery_queue)
+    }
+
+    pub fn recovery_queue_mut(&mut self) -> Option<&mut DownloadQueue> {
+        self.active_mut().map(|active| &mut active.recovery_queue)
+    }
+
+    pub fn assembly(&self) -> Option<&JobAssembly> {
+        self.active().map(|active| &active.assembly)
+    }
+
+    pub fn assembly_mut(&mut self) -> Option<&mut JobAssembly> {
+        self.active_mut().map(|active| &mut active.assembly)
+    }
+
+    // Articles still waiting in the primary queue. A job whose articles are
+    // not built yet has every article not in hand still to fetch, which is
+    // what its queue holds once they are built.
+    pub fn queued_download_len(&self) -> usize {
+        match self {
+            Self::Queued(summaries) | Self::Activating(summaries, _) => {
+                summaries.0.iter().map(|file| file.remaining as usize).sum()
+            }
+            Self::Active(active) => active.download_queue.len(),
+        }
+    }
+
+    // Articles parked in the recovery queue; none before the job's articles
+    // are built.
+    pub fn queued_recovery_len(&self) -> usize {
+        self.recovery_queue().map_or(0, DownloadQueue::len)
+    }
+
+    // Whether the job still has articles to fetch in its primary queue. A
+    // job whose articles are not built yet has every one of them still to
+    // fetch.
+    pub fn has_queued_download_work(&self) -> bool {
+        self.download_queue().is_none_or(|queue| !queue.is_empty())
+    }
+}
+
 impl JobState {
+    // One file's article count and size, whether the job holds its articles
+    // or only their summary.
+    pub fn file_summary(&self, file_index: usize) -> FileSummary {
+        match &self.articles {
+            JobArticles::Queued(summaries) | JobArticles::Activating(summaries, _) => {
+                summaries.0.get(file_index).copied().unwrap_or_default()
+            }
+            JobArticles::Active(_) => self
+                .spec
+                .files
+                .get(file_index)
+                .map(FileSummary::of)
+                .unwrap_or_default(),
+        }
+    }
+
+    // The recovery files' total size and what of them has arrived; nothing
+    // has arrived of a job not yet handed work.
+    pub fn optional_recovery_bytes(&self) -> (u64, u64) {
+        if let Some(assembly) = self.articles.assembly() {
+            return assembly.optional_recovery_bytes();
+        }
+        if !self
+            .spec
+            .files
+            .iter()
+            .any(|file| file.role.counts_toward_health())
+        {
+            return (0, 0);
+        }
+        let recovery = (0..self.spec.files.len())
+            .filter(|index| self.spec.files[*index].role.is_recovery())
+            .map(|index| self.file_summary(index).bytes)
+            .sum();
+        (recovery, 0)
+    }
+
+    pub fn total_file_count(&self) -> usize {
+        self.articles
+            .assembly()
+            .map_or(self.spec.files.len(), JobAssembly::total_file_count)
+    }
+
+    pub fn complete_file_count(&self) -> usize {
+        self.articles
+            .assembly()
+            .map_or(0, JobAssembly::complete_file_count)
+    }
+
+    // The share of the job's files assembled; none of a job not yet handed
+    // work.
+    pub fn assembly_progress(&self) -> f64 {
+        self.articles.assembly().map_or(0.0, JobAssembly::progress)
+    }
+
     pub fn refresh_runtime_lanes_from_status(&mut self) {
         let (download_state, post_state, run_state) =
             runtime_lanes_from_status_snapshot(&self.status);
@@ -849,6 +1038,24 @@ mod tests {
             job_status_from_persisted_str("moving", None),
             JobStatus::Moving
         );
+    }
+
+    #[test]
+    fn partial_round_trips_through_its_persisted_string_and_ends_like_complete() {
+        assert_eq!(JobStatus::Partial.persisted_status(), "partial");
+        assert_eq!(
+            job_status_from_persisted_str("partial", None),
+            JobStatus::Partial
+        );
+        assert_eq!(
+            runtime_lanes_from_status_snapshot(&JobStatus::Partial),
+            runtime_lanes_from_status_snapshot(&JobStatus::Complete)
+        );
+        assert_eq!(
+            JobStatus::Partial.shortfall_stage(),
+            Some(crate::post_processing::model::PipelineFailureStage::Extract)
+        );
+        assert_eq!(JobStatus::Complete.shortfall_stage(), None);
     }
 
     #[test]

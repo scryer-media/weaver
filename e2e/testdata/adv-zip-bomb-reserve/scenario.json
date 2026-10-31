@@ -1,0 +1,16 @@
+{
+  "slug": "adv-zip-bomb-reserve",
+  "title": "E2E.Adversarial.Zip.Bomb.Reserve.2026-TESTGRP",
+  "description": "3 GiB of deflated zeros, run with the free-space reserve set 1 GiB under what the scratch disk holds and the ratio floor lifted past the bomb. The disk reserve refuses it once, by name, and nothing is extracted.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "adversarial": {
+    "group": "reserve",
+    "outcome": "failed",
+    "errorContains": "WEAVER_EXTRACTION_REJECTED[disk_reserve]",
+    "failureKind": "unpack",
+    "budgetRefusals": 1,
+    "rejectionMetric": "disk_reserve",
+    "extractsNothing": true
+  }
+}

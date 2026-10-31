@@ -449,6 +449,7 @@ const GENERAL_SETTINGS_FIELDS = `
     maxDownloadSpeed
     maxRetries
     propagationDelaySecs
+    maxConcurrentNzbs
     enableSrrdbLookup
     duplicatePolicy {
       strictActiveOrSuccess

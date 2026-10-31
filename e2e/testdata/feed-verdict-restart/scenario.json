@@ -1,0 +1,15 @@
+{
+  "slug": "feed-verdict-restart",
+  "title": "E2E.Test.feed.verdict.restart.2026-TESTGRP",
+  "description": "The restart harness withholds every broken-file article, proves the abandoned-file feed verdict committed, and requires Partial with whole survivor.bin after restart. It derives the damaged broken.bin placeholder's size and zero-byte digest from the submitted NZB, then checks the exact final file set and both hashes.",
+  "category": "2000",
+  "expected_outcome": "partial_delivery",
+  "expectedOutputBLAKE3": {
+    "survivor.bin": "8dee7011d1ca0d3360dd391ba9382aec193a6960f09785955f916732a1d67666"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks"
+  ],
+  "segment_size": 16384,
+  "exactOutputFiles": true
+}

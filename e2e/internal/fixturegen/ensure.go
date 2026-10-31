@@ -170,7 +170,7 @@ func Ensure(ctx context.Context, config EnsureConfig) (EnsureReport, error) {
 	}
 	sort.Strings(report.Salted)
 	if len(report.Salted) > 0 {
-		logf("%d salted path(s) are verified by presence only; their writer draws a salt and their bytes cannot be pinned",
+		logf("%d salted path(s) are verified by presence only; their writer emits variable bytes that cannot be pinned",
 			len(report.Salted))
 	}
 

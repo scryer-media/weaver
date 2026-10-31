@@ -29,18 +29,6 @@ pub(crate) struct DirectoryFingerprint {
     file_index: u64,
 }
 
-// An atomic regular-file move with no copy or hard-link fallback. Callers
-// journaling both names can replay an interruption without partial outputs.
-pub(crate) fn rename_file_exclusive(src: &Path, dst: &Path) -> io::Result<()> {
-    if !std::fs::symlink_metadata(src)?.file_type().is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "move source is not a regular file",
-        ));
-    }
-    rename_path_exclusive(src, dst)
-}
-
 // Atomic for both directories and files; never replaces an existing target.
 pub(crate) fn rename_path_exclusive(src: &Path, dst: &Path) -> io::Result<()> {
     if src == dst {
@@ -256,42 +244,113 @@ pub(crate) fn destination_parent_matches(
     directory_fingerprint_from_path(parent).map(|actual| &actual == expected)
 }
 
-pub(crate) fn normalize_extracted_paths(root: &Path, members: &[String]) -> io::Result<()> {
-    for member in members {
-        let relative = Path::new(member);
-        if relative.as_os_str().is_empty()
-            || relative
-                .components()
-                .any(|part| !matches!(part, std::path::Component::Normal(_)))
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid extracted member path",
-            ));
-        }
-        let mut path = root.to_path_buf();
-        for component in relative.components() {
-            match std::fs::symlink_metadata(&path) {
-                Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "invalid extracted member parent",
-                    ));
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::NotFound => break,
-                Err(error) => return Err(error),
-            }
-            normalize_extracted_path(&path, false)?;
-            path.push(component);
-        }
-        normalize_extracted_path(&path, false)?;
+fn path_equivalence_key(path: &Path) -> String {
+    let normalized = lexical_normalize(path);
+    let key = normalized.to_string_lossy();
+    #[cfg(windows)]
+    {
+        key.replace('/', "\\").to_ascii_lowercase()
     }
+    #[cfg(not(windows))]
+    {
+        key.into_owned()
+    }
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
+#[cfg(windows)]
+fn rename_equivalent_path(src: &Path, dst: &Path) -> io::Result<()> {
+    let parent = src.parent().unwrap_or_else(|| Path::new("."));
+    let pid = std::process::id();
+    for attempt in 0..100u32 {
+        let tmp = parent.join(format!(".weaver-rename-{pid}-{attempt}.tmp"));
+        if tmp.try_exists()? {
+            continue;
+        }
+        std::fs::rename(src, &tmp)?;
+        match std::fs::rename(&tmp, dst) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let _ = std::fs::rename(&tmp, src);
+                return Err(error);
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate temporary path for case-only rename",
+    ))
+}
+
+#[cfg(not(windows))]
+fn rename_equivalent_path(_src: &Path, _dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, unix))]
-fn normalize_extracted_tree(path: &Path) -> io::Result<()> {
+fn directory_fingerprint_from_path(path: &Path) -> io::Result<DirectoryFingerprint> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("destination parent is not a directory: {}", path.display()),
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        Ok(DirectoryFingerprint {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+    #[cfg(windows)]
+    {
+        let directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+        let result =
+            unsafe { GetFileInformationByHandle(directory.as_raw_handle(), info.as_mut_ptr()) };
+        if result == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let info = unsafe { info.assume_init() };
+        let file_index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
+        Ok(DirectoryFingerprint {
+            volume_serial_number: info.dwVolumeSerialNumber,
+            file_index,
+        })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        Ok(DirectoryFingerprint {})
+    }
+}
+
+// Give a delivered tree to the user Weaver runs as: every entry under
+// `path`, and `path` itself, owned by the effective uid and gid, and each
+// file 0o666 and directory 0o777 less the process umask. Links are owned
+// over but never followed or given a mode. Unix only; elsewhere nothing.
+pub(crate) fn normalize_extracted_tree(path: &Path) -> io::Result<()> {
     normalize_extracted_path(path, true)
 }
 
@@ -405,108 +464,6 @@ fn current_umask() -> u32 {
     })
 }
 
-fn path_equivalence_key(path: &Path) -> String {
-    let normalized = lexical_normalize(path);
-    let key = normalized.to_string_lossy();
-    #[cfg(windows)]
-    {
-        key.replace('/', "\\").to_ascii_lowercase()
-    }
-    #[cfg(not(windows))]
-    {
-        key.into_owned()
-    }
-}
-
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    normalized.push(component.as_os_str());
-                }
-            }
-            Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {
-                normalized.push(component.as_os_str());
-            }
-        }
-    }
-    normalized
-}
-
-#[cfg(windows)]
-fn rename_equivalent_path(src: &Path, dst: &Path) -> io::Result<()> {
-    let parent = src.parent().unwrap_or_else(|| Path::new("."));
-    let pid = std::process::id();
-    for attempt in 0..100u32 {
-        let tmp = parent.join(format!(".weaver-rename-{pid}-{attempt}.tmp"));
-        if tmp.try_exists()? {
-            continue;
-        }
-        std::fs::rename(src, &tmp)?;
-        match std::fs::rename(&tmp, dst) {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                let _ = std::fs::rename(&tmp, src);
-                return Err(error);
-            }
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not allocate temporary path for case-only rename",
-    ))
-}
-
-#[cfg(not(windows))]
-fn rename_equivalent_path(_src: &Path, _dst: &Path) -> io::Result<()> {
-    Ok(())
-}
-
-fn directory_fingerprint_from_path(path: &Path) -> io::Result<DirectoryFingerprint> {
-    let metadata = std::fs::metadata(path)?;
-    if !metadata.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("destination parent is not a directory: {}", path.display()),
-        ));
-    }
-
-    #[cfg(unix)]
-    {
-        Ok(DirectoryFingerprint {
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-        })
-    }
-    #[cfg(windows)]
-    {
-        let directory = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(path)?;
-        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
-        let result =
-            unsafe { GetFileInformationByHandle(directory.as_raw_handle(), info.as_mut_ptr()) };
-        if result == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let info = unsafe { info.assume_init() };
-        let file_index = ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64;
-        Ok(DirectoryFingerprint {
-            volume_serial_number: info.dwVolumeSerialNumber,
-            file_index,
-        })
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = metadata;
-        Ok(DirectoryFingerprint {})
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,24 +504,6 @@ mod tests {
         rename_no_overwrite(&src, &dst).unwrap();
 
         assert!(!src.exists());
-        assert_eq!(std::fs::read(&dst).unwrap(), b"source");
-    }
-
-    #[test]
-    fn rename_file_exclusive_moves_once_and_never_replaces() {
-        let temp = tempfile::tempdir().unwrap();
-        let src = temp.path().join("src.bin");
-        let dst = temp.path().join("dst.bin");
-        std::fs::write(&src, b"source").unwrap();
-
-        rename_file_exclusive(&src, &dst).unwrap();
-        assert!(!src.exists());
-        assert_eq!(std::fs::read(&dst).unwrap(), b"source");
-
-        std::fs::write(&src, b"second").unwrap();
-        let error = rename_file_exclusive(&src, &dst).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(std::fs::read(&src).unwrap(), b"second");
         assert_eq!(std::fs::read(&dst).unwrap(), b"source");
     }
 
@@ -611,38 +550,6 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(std::fs::read(&dst).unwrap(), b"existing");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn normalize_extracted_members_leaves_live_sources_unchanged() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("out");
-        let nested = root.join("nested");
-        std::fs::create_dir_all(&nested).unwrap();
-        let member = nested.join("movie.mkv");
-        let source = nested.join("live.partial");
-        std::fs::write(&member, b"media").unwrap();
-        std::fs::write(&source, b"source").unwrap();
-        std::fs::set_permissions(&member, std::fs::Permissions::from_mode(0o777)).unwrap();
-        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let before = std::fs::metadata(&source).unwrap();
-
-        normalize_extracted_paths(&root, &["nested/movie.mkv".to_owned()]).unwrap();
-
-        let after = std::fs::metadata(&source).unwrap();
-        assert_eq!(before.mode(), after.mode());
-        assert_eq!(
-            (before.ctime(), before.ctime_nsec()),
-            (after.ctime(), after.ctime_nsec())
-        );
-        assert_eq!(std::fs::read(&source).unwrap(), b"source");
-        assert_eq!(
-            std::fs::metadata(&member).unwrap().mode() & 0o777,
-            0o666 & !current_umask()
-        );
     }
 
     #[cfg(unix)]
@@ -712,5 +619,36 @@ mod tests {
             std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_extracted_tree_gives_every_entry_to_the_effective_user() {
+        use std::os::unix::fs::MetadataExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("out");
+        let dir = root.join("nested");
+        let file = dir.join("movie.mkv");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&file, b"media").unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        // Moved to another of the user's groups where it has one, so the
+        // tree starts owned otherwise than it ends.
+        let mut groups = vec![0 as libc::gid_t; 64];
+        let count = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+        groups.truncate(usize::try_from(count).unwrap_or(0));
+        if let Some(other) = groups.into_iter().find(|group| *group != gid) {
+            std::os::unix::fs::lchown(&file, None, Some(other)).unwrap();
+            assert_eq!(std::fs::metadata(&file).unwrap().gid(), other);
+        }
+
+        normalize_extracted_tree(&root).unwrap();
+
+        for path in [&root, &dir, &file] {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            assert_eq!((metadata.uid(), metadata.gid()), (uid, gid), "{path:?}");
+        }
     }
 }

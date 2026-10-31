@@ -64,10 +64,12 @@ impl Pipeline {
     // download work. Its wait is the earliest future deadline among the
     // holds the scheduler keeps on it — a propagation deferral, a restart
     // durable-lead retry, a timed infrastructure retry of one of its
-    // articles — or the soft byte-pressure delay every job shares. A stalled
-    // job with none of these is waiting on nothing anyone scheduled, and the
-    // stall is unexplained: `None`. Otherwise the earliest wait across the
-    // stalled jobs, which is when the stall starts counting.
+    // articles — or the soft byte-pressure delay every job shares. A job
+    // whose articles are being built waits until now, so the stall counts
+    // from now while that lasts. A stalled job with none of these is waiting
+    // on nothing anyone scheduled, and the stall is unexplained: `None`.
+    // Otherwise the earliest wait across the stalled jobs, which is when the
+    // stall starts counting.
     //
     // Retries that sleep in their own task (a body-lane or blocked-server
     // recheck, a server quota wait) keep no deadline here, so they do not
@@ -100,6 +102,13 @@ impl Pipeline {
         }
         let mut waits = HashMap::new();
         for job_id in self.download_scheduler_eligible_jobs() {
+            // A job whose articles are being built waits on that, which has
+            // no deadline: the clock restarts while it lasts, as under a
+            // quota, and a slow read never kicks the other jobs.
+            if self.awaits_job_articles(job_id) {
+                waits.insert(job_id, now);
+                continue;
+            }
             let job_wait = [
                 self.propagation_ready_at
                     .get(&job_id)
@@ -283,9 +292,13 @@ impl Pipeline {
             self.propagation_ready_at.remove(job_id);
             // A hint only says one attempt failed on a server; exclusions are
             // facts about the article and stay.
-            if let Some(state) = self.jobs.get_mut(job_id) {
-                rotation_hints_cleared += state.download_queue.clear_rotation_hints()
-                    + state.recovery_queue.clear_rotation_hints();
+            if let Some(active) = self
+                .jobs
+                .get_mut(job_id)
+                .and_then(|state| state.articles.active_mut())
+            {
+                rotation_hints_cleared += active.download_queue.clear_rotation_hints()
+                    + active.recovery_queue.clear_rotation_hints();
             }
         }
         self.download_pressure_soft_dispatch_after = None;
@@ -340,6 +353,13 @@ impl Pipeline {
             .download_scheduler_eligible_jobs()
             .into_iter()
             .filter(|job_id| !waits.contains_key(job_id))
+            // A job still waiting for its articles to be read is not stalled
+            // in dispatch: it has nothing built to hand out yet.
+            .filter(|job_id| {
+                self.jobs
+                    .get(job_id)
+                    .is_some_and(|state| state.articles.active().is_some())
+            })
             .filter(|job_id| {
                 downloaded_bytes_at_kick
                     .get(job_id)
@@ -364,10 +384,14 @@ impl Pipeline {
             eligible_count,
         );
         for job_id in released {
-            let Some(state) = self.jobs.get_mut(&job_id) else {
+            let Some(active) = self
+                .jobs
+                .get_mut(&job_id)
+                .and_then(|state| state.articles.active_mut())
+            else {
                 continue;
             };
-            let queued = state.download_queue.extract_matching(|_| true);
+            let queued = active.download_queue.extract_matching(|_| true);
             for work in &queued {
                 self.book_unservable_work(work);
             }
@@ -391,7 +415,9 @@ impl Pipeline {
         let queue_depth = self
             .jobs
             .values()
-            .map(|state| state.download_queue.len() + state.recovery_queue.len())
+            .map(|state| {
+                state.articles.queued_download_len() + state.articles.queued_recovery_len()
+            })
             .sum::<usize>();
         let hot_job_id = self.current_hot_job().map(|id| id.0).unwrap_or_default();
         for job_id in jobs {
@@ -404,8 +430,8 @@ impl Pipeline {
                     recovery,
                     job_id = job_id.0,
                     status = ?state.status,
-                    download_queue_len = state.download_queue.len(),
-                    recovery_queue_len = state.recovery_queue.len(),
+                    download_queue_len = state.articles.queued_download_len(),
+                    recovery_queue_len = state.articles.queued_recovery_len(),
                     downloaded_bytes = state.downloaded_bytes,
                     stalled_secs = stalled_for.as_secs(),
                     eligible_count,
@@ -426,8 +452,8 @@ impl Pipeline {
                     recovery,
                     job_id = job_id.0,
                     status = ?state.status,
-                    download_queue_len = state.download_queue.len(),
-                    recovery_queue_len = state.recovery_queue.len(),
+                    download_queue_len = state.articles.queued_download_len(),
+                    recovery_queue_len = state.articles.queued_recovery_len(),
                     downloaded_bytes = state.downloaded_bytes,
                     stalled_secs = stalled_for.as_secs(),
                     requeued_retries,
@@ -463,7 +489,9 @@ impl Pipeline {
         let queue_depth = self
             .jobs
             .values()
-            .map(|state| state.download_queue.len() + state.recovery_queue.len())
+            .map(|state| {
+                state.articles.queued_download_len() + state.articles.queued_recovery_len()
+            })
             .sum::<usize>();
         if queue_depth == 0 {
             self.last_download_dispatch_stall_log_at = None;
@@ -490,7 +518,8 @@ impl Pipeline {
         let servers_available = self.dispatchable_server_count();
         if let Some(job_id) = self.job_order.iter().copied().find(|job_id| {
             self.jobs.get(job_id).is_some_and(|state| {
-                !state.download_queue.is_empty() || !state.recovery_queue.is_empty()
+                state.articles.has_queued_download_work()
+                    || state.articles.queued_recovery_len() > 0
             })
         }) {
             let state = self
@@ -506,8 +535,8 @@ impl Pipeline {
             warn!(
                 job_id = job_id.0,
                 status = ?state.status,
-                download_queue_len = state.download_queue.len(),
-                recovery_queue_len = state.recovery_queue.len(),
+                download_queue_len = state.articles.queued_download_len(),
+                recovery_queue_len = state.articles.queued_recovery_len(),
                 status_allows_dispatch = Self::status_allows_download_dispatch(&state.status),
                 eligible_count,
                 queue_depth,
@@ -528,8 +557,6 @@ impl Pipeline {
                 released_results_by_job = backlog.released_results,
                 released_result_bytes_by_job = backlog.released_result_bytes,
                 pending_decodes_by_job = backlog.pending_decodes,
-                buffered_write_segments_by_job = backlog.buffered_write_segments,
-                buffered_write_bytes_by_job = backlog.buffered_write_bytes,
                 "download dispatch liveness stall: queued work but no active downloads"
             );
         } else {
@@ -610,7 +637,9 @@ impl Pipeline {
         let queue_depth = self
             .jobs
             .values()
-            .map(|state| state.download_queue.len() + state.recovery_queue.len())
+            .map(|state| {
+                state.articles.queued_download_len() + state.articles.queued_recovery_len()
+            })
             .sum::<usize>();
         // Nothing to fill the lanes with, or the lanes are full: either way
         // this is not the condition, and the window restarts from here.
@@ -655,12 +684,13 @@ impl Pipeline {
         );
     }
 
-    // Update shared atomic queue depth metrics from per-job queues.
+    // Update shared atomic queue depth metrics from per-job queues, and the
+    // server quota block that reads them.
     pub(crate) fn update_queue_metrics(&self) {
         let (total, recovery) = self.jobs.values().fold((0usize, 0usize), |(t, r), s| {
             (
-                t + s.download_queue.len() + s.recovery_queue.len(),
-                r + s.recovery_queue.len(),
+                t + s.articles.queued_download_len() + s.articles.queued_recovery_len(),
+                r + s.articles.queued_recovery_len(),
             )
         });
         self.metrics
@@ -670,6 +700,7 @@ impl Pipeline {
             .recovery_queue_depth
             .store(recovery, Ordering::Relaxed);
         self.publish_active_stage_metrics();
+        self.refresh_server_quota_block_presentation();
     }
 
     // Payload delivered and the wall time it took, with deliberate throttle
@@ -918,32 +949,33 @@ impl Pipeline {
                     // to say" value. In particular `segments` is empty: the
                     // dual-CRC grid can only be fed block-aligned CRC evidence,
                     // and there is none to give it here.
-                    weaver_nntp::fused_yenc::FusedArticleBody::Uu(outcome) => DecodeResult {
-                        segment_id,
-                        raw_size: raw_size as u64,
-                        encoding: SegmentEncoding::Uu(crate::pipeline::UuSegmentFacts {
+                    weaver_nntp::fused_yenc::FusedArticleBody::Uu(outcome) => {
+                        let facts = crate::pipeline::UuSegmentFacts {
                             damaged: outcome.damaged,
                             ended: outcome.ended,
-                        }),
-                        yenc_layout: YencLayoutAssertions {
-                            file_size: 0,
-                            part: None,
-                            total: None,
-                            begin: None,
-                            end: None,
-                        },
-                        // "Not known bad" — there is nothing to check against,
-                        // which is different from having checked and passed.
-                        crc_valid: true,
-                        truncation_suspected: false,
-                        part_crc_verified: false,
-                        part_crc: 0,
-                        expected_file_crc: None,
-                        data,
-                        yenc_name: outcome.filename.unwrap_or_default(),
-                        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
-                        segments: Vec::new(),
-                    },
+                        };
+                        DecodeResult {
+                            segment_id,
+                            raw_size: raw_size as u64,
+                            encoding: SegmentEncoding::Uu(facts),
+                            yenc_layout: YencLayoutAssertions {
+                                file_size: 0,
+                                part: None,
+                                total: None,
+                                begin: None,
+                                end: None,
+                            },
+                            crc_valid: facts.clean(),
+                            truncation_suspected: false,
+                            part_crc_verified: false,
+                            part_crc: 0,
+                            expected_file_crc: None,
+                            data,
+                            yenc_name: outcome.filename.unwrap_or_default(),
+                            checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+                            segments: Vec::new(),
+                        }
+                    }
                 }))
             }
             Err(weaver_nntp::client::DecodedBodyError::Nntp(error)) => {

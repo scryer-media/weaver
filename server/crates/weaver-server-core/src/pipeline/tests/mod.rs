@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use crate::Database;
 use crate::ingest::submit_nzb_bytes;
-use crate::jobs::FileIdentitySource;
 use crate::jobs::ids::MessageId;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::runtime::buffers::{BufferPool, BufferPoolConfig};
@@ -21,7 +20,6 @@ use crate::settings::{Config, SharedConfig};
 use crate::{
     FileSpec, JobInfo, PipelineMetrics, SchedulerHandle, SegmentSpec, SharedPipelineState,
 };
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tempfile::TempDir;
 use tokio::sync::{RwLock, oneshot};
 use weaver_model::files::FileRole;
@@ -33,7 +31,7 @@ macro_rules! segment_spec {
             ordinal: $number,
             article_number: $number,
             bytes: $bytes,
-            message_id: $message_id,
+            message_ids: crate::jobs::MessageIds::new(vec![$message_id]),
         }
     };
     (ordinal: $ordinal:expr, article_number: $article_number:expr, bytes: $bytes:expr, message_id: $message_id:expr $(,)?) => {
@@ -41,54 +39,74 @@ macro_rules! segment_spec {
             ordinal: $ordinal,
             article_number: $article_number,
             bytes: $bytes,
-            message_id: $message_id,
+            message_ids: crate::jobs::MessageIds::new(vec![$message_id]),
         }
     };
 }
 
+mod archive_output_contract;
+mod archive_passwords;
 mod archive_topology;
 mod cancel_batch;
 mod control_lifecycle;
 mod core;
-mod decode_and_files;
-mod direct_store;
-mod direct_unpack;
+mod decode_stage;
+pub(in crate::pipeline) mod direct_store;
 mod download_dispatch;
+pub(in crate::pipeline) mod engines;
 mod full_file_names;
 mod hardware_profile;
-mod health_probe;
 mod idle;
+mod nzb_admission;
+mod par2;
 mod par2_completion;
-mod par2_multiset_binding;
-mod par2_multiset_gate;
-mod par2_multiset_grid;
-mod par3_completion;
-mod par3_recovery;
 #[cfg(unix)]
 mod post_processing_completion;
 mod post_processing_pause;
+mod provider_scheduling;
 mod queue;
-mod rar_extraction;
-mod restart_resume_floor;
 mod restore_history;
 mod script_events;
-mod sequential_unpack;
 mod server_attribution;
-mod sfv_completion;
-mod support_facts;
 mod terminal_settlement;
+mod uu_assembly;
 mod yenc_compatibility;
-mod zip64;
 
 impl Pipeline {
-    async fn restore_job(&mut self, request: RestoreJobRequest) -> Result<(), SchedulerError> {
+    pub(in crate::pipeline) async fn restore_job(
+        &mut self,
+        request: RestoreJobRequest,
+    ) -> Result<(), SchedulerError> {
         let id = request.job_id;
         if self.jobs.contains_key(&id) {
             return Err(SchedulerError::JobExists(id));
         }
+        // Synthetic restore requests still need the active record that real
+        // startup recovery reads, so admission can commit before work starts.
+        if !self.db.load_active_jobs()?.contains_key(&id) {
+            self.db.create_active_job(&crate::ActiveJob {
+                job_id: id,
+                nzb_hash: request.job_hash,
+                nzb_path: request.working_dir.join("restore-fixture.nzb"),
+                nzb_zstd: sample_nzb_zstd(),
+                output_dir: request.working_dir.clone(),
+                created_at: 0,
+                category: request.spec.category.clone(),
+                metadata: request.spec.metadata.clone(),
+                status: "queued",
+                download_state: "queued",
+                post_state: "idle",
+                run_state: "active",
+                paused_resume_status: None,
+                paused_resume_download_state: None,
+                paused_resume_post_state: None,
+                password_override: None,
+                supplied_password_candidates: Vec::new(),
+            })?;
+        }
         // Some crash fixtures reuse the stopped runtime's shared queue.
         self.shared_state.queue.write(|inner| {
-            inner.jobs.retain(|row| row.id != id);
+            inner.retain_jobs(|row| row.id != id);
             crate::pipeline::queue::Change::changed(())
         });
         self.shared_state.queue.restore(request)?;
@@ -137,11 +155,14 @@ impl TestHarness {
             retry: None,
             max_download_speed: None,
             propagation_delay_secs: None,
+            max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
-            direct_store: None,
-            direct_unpack: None,
+            direct_store: Some(crate::settings::DirectStoreOverrides {
+                holds_disk_reserve_bytes: Some(1),
+                ..Default::default()
+            }),
             // Pinned off rather than left at the shipped default, so an
             // extraction fixture whose member happens to be called
             // `sample.mkv` keeps asserting extraction instead of asserting the
@@ -200,9 +221,12 @@ impl TestHarness {
             shared_state,
             db.clone(),
             config.clone(),
+            crate::runtime::StartupDiskGate::opened(),
         )
         .await
         .unwrap();
+        // Ordinary fixtures do not inherit the host's production disk reserve.
+        Arc::make_mut(&mut pipeline.extraction_limits).min_free_bytes = 1;
         let pipeline_task = tokio::spawn(async move {
             pipeline.run().await;
         });
@@ -234,22 +258,77 @@ fn sample_nzb_bytes() -> Vec<u8> {
         .to_vec()
 }
 
-fn sample_nzb_zstd() -> Vec<u8> {
+pub(in crate::pipeline) fn sample_nzb_zstd() -> Vec<u8> {
     crate::ingest::compress_nzb_bytes(&sample_nzb_bytes()).unwrap()
 }
 
-fn sample_nzb_zstd_with_password(password: &str) -> Vec<u8> {
-    let nzb = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-        <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
-          <head><meta type="password">{password}</meta></head>
-          <file poster="poster" date="1700000000" subject="Silver Horizon.Sample.rar">
-            <groups><group>alt.binaries.test</group></groups>
-            <segments><segment bytes="100" number="1">msgid@example.com</segment></segments>
-          </file>
-        </nzb>"#
+// The stored NZB a fixture spec would have been read from: the same files,
+// in the same order, with the same articles, so a job added with it reads
+// its articles back when it is first handed work.
+pub(in crate::pipeline) fn nzb_zstd_for(spec: &JobSpec) -> Vec<u8> {
+    fn escape(text: &str) -> String {
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    }
+    let mut xml = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">"#,
     );
-    crate::ingest::compress_nzb_bytes(nzb.as_bytes()).unwrap()
+    for file in &spec.files {
+        let count = file.segments.len();
+        xml.push_str(&format!(
+            r#"<file poster="fixture" date="{}" subject="{}"><groups>"#,
+            file.posted_at_epoch.unwrap_or(1_700_000_000),
+            escape(&format!("\"{}\" yEnc (1/{count})", file.filename)),
+        ));
+        for group in &file.groups {
+            xml.push_str(&format!("<group>{}</group>", escape(group)));
+        }
+        if file.groups.is_empty() {
+            xml.push_str("<group>alt.binaries.test</group>");
+        }
+        xml.push_str("</groups><segments>");
+        for segment in &file.segments {
+            for message_id in segment.message_ids.all() {
+                xml.push_str(&format!(
+                    r#"<segment bytes="{}" number="{}">{}</segment>"#,
+                    segment.bytes,
+                    segment.article_number.max(segment.ordinal + 1),
+                    escape(message_id),
+                ));
+            }
+        }
+        xml.push_str("</segments></file>");
+    }
+    xml.push_str("</nzb>");
+    crate::ingest::compress_nzb_bytes(xml.as_bytes()).unwrap()
+}
+
+// Build a waiting job's articles as its first handout would, and wait for
+// them: the read is sent for and its result delivered on the actor's turn.
+pub(in crate::pipeline) async fn activate_job(pipeline: &mut Pipeline, job_id: JobId) {
+    let retiring = pipeline.retiring_graph_jobs.contains_key(&job_id);
+    while pipeline.retiring_graph_jobs.contains_key(&job_id) {
+        let said = pipeline
+            .graph_runs
+            .recv()
+            .await
+            .expect("the retiring owner acknowledges completion");
+        pipeline.graph_run_said(said);
+    }
+    if retiring {
+        // The next actor turn installs an admission that waited for these
+        // ACKs; requesting activation before that turn has no job to activate.
+        pipeline.apply_queue_intents().await;
+    }
+    pipeline.request_job_activation(job_id);
+    let done = pipeline
+        .job_activated_rx
+        .recv()
+        .await
+        .expect("the activation channel stays open");
+    pipeline.handle_job_activated(done);
 }
 
 fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobState {
@@ -268,8 +347,13 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         download_state: crate::jobs::model::DownloadState::Downloading,
         post_state: crate::jobs::model::PostState::Idle,
         run_state: crate::jobs::model::RunState::Active,
-        assembly: JobAssembly::new(job_id),
-        extraction_depth: 0,
+        articles: crate::jobs::model::JobArticles::Active(Box::new(
+            crate::jobs::model::ActiveArticles {
+                assembly: JobAssembly::new(job_id),
+                download_queue: DownloadQueue::new(),
+                recovery_queue: DownloadQueue::new(),
+            },
+        )),
         created_at: std::time::Instant::now(),
         created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
         queued_repair_at_epoch_ms: None,
@@ -284,23 +368,10 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         downloaded_wire_bytes: 0,
         server_attribution: Default::default(),
         failed_bytes: 0,
-        probe_projected_failed_bytes: 0,
         par2_bytes: 0,
-        health_probing: false,
-        health_deferral: Default::default(),
-        health_probe_round: 0,
-        announced_checkpoints: Default::default(),
-        health_probe_failing_files: 0,
-        health_failing_files: std::collections::HashSet::new(),
-        early_recovery_requested_blocks: 0,
-        last_health_probe_failed_bytes: 0,
-        next_health_probe_failed_bytes: 1,
         support_facts: Default::default(),
         detected_archives: HashMap::new(),
         file_identities: HashMap::new(),
-        held_segments: Vec::new(),
-        download_queue: DownloadQueue::new(),
-        recovery_queue: DownloadQueue::new(),
         staging_dir: None,
         category_bytes: None,
         nzb_password_candidates: Default::default(),
@@ -333,6 +404,7 @@ fn finished_job_info(job_id: JobId) -> JobInfo {
         total_files: 0,
         completed_files: 0,
         remaining_par_files: 0,
+        file_remaining_bytes: Vec::new(),
         password: None,
         category: None,
         metadata: vec![],
@@ -438,6 +510,9 @@ async fn settle_lane_dials(pipeline: &mut Pipeline) {
             .expect("lane event channel should stay open")
         {
             OwnedDownloadLaneEvent::AcquireFailed { .. } => {}
+            OwnedDownloadLaneEvent::LeaseObsolete { lease } => {
+                panic!("lane {} became obsolete before dialing", lease.lane_id)
+            }
             OwnedDownloadLaneEvent::BatchComplete { lane_id, .. } => {
                 panic!("lane {lane_id} fetched from a server that refuses every session")
             }
@@ -543,6 +618,10 @@ async fn new_direct_pipeline_on_machine(
     // Jobs added through the handle persist their archive password, which
     // needs a key, exactly as a running server has one.
     db.set_encryption_key(crate::persistence::encryption::EncryptionKey::generate());
+    let mut direct_store = direct_store.unwrap_or_default();
+    // A drained fixture can page its holds regardless of host disk headroom.
+    // Keep any explicit reserve supplied by the scenario.
+    direct_store.holds_disk_reserve_bytes.get_or_insert(1);
     let config: SharedConfig = Arc::new(RwLock::new(Config {
         data_dir: data_dir.display().to_string(),
         hardware_profile: None,
@@ -554,11 +633,11 @@ async fn new_direct_pipeline_on_machine(
         retry: None,
         max_download_speed: None,
         propagation_delay_secs: None,
+        max_concurrent_nzbs: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
-        direct_store,
-        direct_unpack: None,
+        direct_store: Some(direct_store),
         // Pinned off for the same reason as the harness above: an extraction
         // fixture must not start asserting the delivery-naming policy.
         delivery_naming: Some(crate::settings::DeliveryNamingOverrides {
@@ -597,7 +676,7 @@ async fn new_direct_pipeline_on_machine(
     });
     let buffers = BufferPool::new(buffer_config);
 
-    let pipeline = Pipeline::new(
+    let mut pipeline = Pipeline::new(
         event_tx,
         nntp,
         buffers,
@@ -612,11 +691,31 @@ async fn new_direct_pipeline_on_machine(
         shared_state,
         db,
         config,
+        crate::runtime::StartupDiskGate::opened(),
     )
     .await
     .unwrap();
 
+    // Reserve-specific scenarios install their own limits after construction.
+    Arc::make_mut(&mut pipeline.extraction_limits).min_free_bytes = 1;
     (pipeline, intermediate_dir, complete_dir)
+}
+
+async fn new_scheduler_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {
+    let (mut pipeline, intermediate, complete) = new_direct_pipeline(temp_dir).await;
+    // Scheduler-only callers name two real policy entries without dialing.
+    pipeline.nntp = Arc::new(NntpClient::new(NntpClientConfig {
+        servers: (0..2)
+            .map(|_| weaver_nntp::pool::ServerPoolConfig {
+                max_connections: 100,
+                ..Default::default()
+            })
+            .collect(),
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 1,
+        soft_timeout: Duration::from_secs(15),
+    }));
+    (pipeline, intermediate, complete)
 }
 
 pub(crate) async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {
@@ -653,7 +752,7 @@ pub(crate) async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBu
 // after the drop — so the flush moves those writes ahead of the reopen
 // instead of racing it, and loses nothing a plain drop would have kept. What
 // a crash does lose is the state that was never queued, and that stays lost.
-async fn retire_pipeline_database(pipeline: Pipeline) {
+pub(in crate::pipeline) async fn retire_pipeline_database(pipeline: Pipeline) {
     let db = pipeline.db.clone();
     drop(pipeline);
     db.flush_write_queue().await.unwrap();
@@ -666,22 +765,29 @@ async fn retire_pipeline_database(pipeline: Pipeline) {
         .unwrap();
 }
 
-// [`new_direct_pipeline`] whose direct-store gate comes from configuration.
-async fn new_config_gated_direct_pipeline(
-    temp_dir: &TempDir,
-    direct_store: crate::settings::DirectStoreOverrides,
-) -> (Pipeline, PathBuf, PathBuf) {
-    new_direct_pipeline_with(
-        temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        0,
-        Some(direct_store),
-    )
-    .await
+// Hear the run mail until the graph job has nothing out: a repair it lent
+// returns there, and is applied as it is heard.
+pub(in crate::pipeline) async fn hear_graph_mail(pipeline: &mut Pipeline, job_id: JobId) {
+    while pipeline
+        .graph_jobs
+        .get(&job_id)
+        .or_else(|| pipeline.retiring_graph_jobs.get(&job_id))
+        .is_some_and(|job| job.awaits_mail())
+    {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
+}
+
+// The checkpoint plan a download lane hands the decoder for `job_id`: the
+// block sizes its graph job's recovery declares.
+fn checkpoint_plan(pipeline: &Pipeline, job_id: JobId) -> weaver_yenc::CheckpointPlan {
+    pipeline
+        .graph_jobs
+        .get(&job_id)
+        .map_or(weaver_yenc::CheckpointPlan::None, |graph| {
+            weaver_yenc::CheckpointPlan::from_slice_sizes(graph.block_sizes()).plan
+        })
 }
 
 fn encode_article_part(
@@ -1012,6 +1118,115 @@ fn build_test_rar4_end_header(more_volumes: bool) -> Vec<u8> {
     build_test_rar4_block(0x7b, flags, &[])
 }
 
+// A single stored member split across an **old-numbering** RAR4 set —
+// `<base>.rar`, `<base>.r00`, `<base>.r01`, … — the one multi-volume RAR
+// shape whose headers state no per-volume number anywhere: RAR4's main header
+// has no number field (that is RAR5's), and these end records carry no
+// `VOLUME_NUMBER` flag (a numbered `ENDARC` is what modern `.partNN` writers
+// emit). Every volume of such a set parses as volume 0; only the filename
+// says which volume a file is.
+pub(in crate::pipeline::tests) fn single_member_rar4_old_numbering_set(
+    base: &str,
+    member_name: &str,
+    payload: &[u8],
+    volume_count: usize,
+) -> Vec<(String, Vec<u8>)> {
+    let member_crc = checksum::crc32(payload);
+    let chunk = payload.len().div_ceil(volume_count);
+    (0..volume_count)
+        .map(|volume| {
+            let start = (volume * chunk).min(payload.len());
+            let end = ((volume + 1) * chunk).min(payload.len());
+            let part = &payload[start..end];
+            let is_first = volume == 0;
+            let is_last = volume + 1 == volume_count;
+            let mut split_flags = 0u16;
+            if !is_first {
+                split_flags |= 0x0001;
+            }
+            if !is_last {
+                split_flags |= 0x0002;
+            }
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&TEST_RAR4_SIG);
+            // VOLUME only — no NEW_NUMBERING, exactly like the old scheme.
+            bytes.extend_from_slice(&build_test_rar4_block(0x73, 0x0001, &[0u8; 6]));
+            bytes.extend_from_slice(&build_test_rar4_file_header(
+                member_name,
+                split_flags,
+                part.len() as u32,
+                payload.len() as u32,
+                if is_last {
+                    member_crc
+                } else {
+                    checksum::crc32(part)
+                },
+            ));
+            bytes.extend_from_slice(part);
+            bytes.extend_from_slice(&build_test_rar4_end_header(!is_last));
+            let filename = if is_first {
+                format!("{base}.rar")
+            } else {
+                format!("{base}.r{:02}", volume - 1)
+            };
+            (filename, bytes)
+        })
+        .collect()
+}
+
+// Fill in the CRC16 of every RAR4 block in `bytes`. The shared fixture
+// builders leave it zero because weaver's own parser only warns on a
+// mismatch; the recovery restorer's validity probe does not, and a set
+// written to exercise it has to be one it would accept.
+pub(in crate::pipeline::tests) fn with_rar4_header_crcs(mut bytes: Vec<u8>) -> Vec<u8> {
+    let mut offset = TEST_RAR4_SIG.len();
+    while offset + 7 <= bytes.len() {
+        let flags = u16::from_le_bytes([bytes[offset + 3], bytes[offset + 4]]);
+        let header_size = u16::from_le_bytes([bytes[offset + 5], bytes[offset + 6]]) as usize;
+        let data_size = if flags & 0x8000 != 0 {
+            u32::from_le_bytes([
+                bytes[offset + 7],
+                bytes[offset + 8],
+                bytes[offset + 9],
+                bytes[offset + 10],
+            ]) as usize
+        } else {
+            0
+        };
+        let crc = (checksum::crc32(&bytes[offset + 2..offset + header_size]) & 0xFFFF) as u16;
+        bytes[offset..offset + 2].copy_from_slice(&crc.to_le_bytes());
+        offset += header_size + data_size;
+    }
+    bytes
+}
+
+// A RAR3 standalone recovery volume for `volumes`: the set's RS parity over
+// every data volume, padded to the longest, followed by the 7-byte footer
+// (`data-1`, `rec-1`, `position-1`, CRC32) a new-style `.rev` carries and the
+// restorer reads its geometry from.
+pub(in crate::pipeline::tests) fn single_recovery_volume_for_rar4_set(
+    volumes: &[&[u8]],
+) -> Vec<u8> {
+    let width = volumes.iter().map(|volume| volume.len()).max().unwrap_or(0);
+    let coder = reedsolomon_rs::rar3::Rar3RsCoder::new(1).expect("one recovery volume");
+    let mut rev = Vec::with_capacity(width + 7);
+    let mut column = vec![0u8; volumes.len()];
+    let mut parity = [0u8; 1];
+    for position in 0..width {
+        for (slot, volume) in column.iter_mut().zip(volumes) {
+            *slot = volume.get(position).copied().unwrap_or(0);
+        }
+        coder.encode(&column, &mut parity);
+        rev.push(parity[0]);
+    }
+    rev.push((volumes.len() - 1) as u8);
+    rev.push(0);
+    rev.push(0);
+    let crc = checksum::crc32(&rev);
+    rev.extend_from_slice(&crc.to_le_bytes());
+    rev
+}
+
 // A stored RAR4 file header. `unpack_version` 29 is what makes a split part's
 // CRC32 describe that part's packed bytes rather than nothing at all.
 fn build_test_rar4_file_header(
@@ -1106,91 +1321,6 @@ fn build_multifile_multivolume_rar_set() -> Vec<(String, Vec<u8>)> {
     ]
 }
 
-fn shortened_e01_rar_headers(files: &[(String, Vec<u8>)]) -> Vec<u8> {
-    let mut archive = unrar_rs::RarArchive::open(std::io::Cursor::new(files[0].1.clone())).unwrap();
-    for (volume, (_, bytes)) in files.iter().enumerate().skip(1) {
-        archive
-            .add_volume(volume, Box::new(std::io::Cursor::new(bytes.clone())))
-            .unwrap();
-    }
-    let mut cached = serde_json::to_value(archive.export_headers()).unwrap();
-    let e01 = cached["members"]
-        .as_array_mut()
-        .unwrap()
-        .iter_mut()
-        .find(|member| member["name"] == "E01.mkv")
-        .unwrap();
-    let first_segment = e01["segments"].as_array().unwrap()[0].clone();
-    e01["segments"] = serde_json::json!([first_segment]);
-    e01["split_after"] = serde_json::json!(false);
-    rmp_serde::to_vec(&serde_json::from_value::<unrar_rs::CachedArchiveHeaders>(cached).unwrap())
-        .unwrap()
-}
-
-fn dummy_rar_volume_facts(volume_number: u32) -> unrar_rs::RarVolumeFacts {
-    unrar_rs::RarVolumeFacts {
-        format: 5,
-        volume_number: Some(volume_number),
-        more_volumes: true,
-        is_solid: false,
-        is_encrypted: false,
-        is_volume: true,
-        has_recovery_record: false,
-        is_locked: false,
-        has_authenticity_verification: false,
-        has_locator: false,
-        quick_open_offset: None,
-        headers_from_quick_open: false,
-        recovery_record_offset: None,
-        original_name: None,
-        original_name_raw: None,
-        original_creation_time_ns: None,
-        members: Vec::new(),
-        services: Vec::new(),
-    }
-}
-
-fn dummy_named_rar_volume_facts(volume_number: u32, member_name: &str) -> unrar_rs::RarVolumeFacts {
-    unrar_rs::RarVolumeFacts {
-        members: vec![unrar_rs::RarVolumeMemberFacts {
-            order: 0,
-            name: member_name.to_string(),
-            name_raw: Some(member_name.as_bytes().to_vec()),
-            unpacked_size: Some(1024),
-            data_crc32: None,
-            data_blake2_hash: None,
-            version: None,
-            packed_crc32: None,
-            packed_blake2_hash: None,
-            packed_hash_uses_mac: false,
-            split_before: volume_number > 0,
-            split_after: true,
-            is_directory: false,
-            is_encrypted: false,
-            encryption: None,
-            rar4_salt: None,
-            host_os: Some(unrar_rs::RarVolumeHostOs::Unix),
-            attributes: Some(0o644),
-            owner: None,
-            mtime_ns: None,
-            ctime_ns: None,
-            atime_ns: None,
-            data_offset: 0,
-            data_size: 128,
-            compression_method: 0x30,
-            compression_version: 29,
-            compression_solid: false,
-            dict_size: 0,
-            use_hash_mac: false,
-            redirection_type: None,
-            redirection_target: None,
-            redirection_target_raw: None,
-            redirection_target_is_directory: false,
-        }],
-        ..dummy_rar_volume_facts(volume_number)
-    }
-}
-
 fn rar_job_spec(name: &str, files: &[(String, Vec<u8>)]) -> JobSpec {
     JobSpec {
         name: name.to_string(),
@@ -1216,7 +1346,19 @@ fn rar_job_spec(name: &str, files: &[(String, Vec<u8>)]) -> JobSpec {
     }
 }
 
-fn standalone_job_spec(name: &str, files: &[(String, u32)]) -> JobSpec {
+// Article `segment_number` of file `file_index` in job `job_id`.
+pub(in crate::pipeline) fn segment_id(
+    job_id: JobId,
+    file_index: u32,
+    segment_number: u32,
+) -> SegmentId {
+    SegmentId {
+        file_id: NzbFileId { job_id, file_index },
+        segment_number,
+    }
+}
+
+pub(in crate::pipeline) fn standalone_job_spec(name: &str, files: &[(String, u32)]) -> JobSpec {
     JobSpec {
         name: name.to_string(),
         password: None,
@@ -1298,124 +1440,6 @@ fn standalone_with_par2_job_spec(name: &str, payload_bytes: u32, recovery_bytes:
     }
 }
 
-fn minimal_par2_file_set() -> Par2FileSet {
-    Par2FileSet {
-        recovery_set_id: par2_rs::RecoverySetId::from_bytes([0; 16]),
-        slice_size: 1,
-        recovery_file_ids: Vec::new(),
-        non_recovery_file_ids: Vec::new(),
-        files: HashMap::new(),
-        slice_checksums: HashMap::new(),
-        recovery_slices: std::collections::BTreeMap::new(),
-        creator: None,
-    }
-}
-
-fn placement_par2_file_set(files: &[(String, Vec<u8>)]) -> Par2FileSet {
-    let slice_size = files
-        .iter()
-        .map(|(_, bytes)| bytes.len() as u64)
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    let mut recovery_file_ids = Vec::new();
-    let mut descriptions = HashMap::new();
-
-    for (index, (filename, bytes)) in files.iter().enumerate() {
-        let mut raw_id = [0u8; 16];
-        raw_id[12..].copy_from_slice(&((index as u32) + 1).to_be_bytes());
-        let file_id = par2_rs::FileId::from_bytes(raw_id);
-        let hash_full = par2_rs::checksum::md5(bytes);
-        let hash_16k = par2_rs::checksum::md5(&bytes[..bytes.len().min(16 * 1024)]);
-        recovery_file_ids.push(file_id);
-        descriptions.insert(
-            file_id,
-            par2_rs::FileDescription {
-                file_id,
-                hash_full,
-                hash_16k,
-                length: bytes.len() as u64,
-                par2_name: filename.clone(),
-                filename: filename.clone(),
-            },
-        );
-    }
-
-    Par2FileSet {
-        recovery_set_id: par2_rs::RecoverySetId::from_bytes([9; 16]),
-        slice_size,
-        recovery_file_ids,
-        non_recovery_file_ids: Vec::new(),
-        files: descriptions,
-        slice_checksums: HashMap::new(),
-        recovery_slices: std::collections::BTreeMap::new(),
-        creator: None,
-    }
-}
-
-fn install_test_par2_runtime(
-    pipeline: &mut Pipeline,
-    job_id: JobId,
-    par2_set: Par2FileSet,
-    files: &[(u32, &str, u32, bool)],
-) {
-    let set_id = par2_set.recovery_set_id;
-    let candidates = pipeline
-        .par2_metadata_candidate_indices(job_id)
-        .into_iter()
-        .map(|(file_index, is_index, _)| {
-            let filename = pipeline
-                .jobs
-                .get(&job_id)
-                .and_then(|state| state.spec.files.get(file_index as usize))
-                .map(|file| file.filename.clone())
-                .unwrap_or_default();
-            (file_index, is_index, filename)
-        })
-        .collect::<Vec<_>>();
-    let runtime = pipeline.ensure_par2_runtime(job_id);
-    runtime.served = Some(set_id);
-    runtime.ensure_set_runtime(set_id).set = Some(Arc::new(par2_set));
-    runtime.files.clear();
-    for (file_index, is_index, filename) in candidates {
-        let discovery = if is_index {
-            Par2DiscoveryState::Parsed {
-                set_ids: vec![set_id],
-            }
-        } else {
-            Par2DiscoveryState::PrefixProbed {
-                set_ids: vec![set_id],
-            }
-        };
-        runtime.files.insert(
-            file_index,
-            Par2FileRuntime {
-                filename,
-                discovery,
-                ..Default::default()
-            },
-        );
-    }
-    for (file_index, filename, recovery_blocks, promoted) in files {
-        let file = runtime.files.entry(*file_index).or_default();
-        file.filename = (*filename).to_string();
-        file.recovery_blocks = *recovery_blocks;
-        file.promoted = *promoted;
-        if matches!(file.discovery, Par2DiscoveryState::Unseen) {
-            file.discovery = Par2DiscoveryState::PrefixProbed {
-                set_ids: vec![set_id],
-            };
-        }
-    }
-    // Installing a set is this helper's stand-in for the packet arrivals that
-    // build one, and those evict any retained session before they touch the
-    // set. Without the same step here a test that swaps in a wider set keeps a
-    // session holding the narrower snapshot, and the next pass answers from it.
-    pipeline.evict_par2_repair_session(job_id, set_id);
-    pipeline.refresh_par2_checkpoint_plan(job_id);
-    pipeline.refresh_par2_md5_substitution_bindings(job_id);
-}
-
 fn build_test_par2_packet(
     packet_type: &[u8; 16],
     body: &[u8],
@@ -1440,47 +1464,6 @@ fn build_test_par2_packet(
 
 pub(super) fn build_test_par2_index(filename: &str, file_data: &[u8], slice_size: u64) -> Vec<u8> {
     build_test_par2_index_for_files(&[(filename, file_data)], slice_size)
-}
-
-// A `.volNN+CC.par2` byte stream carrying only the named recovery packets.
-//
-// The index builders above stop at descriptions and slice checksums, and
-// [`build_repairable_par2_set`] keeps its recovery slices in memory. Neither
-// produces a *volume file*, which is what a test needs when the question is
-// what weaver can read back off the disk — including from a volume that only
-// partly arrived.
-pub(super) fn build_test_par2_recovery_volume(
-    recovery_set_id: [u8; 16],
-    slices: &[(u32, &[u8])],
-) -> Vec<u8> {
-    let mut stream = Vec::new();
-    for (exponent, data) in slices {
-        let mut body = Vec::with_capacity(4 + data.len());
-        body.extend_from_slice(&exponent.to_le_bytes());
-        body.extend_from_slice(data);
-        stream.extend_from_slice(&build_test_par2_packet(
-            par2_rs::packet::header::TYPE_RECOVERY,
-            &body,
-            recovery_set_id,
-        ));
-    }
-    stream
-}
-
-// Zero the payload of the recovery packet at `packet_index` in a volume built
-// by [`build_test_par2_recovery_volume`], leaving its header intact.
-//
-// That is the on-disk shape of a volume whose interior article never arrived:
-// the scanner still finds the packet by its magic and header, and only the
-// packet's own MD5 can tell that the bytes behind it are a hole.
-pub(super) fn punch_recovery_packet_payload(
-    volume: &mut [u8],
-    packet_index: usize,
-    slice_size: usize,
-) {
-    let packet_len = par2_rs::packet::header::HEADER_SIZE + 4 + slice_size;
-    let payload_start = packet_index * packet_len + par2_rs::packet::header::HEADER_SIZE + 4;
-    volume[payload_start..payload_start + slice_size].fill(0);
 }
 
 pub(super) fn build_test_par2_index_for_files(files: &[(&str, &[u8])], slice_size: u64) -> Vec<u8> {
@@ -1570,301 +1553,6 @@ pub(super) fn build_test_par2_index_for_files(files: &[(&str, &[u8])], slice_siz
     stream
 }
 
-// A recovery set over several described files, with real recovery slices
-// computed over the set's whole input-slice sequence (files in recovery-set
-// order, each slice zero-padded to `slice_size`) — which is what makes a
-// multi-file repair actually repairable in a test.
-pub(super) fn build_repairable_par2_set_for_files(
-    files: &[(&str, &[u8])],
-    slice_size: u64,
-    recovery_block_count: usize,
-) -> Par2FileSet {
-    struct Described {
-        file_id: par2_rs::FileId,
-        description: par2_rs::FileDescription,
-        slice_checksums: Vec<par2_rs::SliceChecksum>,
-        slice_count: usize,
-    }
-
-    let described: Vec<Described> = files
-        .iter()
-        .map(|(filename, file_data)| {
-            let file_length = file_data.len() as u64;
-            let hash_full = checksum::md5(file_data);
-            let hash_16k = checksum::md5(&file_data[..file_data.len().min(16 * 1024)]);
-
-            let mut file_id_input = Vec::new();
-            file_id_input.extend_from_slice(&hash_16k);
-            file_id_input.extend_from_slice(&file_length.to_le_bytes());
-            file_id_input.extend_from_slice(filename.as_bytes());
-            let file_id = par2_rs::FileId::from_bytes(checksum::md5(&file_id_input));
-
-            let slice_count = if file_length == 0 {
-                0usize
-            } else {
-                file_length.div_ceil(slice_size) as usize
-            };
-            let slice_checksums = (0..slice_count)
-                .map(|slice_index| {
-                    let start = slice_index as u64 * slice_size;
-                    let end = ((start + slice_size) as usize).min(file_data.len());
-                    let slice_data = &file_data[start as usize..end];
-                    let mut checksum_state = par2_rs::SliceChecksumState::new();
-                    checksum_state.update(slice_data);
-                    let pad_to = ((slice_data.len() as u64) < slice_size).then_some(slice_size);
-                    let (crc32, md5) = checksum_state.finalize(pad_to);
-                    par2_rs::SliceChecksum { crc32, md5 }
-                })
-                .collect();
-
-            Described {
-                file_id,
-                description: par2_rs::FileDescription {
-                    file_id,
-                    hash_full,
-                    hash_16k,
-                    length: file_length,
-                    par2_name: (*filename).to_string(),
-                    filename: (*filename).to_string(),
-                },
-                slice_checksums,
-                slice_count,
-            }
-        })
-        .collect();
-
-    let mut main_body = Vec::new();
-    main_body.extend_from_slice(&slice_size.to_le_bytes());
-    main_body.extend_from_slice(&(described.len() as u32).to_le_bytes());
-    for file in &described {
-        main_body.extend_from_slice(file.file_id.as_bytes());
-    }
-
-    let mut par2_set = Par2FileSet {
-        recovery_set_id: par2_rs::RecoverySetId::from_bytes(checksum::md5(&main_body)),
-        slice_size,
-        recovery_file_ids: described.iter().map(|file| file.file_id).collect(),
-        non_recovery_file_ids: Vec::new(),
-        files: described
-            .iter()
-            .map(|file| (file.file_id, file.description.clone()))
-            .collect(),
-        slice_checksums: described
-            .iter()
-            .map(|file| (file.file_id, file.slice_checksums.clone()))
-            .collect(),
-        recovery_slices: std::collections::BTreeMap::new(),
-        creator: None,
-    };
-
-    let slice_size_bytes = slice_size as usize;
-    let word_count = (slice_size_bytes / 2).max(1);
-    let total_slices: usize = described.iter().map(|file| file.slice_count).sum();
-    let constants = par2_rs::input_slice_constants(total_slices);
-
-    // The set's input-slice sequence: every file's slices in recovery-set
-    // order, each padded out to a full slice.
-    let mut padded = Vec::with_capacity(total_slices * slice_size_bytes);
-    for ((_, file_data), file) in files.iter().zip(described.iter()) {
-        let mut file_padded = file_data.to_vec();
-        file_padded.resize(file.slice_count * slice_size_bytes, 0);
-        padded.extend_from_slice(&file_padded);
-    }
-
-    for exponent in 0..recovery_block_count {
-        let exponent = exponent as u32;
-        let mut recovery = vec![0u8; slice_size_bytes];
-
-        for (input_index, &constant) in constants.iter().enumerate() {
-            let factor = par2_rs::gf_pow(constant, exponent);
-            for word_index in 0..word_count {
-                let input_word = u16::from_le_bytes([
-                    padded[input_index * slice_size_bytes + word_index * 2],
-                    padded[input_index * slice_size_bytes + word_index * 2 + 1],
-                ]);
-                let contribution = par2_rs::gf_mul(input_word, factor);
-                let current =
-                    u16::from_le_bytes([recovery[word_index * 2], recovery[word_index * 2 + 1]]);
-                let updated = par2_rs::gf_add(current, contribution).to_le_bytes();
-                recovery[word_index * 2] = updated[0];
-                recovery[word_index * 2 + 1] = updated[1];
-            }
-        }
-
-        par2_set.recovery_slices.insert(
-            exponent,
-            par2_rs::RecoverySlice {
-                exponent,
-                data: bytes::Bytes::from(recovery).into(),
-            },
-        );
-    }
-
-    par2_set
-}
-
-// A recovery set whose recovery slices are placeholders rather than encoded
-// blocks.
-//
-// [`build_repairable_par2_set`] and its multi-file sibling encode real
-// recovery data, at one field multiply per (input slice, recovery block) pair.
-// That is nothing for the handful of slices those fixtures carry and
-// completely impractical for a set shaped to stress a decode matrix, where the
-// pair count runs into the hundreds of millions.
-//
-// A *verdict* never looks at recovery bytes: availability is the count of
-// recovery slices whose length matches the set's slice size, and repairability
-// compares that count against the damage. So a fixture that only ever asks
-// what the verdict is — and stops before anything plans or solves a repair —
-// is served exactly as well by placeholders, in milliseconds instead of hours.
-//
-// Never use this for a fixture that actually repairs: the bytes are zeros and
-// would reconstruct garbage.
-pub(super) fn build_par2_set_with_uncomputed_recovery(
-    filename: &str,
-    file_data: &[u8],
-    slice_size: u64,
-    recovery_block_count: usize,
-) -> Par2FileSet {
-    let mut par2_set = build_repairable_par2_set_for_files(&[(filename, file_data)], slice_size, 0);
-    for exponent in 0..recovery_block_count as u32 {
-        par2_set.recovery_slices.insert(
-            exponent,
-            par2_rs::RecoverySlice {
-                exponent,
-                data: bytes::Bytes::from(vec![0u8; slice_size as usize]).into(),
-            },
-        );
-    }
-    par2_set
-}
-
-fn build_repairable_par2_set(
-    filename: &str,
-    file_data: &[u8],
-    slice_size: u64,
-    recovery_block_count: usize,
-) -> Par2FileSet {
-    let file_length = file_data.len() as u64;
-    let hash_full = checksum::md5(file_data);
-    let hash_16k = checksum::md5(&file_data[..file_data.len().min(16 * 1024)]);
-
-    let mut file_id_input = Vec::new();
-    file_id_input.extend_from_slice(&hash_16k);
-    file_id_input.extend_from_slice(&file_length.to_le_bytes());
-    file_id_input.extend_from_slice(filename.as_bytes());
-    let file_id = par2_rs::FileId::from_bytes(checksum::md5(&file_id_input));
-
-    let mut slice_checksums = Vec::new();
-    let slice_count = if file_length == 0 {
-        0usize
-    } else {
-        file_length.div_ceil(slice_size) as usize
-    };
-    for slice_index in 0..slice_count {
-        let start = slice_index as u64 * slice_size;
-        let end = ((start + slice_size) as usize).min(file_data.len());
-        let slice_data = &file_data[start as usize..end];
-        let mut checksum_state = par2_rs::SliceChecksumState::new();
-        checksum_state.update(slice_data);
-        let pad_to = ((slice_data.len() as u64) < slice_size).then_some(slice_size);
-        let (crc32, md5) = checksum_state.finalize(pad_to);
-        slice_checksums.push(par2_rs::SliceChecksum { crc32, md5 });
-    }
-
-    let mut main_body = Vec::new();
-    main_body.extend_from_slice(&slice_size.to_le_bytes());
-    main_body.extend_from_slice(&1u32.to_le_bytes());
-    main_body.extend_from_slice(file_id.as_bytes());
-
-    let mut par2_set = Par2FileSet {
-        recovery_set_id: par2_rs::RecoverySetId::from_bytes(checksum::md5(&main_body)),
-        slice_size,
-        recovery_file_ids: vec![file_id],
-        non_recovery_file_ids: Vec::new(),
-        files: HashMap::from([(
-            file_id,
-            par2_rs::FileDescription {
-                file_id,
-                hash_full,
-                hash_16k,
-                length: file_length,
-                par2_name: filename.to_string(),
-                filename: filename.to_string(),
-            },
-        )]),
-        slice_checksums: HashMap::from([(file_id, slice_checksums)]),
-        recovery_slices: std::collections::BTreeMap::new(),
-        creator: None,
-    };
-
-    let slice_size_bytes = slice_size as usize;
-    let word_count = (slice_size_bytes / 2).max(1);
-    let constants = par2_rs::input_slice_constants(slice_count);
-    let mut padded = file_data.to_vec();
-    padded.resize(slice_count * slice_size_bytes, 0);
-
-    for exponent in 0..recovery_block_count {
-        let exponent = exponent as u32;
-        let mut recovery = vec![0u8; slice_size_bytes];
-
-        for (input_index, &constant) in constants.iter().enumerate() {
-            let factor = par2_rs::gf_pow(constant, exponent);
-            for word_index in 0..word_count {
-                let input_word = u16::from_le_bytes([
-                    padded[input_index * slice_size_bytes + word_index * 2],
-                    padded[input_index * slice_size_bytes + word_index * 2 + 1],
-                ]);
-                let contribution = par2_rs::gf_mul(input_word, factor);
-                let current =
-                    u16::from_le_bytes([recovery[word_index * 2], recovery[word_index * 2 + 1]]);
-                let updated = par2_rs::gf_add(current, contribution).to_le_bytes();
-                recovery[word_index * 2] = updated[0];
-                recovery[word_index * 2 + 1] = updated[1];
-            }
-        }
-
-        par2_set.recovery_slices.insert(
-            exponent,
-            par2_rs::RecoverySlice {
-                exponent,
-                data: bytes::Bytes::from(recovery).into(),
-            },
-        );
-    }
-
-    par2_set
-}
-
-fn par2_only_job_spec(name: &str, filename: &str, bytes: u32) -> JobSpec {
-    JobSpec {
-        name: name.to_string(),
-        password: None,
-        total_bytes: bytes as u64,
-        category: None,
-        metadata: vec![],
-        files: vec![FileSpec {
-            filename: filename.to_string(),
-            role: FileRole::from_filename(filename),
-            groups: vec!["alt.binaries.test".to_string()],
-            posted_at_epoch: None,
-            segments: vec![segment_spec! {
-                number: 0,
-                bytes: bytes,
-                message_id: "par2-0@example.com".to_string(),
-            }],
-        }],
-    }
-}
-
-fn build_empty_rar_volume() -> Vec<u8> {
-    let mut volume = Vec::new();
-    volume.extend_from_slice(&TEST_RAR5_SIG);
-    volume.extend_from_slice(&build_test_rar_main_header(0, None));
-    volume.extend_from_slice(&build_test_rar_end_header(false));
-    volume
-}
-
 fn segmented_job_spec(name: &str, filename: &str, segment_sizes: &[u32]) -> JobSpec {
     JobSpec {
         name: name.to_string(),
@@ -1921,7 +1609,7 @@ async fn cancel_one_job(
     }
 }
 
-// Hands the actor the archive outcome of the one cancel batch in flight.
+// Hand the actor the archive outcome, then hear its cancelled workers out.
 async fn finish_cancel_jobs(pipeline: &mut Pipeline) {
     match pipeline
         .terminal_post_processing_done_rx
@@ -1932,10 +1620,24 @@ async fn finish_cancel_jobs(pipeline: &mut Pipeline) {
         TerminalPostProcessingEvent::CancelJobsDone(done) => pipeline.handle_cancel_jobs_done(done),
         _ => panic!("expected the cancel's archive done event"),
     }
+    while pipeline.pending_graph_terminals.values().any(|terminal| {
+        matches!(
+            terminal,
+            super::health::PendingGraphTerminal::Cancelled { .. }
+        )
+    }) {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
 }
 
-async fn insert_active_job(pipeline: &mut Pipeline, job_id: JobId, spec: JobSpec) -> PathBuf {
-    insert_active_job_with_persisted_nzb(pipeline, job_id, spec, sample_nzb_zstd()).await
+pub(in crate::pipeline) async fn insert_active_job(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    spec: JobSpec,
+) -> PathBuf {
+    let nzb_zstd = nzb_zstd_for(&spec);
+    insert_active_job_with_persisted_nzb(pipeline, job_id, spec, nzb_zstd).await
 }
 
 async fn insert_active_job_with_persisted_nzb(
@@ -2002,12 +1704,10 @@ async fn insert_active_job_with_persisted_nzb_named(
             supplied_password_candidates: Vec::new(),
         })
         .unwrap();
-    let (assembly, download_queue, recovery_queue) =
-        Pipeline::build_job_assembly(job_id, &spec, &HashSet::new());
-    // Mirror admission: `add_job` registers a job's bare `.7z` files as
-    // direct-unpack arming candidates, and this harness hand-builds the state
-    // `add_job` would otherwise have produced.
-    pipeline.register_direct_unpack_singles(job_id, &spec);
+    // This fixture represents work already admitted, not queued intake.
+    pipeline.db.set_nzb_admitted(job_id, true).unwrap();
+    pipeline.nzb_admitted.insert(job_id);
+    pipeline.nzb_seen.insert(job_id);
     let par2_bytes = spec.par2_bytes();
     pipeline.jobs.insert(
         job_id,
@@ -2019,8 +1719,7 @@ async fn insert_active_job_with_persisted_nzb_named(
             download_state: crate::jobs::model::DownloadState::Downloading,
             post_state: crate::jobs::model::PostState::Idle,
             run_state: crate::jobs::model::RunState::Active,
-            assembly,
-            extraction_depth: 0,
+            articles: crate::jobs::model::JobArticles::Queued(Default::default()),
             created_at: std::time::Instant::now(),
             created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
             queued_repair_at_epoch_ms: None,
@@ -2035,100 +1734,77 @@ async fn insert_active_job_with_persisted_nzb_named(
             downloaded_wire_bytes: 0,
             server_attribution: Default::default(),
             failed_bytes: 0,
-            probe_projected_failed_bytes: 0,
             par2_bytes,
-            health_probing: false,
-            health_deferral: Default::default(),
-            health_probe_round: 0,
-            announced_checkpoints: Default::default(),
-            health_probe_failing_files: 0,
-            health_failing_files: std::collections::HashSet::new(),
-            early_recovery_requested_blocks: 0,
-            last_health_probe_failed_bytes: 0,
-            next_health_probe_failed_bytes: 1,
             support_facts: Default::default(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
-            held_segments: Vec::new(),
-            download_queue,
-            recovery_queue,
             staging_dir: None,
             category_bytes: None,
             nzb_password_candidates: Default::default(),
         },
     );
+    // The fixture's articles are built as a job's first handout builds them.
+    pipeline.activate_job_articles(job_id, &HashSet::new(), None, None, Vec::new());
     pipeline.job_order.push(job_id);
     pipeline.report_all_for_test();
     working_dir
 }
 
-fn rar5_fixture_bytes(name: &str) -> Vec<u8> {
+// A job of one plain file, `filename`, whose one article carries all of
+// `payload`, inserted and then delivered as a lane delivers it: the article
+// comes back from the server, is decoded, and the graph hears it. The file is
+// whole when this returns, so the job has something usable to complete with.
+pub(in crate::pipeline) async fn insert_delivered_job(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    name: &str,
+    filename: &str,
+    payload: &[u8],
+) -> PathBuf {
+    let spec = standalone_job_spec(name, &[(filename.to_string(), payload.len() as u32)]);
+    let working_dir = insert_active_job(pipeline, job_id, spec).await;
+    let work = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
+    let segment_id = work.segment_id;
+    let raw = encode_article_part(filename, payload, 1, 1, 1, payload.len() as u64);
+    // Lane 0 holds the article, as a dispatched lease would book it.
+    pipeline.hold_test_lane_works(vec![work], false);
+    pipeline
+        .handle_download_done(DownloadResult {
+            lane_id: 0,
+            job_id,
+            runtime_generation: 0,
+            segment_id,
+            data: Ok(DownloadPayload::Raw(raw)),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: 0,
+            exclude_servers: Vec::new(),
+            release_connection_slot: true,
+        })
+        .await;
+    drain_decode_results(pipeline, 1).await;
+    hear_graph_mail(pipeline, job_id).await;
+    working_dir
+}
+
+pub(in crate::pipeline) fn rar5_fixture_bytes(name: &str) -> Vec<u8> {
     std::fs::read(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/rar5")
             .join(name),
     )
     .unwrap()
-}
-
-fn rar_original_fixture_bytes(name: &str) -> Vec<u8> {
-    std::fs::read(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/originals")
-            .join(name),
-    )
-    .unwrap()
-}
-
-fn sevenz_fixture_bytes(prefix: &str) -> Vec<(String, Vec<u8>)> {
-    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sevenz");
-    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&fixture_dir)
-        .unwrap()
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let path = entry.path();
-            let filename = path.file_name()?.to_str()?.to_string();
-            (filename.starts_with(prefix)).then(|| (filename, std::fs::read(path).unwrap()))
-        })
-        .collect();
-    files.sort_by(|left, right| left.0.cmp(&right.0));
-    files
-}
-
-async fn drive_extractions_to_terminal(pipeline: &mut Pipeline, job_id: JobId, max_rounds: usize) {
-    for _ in 0..max_rounds {
-        pump_pipeline_runtime_queues(pipeline).await;
-        if matches!(
-            job_status_for_assert(pipeline, job_id),
-            Some(JobStatus::Complete) | Some(JobStatus::Failed { .. })
-        ) {
-            return;
-        }
-
-        if matches!(
-            job_status_for_assert(pipeline, job_id),
-            Some(JobStatus::Moving)
-        ) {
-            let done = pipeline
-                .move_done_rx
-                .recv()
-                .await
-                .expect("move channel should stay open");
-            pipeline.handle_move_to_complete_done(done).await;
-            pump_pipeline_runtime_queues(pipeline).await;
-            continue;
-        }
-
-        let done = pipeline
-            .extract_done_rx
-            .recv()
-            .await
-            .expect("extraction channel should stay open");
-        pipeline.handle_extraction_done(done).await;
-        pump_pipeline_runtime_queues(pipeline).await;
-    }
-
-    panic!("job {job_id} did not reach a terminal state after {max_rounds} extraction rounds");
 }
 
 async fn settle_inflight_moves(pipeline: &mut Pipeline) {
@@ -2158,147 +1834,13 @@ async fn settle_inflight_moves(pipeline: &mut Pipeline) {
     }
 }
 
-async fn drain_rar_refreshes(pipeline: &mut Pipeline) {
-    for _ in 0..32 {
-        while let Ok(done) = pipeline.rar_refresh_done_rx.try_recv() {
-            pipeline.handle_rar_refresh_done(done).await;
-        }
-        if pipeline
-            .rar_refresh_state
-            .values()
-            .all(|state| state.in_flight.is_none() && state.queued.is_none())
-        {
-            return;
-        }
-        let done = pipeline
-            .rar_refresh_done_rx
-            .recv()
-            .await
-            .expect("RAR refresh channel should stay open");
-        pipeline.handle_rar_refresh_done(done).await;
-    }
-    panic!("RAR refresh queue did not drain");
-}
-
 fn set_job_status_for_test(pipeline: &mut Pipeline, job_id: JobId, status: JobStatus) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     state.status = status;
     state.refresh_runtime_lanes_from_status();
 }
 
-fn pause_job_for_rar_fixture_setup(pipeline: &mut Pipeline, job_id: JobId) {
-    // UnRAR owns the active volume chain inside ExtractCurrentFile/MergeArchive.
-    // Tests that swap, delete, or surgically rewrite RAR state must not leave
-    // eager extraction workers holding those readers while they mutate fixtures.
-    set_job_status_for_test(pipeline, job_id, JobStatus::Paused);
-}
-
-fn resume_job_downloading_for_test(pipeline: &mut Pipeline, job_id: JobId) {
-    set_job_status_for_test(pipeline, job_id, JobStatus::Downloading);
-}
-
-async fn write_and_complete_rar_volume(
-    pipeline: &mut Pipeline,
-    job_id: JobId,
-    file_index: u32,
-    filename: &str,
-    bytes: &[u8],
-) {
-    write_and_complete_rar_volume_without_drain(pipeline, job_id, file_index, filename, bytes)
-        .await;
-    drain_rar_refreshes(pipeline).await;
-}
-
-async fn write_and_complete_rar_volume_without_drain(
-    pipeline: &mut Pipeline,
-    job_id: JobId,
-    file_index: u32,
-    filename: &str,
-    bytes: &[u8],
-) {
-    let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
-    tokio::fs::write(working_dir.join(filename), bytes)
-        .await
-        .unwrap();
-
-    let file_id = NzbFileId { job_id, file_index };
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state
-            .assembly
-            .file_mut(file_id)
-            .unwrap()
-            .commit_segment(0, bytes.len() as u32)
-            .unwrap();
-    }
-
-    pipeline
-        .refresh_archive_state_for_completed_file(job_id, file_id, true)
-        .await;
-}
-
-async fn write_and_complete_file(
-    pipeline: &mut Pipeline,
-    job_id: JobId,
-    file_index: u32,
-    filename: &str,
-    bytes: &[u8],
-) {
-    let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
-    tokio::fs::write(working_dir.join(filename), bytes)
-        .await
-        .unwrap();
-
-    let file_id = NzbFileId { job_id, file_index };
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        let file = state.assembly.file_mut(file_id).unwrap();
-        // Mirror the decode worker: every accepted arrival records its
-        // placement before the commit, which is what the contiguity proof
-        // reads.
-        file.record_placement(0, 0, bytes.len() as u32);
-        file.commit_segment(0, bytes.len() as u32).unwrap();
-    }
-
-    pipeline
-        .refresh_archive_state_for_completed_file(job_id, file_id, true)
-        .await;
-}
-
-fn two_segment_standalone_job_spec(
-    name: &str,
-    filename: &str,
-    first_bytes: u32,
-    second_bytes: u32,
-) -> JobSpec {
-    JobSpec {
-        name: name.to_string(),
-        password: None,
-        total_bytes: (first_bytes + second_bytes) as u64,
-        category: None,
-        metadata: vec![],
-        files: vec![FileSpec {
-            filename: filename.to_string(),
-            role: FileRole::Standalone,
-            groups: vec!["alt.binaries.test".to_string()],
-            posted_at_epoch: None,
-            segments: vec![
-                segment_spec! {
-                    number: 0,
-                    bytes: first_bytes,
-                    message_id: "segment-0@example.com".to_string(),
-                },
-                segment_spec! {
-                    number: 1,
-                    bytes: second_bytes,
-                    message_id: "segment-1@example.com".to_string(),
-                },
-            ],
-        }],
-    }
-}
-
-async fn submit_decoded_segment(
+pub(in crate::pipeline) async fn submit_decoded_segment(
     pipeline: &mut Pipeline,
     file_id: NzbFileId,
     segment_number: u32,
@@ -2367,7 +1909,7 @@ async fn submit_decoded_segment_with_segments(
     let declared_file_len = pipeline
         .jobs
         .get(&file_id.job_id)
-        .and_then(|state| state.assembly.file(file_id))
+        .and_then(|state| state.articles.assembly()?.file(file_id))
         .expect("active test file assembly")
         .total_bytes();
     submit_decoded_segment_declaring(
@@ -2409,7 +1951,7 @@ async fn submit_decoded_segment_declaring(
     let file = pipeline
         .jobs
         .get(&file_id.job_id)
-        .and_then(|state| state.assembly.file(file_id))
+        .and_then(|state| state.articles.assembly()?.file(file_id))
         .expect("active test file assembly");
     let yenc_layout = YencLayoutAssertions {
         file_size: declared_file_len,
@@ -2442,7 +1984,7 @@ async fn submit_decoded_segment_declaring(
                 expected_file_crc,
                 data: DecodedChunk::from(data.to_vec()),
                 yenc_name: filename.to_string(),
-                checkpoint_plan: pipeline.par2_checkpoint_plan(file_id.job_id),
+                checkpoint_plan: checkpoint_plan(pipeline, file_id.job_id),
                 segments,
             },
             SegmentSource {
@@ -2451,304 +1993,17 @@ async fn submit_decoded_segment_declaring(
             },
         )
         .await;
-    // A decode can demote a direct set, and a demotion hands its reconstruction
-    // sweep to a detached worker instead of running it inline. In the running
-    // server the select loop picks the ticket up; here nothing does, so the
-    // volumes would never become files and every assertion after the demoting
-    // article would be reading a half-finished handback.
-    //
-    // Likewise the verification a set's last article triggers: its read-back
-    // is a detached ticket, and the verdict every assertion after that article
-    // used to find already reached lands on the check the ticket re-arms —
-    // settled first, because that verdict can be the demotion the sweep below
-    // then hands back.
-    settle_direct_verification_read(pipeline, file_id.job_id).await;
-    settle_direct_demotion_work(pipeline).await;
 }
 
-// [`submit_decoded_segment`] delivered the way the orchestrator delivers a
-// **queued** decode: through [`Pipeline::handle_decode_done`], the seam that
-// owns the decode-stage bookkeeping.
-//
-// The other submit helpers enter at `handle_decode_success`, which is the
-// *streamed* shape — decoded on the download lane, before its download result
-// is finished with. An article that went to the decode queue instead settles
-// here, a turn of the select loop after the download result that queued it,
-// and that ordering is what decides whether a health probe is still waited on
-// or retired.
-async fn settle_queued_decode(
-    pipeline: &mut Pipeline,
-    file_id: NzbFileId,
-    segment_number: u32,
-    file_offset: u64,
-    data: &[u8],
-    filename: &str,
-) {
-    let (file_size, total_segments) = {
-        let file = pipeline
-            .jobs
-            .get(&file_id.job_id)
-            .and_then(|state| state.assembly.file(file_id))
-            .expect("active test file assembly");
-        (file.total_bytes(), file.total_segments())
-    };
-    let checkpoint_plan = pipeline.par2_checkpoint_plan(file_id.job_id);
-    let yenc_layout = YencLayoutAssertions {
-        file_size,
-        part: Some(segment_number + 1),
-        total: Some(total_segments),
-        begin: Some(file_offset + 1),
-        end: Some(file_offset + data.len() as u64),
-    };
-    pipeline
-        .handle_decode_done(DecodeDone::Success {
-            result: DecodeResult {
-                encoding: SegmentEncoding::Yenc,
-                segment_id: SegmentId {
-                    file_id,
-                    segment_number,
-                },
-                raw_size: data.len() as u64,
-                yenc_layout,
-                crc_valid: true,
-                part_crc_verified: true,
-                part_crc: par2_rs::checksum::crc32(data),
-                truncation_suspected: false,
-                expected_file_crc: None,
-                data: DecodedChunk::from(data.to_vec()),
-                yenc_name: filename.to_string(),
-                checkpoint_plan,
-                segments: vec![weaver_yenc::Segment {
-                    file_offset,
-                    len: data.len() as u64,
-                    crc32: par2_rs::checksum::crc32(data),
-                }],
-            },
-            source: SegmentSource {
-                source_server_idx: None,
-                exclude_servers: Vec::new(),
-            },
-        })
-        .await;
-    settle_direct_demotion_work(pipeline).await;
-}
-
-// Put a job in the state the download-result path leaves behind when it has
-// just processed the *last* article of a job whose decode is still queued:
-// the pass is open, the queues are empty, and one decode is outstanding.
-fn park_job_on_its_final_decode(pipeline: &mut Pipeline, segment_id: SegmentId, raw_size: u64) {
-    let job_id = segment_id.file_id.job_id;
-    pipeline.active_download_passes.insert(job_id);
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
-    }
-    pipeline.metrics.note_decode_task_started(raw_size);
-    pipeline.note_decode_started(segment_id, raw_size);
-}
-
-// Drives every routed article's placement to its commit, the way the
-// orchestrator's select loop would: the destination writes run on a task of
-// their own, and the commit waits for the done message.
-//
-// It waits on the messages themselves, with no deadline.
-async fn settle_direct_placement_work(pipeline: &mut Pipeline) {
-    while !pipeline.direct_placement_lanes.is_empty() {
-        let done = pipeline
-            .direct_placement_done_rx
-            .recv()
-            .await
-            .expect("the direct placement channel should stay open");
-        pipeline.handle_direct_placement_done(done).await;
-    }
-}
-
-// Drives every outstanding demotion reconstruction ticket to its handler, the
-// way the orchestrator's select loop would.
-//
-// It waits on the completion itself, with no deadline: how long a sweep takes
-// depends on the machine, so a hang is the test runner's to catch.
-async fn settle_direct_demotion_work(pipeline: &mut Pipeline) {
-    // A placement whose write failed is what demotes the set.
-    settle_direct_placement_work(pipeline).await;
-    while !pipeline.direct_demotion_in_flight.is_empty() {
-        let done = pipeline
-            .direct_demotion_done_rx
-            .recv()
-            .await
-            .expect("the demotion completion channel should stay open");
-        pipeline.handle_direct_demotion_done(done).await;
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn submit_decoded_segment_from_server(
-    pipeline: &mut Pipeline,
-    file_id: NzbFileId,
-    segment_number: u32,
-    file_offset: u64,
-    data: &[u8],
-    filename: &str,
-    expected_file_crc: Option<u32>,
-    part_crc_verified: bool,
-    source_server_idx: Option<usize>,
-    exclude_servers: Vec<usize>,
-) {
-    let file = pipeline
-        .jobs
-        .get(&file_id.job_id)
-        .and_then(|state| state.assembly.file(file_id))
-        .expect("active test file assembly");
-    let yenc_layout = YencLayoutAssertions {
-        file_size: file.total_bytes(),
-        part: Some(segment_number + 1),
-        total: Some(file.total_segments()),
-        begin: Some(file_offset + 1),
-        end: Some(file_offset + data.len() as u64),
-    };
-    pipeline
-        .handle_decode_success(
-            DecodeResult {
-                encoding: SegmentEncoding::Yenc,
-                segment_id: SegmentId {
-                    file_id,
-                    segment_number,
-                },
-                raw_size: data.len() as u64,
-                yenc_layout,
-                crc_valid: true,
-                part_crc_verified,
-                part_crc: par2_rs::checksum::crc32(data),
-                truncation_suspected: false,
-                expected_file_crc,
-                data: DecodedChunk::from(data.to_vec()),
-                yenc_name: filename.to_string(),
-                checkpoint_plan: pipeline.par2_checkpoint_plan(file_id.job_id),
-                // What a decoder with no PAR2 block size declared emits: one
-                // segment covering the whole article, based where `=ypart`
-                // places it.
-                segments: vec![weaver_yenc::Segment {
-                    file_offset: yenc_layout.begin.map_or(0, |begin| begin.saturating_sub(1)),
-                    len: data.len() as u64,
-                    crc32: par2_rs::checksum::crc32(data),
-                }],
-            },
-            SegmentSource {
-                source_server_idx,
-                exclude_servers,
-            },
-        )
-        .await;
-    settle_direct_placement_work(pipeline).await;
-}
-
-async fn persist_completed_file_hash(
+pub(in crate::pipeline) fn job_status_for_assert(
     pipeline: &Pipeline,
     job_id: JobId,
-    file_index: u32,
-    filename: &str,
-    bytes: &[u8],
-) {
-    let filename = filename.to_string();
-    let hash = par2_rs::checksum::md5(bytes);
-    pipeline
-        .db_blocking(move |db| db.complete_file(job_id, file_index, &filename, &hash))
-        .await
-        .unwrap();
-}
-
-async fn write_and_complete_file_like_decode_worker(
-    pipeline: &mut Pipeline,
-    job_id: JobId,
-    file_index: u32,
-    filename: &str,
-    bytes: &[u8],
-) {
-    write_and_complete_file(pipeline, job_id, file_index, filename, bytes).await;
-    pipeline.retry_par2_authoritative_identity(job_id).await;
-    pipeline.try_rar_extraction(job_id).await;
-    pipeline.check_job_completion(job_id).await;
-    pump_pipeline_runtime_queues(pipeline).await;
-}
-
-fn member_span(
-    pipeline: &Pipeline,
-    job_id: JobId,
-    set_name: &str,
-    member_name: &str,
-) -> Option<(u32, u32)> {
-    pipeline
-        .jobs
-        .get(&job_id)
-        .and_then(|state| state.assembly.archive_topology_for(set_name))
-        .and_then(|topology| {
-            topology
-                .members
-                .iter()
-                .find(|member| member.name == member_name)
-                .map(|member| (member.first_volume, member.last_volume))
-        })
-}
-
-fn unresolved_spans(pipeline: &Pipeline, job_id: JobId, set_name: &str) -> Vec<(u32, u32)> {
-    let mut spans: Vec<(u32, u32)> = pipeline
-        .jobs
-        .get(&job_id)
-        .and_then(|state| state.assembly.archive_topology_for(set_name))
-        .map(|topology| {
-            topology
-                .unresolved_spans
-                .iter()
-                .map(|span| (span.first_volume, span.last_volume))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    spans.sort_unstable();
-    spans
-}
-
-fn job_status_for_assert(pipeline: &Pipeline, job_id: JobId) -> Option<JobStatus> {
+) -> Option<JobStatus> {
     pipeline
         .jobs
         .get(&job_id)
         .map(|state| state.status.clone())
         .or_else(|| pipeline.shared_state.get_job(job_id).map(|job| job.status))
-}
-
-fn drain_job_verification_started(
-    events: &mut tokio::sync::broadcast::Receiver<PipelineEvent>,
-    job_id: JobId,
-) -> usize {
-    let mut count = 0;
-    loop {
-        match events.try_recv() {
-            Ok(PipelineEvent::JobVerificationStarted {
-                job_id: event_job_id,
-            }) if event_job_id == job_id => {
-                count += 1;
-            }
-            Ok(_) => {}
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
-            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
-            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
-        }
-    }
-    count
-}
-
-fn drain_job_repair_complete(
-    events: &mut tokio::sync::broadcast::Receiver<PipelineEvent>,
-    job_id: JobId,
-) -> usize {
-    let mut count = 0usize;
-    while let Ok(event) = events.try_recv() {
-        if matches!(event, PipelineEvent::RepairComplete { job_id: event_job_id, .. } if event_job_id == job_id)
-        {
-            count += 1;
-        }
-    }
-    count
 }
 
 fn drain_job_events(
@@ -2764,381 +2019,35 @@ fn drain_job_events(
     drained
 }
 
-fn debug_job_state(pipeline: &Pipeline, job_id: JobId) -> String {
-    let mut lines = Vec::new();
-    lines.push(format!(
-        "status={:?}",
-        job_status_for_assert(pipeline, job_id)
-    ));
-    lines.push(format!(
-        "pending_completion_checks={:?}",
-        pipeline
-            .pending_completion_checks
-            .iter()
-            .copied()
-            .collect::<Vec<_>>()
-    ));
-    lines.push(format!(
-        "inflight_extractions={:?}",
-        pipeline
-            .inflight_extractions
-            .get(&job_id)
-            .cloned()
-            .unwrap_or_default()
-    ));
-    lines.push(format!(
-        "extracted_archives={:?}",
-        pipeline
-            .extracted_archives
-            .get(&job_id)
-            .cloned()
-            .unwrap_or_default()
-    ));
-    lines.push(format!(
-        "failed_extractions={:?}",
-        pipeline
-            .failed_extractions
-            .get(&job_id)
-            .cloned()
-            .unwrap_or_default()
-    ));
-
-    if let Some(state) = pipeline.jobs.get(&job_id) {
-        let topologies: Vec<String> = state
-            .assembly
-            .archive_topologies()
-            .iter()
-            .map(|(set_name, topology)| {
-                format!(
-                    "{}:{:?}:complete={:?}:expected={:?}:members={}:unresolved={:?}",
-                    set_name,
-                    topology.archive_type,
-                    topology.complete_volumes,
-                    topology.expected_volume_count,
-                    topology.members.len(),
-                    topology.unresolved_spans
-                )
-            })
-            .collect();
-        lines.push(format!("topologies={topologies:?}"));
-    }
-
-    let rar_sets: Vec<String> = pipeline
-        .rar_sets
-        .iter()
-        .filter(|((jid, _), _)| *jid == job_id)
-        .map(|((_, set_name), state)| {
-            let plan = state.plan.as_ref().map(|plan| {
-                format!(
-                    "phase={:?},ready={:?},waiting={:?},members={:?},solid={}",
-                    plan.phase,
-                    plan.ready_members
-                        .iter()
-                        .map(|member| member.name.clone())
-                        .collect::<Vec<_>>(),
-                    plan.waiting_on_volumes,
-                    plan.member_names,
-                    plan.is_solid
-                )
-            });
-            format!(
-                "{}:active_workers={}:in_flight={:?}:facts={:?}:volume_files={:?}:plan={:?}",
-                set_name,
-                state.active_workers,
-                state.in_flight_members,
-                state.facts.keys().copied().collect::<Vec<_>>(),
-                state.volume_files,
-                plan
-            )
-        })
-        .collect();
-    lines.push(format!("rar_sets={rar_sets:?}"));
-
-    lines.join("\n")
-}
-
-// Drives every detached pipeline ticket — direct-store post-repair
-// read-backs, tolerated extractions, demotion reconstruction sweeps and PAR2
-// damaged-path analyses — to its handler, the way the orchestrator's select
-// loop would, until none is in flight.
-//
-// They are settled in one loop because they chain: an analysis verdict
-// re-enters the completion check, which can decide on a repair whose
-// read-back is a direct-store ticket of its own.
-async fn settle_direct_post_repair_work(pipeline: &mut Pipeline) {
-    enum Ticket {
-        PostRepair(crate::pipeline::DirectPostRepairWorkDone),
-        Tolerated(crate::pipeline::DirectToleratedWorkDone),
-        Demotion(crate::pipeline::DirectDemotionWorkDone),
-        Repair(crate::pipeline::RepairWorkDone),
-        Rearm(crate::pipeline::DirectRearmDone),
-        Barrier(crate::pipeline::DirectBarrierDone),
-    }
-    // PAR3 jobs whose idle coordinator has already been offered a completion
-    // check by this call.
-    let mut republished = HashSet::new();
-    loop {
-        pipeline.pump_decode_queue();
-        while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
-            pipeline.check_job_completion(queued_job).await;
-            pipeline.pump_decode_queue();
-        }
-        let mut handled_a_ticket = false;
-        while let Ok(done) = pipeline.direct_post_repair_done_rx.try_recv() {
-            pipeline.handle_direct_post_repair_done(done);
-            handled_a_ticket = true;
-        }
-        while let Ok(done) = pipeline.direct_tolerated_done_rx.try_recv() {
-            pipeline.handle_direct_tolerated_done(done).await;
-            handled_a_ticket = true;
-        }
-        while let Ok(done) = pipeline.direct_demotion_done_rx.try_recv() {
-            pipeline.handle_direct_demotion_done(done).await;
-            handled_a_ticket = true;
-        }
-        while let Ok(done) = pipeline.repair_work_done_rx.try_recv() {
-            pipeline.handle_repair_work_done(done).await;
-            handled_a_ticket = true;
-        }
-        while let Ok(done) = pipeline.direct_rearm_done_rx.try_recv() {
-            pipeline.handle_direct_rearm_done(done).await;
-            handled_a_ticket = true;
-        }
-        while let Ok(done) = pipeline.direct_barrier_done_rx.try_recv() {
-            pipeline.handle_direct_barrier_done(done).await;
-            handled_a_ticket = true;
-        }
-        if !pipeline.direct_placement_lanes.is_empty() {
-            settle_direct_placement_work(pipeline).await;
-            handled_a_ticket = true;
-        }
-        // A ticket that had already finished by the time this loop looked is
-        // handled here rather than at the wait below, and its handler arms the
-        // completion check that carries the outcome forward. Going back to the
-        // top is what runs that check: deciding the queue is idle now would
-        // strand the outcome, and whether the ticket lands before or after the
-        // look is pure timing.
-        if handled_a_ticket || !pipeline.pending_completion_checks.is_empty() {
-            continue;
-        }
-        let post_repair_pending = !pipeline.direct_post_repair_in_flight.is_empty();
-        let tolerated_pending = !pipeline.direct_tolerated_in_flight.is_empty();
-        let demotion_pending = !pipeline.direct_demotion_in_flight.is_empty();
-        // A write that lands after the queue drained leaves a PAR3 source
-        // withdrawn with no worker out: nothing will hand back, and the
-        // completion check the download worker schedules at the drain is what
-        // republishes it. Run that check once here; a coordinator still idle
-        // after it is waiting on its caller, not on a ticket.
-        let idle: Vec<JobId> = pipeline
-            .par3_runtime
-            .as_ref()
-            .map(|coordinator| {
-                pipeline
-                    .jobs
-                    .keys()
-                    .copied()
-                    .filter(|job_id| {
-                        coordinator.has_work(*job_id) && !coordinator.has_worker_in_flight(*job_id)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        if let Some(job_id) = idle
-            .iter()
-            .copied()
-            .find(|job_id| republished.insert(*job_id))
-        {
-            pipeline.check_job_completion(job_id).await;
-            continue;
-        }
-        let par2_analysis_pending = !pipeline.par2_analysis_in_flight.is_empty()
-            || pipeline.par3_runtime.as_ref().is_some_and(|coordinator| {
-                pipeline
-                    .jobs
-                    .keys()
-                    .any(|job_id| coordinator.has_work(*job_id) && !idle.contains(job_id))
-            });
-        let rearm_pending = !pipeline.direct_rearm_in_flight.is_empty();
-        let barrier_pending = !pipeline.direct_barrier_flights.is_empty();
-        if !post_repair_pending
-            && !tolerated_pending
-            && !demotion_pending
-            && !par2_analysis_pending
-            && !rearm_pending
-            && !barrier_pending
-        {
-            return;
-        }
-        let post_repair_rx = &mut pipeline.direct_post_repair_done_rx;
-        let tolerated_rx = &mut pipeline.direct_tolerated_done_rx;
-        let demotion_rx = &mut pipeline.direct_demotion_done_rx;
-        let repair_rx = &mut pipeline.repair_work_done_rx;
-        let rearm_rx = &mut pipeline.direct_rearm_done_rx;
-        let barrier_rx = &mut pipeline.direct_barrier_done_rx;
-        let ticket = tokio::select! {
-            done = post_repair_rx.recv(), if post_repair_pending => {
-                Ticket::PostRepair(done.expect("direct post-repair completion channel should stay open"))
-            }
-            done = tolerated_rx.recv(), if tolerated_pending => {
-                Ticket::Tolerated(done.expect("direct tolerated-extraction channel should stay open"))
-            }
-            done = demotion_rx.recv(), if demotion_pending => {
-                Ticket::Demotion(done.expect("direct demotion channel should stay open"))
-            }
-            done = repair_rx.recv(), if par2_analysis_pending => {
-                Ticket::Repair(done.expect("repair completion channel should stay open"))
-            }
-            done = rearm_rx.recv(), if rearm_pending => {
-                Ticket::Rearm(done.expect("direct restart re-read channel should stay open"))
-            }
-            done = barrier_rx.recv(), if barrier_pending => {
-                Ticket::Barrier(done.expect("direct barrier channel should stay open"))
-            }
-        };
-        match ticket {
-            Ticket::PostRepair(done) => pipeline.handle_direct_post_repair_done(done),
-            Ticket::Tolerated(done) => pipeline.handle_direct_tolerated_done(done).await,
-            Ticket::Demotion(done) => pipeline.handle_direct_demotion_done(done).await,
-            Ticket::Repair(done) => pipeline.handle_repair_work_done(done).await,
-            Ticket::Rearm(done) => pipeline.handle_direct_rearm_done(done).await,
-            Ticket::Barrier(done) => pipeline.handle_direct_barrier_done(done).await,
-        }
-    }
-}
-
-// Services the outstanding PAR2 damaged-path analysis tickets the way the
-// orchestrator's select loop would, and then runs only the completion check
-// each verdict re-arms.
-//
-// This is the narrow stand-in for what used to be an inline `await`: the
-// analysis returns and the *same* completion check continues on it. Nothing
-// further is drained, so a test can assert on the state that check left
-// behind rather than on the state a fully drained queue eventually reaches.
-async fn settle_par2_analysis_work(pipeline: &mut Pipeline) {
-    while !pipeline.par2_analysis_in_flight.is_empty() {
-        let done = pipeline
-            .repair_work_done_rx
-            .recv()
-            .await
-            .expect("the PAR2 analysis completion channel should stay open");
-        pipeline.handle_repair_work_done(done).await;
-        if let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
-            pipeline.check_job_completion(queued_job).await;
-        }
-    }
-}
-
-// The direct-store twin of [`settle_par2_analysis_work`]: waits for the
-// job's detached verification read-back, if one is out, and runs only the
-// completion check its verdict re-arms, so a test sees the state that check
-// leaves behind and not the end of a fully drained queue. One round only: a
-// verdict that starts a repair leaves the repair's own read-back ticket out,
-// for the test to settle or to interpose on as it needs.
-async fn settle_direct_verification_read(pipeline: &mut Pipeline, job_id: JobId) {
-    // The set's last article is committed when its placement lands, and that
-    // commit is what submits the read-back.
-    settle_direct_placement_work(pipeline).await;
-    let Some(in_flight) = pipeline.direct_post_repair_in_flight.get(&job_id) else {
-        return;
-    };
-    let work_id = in_flight.work_id;
-    loop {
-        let done = pipeline
-            .direct_post_repair_done_rx
-            .recv()
-            .await
-            .expect("direct post-repair completion channel should stay open");
-        let ours = done.job_id == job_id && done.work_id == work_id;
-        pipeline.handle_direct_post_repair_done(done);
-        if ours {
-            break;
-        }
-    }
-    if let Some(position) = pipeline
-        .pending_completion_checks
-        .iter()
-        .position(|queued| *queued == job_id)
-    {
-        pipeline.pending_completion_checks.remove(position);
-        pipeline.check_job_completion(job_id).await;
-    }
-}
-
-// Waits for the job's detached verification read-back and hands its verdict
-// to the pipeline **without** running the completion check it re-arms, for
-// tests that drive the verification seam themselves and call it again.
-async fn park_direct_verification_verdict(pipeline: &mut Pipeline, job_id: JobId) {
-    let Some(in_flight) = pipeline.direct_post_repair_in_flight.get(&job_id) else {
-        return;
-    };
-    let work_id = in_flight.work_id;
-    loop {
-        let done = pipeline
-            .direct_post_repair_done_rx
-            .recv()
-            .await
-            .expect("direct post-repair completion channel should stay open");
-        let ours = done.job_id == job_id && done.work_id == work_id;
-        pipeline.handle_direct_post_repair_done(done);
-        if ours {
-            break;
-        }
-    }
-    pipeline
-        .pending_completion_checks
-        .retain(|queued| *queued != job_id);
-}
-
 async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
-    settle_direct_post_repair_work(pipeline).await;
-
-    settle_inflight_moves(pipeline).await;
-
-    while let Ok(done) = pipeline.extract_done_rx.try_recv() {
-        pipeline.handle_extraction_done(done).await;
+    pipeline.pump_decode_queue();
+    while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
+        pipeline.check_job_completion(queued_job).await;
         pipeline.pump_decode_queue();
-        while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
-            pipeline.check_job_completion(queued_job).await;
-            pipeline.pump_decode_queue();
-        }
-        settle_direct_post_repair_work(pipeline).await;
     }
-
     settle_inflight_moves(pipeline).await;
+    settle_failed_releases(pipeline).await;
 }
 
-// The next extraction result for a driver that steps `job_id` a fixed number
-// of rounds. An extraction the pipeline has in flight for the job, whole-set
-// or a RAR member worker, is waited for with no deadline, so a round never ends on a slow extraction; otherwise
-// a result already sent is taken, and a turn is yielded to background work.
-async fn next_owed_extraction(pipeline: &mut Pipeline, job_id: JobId) -> Option<ExtractionDone> {
-    if pipeline
-        .inflight_extractions
-        .get(&job_id)
-        .is_some_and(|sets| !sets.is_empty())
-        || pipeline.has_active_rar_workers(job_id)
-    {
-        return Some(
-            pipeline
-                .extract_done_rx
-                .recv()
-                .await
-                .expect("extraction channel should stay open"),
-        );
+// Hands the actor every failed job's working-directory release in flight,
+// so each records its history as the orchestrator records it.
+pub(in crate::pipeline) async fn settle_failed_releases(pipeline: &mut Pipeline) {
+    while !pipeline.pending_graph_terminals.is_empty() {
+        let said = pipeline
+            .graph_runs
+            .recv()
+            .await
+            .expect("a failed graph retains its workers until their acknowledgment");
+        pipeline.graph_run_said(said);
     }
-    let done = pipeline.extract_done_rx.try_recv().ok();
-    if done.is_none() {
-        tokio::task::yield_now().await;
+    while !pipeline.releasing_failed_jobs.is_empty() {
+        let released = pipeline
+            .failed_release_rx
+            .recv()
+            .await
+            .expect("release channel should stay open");
+        pipeline.handle_failed_job_released(released);
     }
-    done
-}
-
-async fn next_extraction_done(pipeline: &mut Pipeline) -> ExtractionDone {
-    pipeline
-        .extract_done_rx
-        .recv()
-        .await
-        .expect("extraction channel should stay open")
 }
 
 // Polls until `predicate` holds. There is no deadline: the test runner
@@ -3159,7 +2068,6 @@ async fn drain_decode_results(pipeline: &mut Pipeline, expected: usize) {
             )
         });
         pipeline.handle_decode_done(done).await;
-        settle_direct_placement_work(pipeline).await;
         settle_inflight_moves(pipeline).await;
     }
     settle_inflight_moves(pipeline).await;
@@ -3203,121 +2111,5 @@ fn age_job_days(pipeline: &mut Pipeline, job_id: JobId, days: u64) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     for file in &mut state.spec.files {
         file.posted_at_epoch = Some(posted);
-    }
-}
-
-async fn setup_extracting_rar_full_set(
-    pipeline: &mut Pipeline,
-    job_id: JobId,
-    title: &str,
-) -> String {
-    let files = build_multifile_multivolume_rar_set();
-    let spec = rar_job_spec(title, &files);
-    insert_active_job(pipeline, job_id, spec).await;
-    pause_job_for_rar_fixture_setup(pipeline, job_id);
-
-    for (file_index, (filename, bytes)) in files.iter().enumerate() {
-        write_and_complete_rar_volume(pipeline, job_id, file_index as u32, filename, bytes).await;
-    }
-
-    let set_name = "show".to_string();
-    let key = (job_id, set_name.clone());
-    {
-        let set_state = pipeline
-            .rar_sets
-            .get_mut(&key)
-            .expect("set state should exist after RAR volumes complete");
-        set_state.active_workers = 1;
-        set_state.in_flight_members.clear();
-        set_state.phase = crate::pipeline::rar_state::RarSetPhase::Extracting;
-        let plan = set_state
-            .plan
-            .as_mut()
-            .expect("RAR plan should exist after volume facts are built");
-        plan.phase = crate::pipeline::rar_state::RarSetPhase::Extracting;
-    }
-    pipeline
-        .inflight_extractions
-        .entry(job_id)
-        .or_default()
-        .insert(set_name.clone());
-    set_name
-}
-
-fn rar_unlock_work(job_id: JobId, file_index: u32, priority: u32) -> DownloadWork {
-    DownloadWork {
-        counters: None,
-        segment_id: SegmentId {
-            file_id: NzbFileId { job_id, file_index },
-            segment_number: 0,
-        },
-        message_id: MessageId::new(&format!("rar-unlock-{job_id:?}-{file_index}@example.com")),
-        groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
-        priority,
-        byte_estimate: 1024,
-        retry_count: 0,
-        is_recovery: false,
-        completion_critical: false,
-        exclude_servers: Vec::new(),
-        avoid_server: None,
-    }
-}
-
-fn install_rar_unlock_plan(
-    pipeline: &mut Pipeline,
-    job_id: JobId,
-    set_name: &str,
-    is_solid: bool,
-    volume_count: u32,
-    complete_volumes: HashSet<u32>,
-    members: Vec<crate::jobs::assembly::ArchiveMember>,
-) {
-    let topology = crate::jobs::assembly::ArchiveTopology {
-        archive_type: crate::jobs::assembly::ArchiveType::Rar,
-        volume_map: (0..volume_count)
-            .map(|volume| (format!("{set_name}.part{:02}.rar", volume + 1), volume))
-            .collect(),
-        complete_volumes,
-        expected_volume_count: Some(volume_count),
-        members: members.clone(),
-        unresolved_spans: Vec::new(),
-    };
-    if let Some(state) = pipeline.jobs.get_mut(&job_id) {
-        state
-            .assembly
-            .set_archive_topology(set_name.to_string(), topology.clone());
-    }
-    pipeline.rar_sets.insert(
-        (job_id, set_name.to_string()),
-        rar_state::RarSetState {
-            phase: rar_state::RarSetPhase::WaitingForVolumes,
-            plan: Some(rar_state::RarDerivedPlan {
-                phase: rar_state::RarSetPhase::WaitingForVolumes,
-                is_solid,
-                ready_members: Vec::new(),
-                member_names: members.iter().map(|member| member.name.clone()).collect(),
-                member_dependencies: HashMap::new(),
-                waiting_on_volumes: HashSet::new(),
-                deletion_eligible: HashSet::new(),
-                delete_decisions: BTreeMap::new(),
-                topology,
-                fallback_reason: None,
-            }),
-            ..Default::default()
-        },
-    );
-}
-
-fn reset_rar_unlock_queue(pipeline: &mut Pipeline, job_id: JobId, indices: &[u32]) {
-    let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    state.download_queue = DownloadQueue::new();
-    for &file_index in indices {
-        let priority = FileRole::RarVolume {
-            volume_number: file_index,
-        }
-        .download_priority();
-        state
-            .download_queue
-            .push(rar_unlock_work(job_id, file_index, priority));
     }
 }

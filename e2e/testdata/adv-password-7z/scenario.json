@@ -1,0 +1,25 @@
+{
+  "slug": "adv-password-7z",
+  "title": "E2E.Adversarial.Password.7z.2026-TESTGRP",
+  "description": "An encrypted 7z archive submitted once with no password and once with a wrong one, with a configured password list that holds only wrong passwords. Each job fails with the password verdict, once, and fetches nothing more from the server after it.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "fixtureAssets": [
+    "7z-encrypted/archive.7z"
+  ],
+  "adversarial": {
+    "group": "default",
+    "outcome": "failed",
+    "failureKind": "password",
+    "submissions": [
+      {
+        "label": "absent",
+        "password": ""
+      },
+      {
+        "label": "wrong",
+        "password": "adversarial-wrong-password"
+      }
+    ]
+  }
+}

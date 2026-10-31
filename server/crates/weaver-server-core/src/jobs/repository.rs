@@ -6,7 +6,7 @@ use crate::history;
 use crate::history::persistence::replace_job_history_attributes_tx;
 use crate::jobs::ids::JobId;
 use crate::jobs::persistence::lock_active_job_for_delete_tx;
-use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, SqlTx, StoreDatastore};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, StoreDatastore};
 use crate::persistence::{Database, DatabaseWriterExecutor};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -14,18 +14,10 @@ pub struct OrphanActiveStateCounts {
     pub active_file_progress: usize,
     pub active_files: usize,
     pub active_file_identities: usize,
-    pub active_par2: usize,
-    pub active_par2_files: usize,
     pub active_extracted: usize,
-    pub active_failed_extractions: usize,
-    pub active_extraction_chunks: usize,
-    pub active_archive_headers: usize,
-    pub active_rar_volume_facts: usize,
     pub active_detected_archives: usize,
-    pub active_volume_status: usize,
-    pub active_rar_verified_suspect: usize,
-    pub active_direct_coverage: usize,
-    pub active_repair_outputs: usize,
+    // Every graph checkpoint table together.
+    pub graph_checkpoint: usize,
 }
 
 impl OrphanActiveStateCounts {
@@ -33,53 +25,28 @@ impl OrphanActiveStateCounts {
         self.active_file_progress
             + self.active_files
             + self.active_file_identities
-            + self.active_par2
-            + self.active_par2_files
             + self.active_extracted
-            + self.active_failed_extractions
-            + self.active_extraction_chunks
-            + self.active_archive_headers
-            + self.active_rar_volume_facts
             + self.active_detected_archives
-            + self.active_volume_status
-            + self.active_rar_verified_suspect
-            + self.active_direct_coverage
-            + self.active_repair_outputs
+            + self.graph_checkpoint
     }
 }
 
-const INLINE_INCREMENTAL_VACUUM_PAGES: u64 = 256;
-
-const ACTIVE_JOB_CHILD_TABLES: [&str; 15] = [
+const ACTIVE_JOB_CHILD_TABLES: [&str; 14] = [
     "active_file_progress",
     "active_files",
     "active_file_identities",
-    "active_par2",
-    "active_par2_files",
     "active_extracted",
-    "active_failed_extractions",
-    "active_extraction_chunks",
-    "active_archive_headers",
-    "active_rar_volume_facts",
     "active_detected_archives",
-    "active_volume_status",
-    "active_rar_verified_suspect",
-    "active_direct_coverage",
-    "active_repair_outputs",
+    "graph_nodes",
+    "graph_members",
+    "graph_coverage",
+    "graph_envelopes",
+    "graph_crypt",
+    "graph_recovery",
+    "graph_holds",
+    "graph_facts_parts",
+    "graph_held_parts",
 ];
-
-async fn run_inline_incremental_vacuum(datastore: &StoreDatastore) -> Result<(), StateError> {
-    if datastore.engine() != SqlEngine::Sqlite {
-        return Ok(());
-    }
-    SqlRuntime::execute(
-        datastore.read_exec(),
-        &format!("PRAGMA incremental_vacuum({INLINE_INCREMENTAL_VACUUM_PAGES})"),
-        &[],
-    )
-    .await?;
-    Ok(())
-}
 
 async fn delete_orphan_rows(tx: &mut SqlTx<'_>, table: &'static str) -> Result<usize, StateError> {
     let deleted = tx
@@ -283,7 +250,6 @@ async fn archive_job_sql(
         })
     })
     .await?;
-    run_inline_incremental_vacuum(&datastore).await?;
     Ok(archived)
 }
 
@@ -321,7 +287,6 @@ impl Database {
             })
             .await?;
             db.notify_script_events_changed();
-            run_inline_incremental_vacuum(&datastore).await?;
             Ok(())
         });
         if result.is_ok() {
@@ -333,69 +298,31 @@ impl Database {
     pub fn prune_orphan_active_state(&self) -> Result<OrphanActiveStateCounts, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            let counts =
-                SqlRuntime::run_in_transaction(&datastore, "prune_orphan_active_state", |tx| {
-                    Box::pin(async move {
-                        Ok(OrphanActiveStateCounts {
-                            active_file_progress: delete_orphan_rows(tx, "active_file_progress")
-                                .await?,
-                            active_files: delete_orphan_rows(tx, "active_files").await?,
-                            active_file_identities: delete_orphan_rows(
-                                tx,
-                                "active_file_identities",
-                            )
+            SqlRuntime::run_in_transaction(&datastore, "prune_orphan_active_state", |tx| {
+                Box::pin(async move {
+                    Ok(OrphanActiveStateCounts {
+                        active_file_progress: delete_orphan_rows(tx, "active_file_progress")
                             .await?,
-                            active_par2: delete_orphan_rows(tx, "active_par2").await?,
-                            active_par2_files: delete_orphan_rows(tx, "active_par2_files").await?,
-                            active_extracted: delete_orphan_rows(tx, "active_extracted").await?,
-                            active_failed_extractions: delete_orphan_rows(
-                                tx,
-                                "active_failed_extractions",
-                            )
+                        active_files: delete_orphan_rows(tx, "active_files").await?,
+                        active_file_identities: delete_orphan_rows(tx, "active_file_identities")
                             .await?,
-                            active_extraction_chunks: delete_orphan_rows(
-                                tx,
-                                "active_extraction_chunks",
-                            )
-                            .await?,
-                            active_archive_headers: delete_orphan_rows(
-                                tx,
-                                "active_archive_headers",
-                            )
-                            .await?,
-                            active_rar_volume_facts: delete_orphan_rows(
-                                tx,
-                                "active_rar_volume_facts",
-                            )
-                            .await?,
-                            active_detected_archives: delete_orphan_rows(
-                                tx,
-                                "active_detected_archives",
-                            )
-                            .await?,
-                            active_volume_status: delete_orphan_rows(tx, "active_volume_status")
-                                .await?,
-                            active_rar_verified_suspect: delete_orphan_rows(
-                                tx,
-                                "active_rar_verified_suspect",
-                            )
-                            .await?,
-                            active_repair_outputs: delete_orphan_rows(tx, "active_repair_outputs")
-                                .await?,
-                            active_direct_coverage: delete_orphan_rows(
-                                tx,
-                                "active_direct_coverage",
-                            )
-                            .await?,
-                        })
+                        active_extracted: delete_orphan_rows(tx, "active_extracted").await?,
+                        active_detected_archives: delete_orphan_rows(
+                            tx,
+                            "active_detected_archives",
+                        )
+                        .await?,
+                        graph_checkpoint: {
+                            let mut removed = 0;
+                            for table in crate::jobs::graph_checkpoint::TABLES {
+                                removed += delete_orphan_rows(tx, table).await?;
+                            }
+                            removed
+                        },
                     })
                 })
-                .await?;
-
-            if counts.total_removed() > 0 {
-                run_inline_incremental_vacuum(&datastore).await?;
-            }
-            Ok(counts)
+            })
+            .await
         })
     }
 }

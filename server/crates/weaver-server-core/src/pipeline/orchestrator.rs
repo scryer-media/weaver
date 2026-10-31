@@ -12,12 +12,8 @@ mod runtime;
 mod scripts;
 mod state;
 
-pub(super) use commands::CancelJobsDone;
+pub(super) use commands::{CancelJobsDone, CancelledJobCleanup};
+pub(crate) use runtime::is_terminal_status;
 pub(super) use runtime::timestamp_secs;
-pub(crate) use runtime::{
-    DirectWriteBatches, close_cached_write_handles_under, is_terminal_status,
-    register_direct_placement, release_cached_write_handle, remove_file_after_cached_write_handle,
-    sync_direct_destinations, write_direct_batches, write_segment_to_disk, write_segments_to_disk,
-};
 #[cfg(test)]
-pub(crate) use runtime::{compute_decode_backlog_budget_bytes, compute_write_backlog_budget_bytes};
+pub(super) use runtime::{compute_decode_backlog_budget_bytes, compute_write_backlog_budget_bytes};

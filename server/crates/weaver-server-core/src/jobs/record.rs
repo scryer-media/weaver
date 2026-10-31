@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use crate::jobs::assembly::{DetectedArchiveIdentity, FileCoverage};
+use crate::jobs::assembly::DetectedArchiveIdentity;
 use crate::jobs::ids::{JobId, NzbFileId};
 
 #[derive(Debug, Clone)]
@@ -86,13 +86,9 @@ pub struct RecoveredJob {
     pub nzb_path: PathBuf,
     pub nzb_zstd: Option<Vec<u8>>,
     pub output_dir: PathBuf,
-    // Written coverage per incomplete file, from rows this binary's schema
-    // can read. A row it cannot is refused at load and leaves no entry.
-    pub file_progress: HashMap<u32, FileCoverage>,
     pub detected_archives: HashMap<u32, DetectedArchiveIdentity>,
     pub file_identities: HashMap<u32, ActiveFileIdentity>,
     pub complete_files: HashSet<NzbFileId>,
-    pub extracted_members: HashSet<String>,
     pub status: String,
     pub download_state: Option<String>,
     pub post_state: Option<String>,
@@ -111,46 +107,4 @@ pub struct RecoveredJob {
     // Unpack password override: `None` = keep the NZB-derived password,
     // `Some("")` = explicitly no password, otherwise the override itself.
     pub password_override: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActivePar2File {
-    pub file_index: u32,
-    pub filename: String,
-    pub recovery_block_count: u32,
-    pub promoted: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActiveFileProgress {
-    pub job_id: JobId,
-    pub file_index: u32,
-    // The file's written coverage as of the restart barrier that wrote it.
-    pub coverage: FileCoverage,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ActiveExtractionChunk {
-    pub job_id: JobId,
-    pub set_name: String,
-    pub member_name: String,
-    pub volume_index: u32,
-    pub bytes_written: u64,
-    pub temp_path: String,
-    pub start_offset: u64,
-    pub end_offset: u64,
-}
-
-pub type RarVolumeFactsBySet = HashMap<String, Vec<(u32, Vec<u8>)>>;
-
-#[derive(Debug, Clone)]
-pub struct ExtractionChunk {
-    pub member_name: String,
-    pub volume_index: u32,
-    pub bytes_written: u64,
-    pub temp_path: String,
-    pub start_offset: u64,
-    pub end_offset: u64,
-    pub verified: bool,
-    pub appended: bool,
 }

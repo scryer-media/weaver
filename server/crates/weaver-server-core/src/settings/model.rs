@@ -13,6 +13,10 @@ use crate::runtime::hardware_profile::HardwareProfile;
 use crate::servers::ServerConfig;
 use crate::watch_folder::WatchFolderConfig;
 
+// The NZB admission limit when none is saved, for new and upgraded installations.
+pub const DEFAULT_MAX_CONCURRENT_NZBS: std::num::NonZeroU32 =
+    std::num::NonZeroU32::new(10).unwrap();
+
 // Shared config handle for runtime reads and writes.
 pub type SharedConfig = Arc<RwLock<Config>>;
 
@@ -39,6 +43,9 @@ pub struct Config {
     // Minimum post age before downloading. Zero disables the hold.
     #[serde(default)]
     pub propagation_delay_secs: Option<u32>,
+    // NZBs admitted through terminal completion, across every Usenet provider.
+    #[serde(default)]
+    pub max_concurrent_nzbs: Option<std::num::NonZeroU32>,
     // Whether to delete intermediate files (NZB articles, PAR2, RAR volumes)
     // after successful extraction. Defaults to true.
     #[serde(default)]
@@ -49,12 +56,10 @@ pub struct Config {
     // Duplicate admission handling policy.
     #[serde(default)]
     pub duplicate_policy: DuplicatePolicy,
-    // RAR direct-store routing. Absent means "every default".
+    // Limits on the bytes the graph engine holds while it waits to place
+    // them. Absent means "every default".
     #[serde(default)]
     pub direct_store: Option<DirectStoreOverrides>,
-    // 7z and ZIP/ZIP64 direct unpack. Absent means "every default".
-    #[serde(default)]
-    pub direct_unpack: Option<DirectUnpackOverrides>,
     // Naming policy for the files a finished job delivers. Absent means
     // "every default".
     #[serde(default)]
@@ -117,6 +122,12 @@ impl Config {
             .as_ref()
             .and_then(|naming| naming.enable_srrdb_lookup)
             .unwrap_or(false)
+    }
+
+    pub fn max_concurrent_nzbs(&self) -> u32 {
+        self.max_concurrent_nzbs
+            .unwrap_or(DEFAULT_MAX_CONCURRENT_NZBS)
+            .get()
     }
 
     // A saved setting takes precedence over the legacy environment override.
@@ -208,24 +219,17 @@ impl Config {
     }
 }
 
-// Operator-facing switches for RAR direct-store routing.
+// Operator-facing limits on the graph engine's holds: decoded bytes whose
+// place in an output is not yet known, kept in RAM and paged to scratch.
 //
-// These answer the plan's open question 1 — config, not env-only — while
-// keeping an env override for incident response. Precedence is
-// **environment over config over default**, and it is resolved in
-// `pipeline::direct_store::DirectStoreSettings::resolve`; see that type for
-// the exact variable names.
+// Precedence is **environment over config over default**, resolved in
+// `pipeline::graph::limits::HoldSettings`; see that type for the exact
+// variable names.
 //
 // Every field is optional so an absent `[direct_store]` table, a partially
 // filled one and an older config file all mean "use the defaults".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DirectStoreOverrides {
-    // Route eligible unencrypted RAR `Store` sets straight to their final
-    // destinations, so their volumes never exist as files.
-    //
-    // **Defaults to off.** Turning the default on is a release decision, not a
-    // config default change.
-    pub enabled: Option<bool>,
     // Per-set ceiling on the holds scratch file, in bytes. Decoded bytes whose
     // destination is not yet known are held in RAM and paged here on a breach;
     // breaching *this* ceiling demotes that one set. Defaults to 1 GiB.
@@ -244,24 +248,6 @@ pub struct DirectStoreOverrides {
     // twentieth of the filesystem, between 512 MiB and 20 GiB; zero disables
     // the check.
     pub holds_disk_reserve_bytes: Option<u64>,
-}
-
-// Operator-facing switches for 7z and ZIP/ZIP64 direct unpack (`[direct_unpack]`).
-//
-// Same precedence as `[direct_store]` — **environment over config over
-// default** — resolved in `pipeline::direct_unpack::DirectUnpackSettings::resolve`;
-// see that type for the variable name.
-//
-// Every field is optional so an absent `[direct_unpack]` table, a partially
-// filled one and an older config file all mean "use the defaults".
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DirectUnpackOverrides {
-    // Begin extracting a 7z or ZIP set while its parts are still downloading, instead
-    // of waiting for the whole set to land.
-    //
-    // **Defaults to on.** Set to `false` here, or export the environment
-    // override, to fall back to extracting after the whole set has landed.
-    pub enabled: Option<bool>,
 }
 
 // Operator-facing switches for how a finished job names what it delivers
@@ -378,10 +364,10 @@ mod tests {
             max_download_speed: None,
             cleanup_after_extract: None,
             propagation_delay_secs: None,
+            max_concurrent_nzbs: None,
             watch_folder: WatchFolderConfig::default(),
             duplicate_policy: DuplicatePolicy::default(),
             direct_store: None,
-            direct_unpack: None,
             delivery_naming: None,
             hardware_profile: None,
             metrics: Default::default(),

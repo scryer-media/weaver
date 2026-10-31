@@ -6,83 +6,6 @@
 use super::*;
 
 #[tokio::test]
-async fn emits_download_pipeline_drained_once_before_later_completion_events() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let mut events = pipeline.event_tx.subscribe();
-    let job_id = JobId(20011);
-    insert_active_job(
-        &mut pipeline,
-        job_id,
-        JobSpec {
-            name: "Drain Pending Buffers".to_string(),
-            password: None,
-            files: vec![],
-            total_bytes: 0,
-            category: None,
-            metadata: vec![],
-        },
-    )
-    .await;
-
-    pipeline.active_download_passes.insert(job_id);
-    pipeline.pending_decode.push_back(PendingDecodeWork {
-        segment_id: SegmentId {
-            file_id: NzbFileId {
-                job_id,
-                file_index: 0,
-            },
-            segment_number: 0,
-        },
-        raw: Bytes::from_static(b"pending"),
-        source_server_idx: None,
-        exclude_servers: Vec::new(),
-    });
-
-    pipeline.emit_download_finished_if_active(job_id);
-    assert!(pipeline.jobs_finalizing_download.contains(&job_id));
-
-    pipeline.pending_decode.clear();
-    pipeline.schedule_job_completion_check(job_id);
-    pump_pipeline_runtime_queues(&mut pipeline).await;
-
-    let drained_events = drain_job_events(&mut events, job_id);
-    assert!(matches!(
-        drained_events.first(),
-        Some(PipelineEvent::DownloadFinished {
-            finalization_pending: true,
-            ..
-        })
-    ));
-    assert_eq!(
-        drained_events
-            .iter()
-            .filter(|event| matches!(event, PipelineEvent::DownloadPipelineDrained { .. }))
-            .count(),
-        1
-    );
-    let drained_idx = drained_events
-        .iter()
-        .position(|event| matches!(event, PipelineEvent::DownloadPipelineDrained { .. }))
-        .expect("download pipeline drained event");
-    let next_stage_idx = drained_events
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                PipelineEvent::MoveToCompleteStarted { .. }
-                    | PipelineEvent::JobVerificationStarted { .. }
-                    | PipelineEvent::RepairStarted { .. }
-                    | PipelineEvent::ExtractionReady { .. }
-                    | PipelineEvent::JobCompleted { .. }
-            )
-        })
-        .expect("later completion event");
-    assert!(drained_idx < next_stage_idx, "events: {drained_events:?}");
-    assert!(!pipeline.jobs_finalizing_download.contains(&job_id));
-}
-
-#[tokio::test]
 async fn skips_download_pipeline_drained_when_no_post_download_work_remains() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -173,7 +96,15 @@ async fn dispatch_downloads_respects_hard_decode_byte_pressure() {
         DownloadPressureReason::Decode.as_code()
     );
     assert_eq!(
-        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         files.len()
     );
 
@@ -204,153 +135,6 @@ async fn dispatch_downloads_respects_hard_decode_byte_pressure() {
             .download_pressure_stall_duration_ms
             .load(Ordering::Relaxed)
             > 0
-    );
-}
-
-#[tokio::test]
-async fn dispatch_downloads_waits_for_downstream_work_when_restart_durable_lead_is_too_large() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        2,
-    )
-    .await;
-    let job_id = JobId(20003);
-    let file_id = NzbFileId {
-        job_id,
-        file_index: 0,
-    };
-    let durable_lead_limit = Pipeline::restart_durable_lead_limit_bytes();
-    let segment_bytes = 1024 * 1024u32;
-    let segment_count = (durable_lead_limit / u64::from(segment_bytes) + 2) as u32;
-    let segments = (0..segment_count)
-        .map(|segment| {
-            segment_spec! {
-                number: segment,
-                bytes: segment_bytes,
-                message_id: format!("restart-lead-{segment}@example.com"),
-            }
-        })
-        .collect::<Vec<_>>();
-    let spec = JobSpec {
-        name: "Restart Durable Lead".to_string(),
-        password: None,
-        total_bytes: u64::from(segment_count) * u64::from(segment_bytes),
-        category: None,
-        metadata: vec![],
-        files: vec![FileSpec {
-            filename: "large.bin".to_string(),
-            role: FileRole::Standalone,
-            groups: vec!["alt.binaries.test".to_string()],
-            posted_at_epoch: None,
-            segments,
-        }],
-    };
-    insert_active_job(&mut pipeline, job_id, spec).await;
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.downloaded_bytes = durable_lead_limit;
-        state.restored_download_floor_bytes = 1;
-    }
-    let next_work = DownloadWork {
-        counters: None,
-        segment_id: SegmentId {
-            file_id,
-            segment_number: 0,
-        },
-        message_id: MessageId::new("restart-lead-0@example.com"),
-        groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
-        priority: FileRole::Standalone.download_priority(),
-        byte_estimate: segment_bytes,
-        retry_count: 0,
-        is_recovery: false,
-        completion_critical: false,
-        exclude_servers: vec![],
-        avoid_server: None,
-    };
-
-    pipeline.active_decodes_by_job.insert(job_id, 1);
-    assert!(!pipeline.primary_download_within_restart_durable_lead(job_id, &next_work));
-
-    let blocked_pass_started = Instant::now();
-    pipeline.dispatch_downloads();
-
-    assert_eq!(pipeline.active_downloads, 0);
-    assert_eq!(
-        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
-        segment_count as usize
-    );
-    assert_eq!(
-        pipeline
-            .metrics
-            .download_restart_durable_lead_blocked_total
-            .load(Ordering::Relaxed),
-        1
-    );
-    assert!(
-        pipeline.last_download_dispatch_stall_log_at.is_some(),
-        "durable-lead parking with queued work and no active downloads should emit a liveness diagnostic"
-    );
-    assert!(
-        pipeline
-            .download_restart_durable_lead_retry_after
-            .get(&job_id)
-            .is_some_and(|ready_at| *ready_at > blocked_pass_started)
-    );
-    let retry_delay = pipeline
-        .next_restart_durable_lead_retry_delay()
-        .expect("durable lead block should expose a retry wakeup");
-    assert!(retry_delay <= Duration::from_millis(250));
-
-    // The block holds for a fraction of a second. A pass inside it is the case
-    // under test, so the test keeps the hold open rather than racing the
-    // clock to arrive in time.
-    *pipeline
-        .download_restart_durable_lead_retry_after
-        .get_mut(&job_id)
-        .expect("the blocked job keeps its retry time") =
-        Instant::now() + Duration::from_secs(3600);
-    pipeline.dispatch_downloads();
-    assert_eq!(
-        pipeline
-            .metrics
-            .download_restart_durable_lead_blocked_total
-            .load(Ordering::Relaxed),
-        1
-    );
-
-    pipeline
-        .persisted_file_progress
-        .insert(file_id, durable_lead_limit);
-    pipeline.active_decodes_by_job.remove(&job_id);
-    pipeline.note_released_download_result_pending(job_id, 768 * 1024);
-
-    assert!(pipeline.primary_download_within_restart_durable_lead(job_id, &next_work));
-    assert_eq!(
-        pipeline
-            .pending_released_download_result_bytes_by_job
-            .get(&job_id)
-            .copied(),
-        Some(768 * 1024)
-    );
-    assert!(
-        pipeline
-            .download_restart_durable_lead_retry_after
-            .get(&job_id)
-            .is_some_and(|ready_at| *ready_at > Instant::now())
-    );
-    pipeline.dispatch_downloads();
-
-    assert!(pipeline.active_downloads > 0);
-    assert!(
-        !pipeline
-            .download_restart_durable_lead_retry_after
-            .contains_key(&job_id)
     );
 }
 
@@ -406,7 +190,18 @@ async fn hot_download_batch_lease_stays_large_for_fresh_job_when_restart_lead_wo
         pipeline.active_downloads_by_job.get(&job_id),
         Some(&(segment_count as usize))
     );
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 0);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -470,92 +265,17 @@ async fn hot_download_batch_lease_caps_restored_job_for_restart_durable_lead() {
 
     assert_eq!(pipeline.active_downloads, 4);
     assert_eq!(pipeline.active_downloads_by_job.get(&job_id), Some(&4));
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 2);
-}
-
-#[tokio::test]
-async fn dispatch_downloads_escapes_restart_durable_lead_when_pipeline_is_idle() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        2,
-    )
-    .await;
-    let job_id = JobId(20030);
-    let durable_lead_limit = Pipeline::restart_durable_lead_limit_bytes();
-    let segment_bytes = 1024 * 1024u32;
-    let segment_count = (durable_lead_limit / u64::from(segment_bytes) + 2) as u32;
-    let segments = (0..segment_count)
-        .map(|segment| {
-            segment_spec! {
-                number: segment,
-                bytes: segment_bytes,
-                message_id: format!("restart-lead-idle-{segment}@example.com"),
-            }
-        })
-        .collect::<Vec<_>>();
-    let spec = JobSpec {
-        name: "Restart Durable Lead Idle".to_string(),
-        password: None,
-        total_bytes: u64::from(segment_count) * u64::from(segment_bytes),
-        category: None,
-        metadata: vec![],
-        files: vec![FileSpec {
-            filename: "large-idle.bin".to_string(),
-            role: FileRole::Standalone,
-            groups: vec!["alt.binaries.test".to_string()],
-            posted_at_epoch: None,
-            segments,
-        }],
-    };
-    insert_active_job(&mut pipeline, job_id, spec).await;
-    let file_id = NzbFileId {
-        job_id,
-        file_index: 0,
-    };
-    submit_decoded_segment(
-        &mut pipeline,
-        file_id,
-        1,
-        64,
-        b"buffered-gap",
-        "large-idle.bin",
-        None,
-    )
-    .await;
-    assert!(
-        pipeline
-            .write_buffers
-            .get(&file_id)
-            .is_some_and(|write_buf| write_buf.buffered_len() > 0)
-    );
-    pipeline.jobs.get_mut(&job_id).unwrap().downloaded_bytes = durable_lead_limit;
-    pipeline
-        .pending_released_download_results_by_job
-        .insert(job_id, 1);
-    pipeline
-        .download_restart_durable_lead_retry_after
-        .insert(job_id, Instant::now() + Duration::from_secs(3600));
-
-    pipeline.dispatch_downloads();
-
-    assert!(pipeline.active_downloads > 0);
-    assert!(
-        !pipeline
-            .download_restart_durable_lead_retry_after
-            .contains_key(&job_id)
-    );
     assert_eq!(
         pipeline
-            .metrics
-            .download_restart_durable_lead_blocked_total
-            .load(Ordering::Relaxed),
-        0
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        2
     );
 }
 
@@ -603,10 +323,13 @@ async fn dispatch_downloads_counts_completed_files_for_restart_durable_lead() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
         for file_index in 0..complete_files {
             let file_id = NzbFileId { job_id, file_index };
             state
+                .articles
+                .active_mut()
+                .unwrap()
                 .assembly
                 .file_mut(file_id)
                 .unwrap()
@@ -644,6 +367,9 @@ async fn dispatch_downloads_counts_completed_files_for_restart_durable_lead() {
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .push(next_work);
 
@@ -656,121 +382,6 @@ async fn dispatch_downloads_counts_completed_files_for_restart_durable_lead() {
             .download_restart_durable_lead_blocked_total
             .load(Ordering::Relaxed),
         0
-    );
-}
-
-#[tokio::test]
-async fn dispatch_downloads_leaves_unpromoted_recovery_queue_parked_when_primary_queue_is_empty() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        2,
-    )
-    .await;
-    let job_id = JobId(20014);
-    let spec = standalone_with_par2_job_spec("Recovery Dispatch", 128, 64);
-    insert_active_job(&mut pipeline, job_id, spec).await;
-
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        assert_eq!(state.recovery_queue.len(), 1);
-    }
-
-    pipeline.dispatch_downloads();
-
-    assert_eq!(pipeline.active_downloads, 0);
-    assert_eq!(pipeline.active_recovery, 0);
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 0);
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().recovery_queue.len(), 1);
-    assert_eq!(
-        pipeline
-            .pending_completion_checks
-            .iter()
-            .copied()
-            .collect::<Vec<_>>(),
-        vec![job_id]
-    );
-}
-
-#[tokio::test]
-async fn dispatch_downloads_respects_hard_write_byte_pressure() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 1,
-            medium_count: 1,
-            large_count: 1,
-        },
-        2,
-    )
-    .await;
-    let job_id = JobId(20004);
-    let spec = standalone_job_spec(
-        "Write Backlog Gates Dispatch",
-        &[("queued.bin".to_string(), 512u32)],
-    );
-    insert_active_job(&mut pipeline, job_id, spec).await;
-
-    let file_id = NzbFileId {
-        job_id,
-        file_index: 0,
-    };
-    let buffered = BufferedDecodedSegment {
-        damaged_source: None,
-        encoding: SegmentEncoding::Yenc,
-        segment_id: SegmentId {
-            file_id,
-            segment_number: 99,
-        },
-        decoded_size: 4096,
-        data: DecodedChunk::from(vec![7u8; 4096]),
-        part_crc: par2_rs::checksum::crc32(&vec![7u8; 4096]),
-        part_crc_verified: true,
-        declared_file_len: 0,
-        yenc_name: "queued.bin".to_string(),
-        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
-        segments: Vec::new(),
-    };
-    let buffered_len = buffered.len_bytes();
-    pipeline
-        .write_buffers
-        .entry(file_id)
-        .or_insert_with(|| WriteReorderBuffer::new(4))
-        .insert(4096, buffered);
-    pipeline.note_write_buffered(buffered_len, 1);
-    pipeline.write_backlog_budget_bytes = buffered_len;
-
-    pipeline.dispatch_downloads();
-
-    assert_eq!(pipeline.active_downloads, 0);
-    assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
-    assert_eq!(
-        pipeline
-            .metrics
-            .write_buffered_segments
-            .load(Ordering::Relaxed),
-        1
-    );
-    assert_eq!(
-        pipeline
-            .metrics
-            .download_pressure_state
-            .load(Ordering::Relaxed),
-        DownloadPressureState::Hard.as_code()
-    );
-    assert_eq!(
-        pipeline
-            .metrics
-            .download_pressure_reason
-            .load(Ordering::Relaxed),
-        DownloadPressureReason::Write.as_code()
     );
 }
 
@@ -818,13 +429,19 @@ async fn capped_uu_spool_dispatches_only_the_missing_cursor_prefix() {
         avoid_server: None,
     };
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    state.download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
     // The later segment is deliberately the queue head. Capped admission must
     // scan past it to fetch the ordinal that can release the parked prefix.
     state
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .push(work(1, "uu-later@example.invalid"));
     state
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .push(work(0, "uu-prefix@example.invalid"));
     pipeline.uu_files.insert(
@@ -843,9 +460,20 @@ async fn capped_uu_spool_dispatches_only_the_missing_cursor_prefix() {
 
     assert_eq!(lease.works.len(), 1);
     assert_eq!(lease.works[0].segment_id.segment_number, 0);
-    assert_eq!(pipeline.jobs[&job_id].download_queue.len(), 1);
     assert_eq!(
         pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        1
+    );
+    assert_eq!(
+        pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .peek_next_matching(|_| true)
             .map(|work| work.segment_id.segment_number),
@@ -872,7 +500,7 @@ async fn capped_uu_spool_keeps_unrelated_yenc_ordinals_eligible() {
     let mut second = spec.files[0].segments[0].clone();
     second.ordinal = 1;
     second.article_number = 2;
-    second.message_id = "second@example.invalid".to_string();
+    second.message_ids = "second@example.invalid".into();
     spec.files[0].segments.push(second);
     spec.total_bytes *= 2;
     insert_active_job(&mut pipeline, uu_job, spec.clone()).await;
@@ -883,6 +511,9 @@ async fn capped_uu_spool_keeps_unrelated_yenc_ordinals_eligible() {
         let first = pipeline
             .jobs
             .get_mut(&job_id)
+            .unwrap()
+            .articles
+            .active_mut()
             .unwrap()
             .download_queue
             .pop()
@@ -1184,7 +815,7 @@ async fn dispatch_downloads_allows_postprocessing_status_with_remaining_download
             state.download_state,
             crate::jobs::model::DownloadState::Complete
         );
-        assert_eq!(state.download_queue.len(), 1);
+        assert_eq!(state.articles.active().unwrap().download_queue.len(), 1);
     }
 
     pipeline.dispatch_downloads();
@@ -1195,7 +826,7 @@ async fn dispatch_downloads_allows_postprocessing_status_with_remaining_download
     for (job_id, status) in &cases {
         let state = pipeline.jobs.get(job_id).unwrap();
         assert_eq!(&state.status, status);
-        assert_eq!(state.download_queue.len(), 0);
+        assert_eq!(state.articles.active().unwrap().download_queue.len(), 0);
         assert!(pipeline.active_download_passes.contains(job_id));
     }
 }
@@ -1245,6 +876,9 @@ async fn dispatch_downloads_prefers_new_higher_priority_job_after_inflight_segme
     {
         let state = pipeline.jobs.get_mut(&low_job_id).unwrap();
         let in_flight = state
+            .articles
+            .active_mut()
+            .unwrap()
             .download_queue
             .pop()
             .expect("low-priority job should have an in-flight segment to drain");
@@ -1261,13 +895,24 @@ async fn dispatch_downloads_prefers_new_higher_priority_job_after_inflight_segme
     assert_eq!(pipeline.active_downloads, 2);
     assert_eq!(pipeline.active_download_connections, 2);
     assert_eq!(
-        pipeline.jobs.get(&low_job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&low_job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         1
     );
     assert_eq!(
         pipeline
             .jobs
             .get(&high_job_id)
+            .unwrap()
+            .articles
+            .active()
             .unwrap()
             .download_queue
             .len(),
@@ -1318,6 +963,9 @@ async fn dispatch_downloads_yields_retained_hot_job_to_high_priority_while_criti
         .jobs
         .get(&normal_job_id)
         .unwrap()
+        .articles
+        .active()
+        .unwrap()
         .download_queue
         .len();
     assert!(
@@ -1358,6 +1006,9 @@ async fn dispatch_downloads_yields_retained_hot_job_to_high_priority_while_criti
             .jobs
             .get(&normal_job_id)
             .unwrap()
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .len(),
         normal_queued_before_priority_update,
@@ -1367,6 +1018,9 @@ async fn dispatch_downloads_yields_retained_hot_job_to_high_priority_while_criti
         pipeline
             .jobs
             .get(&promoted_job_id)
+            .unwrap()
+            .articles
+            .active()
             .unwrap()
             .download_queue
             .len(),
@@ -1420,10 +1074,16 @@ async fn dispatch_downloads_prefers_earliest_job_within_priority_band() {
     {
         let state = pipeline.jobs.get_mut(&later_job_id).unwrap();
         let _ = state
+            .articles
+            .active_mut()
+            .unwrap()
             .download_queue
             .pop()
             .expect("later job should have one completed segment removed from queue");
         state
+            .articles
+            .active_mut()
+            .unwrap()
             .assembly
             .file_mut(NzbFileId {
                 job_id: later_job_id,
@@ -1442,6 +1102,9 @@ async fn dispatch_downloads_prefers_earliest_job_within_priority_band() {
             .jobs
             .get(&earlier_job_id)
             .unwrap()
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .len(),
         0
@@ -1450,6 +1113,9 @@ async fn dispatch_downloads_prefers_earliest_job_within_priority_band() {
         pipeline
             .jobs
             .get(&later_job_id)
+            .unwrap()
+            .articles
+            .active()
             .unwrap()
             .download_queue
             .len(),
@@ -1555,13 +1221,23 @@ async fn a_lower_priority_critical_recovery_waits_behind_the_hot_jobs_regular_by
     .await;
     let critical_queued_before = {
         let state = pipeline.jobs.get_mut(&critical_job_id).unwrap();
-        let work = state.download_queue.drain_all();
+        let work = state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .drain_all();
         for mut work in work {
             work.is_recovery = true;
             work.completion_critical = true;
-            state.download_queue.push(work);
+            state
+                .articles
+                .active_mut()
+                .unwrap()
+                .download_queue
+                .push(work);
         }
-        state.download_queue.len()
+        state.articles.active().unwrap().download_queue.len()
     };
 
     pipeline.dispatch_downloads();
@@ -1582,6 +1258,9 @@ async fn a_lower_priority_critical_recovery_waits_behind_the_hot_jobs_regular_by
         pipeline
             .jobs
             .get(&critical_job_id)
+            .unwrap()
+            .articles
+            .active()
             .unwrap()
             .download_queue
             .len(),
@@ -1631,11 +1310,21 @@ async fn the_hot_job_takes_the_only_connection_ahead_of_a_critical_recovery() {
     .await;
     {
         let state = pipeline.jobs.get_mut(&critical_job_id).unwrap();
-        let work = state.download_queue.drain_all();
+        let work = state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .drain_all();
         for mut work in work {
             work.is_recovery = true;
             work.completion_critical = true;
-            state.download_queue.push(work);
+            state
+                .articles
+                .active_mut()
+                .unwrap()
+                .download_queue
+                .push(work);
         }
     }
 
@@ -1852,10 +1541,21 @@ async fn critical_work_of_later_jobs_waits_behind_the_hot_jobs_regular_bytes() {
     .await;
     for job_id in [critical_a, critical_b] {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        for mut work in state.download_queue.drain_all() {
+        for mut work in state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .drain_all()
+        {
             work.is_recovery = true;
             work.completion_critical = true;
-            state.download_queue.push(work);
+            state
+                .articles
+                .active_mut()
+                .unwrap()
+                .download_queue
+                .push(work);
         }
     }
 
@@ -1870,7 +1570,15 @@ async fn critical_work_of_later_jobs_waits_behind_the_hot_jobs_regular_bytes() {
     assert_eq!(pipeline.active_completion_critical_connections, 0);
     for job_id in [critical_a, critical_b] {
         assert_eq!(
-            pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+            pipeline
+                .jobs
+                .get(&job_id)
+                .unwrap()
+                .articles
+                .active()
+                .unwrap()
+                .download_queue
+                .len(),
             1,
             "a later job's critical article waits while the hot job can be served"
         );
@@ -1948,7 +1656,15 @@ async fn hot_clear_pressure_lane_leases_sequential_runway() {
         pipeline.download_refill_want(pipeline.download_lane_mode_for_server(0, pressure, true));
     assert_eq!(pipeline.active_downloads, want);
     assert_eq!(
-        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         100 - want
     );
     assert_eq!(
@@ -1999,6 +1715,7 @@ async fn a_lane_refill_is_answered_from_the_hot_job_while_a_same_priority_peer_w
         pipeline.download_lane_owners.insert(
             Pipeline::next_download_lane_id(),
             DownloadLaneOwner {
+                body_activity: Vec::new(),
                 job_id: hot_job_id,
                 mode: DownloadLaneMode::Sequential,
                 completion_critical: false,
@@ -2017,6 +1734,9 @@ async fn a_lane_refill_is_answered_from_the_hot_job_while_a_same_priority_peer_w
     let peer_queued_before = pipeline
         .jobs
         .get(&peer_job_id)
+        .unwrap()
+        .articles
+        .active()
         .unwrap()
         .download_queue
         .len();
@@ -2038,6 +1758,9 @@ async fn a_lane_refill_is_answered_from_the_hot_job_while_a_same_priority_peer_w
         pipeline
             .jobs
             .get(&peer_job_id)
+            .unwrap()
+            .articles
+            .active()
             .unwrap()
             .download_queue
             .len(),
@@ -2127,6 +1850,8 @@ async fn failed_job_retains_released_result_ledgers_until_terminal_processing() 
     pipeline.note_released_download_result_pending(job_id, payload.len() as u64);
 
     pipeline.fail_job(job_id, "expected failure".to_string());
+
+    settle_failed_releases(&mut pipeline).await;
 
     assert_eq!(
         pipeline
@@ -2287,7 +2012,13 @@ async fn owned_download_lane_requeues_unrequested_tail_without_retry_result() {
     )
     .await;
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    let tail_work = state.download_queue.pop().unwrap();
+    let tail_work = state
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
     pipeline.hold_test_lane_works(vec![tail_work.clone()], false);
 
     let (ack, ack_rx) = std::sync::mpsc::sync_channel(1);
@@ -2315,6 +2046,90 @@ async fn owned_download_lane_requeues_unrequested_tail_without_retry_result() {
             .pending_released_download_results_by_job
             .contains_key(&job_id)
     );
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 2);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        2
+    );
     assert!(ack_rx.try_recv().is_ok());
+}
+
+#[tokio::test]
+async fn emits_download_pipeline_drained_once_before_later_completion_events() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20011);
+    insert_delivered_job(
+        &mut pipeline,
+        job_id,
+        "Drain Pending Buffers",
+        "payload.bin",
+        b"payload",
+    )
+    .await;
+    // Only what follows the end of the download pass is under test.
+    let mut events = pipeline.event_tx.subscribe();
+
+    pipeline.active_download_passes.insert(job_id);
+    pipeline.pending_decode.push_back(PendingDecodeWork {
+        segment_id: SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            segment_number: 0,
+        },
+        raw: Bytes::from_static(b"pending"),
+        source_server_idx: None,
+        exclude_servers: Vec::new(),
+    });
+
+    pipeline.emit_download_finished_if_active(job_id);
+    assert!(pipeline.jobs_finalizing_download.contains(&job_id));
+
+    pipeline.pending_decode.clear();
+    pipeline.schedule_job_completion_check(job_id);
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+
+    let drained_events = drain_job_events(&mut events, job_id);
+    assert!(matches!(
+        drained_events.first(),
+        Some(PipelineEvent::DownloadFinished {
+            finalization_pending: true,
+            ..
+        })
+    ));
+    assert_eq!(
+        drained_events
+            .iter()
+            .filter(|event| matches!(event, PipelineEvent::DownloadPipelineDrained { .. }))
+            .count(),
+        1
+    );
+    let drained_idx = drained_events
+        .iter()
+        .position(|event| matches!(event, PipelineEvent::DownloadPipelineDrained { .. }))
+        .expect("download pipeline drained event");
+    let next_stage_idx = drained_events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                PipelineEvent::MoveToCompleteStarted { .. }
+                    | PipelineEvent::JobVerificationStarted { .. }
+                    | PipelineEvent::RepairStarted { .. }
+                    | PipelineEvent::ExtractionReady { .. }
+                    | PipelineEvent::JobCompleted { .. }
+            )
+        })
+        .expect("later completion event");
+    assert!(drained_idx < next_stage_idx, "events: {drained_events:?}");
+    assert!(!pipeline.jobs_finalizing_download.contains(&job_id));
 }

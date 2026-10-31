@@ -1,0 +1,17 @@
+{
+  "slug": "adv-zip-nest-17",
+  "title": "E2E.Adversarial.Zip.Nest.17.2026-TESTGRP",
+  "description": "Seventeen stored zips deep, one level past the graph's fixed nesting limit of sixteen. The container at the limit is delivered as a file and the job completes; the member below it is not unpacked. nested-5deep covers RAR nesting inside the limit.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "requiredOutputSuffixes": [
+      ".zip"
+    ],
+    "forbiddenOutputs": [
+      "deepest.txt"
+    ]
+  }
+}

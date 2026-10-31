@@ -1827,11 +1827,6 @@ pub fn wake_queue(db: Database) {
 #[path = "event_tests.rs"]
 mod tests;
 
-#[cfg(test)]
-pub(crate) async fn hold_test_event_queue(db: &Database) -> tokio::sync::MutexGuard<'_, ()> {
-    db.script_runtime.queue.lock().await
-}
-
 // Returns once `done` holds, re-checking it on every script-state change. The
 // change is armed before each check, so one landing between the check and the
 // wait is not missed.

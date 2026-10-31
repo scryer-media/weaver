@@ -134,6 +134,11 @@ impl RuntimeTuner {
         self.profile.disk.random_read_iops = random_read_iops;
     }
 
+    // Apply the startup disk probe's write-through throughput the same way.
+    pub fn set_sequential_write_mbps(&mut self, sequential_write_mbps: f64) {
+        self.profile.disk.sequential_write_mbps = sequential_write_mbps;
+    }
+
     // Maximum concurrent streaming member extractions, adaptive to disk type
     // and bounded by the hardware profile in force.
     //
@@ -155,8 +160,13 @@ impl RuntimeTuner {
             cores.max(2).min(cap)
         } else {
             // Slow storage: head seeks between concurrent streams hurt.
-            // Allow 2 only if IOPS suggests a decent drive.
-            let by_disk = if self.profile.disk.random_read_iops > 500.0 {
+            // Allow 2 only if IOPS suggests a decent drive and its writes
+            // keep up: two extractions both write what they unpack, and a
+            // slow writer behind them stalls both. Zero write throughput is
+            // "not measured" (pinned IOPS skip the probe) and says nothing.
+            let write_mbps = self.profile.disk.sequential_write_mbps;
+            let slow_writes = write_mbps > 0.0 && write_mbps < 100.0;
+            let by_disk = if self.profile.disk.random_read_iops > 500.0 && !slow_writes {
                 2
             } else {
                 1

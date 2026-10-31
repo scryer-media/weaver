@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::post_processing::effects::JobScriptEffects;
+use crate::post_processing::events::EventContext;
 use crate::post_processing::instances::{InstanceTrigger, ScriptInstanceDraft};
 use crate::post_processing::model::{PostProcessingSettings, QueueEvent, ScriptName, ScriptStatus};
 
@@ -13,7 +14,7 @@ fn queue_instance(event: QueueEvent) -> ScriptInstanceDraft {
     )
 }
 
-fn enable_queue_script(db: &Database, root: &Path) {
+pub(in crate::pipeline::tests) fn enable_queue_script(db: &Database, root: &Path) {
     let scripts = db
         .initialize_post_processing_script_directory(root, None)
         .unwrap();
@@ -31,183 +32,6 @@ fn enable_queue_script(db: &Database, root: &Path) {
     for event in QueueEvent::ALL {
         db.create_script_instance(queue_instance(event)).unwrap();
     }
-}
-
-#[tokio::test]
-async fn downloaded_barrier_persists_and_mark_bad_prevents_native_finalization() {
-    let temp = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
-    enable_queue_script(&pipeline.db, temp.path());
-    // Something to run once the job has ended, so the job is still there to
-    // look at after it is marked bad. Its script is not on disk: the run is
-    // reported and starts nothing.
-    pipeline
-        .db
-        .create_script_instance(ScriptInstanceDraft::new(
-            ScriptName::new("after.sh").unwrap(),
-            InstanceTrigger::PostProcessing,
-        ))
-        .unwrap();
-    let job_id = JobId(164);
-    insert_active_job(
-        &mut pipeline,
-        job_id,
-        standalone_job_spec("script-barrier", &[]),
-    )
-    .await;
-    let config = pipeline.config.clone();
-    let _config_write = config.write().await;
-    assert_eq!(
-        pipeline
-            .queue_script_context(job_id, QueueEvent::NzbDownloaded)
-            .unwrap()
-            .facts
-            .data_dir
-            .as_ref(),
-        Some(&pipeline.script_data_dir)
-    );
-    drop(_config_write);
-    // A restored job has no ADDED event. Model a downloaded run that was already
-    // claimed so the worker cannot finish it before the barrier is inspected.
-    assert_eq!(pipeline.db.queue_script_count().unwrap(), 0);
-    let context = pipeline
-        .queue_script_context(job_id, QueueEvent::NzbDownloaded)
-        .unwrap();
-    let run_id = pipeline
-        .db
-        .enqueue_script_event(&context, 1)
-        .unwrap()
-        .unwrap();
-    let datastore = pipeline.db.datastore();
-    pipeline
-        .db
-        .run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "test_claim_script", |tx| {
-                let run_id = run_id.clone();
-                Box::pin(async move {
-                    tx.execute(
-                        "UPDATE script_event_queue SET state = 'started' WHERE run_id = {}",
-                        &[SqlArg::Text(run_id)],
-                    )
-                    .await?;
-                    Ok(())
-                })
-            })
-            .await
-        })
-        .unwrap();
-    pipeline.check_job_completion(job_id).await;
-    assert_eq!(pipeline.jobs[&job_id].status, JobStatus::Downloading);
-    // Holding the barrier, before admission: the download is complete, so the
-    // job neither pauses nor accepts a semantic cancel, and reports waiting.
-    assert!(matches!(
-        pipeline.pause_job_runtime(job_id),
-        Err(crate::SchedulerError::Conflict(_))
-    ));
-    let cancelled = cancel_one_job(
-        &mut pipeline,
-        job_id,
-        crate::jobs::handle::CancellationOrigin::SemanticSuperseded,
-    )
-    .await;
-    assert!(matches!(cancelled, Err(crate::SchedulerError::Conflict(_))));
-    let listed = pipeline
-        .list_jobs()
-        .into_iter()
-        .find(|job| job.job_id == job_id)
-        .unwrap();
-    assert_eq!(listed.status, JobStatus::AwaitingQueueScripts);
-    assert_eq!(listed.run_state, crate::jobs::model::RunState::Active);
-    let TerminalPostProcessingEvent::QueueAdmitted(id) = pipeline
-        .terminal_post_processing_done_rx
-        .recv()
-        .await
-        .unwrap()
-    else {
-        panic!("expected queue admission");
-    };
-    assert_eq!(id, job_id);
-    pipeline.handle_queue_scripts_admitted(id);
-    assert_eq!(
-        pipeline.jobs[&job_id].status,
-        JobStatus::AwaitingQueueScripts
-    );
-    assert!(!pipeline.par2_verified.contains(&job_id));
-    assert!(!pipeline.inflight_moves.contains(&job_id));
-    pipeline.db.flush_write_queue().await.unwrap();
-    let datastore = pipeline.db.datastore();
-    let persisted = pipeline
-        .db
-        .run_sql_blocking_read(async move {
-            SqlRuntime::fetch_optional(
-                datastore.read_exec(),
-                "SELECT status FROM active_jobs WHERE job_id = {}",
-                &[SqlArg::I64(job_id.0 as i64)],
-            )
-            .await?
-            .unwrap()
-            .text("status")
-        })
-        .unwrap();
-    assert_eq!(persisted, "awaiting_queue_scripts");
-
-    pipeline
-        .db
-        .save_job_script_effects(
-            job_id.0,
-            &JobScriptEffects {
-                marked_bad: true,
-                parameters: [("Detector".into(), "bad".into())].into_iter().collect(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    // Restart recovery does not replay a started script, but its streamed
-    // directives must still govern the next completion pass.
-    pipeline.db.recover_script_events().unwrap();
-    pipeline.db.notify_script_events_changed();
-    let TerminalPostProcessingEvent::QueueDone(id, result) = pipeline
-        .terminal_post_processing_done_rx
-        .recv()
-        .await
-        .unwrap()
-    else {
-        panic!("expected queue completion");
-    };
-    assert_eq!(id, job_id);
-    result.as_ref().unwrap();
-    pipeline.handle_queue_scripts_done(id, result).await;
-    assert!(!pipeline.queue_script_waiters.contains(&job_id));
-    assert!(pipeline.queue_scripts_completed.contains(&job_id));
-    assert!(!pipeline.par2_verified.contains(&job_id));
-    assert!(!pipeline.inflight_moves.contains(&job_id));
-    assert!(pipeline.inflight_terminal_post_processing.contains(&job_id));
-    assert!(
-        pipeline.jobs[&job_id]
-            .spec
-            .metadata
-            .contains(&("Detector".into(), "bad".into()))
-    );
-    loop {
-        match pipeline
-            .terminal_post_processing_done_rx
-            .recv()
-            .await
-            .unwrap()
-        {
-            TerminalPostProcessingEvent::Started(id) => {
-                pipeline.handle_terminal_post_processing_started(id)
-            }
-            TerminalPostProcessingEvent::Done(done) if done.job_id == job_id => {
-                pipeline.handle_terminal_post_processing_done(done);
-                break;
-            }
-            _ => {}
-        }
-    }
-    pipeline.db.flush_write_queue().await.unwrap();
-    let history = pipeline.db.get_job_history(job_id.0).unwrap().unwrap();
-    assert!(history.error_message.unwrap().contains("FAILURE/BAD"));
 }
 
 #[tokio::test]
@@ -379,130 +203,6 @@ async fn a_late_queue_event_leaves_a_job_that_moved_on_alone() {
     pipeline.handle_queue_scripts_done(job_id, Ok(())).await;
     assert_eq!(pipeline.jobs[&job_id].status, JobStatus::Verifying);
     assert!(!pipeline.queue_scripts_completed.contains(&job_id));
-}
-
-// The live path: a job's last article is decoded by the real decode seam, and
-// the completion check that follows must hold the job at the NZB_DOWNLOADED
-// barrier instead of moving it to the complete folder.
-#[tokio::test]
-async fn the_last_decode_of_a_downloaded_job_holds_the_nzb_downloaded_barrier() {
-    let temp = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
-    enable_queue_script(&pipeline.db, temp.path());
-    let job_id = JobId(165);
-    let payload = b"standalone payload bytes for the barrier".to_vec();
-    insert_active_job(
-        &mut pipeline,
-        job_id,
-        standalone_job_spec(
-            "script-barrier-live",
-            &[("payload.bin".to_string(), payload.len() as u32)],
-        ),
-    )
-    .await;
-    let file_id = NzbFileId {
-        job_id,
-        file_index: 0,
-    };
-    park_job_on_its_final_decode(
-        &mut pipeline,
-        SegmentId {
-            file_id,
-            segment_number: 0,
-        },
-        payload.len() as u64,
-    );
-    settle_queued_decode(&mut pipeline, file_id, 0, 0, &payload, "payload.bin").await;
-    assert!(
-        pipeline.queue_script_waiters.contains(&job_id),
-        "the completion pass did not hold the barrier; status {:?}, pending download work {}",
-        pipeline.jobs[&job_id].status,
-        pipeline.job_has_pending_download_pipeline_work(job_id)
-    );
-    assert!(pipeline.inflight_moves.is_empty());
-    let TerminalPostProcessingEvent::QueueAdmitted(id) = pipeline
-        .terminal_post_processing_done_rx
-        .recv()
-        .await
-        .unwrap()
-    else {
-        panic!("expected queue admission");
-    };
-    assert_eq!(id, job_id);
-    pipeline.handle_queue_scripts_admitted(id);
-    assert_eq!(
-        pipeline.jobs[&job_id].status,
-        JobStatus::AwaitingQueueScripts
-    );
-}
-
-// The streamed shape: the job's last article was decoded on its download lane,
-// and the completion pass runs while that article's download result is still
-// booked as pending. The barrier must hold here all the same; this is the pass
-// that otherwise moves the job to the complete folder.
-#[tokio::test]
-async fn the_streamed_last_decode_of_a_downloaded_job_holds_the_nzb_downloaded_barrier() {
-    let temp = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
-    enable_queue_script(&pipeline.db, temp.path());
-    let job_id = JobId(166);
-    let payload = b"standalone payload bytes decoded on the lane".to_vec();
-    insert_active_job(
-        &mut pipeline,
-        job_id,
-        standalone_job_spec(
-            "script-barrier-streamed",
-            &[("payload.bin".to_string(), payload.len() as u32)],
-        ),
-    )
-    .await;
-    let file_id = NzbFileId {
-        job_id,
-        file_index: 0,
-    };
-    pipeline.active_download_passes.insert(job_id);
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
-    }
-    // What `process_released_download_done` holds open around the decode.
-    pipeline.note_released_download_result_pending(job_id, payload.len() as u64);
-    assert!(pipeline.job_has_pending_download_pipeline_work(job_id));
-    submit_decoded_segment(&mut pipeline, file_id, 0, 0, &payload, "payload.bin", None).await;
-    pipeline.finish_released_download_result_processing(job_id, payload.len() as u64);
-    pipeline.maybe_finish_download_pass(job_id);
-    assert!(
-        pipeline.queue_script_waiters.contains(&job_id),
-        "the completion pass did not hold the barrier; status {:?}",
-        pipeline.jobs[&job_id].status
-    );
-    assert!(pipeline.inflight_moves.is_empty());
-    assert_eq!(pipeline.jobs[&job_id].status, JobStatus::Downloading);
-    let TerminalPostProcessingEvent::QueueAdmitted(id) = pipeline
-        .terminal_post_processing_done_rx
-        .recv()
-        .await
-        .unwrap()
-    else {
-        panic!("expected queue admission");
-    };
-    assert_eq!(id, job_id);
-    pipeline.handle_queue_scripts_admitted(id);
-    assert_eq!(
-        pipeline.jobs[&job_id].status,
-        JobStatus::AwaitingQueueScripts
-    );
-    // The download pass that closes after the booking must not disturb the
-    // held job.
-    while let Some(next) = pipeline.pending_completion_checks.pop_front() {
-        pipeline.check_job_completion(next).await;
-    }
-    assert!(pipeline.inflight_moves.is_empty());
-    assert_eq!(
-        pipeline.jobs[&job_id].status,
-        JobStatus::AwaitingQueueScripts
-    );
 }
 
 // An instance that blocks on a job's arrival keeps the job from downloading
@@ -724,4 +424,69 @@ async fn file_only_scripts_hold_the_pre_move_barrier_without_downloaded_subscrib
     }
     pipeline.db.finish_script_event_for_test(&run_id).unwrap();
     barrier.await.unwrap();
+}
+
+// The NZBNA_DELETESTATUS of every NZB_DELETED event queued for the job, in
+// the order queued. Admissions are taken in the order raised, so once one
+// raised after them has been admitted, every earlier one has been.
+async fn deletions_queued(pipeline: &Pipeline, job_id: JobId, after: EventContext) -> Vec<String> {
+    let _ = pipeline.db.admit_queue_script_event(after, false).await;
+    let datastore = pipeline.db.datastore();
+    let payloads = pipeline
+        .db
+        .run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT payload FROM script_event_queue WHERE job_id = {} AND event = 'NZB_DELETED' ORDER BY seq",
+                &[SqlArg::I64(job_id.0 as i64)],
+            )
+            .await?
+            .iter()
+            .map(|row| row.text("payload"))
+            .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap();
+    payloads
+        .iter()
+        .map(|payload| {
+            let context: EventContext = serde_json::from_str(payload).unwrap();
+            context.env["NZBNA_DELETESTATUS"].clone()
+        })
+        .collect()
+}
+
+// A job its post failed is deleted for health as NZBGet deletes one; any
+// other failure, such as an extraction's, raises no deletion.
+#[tokio::test]
+async fn a_health_failure_raises_the_jobs_deletion_for_health() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    enable_queue_script(&pipeline.db, temp.path());
+    let health = JobId(173);
+    let other = JobId(174);
+    insert_active_job(&mut pipeline, health, standalone_job_spec("dead-post", &[])).await;
+    insert_active_job(&mut pipeline, other, standalone_job_spec("withheld", &[])).await;
+    let after_health = pipeline
+        .queue_script_context(health, QueueEvent::NzbMarked)
+        .unwrap();
+    let after_other = pipeline
+        .queue_script_context(other, QueueEvent::NzbMarked)
+        .unwrap();
+
+    pipeline.fail_job_on_health(health, "first articles are missing".into());
+    pipeline.fail_job(
+        other,
+        "lantern.rar withheld for want of its password".into(),
+    );
+    settle_failed_releases(&mut pipeline).await;
+
+    assert_eq!(
+        deletions_queued(&pipeline, health, after_health).await,
+        vec!["HEALTH".to_string()]
+    );
+    assert!(
+        deletions_queued(&pipeline, other, after_other)
+            .await
+            .is_empty()
+    );
 }

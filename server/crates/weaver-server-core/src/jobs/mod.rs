@@ -3,9 +3,12 @@
 
 mod archive_password;
 pub mod assembly;
+pub mod diagnostic_names;
 pub mod duplicate;
 pub mod duplicate_persistence;
 pub mod error;
+pub(crate) mod feed_verdict;
+pub(crate) mod graph_checkpoint;
 pub mod handle;
 pub mod ids;
 pub mod model;
@@ -13,7 +16,6 @@ pub mod persistence;
 pub mod phase_progress;
 pub mod queries;
 pub mod record;
-pub(crate) mod repair_outputs;
 pub mod repository;
 pub mod server_attribution;
 mod server_attribution_persistence;
@@ -47,11 +49,9 @@ pub use handle::{
 pub use ids::{ConnectionId, JobId, MessageId, NzbFileId, SegmentId, ServerId};
 pub use model::{
     ArchivePasswordCandidate, ArchivePasswordSource, DownloadState, FieldUpdate, FileSpec, JobSpec,
-    JobState, JobStatus, JobUpdate, PostState, RunState, SegmentSpec, derive_legacy_job_status,
-    epoch_ms_now, job_status_from_persisted_str, runtime_lanes_from_status_snapshot,
+    JobState, JobStatus, JobUpdate, MessageIds, PostState, RunState, SegmentSpec,
+    derive_legacy_job_status, epoch_ms_now, job_status_from_persisted_str,
+    runtime_lanes_from_status_snapshot,
 };
 pub use phase_progress::{JobPhase, JobPhaseProgress, PhaseAttemptCounters, PhaseCounters};
-pub use record::{
-    ActiveFileIdentity, ActiveFileProgress, ActiveJob, ActivePar2File, ExtractionChunk,
-    FileIdentitySource, RecoveredJob,
-};
+pub use record::{ActiveFileIdentity, ActiveJob, FileIdentitySource, RecoveredJob};

@@ -1,0 +1,16 @@
+{
+  "slug": "adv-exe-carrying-rar",
+  "title": "E2E.Adversarial.Exe.Carrying.Rar.2026-TESTGRP",
+  "description": "rar5-single's archive posted under a .exe name. The job either opens it by content and completes, or the unwanted-extension policy refuses it by name.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "fixtureAssets": [
+    "rar5-single/archive.rar::setup.exe"
+  ],
+  "adversarial": {
+    "group": "default",
+    "outcome": "either",
+    "errorContains": "unwanted extension",
+    "minOutputFiles": 1
+  }
+}

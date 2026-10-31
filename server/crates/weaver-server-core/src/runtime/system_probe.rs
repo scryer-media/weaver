@@ -7,15 +7,17 @@
 // machine. All subprocess calls use [`std::process::Command`] (blocking)
 // since this only executes once during initialization.
 
-use std::path::Path;
 #[cfg(any(target_os = "linux", all(test, unix)))]
-use std::path::{Component, PathBuf};
+use std::path::Component;
+use std::path::{Path, PathBuf};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::system_profile::*;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 // Probe the running system and return a fully measured [`SystemProfile`].
 //
@@ -23,7 +25,9 @@ use tracing::debug;
 // falls back to a safe default rather than aborting startup.
 pub fn detect(output_dir: &Path) -> SystemProfile {
     let mut profile = detect_startup_profile(output_dir);
-    profile.disk.random_read_iops = measure_random_read_iops(output_dir);
+    let measured = startup_disk_measurement(output_dir);
+    profile.disk.sequential_write_mbps = measured.sequential_write_mbps;
+    profile.disk.random_read_iops = measured.random_read_iops;
     profile
 }
 
@@ -40,9 +44,10 @@ pub fn classify_storage(path: &Path) -> (StorageClass, FilesystemType) {
 
 // Collect the fast system facts needed to start the runtime.
 //
-// Random-read IOPS is intentionally left at zero until
-// [`measure_random_read_iops`] runs. Zero is conservative: the tuner admits
-// only one extraction until the measured value is applied.
+// Random-read IOPS and sequential write throughput are intentionally left at
+// zero until [`startup_disk_measurement`] runs. Zero IOPS is conservative:
+// the tuner admits only one extraction until the measured values are
+// applied. Zero write throughput reads as "not measured".
 pub fn detect_startup_profile(output_dir: &Path) -> SystemProfile {
     let cpu = detect_cpu();
     let memory = detect_memory();
@@ -50,7 +55,7 @@ pub fn detect_startup_profile(output_dir: &Path) -> SystemProfile {
     let disk = DiskProfile {
         storage_class,
         filesystem,
-        sequential_write_mbps: 500.0,
+        sequential_write_mbps: 0.0,
         random_read_iops: 0.0,
         same_filesystem: true,
     };
@@ -535,22 +540,151 @@ fn parse_cgroup_memory_limit(value: &str) -> Option<u64> {
 // Disk
 // ---------------------------------------------------------------------------
 
-// Measure random 4 KB read IOPS, including the explicit test/benchmark
-// override. This runs after HTTP startup in the long-lived server process.
-pub fn measure_random_read_iops(output_dir: &Path) -> f64 {
-    match startup_iops_override() {
-        Some(pinned) => {
-            debug!(iops = pinned, "disk probe skipped: WEAVER_STARTUP_IOPS");
-            pinned
-        }
-        None => benchmark_random_read_iops(output_dir).unwrap_or(10_000.0),
-    }
+// What the startup disk probe measured: sequential write-through throughput
+// and random 4 KiB read IOPS on the data directory's filesystem. A zero
+// `sequential_write_mbps` means it was not measured.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DiskMeasurement {
+    pub sequential_write_mbps: f64,
+    pub random_read_iops: f64,
 }
 
-// `WEAVER_STARTUP_IOPS=<positive number>` skips the startup random-read
-// probe and pins `random_read_iops` to that value, so benchmark and e2e
-// runs are not skewed by the probe's I/O wait (and tuning stays
-// deterministic across runs). Unset or invalid values run the probe.
+// The measurement kept between starts, with the time it was taken.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+struct StoredDiskMeasurement {
+    measured_at: u64,
+    sequential_write_mbps: f64,
+    random_read_iops: f64,
+}
+
+// Where the measurement is kept, in the probed directory.
+const DISK_PROBE_RECORD: &str = "disk-probe.json";
+// The probe's scratch file. A plain name with a text extension rather than a
+// dotfile: security software watching the data directory treats a hidden
+// file written with write-through as suspicious and scans it on every write.
+const DISK_PROBE_FILE: &str = "weaver-disk-probe.txt";
+// A stored measurement older than this is taken again. The disk under a data
+// directory rarely changes, and the probe is the disk work a start can skip.
+const DISK_PROBE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+// Used when the probe cannot run at all: SSD-class reads, writes unmeasured.
+const DISK_PROBE_FALLBACK_IOPS: f64 = 10_000.0;
+
+// The write phase writes this buffer repeatedly, then the read phase reads
+// back from what it laid down.
+const PROBE_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+// How many buffers each successive write chunk holds: 16, 64, 144, 256 MiB.
+// Growing chunks keep a fast disk from finishing inside timer noise while a
+// slow one stops after the first.
+const PROBE_WRITE_REPEATS: [usize; 4] = [1, 4, 9, 16];
+// The write phase stops before the next chunk once this much write-and-sync
+// time has been measured.
+const PROBE_WRITE_BUDGET: Duration = Duration::from_secs(1);
+const PROBE_READ_SIZE: usize = 4096;
+const PROBE_READ_COUNT: usize = 200;
+
+// The disk measurement to apply at startup.
+//
+// `WEAVER_STARTUP_IOPS` pins the read IOPS and skips the probe entirely, so
+// benchmark and e2e runs neither wait on it nor read a stored result. Other-
+// wise a measurement stored within the last seven days is used as is, and a
+// missing, unreadable or older one is measured again and stored.
+pub fn startup_disk_measurement(dir: &Path) -> DiskMeasurement {
+    if let Some(pinned) = startup_iops_override() {
+        debug!(iops = pinned, "disk probe skipped: WEAVER_STARTUP_IOPS");
+        return DiskMeasurement {
+            sequential_write_mbps: 0.0,
+            random_read_iops: pinned,
+        };
+    }
+    stored_or_measured_disk_profile(dir, SystemTime::now, measure_disk_profile)
+}
+
+// The stored-or-measured decision with its clock and probe passed in, so a
+// test can age the record without waiting and without touching the disk.
+fn stored_or_measured_disk_profile(
+    dir: &Path,
+    now: impl Fn() -> SystemTime,
+    measure: impl FnOnce(&Path) -> Option<DiskMeasurement>,
+) -> DiskMeasurement {
+    let record = dir.join(DISK_PROBE_RECORD);
+    let now_secs = unix_seconds(now());
+    if let Some(stored) = read_stored_disk_measurement(&record)
+        && let Some(age) = now_secs.checked_sub(stored.measured_at)
+        && age < DISK_PROBE_MAX_AGE.as_secs()
+    {
+        info!(
+            age_days = age / (24 * 60 * 60),
+            write_mbps = format!("{:.0}", stored.sequential_write_mbps),
+            iops = format!("{:.0}", stored.random_read_iops),
+            "using stored disk measurement"
+        );
+        return DiskMeasurement {
+            sequential_write_mbps: stored.sequential_write_mbps,
+            random_read_iops: stored.random_read_iops,
+        };
+    }
+
+    let started = Instant::now();
+    let Some(measured) = measure(dir) else {
+        // Nothing is stored, so the next start tries again.
+        warn!(
+            dir = %dir.display(),
+            "disk probe could not run; assuming fast reads and unmeasured writes"
+        );
+        return DiskMeasurement {
+            sequential_write_mbps: 0.0,
+            random_read_iops: DISK_PROBE_FALLBACK_IOPS,
+        };
+    };
+    info!(
+        write_mbps = format!("{:.0}", measured.sequential_write_mbps),
+        iops = format!("{:.0}", measured.random_read_iops),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "measured disk"
+    );
+    let stored = StoredDiskMeasurement {
+        measured_at: unix_seconds(now()),
+        sequential_write_mbps: measured.sequential_write_mbps,
+        random_read_iops: measured.random_read_iops,
+    };
+    if let Err(error) = write_stored_disk_measurement(&record, &stored) {
+        debug!(
+            path = %record.display(),
+            error = %error,
+            "could not store the disk measurement; it is taken again next start"
+        );
+    }
+    measured
+}
+
+fn unix_seconds(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
+fn read_stored_disk_measurement(path: &Path) -> Option<StoredDiskMeasurement> {
+    let bytes = std::fs::read(path).ok()?;
+    let stored: StoredDiskMeasurement = serde_json::from_slice(&bytes).ok()?;
+    let usable = |value: f64| value.is_finite() && value >= 0.0;
+    (usable(stored.sequential_write_mbps)
+        && usable(stored.random_read_iops)
+        && stored.random_read_iops > 0.0)
+        .then_some(stored)
+}
+
+fn write_stored_disk_measurement(
+    path: &Path,
+    stored: &StoredDiskMeasurement,
+) -> std::io::Result<()> {
+    let json = serde_json::to_vec(stored).map_err(std::io::Error::other)?;
+    std::fs::write(path, json)
+}
+
+// `WEAVER_STARTUP_IOPS=<positive number>` skips the startup disk probe and
+// pins `random_read_iops` to that value, so benchmark and e2e runs are not
+// skewed by the probe's I/O wait (and tuning stays deterministic across
+// runs). Unset or invalid values run the probe.
 fn startup_iops_override() -> Option<f64> {
     parse_startup_iops(std::env::var("WEAVER_STARTUP_IOPS").ok().as_deref())
 }
@@ -560,120 +694,371 @@ fn parse_startup_iops(raw: Option<&str>) -> Option<f64> {
     (value.is_finite() && value > 0.0).then_some(value)
 }
 
-// Benchmark random 4 KB read IOPS on the given directory's filesystem.
-//
-// Creates a temporary 4 MB file, issues 200 random `pread()` calls,
-// and returns measured IOPS. Takes <1 ms on SSD, ~1 s on HDD.
-#[cfg(unix)]
-fn benchmark_random_read_iops(dir: &Path) -> Option<f64> {
-    use std::io::Write;
+// Removes the probe's scratch file however the probe ends.
+struct ProbeFileGuard(PathBuf);
 
-    let tmp_path = dir.join(".weaver-iops-probe");
-
-    // Write a 4 MB file of zeros.
-    let mut file = std::fs::File::create(&tmp_path).ok()?;
-    let buf = vec![0u8; 4 * 1024 * 1024];
-    file.write_all(&buf).ok()?;
-    file.sync_all().ok()?;
-    drop(file);
-
-    // Re-open read-only and benchmark random reads.
-    let fd = std::fs::File::open(&tmp_path).ok()?;
-    use std::os::unix::io::AsRawFd;
-    let raw_fd = fd.as_raw_fd();
-
-    const READ_SIZE: usize = 4096;
-    const NUM_READS: usize = 200;
-    const FILE_SIZE: usize = 4 * 1024 * 1024;
-    const MAX_OFFSET: usize = FILE_SIZE - READ_SIZE;
-
-    // Simple deterministic pseudo-random offsets (aligned to 4 KB).
-    let mut read_buf = [0u8; READ_SIZE];
-    let mut rng_state: u64 = 0xDEAD_BEEF_CAFE_BABEu64;
-
-    let start = std::time::Instant::now();
-    for _ in 0..NUM_READS {
-        // xorshift64
-        rng_state ^= rng_state << 13;
-        rng_state ^= rng_state >> 7;
-        rng_state ^= rng_state << 17;
-        let offset = ((rng_state as usize) % (MAX_OFFSET / READ_SIZE)) * READ_SIZE;
-
-        unsafe {
-            libc::pread(
-                raw_fd,
-                read_buf.as_mut_ptr() as *mut libc::c_void,
-                READ_SIZE,
-                offset as libc::off_t,
-            );
-        }
-    }
-    let elapsed = start.elapsed().as_secs_f64();
-
-    drop(fd);
-    let _ = std::fs::remove_file(&tmp_path);
-
-    if elapsed > 0.0 {
-        Some(NUM_READS as f64 / elapsed)
-    } else {
-        Some(NUM_READS as f64 * 1_000_000.0) // sub-microsecond → very fast
+impl Drop for ProbeFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
-#[cfg(windows)]
-fn benchmark_random_read_iops(dir: &Path) -> Option<f64> {
+// Measure sequential write-through throughput, then random 4 KiB reads on
+// the file the writes laid down, in the given directory.
+//
+// The writes go through the cache to the device and the reads bypass it
+// where the platform allows, so neither figure is the page cache's. `None`
+// when the directory cannot hold the probe file or any I/O fails.
+pub fn measure_disk_profile(dir: &Path) -> Option<DiskMeasurement> {
+    let path = dir.join(DISK_PROBE_FILE);
+    let _guard = ProbeFileGuard(path.clone());
+    let (written, sequential_write_mbps) = measure_sequential_write(&path)?;
+    let random_read_iops = measure_random_read(&path, written)?;
+    Some(DiskMeasurement {
+        sequential_write_mbps,
+        random_read_iops,
+    })
+}
+
+// Random bytes, so a compressing filesystem or drive firmware cannot shrink
+// the writes. Prepared before any timing starts.
+fn probe_write_buffer() -> Vec<u8> {
+    let mut buffer = vec![0u8; PROBE_CHUNK_BYTES];
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    for word in buffer.chunks_exact_mut(8) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        word.copy_from_slice(&state.to_le_bytes());
+    }
+    buffer
+}
+
+// Returns the bytes written and the throughput in MB/s (10^6 bytes).
+fn measure_sequential_write(path: &Path) -> Option<(u64, f64)> {
     use std::io::Write;
-    use std::os::windows::fs::FileExt;
 
-    let tmp_path = dir.join(".weaver-iops-probe");
-
-    // Write a 4 MB file of zeros.
-    let mut file = std::fs::File::create(&tmp_path).ok()?;
-    let buf = vec![0u8; 4 * 1024 * 1024];
-    file.write_all(&buf).ok()?;
-    file.sync_all().ok()?;
-    drop(file);
-
-    // Re-open read-only and benchmark random positional reads (`seek_read`
-    // is the Windows analog of pread: it does not move the file cursor).
-    let fd = std::fs::File::open(&tmp_path).ok()?;
-
-    const READ_SIZE: usize = 4096;
-    const NUM_READS: usize = 200;
-    const FILE_SIZE: usize = 4 * 1024 * 1024;
-    const MAX_OFFSET: usize = FILE_SIZE - READ_SIZE;
-
-    // Simple deterministic pseudo-random offsets (aligned to 4 KB).
-    let mut read_buf = [0u8; READ_SIZE];
-    let mut rng_state: u64 = 0xDEAD_BEEF_CAFE_BABEu64;
-
-    let start = std::time::Instant::now();
-    for _ in 0..NUM_READS {
-        // xorshift64
-        rng_state ^= rng_state << 13;
-        rng_state ^= rng_state >> 7;
-        rng_state ^= rng_state << 17;
-        let offset = ((rng_state as usize) % (MAX_OFFSET / READ_SIZE)) * READ_SIZE;
-
-        let _ = fd.seek_read(&mut read_buf, offset as u64);
+    let buffer = probe_write_buffer();
+    let mut file = open_write_through(path).ok()?;
+    let mut written: u64 = 0;
+    let mut measured = Duration::ZERO;
+    for repeats in PROBE_WRITE_REPEATS {
+        if measured >= PROBE_WRITE_BUDGET {
+            break;
+        }
+        let started = Instant::now();
+        for _ in 0..repeats {
+            file.write_all(&buffer).ok()?;
+        }
+        file.sync_data().ok()?;
+        measured += started.elapsed();
+        written += (repeats * PROBE_CHUNK_BYTES) as u64;
     }
-    let elapsed = start.elapsed().as_secs_f64();
-
-    drop(fd);
-    let _ = std::fs::remove_file(&tmp_path);
-
-    if elapsed > 0.0 {
-        Some(NUM_READS as f64 / elapsed)
+    let seconds = measured.as_secs_f64();
+    let mbps = if seconds > 0.0 {
+        written as f64 / seconds / 1_000_000.0
     } else {
-        Some(NUM_READS as f64 * 1_000_000.0) // sub-microsecond → very fast
+        // Sub-resolution timing: as if it took a microsecond, faster than
+        // anything the tuner tells apart.
+        written as f64
+    };
+    Some((written, mbps))
+}
+
+#[cfg(unix)]
+fn open_write_through(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_SYNC)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_write_through(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_TEMPORARY, FILE_FLAG_WRITE_THROUGH,
+    };
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(FILE_FLAG_WRITE_THROUGH)
+        .attributes(FILE_ATTRIBUTE_TEMPORARY)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_write_through(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::create(path)
+}
+
+// 4 KiB-aligned offsets inside the first `file_len` bytes, from a fixed
+// xorshift sequence so every run reads the same pattern.
+fn probe_read_offsets(file_len: u64) -> Vec<u64> {
+    let blocks = (file_len / PROBE_READ_SIZE as u64).max(1);
+    let mut state: u64 = 0xDEAD_BEEF_CAFE_BABE;
+    (0..PROBE_READ_COUNT)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % blocks) * PROBE_READ_SIZE as u64
+        })
+        .collect()
+}
+
+fn reads_per_second(elapsed: f64) -> f64 {
+    if elapsed > 0.0 {
+        PROBE_READ_COUNT as f64 / elapsed
+    } else {
+        PROBE_READ_COUNT as f64 * 1_000_000.0 // sub-microsecond → very fast
     }
+}
+
+// Times one read per offset. `read` reports whether it got the whole block; a
+// read that failed or came up short ends the measurement, because it returns
+// far faster than the device and would read as impossibly high IOPS.
+#[cfg(any(unix, windows))]
+fn timed_reads(offsets: Vec<u64>, mut read: impl FnMut(u64) -> bool) -> Option<f64> {
+    let start = Instant::now();
+    for offset in offsets {
+        if !read(offset) {
+            return None;
+        }
+    }
+    Some(reads_per_second(start.elapsed().as_secs_f64()))
+}
+
+// Random 4 KiB `pread`s. The file's cached pages are dropped first where the
+// platform can be asked to, so the reads reach the device.
+#[cfg(unix)]
+fn measure_random_read(path: &Path, file_len: u64) -> Option<f64> {
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::File::open(path).ok()?;
+    let raw_fd = file.as_raw_fd();
+    // SAFETY: `raw_fd` is an open descriptor owned by `file` for this call.
+    #[cfg(target_os = "linux")]
+    let _ = unsafe { libc::posix_fadvise(raw_fd, 0, 0, libc::POSIX_FADV_DONTNEED) };
+    // SAFETY: as above; F_NOCACHE only changes caching for this descriptor.
+    #[cfg(target_os = "macos")]
+    let _ = unsafe { libc::fcntl(raw_fd, libc::F_NOCACHE, 1) };
+    let offsets = probe_read_offsets(file_len);
+    let mut read_buf = [0u8; PROBE_READ_SIZE];
+
+    timed_reads(offsets, |offset| {
+        // SAFETY: `read_buf` is a live, writable buffer of PROBE_READ_SIZE
+        // bytes and `raw_fd` stays open for the loop.
+        let read = unsafe {
+            libc::pread(
+                raw_fd,
+                read_buf.as_mut_ptr() as *mut libc::c_void,
+                PROBE_READ_SIZE,
+                offset as libc::off_t,
+            )
+        };
+        read == PROBE_READ_SIZE as isize
+    })
+}
+
+// Random 4 KiB positional reads with the system cache bypassed. Unbuffered
+// reads need sector-aligned offsets, lengths and buffers: the offsets and
+// length are 4 KiB multiples and the buffer is allocated 4 KiB aligned.
+#[cfg(windows)]
+fn measure_random_read(path: &Path, file_len: u64) -> Option<f64> {
+    use std::os::windows::fs::{FileExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_NO_BUFFERING;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_NO_BUFFERING)
+        .open(path)
+        .ok()?;
+    let mut read_buf = AlignedProbeBuffer::new(PROBE_READ_SIZE, PROBE_READ_SIZE)?;
+    let offsets = probe_read_offsets(file_len);
+
+    timed_reads(offsets, |offset| {
+        // `seek_read` is the positional read: it does not move the cursor.
+        matches!(
+            file.seek_read(read_buf.as_mut_slice(), offset),
+            Ok(PROBE_READ_SIZE)
+        )
+    })
 }
 
 // Fallback for platforms without a positional-read benchmark: assume
 // SSD-class IOPS. The tuner will adjust based on observed throughput.
 #[cfg(not(any(unix, windows)))]
-fn benchmark_random_read_iops(_dir: &Path) -> Option<f64> {
+fn measure_random_read(_path: &Path, _file_len: u64) -> Option<f64> {
     Some(50_000.0)
+}
+
+// A zeroed heap buffer with a chosen alignment, for unbuffered reads.
+#[cfg(windows)]
+struct AlignedProbeBuffer {
+    ptr: std::ptr::NonNull<u8>,
+    layout: std::alloc::Layout,
+}
+
+#[cfg(windows)]
+impl AlignedProbeBuffer {
+    fn new(len: usize, align: usize) -> Option<Self> {
+        let layout = std::alloc::Layout::from_size_align(len, align).ok()?;
+        if layout.size() == 0 {
+            return None;
+        }
+        // SAFETY: the layout has a non-zero size, checked above.
+        let ptr = std::ptr::NonNull::new(unsafe { std::alloc::alloc_zeroed(layout) })?;
+        Some(Self { ptr, layout })
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `ptr` is a live allocation of `layout.size()` zero-
+        // initialized bytes owned by `self`, borrowed mutably here.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size()) }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for AlignedProbeBuffer {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `new` with this same layout and not yet freed.
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
+// Opened once the startup disk work is done: the disk probe ran, was skipped
+// for a stored measurement or a pinned figure, or failed.
+//
+// Work that touches the disk at startup and can wait (database maintenance,
+// the free-space samplers) waits on this, so it does not compete with the
+// probe or with the first seconds of serving. Both async tasks and plain
+// threads wait on it; once open it stays open.
+#[derive(Clone)]
+pub struct StartupDiskGate(Arc<StartupDiskGateInner>);
+
+struct StartupDiskGateInner {
+    open: AtomicBool,
+    // Guards the waiters below and orders `open` against them.
+    waiters: Mutex<Vec<Box<dyn FnOnce() + Send>>>,
+    blocked: Condvar,
+    notify: tokio::sync::Notify,
+}
+
+impl std::fmt::Debug for StartupDiskGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StartupDiskGate")
+            .field("open", &self.is_open())
+            .finish()
+    }
+}
+
+impl StartupDiskGate {
+    // A gate that waits for [`Self::open`].
+    pub fn closed() -> Self {
+        Self(Arc::new(StartupDiskGateInner {
+            open: AtomicBool::new(false),
+            waiters: Mutex::new(Vec::new()),
+            blocked: Condvar::new(),
+            notify: tokio::sync::Notify::new(),
+        }))
+    }
+
+    // A gate with nothing to wait for.
+    pub fn opened() -> Self {
+        let gate = Self::closed();
+        gate.open();
+        gate
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.0.open.load(Ordering::Acquire)
+    }
+
+    // Let every waiter through, now and from here on.
+    pub fn open(&self) {
+        let waiters = {
+            let mut waiters = self
+                .0
+                .waiters
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.0.open.store(true, Ordering::Release);
+            std::mem::take(&mut *waiters)
+        };
+        self.0.blocked.notify_all();
+        self.0.notify.notify_waiters();
+        for waiter in waiters {
+            waiter();
+        }
+    }
+
+    // Run `waiter` once the gate opens, or now if it already has. It runs on
+    // the opening thread, outside the gate's lock.
+    pub fn on_open(&self, waiter: impl FnOnce() + Send + 'static) {
+        {
+            let mut waiters = self
+                .0
+                .waiters
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !self.0.open.load(Ordering::Acquire) {
+                waiters.push(Box::new(waiter));
+                return;
+            }
+        }
+        waiter();
+    }
+
+    // Block this thread until the gate opens.
+    pub fn wait_blocking(&self) {
+        let waiters = self
+            .0
+            .waiters
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        drop(
+            self.0
+                .blocked
+                .wait_while(waiters, |_| !self.0.open.load(Ordering::Acquire))
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+    }
+
+    // Wait, without blocking a runtime thread, until the gate opens.
+    pub async fn wait(&self) {
+        loop {
+            // Enabled before the check: a `notified` future only counts as
+            // a waiter once polled or enabled, so an `open` between the
+            // check and the first poll would otherwise be missed.
+            let mut opened = std::pin::pin!(self.0.notify.notified());
+            opened.as_mut().enable();
+            if self.is_open() {
+                return;
+            }
+            opened.await;
+        }
+    }
+}
+
+// Opens the gate when dropped, so a startup task that ends any way at all,
+// a panic included, never leaves the gate's waiters waiting.
+pub struct StartupDiskGateOpener(StartupDiskGate);
+
+impl StartupDiskGateOpener {
+    pub fn new(gate: StartupDiskGate) -> Self {
+        Self(gate)
+    }
+}
+
+impl Drop for StartupDiskGateOpener {
+    fn drop(&mut self) {
+        self.0.open();
+    }
 }
 
 fn detect_disk_info(output_dir: &Path) -> (StorageClass, FilesystemType) {

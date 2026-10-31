@@ -1,0 +1,580 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+// Plain files, alone or under a PAR2 set, clean, damaged and lost.
+
+use weaver_graph::recovery::RepairOutcome;
+
+use super::harness::{
+    ARTICLE, Claim, Post, Scenario, assert_fetched_once, one_block_article, par2_set, par2_volumes,
+    payload, recovery_packet, repair_and_terminal_events, run, run_holding, try_run,
+    without_slice_checksums,
+};
+use crate::history::HistoryFailureKind;
+use crate::jobs::model::JobStatus;
+
+// Plain files followed by one PAR2 set over them, the index then the
+// volume; the files are numbered as listed, the index and volume after.
+fn covered(files: &[(&str, Vec<u8>)], blocks: u32) -> Vec<Post> {
+    let described: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, bytes)| (*name, bytes.as_slice()))
+        .collect();
+    let mut posts: Vec<Post> = files
+        .iter()
+        .map(|(name, bytes)| Post::plain(name, bytes.clone()))
+        .collect();
+    posts.extend(par2_set("lantern", &described, blocks));
+    posts
+}
+
+fn claims_all(claims: &std::collections::BTreeMap<String, Claim>, expected: Claim) -> bool {
+    !claims.is_empty() && claims.values().all(|claim| *claim == expected)
+}
+
+#[tokio::test]
+async fn recovery_founds_an_unposted_root_file_and_survives_restart() {
+    let absent = payload(2 * ARTICLE, 91);
+    let present = payload(ARTICLE, 92);
+    let mut posts = vec![Post::plain("present.bin", present.clone())];
+    posts.extend(par2_set(
+        "lantern",
+        &[("absent.bin", &absent), ("present.bin", &present)],
+        2,
+    ));
+    let scenario = Scenario::new(posts);
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(graph.files["lantern beacon/absent.bin"], absent);
+    assert_eq!(graph.files["lantern beacon/present.bin"], present);
+    let restarted = super::restart::run_restarting(&scenario, &mut |_| {}).await;
+    assert_eq!(restarted.status, Some(JobStatus::Complete));
+    assert_eq!(restarted.files, graph.files);
+    assert!(restarted.restarts > 0);
+    assert!(restarted.from_disk.is_empty(), "{:?}", restarted.from_disk);
+}
+
+// A file posted short of the length its set describes, its last article
+// ending early and arriving clean. The set finds the last slice wrong and
+// rebuilds it to the described length, and the member is that length: the
+// file is delivered whole, every described byte in it.
+#[tokio::test]
+async fn a_file_posted_short_of_its_description_is_rebuilt_to_the_described_length() {
+    let data = payload(4 * ARTICLE, 63);
+    let described = [("lantern.bin", data.as_slice())];
+    let mut posts = vec![Post::plain("lantern.bin", data[..data.len() - 24].to_vec())];
+    posts.extend(par2_set("lantern", &described, 2));
+    let graph = run(&Scenario::new(posts)).await;
+    assert_fetched_once(&graph);
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+    assert!(claims_all(&graph.graph().claims, Claim::Complete));
+    assert_eq!(graph.files.values().next(), Some(&data));
+}
+
+#[tokio::test]
+async fn plain_files_clean() {
+    let scenario = Scenario::new(vec![
+        Post::plain("lantern.bin", payload(3 * ARTICLE, 1)),
+        Post::plain("beacon.dat", payload(2 * ARTICLE - 9, 2)),
+    ]);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert!(claims_all(&graph.claims, Claim::Complete));
+    assert!(claims_all(&graph.graph().claims, Claim::Complete));
+}
+
+// A recovery packet posted twice in its volume, one copy bad in a way its
+// header does not show: its length field claims eight bytes more, so the
+// packet it describes runs into the valid copy; or it is cut to its magic,
+// so the header read with it is the valid copy's front. Whichever copy
+// comes first, the walk finds the valid one past the bad one, the damaged
+// slice is repaired with it, and nothing is asked for twice.
+#[tokio::test]
+async fn a_bad_copy_of_a_recovery_packet_never_hides_the_valid_one() {
+    fn longer(valid: &[u8]) -> Vec<u8> {
+        let mut bad = valid.to_vec();
+        bad[8] ^= 0x08;
+        bad
+    }
+    fn cut(valid: &[u8]) -> Vec<u8> {
+        valid[..8].to_vec()
+    }
+    let body = payload(4 * ARTICLE, 61);
+    for (mutate, bad_first) in [
+        (longer as fn(&[u8]) -> Vec<u8>, false),
+        (longer, true),
+        (cut, false),
+        (cut, true),
+    ] {
+        let mut posts = covered(&[("lantern.bin", body.clone())], 1);
+        let valid = recovery_packet(&posts[2]);
+        let bad = mutate(&valid);
+        posts[2].bytes = if bad_first {
+            [bad, valid].concat()
+        } else {
+            [valid, bad].concat()
+        };
+        let context = format!("bad_first={bad_first} bad={} bytes", posts[2].bytes.len());
+        let graph = run(&Scenario::new(posts).damaged(0, 1)).await;
+        assert_fetched_once(&graph);
+        assert!(graph.completed(), "{context}: {:?}", graph.failure);
+        assert!(claims_all(&graph.claims, Claim::Complete), "{context}");
+        assert_eq!(
+            graph.graph().outcomes,
+            vec![Some(RepairOutcome::Repaired { slices: 1 })],
+            "{context}"
+        );
+    }
+}
+
+// A set posted without its slice checksums hashes its file whole and no
+// finer. A clean file checks against that hash and nothing is spent on it;
+// a damaged one cannot say which slice is bad, so the set rebuilds every
+// slice from its recovery, and the file is delivered whole.
+#[tokio::test]
+async fn a_set_without_slice_checksums_checks_and_rebuilds_its_file_whole() {
+    let data = payload(4 * ARTICLE, 62);
+    let posts = || {
+        let mut posts = covered(&[("lantern.bin", data.clone())], 4);
+        for post in &mut posts[1..] {
+            post.bytes = without_slice_checksums(&post.bytes);
+        }
+        posts
+    };
+    let clean = run(&Scenario::new(posts())).await;
+    assert!(clean.completed(), "{:?}", clean.failure);
+    assert_eq!(clean.graph().outcomes, vec![Some(RepairOutcome::Clean)]);
+    assert_eq!(clean.files.values().next(), Some(&data));
+
+    let damaged = run(&Scenario::new(posts()).damaged(0, 1)).await;
+    assert_fetched_once(&damaged);
+    assert!(damaged.completed(), "{:?}", damaged.failure);
+    assert!(claims_all(&damaged.claims, Claim::Complete));
+    assert_eq!(
+        damaged.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 4 })]
+    );
+    assert_eq!(damaged.files.values().next(), Some(&data));
+}
+
+#[tokio::test]
+async fn one_damaged_article_under_par2_is_repaired() {
+    let data = payload(4 * ARTICLE, 3);
+    let scenario = Scenario::new(covered(&[("lantern.bin", data)], 2)).damaged(0, 1);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert!(claims_all(&graph.claims, Claim::Complete));
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+}
+
+#[tokio::test]
+async fn two_damaged_articles_across_two_files_under_one_set_are_repaired() {
+    let scenario = Scenario::new(covered(
+        &[
+            ("lantern.bin", payload(3 * ARTICLE, 4)),
+            ("beacon.bin", payload(3 * ARTICLE, 5)),
+        ],
+        3,
+    ))
+    .damaged(0, 1)
+    .damaged(1, 2);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert!(claims_all(&graph.claims, Claim::Complete));
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 2 })]
+    );
+}
+
+#[tokio::test]
+async fn a_lost_article_under_par2_is_repaired_with_its_blocks_reported() {
+    let scenario =
+        Scenario::new(covered(&[("lantern.bin", payload(4 * ARTICLE, 6))], 2)).lost(0, 1);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert!(claims_all(&graph.claims, Claim::Complete));
+    let view = graph.graph();
+    assert_eq!(view.blocks_reachable, 2);
+    assert_eq!(
+        view.outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+}
+
+#[tokio::test]
+async fn a_lost_recovery_article_lowers_the_blocks_reachable_and_the_repair_succeeds() {
+    let posts = covered(&[("lantern.bin", payload(4 * ARTICLE, 7))], 4);
+    let lost = one_block_article(&posts[2]);
+    let scenario = Scenario::new(posts).damaged(0, 2).lost(2, lost);
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert!(claims_all(&graph.claims, Claim::Complete));
+    let view = graph.graph();
+    assert_eq!(view.blocks_reachable, 3);
+    assert_eq!(
+        view.outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+}
+
+// Two damaged slices against a set of two blocks, one of them lost with its
+// volume article. The graph counts what the lost article cost, fails the
+// repair as one block reachable, files it under repair and delivers
+// nothing.
+#[tokio::test]
+async fn a_lost_recovery_article_short_of_blocks_fails_as_repair() {
+    let posts = covered(&[("lantern.bin", payload(4 * ARTICLE, 8))], 2);
+    let lost = one_block_article(&posts[2]);
+    let scenario = Scenario::new(posts)
+        .damaged(0, 1)
+        .damaged(0, 2)
+        .lost(2, lost);
+    let graph = run(&scenario).await;
+    assert!(graph.refetched().is_empty());
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
+    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
+
+    let view = graph.graph();
+    assert_eq!(view.blocks_reachable, 1);
+    assert_eq!(
+        view.outcomes,
+        vec![Some(RepairOutcome::Impossible {
+            damaged: 2,
+            reachable: 1
+        })]
+    );
+    assert_eq!(view.claims["lantern.bin"], Claim::Damaged, "a damaged leaf");
+    // A repair the post's losses defeated: queue scripts hear the job
+    // deleted for health.
+    assert!(view.health);
+    // The set's files are its members, never its own volumes.
+    assert_eq!(
+        graph.failure.as_deref(),
+        Some(
+            "PAR2 recovery failed for 1 set(s): lantern.par2 (lantern.bin): not repairable: \
+             2 damaged slices, only 1 recovery blocks reachable"
+        )
+    );
+}
+
+// A damaged article no recovery covers, in the job's only file: the graph
+// keeps the article and claims the file damaged, and since nothing is whole
+// the job fails for the short file.
+#[tokio::test]
+async fn a_damaged_article_without_par2_fails_with_the_file_claimed_damaged() {
+    let scenario =
+        Scenario::new(vec![Post::plain("lantern.bin", payload(10 * ARTICLE, 9))]).damaged(0, 4);
+    let graph = run(&scenario).await;
+    assert!(graph.refetched().is_empty());
+    // Nothing is whole: the job fails, naming the short file.
+    assert_eq!(
+        graph.failure.as_deref(),
+        Some("no file was delivered whole; 1 short: lantern.bin")
+    );
+    // A failed job ships nothing; the graph's own claim keeps the damage.
+    assert_eq!(graph.claims["lantern.bin"], Claim::Missing);
+    assert_eq!(graph.graph().claims["lantern.bin"], Claim::Damaged);
+    // Nothing whole for want of what arrived: a deletion for health.
+    assert!(graph.graph().health);
+}
+
+// A damaged member no set covers: the graph leaves it a damaged leaf and
+// delivers the rest repaired.
+#[tokio::test]
+async fn a_damaged_member_no_set_covers_is_a_damaged_leaf() {
+    let covered_data = payload(3 * ARTICLE, 10);
+    let mut posts = vec![
+        Post::plain("lantern.mkv", covered_data.clone()),
+        Post::plain("beacon.mkv", payload(3 * ARTICLE, 11)),
+    ];
+    posts.extend(par2_set("lantern", &[("lantern.mkv", &covered_data)], 2));
+    let scenario = Scenario::new(posts).damaged(1, 1);
+    let graph = run(&scenario).await;
+    assert!(graph.refetched().is_empty());
+    // The damaged leaf beside the whole member makes the job Partial.
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?}",
+        graph.failure
+    );
+    assert_eq!(graph.claims["lantern.mkv"], Claim::Complete);
+    assert_eq!(graph.claims["beacon.mkv"], Claim::Damaged);
+    let view = graph.graph();
+    assert_eq!(view.claims["lantern.mkv"], Claim::Complete);
+    assert_eq!(view.claims["beacon.mkv"], Claim::Damaged, "a damaged leaf");
+}
+
+// The grid: every article of a clean PAR2 job arrived with a verified
+// checksum, so the graph rules on it from what passed and reads nothing
+// back.
+#[tokio::test]
+async fn a_clean_par2_job_reads_none_of_its_files_back() {
+    let scenario = Scenario::new(covered(
+        &[
+            ("lantern.bin", payload(4 * ARTICLE, 12)),
+            ("beacon.bin", payload(2 * ARTICLE + 5, 13)),
+        ],
+        2,
+    ));
+    let graph = run(&scenario).await;
+    assert_fetched_once(&graph);
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(graph.reads, 0, "the graph read a member back");
+    assert_eq!(graph.graph().outcomes, vec![Some(RepairOutcome::Clean)]);
+}
+
+// A PAR2 set rebuilds the one damaged article: the graph announces the
+// repair once, with the slice it rebuilt, before the job completes.
+#[tokio::test]
+async fn a_par2_repair_is_announced_once_before_the_job_completes() {
+    let data = payload(4 * ARTICLE, 21);
+    let scenario = Scenario::new(covered(&[("lantern.bin", data)], 2)).damaged(0, 1);
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(
+        repair_and_terminal_events(&graph),
+        vec!["RepairComplete 1".to_string(), "JobCompleted".to_string()]
+    );
+}
+
+// Three damaged slices against two recovery blocks: the repair did not
+// hold, so nothing announces one, and the job fails.
+#[tokio::test]
+async fn a_par2_set_short_of_blocks_announces_no_repair_and_fails() {
+    let data = payload(4 * ARTICLE, 22);
+    let scenario = Scenario::new(covered(&[("lantern.bin", data)], 2))
+        .damaged(0, 0)
+        .damaged(0, 1)
+        .damaged(0, 2);
+    let graph = run(&scenario).await;
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Impossible {
+            damaged: 3,
+            reachable: 2
+        })]
+    );
+    assert_eq!(
+        repair_and_terminal_events(&graph),
+        vec!["JobFailed".to_string()]
+    );
+}
+
+// Twelve slices of `lantern.bin` zeroed before posting, so every article
+// arrives with a good checksum and only the set's slice checksums can see
+// the damage, against one recovery block.
+// The set rules the repair impossible and reports the slices it
+// proved bad, so the member is a damaged leaf the failed set covers:
+// unrepaired, not delivered, and the job fails as a repair failure.
+#[tokio::test]
+async fn zeroed_slices_in_clean_articles_short_of_par2_recovery_fail_as_repair() {
+    let original = payload(40 * ARTICLE, 0);
+    let mut posted = original.clone();
+    posted[20 * ARTICLE..32 * ARTICLE].fill(0);
+    let mut posts = vec![Post::plain("lantern.bin", posted)];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &original)], 1));
+    let graph = run(&Scenario::new(posts)).await;
+    assert!(graph.refetched().is_empty());
+    assert_eq!(
+        graph.failure_kind,
+        Some(HistoryFailureKind::Repair),
+        "{:?}",
+        graph.failure
+    );
+    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
+
+    let view = graph.graph();
+    assert_eq!(
+        view.outcomes,
+        vec![Some(RepairOutcome::Impossible {
+            damaged: 12,
+            reachable: 1
+        })]
+    );
+    assert_eq!(
+        graph.failure.as_deref(),
+        Some(
+            "PAR2 recovery failed for 1 set(s): lantern.par2 (lantern.bin): not repairable: \
+             12 damaged slices, only 1 recovery blocks reachable"
+        )
+    );
+    assert_eq!(view.claims["lantern.bin"], Claim::Damaged, "a damaged leaf");
+    assert_eq!(view.delivery.unrepaired, ["lantern.bin"]);
+    assert!(view.delivery.whole.is_empty(), "{:?}", view.delivery);
+}
+
+// A damaged slice under one volume of four blocks, the volume read front to
+// back after the payload. The set waits on its blocks, and rules the moment
+// the first of them is in: the three behind it, and the volume closing, are
+// not what it waited for. Its repair goes out in that step, and what it came
+// to is heard before the next article is served.
+#[tokio::test]
+async fn a_waiting_set_rules_in_the_step_its_first_block_arrives() {
+    use super::harness::{JOB, admit, recovery_blocks, serve};
+    use crate::pipeline::tests::{hear_graph_mail, retire_pipeline_database};
+
+    let posts = covered(&[("lantern.bin", payload(4 * ARTICLE, 9))], 4);
+    let volume = &posts[2];
+    let needed = *recovery_blocks(volume)[0].last().unwrap();
+    let articles = |post: &Post| post.bytes.len().div_ceil(ARTICLE) as u32;
+    let (payload_articles, index_articles, volume_articles) =
+        (articles(&posts[0]), articles(&posts[1]), articles(volume));
+    assert!(needed + 1 < volume_articles, "blocks follow the first");
+    let scenario = Scenario::new(posts).damaged(0, 1);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let order = (0..index_articles)
+        .map(|ordinal| (1, ordinal))
+        .chain([(2, 0)])
+        .chain((0..payload_articles).map(|ordinal| (0, ordinal)))
+        .chain((1..volume_articles).map(|ordinal| (2, ordinal)));
+    let mut ruled = None;
+    for article in order {
+        serve(&mut pipeline, &scenario, article).await;
+        hear_graph_mail(&mut pipeline, JOB).await;
+        let outcomes: Vec<_> = pipeline.graph_jobs[&JOB]
+            .recovery_summary()
+            .iter()
+            .map(|set| set.outcome)
+            .collect();
+        if outcomes == [Some(RepairOutcome::Repaired { slices: 1 })] {
+            ruled = Some(article);
+            break;
+        }
+    }
+    assert_eq!(ruled, Some((2, needed)));
+    retire_pipeline_database(pipeline).await;
+}
+
+// Every article of the payload lost, under a set with a block for each of
+// its slices: the set asks for its volume and rebuilds the whole file from
+// nothing, exactly as it rebuilds a file only some of whose articles came.
+#[tokio::test]
+async fn an_entirely_lost_payload_under_par2_is_rebuilt() {
+    let scenario = Scenario::new(covered(&[("lantern.bin", payload(2 * ARTICLE, 23))], 2))
+        .lost(0, 0)
+        .lost(0, 1);
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert!(claims_all(&graph.claims, Claim::Complete));
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 2 })]
+    );
+}
+
+// Every article of the index damaged, a payload article lost, and two
+// intact recovery volumes: each volume carries the set's file descriptions
+// beside its blocks, so the set is founded from them and rebuilds the file.
+#[tokio::test]
+async fn a_damaged_index_leaves_the_set_to_its_volumes() {
+    let data = payload(6 * ARTICLE, 41);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_volumes("lantern", &[("lantern.bin", &data)], 4, 2));
+    let index = posts[1].bytes.len().div_ceil(ARTICLE) as u32;
+    let mut scenario = Scenario::new(posts).lost(0, 2);
+    for ordinal in 0..index {
+        scenario = scenario.damaged(1, ordinal);
+    }
+    let graph = try_run(&scenario).await.expect("the job settles");
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert!(graph.files["lantern beacon/lantern.bin"] == data);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+}
+
+// The index damaged and each recovery volume lost past its first article:
+// the set is known from the blocks at the volumes' heads, but no packet that
+// says what it describes is left, so it checked nothing. Every payload byte
+// arrived, so the job completes.
+#[tokio::test]
+async fn a_set_with_no_description_left_checks_nothing() {
+    let data = payload(6 * ARTICLE, 47);
+    let scenario = undescribed(data.clone(), false);
+    let graph = try_run(&scenario).await.expect("the job settles");
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert!(graph.files["lantern beacon/lantern.bin"] == data);
+}
+
+// The same with a payload article lost: nothing can rebuild it, so the job
+// fails for the short file rather than waiting on a description.
+#[tokio::test]
+async fn a_set_with_no_description_left_fails_the_short_file() {
+    let scenario = undescribed(payload(6 * ARTICLE, 43), true);
+    let graph = try_run(&scenario).await.expect("the job settles");
+    assert_eq!(
+        graph.failure.as_deref(),
+        Some("no file was delivered whole; 1 short: lantern.bin")
+    );
+}
+
+fn undescribed(data: Vec<u8>, lose_payload: bool) -> Scenario {
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_volumes("lantern", &[("lantern.bin", &data)], 4, 2));
+    let articles: Vec<u32> = posts
+        .iter()
+        .map(|post| post.bytes.len().div_ceil(ARTICLE) as u32)
+        .collect();
+    let mut scenario = Scenario::new(posts);
+    if lose_payload {
+        scenario = scenario.lost(0, 2);
+    }
+    for ordinal in 0..articles[1] {
+        scenario = scenario.damaged(1, ordinal);
+    }
+    for (file, count) in articles.iter().enumerate().skip(2) {
+        for ordinal in 1..*count {
+            scenario = scenario.lost(file as u32, ordinal);
+        }
+    }
+    scenario
+}
+
+// The server holds every article of the recovery volume and serves the rest.
+// The payload lands with a slice the set does not vouch for, and the set,
+// which took the volume by its posted name, waits on the blocks it names
+// rather than ruling short: while the volume is held the job reads as
+// fetching repair data. The root reads as still downloading, so the post
+// lane is idle, one of the lanes the queue item shows the state in. Once
+// the server lets the volume go the job repairs, no longer fetching, and
+// hands the file over whole.
+#[tokio::test]
+async fn a_held_recovery_volume_reads_as_fetching_repair_data() {
+    let data = payload(8 * ARTICLE, 47);
+    let mut posted = data.clone();
+    posted[2 * ARTICLE..3 * ARTICLE].fill(0);
+    let mut posts = vec![Post::plain("lantern.bin", posted)];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 4));
+    assert!(posts[2].name.contains(".vol"));
+    let held = run_holding(&Scenario::new(posts), 2).await;
+    assert_eq!(held.outcomes, vec![Some(RepairOutcome::Waiting)]);
+    assert_eq!(held.report.status, JobStatus::Downloading);
+    assert_eq!(held.report.post_state, crate::PostState::Idle);
+    assert!(held.report.fetching_repair_data, "not fetching while held");
+    assert!(
+        held.after.iter().all(|(_, fetching)| !fetching),
+        "still fetching once the volume came: {:?}",
+        held.after
+    );
+    assert_eq!(held.status, Some(JobStatus::Complete));
+    assert!(
+        held.files["lantern beacon/lantern.bin"] == data,
+        "not repaired"
+    );
+}

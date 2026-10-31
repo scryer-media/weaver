@@ -44,6 +44,8 @@ impl Database {
             for delete_files in [false, true] {
                 let statuses: Vec<_> = [
                     ("failed", failed),
+                    // A partial delivery is pruned as the failure clients see.
+                    ("partial", failed),
                     ("complete", completed),
                     ("cancelled", cancelled),
                 ]

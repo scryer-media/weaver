@@ -30,16 +30,8 @@ pub(in crate::pipeline) struct SourceOpenError {
 }
 
 impl SourceOpenError {
-    pub(in crate::pipeline) fn new(context: String, cause: io::Error) -> Self {
-        Self { context, cause }
-    }
-
     pub(in crate::pipeline) fn cause(&self) -> &io::Error {
         &self.cause
-    }
-
-    pub(in crate::pipeline) fn into_io_error(self) -> io::Error {
-        io::Error::new(self.cause.kind(), self)
     }
 }
 

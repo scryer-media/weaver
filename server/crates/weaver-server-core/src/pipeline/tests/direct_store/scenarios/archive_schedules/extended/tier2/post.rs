@@ -89,8 +89,6 @@ pub(in super::super) struct UuStyle {
     // The final group carries only the bytes it needs instead of a full
     // four characters.
     pub unpadded_tail: bool,
-    // The last line's length character overstates its bytes by one.
-    pub wrong_last_length: bool,
     pub end: UuEnd,
     // Bare LF line endings instead of CRLF.
     pub bare_lf: bool,
@@ -124,7 +122,6 @@ impl UuStyle {
         preamble: false,
         space_zero: false,
         unpadded_tail: false,
-        wrong_last_length: false,
         end: UuEnd::Full,
         bare_lf: false,
         line_bytes: 45,
@@ -533,9 +530,6 @@ fn uu_render(
     for (index, line) in lines.iter().enumerate() {
         let last = index + 1 == lines.len();
         let mut length = line.len() as u8;
-        if last && style.wrong_last_length {
-            length += 1;
-        }
         if damage == Some(Damage::Overlong) && index == damaged_line {
             length += 3;
         }
@@ -613,7 +607,33 @@ pub(in super::super) struct Post {
     pub expected: Vec<(String, Vec<u8>)>,
     // Further files a complete job may publish besides `expected`, such as
     // furniture posted beside the archive.
-    pub allowed: Vec<String>,
+    pub allowed: Vec<Allowed>,
+}
+
+// A file a job may publish besides `expected`.
+#[derive(Clone, Debug)]
+pub(in super::super) struct Allowed {
+    pub name: String,
+    // Its bytes when whole, for a file a user can open: a sample, a picture,
+    // a text. `None` for a container or furniture, which never make a job
+    // Partial however whole they are.
+    pub usable: Option<Vec<u8>>,
+}
+
+impl Allowed {
+    pub(in super::super) fn usable(name: &str, bytes: &[u8]) -> Self {
+        Self {
+            name: name.to_string(),
+            usable: Some(bytes.to_vec()),
+        }
+    }
+
+    pub(in super::super) fn unusable(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            usable: None,
+        }
+    }
 }
 
 impl Post {

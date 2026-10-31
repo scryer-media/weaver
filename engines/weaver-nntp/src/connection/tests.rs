@@ -1513,70 +1513,6 @@ async fn raw_body_counts_exact_wire_payload() {
 }
 
 #[tokio::test]
-async fn expired_active_budget_does_not_enter_async_rate_wait() {
-    let port = spawn_scripted_server(
-        vec![
-            ScriptStep {
-                expect_prefix: None,
-                response: b"200 ready\r\n",
-                delay: Duration::ZERO,
-            },
-            ScriptStep {
-                expect_prefix: Some("CAPABILITIES"),
-                response: b"500 unknown\r\n",
-                delay: Duration::ZERO,
-            },
-            ScriptStep {
-                expect_prefix: Some("BODY "),
-                response: b"222 body follows\r\n",
-                delay: Duration::ZERO,
-            },
-        ],
-        Duration::from_secs(1),
-    )
-    .await;
-
-    let mut conn = NntpConnection::connect(&scripted_plain_config(port))
-        .await
-        .unwrap();
-    let registry = crate::transfer::ServerTransferRegistry::new();
-    let control = registry.configure(
-        crate::transfer::StableServerId(46),
-        crate::transfer::ServerTransferConfig {
-            rate_bytes_per_sec: 100,
-            quota: None,
-        },
-    );
-    conn.set_transfer_control(Some(control.clone()));
-    conn.write_body_request("<expired-budget@example.com>")
-        .await
-        .unwrap();
-    conn.flush_commands().await.unwrap();
-    let initial = conn.read_response().await.unwrap();
-
-    let decoded = vec![b'A'; 1_200];
-    let mut buffered_body = Vec::new();
-    encode(&decoded, &mut buffered_body, 128, "expired.bin").unwrap();
-    buffered_body.extend_from_slice(b".\r\n");
-    conn.read_buf = BytesMut::from(buffered_body.as_slice());
-    let mut budget = ActiveTransferBudget::new(Duration::ZERO);
-
-    let error = conn
-        .stream_yenc_article_response(initial, Some(&mut budget), |_| Ok(()))
-        .await
-        .unwrap_err();
-
-    assert!(matches!(
-        error,
-        FusedYencError::Nntp(NntpError::SoftTimeout(_))
-    ));
-    assert!(conn.is_poisoned());
-    let snapshot = control.snapshot();
-    assert!(snapshot.lifetime_body_bytes >= decoded.len() as u64);
-    assert_eq!(snapshot.throttle_wait, Duration::ZERO);
-}
-
-#[tokio::test]
 async fn quota_rejection_happens_before_body_command() {
     let port = spawn_scripted_server(
         vec![
@@ -1848,7 +1784,7 @@ async fn stream_yenc_article_reauthenticates_on_mid_session_480() {
 }
 
 #[tokio::test]
-async fn stream_yenc_article_batches_large_decoded_output() {
+async fn stream_yenc_article_hands_a_large_sized_part_over_as_one_batch() {
     let mut original = Vec::with_capacity(FUSED_YENC_OUTPUT_BATCH_TARGET + 123);
     for idx in 0..(FUSED_YENC_OUTPUT_BATCH_TARGET + 123) {
         original.push((idx % 251) as u8);
@@ -1889,9 +1825,11 @@ async fn stream_yenc_article_batches_large_decoded_output() {
         .unwrap();
 
     assert_eq!(article.to_data(), original);
+    // The part declares its length, so it is one batch of that length past
+    // the fixed target: the writer adopts it without joining pieces.
     let chunk_lens: Vec<usize> = delivered.iter().map(Vec::len).collect();
-    assert_eq!(chunk_lens, vec![FUSED_YENC_OUTPUT_BATCH_TARGET, 123]);
-    assert_eq!(article.stats.output_batches, 2);
+    assert_eq!(chunk_lens, vec![FUSED_YENC_OUTPUT_BATCH_TARGET + 123]);
+    assert_eq!(article.stats.output_batches, 1);
     // The callback sees the same bytes as the buffered article, in order.
     assert_eq!(delivered.concat(), article.to_data());
 }
@@ -2008,4 +1946,54 @@ async fn fetch_body_from_real_server() {
     let mut conn = NntpConnection::connect(&config).await.unwrap();
     let result = conn.body_by_id("<test@example.com>").await;
     println!("{result:?}");
+}
+
+// The other half of the inactivity budget: a BODY that answers, delivers
+// some bytes and then goes silent is timed out once a whole budget passes
+// with nothing more. The server holds the session open longer than any test
+// runs, so only the client's budget can end the read.
+#[tokio::test]
+async fn a_body_that_goes_silent_partway_exhausts_its_budget() {
+    let port = spawn_scripted_server(
+        vec![
+            ScriptStep {
+                expect_prefix: None,
+                response: b"200 ready\r\n",
+                delay: Duration::ZERO,
+            },
+            ScriptStep {
+                expect_prefix: Some("CAPABILITIES"),
+                response: b"500 unknown\r\n",
+                delay: Duration::ZERO,
+            },
+            ScriptStep {
+                expect_prefix: Some("BODY "),
+                response: b"222 body follows\r\n=ybegin line=128 size=256 name=x\r\nkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\r\n",
+                delay: Duration::ZERO,
+            },
+        ],
+        UNREACHED_TIMEOUT,
+    )
+    .await;
+
+    let mut conn = NntpConnection::connect(&scripted_plain_config(port))
+        .await
+        .unwrap();
+    conn.write_body_request("<silent-partway@example.com>")
+        .await
+        .unwrap();
+    conn.flush_commands().await.unwrap();
+    let initial = conn.read_response().await.unwrap();
+    let mut budget = ActiveTransferBudget::new(Duration::from_millis(50));
+
+    let error = conn
+        .stream_yenc_article_response(initial, Some(&mut budget), |_| Ok(()))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        FusedYencError::Nntp(NntpError::SoftTimeout(_))
+    ));
+    assert!(conn.is_poisoned());
 }

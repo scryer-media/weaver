@@ -1,0 +1,14 @@
+{
+  "slug": "held-stream-uu",
+  "title": "E2E.Test.held.stream.uu.2026-TESTGRP",
+  "description": "A small UUDeview multipart stream input for durable unanchored held-part pause/restart/resume; the restart harness holds first article IDs.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "灯火.bin": "234199861d19027985775f1ea97812b2dab354ad92cc3f64dc62c775a70197b5"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks"
+  ],
+  "exactOutputFiles": true
+}

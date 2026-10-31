@@ -3,78 +3,15 @@
 
 use super::*;
 
-const MAX_NESTED_EXTRACTION_DEPTH: u32 = 3;
-const MAX_CONCURRENT_REPAIRS: usize = 1;
-
-#[derive(Debug, Clone)]
-struct ScannedExtractionFile {
-    relative_path: String,
-    declared_role: weaver_model::files::FileRole,
-    detected_archive: Option<crate::jobs::assembly::DetectedArchiveIdentity>,
-    size: u64,
-}
-
-#[derive(Debug, Clone)]
-struct NestedArchiveFile {
-    relative_path: String,
-    declared_role: weaver_model::files::FileRole,
-    detected_archive: Option<crate::jobs::assembly::DetectedArchiveIdentity>,
-    archive_type: crate::jobs::assembly::ArchiveType,
-    set_name: String,
-    volume_number: u32,
-    size: u64,
-}
-
-impl ScannedExtractionFile {
-    fn effective_role(&self) -> weaver_model::files::FileRole {
-        self.detected_archive
-            .as_ref()
-            .map(crate::jobs::assembly::DetectedArchiveIdentity::effective_role)
-            .unwrap_or_else(|| self.declared_role.clone())
-    }
-
-    fn archive_set_name(&self) -> Option<String> {
-        self.detected_archive
-            .as_ref()
-            .map(|detected| detected.set_name.clone())
-            .or_else(|| {
-                weaver_model::files::archive_base_name(&self.relative_path, &self.declared_role)
-            })
-    }
-}
-
-// Simple archive type for non-RAR, non-7z extraction.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum SimpleArchiveKind {
-    Zip,
-    Tar,
-    TarGz,
-    TarBz2,
-    TarXz,
-    Gz,
-    Deflate,
-    Brotli,
-    Zstd,
-    Bzip2,
-    Xz,
-    Split,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NestedExtractionDecision {
-    Started,
-    Deferred,
-    NoNestedArchives,
-    PreserveOutputsAtDepthLimit,
-}
+// The deepest a graph job's namespaces may nest: the ten-deep chain the
+// one-engine plan delivers, with headroom. A child bound below it is
+// refused, and the job fails naming depth.
+pub(in crate::pipeline) const MAX_GRAPH_NESTING_DEPTH: u32 = 16;
 
 pub(crate) mod check;
 pub(crate) mod claims;
 pub(crate) mod deobfuscate;
-pub(in crate::pipeline) mod extract;
-mod nested;
 mod output;
-pub(crate) mod placement;
-pub(crate) mod rar;
-mod sfv;
+#[cfg(test)]
+pub(in crate::pipeline) use output::member_crc32_by_path;
 mod status;

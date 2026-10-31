@@ -38,772 +38,6 @@ async fn owned_download_lane_pool_respects_configured_connection_count_at_startu
     assert_eq!(high_pipeline.tuner.params().max_concurrent_downloads, 24);
 }
 
-#[tokio::test]
-async fn par2_metadata_bootstrap_defers_payload_until_checkpoint_plan_is_known() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        4,
-    )
-    .await;
-    let job_id = JobId(40143);
-    let payload = (0..(7 * 128))
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
-    let mut grid64 = placement_par2_file_set(&[("payload.mkv".to_string(), payload.clone())]);
-    grid64.slice_size = 64;
-    let mut grid96 = placement_par2_file_set(&[("payload.mkv".to_string(), payload.clone())]);
-    grid96.recovery_set_id = par2_rs::RecoverySetId::from_bytes([10; 16]);
-    grid96.slice_size = 96;
-
-    let index64 = build_test_par2_index("payload.mkv", &payload, 64);
-    let index96 = build_test_par2_index("payload.mkv", &payload, 96);
-    let payload_segments = (0..7)
-        .map(|number| {
-            segment_spec! {
-                number: number,
-                bytes: 128,
-                message_id: format!("payload-{number}@example.com"),
-            }
-        })
-        .collect::<Vec<_>>();
-    let spec = JobSpec {
-        name: "PAR2 Metadata Bootstrap".to_string(),
-        password: None,
-        total_bytes: (index64.len() + index96.len() + payload.len()) as u64,
-        category: None,
-        metadata: vec![],
-        files: vec![
-            FileSpec {
-                filename: "00-grid64.par2".to_string(),
-                role: FileRole::Par2 {
-                    is_index: true,
-                    recovery_block_count: 0,
-                },
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: vec![segment_spec! {
-                    number: 0,
-                    bytes: index64.len() as u32,
-                    message_id: "grid64@example.com".to_string(),
-                }],
-            },
-            FileSpec {
-                filename: "01-grid96.par2".to_string(),
-                role: FileRole::Par2 {
-                    is_index: true,
-                    recovery_block_count: 0,
-                },
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: vec![segment_spec! {
-                    number: 0,
-                    bytes: index96.len() as u32,
-                    message_id: "grid96@example.com".to_string(),
-                }],
-            },
-            FileSpec {
-                filename: "payload.mkv".to_string(),
-                role: FileRole::Standalone,
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: payload_segments,
-            },
-        ],
-    };
-    insert_active_job(&mut pipeline, job_id, spec).await;
-    let grid64_id = grid64.recovery_set_id;
-    let grid96_id = grid96.recovery_set_id;
-    let index64_priority = pipeline
-        .jobs
-        .get(&job_id)
-        .unwrap()
-        .download_queue
-        .peek_next_matching(|work| work.segment_id.file_id.file_index == 0)
-        .expect("the first explicit index must be the ordinary queue head")
-        .priority;
-
-    let index_lease = pipeline
-        .lease_for_server_for_test(0)
-        .expect("the explicit indexes must lease first");
-    assert_eq!(index_lease.works.len(), 2);
-    assert!(matches!(
-        index_lease.checkpoint_plan,
-        weaver_yenc::CheckpointPlan::None
-    ));
-    assert!(
-        index_lease
-            .works
-            .iter()
-            .all(|work| work.segment_id.file_id.file_index < 2),
-        "the bootstrap claims the indexes, never the payload"
-    );
-    assert!(
-        index_lease
-            .works
-            .iter()
-            .all(|work| !work.is_recovery && work.priority == index64_priority),
-        "explicit indexes must retain primary lane and accounting classification"
-    );
-
-    {
-        let runtime = pipeline.ensure_par2_runtime(job_id);
-        runtime.served = Some(grid64_id);
-        runtime.ensure_set_runtime(grid64_id).set = Some(std::sync::Arc::new(grid64));
-        runtime.files.insert(
-            0,
-            Par2FileRuntime {
-                filename: "00-grid64.par2".to_string(),
-                discovery: Par2DiscoveryState::Parsed {
-                    set_ids: vec![grid64_id],
-                },
-                ..Default::default()
-            },
-        );
-    }
-    pipeline.refresh_par2_checkpoint_plan(job_id);
-    assert!(pipeline.promote_par2_metadata(job_id));
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        assert_eq!(
-            state.download_queue.reprioritize_matching(|work| {
-                (work.segment_id.file_id.file_index == 2)
-                    .then_some(super::repair::PROMOTED_RECOVERY_PRIORITY - 1)
-            }),
-            7
-        );
-    }
-
-    assert!(
-        pipeline.lease_for_server_for_test(0).is_none(),
-        "payload work must wait for PAR2 metadata instead of receiving a stale None plan"
-    );
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 7);
-
-    let runtime = pipeline.ensure_par2_runtime(job_id);
-    runtime.ensure_set_runtime(grid96_id).set = Some(std::sync::Arc::new(grid96));
-    runtime.files.insert(
-        1,
-        Par2FileRuntime {
-            filename: "01-grid96.par2".to_string(),
-            discovery: Par2DiscoveryState::Parsed {
-                set_ids: vec![grid96_id],
-            },
-            ..Default::default()
-        },
-    );
-    pipeline.refresh_par2_checkpoint_plan(job_id);
-    assert!(pipeline.par2_metadata_discovery_closed(job_id));
-
-    let payload_lease = pipeline
-        .lease_for_server_for_test(0)
-        .expect("payload work must lease after both grids are known");
-    assert!(
-        !payload_lease.works.is_empty(),
-        "the released payload lease must contain work"
-    );
-    assert!(
-        payload_lease
-            .works
-            .iter()
-            .all(|work| work.segment_id.file_id.file_index == 2)
-    );
-    assert!(matches!(
-        payload_lease.checkpoint_plan,
-        weaver_yenc::CheckpointPlan::Multi(_)
-    ));
-}
-
-#[tokio::test]
-async fn par2_metadata_bootstrap_claims_every_explicit_index_in_one_primary_batch() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        4,
-    )
-    .await;
-    let job_id = JobId(40146);
-    let spec = JobSpec {
-        name: "Batched Explicit PAR2 Metadata Bootstrap".to_string(),
-        password: None,
-        total_bytes: 256,
-        category: None,
-        metadata: vec![],
-        files: vec![
-            FileSpec {
-                filename: "00-first.par2".to_string(),
-                role: FileRole::Par2 {
-                    is_index: true,
-                    recovery_block_count: 0,
-                },
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: vec![segment_spec! {
-                    number: 0,
-                    bytes: 64,
-                    message_id: "batched-first@example.com".to_string(),
-                }],
-            },
-            FileSpec {
-                filename: "01-second.par2".to_string(),
-                role: FileRole::Par2 {
-                    is_index: true,
-                    recovery_block_count: 0,
-                },
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: vec![segment_spec! {
-                    number: 0,
-                    bytes: 64,
-                    message_id: "batched-second@example.com".to_string(),
-                }],
-            },
-            FileSpec {
-                filename: "payload.bin".to_string(),
-                role: FileRole::Standalone,
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: vec![
-                    segment_spec! {
-                        number: 0,
-                        bytes: 64,
-                        message_id: "batched-payload-0@example.com".to_string(),
-                    },
-                    segment_spec! {
-                        number: 1,
-                        bytes: 64,
-                        message_id: "batched-payload-1@example.com".to_string(),
-                    },
-                ],
-            },
-        ],
-    };
-    insert_active_job(&mut pipeline, job_id, spec).await;
-    let priority = FileRole::Par2 {
-        is_index: true,
-        recovery_block_count: 0,
-    }
-    .download_priority();
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        let mut queued = state.download_queue.drain_all();
-        for work in &mut queued {
-            work.priority = priority;
-        }
-        queued.sort_by_key(|work| work.segment_id.file_id.file_index);
-        for work in queued {
-            state.download_queue.push(work);
-        }
-    }
-    assert_eq!(pipeline.current_hot_job(), Some(job_id));
-
-    let lease = pipeline
-        .lease_for_server_for_test(0)
-        .expect("same-priority explicit indexes must batch");
-    assert_eq!(lease.works.len(), 2);
-    assert!(
-        lease.works.iter().all(|work| {
-            work.segment_id.file_id.file_index < 2
-                && !work.is_recovery
-                && !work.completion_critical
-                && work.priority == priority
-        }),
-        "the bootstrap lease must contain only primary explicit-index work"
-    );
-    assert!(
-        pipeline
-            .jobs
-            .get(&job_id)
-            .unwrap()
-            .download_queue
-            .count_matching(|work| work.segment_id.file_id.file_index == 2)
-            == 2,
-        "an otherwise compatible ordinary payload must remain queued"
-    );
-    let payload_head = pipeline
-        .jobs
-        .get(&job_id)
-        .unwrap()
-        .download_queue
-        .peek_next_matching(|_| true)
-        .map(|work| work.segment_id)
-        .unwrap();
-    for _ in 0..2 {
-        assert!(
-            pipeline.lease_for_server_for_test(0).is_none(),
-            "in-flight indexes keep compatible payload work behind the gate"
-        );
-    }
-    assert_eq!(
-        pipeline
-            .jobs
-            .get(&job_id)
-            .unwrap()
-            .download_queue
-            .peek_next_matching(|_| true)
-            .map(|work| work.segment_id),
-        Some(payload_head),
-        "a blocked lease attempt must not rotate equal-priority payload work"
-    );
-    assert!(matches!(
-        pipeline.par2_discovery_state_for_candidate(job_id, 0),
-        Par2DiscoveryState::MetadataCarrierQueued { .. }
-    ));
-    assert!(matches!(
-        pipeline.par2_discovery_state_for_candidate(job_id, 1),
-        Par2DiscoveryState::MetadataCarrierQueued { .. }
-    ));
-    assert!(
-        !pipeline
-            .list_jobs()
-            .into_iter()
-            .find(|job| job.job_id == job_id)
-            .expect("bootstrapping job remains visible")
-            .fetching_repair_data,
-        "ordinary explicit-index bootstrap must not surface as completion-critical recovery fetch"
-    );
-
-    let second_index = lease
-        .works
-        .iter()
-        .find(|work| work.segment_id.file_id.file_index == 1)
-        .expect("the second explicit index must be in the lease")
-        .segment_id;
-    pipeline.mark_promoted_recovery_segment_unavailable(second_index);
-    assert!(pipeline.promote_par2_metadata(job_id));
-    assert!(matches!(
-        pipeline.par2_discovery_state_for_candidate(job_id, 1),
-        Par2DiscoveryState::Exhausted { .. }
-    ));
-}
-
-#[tokio::test]
-async fn par2_metadata_bootstrap_blocks_compatible_payload_refill_until_plan_is_published() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        4,
-    )
-    .await;
-    let job_id = JobId(40147);
-    let payload = b"refill-payload".to_vec();
-    let mut grid = placement_par2_file_set(&[("payload.bin".to_string(), payload.clone())]);
-    grid.slice_size = 8;
-    let spec = JobSpec {
-        name: "PAR2 Bootstrap Refill".to_string(),
-        password: None,
-        total_bytes: 128,
-        category: None,
-        metadata: vec![],
-        files: vec![
-            FileSpec {
-                filename: "index.par2".to_string(),
-                role: FileRole::Par2 {
-                    is_index: true,
-                    recovery_block_count: 0,
-                },
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: vec![segment_spec! {
-                    number: 0,
-                    bytes: 64,
-                    message_id: "refill-index@example.com".to_string(),
-                }],
-            },
-            FileSpec {
-                filename: "payload.bin".to_string(),
-                role: FileRole::Standalone,
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: vec![segment_spec! {
-                    number: 0,
-                    bytes: payload.len() as u32,
-                    message_id: "refill-payload@example.com".to_string(),
-                }],
-            },
-        ],
-    };
-    insert_active_job(&mut pipeline, job_id, spec).await;
-    let priority = FileRole::Par2 {
-        is_index: true,
-        recovery_block_count: 0,
-    }
-    .download_priority();
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        let mut queued = state.download_queue.drain_all();
-        for work in &mut queued {
-            work.priority = priority;
-        }
-        queued.sort_by_key(|work| work.segment_id.file_id.file_index);
-        for work in queued {
-            state.download_queue.push(work);
-        }
-    }
-    let index_lease = pipeline
-        .lease_for_server_for_test(0)
-        .expect("the explicit index leads its job's queue");
-    assert!(
-        index_lease
-            .works
-            .iter()
-            .all(|work| work.segment_id.file_id.file_index == 0)
-    );
-    assert!(
-        pipeline.lease_for_server_for_test(0).is_none(),
-        "an open bootstrap must leave the payload behind it"
-    );
-    assert_eq!(
-        pipeline
-            .jobs
-            .get(&job_id)
-            .unwrap()
-            .download_queue
-            .count_matching(|work| work.segment_id.file_id.file_index == 1),
-        1
-    );
-
-    let grid_id = grid.recovery_set_id;
-    {
-        let runtime = pipeline.ensure_par2_runtime(job_id);
-        runtime.served = Some(grid_id);
-        runtime.ensure_set_runtime(grid_id).set = Some(std::sync::Arc::new(grid));
-        runtime.files.insert(
-            0,
-            Par2FileRuntime {
-                filename: "index.par2".to_string(),
-                discovery: Par2DiscoveryState::Parsed {
-                    set_ids: vec![grid_id],
-                },
-                ..Default::default()
-            },
-        );
-    }
-    pipeline.refresh_par2_checkpoint_plan(job_id);
-
-    let payload_refill = pipeline
-        .lease_for_server_for_test(0)
-        .expect("the payload refill must resume once the plan is published");
-    assert!(
-        payload_refill
-            .works
-            .iter()
-            .all(|work| work.segment_id.file_id.file_index == 1)
-    );
-    assert!(matches!(
-        payload_refill.checkpoint_plan,
-        weaver_yenc::CheckpointPlan::Single(_)
-    ));
-}
-
-#[tokio::test]
-async fn par2_metadata_bootstrap_keeps_equal_priority_payload_out_of_the_handout() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        4,
-    )
-    .await;
-    let job_id = JobId(40148);
-    let spec = JobSpec {
-        name: "PAR2 Bootstrap IP Trial".to_string(),
-        password: None,
-        total_bytes: 320,
-        category: None,
-        metadata: vec![],
-        files: vec![
-            FileSpec {
-                filename: "index.par2".to_string(),
-                role: FileRole::Par2 {
-                    is_index: true,
-                    recovery_block_count: 0,
-                },
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: vec![segment_spec! {
-                    number: 0,
-                    bytes: 64,
-                    message_id: "trial-index@example.com".to_string(),
-                }],
-            },
-            FileSpec {
-                filename: "payload.bin".to_string(),
-                role: FileRole::Standalone,
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: (0..4)
-                    .map(|number| {
-                        segment_spec! {
-                            number: number,
-                            bytes: 64,
-                            message_id: format!("trial-payload-{number}@example.com"),
-                        }
-                    })
-                    .collect(),
-            },
-        ],
-    };
-    insert_active_job(&mut pipeline, job_id, spec).await;
-    let priority = FileRole::Par2 {
-        is_index: true,
-        recovery_block_count: 0,
-    }
-    .download_priority();
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        let mut queued = state.download_queue.drain_all();
-        for work in &mut queued {
-            work.priority = priority;
-        }
-        queued.sort_by_key(|work| work.segment_id.file_id.file_index);
-        for work in queued {
-            state.download_queue.push(work);
-        }
-    }
-
-    let lease = pipeline
-        .lease_for_server_for_test(0)
-        .expect("the index itself is servable while its bootstrap is open");
-    assert!(
-        lease
-            .works
-            .iter()
-            .all(|work| work.segment_id.file_id.file_index == 0),
-        "the bootstrap claims the queue, so no payload rides out beside the index"
-    );
-    assert_eq!(
-        pipeline
-            .jobs
-            .get(&job_id)
-            .unwrap()
-            .download_queue
-            .count_matching(|work| work.segment_id.file_id.file_index == 1),
-        4,
-        "every equal-priority payload article stays queued"
-    );
-    assert!(matches!(
-        pipeline.par2_discovery_state_for_candidate(job_id, 0),
-        Par2DiscoveryState::MetadataCarrierQueued { .. }
-    ));
-}
-
-#[tokio::test]
-async fn par2_metadata_bootstrap_releases_payload_after_an_explicit_index_is_unavailable() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        4,
-    )
-    .await;
-    let job_id = JobId(40144);
-    let spec = JobSpec {
-        name: "Missing Explicit PAR2 Index Bootstrap".to_string(),
-        password: None,
-        total_bytes: 192,
-        category: None,
-        metadata: vec![],
-        files: vec![
-            FileSpec {
-                filename: "missing.par2".to_string(),
-                role: FileRole::Par2 {
-                    is_index: true,
-                    recovery_block_count: 0,
-                },
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: vec![segment_spec! {
-                    number: 0,
-                    bytes: 64,
-                    message_id: "missing-index@example.com".to_string(),
-                }],
-            },
-            FileSpec {
-                filename: "payload.bin".to_string(),
-                role: FileRole::Standalone,
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: vec![segment_spec! {
-                    number: 0,
-                    bytes: 128,
-                    message_id: "missing-index-payload@example.com".to_string(),
-                }],
-            },
-        ],
-    };
-    insert_active_job(&mut pipeline, job_id, spec).await;
-
-    let index_lease = pipeline
-        .lease_for_server_for_test(0)
-        .expect("the explicit index must lease before the payload");
-    assert!(
-        index_lease.works.iter().all(|work| !work.is_recovery),
-        "the unavailable callback must track an explicit primary index"
-    );
-    pipeline.mark_promoted_recovery_segment_unavailable(index_lease.works[0].segment_id);
-
-    let payload_lease = pipeline
-        .lease_for_server_for_test(0)
-        .expect("terminally unavailable metadata must not leave payload blocked forever");
-    assert!(
-        payload_lease
-            .works
-            .iter()
-            .all(|work| work.segment_id.file_id.file_index == 1)
-    );
-    assert!(pipeline.par2_metadata_discovery_closed(job_id));
-}
-
-#[tokio::test]
-async fn par2_metadata_bootstrap_does_not_hold_payload_for_late_indexless_discovery() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        4,
-    )
-    .await;
-    let job_id = JobId(40145);
-    let payload = b"late-carrier-payload".to_vec();
-    let mut grid = placement_par2_file_set(&[("payload.bin".to_string(), payload.clone())]);
-    grid.slice_size = 8;
-    let index = build_test_par2_index("payload.bin", &payload, 8);
-    let spec = JobSpec {
-        name: "Late Indexless PAR2 Carrier Bootstrap".to_string(),
-        password: None,
-        total_bytes: (index.len() + payload.len() + 64) as u64,
-        category: None,
-        metadata: vec![],
-        files: vec![
-            FileSpec {
-                filename: "00-index.par2".to_string(),
-                role: FileRole::Par2 {
-                    is_index: true,
-                    recovery_block_count: 0,
-                },
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: vec![segment_spec! {
-                    number: 0,
-                    bytes: index.len() as u32,
-                    message_id: "late-index@example.com".to_string(),
-                }],
-            },
-            FileSpec {
-                filename: "01-late.vol00+01.par2".to_string(),
-                role: FileRole::Par2 {
-                    is_index: false,
-                    recovery_block_count: 1,
-                },
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: vec![segment_spec! {
-                    number: 0,
-                    bytes: 64,
-                    message_id: "late-carrier@example.com".to_string(),
-                }],
-            },
-            FileSpec {
-                filename: "payload.bin".to_string(),
-                role: FileRole::Standalone,
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: vec![segment_spec! {
-                    number: 0,
-                    bytes: payload.len() as u32,
-                    message_id: "late-payload@example.com".to_string(),
-                }],
-            },
-        ],
-    };
-    insert_active_job(&mut pipeline, job_id, spec).await;
-
-    let index_lease = pipeline
-        .lease_for_server_for_test(0)
-        .expect("the explicit index must lease first");
-    assert!(
-        index_lease
-            .works
-            .iter()
-            .all(|work| { work.segment_id.file_id.file_index == 0 && !work.is_recovery })
-    );
-
-    let grid_id = grid.recovery_set_id;
-    {
-        let runtime = pipeline.ensure_par2_runtime(job_id);
-        runtime.served = Some(grid_id);
-        runtime.ensure_set_runtime(grid_id).set = Some(std::sync::Arc::new(grid));
-        runtime.files.insert(
-            0,
-            Par2FileRuntime {
-                filename: "00-index.par2".to_string(),
-                discovery: Par2DiscoveryState::Parsed {
-                    set_ids: vec![grid_id],
-                },
-                ..Default::default()
-            },
-        );
-    }
-    pipeline.refresh_par2_checkpoint_plan(job_id);
-
-    let payload_lease = pipeline
-        .lease_for_server_for_test(0)
-        .expect("a late indexless candidate must not become a payload barrier");
-    assert!(
-        payload_lease
-            .works
-            .iter()
-            .all(|work| { work.segment_id.file_id.file_index == 2 && !work.is_recovery }),
-        "the known explicit grid must flow into the payload lease"
-    );
-    assert!(matches!(
-        payload_lease.checkpoint_plan,
-        weaver_yenc::CheckpointPlan::Single(_)
-    ));
-    assert!(
-        !pipeline.par2_metadata_discovery_closed(job_id),
-        "completion must still discover the late indexless set"
-    );
-    assert_eq!(
-        pipeline
-            .jobs
-            .get(&job_id)
-            .unwrap()
-            .recovery_queue
-            .count_matching(|work| work.segment_id.file_id.file_index == 1),
-        1,
-        "late recovery work stays parked until completion discovery"
-    );
-}
-
 // Recovery rides the same owned lanes as ordinary work.
 //
 // Recovery used to be pushed onto the async pool and pinned to sequential
@@ -852,6 +86,7 @@ async fn a_recovery_lease_takes_an_owned_lane() {
         avoid_server: None,
     };
     let lease = DownloadBatchLease {
+        body_activity: Arc::default(),
         lane_id: 0,
         job_id,
         runtime_generation: pipeline.pool_generation,
@@ -902,6 +137,7 @@ async fn a_recovery_lease_keeps_the_owned_lane_fleet_intact() {
         avoid_server: None,
     };
     let lease = DownloadBatchLease {
+        body_activity: Arc::default(),
         lane_id: 0,
         job_id: work.segment_id.file_id.job_id,
         runtime_generation: pipeline.pool_generation,
@@ -990,67 +226,14 @@ async fn a_handout_is_bounded_by_the_want_not_by_the_queue() {
         .expect("the hot job can serve this server");
     assert_eq!(lease.works.len(), want);
     assert_eq!(
-        pipeline.jobs[&job_id].download_queue.len(),
+        pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         33 - want,
         "the rest of the tail stays queued for the lanes behind this one"
-    );
-}
-
-// Promoted completion-critical work leads its own job's queue, and is handed
-// out under the same bound as anything else: a promotion is not a licence for
-// one lane to take the whole burst.
-#[tokio::test]
-async fn promoted_completion_critical_work_leads_the_queue_under_the_ordinary_bound() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        8,
-    )
-    .await;
-
-    let job_id = JobId(40144);
-    let files = many_standalone_files("promoted-recovery", 45);
-    insert_active_job(
-        &mut pipeline,
-        job_id,
-        standalone_job_spec("Promoted Recovery", &files),
-    )
-    .await;
-    let promoted = pipeline
-        .jobs
-        .get_mut(&job_id)
-        .unwrap()
-        .download_queue
-        .promote_matching_to_completion_critical_with_rank(|_| Some((0, None)));
-    assert_eq!(promoted, 45);
-
-    // Every lane of the job is parked: this is the state a promotion wakes.
-    assert!(pipeline.active_download_connections_by_job.is_empty());
-    assert_eq!(pipeline.active_download_connections, 0);
-
-    let want = pipeline.download_refill_want(DownloadLaneMode::Sequential);
-    let mut leased = Vec::new();
-    for _ in 0..8 {
-        let Some(lease) = pipeline.lease_for_server_for_test(0) else {
-            break;
-        };
-        assert!(lease.completion_critical);
-        assert!(lease.works.iter().all(|work| work.completion_critical));
-        leased.push(lease.works.len());
-    }
-    assert_eq!(
-        leased.len(),
-        8,
-        "the promoted set reaches every lane: {leased:?}"
-    );
-    assert!(
-        leased.iter().all(|count| *count == want),
-        "no lane may take the whole promoted set: {leased:?}"
     );
 }
 
@@ -1115,8 +298,8 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
 
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
@@ -1171,6 +354,9 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .expect("transport retry should remain in the batched infrastructure queue");
@@ -1222,6 +408,9 @@ async fn transient_retry_backoff_does_not_fail_job_early() {
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .unwrap();
@@ -1245,8 +434,8 @@ async fn transport_failure_retry_rotates_off_the_failed_server() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
 
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
@@ -1283,6 +472,9 @@ async fn transport_failure_retry_rotates_off_the_failed_server() {
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .expect("transport retry should requeue");
@@ -1307,8 +499,8 @@ async fn transport_failure_retry_keeps_single_server_eligible() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
 
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
@@ -1344,6 +536,9 @@ async fn transport_failure_retry_keeps_single_server_eligible() {
     let retry = pipeline
         .jobs
         .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
         .unwrap()
         .download_queue
         .pop()
@@ -1393,8 +588,8 @@ async fn transport_failure_retry_does_not_rotate_toward_backfill() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
 
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
@@ -1430,6 +625,9 @@ async fn transport_failure_retry_does_not_rotate_toward_backfill() {
     let retry = pipeline
         .jobs
         .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
         .unwrap()
         .download_queue
         .pop()
@@ -1480,6 +678,9 @@ async fn fail_segment_on_transport(
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .expect("transport retry should requeue");
@@ -1506,8 +707,8 @@ async fn a_segment_that_keeps_breaking_connections_is_held_back_then_pays_for_re
     let spec = segmented_job_spec("Poison article", "poison.bin", &[128]);
     insert_active_job(&mut pipeline, job_id, spec).await;
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    state.download_queue = DownloadQueue::new();
-    state.recovery_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
 
     let (delay, retry_count) = fail_segment_on_transport(&mut pipeline, segment_id, 0).await;
     assert!(
@@ -1546,8 +747,8 @@ async fn an_outage_never_spends_article_retry_budget() {
     let spec = segmented_job_spec("Outage", "outage.bin", &[128]);
     insert_active_job(&mut pipeline, job_id, spec).await;
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    state.download_queue = DownloadQueue::new();
-    state.recovery_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
 
     for _ in 0..6 {
         let (_, retry_count) = fail_segment_on_transport(&mut pipeline, segment_id, 0).await;
@@ -1619,8 +820,8 @@ async fn group_discovery_at_retry_limit_preserves_the_article_for_a_grouped_retr
     let spec = segmented_job_spec("Group discovery", "group.bin", &[128]);
     insert_active_job(&mut pipeline, job_id, spec).await;
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    state.download_queue = DownloadQueue::new();
-    state.recovery_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
 
@@ -1657,6 +858,9 @@ async fn group_discovery_at_retry_limit_preserves_the_article_for_a_grouped_retr
     let retry = pipeline
         .jobs
         .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
         .unwrap()
         .download_queue
         .pop()
@@ -1701,212 +905,6 @@ fn infrastructure_failures_preserve_article_retry_budget() {
 }
 
 #[tokio::test]
-async fn pool_capacity_failure_at_retry_limit_does_not_poison_health() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(20013);
-    let segment_id = SegmentId {
-        file_id: NzbFileId {
-            job_id,
-            file_index: 0,
-        },
-        segment_number: 0,
-    };
-    let spec = segmented_job_spec("Pool Capacity Guard", "retry.bin", &[128]);
-    insert_active_job(&mut pipeline, job_id, spec).await;
-
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
-    }
-
-    hold_on_test_lane(&mut pipeline, &[segment_id]);
-    pipeline.active_download_passes.insert(job_id);
-
-    pipeline
-        .handle_download_done(DownloadResult {
-            lane_id: 0,
-            job_id: segment_id.file_id.job_id,
-            runtime_generation: 0,
-            segment_id,
-            data: Err(DownloadError::fetch(
-                DownloadFailureKind::CapacityUnavailable,
-                "no connections available",
-            )),
-            attempts: Vec::new(),
-            lane_observation: None,
-            source_server_idx: None,
-            origin: DownloadResultOrigin::NormalPrimary,
-            retry_count: MAX_SEGMENT_RETRIES,
-            exclude_servers: vec![0],
-            release_connection_slot: true,
-        })
-        .await;
-
-    assert_eq!(
-        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
-        Some(0)
-    );
-    assert_eq!(
-        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
-        Some(JobStatus::Downloading)
-    );
-    assert_eq!(
-        pipeline.pending_retries_by_job.get(&job_id).copied(),
-        Some(1)
-    );
-    assert!(pipeline.pending_completion_checks.is_empty());
-    assert!(pipeline.unavailable_promoted_recovery_segments.is_empty());
-    assert_eq!(
-        pipeline
-            .metrics
-            .segments_failed_permanent
-            .load(Ordering::Relaxed),
-        0
-    );
-
-    assert_eq!(
-        pipeline
-            .download_wait_by_job
-            .get(&job_id)
-            .map(|wait| wait.reason),
-        Some("provider connection capacity unavailable")
-    );
-    tokio::task::yield_now().await;
-    assert_eq!(
-        pipeline
-            .metrics
-            .parked_infrastructure_work
-            .load(Ordering::Relaxed),
-        1
-    );
-    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
-    let retry = pipeline
-        .jobs
-        .get_mut(&job_id)
-        .unwrap()
-        .download_queue
-        .pop()
-        .expect("generation wake should requeue parked infrastructure work");
-    assert_eq!(retry.segment_id, segment_id);
-    assert_eq!(retry.retry_count, MAX_SEGMENT_RETRIES);
-    assert_eq!(retry.exclude_servers, vec![0]);
-    assert!(!pipeline.download_wait_by_job.contains_key(&job_id));
-    assert_eq!(
-        pipeline
-            .metrics
-            .parked_infrastructure_work
-            .load(Ordering::Relaxed),
-        0
-    );
-}
-
-#[tokio::test]
-async fn body_lane_unavailable_at_retry_limit_requeues_without_article_failure() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(20014);
-    let segment_id = SegmentId {
-        file_id: NzbFileId {
-            job_id,
-            file_index: 0,
-        },
-        segment_number: 0,
-    };
-    let spec = segmented_job_spec("Lane Acquire Guard", "retry.bin", &[128]);
-    insert_active_job(&mut pipeline, job_id, spec).await;
-
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
-    }
-
-    hold_on_test_lane(&mut pipeline, &[segment_id]);
-    pipeline.active_download_passes.insert(job_id);
-
-    pipeline
-        .handle_download_done(DownloadResult {
-            lane_id: 0,
-            job_id: segment_id.file_id.job_id,
-            runtime_generation: 0,
-            segment_id,
-            data: Err(DownloadError::fetch(
-                DownloadFailureKind::LaneUnavailable,
-                "failed to acquire BODY lane",
-            )),
-            attempts: Vec::new(),
-            lane_observation: None,
-            source_server_idx: None,
-            origin: DownloadResultOrigin::NormalPrimary,
-            retry_count: MAX_SEGMENT_RETRIES + 1,
-            exclude_servers: vec![0, 1],
-            release_connection_slot: false,
-        })
-        .await;
-
-    assert_eq!(
-        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
-        Some(0)
-    );
-    assert_eq!(
-        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
-        Some(JobStatus::Downloading)
-    );
-    assert_eq!(
-        pipeline.pending_retries_by_job.get(&job_id).copied(),
-        Some(1)
-    );
-    assert!(pipeline.pending_completion_checks.is_empty());
-    assert!(pipeline.unavailable_promoted_recovery_segments.is_empty());
-    assert_eq!(
-        pipeline
-            .metrics
-            .segments_failed_permanent
-            .load(Ordering::Relaxed),
-        0
-    );
-    tokio::task::yield_now().await;
-    assert_eq!(
-        pipeline
-            .metrics
-            .parked_infrastructure_work
-            .load(Ordering::Relaxed),
-        1
-    );
-    assert_eq!(
-        pipeline
-            .download_wait_by_job
-            .get(&job_id)
-            .map(|wait| wait.reason),
-        Some("no eligible NNTP server")
-    );
-
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(pipeline.retry_rx.try_recv().is_err());
-    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
-    let retry = pipeline
-        .jobs
-        .get_mut(&job_id)
-        .unwrap()
-        .download_queue
-        .pop()
-        .expect("generation wake should requeue parked pre-BODY work without retry charge");
-    assert_eq!(retry.segment_id, segment_id);
-    assert_eq!(retry.retry_count, MAX_SEGMENT_RETRIES + 1);
-    assert_eq!(retry.exclude_servers, vec![0, 1]);
-    assert_eq!(
-        pipeline
-            .metrics
-            .parked_infrastructure_work
-            .load(Ordering::Relaxed),
-        0
-    );
-    assert!(!pipeline.download_wait_by_job.contains_key(&job_id));
-}
-
-#[tokio::test]
 async fn generation_wake_requeues_ten_thousand_segments_in_one_batch() {
     const RETRY_COUNT: usize = 10_000;
 
@@ -1919,7 +917,14 @@ async fn generation_wake_requeues_ten_thousand_segments_in_one_batch() {
         segmented_job_spec("Generation Batch", "retry.bin", &[128]),
     )
     .await;
-    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue = DownloadQueue::new();
     pipeline.pending_retries_by_job.insert(job_id, RETRY_COUNT);
     pipeline.download_wait_by_job.insert(
         job_id,
@@ -1990,7 +995,15 @@ async fn generation_wake_requeues_ten_thousand_segments_in_one_batch() {
         Some("no_server")
     );
     assert_eq!(
-        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         RETRY_COUNT
     );
     assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
@@ -2025,8 +1038,8 @@ async fn stale_generation_transport_failure_is_requeued_without_poisoning_health
     .await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     pipeline.pool_generation = 2;
     hold_on_test_lane(&mut pipeline, &[segment_id]);
@@ -2053,7 +1066,12 @@ async fn stale_generation_transport_failure_is_requeued_without_poisoning_health
 
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
     assert_eq!(state.failed_bytes, 0);
-    let queued = state.download_queue.drain_all();
+    let queued = state
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .drain_all();
     assert_eq!(queued.len(), 1);
     assert_eq!(queued[0].segment_id, segment_id);
     assert_eq!(queued[0].retry_count, MAX_SEGMENT_RETRIES + 10);
@@ -2146,8 +1164,8 @@ async fn terminal_accounting_is_idempotent() {
     .await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
 
     pipeline.book_failed_segment(segment_id);
@@ -2163,15 +1181,23 @@ async fn terminal_accounting_is_idempotent() {
         };
     }
     pipeline.reprocess_job(job_id).await.unwrap();
+    activate_job(&mut pipeline, job_id).await;
     assert!(!pipeline.segment_terminal_states.contains_key(&segment_id));
     assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, 0);
 
-    // Reprocessing a job that is still resident rebuilds its assembly with
-    // every segment already committed, so the ledger has nothing left to book:
-    // delivery is a terminal state too, and it outranks a failure result.
+    // A reprocess is a new admission: the graph fetches every article again,
+    // so the article is pending and its loss books its declared bytes afresh.
+    // Health policy is not what is under test: a recovery set large enough to
+    // make the critical threshold zero keeps the loss in the deferral arm
+    // instead of aborting the job out from under the ledger.
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.par2_bytes = state.spec.total_bytes;
+    }
+    let booked = u64::from(pipeline.jobs[&job_id].spec.files[0].segments[0].bytes);
     pipeline.book_failed_segment(segment_id);
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, 0);
-    assert!(!pipeline.segment_terminal_states.contains_key(&segment_id));
+    assert_eq!(pipeline.jobs.get(&job_id).unwrap().failed_bytes, booked);
+    assert!(pipeline.segment_terminal_states.contains_key(&segment_id));
     pipeline.purge_terminal_job_runtime(job_id);
     assert!(!pipeline.segment_terminal_states.contains_key(&segment_id));
 }
@@ -2185,20 +1211,14 @@ async fn a_file_whose_every_segment_dies_books_each_declared_size_exactly_once()
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(20018);
     let segment_sizes = [1_000u32, 2_000, 3_000, 4_000];
-    insert_active_job(
-        &mut pipeline,
-        job_id,
-        segmented_job_spec("Silver Horizon", "silver-horizon.mkv", &segment_sizes),
-    )
-    .await;
-    {
-        // Health policy is not what is under test. A recovery set large enough
-        // to make the critical threshold zero keeps a wholly dead file in the
-        // deferral arm instead of aborting the job out from under the ledger.
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.next_health_probe_failed_bytes = u64::MAX;
-        state.par2_bytes = state.spec.total_bytes;
-    }
+    // Health policy is not what is under test. A sibling file ten times the
+    // dying one's size keeps the post above its critical line, so the feed
+    // never gives it up out from under the ledger.
+    let mut spec = segmented_job_spec("Silver Horizon", "silver-horizon.mkv", &segment_sizes);
+    let sibling = segmented_job_spec("Silver Horizon", "silver-horizon-extra.mkv", &[10_000; 10]);
+    spec.total_bytes += sibling.total_bytes;
+    spec.files.extend(sibling.files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
 
     let segment = |segment_number| SegmentId {
         file_id: NzbFileId {
@@ -2256,7 +1276,6 @@ async fn segments_that_arrive_after_a_failure_leave_the_ledger_untouched() {
     };
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.next_health_probe_failed_bytes = u64::MAX;
         state.par2_bytes = state.spec.total_bytes;
     }
 
@@ -2270,7 +1289,13 @@ async fn segments_that_arrive_after_a_failure_leave_the_ledger_untouched() {
     pipeline.book_terminal_segment(segment(2), SegmentTerminalState::DecodeExhausted);
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        let file = state.assembly.file_mut(file_id).unwrap();
+        let file = state
+            .articles
+            .active_mut()
+            .unwrap()
+            .assembly
+            .file_mut(file_id)
+            .unwrap();
         file.commit_segment(1, 2_000).unwrap();
         file.commit_segment(3, 4_000).unwrap();
     }
@@ -2286,173 +1311,44 @@ async fn segments_that_arrive_after_a_failure_leave_the_ledger_untouched() {
     assert_eq!(pipeline.segment_terminal_states.len(), 2);
 }
 
-// `weaver_files_missing_total` counts **files**, not failed segments, and it
-// counts them where the download pass gives up rather than at each permanent
-// segment failure: two dead segments in one file are one missing file.
+// What the feed weighs a post on is kept as each article is given up, so
+// reading it walks nothing of the post: with the post's article lists
+// dropped, as a parked job drops them, the figures read the same, and the
+// losses alone are what the reads cost.
 #[tokio::test]
-async fn exhausted_download_counts_one_missing_file_with_its_missing_segments() {
+async fn the_feed_reads_a_posts_losses_without_walking_its_articles() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(20017);
-    let segment_sizes = [4_000u32; 20];
-    insert_active_job(
-        &mut pipeline,
-        job_id,
-        segmented_job_spec("Silver Horizon", "silver-horizon.mkv", &segment_sizes),
-    )
-    .await;
-
-    // Two of the twenty segments exhaust their retries. Health probes are not
-    // what is under test, so hold them off; the surviving 90% health is above
-    // the no-PAR2 critical threshold either way, so the job stays alive to
-    // reach the completion check below.
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.next_health_probe_failed_bytes = u64::MAX;
+    let job_id = JobId(20021);
+    let segment_sizes = [1_000u32, 2_000, 3_000, 4_000];
+    // A sibling ten times the size keeps the post above its critical line.
+    let mut spec = segmented_job_spec("Silver Horizon", "silver-horizon.mkv", &segment_sizes);
+    let sibling = segmented_job_spec("Silver Horizon", "silver-horizon-extra.mkv", &[10_000; 10]);
+    spec.total_bytes += sibling.total_bytes;
+    spec.files.extend(sibling.files);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let segment = |segment_number| SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number,
+    };
+    pipeline.book_terminal_segment(segment(0), SegmentTerminalState::Missing);
+    pipeline.book_terminal_segment(segment(2), SegmentTerminalState::Unservable);
+    let read = |pipeline: &Pipeline| {
+        (
+            pipeline.missing_bytes(job_id),
+            pipeline.derived_failed_bytes(job_id),
+            pipeline.graph_article_given_up(segment(2)),
+            pipeline.graph_article_given_up(segment(1)),
+        )
+    };
+    assert_eq!(read(&pipeline), (1_000, 4_000, true, false));
+    for file in &mut pipeline.jobs.get_mut(&job_id).unwrap().spec.files {
+        file.segments.clear();
     }
-    for segment_number in 0..2 {
-        pipeline.book_failed_segment(SegmentId {
-            file_id: NzbFileId {
-                job_id,
-                file_index: 0,
-            },
-            segment_number,
-        });
-    }
-    assert!(
-        pipeline.jobs.contains_key(&job_id),
-        "two permanent failures must not be enough to abort the job"
-    );
-
-    // The queues drain with the file still short: nothing else is coming.
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
-        state.status = JobStatus::Downloading;
-        state.refresh_runtime_lanes_from_status();
-    }
-
-    let before = pipeline.metrics.job_lifecycle.snapshot();
-    assert_eq!(before.files_missing_total, 0);
-    assert_eq!(before.missing_segments_total, 0);
-
-    pipeline.check_job_completion(job_id).await;
-
-    let snapshot = pipeline.metrics.job_lifecycle.snapshot();
-    // One file, counted once, carrying every segment it never received — not
-    // one row per booked segment failure.
-    assert_eq!(snapshot.files_missing_total, 1);
-    assert_eq!(
-        snapshot.missing_segments_total,
-        u64::from(segment_sizes.len() as u32)
-    );
-}
-
-// The completion check re-enters many times per job, so the per-file guard is
-// what keeps `weaver_files_missing_total` from climbing on every pass.
-#[tokio::test]
-async fn missing_files_are_counted_once_across_repeated_completion_checks() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(20019);
-    insert_active_job(
-        &mut pipeline,
-        job_id,
-        segmented_job_spec(
-            "Silver Horizon Encore",
-            "encore.mkv",
-            &[4_000, 4_000, 4_000],
-        ),
-    )
-    .await;
-
-    for _ in 0..5 {
-        pipeline.note_incomplete_files_after_download_drain(job_id);
-    }
-
-    let snapshot = pipeline.metrics.job_lifecycle.snapshot();
-    assert_eq!(snapshot.files_missing_total, 1);
-    assert_eq!(snapshot.missing_segments_total, 3);
-}
-
-// A job with no PAR2 set can never produce an `intact`/`damaged`/`missing`
-// verdict, so it is accounted for as `unverifiable` at its terminal
-// transition instead of being left out of `weaver_verifications_total`.
-#[tokio::test]
-async fn job_without_par2_records_one_unverifiable_verification() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(20018);
-    insert_active_job(
-        &mut pipeline,
-        job_id,
-        segmented_job_spec("Silver Horizon Reprise", "reprise.mkv", &[4_000, 4_000]),
-    )
-    .await;
-    assert!(pipeline.par2_set(job_id).is_none());
-
-    fn unverifiable(pipeline: &Pipeline) -> u64 {
-        pipeline
-            .metrics
-            .job_lifecycle
-            .snapshot()
-            .verifications
-            .iter()
-            .find(|(result, _)| *result == "unverifiable")
-            .map(|(_, count)| *count)
-            .expect("unverifiable is one of the pre-declared verification results")
-    }
-
-    assert_eq!(unverifiable(&pipeline), 0);
-
-    // A live job reaching the decision twice contributes one row: the guard
-    // set is claimed by the first, and a real verdict would have claimed it
-    // first of all.
-    pipeline.note_job_unverifiable_if_no_par2_set(job_id);
-    pipeline.note_job_unverifiable_if_no_par2_set(job_id);
-    assert_eq!(unverifiable(&pipeline), 1);
-
-    // The terminal transition itself is one of those decisions, so a failure
-    // after the fact adds nothing.
-    pipeline.fail_job(job_id, "no article ever landed".to_string());
-    assert_eq!(unverifiable(&pipeline), 1);
-}
-
-// The same terminal transition on a job that *does* carry a recovery set
-// records nothing: that job's verdict is the verification pass's to report.
-#[tokio::test]
-async fn job_with_par2_set_records_no_unverifiable_verification() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(20020);
-    let payload_filename = "payload.mkv";
-    let payload: Vec<u8> = (0..32u32).map(|value| (value % 251) as u8).collect();
-    insert_active_job(
-        &mut pipeline,
-        job_id,
-        standalone_job_spec(
-            "Silver Horizon Recovered",
-            &[(payload_filename.to_string(), payload.len() as u32)],
-        ),
-    )
-    .await;
-    install_test_par2_runtime(
-        &mut pipeline,
-        job_id,
-        placement_par2_file_set(&[(payload_filename.to_string(), payload)]),
-        &[],
-    );
-    assert!(pipeline.par2_set(job_id).is_some());
-
-    pipeline.note_job_unverifiable_if_no_par2_set(job_id);
-    pipeline.fail_job(job_id, "disk went away".to_string());
-
-    let verifications = pipeline.metrics.job_lifecycle.snapshot().verifications;
-    assert!(
-        verifications.iter().all(|(_, count)| *count == 0),
-        "a job with a recovery set must not be attributed to any verdict here: {verifications:?}"
-    );
+    assert_eq!(read(&pipeline), (1_000, 4_000, true, false));
 }
 
 #[tokio::test]
@@ -2471,8 +1367,8 @@ async fn server_quota_lane_failure_parks_until_retry_at_without_lane_spin() {
     insert_active_job(&mut pipeline, job_id, spec).await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
@@ -2568,8 +1464,8 @@ async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection()
     insert_active_job(&mut pipeline, job_id, spec).await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[large_segment, tail_segment]);
     pipeline.active_download_passes.insert(job_id);
@@ -2688,6 +1584,9 @@ async fn quota_acquire_failure_requeues_smaller_tail_for_independent_selection()
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .expect("untested tail must re-enter the download queue");
@@ -2733,8 +1632,8 @@ async fn server_quota_reservation_refund_wakes_parked_work() {
     insert_active_job(&mut pipeline, job_id, spec).await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
@@ -2814,8 +1713,8 @@ async fn server_quota_source_failure_keeps_backfill_locked_and_fails_over_to_fil
     insert_active_job(&mut pipeline, job_id, spec).await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
@@ -2959,8 +1858,8 @@ async fn server_quota_source_failure_parks_while_only_backfill_remains() {
     insert_active_job(&mut pipeline, job_id, spec).await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
@@ -3067,8 +1966,8 @@ async fn other_fill_refund_wakes_manual_quota_park_without_unlocking_backfill() 
     insert_active_job(&mut pipeline, job_id, spec).await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
@@ -3276,8 +2175,8 @@ async fn article_not_found_exhaustion_counts_retention_excluded_servers() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
@@ -3340,7 +2239,14 @@ async fn enqueued_work_no_server_may_fetch_is_booked_missing() {
     let job_id = JobId(40153);
     let spec = segmented_job_spec("Unservable Requeue", "solo.bin", &[128]);
     insert_active_job(&mut pipeline, job_id, spec).await;
-    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue = DownloadQueue::new();
     let segment_id = SegmentId {
         file_id: NzbFileId {
             job_id,
@@ -3371,10 +2277,13 @@ async fn enqueued_work_no_server_may_fetch_is_booked_missing() {
         1
     );
     assert!(
-        pipeline
-            .jobs
-            .get(&job_id)
-            .is_none_or(|state| state.download_queue.is_empty() && state.failed_bytes == 128),
+        pipeline.jobs.get(&job_id).is_none_or(|state| state
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .is_empty()
+            && state.failed_bytes == 128),
         "the article must be booked missing, not queued (job may already be archived by health)"
     );
 }
@@ -3392,7 +2301,15 @@ async fn fully_retention_excluded_queue_is_retired_when_the_scheduler_is_asked()
     insert_active_job(&mut pipeline, job_id, spec).await;
     pipeline.nntp = std::sync::Arc::new(retention_client(&[5, 5]));
     age_job_days(&mut pipeline, job_id, 10);
-    assert_eq!(pipeline.jobs[&job_id].download_queue.len(), 4);
+    assert_eq!(
+        pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        4
+    );
 
     let pressure = pipeline.refresh_download_pressure();
     let handout = pipeline.next_works(0, 4, None, pressure);
@@ -3408,10 +2325,13 @@ async fn fully_retention_excluded_queue_is_retired_when_the_scheduler_is_asked()
         4
     );
     assert!(
-        pipeline
-            .jobs
-            .get(&job_id)
-            .is_none_or(|state| state.download_queue.is_empty() && state.failed_bytes == 512),
+        pipeline.jobs.get(&job_id).is_none_or(|state| state
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .is_empty()
+            && state.failed_bytes == 512),
         "every article must be booked missing (job may already be archived by health)"
     );
 }
@@ -3428,8 +2348,8 @@ async fn fully_retention_excluded_job_books_missing_instead_of_requeueing() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
@@ -3491,8 +2411,8 @@ async fn traced_article_not_found_retries_other_servers_without_retry_budget() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
 
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
@@ -3562,8 +2482,8 @@ async fn recovery_article_not_found_does_not_mark_health_failure() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
 
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 2, 0)]);
@@ -3623,8 +2543,8 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
 
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
@@ -3659,16 +2579,6 @@ async fn exhausted_incomplete_download_fails_instead_of_hanging() {
         })
         .await;
     drain_decode_results(&mut pipeline, 1).await;
-
-    assert_eq!(
-        pipeline
-            .jobs
-            .get(&job_id)
-            .unwrap()
-            .assembly
-            .complete_data_file_count(),
-        0
-    );
 
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 1)]);
     pipeline.active_download_passes.insert(job_id);
@@ -3729,26 +2639,31 @@ async fn download_pass_finishes_when_only_optional_recovery_queue_remains() {
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.status = JobStatus::Downloading;
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue.push(DownloadWork {
-            counters: None,
-            segment_id: SegmentId {
-                file_id: NzbFileId {
-                    job_id,
-                    file_index: 1,
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state
+            .articles
+            .active_mut()
+            .unwrap()
+            .recovery_queue
+            .push(DownloadWork {
+                counters: None,
+                segment_id: SegmentId {
+                    file_id: NzbFileId {
+                        job_id,
+                        file_index: 1,
+                    },
+                    segment_number: 0,
                 },
-                segment_number: 0,
-            },
-            message_id: MessageId::new("recovery-0@example.com"),
-            groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
-            priority: 1000,
-            byte_estimate: 128,
-            retry_count: 0,
-            is_recovery: true,
-            completion_critical: false,
-            exclude_servers: Vec::new(),
-            avoid_server: None,
-        });
+                message_id: MessageId::new("recovery-0@example.com"),
+                groups: std::sync::Arc::from(vec!["alt.binaries.test".to_string()]),
+                priority: 1000,
+                byte_estimate: 128,
+                retry_count: 0,
+                is_recovery: true,
+                completion_critical: false,
+                exclude_servers: Vec::new(),
+                avoid_server: None,
+            });
     }
 
     pipeline.active_download_passes.insert(job_id);
@@ -3769,7 +2684,15 @@ async fn download_pass_finishes_when_only_optional_recovery_queue_remains() {
         vec![job_id]
     );
     assert_eq!(
-        pipeline.jobs.get(&job_id).unwrap().recovery_queue.len(),
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .recovery_queue
+            .len(),
         1,
         "optional recovery files should stay parked until promoted"
     );
@@ -3796,6 +2719,7 @@ async fn released_result_books_its_own_job_after_its_lane_owner_is_gone() {
     pipeline.download_lane_owners.insert(
         lane_id,
         DownloadLaneOwner {
+            body_activity: Vec::new(),
             job_id,
             mode: DownloadLaneMode::Sequential,
             completion_critical: false,
@@ -3879,8 +2803,8 @@ async fn article_not_found_exhausts_when_the_work_already_failed_elsewhere() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
@@ -3945,8 +2869,8 @@ async fn article_not_found_that_learns_no_new_server_books_instead_of_retrying()
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[held_segment(job_id, 0, 0)]);
     pipeline.active_download_passes.insert(job_id);
@@ -4007,8 +2931,8 @@ async fn egress_quota_refusal_parks_when_no_server_has_a_leg_in_quota() {
     insert_active_job(&mut pipeline, job_id, spec).await;
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     }
     hold_on_test_lane(&mut pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
@@ -4159,6 +3083,136 @@ async fn egress_quota_refusal_parks_when_no_server_has_a_leg_in_quota() {
     pipeline.jobs.remove(&job_id);
     pipeline.shared_state.publish_jobs(Vec::new());
     runtime.network.shutdown().await;
+}
+
+#[tokio::test]
+async fn recovery_metadata_bootstrap_holds_graph_payload_until_indexes_settle() {
+    for par3 in [false, true] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+            &temp_dir,
+            BufferPoolConfig {
+                small_count: 8,
+                medium_count: 4,
+                large_count: 2,
+            },
+            4,
+        )
+        .await;
+        let job_id = JobId(40146);
+        let payload = (0..(7 * 128))
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let index = build_test_par2_index("payload.mkv", &payload, 64);
+        let payload_segments = (0..7)
+            .map(|number| {
+                segment_spec! {
+                    number: number,
+                    bytes: 128,
+                    message_id: format!("graph-payload-{number}@example.com"),
+                }
+            })
+            .collect::<Vec<_>>();
+        let spec = JobSpec {
+            name: "Graph PAR2 Bootstrap".to_string(),
+            password: None,
+            total_bytes: (index.len() + payload.len()) as u64,
+            category: None,
+            metadata: vec![],
+            files: vec![
+                FileSpec {
+                    filename: if par3 {
+                        "00-index.par3"
+                    } else {
+                        "00-index.par2"
+                    }
+                    .to_string(),
+                    role: if par3 {
+                        FileRole::Par3 { is_index: true }
+                    } else {
+                        FileRole::Par2 {
+                            is_index: true,
+                            recovery_block_count: 0,
+                        }
+                    },
+                    groups: vec!["alt.binaries.test".to_string()],
+                    posted_at_epoch: None,
+                    segments: vec![segment_spec! {
+                        number: 0,
+                        bytes: index.len() as u32,
+                        message_id: "graph-index@example.com".to_string(),
+                    }],
+                },
+                FileSpec {
+                    filename: "payload.mkv".to_string(),
+                    role: FileRole::Standalone,
+                    groups: vec!["alt.binaries.test".to_string()],
+                    posted_at_epoch: None,
+                    segments: payload_segments,
+                },
+            ],
+        };
+        insert_active_job(&mut pipeline, job_id, spec).await;
+        let queued = pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len();
+        assert_eq!(queued, 8);
+
+        // The namespace holds the payload an index to come will place: only
+        // the index leases until it has been read, and nothing is refused.
+        let mut leased = Vec::new();
+        while let Some(lease) = pipeline.lease_for_server_for_test(0) {
+            leased.extend(lease.works.into_iter().map(|work| work.segment_id));
+        }
+        assert_eq!(
+            leased
+                .iter()
+                .map(|id| id.file_id.file_index)
+                .collect::<Vec<_>>(),
+            vec![0],
+            "{leased:?}"
+        );
+        assert_eq!(
+            pipeline
+                .jobs
+                .get(&job_id)
+                .unwrap()
+                .articles
+                .active()
+                .unwrap()
+                .download_queue
+                .len(),
+            queued - 1
+        );
+        let graph = pipeline.graph_jobs.get_mut(&job_id).unwrap();
+        graph
+            .lost(
+                weaver_graph::VolumeIndex(0),
+                0,
+                &mut crate::pipeline::graph::status::RepairSlots::default(),
+                0,
+            )
+            .unwrap();
+        let declared = [(
+            weaver_graph::MemberId(0),
+            if par3 {
+                crate::pipeline::graph::metadata::RecoveryFormat::Par3
+            } else {
+                crate::pipeline::graph::metadata::RecoveryFormat::Par2
+            },
+        )];
+        assert_eq!(
+            graph.indexes_to_come(declared),
+            None,
+            "a missing index must release payload"
+        );
+    }
 }
 
 // A pipelined BODY batch that ended with its connection torn down.
@@ -4362,4 +3416,212 @@ async fn a_job_the_dispatcher_holds_off_every_lane_reports_why_on_the_queue() {
         view(&pipeline).download_wait_reason.as_deref(),
         Some("no_server")
     );
+}
+
+#[tokio::test]
+async fn pool_capacity_failure_at_retry_limit_does_not_poison_health() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20013);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let spec = segmented_job_spec("Pool Capacity Guard", "retry.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
+    }
+
+    hold_on_test_lane(&mut pipeline, &[segment_id]);
+    pipeline.active_download_passes.insert(job_id);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            lane_id: 0,
+            job_id: segment_id.file_id.job_id,
+            runtime_generation: 0,
+            segment_id,
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::CapacityUnavailable,
+                "no connections available",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: MAX_SEGMENT_RETRIES,
+            exclude_servers: vec![0],
+            release_connection_slot: true,
+        })
+        .await;
+
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
+        Some(0)
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+        Some(JobStatus::Downloading)
+    );
+    assert_eq!(
+        pipeline.pending_retries_by_job.get(&job_id).copied(),
+        Some(1)
+    );
+    assert!(pipeline.pending_completion_checks.is_empty());
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        0
+    );
+
+    assert_eq!(
+        pipeline
+            .download_wait_by_job
+            .get(&job_id)
+            .map(|wait| wait.reason),
+        Some("provider connection capacity unavailable")
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(
+        pipeline
+            .metrics
+            .parked_infrastructure_work
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    let retry = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .expect("generation wake should requeue parked infrastructure work");
+    assert_eq!(retry.segment_id, segment_id);
+    assert_eq!(retry.retry_count, MAX_SEGMENT_RETRIES);
+    assert_eq!(retry.exclude_servers, vec![0]);
+    assert!(!pipeline.download_wait_by_job.contains_key(&job_id));
+    assert_eq!(
+        pipeline
+            .metrics
+            .parked_infrastructure_work
+            .load(Ordering::Relaxed),
+        0
+    );
+}
+
+#[tokio::test]
+async fn body_lane_unavailable_at_retry_limit_requeues_without_article_failure() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20014);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let spec = segmented_job_spec("Lane Acquire Guard", "retry.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+
+    {
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
+    }
+
+    hold_on_test_lane(&mut pipeline, &[segment_id]);
+    pipeline.active_download_passes.insert(job_id);
+
+    pipeline
+        .handle_download_done(DownloadResult {
+            lane_id: 0,
+            job_id: segment_id.file_id.job_id,
+            runtime_generation: 0,
+            segment_id,
+            data: Err(DownloadError::fetch(
+                DownloadFailureKind::LaneUnavailable,
+                "failed to acquire BODY lane",
+            )),
+            attempts: Vec::new(),
+            lane_observation: None,
+            source_server_idx: None,
+            origin: DownloadResultOrigin::NormalPrimary,
+            retry_count: MAX_SEGMENT_RETRIES + 1,
+            exclude_servers: vec![0, 1],
+            release_connection_slot: false,
+        })
+        .await;
+
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.failed_bytes),
+        Some(0)
+    );
+    assert_eq!(
+        pipeline.jobs.get(&job_id).map(|state| state.status.clone()),
+        Some(JobStatus::Downloading)
+    );
+    assert_eq!(
+        pipeline.pending_retries_by_job.get(&job_id).copied(),
+        Some(1)
+    );
+    assert!(pipeline.pending_completion_checks.is_empty());
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        0
+    );
+    tokio::task::yield_now().await;
+    assert_eq!(
+        pipeline
+            .metrics
+            .parked_infrastructure_work
+            .load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        pipeline
+            .download_wait_by_job
+            .get(&job_id)
+            .map(|wait| wait.reason),
+        Some("no eligible NNTP server")
+    );
+
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    let retry = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .expect("generation wake should requeue parked pre-BODY work without retry charge");
+    assert_eq!(retry.segment_id, segment_id);
+    assert_eq!(retry.retry_count, MAX_SEGMENT_RETRIES + 1);
+    assert_eq!(retry.exclude_servers, vec![0, 1]);
+    assert_eq!(
+        pipeline
+            .metrics
+            .parked_infrastructure_work
+            .load(Ordering::Relaxed),
+        0
+    );
+    assert!(!pipeline.download_wait_by_job.contains_key(&job_id));
 }

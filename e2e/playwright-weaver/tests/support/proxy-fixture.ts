@@ -17,9 +17,11 @@ export type FixtureEvent = {
   sequence: number; at: number; kind: string; route?: string; host?: string; port?: number;
   client?: string; status?: number; socksReply?: number; path?: string; name?: string; bytes?: number;
 };
+/** A route's service as the control last set it. */
+export type RouteService = { up: boolean; hold: boolean; holdConnect: boolean; connectStatus: number | null; socksReply: number | null };
 export type FixtureState = {
   ip: string; addresses: string[]; ports: Record<string, number>; sequence: number;
-  events: FixtureEvent[]; active: Record<string, number>;
+  events: FixtureEvent[]; active: Record<string, number>; routes: Record<string, RouteService>;
 };
 
 export async function fixtureState(request: APIRequestContext): Promise<FixtureState> {
@@ -51,6 +53,8 @@ export async function waitFixtureEvents(
 
 export type RouteCommand = {
   route: string; up?: boolean; hold?: boolean; cut?: boolean;
+  /** Hold connection admission until the test has observed the pending probe. */
+  holdConnect?: boolean;
   /** CONNECT answers this status instead of 200; null restores normal service. */
   connectStatus?: number | null;
   /** SOCKS5 answers this reply code instead of success; null restores it. */
@@ -69,11 +73,44 @@ export async function setFixtureNzb(request: APIRequestContext, nzb: string, fee
 export const CONNECT_MEMBERS = ["connect1", "connect2", "connect3", "connect4", "connect5", "connect6"] as const;
 export const SOCKS_MEMBERS = ["socks1", "socks2", "socks3", "socks4"] as const;
 
-/** Restore every route the specs touch to normal service. */
+/** Normal service: up, not held, and answering CONNECT and SOCKS5 as it should. */
+export const inService = (service: RouteService | undefined): boolean =>
+  service !== undefined && service.up && !service.hold && !service.holdConnect && service.connectStatus === null && service.socksReply === null;
+
+/**
+ * Wait until the fixture itself reports every named route in normal service.
+ * With no names, every route it has.
+ */
+export async function waitRoutesInService(request: APIRequestContext, names?: string[]): Promise<void> {
+  let state = await fixtureState(request);
+  if (!state.routes) throw new Error("the proxy fixture does not report its routes' service");
+  const wanted = names ?? Object.keys(state.routes);
+  const unknown = wanted.filter(name => !(name in state.routes));
+  if (unknown.length) throw new Error(`the proxy fixture has no route ${unknown.join(", ")}`);
+  await expect.poll(async () => {
+    state = await fixtureState(request);
+    return wanted.filter(name => !inService(state.routes[name]));
+  }, { message: `proxy fixture routes ${wanted.join(", ")} in service`, timeout: 0 }).toEqual([]);
+}
+
+/**
+ * Restore every route the fixture has to normal service, each on its own so
+ * one refused command leaves no later route cut, then wait until the fixture
+ * reports every one of them back.
+ */
 export async function resetRoutes(request: APIRequestContext): Promise<void> {
-  for (const route of ["primary", "secondary", "tertiary", "direct", ...CONNECT_MEMBERS, ...SOCKS_MEMBERS]) {
-    await controlRoute(request, { route, up: true, hold: false, connectStatus: null, socksReply: null });
+  const state = await fixtureState(request);
+  if (!state.routes) throw new Error("the proxy fixture does not report its routes' service");
+  const failures: string[] = [];
+  for (const route of Object.keys(state.routes)) {
+    try {
+      await controlRoute(request, { route, up: true, hold: false, holdConnect: false, connectStatus: null, socksReply: null });
+    } catch (error) {
+      failures.push(`${route}: ${String(error)}`);
+    }
   }
+  if (failures.length) throw new Error(`restore proxy fixture routes: ${failures.join("; ")}`);
+  await waitRoutesInService(request);
 }
 
 /** Attempts through `route` after the watermark, in order. */

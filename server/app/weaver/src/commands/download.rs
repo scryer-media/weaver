@@ -146,6 +146,7 @@ pub(crate) async fn run(
         shared_state,
         db.clone(),
         standalone_config,
+        weaver_server_core::runtime::StartupDiskGate::opened(),
     )
     .await?;
 
@@ -357,7 +358,8 @@ async fn wait_for_job_terminal(
             },
             _ = status_tick.tick() => match handle.get_job(job_id) {
                 Ok(job) => match &job.status {
-                    JobStatus::Complete => return Ok(()),
+                    // The pipeline announces a partial delivery as completed.
+                    JobStatus::Complete | JobStatus::Partial => return Ok(()),
                     JobStatus::Failed { error } => return Err(error.clone()),
                     _ => {}
                 },

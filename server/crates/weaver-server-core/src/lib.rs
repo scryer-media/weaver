@@ -46,23 +46,22 @@ pub use history::{
     public_history_attributes, split_history_metadata,
 };
 pub use jobs::{
-    ActiveFileProgress, ActiveJob, ActivePar2File, CallerScopedIdempotency, CancelJobsOutcome,
-    DownloadBlockKind, DownloadBlockState, DownloadState, DuplicateAction, DuplicateAdmission,
-    DuplicateAdmissionRequest, DuplicateBackfillEntry, DuplicateBackfillSource,
-    DuplicateBackfillState, DuplicateDecision, DuplicateJobLifecycle, DuplicateJobSummary,
-    DuplicateMode, DuplicatePolicy, EgressQuotaBlock, ExtractionChunk, FieldUpdate, FileSpec,
-    FingerprintEvidence, FingerprintKind, HISTORY_DELETE_BATCH_SIZE, HardwareProfileInForce,
-    HistoryDeleteBatchOutcome, HistoryDeleteOutcome, JobFingerprint, JobId, JobInfo, JobPhase,
-    JobPhaseProgress, JobSpec, JobState, JobStatus, JobUpdate, MessageId, NntpRuntimeActivation,
-    NzbFileId, PhaseCounters, PostState, QueueMoveTarget, RecoveredJob, RestoreJobRequest,
-    RunState, SchedulerError, SchedulerHandle, SegmentId, SegmentSpec, SemanticCandidateSnapshot,
-    SemanticCandidateSource, SemanticCandidateState, SemanticDuplicate,
-    SemanticDuplicateLifecycleEvent, SemanticPromotionClaim, SemanticPromotionState,
-    SemanticTerminalCause, ServerId, ServerTransportHealth, SharedPipelineState, SubmissionOrigin,
-    classify_semantic_terminal_cause, derive_legacy_job_status, epoch_ms_now,
-    job_status_from_persisted_str, normalize_semantic_duplicate_key,
-    record_semantic_duplicate_lifecycle_metric, runtime_lanes_from_status_snapshot,
-    semantic_duplicate_lifecycle_metrics_snapshot,
+    ActiveJob, CallerScopedIdempotency, CancelJobsOutcome, DownloadBlockKind, DownloadBlockState,
+    DownloadState, DuplicateAction, DuplicateAdmission, DuplicateAdmissionRequest,
+    DuplicateBackfillEntry, DuplicateBackfillSource, DuplicateBackfillState, DuplicateDecision,
+    DuplicateJobLifecycle, DuplicateJobSummary, DuplicateMode, DuplicatePolicy, EgressQuotaBlock,
+    FieldUpdate, FileSpec, FingerprintEvidence, FingerprintKind, HISTORY_DELETE_BATCH_SIZE,
+    HardwareProfileInForce, HistoryDeleteBatchOutcome, HistoryDeleteOutcome, JobFingerprint, JobId,
+    JobInfo, JobPhase, JobPhaseProgress, JobSpec, JobState, JobStatus, JobUpdate, MessageId,
+    MessageIds, NntpRuntimeActivation, NzbFileId, PhaseCounters, PostState, QueueMoveTarget,
+    RecoveredJob, RestoreJobRequest, RunState, SchedulerError, SchedulerHandle, SegmentId,
+    SegmentSpec, SemanticCandidateSnapshot, SemanticCandidateSource, SemanticCandidateState,
+    SemanticDuplicate, SemanticDuplicateLifecycleEvent, SemanticPromotionClaim,
+    SemanticPromotionState, SemanticTerminalCause, ServerId, ServerTransportHealth,
+    SharedPipelineState, SubmissionOrigin, classify_semantic_terminal_cause,
+    derive_legacy_job_status, epoch_ms_now, job_status_from_persisted_str,
+    normalize_semantic_duplicate_key, record_semantic_duplicate_lifecycle_metric,
+    runtime_lanes_from_status_snapshot, semantic_duplicate_lifecycle_metrics_snapshot,
 };
 pub use operations::instrumentation::{
     ARTICLE_LATENCY_BOUNDS, AtomicHistogram, DB_OP_DURATION_BOUNDS, DECODE_TASK_DURATION_BOUNDS,
@@ -88,7 +87,7 @@ pub use operations::{
     MetricsHistoryQueryData, MetricsHistoryQueryResult, MetricsHistoryTier, RawMetricsHistoryPoint,
     RollupMetricsHistoryPoint, StableStateExport,
 };
-pub use persistence::{Database, Refusal, StateError};
+pub use persistence::{Database, LoadError, Refusal, StateError};
 pub use pipeline::Pipeline;
 pub use pipeline::download::{DownloadQueue, DownloadWork};
 pub use rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};

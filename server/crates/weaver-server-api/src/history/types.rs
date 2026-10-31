@@ -710,8 +710,7 @@ fn attention_for_history_row(row: &JobHistoryRow, state: QueueItemState) -> Opti
 fn history_state_from_row(row: &JobHistoryRow) -> QueueItemState {
     match row.status.to_ascii_lowercase().as_str() {
         "complete" => QueueItemState::Completed,
-        "cancelled" => QueueItemState::Failed,
-        "failed" => QueueItemState::Failed,
+        "cancelled" | "failed" | "partial" => QueueItemState::Failed,
         "paused" => QueueItemState::Paused,
         _ => QueueItemState::Failed,
     }

@@ -9,7 +9,7 @@ import {
   graphqlErrors, ladderLeg, legOn, legsOf, openOn, proxyProfiles, resetProxyHostKey, rssKey, rung, saveProxyProfile, serverKey,
 } from "./support/network-flow";
 import { DIRECT_HOST, NetworkWorld, PROXIED_HOST, expectNoFailureEvents, saveEvidence, serverHealth } from "./support/network-scenario";
-import { attemptsOn, controlRoute, fixtureEvents, fixtureMark, waitFixtureEvents } from "./support/proxy-fixture";
+import { attemptsOn, controlRoute, fixtureEvents, fixtureMark, waitFixtureEvents, waitRoutesInService } from "./support/proxy-fixture";
 import { addToxic, removeToxic } from "./support/toxiproxy";
 import { controlTunnel, tunnelState } from "./support/tunnel-fixture";
 
@@ -120,13 +120,27 @@ test("L05 Hold parks a dead leg's share instead of moving it", async ({ request 
   const subscription = await FlowSubscription.open();
   try {
     await controlRoute(request, { route: "connect1", up: false, cut: true });
-    const flow = await flowAfter(request, cut, sample => legOn(sample, serverKey(server), b.id)?.state === "DOWN", "leg B Down");
+    // The API also reports Down while every rung cools after its first
+    // failure, before the leg's two-failure policy parks its allocation.
+    const parked = (sample: NetworkFlow) => {
+      const leg = legOn(sample, serverKey(server), b.id);
+      return leg?.state === "DOWN" && leg.target === 0 && leg.open === 0 && leg.opening === 0;
+    };
+    const flow = await flowAfter(request, cut,
+      sample => parked(sample) && legOn(sample, serverKey(server), a.id)?.target === 2,
+      "leg B parked with its share held and leg A still targeting two seats");
     expect(legOn(flow, serverKey(server), a.id)?.target).toBe(2);
     expect(legOn(flow, serverKey(server), b.id)?.target).toBe(0);
     const downSince = flow.sampledAt;
-    await subscription.next(downSince, () => true, "a sample after leg B went Down");
-    const after = subscription.since(downSince).map(sample => openOn(sample, serverKey(server)));
-    expect(after.filter(open => open > 2), "open connections while leg B is held Down").toEqual([]);
+    await subscription.next(downSince, parked, "another sample with leg B's allocation parked");
+    // A recovery probe may temporarily use a seat; only parked Down samples
+    // describe the hold whose unused share must not be donated to leg A.
+    const after = subscription.since(downSince).filter(parked);
+    expect(after.length).toBeGreaterThan(0);
+    for (const sample of after) {
+      expect(legOn(sample, serverKey(server), a.id)?.target).toBe(2);
+      expect(openOn(sample, serverKey(server)), "open connections while leg B is held Down").toBeLessThanOrEqual(2);
+    }
   } finally {
     subscription.close();
   }
@@ -136,23 +150,35 @@ test("L05 Hold parks a dead leg's share instead of moving it", async ({ request 
 test("L06 a dead leg goes Down, probes with one connection, and returns Up once its proxy does", async ({ request }, info) => {
   test.setTimeout(0);
   const { a, b, server } = await proxiedSecondLeg("REDISTRIBUTE");
+  // Leg B's proxy must be in service before the download starts, or the leg
+  // goes Down on its first dial and the states below start from the wrong one.
+  await waitRoutesInService(request, ["connect1"]);
   // The fixture paces every body line, so 10 ms lets a 64 KiB article finish in
   // about five seconds, inside the per-article soft timeout: a recovery probe can
   // succeed while the job is still paced. 480 parts outlast the leg cooldowns
   // and the 60 s cap on server recovery backoff several times over.
   const download = await world.pacedDownload("l06-probing", { parts: 480, slowMs: 10 });
-  await flowAfter(request, await flowMark(request), sample => carrying(sample, server, [[a.id, 2], [b.id, 2]]), "legs 2/2 open");
+  await flowAfter(request, await flowMark(request),
+    sample => legOn(sample, serverKey(server), b.id)?.state === "UP" && carrying(sample, server, [[a.id, 2], [b.id, 2]]), "leg B Up, legs 2/2 open");
   const subscription = await FlowSubscription.open();
   try {
     const start = (await subscription.next(0, () => true, "first sample")).sampledAt;
     await controlRoute(request, { route: "connect1", up: false, cut: true });
     const stateB = (sample: NetworkFlow) => legOn(sample, serverKey(server), b.id);
     const firstDown = await subscription.next(start, sample => stateB(sample)?.state === "DOWN", "leg B Down");
-    const probing = await subscription.next(firstDown.sampledAt, sample => stateB(sample)?.state === "PROBING", "leg B probing after its cooldown");
+    // Keep each probe in flight until its state has been observed. The flow
+    // subscription may coalesce a fast PROBING -> UP/DOWN transition.
+    await controlRoute(request, { route: "connect1", holdConnect: true });
+    const heldAfter = await flowMark(request);
+    const probing = await subscription.next(Math.max(firstDown.sampledAt, heldAfter), sample => stateB(sample)?.state === "PROBING" && stateB(sample)?.opening === 1, "leg B probing after its cooldown");
     expect(stateB(probing)?.target).toBe(1);
+    await controlRoute(request, { route: "connect1", holdConnect: false });
     const downAgain = await subscription.next(probing.sampledAt, sample => stateB(sample)?.state === "DOWN", "failed probe puts leg B Down again");
-    await controlRoute(request, { route: "connect1", up: true });
-    const probingAgain = await subscription.next(downAgain.sampledAt, sample => stateB(sample)?.state === "PROBING", "leg B probing again");
+    await controlRoute(request, { route: "connect1", up: true, holdConnect: true });
+    const recoveryHeldAfter = await flowMark(request);
+    const probingAgain = await subscription.next(Math.max(downAgain.sampledAt, recoveryHeldAfter), sample => stateB(sample)?.state === "PROBING" && stateB(sample)?.opening === 1, "leg B probing again");
+    expect(stateB(probingAgain)?.target).toBe(1);
+    await controlRoute(request, { route: "connect1", holdConnect: false });
     await subscription.next(probingAgain.sampledAt, sample => stateB(sample)?.state === "UP" && carrying(sample, server, [[a.id, 2], [b.id, 2]]), "leg B Up at 2/2");
     await saveEvidence(info, "L06-states", subscription.since(start).map(sample => ({ at: sample.sampledAt, b: stateB(sample)?.state, targets: legsOf(sample, serverKey(server)).map(leg => leg.target) })));
   } finally {

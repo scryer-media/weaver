@@ -612,7 +612,7 @@ async fn job_nonexistent_returns_null() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn history_facades_wait_for_queue_retirement_after_a_terminal_archive() {
+async fn queue_facades_hold_a_terminal_job_until_history_shows_it() {
     use weaver_server_core::{JobId, JobStatus};
 
     let h = TestHarness::new().await;
@@ -625,10 +625,20 @@ async fn history_facades_wait_for_queue_retirement_after_a_terminal_archive() {
     row.nzb_path = None;
     h.insert_history_row(&row);
     let query = format!(
-        "{{ historyItem(id: {}) {{ id }} historyItems {{ id }} historyItemsCount
-             historyPage(input: {{ pageIndex: 0, pageSize: 25 }}) {{ totalCount items {{ id }} }} }}",
+        "{{ historyItem(id: {0}) {{ id }} historyItems {{ id }} historyItemsCount
+             historyPage(input: {{ pageIndex: 0, pageSize: 25 }}) {{ totalCount items {{ id }} }}
+             queueItem(id: {0}) {{ id }} queueItems {{ id }} queueSummary {{ totalItems }}
+             queueSnapshot {{ items {{ id }} }}
+             queuePage(input: {{ pageIndex: 0, pageSize: 25 }}) {{ totalCount items {{ id }} }} }}",
         id.0
     );
+    let queued = |data: &serde_json::Value| {
+        assert_eq!(data["queueItem"]["id"].as_u64(), Some(id.0));
+        assert_eq!(data["queueItems"][0]["id"].as_u64(), Some(id.0));
+        assert_eq!(data["queueSummary"]["totalItems"].as_u64(), Some(1));
+        assert_eq!(data["queueSnapshot"]["items"][0]["id"].as_u64(), Some(id.0));
+        assert_eq!(data["queuePage"]["totalCount"].as_u64(), Some(1));
+    };
 
     // This fixture holds queue membership independently of the runtime, just as
     // an archive committed before its retirement acknowledgement is consumed.
@@ -654,6 +664,7 @@ async fn history_facades_wait_for_queue_retirement_after_a_terminal_archive() {
         assert_eq!(data["historyItemsCount"].as_u64(), Some(0));
         assert_eq!(data["historyPage"]["totalCount"].as_u64(), Some(0));
         assert!(data["historyPage"]["items"].as_array().unwrap().is_empty());
+        queued(&data);
     }
 
     h.shared_state.publish_jobs(vec![]);
@@ -663,6 +674,16 @@ async fn history_facades_wait_for_queue_retirement_after_a_terminal_archive() {
     assert_eq!(data["historyItem"]["id"].as_u64(), Some(id.0));
     assert_eq!(data["historyItemsCount"].as_u64(), Some(1));
     assert_eq!(data["historyPage"]["totalCount"].as_u64(), Some(1));
+    assert!(data["queueItem"].is_null());
+    assert!(data["queueItems"].as_array().unwrap().is_empty());
+    assert_eq!(data["queueSummary"]["totalItems"].as_u64(), Some(0));
+    assert!(
+        data["queueSnapshot"]["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(data["queuePage"]["totalCount"].as_u64(), Some(0));
     let deleted = h
         .execute(&format!(
             "mutation {{ deleteHistory(id: {}) {{ id }} }}",
@@ -856,6 +877,44 @@ async fn history_items_project_bulk_duplicate_summary() {
         page_item["duplicateSummary"]["action"].as_str(),
         Some("ACCEPT")
     );
+}
+
+// Clients do not model a partial delivery yet: its row reads as failed, and
+// asking for failed rows brings it back.
+#[tokio::test]
+async fn history_reports_a_partial_job_as_failed() {
+    let h = TestHarness::new().await;
+    h.insert_history_row(&sample_history_row(
+        1,
+        "whole-history",
+        "complete",
+        1_700_000_001,
+    ));
+    h.insert_history_row(&sample_history_row(
+        2,
+        "partial-history",
+        "partial",
+        1_700_000_002,
+    ));
+
+    let resp = h
+        .execute(
+            r#"{
+              historyItems(filter: { states: [FAILED] }, first: 10) {
+                id
+                state
+              }
+              historyItemsCount(filter: { states: [FAILED] })
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let items = data["historyItems"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["id"].as_u64().unwrap(), 2);
+    assert_eq!(items[0]["state"].as_str().unwrap(), "FAILED");
+    assert_eq!(data["historyItemsCount"].as_u64().unwrap(), 1);
 }
 
 #[tokio::test]

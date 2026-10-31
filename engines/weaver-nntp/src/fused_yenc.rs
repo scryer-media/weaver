@@ -253,6 +253,10 @@ pub struct FusedYencArticleDecoder {
     output: Vec<u8>,
     output_chunks: Vec<Box<[u8]>>,
     output_reserved: bool,
+    // Where a batch is cut. A part that declares its length decodes into one
+    // batch of that length, so the article leaves as one allocation the
+    // writer adopts whole; output nothing declares is cut at the fixed target.
+    batch_target: usize,
     // The batch was sized from a declared length, so a full batch means the
     // trailer is next and the kernel must not grow it to find that out.
     output_sized: bool,
@@ -278,6 +282,7 @@ impl FusedYencArticleDecoder {
             output: Vec::new(),
             output_chunks: Vec::new(),
             output_reserved: false,
+            batch_target: OUTPUT_BATCH_TARGET,
             output_sized: false,
             tail_scratch: Vec::new(),
             profile_cpu: false,
@@ -809,9 +814,14 @@ impl FusedYencArticleDecoder {
         // exactly the one that most needs a head start, and skipping the
         // reservation entirely left it growing from zero one doubling at a
         // time. The cap bounds a lying header's damage; it is not a reason to
-        // reserve nothing.
-        let reserve = expected.min(MAX_ARTICLE_RESERVE).min(OUTPUT_BATCH_TARGET);
-        if reserve == 0 || reserve <= self.output.capacity() {
+        // reserve nothing. The batch is the declared part, so a part that
+        // tells the truth leaves the decoder as one allocation.
+        let reserve = expected.min(MAX_ARTICLE_RESERVE);
+        if reserve == 0 {
+            return;
+        }
+        self.batch_target = reserve.max(OUTPUT_BATCH_TARGET);
+        if reserve <= self.output.capacity() {
             return;
         }
 
@@ -828,12 +838,12 @@ impl FusedYencArticleDecoder {
     }
 
     fn flush_ready_output(&mut self) {
-        while self.output.len() >= OUTPUT_BATCH_TARGET {
-            let full_batch = if self.output.len() == OUTPUT_BATCH_TARGET {
+        while self.output.len() >= self.batch_target {
+            let full_batch = if self.output.len() == self.batch_target {
                 let next_capacity = self.next_output_capacity();
                 std::mem::replace(&mut self.output, Vec::with_capacity(next_capacity))
             } else {
-                let remainder = self.output.split_off(OUTPUT_BATCH_TARGET);
+                let remainder = self.output.split_off(self.batch_target);
                 std::mem::replace(&mut self.output, remainder)
             };
             self.output_chunks.push(full_batch.into_boxed_slice());
@@ -854,7 +864,7 @@ impl FusedYencArticleDecoder {
     // consume two bytes of line ending. An unreserved batch (no declared
     // size) has nothing exact to defend and keeps growing amortised as before.
     fn next_body_input_len(&self, available: usize) -> usize {
-        let batch_room = OUTPUT_BATCH_TARGET.saturating_sub(self.output.len());
+        let batch_room = self.batch_target.saturating_sub(self.output.len());
         let spare = self.output.capacity() - self.output.len();
         let room = if self.sized_batch_is_full() {
             batch_room.min(TAIL_PROBE_INPUT)
@@ -903,7 +913,7 @@ impl FusedYencArticleDecoder {
             return OUTPUT_BATCH_TARGET;
         };
         let decoded = usize::try_from(self.decode_state.bytes_decoded).unwrap_or(usize::MAX);
-        expected.saturating_sub(decoded).min(OUTPUT_BATCH_TARGET)
+        expected.saturating_sub(decoded).min(self.batch_target)
     }
 
     fn advance_src(&mut self, src: &mut BytesMut, count: usize) {
@@ -1376,9 +1386,11 @@ mod tests {
         let mut decoder = FusedYencArticleDecoder::new();
         assert!(decoder.decode_available(&mut src).unwrap().is_none());
 
+        // A part that declares its length is one batch of that length, past
+        // the fixed target, and it is handed over before the trailer.
         let chunks = decoder.drain_output_chunks();
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].len(), OUTPUT_BATCH_TARGET);
+        assert_eq!(chunks[0].len(), original.len());
     }
 
     #[test]
@@ -1691,7 +1703,8 @@ mod tests {
     // ── E19: pre-reservation for oversized articles ──────────────────────
 
     // An article whose declared size exceeds the 16 MiB cap used to get *no*
-    // pre-reservation at all. It must reserve a batch and grow from there.
+    // pre-reservation at all. It must reserve up to the cap and grow from
+    // there.
     #[test]
     fn fused_reserves_output_for_articles_larger_than_the_cap() {
         for size in [OUTPUT_BATCH_TARGET as u64, MAX_ARTICLE_RESERVE as u64 * 2] {
@@ -1707,8 +1720,8 @@ mod tests {
             let mut decoder = FusedYencArticleDecoder::new();
             assert!(decoder.decode_available(&mut src).unwrap().is_none());
             assert_eq!(
-                decoder.output.capacity(),
-                OUTPUT_BATCH_TARGET,
+                decoder.output.capacity() as u64,
+                size.min(MAX_ARTICLE_RESERVE as u64),
                 "size={size} reserved {}",
                 decoder.output.capacity()
             );
@@ -1719,7 +1732,9 @@ mod tests {
 
     // A truthful header's batch is sized once and never touched again: not
     // mid-article, and not on the finishing call that consumes the trailer,
-    // where the kernel's own reserve used to double it for nothing.
+    // where the kernel's own reserve used to double it for nothing. The batch
+    // is the whole declared part, past the fixed target too, so the article
+    // leaves as one allocation.
     #[test]
     fn fused_never_grows_a_sized_batch_for_a_truthful_header() {
         for size in [37usize, 4096, 100 * 1024 + 7, OUTPUT_BATCH_TARGET + 999] {
@@ -1728,7 +1743,7 @@ mod tests {
             encode(&original, &mut article, 128, "exact.bin").unwrap();
             let article = dot_stuff_lines(&article);
             let transcript = transcript(&article, b"223 next\r\n");
-            let batch_cap = size.min(OUTPUT_BATCH_TARGET);
+            let batch_cap = size;
 
             for chunk_len in [1usize, 1024, 16 * 1024, usize::MAX] {
                 let mut decoder = FusedYencArticleDecoder::new();
@@ -1750,6 +1765,11 @@ mod tests {
                 assert_eq!(
                     finished.stats.output_grow_events, 0,
                     "size={size} chunk={chunk_len}"
+                );
+                assert_eq!(
+                    finished.chunks.len(),
+                    1,
+                    "size={size} chunk={chunk_len}: one allocation per article"
                 );
                 assert_eq!(
                     finished.to_data(),
@@ -1829,7 +1849,8 @@ mod tests {
     }
 
     // The same, for an article large enough to cross the batch target: the
-    // batches really do arrive before the article is finished.
+    // batches really do arrive before the article is finished. A part that
+    // declares its length is one batch, so this one declares none.
     #[test]
     fn fused_delivers_multiple_batches_before_the_article_finishes() {
         let mut original = Vec::with_capacity(2 * OUTPUT_BATCH_TARGET + 123);
@@ -1839,6 +1860,12 @@ mod tests {
 
         let mut article = Vec::new();
         encode(&original, &mut article, 128, "batched.bin").unwrap();
+        let size_field = format!(" size={}", original.len());
+        let at = article
+            .windows(size_field.len())
+            .position(|window| window == size_field.as_bytes())
+            .expect("encoder declared a size");
+        article.drain(at..at + size_field.len());
         let transcript = transcript(&article, b"223 next\r\n");
 
         for chunk_len in [4 * 1024usize, 64 * 1024, 700 * 1024] {

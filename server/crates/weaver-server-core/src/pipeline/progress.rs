@@ -106,35 +106,6 @@ impl Pipeline {
         self.job_stage_started_at.retain(|(id, _), _| *id != job_id);
     }
 
-    pub(crate) fn phase_subtract_completed_bytes(
-        &mut self,
-        job_id: JobId,
-        phase: JobPhase,
-        bytes: u64,
-    ) {
-        if bytes == 0 {
-            return;
-        }
-        let Some(runtime) = self.phase_progress.get(&(job_id, phase)) else {
-            return;
-        };
-        let _ = runtime.counters.completed_bytes.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_sub(bytes)),
-        );
-    }
-
-    pub(crate) fn phase_end_extracting_if_idle(&mut self, job_id: JobId) {
-        let has_inflight_extractions = self
-            .inflight_extractions
-            .get(&job_id)
-            .is_some_and(|sets| !sets.is_empty());
-        if !has_inflight_extractions && !self.has_active_rar_workers(job_id) {
-            self.phase_end(job_id, JobPhase::Extracting);
-        }
-    }
-
     // Credit one landed article's wire bytes to its job's download rate, and
     // to the server that served it.
     //
@@ -149,6 +120,17 @@ impl Pipeline {
     // whose server cannot be named is credited to the job's bytes and left
     // out of the ledger: an uncounted article is recoverable from the totals,
     // a misattributed one is not.
+    // Write the job's debug ring out beside a stall report, once per stall
+    // episode. The job's downloaded wire bytes are its progress: a report at
+    // the same count as the last replay belongs to the same episode.
+    pub(crate) fn dump_job_debug_ring(&self, job_id: JobId, reason: &'static str) {
+        let progress = self
+            .jobs
+            .get(&job_id)
+            .map_or(0, |state| state.downloaded_wire_bytes);
+        crate::runtime::job_debug_ring::dump(job_id.0, progress, reason);
+    }
+
     pub(crate) fn note_job_wire_bytes(
         &mut self,
         segment_id: SegmentId,

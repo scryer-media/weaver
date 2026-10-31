@@ -15,6 +15,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/scryer-media/weaver/e2e/internal/corpus"
+	"github.com/scryer-media/weaver/e2e/internal/fixturegen"
 )
 
 func TestInferForcedRuntimeLanes(t *testing.T) {
@@ -120,6 +123,55 @@ func TestCorpusRestartProfileIsTheRestartCaseSlugs(t *testing.T) {
 	}
 }
 
+// The rename restart case crashes as its payload moves to the name the PAR3
+// set records. A payload posted under a numbered piece's name, `name.201`, is
+// held by a split and born under the set's name, so nothing moves and the
+// crash never comes. The payload must be posted under a name that leaves it a
+// plain file on disk until the set renames it.
+func TestRenameRestartFixtureMovesItsPayload(t *testing.T) {
+	scenario, err := loadScenario(filepath.Join(testdataDir(), renameRestartSlug))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := scenario.ExpectedOutputBLAKE3[renameRestartTarget]; !ok {
+		t.Fatalf("%s does not deliver %s, the name the crash waits on", renameRestartSlug, renameRestartTarget)
+	}
+	ledger, _, err := corpus.LoadLedger(e2eDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	posted := map[string]bool{}
+	for _, path := range fixturegen.ScenarioPaths(ledger, renameRestartSlug) {
+		posted[filepath.Base(path)] = true
+	}
+	for _, asset := range scenario.FixtureAssets {
+		_, name, err := parseFixtureAssetSpec(asset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		posted[name] = true
+	}
+	var payloads []string
+	for name := range posted {
+		if !strings.HasSuffix(strings.ToLower(name), ".par3") {
+			payloads = append(payloads, name)
+		}
+	}
+	if len(payloads) != 1 {
+		t.Fatalf("%s posts payloads %v, want exactly one", renameRestartSlug, payloads)
+	}
+	name := payloads[0]
+	if name == renameRestartTarget {
+		t.Fatalf("%s posts its payload under the set's name %s, so nothing moves", renameRestartSlug, name)
+	}
+	// The sniffer's numbered piece: a stem, a dot, and a last extension of
+	// digits only.
+	if dot := strings.LastIndex(name, "."); dot > 0 && dot < len(name)-1 &&
+		strings.Trim(name[dot+1:], "0123456789") == "" {
+		t.Fatalf("%s posts its payload as numbered piece %s, which a split holds, so nothing moves", renameRestartSlug, name)
+	}
+}
+
 func TestRestartCasesIncludeConventional7zDamagedBlockRepair(t *testing.T) {
 	const caseName = "conventional_7z_damaged_block_repairs_once"
 	for _, tc := range restartCases() {
@@ -140,55 +192,6 @@ func TestRestartCasesIncludeConventional7zDamagedBlockRepair(t *testing.T) {
 		t.Fatalf("%s is not seeded for the restart suite", conventional7zRepairSlug)
 	}
 	t.Fatalf("restart suite does not include %s", caseName)
-}
-
-// Log lines in the shape weaver writes them, for a job that settled on the
-// strong-decode claim and then hit a damaged block in extraction.
-func conventional7zRepairLogLines(jobID int, extractionError string, failed bool) string {
-	lines := []string{
-		fmt.Sprintf("2026-01-01T00:00:01Z  INFO weaver_server_core::pipeline::completion::finalize::check::completion: skipping authoritative PAR2 verify for clean exhausted strong-decode job job_id=%d", jobID),
-		fmt.Sprintf("2026-01-01T00:00:02Z  WARN weaver_server_core::pipeline::extraction::rar::scheduler: set extraction failed job_id=%d set_name=archive.7z error=%s", jobID, extractionError),
-	}
-	if failed {
-		lines = append(lines, fmt.Sprintf("2026-01-01T00:00:03Z ERROR weaver_server_core::pipeline::health: job failed job_id=%d reason=%s", jobID, extractionError))
-	}
-	return strings.Join(lines, "\n") + "\n"
-}
-
-func TestReadConventional7zRepairLog(t *testing.T) {
-	const dataError = `7z block data error: BlockDecode { block_index: 0, packed_offset: 32, kind: Io, message: "Io(Custom { kind: InvalidData, error: \"Error during PPMd decoding\" }, \"\")" }`
-	const terminalError = `7z extraction failed: BlockDecode { block_index: 0, packed_offset: 32, kind: Io, message: "Io(Custom { kind: InvalidData, error: \"Error during PPMd decoding\" }, \"\")" }`
-
-	repaired := readConventional7zRepairLog(conventional7zRepairLogLines(28, dataError, false), 28)
-	if !repaired.SkippedAuthoritativeVerify || !repaired.DataErrorAfterSkip || repaired.Failed {
-		t.Fatalf("a recoverable data error after the skip reads as the repair path: %+v", repaired)
-	}
-
-	// The shape the contract rules out: the error worded as terminal, and
-	// the job failed on it.
-	ended := readConventional7zRepairLog(conventional7zRepairLogLines(28, terminalError, true), 28)
-	if !ended.SkippedAuthoritativeVerify || ended.DataErrorAfterSkip || !ended.Failed {
-		t.Fatalf("a terminal error and a failed job read as such: %+v", ended)
-	}
-
-	// Another job's lines, including one whose ID shares a prefix, say
-	// nothing about this one.
-	other := readConventional7zRepairLog(
-		conventional7zRepairLogLines(280, terminalError, true)+conventional7zRepairLogLines(2, dataError, false),
-		28,
-	)
-	if other != (conventional7zRepairLog{}) {
-		t.Fatalf("other jobs' lines leaked into the reading: %+v", other)
-	}
-
-	// A data error with no skip before it is not the settled-clean shape.
-	unsettled := readConventional7zRepairLog(
-		fmt.Sprintf("x WARN set extraction failed job_id=28 set_name=archive.7z error=%s\n", dataError),
-		28,
-	)
-	if unsettled.DataErrorAfterSkip {
-		t.Fatalf("a data error without the skip before it was read as after it: %+v", unsettled)
-	}
 }
 
 func TestCapturePar2AliasStateReportsSplitOwnershipAndMissingVolumes(t *testing.T) {
