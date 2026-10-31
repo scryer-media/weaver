@@ -164,7 +164,7 @@ impl NamespaceWriter {
             .map_or(Ok(()), std::fs::create_dir_all)
             .and_then(|()| std::fs::hard_link(leaf.path(), &link))
             .is_ok();
-        if linked && !self.envelopes.start_in(child, envelope, &name) {
+        if linked && !self.envelopes.start_in(child, envelope, &name, true) {
             let _ = std::fs::remove_file(&link);
         }
     }

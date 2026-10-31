@@ -1145,6 +1145,38 @@ fn a_name_a_discarded_file_sat_at_is_free_once_its_checkpoint_commits() {
     assert!(!job.writer.moves_waiting());
 }
 
+// A file none of whose bytes were written was never made, so discarding it
+// leaves nothing to go: a file made at its path before the checkpoint
+// commits, such as the envelope of the volume's next holder, is a newer one
+// and stays once it does.
+#[test]
+fn a_discarded_leaf_with_no_file_takes_no_newer_file_at_its_path() {
+    let mut job = Job::new(PLENTY);
+    let name = crate::pipeline::graph::envelope::envelope_name(NodeId(2), 1);
+    let leaf = Leaf::at(job.dir.path(), &name);
+    job.writer.discard(leaf).expect("discard");
+    let path = job.dir.path().join(&name);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"next").unwrap();
+    job.commit();
+    assert_eq!(std::fs::read(&path).unwrap(), b"next");
+}
+
+// The other order: the newer file is at the path before the leaf that never
+// made one is discarded. The path holding a file says nothing of the leaf.
+#[test]
+fn a_discarded_leaf_with_no_file_leaves_a_newer_file_already_at_its_path() {
+    let mut job = Job::new(PLENTY);
+    let name = crate::pipeline::graph::envelope::envelope_name(NodeId(2), 1);
+    let leaf = Leaf::at(job.dir.path(), &name);
+    let path = job.dir.path().join(&name);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"next").unwrap();
+    job.writer.discard(leaf).expect("discard");
+    job.commit();
+    assert_eq!(std::fs::read(&path).unwrap(), b"next");
+}
+
 #[test]
 fn a_new_repair_leaf_cannot_outlive_its_uncommitted_name_during_a_move() {
     let mut job = Job::new(PLENTY);

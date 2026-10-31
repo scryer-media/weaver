@@ -930,9 +930,16 @@ impl Object for RarStore {
     // travels with it: its headers are walked again under this store's own,
     // so headers no password of the store opens ask the job, and every
     // password the store holds is one the job offered it.
-    fn adopt(&mut self, volume: VolumeIndex, name: &str, carried: weaver_graph::Carried) {
+    fn adopt(
+        &mut self,
+        volume: VolumeIndex,
+        name: &str,
+        front: &[u8],
+        length: Option<u64>,
+        carried: weaver_graph::Carried,
+    ) {
         let Ok(mut held) = carried.downcast::<Volume>() else {
-            return self.bound(volume, name, &[], None);
+            return self.bound(volume, name, front, length);
         };
         held.name_as(name);
         *self.volume(volume) = *held;
@@ -954,11 +961,15 @@ impl Object for RarStore {
             .as_ref()
             .is_some_and(|named| named.index() != volume.0)
             && !stated;
-        // The name is what settles a volume its headers do not place.
+        // The name is what settles a volume its headers do not place, and
+        // what it settles is said now, as a length said anew is: a
+        // checkpoint before the next delivery records the name, and a
+        // restore reads it again as said already.
         self.touch(volume);
         if misplaced && self.carried(volume).is_some() {
             self.give_back_held(vec![volume], out);
         }
+        self.settle(None, out);
     }
 
     fn refused(&mut self) {

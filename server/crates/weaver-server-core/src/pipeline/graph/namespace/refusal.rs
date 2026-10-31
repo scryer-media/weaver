@@ -146,19 +146,20 @@ impl NamespaceWriter {
         taken: u64,
         output_name: &str,
     ) -> Result<Option<u32>, WriteError> {
-        let Some((file, kept)) = self.envelopes.kept_file(retired, envelope) else {
+        let Some(kept) = self.envelopes.kept_file(retired, envelope) else {
             return Ok(None);
         };
-        if kept != taken {
+        if kept.covered != taken {
             return Ok(None);
         }
         let shared = match tree.child_of(node, member) {
             Some((child, at)) if tree.engine(child).is_some() => {
-                self.envelopes.start_in(child, at.0, &file)
+                self.envelopes
+                    .start_in(child, at.0, &kept.name, kept.on_disk)
             }
             Some(_) => false,
             None => {
-                let leaf = Leaf::at(&self.working_dir, &file);
+                let leaf = Leaf::over(&self.working_dir, &kept.name, kept.on_disk);
                 self.files_mut(node).leaves.insert(member, leaf);
                 self.intend(node, member, output_name);
                 true
