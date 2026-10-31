@@ -57,6 +57,10 @@ pub(crate) struct Leaf {
     // Open while bytes are still arriving; dropped when the member is
     // covered, and reopened only for a repair.
     file: Option<File>,
+    // Whether the file is on disk: the leaf made it, or was handed one
+    // that sits at its name. Never read off the disk, where the name may
+    // already hold a newer file another leaf was given.
+    on_disk: bool,
     // What was written, by contiguous run keyed by its start, with the
     // digest of the run of the kind the member's check states, folded as the
     // writes land so the member's own digest is known without reading the
@@ -86,6 +90,23 @@ impl Leaf {
     // The leaf for `output_name` under `dir`. Nothing is created until the
     // first byte arrives.
     pub(crate) fn at(dir: &Path, output_name: &str) -> Self {
+        Self::over(dir, output_name, false)
+    }
+
+    // The leaf a restore rebuilds over what its checkpoint left at
+    // `output_name`. Whether the file is there is read once, here: nothing
+    // has been given a name since the restore began, so what sits at the
+    // name is the leaf's own file.
+    pub(crate) fn found(dir: &Path, output_name: &str) -> Self {
+        let mut leaf = Self::at(dir, output_name);
+        leaf.on_disk = leaf.path.exists();
+        leaf
+    }
+
+    // The leaf for a file at `output_name` under `dir` that another leaf
+    // hands it, with `on_disk` whether that file is there, as that leaf
+    // knows.
+    pub(crate) fn over(dir: &Path, output_name: &str, on_disk: bool) -> Self {
         Self {
             identity: NEXT_LEAF.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             revision: 0,
@@ -94,6 +115,7 @@ impl Leaf {
             wants: None,
             directory: Self::is_directory(output_name),
             file: None,
+            on_disk,
             written: BTreeMap::new(),
             changed: BTreeMap::new(),
         }
@@ -145,7 +167,7 @@ impl Leaf {
     // Whether the file is on disk: nothing is created until the first byte
     // arrives.
     pub(crate) fn on_disk(&self) -> bool {
-        self.file.is_some() || self.path.exists()
+        self.on_disk
     }
 
     #[cfg(test)]
@@ -159,8 +181,10 @@ impl Leaf {
         output_name.ends_with(['/', '\\'])
     }
 
-    pub(crate) fn create_directory(&self) -> Result<(), LeafError> {
-        std::fs::create_dir_all(&self.path).map_err(LeafError::io(&self.path))
+    pub(crate) fn create_directory(&mut self) -> Result<(), LeafError> {
+        std::fs::create_dir_all(&self.path).map_err(LeafError::io(&self.path))?;
+        self.on_disk = true;
+        Ok(())
     }
 
     // Write `bytes` at `offset`, folding nothing: a file whose bytes no
@@ -447,6 +471,7 @@ impl Leaf {
             let file =
                 create_sparse(&self.path, &PlatformMarker).map_err(LeafError::io(&self.path))?;
             self.file = Some(file);
+            self.on_disk = true;
         }
         Ok(())
     }
@@ -556,6 +581,7 @@ impl Leaf {
             create_parent(&self.path)?;
             let file =
                 create_sparse(&self.path, &PlatformMarker).map_err(LeafError::io(&self.path))?;
+            self.on_disk = true;
             if let Some(length) = length {
                 let current = file.metadata().map_err(LeafError::io(&self.path))?.len();
                 if current < length {

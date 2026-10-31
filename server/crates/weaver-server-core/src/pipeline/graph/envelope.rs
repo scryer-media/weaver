@@ -77,6 +77,15 @@ pub(crate) struct Kept {
     pub(crate) length_read: Option<u64>,
 }
 
+// The file an envelope is kept in: its name, how many bytes it holds, and
+// whether it is on disk.
+#[derive(Debug)]
+pub(crate) struct KeptFile {
+    pub(crate) name: String,
+    pub(crate) covered: u64,
+    pub(crate) on_disk: bool,
+}
+
 impl Kept {
     // An envelope with nothing kept yet, in `leaf`'s file.
     fn in_file(leaf: Leaf) -> Self {
@@ -210,24 +219,32 @@ impl Envelopes {
 
     // The file an envelope sits in, relative to the working directory, and
     // how many bytes it keeps there.
-    pub(crate) fn kept_file(&self, node: NodeId, envelope: u32) -> Option<(String, u64)> {
+    pub(crate) fn kept_file(&self, node: NodeId, envelope: u32) -> Option<KeptFile> {
         let shelf = self.shelves.get(&node)?;
         let state = shelf.lock();
-        state
-            .kept
-            .get(&envelope)
-            .map(|kept| (kept.leaf.name().to_owned(), kept.coverage.bytes_covered()))
+        state.kept.get(&envelope).map(|kept| KeptFile {
+            name: kept.leaf.name().to_owned(),
+            covered: kept.coverage.bytes_covered(),
+            on_disk: kept.leaf.on_disk(),
+        })
     }
 
     // The envelope starts in `name`, a file that already holds its bytes at
-    // their own offsets: nothing is cleared, and what is kept in it is
-    // written over the same bytes. False when the envelope started already.
-    pub(crate) fn start_in(&mut self, node: NodeId, envelope: u32, name: &str) -> bool {
+    // their own offsets, or none when `on_disk` says it was never made:
+    // nothing is cleared, and what is kept in it is written over the same
+    // bytes. False when the envelope started already.
+    pub(crate) fn start_in(
+        &mut self,
+        node: NodeId,
+        envelope: u32,
+        name: &str,
+        on_disk: bool,
+    ) -> bool {
         let shelf = self.shelf(node);
         let started = shelf.update(|state| match state.kept.entry(envelope) {
             Entry::Occupied(_) => false,
             Entry::Vacant(free) => {
-                free.insert(Kept::in_file(Leaf::at(&shelf.dir, name)));
+                free.insert(Kept::in_file(Leaf::over(&shelf.dir, name, on_disk)));
                 true
             }
         });

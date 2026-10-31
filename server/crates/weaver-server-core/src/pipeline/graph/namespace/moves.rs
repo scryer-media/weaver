@@ -252,11 +252,11 @@ impl NamespaceWriter {
         on_disk: Option<&str>,
     ) -> Leaf {
         let Some(sat) = on_disk else {
-            return Leaf::at(&self.working_dir, output_name);
+            return Leaf::found(&self.working_dir, output_name);
         };
-        let mut leaf = Leaf::at(&self.working_dir, sat);
-        let wanted = Leaf::at(&self.working_dir, output_name);
-        if !leaf.path().exists() && wanted.path().exists() {
+        let mut leaf = Leaf::found(&self.working_dir, sat);
+        let wanted = Leaf::found(&self.working_dir, output_name);
+        if !leaf.on_disk() && wanted.on_disk() {
             self.left.insert(key(sat), None);
             return wanted;
         }

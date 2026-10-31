@@ -124,7 +124,7 @@ impl NamespaceWriter {
             }
         }
         for (node, holds) in by_node {
-            let scratch = Leaf::at(&self.working_dir, &scratch_name(node));
+            let scratch = Leaf::found(&self.working_dir, &scratch_name(node));
             let written = scratch.len().unwrap_or(0);
             // The file's bytes are already on disk, so the disk reserve
             // judges them against the space they would leave if absent.
