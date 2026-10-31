@@ -234,6 +234,12 @@ impl GraphJob {
         said.scope == self.runs.scope() && self.loans.current_repair(said.node, said.generation)
     }
 
+    // Whether a repair, replay or check of the job is out on a thread.
+    #[cfg(test)]
+    pub(crate) fn lent(&self) -> bool {
+        self.loans.out()
+    }
+
     // Whether something of the job is out on a thread and will speak
     // through the run mail: a run, or a repair.
     pub(in crate::pipeline) fn awaits_mail(&self) -> bool {

@@ -202,6 +202,10 @@ pub(crate) struct NamespaceWriter {
     // The set whose repair is being acknowledged: only its certified writes
     // retain its settled ruling.
     acknowledging: Option<Acknowledging>,
+    // Members refused while a repair's return was applied, each read as the
+    // first piece of a file once the whole return is down: a later slice of
+    // the same return may still rewrite the front of a piece beside it.
+    refused_in_batch: BTreeSet<(NodeId, MemberId)>,
     #[cfg(test)]
     diagnostics: Vec<weaver_graph::recovery::RepairDiagnostic>,
     placements: Vec<Placement>,
@@ -236,6 +240,7 @@ impl NamespaceWriter {
             segments: Vec::new(),
             effects: Vec::new(),
             acknowledging: None,
+            refused_in_batch: BTreeSet::new(),
             #[cfg(test)]
             diagnostics: Vec::new(),
             placements: Vec::new(),
@@ -294,6 +299,28 @@ impl NamespaceWriter {
     // to own it.
     pub(crate) fn refused(&self, node: NodeId, member: MemberId) -> Option<Why> {
         self.files.get(&node)?.refused.get(&member).copied()
+    }
+
+    // A repair's return is down. Each member refused while it was applied,
+    // and refused still with no object holding it, may be the first piece
+    // of a file, read on the bytes the return left every piece with.
+    pub(crate) fn refused_after_return(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        for (node, member) in std::mem::take(&mut self.refused_in_batch) {
+            if self.refused(node, member).is_none() || tree.child_of(node, member).is_some() {
+                continue;
+            }
+            let mut effects = Vec::new();
+            tree.refused_whole(node, member, &mut self.placing(builder), &mut effects);
+            self.prune(tree)?;
+            self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -975,9 +1002,20 @@ impl NamespaceWriter {
                 let mut effects = Vec::new();
                 tree.bury(*node, *member, &mut effects);
                 // A refused member its recovery set proves whole may be the
-                // first piece of a file, now in its own file.
+                // first piece of a file, now in its own file. One refused
+                // while a repair's return is applied is read once all of it
+                // is down.
                 if matches!(effect, Effect::Refused { .. }) {
-                    tree.refused_whole(*node, *member, &mut self.placing(builder), &mut effects);
+                    if self.acknowledging.is_some() {
+                        self.refused_in_batch.insert((*node, *member));
+                    } else {
+                        tree.refused_whole(
+                            *node,
+                            *member,
+                            &mut self.placing(builder),
+                            &mut effects,
+                        );
+                    }
                 }
                 self.prune(tree)?;
                 self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
@@ -1899,19 +1937,21 @@ pub(crate) fn read_member(
     let mut read = |placement: &Placement, into: &mut Vec<u8>| {
         read_placed(source, (node, member), child, placement, into)
     };
+    // What the object cannot rebuild is read from the member's own file
+    // where that has it: a volume given back stays in its member's file,
+    // and an object that takes it again reads it there in place.
+    let mut posted = |range: ByteRange, into: &mut Vec<u8>| {
+        let start = into.len();
+        source.posted(child, volume, range, &mut read, into) || {
+            into.truncate(start);
+            source.leaf(node, member, range, into)
+        }
+    };
     let mut at = range.start;
     let pieces = source.held(node, member, range);
     for group in pieces.chunk_by(|(a, _), (b, _)| a.end == b.start) {
         let held = ByteRange::new(group[0].0.start, group[group.len() - 1].0.end);
-        if at < held.start
-            && !source.posted(
-                child,
-                volume,
-                ByteRange::new(at, held.start),
-                &mut read,
-                into,
-            )
-        {
+        if at < held.start && !posted(ByteRange::new(at, held.start), into) {
             return false;
         }
         // Held custody is current authority, even if its backing cannot be
@@ -1921,14 +1961,7 @@ pub(crate) fn read_member(
         }
         at = held.end;
     }
-    at == range.end
-        || source.posted(
-            child,
-            volume,
-            ByteRange::new(at, range.end),
-            &mut read,
-            into,
-        )
+    at == range.end || posted(ByteRange::new(at, range.end), into)
 }
 
 // What one placement of the object at `child`, bound to `member` of `node`,

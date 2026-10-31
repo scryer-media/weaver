@@ -12,6 +12,7 @@
 //
 // Campaigns and family smokes alike run only from the manually dispatched
 // extended workflow: the default suite excludes the whole archive matrix.
+use super::super::graph::Answers;
 use super::*;
 use std::ops::Range;
 
@@ -104,7 +105,8 @@ pub(super) struct Built {
     pub ruling: Option<Verdict>,
 }
 
-// Run one cell, enforcing every case's verdict directly.
+// Run one cell, enforcing every case's verdict directly, once for each time
+// its repairs' answers may be heard.
 pub(super) async fn run_cell<C: Cell>(cell: C, cases: Vec<(usize, Schedule)>) {
     let mut built: BTreeMap<(u8, bool), Built> = BTreeMap::new();
     for (case, (order, interruption)) in cases {
@@ -117,18 +119,22 @@ pub(super) async fn run_cell<C: Cell>(cell: C, cases: Vec<(usize, Schedule)>) {
         let verdict = fixture.ruling.unwrap_or_else(|| {
             recovery::verdict(&fixture.post, fixture.geometry, &lost, interruption.fails())
         });
-        let context = format!(
-            "{cell:?} case={case} order={order:?} interruption={interruption:?} verdict={verdict:?} par2={}",
-            cell.par2()
-        );
-        eprintln!("{context}");
-        let ran = run::run(&fixture.post, &order, interruption).await;
-        ran.assert(
-            &fixture.post,
-            verdict,
-            fixture.geometry.is_some() && interruption.fails(),
-            &context,
-        );
+        let recovery = !fixture.post.index_of(post::Role::Index).is_empty()
+            || !fixture.post.index_of(post::Role::Recovery).is_empty();
+        for &answers in Answers::under(recovery) {
+            let context = format!(
+                "{cell:?} case={case} order={order:?} interruption={interruption:?} answers={answers:?} verdict={verdict:?} par2={}",
+                cell.par2()
+            );
+            eprintln!("{context}");
+            let ran = run::run(&fixture.post, &order, (interruption, answers)).await;
+            ran.assert(
+                &fixture.post,
+                verdict,
+                fixture.geometry.is_some() && interruption.fails(),
+                &context,
+            );
+        }
     }
 }
 

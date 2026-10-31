@@ -216,12 +216,44 @@ fn continues(tail: &RarVolumeMemberFacts, head: &RarVolumeMemberFacts) -> bool {
         }
 }
 
+// Where a volume's headers and name place it in a set: the place, the
+// place when what gave it states the volume's position, its headers or its
+// name in the set's numbering, rather than links alone, and whether the
+// volume is not yet judged.
+#[derive(Default)]
+pub(super) struct Placing {
+    placed: Option<VolumeIndex>,
+    stated: Option<VolumeIndex>,
+    not_yet: bool,
+}
+
+impl Placing {
+    // The claim the place makes. A set ends at the volume that says no
+    // volume follows it.
+    fn claim(self, store: &RarStore) -> Claim {
+        let places: Vec<VolumeIndex> = self
+            .placed
+            .filter(|at| store.last().is_none_or(|last| *at <= last))
+            .into_iter()
+            .collect();
+        if self.not_yet {
+            Claim::NotYet(places)
+        } else {
+            Claim::Places(places)
+        }
+    }
+}
+
 impl RarStore {
     pub(super) fn claim_volume(&self, name: &str, first_bytes: &[u8]) -> Claim {
+        self.placing_volume(name, first_bytes).claim(self)
+    }
+
+    fn placing_volume(&self, name: &str, first_bytes: &[u8]) -> Placing {
         let Ok(format) = unrar_rs::signature::read_signature(&mut Cursor::new(first_bytes)) else {
-            return Claim::default();
+            return Placing::default();
         };
-        self.claim_as(name, format, self.front_facts(first_bytes).as_ref())
+        self.placing(name, format, self.front_facts(first_bytes).as_ref())
     }
 
     // A transferable volume is judged by its parsed headers, or by the
@@ -238,22 +270,50 @@ impl RarStore {
         front: &[u8],
         facts: Option<&RarVolumeFacts>,
     ) -> Claim {
+        self.placing_front(name, front, facts).claim(self)
+    }
+
+    fn placing_front(&self, name: &str, front: &[u8], facts: Option<&RarVolumeFacts>) -> Placing {
         match facts {
             Some(facts) if facts.is_volume => {
-                self.claim_as(name, facts.archive_format(), Some(facts))
+                self.placing(name, facts.archive_format(), Some(facts))
             }
-            Some(_) => Claim::default(),
-            None => self.claim_volume(name, front),
+            Some(_) => Placing::default(),
+            None => self.placing_volume(name, front),
         }
     }
 
-    // The places a volume's headers and name give it in this set. Headers
+    // Whether the volume at `index` yields to the member whose name and
+    // front, or what was parsed of it, give that place: links alone hold it
+    // there, and the member states it, by its headers or by its name in the
+    // set's numbering. A claimant that only links never moves it.
+    pub(super) fn yields(
+        &self,
+        index: VolumeIndex,
+        holder: &Volume,
+        name: &str,
+        front: &[u8],
+        given: Option<&Volume>,
+    ) -> bool {
+        let placing = match given {
+            Some(given) => self.placing_front(name, front, given.stated()),
+            None => self.placing_volume(name, front),
+        };
+        !settled(index, holder) && placing.stated == Some(index)
+    }
+
+    // The place a volume's headers and name give it in this set. Headers
     // that give it a place its name gives another set are judged by the
     // volumes beside it, by its file headers; a front that has none of
-    // those yet is not yet judged, and its places are what it gives now.
-    fn claim_as(&self, name: &str, format: ArchiveFormat, facts: Option<&RarVolumeFacts>) -> Claim {
+    // those yet is not yet judged, and its place is what it gives now.
+    fn placing(
+        &self,
+        name: &str,
+        format: ArchiveFormat,
+        facts: Option<&RarVolumeFacts>,
+    ) -> Placing {
         if self.holds_other_than(format) {
-            return Claim::default();
+            return Placing::default();
         }
         // The set's numbering is the one the bound names share; before any
         // is bound, the one this member's own name gives. Each bound name
@@ -295,20 +355,15 @@ impl RarStore {
         let named = named.filter(|_| bound || self.volumes.is_empty() || headers.is_some());
         // A position held already is answered all the same: the volume
         // posted again is that volume.
-        let placed = match (headers, named) {
-            (Some(placed), _) if stated => Some(placed),
-            (_, Some(named)) => Some(named),
-            (linked, None) => linked,
+        let (placed, stated) = match (headers, named) {
+            (Some(placed), _) if stated => (Some(placed), Some(placed)),
+            (_, Some(named)) => (Some(named), Some(named)),
+            (linked, None) => (linked, None),
         };
-        // A set ends at the volume that says no volume follows it.
-        let places: Vec<VolumeIndex> = placed
-            .filter(|at| self.last().is_none_or(|last| *at <= last))
-            .into_iter()
-            .collect();
-        if not_yet {
-            Claim::NotYet(places)
-        } else {
-            Claim::Places(places)
+        Placing {
+            placed,
+            stated,
+            not_yet,
         }
     }
 
@@ -393,18 +448,9 @@ pub(crate) fn states_position(facts: &RarVolumeFacts) -> bool {
 // the set's numbering, or its walk has read its headers to their end, where
 // a stated number would show. Links alone never fix a position, since one
 // member spanning every volume links each free place beside the held ones,
-// so a volume they placed is mapped only once its own end is read.
-// A holder at `index` yields its place to a claimant whose headers state
-// a position, the claim that named the place, when links alone hold it
-// there. A claimant that only links never moves it.
-pub(super) fn yields(
-    index: VolumeIndex,
-    holder: &Volume,
-    claimant: Option<&RarVolumeFacts>,
-) -> bool {
-    !settled(index, holder) && claimant.is_some_and(states_position)
-}
-
+// so a volume they placed is mapped only once its own end is read, and a
+// holder links alone hold yields to a claimant that states the place.
+//
 // Whether a volume is settled at `index`: read to its end, or placed there
 // by a stated position or by its name. Nothing settles a volume where its
 // own headers say it is not, a name least of all.

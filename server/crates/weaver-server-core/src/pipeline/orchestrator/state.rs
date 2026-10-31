@@ -109,8 +109,8 @@ impl Pipeline {
             // Memory and disk parks use distinct ledgers; each part is let
             // go as any part is, its spool file with it.
             if let Some(uu) = self.uu_files.remove(&file_id) {
-                for bytes in uu.parked.into_values() {
-                    self.release_parked_bytes(bytes);
+                for part in uu.parked.into_values() {
+                    self.release_parked_bytes(part.bytes);
                     self.release_uu_parked_segment();
                 }
             }

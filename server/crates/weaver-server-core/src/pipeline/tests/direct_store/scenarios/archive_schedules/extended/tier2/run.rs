@@ -17,7 +17,7 @@
 // decode has nowhere else to come from and is given up for repair at once.
 // After each article the pipeline moves as an orchestrator turn moves it,
 // through the archive matrix's graph driver.
-use super::super::super::graph::{fingerprint, restore, turn};
+use super::super::super::graph::{Answers, Turns, fingerprint, restore};
 use super::post::{Post, Role};
 use super::*;
 use crate::history::HistoryFailureKind;
@@ -92,7 +92,7 @@ pub(in super::super) fn lost_articles(
 }
 
 // Answers one request for an article with what the post has for it.
-async fn deliver(pipeline: &mut Pipeline, post: &Post, file: u32, article: u32) {
+async fn deliver(pipeline: &mut Pipeline, turns: &mut Turns, post: &Post, file: u32, article: u32) {
     use weaver_nntp::client::{DecodedBody, DecodedBodyTrace};
     let job = JOB;
     retire_schedule_article(pipeline, job, file, article);
@@ -153,13 +153,13 @@ async fn deliver(pipeline: &mut Pipeline, post: &Post, file: u32, article: u32) 
         // last, ends the download pass.
         pipeline.note_decode_started(segment, raw.len() as u64);
         pipeline.handle_decode_done(done).await;
-        turn(pipeline).await;
+        turns.turn(pipeline).await;
     }
 }
 
 // Books an article the one server does not have, as the downloader does
 // once every server has answered 430.
-async fn unavailable(pipeline: &mut Pipeline, file: u32, article: u32) {
+async fn unavailable(pipeline: &mut Pipeline, turns: &mut Turns, file: u32, article: u32) {
     retire_schedule_article(pipeline, JOB, file, article);
     if !pipeline.jobs.contains_key(&JOB) {
         return;
@@ -172,20 +172,25 @@ async fn unavailable(pipeline: &mut Pipeline, file: u32, article: u32) {
         segment_number: article,
     });
     pipeline.maybe_finish_download_pass(JOB);
-    turn(pipeline).await;
+    turns.turn(pipeline).await;
 }
 
 // Runs `post` under one schedule.
 pub(in super::super) async fn run(
     post: &Post,
     order: &[(u32, u32)],
-    interruption: Interruption,
+    (interruption, answers): (Interruption, Answers),
 ) -> Ran {
-    Box::pin(drive(post, order, interruption)).await
+    Box::pin(drive(post, order, (interruption, answers))).await
 }
 
-async fn drive(post: &Post, order: &[(u32, u32)], interruption: Interruption) -> Ran {
+async fn drive(
+    post: &Post,
+    order: &[(u32, u32)],
+    (interruption, answers): (Interruption, Answers),
+) -> Ran {
     enable_schedule_trace();
+    let mut turns = Turns::new(answers);
     let spec = post.spec();
     let groups = groups(post);
     let lost = lost_articles(post, interruption);
@@ -204,11 +209,11 @@ async fn drive(post: &Post, order: &[(u32, u32)], interruption: Interruption) ->
             || (starved && posted.role == Role::Recovery))
     };
     // One article as the one server answers it.
-    let serve = async |pipeline: &mut Pipeline, file: u32, article: u32| {
+    let serve = async |pipeline: &mut Pipeline, turns: &mut Turns, file: u32, article: u32| {
         if available(file, article) {
-            deliver(pipeline, post, file, article).await;
+            deliver(pipeline, turns, post, file, article).await;
         } else {
-            unavailable(pipeline, file, article).await;
+            unavailable(pipeline, turns, file, article).await;
         }
     };
     let root = tempfile::tempdir().unwrap();
@@ -222,22 +227,23 @@ async fn drive(post: &Post, order: &[(u32, u32)], interruption: Interruption) ->
     insert_active_job(&mut pipeline, JOB, spec.clone()).await;
     // The schedule delivers what the server has; what it lacks is answered
     // when the job asks for it.
-    let deliver_index = async |pipeline: &mut Pipeline| {
+    let deliver_index = async |pipeline: &mut Pipeline, turns: &mut Turns| {
         for &file in &indices {
             for article in 0..post.files[file].articles() {
                 if available(file as u32, article) {
-                    deliver(pipeline, post, file as u32, article).await;
+                    deliver(pipeline, turns, post, file as u32, article).await;
                 }
             }
         }
     };
     if index_first {
-        deliver_index(&mut pipeline).await;
+        deliver_index(&mut pipeline, &mut turns).await;
     }
     for (step, action, arrives) in interruption.boundaries(order.len()) {
         match action {
             BoundaryAction::None => {}
             action @ (BoundaryAction::Restart | BoundaryAction::Crash) => {
+                turns.release(&mut pipeline).await;
                 if action == BoundaryAction::Restart {
                     pipeline.drain().await;
                 }
@@ -251,6 +257,9 @@ async fn drive(post: &Post, order: &[(u32, u32)], interruption: Interruption) ->
                     retired = Some(status);
                     break;
                 }
+                // What the restored job lends out speaks before the next
+                // article, or is held behind it.
+                turns.turn(&mut pipeline).await;
             }
         }
         if !arrives {
@@ -265,13 +274,13 @@ async fn drive(post: &Post, order: &[(u32, u32)], interruption: Interruption) ->
                 break;
             }
             if available(file, article) {
-                deliver(&mut pipeline, post, file, article).await;
+                deliver(&mut pipeline, &mut turns, post, file, article).await;
             }
         }
         trace.push(format!("arrive slot {slot}"));
     }
     if !index_first && retired.is_none() {
-        deliver_index(&mut pipeline).await;
+        deliver_index(&mut pipeline, &mut turns).await;
     }
     // Once the schedule is spent, every article the job asks for is served
     // until nothing is queued, scheduled or running. A round in which
@@ -288,7 +297,10 @@ async fn drive(post: &Post, order: &[(u32, u32)], interruption: Interruption) ->
                 work.segment_id.segment_number,
             );
             trace.push(format!("requested {file}:{article}"));
-            serve(&mut pipeline, file, article).await;
+            serve(&mut pipeline, &mut turns, file, article).await;
+        }
+        if turns.release(&mut pipeline).await {
+            continue;
         }
         if finished(&pipeline) {
             break;

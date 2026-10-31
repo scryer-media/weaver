@@ -1701,7 +1701,15 @@ pub(super) mod sets {
             1,
             super::post::Wire::Damaged(super::post::Damage::Recomputed),
         );
-        let result = super::run::run(&post, &slot_arrivals(4), Interruption::None).await;
+        let result = super::run::run(
+            &post,
+            &slot_arrivals(4),
+            (
+                Interruption::None,
+                crate::pipeline::tests::direct_store::scenarios::archive_schedules::graph::Answers::Heard,
+            ),
+        )
+        .await;
         result.assert(&post, Verdict::Fails, false, "damaged neighbouring set");
         let (healthy, bytes) = &post.expected[0];
         assert_eq!(

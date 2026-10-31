@@ -949,32 +949,33 @@ impl Pipeline {
                     // to say" value. In particular `segments` is empty: the
                     // dual-CRC grid can only be fed block-aligned CRC evidence,
                     // and there is none to give it here.
-                    weaver_nntp::fused_yenc::FusedArticleBody::Uu(outcome) => DecodeResult {
-                        segment_id,
-                        raw_size: raw_size as u64,
-                        encoding: SegmentEncoding::Uu(crate::pipeline::UuSegmentFacts {
+                    weaver_nntp::fused_yenc::FusedArticleBody::Uu(outcome) => {
+                        let facts = crate::pipeline::UuSegmentFacts {
                             damaged: outcome.damaged,
                             ended: outcome.ended,
-                        }),
-                        yenc_layout: YencLayoutAssertions {
-                            file_size: 0,
-                            part: None,
-                            total: None,
-                            begin: None,
-                            end: None,
-                        },
-                        // "Not known bad" — there is nothing to check against,
-                        // which is different from having checked and passed.
-                        crc_valid: true,
-                        truncation_suspected: false,
-                        part_crc_verified: false,
-                        part_crc: 0,
-                        expected_file_crc: None,
-                        data,
-                        yenc_name: outcome.filename.unwrap_or_default(),
-                        checkpoint_plan: weaver_yenc::CheckpointPlan::None,
-                        segments: Vec::new(),
-                    },
+                        };
+                        DecodeResult {
+                            segment_id,
+                            raw_size: raw_size as u64,
+                            encoding: SegmentEncoding::Uu(facts),
+                            yenc_layout: YencLayoutAssertions {
+                                file_size: 0,
+                                part: None,
+                                total: None,
+                                begin: None,
+                                end: None,
+                            },
+                            crc_valid: facts.clean(),
+                            truncation_suspected: false,
+                            part_crc_verified: false,
+                            part_crc: 0,
+                            expected_file_crc: None,
+                            data,
+                            yenc_name: outcome.filename.unwrap_or_default(),
+                            checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+                            segments: Vec::new(),
+                        }
+                    }
                 }))
             }
             Err(weaver_nntp::client::DecodedBodyError::Nntp(error)) => {

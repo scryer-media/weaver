@@ -897,6 +897,7 @@ impl Object for RarStore {
     fn provisional(
         &self,
         volume: VolumeIndex,
+        name: &str,
         first_bytes: &[u8],
         carried: Option<&weaver_graph::Carried>,
     ) -> bool {
@@ -904,11 +905,7 @@ impl Object for RarStore {
             return false;
         };
         let given = carried.and_then(|carried| carried.downcast_ref::<Volume>());
-        let facts = match given {
-            Some(given) => given.stated().cloned(),
-            None => self.front_facts(first_bytes),
-        };
-        claim::yields(volume, holder, facts.as_ref())
+        self.yields(volume, holder, name, first_bytes, given)
     }
 
     fn reclaim(

@@ -311,7 +311,7 @@ impl Pipeline {
             .uu_files
             .iter()
             .filter(|(file_id, _)| file_id.job_id == job_id)
-            .any(|(_, uu)| uu.parked.values().any(|bytes| !bytes.is_spilled()));
+            .any(|(_, uu)| uu.parked.values().any(|part| !part.bytes.is_spilled()));
         uu || self
             .unanchored_parked
             .iter()

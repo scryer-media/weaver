@@ -531,11 +531,30 @@ fn a_volume_links_alone_hold_yields_to_a_claim_that_states_its_place() {
     let front = |index: usize| volumes[index][..4096].to_vec();
     let mut held = store();
     held.bound(VolumeIndex(0), "c0ffee", &front(2), None);
-    assert!(held.provisional(VolumeIndex(0), &front(0), None));
-    assert!(!held.provisional(VolumeIndex(0), &front(1), None));
+    assert!(held.provisional(VolumeIndex(0), "beef", &front(0), None));
+    assert!(!held.provisional(VolumeIndex(0), "beef", &front(1), None));
     let mut first = store();
     first.bound(VolumeIndex(0), "d00d", &front(0), None);
-    assert!(!first.provisional(VolumeIndex(0), &front(0), None));
+    assert!(!first.provisional(VolumeIndex(0), "beef", &front(0), None));
+}
+
+// A nameless RAR4 middle volume held beside the set's first by links alone
+// yields its place to the volume whose name numbers it there, as a recovery
+// set's rename gives it; a claimant with no such name, its front stating no
+// place either, moves nothing.
+#[test]
+fn a_volume_links_alone_hold_yields_to_a_claim_whose_name_states_its_place() {
+    let volumes = write(
+        &[Item::File("feature.bin", payload(5, 23_000))],
+        &split(Version::Rar4),
+    );
+    assert!(volumes.len() > 2);
+    let front = |index: usize| volumes[index][..4096].to_vec();
+    let mut held = store();
+    held.bound(VolumeIndex(0), "set.part01.rar", &front(0), None);
+    held.bound(VolumeIndex(1), "c0ffee", &front(2), None);
+    assert!(held.provisional(VolumeIndex(1), "set.part02.rar", &front(1), None));
+    assert!(!held.provisional(VolumeIndex(1), "d00d", &front(1), None));
 }
 
 #[test]
@@ -576,7 +595,7 @@ fn a_volume_named_first_yields_the_place_its_own_front_rules_out() {
         let mut object = store();
         object.bound(VolumeIndex(0), "3c9e1f.rar", &front(&volumes[1]), None);
         assert!(
-            object.provisional(VolumeIndex(0), &front(&volumes[0]), None),
+            object.provisional(VolumeIndex(0), "3c9e1f.r00", &front(&volumes[0]), None),
             "solid={solid}: a holder its front misplaces yields"
         );
         assert_eq!(
@@ -1122,6 +1141,54 @@ fn a_damaged_end_record_never_ends_the_set() {
         );
         owner.deliver_as(0, flags, Provenance::Repaired, None);
         owner.close(0);
+        streamed(&owner);
+        posted_whole(&owner);
+    }
+}
+
+// Every volume comes whole and the set is laid end to end; then, before any
+// volume closes, the middle volume's end record comes again damaged. The
+// walk stops trusting that record, so the layout reaches no further than
+// the middle volume. The last volume's parts were placed already: they stay
+// where they went, its bytes are still posted whole, and the repair that
+// brings the real record reads the set whole.
+#[test]
+fn a_volume_unlinked_after_its_parts_were_placed_keeps_them() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &split(version));
+        assert_eq!(volumes.len(), 3, "{version:?}");
+        let flags = end_flags(version, &volumes[1]);
+        let last = volumes[2].len() as u64;
+        let mut owner = Owner::named(store(), volumes);
+        for volume in 0..owner.volumes.len() {
+            owner.frames(volume, 1000);
+        }
+        posted_whole(&owner);
+        owner.deliver_as(
+            1,
+            flags,
+            Provenance::Damaged,
+            Some(&vec![0; flags.len() as usize]),
+        );
+        let mut placements = Vec::new();
+        owner
+            .object
+            .locate(VolumeIndex(2), ByteRange::new(0, last), &mut placements);
+        assert!(
+            !placements
+                .iter()
+                .any(|placement| matches!(placement, Placement::Held { .. })),
+            "{version:?} {placements:?}"
+        );
+        assert_eq!(
+            owner.posted(2).as_deref(),
+            Some(owner.volumes[2].1.as_slice()),
+            "{version:?} last volume posted"
+        );
+        owner.deliver_as(1, flags, Provenance::Repaired, None);
+        for volume in 0..owner.volumes.len() {
+            owner.close(volume);
+        }
         streamed(&owner);
         posted_whole(&owner);
     }

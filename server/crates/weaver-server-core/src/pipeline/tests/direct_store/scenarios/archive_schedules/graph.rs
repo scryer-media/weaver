@@ -10,6 +10,7 @@ use weaver_graph::recovery::RepairOutcome;
 
 use super::*;
 use crate::history::HistoryFailureKind;
+use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::tests::engines::harness::{JOB, finished};
 
 pub(in crate::pipeline::tests) mod grouping;
@@ -336,7 +337,7 @@ pub(in super::super) async fn run_graph_schedule(
     described: Option<&[String]>,
     order: &[(u32, u32)],
     wanted: &[&str],
-    interruption: Interruption,
+    (interruption, answers): (Interruption, Answers),
 ) -> GraphOutcome {
     Box::pin(drive_graph_schedule(
         options,
@@ -345,7 +346,7 @@ pub(in super::super) async fn run_graph_schedule(
         described,
         order,
         wanted,
-        interruption,
+        (interruption, answers),
     ))
     .await
 }
@@ -438,11 +439,83 @@ impl Run<'_> {
     }
 }
 
-// What an orchestrator turn does after an article: the runs' mail is heard,
-// every completion check a step scheduled runs, and the runtime queues
+// When a repair's answer is heard, a wire of the schedule like its
+// interruption: before the next article arrives, or held while the rest of
+// the schedule's articles arrive, until a restart or a crash stops the
+// pipeline or the schedule is spent. A post with no recovery set lends no
+// repair, so it runs only heard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in super::super) enum Answers {
+    Heard,
+    Held,
+}
+
+impl Answers {
+    pub(in super::super) fn under(recovery: bool) -> &'static [Self] {
+        if recovery {
+            &[Self::Heard, Self::Held]
+        } else {
+            &[Self::Heard]
+        }
+    }
+}
+
+// The orchestrator turns of one schedule, and the repair answer a held
+// schedule keeps back.
+pub(in super::super) struct Turns {
+    answers: Answers,
+    held: Vec<Said>,
+}
+
+impl Turns {
+    pub(in super::super) fn new(answers: Answers) -> Self {
+        Self {
+            answers,
+            held: Vec::new(),
+        }
+    }
+
+    // What an orchestrator turn does after an article: the runs' mail is
+    // heard, every completion check a step scheduled runs, and the runtime
+    // queues settle. Whatever is lent out is then waited for, so its answer
+    // is heard before the next article, or kept back when the schedule
+    // holds repairs' answers.
+    pub(in super::super) async fn turn(&mut self, pipeline: &mut Pipeline) {
+        let mut mail = pipeline.graph_runs.waiting();
+        loop {
+            for said in mail {
+                if self.answers == Answers::Held && matches!(said.heard, Heard::Repaired(_)) {
+                    self.held.push(said);
+                } else {
+                    pipeline.graph_run_said(said);
+                }
+            }
+            settle(pipeline).await;
+            if !self.held.is_empty() || !pipeline.graph_jobs.get(&JOB).is_some_and(|job| job.lent())
+            {
+                break;
+            }
+            mail = vec![pipeline.graph_runs.recv().await.expect("a loan answers")];
+        }
+    }
+
+    // Hears what is held back, before the schedule stops the pipeline or
+    // once it has no articles left to hold it behind.
+    pub(in super::super) async fn release(&mut self, pipeline: &mut Pipeline) -> bool {
+        if self.held.is_empty() {
+            return false;
+        }
+        for said in std::mem::take(&mut self.held) {
+            pipeline.graph_run_said(said);
+        }
+        settle(pipeline).await;
+        true
+    }
+}
+
+// Every completion check a step scheduled runs, and the runtime queues
 // settle.
-pub(super) async fn turn(pipeline: &mut Pipeline) {
-    pipeline.hear_graph_runs();
+async fn settle(pipeline: &mut Pipeline) {
     while let Some(queued) = pipeline.pending_completion_checks.pop_front() {
         pipeline.check_job_completion(queued).await;
     }
@@ -534,9 +607,10 @@ async fn drive_graph_schedule(
     described: Option<&[String]>,
     order: &[(u32, u32)],
     wanted: &[&str],
-    interruption: Interruption,
+    (interruption, answers): (Interruption, Answers),
 ) -> GraphOutcome {
     enable_schedule_trace();
+    let mut turns = Turns::new(answers);
     // Every volume the set is written as: what a recovery set or a listing
     // describes. The run serves the ones the post carries.
     let written = volumes;
@@ -569,7 +643,7 @@ async fn drive_graph_schedule(
         && index_first
     {
         run.serve(&mut pipeline, index).await;
-        turn(&mut pipeline).await;
+        turns.turn(&mut pipeline).await;
         run.look(&pipeline);
     }
     let mut retired = None;
@@ -577,6 +651,7 @@ async fn drive_graph_schedule(
         match action {
             BoundaryAction::None => {}
             action @ (BoundaryAction::Restart | BoundaryAction::Crash) => {
+                turns.release(&mut pipeline).await;
                 if action == BoundaryAction::Restart {
                     pipeline.drain().await;
                 }
@@ -598,6 +673,9 @@ async fn drive_graph_schedule(
                     break;
                 }
                 run.note_asks(&mut pipeline);
+                // What the restored job lends out speaks before the next
+                // article, or is held behind it.
+                turns.turn(&mut pipeline).await;
                 run.look(&pipeline);
             }
         }
@@ -608,7 +686,7 @@ async fn drive_graph_schedule(
             break;
         };
         run.serve(&mut pipeline, article).await;
-        turn(&mut pipeline).await;
+        turns.turn(&mut pipeline).await;
         run.look(&pipeline);
         run.note_asks(&mut pipeline);
     }
@@ -617,7 +695,7 @@ async fn drive_graph_schedule(
         && retired.is_none()
     {
         run.serve(&mut pipeline, index).await;
-        turn(&mut pipeline).await;
+        turns.turn(&mut pipeline).await;
         run.look(&pipeline);
     }
     let mut stalled = None;
@@ -635,8 +713,12 @@ async fn drive_graph_schedule(
                 run.rerequested.insert(article);
             }
             run.serve(&mut pipeline, article).await;
-            turn(&mut pipeline).await;
+            turns.turn(&mut pipeline).await;
             run.look(&pipeline);
+        }
+        if turns.release(&mut pipeline).await {
+            run.look(&pipeline);
+            continue;
         }
         if finished(&pipeline) {
             break;
@@ -810,42 +892,50 @@ pub(in super::super) fn graph_compressed_fixture(format: CompressedFormat) -> Gr
     }
 }
 
-// One cell: the schedule driven under `spec`'s password and judged. A cell
-// the rule set disagrees with comes back as its report.
+// One cell: the schedule driven under `spec`'s password and judged, once
+// for each time its repairs' answers may be heard. A cell the rule set
+// disagrees with comes back as its report.
 async fn graph_cell(
     fixture: &GraphFixture,
     spec: JobSpec,
     opens: bool,
     cell: String,
     (order, interruption): Schedule,
-) -> Option<String> {
-    eprintln!("{cell} order={order:?} interruption={interruption:?}");
-    let wanted: Vec<&str> = fixture.members.keys().map(String::as_str).collect();
-    let outcome = run_graph_schedule(
-        fixture.options,
-        spec,
-        &fixture.volumes,
-        fixture.described.as_deref(),
-        &order,
-        &wanted,
-        interruption,
-    )
-    .await;
-    let post = Post {
-        members: &fixture.members,
-        leaves: (fixture.deliverable)(opens, interruption),
-    };
-    let said = graph_disagreements(&outcome, &post, interruption, fixture.options);
-    (!said.is_empty()).then(|| {
-        format!(
-            "{cell} order={order:?} interruption={interruption:?}: {}; the graph: status={:?} bound={:?} recovery={:?} trace={:?}",
-            said.join("; "),
-            outcome.status,
-            outcome.bound,
-            outcome.recovery,
-            outcome.trace
+) -> Vec<String> {
+    let mut reports = Vec::new();
+    let recovery = fixture.options.recovery != RecoveryFormat::Absent;
+    for &answers in Answers::under(recovery) {
+        let wire =
+            format!("{cell} order={order:?} interruption={interruption:?} answers={answers:?}");
+        eprintln!("{wire}");
+        let wanted: Vec<&str> = fixture.members.keys().map(String::as_str).collect();
+        let outcome = run_graph_schedule(
+            fixture.options,
+            spec.clone(),
+            &fixture.volumes,
+            fixture.described.as_deref(),
+            &order,
+            &wanted,
+            (interruption, answers),
         )
-    })
+        .await;
+        let post = Post {
+            members: &fixture.members,
+            leaves: (fixture.deliverable)(opens, interruption),
+        };
+        let said = graph_disagreements(&outcome, &post, interruption, fixture.options);
+        if !said.is_empty() {
+            reports.push(format!(
+                "{wire}: {}; the graph: status={:?} bound={:?} recovery={:?} trace={:?}",
+                said.join("; "),
+                outcome.status,
+                outcome.bound,
+                outcome.recovery,
+                outcome.trace
+            ));
+        }
+    }
+    reports
 }
 
 // The fixture's cases under its own password, by replay index; the reports

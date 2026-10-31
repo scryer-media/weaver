@@ -58,7 +58,7 @@ async fn submit_uu_segment_named(
                     begin: None,
                     end: None,
                 },
-                crc_valid: true,
+                crc_valid: facts.clean(),
                 part_crc_verified: false,
                 part_crc: 0,
                 truncation_suspected: false,
@@ -319,6 +319,53 @@ async fn uu_segments_park_until_their_prefix_arrives() {
     assert_eq!(held_spool_files(&pipeline, job_id), 0);
 }
 
+// A damaged part that waited for its prefix is released as damaged: the park
+// keeps what its decode found, so it is never placed as a clean part.
+#[tokio::test]
+async fn a_damaged_part_released_from_the_park_stays_damaged() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20091);
+    let parts: Vec<Vec<u8>> = vec![vec![b'a'; 600], vec![b'b'; 450]];
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        uu_job_spec(&parts.iter().map(|p| p.len()).collect::<Vec<_>>()),
+    )
+    .await;
+    let file_id = NzbFileId {
+        job_id,
+        file_index: 0,
+    };
+
+    submit_uu_segment(&mut pipeline, file_id, 1, &parts[1], true, true).await;
+    assert_eq!(
+        pipeline.uu_files.get(&file_id).map(|uu| uu.parked.len()),
+        Some(1),
+        "the damaged part waits on its prefix"
+    );
+    assert_eq!(pipeline.metrics.crc_errors.load(Ordering::Relaxed), 0);
+
+    submit_uu_segment(&mut pipeline, file_id, 0, &parts[0], false, false).await;
+
+    assert_eq!(pipeline.uu_parked_segments, 0, "the park released the part");
+    assert_eq!(
+        pipeline.metrics.crc_errors.load(Ordering::Relaxed),
+        1,
+        "the released part counts as damaged"
+    );
+    let file = pipeline.jobs[&job_id]
+        .articles
+        .assembly()
+        .and_then(|assembly| assembly.file(file_id))
+        .expect("the file is assembling");
+    assert!(file.placement_of(0).is_some(), "the clean prefix is placed");
+    assert!(
+        file.placement_of(1).is_none(),
+        "the damaged part is not placed as a clean part"
+    );
+}
+
 #[tokio::test]
 async fn uu_spills_reassemble_in_order_once_the_prefix_lands() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -389,7 +436,7 @@ async fn uu_spills_reassemble_in_order_once_the_prefix_lands() {
     let first_spool = match pipeline
         .uu_files
         .get(&payload_file_id)
-        .and_then(|uu| uu.parked.get(&1))
+        .and_then(|uu| uu.parked.get(&1).map(|part| &part.bytes))
     {
         Some(ParkedBytes::Spilled { path, .. }) => path.to_path_buf(),
         _ => panic!("part 1 must spill while the prefix is missing"),
@@ -397,7 +444,7 @@ async fn uu_spills_reassemble_in_order_once_the_prefix_lands() {
     let second_spool = match pipeline
         .uu_files
         .get(&payload_file_id)
-        .and_then(|uu| uu.parked.get(&2))
+        .and_then(|uu| uu.parked.get(&2).map(|part| &part.bytes))
     {
         Some(ParkedBytes::Spilled { path, .. }) => path.to_path_buf(),
         _ => panic!("part 2 must spill while the prefix is missing"),
@@ -454,11 +501,11 @@ async fn uu_park_spills_after_resident_budget_and_drains_in_order() {
 
     let parked = pipeline.uu_files.get(&file_id).expect("UU park");
     assert!(matches!(
-        parked.parked.get(&2),
+        parked.parked.get(&2).map(|part| &part.bytes),
         Some(ParkedBytes::Memory(_))
     ));
     assert!(matches!(
-        parked.parked.get(&1),
+        parked.parked.get(&1).map(|part| &part.bytes),
         Some(ParkedBytes::Spilled { .. })
     ));
     assert_eq!(pipeline.write_buffered_bytes, parts[2].len());
@@ -718,7 +765,7 @@ async fn uu_spilled_replacement_and_displacement_remove_old_files() {
     let replaced_path = match pipeline
         .uu_files
         .get(&file_id)
-        .and_then(|uu| uu.parked.get(&1))
+        .and_then(|uu| uu.parked.get(&1).map(|part| &part.bytes))
     {
         Some(ParkedBytes::Spilled { path, .. }) => path.to_path_buf(),
         _ => panic!("expected spilled ordinal 1"),
@@ -736,7 +783,7 @@ async fn uu_spilled_replacement_and_displacement_remove_old_files() {
     let retained_path = match pipeline
         .uu_files
         .get(&file_id)
-        .and_then(|uu| uu.parked.get(&1))
+        .and_then(|uu| uu.parked.get(&1).map(|part| &part.bytes))
     {
         Some(ParkedBytes::Spilled { path, .. }) => path.to_path_buf(),
         _ => panic!("expected replacement spool"),
@@ -767,7 +814,7 @@ async fn uu_spilled_replacement_and_displacement_remove_old_files() {
     let farthest_path = match pipeline
         .uu_files
         .get(&displaced_file_id)
-        .and_then(|uu| uu.parked.get(&2))
+        .and_then(|uu| uu.parked.get(&2).map(|part| &part.bytes))
     {
         Some(ParkedBytes::Spilled { path, .. }) => path.to_path_buf(),
         _ => panic!("expected spilled ordinal 2"),
@@ -781,7 +828,7 @@ async fn uu_spilled_replacement_and_displacement_remove_old_files() {
         pipeline
             .uu_files
             .get(&displaced_file_id)
-            .and_then(|uu| uu.parked.get(&1)),
+            .and_then(|uu| uu.parked.get(&1).map(|part| &part.bytes)),
         Some(ParkedBytes::Spilled { .. })
     ));
     assert_eq!(pipeline.uu_spooled_bytes, parts[1].len());
@@ -819,7 +866,7 @@ async fn uu_missing_spool_file_fails_job_without_leaking_accounting() {
     let spool_path = match pipeline
         .uu_files
         .get(&file_id)
-        .and_then(|uu| uu.parked.get(&1))
+        .and_then(|uu| uu.parked.get(&1).map(|part| &part.bytes))
     {
         Some(ParkedBytes::Spilled { path, .. }) => path.to_path_buf(),
         _ => panic!("expected a spilled UU part"),
@@ -1608,4 +1655,94 @@ async fn a_mixed_yenc_and_uuencode_job_writes_every_file_byte_identically() {
         let written = tokio::fs::read(working_dir.join(name)).await.unwrap();
         assert_eq!(written, expected, "{name} was not written byte-identically");
     }
+}
+
+// One uuencode article as a server sends it: a `begin` header, one data line
+// per 45 bytes, the closing lines, and the terminating dot. `cut` halves the
+// characters of the line at that index while its length character still
+// claims the whole line, as a body cut short in transit does.
+fn uu_article_on_the_wire(bytes: &[u8], cut: Option<usize>) -> Vec<u8> {
+    fn sextet(value: u8) -> u8 {
+        match value & 0x3f {
+            0 => b'`',
+            value => value + b' ',
+        }
+    }
+    let mut raw =
+        b"222 0 <uu@example.invalid> body follows\r\nbegin 644 silver-horizon.bin\r\n".to_vec();
+    for (index, line) in bytes.chunks(45).enumerate() {
+        let mut encoded = vec![sextet(line.len() as u8)];
+        for triple in line.chunks(3) {
+            let a = triple[0];
+            let b = triple.get(1).copied().unwrap_or(0);
+            let c = triple.get(2).copied().unwrap_or(0);
+            encoded.extend_from_slice(&[
+                sextet(a >> 2),
+                sextet((a << 4) | (b >> 4)),
+                sextet((b << 2) | (c >> 6)),
+                sextet(c),
+            ]);
+        }
+        if cut == Some(index) {
+            encoded.truncate(1 + (encoded.len() - 1) / 2);
+        }
+        raw.extend_from_slice(&encoded);
+        raw.extend_from_slice(b"\r\n");
+    }
+    raw.extend_from_slice(b"`\r\nend\r\n.\r\n");
+    raw
+}
+
+// What the download stage makes of one uuencode article off the wire.
+fn uu_decode_result(raw: &[u8]) -> DecodeResult {
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id: JobId(1),
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let mut decoder = weaver_nntp::fused_yenc::FusedYencArticleDecoder::new();
+    let decoded = decoder
+        .decode_available(&mut bytes::BytesMut::from(raw))
+        .expect("the article decodes")
+        .expect("the article is whole on the wire");
+    let trace = weaver_nntp::client::DecodedBodyTrace {
+        attempts: Vec::new(),
+        result: Ok(weaver_nntp::client::DecodedBody {
+            raw_size: raw.len() as u32,
+            decoded: decoded.chunks,
+            body: decoded.body,
+            cpu: Default::default(),
+            io: Default::default(),
+        }),
+    };
+    match Pipeline::download_data_from_decoded_trace(segment_id, trace).0 {
+        Ok(DownloadPayload::Decoded(result)) => result,
+        _ => panic!("a uuencode article yields a decoded result"),
+    }
+}
+
+// A uuencode part whose line was cut short is damaged, and its decode result
+// says so: it never claims the clean standing of a part with nothing wrong,
+// whose result is "not known bad".
+#[test]
+fn a_uu_part_cut_short_is_never_reported_clean() {
+    let bytes: Vec<u8> = (0..180u32).map(|at| (at * 7 + 3) as u8).collect();
+
+    let whole = uu_decode_result(&uu_article_on_the_wire(&bytes, None));
+    assert!(whole.encoding.is_uu());
+    assert_eq!(whole.data.len_bytes(), bytes.len());
+    assert!(whole.crc_valid, "a whole uuencode part is not known bad");
+
+    let cut = uu_decode_result(&uu_article_on_the_wire(&bytes, Some(1)));
+    assert!(
+        cut.encoding.uu_facts().is_some_and(|facts| facts.damaged),
+        "the cut line is damage"
+    );
+    assert!(
+        cut.data.len_bytes() < bytes.len(),
+        "the cut line lost bytes"
+    );
+    assert!(!cut.crc_valid, "a part cut short is never reported clean");
 }
