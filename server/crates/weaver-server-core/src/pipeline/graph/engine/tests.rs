@@ -303,9 +303,12 @@ fn forgetting_the_node_stops_a_waiting_read() {
     envelopes.keep(NODE, 0, 0, b"0", Provenance::Fresh).unwrap();
     let volumes = reader(&shelf);
     let read = std::thread::spawn(move || read(&volumes, 0, 4));
-    envelopes.forget(NODE).unwrap();
+    let files = envelopes.forget(NODE);
     let error = read.join().unwrap().unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    // The file stays for its owner to remove once no checkpoint names it.
+    assert_eq!(files.len(), 1);
+    assert!(files[0].path().exists());
 }
 
 // A run that says nothing and returns.

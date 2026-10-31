@@ -23,13 +23,23 @@ fn set(names: &[&str]) -> Box<dyn Object> {
 }
 
 fn deliver(object: &mut dyn Object, volume: u32, offset: u64, bytes: &[u8]) -> Vec<Emit> {
+    deliver_as(object, volume, offset, bytes, Provenance::Fresh)
+}
+
+fn deliver_as(
+    object: &mut dyn Object,
+    volume: u32,
+    offset: u64,
+    bytes: &[u8],
+    provenance: Provenance,
+) -> Vec<Emit> {
     let mut out = Vec::new();
     object.deliver(
         Delivery {
             volume: VolumeIndex(volume),
             offset,
             bytes: &weaver_graph::Evidenced::from(bytes.to_vec()),
-            provenance: Provenance::Fresh,
+            provenance,
         },
         &mut |_, _| false,
         &mut out,
@@ -710,6 +720,35 @@ fn a_piece_is_judged_once() {
     sized(&mut *object, 1, 100);
     assert!(deliver(&mut *object, 1, 0, &front(RAR5, 100)).contains(&Emit::Refuted));
     assert!(!deliver(&mut *object, 1, 0, &front(RAR5, 100)).contains(&Emit::Refuted));
+}
+
+// A later piece whose front arrived damaged is not judged on those bytes:
+// the bytes a repair brings over them are its front, and they refute. The
+// rest of the piece, arriving clean past the damage, decides nothing, and
+// a restart before the repair keeps the front waiting.
+#[test]
+fn a_damaged_front_waits_for_its_repair_to_be_judged() {
+    let piece = front(&sevenz_signature_header(), 100);
+    let lost = vec![0_u8; 40];
+    for restart in [false, true] {
+        let mut object = set(&["vessel.bin.001", "vessel.bin.002"]);
+        sized(&mut *object, 1, 100);
+        let mut out = deliver_as(&mut *object, 1, 0, &lost, Provenance::Damaged);
+        out.extend(deliver(&mut *object, 1, 40, &piece[40..]));
+        assert!(!out.contains(&Emit::Refuted), "damage decides nothing");
+        if restart {
+            object = crate::restore(&object.facts(), Budget::default()).unwrap();
+        }
+        let out = deliver_as(&mut *object, 1, 0, &piece[..40], Provenance::Repaired);
+        assert!(out.contains(&Emit::Refuted), "restart={restart}");
+    }
+
+    // A damaged front a repair proves headless joins.
+    let mut object = set(&["vessel.bin.001", "vessel.bin.002"]);
+    sized(&mut *object, 1, 100);
+    deliver_as(&mut *object, 1, 0, &piece, Provenance::Damaged);
+    let out = deliver_as(&mut *object, 1, 0, &front(&[], 100), Provenance::Repaired);
+    assert!(!out.contains(&Emit::Refuted));
 }
 
 // The first piece opens the joined file, so its front never refutes,

@@ -717,7 +717,7 @@ impl Pipeline {
                 pending.put_with_feed(graph, held, self.post_probes.verdicts.get(&job_id));
             graph.recorded(pending.stamp());
             let mut moved = false;
-            if graph.moves_waiting() {
+            if graph.awaits_commit() {
                 match pending.await_commit(graph.awaited(), job_id.0, &mail) {
                     Some(committed) => match graph.committed(committed) {
                         Ok(left) => moved = left,

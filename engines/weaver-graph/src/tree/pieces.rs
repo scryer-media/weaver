@@ -48,7 +48,7 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
-        let Some(Pieces { order, copies }) = self.pieces(node, member) else {
+        let Some(Pieces { order, copies }) = self.joined_by(node, member) else {
             return;
         };
         for piece in &order {
@@ -71,6 +71,41 @@ impl Tree {
         for (copy, into) in copies {
             self.fold(node, copy, into, effects);
         }
+    }
+
+    // The pieces of one file a refused member is one of, whichever of them
+    // was given up last: those it leads when its own front signs, else
+    // those a refused member whose front signs leads, it among them. Each
+    // object holding a piece gives it up in an order the arrivals set, not
+    // the pieces, so a piece freed after its first was refused finds that
+    // first again, and the pieces join the same either way.
+    fn joined_by(&self, node: NodeId, member: MemberId) -> Option<Pieces> {
+        let namespace = self.namespace(node)?;
+        let signs = |id: MemberId| {
+            matches!(
+                signed(
+                    namespace.first_bytes(id),
+                    namespace.get(id).and_then(|record| record.length)
+                ),
+                Sniff::Object(_)
+            )
+        };
+        if signs(member) {
+            return self.pieces(node, member);
+        }
+        namespace
+            .members()
+            .map(|record| record.id)
+            .filter(|first| {
+                *first != member
+                    && signs(*first)
+                    && self.child_of(node, *first).is_none()
+                    && self.refused_by(node, *first).is_some()
+            })
+            .find_map(|first| {
+                self.pieces(node, first)
+                    .filter(|pieces| pieces.order.contains(&member))
+            })
     }
 
     // The pieces `first` leads, when the recovery set that covers it covers

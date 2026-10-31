@@ -196,6 +196,7 @@ impl RestoreSeat {
         rows: crate::jobs::graph_checkpoint::GraphCheckpoint,
     ) -> Result<GraphRestore, GraphRestoreError> {
         let snapshot = checkpoint::snapshot(&rows)?;
+        sweep_unnamed(&self.working_dir, &snapshot, &rows.held_parts);
         let held = held_parts_from_rows(job_id, &self.working_dir, &rows.held_parts);
         let storage = Storage {
             passwords: restore_passwords(&self.db, job_id, self.spec_password.as_deref())?,
@@ -241,6 +242,66 @@ impl RestoreSeat {
             held,
             feed_verdict,
         })
+    }
+}
+
+// The checkpoint a job comes back to is the truth of what it holds under
+// its chunk directory: what the checkpoint names there is the job's, and
+// nothing else is. A file a step wrote whose checkpoint never committed,
+// or one a committed checkpoint stopped naming before it was removed, goes
+// before the job is rebuilt, so no file the job opens again meets bytes
+// it never recorded. A file that cannot be removed stays; the job does not
+// read it.
+pub(super) fn sweep_unnamed(
+    working_dir: &Path,
+    snapshot: &checkpoint::Snapshot,
+    held_parts: &[crate::jobs::graph_checkpoint::HeldPartRow],
+) {
+    let internal = Path::new(weaver_graph::names::INTERNAL_DIR);
+    let envelopes = snapshot.kept.iter().map(|kept| {
+        kept.file
+            .clone()
+            .unwrap_or_else(|| super::envelope::envelope_name(kept.node, kept.envelope))
+    });
+    let waiting = snapshot
+        .files
+        .values()
+        .filter_map(|file| file.on_disk.clone());
+    let holds = snapshot
+        .holds
+        .iter()
+        .map(|hold| super::namespace::scratch_name(hold.node));
+    let spooled = held_parts.iter().map(|part| part.spool_path.clone());
+    // Each name is a file, or a directory with all it holds, directly in
+    // the chunk directory.
+    let named: HashSet<std::ffi::OsString> = envelopes
+        .chain(waiting)
+        .chain(holds)
+        .chain(spooled)
+        .filter_map(|name| {
+            let within = Path::new(&name).strip_prefix(internal).ok()?;
+            within.iter().next().map(std::ffi::OsStr::to_os_string)
+        })
+        .collect();
+    let Ok(entries) = std::fs::read_dir(working_dir.join(internal)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if named.contains(&entry.file_name()) {
+            continue;
+        }
+        let path = entry.path();
+        let removed = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+        if let Err(error) = removed {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "a file the restored checkpoint does not name could not be removed"
+            );
+        }
     }
 }
 

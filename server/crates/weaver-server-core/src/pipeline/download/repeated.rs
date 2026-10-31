@@ -279,7 +279,9 @@ impl RepeatedArticles {
             .map(|(id, _)| (MessageId::new(id), Arc::new(tokio::sync::Mutex::new(None))))
             .collect();
         drop(scratch);
-        let scratch_root = root.join(".weaver-chunks");
+        // Beside the job's own files, not among them: the cache is this
+        // process's, and no checkpoint names it.
+        let scratch_root = root.join(weaver_graph::names::CACHE_DIR);
         match std::fs::create_dir(&scratch_root) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -725,7 +727,9 @@ mod tests {
         let base = tempfile::tempdir().unwrap();
         let old = base.path().join("old name");
         let new = base.path().join("new name");
-        let dir = old.join(".weaver-chunks").join("article-cache-test");
+        let dir = old
+            .join(weaver_graph::names::CACHE_DIR)
+            .join("article-cache-test");
         std::fs::create_dir_all(&dir).unwrap();
         let memory = Arc::new(ProcessMemoryBudget::new(1 << 20));
         let cache = RepeatedArticles {
@@ -742,7 +746,9 @@ mod tests {
         std::fs::rename(&old, &new).unwrap();
         cache.relocate_working_dir(&old, &new);
 
-        let moved = new.join(".weaver-chunks").join("article-cache-test");
+        let moved = new
+            .join(weaver_graph::names::CACHE_DIR)
+            .join("article-cache-test");
         assert_eq!(cache.root.path(), moved);
         assert_eq!(body.path().parent(), Some(moved.as_path()));
         let restored = body.read(id, &memory).unwrap();

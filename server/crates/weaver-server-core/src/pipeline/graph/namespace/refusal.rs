@@ -24,6 +24,7 @@ use bytes::Bytes;
 use weaver_graph::{Builder, ByteRange, Effect, MemberId, NodeId, Placement, Provenance, Tree};
 
 use super::{Arrival, NamespaceWriter, READ_BACK, Segments, Write, WriteError};
+use crate::pipeline::graph::leaf::Leaf;
 
 impl NamespaceWriter {
     pub(super) fn materialise(
@@ -59,21 +60,36 @@ impl NamespaceWriter {
             .get(&node)
             .map(|files| files.holds.held_ranges(super::held_volume(member)))
             .unwrap_or_default();
+        let record = tree
+            .namespace(node)
+            .and_then(|namespace| namespace.get(member))
+            .ok_or(WriteError::UnknownMember { node, member })?;
+        let output_name = record.output_name.clone();
+        let runs: Vec<_> = record
+            .coverage
+            .runs()
+            .flat_map(|run| outside(run.range, &held).map(move |range| (range, run.provenance)))
+            .collect();
+        let ranges: Vec<ByteRange> = runs.iter().map(|(range, _)| *range).collect();
+        let shared = match kept_as_volume(tree, (retired, volume), &ranges) {
+            Some(envelope) => {
+                let taken = ranges.iter().map(ByteRange::len).sum();
+                self.share_envelope(
+                    tree,
+                    (node, member),
+                    (retired, envelope),
+                    taken,
+                    &output_name,
+                )?
+            }
+            None => None,
+        };
         if tree.child_of(node, member).is_some() {
             self.replay(tree, builder, segments, node, member, super::ALL, None, out)?;
         } else {
             self.release_to_leaf(tree, node, member)?;
         }
         self.release_subtree(tree, retired)?;
-        let record = tree
-            .namespace(node)
-            .and_then(|namespace| namespace.get(member))
-            .ok_or(WriteError::UnknownMember { node, member })?;
-        let runs: Vec<_> = record
-            .coverage
-            .runs()
-            .flat_map(|run| outside(run.range, &held).map(move |range| (range, run.provenance)))
-            .collect();
         for (range, provenance) in runs {
             let mut at = range.start;
             while at < range.end {
@@ -92,14 +108,91 @@ impl NamespaceWriter {
                     // Reproduced bytes were evidence when they first came;
                     // damage is new, and the recovery objects hear it.
                     if arrival.provenance == provenance {
-                        self.route(tree, builder, segments, arrival, out)?;
+                        self.route_as_brought(tree, builder, segments, arrival, out)?;
                     } else {
                         self.arrive(tree, builder, segments, Write::new(&arrival), arrival, out)?;
                     }
                 }
             }
         }
+        if let Some(envelope) = shared {
+            // The file is the member's now, or its engine's envelope: the
+            // retired object no longer keeps it, so it is not removed with
+            // the object's other envelopes.
+            self.envelopes.take(retired, envelope);
+        }
         self.close_if_leaf(tree, node, member)
+    }
+
+    // The retired object's envelope holds every byte the member took, at
+    // the member's own offsets, and nothing else, so the bytes go back into
+    // that same file rather than into a second one: the member's own file,
+    // which moves to its name once the checkpoint that records it there has
+    // committed, as any file waiting to move does, or the envelope of the
+    // engine bound in the object's place, which keeps it where it is. Until
+    // then the checkpoint the database holds names it as the retired
+    // object's envelope, so the bytes are on disk once, where both
+    // checkpoints look for them. The envelope, when it is shared; `None`,
+    // with nothing done, when it keeps more than the member took, or the
+    // bytes go to an object that is not an engine, which keeps only some of
+    // a volume as envelope, or to an engine whose envelope already started.
+    fn share_envelope(
+        &mut self,
+        tree: &Tree,
+        (node, member): (NodeId, MemberId),
+        (retired, envelope): (NodeId, u32),
+        taken: u64,
+        output_name: &str,
+    ) -> Result<Option<u32>, WriteError> {
+        let Some((file, kept)) = self.envelopes.kept_file(retired, envelope) else {
+            return Ok(None);
+        };
+        if kept != taken {
+            return Ok(None);
+        }
+        let shared = match tree.child_of(node, member) {
+            Some((child, at)) if tree.engine(child).is_some() => {
+                self.envelopes.start_in(child, at.0, &file)
+            }
+            Some(_) => false,
+            None => {
+                let leaf = Leaf::at(&self.working_dir, &file);
+                self.files_mut(node).leaves.insert(member, leaf);
+                self.intend(node, member, output_name);
+                true
+            }
+        };
+        Ok(shared.then_some(envelope))
+    }
+
+    // Bytes a member already took, placed again from where they went, each
+    // part by the posting that brought it: the first copy stands against
+    // them as it stood when they came, so all of them go down again.
+    pub(super) fn route_as_brought(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        arrival: Arrival,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let range = arrival.range();
+        let parts = tree.namespace(arrival.node).map_or_else(
+            || vec![(range, arrival.member)],
+            |namespace| namespace.brought(arrival.member, range),
+        );
+        for (part, posting) in parts {
+            let from = super::index(part.start - range.start);
+            let to = super::index(part.end - range.start);
+            let piece = Arrival {
+                member: posting,
+                offset: part.start,
+                bytes: arrival.bytes.slice(from..to),
+                ..arrival.clone()
+            };
+            self.route(tree, builder, segments, piece, out)?;
+        }
+        Ok(())
     }
 
     fn close_if_leaf(
@@ -184,6 +277,40 @@ impl NamespaceWriter {
         }
         Ok(())
     }
+}
+
+// The envelope in which the object at `retired` placed every byte of
+// `ranges` of its volume, at the volume's own offsets, if one did: that
+// envelope's file holds those bytes as the volume does.
+fn kept_as_volume(
+    tree: &Tree,
+    (retired, volume): (NodeId, weaver_graph::VolumeIndex),
+    ranges: &[ByteRange],
+) -> Option<u32> {
+    let mut placements = Vec::new();
+    let mut kept_in = None;
+    for range in ranges {
+        placements.clear();
+        tree.locate(retired, volume, *range, &mut placements);
+        let mut at = range.start;
+        for placement in &placements {
+            let Placement::Envelope {
+                envelope,
+                range: kept,
+            } = placement
+            else {
+                return None;
+            };
+            if kept.start != at || *kept_in.get_or_insert(*envelope) != *envelope {
+                return None;
+            }
+            at = kept.end;
+        }
+        if at != range.end {
+            return None;
+        }
+    }
+    kept_in
 }
 
 // The parts of `range` no held range covers, in order.

@@ -125,9 +125,46 @@ fn cell_post(cell: Cell, fixture: Fixture, options: ScheduleOptions) -> Delivera
         let password = fixture.spec.password.as_deref();
         // Every 7z piece but the last is as long as the first, so a set
         // with more than one middle piece has pieces only a name orders.
-        let (count, _) = cell.naming.layout();
+        let (count, posted) = cell.naming.layout();
         let unordered = cell.container.is_sevenz() && count > 3 && !cell.orders_middles();
-        let deliverable = if !opens || unordered {
+        let withheld = interruption.withheld().map(|(volume, _)| volume as usize);
+        // The numbers the names of the pieces the job holds give them, each
+        // with the front its piece arrives with or its recovery set
+        // rebuilds.
+        let numbered: Vec<(u32, &[u8])> = fixture
+            .volumes
+            .iter()
+            .enumerate()
+            .filter(|(copy, _)| recovers || Some(*copy) != withheld)
+            .filter_map(|(copy, (name, _))| {
+                let number = match weaver_model::files::FileRole::from_filename(name) {
+                    weaver_model::files::FileRole::SevenZipSplit { number }
+                    | weaver_model::files::FileRole::SplitFile { number } => number,
+                    _ => return None,
+                };
+                Some((number, left[posted[copy]].as_deref()?))
+            })
+            .collect();
+        // Names join the pieces of a 7z set when they number them from the
+        // first: a set whose lowest number is above one is not joined, names
+        // that number nothing join nothing, and a piece numbered after the
+        // lowest whose front signs refutes the numbered set, the signing
+        // piece left standing alone. Without them only a recovery set joins
+        // the pieces.
+        let lowest = numbered.iter().map(|(number, _)| *number).min();
+        let names_join = lowest == Some(0)
+            && !numbered.iter().any(|(number, front)| {
+                *number > 0
+                    && matches!(
+                        weaver_graph::signed(front, Some(front.len() as u64)),
+                        weaver_graph::Sniff::Object(_)
+                    )
+            });
+        let joins = !cell.container.is_sevenz()
+            || count == 1
+            || options.recovery != RecoveryFormat::Absent
+            || names_join;
+        let deliverable = if !opens || unordered || !joins {
             BTreeSet::new()
         } else if mended && left.iter().all(Option::is_some) {
             members.keys().cloned().collect()
@@ -146,7 +183,6 @@ fn cell_post(cell: Cell, fixture: Fixture, options: ScheduleOptions) -> Delivera
         // as one, and holds the pieces posted as files. A recovery set under
         // the posted names says nothing of what the pieces are, and what it
         // recreates is already in what the post leaves.
-        let withheld = interruption.withheld().map(|(volume, _)| volume as usize);
         let archive = !cell.container.is_sevenz()
             || crate::pipeline::tests::archive_output_contract::names_show_archive(
                 fixture
@@ -162,7 +198,6 @@ fn cell_post(cell: Cell, fixture: Fixture, options: ScheduleOptions) -> Delivera
                     .as_ref()
                     .is_some_and(|bytes| bytes.starts_with(SEVENZ))
             });
-        let (_, posted) = cell.naming.layout();
         let visible = fixture
             .volumes
             .iter()
@@ -173,7 +208,7 @@ fn cell_post(cell: Cell, fixture: Fixture, options: ScheduleOptions) -> Delivera
                     .then_some((name.as_str(), bytes.as_slice()))
             })
             .collect::<Option<Vec<_>>>();
-        let joined = (!cell.binding.names_real())
+        let joined = (!cell.binding.names_real() && names_join)
             .then_some(visible)
             .flatten()
             .and_then(crate::pipeline::tests::archive_output_contract::joined_posting)

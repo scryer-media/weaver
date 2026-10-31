@@ -89,8 +89,9 @@ struct Piece {
 // A later piece's front, judged once whether it opens a file of its own.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum Front {
-    // Not judged yet: its bytes from offset zero that came so far, as many
-    // as a head-only signature reads at most (`HEAD_VERDICT_BYTES`).
+    // Not judged yet: its good bytes from offset zero that came so far, as
+    // many as a head-only signature reads at most (`HEAD_VERDICT_BYTES`).
+    // Damaged bytes stop it where they start, until a repair brings them.
     Open(Vec<u8>),
     // Nothing to judge: it joined the set or refuted it, or it is the
     // first piece, whose head opens the joined file.
@@ -174,9 +175,14 @@ impl SplitStore {
     // later piece whose front opens on a signature that stands only at a
     // file's head is a file of its own, and so is the set. Judged once, on
     // the front its deliveries gather from offset zero, however its
-    // articles cut it and whichever piece came first. The first piece is
-    // never judged (`bound`).
+    // articles cut it and whichever piece came first. Damaged bytes say
+    // nothing of the front: it waits for the bytes a repair brings over
+    // them, and is judged on those. The first piece is never judged
+    // (`bound`).
     fn refutes(&mut self, index: u32, delivery: &Delivery<'_>) -> bool {
+        if delivery.provenance.is_damaged() {
+            return false;
+        }
         let Some(piece) = self.pieces.get_mut(&index) else {
             return false;
         };
