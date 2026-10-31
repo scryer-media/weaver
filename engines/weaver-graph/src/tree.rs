@@ -4239,6 +4239,7 @@ mod tests {
     mod handed;
     mod lift;
     mod numbered;
+    mod pieces;
     mod refuted;
     mod reopen;
     mod reposted;

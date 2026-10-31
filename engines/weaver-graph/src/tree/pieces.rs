@@ -101,9 +101,12 @@ impl Tree {
         let covered = |member: MemberId| self.recovery(set).is_some_and(|set| set.covers(member));
         let mut postings: Vec<(MemberId, u64)> = Vec::new();
         let mut copies = Vec::new();
+        // A member whose name carries a known type is a file of its own and
+        // never a piece: hash-named pieces carry no such extension.
         for other in namespace.members() {
             let piece = other.id;
             if piece == first
+                || crate::known_type(&other.name)
                 || namespace.copy_of(piece).is_some()
                 || self.child_of(node, piece).is_some()
                 || !other.fronted
