@@ -713,11 +713,18 @@ impl GraphJob {
 
     // One round of seeks: every object's standing wants lifted to the root,
     // answered together so the window draws from all of them at once, and
-    // the answers handed back. Returns the class changes for the queue.
+    // the answers handed back. A round that parks articles takes them out
+    // of what the root still fetches unasked, which may end a namespace as
+    // losing them would: the job is stepped as it is after a loss, and
+    // what its runs want then is asked by the round their mail brings.
+    // Returns the class changes for the queue.
     pub(crate) fn seek_round(
         &mut self,
         queued: impl FnMut(VolumeIndex) -> bool,
+        slots: &mut RepairSlots,
+        limit: usize,
     ) -> Result<Vec<Move>, GraphError> {
+        let from = self.root.map.moves_pending();
         sample::indexes(&self.root.indexes, &self.root.map, &mut self.root.window);
         sample::bootstrap(&self.tree, &self.root.map, &mut self.root.window);
         sample::fronts(&self.tree, &mut self.root.map);
@@ -750,6 +757,10 @@ impl GraphJob {
             );
         }
         self.settle(effects)?;
+        if self.root.map.parked_since(from) {
+            self.step_runs(Vec::new(), limit)?;
+            self.lend(slots, limit)?;
+        }
         Ok(self.root.map.take_moves())
     }
 
