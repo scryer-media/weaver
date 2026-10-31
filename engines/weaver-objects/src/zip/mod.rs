@@ -29,8 +29,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
-    ByteRange, Delivery, Durable, Emit, Extent, Facts, Give, Kind, Located, MemberId, Object,
-    Placement, Pull, Seek, Standing, Take, VolumeIndex, Weight, Why,
+    ByteRange, Claim, Delivery, Durable, Emit, Extent, Facts, Give, Kind, Located, MemberId,
+    Object, Placement, Pull, Seek, Standing, Take, VolumeIndex, Weight, Why,
 };
 
 use crate::engine::{Format, SetName};
@@ -563,7 +563,7 @@ impl Object for Zip {
         }
     }
 
-    fn claim(&mut self, name: &str, _first_bytes: &[u8], _length: Option<u64>) -> Vec<VolumeIndex> {
+    fn claim(&mut self, name: &str, _first_bytes: &[u8], _length: Option<u64>) -> Claim {
         self.volume_of(name).into_iter().collect()
     }
 

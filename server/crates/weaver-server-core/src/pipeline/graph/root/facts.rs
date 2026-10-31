@@ -45,7 +45,8 @@ impl RootFacts {
     // 3: each volume's lists shelved a chunk of articles to a part.
     // 4: a sealed value encodes as nothing, numbered by its owner's walk.
     // 5: sparse outstanding namespace checksum checks in the root row.
-    pub(crate) const VERSION: u16 = 5;
+    // 6: the reasons a checkpoint names lost one.
+    pub(crate) const VERSION: u16 = 6;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

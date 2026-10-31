@@ -39,11 +39,11 @@ async fn two_sets_in_one_job_each_repair_their_own_damage() {
     let lantern = payload(3 * ARTICLE, 21);
     let beacon = payload(3 * ARTICLE, 22);
     let mut posts = vec![
-        Post::plain("lantern.bin", lantern.clone()),
-        Post::plain("beacon.bin", beacon.clone()),
+        Post::plain("lantern.mkv", lantern.clone()),
+        Post::plain("beacon.mkv", beacon.clone()),
     ];
-    posts.extend(par2_set("lantern", &[("lantern.bin", &lantern)], 2));
-    posts.extend(par2_set("beacon", &[("beacon.bin", &beacon)], 2));
+    posts.extend(par2_set("lantern", &[("lantern.mkv", &lantern)], 2));
+    posts.extend(par2_set("beacon", &[("beacon.mkv", &beacon)], 2));
     let scenario = Scenario::new(posts).damaged(0, 1).damaged(1, 2);
     let graph = run(&scenario).await;
     assert_fetched_once(&graph);
@@ -63,18 +63,18 @@ fn shared_member() -> Vec<Post> {
     let ember = payload(3 * ARTICLE, 24);
     let beacon = payload(3 * ARTICLE, 25);
     let mut posts = vec![
-        Post::plain("lantern.bin", lantern.clone()),
-        Post::plain("ember.bin", ember.clone()),
-        Post::plain("beacon.bin", beacon.clone()),
+        Post::plain("lantern.mkv", lantern.clone()),
+        Post::plain("ember.mkv", ember.clone()),
+        Post::plain("beacon.mkv", beacon.clone()),
     ];
     posts.extend(par2_set(
         "lantern",
-        &[("lantern.bin", &lantern), ("ember.bin", &ember)],
+        &[("lantern.mkv", &lantern), ("ember.mkv", &ember)],
         1,
     ));
     posts.extend(par2_set(
         "beacon",
-        &[("beacon.bin", &beacon), ("ember.bin", &ember)],
+        &[("beacon.mkv", &beacon), ("ember.mkv", &ember)],
         2,
     ));
     posts
@@ -109,8 +109,8 @@ async fn a_member_two_sets_describe_fails_on_the_first_sets_shortfall() {
         "{:?}",
         graph.failure
     );
-    assert_eq!(graph.claims["lantern.bin"], Claim::Complete);
-    assert_eq!(graph.claims["beacon.bin"], Claim::Complete);
+    assert_eq!(graph.claims["lantern.mkv"], Claim::Complete);
+    assert_eq!(graph.claims["beacon.mkv"], Claim::Complete);
     assert_eq!(
         graph.graph().outcomes,
         vec![Some(RepairOutcome::Impossible {
@@ -133,17 +133,17 @@ async fn a_name_two_sets_describe_differently_is_bound_by_id() {
     let beacon = payload(3 * ARTICLE, 29);
     let mut posts = vec![
         Post::plain("quill.bin", quill.clone()),
-        Post::plain("lantern.bin", lantern.clone()),
-        Post::plain("beacon.bin", beacon.clone()),
+        Post::plain("lantern.mkv", lantern.clone()),
+        Post::plain("beacon.mkv", beacon.clone()),
     ];
     posts.extend(par2_set(
         "lantern",
-        &[("lantern.bin", &lantern), ("quill.bin", &quill)],
+        &[("lantern.mkv", &lantern), ("quill.bin", &quill)],
         2,
     ));
     posts.extend(par2_set(
         "beacon",
-        &[("beacon.bin", &beacon), ("quill.bin", &other_quill)],
+        &[("beacon.mkv", &beacon), ("quill.bin", &other_quill)],
         2,
     ));
     let scenario = Scenario::new(posts);
@@ -201,8 +201,8 @@ fn delivered_as_described(outcome: &Outcome, files: &[(&str, Vec<u8>)]) {
 #[tokio::test]
 async fn obfuscated_names_are_renamed_by_the_set() {
     let files = [
-        ("lantern.bin", payload(3 * ARTICLE, 30)),
-        ("beacon.bin", payload(2 * ARTICLE + 7, 31)),
+        ("lantern.mkv", payload(3 * ARTICLE, 30)),
+        ("beacon.mkv", payload(2 * ARTICLE + 7, 31)),
     ];
     let scenario = Scenario::new(obfuscated(&files, 2));
     let graph = run(&scenario).await;
@@ -213,7 +213,7 @@ async fn obfuscated_names_are_renamed_by_the_set() {
     assert_eq!(view.outcomes, vec![Some(RepairOutcome::Clean)]);
     assert_eq!(
         view.claims.keys().collect::<Vec<_>>(),
-        ["beacon.bin", "lantern.bin"],
+        ["beacon.mkv", "lantern.mkv"],
         "the namespace renamed both members"
     );
     assert!(claims_all(&view.claims, Claim::Complete));
@@ -222,8 +222,8 @@ async fn obfuscated_names_are_renamed_by_the_set() {
 #[tokio::test]
 async fn a_damaged_obfuscated_member_is_repaired_and_renamed() {
     let files = [
-        ("lantern.bin", payload(HASH_WINDOW + 4 * ARTICLE, 32)),
-        ("beacon.bin", payload(2 * ARTICLE + 7, 33)),
+        ("lantern.mkv", payload(HASH_WINDOW + 4 * ARTICLE, 32)),
+        ("beacon.mkv", payload(2 * ARTICLE + 7, 33)),
     ];
     let past_window = (HASH_WINDOW / ARTICLE) as u32 + 1;
     let scenario = Scenario::new(obfuscated(&files, 2)).damaged(0, past_window);
@@ -248,16 +248,16 @@ async fn a_damaged_obfuscated_member_is_repaired_and_renamed() {
 #[tokio::test]
 async fn swapped_names_are_put_back_by_the_set() {
     let files = [
-        ("lantern.bin", payload(3 * ARTICLE, 34)),
-        ("beacon.bin", payload(2 * ARTICLE + 7, 35)),
+        ("lantern.mkv", payload(3 * ARTICLE, 34)),
+        ("beacon.mkv", payload(2 * ARTICLE + 7, 35)),
     ];
     let described: Vec<(&str, &[u8])> = files
         .iter()
         .map(|(name, bytes)| (*name, bytes.as_slice()))
         .collect();
     let mut posts = vec![
-        Post::plain("beacon.bin", files[0].1.clone()),
-        Post::plain("lantern.bin", files[1].1.clone()),
+        Post::plain("beacon.mkv", files[0].1.clone()),
+        Post::plain("lantern.mkv", files[1].1.clone()),
     ];
     posts.extend(par2_set("lantern", &described, 2));
     let scenario = Scenario::new(posts);
@@ -277,16 +277,16 @@ async fn swapped_names_are_put_back_by_the_set() {
 #[tokio::test]
 async fn swapped_names_are_put_back_by_a_set_whose_recovery_volume_is_gone() {
     let files = [
-        ("lantern.bin", payload(3 * ARTICLE, 34)),
-        ("beacon.bin", payload(2 * ARTICLE + 7, 35)),
+        ("lantern.mkv", payload(3 * ARTICLE, 34)),
+        ("beacon.mkv", payload(2 * ARTICLE + 7, 35)),
     ];
     let described: Vec<(&str, &[u8])> = files
         .iter()
         .map(|(name, bytes)| (*name, bytes.as_slice()))
         .collect();
     let mut posts = vec![
-        Post::plain("beacon.bin", files[0].1.clone()),
-        Post::plain("lantern.bin", files[1].1.clone()),
+        Post::plain("beacon.mkv", files[0].1.clone()),
+        Post::plain("lantern.mkv", files[1].1.clone()),
     ];
     posts.extend(par2_set("lantern", &described, 2));
     let articles = posts[3].bytes.len().div_ceil(ARTICLE) as u32;

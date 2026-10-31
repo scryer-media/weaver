@@ -9,7 +9,7 @@
 // and what it rebuilt is written back into the members.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use weaver_graph::recovery::MemberAccess;
@@ -79,6 +79,20 @@ fn stage(dir: &Path, file: &Staged, access: &mut dyn MemberAccess) -> Option<Pat
         let _ = std::fs::remove_file(&path);
     }
     copied.map(|()| path)
+}
+
+// A rebuilt volume's file and its length, for the volume to be judged by.
+pub(super) fn open(path: &Path) -> Option<(File, u64)> {
+    let file = File::open(path).ok()?;
+    let length = file.metadata().ok()?.len();
+    Some((file, length))
+}
+
+// The file's bytes over `range` onto the end of `into`.
+pub(super) fn read_at(file: &mut File, range: ByteRange, into: &mut Vec<u8>) -> bool {
+    let start = into.len();
+    into.resize(start + range.len() as usize, 0);
+    file.seek(SeekFrom::Start(range.start)).is_ok() && file.read_exact(&mut into[start..]).is_ok()
 }
 
 // Write a rebuilt volume into its member, a piece at a time, as far as the

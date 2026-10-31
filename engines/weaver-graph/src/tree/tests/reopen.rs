@@ -50,18 +50,19 @@ impl Object for Based {
             self.base = name.strip_suffix(".rar").map(str::to_owned);
         }
     }
-    fn claim(&mut self, name: &str, _: &[u8], _: Option<u64>) -> Vec<VolumeIndex> {
+    fn claim(&mut self, name: &str, _: &[u8], _: Option<u64>) -> Claim {
         let Some((base, extension)) = name.rsplit_once('.') else {
-            return Vec::new();
+            return Claim::default();
         };
         if Some(base) != self.base.as_deref() {
-            return Vec::new();
+            return Claim::default();
         }
         match extension {
             "r00" => vec![VolumeIndex(1)],
             "r01" => vec![VolumeIndex(2)],
             _ => Vec::new(),
         }
+        .into()
     }
 }
 

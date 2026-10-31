@@ -5,7 +5,8 @@
 // from block N and block N-1 alone: a run of whole blocks deciphers the
 // moment the block before it is in, and until then it waits, staged. The 16
 // cipher bytes ending at a run's frontier, at its start, every STRIDE bytes
-// inside it and either side of damage are kept as checkpoints.
+// inside it, either side of damage and a block an arrival started inside are
+// kept as checkpoints.
 //
 // What came out is the owner's record, read through `Placed`, as is the
 // plaintext past the payload, its `Padding`. CBC encryption is deterministic:
@@ -94,6 +95,10 @@ struct Block {
     have: u16,
     damaged: u16,
     repaired: bool,
+    // An arrival started inside it: its bytes before that point came in
+    // another, which an un-say from there on does not bring again, so once
+    // whole it is kept, and that un-say deciphers it again from here.
+    cut: bool,
 }
 
 impl Block {
@@ -456,10 +461,14 @@ impl Chain {
             let held = self.staged.get(&start).or(self.checkpoints.get(&next));
             let mut block = held.copied().unwrap_or_default();
             let wrote = block.write(at, piece, provenance);
+            block.cut |= at != 0;
             if wrote || seen.came_out(block_at(start)).is_none() {
                 self.checkpoints.remove(&next);
                 self.staged.insert(start, block);
                 changed.insert(start);
+            } else if let Some(kept) = self.checkpoints.get_mut(&next) {
+                // Unchanged and out: the cipher filed for it keeps the cut.
+                kept.cut = block.cut;
             }
         }
         // A changed block re-chains the one after it, staged or out.
@@ -592,17 +601,17 @@ impl Chain {
             at = at.saturating_add(STRIDE);
         }
         // Either side of a block that comes out damaged, so a repair can
-        // re-decipher it and the block it seeds.
+        // re-decipher it and the block it seeds; a cut block itself.
         let mut seed = preceding;
         let mut provenances = Vec::with_capacity(blocks.len());
         for (index, block) in blocks.iter().enumerate() {
             let provenance = worse(block.provenance(), seed.provenance());
             let at = start + index as u64 * BLOCK;
-            if provenance.is_damaged() {
+            if provenance.is_damaged() || block.cut {
                 self.checkpoints.insert(at + BLOCK, *block);
-                if at > 0 {
-                    self.checkpoints.insert(at, seed);
-                }
+            }
+            if provenance.is_damaged() && at > 0 {
+                self.checkpoints.insert(at, seed);
             }
             self.staged.remove(&at);
             provenances.push(provenance);
@@ -634,9 +643,12 @@ impl Chain {
     }
 
     // Whether the checkpoint ending at `at` is still a seed someone needs:
-    // at a deciphered run's start or end, every STRIDE bytes inside one, and
-    // either side of damage.
+    // at a deciphered run's start or end, every STRIDE bytes inside one,
+    // either side of damage, and a cut block.
     fn keep(&self, seen: &Seen<'_>, at: u64) -> bool {
+        if self.checkpoints.get(&at).is_some_and(|block| block.cut) {
+            return true;
+        }
         let before = at
             .checked_sub(BLOCK)
             .and_then(|block| seen.came_out(block_at(block)));

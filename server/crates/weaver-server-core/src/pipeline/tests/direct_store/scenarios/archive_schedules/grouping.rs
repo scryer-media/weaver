@@ -339,7 +339,7 @@ impl Fixture {
                     "/tests/fixtures/extraction_profiles/sevenz_solid.7z"
                 ))
                 .to_vec();
-                let expected = ["part0.bin", "part1.bin", "part2.bin"]
+                let expected = ["part0.mkv", "part1.mkv", "part2.mkv"]
                     .into_iter()
                     .enumerate()
                     .map(|(index, name)| {

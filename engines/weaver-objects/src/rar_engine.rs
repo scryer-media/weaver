@@ -17,7 +17,7 @@ use weaver_graph::{ByteRange, Emit, Engine, Object, Placement};
 use unrar_rs::{KdfCache, RarVolumeFacts};
 use weaver_graph::{Extraction, Kind, VolumeIndex};
 
-use crate::engine::{EngineObject, Format, Holding, Placed};
+use crate::engine::{EngineObject, Format, Holding};
 use crate::rar_store::claim::{self, Held};
 
 pub struct Rar;
@@ -51,7 +51,7 @@ impl Format for Rar {
         bound: &BTreeMap<u32, Holding<'_, RarVolumeFacts>>,
         front: Option<&RarVolumeFacts>,
         _length: Option<u64>,
-    ) -> Option<Placed> {
+    ) -> Option<VolumeIndex> {
         claim::place(front?, &held(bound))
     }
 

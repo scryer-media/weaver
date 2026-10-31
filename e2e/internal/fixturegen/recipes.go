@@ -134,6 +134,7 @@ var ScenarioOnly = map[string]string{
 	"rar5-multivolume-missing-tail":            "stages the first two volumes of rar5-multivolume and omits the third",
 	"single-mkv-sparse-nzb":                    "stages single-mkv's payload under a sparse NZB numbering",
 	"extensionless-payload-named-by-content":   "stages single-mkv's payload under a name with no extension",
+	"par3-obfuscated-plain-name":               "stages par3-obfuscated-names under a bare hex name, so the payload is a plain file until its PAR3 set moves it",
 	"stat-health-probe":                        "stages two direct MKVs; the same articles are deleted from each by the harness",
 	"adv-rar-named-mkv":                        "stages rar5-single's archive under a .mkv name",
 	"adv-7z-named-rar":                         "stages single-7z's archive under a .rar name",
@@ -1350,7 +1351,7 @@ func Recipes() []Recipe {
 	add(Recipe{
 		Slug: "par2-multi-set-archives-insufficient", Family: "PAR2",
 		Notes: "The 64 KiB/96 KiB mixed-grid counterpart: the primary archive has enough recovery data for its two damaged slices, " +
-			"while the secondary archive has only one recovery block and must make the aggregate job fail.",
+			"while the secondary archive has only one recovery block, so the job ends Partial with the primary's member delivered whole.",
 		Inputs: []string{samplePayloadPath, previewPayloadPath},
 		Build:  multiPARSetArchives(1),
 	})

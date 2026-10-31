@@ -484,7 +484,8 @@ fn a_repaired_member_longer_than_described_is_recognised_at_its_length() {
 
 // A member none of whose bytes came, booked at more than the described
 // length for the articles it lost, is rebuilt at the described length and
-// takes it: what was booked never arrived, and keeps its name.
+// takes it: what was booked never arrived, and keeps its name. The bind
+// lists it, as it lists every member it settles at another length.
 #[test]
 fn a_repaired_member_booked_longer_than_described_takes_the_described_length() {
     let data = payload(13, 5000);
@@ -500,7 +501,7 @@ fn a_repaired_member_booked_longer_than_described_takes_the_described_length() {
         matches!(outcome, RepairOutcome::Repaired { .. }),
         "{outcome:?}"
     );
-    assert!(bind(&mut job).is_empty());
+    assert_eq!(bind(&mut job), vec![member]);
     let record = job.namespace.get(member).unwrap();
     assert_eq!(record.name, "payload.bin");
     assert_eq!(record.length, Some(data.len() as u64));
@@ -916,7 +917,8 @@ fn a_lost_article_inside_a_volume_keeps_the_packets_past_it() {
     let volume = job
         .object
         .claim(name, &bytes[..64], None)
-        .pop()
+        .last()
+        .copied()
         .expect("a PAR2 volume");
     let lost = ByteRange::at(ARTICLE, ARTICLE);
     let mut out = Vec::new();

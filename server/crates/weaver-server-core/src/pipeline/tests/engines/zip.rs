@@ -19,8 +19,8 @@ const SECRET: &str = "beacon-lantern-secret";
 
 pub(super) fn members() -> Vec<(&'static str, Vec<u8>)> {
     vec![
-        ("ember.bin", payload(5 * ARTICLE + 13, 51)),
-        ("quill.bin", payload(3 * ARTICLE - 5, 52)),
+        ("ember.mkv", payload(5 * ARTICLE + 13, 51)),
+        ("quill.mkv", payload(3 * ARTICLE - 5, 52)),
     ]
 }
 
@@ -312,10 +312,10 @@ fn second_local(bytes: &[u8]) -> usize {
         .unwrap()
 }
 
-// quill.bin's deflated stream damaged with no PAR2, in 16-byte articles: the
+// quill.mkv's deflated stream damaged with no PAR2, in 16-byte articles: the
 // fifth article past its local header's, inside its data. The engine opens
-// the archive from its records alone, closes ember.bin whole, then fails on
-// quill.bin's lost bytes: ember.bin is delivered as written, quill.bin left
+// the archive from its records alone, closes ember.mkv whole, then fails on
+// quill.mkv's lost bytes: ember.mkv is delivered as written, quill.mkv left
 // out, the container as posted put in its place, and the job ends Partial.
 #[tokio::test]
 async fn a_deflate_zip_with_a_damaged_member_and_no_par2_delivers_the_members_it_closed() {
@@ -340,11 +340,11 @@ async fn a_deflate_zip_with_a_damaged_member_and_no_par2_delivers_the_members_it
     assert!(kinds(&graph).contains(&"zip_engine"), "{:?}", kinds(&graph));
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
-        [delivered("ember.bin"), delivered("lantern.zip")]
+        [delivered("ember.mkv"), delivered("lantern.zip")]
     );
     assert!(
-        graph.files[&delivered("ember.bin")] == members()[0].1,
-        "ember.bin closed before the failure, delivered whole"
+        graph.files[&delivered("ember.mkv")] == members()[0].1,
+        "ember.mkv closed before the failure, delivered whole"
     );
     assert_eq!(
         graph.files[&delivered("lantern.zip")].len(),
@@ -428,7 +428,7 @@ async fn a_zip_whose_last_disk_starts_at_an_entry_posted_last_volume_first_deliv
     assert!(kinds(&graph).contains(&"zip_engine"), "{:?}", kinds(&graph));
 }
 
-// One article of ember.bin's deflated stream damaged beside PAR2: graph
+// One article of ember.mkv's deflated stream damaged beside PAR2: graph
 // repairs it in the stream and the engine reads it whole, with no refetch.
 // The engine waits at the damaged article until the PAR2 set has ruled on
 // the archive, which it does only once its index is in and it covers it.
@@ -499,7 +499,7 @@ async fn a_zip_naming_its_entry_in_code_page_437_delivers_it_decoded() {
 fn with_empty_directory(options: SimpleFileOptions) -> Vec<u8> {
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     writer.add_directory("hollow/", stored()).unwrap();
-    writer.start_file("ember.bin", options).unwrap();
+    writer.start_file("ember.mkv", options).unwrap();
     writer.write_all(&members()[0].1).unwrap();
     writer.finish().unwrap().into_inner()
 }

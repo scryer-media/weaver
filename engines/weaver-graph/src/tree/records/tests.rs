@@ -18,7 +18,10 @@ use crate::tree::NodeId;
 use crate::volume::{ByteRange, VolumeIndex};
 
 const XZ: &[u8] = b"\xfd7zXZ\x00";
-const GZIP: &[u8] = b"\x1f\x8b";
+const GZIP: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03";
+const PAYLOAD: &[u8] = b"payload";
+// Where the archive's front ends: its damage lands here, its replay after.
+const FRONT_END: u64 = (XZ.len() + GZIP.len() + PAYLOAD.len()) as u64;
 
 // A pretend wrapper: its own magic, then one member that is everything
 // after it, under a fixed name. As an engine it bids for the volume after
@@ -176,9 +179,9 @@ pub(crate) fn three_levels() -> (Tree, MemberId) {
         );
     };
     deliver(&mut tree, leaf, 0, b"leaf", Provenance::Fresh);
-    let front = [XZ, GZIP, b"payload"].concat();
+    let front = [XZ, GZIP, PAYLOAD].concat();
     deliver(&mut tree, archive, 0, &front, Provenance::Fresh);
-    deliver(&mut tree, archive, 15, b"bad", Provenance::Damaged);
+    deliver(&mut tree, archive, FRONT_END, b"bad", Provenance::Damaged);
     (tree, archive)
 }
 
@@ -226,7 +229,7 @@ fn a_rebuilt_tree_takes_the_replay_as_the_live_one_does() {
             NodeId::ROOT,
             archive,
             Posted {
-                offset: 18,
+                offset: FRONT_END + 3,
                 bytes: Bytes::from_static(b" more").into(),
                 provenance: Provenance::Fresh,
             },

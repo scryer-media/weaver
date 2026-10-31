@@ -183,7 +183,7 @@ fn cell_post(cell: Cell, fixture: Fixture, options: ScheduleOptions) -> Delivera
         let files = if let Some((name, _)) = joined {
             Some(Files {
                 posted: 1,
-                whole: 1,
+                whole: vec![name.clone()],
                 joined: Some(name),
             })
         } else {
@@ -194,8 +194,14 @@ fn cell_post(cell: Cell, fixture: Fixture, options: ScheduleOptions) -> Delivera
                     joined: None,
                     whole: posted
                         .iter()
-                        .filter(|piece| fixture.volumes.iter().any(|(_, bytes)| bytes == **piece))
-                        .count(),
+                        .filter_map(|piece| {
+                            fixture
+                                .volumes
+                                .iter()
+                                .find(|(_, bytes)| bytes == *piece)
+                                .map(|(name, _)| name.clone())
+                        })
+                        .collect(),
                 }
             })
         };

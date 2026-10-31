@@ -46,7 +46,6 @@ pub(crate) struct Shelf {
 
 #[derive(Debug, Default)]
 pub(crate) struct Shelved {
-    pub(crate) uncertain_lengths: bool,
     pub(crate) kept: BTreeMap<u32, Kept>,
     // The volumes bound to the object, by index, and whether any more can
     // join. An index orders them; a gap is not a volume.

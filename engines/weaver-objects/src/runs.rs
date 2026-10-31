@@ -105,6 +105,19 @@ impl CrcRuns {
         self.held += run.len;
     }
 
+    // The bytes at `range` were un-said: the runs over them prove nothing
+    // until a copy comes again, and that copy replaces them, as clean bytes
+    // replace damaged ones.
+    pub(crate) fn doubt(&mut self, range: ByteRange) {
+        let first = self.runs.partition_point(|run| run.end() <= range.start);
+        for run in self.runs[first..].iter_mut() {
+            if run.start >= range.end {
+                break;
+            }
+            run.verified = false;
+        }
+    }
+
     // The bytes the runs hold between them.
     pub(crate) fn held(&self) -> u64 {
         self.held

@@ -5,7 +5,7 @@ use sevenz_turbo::{ArchiveLimits, Password};
 use weaver_graph::Kind;
 
 use super::super::{Lock, SevenZipStore};
-use super::{PASSWORD, aes, archive, copy, split, store};
+use super::{PASSWORD, aes, archive, copy, store};
 use crate::testing::replay::{Step, contains, frames, restores_alike};
 
 fn steps<'a>(volumes: &'a [(String, Vec<u8>)], frame: usize) -> Vec<Step<'a>> {
@@ -27,13 +27,6 @@ fn a_stored_7z_restored_before_its_end_header_goes_on_as_the_live_one() {
     for cut in [2, steps.len() / 2, steps.len() - 1] {
         restores_alike(Box::new(store()), &steps, cut, &[]);
     }
-}
-
-#[test]
-fn a_split_7z_restored_between_its_volumes_goes_on_as_the_live_one() {
-    let volumes = split(&archive(copy(), false), 3);
-    let steps = steps(&volumes, 2048);
-    restores_alike(Box::new(store()), &steps, steps.len() / 2, &[]);
 }
 
 // Opened, then restored: the folder's cipher comes back sealed and opens

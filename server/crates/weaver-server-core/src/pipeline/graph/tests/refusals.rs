@@ -297,7 +297,7 @@ async fn a_store_that_needs_an_engine_hands_its_volumes_to_one() {
     // The engine read the volumes back from what the store had placed, its
     // header envelopes and its members' files, and wrote what it found.
     for member in 0..2 {
-        assert_eq!(refusing.file(&format!("echo-{member}.bin")), body(member));
+        assert_eq!(refusing.file(&format!("echo-{member}.mkv")), body(member));
     }
     assert_eq!(refusing.job.phase(), RootPhase::Done);
 }

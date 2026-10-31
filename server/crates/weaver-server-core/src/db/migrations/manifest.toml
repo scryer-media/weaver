@@ -958,3 +958,13 @@ checksum_algo = "blake3"
 kind = "sql"
 file = "migrations/0078_feed_verdict/schema.sql"
 scope = "all"
+
+[[migration]]
+version = 79
+description = "a graph checkpoint keeps the kind a member's own bytes refuted"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0079_graph_member_refuted/schema.sql"
+scope = "all"

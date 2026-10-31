@@ -6,7 +6,9 @@ use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::scenarios::sevenz_store::{
     Entry, build_7z_shaped, split_volumes,
 };
-use crate::pipeline::tests::direct_store::{multi_member_store_set, single_member_rar4_store_set};
+use crate::pipeline::tests::direct_store::{
+    multi_member_store_set, single_member_rar4_store_set, single_member_store_set,
+};
 
 #[tokio::test]
 async fn a_complete_signatureless_numbered_post_keeps_its_joined_bytes() {
@@ -82,7 +84,7 @@ async fn reposted_solid_rar_after_nonfirst_volume_crash_is_complete() {
     }
 }
 
-async fn silent_damage_is_reextracted(par3: bool, front: bool) {
+async fn silent_damage_is_reextracted(par3: bool, front: bool, backwards: bool) {
     let body = payload(97_792, 13);
     let archive = build_7z_shaped(
         &[Entry::file("lantern.mkv", body.clone())],
@@ -114,11 +116,15 @@ async fn silent_damage_is_reextracted(par3: bool, front: bool) {
         posts[1].bytes[767] ^= 0x80;
     }
     posts.extend(sidecars);
-    let outcome = run(&Scenario::new(posts).framed(768).backwards()).await;
+    let mut scenario = Scenario::new(posts).framed(768);
+    if backwards {
+        scenario = scenario.backwards();
+    }
+    let outcome = run(&scenario).await;
     assert_eq!(
         outcome.status,
         Some(JobStatus::Complete),
-        "delivery={:?}, rulings={:?}",
+        "backwards={backwards}, delivery={:?}, rulings={:?}",
         outcome.graph.delivery,
         outcome.graph.rulings
     );
@@ -127,6 +133,61 @@ async fn silent_damage_is_reextracted(par3: bool, front: bool) {
         outcome.files.values().any(|bytes| bytes == &body),
         "byte-exact re-extracted member"
     );
+}
+
+// The same 7z, posted with a byte already wrong when the recovery set was
+// made over it, so the set proves the wrong byte as posted, and with a
+// further byte flipped in transit that the set repairs. The set proves
+// every piece, and the member is checked again on what it proved: it still
+// fails its own checksum, so it stays damaged.
+#[tokio::test]
+async fn a_sevenz_member_wrong_as_posted_stays_damaged_after_its_set_repairs_the_rest() {
+    for par3 in [false, true] {
+        for backwards in [false, true] {
+            let body = payload(97_792, 13);
+            let archive = build_7z_shaped(
+                &[Entry::file("lantern.mkv", body.clone())],
+                sevenz_turbo::EncoderMethod::COPY,
+                None,
+                false,
+            );
+            let mut written = split_volumes(&archive, 4);
+            written[2].1[300] ^= 0x80;
+            let descriptions: Vec<_> = written
+                .iter()
+                .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+                .collect();
+            let sidecars = if par3 {
+                par3_set("archive", &descriptions, 8)
+            } else {
+                par2_set("archive", &descriptions, 8)
+            };
+            let mut posts: Vec<_> = written
+                .into_iter()
+                .map(|(name, bytes)| Post::plain(&name, bytes))
+                .collect();
+            posts[1].bytes[767] ^= 0x80;
+            posts.extend(sidecars);
+            let mut scenario = Scenario::new(posts).framed(768);
+            if backwards {
+                scenario = scenario.backwards();
+            }
+            let outcome = run(&scenario).await;
+            let context = format!(
+                "par3={par3}, backwards={backwards}, delivery={:?}, rulings={:?}",
+                outcome.graph.delivery, outcome.graph.rulings
+            );
+            assert_ne!(outcome.status, Some(JobStatus::Complete), "{context}");
+            assert!(
+                outcome.graph.delivery.damaged == ["lantern.mkv"],
+                "{context}"
+            );
+            assert!(
+                !outcome.files.values().any(|bytes| bytes == &body),
+                "{context}"
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -325,22 +386,32 @@ async fn par3_repairs_a_missing_piece_and_twelve_corrupt_articles() {
 
 #[tokio::test]
 async fn silently_corrupt_fragmented_sevenz_is_reextracted_after_par2() {
-    silent_damage_is_reextracted(false, false).await;
+    silent_damage_is_reextracted(false, false, true).await;
+}
+
+#[tokio::test]
+async fn silently_corrupt_fragmented_sevenz_posted_in_order_is_reextracted_after_par2() {
+    silent_damage_is_reextracted(false, false, false).await;
 }
 
 #[tokio::test]
 async fn silently_corrupt_fragmented_sevenz_is_reextracted_after_par3() {
-    silent_damage_is_reextracted(true, false).await;
+    silent_damage_is_reextracted(true, false, true).await;
+}
+
+#[tokio::test]
+async fn silently_corrupt_fragmented_sevenz_posted_in_order_is_reextracted_after_par3() {
+    silent_damage_is_reextracted(true, false, false).await;
 }
 
 #[tokio::test]
 async fn silently_corrupt_sevenz_front_is_reidentified_after_par2() {
-    silent_damage_is_reextracted(false, true).await;
+    silent_damage_is_reextracted(false, true, true).await;
 }
 
 #[tokio::test]
 async fn silently_corrupt_sevenz_front_is_reidentified_after_par3() {
-    silent_damage_is_reextracted(true, true).await;
+    silent_damage_is_reextracted(true, true, true).await;
 }
 
 #[tokio::test]
@@ -518,10 +589,16 @@ async fn drive_stream(
             continue;
         }
         if duplicates.contains(&article) {
-            explicit_article_body(&mut pipeline, scenario, article, true).await;
+            explicit_article_body(
+                &mut pipeline,
+                (&mut graph, &mut reads),
+                scenario,
+                article,
+                true,
+            )
+            .await;
         }
-        explicit_article(&mut pipeline, scenario, article).await;
-        harness::observe(&pipeline, &mut graph, &mut reads);
+        explicit_article(&mut pipeline, (&mut graph, &mut reads), scenario, article).await;
     }
     // Metadata is supplied after the posted archive bytes, as a late index
     // completes its own download while extraction is already in progress.
@@ -535,8 +612,8 @@ async fn drive_stream(
             if articles.contains(&(file as u32, ordinal as u32)) {
                 continue;
             }
-            explicit_article(&mut pipeline, scenario, (file as u32, ordinal as u32)).await;
-            harness::observe(&pipeline, &mut graph, &mut reads);
+            let article = (file as u32, ordinal as u32);
+            explicit_article(&mut pipeline, (&mut graph, &mut reads), scenario, article).await;
         }
     }
     loop {
@@ -549,11 +626,11 @@ async fn drive_stream(
                 work.segment_id.file_id.file_index,
                 work.segment_id.segment_number,
             );
+            let look = (&mut graph, &mut reads);
             if duplicates.contains(&article) {
-                explicit_article_body(&mut pipeline, scenario, article, true).await;
+                explicit_article_body(&mut pipeline, look, scenario, article, true).await;
             }
-            explicit_article(&mut pipeline, scenario, article).await;
-            harness::observe(&pipeline, &mut graph, &mut reads);
+            explicit_article(&mut pipeline, (&mut graph, &mut reads), scenario, article).await;
         }
         if harness::finished(&pipeline) {
             break;
@@ -577,6 +654,9 @@ async fn drive_stream(
                 .await
                 .expect("owned worker returns");
             pipeline.graph_run_said(said);
+            // The mail may carry the ruling the job waited on last: look
+            // before the completion gate ends the job and takes it away.
+            harness::observe(&pipeline, &mut graph, &mut reads);
         } else if harness::take_retry(&mut pipeline).await {
             continue;
         } else {
@@ -596,10 +676,17 @@ async fn drive_stream(
     let status = job_status_for_assert(&pipeline, JOB);
     let mut files = std::collections::BTreeMap::new();
     harness::collect(&complete, &complete, &mut files);
+    let mut retained_files = std::collections::BTreeMap::new();
+    harness::collect(
+        &pipeline.intermediate_dir,
+        &pipeline.intermediate_dir,
+        &mut retained_files,
+    );
     retire_pipeline_database(pipeline).await;
     super::restart::Restarted {
         status,
         files,
+        retained_files,
         graph,
         from_disk: Default::default(),
         in_memory: Default::default(),
@@ -610,14 +697,29 @@ async fn drive_stream(
 
 async fn explicit_article(
     pipeline: &mut crate::pipeline::Pipeline,
+    look: (&mut super::harness::GraphView, &mut u64),
     scenario: &Scenario,
     (file, ordinal): (u32, u32),
 ) {
-    explicit_article_body(pipeline, scenario, (file, ordinal), false).await;
+    explicit_article_body(pipeline, look, scenario, (file, ordinal), false).await;
+}
+
+// Hear what the runs said, looking once the mail is in and again after the
+// completion gate turned: the mail may carry the ruling the job waited on
+// last, and a job the gate ends leaves the pipeline with its rulings.
+async fn heard(
+    pipeline: &mut crate::pipeline::Pipeline,
+    (graph, reads): (&mut super::harness::GraphView, &mut u64),
+) {
+    pipeline.hear_graph_runs();
+    super::harness::observe(pipeline, graph, reads);
+    super::super::pump_pipeline_runtime_queues(pipeline).await;
+    super::harness::observe(pipeline, graph, reads);
 }
 
 async fn explicit_article_body(
     pipeline: &mut crate::pipeline::Pipeline,
+    look: (&mut super::harness::GraphView, &mut u64),
     scenario: &Scenario,
     (file, ordinal): (u32, u32),
     corrupt: bool,
@@ -653,8 +755,7 @@ async fn explicit_article_body(
     }
     if scenario.lost.contains(&(file, ordinal)) {
         pipeline.book_failed_segment(id);
-        pipeline.hear_graph_runs();
-        super::super::pump_pipeline_runtime_queues(pipeline).await;
+        heard(pipeline, look).await;
         return;
     }
     let post = &scenario.posts[file as usize];
@@ -719,8 +820,7 @@ async fn explicit_article_body(
     pipeline
         .handle_decode_done(DecodeDone::Success { result, source })
         .await;
-    pipeline.hear_graph_runs();
-    super::super::pump_pipeline_runtime_queues(pipeline).await;
+    heard(pipeline, look).await;
 }
 
 #[tokio::test]
@@ -829,81 +929,203 @@ async fn a_recovery_named_rar_gap_restores_without_publishing_a_piece() {
     );
 }
 
+// A three-volume RAR5 set posted under numbered names that start above one,
+// the interior volume's tail never served, and a PAR2 set that names the
+// volumes by what they are. The numbered names claim nothing the volumes'
+// own headers deny: the RAR store owns all three by their signatures, the
+// PAR2 that covers them by name rebuilds the short one, and the member
+// extracts whole, whichever way the articles arrive.
+async fn numbered_rar5_set_short_interior_volume(backwards: bool) {
+    let bytes = payload(70_001, 29);
+    let written = single_member_store_set("nested/feature.mkv", &bytes, 3);
+    let named: Vec<_> = written
+        .iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| (format!("archive.part{}.rar", index + 1), bytes.clone()))
+        .collect();
+    let frame = named
+        .iter()
+        .map(|(_, bytes)| bytes.len().div_ceil(2))
+        .max()
+        .unwrap();
+    let descriptions: Vec<_> = named
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let mut posts: Vec<_> = named
+        .iter()
+        .enumerate()
+        .map(|(index, (_, bytes))| {
+            Post::plain(
+                &format!("51273aad56a8b904e96928935278a627.{}", 101 + index),
+                bytes.clone(),
+            )
+        })
+        .collect();
+    let slice = (named
+        .iter()
+        .map(|(_, bytes)| bytes.len())
+        .max()
+        .unwrap()
+        .div_ceil(32)
+        .div_ceil(4)
+        * 4)
+    .max(256);
+    let blocks = named
+        .iter()
+        .map(|(_, bytes)| bytes.len().div_ceil(slice) as u32)
+        .sum();
+    posts.extend(super::harness::par2_volumes_sliced(
+        "archive.rar",
+        &descriptions,
+        slice as u64,
+        blocks,
+        1,
+    ));
+    let mut scenario = Scenario::new(posts).framed(frame).lost(1, 1);
+    if backwards {
+        scenario = scenario.backwards();
+    }
+    let outcome = run(&scenario).await;
+    assert_eq!(
+        outcome.status,
+        Some(JobStatus::Complete),
+        "delivery={:?}, rulings={:?}, names={:?}",
+        outcome.graph.delivery,
+        outcome.graph.rulings,
+        outcome.files.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        outcome.files.len(),
+        1,
+        "only the extracted member is delivered: {:?}",
+        outcome.files.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        outcome.files.values().any(|file| file == &bytes),
+        "byte-exact extracted member"
+    );
+}
+
 #[tokio::test]
-async fn reposted_solid_sevenz_after_crash_has_one_output_incarnation() {
+async fn a_numbered_rar5_set_short_its_interior_tail_is_repaired_by_par2() {
+    numbered_rar5_set_short_interior_volume(false).await;
+}
+
+#[tokio::test]
+async fn a_numbered_rar5_set_short_its_interior_tail_is_repaired_by_par2_backwards() {
+    numbered_rar5_set_short_interior_volume(true).await;
+}
+
+// Two pieces of a 7z, each posted twice under hash names, with nothing that
+// names them. Ruling 2026-10-30 3:50 PM MDT: pieces no name numbers and no
+// recovery set covers are never grouped, so each goes as posted.
+fn hash_named_pieces_posted_twice(base: u128) -> (Vec<Post>, Vec<Vec<u8>>, usize) {
     let archive = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/extraction_profiles/sevenz_solid.7z"
     ));
     let cut = archive.len().div_ceil(2);
-    let pieces = [&archive[..cut], &archive[cut..]];
+    let pieces = [archive[..cut].to_vec(), archive[cut..].to_vec()];
     let posts = [0, 1, 0, 1]
         .into_iter()
         .enumerate()
         .map(|(index, piece)| {
             Post::plain(
-                &format!("{:032x}", 0xd1c7_0000_u128 + index as u128),
-                pieces[piece].to_vec(),
+                &format!("{:032x}", base + index as u128),
+                pieces[piece].clone(),
             )
         })
         .collect();
+    (posts, pieces.to_vec(), cut)
+}
+
+// The first piece's second posting folds into its first, and it is
+// withheld; the second piece's two postings are two plain files. Nothing is
+// joined and no file comes twice under one name. No whole file has a known
+// type, so the job fails and its files stay where they were fetched.
+fn assert_each_piece_as_posted(
+    outcome: &super::restart::Restarted,
+    base: u128,
+    pieces: &[Vec<u8>],
+) {
+    let name = |index: u128| format!("{:032x}", base + index);
+    assert!(
+        matches!(outcome.status, Some(JobStatus::Failed { .. })),
+        "status={:?} delivery={:?}",
+        outcome.status,
+        outcome.graph.delivery
+    );
+    assert!(
+        !outcome.graph.kinds.iter().any(|kind| kind == "split"),
+        "{:?}",
+        outcome.graph.kinds
+    );
+    let retained = |index: u128| {
+        outcome
+            .retained_files
+            .iter()
+            .find(|(path, _)| path.rsplit('/').next() == Some(name(index).as_str()))
+            .map(|(_, bytes)| bytes)
+    };
+    assert_eq!(
+        retained(1),
+        Some(&pieces[1]),
+        "{:?}",
+        outcome.retained_files.keys()
+    );
+    assert_eq!(
+        retained(3),
+        Some(&pieces[1]),
+        "{:?}",
+        outcome.retained_files.keys()
+    );
+    let joined = pieces.concat();
+    assert!(
+        !outcome
+            .files
+            .values()
+            .chain(outcome.retained_files.values())
+            .any(|file| *file == joined),
+        "nothing joined"
+    );
+    assert_eq!(
+        format!("{:?}", outcome.graph.delivery.withheld),
+        format!("[({:?}, Unmapped)]", name(0)),
+        "delivery={:?}",
+        outcome.graph.delivery
+    );
+    assert_eq!(outcome.graph.delivery.whole, [name(1), name(3)]);
+    let names: Vec<_> = outcome
+        .files
+        .keys()
+        .chain(outcome.retained_files.keys())
+        .cloned()
+        .collect();
+    assert!(
+        names
+            .iter()
+            .all(|file| !file.contains(" (1)") && !file.ends_with(".bin")),
+        "nothing joined, no second incarnation: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn reposted_hash_named_pieces_after_crash_go_as_posted() {
+    let base = 0xd1c7_0000_u128;
+    let (posts, pieces, cut) = hash_named_pieces_posted_twice(base);
     let scenario = Scenario::new(posts)
         .framed(cut)
         .first(&[(0, 0), (1, 0), (2, 0), (3, 0)]);
     let restored = explicit_crash(&scenario, &[(0, 0), (1, 0), (2, 0), (3, 0)], 1).await;
-    assert_eq!(
-        restored.status,
-        Some(JobStatus::Complete),
-        "delivery={:?}, rulings={:?}",
-        restored.graph.delivery,
-        restored.graph.rulings
-    );
-    assert!(
-        restored
-            .files
-            .keys()
-            .all(|name| name.ends_with("/part0.bin")
-                || name.ends_with("/part1.bin")
-                || name.ends_with("/part2.bin")),
-        "no second extracted incarnation and no leaf of a reposted volume: {:?}",
-        restored.files.keys().collect::<Vec<_>>()
-    );
-    for index in 0..3 {
-        let expected: Vec<u8> = (0..8193)
-            .map(|n| ((n * 7 + n / 251 + index * 13) % 253) as u8)
-            .collect();
-        assert!(
-            restored
-                .files
-                .get(&format!("lantern beacon/part{index}.bin"))
-                == Some(&expected),
-            "part{index}.bin is byte-exact"
-        );
-    }
+    assert_each_piece_as_posted(&restored, base, &pieces);
 }
 
-// A solid 7z set posted twice. Its first posting is part extracted when the
-// job restarts; the second posting of each volume comes after, with every
-// byte. Each is another posting of the volume it copies: one extractor, one
-// name per member.
+// The same, with the job restarted part way through the first postings.
 #[tokio::test]
-async fn a_restored_repost_of_a_solid_set_spawns_no_second_incarnation() {
-    let archive = include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/extraction_profiles/sevenz_solid.7z"
-    ));
-    let cut = archive.len().div_ceil(2);
-    let pieces = [&archive[..cut], &archive[cut..]];
-    let posts = [0, 1, 0, 1]
-        .into_iter()
-        .enumerate()
-        .map(|(index, piece)| {
-            Post::plain(
-                &format!("{:032x}", 0xd1c8_0000_u128 + index as u128),
-                pieces[piece].to_vec(),
-            )
-        })
-        .collect();
+async fn a_restored_repost_of_hash_named_pieces_goes_as_posted() {
+    let base = 0xd1c8_0000_u128;
+    let (posts, pieces, cut) = hash_named_pieces_posted_twice(base);
     let scenario = Scenario::new(posts).framed(cut.div_ceil(2));
     let order = [
         (0, 0),
@@ -916,40 +1138,7 @@ async fn a_restored_repost_of_a_solid_set_spawns_no_second_incarnation() {
         (3, 1),
     ];
     let restored = explicit_crash(&scenario, &order, 3).await;
-    assert_eq!(
-        restored.status,
-        Some(JobStatus::Complete),
-        "delivery={:?}, rulings={:?}",
-        restored.graph.delivery,
-        restored.graph.rulings
-    );
-    assert!(
-        restored.graph.delivery.damaged.is_empty(),
-        "nothing delivered damaged: {:?}",
-        restored.graph.delivery
-    );
-    let names: Vec<_> = restored.files.keys().cloned().collect();
-    assert!(
-        names.iter().all(|name| !name.contains(" (1)")),
-        "no second extracted incarnation: {names:?}"
-    );
-    assert_eq!(
-        names,
-        ["part0.bin", "part1.bin", "part2.bin"].map(|name| format!("lantern beacon/{name}")),
-        "one extraction, nothing beside it"
-    );
-    for index in 0..3 {
-        let expected: Vec<u8> = (0..8193)
-            .map(|n| ((n * 7 + n / 251 + index * 13) % 253) as u8)
-            .collect();
-        assert!(
-            restored
-                .files
-                .get(&format!("lantern beacon/part{index}.bin"))
-                == Some(&expected),
-            "part{index}.bin is byte-exact"
-        );
-    }
+    assert_each_piece_as_posted(&restored, base, &pieces);
 }
 
 async fn late_rar_index_after_crash(lost_tail: bool) {
@@ -1140,9 +1329,9 @@ async fn recovered_reposts_with_no_original_front_have_one_usable_archive() {
         assert!(
             outcome
                 .files
-                .get(&format!("lantern beacon/part{index}.bin"))
+                .get(&format!("lantern beacon/part{index}.mkv"))
                 == Some(&expected),
-            "part{index}.bin is byte-exact"
+            "part{index}.mkv is byte-exact"
         );
     }
     assert!(

@@ -384,10 +384,11 @@ impl Leaf {
     // A restored member's fold, which a restore starts empty. A member
     // whose bytes passed its stated CRC folds to that CRC; any other folds
     // what of `ranges` its file holds, read back from it. A range the file
-    // does not hold is left out of the fold.
+    // does not hold is left out of the fold: a file lost, or cut short,
+    // since its bytes passed holds no bytes that passed, and folds nothing.
     pub(crate) fn fold_passed(&mut self, length: u64, digest: Digest) {
         self.written.clear();
-        if length > 0 {
+        if length > 0 && self.len().is_ok_and(|held| held >= length) {
             self.written.insert(
                 0,
                 Written {

@@ -389,14 +389,9 @@ impl GraphJob {
         let Facts { ended, deciding } = facts;
         let complete = ended && !deciding;
         let bound = volumes.keys().map(|volume| volume.0);
-        let uncertain = volumes
-            .values()
-            .any(|member| namespace.length_uncertain(*member));
         self.writer
             .update_shelf(node, |shelf, state| {
                 let mut changed = state.complete != complete || state.deciding != deciding;
-                changed |= state.uncertain_lengths != uncertain;
-                state.uncertain_lengths = uncertain;
                 if !state.volumes.iter().copied().eq(bound.clone()) {
                     state.volumes = bound.collect();
                     changed = true;

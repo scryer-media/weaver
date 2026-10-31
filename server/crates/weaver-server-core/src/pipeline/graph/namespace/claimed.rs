@@ -48,6 +48,15 @@ impl NamespaceWriter {
         {
             return self.release_owned_elsewhere(tree, node, member);
         }
+        // A member can have both: a file a refusal read it back into, and
+        // holds for what came after an object took it again. What the holds
+        // carry never reached the file, so it goes on from the holds, and
+        // the file is read only around them.
+        let held = self
+            .files
+            .get(&node)
+            .map(|files| files.holds.held_ranges(super::held_volume(member)))
+            .unwrap_or_default();
         let owner = tree.child_of(node, member);
         let mut at = 0;
         while tree.child_of(node, member) == owner
@@ -79,6 +88,15 @@ impl NamespaceWriter {
                 at = run.range.end;
                 continue;
             }
+            if let Some(hold) = held.iter().find(|hold| hold.contains(start)) {
+                at = hold.end;
+                continue;
+            }
+            let end = held
+                .iter()
+                .map(|hold| hold.start)
+                .filter(|from| *from > start)
+                .fold(end, u64::min);
             let chunk = ByteRange::new(start, end.min(start.saturating_add(READ_BACK)));
             at = chunk.end;
             let mut bytes = Vec::new();

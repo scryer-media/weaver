@@ -82,13 +82,13 @@ async fn an_sfv_mismatch_ends_partial_as_repair() {
     let lantern = payload(3 * ARTICLE, 24);
     let beacon = payload(2 * ARTICLE, 25);
     let scenario = Scenario::new(vec![
-        Post::plain("lantern.bin", lantern.clone()),
-        Post::plain("beacon.bin", beacon.clone()),
+        Post::plain("lantern.mkv", lantern.clone()),
+        Post::plain("beacon.mkv", beacon.clone()),
         listing(
             "lantern.sfv",
             &[
-                ("lantern.bin", crc(&lantern)),
-                ("beacon.bin", crc(&beacon) ^ 0xffff_ffff),
+                ("lantern.mkv", crc(&lantern)),
+                ("beacon.mkv", crc(&beacon) ^ 0xffff_ffff),
             ],
         ),
     ]);
@@ -107,8 +107,8 @@ async fn an_sfv_mismatch_ends_partial_as_repair() {
     // listing found bad.
     assert_eq!(graph.files.len(), 3, "{:?}", graph.files.keys());
     let view = graph.graph();
-    assert_eq!(view.claims["lantern.bin"], Claim::Complete);
-    assert_eq!(view.claims["beacon.bin"], Claim::Damaged);
+    assert_eq!(view.claims["lantern.mkv"], Claim::Complete);
+    assert_eq!(view.claims["beacon.mkv"], Claim::Damaged);
 }
 
 // The listing disagrees with the member, so only an entry bound to it across
@@ -170,11 +170,11 @@ async fn a_listed_file_whose_articles_are_all_lost_ends_partial_marking_it() {
     let lantern = payload(2 * ARTICLE, 35);
     let beacon = payload(2 * ARTICLE, 36);
     let scenario = Scenario::new(vec![
-        Post::plain("lantern.bin", lantern.clone()),
-        Post::plain("beacon.bin", beacon.clone()),
+        Post::plain("lantern.mkv", lantern.clone()),
+        Post::plain("beacon.mkv", beacon.clone()),
         listing(
             "lantern.sfv",
-            &[("lantern.bin", crc(&lantern)), ("beacon.bin", crc(&beacon))],
+            &[("lantern.mkv", crc(&lantern)), ("beacon.mkv", crc(&beacon))],
         ),
     ])
     .lost(1, 0)
@@ -188,6 +188,6 @@ async fn a_listed_file_whose_articles_are_all_lost_ends_partial_marking_it() {
     );
     assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
     let view = graph.graph();
-    assert_eq!(view.claims["lantern.bin"], Claim::Complete);
-    assert_eq!(view.claims["beacon.bin"], Claim::Damaged);
+    assert_eq!(view.claims["lantern.mkv"], Claim::Complete);
+    assert_eq!(view.claims["beacon.mkv"], Claim::Damaged);
 }

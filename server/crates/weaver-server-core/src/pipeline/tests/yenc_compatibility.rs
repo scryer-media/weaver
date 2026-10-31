@@ -966,6 +966,37 @@ async fn a_bad_extent_that_arrives_first_fails_alone_and_its_neighbours_place() 
     assert_only_the_bad_part_is_fetched_again(&mut pipeline, file_id, &path).await;
 }
 
+// The bad article arrives first at 10, where the end of part 2 and the start
+// of part 3 belong, and its bytes are in the root. Part 2 contradicts it and
+// withdraws it: the range only it covered, 12 to 14, is covered no more, so
+// the file holds there no bytes that were never part 3's.
+#[tokio::test(start_paused = true)]
+async fn a_withdrawn_article_no_longer_covers_what_it_wrote() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, path) = setup(&temp, 40232, &[8; 4]).await;
+    let covered = |pipeline: &Pipeline, start, end| {
+        pipeline.graph_jobs[&file_id.job_id]
+            .namespace()
+            .get(weaver_graph::MemberId(0))
+            .unwrap()
+            .coverage
+            .covered(weaver_graph::ByteRange::new(start, end))
+    };
+    deliver_part(&mut pipeline, file_id, 0, 10, b"XXXX").await;
+    assert!(covered(&pipeline, 10, 14), "its bytes are in the root");
+    deliver_part(&mut pipeline, file_id, 2, 8, b"cccc").await;
+    assert!(covered(&pipeline, 8, 12));
+    assert!(
+        !covered(&pipeline, 12, 13),
+        "what only it wrote is uncovered"
+    );
+    assert!(!covered(&pipeline, 13, 14));
+    for (number, offset, bytes) in [(1u32, 4u64, b"bbbb"), (3, 12, b"dddd")] {
+        deliver_part(&mut pipeline, file_id, number, offset, bytes).await;
+    }
+    assert_only_the_bad_part_is_fetched_again(&mut pipeline, file_id, &path).await;
+}
+
 // An article held for the one before it is kept across a pause, as every
 // article that arrived is: it spills to the job's spool as the job parks, is
 // not asked for again when the job is resumed and built afresh, and is placed

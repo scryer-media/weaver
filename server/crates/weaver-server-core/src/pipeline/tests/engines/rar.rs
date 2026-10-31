@@ -625,6 +625,47 @@ async fn an_obfuscated_set_second_volume_first_and_par2_last_is_one_store() {
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
 }
 
+// A RAR5 set of three volumes renamed to numbers of its own whose lowest is
+// above one, `.10` to `.12` and `.100` to `.102`, every volume opening with
+// its signature and no recovery set beside it. The numbers found a split
+// set that counts from one, so none of these is its first piece, and the
+// first signed front to reach it refutes it: the volumes go back as posted,
+// their signatures found one RAR store, and the member is delivered. Either
+// arrival order.
+#[tokio::test]
+async fn a_signed_set_numbered_from_above_one_is_a_rar_set_in_either_order() {
+    let body = body();
+    let volumes = single_member_store_set(MEMBER, &body, 3);
+    assert_eq!(volumes.len(), 3, "three volumes");
+    for start in [10u32, 100] {
+        for backwards in [false, true] {
+            let mut out: Vec<Post> = volumes
+                .iter()
+                .zip(start..)
+                .map(|((_, bytes), number)| {
+                    Post::plain(
+                        &format!("51273aad56a8b904e96928935278a627.{number}"),
+                        bytes.clone(),
+                    )
+                })
+                .collect();
+            if backwards {
+                out.reverse();
+            }
+            let graph = run(&Scenario::new(out)).await;
+            assert!(
+                graph.completed(),
+                "from .{start}, backwards {backwards}: {:?} {:?} kinds {:?}",
+                graph.status,
+                graph.failure,
+                kinds(&graph)
+            );
+            assert_member(&graph, &body);
+            assert_fetched_once(&graph);
+        }
+    }
+}
+
 // A set bound by its headers before its PAR2 set arrives: under hash names
 // posted in order, each volume is claimed where its headers place it, and
 // the PAR2 set, last, names them. The names are all it changes: one store,
@@ -1297,7 +1338,7 @@ fn middle_volume_lost(lead: Option<&[u8]>, unreadable: bool) -> (Vec<u8>, Scenar
     const MIDDLE: u32 = 2;
     let article = ARTICLE as u64;
     let build = |body: &[u8]| match lead {
-        Some(lead) => protected_store_set_led_by(("ember.bin", lead), MEMBER, body, 5, 1),
+        Some(lead) => protected_store_set_led_by(("ember.mkv", lead), MEMBER, body, 5, 1),
         None => protected_store_set(MEMBER, body, 5, 1),
     };
     (0..10 * ARTICLE)
@@ -1387,13 +1428,13 @@ async fn two_files_one_whole_beside_a_middle_volume_lost_with_its_record_unreada
     let view = graph.graph();
     assert_eq!(
         view.delivery.whole,
-        vec!["ember.bin".to_string()],
+        vec!["ember.mkv".to_string()],
         "{:?}",
         view.delivery
     );
     assert_record_said_nothing(view);
     assert!(
-        graph.files[&delivered("ember.bin")] == lead,
+        graph.files[&delivered("ember.mkv")] == lead,
         "the whole file's bytes"
     );
 }
@@ -1406,7 +1447,7 @@ async fn two_files_beside_a_middle_volume_lost_with_its_record_readable_are_comp
     let graph = run(&scenario).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     assert!(
-        graph.files[&delivered("ember.bin")] == lead,
+        graph.files[&delivered("ember.mkv")] == lead,
         "the first file's bytes"
     );
     assert!(
@@ -1546,4 +1587,274 @@ async fn a_rar_members_checksum_reaches_the_naming_plan() {
         "{by_path:?} from {:?}",
         graph.graph().delivery.files
     );
+}
+
+// The recovery set's posts, from each volume's name and bytes, and the
+// articles withheld, as (file, ordinal), from the volumes.
+type Index = fn(&[(&str, &[u8])]) -> Vec<Post>;
+type Lost = fn(&[(String, Vec<u8>)]) -> Vec<(u32, u32)>;
+
+// A three-volume RAR5 set under a hash numbered from above one, each volume
+// signed, and a recovery set that names the volumes `archive.partN.rar` by
+// their content. No piece of a set numbered from above one is the first of
+// a split, so the first signed front refutes the split store and the
+// volumes' own signatures found one RAR store; the names the recovery set
+// gives only relabel what that store holds. `index` is the recovery set's
+// posts, `lost` the articles withheld. Posted in order and backwards.
+async fn numbered_from_above_one(index: Index, lost: Lost) -> Vec<Outcome> {
+    let body = body();
+    let volumes = single_member_store_set(MEMBER, &body, 3);
+    let named: Vec<String> = (1..=volumes.len())
+        .map(|part| format!("archive.part{part}.rar"))
+        .collect();
+    let files: Vec<(&str, &[u8])> = named
+        .iter()
+        .zip(&volumes)
+        .map(|(name, (_, bytes))| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let mut out: Vec<Post> = volumes
+        .iter()
+        .zip(101..)
+        .map(|((_, bytes), number)| {
+            Post::plain(
+                &format!("51273aad56a8b904e96928935278a627.{number}"),
+                bytes.clone(),
+            )
+        })
+        .collect();
+    out.extend(index(&files));
+    let mut graphs = Vec::new();
+    for backwards in [false, true] {
+        let posts = out
+            .iter()
+            .map(|post| Post::plain(&post.name, post.bytes.clone()))
+            .collect();
+        let mut scenario = Scenario::new(posts);
+        for (file, ordinal) in lost(&volumes) {
+            scenario = scenario.lost(file, ordinal);
+        }
+        if backwards {
+            scenario = scenario.backwards();
+        }
+        let graph = run(&scenario).await;
+        assert_member(&graph, &body);
+        assert_fetched_once(&graph);
+        assert_eq!(
+            kinds(&graph),
+            ["par2", "rar_store"],
+            "backwards {backwards}"
+        );
+        graphs.push(graph);
+    }
+    graphs
+}
+
+fn nothing_lost(_: &[(String, Vec<u8>)]) -> Vec<(u32, u32)> {
+    Vec::new()
+}
+
+// An index alone, under a hash with no extension.
+#[tokio::test]
+async fn a_set_numbered_from_above_one_named_by_an_extensionless_par2_index_delivers() {
+    fn index(files: &[(&str, &[u8])]) -> Vec<Post> {
+        let index = par2_set("archive.rar", files, 1).remove(0);
+        vec![Post::plain("9c41d07be35a6f28", index.bytes)]
+    }
+    for graph in numbered_from_above_one(index, nothing_lost).await {
+        assert_eq!(graph.graph().outcomes, vec![Some(RepairOutcome::Clean)]);
+    }
+}
+
+// The index and a volume under their own canonical names.
+#[tokio::test]
+async fn a_set_numbered_from_above_one_named_by_canonical_par2_sidecars_delivers() {
+    fn index(files: &[(&str, &[u8])]) -> Vec<Post> {
+        par2_set("archive.rar", files, 2)
+    }
+    for graph in numbered_from_above_one(index, nothing_lost).await {
+        assert_eq!(graph.graph().outcomes, vec![Some(RepairOutcome::Clean)]);
+    }
+}
+
+// The interior volume's last article withheld: the recovery set names the
+// volumes and rebuilds the tail it covers.
+#[tokio::test]
+async fn a_set_numbered_from_above_one_whose_interior_tail_is_withheld_is_repaired() {
+    fn index(files: &[(&str, &[u8])]) -> Vec<Post> {
+        par2_set("archive.rar", files, 2)
+    }
+    fn interior_tail(volumes: &[(String, Vec<u8>)]) -> Vec<(u32, u32)> {
+        let last = volumes[1].1.len().div_ceil(ARTICLE) - 1;
+        vec![(1, u32::try_from(last).unwrap())]
+    }
+    for graph in numbered_from_above_one(index, interior_tail).await {
+        assert_eq!(
+            graph.graph().outcomes,
+            vec![Some(RepairOutcome::Repaired { slices: 1 })]
+        );
+    }
+}
+
+// Articles of 60 bytes over a one-volume set: the one in the middle,
+// `sent_back`, holds `MEMBER`'s bytes only.
+const FRAME: usize = 60;
+
+// One volume of `MEMBER`, enciphered under `password` when there is one,
+// with `spoiled` the copy of the article at `sent_back` a server holds that
+// is not the posted bytes, though it passes its own check. One set stands
+// behind every copy: each enciphering draws its own salt.
+fn sent_back_scenario(
+    posted: &[(String, Vec<u8>)],
+    password: Option<&str>,
+    sent_back: u32,
+    spoiled: bool,
+) -> Scenario {
+    let mut volumes = posted.to_vec();
+    let at = sent_back as usize * FRAME;
+    if spoiled {
+        volumes[0].1[at..at + FRAME]
+            .iter_mut()
+            .for_each(|byte| *byte ^= 0x5a);
+    }
+    let scenario = Scenario::new(posts(volumes)).framed(FRAME);
+    match password {
+        Some(password) => scenario.password(password),
+        None => scenario,
+    }
+}
+
+// Whether `MEMBER` of the job's store is closed.
+fn member_closed(pipeline: &Pipeline) -> bool {
+    let tree = pipeline.graph_jobs[&JOB].tree();
+    tree.child_of(weaver_graph::NodeId::ROOT, weaver_graph::MemberId(0))
+        .and_then(|(store, _)| tree.namespace(store))
+        .is_some_and(|namespace| {
+            namespace
+                .members()
+                .any(|member| member.name == MEMBER && member.closed)
+        })
+}
+
+// The articles come in order, `first`'s copy of each: every one with
+// `closed`, so `MEMBER` closes, or else up to and with the one in the
+// middle. Then that one is sent back for another copy, as the decoder sends
+// back an article its neighbours refute, and `again`'s copy comes; then the
+// rest. What the job delivers once it ends, and how it ends.
+async fn sent_back_once(
+    sealing: Sealing,
+    first_spoiled: bool,
+    closed: bool,
+) -> (
+    Option<JobStatus>,
+    std::collections::BTreeMap<String, Vec<u8>>,
+) {
+    use super::refused_then_repaired::{drive_to_finish, serve_queued};
+    use crate::jobs::ids::{NzbFileId, SegmentId};
+    use crate::pipeline::tests::pump_pipeline_runtime_queues;
+
+    let body = body();
+    let (posted, password) = match sealing {
+        Sealing::Stored => (single_member_store_set(MEMBER, &body, 1), None),
+        Sealing::Enciphered { keyed } => (
+            encrypted_store_set(MEMBER, &body, 1, SECRET, Some(SECRET), keyed),
+            Some(SECRET),
+        ),
+    };
+    let articles = posted[0].1.len().div_ceil(FRAME) as u32;
+    let sent_back = articles / 2;
+    let first = sent_back_scenario(&posted, password, sent_back, first_spoiled);
+    let again = sent_back_scenario(&posted, password, sent_back, !first_spoiled);
+    let held = if closed { articles } else { sent_back + 1 };
+    let (_temp, mut pipeline, complete_dir) = admit(&first).await;
+    for ordinal in 0..held {
+        serve_queued(&mut pipeline, &first, (0, ordinal)).await;
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+    }
+    assert_eq!(member_closed(&pipeline), closed);
+    pipeline.graph_article_sent_back(SegmentId {
+        file_id: NzbFileId {
+            job_id: JOB,
+            file_index: 0,
+        },
+        segment_number: sent_back,
+    });
+    serve_queued(&mut pipeline, &again, (0, sent_back)).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+    for ordinal in held..articles {
+        serve_queued(&mut pipeline, &again, (0, ordinal)).await;
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+    }
+    drive_to_finish(&mut pipeline, &again).await;
+    let status = job_status_for_assert(&pipeline, JOB);
+    let mut files = std::collections::BTreeMap::new();
+    super::harness::collect(&complete_dir, &complete_dir, &mut files);
+    retire_pipeline_database(pipeline).await;
+    (status, files)
+}
+
+// How the set's one member is posted: stored as it is, or enciphered, its
+// checksum either the member's CRC32 or one keyed by the password.
+#[derive(Clone, Copy)]
+enum Sealing {
+    Stored,
+    Enciphered { keyed: bool },
+}
+
+// The copy that came first was not the article's bytes and is sent back
+// before `MEMBER` closes, and the one sent for comes right: the member is
+// checked over the bytes it holds, and comes out whole.
+async fn a_wrong_copy_sent_back_is_replaced_and_proved(sealing: Sealing) {
+    let (status, files) = sent_back_once(sealing, true, false).await;
+    assert_eq!(status, Some(JobStatus::Complete), "{:?}", files.keys());
+    assert!(
+        files.get(&delivered(MEMBER)) == Some(&body()),
+        "member bytes"
+    );
+}
+
+// The copy that came first was right and `MEMBER` closed on it, and the one
+// that comes after the send back is not: what the member's checksum proved
+// of the first copy does not stand for the second, so `MEMBER` is not
+// delivered as whole.
+async fn a_wrong_copy_after_a_send_back_fails_the_member(sealing: Sealing) {
+    let (status, files) = sent_back_once(sealing, false, true).await;
+    assert!(
+        !matches!(status, Some(JobStatus::Complete)),
+        "{status:?} {:?}",
+        files.keys()
+    );
+    assert!(
+        files.get(&delivered(MEMBER)) != Some(&body()),
+        "member whole"
+    );
+}
+
+#[tokio::test]
+async fn a_stored_rar_member_whose_wrong_article_was_sent_back_is_proved_on_its_right_copy() {
+    a_wrong_copy_sent_back_is_replaced_and_proved(Sealing::Stored).await;
+}
+
+#[tokio::test]
+async fn an_enciphered_rar_member_whose_wrong_article_was_sent_back_is_proved_on_its_right_copy() {
+    a_wrong_copy_sent_back_is_replaced_and_proved(Sealing::Enciphered { keyed: false }).await;
+}
+
+#[tokio::test]
+async fn a_keyed_rar_member_whose_wrong_article_was_sent_back_is_proved_on_its_right_copy() {
+    a_wrong_copy_sent_back_is_replaced_and_proved(Sealing::Enciphered { keyed: true }).await;
+}
+
+#[tokio::test]
+async fn a_stored_rar_member_whose_article_came_again_wrong_fails_its_checksum() {
+    a_wrong_copy_after_a_send_back_fails_the_member(Sealing::Stored).await;
+}
+
+#[tokio::test]
+async fn an_enciphered_rar_member_whose_article_came_again_wrong_fails_its_checksum() {
+    a_wrong_copy_after_a_send_back_fails_the_member(Sealing::Enciphered { keyed: false }).await;
+}
+
+#[tokio::test]
+async fn a_keyed_rar_member_whose_article_came_again_wrong_fails_its_checksum() {
+    a_wrong_copy_after_a_send_back_fails_the_member(Sealing::Enciphered { keyed: true }).await;
 }

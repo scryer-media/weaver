@@ -82,7 +82,7 @@ fn candle() -> Vec<u8> {
 }
 
 // The broad set: an enciphered two-volume RAR5 set holding `beacon.bin`, an
-// AES stored 7z holding `ember.bin` and `quill.bin`, `candle.bin`, and
+// AES stored 7z holding `ember.mkv` and `quill.mkv`, `candle.mkv`, and
 // `inner.par2` with four recovery blocks over both archives.
 fn broad() -> Vec<(String, Vec<u8>)> {
     let mut entries = encrypted_store_set("beacon.bin", &beacon(), 2, SECRET, Some(SECRET), false);
@@ -98,7 +98,7 @@ fn broad() -> Vec<(String, Vec<u8>)> {
         .into_iter()
         .map(|post| (post.name, post.bytes))
         .collect();
-    entries.push(("candle.bin".to_string(), candle()));
+    entries.push(("candle.mkv".to_string(), candle()));
     entries.extend(set);
     entries
 }
@@ -137,11 +137,11 @@ fn assert_broad_whole(graph: &Outcome) {
         graph.files.keys().cloned().collect::<Vec<_>>(),
         [
             "beacon.bin",
-            "candle.bin",
-            "ember.bin",
+            "candle.mkv",
+            "ember.mkv",
             "inner.par2",
             "inner.vol0+4.par2",
-            "quill.bin"
+            "quill.mkv"
         ]
         .map(delivered),
         "graph: delivered names"
@@ -151,8 +151,8 @@ fn assert_broad_whole(graph: &Outcome) {
         "beacon.bin"
     );
     assert!(
-        graph.files[&delivered("candle.bin")] == candle(),
-        "candle.bin"
+        graph.files[&delivered("candle.mkv")] == candle(),
+        "candle.mkv"
     );
     for (name, bytes) in sevenz_members() {
         assert!(graph.files[&delivered(name)] == bytes, "{name}");
@@ -180,7 +180,7 @@ async fn the_broad_set_two_deep_restarted_after_every_article_is_repaired_with_n
 }
 
 // Two sets two deep: `ember.bin` under one recovery block with two of its
-// articles damaged, `quill.bin` under two with one; an article two deep
+// articles damaged, `quill.mkv` under two with one; an article two deep
 // spans two slices of its member. The short set's file is listed
 // unrepaired, the other is rebuilt, and the job is Partial for a Repair
 // failure.
@@ -194,9 +194,9 @@ async fn two_sets_two_deep_one_short_of_blocks_end_partial_with_the_other_sets_f
             .into_iter()
             .map(|post| (post.name, post.bytes)),
     );
-    entries.push(("quill.bin".into(), quill.clone()));
+    entries.push(("quill.mkv".into(), quill.clone()));
     entries.extend(
-        par2_set("quill", &[("quill.bin", quill.as_slice())], 2)
+        par2_set("quill", &[("quill.mkv", quill.as_slice())], 2)
             .into_iter()
             .map(|post| (post.name, post.bytes)),
     );
@@ -225,8 +225,8 @@ async fn two_sets_two_deep_one_short_of_blocks_end_partial_with_the_other_sets_f
         graph.graph().delivery
     );
     assert!(
-        graph.files[&delivered("quill.bin")] == quill,
-        "quill.bin rebuilt"
+        graph.files[&delivered("quill.mkv")] == quill,
+        "quill.mkv rebuilt"
     );
     assert_eq!(graph.graph().delivery.unrepaired, ["ember.bin"]);
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
@@ -297,12 +297,12 @@ async fn an_lzma2_7z_two_deep_handed_to_the_engine_restarted_after_every_article
                 "cinder.7z",
                 container(Lzma2Options::from_level(1).into(), None),
             ),
-            ("candle.bin", candle()),
+            ("candle.mkv", candle()),
         ]),
     )]);
     let graph = run(&scenario).await;
     assert!(graph.completed(), "{:?}", graph.failure);
-    assert!(graph.files[&delivered("candle.bin")] == candle());
+    assert!(graph.files[&delivered("candle.mkv")] == candle());
     for (name, bytes) in sevenz_members() {
         assert!(graph.files[&delivered(name)] == bytes, "{name}");
     }
@@ -330,9 +330,9 @@ async fn an_uncovered_damaged_archive_two_deep_refused_to_a_leaf_restarted_after
     );
     assert_eq!(
         whole.files.keys().cloned().collect::<Vec<_>>(),
-        vec![delivered("cinder.7z"), delivered("quill.bin")]
+        vec![delivered("cinder.7z"), delivered("quill.mkv")]
     );
-    assert!(whole.files[&delivered("quill.bin")] == members[1].1);
+    assert!(whole.files[&delivered("quill.mkv")] == members[1].1);
     assert!(whole.refetched().is_empty(), "{:?}", whole.refetched());
     let restarted = run_restarting(&scenario, &mut |_| {}).await;
     assert_restarted(&restarted, &whole);
@@ -435,7 +435,7 @@ async fn an_aes_zip_two_deep_delivers_its_members() {
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
-        ["ember.bin", "quill.bin"].map(delivered)
+        ["ember.mkv", "quill.mkv"].map(delivered)
     );
     for (name, bytes) in zip_members() {
         assert!(graph.files[&delivered(name)] == bytes, "{name}");
@@ -639,7 +639,7 @@ async fn a_rar_set_two_deep_missing_a_volume_is_rebuilt_from_its_rev() {
 }
 
 // A compressed, enciphered RAR, `cinder.rar`, two deep beside `beacon.bin`,
-// `candle.bin` one deep, and no password: the store gives the RAR up to its
+// `candle.mkv` one deep, and no password: the store gives the RAR up to its
 // engine, which asks, and nothing answers. The job ends as the locked RAR
 // at the root does, partial on its password with the archive withheld and
 // delivered as posted, and the members above it and beside it delivered.
@@ -652,7 +652,7 @@ async fn a_compressed_rar_two_deep_whose_password_never_comes_ends_partial_with_
     ))
     .unwrap();
     let outer = sevenz(&[
-        ("candle.bin", candle()),
+        ("candle.mkv", candle()),
         (
             "level.rar",
             rar(&[("beacon.bin", beacon()), ("cinder.rar", locked.clone())]),
@@ -669,15 +669,15 @@ async fn a_compressed_rar_two_deep_whose_password_never_comes_ends_partial_with_
     assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Password));
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
-        ["beacon.bin", "candle.bin", "cinder.rar"].map(delivered)
+        ["beacon.bin", "candle.mkv", "cinder.rar"].map(delivered)
     );
     assert!(
         graph.files[&delivered("beacon.bin")] == beacon(),
         "beacon.bin"
     );
     assert!(
-        graph.files[&delivered("candle.bin")] == candle(),
-        "candle.bin"
+        graph.files[&delivered("candle.mkv")] == candle(),
+        "candle.mkv"
     );
     assert!(
         graph.files[&delivered("cinder.rar")] == locked,
@@ -800,10 +800,10 @@ async fn a_rar_set_two_deep_served_last_article_first_delivers_as_at_the_root() 
     assert_two_deep_as_at_the_root(|| rar_posts(spread_set()), Scenario::backwards).await;
 }
 
-// A compressed AES 7z, `cinder.7z`, beside `beacon.bin`, and `candle.bin`
+// A compressed AES 7z, `cinder.7z`, beside `beacon.bin`, and `candle.mkv`
 // beside them, with no password: the 7z's store asks, nothing answers, and
 // it withholds the archive, its folders shut. Two deep, inside `level.rar`
-// beside `beacon.bin` with `candle.bin` one deep, the job ends as it does at
+// beside `beacon.bin` with `candle.mkv` one deep, the job ends as it does at
 // the root: partial on the password, the archive withheld and delivered as
 // posted, and the members above it and beside it delivered.
 #[tokio::test]
@@ -812,12 +812,12 @@ async fn a_compressed_aes_7z_two_deep_whose_password_never_comes_ends_as_at_the_
     let locked = container(Lzma2Options::from_level(1).into(), Some(SECRET));
     let root = run(&Scenario::new(vec![
         Post::plain("beacon.bin", beacon()),
-        Post::plain("candle.bin", candle()),
+        Post::plain("candle.mkv", candle()),
         Post::plain("cinder.7z", locked.clone()),
     ]))
     .await;
     let outer = sevenz(&[
-        ("candle.bin", candle()),
+        ("candle.mkv", candle()),
         (
             "level.rar",
             rar(&[("beacon.bin", beacon()), ("cinder.7z", locked.clone())]),
@@ -848,15 +848,15 @@ async fn a_compressed_aes_7z_two_deep_whose_password_never_comes_ends_as_at_the_
     assert_eq!(kinds(&graph), ["rar_store", "sevenz_store"]);
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
-        ["beacon.bin", "candle.bin", "cinder.7z"].map(delivered)
+        ["beacon.bin", "candle.mkv", "cinder.7z"].map(delivered)
     );
     assert!(
         graph.files[&delivered("beacon.bin")] == beacon(),
         "beacon.bin"
     );
     assert!(
-        graph.files[&delivered("candle.bin")] == candle(),
-        "candle.bin"
+        graph.files[&delivered("candle.mkv")] == candle(),
+        "candle.mkv"
     );
     assert!(graph.files[&delivered("cinder.7z")] == locked, "cinder.7z");
 }
@@ -931,18 +931,25 @@ async fn a_par2_set_two_deep_crashed_before_its_repair_landed_repairs_and_delive
 // archive, and one member delivers. Two deep, `cinder` and `ashen` side by
 // side in `level.rar` in `lantern.7z`, once as stored 7zs and once as stored
 // RAR5 volumes: each job is Complete with the members once, the second
-// archive's bytes no file of their own, and nothing asked for twice.
+// archive's bytes no file of their own, and nothing asked for twice, its
+// articles served in order or backwards.
 #[tokio::test]
 async fn the_repost_rule_holds_two_deep_for_a_7z_and_a_rar5_posted_again_under_another_name() {
     let members = sevenz_members();
     let beacon = vec![("beacon.bin", beacon())];
-    for (archive, ext, held) in [
-        (sevenz(&members), "7z", members.clone()),
-        (rar(&beacon), "rar", beacon.clone()),
+    for (archive, ext, held, backwards) in [
+        (sevenz(&members), "7z", members.clone(), false),
+        (sevenz(&members), "7z backwards", members.clone(), true),
+        (rar(&beacon), "rar", beacon.clone(), false),
+        (rar(&beacon), "rar backwards", beacon.clone(), true),
     ] {
-        let (first, again) = (format!("cinder.{ext}"), format!("ashen.{ext}"));
+        let suffix = ext.split(' ').next().unwrap();
+        let (first, again) = (format!("cinder.{suffix}"), format!("ashen.{suffix}"));
         let outer = two_deep(&[(&first, archive.clone()), (&again, archive)]);
-        let scenario = Scenario::new(vec![Post::plain("lantern.7z", outer)]);
+        let mut scenario = Scenario::new(vec![Post::plain("lantern.7z", outer)]);
+        if backwards {
+            scenario = scenario.backwards();
+        }
         let graph = run(&scenario).await;
         assert!(
             graph.completed(),

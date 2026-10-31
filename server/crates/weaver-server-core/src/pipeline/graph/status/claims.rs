@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use weaver_graph::{Member, MemberId, NodeId, Tree, Why};
+use weaver_graph::{Member, MemberId, NodeId, Tree, Why, known_type};
 
 use crate::jobs::model::JobStatus;
 use crate::post_processing::model::PipelineFailureStage;
@@ -232,7 +232,10 @@ impl Delivery {
     // volumes, and the job completes when it can; beside the post's own
     // files alone it is a file the post lacks. The feed giving the post up
     // words a failure and rules nothing: a delivery with a whole usable
-    // output and nothing short is complete.
+    // output and nothing short is complete. A short delivery is partial only
+    // when a whole file is of a type people open (`known_type`), whatever
+    // depth it came from; whole files of no known type ship, but a job they
+    // alone stand for fails.
     pub(crate) fn status(&self, failure: Option<&Failure>) -> JobStatus {
         let extracted = self.files.iter().any(|file| file.whole && file.depth > 0);
         let short = !(self.damaged.is_empty()
@@ -242,9 +245,14 @@ impl Delivery {
         if !self.whole.is_empty() && !short && failure.is_none_or(|failure| failure.from_feed) {
             return JobStatus::Complete;
         }
-        if !self.whole.is_empty() {
+        if self.whole.iter().any(|name| known_type(name)) {
             return JobStatus::Partial;
         }
+        let nothing = if self.whole.is_empty() {
+            "no file was delivered whole"
+        } else {
+            "no file of a known type was delivered whole"
+        };
         let error = match failure
             .map(|failure| failure.message.clone())
             .or_else(|| self.withheld_error())
@@ -259,11 +267,8 @@ impl Delivery {
                     .map(String::as_str)
                     .collect();
                 match short.len() {
-                    0 => "no file was delivered whole".to_owned(),
-                    count => format!(
-                        "no file was delivered whole; {count} short: {}",
-                        short.join(", ")
-                    ),
+                    0 => nothing.to_owned(),
+                    count => format!("{nothing}; {count} short: {}", short.join(", ")),
                 }
             }
         };
@@ -445,7 +450,6 @@ fn withheld_because(why: Why) -> &'static str {
         Why::Encrypted | Why::EncryptedHeader => "needs a password and none was given",
         Why::Compressed => "is compressed and no engine reads it",
         Why::Unmapped => "never placed every member it named",
-        Why::OrderUnknown => "is a piece of a set nothing puts in order",
         Why::InvalidArchive => "is an invalid archive rejected by validation",
         _ => "was refused",
     }

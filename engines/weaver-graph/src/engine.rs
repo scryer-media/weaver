@@ -51,10 +51,6 @@ pub trait Volumes: Send + Sync {
     // The volume's length, once it is closed.
     fn len(&self, volume: VolumeIndex) -> Option<u64>;
 
-    fn uncertain_lengths(&self) -> bool {
-        false
-    }
-
     // Whether no read of the volume waits: it is closed, and every byte of
     // it is in or will never come. Work on a lent pool reads only such
     // volumes. A view that cannot tell says no.
@@ -63,12 +59,6 @@ pub trait Volumes: Send + Sync {
     }
 
     fn read_at(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize>;
-
-    // The run read on past a span a read failed on as lost: what it builds
-    // holds that span as a gap marked damaged, at the place the span's bytes
-    // would have filled, which a recovery set over its output can rebuild.
-    // The lost read no longer ends the run.
-    fn bridged(&self, _lost: Lost) {}
 }
 
 // Where a run says what it found. `false` means stop: the run was cancelled

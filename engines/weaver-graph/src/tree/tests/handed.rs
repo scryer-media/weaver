@@ -180,3 +180,119 @@ fn an_object_taken_back_in_a_lent_windows_place_is_handed_the_last_candidate_fir
         ]
     );
 }
+
+// A member whose front is all a member keeps comes while a window beside it
+// is lent: it queues behind the loan, undecided. Damage past its front,
+// settled as the server's namespace writer settles a member whose front can
+// say no more, leaves it queued: the window, back, is asked with the rest,
+// and the front, judged, founds the store it signs.
+#[test]
+fn a_full_front_queued_behind_a_lent_window_waits_through_damage() {
+    let (mut tree, first, child, _) = bound_tree();
+    let log = Log::default();
+    let window = tree
+        .attach_window(
+            NodeId::ROOT,
+            (first, WINDOW),
+            (Kind::Par2, &candidate("candidate")),
+            Vec::new(),
+            &mut Reading(Arc::clone(&log)),
+            &mut Vec::new(),
+        )
+        .expect("a window is built");
+    let lent = tree.lend(window).expect("the window lends");
+    let member = tree.announce_root("fresh.rar", None, &mut Vec::new());
+    let mut front = SIGNATURE.to_vec();
+    front.resize(crate::member::FIRST_BYTES, 0);
+    tree.deliver(
+        NodeId::ROOT,
+        member,
+        Posted {
+            offset: 0,
+            bytes: Bytes::from(front).into(),
+            provenance: Provenance::Fresh,
+        },
+        &mut Reading(Arc::clone(&log)),
+        &mut Vec::new(),
+    );
+    assert!(tree.is_undecided(NodeId::ROOT, member), "it queues");
+    assert!(!tree.front_to_come(NodeId::ROOT, member), "full");
+    let past = crate::member::FIRST_BYTES as u64;
+    let mut effects = Vec::new();
+    tree.damage(
+        NodeId::ROOT,
+        VolumeIndex(member.0),
+        ByteRange::new(past, past + 10),
+        &mut effects,
+    );
+    if tree.is_undecided(NodeId::ROOT, member) && !tree.front_to_come(NodeId::ROOT, member) {
+        tree.settle_leaf(NodeId::ROOT, member, &mut effects);
+    }
+    assert!(
+        tree.is_undecided(NodeId::ROOT, member),
+        "it waits for the loan"
+    );
+    tree.take_back(window, lent, &mut Reading(Arc::clone(&log)), &mut effects);
+    assert!(!tree.is_undecided(NodeId::ROOT, member));
+    let (owner, volume) = tree.child_of(NodeId::ROOT, member).expect("a store");
+    assert_ne!(owner, child, "a store of its own");
+    assert_eq!(volume, VolumeIndex(0));
+}
+
+// A member shorter than any verdict's bytes, whole, queues behind a lent
+// window and closes there, settled as the server's namespace writer settles
+// a member that closed undecided. Its front is all of it, so it says all a
+// sniff can: the window, back, is asked with the rest, and the front founds
+// the store it signs.
+#[test]
+fn a_whole_member_shorter_than_a_verdict_founds_its_store_after_a_loan() {
+    let (mut tree, first, child, _) = bound_tree();
+    let log = Log::default();
+    let window = tree
+        .attach_window(
+            NodeId::ROOT,
+            (first, WINDOW),
+            (Kind::Par2, &candidate("candidate")),
+            Vec::new(),
+            &mut Reading(Arc::clone(&log)),
+            &mut Vec::new(),
+        )
+        .expect("a window is built");
+    let lent = tree.lend(window).expect("the window lends");
+    let member = tree.announce_root("tiny.rar", None, &mut Vec::new());
+    let mut whole = SIGNATURE.to_vec();
+    whole.extend_from_slice(b"tiny");
+    assert!(whole.len() < crate::VERDICT_BYTES, "shorter than a verdict");
+    tree.deliver(
+        NodeId::ROOT,
+        member,
+        Posted {
+            offset: 0,
+            bytes: Bytes::from(whole).into(),
+            provenance: Provenance::Fresh,
+        },
+        &mut Reading(Arc::clone(&log)),
+        &mut Vec::new(),
+    );
+    assert!(tree.is_undecided(NodeId::ROOT, member), "it queues");
+    let mut effects = Vec::new();
+    tree.close(
+        NodeId::ROOT,
+        member,
+        &mut Reading(Arc::clone(&log)),
+        &mut effects,
+    );
+    assert!(!tree.front_to_come(NodeId::ROOT, member), "whole");
+    if tree.is_undecided(NodeId::ROOT, member) {
+        tree.settle_leaf(NodeId::ROOT, member, &mut effects);
+    }
+    assert!(
+        tree.is_undecided(NodeId::ROOT, member),
+        "it waits for the loan"
+    );
+    tree.take_back(window, lent, &mut Reading(Arc::clone(&log)), &mut effects);
+    assert!(!tree.is_undecided(NodeId::ROOT, member));
+    let (owner, volume) = tree.child_of(NodeId::ROOT, member).expect("a store");
+    assert_ne!(owner, child, "a store of its own");
+    assert_eq!(volume, VolumeIndex(0));
+}

@@ -85,12 +85,13 @@ impl Object for Holder {
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
     }
-    fn claim(&mut self, name: &str, _: &[u8], _: Option<u64>) -> Vec<VolumeIndex> {
+    fn claim(&mut self, name: &str, _: &[u8], _: Option<u64>) -> Claim {
         match self.place(name) {
             Some(place) => vec![place],
             None if self.taker => vec![self.free()],
             None => Vec::new(),
         }
+        .into()
     }
     fn bound(&mut self, volume: VolumeIndex, name: &str, _: &[u8], _: Option<u64>) {
         if volume == VolumeIndex(0) {
@@ -135,15 +136,16 @@ impl Object for Holder {
         _: &[u8],
         _: Option<u64>,
         carried: &(dyn std::any::Any + Send + Sync),
-    ) -> Vec<VolumeIndex> {
+    ) -> Claim {
         let Some(name) = carried.downcast_ref::<String>() else {
-            return Vec::new();
+            return Claim::default();
         };
         match self.place(name) {
             Some(place) => vec![place],
             None if self.taker => vec![self.free()],
             None => Vec::new(),
         }
+        .into()
     }
 }
 

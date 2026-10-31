@@ -24,13 +24,15 @@
 // the sniffer. It must never learn a format's layout. Nothing here names a
 // header field, an article or a piece. The one exception is the sniffer,
 // which knows magic bytes and file types, and only those, so that it can
-// say which object a member belongs to.
+// say which object a member belongs to, and its sibling the table of file
+// types people open, so that a delivery can say whether a whole file is one.
 
 pub mod deliver;
 pub mod engine;
 pub mod evidence;
 pub mod facts;
 pub mod holds;
+pub mod known;
 pub mod marks;
 pub mod member;
 pub mod names;
@@ -51,18 +53,22 @@ pub use facts::{
     Change, Durable, Facts, Give, Part, Restore, RestoreError, Sealed, Shelf, Take, Taken,
     decode_parts, encode_parts, encode_since,
 };
+pub use known::known_type;
 pub use marks::{Marked, Marks};
 pub use member::{Coverage, Member, MemberId, Namespace, Run};
 pub use names::NameLedger;
 pub use object::{
-    Beside, Carried, Extent, Kind, Located, Object, ObjectId, Placement, Placements, Posting,
-    Standing,
+    Beside, Carried, Claim, Extent, Kind, Located, Object, ObjectId, Placement, Placements,
+    Posting, Standing,
 };
 pub use records::{
     CoverageRecord, CryptRecord, EnvelopeRecord, MemberRecord, NodeRecord, NodeState, TreeRecord,
 };
 pub use recovery::{Recovery, Segment, SliceVerdict};
 pub use seek::{Pull, Purpose, Seek, SeekUp, Weight, When};
-pub use sniff::{Sniff, VERDICT_BYTES, names_recovery, par2_index, signed, sniff};
+pub use sniff::{
+    HEAD_VERDICT_BYTES, Sniff, VERDICT_BYTES, names_recovery, par2_index, signed, signs_a_head,
+    sniff,
+};
 pub use tree::{Builder, Effect, NodeId, Tree};
 pub use volume::{ByteRange, VolumeIndex};

@@ -273,8 +273,8 @@ async fn a_split_sevenz_posted_twice_is_one_set() {
     assert_eq!(
         names,
         vec![
-            "lantern beacon/ember.bin".to_string(),
-            "lantern beacon/quill.bin".to_string()
+            "lantern beacon/ember.mkv".to_string(),
+            "lantern beacon/quill.mkv".to_string()
         ]
     );
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
@@ -361,29 +361,20 @@ async fn a_compressed_posting_lost_whole_yields_its_place_to_its_copy() {
 // A 7z coded by `method`, split in two and posted twice, posting `file`
 // lost before any copy comes: the set completes with both members.
 async fn assert_sevenz_completes_without(method: sevenz_turbo::EncoderMethod, file: u32) {
-    assert_sevenz_posted_twice_completes_without(method, &[file], |post| post).await;
-}
-
-// The same with every posting in `files` lost, each posted under `named`.
-async fn assert_sevenz_posted_twice_completes_without(
-    method: sevenz_turbo::EncoderMethod,
-    files: &[u32],
-    named: impl FnMut(Post) -> Post,
-) {
     let archive = container(sevenz_turbo::EncoderConfiguration::new(method), None);
     let pieces = split(&archive, 2);
     let copies: Vec<Post> = pieces
         .iter()
         .map(|post| Post::plain(&post.name.replace(".7z.00", ".7z.000"), post.bytes.clone()))
         .collect();
-    let posts = pieces.into_iter().chain(copies).map(named).collect();
-    let graph = run(&lose_each(posts, files)).await;
+    let posts = pieces.into_iter().chain(copies).collect();
+    let graph = run(&lose_each(posts, &[file])).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
         vec![
-            "lantern beacon/ember.bin".to_string(),
-            "lantern beacon/quill.bin".to_string()
+            "lantern beacon/ember.mkv".to_string(),
+            "lantern beacon/quill.mkv".to_string()
         ]
     );
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
@@ -403,23 +394,6 @@ async fn a_coded_sevenz_piece_lost_whole_yields_its_place_to_its_copy() {
 #[tokio::test]
 async fn a_first_sevenz_piece_lost_before_anything_comes_is_no_volume() {
     assert_sevenz_completes_without(sevenz_turbo::EncoderMethod::COPY, 0).await;
-}
-
-// Both pieces of a 7z lost before their copies come, under names that say
-// nothing: the lost second piece holds a place by its name alone, and the
-// second copy, whose bytes come, takes the place from it.
-#[tokio::test]
-async fn sevenz_pieces_lost_under_names_that_say_nothing_yield_to_their_copies() {
-    let mut index = 0_u128;
-    assert_sevenz_posted_twice_completes_without(
-        sevenz_turbo::EncoderMethod::COPY,
-        &[0, 1],
-        |post| {
-            index += 1;
-            Post::plain(&format!("{:032x}", 0xd1c7_0000_u128 + index), post.bytes)
-        },
-    )
-    .await;
 }
 
 // A 7z split in two and posted twice under names that say nothing, with a

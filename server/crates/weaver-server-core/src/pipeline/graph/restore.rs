@@ -4,7 +4,8 @@
 // The restart seam of a graph job: its checkpoint read back, the job rebuilt
 // from it, and the articles it has in hand given to the restore as the ones
 // the queue does not fetch, with the parts that arrived and wait to be
-// placed. A job with no checkpoint is admitted afresh.
+// placed. A job with no checkpoint is admitted afresh, and so is a job whose
+// checkpoint this build does not restore: to this build it has none.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,7 @@ use super::hardware::Hardware;
 use super::job::restore::{RestoreFailure, Restored};
 use super::job::{GraphJob, RootFile, Storage};
 use super::limits::caps_for;
+use crate::LoadError;
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::JobSpec;
 use crate::operations::disk::CapacityReader;
@@ -35,12 +37,42 @@ pub(crate) enum GraphRestoreError {
     NoCheckpoint(u64),
     #[error("graph job checkpoint could not be read: {0}")]
     Load(#[from] crate::StateError),
+    #[error("graph job checkpoint holds a value this build does not read: {0}")]
+    Rows(crate::StateError),
     #[error("graph job checkpoint is not one this build restores: {0}")]
     Checkpoint(#[from] CheckpointError),
     #[error("graph job could not be rebuilt from its checkpoint: {0}")]
     Rebuild(#[from] RestoreFailure),
     #[error("graph job restore stopped: {0}")]
     Join(String),
+}
+
+impl From<LoadError> for GraphRestoreError {
+    fn from(error: LoadError) -> Self {
+        match error {
+            LoadError::Read(error) => Self::Load(error),
+            LoadError::Rows(error) => Self::Rows(error),
+        }
+    }
+}
+
+impl GraphRestoreError {
+    // The database returned the checkpoint, and this build cannot make a
+    // job of it: a value of a type or shape it does not take, a name it
+    // does not have, facts at a version it does not read, or records it
+    // cannot make the tree or the root of. Each is found before the rebuild
+    // touches a file. A read that failed, or a rebuild that failed writing,
+    // is not this.
+    fn not_this_builds(&self) -> bool {
+        matches!(
+            self,
+            Self::Rows(_)
+                | Self::Checkpoint(_)
+                | Self::Rebuild(
+                    RestoreFailure::Tree(_) | RestoreFailure::Root(_) | RestoreFailure::Post(_)
+                )
+        )
+    }
 }
 
 pub(crate) struct GraphRestore {
@@ -130,21 +162,43 @@ impl RestoreSeat {
         &self.working_dir
     }
 
-    // Read the job's checkpoint back and rebuild the job from it. Blocks:
-    // called off the pipeline thread.
+    // Read the job's checkpoint back and rebuild the job from it. A
+    // checkpoint this build does not restore is none: the job starts afresh
+    // and fetches every article, and its first checkpoint replaces the old
+    // rows whole. Blocks: called off the pipeline thread.
     pub(crate) fn restore(
         self,
         job_id: JobId,
         files: Vec<RootFile>,
     ) -> Result<GraphRestore, GraphRestoreError> {
-        let rows = self
-            .db
-            .load_graph_checkpoint(job_id)?
-            .ok_or(GraphRestoreError::NoCheckpoint(job_id.0))?;
+        let loaded = self.db.load_graph_checkpoint(job_id);
+        loaded
+            .map_err(GraphRestoreError::from)
+            .and_then(|rows| rows.ok_or(GraphRestoreError::NoCheckpoint(job_id.0)))
+            .and_then(|rows| self.rebuild(job_id, files, rows))
+            .map_err(|error| {
+                if !error.not_this_builds() {
+                    return error;
+                }
+                tracing::warn!(
+                    job_id = job_id.0,
+                    %error,
+                    "graph job checkpoint is not one this build restores; the job starts afresh"
+                );
+                GraphRestoreError::NoCheckpoint(job_id.0)
+            })
+    }
+
+    fn rebuild(
+        self,
+        job_id: JobId,
+        files: Vec<RootFile>,
+        rows: crate::jobs::graph_checkpoint::GraphCheckpoint,
+    ) -> Result<GraphRestore, GraphRestoreError> {
         let snapshot = checkpoint::snapshot(&rows)?;
         let held = held_parts_from_rows(job_id, &self.working_dir, &rows.held_parts);
         let storage = Storage {
-            passwords: restore_passwords(&self.db, job_id, self.spec_password.as_deref()),
+            passwords: restore_passwords(&self.db, job_id, self.spec_password.as_deref())?,
             caps: caps_for(&self.db, &self.extraction_limits, &files),
             working_dir: self.working_dir,
             accountant: self.accountant,
@@ -192,16 +246,22 @@ impl RestoreSeat {
 
 // The candidates in the order the job's admission tried them, so the index
 // each node's checkpoint kept names the same candidate. Read from the spec
-// and the database, as the job's state is not in place yet.
+// and the database, as the job's state is not in place yet. The loaders say
+// which failure is which, as the checkpoint's does: one that cannot read
+// holds the job, as a list short of what admission tried would name the
+// wrong candidate; one that reads what this build cannot take starts it
+// afresh.
 fn restore_passwords(
     db: &crate::Database,
     job_id: JobId,
     spec_password: Option<&str>,
-) -> Vec<String> {
-    let (carried, _) = read_job_password_candidates(db, job_id);
-    let global = db.global_archive_password_candidates().unwrap_or_default();
-    assemble_archive_password_candidates(spec_password, &carried, &global)
-        .iter()
-        .map(|candidate| candidate.value().to_owned())
-        .collect()
+) -> Result<Vec<String>, LoadError> {
+    let (carried, _) = read_job_password_candidates(db, job_id)?;
+    let global = db.global_archive_password_candidates()?;
+    Ok(
+        assemble_archive_password_candidates(spec_password, &carried, &global)
+            .iter()
+            .map(|candidate| candidate.value().to_owned())
+            .collect(),
+    )
 }

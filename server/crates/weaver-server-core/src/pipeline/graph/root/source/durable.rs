@@ -120,6 +120,15 @@ impl ArticleMap {
             .collect()
     }
 
+    // Where an arrived article's bytes were delivered, when that is known.
+    pub(crate) fn arrived_range(&self, volume: VolumeIndex, ordinal: u32) -> Option<ByteRange> {
+        let found = self.volumes.get(volume.0 as usize)?;
+        match found.articles[found.index(ordinal)?].state {
+            State::Arrived(range) => range,
+            State::Waiting | State::Lost { .. } => None,
+        }
+    }
+
     // An arrived article whose bytes are not on disk is fetched again; an
     // article an earlier run fetched unseen is too, since nothing says where
     // its bytes went.

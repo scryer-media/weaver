@@ -89,8 +89,6 @@ pub(in super::super) struct UuStyle {
     // The final group carries only the bytes it needs instead of a full
     // four characters.
     pub unpadded_tail: bool,
-    // The last line's length character overstates its bytes by one.
-    pub wrong_last_length: bool,
     pub end: UuEnd,
     // Bare LF line endings instead of CRLF.
     pub bare_lf: bool,
@@ -124,7 +122,6 @@ impl UuStyle {
         preamble: false,
         space_zero: false,
         unpadded_tail: false,
-        wrong_last_length: false,
         end: UuEnd::Full,
         bare_lf: false,
         line_bytes: 45,
@@ -533,9 +530,6 @@ fn uu_render(
     for (index, line) in lines.iter().enumerate() {
         let last = index + 1 == lines.len();
         let mut length = line.len() as u8;
-        if last && style.wrong_last_length {
-            length += 1;
-        }
         if damage == Some(Damage::Overlong) && index == damaged_line {
             length += 3;
         }

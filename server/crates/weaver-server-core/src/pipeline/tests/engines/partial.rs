@@ -80,7 +80,7 @@ fn nest(volumes: &Volumes) -> Vec<Post> {
 // A plain file posted beside the archive, so a job with it whole is Partial
 // rather than Failed when the archive is short.
 fn beside(mut posted: Vec<Post>) -> Vec<Post> {
-    posted.push(Post::plain("quill.bin", quill()));
+    posted.push(Post::plain("quill.mkv", quill()));
     posted
 }
 
@@ -416,11 +416,11 @@ fn raw(volumes: &Volumes) -> Vec<(String, Option<Vec<u8>>)> {
 }
 
 fn with_quill(mut files: Vec<(String, Option<Vec<u8>>)>) -> Vec<(String, Option<Vec<u8>>)> {
-    files.push(file("quill.bin", Some(quill())));
+    files.push(file("quill.mkv", Some(quill())));
     files
 }
 
-const QUILL: &str = "name=quill.bin from=quill.bin depth=0 whole=true";
+const QUILL: &str = "name=quill.mkv from=quill.mkv depth=0 whole=true";
 
 // Encrypted, content only: the headers read, the bytes do not.
 
@@ -435,7 +435,7 @@ async fn an_encrypted_rar_with_no_password_beside_a_plain_file_ends_partial_with
             status: Some(Status::Partial),
             kind: Some("Password"),
             files: with_quill(raw(&volumes)),
-            whole: &["quill.bin"],
+            whole: &["quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[
@@ -462,7 +462,7 @@ async fn an_encrypted_rar_inside_a_stored_rar_ends_partial_with_its_volume_withh
             status: Some(Status::Partial),
             kind: Some("Password"),
             files: with_quill(raw(&volumes)),
-            whole: &["quill.bin"],
+            whole: &["quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[("silver.horizon.part01.rar", Why::Encrypted)],
@@ -485,7 +485,7 @@ async fn an_encrypted_two_volume_rar_inside_a_stored_rar_withholds_both_volumes_
             status: Some(Status::Partial),
             kind: Some("Password"),
             files: with_quill(raw(&volumes)),
-            whole: &["quill.bin"],
+            whole: &["quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[
@@ -514,7 +514,7 @@ async fn a_header_encrypted_rar_with_no_password_ends_partial_with_the_archive_w
             status: Some(Status::Partial),
             kind: Some("Password"),
             files: with_quill(raw(&volumes)),
-            whole: &["quill.bin"],
+            whole: &["quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[
@@ -541,7 +541,7 @@ async fn a_header_encrypted_rar_inside_a_stored_rar_ends_partial_with_its_volume
             status: Some(Status::Partial),
             kind: Some("Password"),
             files: with_quill(raw(&volumes)),
-            whole: &["quill.bin"],
+            whole: &["quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[
@@ -575,7 +575,7 @@ async fn an_lzma2_7z_is_refused_compressed_by_the_store_and_delivered_whole_by_t
                 file("beacon.bin", Some(body())),
                 file("ember.bin", Some(ember())),
             ]),
-            whole: &["beacon.bin", "ember.bin", "quill.bin"],
+            whole: &["beacon.bin", "ember.bin", "quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[],
@@ -605,7 +605,7 @@ async fn an_lzma2_7z_inside_a_stored_rar_is_refused_compressed_and_delivered_who
                 file("beacon.bin", Some(body())),
                 file("ember.bin", Some(ember())),
             ]),
-            whole: &["beacon.bin", "ember.bin", "quill.bin"],
+            whole: &["beacon.bin", "ember.bin", "quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[],
@@ -633,7 +633,7 @@ async fn a_rar_whose_member_names_a_method_its_bytes_do_not_decode_is_delivered_
             status: Some(Status::Partial),
             kind: Some("Unpack"),
             files: with_quill(vec![file("silver.horizon.rar", None)]),
-            whole: &["quill.bin"],
+            whole: &["quill.mkv"],
             damaged: &["silver.horizon.rar"],
             unrepaired: &[],
             withheld: &[],
@@ -663,7 +663,7 @@ async fn a_rar_inside_a_stored_rar_whose_member_names_a_method_its_bytes_do_not_
             status: Some(Status::Partial),
             kind: Some("Unpack"),
             files: with_quill(vec![file("silver.horizon.rar", None)]),
-            whole: &["quill.bin"],
+            whole: &["quill.mkv"],
             damaged: &["silver.horizon.rar"],
             unrepaired: &[],
             withheld: &[],
@@ -689,7 +689,7 @@ async fn a_rar_holding_a_symlink_delivers_its_file_and_refuses_the_link_not_a_fi
             status: Some(Status::Complete),
             kind: None,
             files: with_quill(vec![file("beacon.bin", Some(body()))]),
-            whole: &["beacon.bin", "quill.bin"],
+            whole: &["beacon.bin", "quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[],
@@ -710,7 +710,7 @@ async fn a_rar_holding_a_symlink_inside_a_stored_rar_delivers_its_file_and_refus
             status: Some(Status::Complete),
             kind: None,
             files: with_quill(vec![file("beacon.bin", Some(body()))]),
-            whole: &["beacon.bin", "quill.bin"],
+            whole: &["beacon.bin", "quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[],
@@ -730,7 +730,7 @@ async fn a_7z_holding_a_symlink_delivers_its_file_and_drops_the_link() {
             status: Some(Status::Complete),
             kind: None,
             files: with_quill(vec![file("beacon.bin", Some(body()))]),
-            whole: &["beacon.bin", "quill.bin"],
+            whole: &["beacon.bin", "quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[],
@@ -750,7 +750,7 @@ async fn a_7z_holding_a_symlink_inside_a_stored_rar_delivers_its_file_and_drops_
             status: Some(Status::Complete),
             kind: None,
             files: with_quill(vec![file("beacon.bin", Some(body()))]),
-            whole: &["beacon.bin", "quill.bin"],
+            whole: &["beacon.bin", "quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[],
@@ -772,7 +772,7 @@ async fn a_rar_whose_member_is_a_directory_entry_delivers_the_file_and_lists_the
             status: Some(Status::Complete),
             kind: None,
             files: with_quill(vec![file("gallery/beacon.bin", Some(body()))]),
-            whole: &["gallery/", "gallery/beacon.bin", "quill.bin"],
+            whole: &["gallery/", "gallery/beacon.bin", "quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[],
@@ -797,7 +797,7 @@ async fn a_rar_whose_member_is_a_directory_entry_inside_a_stored_rar_delivers_th
             status: Some(Status::Complete),
             kind: None,
             files: with_quill(vec![file("gallery/beacon.bin", Some(body()))]),
-            whole: &["gallery/", "gallery/beacon.bin", "quill.bin"],
+            whole: &["gallery/", "gallery/beacon.bin", "quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[],
@@ -826,7 +826,7 @@ async fn a_rar_whose_first_volume_never_arrives_delivers_the_tail_volumes_first_
             status: Some(Status::Partial),
             kind: Some("Unpack"),
             files: with_quill(raw(&volumes)),
-            whole: &["quill.bin"],
+            whole: &["quill.mkv"],
             damaged: &["silver.horizon.part02.rar", "silver.horizon.part03.rar"],
             unrepaired: &[],
             withheld: &[],
@@ -856,7 +856,7 @@ async fn a_rar_inside_a_stored_rar_whose_first_volume_never_arrives_delivers_the
             status: Some(Status::Partial),
             kind: Some("Unpack"),
             files: with_quill(raw(&volumes)),
-            whole: &["quill.bin"],
+            whole: &["quill.mkv"],
             damaged: &["silver.horizon.part02.rar", "silver.horizon.part03.rar"],
             unrepaired: &[],
             withheld: &[],
@@ -887,12 +887,12 @@ async fn a_rar_whose_first_volumes_main_header_article_never_arrives_delivers_it
             status: Some(Status::Partial),
             kind: Some("Unpack"),
             files: vec![
-                file("quill.bin", Some(quill())),
+                file("quill.mkv", Some(quill())),
                 file("silver.horizon.part01.rar", None),
                 file("silver.horizon.part02.rar", Some(volumes[1].1.clone())),
                 file("silver.horizon.part03.rar", Some(volumes[2].1.clone())),
             ],
-            whole: &["quill.bin"],
+            whole: &["quill.mkv"],
             damaged: &[
                 "silver.horizon.part01.rar",
                 "silver.horizon.part02.rar",
@@ -928,7 +928,7 @@ async fn a_rar_volume_whose_middle_article_never_arrives_is_delivered_damaged_un
             status: Some(Status::Partial),
             kind: Some("Unpack"),
             files: with_quill(vec![file("silver.horizon.part01.rar", None)]),
-            whole: &["quill.bin"],
+            whole: &["quill.mkv"],
             damaged: &["silver.horizon.part01.rar"],
             unrepaired: &[],
             withheld: &[],
@@ -956,7 +956,7 @@ async fn a_rar_inside_a_stored_rar_whose_middle_article_never_arrives_delivers_t
             status: Some(Status::Partial),
             kind: Some("Unpack"),
             files: with_quill(vec![file("silver.horizon.part01.rar", None)]),
-            whole: &["quill.bin"],
+            whole: &["quill.mkv"],
             damaged: &["silver.horizon.part01.rar"],
             unrepaired: &[],
             withheld: &[],
@@ -983,7 +983,7 @@ async fn a_rar_volume_whose_end_header_article_never_arrives_delivers_its_member
             status: Some(Status::Complete),
             kind: None,
             files: with_quill(vec![file("beacon.bin", Some(body()))]),
-            whole: &["beacon.bin", "quill.bin"],
+            whole: &["beacon.bin", "quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[],
@@ -1005,7 +1005,7 @@ async fn a_tar_whose_entry_size_is_not_a_number_is_delivered_raw_unsupported() {
             status: Some(Status::Complete),
             kind: None,
             files: with_quill(vec![file("lantern.tar", Some(unsized_tar()))]),
-            whole: &["lantern.tar", "quill.bin"],
+            whole: &["lantern.tar", "quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[],
@@ -1028,7 +1028,7 @@ async fn a_tar_inside_a_stored_rar_whose_entry_size_is_not_a_number_is_delivered
             status: Some(Status::Complete),
             kind: None,
             files: with_quill(vec![file("lantern.tar", Some(unsized_tar()))]),
-            whole: &["lantern.tar", "quill.bin"],
+            whole: &["lantern.tar", "quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[],
@@ -1112,7 +1112,7 @@ async fn a_7z_whose_entry_path_climbs_out_is_refused_unsupported_and_delivered_u
                 file("outside.bin", Some(body())),
                 file("beacon.bin", Some(ember())),
             ]),
-            whole: &["beacon.bin", "outside.bin", "quill.bin"],
+            whole: &["beacon.bin", "outside.bin", "quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[],
@@ -1140,7 +1140,7 @@ async fn a_7z_inside_a_stored_rar_whose_entry_path_climbs_out_is_refused_unsuppo
                 file("outside.bin", Some(body())),
                 file("beacon.bin", Some(ember())),
             ]),
-            whole: &["beacon.bin", "outside.bin", "quill.bin"],
+            whole: &["beacon.bin", "outside.bin", "quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[],
@@ -1168,7 +1168,7 @@ async fn a_rar_whose_last_volume_never_arrives_withholds_its_volumes_unmapped() 
             status: Some(Status::Partial),
             kind: Some("Unpack"),
             files: with_quill(raw(&volumes)),
-            whole: &["quill.bin"],
+            whole: &["quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[
@@ -1197,7 +1197,7 @@ async fn a_rar_inside_a_stored_rar_whose_last_volume_never_arrives_withholds_its
             status: Some(Status::Partial),
             kind: Some("Unpack"),
             files: with_quill(raw(&volumes)),
-            whole: &["quill.bin"],
+            whole: &["quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[
@@ -1230,7 +1230,7 @@ async fn a_7z_whose_last_part_never_arrives_withholds_its_parts_unmapped() {
             status: Some(Status::Partial),
             kind: Some("Unpack"),
             files: with_quill(vec![file("lantern.7z", Some(joined))]),
-            whole: &["quill.bin"],
+            whole: &["quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[("lantern.7z", Why::Unmapped)],
@@ -1245,23 +1245,23 @@ async fn a_7z_whose_last_part_never_arrives_withholds_its_parts_unmapped() {
 async fn a_7z_inside_a_stored_rar_whose_last_part_never_arrives_withholds_its_parts_unmapped() {
     let volumes = sevenz_without_its_last_part();
     let scenario = Scenario::new(beside(nest(&volumes)));
+    // As above, two deep: the pieces join inside the RAR and the 7z store
+    // beneath the joined file withholds it.
+    let joined: Vec<u8> = volumes
+        .iter()
+        .flat_map(|(_, bytes)| bytes.clone())
+        .collect();
     run_expecting(
         &scenario,
         Graph {
             status: Some(Status::Partial),
             kind: Some("Unpack"),
-            files: with_quill(raw(&volumes)),
-            whole: &["quill.bin"],
+            files: with_quill(vec![file("lantern.7z", Some(joined))]),
+            whole: &["quill.mkv"],
             damaged: &[],
             unrepaired: &[],
-            withheld: &[
-                ("lantern.7z.001", Why::Unmapped),
-                ("lantern.7z.002", Why::Unmapped),
-            ],
-            refused: &[
-                "kind=sevenz_store member=lantern.7z.001 why=unmapped",
-                "kind=sevenz_store member=lantern.7z.002 why=unmapped",
-            ],
+            withheld: &[("lantern.7z", Why::Unmapped)],
+            refused: &["kind=sevenz_store member=lantern.7z why=unmapped"],
             delivered: &[QUILL],
         },
     )
@@ -1351,7 +1351,7 @@ async fn a_stored_7z_with_a_damaged_member_and_no_par2_refuses_itself_unrepairab
                 file("ember.bin", Some(ember())),
                 file("lantern.7z", None),
             ]),
-            whole: &["ember.bin", "quill.bin"],
+            whole: &["ember.bin", "quill.mkv"],
             damaged: &["lantern.7z"],
             unrepaired: &[],
             withheld: &[],
@@ -1372,22 +1372,22 @@ async fn a_security_invalid_zip_is_never_a_whole_posted_file() {
     let locations: Vec<usize> = archive
         .windows(9)
         .enumerate()
-        .filter_map(|(at, bytes)| (bytes == b"quill.bin").then_some(at))
+        .filter_map(|(at, bytes)| (bytes == b"quill.mkv").then_some(at))
         .collect();
     assert_eq!(locations.len(), 2, "local and central names");
     for at in locations {
-        archive[at..at + 9].copy_from_slice(b"ember.bin");
+        archive[at..at + 9].copy_from_slice(b"ember.mkv");
     }
     for sibling in [false, true] {
         let mut posted = vec![Post::plain("duplicates.zip", archive.clone())];
         if sibling {
-            posted.push(Post::plain("survivor.bin", quill()));
+            posted.push(Post::plain("survivor.mkv", quill()));
         }
         let outcome = super::harness::run(&Scenario::new(posted)).await;
         if sibling {
             assert_eq!(outcome.status, Some(JobStatus::Partial));
-            assert_eq!(outcome.graph().delivery.whole, ["survivor.bin"]);
-            assert_eq!(outcome.files[&format!("{FOLDER}/survivor.bin")], quill());
+            assert_eq!(outcome.graph().delivery.whole, ["survivor.mkv"]);
+            assert_eq!(outcome.files[&format!("{FOLDER}/survivor.mkv")], quill());
         } else {
             assert!(matches!(outcome.status, Some(JobStatus::Failed { .. })));
             assert!(outcome.graph().delivery.whole.is_empty());
@@ -1400,7 +1400,7 @@ async fn a_security_invalid_zip_is_never_a_whole_posted_file() {
             !outcome
                 .files
                 .keys()
-                .any(|name| name.ends_with("ember.bin") || name.ends_with("ember (1).bin"))
+                .any(|name| name.ends_with("ember.mkv") || name.ends_with("ember (1).mkv"))
         );
         for (name, bytes) in outcome.files.iter().chain(outcome.retained_files.iter()) {
             if name.ends_with("duplicates.zip") {
@@ -1425,17 +1425,17 @@ async fn a_stored_zip_whose_central_directory_article_never_arrives_rules_for_it
             status: Some(Status::Complete),
             kind: None,
             files: vec![
-                file("ember.bin", Some(payload(5 * ARTICLE + 13, 51))),
-                file("quill.bin", Some(payload(3 * ARTICLE - 5, 52))),
+                file("ember.mkv", Some(payload(5 * ARTICLE + 13, 51))),
+                file("quill.mkv", Some(payload(3 * ARTICLE - 5, 52))),
             ],
-            whole: &["ember.bin", "quill.bin"],
+            whole: &["ember.mkv", "quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[],
             refused: &[],
             delivered: &[
-                "name=ember.bin from=ember.bin depth=1 whole=true",
-                "name=quill.bin from=quill.bin depth=1 whole=true",
+                "name=ember.mkv from=ember.mkv depth=1 whole=true",
+                "name=quill.mkv from=quill.mkv depth=1 whole=true",
             ],
         },
     )
@@ -1457,7 +1457,7 @@ async fn a_header_encrypted_rar_with_no_check_and_no_password_refuses_itself_enc
             status: Some(Status::Partial),
             kind: Some("Password"),
             files: with_quill(raw(&volumes)),
-            whole: &["quill.bin"],
+            whole: &["quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[("silver.horizon.part01.rar", Why::EncryptedHeader)],
@@ -1486,7 +1486,7 @@ async fn a_rar_that_announced_a_member_it_never_placed_refuses_itself_unmapped()
             status: Some(Status::Partial),
             kind: Some("Unpack"),
             files: with_quill(raw(&volumes)),
-            whole: &["quill.bin"],
+            whole: &["quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[("silver.horizon.part01.rar", Why::Unmapped)],
@@ -1501,7 +1501,7 @@ async fn a_rar_that_announced_a_member_it_never_placed_refuses_itself_unmapped()
 
 fn three_one_withheld() -> Scenario {
     let mut posted = vec![Post::plain("lantern.rar", encrypted(1, 5).remove(0).1)];
-    posted.push(Post::plain("quill.bin", quill()));
+    posted.push(Post::plain("quill.mkv", quill()));
     posted.push(Post::plain("ember.bin", ember()));
     Scenario::new(posted)
 }
@@ -1517,9 +1517,9 @@ async fn a_job_of_three_members_one_withheld_ends_partial_with_two_delivered() {
             files: vec![
                 file("ember.bin", Some(ember())),
                 file("lantern.rar", Some(encrypted(1, 5).remove(0).1)),
-                file("quill.bin", Some(quill())),
+                file("quill.mkv", Some(quill())),
             ],
-            whole: &["ember.bin", "quill.bin"],
+            whole: &["ember.bin", "quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[("lantern.rar", Why::Encrypted)],
@@ -1571,7 +1571,7 @@ async fn a_job_whose_only_whole_file_is_a_withheld_archives_sibling_ends_partial
     let locked = encrypted(1, 5).remove(0).1;
     let mut posted = vec![Post::plain("lantern.rar", locked.clone())];
     posted.extend(posts(&store(1)));
-    posted.push(Post::plain("quill.bin", quill()));
+    posted.push(Post::plain("quill.mkv", quill()));
     let scenario = Scenario::new(posted).lost(1, 3);
     run_expecting(
         &scenario,
@@ -1580,10 +1580,10 @@ async fn a_job_whose_only_whole_file_is_a_withheld_archives_sibling_ends_partial
             kind: Some("Password"),
             files: vec![
                 file("lantern.rar", Some(locked)),
-                file("quill.bin", Some(quill())),
+                file("quill.mkv", Some(quill())),
                 file("silver.horizon.part01.rar", None),
             ],
-            whole: &["quill.bin"],
+            whole: &["quill.mkv"],
             damaged: &["silver.horizon.part01.rar"],
             unrepaired: &[],
             withheld: &[("lantern.rar", Why::Encrypted)],
@@ -1605,10 +1605,10 @@ async fn two_sets_one_short_of_blocks_end_partial_with_the_other_sets_files_whol
     let short = noise(6 * ARTICLE + 5, 33);
     let whole = noise(5 * ARTICLE + 3, 44);
     let mut posted = under_one_block("ember.bin", "ember", short.clone());
-    posted.extend(under_one_block("quill.bin", "quill", whole.clone()));
+    posted.extend(under_one_block("quill.mkv", "quill", whole.clone()));
     let quill_index = posted
         .iter()
-        .position(|post| post.name == "quill.bin")
+        .position(|post| post.name == "quill.mkv")
         .unwrap() as u32;
     let scenario = Scenario::new(posted)
         .lost(0, 1)
@@ -1619,13 +1619,13 @@ async fn two_sets_one_short_of_blocks_end_partial_with_the_other_sets_files_whol
         Graph {
             status: Some(Status::Partial),
             kind: Some("Repair"),
-            files: vec![file("ember.bin", None), file("quill.bin", Some(whole))],
-            whole: &["quill.bin"],
+            files: vec![file("ember.bin", None), file("quill.mkv", Some(whole))],
+            whole: &["quill.mkv"],
             damaged: &[],
             unrepaired: &["ember.bin"],
             withheld: &[],
             refused: &[],
-            delivered: &["name=quill.bin from=quill.bin depth=0 whole=true"],
+            delivered: &["name=quill.mkv from=quill.mkv depth=0 whole=true"],
         },
     )
     .await;
@@ -1845,7 +1845,7 @@ async fn a_solid_rar_under_a_starved_par2_delivers_the_members_before_the_loss()
     let scenario = Scenario::new(starved("rar5_solid_small.rar"))
         .framed(116)
         .lost(1, 3);
-    run_partial_with_whole(&scenario, &["part0.bin", "part1.bin"]).await;
+    run_partial_with_whole(&scenario, &["part0.mkv", "part1.mkv"]).await;
 }
 
 // The same with the headers encrypted: the engine opens the stream with
@@ -1856,5 +1856,5 @@ async fn a_header_encrypted_solid_rar_under_a_starved_par2_delivers_the_members_
         .framed(200)
         .lost(1, 3)
         .password("moonlit-harbour");
-    run_partial_with_whole(&scenario, &["part0.bin"]).await;
+    run_partial_with_whole(&scenario, &["part0.mkv"]).await;
 }

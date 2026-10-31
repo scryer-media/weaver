@@ -16,7 +16,7 @@ use weaver_graph::{
 
 use super::SevenZipStore;
 use crate::keys::Keys;
-use crate::testing::{Quiet, payload};
+use crate::testing::payload;
 use owner::Owner;
 
 const PASSWORD: &str = "a-test-passphrase";
@@ -160,212 +160,30 @@ fn bytes_ahead_of_the_tail_are_held_until_it_arrives() {
     streamed(&owner);
 }
 
-fn split(bytes: &[u8], parts: usize) -> Vec<(String, Vec<u8>)> {
-    let part = bytes.len().div_ceil(parts);
-    bytes
-        .chunks(part)
-        .enumerate()
-        .map(|(index, chunk)| (format!("alpha.7z.{:03}", index + 1), chunk.to_vec()))
-        .collect()
-}
-
+// A 7z posted again is the file when its signature header measures the same
+// container; a name, a piece with no signature, or another container's
+// front is nothing of it.
 #[test]
-fn a_split_set_streams_with_its_volumes_out_of_order() {
+fn a_copy_of_the_file_with_its_signature_is_claimed_as_the_file() {
     let bytes = archive(copy(), false);
-    let volumes = split(&bytes, 3);
-    assert_eq!(volumes.len(), 3);
-    let mut owner = Owner::new(store(), volumes);
-    for volume in [2, 0, 1] {
-        owner.frames(volume, 4096);
-    }
-    for volume in [2, 0, 1] {
-        owner.close(volume);
-    }
-    no_trouble(&owner);
-    streamed(&owner);
-    let rebuilt: Vec<u8> = (0..3)
-        .flat_map(|volume| owner.posted(volume).unwrap())
-        .collect();
-    assert_eq!(rebuilt, bytes);
-}
-
-// Pieces under names that number none of them, the given ones bound:
-// every piece but the last is as long as the first, so a middle piece
-// fits every middle place.
-fn unnamed(parts: usize, bound: &[usize]) -> (SevenZipStore, Vec<(&'static str, Vec<u8>)>) {
-    let bytes = archive(copy(), false);
-    let names = [
-        "e93a07c1d25b4f68a0c3e1f7b9d24c85",
-        "1b7f3d9e05a24c6f8e1d0b3a7c9f2e64",
-        "c40e8b2f6a1d4973b5e0f2c8d16a9b37",
-        "7a2c5e9f0b3d4e81a6f9c2b07d4e1f58",
-        "f2b8d04e6c1a4397a5e3c9d17b0f6e2a",
-    ];
-    let pieces: Vec<_> = names
-        .into_iter()
-        .zip(split(&bytes, parts))
-        .map(|(name, (_, piece))| (name, piece))
-        .collect();
-    assert_eq!(pieces.len(), parts);
-    assert!(pieces[parts - 1].1.len() < pieces[0].1.len());
+    let other = archive(aes(), false);
     let mut object = store();
-    for &volume in bound {
-        let (name, piece) = &pieces[volume];
-        let (front, length) = (&piece[..32], Some(piece.len() as u64));
-        if volume > 0 {
-            assert!(
-                object
-                    .claim(name, front, length)
-                    .contains(&VolumeIndex(volume as u32))
-            );
-        }
-        object.bound(VolumeIndex(volume as u32), name, front, length);
-    }
-    (object, pieces)
-}
-
-// Four pieces, the store holding the first and the last.
-fn unnamed_middles() -> (SevenZipStore, Vec<(&'static str, Vec<u8>)>) {
-    unnamed(4, &[0, 3])
-}
-
-// A piece's front and length as the tree hands them, and as quiet sees it
-// beside the set.
-fn beside<'a>(piece: &'a (&'static str, Vec<u8>)) -> (&'static str, &'a [u8], u64) {
-    (piece.0, &piece.1[..32], piece.1.len() as u64)
-}
-
-// No name or header says which middle piece comes first: the store offers
-// each both middle places, the tree binds neither while two are free, the
-// set refuses for them once the job is quiet, and the refused set takes
-// them past every place it has, so they go where the set went.
-#[test]
-fn two_middle_pieces_nothing_orders_refuse_the_set_at_quiet() {
-    let (mut object, pieces) = unnamed_middles();
-    let middles: Vec<_> = pieces[1..3].iter().map(beside).collect();
-    for (name, front, length) in &middles {
-        assert_eq!(
-            object.claim(name, front, Some(*length)),
-            vec![VolumeIndex(1), VolumeIndex(2)]
-        );
-    }
-    let mut out = Vec::new();
-    object.quiet(&Quiet(middles.clone()), &mut out);
-    assert_eq!(out, vec![Emit::Refuse(Why::OrderUnknown)]);
-    let (name, front, length) = middles[0];
+    let length = Some(bytes.len() as u64);
+    object.bound(VolumeIndex(0), "alpha.7z", &bytes[..32], length);
     assert_eq!(
-        object.claim(name, front, Some(length)),
-        vec![VolumeIndex(4)]
+        object.claim("alpha.7z", &bytes[..32], length),
+        vec![VolumeIndex(0)]
     );
-}
-
-// An unsigned copy of a held continuation volume is offered the held place,
-// before a restore and after: whether it is the piece holding it is the
-// tree's to judge, by their fronts, not the store's.
-#[test]
-fn an_unsigned_copy_of_a_held_continuation_volume_is_offered_the_held_place() {
-    let bytes = archive(copy(), false);
-    let names = [
-        "e93a07c1d25b4f68a0c3e1f7b9d24c85",
-        "1b7f3d9e05a24c6f8e1d0b3a7c9f2e64",
-    ];
-    let pieces = split(&bytes, 3);
-    assert_eq!(pieces.len(), 3);
-    let mut object = store();
-    for volume in [0, 1] {
-        let piece = &pieces[volume].1;
-        let (front, length) = (&piece[..32], Some(piece.len() as u64));
-        object.bound(VolumeIndex(volume as u32), names[volume], front, length);
-    }
-    let mut restored =
-        crate::restore(&object.facts(), weaver_graph::Budget::default()).expect("restores");
-    let piece = &pieces[1].1;
-    let (front, length) = (&piece[..32], Some(piece.len() as u64));
-    let copy = "5d0f9a3c7e1b4826a9c4f0e2b7d13a68";
-    assert_eq!(object.claim(copy, front, length), vec![VolumeIndex(1)]);
-    assert_eq!(restored.claim(copy, front, length), vec![VolumeIndex(1)]);
-}
-
-// A place whose piece's front came is held across a restore: a piece of
-// the same length that no name places is offered both middle places, the
-// held one for the tree to weigh by fronts, and the set does not refuse
-// for it, since one place is left free.
-#[test]
-fn a_place_whose_front_came_is_held_after_a_restore() {
-    let (mut object, pieces) = unnamed_middles();
-    let (name, front, length) = beside(&pieces[1]);
-    object.bound(VolumeIndex(1), name, front, Some(length));
-    let mut restored =
-        crate::restore(&object.facts(), weaver_graph::Budget::default()).expect("restores");
-    let (name, front, length) = beside(&pieces[2]);
-    let objects: [&mut dyn weaver_graph::Object; 2] = [&mut object, restored.as_mut()];
-    for object in objects {
-        assert_eq!(
-            object.claim(name, front, Some(length)),
-            vec![VolumeIndex(1), VolumeIndex(2)]
-        );
-        let mut out = Vec::new();
-        object.quiet(&Quiet(vec![beside(&pieces[2])]), &mut out);
-        assert!(!out.contains(&Emit::Refuse(Why::OrderUnknown)), "{out:?}");
-    }
-}
-
-// Five pieces, the first, second and fourth held: a middle piece no name
-// places is offered every middle place, and one is free, so the set does
-// not refuse for it.
-#[test]
-fn a_middle_piece_with_one_place_free_does_not_refuse_the_set() {
-    let (mut object, pieces) = unnamed(5, &[0, 1, 3]);
-    let (name, front, length) = beside(&pieces[2]);
     assert_eq!(
-        object.claim(name, front, Some(length)),
-        vec![VolumeIndex(1), VolumeIndex(2), VolumeIndex(3)]
+        object.claim("e93a07c1d25b4f68a0c3e1f7b9d24c85", &bytes[..32], length),
+        vec![VolumeIndex(0)]
     );
-    let mut out = Vec::new();
-    object.quiet(&Quiet(vec![beside(&pieces[2])]), &mut out);
-    assert!(!out.contains(&Emit::Refuse(Why::OrderUnknown)), "{out:?}");
-}
-
-// A recovery set that gives the pieces their real names orders them: once
-// the first piece carries its own, each middle piece takes the place its
-// number gives, and nothing is left beside the set to refuse it for.
-#[test]
-fn a_piece_a_recovery_set_names_takes_the_place_its_number_gives() {
-    let (mut object, pieces) = unnamed_middles();
-    object.renamed(VolumeIndex(0), "alpha.7z.001", &mut Vec::new());
-    for (volume, name) in [(2, "alpha.7z.003"), (1, "alpha.7z.002")] {
-        let piece = &pieces[volume].1;
-        let (front, length) = (&piece[..32], Some(piece.len() as u64));
-        assert_eq!(
-            object.claim(name, front, length),
-            vec![VolumeIndex(volume as u32)]
-        );
-        object.bound(VolumeIndex(volume as u32), name, front, length);
-    }
-    let mut out = Vec::new();
-    object.quiet(&Quiet(Vec::new()), &mut out);
-    assert!(!out.contains(&Emit::Refuse(Why::OrderUnknown)), "{out:?}");
-}
-
-// A uuencoded piece says no length until it ends, so neither the first
-// piece's length nor a later piece's own is known while they arrive: a
-// piece numbered from the first piece's name still takes the place its
-// number gives, before the first piece has closed.
-#[test]
-fn a_numbered_piece_of_unknown_length_takes_its_place_before_the_first_closes() {
-    let bytes = archive(copy(), false);
-    let volumes = split(&bytes, 4);
-    let mut object = store();
-    let (name, piece) = &volumes[0];
-    object.bound(VolumeIndex(0), name, &piece[..32], None);
-    for volume in [2, 1, 3] {
-        let (name, piece) = &volumes[volume];
-        assert_eq!(
-            object.claim(name, &piece[..32], None),
-            vec![VolumeIndex(volume as u32)]
-        );
-        object.bound(VolumeIndex(volume as u32), name, &piece[..32], None);
-    }
+    assert!(
+        object
+            .claim("alpha.7z.002", &bytes[100..132], None)
+            .is_empty()
+    );
+    assert!(object.claim("alpha.7z", &other[..32], None).is_empty());
 }
 
 #[test]
@@ -602,9 +420,20 @@ fn an_end_header_declared_past_any_byte_holds_nothing_until_bytes_arrive() {
         &mut out,
     );
     assert_eq!(lone.kept.from(32), &[] as &[u8]);
+    // The end header never comes, so the store names no member and says
+    // nothing of the format: what it named is unmapped on quiet.
     let mut owner = Owner::single(store(), bytes);
     owner.whole(4096);
-    assert!(has(&owner, &Emit::NeedsEngine(Why::Unsupported)));
+    owner.quiet();
+    assert!(owner.members.is_empty(), "{:?}", owner.members);
+    assert!(
+        !owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::NeedsEngine(_) | Emit::Damaged { .. })),
+        "{:?}",
+        owner.said
+    );
 }
 
 // A 7z of a major version this store cannot read is refused for that, not
@@ -915,6 +744,50 @@ fn member_id(owner: &Owner, name: &str) -> MemberId {
         .unwrap()
 }
 
+// An article of `alpha.bin` starting inside a cipher block, `seam`, and
+// ending inside another comes again, as a restart's lost article does: the
+// store forgets what it said of it, the articles either side stay where they
+// are and do not come again, and the article comes again whole. The member
+// comes out whole again, and enciphers back to the bytes as posted.
+fn unsaid_from_inside_a_block(methods: Vec<EncoderConfiguration>, password: Option<&str>) {
+    let bytes = archive(methods, false);
+    let length = bytes.len() as u64;
+    let mut owner = Owner::single(store(), bytes.clone());
+    if let Some(password) = password {
+        owner.offer(password);
+    }
+    // 32 for the signature header, then 5005 bytes into `alpha.bin`, 13
+    // into its cipher block.
+    let seam = 32 + 5005;
+    let lost = ByteRange::new(seam, seam + 1000);
+    for range in [
+        ByteRange::new(0, seam),
+        lost,
+        ByteRange::new(lost.end, length),
+    ] {
+        owner.deliver(0, range);
+    }
+    owner.close(0);
+    no_trouble(&owner);
+    streamed(&owner);
+    owner.uncover(0, lost);
+    assert!(!owner.member("alpha.bin").closed);
+    owner.deliver(0, lost);
+    no_trouble(&owner);
+    streamed(&owner);
+    assert_eq!(owner.posted(0).as_deref(), Some(bytes.as_slice()));
+}
+
+#[test]
+fn a_stored_member_unsaid_from_inside_it_comes_out_again_whole() {
+    unsaid_from_inside_a_block(copy(), None);
+}
+
+#[test]
+fn an_enciphered_member_unsaid_from_inside_a_cipher_block_comes_out_again_whole() {
+    unsaid_from_inside_a_block(aes(), Some(PASSWORD));
+}
+
 // A stored member's bytes are raw runs of the container, so a seek before the
 // end header is read is not located yet, the same seek after it lies where
 // the map puts it, and only a range the map rules out is never located.
@@ -1031,15 +904,14 @@ fn a_repaired_7z_header_remaps_routed_payload_without_an_engine() {
             .all(|at| at < 32 || header.contains(at as u64)),
         "only the headers differ"
     );
-    let old = split(&before, 2);
-    let new = split(&after, 2);
-    let base = old[0].1.len() as u64;
-    assert!(header.start >= base, "the headers lie in the second volume");
-    let tail = ByteRange::new(header.start - base, header.end - base);
-    let mut owner = Owner::new(store(), old.clone());
-    // The first volume, then the old header: alpha whole, beta in part.
-    owner.frames(0, 4096);
-    owner.deliver(1, tail);
+    let cut = before.len() / 2;
+    assert!(header.start >= cut as u64, "the headers lie past the cut");
+    let mut owner = Owner::single(store(), before.clone());
+    // The file up to the cut, then the old header: alpha whole, beta in part.
+    for at in (0..cut).step_by(4096) {
+        owner.deliver(0, ByteRange::new(at as u64, (at + 4096).min(cut) as u64));
+    }
+    owner.deliver(0, header);
     assert!(owner.member("alpha.bin").closed);
     assert!(owner.replays == 0);
     // The repair writes the new signature header, then the new headers.
@@ -1047,27 +919,26 @@ fn a_repaired_7z_header_remaps_routed_payload_without_an_engine() {
         0,
         ByteRange::new(0, 32),
         Provenance::Repaired,
-        Some(&new[0].1[..32]),
+        Some(&after[..32]),
     );
     owner.deliver_as(
-        1,
-        tail,
+        0,
+        header,
         Provenance::Repaired,
-        Some(&new[1].1[tail.start as usize..tail.end as usize]),
+        Some(&after[header.start as usize..header.end as usize]),
     );
     assert!(owner.replays > 0, "routed bytes come again");
     assert!(has(&owner, &Emit::Retract(MemberId(0))));
     assert!(has(&owner, &Emit::Retract(MemberId(1))));
     assert!(!has(&owner, &Emit::Retract(MemberId(2))), "gamma stays");
-    // The rest of the payload, then both volumes close.
+    // The rest of the payload, then the file closes.
     owner.deliver_as(
-        1,
-        ByteRange::new(0, tail.start),
+        0,
+        ByteRange::new(cut as u64, header.start),
         Provenance::Fresh,
-        Some(&new[1].1[..tail.start as usize]),
+        Some(&after[cut..header.start as usize]),
     );
     owner.close(0);
-    owner.close(1);
     owner.quiet();
     assert!(
         !owner
@@ -1087,41 +958,11 @@ fn a_repaired_7z_header_remaps_routed_payload_without_an_engine() {
     }
     assert_eq!(owner.held(), 0);
     assert!(owner.refetched.is_empty(), "{:?}", owner.refetched);
-    let rebuilt: Vec<u8> = (0..2)
-        .flat_map(|volume| owner.posted(volume).unwrap())
-        .collect();
-    assert_eq!(rebuilt, after);
+    assert_eq!(owner.posted(0).unwrap(), after);
 }
 
 #[test]
-fn corrected_piece_geometry_preserves_the_old_inverse_map_until_handoff() {
-    let bytes = archive(copy(), false);
-    let volumes = split(&bytes, 3);
-    let mut owner = Owner::new(store(), volumes.clone());
-    owner.whole(4096);
-    streamed(&owner);
-    let before = owner.object.geometry;
-    let mut out = Vec::new();
-    owner
-        .object
-        .sized(VolumeIndex(0), volumes[0].1.len() as u64 + 17, &mut out);
-    assert_eq!(out, vec![Emit::NeedsEngine(Why::OrderUnknown)]);
-    assert_eq!(
-        owner.object.geometry, before,
-        "old placement coordinates remain readable"
-    );
-    for (volume, (_, expected)) in volumes.iter().enumerate() {
-        assert_eq!(owner.posted(volume).as_ref(), Some(expected));
-    }
-    out.clear();
-    owner
-        .object
-        .sized(VolumeIndex(0), volumes[0].1.len() as u64 + 17, &mut out);
-    assert!(out.is_empty(), "the handoff is requested once");
-}
-
-#[test]
-fn unchanged_piece_geometry_does_not_restart_the_store() {
+fn a_file_longer_than_its_container_does_not_restart_the_store() {
     let bytes = archive(copy(), false);
     let mut owner = Owner::single(store(), bytes.clone());
     owner.whole(4096);
@@ -1130,7 +971,7 @@ fn unchanged_piece_geometry_does_not_restart_the_store() {
         .object
         .sized(VolumeIndex(0), bytes.len() as u64, &mut out);
     assert!(out.is_empty());
-    // More bytes after a single-volume container do not move any member.
+    // More bytes after the container do not move any member.
     owner
         .object
         .sized(VolumeIndex(0), bytes.len() as u64 + 17, &mut out);
@@ -1138,9 +979,6 @@ fn unchanged_piece_geometry_does_not_restart_the_store() {
         !out.iter()
             .any(|emit| matches!(emit, Emit::NeedsEngine(_) | Emit::Refuse(_)))
     );
-    assert_eq!(
-        owner.object.lengths[&VolumeIndex(0)],
-        bytes.len() as u64 + 17
-    );
+    assert_eq!(owner.object.length, Some(bytes.len() as u64 + 17));
     streamed(&owner);
 }

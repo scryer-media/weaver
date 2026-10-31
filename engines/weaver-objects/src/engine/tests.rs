@@ -4,7 +4,6 @@
 use weaver_graph::{Object, Seek, VolumeIndex};
 
 use crate::rar_engine::RarEngine;
-use crate::sevenz_engine::SevenZipEngine;
 use crate::testing::replay::{Step, contains, restores_alike};
 use crate::zip_engine::ZipEngine;
 
@@ -41,15 +40,10 @@ fn restored(engine: Box<dyn Object>, names: [&str; 3], last: u32) {
 }
 
 #[test]
-fn every_engine_restored_from_its_facts_claims_and_bids_alike() {
+fn every_engine_of_volumes_restored_from_its_facts_claims_and_bids_alike() {
     restored(
         Box::new(RarEngine::new()),
         ["alpha.part1.rar", "alpha.part2.rar", "alpha.part3.rar"],
-        2,
-    );
-    restored(
-        Box::new(SevenZipEngine::new()),
-        ["alpha.7z.001", "alpha.7z.002", "alpha.7z.003"],
         2,
     );
     restored(

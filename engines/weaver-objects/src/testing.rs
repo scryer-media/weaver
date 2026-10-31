@@ -8,7 +8,7 @@
 pub(crate) mod replay;
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use weaver_graph::recovery::MemberAccess;
 use weaver_graph::{
@@ -247,8 +247,13 @@ pub(crate) struct Store {
     // one fails, as the namespace's would, and a repair over one fills it.
     pub(crate) holes: BTreeMap<MemberId, Vec<ByteRange>>,
     pub(crate) reads: usize,
+    // The bytes of members read back.
+    pub(crate) read_bytes: u64,
     pub(crate) volume_reads: usize,
     pub(crate) writes: usize,
+    // A directory lent for work on files, as a namespace that keeps them
+    // lends one.
+    pub(crate) scratch: Option<PathBuf>,
 }
 
 impl MemberAccess for Store {
@@ -263,11 +268,16 @@ impl MemberAccess for Store {
         }
         match bytes.get(range.start as usize..range.end as usize) {
             Some(piece) => {
+                self.read_bytes += piece.len() as u64;
                 into.extend_from_slice(piece);
                 true
             }
             None => false,
         }
+    }
+
+    fn scratch(&mut self) -> Option<PathBuf> {
+        self.scratch.clone()
     }
 
     fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {

@@ -195,14 +195,15 @@ pub(crate) fn assemble_archive_password_candidates(
 }
 
 // The job half of the harvest, read from the database: the passwords
-// supplied with the job, then its persisted NZB's, and whether the read,
-// decrypt and parse succeeded (`harvested`).
+// supplied with the job, then its persisted NZB's, and whether the NZB's
+// parse succeeded (`harvested`). A missing row is an empty list; a row that
+// did not load is the loader's error.
 pub(crate) fn read_job_password_candidates(
     db: &crate::Database,
     job_id: JobId,
-) -> (Vec<ArchivePasswordCandidate>, bool) {
-    match db.load_active_job_password_sources(job_id) {
-        Ok(Some(((nzb_path, Some(nzb_zstd)), supplied))) => {
+) -> Result<(Vec<ArchivePasswordCandidate>, bool), crate::LoadError> {
+    Ok(match db.load_active_job_password_sources(job_id)? {
+        Some(((nzb_path, Some(nzb_zstd)), supplied)) => {
             match persisted_nzb_password_candidates(&nzb_path, &nzb_zstd) {
                 Ok(nzb) => (job_carried_password_candidates(&supplied, nzb), true),
                 Err(error) => {
@@ -215,17 +216,9 @@ pub(crate) fn read_job_password_candidates(
                 }
             }
         }
-        Ok(Some(((_, None), supplied))) => (supplied, true),
-        Ok(None) => (Vec::new(), true),
-        Err(error) => {
-            warn!(
-                job_id = job_id.0,
-                error = %error,
-                "failed to load password candidates for job"
-            );
-            (Vec::new(), false)
-        }
-    }
+        Some(((_, None), supplied)) => (supplied, true),
+        None => (Vec::new(), true),
+    })
 }
 
 impl Pipeline {
@@ -274,7 +267,15 @@ impl Pipeline {
         let carried = match state.and_then(|state| state.nzb_password_candidates.get()) {
             Some(cached) => cached.clone(),
             None => {
-                let (candidates, harvested) = read_job_password_candidates(&self.db, job_id);
+                let (candidates, harvested) = read_job_password_candidates(&self.db, job_id)
+                    .unwrap_or_else(|error| {
+                        warn!(
+                            job_id = job_id.0,
+                            error = %error,
+                            "failed to load password candidates for job"
+                        );
+                        (Vec::new(), false)
+                    });
                 // A job in the pipeline already has its row, and nothing
                 // adds NZB bytes or supplied passwords to a row later, so a
                 // missing row or NZB stays missing and its list is

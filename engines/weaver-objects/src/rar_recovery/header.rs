@@ -16,9 +16,9 @@
 // in source code comments of resulting package.
 
 // What a RAR recovery volume says of the set it rebuilds: how many data and
-// recovery volumes it has, and in RAR5, each data volume's size. The object
-// reads it to name the volumes no member carries; the restore checks every
-// checksum itself.
+// recovery volumes it has, and in RAR5, each data volume's size and CRC32.
+// The object reads it to name the volumes no member carries and to judge
+// each one that came; the restore checks every checksum again itself.
 
 use crate::grid;
 
@@ -35,6 +35,9 @@ pub(super) struct Header {
     // Each data volume's size, as a RAR5 volume's table gives it. A RAR3
     // volume is the width of the widest data volume.
     pub(super) sizes: Vec<u64>,
+    // Each data volume's CRC32 over all its bytes, as a RAR5 table gives it
+    // beside its size. A RAR3 footer gives none.
+    pub(super) crcs: Vec<u32>,
     // Whether the last size is the last volume's own: a RAR5 table's is,
     // while a RAR3 last volume falls short of the width.
     pub(super) last_described: bool,
@@ -89,16 +92,18 @@ fn body(raw: &[u8]) -> Option<Header> {
     // A recovery volume after the first may carry no table; the set's sizes
     // come from one that does.
     let mut sizes = Vec::new();
+    let mut crcs = Vec::new();
     if raw.len().saturating_sub(reader.at) >= data_count * 12 {
         for _ in 0..data_count {
             sizes.push(le_u64(reader.take(8)?));
-            let _crc = reader.take(4)?;
+            crcs.push(le_u32(reader.take(4)?));
         }
     }
     Some(Header {
         data_count: u32::try_from(data_count).ok()?,
         rec_count: u32::try_from(rec_count).ok()?,
         sizes,
+        crcs,
         last_described: true,
     })
 }
@@ -133,6 +138,7 @@ pub(super) fn rar3(footer: &[u8; RAR3_FOOTER], length: u64) -> Option<Header> {
         data_count,
         rec_count,
         sizes: vec![width; data_count as usize],
+        crcs: Vec::new(),
         last_described: false,
     })
 }

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Where bytes are: the inverse map from a volume range to members, the
-// envelope and held bytes; the forward map from a member to its volumes;
-// and the posted bytes rebuilt, re-enciphering an AES folder's plaintext.
+// Where bytes are: the inverse map from a range of the file to members, the
+// envelope and held bytes; the forward map from a member to its ranges of
+// the file; and the posted bytes rebuilt, re-enciphering an AES folder's
+// plaintext.
 //
 // Before the map, the signature, the end header, what follows it and the
 // header ranges the parse asked for are the envelope, and everything else is
@@ -19,8 +20,8 @@ use weaver_graph::{
 use super::header::SIGNATURE;
 use super::map::Map;
 use super::record::FolderPlaced;
-use super::{ENVELOPE, Lock, Out, SevenZipStore};
-use crate::crypt::{BLOCK, Cbc, Padding};
+use super::{ENVELOPE, FILE, Lock, Out, SevenZipStore};
+use crate::crypt::{BLOCK, Cbc, Padding, block_floor};
 
 // A piece of the container: the envelope and held bytes in container
 // coordinates, a member's at its own offsets.
@@ -70,44 +71,19 @@ fn push(out: &mut Vec<Placement>, placement: Placement) {
 }
 
 impl SevenZipStore {
-    pub(super) fn place(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
-        // Bytes past what the geometry gives a volume belong to nothing.
-        let overrun = Placement::Envelope {
-            envelope: ENVELOPE + 1 + volume.0,
-            range,
-        };
-        let Some(container) = self.container(volume, range) else {
-            match self.geometry {
-                Some(_) => push(out, overrun),
-                None => push(out, Placement::Held { range }),
-            }
-            return;
-        };
-        let base = self.base(volume);
+    pub(super) fn place(&self, range: ByteRange, out: &mut Vec<Placement>) {
         let mut pieces = Vec::new();
-        self.classify(container, &mut pieces);
+        self.classify(range, &mut pieces);
         for piece in pieces {
             let placement = match piece {
                 Piece::Envelope(range) => Placement::Envelope {
                     envelope: ENVELOPE,
                     range,
                 },
-                Piece::Held(range) => Placement::Held {
-                    range: range.shift(-(base as i64)),
-                },
+                Piece::Held(range) => Placement::Held { range },
                 Piece::Member(member, range) => Placement::Member { member, range },
             };
             push(out, placement);
-        }
-        let reached = container.end - base;
-        if reached < range.end {
-            push(
-                out,
-                Placement::Envelope {
-                    envelope: ENVELOPE + 1 + volume.0,
-                    range: ByteRange::new(reached.max(range.start), range.end),
-                },
-            );
         }
     }
 
@@ -188,18 +164,19 @@ impl SevenZipStore {
         }
     }
 
-    // The bytes posted at `range` of the volume come again: each member
+    // The bytes posted at `range` of the file come again: each member
     // they reached forgets what was said of them and is open until it is
     // said again, and a cipher that was ever open forgets the padding they
     // came out to. A locked folder's bytes were held, and nothing came out
-    // of them.
-    pub(super) fn unsay(&mut self, volume: VolumeIndex, range: ByteRange) {
-        let (Some(container), Some(map)) = (self.container(volume, range), &self.map) else {
+    // of them. A cipher block comes out whole, so an enciphered span is
+    // un-said from the start of the block it starts in.
+    pub(super) fn unsay(&mut self, range: ByteRange) {
+        let Some(map) = &self.map else {
             return;
         };
         let mut pieces = Vec::new();
-        for (index, folder) in map.folders_in(container) {
-            let Some(part) = container.intersect(folder.pack) else {
+        for (index, folder) in map.folders_in(range) {
+            let Some(part) = range.intersect(folder.pack) else {
                 continue;
             };
             let local = part.shift(-(folder.pack.start as i64));
@@ -214,13 +191,17 @@ impl SevenZipStore {
                 }
                 false => local,
             };
-            let said = match lock {
+            let (local, said) = match lock {
                 Lock::Locked => continue,
-                Lock::Plain => local,
-                Lock::Open(..) | Lock::Sealed(..) => ByteRange::new(
-                    local.start.min(folder.plain_len),
-                    local.end.min(folder.plain_len),
-                ),
+                Lock::Plain => (local, local),
+                Lock::Open(..) | Lock::Sealed(..) => {
+                    let local = ByteRange::new(block_floor(local.start), local.end);
+                    let said = ByteRange::new(
+                        local.start.min(folder.plain_len),
+                        local.end.min(folder.plain_len),
+                    );
+                    (local, said)
+                }
             };
             classify_plain(map, index, said, folder.pack.start, &mut pieces);
             if let Some(padding) = lock.padding_mut() {
@@ -278,37 +259,32 @@ impl SevenZipStore {
         } else {
             container
         };
-        let mut pieces = Vec::new();
-        self.to_volumes(container, &mut pieces);
-        out.extend(
-            pieces
-                .into_iter()
-                .map(|(volume, range)| Extent { volume, range }),
-        );
+        out.push(Extent {
+            volume: FILE,
+            range: container,
+        });
         Located::Whole
     }
 
-    // The posted bytes of these ranges of the store's volumes, as it stands
-    // now: their inverse map, and every open folder's cipher with the map
-    // and what its members said, shared, so the cipher can be put back over
-    // the plaintext away from the store.
+    // The posted bytes of these ranges of the file, as it stands now: their
+    // inverse map, and every open folder's cipher with the map and what its
+    // members said, shared, so the cipher can be put back over the
+    // plaintext away from the store.
     pub(super) fn posted_over(&self, ranges: &[(VolumeIndex, ByteRange)]) -> Posted {
-        let placed = Placements::take(ranges, |volume, range, out| self.place(volume, range, out));
+        let placed = Placements::take(ranges, |_, range, out| self.place(range, out));
         let mut sealed = Vec::new();
-        for &(volume, range) in ranges {
-            let (Some(container), Some(map)) = (self.container(volume, range), &self.map) else {
+        for &(_, range) in ranges {
+            let Some(map) = &self.map else {
                 continue;
             };
-            for (index, folder) in map.folders_in(container) {
+            for (index, folder) in map.folders_in(range) {
                 let (Lock::Open(cbc, padding), Some(part)) =
-                    (&self.folders[index], container.intersect(folder.pack))
+                    (&self.folders[index], range.intersect(folder.pack))
                 else {
                     continue;
                 };
                 sealed.push(Sealed {
-                    volume,
                     part,
-                    base: self.base(volume),
                     folder: index,
                     pack: folder.pack.start,
                     cbc: Arc::clone(cbc),
@@ -325,13 +301,10 @@ impl SevenZipStore {
     }
 }
 
-// An open folder's part of a volume, in container coordinates, with where
-// the volume and the folder start there, and the folder's cipher and its
-// padding as they stood.
+// An open folder's part of the file, with where the folder starts, and the
+// folder's cipher and its padding as they stood.
 struct Sealed {
-    volume: VolumeIndex,
     part: ByteRange,
-    base: u64,
     folder: usize,
     pack: u64,
     cbc: Arc<Cbc>,
@@ -357,14 +330,14 @@ impl Posting for Posted {
         into: &mut Vec<u8>,
     ) -> bool {
         let mut cursor = range.start;
-        for sealed in self.sealed.iter().filter(|sealed| sealed.volume == volume) {
-            let Some(part) = sealed.part.intersect(range.shift(sealed.base as i64)) else {
+        for sealed in &self.sealed {
+            let Some(part) = sealed.part.intersect(range) else {
                 continue;
             };
             let Some(map) = &self.map else {
                 return false;
             };
-            let start = part.start - sealed.base;
+            let start = part.start;
             if start > cursor
                 && !self
                     .placed
@@ -388,7 +361,7 @@ impl Posting for Posted {
             {
                 return false;
             }
-            cursor = part.end - sealed.base;
+            cursor = part.end;
         }
         cursor >= range.end
             || self

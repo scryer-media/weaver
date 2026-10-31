@@ -80,113 +80,113 @@
       }
     },
     "rar5_solid_encrypted_small.rar": {
-      "part0.bin": {
+      "part0.mkv": {
         "size": 8193,
         "sha256": "969af86b1b176e2da8e4444723e8997b0d0be1e140d76664d41baeea66b35b36"
       },
-      "part1.bin": {
+      "part1.mkv": {
         "size": 8193,
         "sha256": "da325bf9645e0423d48052c04840b640fe2f9f5404edb799d18e371a669d6e2c"
       },
-      "part2.bin": {
+      "part2.mkv": {
         "size": 8193,
         "sha256": "10e4ebe6d6bbfaac2603bcb11a3e769ba30084b17966cbb57dbb260b3f0a6237"
       }
     },
     "rar5_solid_headers_small.rar": {
-      "part0.bin": {
+      "part0.mkv": {
         "size": 8193,
         "sha256": "969af86b1b176e2da8e4444723e8997b0d0be1e140d76664d41baeea66b35b36"
       },
-      "part1.bin": {
+      "part1.mkv": {
         "size": 8193,
         "sha256": "da325bf9645e0423d48052c04840b640fe2f9f5404edb799d18e371a669d6e2c"
       },
-      "part2.bin": {
+      "part2.mkv": {
         "size": 8193,
         "sha256": "10e4ebe6d6bbfaac2603bcb11a3e769ba30084b17966cbb57dbb260b3f0a6237"
       }
     },
     "rar5_solid_small.rar": {
-      "part0.bin": {
+      "part0.mkv": {
         "size": 8193,
         "sha256": "969af86b1b176e2da8e4444723e8997b0d0be1e140d76664d41baeea66b35b36"
       },
-      "part1.bin": {
+      "part1.mkv": {
         "size": 8193,
         "sha256": "da325bf9645e0423d48052c04840b640fe2f9f5404edb799d18e371a669d6e2c"
       },
-      "part2.bin": {
+      "part2.mkv": {
         "size": 8193,
         "sha256": "10e4ebe6d6bbfaac2603bcb11a3e769ba30084b17966cbb57dbb260b3f0a6237"
       }
     },
     "rar4_solid_lz_encrypted.rar": {
-      "part0.bin": {
+      "part0.mkv": {
         "size": 8193,
         "sha256": "969af86b1b176e2da8e4444723e8997b0d0be1e140d76664d41baeea66b35b36"
       },
-      "part1.bin": {
+      "part1.mkv": {
         "size": 8193,
         "sha256": "da325bf9645e0423d48052c04840b640fe2f9f5404edb799d18e371a669d6e2c"
       },
-      "part2.bin": {
+      "part2.mkv": {
         "size": 8193,
         "sha256": "10e4ebe6d6bbfaac2603bcb11a3e769ba30084b17966cbb57dbb260b3f0a6237"
       }
     },
     "rar4_solid_lz_headers.rar": {
-      "part0.bin": {
+      "part0.mkv": {
         "size": 8193,
         "sha256": "969af86b1b176e2da8e4444723e8997b0d0be1e140d76664d41baeea66b35b36"
       },
-      "part1.bin": {
+      "part1.mkv": {
         "size": 8193,
         "sha256": "da325bf9645e0423d48052c04840b640fe2f9f5404edb799d18e371a669d6e2c"
       },
-      "part2.bin": {
+      "part2.mkv": {
         "size": 8193,
         "sha256": "10e4ebe6d6bbfaac2603bcb11a3e769ba30084b17966cbb57dbb260b3f0a6237"
       }
     },
     "rar4_solid_ppmd_plain.rar": {
-      "part0.bin": {
+      "part0.mkv": {
         "size": 8193,
         "sha256": "969af86b1b176e2da8e4444723e8997b0d0be1e140d76664d41baeea66b35b36"
       },
-      "part1.bin": {
+      "part1.mkv": {
         "size": 8193,
         "sha256": "da325bf9645e0423d48052c04840b640fe2f9f5404edb799d18e371a669d6e2c"
       },
-      "part2.bin": {
+      "part2.mkv": {
         "size": 8193,
         "sha256": "10e4ebe6d6bbfaac2603bcb11a3e769ba30084b17966cbb57dbb260b3f0a6237"
       }
     },
     "rar4_solid_ppmd_encrypted.rar": {
-      "part0.bin": {
+      "part0.mkv": {
         "size": 8193,
         "sha256": "969af86b1b176e2da8e4444723e8997b0d0be1e140d76664d41baeea66b35b36"
       },
-      "part1.bin": {
+      "part1.mkv": {
         "size": 8193,
         "sha256": "da325bf9645e0423d48052c04840b640fe2f9f5404edb799d18e371a669d6e2c"
       },
-      "part2.bin": {
+      "part2.mkv": {
         "size": 8193,
         "sha256": "10e4ebe6d6bbfaac2603bcb11a3e769ba30084b17966cbb57dbb260b3f0a6237"
       }
     },
     "rar4_solid_ppmd_headers.rar": {
-      "part0.bin": {
+      "part0.mkv": {
         "size": 8193,
         "sha256": "969af86b1b176e2da8e4444723e8997b0d0be1e140d76664d41baeea66b35b36"
       },
-      "part1.bin": {
+      "part1.mkv": {
         "size": 8193,
         "sha256": "da325bf9645e0423d48052c04840b640fe2f9f5404edb799d18e371a669d6e2c"
       },
-      "part2.bin": {
+      "part2.mkv": {
         "size": 8193,
         "sha256": "10e4ebe6d6bbfaac2603bcb11a3e769ba30084b17966cbb57dbb260b3f0a6237"
       }

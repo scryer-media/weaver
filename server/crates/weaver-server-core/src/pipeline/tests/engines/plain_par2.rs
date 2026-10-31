@@ -297,10 +297,10 @@ async fn a_damaged_article_without_par2_fails_with_the_file_claimed_damaged() {
 async fn a_damaged_member_no_set_covers_is_a_damaged_leaf() {
     let covered_data = payload(3 * ARTICLE, 10);
     let mut posts = vec![
-        Post::plain("lantern.bin", covered_data.clone()),
-        Post::plain("beacon.bin", payload(3 * ARTICLE, 11)),
+        Post::plain("lantern.mkv", covered_data.clone()),
+        Post::plain("beacon.mkv", payload(3 * ARTICLE, 11)),
     ];
-    posts.extend(par2_set("lantern", &[("lantern.bin", &covered_data)], 2));
+    posts.extend(par2_set("lantern", &[("lantern.mkv", &covered_data)], 2));
     let scenario = Scenario::new(posts).damaged(1, 1);
     let graph = run(&scenario).await;
     assert!(graph.refetched().is_empty());
@@ -311,11 +311,11 @@ async fn a_damaged_member_no_set_covers_is_a_damaged_leaf() {
         "{:?}",
         graph.failure
     );
-    assert_eq!(graph.claims["lantern.bin"], Claim::Complete);
-    assert_eq!(graph.claims["beacon.bin"], Claim::Damaged);
+    assert_eq!(graph.claims["lantern.mkv"], Claim::Complete);
+    assert_eq!(graph.claims["beacon.mkv"], Claim::Damaged);
     let view = graph.graph();
-    assert_eq!(view.claims["lantern.bin"], Claim::Complete);
-    assert_eq!(view.claims["beacon.bin"], Claim::Damaged, "a damaged leaf");
+    assert_eq!(view.claims["lantern.mkv"], Claim::Complete);
+    assert_eq!(view.claims["beacon.mkv"], Claim::Damaged, "a damaged leaf");
 }
 
 // The grid: every article of a clean PAR2 job arrived with a verified

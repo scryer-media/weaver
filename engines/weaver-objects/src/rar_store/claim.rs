@@ -26,11 +26,10 @@ use std::io::Cursor;
 use std::sync::Arc;
 
 use unrar_rs::{ArchiveFormat, KdfCache, RarArchive, RarVolumeFacts, RarVolumeMemberFacts};
-use weaver_graph::VolumeIndex;
+use weaver_graph::{Claim, VolumeIndex};
 
 use super::{RarStore, Volume};
 use crate::engine::SetName;
-use crate::quiet::Placed;
 use crate::rar_engine::naming;
 
 // A volume of the set already held, as far as it places the next: what its
@@ -218,20 +217,18 @@ fn continues(tail: &RarVolumeMemberFacts, head: &RarVolumeMemberFacts) -> bool {
 }
 
 impl RarStore {
-    pub(super) fn claim_volume(&self, name: &str, first_bytes: &[u8]) -> Option<Placed> {
-        let format = unrar_rs::signature::read_signature(&mut Cursor::new(first_bytes)).ok()?;
+    pub(super) fn claim_volume(&self, name: &str, first_bytes: &[u8]) -> Claim {
+        let Ok(format) = unrar_rs::signature::read_signature(&mut Cursor::new(first_bytes)) else {
+            return Claim::default();
+        };
         self.claim_as(name, format, self.front_facts(first_bytes).as_ref())
     }
 
     // A transferable volume is judged by its parsed headers, or by the
     // retained front and name while those headers say nothing. Both are
-    // the same evidence an unowned member offers, without reading it again.
-    pub(super) fn reclaim_volume(
-        &self,
-        name: &str,
-        front: &[u8],
-        given: &Volume,
-    ) -> Option<Placed> {
+    // the same evidence an unowned member offers, without reading it again,
+    // and are answered as it is, not yet included.
+    pub(super) fn reclaim_volume(&self, name: &str, front: &[u8], given: &Volume) -> Claim {
         self.reclaim_front(name, front, given.stated())
     }
 
@@ -240,29 +237,23 @@ impl RarStore {
         name: &str,
         front: &[u8],
         facts: Option<&RarVolumeFacts>,
-    ) -> Option<Placed> {
+    ) -> Claim {
         match facts {
             Some(facts) if facts.is_volume => {
                 self.claim_as(name, facts.archive_format(), Some(facts))
             }
-            Some(_) => None,
+            Some(_) => Claim::default(),
             None => self.claim_volume(name, front),
         }
     }
 
-    // One past every volume the set holds.
-    pub(super) fn past(&self) -> Option<VolumeIndex> {
-        Placed::past(self.volumes.keys().next_back().map(|volume| volume.0))
-    }
-
-    fn claim_as(
-        &self,
-        name: &str,
-        format: ArchiveFormat,
-        facts: Option<&RarVolumeFacts>,
-    ) -> Option<Placed> {
+    // The places a volume's headers and name give it in this set. Headers
+    // that give it a place its name gives another set are judged by the
+    // volumes beside it, by its file headers; a front that has none of
+    // those yet is not yet judged, and its places are what it gives now.
+    fn claim_as(&self, name: &str, format: ArchiveFormat, facts: Option<&RarVolumeFacts>) -> Claim {
         if self.holds_other_than(format) {
-            return None;
+            return Claim::default();
         }
         // The set's numbering is the one the bound names share; before any
         // is bound, the one this member's own name gives. Each bound name
@@ -296,6 +287,8 @@ impl RarStore {
         // state is the volume's only where a held volume beside it judged
         // it, or where nothing gives the volume to another set.
         let (headers, judged) = facts.map_or((None, false), |facts| self.claim_by_headers(facts));
+        let unread = facts.is_some_and(|facts| Nameless { facts }.unread());
+        let not_yet = headers.is_some() && !judged && elsewhere && unread;
         let headers = headers.filter(|_| judged || !elsewhere);
         // A new numbering can refine an established header link, but an
         // unrelated name cannot invent membership beside opaque labels.
@@ -304,14 +297,19 @@ impl RarStore {
         // posted again is that volume.
         let placed = match (headers, named) {
             (Some(placed), _) if stated => Some(placed),
-            (_, Some(named)) => Some(Placed::At(named)),
+            (_, Some(named)) => Some(named),
             (linked, None) => linked,
         };
         // A set ends at the volume that says no volume follows it.
-        placed.filter(|placed| match placed {
-            Placed::At(at) => self.last().is_none_or(|last| *at <= last),
-            Placed::Among(_) => true,
-        })
+        let places: Vec<VolumeIndex> = placed
+            .filter(|at| self.last().is_none_or(|last| *at <= last))
+            .into_iter()
+            .collect();
+        if not_yet {
+            Claim::NotYet(places)
+        } else {
+            Claim::Places(places)
+        }
     }
 
     // What a front states, read with the store's own keys.
@@ -326,7 +324,7 @@ impl RarStore {
 
     // The position this volume's headers give it beside the volumes held,
     // and whether a held volume beside it judged that position.
-    fn claim_by_headers(&self, facts: &RarVolumeFacts) -> (Option<Placed>, bool) {
+    fn claim_by_headers(&self, facts: &RarVolumeFacts) -> (Option<VolumeIndex>, bool) {
         let held = Bound(&self.volumes);
         (place(facts, &held), judged(facts, &held))
     }
@@ -412,13 +410,13 @@ pub(super) fn yields(
 // own headers say it is not, a name least of all.
 pub(super) fn settled(index: VolumeIndex, volume: &Volume) -> bool {
     let facts = volume.stated();
-    volume.walk.ended
-        || (!facts.is_some_and(|facts| misplaced(index, facts))
-            && (facts.is_some_and(states_position)
-                || volume
-                    .numbered
-                    .as_ref()
-                    .is_some_and(|name| name.index() == index.0)))
+    !facts.is_some_and(|facts| misplaced(index, facts))
+        && (volume.walk.ended
+            || facts.is_some_and(states_position)
+            || volume
+                .numbered
+                .as_ref()
+                .is_some_and(|name| name.index() == index.0))
 }
 
 // The position a volume's headers give it beside the volumes held, by
@@ -435,7 +433,7 @@ pub(super) fn settled(index: VolumeIndex, volume: &Volume) -> bool {
 // where a RAR4 volume states its number. Where no free place takes it, it
 // is the one held place its neighbours link it to, posted again; whether it
 // is that volume its bytes say, which the tree compares.
-pub(crate) fn place(facts: &RarVolumeFacts, held: &impl Holds) -> Option<Placed> {
+pub(crate) fn place(facts: &RarVolumeFacts, held: &impl Holds) -> Option<VolumeIndex> {
     let this = Nameless { facts };
     let joins = |previous: &Held<'_>, index: u32| {
         previous.successor != Some(false)
@@ -461,7 +459,7 @@ pub(crate) fn place(facts: &RarVolumeFacts, held: &impl Holds) -> Option<Placed>
                     && this.runs_into(&next)
             })
         });
-        return (before && after).then_some(Placed::At(VolumeIndex(stated)));
+        return (before && after).then_some(VolumeIndex(stated));
     }
     let precedes = |next: &Held<'_>, index: u32| {
         next.facts
@@ -487,11 +485,11 @@ pub(crate) fn place(facts: &RarVolumeFacts, held: &impl Holds) -> Option<Placed>
         .filter(|slot| held.at(*slot).is_none() && fits(*slot))
         .min();
     if let Some(lowest) = lowest {
-        return Some(Placed::At(VolumeIndex(lowest)));
+        return Some(VolumeIndex(lowest));
     }
     let mut again = held.indices().filter(|slot| fits(*slot));
     match (again.next(), again.next()) {
-        (Some(only), None) => Some(Placed::At(VolumeIndex(only))),
+        (Some(only), None) => Some(VolumeIndex(only)),
         _ => None,
     }
 }

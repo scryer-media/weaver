@@ -16,7 +16,7 @@ use crate::jobs::model::JobStatus;
 // Twelve files of four articles each.
 fn files() -> Vec<Post> {
     (0..12u8)
-        .map(|at| Post::plain(&format!("lantern{at:02}.bin"), payload(4 * ARTICLE, at)))
+        .map(|at| Post::plain(&format!("lantern{at:02}.mkv"), payload(4 * ARTICLE, at)))
         .collect()
 }
 
@@ -32,7 +32,7 @@ async fn a_post_whose_first_articles_are_lost_fails_before_its_payload_is_fetche
     // The feed abandons the files that lost an article and keeps fetching
     // the others, which arrive whole.
     assert_eq!(graph.status, Some(crate::jobs::model::JobStatus::Partial));
-    for name in ["lantern10.bin", "lantern11.bin"] {
+    for name in ["lantern10.mkv", "lantern11.mkv"] {
         assert_eq!(graph.claims.get(name), Some(&Claim::Complete), "{name}");
     }
 }
@@ -48,14 +48,14 @@ async fn a_file_whose_every_article_is_lost_has_no_file() {
     let graph = run(&scenario).await;
     assert_eq!(graph.status, Some(JobStatus::Partial));
     for at in 0..11 {
-        let name = format!("lantern{at:02}.bin");
+        let name = format!("lantern{at:02}.mkv");
         assert_eq!(graph.claims.get(&name), Some(&Claim::Complete), "{name}");
     }
     assert!(
         !graph
             .files
             .keys()
-            .any(|path| path.ends_with("lantern11.bin")),
+            .any(|path| path.ends_with("lantern11.mkv")),
         "{:?}",
         graph.files.keys().collect::<Vec<_>>()
     );
@@ -70,7 +70,7 @@ async fn a_file_whose_every_article_is_lost_has_no_file() {
 #[tokio::test]
 async fn a_post_whose_every_first_article_is_lost_fails_on_the_sample_never_on_its_health() {
     let posts: Vec<Post> = (0..10u8)
-        .map(|at| Post::plain(&format!("lantern{at:02}.bin"), payload(2 * ARTICLE, at)))
+        .map(|at| Post::plain(&format!("lantern{at:02}.mkv"), payload(2 * ARTICLE, at)))
         .collect();
     let scenario = (0..10).fold(Scenario::new(posts), |scenario, file| {
         scenario.lost(file, 0)
@@ -95,7 +95,7 @@ async fn a_post_whose_every_first_article_is_lost_fails_on_the_sample_never_on_i
 #[tokio::test]
 async fn a_first_article_lost_before_a_restart_still_counts_toward_the_sample() {
     let posts: Vec<Post> = (0..10u8)
-        .map(|at| Post::plain(&format!("lantern{at:02}.bin"), payload(2 * ARTICLE, at)))
+        .map(|at| Post::plain(&format!("lantern{at:02}.mkv"), payload(2 * ARTICLE, at)))
         .collect();
     let scenario = (0..10).fold(Scenario::new(posts), |scenario, file| {
         scenario.lost(file, 0)
@@ -153,7 +153,7 @@ async fn committed_feed_verdict_survives_restart_without_fetching_abandoned_file
         assert_eq!(fetched, vec![(file, 0)], "abandoned file {file} restarted");
     }
     for file in 10..12u8 {
-        let suffix = format!("lantern{file:02}.bin");
+        let suffix = format!("lantern{file:02}.mkv");
         let (_, delivered) = restarted
             .files
             .iter()
@@ -170,7 +170,7 @@ async fn the_sample_is_the_payloads_first_articles_and_not_its_recoverys() {
     // too small to rebuild them. The sample is the twelve files and the
     // index; the recovery volumes would have diluted it below the share.
     let payload_files: Vec<(String, Vec<u8>)> = (0..12u8)
-        .map(|at| (format!("lantern{at:02}.bin"), payload(512 * ARTICLE, at)))
+        .map(|at| (format!("lantern{at:02}.mkv"), payload(512 * ARTICLE, at)))
         .collect();
     let named: Vec<(&str, &[u8])> = payload_files
         .iter()
@@ -195,7 +195,7 @@ async fn the_sample_is_the_payloads_first_articles_and_not_its_recoverys() {
         "{:?}",
         graph.failure
     );
-    assert_eq!(graph.claims.get("lantern11.bin"), Some(&Claim::Complete));
+    assert_eq!(graph.claims.get("lantern11.mkv"), Some(&Claim::Complete));
 }
 
 #[tokio::test]
@@ -205,7 +205,7 @@ async fn a_sample_short_of_the_share_at_or_above_critical_leaves_the_post_to_its
     // or above its critical line: the feed rules nothing, and the set
     // rebuilds what was lost.
     let payload_files: Vec<(String, Vec<u8>)> = (0..12u8)
-        .map(|at| (format!("lantern{at:02}.bin"), payload(4 * ARTICLE, at)))
+        .map(|at| (format!("lantern{at:02}.mkv"), payload(4 * ARTICLE, at)))
         .collect();
     let named: Vec<(&str, &[u8])> = payload_files
         .iter()
@@ -227,7 +227,7 @@ async fn a_sample_short_of_the_share_at_or_above_critical_leaves_the_post_to_its
 #[tokio::test]
 async fn first_articles_the_recovery_covers_leave_the_post_to_its_repair() {
     let payload_files: Vec<(String, Vec<u8>)> = (0..10u8)
-        .map(|at| (format!("lantern{at:02}.bin"), payload(ARTICLE, at)))
+        .map(|at| (format!("lantern{at:02}.mkv"), payload(ARTICLE, at)))
         .collect();
     let named: Vec<(&str, &[u8])> = payload_files
         .iter()
@@ -253,10 +253,10 @@ async fn losses_past_every_reachable_recovery_block_fail_before_the_payload_is_f
     // Sixty slices of payload, fifteen recovery blocks, and twenty slices
     // lost from the second article on, under the scheduler's leases.
     let bytes = payload(60 * ARTICLE, 7);
-    let mut posts = vec![Post::plain("lantern.bin", bytes.clone())];
+    let mut posts = vec![Post::plain("lantern.mkv", bytes.clone())];
     posts.extend(par2_set(
         "lantern",
-        &[("lantern.bin", bytes.as_slice())],
+        &[("lantern.mkv", bytes.as_slice())],
         15,
     ));
     let scenario = (1..=20).fold(Scenario::new(posts).leased(), |scenario, ordinal| {
@@ -269,7 +269,7 @@ async fn losses_past_every_reachable_recovery_block_fail_before_the_payload_is_f
     assert_eq!(
         graph.failure.as_deref(),
         Some(
-            "PAR2 recovery failed for 1 set(s): lantern.par2 (lantern.bin): not repairable: \
+            "PAR2 recovery failed for 1 set(s): lantern.par2 (lantern.mkv): not repairable: \
              20 damaged slices, only 15 recovery blocks reachable"
         )
     );
@@ -294,7 +294,7 @@ async fn a_post_whose_every_article_is_gone_fails_below_critical() {
     // deleted, so no recovery block can be had. The payload outweighs its
     // recovery as a real post's does, so the health has a critical line.
     let payload_files: Vec<(String, Vec<u8>)> = (0..4u8)
-        .map(|at| (format!("lantern{at:02}.bin"), payload(512 * ARTICLE, at)))
+        .map(|at| (format!("lantern{at:02}.mkv"), payload(512 * ARTICLE, at)))
         .collect();
     let named: Vec<(&str, &[u8])> = payload_files
         .iter()
@@ -336,7 +336,7 @@ async fn a_release_posted_as_its_first_articles_alone_fails_on_its_probe_before_
     // file's first gone: the sample finds every head, so only a probe can
     // tell the post is not coming.
     let posts: Vec<Post> = (0..3u8)
-        .map(|at| Post::plain(&format!("lantern{at:02}.bin"), payload(40 * ARTICLE, at)))
+        .map(|at| Post::plain(&format!("lantern{at:02}.mkv"), payload(40 * ARTICLE, at)))
         .collect();
     let scenario = (0..3u32)
         .flat_map(|file| (1..40u32).map(move |ordinal| (file, ordinal)))
@@ -363,7 +363,7 @@ async fn a_post_with_no_recovery_fails_at_critical_before_the_rest_is_fetched() 
     // uploaded and no probe is armed. With nothing that could rebuild the
     // file, its losses fail the post once its health is at or below
     // critical, long before its last article is asked for.
-    let posts = vec![Post::plain("lantern.bin", payload(60 * ARTICLE, 7))];
+    let posts = vec![Post::plain("lantern.mkv", payload(60 * ARTICLE, 7))];
     let scenario = (1..60)
         .step_by(2)
         .fold(Scenario::new(posts), |scenario, ordinal| {
@@ -391,7 +391,7 @@ async fn a_post_whose_only_recovery_is_par3_defers_to_it_below_critical() {
     // declares and it reaches past the loss, so the verdict waits on it,
     // and it rebuilds both files.
     let payload_files: Vec<(String, Vec<u8>)> = (0..2u8)
-        .map(|at| (format!("lantern{at:02}.bin"), payload(10 * ARTICLE, at)))
+        .map(|at| (format!("lantern{at:02}.mkv"), payload(10 * ARTICLE, at)))
         .collect();
     let named: Vec<(&str, &[u8])> = payload_files
         .iter()
@@ -421,7 +421,7 @@ async fn a_post_whose_only_recovery_is_par3_defers_to_it_below_critical() {
 #[tokio::test]
 async fn a_post_taken_down_fails_on_the_feeds_health_before_the_graph_rules() {
     let posts: Vec<Post> = (0..3u8)
-        .map(|at| Post::plain(&format!("lantern{at:02}.bin"), payload(40 * ARTICLE, at)))
+        .map(|at| Post::plain(&format!("lantern{at:02}.mkv"), payload(40 * ARTICLE, at)))
         .collect();
     let scenario = (0..3u32)
         .flat_map(|file| (1..40u32).map(move |ordinal| (file, ordinal)))
@@ -447,10 +447,10 @@ async fn a_post_taken_down_fails_on_the_feeds_health_before_the_graph_rules() {
 #[tokio::test]
 async fn a_par2_set_refused_one_range_past_its_blocks_fails_in_its_own_words() {
     let bytes = payload(200 * ARTICLE, 7);
-    let mut posts = vec![Post::plain("lantern.bin", bytes.clone())];
+    let mut posts = vec![Post::plain("lantern.mkv", bytes.clone())];
     posts.extend(par2_set(
         "lantern",
-        &[("lantern.bin", bytes.as_slice())],
+        &[("lantern.mkv", bytes.as_slice())],
         40,
     ));
     let scenario = (1..=41).fold(Scenario::new(posts).leased(), |scenario, ordinal| {
@@ -460,7 +460,7 @@ async fn a_par2_set_refused_one_range_past_its_blocks_fails_in_its_own_words() {
     assert_eq!(
         graph.failure.as_deref(),
         Some(
-            "PAR2 recovery failed for 1 set(s): lantern.par2 (lantern.bin): not repairable: \
+            "PAR2 recovery failed for 1 set(s): lantern.par2 (lantern.mkv): not repairable: \
              41 damaged slices, only 40 recovery blocks reachable"
         )
     );
@@ -495,7 +495,7 @@ async fn a_rev_set_refused_three_volumes_with_one_rev_rules_impossible() {
 // the file and the job fails.
 #[tokio::test]
 async fn a_post_with_no_recovery_whose_every_article_is_refused_fails() {
-    let posts = vec![Post::plain("lantern.bin", payload(4 * ARTICLE, 7))];
+    let posts = vec![Post::plain("lantern.mkv", payload(4 * ARTICLE, 7))];
     let scenario = (0..4).fold(Scenario::new(posts), |scenario, ordinal| {
         scenario.lost(0, ordinal)
     });
@@ -535,9 +535,9 @@ async fn a_whole_volume_no_object_opened_is_not_a_usable_file() {
 }
 
 // A stored RAR holding two files and a PAR2 set over them, one recovery
-// block in it. Two articles inside `quill.bin` are refused by every
+// block in it. Two articles inside `quill.mkv` are refused by every
 // server, past what the nested set can rebuild: the set rules impossible
-// and says so, `ember.bin` unpacks whole, and the job ends Partial on that
+// and says so, `ember.mkv` unpacks whole, and the job ends Partial on that
 // one usable file, never Failed.
 #[tokio::test]
 async fn a_nested_par2_set_ruled_impossible_leaves_the_whole_file_partial() {
@@ -546,8 +546,8 @@ async fn a_nested_par2_set_ruled_impossible_leaves_the_whole_file_partial() {
     let archive = par2_in_store(
         "inner",
         &[
-            ("ember.bin", ember.as_slice()),
-            ("quill.bin", quill.as_slice()),
+            ("ember.mkv", ember.as_slice()),
+            ("quill.mkv", quill.as_slice()),
         ],
         1,
     );
@@ -571,7 +571,7 @@ async fn a_nested_par2_set_ruled_impossible_leaves_the_whole_file_partial() {
             .map(|(_, bytes)| bytes.clone())
     };
     assert_eq!(
-        delivered("ember.bin"),
+        delivered("ember.mkv"),
         Some(ember),
         "{:?}",
         graph.files.keys()
@@ -586,7 +586,7 @@ async fn a_nested_par2_set_ruled_impossible_leaves_the_whole_file_partial() {
     );
 }
 
-// The same nested set with blocks to spare: one article inside `quill.bin`
+// The same nested set with blocks to spare: one article inside `quill.mkv`
 // refused by every server is rebuilt by the set inside the archive, and
 // the job completes with both files whole.
 #[tokio::test]
@@ -596,8 +596,8 @@ async fn a_nested_par2_set_rebuilds_a_refused_article_inside_a_stored_rar() {
     let archive = par2_in_store(
         "inner",
         &[
-            ("ember.bin", ember.as_slice()),
-            ("quill.bin", quill.as_slice()),
+            ("ember.mkv", ember.as_slice()),
+            ("quill.mkv", quill.as_slice()),
         ],
         8,
     );
@@ -612,8 +612,8 @@ async fn a_nested_par2_set_rebuilds_a_refused_article_inside_a_stored_rar() {
             .find(|(path, _)| path.rsplit('/').next() == Some(name))
             .map(|(_, bytes)| bytes.clone())
     };
-    assert_eq!(delivered("ember.bin"), Some(ember));
-    assert_eq!(delivered("quill.bin"), Some(quill));
+    assert_eq!(delivered("ember.mkv"), Some(ember));
+    assert_eq!(delivered("quill.mkv"), Some(quill));
 }
 
 // A job whose root is done has nothing downloading for the feed's health
@@ -624,7 +624,7 @@ async fn the_feed_forgets_its_probe_when_the_job_leaves_the_root() {
     use crate::pipeline::graph::root::phase::RootPhase;
     use crate::pipeline::tests::{hear_graph_mail, retire_pipeline_database};
 
-    let post = Post::plain("lantern.bin", payload(4 * ARTICLE, 7));
+    let post = Post::plain("lantern.mkv", payload(4 * ARTICLE, 7));
     let articles = post.bytes.len().div_ceil(ARTICLE) as u32;
     let scenario = Scenario::new(vec![post]);
     let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
@@ -652,7 +652,7 @@ async fn the_feed_forgets_its_probe_when_the_job_leaves_the_root() {
 #[tokio::test]
 async fn a_post_dead_on_its_health_is_dead_after_a_restart() {
     let scenario = (2..8u32).fold(
-        Scenario::new(vec![Post::plain("lantern.bin", payload(10 * ARTICLE, 174))]),
+        Scenario::new(vec![Post::plain("lantern.mkv", payload(10 * ARTICLE, 174))]),
         |scenario, ordinal| scenario.lost(0, ordinal),
     );
     let whole = run(&scenario).await;
@@ -673,8 +673,8 @@ async fn a_post_dead_on_its_health_is_dead_after_a_restart() {
 #[tokio::test]
 async fn a_set_starved_of_its_volumes_is_starved_after_a_restart() {
     let body = payload(10 * ARTICLE, 176);
-    let mut posts = vec![Post::plain("lantern.bin", body.clone())];
-    posts.extend(par2_volumes("lantern", &[("lantern.bin", &body)], 8, 2));
+    let mut posts = vec![Post::plain("lantern.mkv", body.clone())];
+    posts.extend(par2_volumes("lantern", &[("lantern.mkv", &body)], 8, 2));
     // The index arrives; both volumes are lost whole.
     let volumes: Vec<(u32, u32)> = posts[2..]
         .iter()

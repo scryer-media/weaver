@@ -28,8 +28,8 @@ use std::marker::PhantomData;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
-    Budget, ByteRange, Delivery, Durable, Emit, Engine, Extent, Extraction, Facts, Kind, Located,
-    MemberId, Object, Placement, Pull, Seek, Standing, VolumeIndex,
+    Budget, ByteRange, Claim, Delivery, Durable, Emit, Engine, Extent, Extraction, Facts, Kind,
+    Located, MemberId, Object, Placement, Pull, Seek, Standing, VolumeIndex,
 };
 
 pub use self::brotli::Brotli;
@@ -218,8 +218,8 @@ impl<D: Decoder> Object for Stream<D> {
     }
 
     // A stream is its one volume: it claims no other.
-    fn claim(&mut self, _name: &str, _first: &[u8], _length: Option<u64>) -> Vec<VolumeIndex> {
-        Vec::new()
+    fn claim(&mut self, _name: &str, _first: &[u8], _length: Option<u64>) -> Claim {
+        Claim::default()
     }
 
     // The object its bytes founded holds its volume now.

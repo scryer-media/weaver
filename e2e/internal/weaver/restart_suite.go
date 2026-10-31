@@ -2888,11 +2888,15 @@ func runRarExtractionResumesFromCheckpoint(ctx *restartCaseContext) (restartCase
 	), nil
 }
 
-// renameRestartSlug posts one payload under an obfuscated hex name beside
-// the PAR3 set that names it. The set recognises the file by the bytes that
-// have arrived of it, so the file is on disk under the hex name when the set
-// renames it, and moves to the set's name.
-const renameRestartSlug = "par3-obfuscated-names"
+// renameRestartSlug posts one payload under a bare hex name beside the PAR3
+// set that names it. The set recognises the file by the bytes that have
+// arrived of it, so the file is on disk under the hex name when the set
+// renames it, and moves to the set's name, renameRestartTarget. The name has
+// no numbered suffix: a numbered piece is held by a split and is born under
+// the set's name, so nothing would move.
+const renameRestartSlug = "par3-obfuscated-plain-name"
+
+const renameRestartTarget = "indigo.vale.s01e08.mkv"
 
 // The process dies right after the file moved to the name a committed
 // checkpoint recorded for it, before the checkpoint that says it moved. The
@@ -2908,7 +2912,7 @@ func runRenamedFileAdoptedAfterRestart(ctx *restartCaseContext) (restartCaseResu
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := ctx.startWeaverWithOptions("extract.after_rename_before_record", 8); err != nil {
+	if err := ctx.startWeaverWithOptions("extract.after_rename_before_record@"+renameRestartTarget, 8); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug(renameRestartSlug)

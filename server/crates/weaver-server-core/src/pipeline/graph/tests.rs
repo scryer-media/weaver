@@ -495,12 +495,12 @@ async fn paused_graph_work_is_rebuilt_on_resume_and_runs_only_with_nzb_admission
     pipeline.nzb_admitted.remove(&job_id);
     decode_all(&mut pipeline, job_id, &posts, 0).await;
     assert!(!pipeline.graph_jobs[&job_id].awaits_mail());
-    assert!(!working_dir.join("echo-0.bin").exists());
+    assert!(!working_dir.join("echo-0.mkv").exists());
     pipeline.nzb_admitted.insert(job_id);
     pipeline.resume_graph_work(job_id);
     assert!(pipeline.graph_jobs[&job_id].awaits_mail());
     drain_runs(&mut pipeline, job_id).await;
-    assert_eq!(read(&working_dir.join("echo-0.bin")), body);
+    assert_eq!(read(&working_dir.join("echo-0.mkv")), body);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -775,7 +775,7 @@ async fn repeated_failure_keeps_worker_ownership_and_releases_once() {
         0
     );
     assert!(
-        !working_dir.join("echo-0.bin").exists(),
+        !working_dir.join("echo-0.mkv").exists(),
         "late worker output must not be published"
     );
     retire_pipeline_database(pipeline).await;
@@ -972,7 +972,7 @@ async fn an_archive_handed_to_its_engine_writes_what_the_engine_read() {
     let job = &pipeline.graph_jobs[&job_id];
     assert_eq!(job.tree().engines().len(), 1);
     for (index, body) in bodies.iter().enumerate() {
-        assert_eq!(&read(&working_dir.join(format!("echo-{index}.bin"))), body);
+        assert_eq!(&read(&working_dir.join(format!("echo-{index}.mkv"))), body);
         assembly_wrote_nothing(&pipeline, job_id, index as u32);
     }
     // The volumes are the engine's input, not files of the job.
@@ -1008,14 +1008,14 @@ async fn a_delivery_with_a_damaged_member_settles_to_partial() {
     assert_eq!(
         pipeline.graph_delivery(job_id),
         Some(Delivery {
-            whole: vec!["echo-0.bin".to_string(), "echo-1.bin".to_string()],
+            whole: vec!["echo-0.mkv".to_string(), "echo-1.mkv".to_string()],
             damaged: vec!["lantern.dat".to_string()],
             unnamed: Vec::new(),
             unrepaired: Vec::new(),
             withheld: Vec::new(),
             files: vec![
-                delivered("echo-0.bin", 1, true),
-                delivered("echo-1.bin", 1, true),
+                delivered("echo-0.mkv", 1, true),
+                delivered("echo-1.mkv", 1, true),
                 delivered("lantern.dat", 0, false),
             ],
         })
@@ -1126,7 +1126,7 @@ async fn echo_volume_with_a_wrong_article(
         )
         .await;
     }
-    (pipeline, working_dir.join("echo-0.bin"), body, posts)
+    (pipeline, working_dir.join("echo-0.mkv"), body, posts)
 }
 
 // The recovery blocks arrive, and the set repairs the one wrong slice.

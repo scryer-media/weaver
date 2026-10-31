@@ -15,12 +15,9 @@ use super::super::direct_store::scenarios::archive_schedules::grouping::{
 // the first piece arrives.
 const RESTART_AFTER_FIRST: usize = 96;
 
-// The first piece's bytes were held in memory when the pipeline went down,
-// so the restored job fetches it again after the others. The solid set
-// goes to its engine before that piece's front comes back; the engine
-// reads the container's length from it when it does, so the two middle
-// pieces, which only a name could order, go where the refused set went
-// and the job fails with nothing delivered.
+// None of the set's members comes out whole, and the pieces it hands back
+// are whole bytes under hex names of no known file type. Those ship, but no
+// usable file was delivered, so the job fails.
 #[tokio::test]
 async fn a_hex_named_solid_7z_set_restarted_after_its_first_piece_fails() {
     cell_case(

@@ -6,7 +6,7 @@ use std::io::Read;
 use crate::jobs::model::{ArchivePasswordCandidate, ArchivePasswordSource};
 use crate::persistence::encryption::{decrypt_value, encrypt_value, is_encrypted};
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
-use crate::persistence::{Database, StateError};
+use crate::persistence::{Database, LoadError, StateError};
 
 const PASSWORDS: &str = "archive_passwords";
 const PASSWORD_FILE: &str = "archive_password_file";
@@ -83,13 +83,18 @@ impl Database {
         })
     }
 
-    fn load_archive_password_settings(&self) -> Result<(Vec<String>, Option<String>), StateError> {
+    // The global list and the password file's path. A failed read, or a list
+    // that does not decrypt, is `Read`. A value this build cannot take, a
+    // decrypted list included, is `Rows`.
+    fn load_archive_password_settings(&self) -> Result<(Vec<String>, Option<String>), LoadError> {
         let datastore = self.datastore();
-        let (sealed, file) = self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(datastore.read_exec(),
-                "SELECT key, value FROM settings WHERE key IN ('archive_passwords', 'archive_password_file')", &[]).await?;
+        let rows = self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(datastore.read_exec(),
+                "SELECT key, value FROM settings WHERE key IN ('archive_passwords', 'archive_password_file')", &[]).await
+        }).map_err(LoadError::Read)?;
+        let typed = || -> Result<_, StateError> {
             let (mut sealed, mut file) = (None, None);
-            for row in rows {
+            for row in &rows {
                 match row.text("key")?.as_str() {
                     PASSWORDS => sealed = Some(row.text("value")?),
                     PASSWORD_FILE => file = Some(row.text("value")?),
@@ -97,23 +102,24 @@ impl Database {
                 }
             }
             Ok((sealed, file))
-        })?;
+        };
+        let (sealed, file) = typed().map_err(LoadError::Rows)?;
         let passwords = match sealed {
             None => Vec::new(),
             Some(sealed) => {
+                let unreadable =
+                    |message: &str| LoadError::Read(StateError::Conflict(message.into()));
                 let key = self
                     .encryption_key()
-                    .ok_or_else(|| StateError::Conflict("encryption key required".into()))?;
+                    .ok_or_else(|| unreadable("encryption key required"))?;
                 if !is_encrypted(&sealed) {
-                    return Err(StateError::Conflict(
-                        "archive passwords are not encrypted".into(),
-                    ));
+                    return Err(unreadable("archive passwords are not encrypted"));
                 }
-                let value = decrypt_value(key, &sealed).map_err(|_| {
-                    StateError::Conflict("could not decrypt archive passwords".into())
-                })?;
-                serde_json::from_str(&value)
-                    .map_err(|_| StateError::Conflict("invalid archive passwords".into()))?
+                let value = decrypt_value(key, &sealed)
+                    .map_err(|_| unreadable("could not decrypt archive passwords"))?;
+                serde_json::from_str(&value).map_err(|_| {
+                    LoadError::Rows(StateError::Conflict("invalid archive passwords".into()))
+                })?
             }
         };
         Ok((passwords, file.filter(|file| !file.is_empty())))
@@ -121,7 +127,7 @@ impl Database {
 
     pub(crate) fn global_archive_password_candidates(
         &self,
-    ) -> Result<Vec<ArchivePasswordCandidate>, StateError> {
+    ) -> Result<Vec<ArchivePasswordCandidate>, LoadError> {
         // Read past the global cap by the three job buckets' caps, so the
         // harvest still fills its global bucket after dropping the values a job
         // bucket already holds; the harvest applies `MAX_ARCHIVE_PASSWORDS`.

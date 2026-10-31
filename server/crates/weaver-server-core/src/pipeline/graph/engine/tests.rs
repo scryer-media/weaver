@@ -97,8 +97,7 @@ fn a_read_over_damaged_bytes_waits_for_their_repair() {
 }
 
 // Damaged bytes nothing will repair are lost to a read, as missing ones are:
-// the read ends short where they begin, and the next fails on exactly them,
-// until the run says it read on past them.
+// the read ends short where they begin, and the next fails on exactly them.
 #[test]
 fn a_read_over_damaged_bytes_nothing_will_repair_fails_as_lost() {
     let dir = tempfile::tempdir().unwrap();
@@ -126,8 +125,6 @@ fn a_read_over_damaged_bytes_nothing_will_repair_fails_as_lost() {
         }
     );
     assert!(volumes.lost());
-    volumes.bridged(lost);
-    assert!(!volumes.lost(), "a span the run read on past still ends it");
 }
 
 #[test]
@@ -662,7 +659,7 @@ impl Echoing {
     }
 
     fn echoed(&self, member: u32) -> Vec<u8> {
-        std::fs::read(self.dir.path().join(format!("echo-{member}.bin"))).unwrap()
+        std::fs::read(self.dir.path().join(format!("echo-{member}.mkv"))).unwrap()
     }
 }
 
@@ -867,7 +864,7 @@ async fn a_volume_the_run_read_closing_at_another_length_restarts_the_run() {
     echoing.deliver(1);
     assert_ne!(echoing.job.runs().generation(engine), before);
     assert!(!echoing.closed(0), "accepted old output must be retracted");
-    assert!(!echoing.dir.path().join("echo-0.bin").exists());
+    assert!(!echoing.dir.path().join("echo-0.mkv").exists());
 }
 
 // A recovery set reopens a volume whose closed length the run read, to
@@ -930,7 +927,7 @@ async fn length_read_volume_reopened(changed: bool) {
         return;
     }
     assert!(!echoing.closed(0), "every member of the run is retracted");
-    assert!(!echoing.dir.path().join("echo-0.bin").exists());
+    assert!(!echoing.dir.path().join("echo-0.mkv").exists());
     while !echoing.hear().await {}
     assert_ne!(echoing.job.runs().generation(engine), before);
     // The rerun's output takes a backing of its own, as any replacement does.

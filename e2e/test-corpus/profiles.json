@@ -249,7 +249,7 @@
         "testdata/par2-heavy-damage/**",
         "testdata/par2-heavy-damage-a/**",
         "testdata/par2-small-repair/**",
-        "testdata/par3-obfuscated-names/**",
+        "testdata/par3-obfuscated-plain-name/**",
         "testdata/rar5-multi-member/**",
         "testdata/single-mkv/**",
         "testdata/zip-cp437-empty-dirs/**",
@@ -484,6 +484,7 @@
         "testdata/feed-verdict-restart/**",
         "testdata/par2-namespace-restart/**",
         "testdata/par3-rename-chain/**",
+        "testdata/par3-obfuscated-plain-name/**",
         "testdata/par2-describes-unposted/**",
         "testdata/sniff-trailing-names/**"
       ],

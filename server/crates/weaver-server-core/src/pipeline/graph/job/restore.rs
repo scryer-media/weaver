@@ -197,7 +197,7 @@ impl GraphJob {
                     .access(&self.tree)
                     .read_at(NodeId::ROOT, member, range, &mut bytes)
                 {
-                    missing.push((volume, ordinal, Some(range)));
+                    missing.push((volume, ordinal));
                     continue;
                 }
                 let read = Bytes::copy_from_slice(&bytes);
@@ -205,19 +205,10 @@ impl GraphJob {
                 self.deliver_again(ReadBack { volume, pieces })?;
             }
         }
-        missing.extend(
-            self.root
-                .map
-                .unseen()
-                .into_iter()
-                .map(|(volume, ordinal)| (volume, ordinal, None)),
-        );
+        missing.extend(self.root.map.unseen());
         let mut refetched = Vec::with_capacity(missing.len());
-        for (volume, ordinal, range) in missing {
-            self.root.map.unarrive(volume, ordinal);
-            if let Some(range) = range {
-                self.tree.uncover(NodeId::ROOT, volume, range);
-            }
+        for (volume, ordinal) in missing {
+            self.unarrive(volume, ordinal);
             if let Some(found) = self
                 .tree
                 .namespace_mut(NodeId::ROOT)

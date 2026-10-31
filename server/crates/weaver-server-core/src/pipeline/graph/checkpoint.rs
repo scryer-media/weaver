@@ -1047,6 +1047,7 @@ fn member_row(node: i64, member: &MemberRecord, state: FileState) -> MemberRow {
         on_disk: state.on_disk,
         refused: state.refused.map(|why| why_name(why).to_owned()),
         copy_of: member.copy_of.map(|into| i64::from(into.0)),
+        refuted_kind: member.refuted.map(|kind| kind.to_string()),
     }
 }
 
@@ -1254,6 +1255,11 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
             // No row keeps it: the tree reads it from the clean coverage at
             // the member's front, and the replay keeps it again.
             fronted: false,
+            refuted: row
+                .refuted_kind
+                .as_deref()
+                .map(|kind| kind_named(kind).ok_or(refuse("an unknown refuted kind")))
+                .transpose()?,
         };
         nodes
             .get_mut(&node)
@@ -1461,7 +1467,7 @@ fn provenance_named(name: &str) -> Option<Provenance> {
     .find(|provenance| provenance_name(*provenance) == name)
 }
 
-const REASONS: [Why; 14] = [
+const REASONS: [Why; 13] = [
     Why::Compressed,
     Why::TailUnreachable,
     Why::EncryptedHeader,
@@ -1474,7 +1480,6 @@ const REASONS: [Why; 14] = [
     Why::Unsupported,
     Why::Unmapped,
     Why::TooDeep,
-    Why::OrderUnknown,
     Why::InvalidArchive,
 ];
 
@@ -1492,7 +1497,6 @@ pub(crate) fn why_name(why: Why) -> &'static str {
         Why::Unsupported => "unsupported",
         Why::Unmapped => "unmapped",
         Why::TooDeep => "too_deep",
-        Why::OrderUnknown => "order_unknown",
         Why::InvalidArchive => "invalid_archive",
     }
 }

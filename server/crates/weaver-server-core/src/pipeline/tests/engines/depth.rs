@@ -34,8 +34,8 @@ pub(super) fn stored(entries: &[(&str, &[u8])]) -> Vec<u8> {
 // The members the innermost archive holds.
 fn members() -> Vec<(&'static str, Vec<u8>)> {
     vec![
-        ("ember.bin", payload(5 * ARTICLE + 11, 61)),
-        ("quill.bin", payload(3 * ARTICLE - 3, 62)),
+        ("ember.mkv", payload(5 * ARTICLE + 11, 61)),
+        ("quill.mkv", payload(3 * ARTICLE - 3, 62)),
     ]
 }
 
@@ -119,7 +119,7 @@ fn assert_repaired_below(graph: &Outcome) {
     assert!(graph.completed(), "graph: {:?}", graph.failure);
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
-        ["ember.bin", "inner.par2", "inner.vol0+4.par2", "quill.bin"].map(delivered),
+        ["ember.mkv", "inner.par2", "inner.vol0+4.par2", "quill.mkv"].map(delivered),
         "graph: delivered names"
     );
     assert!(members_whole(graph), "graph: the members are rebuilt whole");
@@ -198,7 +198,7 @@ async fn a_described_file_no_post_carries_is_rebuilt_whole() {
         "lantern",
         &[
             ("lantern.bin", lantern.as_slice()),
-            ("quill.bin", quill.as_slice()),
+            ("quill.mkv", quill.as_slice()),
         ],
         4,
     );
@@ -206,7 +206,7 @@ async fn a_described_file_no_post_carries_is_rebuilt_whole() {
     posts.extend(set);
     let graph = run(&Scenario::new(posts)).await;
     assert!(graph.completed(), "{:?}", graph.failure);
-    assert!(graph.files[&delivered("quill.bin")] == quill, "",);
+    assert!(graph.files[&delivered("quill.mkv")] == quill, "",);
     assert!(graph.files[&delivered("lantern.bin")] == lantern, "",);
     assert_fetched_once(&graph);
     assert_eq!(
@@ -235,10 +235,10 @@ async fn an_uncovered_damaged_member_two_deep_is_refused_to_its_archive() {
     );
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
-        vec![delivered("level.7z"), delivered("quill.bin")]
+        vec![delivered("level.7z"), delivered("quill.mkv")]
     );
     assert!(
-        graph.files[&delivered("quill.bin")] == entries[1].1,
+        graph.files[&delivered("quill.mkv")] == entries[1].1,
         "closed whole before the refusal"
     );
     assert!(graph.graph().outcomes.is_empty());

@@ -142,6 +142,33 @@ async fn rar_rev_rebuilds_a_rar5_volume_posted_short_of_its_table_to_its_size() 
     assert_rebuilt(&run(&scenario).await, &body, 1);
 }
 
+// A volume posted one article past the size the set's table gives, every
+// byte arriving clean: the stray bytes do not stop the set or the unpack,
+// and the member is delivered whole.
+#[tokio::test]
+async fn rar_rev_delivers_a_rar5_volume_posted_long_of_its_table() {
+    let body = body();
+    let mut volumes = single_member_store_set(MEMBER, &body, 4);
+    let bytes: Vec<&[u8]> = volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+    let revs = rar5_revs("silver.horizon", &bytes, 1);
+    volumes[1].1.extend_from_slice(&[0x5a; ARTICLE]);
+    let scenario = Scenario::new(posted(volumes, &[], revs));
+    let outcome = run(&scenario).await;
+    assert!(
+        outcome.completed(),
+        "{:?} {:?} {:?}",
+        outcome.status,
+        outcome.failure,
+        outcome.graph().outcomes
+    );
+    assert_eq!(
+        outcome.files.keys().cloned().collect::<Vec<_>>(),
+        vec![delivered(MEMBER)],
+        "delivered names",
+    );
+    assert!(outcome.files[&delivered(MEMBER)] == body, "member bytes");
+}
+
 #[tokio::test]
 async fn rar_rev_rebuilds_two_absent_rar5_volumes_from_two_recovery_volumes() {
     let (body, scenario) = rar5_set(&[1, 3], 2);
@@ -348,7 +375,7 @@ async fn rar_rev_rebuilds_one_absent_rar4_volume_from_its_recovery_volume() {
 // A RAR3 recovery volume as RAR writes it beside volumes whose end headers
 // reserve seven zero bytes for it (REVSPACE): the set's parity, as wide as
 // the widest volume, the footer in place of the parity of those zeros.
-fn rar3_rev(volumes: &[&[u8]]) -> Vec<u8> {
+pub(super) fn rar3_rev(volumes: &[&[u8]]) -> Vec<u8> {
     const FOOTER: usize = 7;
     let width = volumes.iter().map(|volume| volume.len()).max().unwrap_or(0);
     let coder = reedsolomon_rs::rar3::Rar3RsCoder::new(1).expect("one recovery volume");
@@ -375,23 +402,35 @@ fn rar3_rev(volumes: &[&[u8]]) -> Vec<u8> {
 // hole, and the rebuilt third takes the place its name gives it.
 #[tokio::test]
 async fn rar_rev_rebuilds_an_absent_volume_of_a_compressed_part_numbered_rar4_set() {
-    let dir = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/extraction_profiles"
-    );
-    let volumes: Vec<(String, Vec<u8>)> = (1..=4)
-        .map(|part| {
-            let bytes = std::fs::read(format!("{dir}/rar4_lz_four.part0{part}.rar")).unwrap();
-            (format!("silver.horizon.part{part}.rar"), bytes)
-        })
-        .collect();
+    let volumes = lz_four();
     let bytes: Vec<&[u8]> = volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
     let rev = Post::plain("silver.horizon.part1.rev", rar3_rev(&bytes));
     let mut scenario = Scenario::new(posted(volumes, &[2], vec![rev]));
     // Each volume over a few articles, as a post carries it: the fourth
     // volume's front reaches the engine before the third is rebuilt.
     scenario.article = 4096;
-    let graph = run(&scenario).await;
+    assert_lz_four_rebuilt(&run(&scenario).await);
+}
+
+// A compressed four-volume RAR4 set as RAR writes it, under part numbering:
+// each volume's end header states the CRC32 of the bytes before it and
+// reserves seven bytes for a recovery volume.
+pub(super) fn lz_four() -> Vec<(String, Vec<u8>)> {
+    let dir = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/extraction_profiles"
+    );
+    (1..=4)
+        .map(|part| {
+            let bytes = std::fs::read(format!("{dir}/rar4_lz_four.part0{part}.rar")).unwrap();
+            (format!("silver.horizon.part{part}.rar"), bytes)
+        })
+        .collect()
+}
+
+// One volume of the set rebuilt in one ruling, and the set's one member
+// delivered as RAR wrote it.
+pub(super) fn assert_lz_four_rebuilt(graph: &Outcome) {
     assert_eq!(
         graph.graph().outcomes,
         vec![Some(RepairOutcome::Repaired { slices: 1 })]
@@ -426,6 +465,73 @@ async fn rar_rev_rebuilds_two_absent_header_encrypted_volumes() {
     let revs = rar5_revs("silver.horizon", &bytes, 2);
     let scenario = Scenario::new(posted(volumes, &[1, 2], revs)).password(SECRET);
     assert_rebuilt(&run(&scenario).await, &body, 2);
+}
+
+// Five volumes of an `-hp` set, its member's checksum keyed, as the set was
+// made.
+fn header_encrypted_set(body: &[u8]) -> Vec<(String, Vec<u8>)> {
+    header_encrypted_store_set(MEMBER, body, 5, SECRET, HeaderCheck::For(SECRET))
+}
+
+// The volumes, the one at `altered` changed after the set was made: 16
+// bytes in its middle, every article consistent with what was posted.
+fn altered(mut volumes: Vec<(String, Vec<u8>)>, altered: usize) -> Vec<(String, Vec<u8>)> {
+    let middle = volumes[altered].1.len() / 2;
+    volumes[altered].1[middle..middle + 16]
+        .iter_mut()
+        .for_each(|byte| *byte ^= 0x5a);
+    volumes
+}
+
+// With no recovery posted, the member fails its keyed checksum and nothing
+// is delivered whole, as unrar reports the file's CRC failed: in a middle
+// volume, whose part's own check fails, and in the last, which only the
+// file's checksum covers.
+#[tokio::test]
+async fn an_altered_header_encrypted_set_without_recovery_fails_its_keyed_checksum() {
+    let body = payload(45 * ARTICLE, 61);
+    for volume in [1, 4] {
+        let set = altered(header_encrypted_set(&body), volume);
+        let graph = run(&Scenario::new(posts(set)).password(SECRET)).await;
+        assert!(
+            matches!(graph.status, Some(JobStatus::Failed { .. })),
+            "volume {volume}: {:?} {:?}",
+            graph.status,
+            graph.failure
+        );
+        assert!(
+            !graph.files.values().any(|bytes| *bytes == body),
+            "volume {volume}: {:?}",
+            graph.files.keys()
+        );
+    }
+}
+
+// Beside a recovery volume made with the set, the altered volume is rebuilt,
+// and it alone, and the member comes out whole.
+#[tokio::test]
+async fn rar_rev_rebuilds_a_header_encrypted_volume_altered_after_the_set_was_made() {
+    let body = payload(45 * ARTICLE, 61);
+    let made = header_encrypted_set(&body);
+    let bytes: Vec<&[u8]> = made.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+    for volume in [1, 4] {
+        let revs = rar5_revs("silver.horizon", &bytes, 1);
+        let set = posted(altered(made.clone(), volume), &[], revs);
+        assert_rebuilt(&run(&Scenario::new(set).password(SECRET)).await, &body, 1);
+    }
+}
+
+// The same with nothing enciphered, the member's checksum its CRC32.
+#[tokio::test]
+async fn rar_rev_rebuilds_a_rar5_volume_altered_after_the_set_was_made() {
+    let body = body();
+    let made = single_member_store_set(MEMBER, &body, 4);
+    let bytes: Vec<&[u8]> = made.iter().map(|(_, bytes)| bytes.as_slice()).collect();
+    for volume in [1, 3] {
+        let revs = rar5_revs("silver.horizon", &bytes, 1);
+        let set = posted(altered(made.clone(), volume), &[], revs);
+        assert_rebuilt(&run(&Scenario::new(set)).await, &body, 1);
+    }
 }
 
 #[tokio::test]

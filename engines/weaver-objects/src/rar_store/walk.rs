@@ -314,8 +314,13 @@ impl Walk {
         };
         let mut damaged = None;
         if let (true, Some(short_at), Some(length)) = (ended, walk.short_at, length) {
+            // Data that runs past the volume's length is judged only at its
+            // close: until then that length is its producer's word for now
+            // and may yet move.
             if reach > length {
-                damaged = Some(ByteRange::new(length, reach));
+                if closed {
+                    damaged = Some(ByteRange::new(length, reach));
+                }
             } else if RarArchive::parse_volume_facts_with_shared_kdf_cache(
                 SparseImage::of(kept, closed),
                 password,

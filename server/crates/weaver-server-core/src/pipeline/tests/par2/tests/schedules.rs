@@ -110,9 +110,9 @@ impl Fixture {
                 block * 2 + 13 + i
             };
             let name = if matches!(shape, Shape::Nested) {
-                format!("nested/level/source-{i}.bin")
+                format!("nested/level/source-{i}.mkv")
             } else {
-                format!("source-{i}.bin")
+                format!("source-{i}.mkv")
             };
             let bytes: Vec<u8> = (0..len).map(|_| random.next() as u8).collect();
             files.push((name, bytes));
@@ -560,7 +560,7 @@ async fn six_block_subsets(shard: u32) {
     let files: Vec<(String, Vec<u8>)> = (0..2)
         .map(|i| {
             (
-                format!("file-{i}.bin"),
+                format!("file-{i}.mkv"),
                 (0..192).map(|_| random.next() as u8).collect(),
             )
         })

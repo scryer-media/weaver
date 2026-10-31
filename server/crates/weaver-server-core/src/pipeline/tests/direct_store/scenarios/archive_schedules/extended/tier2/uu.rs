@@ -23,7 +23,7 @@ const VOLUMES: usize = 4;
 const ARTICLES_PER_VOLUME: usize = 32;
 
 // The dialects, by index into [`STYLES`].
-const STYLES: [UuStyle; 12] = [
+const STYLES: [UuStyle; 11] = [
     UuStyle::STANDARD,
     UuStyle {
         header: UuHeader::NoMode,
@@ -43,10 +43,6 @@ const STYLES: [UuStyle; 12] = [
     },
     UuStyle {
         unpadded_tail: true,
-        ..UuStyle::STANDARD
-    },
-    UuStyle {
-        wrong_last_length: true,
         ..UuStyle::STANDARD
     },
     UuStyle {
@@ -136,12 +132,12 @@ pub(super) fn cells() -> Vec<UuCell> {
 // Schedules each cell samples from the matrix's smoke schedules.
 pub(super) const PER_UNIT: usize = 139;
 
-// 1,200 cells, 139 schedules each.
-pub(super) const TOTAL: usize = 166_800;
+// 1,100 cells, 139 schedules each.
+pub(super) const TOTAL: usize = 152_900;
 
 pub(super) fn family() -> Family<UuCell> {
     let cells = cells();
-    assert_eq!(cells.len(), 1_200);
+    assert_eq!(cells.len(), 1_100);
     Family {
         units: cells
             .into_iter()
@@ -290,12 +286,11 @@ uu_smokes! {
     preamble_mixed 3 Mixed None, Rar5Encrypted;
     space_zero_par2_as_uu 4 Par2AsUu None, Rar5;
     unpadded_tail_sevenz 5 Set None, SevenZip;
-    wrong_last_length_truncated 6 SetWithPar2 Some(Damage::Truncated), Rar5;
-    no_terminator_overlong 7 Set Some(Damage::Overlong), Rar4;
-    missing_end_bad_byte 8 SetWithPar2 Some(Damage::NoChecksum), Rar5;
-    bare_lf_duplicate 9 Mixed Some(Damage::DifferingDuplicate), Rar5;
-    short_lines_single 10 SingleVolume None, SevenZip;
-    lenient_combo_par2 11 SetWithPar2 None, Rar5Encrypted;
+    no_terminator_overlong 6 Set Some(Damage::Overlong), Rar4;
+    missing_end_bad_byte 7 SetWithPar2 Some(Damage::NoChecksum), Rar5;
+    bare_lf_duplicate 8 Mixed Some(Damage::DifferingDuplicate), Rar5;
+    short_lines_single 9 SingleVolume None, SevenZip;
+    lenient_combo_par2 10 SetWithPar2 None, Rar5Encrypted;
 }
 
 #[tokio::test]
@@ -335,7 +330,7 @@ mod combined_uu_loss_smoke {
     #[tokio::test]
     async fn bare_lf_set_unprotected() {
         loss_smoke(UuCell {
-            style: 9,
+            style: 8,
             shape: Shape::Set,
             damage: None,
             container: Container::Rar4,

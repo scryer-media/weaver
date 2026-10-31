@@ -14,7 +14,15 @@
 //
 // The set counts from `.001`, and any piece founds it. A set missing a
 // number, or its first piece, is no file of its own: its pieces go back as
-// they came.
+// they came. A set is one file cut in pieces, so only its first piece starts
+// with a head: a later piece whose front opens on a signature that stands
+// only at a file's head refutes the set, whichever piece came first, and its
+// pieces go back as they came to be claimed by their own bytes, nothing
+// failed. A signature that may recur inside a file refutes nothing.
+//
+// A set posted under names that number nothing is placed as the tree bound
+// it, each piece at the place its founding gave it: no name of such a set
+// says a place, so I claim none.
 
 #[cfg(test)]
 mod tests;
@@ -24,8 +32,9 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
-    ByteRange, Delivery, Durable, Emit, Extent, Facts, Kind, Located, MemberId, Object, Placement,
-    Pull, Seek, Standing, VolumeIndex, Weight, Why,
+    ByteRange, Claim, Delivery, Durable, Emit, Extent, Facts, HEAD_VERDICT_BYTES, Kind, Located,
+    MemberId, Object, Placement, Pull, Seek, Sniff, Standing, VolumeIndex, Weight, Why,
+    signs_a_head,
 };
 
 use crate::split;
@@ -43,6 +52,9 @@ pub struct SplitStore {
     name: String,
     // The set's first piece, which every piece's place is counted from.
     first: Option<split::Piece>,
+    // Whether my pieces were bound at their places with no name that
+    // numbers them: then no name places a piece in my set.
+    stated: bool,
     // The pieces bound, by place.
     pieces: BTreeMap<u32, Piece>,
     // Pieces whose bytes come to me again, as the geometry changed under
@@ -55,18 +67,93 @@ pub struct SplitStore {
     said: Option<Option<u64>>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Piece {
-    // The piece's length: what its articles declare, and what it reached
-    // once it closed. A piece is never empty, so none is said as none.
+    // The piece's length: what its articles declare, what it reached once
+    // it closed, and what its member is given anew after. A piece is never
+    // empty, so none is said as none.
     declared: Option<u64>,
     // How far its bytes and its losses reached before it closed.
     reached: u64,
-    // How far the bytes it was delivered reached.
-    delivered: u64,
+    // The bytes it was handed and could not place, which its owner holds
+    // and hands again once they can be: in order, none touching another.
+    held: Vec<ByteRange>,
     // How far the bytes it placed in the member reach, from its start.
     placed: u64,
     closed: bool,
+    // What its front said of the set (`refutes`). Kept: a restart between
+    // two short articles of the front still judges both.
+    front: Front,
+}
+
+// A later piece's front, judged once whether it opens a file of its own.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum Front {
+    // Not judged yet: its bytes from offset zero that came so far, as many
+    // as a head-only signature reads at most (`HEAD_VERDICT_BYTES`).
+    Open(Vec<u8>),
+    // Nothing to judge: it joined the set or refuted it, or it is the
+    // first piece, whose head opens the joined file.
+    Judged,
+}
+
+impl Default for Front {
+    fn default() -> Self {
+        Self::Open(Vec::new())
+    }
+}
+
+impl Piece {
+    // Closed, with nothing it was handed within its length still held.
+    fn whole(&self) -> bool {
+        let length = self.declared.unwrap_or(0);
+        self.closed && self.held.iter().all(|range| range.start >= length)
+    }
+
+    // Bytes it was handed: those in `placed` went to the member and are no
+    // longer held, those in `held` are.
+    fn handed(&mut self, placed: ByteRange, held: ByteRange) {
+        if !placed.is_empty() && !self.held.is_empty() {
+            let mut tail = None;
+            self.held.retain_mut(|run| {
+                if run.end <= placed.start || run.start >= placed.end {
+                    return true;
+                }
+                if run.end > placed.end {
+                    if run.start < placed.start {
+                        tail = Some(ByteRange::new(placed.end, run.end));
+                        run.end = placed.start;
+                    } else {
+                        run.start = placed.end;
+                    }
+                    return true;
+                }
+                run.end = placed.start;
+                run.start < placed.start
+            });
+            self.held.extend(tail);
+        }
+        if !held.is_empty() {
+            self.held.push(held);
+        }
+        self.held.sort_unstable_by_key(|run| run.start);
+        self.held.dedup_by(|next, kept| {
+            let touches = next.start <= kept.end;
+            if touches {
+                kept.end = kept.end.max(next.end);
+            }
+            touches
+        });
+        if !placed.is_empty() {
+            self.placed = self.placed.max(placed.end);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Before {
+    whole: bool,
+    awaiting: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,9 +169,50 @@ impl SplitStore {
         Self::default()
     }
 
-    // The place a piece's name numbers in my set, counted from its first
-    // piece: `None` for a piece of another set.
+    // Whether a piece's own bytes refute the claim its name made: a set is
+    // one file cut in pieces, so only its first starts with a head, and a
+    // later piece whose front opens on a signature that stands only at a
+    // file's head is a file of its own, and so is the set. Judged once, on
+    // the front its deliveries gather from offset zero, however its
+    // articles cut it and whichever piece came first. The first piece is
+    // never judged (`bound`).
+    fn refutes(&mut self, index: u32, delivery: &Delivery<'_>) -> bool {
+        let Some(piece) = self.pieces.get_mut(&index) else {
+            return false;
+        };
+        let Front::Open(front) = &mut piece.front else {
+            return false;
+        };
+        let Some(at) = usize::try_from(delivery.offset)
+            .ok()
+            .filter(|at| *at <= front.len() && *at < HEAD_VERDICT_BYTES)
+        else {
+            return false;
+        };
+        let bytes = delivery.bytes.as_ref();
+        let end = at.saturating_add(bytes.len()).min(HEAD_VERDICT_BYTES);
+        if end > front.len() {
+            front.reserve_exact(HEAD_VERDICT_BYTES - front.len());
+            front.resize(end, 0);
+        }
+        front[at..end].copy_from_slice(&bytes[..end - at]);
+        match signs_a_head(front, piece.declared) {
+            Sniff::Pending => false,
+            verdict => {
+                piece.front = Front::Judged;
+                matches!(verdict, Sniff::Object(_))
+            }
+        }
+    }
+
+    // The place a piece's name numbers in my set, counted from one (`FIRST`):
+    // `None` for a piece of another set. A set whose lowest number is above
+    // one has no first piece here, so a front of any of its pieces that
+    // opens on a head refutes it (`refutes`).
     fn place(&self, name: &str) -> Option<VolumeIndex> {
+        if self.stated {
+            return None;
+        }
         let piece = split::parse(name)?;
         let first = self.first.clone().unwrap_or_else(|| piece.numbered(FIRST));
         piece.index_from(&first).map(VolumeIndex)
@@ -103,13 +231,22 @@ impl SplitStore {
     }
 
     // How far a piece's bytes can be placed: to its declared length, or
-    // anywhere once its start is known and it declared none. Nothing while
-    // its start is unknown.
+    // anywhere once its start is known and it declared none, but never
+    // into a place any piece's bytes still sit in until they come again,
+    // its own among them, wherever that place starts: they are read back
+    // from there. Nothing while its start is unknown.
     fn placeable(&self, index: u32) -> u64 {
-        match (self.offset(index), self.pieces.get(&index)) {
-            (Some(_), Some(piece)) => piece.declared.unwrap_or(u64::MAX),
-            _ => 0,
-        }
+        let (Some(start), Some(piece)) = (self.offset(index), self.pieces.get(&index)) else {
+            return 0;
+        };
+        let declared = piece.declared.unwrap_or(u64::MAX);
+        let end = start.saturating_add(declared);
+        self.awaiting
+            .values()
+            .filter_map(|awaited| Some(ByteRange::at(awaited.from?, awaited.until)))
+            .filter(|sitting| sitting.start < end && sitting.end > start)
+            .map(|sitting| sitting.start.saturating_sub(start))
+            .fold(declared, u64::min)
     }
 
     // The member's length: every piece from the first, each declared.
@@ -145,16 +282,37 @@ impl SplitStore {
     }
 
     // The member is whole once every piece from the first closed, each at
-    // its length, and nothing is still to come again.
+    // its length with every byte it was handed within it placed, and
+    // nothing is still to come again.
     fn close_member(&mut self, out: &mut Vec<Emit>) {
         if self.awaiting.is_empty()
             && !self.pieces.is_empty()
             && self.contiguous()
-            && self.pieces.values().all(|piece| piece.closed)
+            && self.pieces.values().all(Piece::whole)
             && self.length().is_some()
         {
             self.say_member(out);
             out.push(Emit::MemberClosed(MEMBER));
+        }
+    }
+
+    // What the member's close turns on, as a piece stands before a change
+    // to it: whether it was whole, and whether bytes were still to come
+    // again.
+    fn before(&self, index: u32) -> Option<Before> {
+        let piece = self.pieces.get(&index)?;
+        Some(Before {
+            whole: piece.whole(),
+            awaiting: !self.awaiting.is_empty(),
+        })
+    }
+
+    // The member can close only on what a change to a piece changed: the
+    // piece became whole, or the last bytes coming again came.
+    fn settle(&mut self, index: u32, before: Before, out: &mut Vec<Emit>) {
+        let whole = self.pieces.get(&index).is_some_and(Piece::whole);
+        if whole && (!before.whole || (before.awaiting && self.awaiting.is_empty())) {
+            self.close_member(out);
         }
     }
 
@@ -170,40 +328,29 @@ impl SplitStore {
         if length == 0 || piece.declared == Some(length) {
             return;
         }
-        let before: Vec<(u32, Option<u64>, u64)> = self
+        let before: Vec<(u32, Option<u64>)> = self
             .pieces
             .keys()
-            .map(|&at| (at, self.offset(at), self.placeable(at)))
+            .map(|&at| (at, self.offset(at)))
             .collect();
         if let Some(piece) = self.pieces.get_mut(&index) {
             piece.declared = Some(length);
         }
-        for (at, start, placeable) in before.into_iter().rev() {
+        for (at, start) in before.into_iter().rev() {
             let now = self.offset(at);
-            let placeable_now = self.placeable(at);
             let Some(piece) = self.pieces.get_mut(&at) else {
                 continue;
             };
-            let moved = piece.placed > 0 && start != now;
-            let released = piece.delivered > placeable && placeable_now > placeable;
-            if !(moved || released) {
+            if piece.placed == 0 || start == now {
                 continue;
             }
-            let until = piece.delivered.min(placeable_now);
-            if moved {
-                out.push(Emit::Again {
-                    volume: VolumeIndex(at),
-                    range: ByteRange::new(0, piece.placed),
-                });
-                piece.placed = 0;
-            }
-            self.awaiting.insert(
-                at,
-                Awaited {
-                    from: start.filter(|_| moved),
-                    until,
-                },
-            );
+            let until = piece.placed;
+            out.push(Emit::Again {
+                volume: VolumeIndex(at),
+                range: ByteRange::new(0, until),
+            });
+            piece.placed = 0;
+            self.awaiting.insert(at, Awaited { from: start, until });
         }
         self.say_member(out);
     }
@@ -213,7 +360,13 @@ impl Durable for SplitStore {
     // 4: a store of the pieces' places, where the stream that joined them
     // kept 3.
     // 5: the pieces whose bytes come again, and where they sat.
-    const VERSION: u16 = 5;
+    // 6: the length each piece's member was last given.
+    // 7: whether the set was bound with no name that numbers it.
+    // 8: what each later piece's front said of the set, or as much of it as
+    // came.
+    // 9: that length gone again: a piece's length is the one it holds; and
+    // what each piece holds unplaced, where it kept how far it was handed.
+    const VERSION: u16 = 9;
 }
 
 impl Object for SplitStore {
@@ -222,7 +375,10 @@ impl Object for SplitStore {
     }
 
     // Bytes of a piece go where the piece starts in the member, as far as
-    // its declared length; the rest is held until its place is known.
+    // its declared length; the rest is held until its place is known. A
+    // piece whose own front refutes the set is placed as any is, so every
+    // piece sits where my map says it does and goes back as it was posted,
+    // and then the set is refuted.
     fn deliver(
         &mut self,
         delivery: Delivery<'_>,
@@ -230,18 +386,29 @@ impl Object for SplitStore {
         out: &mut Vec<Emit>,
     ) {
         let index = delivery.volume.0;
+        let refuted = self.refutes(index, &delivery);
         let range = delivery.range();
+        let Some(before) = self.before(index) else {
+            return;
+        };
+        // Bytes reaching into what a piece placed before it moved are those
+        // bytes coming again: read back already, they stand where they go
+        // now. Bytes past them are new, and its old place still waits.
+        if let Some(awaited) = self.awaiting.get_mut(&index)
+            && range.start < awaited.until
+        {
+            awaited.from = None;
+        }
         let Some(piece) = self.pieces.get_mut(&index) else {
             return;
         };
-        piece.delivered = piece.delivered.max(range.end);
         if !piece.closed {
             piece.reached = piece.reached.max(range.end);
         }
         self.say_member(out);
         let placeable = self.placeable(index);
         let start = self.offset(index);
-        let end = range.end.min(placeable);
+        let end = range.end.min(placeable).max(range.start);
         match start {
             Some(start) if end > range.start => {
                 let len = (end - range.start) as usize;
@@ -251,20 +418,27 @@ impl Object for SplitStore {
                     bytes: delivery.bytes.slice(..len),
                     provenance: delivery.provenance,
                 });
-                if let Some(piece) = self.pieces.get_mut(&index) {
-                    piece.placed = piece.placed.max(end);
-                }
             }
             _ => out.push(Emit::Pending),
         }
-        // A piece's bytes coming again stand where they go now once the
-        // first of them came; the member waits for the last.
-        if let Some(awaited) = self.awaiting.get_mut(&index) {
-            awaited.from = None;
-            if range.end >= awaited.until {
-                self.awaiting.remove(&index);
-                self.close_member(out);
-            }
+        let end = if start.is_some() { end } else { range.start };
+        if let Some(piece) = self.pieces.get_mut(&index) {
+            piece.handed(
+                ByteRange::new(range.start, end),
+                ByteRange::new(end, range.end),
+            );
+        }
+        // The member waits for the last of a piece's bytes coming again.
+        if self
+            .awaiting
+            .get(&index)
+            .is_some_and(|awaited| awaited.from.is_none() && range.end >= awaited.until)
+        {
+            self.awaiting.remove(&index);
+        }
+        self.settle(index, before, out);
+        if refuted {
+            out.push(Emit::Refuted);
         }
     }
 
@@ -378,14 +552,16 @@ impl Object for SplitStore {
         Located::NotYet
     }
 
+    // A length the piece's member is given is the piece's, closed or not:
+    // the member closes at what arrived of it, and a recovery set that
+    // proves another length outranks that, as its bytes outrank what the
+    // piece held. The length the piece holds said again changes nothing.
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {
-        if self
-            .pieces
-            .get(&volume.0)
-            .is_some_and(|piece| !piece.closed)
-        {
-            self.resize(volume.0, length, out);
-        }
+        let Some(before) = self.before(volume.0) else {
+            return;
+        };
+        self.resize(volume.0, length, out);
+        self.settle(volume.0, before, out);
     }
 
     fn envelope(&self, _envelope: u32, _range: ByteRange) -> Option<Bytes> {
@@ -393,18 +569,30 @@ impl Object for SplitStore {
     }
 
     fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], length: Option<u64>) {
-        let Some(piece) = split::parse(name) else {
-            return;
-        };
-        if self.first.is_none() {
-            self.first = Some(piece.numbered(FIRST));
+        match split::parse(name) {
+            Some(piece) if !self.stated => {
+                if self.first.is_none() {
+                    self.first = Some(piece.numbered(FIRST));
+                }
+            }
+            // A piece no name numbers is where it was bound, and so is
+            // every piece of its set.
+            _ if self.first.is_none() => self.stated = true,
+            _ => return,
         }
         if volume == VolumeIndex(0) || self.name.is_empty() {
             split::whole(name)
                 .unwrap_or(name)
                 .clone_into(&mut self.name);
         }
-        let held = self.pieces.entry(volume.0).or_default();
+        let held = self.pieces.entry(volume.0).or_insert_with(|| Piece {
+            front: if volume == VolumeIndex(0) {
+                Front::Judged
+            } else {
+                Front::default()
+            },
+            ..Piece::default()
+        });
         if held.declared.is_none() {
             held.declared = length.filter(|length| *length > 0);
         }
@@ -427,8 +615,9 @@ impl Object for SplitStore {
     }
 
     // A piece of my set by its name, wherever its number places it: what
-    // its bytes open is the joined file's to say.
-    fn claim(&mut self, name: &str, _first_bytes: &[u8], _length: Option<u64>) -> Vec<VolumeIndex> {
+    // the first piece's bytes open is the joined file's to say, and a later
+    // piece's front refutes the set when it reaches me (`refutes`).
+    fn claim(&mut self, name: &str, _first_bytes: &[u8], _length: Option<u64>) -> Claim {
         self.place(name).into_iter().collect()
     }
 

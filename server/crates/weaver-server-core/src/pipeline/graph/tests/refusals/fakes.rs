@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use weaver_graph::{
-    Builder, ByteRange, Delivery, Emit, Engine, Extent, Extraction, Kind, Located, MemberId,
+    Builder, ByteRange, Claim, Delivery, Emit, Engine, Extent, Extraction, Kind, Located, MemberId,
     Object, ObjectId, Placement, Pull, Seek, Sink, Standing, VolumeIndex, Volumes, Why,
 };
 
@@ -242,7 +242,7 @@ impl Object for Store {
         None
     }
 
-    fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Vec<VolumeIndex> {
+    fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Claim {
         name.rsplit_once(".part")
             .and_then(|(_, part)| part.strip_suffix(".rar")?.parse::<u32>().ok())
             .filter(|part| *part >= 2)

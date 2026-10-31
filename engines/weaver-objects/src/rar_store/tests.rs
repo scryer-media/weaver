@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use weaver_graph::{
-    ByteRange, Emit, Located, MemberId, Object, Placement, Provenance, RecoveryKind, VolumeIndex,
-    Weight, Why,
+    ByteRange, Claim, Emit, Located, MemberId, Object, Placement, Provenance, RecoveryKind,
+    VolumeIndex, Weight, Why,
 };
 
 use super::RarStore;
@@ -367,6 +367,43 @@ fn a_far_volume_joins_only_the_set_its_name_numbers() {
         last.claim("alpha.part1.rar", &front(&ours[0]), None),
         vec![VolumeIndex(0)]
     );
+}
+
+// A volume posted again under another set's name, its front so far only
+// the main header that states its number: the store cannot judge it yet.
+// It answers the same whether the volume is offered fresh or given back
+// with what was parsed of it, by a store or to an engine, and whether the
+// store holds the set's volume before it or the one after, as a set
+// arrives in order or backwards.
+#[test]
+fn a_volume_given_back_is_answered_as_one_offered_fresh() {
+    let set = write(&items(), &split(Version::Rar5));
+    let kdf = Arc::new(unrar_rs::KdfCache::new());
+    let stated = |front: &[u8]| super::claim::front_facts(front, None, Arc::clone(&kdf));
+    let front = |volume: &Vec<u8>| volume[..4096.min(volume.len())].to_vec();
+    // The shortest front that states the volume's number: its main header.
+    let short = (1..set[1].len())
+        .map(|len| &set[1][..len])
+        .find(|front| stated(front).is_some())
+        .expect("a front that states its number");
+    let name = "ashen.part2.rar";
+    for held in [0u32, 2] {
+        let case = format!("holding volume {held}");
+        let mut object = store();
+        let own = format!("alpha.part{}.rar", held + 1);
+        object.bound(VolumeIndex(held), &own, &front(&set[held as usize]), None);
+        let fresh = object.claim(name, short, None);
+        assert!(matches!(fresh, Claim::NotYet(_)), "{case}: {fresh:?}");
+        let mut giver = store();
+        giver.bound(VolumeIndex(1), name, short, None);
+        let given = giver.give_back(VolumeIndex(1)).expect(&case);
+        assert_eq!(object.reclaim(name, short, None, &*given), fresh, "{case}");
+        let engine = crate::engine::CarriedVolume {
+            front: stated(short),
+            length: None,
+        };
+        assert_eq!(object.reclaim(name, short, None, &engine), fresh, "{case}");
+    }
 }
 
 // A nameless RAR4 volume posted again goes where no free place takes it:
@@ -1129,6 +1166,40 @@ fn a_repair_behind_an_announced_member_retracts_and_rewalks() {
     }
 }
 
+// The first volume is said shorter than it is and closes on what came; then
+// it is said at its real length while the headers at that end are not in
+// yet. Until they come the layout reaches no further than that volume, and
+// the files it placed past it stand: none is started over, and each comes
+// out whole once the rest of the volume comes.
+#[test]
+fn a_volume_said_longer_before_its_end_is_in_keeps_the_files_it_placed() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &split(version));
+        let length = volumes[0].len() as u64;
+        let cut = length / 2;
+        let mut owner = Owner::named(store(), volumes);
+        owner.sized_as(0, cut);
+        for volume in [1, 2] {
+            owner.frames(volume, 1000);
+            owner.close(volume);
+        }
+        owner.deliver(0, ByteRange::new(0, cut));
+        owner.close(0);
+        owner.sized_as(0, length);
+        owner.deliver_as(0, ByteRange::new(cut, length), Provenance::Repaired, None);
+        assert!(
+            !owner
+                .said
+                .iter()
+                .any(|emit| matches!(emit, Emit::Retract(_))),
+            "{version:?} {:?}",
+            owner.said
+        );
+        streamed(&owner);
+        posted_whole(&owner);
+    }
+}
+
 // An article delivered damaged runs from the first file's data over the
 // next file's header, intact, into that file's data. The walk reads damaged
 // bytes only once the volume closes, so until then the store keeps the
@@ -1356,7 +1427,6 @@ fn fixture(name: &str) -> Vec<u8> {
 #[test]
 fn a_volume_numbered_last_of_all_numbers_is_placed_nowhere() {
     use super::claim::place;
-    use crate::quiet::Placed;
     let mut facts = unrar_rs::RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
         Cursor::new(fixture("rar5/rar5_store.rar")),
         None,
@@ -1367,7 +1437,7 @@ fn a_volume_numbered_last_of_all_numbers_is_placed_nowhere() {
     facts.is_volume = true;
     let held = std::collections::BTreeMap::new();
     facts.volume_number = Some(5);
-    assert_eq!(place(&facts, &held), Some(Placed::At(VolumeIndex(5))));
+    assert_eq!(place(&facts, &held), Some(VolumeIndex(5)));
     facts.volume_number = Some(u32::MAX);
     assert_eq!(place(&facts, &held), None);
 }

@@ -51,7 +51,7 @@ impl Object for Geometry {
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
     }
-    fn claim(&mut self, name: &str, _: &[u8], _: Option<u64>) -> Vec<VolumeIndex> {
+    fn claim(&mut self, name: &str, _: &[u8], _: Option<u64>) -> Claim {
         if name.ends_with(".bin") {
             return (1..=self.middles).map(VolumeIndex).collect();
         }

@@ -192,8 +192,11 @@ fn a_ruling_while_the_volume_is_open_waits_until_it_closes() {
     );
 }
 
+// Every article's own check passing says the bytes are as posted, not
+// that they are what the record protects: the record still reads the
+// volume, and finds it intact.
 #[test]
-fn a_volume_that_passed_whole_is_clean_without_a_read() {
+fn a_volume_that_passed_whole_is_still_checked_against_its_record() {
     let volume = rar5_volume(&payload(3, 5000), 4);
     let (mut job, member) = job(&volume);
     job.object.feed(
@@ -210,7 +213,33 @@ fn a_volume_that_passed_whole_is_clean_without_a_read() {
             .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Clean
     );
-    assert_eq!(job.store.reads, 0);
+    assert!(job.store.reads > 0, "the record read nothing");
+    assert_eq!(job.store.writes, 0);
+    assert_eq!(verdicts(&job, member), vec![SliceVerdict::Intact]);
+}
+
+// A byte changed before the volume was posted: every article passes its
+// own check, and only the record's checksums find the byte. It is rebuilt.
+#[test]
+fn a_volume_changed_before_posting_that_passed_whole_is_rebuilt_from_its_record() {
+    let volume = rar5_volume(&payload(7, 5000), 4);
+    let (mut job, member) = job(&volume);
+    job.store.members.get_mut(&member).unwrap()[1000] ^= 0x5a;
+    let posted = job.store.members[&member].clone();
+    job.object.feed(
+        member,
+        &[Segment {
+            range: ByteRange::new(0, posted.len() as u64),
+            crc32: crc32(&posted),
+            verified: true,
+        }],
+    );
+    close(&mut job);
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
+    assert_eq!(outcome, RepairOutcome::Repaired { slices: 1 });
+    assert!(job.store.members[&member] == volume, "rebuilt bytes");
     assert_eq!(verdicts(&job, member), vec![SliceVerdict::Intact]);
 }
 

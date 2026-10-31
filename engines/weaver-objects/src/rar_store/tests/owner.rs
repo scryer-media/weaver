@@ -115,6 +115,12 @@ impl Owner {
 
     fn size(&mut self, volume: usize) {
         let length = self.volumes[volume].1.len() as u64;
+        self.sized_as(volume, length);
+    }
+
+    // The volume's length said as `length`, whatever its bytes run to, as
+    // a producer says one it learned anew.
+    pub fn sized_as(&mut self, volume: usize, length: u64) {
         let mut out = Vec::new();
         self.object
             .sized(VolumeIndex(volume as u32), length, &mut out);

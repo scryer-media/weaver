@@ -10,8 +10,10 @@ use weaver_graph::recovery::RepairOutcome;
 use crate::jobs::model::JobStatus;
 
 use super::harness::{
-    ARTICLE, Outcome, Post, Scenario, assert_fetched_once, kinds, par2_set, payload, run,
+    ARTICLE, Outcome, Post, Scenario, assert_fetched_once, kinds, par2_set, par3_set, payload, run,
 };
+
+mod unnamed;
 
 const NAME: &str = "lantern.bin";
 const PIECE: usize = 6 * ARTICLE;
@@ -229,6 +231,20 @@ async fn a_piece_that_declared_too_long_pulls_the_tail_back_once() {
     assert_never_joined(&graph, original.len(), 0);
 }
 
+// The same, the last articles first: the piece closes short before the
+// pieces ahead of it declared, and its held bytes, placed after, keep it at
+// what it reached.
+#[tokio::test]
+async fn a_piece_that_declared_too_long_pulls_the_tail_back_in_reverse() {
+    let original = five();
+    let graph = run(&Scenario::new(pieces(&original))
+        .declares(1, (PIECE + ARTICLE) as u64)
+        .backwards())
+    .await;
+    assert_five(&graph, &original);
+    assert_fetched_once(&graph);
+}
+
 // A RAR in numbered pieces whose first piece declares a size one article
 // short: the RAR store beneath the split is told the joined file's length
 // again when its bytes move, and what the RAR holds is delivered whole.
@@ -264,6 +280,194 @@ async fn a_rar_in_pieces_with_a_wrong_declared_size_still_unpacks() {
     );
     assert!(graph.files["lantern beacon/beacon.bin"] == beacon);
     assert_fetched_once(&graph);
+}
+
+// The same RAR in numbered pieces, the first declaring a size one article
+// short, its articles arriving last first: what lays the archive out before
+// the first piece's length moves is laid again once it does, and the job
+// ends as it does in order, with the same file, nothing fetched twice.
+#[tokio::test]
+async fn a_rar_in_pieces_with_a_wrong_declared_size_ends_alike_in_either_order() {
+    let beacon = payload(9 * ARTICLE + 5, 71);
+    let archive = crate::pipeline::tests::direct_store::multi_member_store_set(
+        &[("beacon.bin", beacon.clone())],
+        1,
+    )
+    .remove(0)
+    .1;
+    let all: Vec<u32> = (0..archive.len().div_ceil(PIECE) as u32).collect();
+    let scenario = || {
+        let posts = archive
+            .chunks(PIECE)
+            .enumerate()
+            .map(|(index, piece)| {
+                Post::plain(&format!("lantern.rar.{:03}", index + 1), piece.to_vec())
+            })
+            .collect();
+        Scenario::new(posts).declares(0, (PIECE - ARTICLE) as u64)
+    };
+    let forward = run(&scenario().together(&all)).await;
+    let backward = run(&scenario().backwards()).await;
+    for graph in [&forward, &backward] {
+        assert!(
+            graph.completed(),
+            "{:?} {:?} kinds {:?}",
+            graph.status,
+            graph.failure,
+            kinds(graph)
+        );
+        assert_fetched_once(graph);
+    }
+    assert_eq!(
+        backward.files.keys().collect::<Vec<_>>(),
+        forward.files.keys().collect::<Vec<_>>(),
+    );
+    assert!(backward.files == forward.files);
+    assert!(forward.files["lantern beacon/beacon.bin"] == beacon);
+}
+
+// `archive` cut into numbered pieces named `name.001` onward, the first
+// declaring `declared` bytes rather than what it holds, every piece fetched
+// together: each member of the archive is delivered whole and nothing is
+// fetched again.
+async fn assert_in_pieces_with_a_wrong_declared_size_unpacks(
+    name: &str,
+    archive: &[u8],
+    declared: usize,
+    members: &[(&str, Vec<u8>)],
+) {
+    assert_in_pieces_arriving_so_unpacks(name, archive, declared, members, |scenario, all| {
+        scenario.together(all)
+    })
+    .await;
+}
+
+// The same, the pieces' articles arriving as `arrive` lays them out over
+// every piece's index.
+async fn assert_in_pieces_arriving_so_unpacks(
+    name: &str,
+    archive: &[u8],
+    declared: usize,
+    members: &[(&str, Vec<u8>)],
+    arrive: fn(Scenario, &[u32]) -> Scenario,
+) {
+    let posts: Vec<Post> = archive
+        .chunks(PIECE)
+        .enumerate()
+        .map(|(index, piece)| Post::plain(&format!("{name}.{:03}", index + 1), piece.to_vec()))
+        .collect();
+    assert!(posts.len() > 1, "the archive spans more than one piece");
+    let all: Vec<u32> = (0..posts.len() as u32).collect();
+    let graph = run(&arrive(
+        Scenario::new(posts).declares(0, declared as u64),
+        &all,
+    ))
+    .await;
+    assert!(
+        graph.completed(),
+        "{:?} {:?} kinds {:?}",
+        graph.status,
+        graph.failure,
+        kinds(&graph)
+    );
+    let mut expected: Vec<String> = members
+        .iter()
+        .map(|(member, _)| format!("lantern beacon/{member}"))
+        .collect();
+    expected.sort();
+    assert_eq!(graph.files.keys().cloned().collect::<Vec<_>>(), expected);
+    for (member, bytes) in members {
+        assert!(
+            graph.files[&format!("lantern beacon/{member}")] == *bytes,
+            "{member} bytes"
+        );
+    }
+    assert_fetched_once(&graph);
+}
+
+// A tar in numbered pieces whose first piece declares a size one article
+// short: every later piece moves once, and the tar beneath the split reads
+// each moved run as it comes, before the next one goes.
+#[tokio::test]
+async fn a_tar_in_pieces_with_a_wrong_declared_size_still_unpacks() {
+    let members = super::streams::members();
+    let archive = super::streams::tar(&members);
+    assert_in_pieces_with_a_wrong_declared_size_unpacks(
+        "lantern.tar",
+        &archive,
+        PIECE - ARTICLE,
+        &members,
+    )
+    .await;
+}
+
+// A tar that stops where its next entry would start, without the end
+// blocks, in numbered pieces whose first piece declares a size one article
+// long: the joined file is said too long, then said again at its length at
+// the close, and the tar takes that length, so it ends where the file does.
+#[tokio::test]
+async fn a_tar_without_end_blocks_in_pieces_declared_too_long_still_unpacks() {
+    let members = super::streams::members();
+    let mut archive = super::streams::tar(&members);
+    archive.truncate(archive.len() - 1024);
+    assert_in_pieces_with_a_wrong_declared_size_unpacks(
+        "lantern.tar",
+        &archive,
+        PIECE + ARTICLE,
+        &members,
+    )
+    .await;
+}
+
+// The same tar, the first piece declaring a size one article short, its
+// articles arriving last first: a later piece's front is judged whole
+// whichever comes first, and the tar unpacks as it does in order.
+#[tokio::test]
+async fn a_tar_in_pieces_with_a_wrong_declared_size_arriving_last_first_still_unpacks() {
+    let members = super::streams::members();
+    let archive = super::streams::tar(&members);
+    assert_in_pieces_arriving_so_unpacks(
+        "lantern.tar",
+        &archive,
+        PIECE - ARTICLE,
+        &members,
+        |scenario, _| scenario.backwards(),
+    )
+    .await;
+}
+
+// The same tar without its end blocks, the first piece declaring a size one
+// article long, its articles arriving last first: it unpacks as it does in
+// order.
+#[tokio::test]
+async fn a_tar_without_end_blocks_in_pieces_declared_too_long_arriving_last_first_still_unpacks() {
+    let members = super::streams::members();
+    let mut archive = super::streams::tar(&members);
+    archive.truncate(archive.len() - 1024);
+    assert_in_pieces_arriving_so_unpacks(
+        "lantern.tar",
+        &archive,
+        PIECE + ARTICLE,
+        &members,
+        |scenario, _| scenario.backwards(),
+    )
+    .await;
+}
+
+// A zip in numbered pieces whose first piece declares a size one article
+// short: the zip beneath the split is told the joined file's length again
+// when its bytes move, and looks again.
+#[tokio::test]
+async fn a_zip_in_pieces_with_a_wrong_declared_size_still_unpacks() {
+    let members = super::zip::members();
+    let archive = super::zip::archive(super::zip::stored());
+    assert_in_pieces_with_a_wrong_declared_size_unpacks(
+        "lantern.zip",
+        &archive,
+        PIECE - ARTICLE,
+        &members,
+    )
+    .await;
 }
 
 // Every article of the third piece lost: the set over the pieces rebuilds
@@ -363,8 +567,8 @@ async fn a_gapped_split_beside_a_whole_file_ends_partial() {
         .map(|post| (format!("lantern beacon/{}", post.name), post.bytes.clone()))
         .collect();
     let plain = payload(3 * ARTICLE + 9, 73);
-    posts.push(Post::plain("ember.bin", plain.clone()));
-    expected.insert("lantern beacon/ember.bin".to_string(), plain);
+    posts.push(Post::plain("ember.mkv", plain.clone()));
+    expected.insert("lantern beacon/ember.mkv".to_string(), plain);
     let graph = run(&Scenario::new(posts)).await;
     assert_eq!(
         graph.status,
@@ -441,6 +645,58 @@ async fn rar_volume_names_found_the_rar_store_not_a_split() {
     assert_eq!(kinds(&graph), vec!["rar_store"]);
 }
 
+// A tar split into `lantern.tar.001` and `.002` exactly where its second
+// member's header starts, so the second piece opens as a tar of its own.
+// Nothing straddles the cut: the first piece holds the first member whole,
+// the second the rest and the end blocks. Each member is delivered once,
+// whole, whichever reading the pieces take: in articles too short to hold a
+// tar header's verdict the second piece's front signs nothing and the
+// pieces join; in articles that hold it the second piece refutes the set
+// and each piece is read as its own tar.
+#[tokio::test]
+async fn a_tar_split_on_a_member_header_delivers_every_member_once() {
+    let members = super::streams::members();
+    let archive = super::streams::tar(&members);
+    let cut = 512 + members[0].1.len().next_multiple_of(512);
+    assert_eq!(
+        &archive[cut + 257..cut + 262],
+        b"ustar",
+        "the cut opens a header"
+    );
+    let mut expected: Vec<String> = members
+        .iter()
+        .map(|(name, _)| format!("lantern beacon/{name}"))
+        .collect();
+    expected.sort();
+    for article in [ARTICLE, 4096] {
+        let posts = vec![
+            Post::plain("lantern.tar.001", archive[..cut].to_vec()),
+            Post::plain("lantern.tar.002", archive[cut..].to_vec()),
+        ];
+        let graph = run(&Scenario::new(posts).framed(article)).await;
+        assert!(
+            graph.completed(),
+            "articles of {article}: {:?} {:?} kinds {:?} files {:?}",
+            graph.status,
+            graph.failure,
+            kinds(&graph),
+            graph.files.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            graph.files.keys().cloned().collect::<Vec<_>>(),
+            expected,
+            "articles of {article}: delivered names",
+        );
+        for (name, bytes) in &members {
+            assert!(
+                graph.files[&format!("lantern beacon/{name}")] == *bytes,
+                "articles of {article}: {name} whole"
+            );
+        }
+        assert_fetched_once(&graph);
+    }
+}
+
 // One piece's article lost: the set posted over the joined file repairs the
 // joined file where the join writes it, and that file is what is handed
 // over, whole, with none of the pieces beside it.
@@ -454,5 +710,97 @@ async fn a_plain_split_with_a_lost_article_under_par2_over_the_joined_file_is_re
     assert_eq!(
         graph.graph().outcomes,
         vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+}
+
+// The first piece posted one article longer than its declared size, beside
+// the set `recovery` builds over the pieces as cut.
+fn posted_long(recovery: impl FnOnce(&[(&str, &[u8])]) -> Vec<Post>) -> Scenario {
+    posted_off(|piece| piece.extend_from_slice(&[0x5a; ARTICLE]), recovery)
+}
+
+// The pieces under a recovery set over them as they should be, the first
+// posted changed by `change` but still declaring its true size.
+fn posted_off(
+    change: impl FnOnce(&mut Vec<u8>),
+    recovery: impl FnOnce(&[(&str, &[u8])]) -> Vec<Post>,
+) -> Scenario {
+    let posted = pieces(&joined());
+    let described: Vec<(String, Vec<u8>)> = posted
+        .iter()
+        .map(|post| (post.name.clone(), post.bytes.clone()))
+        .collect();
+    let described: Vec<(&str, &[u8])> = described
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let recovery = recovery(&described);
+    let mut posts = posted;
+    change(&mut posts[0].bytes);
+    posts.extend(recovery);
+    Scenario::new(posts).declares(0, PIECE as u64)
+}
+
+// The set over the pieces proves the first piece the declared size: the
+// stray bytes are cut and the join comes out whole.
+#[tokio::test]
+async fn a_piece_posted_long_is_cut_to_the_length_its_recovery_set_proves() {
+    let graph = run(&posted_long(|described| par2_set("lantern", described, 2))).await;
+    assert_joined(&graph);
+}
+
+#[tokio::test]
+async fn a_piece_posted_long_is_cut_to_the_length_its_recovery_set_proves_in_reverse() {
+    let scenario = posted_long(|described| par2_set("lantern", described, 2)).backwards();
+    assert_joined(&run(&scenario).await);
+}
+
+// A PAR3 set over the pieces proves it alike.
+#[tokio::test]
+async fn a_piece_posted_long_is_cut_to_the_length_its_par3_set_proves() {
+    let graph = run(&posted_long(|described| par3_set("lantern", described, 2))).await;
+    assert_joined(&graph);
+}
+
+#[tokio::test]
+async fn a_piece_posted_long_is_cut_to_the_length_its_par3_set_proves_in_reverse() {
+    let scenario = posted_long(|described| par3_set("lantern", described, 2)).backwards();
+    assert_joined(&run(&scenario).await);
+}
+
+// The first piece posted an article short of the size it declares: the
+// tail it lacks is damage, and the set over the pieces rebuilds it.
+fn posted_short() -> Scenario {
+    posted_off(
+        |piece| piece.truncate(PIECE - ARTICLE),
+        |described| par2_set("lantern", described, 2),
+    )
+}
+
+#[tokio::test]
+async fn a_piece_posted_short_is_rebuilt_to_the_length_its_recovery_set_proves() {
+    let graph = run(&posted_short()).await;
+    assert_joined(&graph);
+    assert!(
+        matches!(
+            graph.graph().outcomes[..],
+            [Some(RepairOutcome::Repaired { .. })]
+        ),
+        "{:?}",
+        graph.graph().outcomes
+    );
+}
+
+#[tokio::test]
+async fn a_piece_posted_short_is_rebuilt_to_the_length_its_recovery_set_proves_in_reverse() {
+    let graph = run(&posted_short().backwards()).await;
+    assert_joined(&graph);
+    assert!(
+        matches!(
+            graph.graph().outcomes[..],
+            [Some(RepairOutcome::Repaired { .. })]
+        ),
+        "{:?}",
+        graph.graph().outcomes
     );
 }

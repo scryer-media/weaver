@@ -151,12 +151,12 @@ async fn an_obfuscated_payload_reconciles_through_its_set() {
 async fn an_unprotected_damaged_file_leaves_the_job_partial() {
     let body = payload(5 * ARTICLE, 179);
     let notes = payload(3 * ARTICLE, 180);
-    let mut posts = covered(&[("lantern.bin", &body)], 2, 1);
+    let mut posts = covered(&[("lantern.mkv", &body)], 2, 1);
     posts.push(Post::plain("notes.txt", notes.clone()));
     let at = posts.len() as u32 - 1;
     let outcome = row(
         &Scenario::new(posts).damaged(at, 1),
-        Expect::Partial(&[("lantern.bin", &body)]),
+        Expect::Partial(&[("lantern.mkv", &body)]),
         "unprotected damaged",
     )
     .await;
@@ -170,12 +170,12 @@ async fn an_unprotected_damaged_file_leaves_the_job_partial() {
 #[tokio::test]
 async fn a_missing_unprotected_file_leaves_the_job_partial() {
     let body = payload(5 * ARTICLE, 181);
-    let mut posts = covered(&[("lantern.bin", &body)], 2, 1);
+    let mut posts = covered(&[("lantern.mkv", &body)], 2, 1);
     posts.push(Post::plain("notes.txt", payload(3 * ARTICLE, 182)));
     let at = posts.len() as u32 - 1;
     let outcome = row(
         &lose_all(Scenario::new(posts), at),
-        Expect::Partial(&[("lantern.bin", &body)]),
+        Expect::Partial(&[("lantern.mkv", &body)]),
         "unprotected missing",
     )
     .await;

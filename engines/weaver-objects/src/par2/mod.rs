@@ -26,7 +26,7 @@ use par2_rs::FileId;
 use par2_rs::packet::{HEADER_SIZE, MAGIC};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome, SetRuling};
 use weaver_graph::{
-    ByteRange, Delivery, Emit, Extent, Kind, Located, MemberId, Namespace, Object, ObjectId,
+    ByteRange, Claim, Delivery, Emit, Extent, Kind, Located, MemberId, Namespace, Object, ObjectId,
     Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex,
 };
 
@@ -197,21 +197,28 @@ impl Par2 {
     // will never come, so each needs a block of its own, unless a slice of
     // a member it binds that is neither refused nor came damaged carries
     // the same checksums. A slice is its bytes, and the repair copies them
-    // from there.
+    // from there. A refused slice the member's checksums prove intact came
+    // after all, by a repair or by a further posting folded into it, and
+    // needs nothing.
     fn refused_slices(&self, key: &[u8; 16]) -> u64 {
         let state = &self.sets[key];
         let Some(index) = state.usable().filter(|index| index.slice_size > 0) else {
             return 0;
         };
         let slice = index.slice_size;
+        let intact = |member: MemberId, at: u64| {
+            self.evidence.get(&(*key, member)).is_some_and(|evidence| {
+                evidence.vetoed().nth(at as usize) == Some(SliceVerdict::Intact)
+            })
+        };
         let refused: BTreeSet<(FileId, u64)> = state
             .members()
             .iter()
             .filter_map(|(file, member)| {
                 let length = index.file_description(file)?.length;
-                Some((*file, length, self.shown.refusals.get(member)?))
+                Some((*file, *member, length, self.shown.refusals.get(member)?))
             })
-            .flat_map(|(file, length, ranges)| {
+            .flat_map(|(file, member, length, ranges)| {
                 ranges
                     .iter()
                     .filter_map(move |range| range.intersect(ByteRange::new(0, length)))
@@ -219,6 +226,7 @@ impl Par2 {
                     .flat_map(move |range| {
                         (range.start / slice..=(range.end - 1) / slice).map(move |at| (file, at))
                     })
+                    .filter(move |&(_, at)| !intact(member, at))
             })
             .collect();
         let holds = |file: FileId, at: u64| {
@@ -621,7 +629,7 @@ impl Object for Par2 {
     // By the magic its bytes open with, or, before any bytes, by a name
     // that continues the set's: the stem of a volume already held, then a
     // `.vol` name ending in `.par2`.
-    fn claim(&mut self, name: &str, first_bytes: &[u8], _length: Option<u64>) -> Vec<VolumeIndex> {
+    fn claim(&mut self, name: &str, first_bytes: &[u8], _length: Option<u64>) -> Claim {
         let ours = if first_bytes.is_empty() {
             self.volumes
                 .iter()
@@ -677,19 +685,17 @@ impl Recovery for Par2 {
         }
         // A member a set bound under a name none of its postings answers
         // to the description with, even folded, is recognised: it takes the
-        // description's name and length. So is one the set repaired whose
-        // good bytes reach past the description: they arrived shifted
-        // along, and the rebuilt file ends at the length the set describes.
-        // A length booked for articles that never came is not bytes, and
-        // proves nothing. One bound under its own name keeps it, and takes
-        // the description's length as `Namespace::take_described` says. A
-        // member longer than its description by bytes that arrived keeps its
-        // length: its posting carries more than the described file.
+        // description's name and length. One bound under its own name keeps
+        // it, and takes the description's length as
+        // `Namespace::take_described` says, once the set's blocks verify.
         for state in self.sets.values() {
             let Some(index) = state.usable() else {
                 continue;
             };
-            let repaired = matches!(state.concluded(), Some(RepairOutcome::Repaired { .. }));
+            let verified = matches!(
+                state.concluded(),
+                Some(RepairOutcome::Clean | RepairOutcome::Repaired { .. })
+            );
             for (file, member) in state.members() {
                 let Some(description) = index.file_description(file) else {
                     continue;
@@ -697,15 +703,7 @@ impl Recovery for Par2 {
                 let answers = namespace
                     .postings(*member)
                     .any(|record| record.name.eq_ignore_ascii_case(&description.filename));
-                let past = ByteRange::new(description.length, u64::MAX);
-                let longer = repaired
-                    && namespace.get(*member).is_some_and(|record| {
-                        record
-                            .coverage
-                            .overlapping(past)
-                            .any(|run| run.provenance.is_verified())
-                    });
-                if !answers || longer {
+                if !answers {
                     if namespace
                         .recognise(*member, &description.filename, description.length)
                         .is_some()
@@ -714,7 +712,9 @@ impl Recovery for Par2 {
                     }
                     continue;
                 }
-                namespace.take_described(*member, description.length, repaired);
+                if namespace.take_described(*member, description.length, verified) {
+                    renamed.push(*member);
+                }
             }
         }
         // A set none of whose bindings changed, and none of whose members'

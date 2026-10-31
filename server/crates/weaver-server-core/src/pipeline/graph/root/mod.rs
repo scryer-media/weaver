@@ -167,14 +167,6 @@ impl ArticleRoot {
 // namespace write path, which calls this with every delivery it feeds to a
 // recovery object. Root coordinates: member M is volume M.
 impl Segments for ArticleRoot {
-    fn length_uncertain(&self, node: NodeId, volume: VolumeIndex) -> bool {
-        // Recovery may found a root member absent from the post. Only
-        // posted volumes can inherit uncertainty from article positions.
-        node == NodeId::ROOT
-            && (volume.0 as usize) < self.map.volume_count()
-            && self.map.ordered_only(volume.0 as usize)
-    }
-
     fn segments_for(
         &self,
         node: NodeId,

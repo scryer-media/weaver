@@ -17,9 +17,10 @@ pub(super) struct Geometry {
 }
 
 impl Geometry {
-    // Whether the length is news.
+    // Whether the length is news: one not known before, or one that differs
+    // from it.
     pub(super) fn set(&mut self, volume: VolumeIndex, length: u64) -> bool {
-        self.lengths.insert(volume.0, length).is_none()
+        self.lengths.insert(volume.0, length) != Some(length)
     }
 
     pub(super) fn base(&self, volume: VolumeIndex) -> Option<u64> {

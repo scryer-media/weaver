@@ -42,6 +42,7 @@ fn member(id: u32, name: &str) -> MemberRecord {
         undecided: false,
         copy_of: None,
         fronted: false,
+        refuted: None,
     }
 }
 
@@ -81,6 +82,7 @@ fn full() -> Snapshot {
     ];
     root.members[0].crc32 = Some(0xDEAD_BEEF);
     root.members[2].buried = true;
+    root.members[2].refuted = Some(Kind::Split);
     root.members[3].copy_of = Some(MemberId(0));
     root.members[0].bound_to = Some(ObjectId(1));
     root.members[0].owner = Some((NodeId(1), VolumeIndex(0)));
@@ -306,6 +308,48 @@ fn a_snapshot_comes_back_from_its_rows() {
     let mut back = taken.clone();
     back.root.volumes[0].articles[1] = (1, ArticleFacts::Lost { damaged: false });
     assert_eq!(snapshot(&rows(&taken)), Ok(back));
+}
+
+// The same rows written to the database and read back: the kind a
+// member's reading was refuted as comes back with it, so a restart after
+// a refutation founds nothing of that kind from the member's name.
+#[test]
+fn a_snapshot_comes_back_from_the_database() {
+    let db = crate::persistence::Database::open_in_memory().unwrap();
+    let job = crate::jobs::ids::JobId(4281);
+    db.create_active_job(&crate::ActiveJob {
+        job_id: job,
+        nzb_hash: [0xA5; 32],
+        nzb_path: std::path::PathBuf::from("/tmp/refuted.nzb"),
+        nzb_zstd: crate::ingest::compress_nzb_bytes(
+            br#"<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"/>"#,
+        )
+        .unwrap(),
+        output_dir: std::path::PathBuf::from("/tmp/refuted"),
+        created_at: 1_700_000_000,
+        category: None,
+        metadata: Vec::new(),
+        status: "queued",
+        download_state: "queued",
+        post_state: "idle",
+        run_state: "active",
+        paused_resume_status: None,
+        paused_resume_download_state: None,
+        paused_resume_post_state: None,
+        password_override: None,
+        supplied_password_candidates: Vec::new(),
+    })
+    .unwrap();
+    let written = rows(&full());
+    db.save_graph_checkpoint(job, Arc::new(between(None, &written)))
+        .unwrap();
+    let read = db
+        .load_graph_checkpoint(job)
+        .unwrap()
+        .expect("a checkpoint was written");
+    let back = snapshot(&read).unwrap();
+    assert_eq!(back.tree.nodes[0].members[2].refuted, Some(Kind::Split));
+    assert_eq!(Ok(back), snapshot(&written));
 }
 
 #[test]

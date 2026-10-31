@@ -48,10 +48,6 @@ use crate::pipeline::extraction::ExtractionFailure;
 // a numbering every namespace has. A source answers for the namespace it
 // delivered into and leaves every other one without.
 pub(crate) trait Segments {
-    fn length_uncertain(&self, _node: NodeId, _volume: VolumeIndex) -> bool {
-        false
-    }
-
     fn segments_for(
         &self,
         node: NodeId,
@@ -349,11 +345,6 @@ impl NamespaceWriter {
         arrival: Arrival,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
-        if segments.length_uncertain(arrival.node, VolumeIndex(arrival.member.0))
-            && let Some(namespace) = tree.namespace_mut(arrival.node)
-        {
-            namespace.mark_length_uncertain(arrival.member);
-        }
         self.place(tree, builder, segments, arrival, write, out)
     }
 
@@ -983,6 +974,21 @@ impl NamespaceWriter {
                 self.materialise(tree, builder, segments, *node, *member, out)?;
                 let mut effects = Vec::new();
                 tree.bury(*node, *member, &mut effects);
+                // A refused member its recovery set proves whole may be the
+                // first piece of a file, now in its own file.
+                if matches!(effect, Effect::Refused { .. }) {
+                    tree.refused_whole(*node, *member, &mut self.placing(builder), &mut effects);
+                }
+                self.prune(tree)?;
+                self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
+            }
+            // Read back into its own file as a refused member is, nothing
+            // refused, and then claimed by what its own bytes sign: its
+            // object's claim on it was the name its bytes refuted.
+            Effect::Disclaimed { node, member } => {
+                self.materialise(tree, builder, segments, *node, *member, out)?;
+                let mut effects = Vec::new();
+                tree.claim_by_bytes(*node, *member, &mut self.placing(builder), &mut effects);
                 self.prune(tree)?;
                 self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
             }
@@ -1039,7 +1045,7 @@ impl NamespaceWriter {
                 // A member whose front stops at bytes that will never come
                 // cannot say what it is from them: it is a leaf, as one that
                 // ended first is. A repair there lets it say again.
-                if tree.is_undecided(*node, *member) && tree.front_lost(*node, *member, *range) {
+                if tree.is_undecided(*node, *member) && !tree.front_to_come(*node, *member) {
                     self.settle(tree, builder, segments, *node, *member, out)?;
                 }
                 let mut effects = Vec::new();
@@ -1055,11 +1061,21 @@ impl NamespaceWriter {
             Effect::Renamed { .. } => self.moved(tree, std::slice::from_ref(&effect))?,
             Effect::NeedsPassword { .. } => {}
             // Every effect before it is applied, so what the object reads
-            // back of its members is on disk.
+            // back of its members is on disk. Each run's effects are
+            // applied before the next run goes, as each delivery's are.
             Effect::Again { node, ranges } => {
-                let mut effects = Vec::new();
-                tree.again(*node, ranges, &mut self.placing(builder), &mut effects);
-                self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
+                let runs = tree.again_read(*node, ranges, &self.placing(builder));
+                for (volume, posted) in runs {
+                    let mut effects = Vec::new();
+                    tree.replay_piece(
+                        *node,
+                        volume,
+                        posted,
+                        &mut self.placing(builder),
+                        &mut effects,
+                    );
+                    self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
+                }
             }
         }
         out.push(effect);

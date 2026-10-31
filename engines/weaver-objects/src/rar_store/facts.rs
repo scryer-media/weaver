@@ -103,7 +103,8 @@ impl From<MemberKeying> for KeyTuple {
 
 impl Durable for StoreFacts {
     // 2: the front each volume stated when it was bound.
-    const VERSION: u16 = 2;
+    // 3: a kept cipher block says whether an arrival started inside it.
+    const VERSION: u16 = 3;
 
     fn impossible(&self) -> Option<&'static str> {
         let indices: BTreeSet<_> = self.volumes.iter().map(|volume| volume.index).collect();

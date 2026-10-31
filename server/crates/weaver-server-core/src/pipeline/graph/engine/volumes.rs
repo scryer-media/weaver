@@ -171,10 +171,6 @@ impl RunVolumes {
 }
 
 impl Volumes for RunVolumes {
-    fn uncertain_lengths(&self) -> bool {
-        self.shelf.lock().uncertain_lengths
-    }
-
     fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>> {
         let Some(from) = after.map_or(Some(0), |after| after.0.checked_add(1)) else {
             return Ok(None);
@@ -238,11 +234,6 @@ impl Volumes for RunVolumes {
         };
         read_exact_at(file, offset, &mut into[..len])?;
         Ok(len)
-    }
-
-    fn bridged(&self, lost: Lost) {
-        self.spans()
-            .remove(&(lost.volume.0, lost.range.start, lost.range.end));
     }
 }
 

@@ -124,7 +124,7 @@ fn shape_fixture(shape: Shape) -> ShapeFixture {
     .then_some("moonlit-harbour");
     let archive = if solid {
         expected.clear();
-        for (index, name) in ["part0.bin", "part1.bin", "part2.bin"]
+        for (index, name) in ["part0.mkv", "part1.mkv", "part2.mkv"]
             .into_iter()
             .enumerate()
         {

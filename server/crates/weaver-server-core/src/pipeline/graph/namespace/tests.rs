@@ -251,6 +251,7 @@ impl Builder for Build {
                 fixing: None,
                 fix: self.fix,
                 seen: Arc::clone(&self.par),
+                last: None,
             })),
             _ => None,
         }
@@ -332,6 +333,8 @@ struct Par {
     fixing: Option<MemberId>,
     fix: Option<Fix>,
     seen: Arc<Mutex<Seen>>,
+    // What its last repair came to, until a bind changes what it covers.
+    last: Option<RepairOutcome>,
 }
 
 impl Object for Par {
@@ -377,6 +380,7 @@ impl Object for Par {
 
 impl Recovery for Par {
     fn bind(&mut self, namespace: &mut weaver_graph::Namespace, renamed: &mut Vec<MemberId>) {
+        let covered = (self.volume, self.others.clone());
         self.volume = namespace.find_by_name("set.par2").map(|own| own.id);
         self.fixing = self
             .fix
@@ -399,6 +403,9 @@ impl Recovery for Par {
             namespace.rename(member, "show.mkv");
             renamed.push(member);
         }
+        if covered != (self.volume, self.others.clone()) {
+            self.last = None;
+        }
     }
 
     fn covers(&self, member: MemberId) -> bool {
@@ -413,6 +420,18 @@ impl Recovery for Par {
     fn wants(&self, _: &mut Vec<Seek>) {}
 
     fn repair(&mut self, access: &mut dyn MemberAccess, _: weaver_graph::Budget) -> RepairOutcome {
+        let outcome = self.ruled(access);
+        self.last = Some(outcome);
+        outcome
+    }
+
+    fn outcome(&self) -> Option<RepairOutcome> {
+        self.last
+    }
+}
+
+impl Par {
+    fn ruled(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
         if self.seen.lock().unwrap().report_error {
             #[derive(Debug)]
             struct Injected(std::io::Error);
@@ -446,10 +465,6 @@ impl Recovery for Par {
         }
         access.write_repaired(member, fix.fix.0, fix.fix.1);
         RepairOutcome::Repaired { slices: 1 }
-    }
-
-    fn outcome(&self) -> Option<RepairOutcome> {
-        None
     }
 }
 

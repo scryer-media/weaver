@@ -1,0 +1,27 @@
+{
+  "slug": "par3-obfuscated-plain-name",
+  "title": "E2E.Test.PAR3.Obfuscated.Plain.Name.Indigo.Vale.S01E08.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "The par3-obfuscated-names payload posted under a bare hex name, so it sits on disk under that name until the PAR3 set moves it to the name the set records.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "fixtureAssets": [
+    "par3-obfuscated-names/51273aad56a8b904e96928935278a627.201::51273aad56a8b904e96928935278a627",
+    "par3-obfuscated-names/indigo.vale.s01e08.par3",
+    "par3-obfuscated-names/indigo.vale.s01e08.vol0+1.par3",
+    "par3-obfuscated-names/indigo.vale.s01e08.vol1+2.par3",
+    "par3-obfuscated-names/indigo.vale.s01e08.vol3+4.par3",
+    "par3-obfuscated-names/indigo.vale.s01e08.vol7+1.par3"
+  ],
+  "expectedOutputBLAKE3": {
+    "indigo.vale.s01e08.mkv": "5c0eba8bbfdd683635fef458bc3f4626c1c918a7211e1c3fca10a63baf17efc9"
+  },
+  "requiredJobEvents": [
+    "RepairComplete"
+  ],
+  "forbiddenJobEvents": [
+    "RepairFailed"
+  ],
+  "forbiddenOutputPaths": [
+    "51273aad56a8b904e96928935278a627"
+  ]
+}

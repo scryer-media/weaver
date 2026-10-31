@@ -62,10 +62,10 @@ pub(in super::super) struct Leaves {
 }
 
 // Pieces a job holds as plain files: how many the post carries to it, and
-// how many of those come whole.
+// the names of those that come whole.
 pub(in super::super) struct Files {
     pub(in super::super) posted: usize,
-    pub(in super::super) whole: usize,
+    pub(in super::super) whole: Vec<String>,
     pub(in super::super) joined: Option<String>,
 }
 
@@ -181,6 +181,11 @@ fn rar_recovers(
     recovered
 }
 
+// Some whole file is one a job can end partial by.
+fn usable<'n>(whole: impl IntoIterator<Item = &'n String>) -> bool {
+    whole.into_iter().any(|name| weaver_graph::known_type(name))
+}
+
 // What a schedule loses: an article of a volume, or a volume the post never
 // carried.
 fn loses(interruption: Interruption) -> bool {
@@ -191,10 +196,10 @@ fn loses(interruption: Interruption) -> bool {
 // delivered whole include the reference reader's deliverable ones, and
 // every published member is checked against its fixture bytes. The job is complete
 // when every member is whole and the post mended all the schedule
-// damaged, failed when nothing is whole, and partial otherwise. A post the
-// job has no reason to read as an archive is files as posted, held to the
-// same rule: complete when every piece came whole, failed when none did,
-// partial otherwise. A job that
+// damaged, partial when a whole member is of a type people open, and failed
+// otherwise. A post the job has no reason to read as an archive is files as
+// posted, held to the same rule: complete when every piece came whole,
+// partial when a whole piece is of a known type, failed otherwise. A job that
 // delivered nothing leaves nothing in its output directory; one that
 // delivered anything moved all of itself there. Only the members and the
 // post's own files are published. Nothing on disk is asked for again. A
@@ -225,19 +230,19 @@ pub(in super::super) fn graph_disagreements(
                 files.joined
             ));
         }
-        if files.whole == 0 {
-            matches!(outcome.status, Some(JobStatus::Failed { .. }))
-        } else if files.whole == files.posted {
+        if !files.whole.is_empty() && files.whole.len() == files.posted {
             outcome.status == Some(JobStatus::Complete)
-        } else {
+        } else if usable(&files.whole) {
             outcome.status == Some(JobStatus::Partial)
+        } else {
+            matches!(outcome.status, Some(JobStatus::Failed { .. }))
         }
-    } else if whole.is_empty() {
-        matches!(outcome.status, Some(JobStatus::Failed { .. }))
-    } else if whole.len() == post.members.len() && *mended {
+    } else if !whole.is_empty() && whole.len() == post.members.len() && *mended {
         outcome.status == Some(JobStatus::Complete)
-    } else {
+    } else if usable(&whole) {
         outcome.status == Some(JobStatus::Partial)
+    } else {
+        matches!(outcome.status, Some(JobStatus::Failed { .. }))
     };
     if !status {
         said.push(format!(
@@ -247,7 +252,8 @@ pub(in super::super) fn graph_disagreements(
             post.members.len(),
             files.as_ref().map_or("none".to_string(), |files| format!(
                 "{} of {} whole",
-                files.whole, files.posted
+                files.whole.len(),
+                files.posted
             ))
         ));
     }

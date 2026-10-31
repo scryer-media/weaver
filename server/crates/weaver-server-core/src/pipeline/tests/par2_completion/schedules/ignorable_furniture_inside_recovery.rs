@@ -150,17 +150,17 @@ async fn another_sets_blocks_never_count_toward_a_short_set() {
     let ember = payload(5 * ARTICLE, 141);
     let quill = payload(4 * ARTICLE + 7, 142);
     let mut posts = vec![
-        Post::plain("ember.bin", ember.clone()),
-        Post::plain("quill.bin", quill.clone()),
+        Post::plain("ember.mkv", ember.clone()),
+        Post::plain("quill.mkv", quill.clone()),
     ];
-    posts.extend(par2_volumes("ember", &[("ember.bin", &ember)], 4, 1));
-    posts.extend(par2_volumes("quill", &[("quill.bin", &quill)], 1, 1));
+    posts.extend(par2_volumes("ember", &[("ember.mkv", &ember)], 4, 1));
+    posts.extend(par2_volumes("quill", &[("quill.mkv", &quill)], 1, 1));
     let outcome = row(
         &Scenario::new(posts).damaged(1, 0).damaged(1, 3),
-        Expect::Partial(&[("ember.bin", &ember)]),
+        Expect::Partial(&[("ember.mkv", &ember)]),
         "quill short",
     )
     .await;
     // Delivered as it stands, unrepaired: not the posted bytes.
-    assert!(super::delivered(&outcome.files, "quill.bin").is_some_and(|bytes| *bytes != quill));
+    assert!(super::delivered(&outcome.files, "quill.mkv").is_some_and(|bytes| *bytes != quill));
 }

@@ -182,6 +182,7 @@ async fn run_stopping(scenario: &Scenario, stop: Stop) -> (Restarted, GraphCheck
     let restarted = Restarted {
         status,
         files,
+        retained_files: BTreeMap::new(),
         from_disk,
         in_memory,
         restarts: usize::from(restored.is_some()),
@@ -374,15 +375,23 @@ async fn a_chain_of_renames_down_after_the_first_move_opens_each_file_where_it_i
 }
 
 // Down after the checkpoint that records the name a piece is handed back
-// under committed, before the move ran: the piece's bytes sat in the
-// envelope's own file, and the restore opens them there and moves them to
-// the name the set gives later.
+// under committed, before any move ran: the split store kept none of the
+// piece's bytes in a file of its own, and the step that renamed the piece
+// handed it back, so its bytes went into the member's own file at the name
+// the set gives. Nothing waits to move, and the restore opens it there.
 #[tokio::test]
 async fn a_piece_handed_back_and_renamed_but_not_moved_is_opened_where_it_sat() {
     let (rows, restarted) = stopped_row(renamed_from_a_piece(), Stop::Committed).await;
+    // The piece is a file of the job's own folder now, bound to nothing.
+    let piece = rows
+        .members
+        .iter()
+        .find(|member| member.node == 0 && member.member == 0)
+        .expect("the piece's row");
     assert_eq!(
-        waiting(&rows),
-        [(".weaver-chunks/graph-envelope-2-200", "lantern.bin")]
+        (piece.output_name.as_str(), piece.bound, piece.has_file),
+        ("lantern.bin", None, true)
     );
+    assert_eq!(waiting(&rows), []);
     assert_eq!(delivered(&restarted), ["lantern.bin"]);
 }

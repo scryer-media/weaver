@@ -22,16 +22,20 @@ use super::harness::{
     ARTICLE, Claim, JOB, Outcome, Post, Scenario, admit, assert_fetched_once, collect, kinds,
     par2_set, par2_volumes_sliced, payload, run, run_unprompted,
 };
-use super::refused_then_repaired::{drive_to_finish, serve_posts};
-use crate::pipeline::tests::{job_status_for_assert, retire_pipeline_database};
+use super::refused_then_repaired::{drive_to_finish, serve_posts, serve_queued};
+use crate::jobs::ids::{NzbFileId, SegmentId};
+use crate::pipeline::Pipeline;
+use crate::pipeline::tests::{
+    job_status_for_assert, pump_pipeline_runtime_queues, retire_pipeline_database,
+};
 
 pub(super) const SECRET: &str = "quill-ember-secret";
 
 // The members every fixture holds, by name.
 pub(super) fn members() -> Vec<(&'static str, Vec<u8>)> {
     vec![
-        ("ember.bin", payload(5 * ARTICLE + 11, 41)),
-        ("quill.bin", payload(3 * ARTICLE - 3, 42)),
+        ("ember.mkv", payload(5 * ARTICLE + 11, 41)),
+        ("quill.mkv", payload(3 * ARTICLE - 3, 42)),
     ]
 }
 
@@ -108,17 +112,40 @@ async fn a_stored_7z_split_into_three_volumes_delivers_its_members() {
     assert_fetched_once(&graph);
 }
 
-// A split set renamed to numbers of its own, counted from ten: the first
-// volume's signature names the set, and the others are numbered from it.
+// `lantern.7z.001` and `.002`: the numbered names found the joiner, which
+// writes both pieces into one file, and the 7z store founds beneath that
+// file and reads it as the one file it is. The members come out of it whole.
 #[tokio::test]
-async fn a_split_7z_under_obfuscated_numbered_names_delivers_its_members() {
-    let volumes = split(&stored(None), 3)
-        .into_iter()
-        .zip(10..)
-        .map(|(post, number)| Post::plain(&format!("a1b2c3d4.{number}"), post.bytes))
-        .collect();
-    let graph = run(&Scenario::new(volumes)).await;
+async fn two_numbered_pieces_join_into_the_one_file_the_7z_store_reads() {
+    let graph = run(&Scenario::new(split(&stored(None), 2))).await;
     assert_members(&graph);
+    assert_eq!(kinds(&graph), vec!["sevenz_store", "split"]);
+}
+
+// A PAR2 set over the pieces and one article of the second piece damaged:
+// the set repairs that piece, the pieces join into the file, and the 7z
+// store beneath delivers every member whole.
+#[tokio::test]
+async fn a_piece_repaired_by_par2_joins_and_delivers_every_member() {
+    let parts = split(&stored(None), 3);
+    let files: Vec<(&str, &[u8])> = parts
+        .iter()
+        .map(|post| (post.name.as_str(), post.bytes.as_slice()))
+        .collect();
+    let recovery = par2_set("lantern", &files, 4);
+    let mut posts = parts;
+    posts.extend(recovery);
+    let graph = run(&Scenario::new(posts).damaged(1, 0)).await;
+    assert_members(&graph);
+    assert!(
+        matches!(
+            graph.graph().outcomes.as_slice(),
+            [Some(RepairOutcome::Repaired { .. })]
+        ),
+        "{:?}",
+        graph.graph().outcomes
+    );
+    assert_eq!(kinds(&graph), vec!["par2", "sevenz_store", "split"]);
 }
 
 // A split set's pieces under hash names that number nothing, the second
@@ -659,14 +686,14 @@ pub(super) fn packed_end(archive: &[u8]) -> usize {
 }
 
 // In 16-byte articles, the last article wholly inside the packed streams:
-// quill.bin's, the second folder, touching no header.
+// quill.mkv's, the second folder, touching no header.
 fn last_packed_article(archive: &[u8]) -> u32 {
     (packed_end(archive) / 16 - 1) as u32
 }
 
-// quill.bin's stream damaged with no PAR2. The engine closes ember.bin whole,
-// then fails quill.bin's CRC: graph delivers ember.bin as written, leaves
-// quill.bin out, puts the container as posted in its place, and ends the job
+// quill.mkv's stream damaged with no PAR2. The engine closes ember.mkv whole,
+// then fails quill.mkv's CRC: graph delivers ember.mkv as written, leaves
+// quill.mkv out, puts the container as posted in its place, and ends the job
 // Partial.
 #[tokio::test]
 async fn an_lzma2_7z_with_a_damaged_member_and_no_par2_delivers_the_members_it_closed() {
@@ -695,11 +722,11 @@ async fn an_lzma2_7z_with_a_damaged_member_and_no_par2_delivers_the_members_it_c
     );
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
-        [delivered("ember.bin"), delivered("lantern.7z")]
+        [delivered("ember.mkv"), delivered("lantern.7z")]
     );
     assert!(
-        graph.files[&delivered("ember.bin")] == members()[0].1,
-        "ember.bin closed before the failure, delivered whole"
+        graph.files[&delivered("ember.mkv")] == members()[0].1,
+        "ember.mkv closed before the failure, delivered whole"
     );
     assert_eq!(
         graph.files[&delivered("lantern.7z")].len(),
@@ -738,7 +765,7 @@ async fn a_single_7z_with_a_damaged_head_and_no_recovery_fails() {
     );
     assert!(
         graph.files.get(&delivered(name)) != Some(&ember),
-        "ember.bin never comes out of a container no store founds on"
+        "ember.mkv never comes out of a container no store founds on"
     );
 }
 
@@ -1043,7 +1070,7 @@ async fn live_stores_replay_checksum_rejected_members_after_repair() {
 }
 
 #[tokio::test]
-async fn recovery_corrected_split_lengths_reconstruct_before_changing_geometry() {
+async fn a_first_piece_posted_short_is_restored_by_recovery_and_the_join_completes() {
     use weaver_graph::{Kind, MemberId, NodeId};
 
     let archive = stored(None);
@@ -1053,8 +1080,8 @@ async fn recovery_corrected_split_lengths_reconstruct_before_changing_geometry()
         .map(|post| (post.name.as_str(), post.bytes.as_slice()))
         .collect();
     let recovery = par2_set("lantern", &protected, 4);
-    // A short posting establishes the wrong first-piece length. Recovery
-    // must restore the tail and replace the geometry derived from it.
+    // A short posting cuts the first piece's tail. Recovery must restore it
+    // before the pieces join into the file the 7z store reads.
     let short = posts[0].bytes.len() - 17;
     posts[0].bytes.truncate(short);
     posts.extend(recovery);
@@ -1065,7 +1092,9 @@ async fn recovery_corrected_split_lengths_reconstruct_before_changing_geometry()
     let (store, _) = tree
         .child_of(NodeId::ROOT, MemberId(0))
         .expect("first piece owned");
-    assert_eq!(tree.kind(store), Some(Kind::SevenZipStore));
+    // The numbered name founds the split store; the 7z store founds beneath
+    // the file it joins.
+    assert_eq!(tree.kind(store), Some(Kind::Split));
     serve_posts(&mut pipeline, &scenario, 3..scenario.posts.len() as u32).await;
     serve_posts(&mut pipeline, &scenario, 1..3).await;
     drive_to_finish(&mut pipeline, &scenario).await;
@@ -1160,4 +1189,142 @@ async fn parent_repair_does_not_override_a_still_failing_member_checksum() {
         matches!(status, Some(JobStatus::Failed { .. })),
         "{status:?}"
     );
+}
+
+// Articles of 60 bytes: past the 32-byte signature header the third,
+// `SENT_BACK`, starts 8 bytes into a cipher block of the folder and ends
+// inside another, and every byte of it is `ember.mkv`'s.
+const FRAME: usize = 60;
+const SENT_BACK: u32 = 2;
+
+// The stored container `posted`, enciphered under `password` when there is
+// one, and with `spoiled` the copy of `SENT_BACK` a server holds that is not
+// the posted bytes, though it passes its own check. One container stands
+// behind every copy: each enciphering draws its own salt and vector.
+fn sent_back_scenario(posted: &[u8], password: Option<&str>, spoiled: bool) -> Scenario {
+    let mut bytes = posted.to_vec();
+    let at = SENT_BACK as usize * FRAME;
+    if spoiled {
+        bytes[at..at + FRAME]
+            .iter_mut()
+            .for_each(|byte| *byte ^= 0x5a);
+    }
+    let scenario = Scenario::new(vec![Post::plain("lantern.7z", bytes)]).framed(FRAME);
+    match password {
+        Some(password) => scenario.password(password),
+        None => scenario,
+    }
+}
+
+// Whether `ember.mkv` of the job's store is closed, its checksum stated.
+fn ember_closed(pipeline: &Pipeline) -> bool {
+    let tree = pipeline.graph_jobs[&JOB].tree();
+    let (store, _) = tree
+        .child_of(weaver_graph::NodeId::ROOT, weaver_graph::MemberId(0))
+        .expect("the store is bound");
+    tree.namespace(store)
+        .unwrap()
+        .members()
+        .any(|member| member.name == "ember.mkv" && member.closed && member.crc32.is_some())
+}
+
+// The articles come in order, `first`'s copy of each: every one with
+// `closed`, so `ember.mkv` closes, or else all but the one that holds its
+// last bytes. Then `SENT_BACK` is sent back for another copy, as the decoder
+// sends back an article its neighbours refute, and `again`'s copy comes;
+// then the rest. The store says the member's bytes from there again, so its
+// own checksum fold no longer covers them all. What the job delivers once
+// it ends, and how it ends.
+async fn sent_back_once(
+    password: Option<&str>,
+    first_spoiled: bool,
+    closed: bool,
+) -> (Option<JobStatus>, BTreeMap<String, Vec<u8>>) {
+    let posted = stored(password);
+    let first = sent_back_scenario(&posted, password, first_spoiled);
+    let again = sent_back_scenario(&posted, password, !first_spoiled);
+    let articles = first.posts[0].bytes.len().div_ceil(FRAME) as u32;
+    // `ember.mkv` ends 32 + its length into the container.
+    let last = (32 + members()[0].1.len() - 1) as u32 / FRAME as u32;
+    let held = if closed { articles } else { last };
+    let (_temp, mut pipeline, complete_dir) = admit(&first).await;
+    for ordinal in 0..held {
+        serve_queued(&mut pipeline, &first, (0, ordinal)).await;
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+    }
+    assert_eq!(ember_closed(&pipeline), closed);
+    pipeline.graph_article_sent_back(SegmentId {
+        file_id: NzbFileId {
+            job_id: JOB,
+            file_index: 0,
+        },
+        segment_number: SENT_BACK,
+    });
+    serve_queued(&mut pipeline, &again, (0, SENT_BACK)).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+    for ordinal in held..articles {
+        serve_queued(&mut pipeline, &again, (0, ordinal)).await;
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+    }
+    drive_to_finish(&mut pipeline, &again).await;
+    let status = job_status_for_assert(&pipeline, JOB);
+    let mut files = BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    retire_pipeline_database(pipeline).await;
+    (status, files)
+}
+
+// The copy that came first was not the article's bytes and is sent back
+// before `ember.mkv` closes, and the one sent for comes right: the member is
+// checked over the bytes it holds once it closes, and both members come out
+// whole.
+async fn a_wrong_copy_sent_back_is_replaced_and_proved(password: Option<&str>) {
+    let (status, files) = sent_back_once(password, true, false).await;
+    assert_eq!(status, Some(JobStatus::Complete), "{:?}", files.keys());
+    for (name, bytes) in members() {
+        assert!(files.get(&delivered(name)) == Some(&bytes), "{name} bytes");
+    }
+}
+
+// The copy that came first was right and `ember.mkv` closed on it, and the
+// one that comes after the send back is not: what the member's checksum
+// proved of the first copy does not stand for the second, so `ember.mkv`
+// fails its checksum and is not delivered as whole; `quill.mkv`, untouched,
+// is.
+async fn a_wrong_copy_after_a_send_back_fails_the_member(password: Option<&str>) {
+    let (status, files) = sent_back_once(password, false, true).await;
+    assert!(
+        !matches!(status, Some(JobStatus::Complete)),
+        "{status:?} {:?}",
+        files.keys()
+    );
+    let (ember, quill) = (members().remove(0), members().remove(1));
+    assert!(
+        files.get(&delivered(ember.0)) != Some(&ember.1),
+        "ember.mkv whole"
+    );
+    assert!(
+        files.get(&delivered(quill.0)) == Some(&quill.1),
+        "quill.mkv bytes"
+    );
+}
+
+#[tokio::test]
+async fn a_stored_member_whose_wrong_article_was_sent_back_is_proved_on_its_right_copy() {
+    a_wrong_copy_sent_back_is_replaced_and_proved(None).await;
+}
+
+#[tokio::test]
+async fn an_enciphered_member_whose_wrong_article_was_sent_back_is_proved_on_its_right_copy() {
+    a_wrong_copy_sent_back_is_replaced_and_proved(Some(SECRET)).await;
+}
+
+#[tokio::test]
+async fn a_stored_member_whose_article_came_again_wrong_fails_its_checksum() {
+    a_wrong_copy_after_a_send_back_fails_the_member(None).await;
+}
+
+#[tokio::test]
+async fn an_enciphered_member_whose_article_came_again_wrong_fails_its_checksum() {
+    a_wrong_copy_after_a_send_back_fails_the_member(Some(SECRET)).await;
 }

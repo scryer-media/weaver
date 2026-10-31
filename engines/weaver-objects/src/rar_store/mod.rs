@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use unrar_rs::{ArchiveFormat, EncryptedStore, StoredLayoutBuilder};
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Emit, Extent, Kind, Located, MemberId, Object, Placement,
+    ByteRange, Claim, Coverage, Delivery, Emit, Extent, Kind, Located, MemberId, Object, Placement,
     Posting, Pull, Seek, Standing, VolumeIndex, Weight, Why,
 };
 use zeroize::Zeroizing;
@@ -218,6 +218,13 @@ impl Entry {
     // unknown, what the parts add up to once the last is in.
     fn plain_len(&self) -> Option<u64> {
         self.length.or_else(|| self.complete.then(|| self.packed()))
+    }
+
+    // Whether the store is the one to judge the member's whole checksum: a
+    // keyed one is not the member's CRC32, so it is stated to nothing below,
+    // which checks the CRC32 it is stated.
+    fn judges_its_checksum(&self) -> bool {
+        self.uses_mac
     }
 }
 
@@ -799,8 +806,10 @@ impl Object for RarStore {
     }
 
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {
+        // A length said anew is the producer's word now: the volume is
+        // walked again against it.
         let found = self.volume(volume);
-        if found.length.is_some() {
+        if found.length == Some(length) {
             return;
         }
         found.length = Some(length);
@@ -842,11 +851,10 @@ impl Object for RarStore {
         }))
     }
 
-    // A store that gave its set up still claims the rest of it, so the rest
-    // goes where the set went.
-    fn claim(&mut self, name: &str, first_bytes: &[u8], _length: Option<u64>) -> Vec<VolumeIndex> {
+    // The place the volume's headers or name give it, held or not: whether
+    // it takes it is the tree's to judge.
+    fn claim(&mut self, name: &str, first_bytes: &[u8], _length: Option<u64>) -> Claim {
         self.claim_volume(name, first_bytes)
-            .map_or_else(Vec::new, |placed| placed.claimed(self.gone, self.past()))
     }
 
     // A volume contributes to no member yet and can travel with all the
@@ -909,14 +917,15 @@ impl Object for RarStore {
         front: &[u8],
         _length: Option<u64>,
         carried: &(dyn std::any::Any + Send + Sync),
-    ) -> Vec<VolumeIndex> {
-        let placed = match carried.downcast_ref::<Volume>() {
+    ) -> Claim {
+        match carried.downcast_ref::<Volume>() {
             Some(given) => self.reclaim_volume(name, front, given),
             None => carried
                 .downcast_ref::<crate::engine::CarriedVolume<unrar_rs::RarVolumeFacts>>()
-                .and_then(|given| self.reclaim_front(name, front, given.front.as_ref())),
-        };
-        placed.map_or_else(Vec::new, |placed| placed.claimed(self.gone, self.past()))
+                .map_or_else(Claim::default, |given| {
+                    self.reclaim_front(name, front, given.front.as_ref())
+                }),
+        }
     }
 
     // The volume as its giver read it: its headers walked, its bytes kept,

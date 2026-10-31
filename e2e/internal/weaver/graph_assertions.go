@@ -65,19 +65,22 @@ func isArchiveFileName(name string) bool {
 // writing, or graphNoRelaunch. A restored graph job rebuilds its tree without
 // binding again, so a restart leaves no second `object bound`; what a restart
 // mid-download must still show is the job finishing after it with its archive
-// read in place: an archive object bound at the root at any time, and every
-// delivery of the job written by the relaunched process.
+// read in place: an archive object bound somewhere in the job's tree at any
+// time, and every delivery of the job written by the relaunched process.
+//
+// An archive object counts at any depth: posted pieces are held by a split
+// object, and the archive object that reads them sits beneath it.
 func graphDirectUnpackVerdict(raw string, jobID int, assertion *ScenarioDirectUnpackAssertion, delivered []string, relaunchAt int) error {
-	rootArchiveBindings := 0
+	archiveBindings := 0
 	for _, bound := range graphLogEvents(raw, jobID, graphObjectBoundMessage) {
-		if graphArchiveKinds[bound["kind"]] && bound["depth"] == "0" {
-			rootArchiveBindings++
+		if graphArchiveKinds[bound["kind"]] {
+			archiveBindings++
 		}
 	}
 	deliveries := graphLogEvents(raw, jobID, graphMemberDeliveredMessage)
 
-	if assertion.RequireArmed && rootArchiveBindings == 0 {
-		return errors.New("the graph bound no archive object over a root member of this job")
+	if assertion.RequireArmed && archiveBindings == 0 {
+		return errors.New("the graph bound no archive object anywhere in this job's tree")
 	}
 	if assertion.RequireConsumed {
 		if len(deliveries) == 0 {
@@ -103,8 +106,8 @@ func graphDirectUnpackVerdict(raw string, jobID int, assertion *ScenarioDirectUn
 		if relaunchAt < 0 || relaunchAt > len(raw) {
 			return errors.New("the harness relaunched no weaver into this log, so there is no restart to judge the job against")
 		}
-		if rootArchiveBindings == 0 {
-			return errors.New("the graph bound no archive object over a root member of this job")
+		if archiveBindings == 0 {
+			return errors.New("the graph bound no archive object anywhere in this job's tree")
 		}
 		if before := graphLogEvents(raw[:relaunchAt], jobID, graphMemberDeliveredMessage); len(before) > 0 {
 			return fmt.Errorf("the graph delivered %q before the restart; the job must complete after it", before[0]["name"])

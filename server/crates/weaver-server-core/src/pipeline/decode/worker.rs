@@ -375,6 +375,7 @@ impl Pipeline {
             file_id,
             segment_number: other,
         };
+        self.graph_article_sent_back(other_id);
         let error = format!(
             "yEnc layout conflict: segment {other} claims [{other_offset}, {}) past what the NZB declares for it, which segment {} contradicts",
             other_offset.saturating_add(u64::from(other_len)),

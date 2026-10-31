@@ -68,10 +68,10 @@ fn verdict(member: &StoredMember) -> Option<Emit> {
     })
 }
 
-// Whether an announced entry is still the member the layout lists.
+// Whether an announced entry is still the member the layout lists: every
+// part the layout lists for it so far is the part the entry holds.
 fn same(entry: &Entry, member: &StoredMember) -> bool {
     entry.name == member.name
-        && entry.pieces.len() <= member.parts.len()
         && entry.pieces.iter().zip(&member.parts).all(|(piece, part)| {
             piece.volume.0 == part.volume
                 && piece.data == ByteRange::at(part.data_offset, part.data_size)
@@ -229,18 +229,17 @@ impl RarStore {
             }
         }
         let members = layout.members();
-        // A kept layout gains volumes only past its tail, so every part an
-        // entry holds is still where it listed it: only one laid afresh can
-        // retract a member.
-        let keep = match afresh {
-            true => self
-                .entries
-                .iter()
-                .zip(members)
-                .take_while(|(entry, member)| same(entry, member))
-                .count(),
-            false => self.entries.len(),
-        };
+        // An entry stands until the layout lists something else for it. A
+        // layout laid afresh may reach less far than the one before, as when
+        // a volume's length is said anew and the headers at its new end are
+        // not in yet: what it does not list yet is unread, not refuted, and
+        // its bytes stay where they were placed.
+        let keep = self
+            .entries
+            .iter()
+            .zip(members)
+            .position(|(entry, member)| !same(entry, member))
+            .unwrap_or(self.entries.len());
         for id in (keep..self.entries.len()).rev() {
             out.push(Emit::Retract(MemberId(id as u32)));
         }
@@ -347,7 +346,7 @@ impl RarStore {
         entry.crc = member.data_crc32;
         entry.uses_mac = member.data_hash_uses_mac;
         // A keyed checksum is not the member's own CRC32.
-        if !entry.uses_mac
+        if !entry.judges_its_checksum()
             && let Some(crc32) = entry.crc
         {
             out.push(Emit::Checksum {

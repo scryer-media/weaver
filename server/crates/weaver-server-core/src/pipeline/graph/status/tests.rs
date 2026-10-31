@@ -508,11 +508,11 @@ fn a_delivery_ends_complete_partial_or_failed_by_its_short_files() {
         JobStatus::Complete
     );
     assert_eq!(
-        delivery(&["ember.bin"], &[], &["ember.dat"]).status(Some(&failed(error))),
+        delivery(&["ember.mkv"], &[], &["ember.dat"]).status(Some(&failed(error))),
         JobStatus::Partial
     );
     assert_eq!(
-        delivery(&["ember.bin"], &["ember.dat"], &[]).status(None),
+        delivery(&["ember.mkv"], &["ember.dat"], &[]).status(None),
         JobStatus::Partial
     );
     // Nothing is whole: the job failed, whatever ships as it stands.
@@ -540,6 +540,64 @@ fn a_delivery_ends_complete_partial_or_failed_by_its_short_files() {
             error: error.to_string()
         }
     );
+}
+
+// A short delivery is partial only when a whole file is of a type people
+// open, posted plainly or unpacked; a whole file of no known type ships, but
+// alone it leaves the job failed.
+#[test]
+fn a_short_delivery_is_partial_only_by_a_whole_file_of_a_known_type() {
+    let error = "PAR2 recovery failed for 1 set(s)";
+    let posted = |whole: &str| Delivery {
+        whole: vec![whole.to_string()],
+        unrepaired: vec!["ember.mkv".to_string()],
+        ..Delivery::default()
+    };
+    assert_eq!(
+        posted("d1c70000.bin").status(Some(&failed(error))),
+        JobStatus::Failed {
+            error: error.to_string()
+        }
+    );
+    assert_eq!(
+        posted("d1c70000.bin").status(None),
+        JobStatus::Failed {
+            error: "no file of a known type was delivered whole; 1 short: ember.mkv".to_string()
+        }
+    );
+    assert_eq!(
+        posted("ember.nfo").status(Some(&failed(error))),
+        JobStatus::Partial
+    );
+    // One member of a 7z unpacked whole, the other lost with the volume
+    // that held it.
+    let unpacked = |whole: &str| Delivery {
+        whole: vec![whole.to_string()],
+        damaged: vec!["ember.idx".to_string()],
+        files: [(whole, true), ("ember.idx", false)]
+            .into_iter()
+            .map(|(name, whole)| Delivered {
+                name: name.to_string(),
+                from: name.to_string(),
+                depth: 1,
+                whole,
+                crc32: None,
+            })
+            .collect(),
+        ..Delivery::default()
+    };
+    assert_eq!(
+        unpacked("ember.bin").status(None),
+        JobStatus::Failed {
+            error: "no file of a known type was delivered whole; 1 short: ember.idx".to_string()
+        }
+    );
+    assert_eq!(unpacked("ember.mkv").status(None), JobStatus::Partial);
+    // Nothing short completes whatever the names.
+    let mut whole = unpacked("ember.bin");
+    whole.damaged.clear();
+    whole.files.truncate(1);
+    assert_eq!(whole.status(None), JobStatus::Complete);
 }
 
 #[test]
@@ -574,7 +632,7 @@ fn a_posted_file_that_never_arrived_is_what_its_name_says() {
     let mut tree = weaver_graph::Tree::new();
     let mut objects = weaver_objects::Objects::default();
     let mut effects = Vec::new();
-    let names = ["ember.bin", "lantern.part01.rar", "d1c70000", "notes.txt"];
+    let names = ["ember.mkv", "lantern.part01.rar", "d1c70000", "notes.txt"];
     let members: Vec<MemberId> = names
         .iter()
         .map(|name| tree.announce_root(name, Some(64), &mut effects))
@@ -606,7 +664,7 @@ fn a_posted_file_that_never_arrived_is_what_its_name_says() {
         |_, _| false,
         unarrived,
     );
-    assert_eq!(delivery.whole, vec!["ember.bin".to_string()]);
+    assert_eq!(delivery.whole, vec!["ember.mkv".to_string()]);
     assert_eq!(delivery.unnamed, vec!["d1c70000".to_string()]);
     assert_eq!(delivery.damaged, vec!["notes.txt".to_string()]);
     assert!(
@@ -642,7 +700,7 @@ fn a_posted_file_that_never_arrived_is_what_its_name_says() {
     // Beside the post's own files alone, the file that never came may have
     // been any file of the post, which lacks it.
     assert_eq!(
-        unnamed(&[("ember.bin", 0)]).status(None),
+        unnamed(&[("ember.mkv", 0)]).status(None),
         JobStatus::Partial
     );
     // The feed gave the post up over the file that never came: its words
@@ -706,7 +764,7 @@ fn a_delivery_with_a_withheld_member_fails_worded_by_the_refusal() {
         )
     );
     assert_eq!(
-        withheld(&["ember.bin"], &[("lantern.rar", Why::Encrypted)]).status(None),
+        withheld(&["ember.mkv"], &[("lantern.rar", Why::Encrypted)]).status(None),
         JobStatus::Partial
     );
     // A recovery object's failure is the one that left the job short.

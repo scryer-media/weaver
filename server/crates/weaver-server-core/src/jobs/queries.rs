@@ -336,6 +336,8 @@ impl Database {
 
     // Everything the archive-password harvest reads from an active job's row:
     // the persisted NZB, and the passwords supplied with the job (decrypted).
+    // A failed read is `Read`; a value of a type this build does not read is
+    // `Rows`; the passwords' own split is `decrypt_supplied_passwords`'.
     pub fn load_active_job_password_sources(
         &self,
         job_id: JobId,
@@ -344,20 +346,25 @@ impl Database {
             PersistedNzbRecord,
             Vec<crate::jobs::ArchivePasswordCandidate>,
         )>,
-        StateError,
+        crate::LoadError,
     > {
+        use crate::LoadError;
         let datastore = self.datastore();
-        let row = self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_optional(
-                datastore.read_exec(),
-                "SELECT nzb_path, nzb_zstd, password_candidates
-                 FROM active_jobs
-                 WHERE job_id = {}
-                 LIMIT 1",
-                &[SqlArg::I64(job_id.0 as i64)],
-            )
-            .await?
-            .map(|row| {
+        let row = self
+            .run_sql_blocking_read(async move {
+                SqlRuntime::fetch_optional(
+                    datastore.read_exec(),
+                    "SELECT nzb_path, nzb_zstd, password_candidates
+                     FROM active_jobs
+                     WHERE job_id = {}
+                     LIMIT 1",
+                    &[SqlArg::I64(job_id.0 as i64)],
+                )
+                .await
+            })
+            .map_err(LoadError::Read)?;
+        row.map(|row| {
+            let typed = || -> Result<_, StateError> {
                 Ok((
                     (
                         PathBuf::from(row.text("nzb_path")?),
@@ -365,10 +372,8 @@ impl Database {
                     ),
                     row.opt_text("password_candidates")?,
                 ))
-            })
-            .transpose()
-        })?;
-        row.map(|(nzb, stored)| {
+            };
+            let (nzb, stored) = typed().map_err(LoadError::Rows)?;
             let supplied = crate::jobs::persistence::decrypt_supplied_passwords(
                 self.encryption_key(),
                 stored,

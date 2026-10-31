@@ -197,6 +197,17 @@ impl Pipeline {
             })
     }
 
+    // An article of a graph job the decoder withdrew, its placement refuted
+    // by its neighbours, is sent back to the root for another copy.
+    pub(in crate::pipeline) fn graph_article_sent_back(&mut self, segment_id: SegmentId) {
+        if let Some(graph) = self.graph_jobs.get_mut(&segment_id.file_id.job_id) {
+            graph.send_back(
+                VolumeIndex(segment_id.file_id.file_index),
+                segment_id.segment_number,
+            );
+        }
+    }
+
     // Whether an article of a graph job will never arrive: every server
     // failed it, in this run or one before a restart.
     pub(in crate::pipeline) fn graph_article_given_up(&self, segment_id: SegmentId) -> bool {

@@ -37,7 +37,7 @@ use par3_rs::{
 use serde::{Deserialize, Serialize};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome, SetRuling};
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Emit, Extent, Kind, Located, Member, MemberId, Namespace,
+    ByteRange, Claim, Coverage, Delivery, Emit, Extent, Kind, Located, Member, MemberId, Namespace,
     Object, ObjectId, Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex, Weight,
 };
 
@@ -603,7 +603,7 @@ impl Object for Par3 {
     // By the magic its bytes open with, or, before any bytes, by a name
     // that continues the set's: the stem of a volume already held, then a
     // `.vol` name ending in `.par3`.
-    fn claim(&mut self, name: &str, first_bytes: &[u8], _length: Option<u64>) -> Vec<VolumeIndex> {
+    fn claim(&mut self, name: &str, first_bytes: &[u8], _length: Option<u64>) -> Claim {
         let ours = if first_bytes.is_empty() {
             self.volumes
                 .iter()
@@ -711,14 +711,14 @@ impl Recovery for Par3 {
             }
             bound.insert(path, member);
         }
-        // A member the set repaired whose good bytes reach past its
-        // description is recognised: they arrived shifted along, and the
-        // rebuilt file takes the described path and length. One bound
-        // under its own name keeps it, and takes the described length as
-        // `Namespace::take_described` says.
-        let repaired = matches!(
+        // A member bound under its own name keeps it, and takes the
+        // described length as `Namespace::take_described` says, once the
+        // set's blocks verify.
+        let verified = matches!(
             self.last,
-            Some(Ruling::Reached(RepairOutcome::Repaired { .. }))
+            Some(Ruling::Reached(
+                RepairOutcome::Clean | RepairOutcome::Repaired { .. }
+            ))
         );
         for (path, member) in &bound {
             let Some(size) = files()
@@ -727,20 +727,8 @@ impl Recovery for Par3 {
             else {
                 continue;
             };
-            let Some(record) = namespace.get(*member) else {
-                continue;
-            };
-            let shifted = repaired
-                && record
-                    .coverage
-                    .overlapping(ByteRange::new(size, u64::MAX))
-                    .any(|run| run.provenance.is_verified());
-            if shifted {
-                if namespace.recognise(*member, path, size).is_some() {
-                    renamed.push(*member);
-                }
-            } else {
-                namespace.take_described(*member, size, repaired);
+            if namespace.take_described(*member, size, verified) {
+                renamed.push(*member);
             }
         }
         if learned || bound != self.bound {

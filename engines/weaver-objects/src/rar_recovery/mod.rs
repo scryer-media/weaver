@@ -7,11 +7,19 @@
 // set as a volume of its own, and covers the data volumes the set's naming
 // puts in it, one slice per volume. It is never delivered.
 //
-// It rules once the volumes are in: clean when every one is whole; a
-// restore when no more are missing or damaged than it holds recovery
-// volumes, which unrar-rs runs over files staged for it and which rebuilds
-// each bad volume whole; impossible otherwise.
+// It rules once the volumes are in. A volume is whole by the checksum RAR
+// keeps for it, whatever the articles' own checks said: they prove the
+// bytes are as posted, not that they are what RAR wrote. The articles'
+// CRC32s, folded on the grid as they pass, give the volume's own CRC32, so
+// a volume is read back only when the fold cannot speak for it, and is
+// judged once until its arrival changes. The set is clean when every volume
+// is whole; a restore when no more are missing or not whole than it holds
+// recovery volumes, which unrar-rs runs over files staged for it and which
+// rebuilds each bad volume whole, after which each volume it rebuilt is
+// judged again from the file it rebuilt, and written back only once whole;
+// impossible otherwise.
 
+mod check;
 mod header;
 mod restore;
 
@@ -24,13 +32,15 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{
-    ByteRange, Delivery, Durable, Emit, Extent, Facts, Kind, Located, MemberId, Namespace, Object,
-    ObjectId, Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex, Weight,
+    ByteRange, Claim, Delivery, Durable, Emit, Extent, Facts, Give, Kind, Located, MemberId,
+    Namespace, Object, ObjectId, Placement, Pull, Recovery, Seek, Segment, SliceVerdict, Take,
+    VolumeIndex, Weight,
 };
 
 use self::header::{Header, RAR3_FOOTER, Read};
 use self::restore::{Source, Staged};
 use crate::engine::SetName;
+use crate::grid::{Folded, Grid, WHOLE};
 use crate::rar_engine::naming;
 
 const REV5_SIGN: &[u8] = b"Rar!\x1aRev";
@@ -132,10 +142,15 @@ pub struct RarRecovery {
     names: BTreeMap<MemberId, String>,
     // A data volume's name, to name the ones no member carries after.
     reference: Option<String>,
-    // The bound volumes that were whole at the last bind.
+    // The bound volumes every byte of which had come clean at the last
+    // bind: the only ones a ruling judges by what arrived, and a change to
+    // them takes the ruling back.
     whole: BTreeSet<u32>,
+    // The CRC32s of the bytes fed for each covered member, folded over the
+    // whole member.
+    grid: Grid,
     // What the last repair came to, for the members bound then.
-    last: Option<Ruling>,
+    last: Option<Last>,
     // Members of the namespace a range of which the parent refused: a data
     // volume among them is missing for good.
     refused: BTreeSet<MemberId>,
@@ -149,10 +164,29 @@ enum Ruling {
     Short { needed: u64 },
 }
 
+// A ruling, with each bound volume it judged and whether it found it whole:
+// a ruling taken again while this one stands judges only the others.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Last {
+    ruling: Ruling,
+    judged: BTreeMap<u32, bool>,
+}
+
 impl Durable for RarRecovery {
     // 2: a repair that came up short kept with the volumes it needs.
     // 3: the members the parent refused a range of.
-    const VERSION: u16 = 3;
+    // 4: a ruling kept with the volumes it found whole by their checksums.
+    // 5: the articles' CRC32s folded per volume; a ruling keeps every
+    //    volume it judged, whole or not.
+    const VERSION: u16 = 5;
+
+    fn parts(&self, take: &mut Take) -> Result<(), String> {
+        self.grid.parts(take)
+    }
+
+    fn restore_parts(&mut self, give: &mut Give) -> Result<(), String> {
+        self.grid.restore_parts(give)
+    }
 }
 
 impl RarRecovery {
@@ -165,6 +199,7 @@ impl RarRecovery {
             names: BTreeMap::new(),
             reference: None,
             whole: BTreeSet::new(),
+            grid: Grid::default(),
             last: None,
             refused: BTreeSet::new(),
         }
@@ -226,10 +261,40 @@ impl RarRecovery {
             .map_or(named, |header| header.data_count.max(named))
     }
 
-    fn missing(&self) -> u64 {
-        (0..self.slots())
-            .filter(|index| !self.whole.contains(index))
-            .count() as u64
+    fn ruling(&self) -> Option<Ruling> {
+        self.last.as_ref().map(|last| last.ruling)
+    }
+
+    // Whether a data volume of `length` bytes, read by `read`, is whole, the
+    // one test of it: held to the checksum RAR keeps for it. A RAR5 set's
+    // table states one for each volume; a RAR3 set's states none, and a RAR
+    // 1.5 to 4.x volume states its own. `fold` is the grid's fold of every
+    // byte that arrived, which speaks for the volume as it arrived; without
+    // one, or where it says nothing, the volume is read back. `None` when the
+    // set holds no checksum for the volume.
+    fn judge(
+        header: Option<&Header>,
+        index: u32,
+        length: u64,
+        fold: Option<Folded>,
+        read: &mut check::Reader<'_>,
+        buffer: &mut Vec<u8>,
+    ) -> Option<bool> {
+        let row = header.and_then(|header| {
+            let at = index as usize;
+            Some((*header.sizes.get(at)?, *header.crcs.get(at)?))
+        });
+        let mut volume = check::Volume::new(read, length, fold, buffer);
+        match row {
+            Some((size, crc)) => Some(volume.matches(size, crc)),
+            None => volume.sound_rar4(),
+        }
+    }
+
+    // How many of the set's data volumes are not judged whole.
+    fn missing(&self, judged: &BTreeMap<u32, bool>) -> u64 {
+        let sound = judged.values().filter(|whole| **whole).count() as u64;
+        u64::from(self.slots()).saturating_sub(sound)
     }
 
     fn usable(&self) -> u64 {
@@ -278,28 +343,82 @@ impl RarRecovery {
         data.chain(revs).collect()
     }
 
-    fn rule(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
-        let missing = self.missing();
+    // Each bound volume judged, then the set's ruling on as many as are not
+    // whole. A volume the standing ruling judged keeps that judgment; one
+    // that did not arrive whole is not whole, unread; the others are judged
+    // from the grid's fold, read back only where it says nothing. A volume
+    // the set holds no checksum for counts against it, so a set short of
+    // one waits on its recovery volumes like any; once none can come, it
+    // rules on nothing rather than short.
+    fn rule(&self, access: &mut dyn MemberAccess) -> (RepairOutcome, BTreeMap<u32, bool>) {
+        let header = self.header();
+        let mut judged = self
+            .last
+            .as_ref()
+            .map(|last| last.judged.clone())
+            .unwrap_or_default();
+        let mut buffer = Vec::new();
+        let mut unjudged = false;
+        for (&index, &member) in &self.bound {
+            if judged.contains_key(&index) {
+                continue;
+            }
+            let whole = match access.length(member) {
+                Some(length) if self.whole.contains(&index) => {
+                    let fold = self.grid.fold(member, WHOLE, 0, ByteRange::new(0, length));
+                    let read = &mut |range, into: &mut Vec<u8>| access.read(member, range, into);
+                    Self::judge(header.as_ref(), index, length, fold, read, &mut buffer)
+                }
+                _ => Some(false),
+            };
+            match whole {
+                Some(whole) => {
+                    judged.insert(index, whole);
+                }
+                None => unjudged = true,
+            }
+        }
+        let outcome = self.rebuild(access, header.as_ref(), &mut judged, unjudged, &mut buffer);
+        (outcome, judged)
+    }
+
+    // The ruling on what was judged, and the restore when it is due. Each
+    // volume the restore rebuilt is judged again from the file it rebuilt,
+    // as its member reads once the namespace takes what was written, and
+    // only a whole one is written back: the ruling stands on the volumes'
+    // judgments, never on what the restore wrote.
+    fn rebuild(
+        &self,
+        access: &mut dyn MemberAccess,
+        header: Option<&Header>,
+        judged: &mut BTreeMap<u32, bool>,
+        mut unjudged: bool,
+        buffer: &mut Vec<u8>,
+    ) -> RepairOutcome {
+        let missing = self.missing(judged);
         if missing == 0 {
             return RepairOutcome::Clean;
         }
         let usable = self.usable();
-        if missing > usable {
-            return if self.coming() {
-                RepairOutcome::Waiting
+        let impossible = |missing: u64, unjudged: bool| {
+            if unjudged {
+                RepairOutcome::Unread
             } else {
                 RepairOutcome::Impossible {
                     damaged: missing,
                     reachable: usable,
                 }
+            }
+        };
+        if missing > usable {
+            return if self.coming() {
+                RepairOutcome::Waiting
+            } else {
+                impossible(missing, unjudged)
             };
         }
-        let impossible = RepairOutcome::Impossible {
-            damaged: missing,
-            reachable: usable,
-        };
         let Some(dir) = access.scratch() else {
-            return impossible;
+            return impossible(missing, unjudged);
         };
         let mut staged = self.staged(access);
         for file in &mut staged {
@@ -308,20 +427,30 @@ impl RarRecovery {
             }
         }
         let Some(rebuilt) = restore::restore(&dir, &staged, access) else {
-            return impossible;
+            return impossible(missing, unjudged);
         };
         let mut written = 0;
         for (index, path) in rebuilt {
-            if let Some(&member) = self.bound.get(&index)
-                && restore::write_back(&path, member, access)
-            {
-                written += 1;
+            let Some(&member) = self.bound.get(&index) else {
+                continue;
+            };
+            let whole = restore::open(&path).and_then(|(mut file, length)| {
+                let read =
+                    &mut |range, into: &mut Vec<u8>| restore::read_at(&mut file, range, into);
+                Self::judge(header, index, length, None, read, buffer)
+            });
+            match whole {
+                Some(true) if restore::write_back(&path, member, access) => {
+                    judged.insert(index, true);
+                    written += 1;
+                }
+                None => unjudged = true,
+                _ => {}
             }
         }
-        if written == 0 {
-            RepairOutcome::Clean
-        } else {
-            RepairOutcome::Repaired { slices: written }
+        match self.missing(judged) {
+            0 => RepairOutcome::Repaired { slices: written },
+            left => impossible(left, unjudged),
         }
     }
 
@@ -388,12 +517,12 @@ impl Object for RarRecovery {
     // names: a front that signs another kind is that kind's, whatever its
     // name; one that signs nothing, as a RAR3 volume's does, is claimed by
     // its name.
-    fn claim(&mut self, name: &str, first_bytes: &[u8], length: Option<u64>) -> Vec<VolumeIndex> {
+    fn claim(&mut self, name: &str, first_bytes: &[u8], length: Option<u64>) -> Claim {
         if matches!(
             weaver_graph::signed(first_bytes, length),
             weaver_graph::Sniff::Object(kind) if kind != Kind::RarRecovery
         ) {
-            return Vec::new();
+            return Claim::default();
         }
         let rev = first_bytes.starts_with(REV5_SIGN) || naming::recovery_stem(name).is_some();
         (rev && !self.revs.is_empty()
@@ -435,7 +564,7 @@ impl Recovery for RarRecovery {
     // index; the first a name gives an index keeps it. The set is the one
     // with the longest name the first recovery volume's name covers: a set
     // called `set2` owns `set21.rev` ahead of one called `set`.
-    fn bind(&mut self, namespace: &mut Namespace, _renamed: &mut Vec<MemberId>) {
+    fn bind(&mut self, namespace: &mut Namespace, renamed: &mut Vec<MemberId>) {
         let Some(rev) = self.revs.first().filter(|_| self.stem.is_some()) else {
             return;
         };
@@ -475,18 +604,25 @@ impl Recovery for RarRecovery {
         // only the width the volumes share, which a volume that reached less
         // may rightly fall short of: it only trims what was booked past it.
         let repaired = matches!(
-            self.last,
+            self.ruling(),
             Some(Ruling::Reached(RepairOutcome::Repaired { .. }))
+        );
+        let verified = matches!(
+            self.outcome(),
+            Some(RepairOutcome::Clean | RepairOutcome::Repaired { .. })
         );
         let stated = self.states_sizes();
         for (index, size) in self.described_sizes() {
             let Some(member) = bound.get(&index).copied() else {
                 continue;
             };
-            if stated {
-                namespace.take_described(member, size, repaired);
-            } else if repaired {
-                namespace.trim_booked(member, size);
+            let settled = if stated {
+                namespace.take_described(member, size, verified)
+            } else {
+                repaired && namespace.trim_booked(member, size)
+            };
+            if settled {
+                renamed.push(member);
             }
         }
         let whole: BTreeSet<u32> = bound
@@ -533,14 +669,16 @@ impl Recovery for RarRecovery {
 
     // A record or another set can repair a data volume after this set
     // found it unusable. Rule again on the new bytes, while preserving a
-    // successful ruling when our own repair is written back.
+    // successful ruling when our own repair is written back. Every segment
+    // is folded on the member's grid, which a ruling judges the volume by.
     fn feed(&mut self, member: MemberId, segments: &[Segment]) {
+        self.grid.offer_all(member, WHOLE, segments);
         if self.covers(member)
             && segments
                 .iter()
                 .any(|segment| segment.verified && !segment.range.is_empty())
             && matches!(
-                self.last,
+                self.ruling(),
                 Some(Ruling::Short { .. } | Ruling::Reached(RepairOutcome::Impossible { .. }))
             )
         {
@@ -548,13 +686,18 @@ impl Recovery for RarRecovery {
         }
     }
 
-    // One slice per volume.
+    // One slice per volume: intact once a ruling found it whole, or found
+    // the set whole or rebuilt.
     fn verdicts(&self, member: MemberId, out: &mut Vec<SliceVerdict>) {
         let Some((index, _)) = self.bound.iter().find(|(_, bound)| **bound == member) else {
             return;
         };
+        let sound = self
+            .last
+            .as_ref()
+            .is_some_and(|last| last.judged.get(index) == Some(&true));
         out.push(match self.outcome() {
-            _ if self.whole.contains(index) => SliceVerdict::Intact,
+            _ if sound => SliceVerdict::Intact,
             Some(RepairOutcome::Clean | RepairOutcome::Repaired { .. }) => SliceVerdict::Intact,
             Some(RepairOutcome::Impossible { .. }) => SliceVerdict::Damaged,
             _ => SliceVerdict::Unknown,
@@ -567,7 +710,7 @@ impl Recovery for RarRecovery {
     // are wanted whole. Nothing of the deferral is kept: the same ruling
     // says it again on every round, after a restart too.
     fn wants(&self, out: &mut Vec<Seek>) {
-        let mut short = match self.last {
+        let mut short = match self.ruling() {
             Some(Ruling::Short { needed }) => needed.saturating_sub(self.usable()),
             _ => 0,
         };
@@ -613,13 +756,14 @@ impl Recovery for RarRecovery {
         if let Some(short) = self.refused_short() {
             return short;
         }
-        let outcome = self.rule(access);
-        self.last = Some(match outcome {
+        let (outcome, judged) = self.rule(access);
+        let ruling = match outcome {
             RepairOutcome::Waiting => Ruling::Short {
-                needed: self.missing(),
+                needed: self.missing(&judged),
             },
             reached => Ruling::Reached(reached),
-        });
+        };
+        self.last = Some(Last { ruling, judged });
         outcome
     }
 
@@ -630,7 +774,7 @@ impl Recovery for RarRecovery {
         if let Some(short) = self.refused_short() {
             return Some(short);
         }
-        match self.last? {
+        match self.ruling()? {
             Ruling::Reached(outcome) => Some(outcome),
             Ruling::Short { needed } => {
                 (self.usable() < needed && self.coming()).then_some(RepairOutcome::Waiting)

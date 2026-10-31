@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The 7z engine: conventional extraction of a 7z set on disk, whole or
-// still growing, through sevenz-turbo. The run and the naming are its own;
-// the object is the shared engine object.
+// The 7z engine: conventional extraction of a 7z file on disk, whole or
+// still growing, through sevenz-turbo. The run is its own; the object is the
+// shared engine object. A 7z posted in numbered pieces is the split store's,
+// which joins them into the one file this engine reads.
 
-mod geometry;
-pub mod naming;
 mod run;
 
 #[cfg(test)]
@@ -15,20 +14,33 @@ use weaver_graph::{Extraction, Kind, VolumeIndex};
 
 use std::collections::BTreeMap;
 
-use crate::engine::{EngineObject, Format, Holding, Placed};
+use crate::engine::{EngineObject, Format, Holding, SetName};
 
 pub struct SevenZip;
 
-// A front states a place only as the first piece's signature header, which
-// measures the container: the one place it is. Every other piece is placed
-// by its name, else by its length.
+// A 7z is one file, so no name numbers a volume of it.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub enum Unnumbered {}
+
+impl SetName for Unnumbered {
+    fn index(&self) -> u32 {
+        match *self {}
+    }
+
+    fn same_set(&self, _other: &Unnumbered) -> bool {
+        match *self {}
+    }
+}
+
+// A front states a place only as the signature header, which measures the
+// container: the one place it is.
 impl Format for SevenZip {
     const KIND: Kind = Kind::SevenZipEngine;
-    type Name = naming::VolumeName;
+    type Name = Unnumbered;
     type Front = u64;
 
-    fn parse(name: &str) -> Option<naming::VolumeName> {
-        naming::parse(name)
+    fn parse(_name: &str) -> Option<Unnumbered> {
+        None
     }
 
     fn front(first_bytes: &[u8]) -> Option<u64> {
@@ -43,19 +55,15 @@ impl Format for SevenZip {
         index != 0
     }
 
-    // A piece with no front of its own is placed by its length, as the
-    // store places it, among the places the first piece measures, held or
-    // not: the tree judges a held place by fronts.
+    // A copy of the file is the file when its signature header measures the
+    // same container.
     fn place(
         bound: &BTreeMap<u32, Holding<'_, u64>>,
         front: Option<&u64>,
-        length: Option<u64>,
-    ) -> Option<Placed> {
+        _length: Option<u64>,
+    ) -> Option<VolumeIndex> {
         let first = bound.get(&0)?;
-        match front {
-            Some(front) => (first.front == Some(front)).then_some(Placed::At(VolumeIndex(0))),
-            None => crate::sevenz_store::fits(first.length?, *first.front?, length?),
-        }
+        (first.front == Some(front?)).then_some(VolumeIndex(0))
     }
 
     fn run(password: Option<String>) -> Box<dyn Extraction> {

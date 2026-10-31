@@ -22,7 +22,7 @@ use zeroize::Zeroizing;
 
 use super::header::{self, Start};
 use super::map::Map;
-use super::{Lock, SevenZipStore};
+use super::{FILE, Lock, SevenZipStore};
 use crate::crypt::{self, BLOCK, Cbc, Padding};
 use crate::grid::crc32;
 use crate::keys::{Derived, Tuple};
@@ -190,19 +190,16 @@ impl SevenZipStore {
         let Some(map) = self.map.clone() else {
             return;
         };
-        let mut pieces = Vec::new();
         for (at, folder) in map.folders.iter().enumerate() {
             if !matches!(self.folders[at], Lock::Open(..)) {
                 continue;
             }
             self.condemned.insert(at);
-            self.to_volumes(folder.pack, &mut pieces);
+            out.push(Emit::Again {
+                volume: FILE,
+                range: folder.pack,
+            });
         }
-        out.extend(
-            pieces
-                .into_iter()
-                .map(|(volume, range)| Emit::Again { volume, range }),
-        );
     }
 
     fn folder_tuple<'a>(

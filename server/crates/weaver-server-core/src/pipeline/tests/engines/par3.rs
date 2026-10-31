@@ -338,6 +338,32 @@ async fn an_obfuscated_member_named_like_a_split_piece_is_repaired_and_renamed()
     );
 }
 
+// The same lone piece, whole, posted before its set and after it: the
+// member is delivered under the name the set gives it, fetched once,
+// whichever came first.
+#[tokio::test]
+async fn a_lone_piece_numbered_from_above_one_is_delivered_under_the_name_its_set_gives() {
+    let lantern = payload(4 * ARTICLE, 75);
+    let described = [("lantern.mkv", lantern.as_slice())];
+    for set_first in [false, true] {
+        let piece = Post::plain("51273aad56a8b904e96928935278a627.201", lantern.clone());
+        let mut posts = par3_set("lantern", &described, 2);
+        if set_first {
+            posts.push(piece);
+        } else {
+            posts.insert(0, piece);
+        }
+        let graph = run(&Scenario::new(posts)).await;
+        assert_delivers(&graph, &[("lantern.mkv", &lantern[..])]);
+        assert_fetched_once(&graph);
+        assert_eq!(
+            graph.graph().outcomes,
+            vec![Some(RepairOutcome::Clean)],
+            "set first {set_first}"
+        );
+    }
+}
+
 // As beside PAR2: the volume is repaired in the stream and the member
 // delivered.
 #[tokio::test]
@@ -426,12 +452,12 @@ async fn a_member_par3_cannot_repair_beside_a_whole_one_ends_partial() {
     let lantern = payload(3 * ARTICLE, 70);
     let beacon = payload(4 * ARTICLE, 71);
     let mut posts = vec![
-        Post::plain("lantern.bin", lantern.clone()),
-        Post::plain("beacon.bin", beacon.clone()),
+        Post::plain("lantern.mkv", lantern.clone()),
+        Post::plain("beacon.mkv", beacon.clone()),
     ];
     posts.extend(par3_set(
         "lantern",
-        &[("lantern.bin", &lantern), ("beacon.bin", &beacon)],
+        &[("lantern.mkv", &lantern), ("beacon.mkv", &beacon)],
         1,
     ));
     let scenario = Scenario::new(posts).damaged(1, 1).damaged(1, 2);
@@ -439,8 +465,8 @@ async fn a_member_par3_cannot_repair_beside_a_whole_one_ends_partial() {
     assert!(graph.refetched().is_empty());
 
     let view = graph.graph();
-    assert_eq!(view.claims["lantern.bin"], Claim::Complete);
-    assert_eq!(view.claims["beacon.bin"], Claim::Damaged);
+    assert_eq!(view.claims["lantern.mkv"], Claim::Complete);
+    assert_eq!(view.claims["beacon.mkv"], Claim::Damaged);
     assert_eq!(
         view.outcomes,
         vec![Some(RepairOutcome::Impossible {
@@ -457,7 +483,7 @@ async fn a_member_par3_cannot_repair_beside_a_whole_one_ends_partial() {
     // The repair that could not rebuild the member is what left it short.
     assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
     assert!(
-        graph.files[&delivered("lantern.bin")] == lantern,
+        graph.files[&delivered("lantern.mkv")] == lantern,
         "{:?}",
         graph.files.keys()
     );

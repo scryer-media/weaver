@@ -17,6 +17,57 @@ use crate::member::MemberId;
 use crate::seek::Seek;
 use crate::volume::{ByteRange, VolumeIndex};
 
+// An object's answer to a claim: the places the member could take, none
+// when there are none, or not yet, while the front in hand is too short for
+// the object to judge the member by, with the places that front gives it.
+// Once no more of the front can come, those places are the answer. It
+// reads as the places wherever only the places matter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Claim {
+    Places(Vec<VolumeIndex>),
+    NotYet(Vec<VolumeIndex>),
+}
+
+impl Default for Claim {
+    fn default() -> Self {
+        Self::Places(Vec::new())
+    }
+}
+
+impl From<Vec<VolumeIndex>> for Claim {
+    fn from(places: Vec<VolumeIndex>) -> Self {
+        Self::Places(places)
+    }
+}
+
+impl FromIterator<VolumeIndex> for Claim {
+    fn from_iter<I: IntoIterator<Item = VolumeIndex>>(places: I) -> Self {
+        Self::Places(places.into_iter().collect())
+    }
+}
+
+impl std::ops::Deref for Claim {
+    type Target = [VolumeIndex];
+
+    fn deref(&self) -> &[VolumeIndex] {
+        match self {
+            Self::Places(places) | Self::NotYet(places) => places,
+        }
+    }
+}
+
+impl AsRef<[VolumeIndex]> for Claim {
+    fn as_ref(&self) -> &[VolumeIndex] {
+        self
+    }
+}
+
+impl PartialEq<Vec<VolumeIndex>> for Claim {
+    fn eq(&self, other: &Vec<VolumeIndex>) -> bool {
+        matches!(self, Self::Places(places) if places == other)
+    }
+}
+
 // A format the sniffer can name and an object can own. The list is closed on
 // purpose: adding a format means adding an object, and nothing else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -282,9 +333,6 @@ pub struct Beside<'a> {
 pub trait Object: Send + Sync {
     fn kind(&self) -> Kind;
 
-    // The source supplied an inferred decoded length for this volume.
-    fn length_uncertain(&mut self, _volume: VolumeIndex) {}
-
     // Bytes of one of my volumes. Say what they were into `out`, which the
     // caller reuses between calls. `read` hands back what one of my
     // placements holds, as it does for `posted`: an object that deciphers
@@ -368,8 +416,10 @@ pub trait Object: Send + Sync {
     // My volume's length is known: its member declared one, or it closed at
     // the length it reached. Said ahead of every delivery while it is known
     // and once more at the close, so an object acts on it once and ignores
-    // the repeats. A store that splits its container into volumes by size
-    // learns its geometry here.
+    // the repeats. A length that differs is the producer's word now, as when
+    // a store beneath a split hears its member said anew, and it is final
+    // only at the close. A store that splits its container into volumes by
+    // size learns its geometry here.
     fn sized(&mut self, _volume: VolumeIndex, _length: u64, _out: &mut Vec<Emit>) {}
 
     // A password the job offers. The object checks it against its own
@@ -400,8 +450,8 @@ pub trait Object: Send + Sync {
     fn handed(&mut self, _handed: &Handed) {}
 
     // A new member appeared beside the one I am bound to. Is it one of my
-    // volumes? A RAR store claims `.part02.rar` after `.part01.rar`, a 7z
-    // store a piece with no signature of its own by its length. Only an
+    // volumes? A RAR store claims `.part02.rar` after `.part01.rar`, a split
+    // store `.002` after `.001`. Only an
     // object can say, because only it knows how its volumes chain. Answer
     // with every volume index the member could become, held or not, its
     // position in the set and never the order it arrived in, or none to let
@@ -409,14 +459,12 @@ pub trait Object: Send + Sync {
     // the tree's to judge, by fronts, as which of several free places it
     // takes is. A freshly built object is asked first about the member it
     // was built for, and none makes that member its first volume. The
-    // answer only reads: the volume exists once `bound` says so.
-    fn claim(
-        &mut self,
-        _name: &str,
-        _first_bytes: &[u8],
-        _length: Option<u64>,
-    ) -> Vec<VolumeIndex> {
-        Vec::new()
+    // answer only reads: the volume exists once `bound` says so. An object
+    // that cannot judge the member by the front it has so far answers not
+    // yet, with the places that front gives it, and is asked again as the
+    // front grows; once no more of it can come, those places are its answer.
+    fn claim(&mut self, _name: &str, _first_bytes: &[u8], _length: Option<u64>) -> Claim {
+        Claim::default()
     }
 
     // Bytes outrank names, headers outrank links: whether I hold `volume`
@@ -460,16 +508,16 @@ pub trait Object: Send + Sync {
 
     // A sibling's transferable volume, with its retained front and parse:
     // is it one of mine? The parse outranks the front and name wherever it
-    // says more. It answers as `claim` does. This only reads, and never
-    // fetches the member again.
+    // says more. It answers as `claim` does, not yet included. This only
+    // reads, and never fetches the member again.
     fn reclaim(
         &self,
         _name: &str,
         _front: &[u8],
         _length: Option<u64>,
         _carried: &(dyn std::any::Any + Send + Sync),
-    ) -> Vec<VolumeIndex> {
-        Vec::new()
+    ) -> Claim {
+        Claim::default()
     }
 
     // A member I reclaimed is now this volume of mine, and what was parsed

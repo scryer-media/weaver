@@ -134,7 +134,10 @@ pub trait MemberAccess {
 pub trait Recovery {
     // Match the namespace's members to what this object describes, by id,
     // name or content. A member recognised by content alone is renamed
-    // through the namespace and listed in `renamed`. Called whenever the
+    // through the namespace, and one the object settles at another length
+    // takes it there (`Namespace::take_described`): each is listed in
+    // `renamed`, and its file and the object it is a volume of follow it.
+    // Called whenever the
     // namespace's members, their lengths or their first bytes change, and
     // after the object learned more of what it describes. An object handed
     // its members when it was made has nothing to match.

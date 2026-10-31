@@ -8,7 +8,7 @@ use std::thread;
 
 use sevenz_turbo::encoder_options::{AesEncoderOptions, Lzma2Options};
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password};
-use weaver_graph::{ObjectId, Purpose, Volumes, Why};
+use weaver_graph::{ObjectId, Volumes, Why};
 
 use super::*;
 use crate::testing::payload;
@@ -239,10 +239,6 @@ fn named(names: &[&str]) -> SevenZipEngine {
     engine
 }
 
-fn split(bytes: &[u8], at: usize) -> Vec<Vec<u8>> {
-    vec![bytes[..at].to_vec(), bytes[at..].to_vec()]
-}
-
 #[test]
 fn a_store_archive_extracts_its_files_by_name_and_skips_the_rest() {
     assert_eq!(run(&mut SevenZipEngine::new(), vec![store()]), store_said());
@@ -271,18 +267,6 @@ fn an_lzma2_archive_extracts_its_members() {
 }
 
 #[test]
-fn a_set_in_two_volumes_extracts_as_one() {
-    let mut engine = named(&["set.7z.001", "set.7z.002"]);
-    for at in [1, 32, 45, store().len() - 1] {
-        assert_eq!(
-            run(&mut engine, split(&store(), at)),
-            store_said(),
-            "split at {at}"
-        );
-    }
-}
-
-#[test]
 fn a_run_waits_for_the_tail_and_continues_when_it_lands() {
     let archive = store();
     let gate = Gate::new(vec![archive.clone()], vec![archive.len() - 1]);
@@ -301,25 +285,6 @@ fn a_run_waits_for_the_tail_and_continues_when_it_lands() {
     );
 
     gate.release(0);
-    runner.join().unwrap();
-    assert_eq!(said(&heard.try_iter().collect::<Vec<_>>()), store_said());
-}
-
-#[test]
-fn a_run_over_a_set_waits_for_the_volume_holding_the_tail() {
-    let gate = Gate::new(split(&store(), 40), vec![40, 0]);
-    let (sent, heard) = mpsc::channel();
-    let extraction = named(&["set.7z.001", "set.7z.002"]).start();
-    let volumes: Arc<dyn Volumes> = gate.clone();
-    let runner = thread::spawn(move || {
-        let mut sink = |emit| sent.send(emit).is_ok();
-        extraction.run(volumes, &mut sink, weaver_graph::Budget::default());
-    });
-
-    gate.wait_for_reader(1);
-    assert!(heard.try_iter().next().is_none());
-
-    gate.release(1);
     runner.join().unwrap();
     assert_eq!(said(&heard.try_iter().collect::<Vec<_>>()), store_said());
 }
@@ -401,102 +366,34 @@ fn a_sink_that_says_stop_hears_nothing_more() {
     assert!(matches!(said[1], Said::Bytes(0, _)));
 }
 
+// A 7z is one file: no name numbers a piece of it, and a copy of the file
+// is the file when its signature header measures the same container.
 #[test]
-fn claim_names_the_volumes_of_its_own_set_only() {
-    let mut engine = named(&["Set.7z.001"]);
-    assert_eq!(engine.claim("set.7Z.002", b"", None), vec![VolumeIndex(1)]);
-    assert_eq!(
-        engine.claim("set.7z.1000", b"", None),
-        vec![VolumeIndex(999)]
-    );
-    assert_eq!(
-        engine.claim("set.7z.0001", b"", None),
-        vec![VolumeIndex(0)],
-        "a piece posted again is that piece"
-    );
-    assert_eq!(
-        engine.claim("set.7z.000", b"", None),
-        Vec::<VolumeIndex>::new()
-    );
-    assert_eq!(
-        engine.claim("other.7z.002", b"", None),
-        Vec::<VolumeIndex>::new()
-    );
-    assert_eq!(engine.claim("set.7z", b"", None), Vec::<VolumeIndex>::new());
-    assert_eq!(
-        engine.claim("set.part2.rar", b"", None),
-        Vec::<VolumeIndex>::new()
-    );
-
-    let mut lone = named(&["set.7z"]);
-    assert_eq!(
-        lone.claim("set.7z.002", b"", None),
-        Vec::<VolumeIndex>::new(),
-        "a lone 7z has no siblings"
-    );
-}
-
-// Whether an unsigned piece is the one holding its place is the tree's to
-// judge, by their fronts: the engine offers it the place all the same.
-#[test]
-fn an_unsigned_copy_of_a_held_continuation_volume_is_offered_the_held_place() {
+fn claim_takes_a_copy_of_its_file_and_no_numbered_piece() {
     let bytes = store();
-    let pieces: Vec<&[u8]> = bytes.chunks(bytes.len().div_ceil(3)).collect();
-    assert_eq!(pieces.len(), 3);
-    assert!(pieces[2].len() < pieces[1].len());
     let mut engine = SevenZipEngine::new();
-    let names = [
-        "e93a07c1d25b4f68a0c3e1f7b9d24c85",
-        "1b7f3d9e05a24c6f8e1d0b3a7c9f2e64",
-    ];
-    for volume in [0, 1] {
-        let piece = pieces[volume];
-        engine.bound(
-            VolumeIndex(volume as u32),
-            names[volume],
-            &piece[..32],
-            Some(piece.len() as u64),
+    engine.bound(
+        VolumeIndex(0),
+        "set.7z",
+        &bytes[..32],
+        Some(bytes.len() as u64),
+    );
+    assert_eq!(
+        engine.claim("e93a07c1d25b4f68a0c3e1f7b9d24c85", &bytes[..32], None),
+        vec![VolumeIndex(0)]
+    );
+    for name in ["set.7z", "set.7z.001", "set.7z.002", "set.part2.rar"] {
+        assert_eq!(
+            engine.claim(name, b"", None),
+            Vec::<VolumeIndex>::new(),
+            "{name}"
         );
     }
-    let piece = pieces[1];
+    let mut numbered = named(&["Set.7z.001"]);
     assert_eq!(
-        engine.claim(
-            "5d0f9a3c7e1b4826a9c4f0e2b7d13a68",
-            &piece[..32],
-            Some(piece.len() as u64)
-        ),
-        vec![VolumeIndex(1)]
-    );
-}
-
-#[test]
-fn the_engine_bids_for_the_volumes_after_the_one_the_run_reached() {
-    let mut engine = named(&["set.7z.001", "set.7z.002", "set.7z.003"]);
-    let mut seeks = Vec::new();
-    engine.wants(&mut seeks);
-    assert!(
-        seeks.is_empty(),
-        "nothing is bid but where the owner says the run is"
-    );
-
-    engine.bid(VolumeIndex(0), &mut seeks);
-    let bids: Vec<_> = seeks
-        .iter()
-        .map(|seek| (seek.volume.0, seek.weight.0, seek.purpose))
-        .collect();
-    assert_eq!(bids, vec![(1, 1, Purpose::Data), (2, 2, Purpose::Data)]);
-
-    seeks.clear();
-    engine.bound(VolumeIndex(3), "set.7z.004", &[], None);
-    engine.bid(VolumeIndex(1), &mut seeks);
-    let bids: Vec<_> = seeks
-        .iter()
-        .map(|seek| (seek.volume.0, seek.weight.0))
-        .collect();
-    assert_eq!(
-        bids,
-        vec![(2, 1), (3, 2)],
-        "the bids are restated from where the run stands"
+        numbered.claim("set.7Z.002", b"", None),
+        Vec::<VolumeIndex>::new(),
+        "a numbered name founds no set of the engine's"
     );
 }
 
@@ -559,10 +456,11 @@ fn a_run_says_each_files_header_checksum_and_none_for_a_directory() {
     );
 }
 
+// A read the owner failed is the owner's to explain, not a verdict on the
+// format.
 #[test]
-fn inferred_geometry_preserves_owner_read_failures_without_a_format_refusal() {
+fn an_owner_read_failure_is_no_format_refusal() {
     struct Failed {
-        uncertain: bool,
         kind: io::ErrorKind,
     }
     impl Volumes for Failed {
@@ -571,9 +469,6 @@ fn inferred_geometry_preserves_owner_read_failures_without_a_format_refusal() {
         }
         fn len(&self, _: VolumeIndex) -> Option<u64> {
             Some(100)
-        }
-        fn uncertain_lengths(&self) -> bool {
-            self.uncertain
         }
         fn read_at(&self, _: VolumeIndex, _: u64, _: &mut [u8]) -> io::Result<usize> {
             Err(self.kind.into())
@@ -584,26 +479,21 @@ fn inferred_geometry_preserves_owner_read_failures_without_a_format_refusal() {
         io::ErrorKind::Interrupted,
         io::ErrorKind::Other,
     ] {
-        for uncertain in [false, true] {
-            let mut object = crate::build(
-                Kind::SevenZipEngine,
-                ObjectId(1),
-                weaver_graph::Budget::default(),
-            )
-            .unwrap();
-            let mut emits = Vec::new();
-            object.engine_mut().unwrap().start().run(
-                Arc::new(Failed { uncertain, kind }),
-                &mut |emit| {
-                    emits.push(emit);
-                    true
-                },
-                weaver_graph::Budget::default(),
-            );
-            assert!(
-                emits.is_empty(),
-                "{kind:?}, uncertain={uncertain}: {emits:?}"
-            );
-        }
+        let mut object = crate::build(
+            Kind::SevenZipEngine,
+            ObjectId(1),
+            weaver_graph::Budget::default(),
+        )
+        .unwrap();
+        let mut emits = Vec::new();
+        object.engine_mut().unwrap().start().run(
+            Arc::new(Failed { kind }),
+            &mut |emit| {
+                emits.push(emit);
+                true
+            },
+            weaver_graph::Budget::default(),
+        );
+        assert!(emits.is_empty(), "{kind:?}: {emits:?}");
     }
 }

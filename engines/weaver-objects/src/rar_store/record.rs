@@ -7,7 +7,8 @@
 // the bytes pass: every part but the last carries the CRC of its own packed
 // bytes, and the last carries the whole file's, keyed when the header says.
 // A part that fails its own is damaged at its range; a file that fails as a
-// whole is damaged at every part. Bytes that came damaged are judged by
+// whole is damaged at the parts no check of their own vouches for, unless a
+// part's own failure accounts for it. Bytes that came damaged are judged by
 // neither: they are already marked where they lie, the runs give no value
 // over them, and the part or file is judged when their repair arrives, so
 // no mark is left on a part whose bytes were never bad.
@@ -20,6 +21,7 @@ use weaver_graph::{
 };
 
 use super::{Lock, RarStore};
+use crate::crypt::block_floor;
 use crate::grid::crc32;
 use crate::runs::{CrcRuns, gate};
 
@@ -61,13 +63,23 @@ impl RarStore {
             }
             self.check_part(id, piece, (part, stream), &slice, provenance, read, out);
             let entry = &mut self.entries[id];
+            let judges = entry.judges_its_checksum();
             let mut plains = Vec::new();
             match &mut entry.lock {
                 Lock::Locked | Lock::Sealed(_) => continue,
                 Lock::Plain => {}
                 Lock::Open(cbc) => {
-                    let (cbc, said) = (Arc::make_mut(cbc), Arc::make_mut(&mut entry.out));
                     let member = MemberId(id as u32);
+                    // Nothing keeps the runs across a restart, and an open
+                    // cipher says nothing new of bytes that came out before
+                    // it: a checksum the store judges reads back what the
+                    // member holds, once, at the first bytes after it.
+                    if judges && entry.plain_runs.held() == 0 {
+                        let whole = vec![ByteRange::new(0, u64::MAX)];
+                        let said = (member, 0, &entry.out.coverage);
+                        refeed(&mut entry.plain_runs, whole, said, read);
+                    }
+                    let (cbc, said) = (Arc::make_mut(cbc), Arc::make_mut(&mut entry.out));
                     let mut plain = |range: ByteRange, buffer: &mut Vec<u8>| {
                         read(&Placement::Member { member, range }, buffer)
                     };
@@ -90,29 +102,41 @@ impl RarStore {
     // they reached forgets what came out of them, its padding with it, and
     // is open until it comes out again. A locked member's bytes were held,
     // and nothing came out of them; a sealed one's came out before the
-    // restart, through the cipher its chain was kept from.
+    // restart, through the cipher its chain was kept from. A cipher block
+    // comes out whole, so an enciphered span is un-said from the start of
+    // the block it starts in.
     pub(super) fn unsay(&mut self, volume: VolumeIndex, range: ByteRange) {
-        for (id, _, stream) in self.linked(volume, range) {
+        for (id, part, stream) in self.linked(volume, range) {
             let Some(entry) = self.entries.get_mut(id) else {
                 continue;
             };
+            // What the checksums folded of these bytes proves nothing of the
+            // copy that comes again.
+            if let Some(piece) = entry.piece_of(stream)
+                && let Some(runs) = entry.parts.get_mut(&piece)
+            {
+                runs.doubt(part.shift(-(entry.pieces[piece].data.start as i64)));
+            }
             let plain_len = entry.plain_len();
-            let payload = plain_len.map_or(stream, |length| {
-                ByteRange::new(stream.start.min(length), stream.end.min(length))
-            });
             let said = Arc::make_mut(&mut entry.out);
-            match &entry.lock {
+            let stream = match &entry.lock {
                 Lock::Locked => continue,
-                Lock::Plain => {}
+                Lock::Plain => stream,
                 Lock::Open(_) | Lock::Sealed(_) => {
+                    let stream = ByteRange::new(block_floor(stream.start), stream.end);
                     if let Some(length) = plain_len {
                         said.padding.forget(length, stream);
                     }
+                    stream
                 }
-            }
+            };
+            let payload = plain_len.map_or(stream, |length| {
+                ByteRange::new(stream.start.min(length), stream.end.min(length))
+            });
             if !payload.is_empty() {
                 said.coverage.erase(payload);
                 said.closed = false;
+                entry.plain_runs.doubt(payload);
             }
         }
     }
@@ -190,7 +214,7 @@ impl RarStore {
             return;
         };
         let hash_key = entry.hash_key.as_deref();
-        let (SliceVerdict::Damaged, _) = gate(
+        let (SliceVerdict::Damaged, composed) = gate(
             &entry.plain_runs,
             length,
             expected,
@@ -201,9 +225,31 @@ impl RarStore {
         };
         // The gate composes verified runs only, so a failure here is on
         // verified bytes: under a key on trial it condemns the key, not the
-        // bytes.
+        // bytes. Under a proved key, a checksum the store judges damages the
+        // file where no part's own check vouches for its bytes, unless a
+        // part failing its own accounts for the failure, as damage already
+        // marked does.
         if let Some(candidate) = entry.trial {
             self.wrong_key = Some(candidate);
+        } else if entry.judges_its_checksum() {
+            let hash_key = entry.hash_key.as_deref();
+            let (mut unvouched, mut accounted) = (Vec::new(), false);
+            for (piece, found) in entry.pieces.iter().enumerate() {
+                let verdict = match (found.crc, entry.parts.get(&piece)) {
+                    (Some(crc), Some(runs)) => {
+                        gate(runs, found.data.len(), crc, found.uses_mac, hash_key).0
+                    }
+                    _ => SliceVerdict::Unknown,
+                };
+                match verdict {
+                    SliceVerdict::Intact => {}
+                    SliceVerdict::Damaged => accounted = true,
+                    _ => unvouched.push((found.volume, found.data)),
+                }
+            }
+            for (volume, data) in unvouched.into_iter().filter(|_| !accounted) {
+                self.say_damaged(volume, data, composed, out);
+            }
         }
     }
 }
@@ -211,13 +257,15 @@ impl RarStore {
 // What a rewrite cut from a member's runs and did not cover came out of the
 // member already: it is read back from the member's own bytes, each piece
 // as it came, and fed again, so the runs tile again and nothing is fetched
-// twice. `at` is where the runs' offset zero lies in the member.
+// twice. `at` is where the runs' offset zero lies in the member. It is read
+// a bounded piece at a time, each piece its own run.
 fn refeed(
     runs: &mut CrcRuns,
     gaps: Vec<ByteRange>,
     (member, at, coverage): (MemberId, u64, &Coverage),
     read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
 ) {
+    const READ_BACK: u64 = 1 << 20;
     let mut buffer = Vec::new();
     for gap in gaps {
         let gap = gap.shift(at as i64);
@@ -225,11 +273,16 @@ fn refeed(
             let Some(range) = run.range.intersect(gap) else {
                 continue;
             };
-            buffer.clear();
-            if read(&Placement::Member { member, range }, &mut buffer) {
-                let local = range.shift(-(at as i64));
-                let cut = runs.feed(local, crc32(&buffer), run.provenance);
-                debug_assert!(cut.is_empty(), "a gap holds no run to cut");
+            let mut start = range.start;
+            while start < range.end {
+                let range = ByteRange::new(start, range.end.min(start + READ_BACK));
+                start = range.end;
+                buffer.clear();
+                if read(&Placement::Member { member, range }, &mut buffer) {
+                    let local = range.shift(-(at as i64));
+                    let cut = runs.feed(local, crc32(&buffer), run.provenance);
+                    debug_assert!(cut.is_empty(), "a gap holds no run to cut");
+                }
             }
         }
     }

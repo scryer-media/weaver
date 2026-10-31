@@ -51,23 +51,32 @@ pub(super) fn encrypt_supplied_passwords(
     encrypt_archive_password(key, Some(&json))
 }
 
+// A job's supplied passwords from their stored form. A value that does not
+// decrypt is `Read`. A decrypted value this build cannot parse, or a source
+// it does not have, is `Rows`.
 pub(crate) fn decrypt_supplied_passwords(
     key: Option<&crate::persistence::encryption::EncryptionKey>,
     stored: Option<String>,
-) -> Result<Vec<crate::jobs::ArchivePasswordCandidate>, StateError> {
-    let json = match decrypt_archive_password(key, stored)? {
+) -> Result<Vec<crate::jobs::ArchivePasswordCandidate>, crate::LoadError> {
+    use crate::LoadError;
+    let json = match decrypt_archive_password(key, stored).map_err(LoadError::Read)? {
         Some(json) if !json.is_empty() => json,
         _ => return Ok(Vec::new()),
     };
-    let pairs: Vec<(String, String)> = serde_json::from_str(&json)
-        .map_err(|error| StateError::Database(format!("invalid archive passwords: {error}")))?;
+    let pairs: Vec<(String, String)> = serde_json::from_str(&json).map_err(|error| {
+        LoadError::Rows(StateError::Database(format!(
+            "invalid archive passwords: {error}"
+        )))
+    })?;
     pairs
         .into_iter()
         .map(|(label, value)| {
             crate::jobs::ArchivePasswordSource::from_label(&label)
                 .map(|source| crate::jobs::ArchivePasswordCandidate::new(source, value))
                 .ok_or_else(|| {
-                    StateError::Database(format!("unknown archive password source {label}"))
+                    LoadError::Rows(StateError::Database(format!(
+                        "unknown archive password source {label}"
+                    )))
                 })
         })
         .collect()

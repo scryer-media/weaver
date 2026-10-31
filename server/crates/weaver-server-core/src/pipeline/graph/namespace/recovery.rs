@@ -673,10 +673,9 @@ impl NamespaceWriter {
             // A rebuilt volume can let its object place bytes held behind it;
             // they go down before the set's proof is read back through the map.
             self.release_held(tree, builder, segments, out)?;
-            if matches!(
-                outcome,
-                Some(RepairOutcome::Clean | RepairOutcome::Repaired { .. })
-            ) {
+            // The ruling as the set stands now: one given before the bind
+            // above changed what it covers is void, and vouches for nothing.
+            if self.stands_proved(tree, set) {
                 rewritten.extend(self.vouched(tree, builder, segments, (node, set), out)?);
             }
             // Repair or proof delivery can complete a member's checksum
@@ -733,10 +732,13 @@ impl NamespaceWriter {
     // A set that found what it covers whole, or made it so, has proven
     // every byte its checks reach, the ones that arrived marked damaged and
     // were good after all among them: it rewrites only the slices that were
-    // bad. Every byte still marked damaged there is delivered again as
-    // repaired, read back from wherever it went, so the marks here and in
-    // every namespace below it say what the set proved; damage past what it
-    // proves stays marked. Returns the members it delivered again.
+    // bad. Every byte still marked damaged there, or marked damaged below on
+    // a member an object further down reads, over bytes that came from
+    // there, is delivered again as repaired, read back from wherever it
+    // went, so those marks say what the set proved; damage past what it
+    // proves stays marked, and so does a producer's verdict on a member
+    // nothing reads further, which its producer judges again. Returns the
+    // members it delivered again.
     fn vouched(
         &mut self,
         tree: &mut Tree,
@@ -746,11 +748,12 @@ impl NamespaceWriter {
         out: &mut Vec<Effect>,
     ) -> Result<Vec<MemberId>, WriteError> {
         let sets = tree.recovery_nodes(node);
-        let marked: Vec<(MemberId, ByteRange)> = tree
+        let mut marked: Vec<(MemberId, ByteRange)> = tree
             .namespace(node)
             .map(|namespace| {
                 namespace
                     .damaged_ranges()
+                    .chain(tree.damaged_below(node))
                     .filter(|(member, _)| {
                         self.covering(tree, &sets, *member)
                             .any(|covering| covering == set)
@@ -764,6 +767,15 @@ impl NamespaceWriter {
                     .collect()
             })
             .unwrap_or_default();
+        // A range marked here and below goes again once.
+        marked.sort_by_key(|(member, range)| (*member, range.start));
+        marked.dedup_by(|(member, range), (into, merged)| {
+            let overlaps = member == into && range.start <= merged.end;
+            if overlaps {
+                merged.end = merged.end.max(range.end);
+            }
+            overlaps
+        });
         let members: Vec<_> = marked.iter().map(|(member, _)| *member).collect();
         for (member, range) in marked {
             let proven = (node, member, range, Provenance::Repaired);
@@ -1041,7 +1053,7 @@ impl NamespaceWriter {
                                 .get(member)
                                 .map(|record| record.name.clone())
                                 .unwrap_or_default();
-                            let by = if by_content.contains(&member) {
+                            let by = if by_content.contains(&member) && described != name {
                                 "content"
                             } else {
                                 "name"
@@ -1093,12 +1105,16 @@ impl NamespaceWriter {
                 );
             }
         }
-        let (moves, claims): (Vec<Effect>, Vec<Effect>) = effects
+        let (moves, mut claims): (Vec<Effect>, Vec<Effect>) = effects
             .into_iter()
             .partition(|effect| matches!(effect, Effect::Renamed { .. }));
         self.moved(tree, &moves)?;
-        // A recognised member's length is the description's: its file, if
-        // it has one, takes it.
+        // A member a set recognised or settled at another length is the
+        // description's length: the object it is a volume of hears its
+        // close again at it, and its file, if it has one, takes it.
+        for member in &renamed {
+            tree.closed_at(node, *member, &mut self.placing(builder), &mut claims);
+        }
         for member in &renamed {
             let length = tree
                 .namespace(node)

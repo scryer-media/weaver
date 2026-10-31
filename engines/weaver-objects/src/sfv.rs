@@ -349,22 +349,24 @@ impl Recovery for Sfv {
     fn repair(&mut self, access: &mut dyn MemberAccess, _: weaver_graph::Budget) -> RepairOutcome {
         let mut damaged = 0;
         for (&member, &expected) in &self.bound {
-            let intact = match self.verdict(member, expected) {
-                SliceVerdict::Intact => true,
-                SliceVerdict::Damaged => false,
-                SliceVerdict::Unknown => {
-                    access
-                        .length(member)
-                        .and_then(|length| read_crc32(member, length, access))
-                        == Some(expected)
-                }
+            // Whether the member's bytes matched the checksum: `None` for one
+            // that could not be read, which is not proven anything.
+            let matched = match self.verdict(member, expected) {
+                SliceVerdict::Intact => Some(true),
+                SliceVerdict::Damaged => Some(false),
+                SliceVerdict::Unknown => access
+                    .length(member)
+                    .and_then(|length| read_crc32(member, length, access))
+                    .map(|crc| crc == expected),
             };
-            if !intact {
+            if matched != Some(true) {
                 damaged += 1;
-                // One checksum over the member: all of it is what failed.
-                if let Some(length) = access.length(member) {
-                    access.found_damaged(member, ByteRange::new(0, length));
-                }
+            }
+            // One checksum over the member: all of it is what failed.
+            if matched == Some(false)
+                && let Some(length) = access.length(member)
+            {
+                access.found_damaged(member, ByteRange::new(0, length));
             }
         }
         let outcome = if damaged == 0 {

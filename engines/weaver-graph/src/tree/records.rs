@@ -141,6 +141,7 @@ impl Tree {
                 || self.given.contains_key(&(node, member.id)),
             copy_of: found.namespace.copy_of(member.id),
             fronted: member.fronted,
+            refuted: member.refuted,
         }
     }
 
@@ -235,6 +236,7 @@ impl Tree {
                 closed: member.closed,
                 crc32: member.crc32,
                 fronted: member.fronted,
+                refuted: member.refuted,
             });
             if member.undecided {
                 // Its front comes again with the replay.

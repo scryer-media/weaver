@@ -502,7 +502,8 @@ impl Object for Tar {
     }
 
     fn sized(&mut self, volume: VolumeIndex, length: u64, _out: &mut Vec<Emit>) {
-        if volume != VOLUME || self.length.is_some() {
+        // A length said anew is the producer's word now.
+        if volume != VOLUME || self.length == Some(length) {
             return;
         }
         self.length = Some(length);

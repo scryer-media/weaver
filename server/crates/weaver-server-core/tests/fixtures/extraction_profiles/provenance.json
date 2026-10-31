@@ -142,13 +142,13 @@
     },
     {
       "file": "rar5_solid_small.rar",
-      "sha256": "dd51304b021b054b75b48448c9c957aef5f33d07fc07c95c8c1535d983f09631",
+      "sha256": "6d51c3710e1320d394c4ca9117335da72b47b2fab60ebfc54e9714acc2b48c05",
       "size": 462,
       "provenance": {
         "kind": "generated",
-        "writer": "RAR 7.23 macOS ARM",
-        "writer_url": "https://www.rarlab.com/rar/rarmacos-arm-723.tar.gz",
-        "writer_archive_sha256": "68b393c000758d477fde43c955ff7542f12f76f3f5e87cdda923152fc791bd4d",
+        "writer": "RAR 7.23 linux/amd64 (weaver-e2e-rarlab:7.23 image)",
+        "writer_url": "https://www.rarlab.com/rar/rarlinux-x64-723.tar.gz",
+        "writer_archive_sha256": "759b4b6aa0d9f77131882162951193f3a0e54bf60e1d8dc4255aa308accab588",
         "arguments": [
           "a",
           "-cfg-",
@@ -161,22 +161,22 @@
           "-ai",
           "-idq",
           "rar5_solid_small.rar",
-          "part0.bin",
-          "part1.bin",
-          "part2.bin"
+          "part0.mkv",
+          "part1.mkv",
+          "part2.mkv"
         ],
-        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+        "inputs": "For index 0..3, part{index}.mkv has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
       }
     },
     {
       "file": "rar5_solid_encrypted_small.rar",
-      "sha256": "37c946b906dcdbfdb8219b8379683fba4bb5cd0524810134a94d0adf2db3ebf5",
+      "sha256": "f0435ca8985a2e0f8b4def2bb67f2ab854d2236ad532c8ad9c939b8145bb50b7",
       "size": 636,
       "provenance": {
         "kind": "generated",
-        "writer": "RAR 7.23 macOS ARM",
-        "writer_url": "https://www.rarlab.com/rar/rarmacos-arm-723.tar.gz",
-        "writer_archive_sha256": "68b393c000758d477fde43c955ff7542f12f76f3f5e87cdda923152fc791bd4d",
+        "writer": "RAR 7.23 linux/amd64 (weaver-e2e-rarlab:7.23 image)",
+        "writer_url": "https://www.rarlab.com/rar/rarlinux-x64-723.tar.gz",
+        "writer_archive_sha256": "759b4b6aa0d9f77131882162951193f3a0e54bf60e1d8dc4255aa308accab588",
         "arguments": [
           "a",
           "-cfg-",
@@ -190,22 +190,22 @@
           "-idq",
           "-pmoonlit-harbour",
           "rar5_solid_encrypted_small.rar",
-          "part0.bin",
-          "part1.bin",
-          "part2.bin"
+          "part0.mkv",
+          "part1.mkv",
+          "part2.mkv"
         ],
-        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+        "inputs": "For index 0..3, part{index}.mkv has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
       }
     },
     {
       "file": "rar5_solid_headers_small.rar",
-      "sha256": "ae39807230e037260699afe152d44744c42ee42645ead5a0897d6a43829ed232",
+      "sha256": "38437494043aaa6d104d36aa1751ebc8b2f78cce2baa5a0ecc0bf61c3824d7d1",
       "size": 798,
       "provenance": {
         "kind": "generated",
-        "writer": "RAR 7.23 macOS ARM",
-        "writer_url": "https://www.rarlab.com/rar/rarmacos-arm-723.tar.gz",
-        "writer_archive_sha256": "68b393c000758d477fde43c955ff7542f12f76f3f5e87cdda923152fc791bd4d",
+        "writer": "RAR 7.23 linux/amd64 (weaver-e2e-rarlab:7.23 image)",
+        "writer_url": "https://www.rarlab.com/rar/rarlinux-x64-723.tar.gz",
+        "writer_archive_sha256": "759b4b6aa0d9f77131882162951193f3a0e54bf60e1d8dc4255aa308accab588",
         "arguments": [
           "a",
           "-cfg-",
@@ -219,16 +219,16 @@
           "-idq",
           "-hpmoonlit-harbour",
           "rar5_solid_headers_small.rar",
-          "part0.bin",
-          "part1.bin",
-          "part2.bin"
+          "part0.mkv",
+          "part1.mkv",
+          "part2.mkv"
         ],
-        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+        "inputs": "For index 0..3, part{index}.mkv has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
       }
     },
     {
       "file": "sevenz_solid.7z",
-      "sha256": "8f7acfd533bb70f11a1bb1d2f3e1e9bc51dfe7875a7e8bfc0dbe181215372948",
+      "sha256": "4a4ae5e8184152901efc6dc50af12ba7b65399473bfbabdfbede6f4f62af8ecf",
       "size": 577,
       "provenance": {
         "kind": "generated",
@@ -244,17 +244,17 @@
           "-mta=off",
           "-mtm=off",
           "sevenz_solid.7z",
-          "part0.bin",
-          "part1.bin",
-          "part2.bin"
+          "part0.mkv",
+          "part1.mkv",
+          "part2.mkv"
         ],
-        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+        "inputs": "For index 0..3, part{index}.mkv has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
       }
     },
     {
       "file": "sevenz_solid_encrypted.7z",
-      "sha256": "7fda016dad18adcaa71383ea9db6b9350d8f2f3fc31ce89e1ad86f0384eaaa5c",
-      "size": 601,
+      "sha256": "5604f2d5f7cdd959f6a78a88e455cd74909520e02eb39047f797245515e82321",
+      "size": 602,
       "provenance": {
         "kind": "generated",
         "writer": "7-Zip 26.01",
@@ -270,16 +270,16 @@
           "-mtm=off",
           "-pmoonlit-harbour",
           "sevenz_solid_encrypted.7z",
-          "part0.bin",
-          "part1.bin",
-          "part2.bin"
+          "part0.mkv",
+          "part1.mkv",
+          "part2.mkv"
         ],
-        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+        "inputs": "For index 0..3, part{index}.mkv has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
       }
     },
     {
       "file": "sevenz_solid_headers.7z",
-      "sha256": "44461be3b0a2d9e511e1ee718b6267cdead3eed0f7c72483a0c5e33aeead2f4b",
+      "sha256": "1f5d865f868fcda07c772e01dce810a7887c338916079ce6afa7446c9bc85e84",
       "size": 638,
       "provenance": {
         "kind": "generated",
@@ -297,16 +297,16 @@
           "-pmoonlit-harbour",
           "-mhe=on",
           "sevenz_solid_headers.7z",
-          "part0.bin",
-          "part1.bin",
-          "part2.bin"
+          "part0.mkv",
+          "part1.mkv",
+          "part2.mkv"
         ],
-        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+        "inputs": "For index 0..3, part{index}.mkv has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
       }
     },
     {
       "file": "rar4_solid_lz_encrypted.rar",
-      "sha256": "568f4c68489a7643c7710d4cb0616caf7559cf5359e1697c442e9c61d4ba9add",
+      "sha256": "09cd54450fb471a6a382eb0a7c1a6b829a414a8b110d330be3d7bab0748dece6",
       "size": 526,
       "provenance": {
         "kind": "generated",
@@ -327,16 +327,16 @@
           "-idq",
           "-pmoonlit-harbour",
           "rar4_solid_lz_encrypted.rar",
-          "part0.bin",
-          "part1.bin",
-          "part2.bin"
+          "part0.mkv",
+          "part1.mkv",
+          "part2.mkv"
         ],
-        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+        "inputs": "For index 0..3, part{index}.mkv has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
       }
     },
     {
       "file": "rar4_solid_lz_headers.rar",
-      "sha256": "cab7411fbd7815268daa8c5d6f6a21993bcab7111124ff640309d9c090096b2e",
+      "sha256": "1492929a4f535bdb2c40f187033afb38d3ad6c3ecca9a73e08d772999de842a3",
       "size": 612,
       "provenance": {
         "kind": "generated",
@@ -357,16 +357,16 @@
           "-idq",
           "-hpmoonlit-harbour",
           "rar4_solid_lz_headers.rar",
-          "part0.bin",
-          "part1.bin",
-          "part2.bin"
+          "part0.mkv",
+          "part1.mkv",
+          "part2.mkv"
         ],
-        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+        "inputs": "For index 0..3, part{index}.mkv has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
       }
     },
     {
       "file": "rar4_solid_ppmd_plain.rar",
-      "sha256": "6a8cf0ea7467b03230dcb29fbf2fc964c8ac6e951d8ca6bb66e4d2f5a0618cde",
+      "sha256": "23ffc94b9c8bfe16d4526e898f3bdc070321550a3cae8cc5517729024136fe15",
       "size": 507,
       "provenance": {
         "kind": "generated",
@@ -387,16 +387,16 @@
           "-ai",
           "-idq",
           "rar4_solid_ppmd_plain.rar",
-          "part0.bin",
-          "part1.bin",
-          "part2.bin"
+          "part0.mkv",
+          "part1.mkv",
+          "part2.mkv"
         ],
-        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+        "inputs": "For index 0..3, part{index}.mkv has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
       }
     },
     {
       "file": "rar4_solid_ppmd_encrypted.rar",
-      "sha256": "8b1f75890d1698ac326c9445789283cdc5174c14de0a88d7f742c63713120790",
+      "sha256": "94ec539b2fb2b9cb552d331981aad8e696eba1e699bcee68be2e2c11a8a952c3",
       "size": 558,
       "provenance": {
         "kind": "generated",
@@ -418,16 +418,16 @@
           "-idq",
           "-pmoonlit-harbour",
           "rar4_solid_ppmd_encrypted.rar",
-          "part0.bin",
-          "part1.bin",
-          "part2.bin"
+          "part0.mkv",
+          "part1.mkv",
+          "part2.mkv"
         ],
-        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+        "inputs": "For index 0..3, part{index}.mkv has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
       }
     },
     {
       "file": "rar4_solid_ppmd_headers.rar",
-      "sha256": "6d75ebbfc8af3d46944960e935ce685af5253f452993bcb9a756db529dd26a10",
+      "sha256": "e313cafbd6e2d325615262eba28df4ea55a33540db15811e3ce3caf2c1dda48e",
       "size": 644,
       "provenance": {
         "kind": "generated",
@@ -449,11 +449,11 @@
           "-idq",
           "-hpmoonlit-harbour",
           "rar4_solid_ppmd_headers.rar",
-          "part0.bin",
-          "part1.bin",
-          "part2.bin"
+          "part0.mkv",
+          "part1.mkv",
+          "part2.mkv"
         ],
-        "inputs": "For index 0..3, part{index}.bin has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
+        "inputs": "For index 0..3, part{index}.mkv has 8193 bytes: byte n = (n*7 + n//251 + index*13) % 253. Encryption salts vary on regeneration."
       }
     },
     {

@@ -51,6 +51,8 @@ fn buffers() -> crate::runtime::buffers::BufferPoolConfig {
 pub(in crate::pipeline::tests) struct Restarted {
     pub(in crate::pipeline::tests) status: Option<JobStatus>,
     pub(in crate::pipeline::tests) files: BTreeMap<String, Vec<u8>>,
+    // What the job left in the intermediate directory: a failed job's output.
+    pub(in crate::pipeline::tests) retained_files: BTreeMap<String, Vec<u8>>,
     // Every article asked for again though no restart since it was last
     // served found it in memory: its bytes were on disk when asked.
     pub(in crate::pipeline::tests) from_disk: BTreeSet<(u32, u32)>,
@@ -210,6 +212,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
     Restarted {
         status,
         files,
+        retained_files: BTreeMap::new(),
         from_disk,
         in_memory,
         restarts,
@@ -1044,6 +1047,104 @@ async fn a_stored_7z_restarted_after_every_article_delivers_its_members() {
     restart_row(Scenario::new(sevenz(EncoderMethod::COPY, 1))).await;
 }
 
+// The two members of `sevenz` stored in two volumes, enciphered under
+// `password` when one is given.
+fn quill_parts(password: Option<&str>) -> Vec<(String, Vec<u8>)> {
+    let entries = [
+        Entry::file("ember.bin", payload(7 * ARTICLE + 11, 78)),
+        Entry::file("quill.bin", payload(4 * ARTICLE - 3, 79)),
+    ];
+    split_volumes(
+        &build_7z_shaped(&entries, EncoderMethod::COPY, password, false),
+        2,
+    )
+}
+
+// The article holding the first byte of `quill.bin` starts inside it and
+// holds the end of `ember.bin` too; enciphered, it starts inside a cipher
+// block whose first bytes are the article before's. The second volume
+// backwards from its end header, then the first volume, and the cut last:
+// both members are whole and on disk when the pipeline goes down with
+// `quill.bin` gone. The article before reads back and comes no more, and
+// the one holding the cut is fetched again. The job finishes as the run
+// that never restarted does, fetching again only the articles holding
+// `quill.bin`.
+async fn lost_quill(password: Option<&str>) {
+    let parts = quill_parts(password);
+    let first = parts[0].1.len();
+    let counts: Vec<u32> = parts
+        .iter()
+        .map(|(_, bytes)| bytes.len().div_ceil(ARTICLE) as u32)
+        .collect();
+    let article_at = |offset: usize| match offset.checked_sub(first) {
+        None => (0, (offset / ARTICLE) as u32),
+        Some(into) => (1, (into / ARTICLE) as u32),
+    };
+    let start_of =
+        |(volume, ordinal): (u32, u32)| volume as usize * first + ordinal as usize * ARTICLE;
+    // `quill.bin` follows `ember.bin` in the folder's plaintext.
+    let quill = 32 + 7 * ARTICLE + 11..32 + 7 * ARTICLE + 11 + 4 * ARTICLE - 3;
+    let cut = article_at(quill.start);
+    let cut_start = start_of(cut);
+    assert!(
+        cut_start < quill.start,
+        "the cut article holds ember.bin too"
+    );
+    if password.is_some() {
+        assert_ne!((cut_start - 32) % 16, 0, "the cut is inside a cipher block");
+    }
+    assert_eq!(cut.0, 1, "the cut is the second volume's");
+    let before = (0, counts[0] - 1);
+    let order: Vec<(u32, u32)> = std::iter::once((0, 0))
+        .chain((1..counts[1]).rev().map(|ordinal| (1, ordinal)))
+        .chain((1..counts[0]).map(|ordinal| (0, ordinal)))
+        .chain(std::iter::once(cut))
+        .collect();
+    let mut scenario = Scenario::new(volumes(parts)).first(&order);
+    if let Some(password) = password {
+        scenario = scenario.password(password);
+    }
+    let whole = run(&scenario).await;
+    assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
+    let down = order.len();
+    let restarted = run_restarting_at(&scenario, &mut |_| {}, Down::Losing("quill.bin"), &|nth| {
+        nth == down
+    })
+    .await;
+    assert_eq!(restarted.restarts, 1);
+    assert_eq!(restarted.status, whole.status, "status");
+    assert_eq!(
+        restarted.files.keys().collect::<Vec<_>>(),
+        whole.files.keys().collect::<Vec<_>>()
+    );
+    for (name, bytes) in &whole.files {
+        assert!(restarted.files[name] == *bytes, "{name}: delivered bytes");
+    }
+    let holding: BTreeSet<(u32, u32)> = (cut.1..=article_at(quill.end - 1).1)
+        .map(|ordinal| (1, ordinal))
+        .filter(|article| !restarted.in_memory.contains(article))
+        .collect();
+    assert!(holding.contains(&cut), "the cut article was on disk");
+    assert!(
+        !restarted.in_memory.contains(&before),
+        "the article before was on disk"
+    );
+    assert_eq!(
+        restarted.from_disk, holding,
+        "the articles holding quill.bin on disk, and no other, come again"
+    );
+}
+
+#[tokio::test]
+async fn an_enciphered_7z_member_lost_from_inside_a_cipher_block_comes_out_again_whole() {
+    lost_quill(Some(SECRET)).await;
+}
+
+#[tokio::test]
+async fn a_stored_7z_member_lost_at_a_restart_comes_out_again_whole() {
+    lost_quill(None).await;
+}
+
 #[tokio::test]
 async fn a_three_volume_stored_7z_restarted_after_every_article_delivers_its_members() {
     restart_row(Scenario::new(sevenz(EncoderMethod::COPY, 3))).await;
@@ -1054,6 +1155,53 @@ async fn a_three_volume_stored_7z_restarted_after_every_article_delivers_its_mem
 #[tokio::test]
 async fn an_lzma2_7z_restarted_after_every_article_replays_the_engine_from_disk() {
     restart_row(Scenario::new(sevenz(EncoderMethod::LZMA2, 1))).await;
+}
+
+// The two members of `sevenz` in one AES folder, cut into two volumes: the
+// second starts inside a cipher block, so an article of it starts inside one
+// whose first bytes are the article before's.
+fn enciphered_7z_parts() -> Vec<(String, Vec<u8>)> {
+    let entries = [
+        Entry::file("ember.bin", payload(7 * ARTICLE + 11, 78)),
+        Entry::file("quill.bin", payload(4 * ARTICLE - 3, 79)),
+    ];
+    let parts = split_volumes(
+        &build_7z_shaped(&entries, EncoderMethod::COPY, Some(SECRET), false),
+        2,
+    );
+    // The folder's cipher starts past the 32-byte signature header.
+    assert_ne!(
+        (parts[0].1.len() - 32) % 16,
+        0,
+        "the second volume starts inside a cipher block"
+    );
+    parts
+}
+
+// The signature, the second volume backwards from its end header, the
+// first volume's last article, then the rest of the first in order: the
+// article that starts the second volume comes before the one that brings
+// the first bytes of its cipher block.
+fn header_first(parts: &[(String, Vec<u8>)]) -> Vec<(u32, u32)> {
+    let counts: Vec<u32> = parts
+        .iter()
+        .map(|(_, bytes)| bytes.len().div_ceil(ARTICLE) as u32)
+        .collect();
+    std::iter::once((0, 0))
+        .chain((0..counts[1]).rev().map(|ordinal| (1, ordinal)))
+        .chain(std::iter::once((0, counts[0] - 1)))
+        .chain((1..counts[0] - 1).map(|ordinal| (0, ordinal)))
+        .collect()
+}
+
+// In order, backwards, and with the second volume ahead of the first.
+#[tokio::test]
+async fn an_enciphered_split_7z_restarted_after_every_article_delivers_its_members() {
+    let scenario = || Scenario::new(volumes(enciphered_7z_parts())).password(SECRET);
+    restart_row(scenario()).await;
+    restart_row(scenario().backwards()).await;
+    let order = header_first(&enciphered_7z_parts());
+    restart_row(scenario().first(&order)).await;
 }
 
 #[tokio::test]
@@ -1435,24 +1583,42 @@ fn request_for(
     }
 }
 
-// Moves the version the root's facts are written in by `by`, so a build
-// that reads only its own version cannot read them.
-async fn shift_root_facts_version(pipeline: &Pipeline, by: i64) {
+// A root member refused for a reason this build does not have.
+const UNKNOWN_REASON: &str =
+    "UPDATE graph_members SET refused = 'order_unknown' WHERE job_id = {} AND node_id = 0";
+// The root's facts at a version this build does not read.
+const ROOT_VERSION_AHEAD: &str =
+    "UPDATE graph_nodes SET facts_version = facts_version + 1 WHERE job_id = {} AND node_id = 0";
+// The root's facts version made a word, which the database returns as text
+// where this build reads a number.
+const WRONG_TYPE: &str =
+    "UPDATE graph_nodes SET facts_version = 'v' || facts_version WHERE job_id = {} AND node_id = 0";
+// The root's facts made a byte no MessagePack value starts with.
+const UNDECODABLE: &str = "UPDATE graph_nodes SET facts = x'c1' WHERE job_id = {} AND node_id = 0";
+// A column the load reads renamed away, so the database fails the read; and
+// renamed back.
+const COLUMN_AWAY: &str = "ALTER TABLE graph_coverage RENAME COLUMN verified TO verified_away";
+const COLUMN_BACK: &str = "ALTER TABLE graph_coverage RENAME COLUMN verified_away TO verified";
+// The same for the job's stored password candidates, which the rebuild
+// reads beside its checkpoint.
+const CANDIDATES_AWAY: &str =
+    "ALTER TABLE active_jobs RENAME COLUMN password_candidates TO password_candidates_away";
+const CANDIDATES_BACK: &str =
+    "ALTER TABLE active_jobs RENAME COLUMN password_candidates_away TO password_candidates";
+
+// Changes the job's checkpoint as `sql` says, each of its arguments the job.
+async fn change_checkpoint(pipeline: &Pipeline, sql: &'static str) {
     let datastore = pipeline.db.datastore();
     crate::persistence::sql_runtime::SqlRuntime::run_in_transaction(
         &datastore,
-        "test_root_facts_version",
+        "test_change_checkpoint",
         |tx| {
             Box::pin(async move {
-                tx.execute(
-                    "UPDATE graph_nodes SET facts_version = facts_version + {} \
-                     WHERE job_id = {} AND node_id = 0",
-                    &[
-                        crate::persistence::sql_runtime::SqlArg::I64(by),
-                        crate::persistence::sql_runtime::SqlArg::I64(JOB.0 as i64),
-                    ],
-                )
-                .await?;
+                let args: Vec<_> = sql
+                    .matches("{}")
+                    .map(|_| crate::persistence::sql_runtime::SqlArg::I64(JOB.0 as i64))
+                    .collect();
+                tx.execute(sql, &args).await?;
                 Ok(())
             })
         },
@@ -1461,12 +1627,12 @@ async fn shift_root_facts_version(pipeline: &Pipeline, by: i64) {
     .unwrap();
 }
 
-// A job served four of its articles and stopped, its checkpoint unreadable
-// by this build: the pipeline it stopped in, retired, and its working dir.
-async fn unreadable_checkpoint(
+// A job served four of its articles, its checkpoint written: the pipeline it
+// runs in, and its working dir.
+async fn served_four(
     temp_dir: &tempfile::TempDir,
     scenario: &Scenario,
-) -> std::path::PathBuf {
+) -> (Pipeline, std::path::PathBuf) {
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(temp_dir, buffers(), 1).await;
     scenario.prepare(&mut pipeline);
     let working_dir = insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
@@ -1479,103 +1645,370 @@ async fn unreadable_checkpoint(
         serve(&mut pipeline, scenario, article).await;
     }
     pipeline.db.flush_write_queue().await.unwrap();
-    shift_root_facts_version(&pipeline, 1).await;
+    (pipeline, working_dir)
+}
+
+// A job served four of its articles and stopped, its checkpoint then changed
+// as `change` says: the pipeline it stopped in, retired, and its working dir.
+async fn changed_checkpoint(
+    temp_dir: &tempfile::TempDir,
+    scenario: &Scenario,
+    change: &'static str,
+) -> std::path::PathBuf {
+    let (pipeline, working_dir) = served_four(temp_dir, scenario).await;
+    change_checkpoint(&pipeline, change).await;
     retire_pipeline_database(pipeline).await;
     working_dir
 }
 
-// A checkpoint the build cannot read blocks the restore: the job stands
-// paused in the queue naming why, fetches nothing, and a resume fails while
-// the checkpoint stays unreadable. Once it reads, the resume restores the job
-// from it and the job finishes.
-#[tokio::test]
-async fn an_unreadable_checkpoint_holds_the_job_paused_until_it_reads() {
-    let body = payload(12 * ARTICLE, 77);
-    let scenario = Scenario::new(vec![Post::plain("ember.bin", body.clone())]);
-    let temp_dir = tempfile::tempdir().unwrap();
-    let working_dir = unreadable_checkpoint(&temp_dir, &scenario).await;
-
-    let (mut pipeline, _, complete_dir) =
-        new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
-    scenario.prepare(&mut pipeline);
-    pipeline
-        .restore_job(request_for(&scenario, working_dir, JobStatus::Downloading))
-        .await
-        .unwrap();
-    assert!(pipeline.blocked_restores.contains_key(&JOB));
-    assert!(!pipeline.graph_jobs.contains_key(&JOB));
-    let info = pipeline
-        .list_jobs()
-        .into_iter()
-        .find(|job| job.job_id == JOB)
-        .expect("a blocked job stays in the queue");
-    assert_eq!(info.status, JobStatus::Paused);
-    assert!(
-        info.error
-            .as_deref()
-            .is_some_and(|error| error.contains("checkpoint")),
-        "{:?}",
-        info.error
-    );
-    // A blocked job holds no articles until its restore goes through.
-    assert!(pipeline.jobs[&JOB].articles.active().is_none());
-    pipeline.dispatch_downloads();
-    assert_eq!(pipeline.active_downloads, 0);
-    let row = pipeline
-        .db
-        .load_active_jobs()
+// Every article the job has queued to fetch.
+fn queued(pipeline: &Pipeline) -> usize {
+    pipeline.jobs[&JOB]
+        .articles
+        .active()
         .unwrap()
-        .remove(&JOB)
-        .unwrap();
-    assert_eq!(row.status, "paused");
-    assert!(pipeline.resume_restored_job(JOB).await.is_err());
-    assert!(pipeline.blocked_restores.contains_key(&JOB));
+        .download_queue
+        .len()
+}
 
-    shift_root_facts_version(&pipeline, -1).await;
-    pipeline.resume_restored_job(JOB).await.unwrap();
-    assert!(!pipeline.blocked_restores.contains_key(&JOB));
-    // Restored as the paused job it was, it holds no articles; resumed, it
-    // is built from its checkpoint when it is next reached.
-    assert!(pipeline.jobs[&JOB].articles.active().is_none());
-    crate::pipeline::tests::activate_job(&mut pipeline, JOB).await;
-    assert!(pipeline.graph_jobs.contains_key(&JOB));
-    assert!(
-        pipeline
-            .list_jobs()
-            .iter()
-            .find(|job| job.job_id == JOB)
-            .unwrap()
-            .error
-            .is_none()
-    );
-    // The four articles the checkpoint settled are not fetched again.
-    assert_eq!(
-        pipeline.jobs[&JOB]
-            .articles
-            .active()
-            .unwrap()
-            .download_queue
-            .len(),
-        8
-    );
-    while let Some(work) = next_work(&mut pipeline, &scenario) {
+// Serves the job every article it asks for, then finishes it.
+async fn serve_to_the_end(pipeline: &mut Pipeline, scenario: &Scenario) {
+    while let Some(work) = next_work(pipeline, scenario) {
         let article = (
             work.segment_id.file_id.file_index,
             work.segment_id.segment_number,
         );
-        serve(&mut pipeline, &scenario, article).await;
+        serve(pipeline, scenario, article).await;
     }
     pipeline.check_job_completion(JOB).await;
-    pump_pipeline_runtime_queues(&mut pipeline).await;
-    assert_eq!(
-        job_status_for_assert(&pipeline, JOB),
-        Some(JobStatus::Complete)
-    );
-    pipeline.db.flush_write_queue().await.unwrap();
-    let mut files = BTreeMap::new();
-    collect(&complete_dir, &complete_dir, &mut files);
-    assert_eq!(files.into_values().collect::<Vec<_>>(), vec![body]);
+    pump_pipeline_runtime_queues(pipeline).await;
+}
+
+// A checkpoint the database returns and this build cannot use is not one it
+// restores, so to this build the job has none. The job starts afresh and is
+// never paused. It reads none of its files back and asks for every article
+// again, the four the checkpoint had settled with the rest, and it finishes.
+#[tokio::test]
+async fn a_checkpoint_naming_an_unknown_reason_starts_the_job_afresh() {
+    starts_afresh(UNKNOWN_REASON).await;
+}
+
+// Whichever layer finds it: a value of a type the load does not read, or
+// facts that do not decode.
+#[tokio::test]
+async fn a_checkpoint_value_of_another_type_starts_the_job_afresh() {
+    starts_afresh(WRONG_TYPE).await;
+}
+
+#[tokio::test]
+async fn a_checkpoint_whose_facts_do_not_decode_starts_the_job_afresh() {
+    starts_afresh(UNDECODABLE).await;
+}
+
+async fn starts_afresh(change: &'static str) {
+    let job = reopened().await;
+    change_checkpoint(&job.pipeline, change).await;
+    job.starts_afresh().await;
+}
+
+// A job served four of its twelve articles and stopped, and its pipeline
+// opened again: what a restart test changes before it restores the job.
+struct Reopened {
+    pipeline: Pipeline,
+    scenario: Scenario,
+    body: Vec<u8>,
+    working_dir: std::path::PathBuf,
+    complete_dir: std::path::PathBuf,
+    _temp_dir: tempfile::TempDir,
+}
+
+async fn reopened() -> Reopened {
+    let body = payload(12 * ARTICLE, 77);
+    let scenario = Scenario::new(vec![Post::plain("ember.bin", body.clone())]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, working_dir) = served_four(&temp_dir, &scenario).await;
     retire_pipeline_database(pipeline).await;
+    let (mut pipeline, _, complete_dir) =
+        new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    scenario.prepare(&mut pipeline);
+    Reopened {
+        pipeline,
+        scenario,
+        body,
+        working_dir,
+        complete_dir,
+        _temp_dir: temp_dir,
+    }
+}
+
+impl Reopened {
+    async fn restore(&mut self) {
+        self.pipeline
+            .restore_job(request_for(
+                &self.scenario,
+                self.working_dir.clone(),
+                JobStatus::Downloading,
+            ))
+            .await
+            .unwrap();
+    }
+
+    // Restored with no checkpoint: never paused, every article asked for
+    // again, and the job finishes.
+    async fn starts_afresh(mut self) {
+        self.restore().await;
+        assert!(!self.pipeline.blocked_restores.contains_key(&JOB));
+        let info = self
+            .pipeline
+            .list_jobs()
+            .into_iter()
+            .find(|job| job.job_id == JOB)
+            .expect("the job is in the queue");
+        assert_ne!(info.status, JobStatus::Paused);
+        assert!(info.error.is_none(), "{:?}", info.error);
+        assert_eq!(queued(&self.pipeline), 12);
+        self.finishes().await;
+    }
+
+    // Restored from its checkpoint: the four settled articles are not
+    // fetched again, and the job finishes.
+    async fn restores_from_its_checkpoint(mut self) {
+        self.restore().await;
+        assert!(!self.pipeline.blocked_restores.contains_key(&JOB));
+        assert!(self.pipeline.graph_jobs.contains_key(&JOB));
+        assert_eq!(queued(&self.pipeline), 8);
+        self.finishes().await;
+    }
+
+    // The restore blocked: the job stands paused in the queue naming why,
+    // fetches nothing, and a resume fails while the read does.
+    async fn is_held(&mut self) {
+        self.restore().await;
+        let pipeline = &mut self.pipeline;
+        assert!(pipeline.blocked_restores.contains_key(&JOB));
+        assert!(!pipeline.graph_jobs.contains_key(&JOB));
+        let info = pipeline
+            .list_jobs()
+            .into_iter()
+            .find(|job| job.job_id == JOB)
+            .expect("a blocked job stays in the queue");
+        assert_eq!(info.status, JobStatus::Paused);
+        assert!(
+            info.error.as_deref().is_some_and(|error| error.starts_with(
+                "Checkpoint could not be restored: graph job checkpoint could not be read"
+            )),
+            "{:?}",
+            info.error
+        );
+        // A blocked job holds no articles until its restore goes through.
+        assert!(pipeline.jobs[&JOB].articles.active().is_none());
+        pipeline.dispatch_downloads();
+        assert_eq!(pipeline.active_downloads, 0);
+        let row = pipeline
+            .db
+            .load_active_jobs()
+            .unwrap()
+            .remove(&JOB)
+            .unwrap();
+        assert_eq!(row.status, "paused");
+        assert!(pipeline.resume_restored_job(JOB).await.is_err());
+        assert!(pipeline.blocked_restores.contains_key(&JOB));
+    }
+
+    // Once the read goes through, the resume restores the held job from its
+    // checkpoint and it finishes.
+    async fn resumes_from_its_checkpoint(mut self) {
+        self.pipeline.resume_restored_job(JOB).await.unwrap();
+        assert!(!self.pipeline.blocked_restores.contains_key(&JOB));
+        // Restored as the paused job it was, it holds no articles; resumed,
+        // it is built from its checkpoint when it is next reached.
+        assert!(self.pipeline.jobs[&JOB].articles.active().is_none());
+        crate::pipeline::tests::activate_job(&mut self.pipeline, JOB).await;
+        assert!(self.pipeline.graph_jobs.contains_key(&JOB));
+        assert!(
+            self.pipeline
+                .list_jobs()
+                .iter()
+                .find(|job| job.job_id == JOB)
+                .unwrap()
+                .error
+                .is_none()
+        );
+        assert_eq!(queued(&self.pipeline), 8);
+        self.finishes().await;
+    }
+
+    async fn finishes(mut self) {
+        serve_to_the_end(&mut self.pipeline, &self.scenario).await;
+        assert_eq!(
+            job_status_for_assert(&self.pipeline, JOB),
+            Some(JobStatus::Complete)
+        );
+        self.pipeline.db.flush_write_queue().await.unwrap();
+        let mut files = BTreeMap::new();
+        collect(&self.complete_dir, &self.complete_dir, &mut files);
+        assert_eq!(files.into_values().collect::<Vec<_>>(), vec![self.body]);
+        retire_pipeline_database(self.pipeline).await;
+    }
+}
+
+// Stores `plain` as the job's supplied password candidates, sealed with
+// `key` as the job's row holds them.
+async fn store_candidates(
+    pipeline: &Pipeline,
+    key: &crate::persistence::encryption::EncryptionKey,
+    plain: &str,
+) {
+    use crate::persistence::sql_runtime::SqlArg;
+    let sealed = crate::persistence::encryption::encrypt_value(key, plain).unwrap();
+    let datastore = pipeline.db.datastore();
+    crate::persistence::sql_runtime::SqlRuntime::run_in_transaction(
+        &datastore,
+        "test_store_candidates",
+        |tx| {
+            let sealed = sealed.clone();
+            Box::pin(async move {
+                tx.execute(
+                    "UPDATE active_jobs SET password_candidates = {} WHERE job_id = {}",
+                    &[SqlArg::Text(sealed), SqlArg::I64(JOB.0 as i64)],
+                )
+                .await?;
+                Ok(())
+            })
+        },
+    )
+    .await
+    .unwrap();
+}
+
+// One supplied candidate under `label`, as a job's row stores the list.
+fn candidates_labelled(label: &str) -> String {
+    serde_json::to_string(&[(label, "ember-word")]).unwrap()
+}
+
+// A later build named a password source this one does not have, and this
+// build was put back over its rows: the job's candidates do not read here,
+// so it starts afresh as for any checkpoint this build cannot use.
+#[tokio::test]
+async fn a_password_candidate_from_a_source_this_build_lacks_starts_the_job_afresh() {
+    let job = reopened().await;
+    let key = job.pipeline.db.encryption_key().unwrap();
+    store_candidates(&job.pipeline, key, &candidates_labelled("vault_entry")).await;
+    job.starts_afresh().await;
+}
+
+// The same for a later build that stored the list in a form this build does
+// not parse.
+#[tokio::test]
+async fn password_candidates_stored_in_a_form_this_build_does_not_parse_start_the_job_afresh() {
+    let job = reopened().await;
+    let key = job.pipeline.db.encryption_key().unwrap();
+    store_candidates(
+        &job.pipeline,
+        key,
+        r#"[{"source":"integration","value":"ember-word"}]"#,
+    )
+    .await;
+    job.starts_afresh().await;
+}
+
+// The bytes each member of the root has covered, as the job's checkpoint in
+// the database says.
+fn covered(pipeline: &Pipeline) -> BTreeMap<i64, i64> {
+    let rows = pipeline
+        .db
+        .load_graph_checkpoint(JOB)
+        .unwrap()
+        .expect("the job has a checkpoint");
+    let mut out = BTreeMap::new();
+    for row in rows.coverage.iter().filter(|row| row.node == 0) {
+        *out.entry(row.member).or_default() += row.end - row.start;
+    }
+    out
+}
+
+// A checkpoint whose root is at a version this build does not read is none,
+// and the fresh job's first checkpoint is written whole: every row the old
+// one left is gone, not only the rows the fresh job writes again.
+#[tokio::test]
+async fn a_fresh_jobs_first_checkpoint_replaces_every_stale_row() {
+    let scenario = Scenario::new(vec![
+        Post::plain("ember.bin", payload(ARTICLE, 81)),
+        Post::plain("cinder.bin", payload(11 * ARTICLE, 82)),
+    ]);
+    let temp_dir = tempfile::tempdir().unwrap();
+    let working_dir = changed_checkpoint(&temp_dir, &scenario, ROOT_VERSION_AHEAD).await;
+
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    scenario.prepare(&mut pipeline);
+    // The old checkpoint covers four articles across both files.
+    let stale = covered(&pipeline);
+    assert_eq!(stale.keys().copied().collect::<Vec<_>>(), vec![0, 1]);
+    assert_eq!(stale.values().sum::<i64>(), 4 * ARTICLE as i64);
+    pipeline
+        .restore_job(request_for(&scenario, working_dir, JobStatus::Downloading))
+        .await
+        .unwrap();
+    assert!(!pipeline.blocked_restores.contains_key(&JOB));
+    assert_eq!(queued(&pipeline), 12);
+    let work = next_work(&mut pipeline, &scenario).expect("the post has articles to come");
+    let article = (
+        work.segment_id.file_id.file_index,
+        work.segment_id.segment_number,
+    );
+    serve(&mut pipeline, &scenario, article).await;
+    pipeline.db.flush_write_queue().await.unwrap();
+    // One article is covered, and the root is at this build's version.
+    assert_eq!(covered(&pipeline).values().sum::<i64>(), ARTICLE as i64);
+    let rows = pipeline.db.load_graph_checkpoint(JOB).unwrap().unwrap();
+    let root = rows.nodes.iter().find(|row| row.node == 0).unwrap();
+    assert_eq!(
+        root.facts_version,
+        i64::from(crate::pipeline::graph::root::facts::RootFacts::VERSION)
+    );
+    retire_pipeline_database(pipeline).await;
+}
+
+// A checkpoint the database fails to read is not one this build does not
+// restore: nothing read says what it holds. The restore is blocked: the job
+// stands paused in the queue naming why, fetches nothing, and a resume fails
+// while the read fails. Once it reads, the resume restores the job from it
+// and the job finishes.
+#[tokio::test]
+async fn a_checkpoint_the_database_cannot_read_holds_the_job_paused_until_it_reads() {
+    held_until_it_reads(COLUMN_AWAY, COLUMN_BACK).await;
+}
+
+// The same for the job's password candidates, which the rebuild reads beside
+// its checkpoint: a failed read holds the job, never an empty list.
+#[tokio::test]
+async fn a_password_candidate_read_that_fails_holds_the_job_paused_until_it_reads() {
+    held_until_it_reads(CANDIDATES_AWAY, CANDIDATES_BACK).await;
+}
+
+// With no candidates stored and the read sound, the list is empty and the
+// job is restored from its checkpoint.
+#[tokio::test]
+async fn a_job_with_no_password_candidates_stored_is_restored_from_its_checkpoint() {
+    let job = reopened().await;
+    let (_, supplied) = job
+        .pipeline
+        .db
+        .load_active_job_password_sources(JOB)
+        .unwrap()
+        .expect("the job has its row");
+    assert!(supplied.is_empty());
+    job.restores_from_its_checkpoint().await;
+}
+
+// A job restarted with `away` making a read of what its restore needs fail,
+// then `back` making it read again.
+async fn held_until_it_reads(away: &'static str, back: &'static str) {
+    let mut job = reopened().await;
+    change_checkpoint(&job.pipeline, away).await;
+    job.is_held().await;
+    change_checkpoint(&job.pipeline, back).await;
+    job.resumes_from_its_checkpoint().await;
 }
 
 // A restart brings a job that was running back with its articles built and
@@ -1982,7 +2415,7 @@ async fn a_job_paused_while_its_stream_runs_resumes_and_its_restored_run_is_hear
 async fn cancelling_a_job_blocked_on_its_checkpoint_clears_the_block() {
     let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(12 * ARTICLE, 78))]);
     let temp_dir = tempfile::tempdir().unwrap();
-    let working_dir = unreadable_checkpoint(&temp_dir, &scenario).await;
+    let working_dir = changed_checkpoint(&temp_dir, &scenario, COLUMN_AWAY).await;
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
     let mut request = request_for(&scenario, working_dir, JobStatus::Paused);
     request.paused_resume_status = Some(JobStatus::Extracting);
@@ -2029,7 +2462,7 @@ async fn a_job_blocked_on_its_checkpoint_resumes_into_the_status_its_lanes_name(
     ] {
         let scenario = Scenario::new(vec![Post::plain("ember.bin", payload(12 * ARTICLE, 79))]);
         let temp_dir = tempfile::tempdir().unwrap();
-        let working_dir = unreadable_checkpoint(&temp_dir, &scenario).await;
+        let working_dir = changed_checkpoint(&temp_dir, &scenario, COLUMN_AWAY).await;
         let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
         let mut request = request_for(&scenario, working_dir, status.clone());
         request.download_state = Some(download_state);
@@ -2173,6 +2606,85 @@ async fn a_job_restored_under_paused_post_processing_starts_no_run_until_resume(
         files.keys()
     );
     retire_pipeline_database(pipeline).await;
+}
+
+// One enciphered RAR5 member whose checksum the password keys, with 16 bytes
+// in the middle of the volume posted wrong when `spoiled`, though every
+// article passes its own check.
+fn keyed_member(body: &[u8], spoiled: bool) -> Scenario {
+    let mut set = encrypted_store_set("beacon.bin", body, 1, SECRET, Some(SECRET), true);
+    if spoiled {
+        let middle = set[0].1.len() / 2;
+        set[0].1[middle..middle + 16]
+            .iter_mut()
+            .for_each(|byte| *byte ^= 0x5a);
+    }
+    Scenario::new(volumes(set)).password(SECRET)
+}
+
+// The article after which a keyed member restarts while it is still open:
+// past the wrong span in its middle, short of its end.
+const KEYED_OPEN_AT: usize = 6;
+
+// Run straight through, a keyed member posted wrong fails its checksum.
+#[tokio::test]
+async fn a_keyed_rar_member_posted_wrong_fails_its_checksum() {
+    let body = payload(6 * ARTICLE + 11, 77);
+    let whole = run(&keyed_member(&body, true)).await;
+    assert!(!whole.completed(), "{:?} {:?}", whole.status, whole.failure);
+}
+
+// Restarted after every article, it fails it too: a restore does not leave
+// the member unchecked.
+#[tokio::test]
+async fn a_keyed_rar_member_posted_wrong_fails_its_checksum_across_restarts() {
+    let body = payload(6 * ARTICLE + 11, 77);
+    let restarted = run_restarting(&keyed_member(&body, true), &mut |_| {}).await;
+    assert!(restarted.restarts > 0);
+    assert!(
+        !matches!(restarted.status, Some(JobStatus::Complete)),
+        "{:?} {:?}",
+        restarted.status,
+        restarted.files.keys()
+    );
+}
+
+// A keyed member restarted while it is open takes its last articles after the
+// restore and comes out whole, as it does run straight through.
+#[tokio::test]
+async fn a_keyed_rar_member_restarted_open_comes_out_whole() {
+    let body = payload(6 * ARTICLE + 11, 77);
+    let scenario = keyed_member(&body, false);
+    let whole = run(&scenario).await;
+    assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
+    assert!(
+        whole.files.values().any(|bytes| *bytes == body),
+        "member bytes"
+    );
+    let restarted =
+        run_restarting_at(&scenario, &mut |_| {}, Down::Crash, &|n| n == KEYED_OPEN_AT).await;
+    assert_restarted(&restarted, &whole);
+}
+
+// A keyed member restarted while it is open, its wrong span read before the
+// restart, fails its checksum once its last articles come.
+#[tokio::test]
+async fn a_keyed_rar_member_restarted_open_over_a_wrong_span_fails_its_checksum() {
+    let body = payload(6 * ARTICLE + 11, 77);
+    let scenario = keyed_member(&body, true);
+    let restarted =
+        run_restarting_at(&scenario, &mut |_| {}, Down::Crash, &|n| n == KEYED_OPEN_AT).await;
+    assert_eq!(restarted.restarts, 1);
+    assert!(
+        !matches!(restarted.status, Some(JobStatus::Complete)),
+        "{:?} {:?}",
+        restarted.status,
+        restarted.files.keys()
+    );
+    assert!(
+        !restarted.files.values().any(|bytes| *bytes == body),
+        "member whole"
+    );
 }
 
 mod moves;

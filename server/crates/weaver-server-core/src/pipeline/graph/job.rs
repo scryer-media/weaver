@@ -534,6 +534,25 @@ impl GraphJob {
         self.root.map.arrived_before(queued);
     }
 
+    // An arrived article is sent back for another copy: its header placed
+    // it where its neighbours showed it is not, so what came was never the
+    // article's bytes. The root waits on it again, and the copy that comes
+    // is taken as its first.
+    pub(crate) fn send_back(&mut self, volume: VolumeIndex, ordinal: u32) {
+        self.unarrive(volume, ordinal);
+    }
+
+    // The root waits on an arrived article again, and what its bytes
+    // covered of their member is covered no more, so no member reads as its
+    // own bytes that may never have been.
+    fn unarrive(&mut self, volume: VolumeIndex, ordinal: u32) {
+        let range = self.root.map.arrived_range(volume, ordinal);
+        self.root.map.unarrive(volume, ordinal);
+        if let Some(range) = range {
+            self.tree.uncover(NodeId::ROOT, volume, range);
+        }
+    }
+
     // Whether the root holds the article or has ruled it lost.
     pub(crate) fn article_settled(&self, volume: VolumeIndex, ordinal: u32) -> bool {
         self.root.map.article_settled(volume, ordinal)

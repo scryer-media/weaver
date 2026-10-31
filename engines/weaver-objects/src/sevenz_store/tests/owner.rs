@@ -287,6 +287,27 @@ impl Owner {
         self.held.len()
     }
 
+    // A range of a volume a restart could not read back, as the tree
+    // uncovers it: the members it reached are not covered there and are
+    // open, and the store forgets what it said of it.
+    pub fn uncover(&mut self, volume: usize, range: ByteRange) {
+        let volume = VolumeIndex(volume as u32);
+        let mut placements = Vec::new();
+        self.object.locate(volume, range, &mut placements);
+        for placement in placements {
+            if let Placement::Member { member, range } = placement
+                && let Some(got) = self.members.get_mut(&member.0)
+            {
+                got.coverage.erase(range);
+                got.closed = false;
+            }
+        }
+        if let Some(delivered) = self.delivered.get_mut(&volume.0) {
+            delivered.erase(range);
+        }
+        self.object.unposted(volume, range);
+    }
+
     fn apply(&mut self, out: Vec<Emit>) {
         let mut again = Vec::new();
         for emit in out {

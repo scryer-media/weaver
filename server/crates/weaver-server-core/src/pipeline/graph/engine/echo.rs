@@ -3,7 +3,7 @@
 
 // A pretend engine for tests: every volume is an eight-byte header and a
 // body, and a run echoes each body, read through its volumes in order, as a
-// member of its own named `echo-<volume>.bin`. Its first volume carries a
+// member of its own named `echo-<volume>.mkv`. Its first volume carries a
 // store's signature so the sniffer names it a store, which the echoes build
 // as this engine; the volumes after it are claimed by their `.partN`
 // names. It bids for the volumes after the one its run reached, nearest
@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use weaver_graph::{
-    Builder, ByteRange, Delivery, Emit, Engine, Extent, Extraction, Kind, Located, MemberId,
+    Builder, ByteRange, Claim, Delivery, Emit, Engine, Extent, Extraction, Kind, Located, MemberId,
     Object, ObjectId, Placement, Provenance, Pull, Seek, Sink, VolumeIndex, Volumes, Weight, Why,
 };
 
@@ -130,7 +130,7 @@ impl Object for Echo {
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
     }
-    fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Vec<VolumeIndex> {
+    fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Claim {
         name.rsplit_once(".part")
             .and_then(|(_, part)| part.strip_suffix(".rar")?.parse::<u32>().ok())
             .filter(|part| *part >= 2)
@@ -193,7 +193,7 @@ impl Extraction for EchoRun {
             let (volume, member) = (VolumeIndex(index), MemberId(index));
             let announced = Emit::Member {
                 member,
-                name: format!("echo-{index}.bin"),
+                name: format!("echo-{index}.mkv"),
                 length: None,
             };
             if !sink(announced) {

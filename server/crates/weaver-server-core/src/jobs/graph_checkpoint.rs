@@ -14,7 +14,7 @@ use std::sync::Arc;
 use super::ids::JobId;
 use super::persistence::lock_active_job_for_write_tx;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
-use crate::{Database, StateError};
+use crate::{Database, LoadError, StateError};
 
 // Every table a checkpoint writes. A job's rows go with the job.
 pub(crate) const TABLES: [&str; 9] = [
@@ -83,6 +83,8 @@ pub(crate) struct MemberRow {
     pub(crate) on_disk: Option<String>,
     pub(crate) refused: Option<String>,
     pub(crate) copy_of: Option<i64>,
+    // The kind whose reading of the member its own bytes refuted.
+    pub(crate) refuted_kind: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -252,7 +254,7 @@ impl Row for MemberRow {
     const KEY: &'static [&'static str] = &["node_id", "member_id"];
     const COLUMNS: &'static str = "job_id, node_id, member_id, name, output_name, crc32, \
          length, closed, bound_node_id, owner_node_id, owner_volume, given_up_node_id, \
-         given_up_volume, buried, undecided, has_file, on_disk, refused, copy_of";
+         given_up_volume, buried, undecided, has_file, on_disk, refused, copy_of, refuted_kind";
 
     fn key(&self) -> (i64, i64) {
         (self.node, self.member)
@@ -285,6 +287,7 @@ impl Row for MemberRow {
             SqlArg::OptText(self.on_disk.clone()),
             SqlArg::OptText(self.refused.clone()),
             SqlArg::OptI64(self.copy_of),
+            SqlArg::OptText(self.refuted_kind.clone()),
         ]
     }
 }
@@ -596,14 +599,17 @@ impl Database {
     pub(crate) fn load_graph_checkpoint(
         &self,
         job_id: JobId,
-    ) -> Result<Option<GraphCheckpoint>, StateError> {
+    ) -> Result<Option<GraphCheckpoint>, LoadError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "load_graph_checkpoint", |tx| {
-                Box::pin(async move { read_checkpoint(tx, job_id).await })
+        let fetched = self
+            .run_sql_blocking(async move {
+                SqlRuntime::run_in_transaction(&datastore, "load_graph_checkpoint", |tx| {
+                    Box::pin(async move { fetch_checkpoint(tx, job_id).await })
+                })
+                .await
             })
-            .await
-        })
+            .map_err(LoadError::Read)?;
+        fetched.map(interpret).transpose().map_err(LoadError::Rows)
     }
 }
 
@@ -691,10 +697,26 @@ async fn write<R: Row>(
     Ok(())
 }
 
-async fn read_checkpoint(
+// A checkpoint's rows as the database returned them, before any value in
+// them is read.
+struct Fetched {
+    nodes: Vec<SqlRow>,
+    members: Vec<SqlRow>,
+    coverage: Vec<SqlRow>,
+    envelopes: Vec<SqlRow>,
+    crypt: Vec<SqlRow>,
+    parts: Vec<SqlRow>,
+    holds: Vec<SqlRow>,
+    held_parts: Vec<SqlRow>,
+    feed_verdict: Option<SqlRow>,
+}
+
+// Every row of the job's checkpoint, or `None` when it has no nodes. Only
+// the database fails here.
+async fn fetch_checkpoint(
     tx: &mut SqlTx<'_>,
     job_id: JobId,
-) -> Result<Option<GraphCheckpoint>, StateError> {
+) -> Result<Option<Fetched>, StateError> {
     let args = [SqlArg::I64(job_id.0 as i64)];
     let nodes = tx
         .fetch_all(
@@ -707,10 +729,78 @@ async fn read_checkpoint(
     if nodes.is_empty() {
         return Ok(None);
     }
+    Ok(Some(Fetched {
+        nodes,
+        members: tx
+            .fetch_all(
+                "SELECT node_id, member_id, name, output_name, crc32, length, closed, \
+                 bound_node_id, owner_node_id, owner_volume, given_up_node_id, given_up_volume, \
+                 buried, undecided, has_file, on_disk, refused, copy_of, refuted_kind \
+                 FROM graph_members WHERE job_id = {} ORDER BY node_id, member_id",
+                &args,
+            )
+            .await?,
+        coverage: tx
+            .fetch_all(
+                "SELECT node_id, member_id, range_start, range_end, provenance, verified \
+                 FROM graph_coverage WHERE job_id = {} ORDER BY node_id, member_id, range_start",
+                &args,
+            )
+            .await?,
+        envelopes: tx
+            .fetch_all(
+                "SELECT node_id, volume, range_start, range_end, provenance, closed, settled, file \
+                 FROM graph_envelopes WHERE job_id = {} ORDER BY node_id, volume, range_start",
+                &args,
+            )
+            .await?,
+        crypt: tx
+            .fetch_all(
+                "SELECT node_id, member_id, run_start, seed \
+                 FROM graph_crypt WHERE job_id = {} ORDER BY node_id, member_id, run_start",
+                &args,
+            )
+            .await?,
+        parts: tx
+            .fetch_all(
+                "SELECT node_id, part, bytes \
+                 FROM graph_facts_parts WHERE job_id = {} ORDER BY node_id, part",
+                &args,
+            )
+            .await?,
+        holds: tx
+            .fetch_all(
+                "SELECT node_id, volume, range_start, range_end, scratch_offset \
+                 FROM graph_holds WHERE job_id = {} ORDER BY node_id, volume, range_start",
+                &args,
+            )
+            .await?,
+        held_parts: tx
+            .fetch_all(
+                "SELECT file_index, ordinal, decoded_len, spool_path, raw_size, crc_valid, \
+                 truncation_suspected, part_crc_verified, part_crc, expected_file_crc, file_size, \
+                 yenc_part, yenc_total, yenc_begin, yenc_end, yenc_name, crc_segments \
+                 FROM graph_held_parts WHERE job_id = {} ORDER BY file_index, ordinal",
+                &args,
+            )
+            .await?,
+        feed_verdict: tx
+            .fetch_optional(
+                "SELECT feed_verdict FROM active_jobs WHERE job_id = {}",
+                &args,
+            )
+            .await?,
+    }))
+}
+
+// The values in the fetched rows. Fails only on a value this build cannot
+// take: a column of another type, or one that does not decode.
+fn interpret(fetched: Fetched) -> Result<GraphCheckpoint, StateError> {
     let pair = |row: &SqlRow, first: &str, second: &str| -> Result<_, StateError> {
         Ok(row.opt_i64(first)?.zip(row.opt_i64(second)?))
     };
-    let nodes = nodes
+    let nodes = fetched
+        .nodes
         .iter()
         .map(|row| {
             Ok(NodeRow {
@@ -728,15 +818,8 @@ async fn read_checkpoint(
             })
         })
         .collect::<Result<_, StateError>>()?;
-    let members = tx
-        .fetch_all(
-            "SELECT node_id, member_id, name, output_name, crc32, length, closed, bound_node_id, \
-             owner_node_id, owner_volume, given_up_node_id, given_up_volume, buried, \
-             undecided, has_file, on_disk, refused, copy_of \
-             FROM graph_members WHERE job_id = {} ORDER BY node_id, member_id",
-            &args,
-        )
-        .await?
+    let members = fetched
+        .members
         .iter()
         .map(|row| {
             Ok(MemberRow {
@@ -756,16 +839,12 @@ async fn read_checkpoint(
                 on_disk: row.opt_text("on_disk")?,
                 refused: row.opt_text("refused")?,
                 copy_of: row.opt_i64("copy_of")?,
+                refuted_kind: row.opt_text("refuted_kind")?,
             })
         })
         .collect::<Result<_, StateError>>()?;
-    let coverage = tx
-        .fetch_all(
-            "SELECT node_id, member_id, range_start, range_end, provenance, verified \
-             FROM graph_coverage WHERE job_id = {} ORDER BY node_id, member_id, range_start",
-            &args,
-        )
-        .await?
+    let coverage = fetched
+        .coverage
         .iter()
         .map(|row| {
             Ok(CoverageRow {
@@ -778,13 +857,8 @@ async fn read_checkpoint(
             })
         })
         .collect::<Result<_, StateError>>()?;
-    let envelopes = tx
-        .fetch_all(
-            "SELECT node_id, volume, range_start, range_end, provenance, closed, settled, file \
-             FROM graph_envelopes WHERE job_id = {} ORDER BY node_id, volume, range_start",
-            &args,
-        )
-        .await?
+    let envelopes = fetched
+        .envelopes
         .iter()
         .map(|row| {
             Ok(EnvelopeRow {
@@ -799,13 +873,8 @@ async fn read_checkpoint(
             })
         })
         .collect::<Result<_, StateError>>()?;
-    let crypt = tx
-        .fetch_all(
-            "SELECT node_id, member_id, run_start, seed \
-             FROM graph_crypt WHERE job_id = {} ORDER BY node_id, member_id, run_start",
-            &args,
-        )
-        .await?
+    let crypt = fetched
+        .crypt
         .iter()
         .map(|row| {
             Ok(CryptRow {
@@ -816,13 +885,8 @@ async fn read_checkpoint(
             })
         })
         .collect::<Result<_, StateError>>()?;
-    let parts = tx
-        .fetch_all(
-            "SELECT node_id, part, bytes \
-             FROM graph_facts_parts WHERE job_id = {} ORDER BY node_id, part",
-            &args,
-        )
-        .await?
+    let parts = fetched
+        .parts
         .iter()
         .map(|row| {
             Ok(PartRow {
@@ -832,13 +896,8 @@ async fn read_checkpoint(
             })
         })
         .collect::<Result<_, StateError>>()?;
-    let holds = tx
-        .fetch_all(
-            "SELECT node_id, volume, range_start, range_end, scratch_offset \
-             FROM graph_holds WHERE job_id = {} ORDER BY node_id, volume, range_start",
-            &args,
-        )
-        .await?
+    let holds = fetched
+        .holds
         .iter()
         .map(|row| {
             Ok(HoldRow {
@@ -850,15 +909,8 @@ async fn read_checkpoint(
             })
         })
         .collect::<Result<_, StateError>>()?;
-    let held_parts = tx
-        .fetch_all(
-            "SELECT file_index, ordinal, decoded_len, spool_path, raw_size, crc_valid, \
-             truncation_suspected, part_crc_verified, part_crc, expected_file_crc, file_size, \
-             yenc_part, yenc_total, yenc_begin, yenc_end, yenc_name, crc_segments \
-             FROM graph_held_parts WHERE job_id = {} ORDER BY file_index, ordinal",
-            &args,
-        )
-        .await?
+    let held_parts = fetched
+        .held_parts
         .iter()
         .map(|row| {
             let article = match row.opt_i64("raw_size")? {
@@ -888,18 +940,14 @@ async fn read_checkpoint(
             })
         })
         .collect::<Result<_, StateError>>()?;
-    let feed_verdict = tx
-        .fetch_optional(
-            "SELECT feed_verdict FROM active_jobs WHERE job_id = {}",
-            &args,
-        )
-        .await?
+    let feed_verdict = fetched
+        .feed_verdict
         .map(|row| row.opt_text("feed_verdict"))
         .transpose()?
         .flatten()
         .map(|value| super::feed_verdict::FeedVerdict::decode(&value))
         .transpose()?;
-    Ok(Some(GraphCheckpoint {
+    Ok(GraphCheckpoint {
         feed_verdict,
         nodes,
         members,
@@ -909,5 +957,5 @@ async fn read_checkpoint(
         parts,
         holds,
         held_parts,
-    }))
+    })
 }

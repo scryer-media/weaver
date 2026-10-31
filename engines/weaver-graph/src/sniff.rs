@@ -10,8 +10,13 @@
 // out every signature: tar, bzip2 and zip by their extensions too, and raw
 // deflate, brotli and SFV, which have no signature, by theirs alone. The one
 // name that outranks a signature is a numbered piece's, `name.001` onward,
-// whichever piece it is and whatever its bytes open: the pieces join into
-// one file, and that file's own front says what it is.
+// whichever piece it is and whatever its bytes open: it founds the split
+// store first, whose pieces join into one file, and that file's own front
+// says what it is. The claim is the name's only until a piece other than
+// the first opens on a signature that stands only at a file's head
+// (`signs_a_head`): that refutes the set at the split store, and every piece
+// is claimed by its own bytes (`signed`). A signature that may recur inside
+// a file, at a member, entry, packet, frame or stream of its own, never does.
 //
 // Bytes read before a verdict, per kind:
 //
@@ -20,8 +25,10 @@
 //   7z 32     the signature header, whose start header must match its CRC;
 //             a major version the store cannot read is the store's to refuse
 //   PAR2 64   the first packet header, whose length must be a packet's
+//   gzip 10   the member header, whose method must be deflate and whose
+//             reserved flags must be clear
 //   bzip2 4   `BZh` and a block-size level
-//   RAR5 8, RAR4 7, RAR5 recovery 8, PAR3 8, xz 6, zip 4, zstd 4, gzip 2   the signature
+//   RAR5 8, RAR4 7, RAR5 recovery 8, PAR3 8, xz 6, zip 4, zstd 4   the signature
 //
 // Each is cut short by bytes that already contradict the signature, and by
 // a known length too small to hold it.
@@ -43,8 +50,9 @@ pub enum Sniff {
 
 pub fn sniff(name: &str, first_bytes: &[u8], length: Option<u64>) -> Sniff {
     // A name never outvotes bytes that might still turn out to be a signature.
-    // A numbered piece's name outvotes any they open: the piece is a slice
-    // of a file, and what that file is, its own front says once joined.
+    // A numbered piece's name outvotes any they open, as the first claim:
+    // the piece is a slice of a file, and what that file is, its own front
+    // says once joined, unless a later piece's own front refutes the set.
     match signed(first_bytes, length) {
         Sniff::Object(_) if numbered_piece(trimmed(name)) => Sniff::Object(Kind::Split),
         Sniff::Leaf => named(name)
@@ -58,8 +66,22 @@ pub fn sniff(name: &str, first_bytes: &[u8], length: Option<u64>) -> Sniff {
 // open, `Pending` while one still might, and `Leaf` once they rule out every
 // one.
 pub fn signed(first_bytes: &[u8], length: Option<u64>) -> Sniff {
+    verdict(first_bytes, length, |_| true)
+}
+
+// What the first bytes say from the signatures that stand only at a file's
+// head, the same three ways: bytes that open one of them can only be a file
+// of their own, never a slice from inside another.
+pub fn signs_a_head(first_bytes: &[u8], length: Option<u64>) -> Sniff {
+    verdict(first_bytes, length, Stands::at_head_only)
+}
+
+fn verdict(first_bytes: &[u8], length: Option<u64>, counts: fn(Stands) -> bool) -> Sniff {
     let mut waiting = false;
-    for signature in SIGNATURES {
+    for signature in SIGNATURES
+        .iter()
+        .filter(|signature| counts(signature.stands))
+    {
         match signature.test(first_bytes, length) {
             Test::Yes => return Sniff::Object(signature.kind),
             Test::Undecided => waiting = true,
@@ -69,8 +91,27 @@ pub fn signed(first_bytes: &[u8], length: Option<u64>) -> Sniff {
     if waiting { Sniff::Pending } else { Sniff::Leaf }
 }
 
+// Where in a file a signature may stand.
+#[derive(Clone, Copy)]
+enum Stands {
+    // At its head alone: it opens the file, and nothing inside it.
+    AtHead,
+    // At its head and again inside it, at every member, entry, packet,
+    // frame or stream that follows.
+    Recurs,
+}
+
+impl Stands {
+    // Whether bytes it opens can only be a file's head: what
+    // `signs_a_head` asks and `HEAD_VERDICT_BYTES` is sized by.
+    const fn at_head_only(self) -> bool {
+        matches!(self, Stands::AtHead)
+    }
+}
+
 struct Signature {
     kind: Kind,
+    stands: Stands,
     magic: &'static [u8],
     // How many bytes the verdict reads: the magic, or the whole header that
     // must hold before the kind is trusted.
@@ -106,9 +147,10 @@ impl Signature {
     }
 }
 
-const fn signature(kind: Kind, magic: &'static [u8]) -> Signature {
+const fn signature(kind: Kind, stands: Stands, magic: &'static [u8]) -> Signature {
     Signature {
         kind,
+        stands,
         magic,
         header: magic.len(),
         holds: |_, _| true,
@@ -123,29 +165,41 @@ const PAR2_PACKET_ALIGNMENT: u64 = 4;
 const PAR2_PACKET_HEADER_BYTES: usize = 64;
 const USTAR_MAGIC_AT: usize = 257;
 const USTAR_MAGIC: &[u8] = b"ustar";
+// ID1 ID2 CM FLG MTIME(4) XFL OS.
+const GZIP_HEADER_BYTES: usize = 10;
+const GZIP_DEFLATE: u8 = 8;
+const GZIP_RESERVED_FLAGS: u8 = 0b1110_0000;
 
 // The most bytes any verdict reads. A contiguous front this long always
 // decides, so this is how much of an undecided member is worth fetching.
-pub const VERDICT_BYTES: usize = {
+pub const VERDICT_BYTES: usize = most_read(false);
+
+// The most bytes a verdict of the head-only signatures reads: a front this
+// long always decides `signs_a_head`.
+pub const HEAD_VERDICT_BYTES: usize = most_read(true);
+
+const fn most_read(head_only: bool) -> usize {
     let mut most = 0;
     let mut index = 0;
     while index < SIGNATURES.len() {
-        if SIGNATURES[index].header > most {
-            most = SIGNATURES[index].header;
+        let signature = &SIGNATURES[index];
+        if (!head_only || signature.stands.at_head_only()) && signature.header > most {
+            most = signature.header;
         }
         index += 1;
     }
     most
-};
+}
 
 // Every magic sits at offset zero but tar's, which its header check reads.
 // No two of them agree on a whole magic across kinds, so the order of the
 // table never changes a verdict.
 const SIGNATURES: &[Signature] = &[
-    signature(Kind::RarStore, b"Rar!\x1a\x07\x00"),
-    signature(Kind::RarStore, b"Rar!\x1a\x07\x01\x00"),
+    signature(Kind::RarStore, Stands::AtHead, b"Rar!\x1a\x07\x00"),
+    signature(Kind::RarStore, Stands::AtHead, b"Rar!\x1a\x07\x01\x00"),
     Signature {
         kind: Kind::SevenZipStore,
+        stands: Stands::AtHead,
         magic: &SEVEN_Z_SIGNATURE,
         header: SEVEN_Z_SIGNATURE_HEADER_LEN,
         holds: sevenz_header_looks_valid,
@@ -153,14 +207,26 @@ const SIGNATURES: &[Signature] = &[
     },
     // A local file header, the end record alone of an empty archive, and the
     // marker that opens the first volume of a spanned archive.
-    signature(Kind::Zip, b"PK\x03\x04"),
-    signature(Kind::Zip, b"PK\x05\x06"),
-    signature(Kind::Zip, b"PK\x07\x08"),
-    signature(Kind::Xz, &[0xfd, b'7', b'z', b'X', b'Z', 0x00]),
-    signature(Kind::Gzip, &[0x1f, 0x8b]),
-    signature(Kind::Zstd, &[0x28, 0xb5, 0x2f, 0xfd]),
+    signature(Kind::Zip, Stands::Recurs, b"PK\x03\x04"),
+    signature(Kind::Zip, Stands::Recurs, b"PK\x05\x06"),
+    signature(Kind::Zip, Stands::Recurs, b"PK\x07\x08"),
+    signature(
+        Kind::Xz,
+        Stands::Recurs,
+        &[0xfd, b'7', b'z', b'X', b'Z', 0x00],
+    ),
+    Signature {
+        kind: Kind::Gzip,
+        stands: Stands::Recurs,
+        magic: &[0x1f, 0x8b],
+        header: GZIP_HEADER_BYTES,
+        holds: |header, _| !gzip_header_contradicted(header),
+        ruled_out: gzip_header_contradicted,
+    },
+    signature(Kind::Zstd, Stands::Recurs, &[0x28, 0xb5, 0x2f, 0xfd]),
     Signature {
         kind: Kind::Bzip2,
+        stands: Stands::Recurs,
         magic: b"BZh",
         header: 4,
         holds: |header, _| matches!(header.get(3), Some(b'1'..=b'9')),
@@ -168,6 +234,7 @@ const SIGNATURES: &[Signature] = &[
     },
     Signature {
         kind: Kind::Tar,
+        stands: Stands::Recurs,
         magic: b"",
         header: USTAR_MAGIC_AT + USTAR_MAGIC.len() + 1,
         holds: ustar_header,
@@ -175,15 +242,16 @@ const SIGNATURES: &[Signature] = &[
     },
     Signature {
         kind: Kind::Par2,
+        stands: Stands::Recurs,
         magic: PAR2_MAGIC,
         header: PAR2_PACKET_HEADER_BYTES,
         holds: par2_header_looks_valid,
         ruled_out: |_| false,
     },
-    signature(Kind::Par3, b"PAR3\x00PKT"),
+    signature(Kind::Par3, Stands::Recurs, b"PAR3\x00PKT"),
     // A RAR5 recovery volume. A RAR3 one opens with parity and is known by
     // its name alone.
-    signature(Kind::RarRecovery, b"Rar!\x1aRev"),
+    signature(Kind::RarRecovery, Stands::AtHead, b"Rar!\x1aRev"),
 ];
 
 // A start header whose CRC fails is bytes that only open like a 7z. One that
@@ -219,6 +287,16 @@ fn tar_checksum_ruled_out(seen: &[u8]) -> bool {
         .iter()
         .take(8)
         .any(|&byte| !matches!(byte, b'0'..=b'7' | b' ' | 0))
+}
+
+// Two magic bytes open one member in 65,536 by chance. A gzip member's
+// method is deflate, and its flags leave the reserved bits clear, so either
+// byte saying otherwise means bytes that only open like a gzip.
+fn gzip_header_contradicted(seen: &[u8]) -> bool {
+    seen.get(2).is_some_and(|&method| method != GZIP_DEFLATE)
+        || seen
+            .get(3)
+            .is_some_and(|&flags| flags & GZIP_RESERVED_FLAGS != 0)
 }
 
 // A cheap, non-authoritative admission check. Packet hashes remain the
@@ -376,6 +454,8 @@ mod tests {
     const RAR5: &[u8] = b"Rar!\x1A\x07\x01\x00";
     const XZ: &[u8] = &[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00, 0x04];
     const PAR3: &[u8] = b"PAR3\0PKT\x40\x00\x00\x00";
+    // A gzip member header: deflate, no flags, no time, the Unix OS byte.
+    const GZIP: &[u8] = &[0x1F, 0x8B, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0x03];
 
     fn object(kind: Kind) -> Sniff {
         Sniff::Object(kind)
@@ -515,10 +595,45 @@ mod tests {
 
     #[test]
     fn gzip_signature() {
-        assert_eq!(
-            sniff("a.gz", &[0x1F, 0x8B, 0x08, 0x00], None),
-            object(Kind::Gzip)
-        );
+        assert_eq!(sniff("a.gz", GZIP, None), object(Kind::Gzip));
+    }
+
+    // Two magic bytes are no signature: the header's method and reserved
+    // flags must hold, whatever the name.
+    #[test]
+    fn gzip_needs_its_whole_member_header() {
+        let mut wrong_method = GZIP.to_vec();
+        wrong_method[2] = 0x09;
+        wrong_method.extend(plain(600));
+        let mut reserved_flags = GZIP.to_vec();
+        reserved_flags[3] = 0xE0;
+        reserved_flags.extend(plain(600));
+        for name in ["9f3a7c1e", "x.gz"] {
+            assert_eq!(sniff(name, GZIP, None), object(Kind::Gzip), "{name}");
+            assert_eq!(sniff(name, &GZIP[..9], None), Sniff::Pending, "{name}");
+            assert_ne!(
+                sniff(name, &wrong_method, None),
+                object(Kind::Gzip),
+                "{name}"
+            );
+            assert_ne!(
+                sniff(name, &reserved_flags, None),
+                object(Kind::Gzip),
+                "{name}"
+            );
+        }
+        assert_eq!(signed(&wrong_method, None), Sniff::Leaf);
+        assert_eq!(signed(&reserved_flags, None), Sniff::Leaf);
+        // A contradicting byte rules gzip out before its header is due; tar
+        // alone may keep so short a front pending.
+        let gzip = SIGNATURES
+            .iter()
+            .find(|signature| signature.kind == Kind::Gzip)
+            .expect("gzip has a signature");
+        for front in [&[0x1F, 0x8B, 0x09][..], &[0x1F, 0x8B, 0x08, 0xE0]] {
+            assert!(matches!(gzip.test(front, None), Test::No), "{front:x?}");
+        }
+        assert!(matches!(gzip.test(&GZIP[..4], None), Test::Undecided));
     }
 
     #[test]
@@ -639,6 +754,55 @@ mod tests {
         assert_ne!(sniff("a.bin", &[b'0'; VERDICT_BYTES], None), Sniff::Pending);
     }
 
+    // Ruling 2026-10-30 5:47 PM MDT: only a signature that stands at a
+    // file's head alone signs a head. Tar, zip, xz, gzip, zstd, bzip2, PAR2
+    // and PAR3 may recur inside a file, so a front opening on one of them
+    // signs no head; RAR, 7z and a RAR5 recovery volume do.
+    #[test]
+    fn only_a_signature_that_stands_at_a_head_alone_signs_one() {
+        let mut rev5 = b"Rar!\x1aRev".to_vec();
+        rev5.extend(plain(64));
+        for front in [RAR4.to_vec(), RAR5.to_vec(), seven_z(), rev5] {
+            assert_eq!(
+                signs_a_head(&front, None),
+                signed(&front, None),
+                "{front:x?}"
+            );
+            assert!(matches!(signs_a_head(&front, None), Sniff::Object(_)));
+        }
+        let recurring: [Vec<u8>; 10] = [
+            ustar(0),
+            b"PK\x03\x04".to_vec(),
+            b"PK\x05\x06".to_vec(),
+            b"PK\x07\x08".to_vec(),
+            XZ.to_vec(),
+            GZIP.to_vec(),
+            vec![0x28, 0xB5, 0x2F, 0xFD],
+            b"BZh9".to_vec(),
+            par2(64),
+            PAR3.to_vec(),
+        ];
+        for front in recurring {
+            assert!(
+                matches!(signed(&front, None), Sniff::Object(_)),
+                "{front:x?}"
+            );
+            assert_eq!(signs_a_head(&front, None), Sniff::Leaf, "{front:x?}");
+        }
+    }
+
+    #[test]
+    fn a_front_of_the_head_verdict_bytes_always_decides_a_head() {
+        assert_eq!(HEAD_VERDICT_BYTES, SEVEN_Z_SIGNATURE_HEADER_LEN);
+        let head = seven_z();
+        assert_eq!(signs_a_head(&head[..31], None), Sniff::Pending);
+        assert_eq!(signs_a_head(&head[..31], Some(31)), Sniff::Leaf);
+        assert_ne!(
+            signs_a_head(&[0x37; HEAD_VERDICT_BYTES], None),
+            Sniff::Pending
+        );
+    }
+
     #[test]
     fn a_stray_checksum_byte_rules_tar_out_early() {
         assert_eq!(sniff("a.bin", &plain(148), None), Sniff::Pending);
@@ -687,7 +851,8 @@ mod tests {
     #[test]
     fn a_name_waits_for_bytes_that_might_be_a_signature() {
         assert_eq!(sniff("a.sfv", b"", None), Sniff::Pending);
-        assert_eq!(sniff("a.br", &[0x1F, 0x8B], None), object(Kind::Gzip));
+        assert_eq!(sniff("a.br", &GZIP[..2], None), Sniff::Pending);
+        assert_eq!(sniff("a.br", GZIP, None), object(Kind::Gzip));
         assert_eq!(sniff("a.sfv", b"", Some(0)), object(Kind::Sfv));
     }
 
@@ -741,7 +906,9 @@ mod tests {
     }
 
     // The first piece opens what the joined file is, and the name outranks
-    // it: the pieces join, and the joined file's front founds its kind.
+    // it as the first claim: the pieces join, and the joined file's front
+    // founds its kind. A later piece that signs a kind refutes the set at
+    // the split store, not here (ruling "Signature refutes name").
     // A format's own volume names are not numbered pieces.
     #[test]
     fn a_numbered_piece_is_a_split_whatever_its_bytes_open() {

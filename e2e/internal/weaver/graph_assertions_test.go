@@ -115,10 +115,21 @@ func TestGraphDirectUnpackVerdict(t *testing.T) {
 			wantErr:   "bound no archive object",
 		},
 		{
-			name:      "never armed: a nested archive is not a root binding",
+			name:      "armed: an archive beneath a split counts",
 			assertion: armedConsumed,
-			lines:     []string{bound("rar_store", "inner.rar", "1"), delivered("payload.mkv", "2", "true")},
-			output:    []string{"payload.mkv"},
+			lines: []string{
+				bound("split", "archive.7z.001", "0"),
+				bound("split", "archive.7z.002", "0"),
+				bound("sevenz_store", "archive.7z", "1"),
+				delivered("payload.mkv", "2", "true"),
+			},
+			output: []string{"payload.mkv"},
+		},
+		{
+			name:      "never armed: a split alone is not an archive",
+			assertion: armedConsumed,
+			lines:     []string{bound("split", "archive.7z.001", "0"), bound("split", "archive.7z.002", "0"), delivered("archive.7z", "1", "true")},
+			output:    []string{"archive.7z"},
 			wantErr:   "bound no archive object",
 		},
 		{
@@ -152,6 +163,12 @@ func TestGraphDirectUnpackVerdict(t *testing.T) {
 			assertion:     restarted,
 			lines:         []string{bound("sevenz_engine", "archive.7z.001", "0"), delivered("payload.mkv", "1", "true")},
 			relaunchAfter: 1,
+		},
+		{
+			name:          "an archive beneath a split bound before the restart",
+			assertion:     restarted,
+			lines:         []string{bound("split", "archive.7z.001", "0"), bound("sevenz_store", "archive.7z", "1"), delivered("payload.mkv", "2", "true")},
+			relaunchAfter: 2,
 		},
 		{
 			name:          "bound and delivered after the restart",
@@ -632,6 +649,11 @@ func TestScenarioFileExpectations(t *testing.T) {
 		{slug: "dead-post-recovery-unobtainable", outcome: "health_failure", error: "below critical"},
 		{slug: "rar5-colliding-member-paths", outcome: "success"},
 		{slug: "par2-ignorable-deficit", outcome: outcomePartialDelivery},
+		{slug: "par2-multi-set-archives-insufficient", outcome: outcomePartialDelivery},
+		{slug: "obfuscated-split-7z", outcome: "extraction_failure", error: "never placed every member it named"},
+		{slug: "nested-obfuscated-split-7z", outcome: "extraction_failure", error: "never placed every member it named"},
+		{slug: "par3-obfuscated-names", outcome: "repair_then_success"},
+		{slug: "par3-obfuscated-plain-name", outcome: "repair_then_success"},
 	} {
 		scenario, err := loadScenario(filepath.Join(testdataDir(), test.slug))
 		if err != nil {

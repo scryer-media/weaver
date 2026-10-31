@@ -32,7 +32,7 @@ fn members(count: usize, seed: u8) -> Vec<(String, Vec<u8>)> {
     (0..count)
         .map(|index| {
             (
-                format!("beacon{index}.bin"),
+                format!("beacon{index}.mkv"),
                 payload(9 * ARTICLE + 7 * (index + 1), seed + index as u8),
             )
         })
@@ -431,7 +431,9 @@ fn assert_repaired_in_store(graph: &Outcome, body: &[u8], reads: u64) {
 async fn a_par2_set_in_a_plain_store_repairs_the_member_beside_it() {
     let (scenario, body) = par2_in_a_store(|bytes| Post::plain("silver.horizon.rar", bytes)).await;
     let graph = run(&scenario).await;
-    assert_repaired_in_store(&graph, &body, 11);
+    // The checksums the store's delivery carries settle the bad slice: the
+    // set reads back the other five to check them, and again to rebuild.
+    assert_repaired_in_store(&graph, &body, 10);
 }
 
 // The same volume inside an xz stream: the store reads it as the stream
@@ -441,7 +443,7 @@ async fn a_par2_set_in_a_store_in_a_stream_repairs_the_member_beside_it() {
     let (scenario, body) =
         par2_in_a_store(|bytes| Post::plain("silver.horizon.rar.xz", xz(&bytes))).await;
     let graph = run(&scenario).await;
-    assert_repaired_in_store(&graph, &body, 11);
+    assert_repaired_in_store(&graph, &body, 10);
 }
 
 // Row 6c. A PAR2 volume posted as an xz stream beside its data: the volume

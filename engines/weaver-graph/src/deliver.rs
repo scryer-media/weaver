@@ -186,9 +186,6 @@ pub enum Why {
     // never placed every member it named: its map never came, or never
     // closed what it announced.
     Unmapped,
-    // A volume the set needs is in, and nothing states where in the set it
-    // goes: more than one free place fits it and no name or header chooses.
-    OrderUnknown,
     // The object would sit deeper than a job's namespaces may nest. What
     // the member holds is the container, delivered as it is.
     TooDeep,
@@ -208,7 +205,6 @@ impl Why {
             | Why::EncryptedHeader
             | Why::Compressed
             | Why::Unmapped
-            | Why::OrderUnknown
             | Why::InvalidArchive => true,
             Why::TailUnreachable
             | Why::UnboundedEntry
@@ -238,7 +234,6 @@ impl Why {
             | Why::FirstBytesLost
             | Why::HoldsBreached
             | Why::Unmapped
-            | Why::OrderUnknown
             | Why::InvalidArchive => false,
         }
     }
@@ -313,6 +308,10 @@ pub enum Emit {
     NeedsEngine(Why),
     // "Nothing here can read this; make it a plain file."
     Refuse(Why),
+    // "Names were all my claim on my volumes, and one's own bytes say it is
+    // something else": nothing failed, and I am no reading of them. Each
+    // goes back as it was posted and is claimed by what its own bytes sign.
+    Refuted,
     // "My own headers say this volume is not mine where I hold it." The
     // claim that bound it was provisional: the member goes back to its
     // namespace, with what I parsed of it, to be offered again.
@@ -330,7 +329,6 @@ mod tests {
             Why::EncryptedHeader,
             Why::Compressed,
             Why::Unmapped,
-            Why::OrderUnknown,
             Why::InvalidArchive,
         ];
         let delivered = [

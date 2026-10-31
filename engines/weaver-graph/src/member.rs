@@ -14,8 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::deliver::Provenance;
 use crate::evidence::Algorithm;
 use crate::marks::Marked;
-use crate::object::ObjectId;
+use crate::object::{Kind, ObjectId};
 use crate::recovery::Recovery;
+use crate::sniff::{Sniff, signed, sniff};
 use crate::volume::ByteRange;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -45,9 +46,26 @@ pub struct Member {
     // more than its name placed it, whether or not the front is kept now.
     // Only a retraction, which starts the member over, takes it back.
     pub fronted: bool,
+    // The kind whose reading of it was refuted: by a later piece's own
+    // bytes against the claim its set's names made, or by the name a
+    // recovery set gave it. That kind is no answer to who owns it, now or
+    // after a restart: its bytes say (`said`). Only a retraction takes it
+    // back.
+    pub refuted: Option<Kind>,
 }
 
 impl Member {
+    // What the member is, as founding asks it: by its name and its front,
+    // except that the kind whose reading of it was refuted is no answer,
+    // and then its bytes alone say. The one question every path asks that
+    // decides who owns a member.
+    pub fn said(&self, front: &[u8]) -> Sniff {
+        match sniff(&self.name, front, self.length) {
+            Sniff::Object(kind) if Some(kind) == self.refuted => signed(front, self.length),
+            said => said,
+        }
+    }
+
     // The kind of digest its stated check is of: what a level that judges
     // the member folds as its bytes pass. A member that states no check
     // needs none, and nothing is folded for it.
@@ -244,8 +262,6 @@ pub struct Namespace {
     // The members posted more than once whose own posting ended. Such a
     // member closes once its own posting and every further one have.
     ended: BTreeSet<MemberId>,
-    // Transport supplied order rather than independently positioned lengths.
-    uncertain_lengths: BTreeSet<MemberId>,
 }
 
 // What arrived of a member's first FIRST_BYTES, and how: bytes past a
@@ -274,19 +290,6 @@ impl Namespace {
         Self::default()
     }
 
-    // The member's posted length may not be its own: a reader of the member
-    // learns it as it learns any change to it.
-    pub fn mark_length_uncertain(&mut self, member: MemberId) {
-        let member = self.resolve(member);
-        if self.uncertain_lengths.insert(member) {
-            self.members.mark(member);
-        }
-    }
-
-    pub fn length_uncertain(&self, member: MemberId) -> bool {
-        self.uncertain_lengths.contains(&self.resolve(member))
-    }
-
     // A member the producer announced. Its output name is the tree's to
     // give; until it does, the member wants the name it was announced by.
     pub fn announce(&mut self, name: &str, length: Option<u64>) -> MemberId {
@@ -304,6 +307,7 @@ impl Namespace {
                 closed: false,
                 crc32: None,
                 fronted: false,
+                refuted: None,
             },
         );
         id
@@ -441,9 +445,6 @@ impl Namespace {
         }
         if self.members.get(&into).is_some_and(|record| record.closed) {
             self.ended.insert(into);
-        }
-        if self.uncertain_lengths.remove(&copy) && self.uncertain_lengths.insert(into) {
-            self.members.mark(into);
         }
         self.copies.insert(copy, into);
         self.members
@@ -674,24 +675,25 @@ impl Namespace {
     }
 
     // A member bound under its own name is a file its recovery set describes
-    // as `size` long; `rebuilt` says the set repaired it. It takes the
-    // described length when it reached less and holds damage or was rebuilt:
-    // a member posted short closes at the length its articles reached, and
-    // the file the set rebuilds is the length the set describes. Rebuilt and
-    // booked longer, it is trimmed as `trim_booked` says. True when its
-    // length changed.
-    pub fn take_described(&mut self, member: MemberId, size: u64, rebuilt: bool) -> bool {
+    // as `size` long; `verified` says the set's blocks verify, as it ruled
+    // it clean or repaired it. The one place a recovery set settles a
+    // member's length: verified, the member is the length the set
+    // describes, shorter or longer than what arrived, as par2 rebuilds a
+    // file of another size at the size it describes. Before that, a member
+    // that reached less and holds damage takes the described length, so
+    // the tail it lacks is damage to repair. True when its length changed.
+    pub fn take_described(&mut self, member: MemberId, size: u64, verified: bool) -> bool {
         let Some(found) = self.members.get(&member) else {
             return false;
         };
-        let short = found.length.is_some_and(|length| length < size)
-            && (rebuilt || !found.coverage.is_clean());
-        if short {
+        let differs = found.length.is_some_and(|length| length != size);
+        let short = found.length.is_some_and(|length| length < size) && !found.coverage.is_clean();
+        if (verified && differs) || short {
             let name = found.name.clone();
             self.recognise(member, &name, size);
             return true;
         }
-        rebuilt && self.trim_booked(member, size)
+        false
     }
 
     // A recovery object repaired the member and describes it as `size`
@@ -725,6 +727,7 @@ impl Namespace {
             found.closed = false;
             found.crc32 = None;
             found.fronted = false;
+            found.refuted = None;
         }
         self.ended.remove(&member);
         self.first_bytes.remove(&member);
@@ -946,11 +949,11 @@ mod tests {
     }
 
     // A member posted short of the length its set describes takes that
-    // length when it holds damage or the set rebuilt it, and keeps its own
-    // when it reached less clean and nothing rebuilt it. One booked longer
-    // is trimmed only once rebuilt.
+    // length when it holds damage or the set's blocks verify, and keeps its
+    // own when it reached less clean and nothing verified it. One booked
+    // longer, or longer by bytes that arrived, takes it once verified.
     #[test]
-    fn a_described_member_takes_its_length_when_short_and_damaged_or_rebuilt() {
+    fn a_described_member_takes_its_length_when_short_and_damaged_or_verified() {
         let short = |damaged: bool, rebuilt: bool| {
             let mut namespace = Namespace::new();
             let member = namespace.announce("ember.bin", Some(20));
@@ -974,6 +977,20 @@ mod tests {
         };
         assert_eq!(booked(false), (false, Some(40)));
         assert_eq!(booked(true), (true, Some(30)));
+        let longer = |verified: bool| {
+            let mut namespace = Namespace::new();
+            let member = namespace.announce("ember.bin", Some(40));
+            namespace.arrive(member, ByteRange::new(0, 40), Provenance::Fresh);
+            let changed = namespace.take_described(member, 30, verified);
+            let record = namespace.get(member).unwrap();
+            (
+                changed,
+                record.length,
+                record.coverage.covered(ByteRange::new(30, 40)),
+            )
+        };
+        assert_eq!(longer(false), (false, Some(40), true));
+        assert_eq!(longer(true), (true, Some(30), false));
     }
 
     // Damage arriving over a member whose middle a repair rebuilt: the
