@@ -427,13 +427,17 @@ pub(crate) fn envelope_name(node: NodeId, envelope: u32) -> String {
 }
 
 // The file a new envelope starts in: the one its node and number name, or,
-// while a member given back from an envelope of that number still sits
-// there waiting to move, the first free one after it. Nothing is written
-// over a file a member sits at.
+// while a file still sits there, the first free one after it.
 fn free_envelope_name(dir: &Path, node: NodeId, envelope: u32) -> String {
-    let name = envelope_name(node, envelope);
-    if !dir.join(&name).exists() {
-        return name;
+    free_name(dir, &envelope_name(node, envelope))
+}
+
+// `name`, or, while a file still sits there, the first free one after it:
+// one a member given back sits at waiting to move, or one that goes once a
+// checkpoint commits. Nothing is written over a file that sits anywhere.
+pub(crate) fn free_name(dir: &Path, name: &str) -> String {
+    if !dir.join(name).exists() {
+        return name.to_owned();
     }
     (1u32..)
         .map(|again| format!("{name}-{again}"))

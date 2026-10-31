@@ -312,7 +312,7 @@ fn write_working_marker(dir: &Dir, value: &str) -> std::io::Result<()> {
 
 // Where the v2 form of a marker is written before it replaces the v1 one.
 // Never read as a marker.
-const WORKING_DIR_MARKER_UPGRADE: &str = ".weaver-job-dir.upgrade";
+pub(crate) const WORKING_DIR_MARKER_UPGRADE: &str = ".weaver-job-dir.upgrade";
 
 // Replaces a verified v1 marker with its v2 form, so the directory stops
 // depending on a device number that may change.

@@ -30,6 +30,7 @@ use crate::pipeline::held::{HeldPart, held_parts_from_rows};
 use crate::pipeline::{
     Pipeline, assemble_archive_password_candidates, read_job_password_candidates,
 };
+use weaver_graph::names::INTERNAL_DIR;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GraphRestoreError {
@@ -245,55 +246,76 @@ impl RestoreSeat {
     }
 }
 
-// The checkpoint a job comes back to is the truth of what it holds under
-// its chunk directory: what the checkpoint names there is the job's, and
+// The checkpoint a job comes back to is the truth of what its working
+// directory holds: what the checkpoint names there is the job's, and
 // nothing else is. A file a step wrote whose checkpoint never committed,
 // or one a committed checkpoint stopped naming before it was removed, goes
-// before the job is rebuilt, so no file the job opens again meets bytes
-// it never recorded. A file that cannot be removed stays; the job does not
+// before the job is rebuilt, so no file the job opens again meets bytes it
+// never recorded and no file it never recorded is delivered. The checkpoint
+// names each member's file, at the name it sits at and the name it waits
+// for, every envelope, every holds scratch and every spooled part. The
+// directory's own marker and the run's cache are the directory's, never the
+// job's, and stay. A file that cannot be removed stays; the job does not
 // read it.
 pub(super) fn sweep_unnamed(
     working_dir: &Path,
     snapshot: &checkpoint::Snapshot,
     held_parts: &[crate::jobs::graph_checkpoint::HeldPartRow],
 ) {
-    let internal = Path::new(weaver_graph::names::INTERNAL_DIR);
+    let members = snapshot.tree.nodes.iter().flat_map(|node| {
+        node.members.iter().filter_map(|record| {
+            let state = snapshot.files.get(&(node.node, record.member))?;
+            state
+                .has_file
+                .then(|| std::iter::once(record.output_name.clone()).chain(state.on_disk.clone()))
+        })
+    });
     let envelopes = snapshot.kept.iter().map(|kept| {
         kept.file
             .clone()
             .unwrap_or_else(|| super::envelope::envelope_name(kept.node, kept.envelope))
     });
-    let waiting = snapshot
-        .files
-        .values()
-        .filter_map(|file| file.on_disk.clone());
     let holds = snapshot
         .holds
         .iter()
         .map(|hold| super::namespace::scratch_name(hold.node));
     let spooled = held_parts.iter().map(|part| part.spool_path.clone());
-    // Each name is a file, or a directory with all it holds, directly in
-    // the chunk directory.
-    let named: HashSet<std::ffi::OsString> = envelopes
-        .chain(waiting)
+    let named: HashSet<PathBuf> = members
+        .flatten()
+        .chain(envelopes)
         .chain(holds)
         .chain(spooled)
-        .filter_map(|name| {
-            let within = Path::new(&name).strip_prefix(internal).ok()?;
-            within.iter().next().map(std::ffi::OsStr::to_os_string)
-        })
+        .map(|name| PathBuf::from(name.replace('\\', "/").trim_end_matches('/')))
         .collect();
-    let Ok(entries) = std::fs::read_dir(working_dir.join(internal)) else {
+    // The directories a named file lies in, the chunk directory always
+    // among them.
+    let mut within: HashSet<PathBuf> = HashSet::from([PathBuf::from(INTERNAL_DIR)]);
+    for name in &named {
+        within.extend(name.ancestors().skip(1).map(Path::to_path_buf));
+    }
+    sweep_within(working_dir, Path::new(""), &named, &within);
+}
+
+fn sweep_within(dir: &Path, at: &Path, named: &HashSet<PathBuf>, within: &HashSet<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir.join(at)) else {
         return;
     };
     for entry in entries.flatten() {
-        if named.contains(&entry.file_name()) {
+        let name = at.join(entry.file_name());
+        let kind = entry.file_type();
+        let directory = kind.as_ref().is_ok_and(std::fs::FileType::is_dir);
+        if named.contains(&name) || (at.as_os_str().is_empty() && the_directorys(&name)) {
+            continue;
+        }
+        if directory && within.contains(&name) {
+            sweep_within(dir, &name, named, within);
             continue;
         }
         let path = entry.path();
-        let removed = match entry.file_type() {
-            Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&path),
-            _ => std::fs::remove_file(&path),
+        let removed = if directory {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
         };
         if let Err(error) = removed {
             tracing::warn!(
@@ -303,6 +325,19 @@ pub(super) fn sweep_unnamed(
             );
         }
     }
+}
+
+// What the working directory holds for itself: its marker, the marker's
+// replacement while one is written, and the run's cache.
+fn the_directorys(name: &Path) -> bool {
+    use crate::jobs::working_dir::{WORKING_DIR_MARKER, WORKING_DIR_MARKER_UPGRADE};
+    [
+        WORKING_DIR_MARKER,
+        WORKING_DIR_MARKER_UPGRADE,
+        weaver_graph::names::CACHE_DIR,
+    ]
+    .iter()
+    .any(|own| name == Path::new(own))
 }
 
 // The candidates in the order the job's admission tried them, so the index

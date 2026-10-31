@@ -336,19 +336,19 @@ impl NamespaceWriter {
     }
 }
 
-// The envelope in which the object at `retired` placed every byte of
-// `ranges` of its volume, at the volume's own offsets, if one did: that
-// envelope's file holds those bytes as the volume does.
-fn kept_as_volume(
+// The envelope in which the object at `node` places every byte of `ranges`
+// of its volume, at the volume's own offsets, if one does: that envelope's
+// file holds those bytes as the volume does.
+pub(super) fn kept_as_volume(
     tree: &Tree,
-    (retired, volume): (NodeId, weaver_graph::VolumeIndex),
+    (node, volume): (NodeId, weaver_graph::VolumeIndex),
     ranges: &[ByteRange],
 ) -> Option<u32> {
     let mut placements = Vec::new();
     let mut kept_in = None;
     for range in ranges {
         placements.clear();
-        tree.locate(retired, volume, *range, &mut placements);
+        tree.locate(node, volume, *range, &mut placements);
         let mut at = range.start;
         for placement in &placements {
             let Placement::Envelope {
@@ -371,7 +371,10 @@ fn kept_as_volume(
 }
 
 // The parts of `range` no held range covers, in order.
-fn outside(range: ByteRange, held: &[ByteRange]) -> impl Iterator<Item = ByteRange> + '_ {
+pub(super) fn outside(
+    range: ByteRange,
+    held: &[ByteRange],
+) -> impl Iterator<Item = ByteRange> + '_ {
     let mut cuts: Vec<ByteRange> = held
         .iter()
         .filter_map(|hold| hold.intersect(range))

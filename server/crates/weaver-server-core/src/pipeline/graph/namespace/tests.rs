@@ -1117,7 +1117,9 @@ fn a_rename_moves_the_file_and_the_name_allocation() {
 
 // A member renamed and then discarded before its file moved leaves its old
 // name once the checkpoint that says the file is gone has committed: the
-// member kept off the name meanwhile takes it.
+// member kept off the name meanwhile takes it. The file itself stays where
+// the database names it until then, so a restore from the checkpoint before
+// finds it.
 #[test]
 fn a_name_a_discarded_file_sat_at_is_free_once_its_checkpoint_commits() {
     let mut job = Job::new(PLENTY);
@@ -1134,9 +1136,11 @@ fn a_name_a_discarded_file_sat_at_is_free_once_its_checkpoint_commits() {
         .remove(&member)
         .expect("leaf");
     job.writer.discard(leaf).expect("discard");
+    assert_eq!(job.file("3f9a.bin"), b"data");
     let next = job.member("3f9a.bin", None);
     assert_eq!(job.root().get(next).unwrap().output_name, "3f9a (1).bin");
     job.commit();
+    assert!(!job.dir.path().join("3f9a.bin").exists());
     assert_eq!(job.root().get(next).unwrap().output_name, "3f9a.bin");
     assert!(!job.writer.moves_waiting());
 }
@@ -1751,7 +1755,8 @@ fn a_member_given_back_after_a_restore_holds_only_what_its_envelope_kept() {
 }
 
 // A retracted member has no file: what comes back is written anew, under
-// the name it keeps.
+// the name it keeps. The file it had stays where the last checkpoint names
+// it until the one that says it is gone commits.
 #[test]
 fn a_retraction_discards_the_leaf_and_keeps_its_name_for_what_comes_back() {
     let mut job = Job::new(PLENTY);
@@ -1761,6 +1766,8 @@ fn a_retraction_discards_the_leaf_and_keeps_its_name_for_what_comes_back() {
         node: child,
         member: MemberId(0),
     }));
+    assert!(job.dir.path().join("inner.bin").exists());
+    job.commit();
     assert!(!job.dir.path().join("inner.bin").exists());
     let inner = job.tree.namespace(child).unwrap().get(MemberId(0)).unwrap();
     assert_eq!(inner.output_name, "inner.bin");
@@ -1814,6 +1821,9 @@ fn a_refusal_keeps_the_member_it_closed_and_replaces_the_open_one_with_the_volum
         .expect("refuse");
     assert_eq!(job.file("pack.bin"), [SIGNATURE, b"hello"].concat());
     assert_eq!(job.file("inner.bin"), b"hello");
+    // The open member's file goes once the checkpoint that says so commits.
+    assert!(job.dir.path().join("open.bin").exists());
+    job.commit();
     assert!(!job.dir.path().join("open.bin").exists());
     assert!(job.tree.buried(child));
     let kept = job.tree.namespace(child).expect("what it closed stays");

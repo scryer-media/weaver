@@ -21,6 +21,7 @@ use weaver_graph::names::{INTERNAL_DIR, key};
 use weaver_graph::{MemberId, NodeId, Tree};
 
 use super::{NamespaceWriter, WriteError};
+use crate::pipeline::graph::envelope::free_name;
 use crate::pipeline::graph::leaf::Leaf;
 
 // A member whose file waits to move to the name it wants.
@@ -85,7 +86,8 @@ impl NamespaceWriter {
         if !self.moves_waiting() && self.free_at(name, (node, member)) {
             return Leaf::at(&self.working_dir, name);
         }
-        let mut leaf = Leaf::at(&self.working_dir, &waiting_name(node, member, name));
+        let waiting = waiting_name(&self.working_dir, node, member, name);
+        let mut leaf = Leaf::at(&self.working_dir, &waiting);
         leaf.intend(name);
         self.moves.push(Waiting {
             node,
@@ -95,18 +97,18 @@ impl NamespaceWriter {
         leaf
     }
 
-    // The member's file goes, and the name it sat at stays shut until the
-    // checkpoint that says so has committed, when the ledger may give it
-    // again.
+    // The file goes once the checkpoint that stops naming it has committed,
+    // and the name it sat at stays shut until then, when the ledger may
+    // give it again. Until that commit the database may still name the
+    // file where it sits, so a restore finds it there.
     pub(super) fn discard(&mut self, leaf: Leaf) -> Result<(), WriteError> {
-        let name = key(leaf.name());
-        leaf.remove()?;
-        self.left.insert(name, None);
+        self.left.insert(key(leaf.name()), None);
+        self.leaving.push((leaf, None));
         Ok(())
     }
 
     // The checkpoint `stamp` records every name wanted, every name left and
-    // every gone node so far.
+    // every file that goes so far.
     pub(crate) fn recorded(&mut self, stamp: u64) {
         for waiting in &mut self.moves {
             waiting.stamp.get_or_insert(stamp);
@@ -114,7 +116,7 @@ impl NamespaceWriter {
         for left in self.left.values_mut() {
             left.get_or_insert(stamp);
         }
-        for (_, gone) in &mut self.forgotten {
+        for (_, gone) in &mut self.leaving {
             gone.get_or_insert(stamp);
         }
     }
@@ -126,9 +128,10 @@ impl NamespaceWriter {
     }
 
     // Whether anything waits for a checkpoint to commit: a move, a name a
-    // file left, or a gone node's file the one the database holds may name.
+    // file left, or a file that goes which the one the database holds may
+    // name.
     pub(crate) fn awaits_commit(&self) -> bool {
-        self.moves_waiting() || !self.forgotten.is_empty()
+        self.moves_waiting() || !self.leaving.is_empty()
     }
 
     // The checkpoint whose commit lets every waiting move run, as far as
@@ -136,7 +139,7 @@ impl NamespaceWriter {
     pub(crate) fn awaited(&self) -> u64 {
         let moves = self.moves.iter().filter_map(|waiting| waiting.stamp);
         let left = self.left.values().filter_map(|stamp| *stamp);
-        let gone = self.forgotten.iter().filter_map(|(_, stamp)| *stamp);
+        let gone = self.leaving.iter().filter_map(|(_, stamp)| *stamp);
         moves.chain(left).chain(gone).max().unwrap_or(0)
     }
 
@@ -159,18 +162,18 @@ impl NamespaceWriter {
             shut
         });
         let moved = self
-            .remove_forgotten(committed)
+            .remove_left(committed)
             .and_then(|()| self.run_moves(committed));
         (freed, moved)
     }
 
-    // Remove every gone node's file that the checkpoints through
+    // Remove every file that goes which the checkpoints through
     // `committed` stop naming.
-    fn remove_forgotten(&mut self, committed: u64) -> Result<(), WriteError> {
-        let (gone, kept) = std::mem::take(&mut self.forgotten)
+    fn remove_left(&mut self, committed: u64) -> Result<(), WriteError> {
+        let (gone, kept) = std::mem::take(&mut self.leaving)
             .into_iter()
             .partition(|(_, stamp)| stamp.is_some_and(|stamp| stamp <= committed));
-        self.forgotten = kept;
+        self.leaving = kept;
         for (leaf, _) in gone {
             leaf.remove()?;
         }
@@ -293,11 +296,13 @@ impl NamespaceWriter {
 }
 
 // Where a member's file waits for its name, under the directory finalize
-// never delivers. A directory member waits as a directory.
-fn waiting_name(node: NodeId, member: MemberId, name: &str) -> String {
+// never delivers: a name no file sits at, as one that goes may still sit at
+// the member's last. A directory member waits as a directory.
+fn waiting_name(dir: &std::path::Path, node: NodeId, member: MemberId, name: &str) -> String {
     let directory = if Leaf::is_directory(name) { "/" } else { "" };
-    format!(
-        "{INTERNAL_DIR}/graph-waiting-{}-{}{directory}",
-        node.0, member.0
-    )
+    let waiting = free_name(
+        dir,
+        &format!("{INTERNAL_DIR}/graph-waiting-{}-{}", node.0, member.0),
+    );
+    format!("{waiting}{directory}")
 }

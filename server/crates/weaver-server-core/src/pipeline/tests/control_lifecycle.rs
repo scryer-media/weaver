@@ -37,7 +37,7 @@ async fn a_repeated_article_cache_failure_fails_the_job_when_its_articles_are_bu
     crate::jobs::working_dir::stamp_working_dir(&pipeline.intermediate_dir, &working_dir, id)
         .await
         .unwrap();
-    let blocker = working_dir.join(".weaver-chunks");
+    let blocker = working_dir.join(weaver_graph::names::CACHE_DIR);
     tokio::fs::write(&blocker, b"not a cache directory")
         .await
         .unwrap();
@@ -97,7 +97,7 @@ async fn a_rename_carries_the_repeated_article_cache_to_the_new_working_dir() {
     assert!(pipeline.repeated_articles.contains_key(&id));
     let old_dir = pipeline.jobs[&id].working_dir.clone();
     let caches = |dir: &std::path::Path| -> Vec<PathBuf> {
-        std::fs::read_dir(dir.join(".weaver-chunks"))
+        std::fs::read_dir(dir.join(weaver_graph::names::CACHE_DIR))
             .into_iter()
             .flatten()
             .flatten()

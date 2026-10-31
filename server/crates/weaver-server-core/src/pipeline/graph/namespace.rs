@@ -193,10 +193,10 @@ pub(crate) struct NamespaceWriter {
     // The names files left, by the ledger's key, each with the checkpoint
     // that records it left once one is taken.
     left: BTreeMap<String, Option<u64>>,
-    // The files of envelopes a gone node kept, each with the checkpoint
-    // that records the node gone once one is taken. Until that checkpoint
-    // commits, the one the database holds may name them.
-    forgotten: Vec<(Leaf, Option<u64>)>,
+    // Every file that goes, each with the checkpoint that stops naming it
+    // once one is taken. Until that checkpoint commits, the one the
+    // database holds may name it, so it stays on disk until then.
+    leaving: Vec<(Leaf, Option<u64>)>,
     // The latest checkpoint the database has committed.
     committed: u64,
     segments: Vec<Segment>,
@@ -240,7 +240,7 @@ impl NamespaceWriter {
             renamed: Vec::new(),
             moves: Vec::new(),
             left: BTreeMap::new(),
-            forgotten: Vec::new(),
+            leaving: Vec::new(),
             committed: 0,
             segments: Vec::new(),
             effects: Vec::new(),
@@ -589,6 +589,9 @@ impl NamespaceWriter {
         child: NodeId,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        // The file is shared before the holds go down, so what they carry
+        // lands in it too.
+        self.share_file(tree, node, member, None);
         if tree.child_of(node, member).map(|(bound, _)| bound) == Some(child) {
             self.replay(tree, builder, segments, node, member, ALL, None, out)?;
         }
@@ -1723,9 +1726,9 @@ impl NamespaceWriter {
         let shelved: Vec<NodeId> = self.envelopes.nodes().collect();
         for node in shelved {
             if tree.buried(node) {
-                let files = self.envelopes.forget(node);
-                self.forgotten
-                    .extend(files.into_iter().map(|leaf| (leaf, None)));
+                for leaf in self.envelopes.forget(node) {
+                    self.discard(leaf)?;
+                }
             }
         }
         let nodes: Vec<NodeId> = self.files.keys().copied().collect();

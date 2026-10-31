@@ -284,8 +284,13 @@ fn what_a_refused_store_closed_whole_is_delivered_whole() {
 async fn a_store_that_needs_an_engine_hands_its_volumes_to_one() {
     let mut refusing = refusing(Mode::NeedsEngine, 2, &[]);
     refusing.deliver_all();
+    // The store's files go once the checkpoint that says so commits.
     for member in 0..2 {
         assert_eq!(refusing.refused(member), Some(Why::Compressed));
+        assert!(refusing.exists(&format!("inner-{member}.bin")));
+    }
+    refusing.checkpoint(1);
+    for member in 0..2 {
         assert!(!refusing.exists(&format!("inner-{member}.bin")));
     }
     assert_eq!(

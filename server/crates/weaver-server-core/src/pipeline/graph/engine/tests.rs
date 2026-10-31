@@ -16,7 +16,7 @@ use super::echo::{Echoes, HEADER, SIGNATURE};
 use super::volumes::RunVolumes;
 use super::{Heard, RUN_OVERHEAD, Reservation, RunMail, Runs};
 use crate::operations::disk::CapacityReader;
-use crate::pipeline::graph::envelope::{Envelopes, Shelf};
+use crate::pipeline::graph::envelope::{Envelopes, Shelf, envelope_name};
 use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::namespace::NamespaceWriter;
 use crate::pipeline::graph::root::intake::Decoded;
@@ -756,6 +756,38 @@ async fn differing_duplicate_copies_give_one_output_in_either_order() {
     }
 }
 
+// A volume that came before the one that built its engine was a file of its
+// own. The engine keeps the volume whole, so its envelope is that file under
+// a second name, not a copy, and the first name goes once the checkpoint
+// that stops naming it commits.
+#[tokio::test]
+async fn a_volume_its_engine_takes_from_its_file_is_on_disk_once() {
+    let mut echoing = echoing(2);
+    echoing.deliver(1);
+    let posted = echoing.dir.path().join("lantern.part2.rar");
+    assert_eq!(std::fs::read(&posted).unwrap(), echoing.volumes[1]);
+    echoing.deliver(0);
+    let envelope = echoing.dir.path().join(envelope_name(echoing.engine(), 1));
+    assert_eq!(std::fs::read(&envelope).unwrap(), echoing.volumes[1]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(&posted).unwrap().ino(),
+            std::fs::metadata(&envelope).unwrap().ino(),
+            "the envelope is the volume's file"
+        );
+    }
+    echoing.job.recorded(1);
+    echoing.job.committed(1).unwrap();
+    assert!(!posted.exists());
+    assert_eq!(std::fs::read(&envelope).unwrap(), echoing.volumes[1]);
+    while !echoing.hear().await {}
+    for member in 0..2 {
+        assert_eq!(echoing.echoed(member), body(member));
+    }
+}
+
 #[tokio::test]
 async fn the_engine_bids_for_the_volumes_after_the_one_its_run_reached() {
     let mut echoing = echoing(3);
@@ -867,6 +899,11 @@ async fn a_volume_the_run_read_closing_at_another_length_restarts_the_run() {
     echoing.deliver(1);
     assert_ne!(echoing.job.runs().generation(engine), before);
     assert!(!echoing.closed(0), "accepted old output must be retracted");
+    // The retracted output stays where the last checkpoint names it until
+    // the one that says it is gone commits.
+    assert!(echoing.dir.path().join("echo-0.mkv").exists());
+    echoing.job.recorded(1);
+    echoing.job.committed(1).unwrap();
     assert!(!echoing.dir.path().join("echo-0.mkv").exists());
 }
 
@@ -930,6 +967,9 @@ async fn length_read_volume_reopened(changed: bool) {
         return;
     }
     assert!(!echoing.closed(0), "every member of the run is retracted");
+    assert!(echoing.dir.path().join("echo-0.mkv").exists());
+    echoing.job.recorded(1);
+    echoing.job.committed(1).unwrap();
     assert!(!echoing.dir.path().join("echo-0.mkv").exists());
     while !echoing.hear().await {}
     assert_ne!(echoing.job.runs().generation(engine), before);
