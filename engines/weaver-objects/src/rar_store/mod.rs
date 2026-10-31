@@ -930,9 +930,16 @@ impl Object for RarStore {
     // travels with it: its headers are walked again under this store's own,
     // so headers no password of the store opens ask the job, and every
     // password the store holds is one the job offered it.
-    fn adopt(&mut self, volume: VolumeIndex, name: &str, carried: weaver_graph::Carried) {
+    fn adopt(
+        &mut self,
+        volume: VolumeIndex,
+        name: &str,
+        front: &[u8],
+        length: Option<u64>,
+        carried: weaver_graph::Carried,
+    ) {
         let Ok(mut held) = carried.downcast::<Volume>() else {
-            return self.bound(volume, name, &[], None);
+            return self.bound(volume, name, front, length);
         };
         held.name_as(name);
         *self.volume(volume) = *held;

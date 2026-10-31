@@ -521,10 +521,20 @@ pub trait Object: Send + Sync {
         Claim::default()
     }
 
-    // A member I reclaimed is now this volume of mine, and what was parsed
-    // of it is mine to keep: `bound`, for a member that brings its parse.
-    fn adopt(&mut self, volume: VolumeIndex, name: &str, _carried: Carried) {
-        self.bound(volume, name, &[], None);
+    // A member I reclaimed is now this volume of mine, with its name, front
+    // and length as the tree holds them, and what was parsed of it is mine
+    // to keep: `bound`, for a member that brings its parse. What the parse
+    // says outranks the tree's facts; I never know less of it than a fresh
+    // bind would tell me.
+    fn adopt(
+        &mut self,
+        volume: VolumeIndex,
+        name: &str,
+        front: &[u8],
+        length: Option<u64>,
+        _carried: Carried,
+    ) {
+        self.bound(volume, name, front, length);
     }
 
     // My volume's member has another name now: a recovery set named it.

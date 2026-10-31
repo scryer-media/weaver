@@ -366,11 +366,18 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         .collect()
     }
 
-    fn adopt(&mut self, volume: VolumeIndex, name: &str, carried: weaver_graph::Carried) {
+    fn adopt(
+        &mut self,
+        volume: VolumeIndex,
+        name: &str,
+        front: &[u8],
+        length: Option<u64>,
+        carried: weaver_graph::Carried,
+    ) {
         let Ok(carried) = carried.downcast::<CarriedVolume<F::Front>>() else {
-            return self.bound(volume, name, &[], None);
+            return self.bound(volume, name, front, length);
         };
-        self.bound(volume, name, &[], carried.length);
+        self.bound(volume, name, front, carried.length.or(length));
         if let Some(front) = carried.front {
             self.fronts.insert(volume.0, front);
         }

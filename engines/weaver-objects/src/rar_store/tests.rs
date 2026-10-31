@@ -388,6 +388,32 @@ fn an_engine_claims_a_volume_a_store_gave_back_as_one_offered_fresh() {
     assert_eq!(engine.reclaim(name, &front(&set[1]), None, &*given), fresh);
 }
 
+// An engine that adopts a volume a store gave back knows its front as a
+// fresh bind would: a later name that numbers it elsewhere moves it no more
+// than it moves one the engine bound.
+#[test]
+fn an_engine_adopts_a_volume_a_store_gave_back_knowing_what_a_fresh_bind_knows() {
+    let set = write(&items(), &split(Version::Rar5));
+    let front = |volume: &Vec<u8>| volume[..4096.min(volume.len())].to_vec();
+    let name = "0000000000000000000000000000beef";
+    let renamed = |engine: &mut crate::rar_engine::RarEngine| {
+        let mut out = Vec::new();
+        engine.renamed(VolumeIndex(1), "alpha.part3.rar", &mut out);
+        out
+    };
+    let mut fresh = crate::rar_engine::RarEngine::new();
+    fresh.bound(VolumeIndex(0), "alpha.part1.rar", &front(&set[0]), None);
+    fresh.bound(VolumeIndex(1), name, &front(&set[1]), None);
+    let mut adopting = crate::rar_engine::RarEngine::new();
+    adopting.bound(VolumeIndex(0), "alpha.part1.rar", &front(&set[0]), None);
+    let mut giver = store();
+    giver.bound(VolumeIndex(0), name, &front(&set[1]), None);
+    let given = giver.give_back(VolumeIndex(0)).expect("an unmapped volume");
+    adopting.adopt(VolumeIndex(1), name, &front(&set[1]), None, given);
+    assert_eq!(renamed(&mut adopting), renamed(&mut fresh));
+    assert!(renamed(&mut fresh).is_empty());
+}
+
 // A volume posted again under another set's name, its front so far only
 // the main header that states its number: the store cannot judge it yet.
 // It answers the same whether the volume is offered fresh or given back

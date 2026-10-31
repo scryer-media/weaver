@@ -2866,7 +2866,9 @@ impl Tree {
                         }
                         if let Some(object) = found.object.as_mut() {
                             match carried {
-                                Some(carried) => object.adopt(volume, &name, carried),
+                                Some(carried) => {
+                                    object.adopt(volume, &name, prefix, length, carried);
+                                }
                                 None => object.bound(volume, &name, prefix, length),
                             }
                         }
@@ -3019,7 +3021,7 @@ impl Tree {
         // owner adopts as it stands: it reads none of the member again.
         let kind = child_node.object.as_mut().map(|object| {
             match carried {
-                Some(carried) => object.adopt(volume, name, carried),
+                Some(carried) => object.adopt(volume, name, front, length, carried),
                 None => object.bound(volume, name, front, length),
             }
             object.kind()
@@ -3081,12 +3083,12 @@ impl Tree {
         let parent = self.nodes.get_mut(&node).ok_or(Why::Unsupported)?;
         for (volume, member) in &volumes {
             if let Some(record) = parent.namespace.get(*member) {
+                let front = parent.namespace.first_bytes(*member);
                 match self.given.remove(&(node, *member)) {
-                    Some(carried) => object.adopt(*volume, &record.name, carried),
-                    None => {
-                        let front = parent.namespace.first_bytes(*member);
-                        object.bound(*volume, &record.name, front, record.length)
+                    Some(carried) => {
+                        object.adopt(*volume, &record.name, front, record.length, carried);
                     }
+                    None => object.bound(*volume, &record.name, front, record.length),
                 }
             }
             parent.namespace.bind(*member, id);
