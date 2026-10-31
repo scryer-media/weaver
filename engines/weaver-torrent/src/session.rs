@@ -29,6 +29,7 @@ use crate::core::{
     net::{HttpClients, NamedBy, NoNames, Resolver},
     spawn_utils::spawn_with_cancel,
     torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info, WebSeed, WebSeedKind},
+    v2_tree::torrent_name,
 };
 use crate::dht::{
     Dht, DhtBuilder, DhtConfig, DhtPersistenceConfig, Id20, PersistentDht, dht_listen_addr,
@@ -2757,7 +2758,21 @@ impl Session {
 
         let ssl = match metadata.info.info().ssl_cert.as_ref() {
             Some(ca) => {
-                let ssl = SslTorrent::new(ca.as_ref(), info_hashes)
+                let info = metadata.info.info();
+                let name = torrent_name(
+                    info.name_utf8
+                        .as_ref()
+                        .or(info.name.as_ref())
+                        .map(|name| name.as_ref()),
+                    // libtorrent's: SHA-1 of the info dict, v2 or not.
+                    || {
+                        use crate::sha1w::ISha1;
+                        let mut sha1 = crate::sha1w::Sha1::new();
+                        sha1.update(&metadata.info_bytes);
+                        Id20::new(sha1.finish()).as_string()
+                    },
+                );
+                let ssl = SslTorrent::new(ca.as_ref(), info_hashes, &name)
                     .context("the torrent's SSL certificate")?;
                 ssl.set_identity(opts.ssl_identity.take())
                     .context("the torrent's SSL identity")?;

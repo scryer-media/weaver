@@ -80,9 +80,15 @@ impl Ca {
         })
     }
 
-    /// A peer's identity under the CA.
-    fn peer(&self, name: &str) -> anyhow::Result<SslIdentity> {
-        let (cert, key) = self.issue(name, Vec::new(), Vec::new())?;
+    /// A peer's identity under the CA, issued to `t`.
+    fn peer(&self, name: &str, t: &SslTestTorrent) -> anyhow::Result<SslIdentity> {
+        self.peer_for(name, &t.name)
+    }
+
+    /// A peer's identity under the CA, issued to the torrent named
+    /// `torrent`.
+    fn peer_for(&self, name: &str, torrent: &str) -> anyhow::Result<SslIdentity> {
+        let (cert, key) = self.issue(name, vec![torrent.to_owned()], Vec::new())?;
         SslIdentity::from_pem(cert.as_bytes(), key.as_bytes())
     }
 
@@ -107,6 +113,8 @@ impl Ca {
 /// One file of random bytes, as an SSL torrent under `ca`.
 struct SslTestTorrent {
     dir: TempDir,
+    // The torrent's name: its directory's.
+    name: String,
     torrent: Bytes,
     info_hashes: InfoHashes,
     content: Vec<u8>,
@@ -131,8 +139,15 @@ impl SslTestTorrent {
         };
         let torrent = created.as_bytes()?;
         let content = std::fs::read(dir.path().join("0.data"))?;
+        let name = dir
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("the torrent's directory has no name")?
+            .to_owned();
         Ok(Self {
             dir,
+            name,
             torrent,
             info_hashes,
             content,
@@ -266,7 +281,7 @@ async fn tls_handshake(
     ca_pem: &str,
     identity: SslIdentity,
 ) -> anyhow::Result<Vec<u8>> {
-    let ssl = SslTorrent::new(ca_pem.as_bytes(), t.info_hashes)?;
+    let ssl = SslTorrent::new(ca_pem.as_bytes(), t.info_hashes, &t.name)?;
     ssl.set_identity(Some(identity))?;
     let (r, w) = halves(TcpStream::connect(addr).await?);
     let (mut r, mut w) = match ssl.connect(r, w).await {
@@ -288,12 +303,12 @@ async fn test_ssl_torrent_transfers_over_tls() -> anyhow::Result<()> {
     setup_test_logging();
     let ca = Ca::new("test_ssl_ca")?;
     let t = SslTestTorrent::new("test_ssl_transfer", &ca).await?;
-    let seeder = seed(&t, ca.peer("seeder")?).await?;
+    let seeder = seed(&t, ca.peer("seeder", &t)?).await?;
     let ssl_addr = seeder
         .ssl_listen_addr()
         .context("seeder has no SSL listener")?;
 
-    let d = download(&t, ssl_addr, Some(ca.peer("downloader")?)).await?;
+    let d = download(&t, ssl_addr, Some(ca.peer("downloader", &t)?)).await?;
     d.handle.wait_until_completed().await?;
     assert!(
         d.storage.log.file_contents(0) == t.content,
@@ -307,7 +322,7 @@ async fn test_ssl_torrent_transfers_over_tls_on_utp() -> anyhow::Result<()> {
     setup_test_logging();
     let ca = Ca::new("test_ssl_ca")?;
     let t = SslTestTorrent::new("test_ssl_transfer_utp", &ca).await?;
-    let seeder = seed_over(&t, ca.peer("seeder")?, ListenerMode::UtpOnly).await?;
+    let seeder = seed_over(&t, ca.peer("seeder", &t)?, ListenerMode::UtpOnly).await?;
     let ssl_addr = seeder
         .ssl_listen_addr()
         .context("seeder has no SSL listener")?;
@@ -315,7 +330,7 @@ async fn test_ssl_torrent_transfers_over_tls_on_utp() -> anyhow::Result<()> {
     let d = download_with(
         &t,
         ssl_addr,
-        Some(ca.peer("downloader")?),
+        Some(ca.peer("downloader", &t)?),
         listening_opts(ListenerMode::UtpOnly),
     )
     .await?;
@@ -348,7 +363,7 @@ async fn test_ssl_torrent_without_identity_needs_certificate_and_dials_tls() -> 
     // An identity starts it, and its peer is reached through TLS naming the
     // torrent, never with a plain handshake.
     d.session
-        .set_ssl_identity(&d.handle, Some(ca.peer("downloader")?))?;
+        .set_ssl_identity(&d.handle, Some(ca.peer("downloader", &t)?))?;
     assert!(d.handle.live().is_some());
     assert!(!matches!(
         d.handle.stats().state,
@@ -380,19 +395,70 @@ async fn test_ssl_listener_refuses_a_peer_under_another_ca() -> anyhow::Result<(
     let ca = Ca::new("test_ssl_ca")?;
     let other = Ca::new("test_ssl_other_ca")?;
     let t = SslTestTorrent::new("test_ssl_foreign_ca", &ca).await?;
-    let seeder = seed(&t, ca.peer("seeder")?).await?;
+    let seeder = seed(&t, ca.peer("seeder", &t)?).await?;
     let ssl_addr = seeder
         .ssl_listen_addr()
         .context("seeder has no SSL listener")?;
 
     // Under the torrent's CA the seeder answers with its handshake.
-    let answer = tls_handshake(&t, ssl_addr, &ca.pem, ca.peer("peer")?).await?;
+    let answer = tls_handshake(&t, ssl_addr, &ca.pem, ca.peer("peer", &t)?).await?;
     assert_eq!(answer.len(), 68, "{answer:?}");
     assert_eq!(&answer[28..48], &t.info_hash().0[..]);
 
     // The same, presenting an identity under another CA: refused.
-    let answer = tls_handshake(&t, ssl_addr, &ca.pem, other.peer("stranger")?).await?;
+    let answer = tls_handshake(&t, ssl_addr, &ca.pem, other.peer("stranger", &t)?).await?;
     assert!(answer.is_empty(), "{answer:?}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_ssl_peers_refuse_a_certificate_issued_to_another_torrent() -> anyhow::Result<()> {
+    setup_test_logging();
+    let ca = Ca::new("test_ssl_ca")?;
+    let t = SslTestTorrent::new("test_ssl_peer_names", &ca).await?;
+    let seeder = seed(&t, ca.peer("seeder", &t)?).await?;
+    let ssl_addr = seeder
+        .ssl_listen_addr()
+        .context("seeder has no SSL listener")?;
+
+    // Issued to `*`, or to another torrent in its subjectAltName but to
+    // this one by its common name: the seeder answers, as libtorrent does.
+    let (cert, key) = ca.issue(&t.name, vec!["another".to_owned()], Vec::new())?;
+    for identity in [
+        ca.peer_for("peer", "*")?,
+        SslIdentity::from_pem(cert.as_bytes(), key.as_bytes())?,
+    ] {
+        let answer = tls_handshake(&t, ssl_addr, &ca.pem, identity).await?;
+        assert_eq!(answer.len(), 68, "{answer:?}");
+    }
+
+    // Under the torrent's CA but issued to another torrent: refused.
+    let answer = tls_handshake(&t, ssl_addr, &ca.pem, ca.peer_for("peer", "another")?).await?;
+    assert!(answer.is_empty(), "{answer:?}");
+
+    // A seeder issued to another torrent: the peer dialling it refuses it.
+    let impostor = seed(&t, ca.peer_for("seeder", "another")?).await?;
+    let impostor_addr = impostor
+        .ssl_listen_addr()
+        .context("impostor has no SSL listener")?;
+    let ssl = SslTorrent::new(ca.pem.as_bytes(), t.info_hashes, &t.name)?;
+    ssl.set_identity(Some(ca.peer("peer", &t)?))?;
+    let (r, w) = halves(TcpStream::connect(impostor_addr).await?);
+    let err = ssl
+        .connect(r, w)
+        .await
+        .err()
+        .context("the TLS to a seeder issued to another torrent completed")?;
+    let err = err.get_ref().and_then(|e| e.downcast_ref::<rustls::Error>());
+    assert!(
+        matches!(
+            err,
+            Some(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::NotValidForName
+            ))
+        ),
+        "{err:?}"
+    );
     Ok(())
 }
 
@@ -401,7 +467,7 @@ async fn test_ssl_torrent_refuses_plain_connections() -> anyhow::Result<()> {
     setup_test_logging();
     let ca = Ca::new("test_ssl_ca")?;
     let t = SslTestTorrent::new("test_ssl_plain_refused", &ca).await?;
-    let seeder = seed(&t, ca.peer("seeder")?).await?;
+    let seeder = seed(&t, ca.peer("seeder", &t)?).await?;
 
     // A plain handshake on the SSL listener: not TLS, refused.
     let ssl_addr = seeder

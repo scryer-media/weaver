@@ -226,6 +226,25 @@ struct Leaf<'a> {
 /// nothing, replaced by `_`, and a name cut at 240 bytes, keeping an
 /// extension of up to nine bytes.
 pub fn sanitize_component(raw: &[u8]) -> String {
+    sanitize_element(raw).unwrap_or_else(|| "_".to_owned())
+}
+
+/// The name libtorrent knows a torrent by (`torrent_info::name`):
+/// `name.utf-8`, or else `name`, sanitized as a path element that is not
+/// forced. What that drops whole, a name of nothing but up to two dots once
+/// sanitized, gives way to `fallback`, the hex v1 info hash in libtorrent,
+/// as does a torrent with neither name.
+pub fn torrent_name(raw: Option<&[u8]>, fallback: impl FnOnce() -> String) -> String {
+    raw.and_then(sanitize_element).unwrap_or_else(fallback)
+}
+
+/// [`sanitize_component`], `None` where libtorrent drops an element it does
+/// not force: one of nothing but up to two dots once sanitized. An empty
+/// element is `_` either way.
+fn sanitize_element(raw: &[u8]) -> Option<String> {
+    if raw.is_empty() {
+        return Some("_".to_owned());
+    }
     let mut element = raw;
     while let [b'/', tail @ ..] = element {
         element = tail;
@@ -264,9 +283,9 @@ pub fn sanitize_component(raw: &[u8]) -> String {
         at += len;
     }
     if added == dots && added <= 2 {
-        return "_".to_owned();
+        return None;
     }
-    out
+    Some(out)
 }
 
 /// The code point at the start of `bytes` and the bytes it spans; `None`
@@ -385,6 +404,23 @@ mod tests {
         assert_eq!(sanitize_component(b"a\\b\0c"), "abc");
         assert_eq!(sanitize_component("\u{202e}gpj.exe".as_bytes()), "gpj.exe");
         assert_eq!(sanitize_component("caf\u{e9}".as_bytes()), "caf\u{e9}");
+    }
+
+    #[test]
+    fn a_torrent_is_named_as_libtorrent_names_it() {
+        let name = |raw: Option<&[u8]>| torrent_name(raw, || "hash".to_owned());
+        // test_torrent_info.cpp `sanitize_path`, elements not forced.
+        assert_eq!(name(Some(b"\0\0\xed\0\x80")), "_");
+        assert_eq!(name(Some(b"/a/")), "a");
+        assert_eq!(name(Some(b"a...b")), "a...b");
+        // What an element not forced drops whole leaves the torrent its
+        // hex info hash.
+        for dropped in [&b"."[..], b"..", b"/..", b"/", b"\xe2\x80\x8b"] {
+            assert_eq!(name(Some(dropped)), "hash", "{dropped:?}");
+        }
+        assert_eq!(name(Some(b"")), "_");
+        assert_eq!(name(None), "hash");
+        assert_eq!(name(Some("caf\u{e9}.mkv".as_bytes())), "caf\u{e9}.mkv");
     }
 
     #[test]
