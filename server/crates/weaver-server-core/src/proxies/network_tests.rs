@@ -34,9 +34,42 @@ fn profile(id: u32, kind: ProxyKind) -> ProxyProfile {
         keepalive_seconds: None,
         timeout_seconds: 30,
         host_key_fingerprint: None,
+        natpmp: false,
+        forwarded_port: None,
         revision: 1,
         secrets: Default::default(),
     }
+}
+
+// A WireGuard proxy's provider forwards a port by NAT-PMP from the gateway
+// at host 1 of its first IPv4 tunnel network, or always the same port; any
+// other proxy, and NAT-PMP with no IPv4 tunnel address, forwards none.
+#[test]
+fn a_wireguard_proxy_forwards_by_nat_pmp_or_a_fixed_port() {
+    use weaver_tunnel::pipe::PortForwarding;
+    let mut wireguard = profile(1, ProxyKind::WireGuard);
+    wireguard.tunnel_addresses = vec!["fd00::2/128".into(), "10.2.0.2/32".into()];
+    assert_eq!(wireguard.port_forwarding(), PortForwarding::None);
+
+    wireguard.forwarded_port = Some(51413);
+    assert_eq!(wireguard.port_forwarding(), PortForwarding::Fixed(51413));
+    wireguard.forwarded_port = Some(0);
+    assert_eq!(wireguard.port_forwarding(), PortForwarding::None);
+
+    wireguard.natpmp = true;
+    assert_eq!(
+        wireguard.port_forwarding(),
+        PortForwarding::NatPmp {
+            gateway: "10.2.0.1".parse().unwrap()
+        }
+    );
+    wireguard.tunnel_addresses = vec!["fd00::2/128".into()];
+    assert_eq!(wireguard.port_forwarding(), PortForwarding::None);
+
+    let mut socks = profile(2, ProxyKind::Socks5);
+    socks.natpmp = true;
+    socks.forwarded_port = Some(51413);
+    assert_eq!(socks.port_forwarding(), PortForwarding::None);
 }
 
 #[test]

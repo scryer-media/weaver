@@ -8,7 +8,7 @@ use weaver_tunnel::{
     TunnelError, TunnelStream,
     bridge::{Bridge, ConnectionOutcome},
     endpoint::DatagramTransport,
-    pipe::{Dialed, Purpose, Resolution},
+    pipe::{Dialed, Inbound, InboundListener, Purpose, Resolution},
 };
 
 /// A torrent session's leg: a leg of its consumer's live route. The stage
@@ -82,11 +82,57 @@ impl Dialer for Carried {
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
         Arc::clone(&self.stage).datagrams()
     }
+    fn inbound(self: Arc<Self>) -> Option<Arc<dyn Inbound>> {
+        let inbound = Arc::clone(&self.stage).inbound()?;
+        Some(Arc::new(CarriedInbound {
+            inbound,
+            carried: self,
+        }))
+    }
     fn budget(&self) -> Duration {
         self.stage.budget()
     }
     fn describe(&self) -> String {
         self.stage.describe()
+    }
+}
+// Connections arriving on the leg, which the route counts as the session's
+// dialled ones are.
+struct CarriedInbound {
+    inbound: Arc<dyn Inbound>,
+    carried: Arc<Carried>,
+}
+#[async_trait::async_trait]
+impl Inbound for CarriedInbound {
+    async fn listen(
+        &self,
+        port: u16,
+        forwarded: bool,
+    ) -> Result<Box<dyn InboundListener>, TunnelError> {
+        Ok(Box::new(CarriedListener {
+            listener: self.inbound.listen(port, forwarded).await?,
+            carried: self.carried.clone(),
+        }))
+    }
+}
+struct CarriedListener {
+    listener: Box<dyn InboundListener>,
+    carried: Arc<Carried>,
+}
+#[async_trait::async_trait]
+impl InboundListener for CarriedListener {
+    fn local_addr(&self) -> std::net::SocketAddr {
+        self.listener.local_addr()
+    }
+    fn mapping(&self) -> Option<tokio::sync::watch::Receiver<weaver_tunnel::pipe::PortMapping>> {
+        self.listener.mapping()
+    }
+    async fn accept(&self) -> Result<Dialed, TunnelError> {
+        let mut accepted = self.listener.accept().await?;
+        self.carried
+            .route
+            .carry(&*self.carried.stage, &mut accepted);
+        Ok(accepted)
     }
 }
 struct TorrentProvider(Arc<dyn Dialer>);

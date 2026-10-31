@@ -119,6 +119,13 @@ impl Dialer for Revocable {
         }
         Arc::clone(&self.inner).datagrams()
     }
+    // The leg's inbound connections, while it is not revoked.
+    fn inbound(self: Arc<Self>) -> Option<Arc<dyn super::Inbound>> {
+        if self.is_revoked() {
+            return None;
+        }
+        Arc::clone(&self.inner).inbound()
+    }
     fn budget(&self) -> Duration {
         self.inner.budget()
     }

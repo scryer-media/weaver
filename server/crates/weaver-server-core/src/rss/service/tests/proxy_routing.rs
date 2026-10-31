@@ -55,6 +55,8 @@ impl Fixture {
             // slow runner (300 s is the largest a profile accepts).
             timeout_seconds: 300,
             host_key_fingerprint: None,
+            natpmp: false,
+            forwarded_port: None,
             revision: 1,
             secrets: ProxySecrets::default(),
         };

@@ -543,6 +543,8 @@ pub(crate) fn outbound_only_through(kind: super::ProxyKind, port: u16) -> Arc<Pr
         keepalive_seconds: None,
         timeout_seconds: 300,
         host_key_fingerprint: None,
+        natpmp: false,
+        forwarded_port: None,
         revision: 1,
         secrets: super::ProxySecrets::default(),
     })

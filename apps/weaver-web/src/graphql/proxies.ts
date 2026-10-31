@@ -5,7 +5,7 @@ import { gql } from "urql";
 export const PROXY_PROFILES_QUERY = gql`
   query ProxyProfiles { proxyProfiles {
     id name kind enabled host port resolver dnsServers tunnelAddresses peerPublicKey tunnelPublicKey
-    mtu keepaliveSeconds timeoutSeconds hostKeyFingerprint
+    mtu keepaliveSeconds timeoutSeconds hostKeyFingerprint natpmp forwardedPort
     hasUsername hasPassword hasPrivateKey hasPassphrase hasPresharedKey
   } }
 `;

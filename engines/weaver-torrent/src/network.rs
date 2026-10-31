@@ -44,6 +44,14 @@ pub trait StreamListener: Send + Sync + 'static {
     fn accept<'a>(
         &'a self,
     ) -> BoxFuture<'a, io::Result<(SocketAddr, BoxAsyncReadVectored, BoxAsyncWrite)>>;
+
+    /// The reports of a port the transport keeps forwarded to this listener
+    /// itself, for one whose transport does. Taken once, when the session
+    /// starts the listener; the session announces the TCP port they give,
+    /// as it does a port its own mappers got.
+    fn port_mappings(&self) -> Option<crate::upnp::PortMapReceiver> {
+        None
+    }
 }
 
 /// Creates the sockets a [`Session`](crate::Session) uses for peer traffic.
@@ -81,6 +89,16 @@ pub trait SocketFactory: Send + Sync + 'static {
         &'a self,
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>>;
+
+    /// Start the session's peer listener on `addr`: the one a port the
+    /// transport forwards reaches, which may listen on that port instead.
+    /// Every other listener, SSL torrents' included, is a [`Self::listen_tcp`].
+    fn listen_peers_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
+        self.listen_tcp(addr)
+    }
 
     /// Bind a datagram socket on `addr`.
     fn bind_udp<'a>(

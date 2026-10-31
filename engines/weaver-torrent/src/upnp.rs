@@ -74,6 +74,9 @@ pub struct PortMapped {
 /// Where a mapper sends its reports. A mapper keeps working when nobody listens.
 pub type PortMapEvents = UnboundedSender<PortMapped>;
 
+/// Where reports arrive from a mapper the session does not run itself.
+pub type PortMapReceiver = tokio::sync::mpsc::UnboundedReceiver<PortMapped>;
+
 /// One mapper's reports: a mapping is reported when its outcome changes,
 /// and an outcome its last report already gave is not sent again.
 pub(crate) struct PortMapReports {

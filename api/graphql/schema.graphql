@@ -2745,6 +2745,14 @@ type ProxyProfile {
 	keepaliveSeconds: Int
 	timeoutSeconds: Int!
 	hostKeyFingerprint: String
+	"""
+	WireGuard: the gateway forwards a port over NAT-PMP.
+	"""
+	natpmp: Boolean!
+	"""
+	WireGuard: the port the provider forwards, always the same one.
+	"""
+	forwardedPort: Int
 	hasUsername: Boolean!
 	hasPassword: Boolean!
 	hasPrivateKey: Boolean!
@@ -2765,6 +2773,8 @@ input ProxyProfileInput {
 	mtu: Int! = 1280
 	keepaliveSeconds: Int
 	timeoutSeconds: Int! = 30
+	natpmp: Boolean! = false
+	forwardedPort: Int
 	username: String
 	password: String
 	privateKey: String

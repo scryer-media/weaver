@@ -837,6 +837,8 @@ export const nextKo: LocaleDictionary = {
   "next.proxies.mtuHelp": "비워 두면 {{value}}을(를) 사용합니다.",
   "next.proxies.keepalive": "킵얼라이브",
   "next.proxies.keepaliveHelp": "비워 두면 {{seconds}}초를 사용하며, 0이면 끕니다.",
+  "next.proxies.natpmp": "NAT-PMP 포트 포워딩",
+  "next.proxies.forwardedPort": "포워딩된 포트",
   "next.proxies.username": "사용자 이름",
   "next.proxies.password": "비밀번호",
   "next.proxies.sshKeyHelp": "Ed25519 키만 가능.",
