@@ -954,11 +954,15 @@ impl Object for RarStore {
             .as_ref()
             .is_some_and(|named| named.index() != volume.0)
             && !stated;
-        // The name is what settles a volume its headers do not place.
+        // The name is what settles a volume its headers do not place, and
+        // what it settles is said now, as a length said anew is: a
+        // checkpoint before the next delivery records the name, and a
+        // restore reads it again as said already.
         self.touch(volume);
         if misplaced && self.carried(volume).is_some() {
             self.give_back_held(vec![volume], out);
         }
+        self.settle(None, out);
     }
 
     fn refused(&mut self) {
