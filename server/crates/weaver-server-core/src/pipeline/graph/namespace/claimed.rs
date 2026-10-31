@@ -108,7 +108,7 @@ impl NamespaceWriter {
                 bytes: Bytes::from(bytes).into(),
                 provenance: run.provenance,
             };
-            self.route(tree, builder, segments, arrival, out)?;
+            self.route_as_brought(tree, builder, segments, arrival, out)?;
         }
         self.release_owned_elsewhere(tree, node, member)
     }

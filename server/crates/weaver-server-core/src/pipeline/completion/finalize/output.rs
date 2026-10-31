@@ -81,7 +81,12 @@ fn validate_delivery_sources(
     source_exists |= scan_delivery_root(
         working_dir,
         "working",
-        &[".weaver-chunks", ".weaver-staging", WORKING_DIR_MARKER],
+        &[
+            ".weaver-chunks",
+            weaver_graph::names::CACHE_DIR,
+            ".weaver-staging",
+            WORKING_DIR_MARKER,
+        ],
         settings,
         &mut validation,
     )?;
@@ -558,6 +563,7 @@ async fn run_move_to_claimed_destination(
         while let Ok(Some(entry)) = entries.next_entry().await {
             let file_name = entry.file_name();
             if file_name == ".weaver-chunks"
+                || file_name == weaver_graph::names::CACHE_DIR
                 || file_name == ".weaver-staging"
                 || file_name == WORKING_DIR_MARKER
             {
@@ -678,18 +684,21 @@ async fn run_move_to_claimed_destination(
         );
     }
 
-    // The chunk workspace is the job's scratch: everything it backed has been
-    // published, so it goes with the working directory it lives in.
-    let chunks = working_dir.join(".weaver-chunks");
-    if let Err(error) = tokio::fs::remove_dir_all(&chunks).await
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(
-            job_id = job_id.0,
-            path = %chunks.display(),
-            error = %error,
-            "failed to remove chunk workspace during final move"
-        );
+    // The chunk workspace is the job's scratch, and the cache beside it the
+    // run's: everything they backed has been published, so they go with the
+    // working directory they live in.
+    for scratch in [".weaver-chunks", weaver_graph::names::CACHE_DIR] {
+        let chunks = working_dir.join(scratch);
+        if let Err(error) = tokio::fs::remove_dir_all(&chunks).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                job_id = job_id.0,
+                path = %chunks.display(),
+                error = %error,
+                "failed to remove chunk workspace during final move"
+            );
+        }
     }
 
     let marker_path = working_dir.join(WORKING_DIR_MARKER);

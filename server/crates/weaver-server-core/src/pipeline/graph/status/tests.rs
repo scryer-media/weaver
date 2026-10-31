@@ -777,6 +777,53 @@ fn a_delivery_with_a_withheld_member_fails_worded_by_the_refusal() {
     );
 }
 
+// A whole file whose name and front say an object reads it, which no
+// object opened, is a container and no end file, whatever its format: alone
+// it fails the job, and beside a whole file of its own it leaves the job
+// partial. The tree is given the member as a leaf straight, the state an
+// object that never bound to a whole joined file leaves.
+#[test]
+fn a_whole_container_nothing_opened_is_no_usable_file() {
+    let mut container = b"Rar!\x1a\x07\x01\x00".to_vec();
+    container.resize(600, b'q');
+    assert!(matches!(
+        weaver_graph::signed(&container, Some(600)),
+        weaver_graph::Sniff::Object(_)
+    ));
+    let read = |names: &[&str]| {
+        let mut tree = weaver_graph::Tree::new();
+        let mut effects = Vec::new();
+        for name in names {
+            let member = tree.announce_root(name, Some(600), &mut effects);
+            let bytes = if name.ends_with(".mkv") {
+                vec![b'm'; 600]
+            } else {
+                container.clone()
+            };
+            let namespace = tree.namespace_mut(NodeId::ROOT).unwrap();
+            namespace.arrive(member, ByteRange::new(0, 600), Provenance::Fresh);
+            namespace.keep_first_bytes(member, 0, &bytes, Provenance::Fresh);
+            namespace.get_mut(member).unwrap().closed = true;
+        }
+        Delivery::read(
+            &tree,
+            |_| true,
+            |_| false,
+            |_, _| false,
+            |_, _| None,
+            |_, _| false,
+            |_| Unarrived::Short,
+        )
+    };
+    let alone = read(&["d1c70000"]);
+    assert!(alone.whole.is_empty(), "{alone:?}");
+    assert_eq!(alone.damaged, vec!["d1c70000".to_string()]);
+    assert!(matches!(alone.status(None), JobStatus::Failed { .. }));
+    let beside = read(&["d1c70000", "lantern.mkv"]);
+    assert_eq!(beside.whole, vec!["lantern.mkv".to_string()]);
+    assert_eq!(beside.status(None), JobStatus::Partial);
+}
+
 // A 7z whose start header fails its CRC is still the store's by its name,
 // and the store refuses it for a reason that does not disclaim it: alone it
 // fails the job, and beside a whole file of its own it leaves the job

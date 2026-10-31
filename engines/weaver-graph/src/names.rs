@@ -314,6 +314,11 @@ impl NameLedger {
 // scratch, repair and envelope files. No output is written under it.
 pub const INTERNAL_DIR: &str = ".weaver-chunks";
 
+// The directory beside it that a process's download caches live in for the
+// run they serve. No checkpoint names what is there, and no output is
+// written under it either.
+pub const CACHE_DIR: &str = ".weaver-cache";
+
 // A name an archive gave, kept inside the folder it is written under. This
 // is the one confinement every output name passes: the leaf that writes it
 // only asserts what is decided here. Either separator splits the name, and
@@ -321,9 +326,9 @@ pub const INTERNAL_DIR: &str = ".weaver-chunks";
 // start at the root. A NUL, which no file system takes in a name, becomes
 // `_`. A part spelled like a drive (`C:`) is an ordinary directory where
 // paths have no drives; on Windows, where a colon in any part names a drive
-// (`C:`, `C:foo`) or a file's stream, every colon becomes `_`. A path that starts at the internal directory starts at
-// that directory's first suffixed name instead. A trailing separator, which
-// names a directory, is kept.
+// (`C:`, `C:foo`) or a file's stream, every colon becomes `_`. A path that starts at the internal directory, or at the
+// cache directory beside it, starts at that directory's first suffixed name
+// instead. A trailing separator, which names a directory, is kept.
 fn confined(wanted: &str) -> String {
     let mut parts: Vec<String> = wanted
         .split(['/', '\\'])
@@ -332,10 +337,14 @@ fn confined(wanted: &str) -> String {
         .collect();
     match parts.first_mut() {
         None => return "_".to_owned(),
-        Some(first) if first.eq_ignore_ascii_case(INTERNAL_DIR) => {
-            *first = format!("{INTERNAL_DIR} (1)");
+        Some(first) => {
+            if let Some(reserved) = [INTERNAL_DIR, CACHE_DIR]
+                .into_iter()
+                .find(|reserved| first.eq_ignore_ascii_case(reserved))
+            {
+                *first = format!("{reserved} (1)");
+            }
         }
-        Some(_) => {}
     }
     let mut name = parts.join("/");
     if wanted.ends_with(['/', '\\']) {
@@ -601,6 +610,10 @@ mod tests {
         assert_eq!(
             root(&mut ledger, 4, "dir/.weaver-chunks/c.bin"),
             "dir/.weaver-chunks/c.bin"
+        );
+        assert_eq!(
+            root(&mut ledger, 5, ".Weaver-Cache/d.bin"),
+            ".weaver-cache (1)/d.bin"
         );
     }
 

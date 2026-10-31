@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use weaver_graph::{Member, MemberId, NodeId, Tree, Why, known_type};
+use weaver_graph::{Member, MemberId, NodeId, Sniff, Tree, Why, known_type};
 
 use crate::jobs::model::JobStatus;
 use crate::post_processing::model::PipelineFailureStage;
@@ -387,10 +387,14 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
         // A member an object disclaimed is the file it was posted as, and
         // whole when its bytes are, whatever its name says it is. Otherwise
         // a piece left as a leaf is delivered as it stands: whole bytes of a
-        // volume nothing produced a file from are no usable file.
+        // volume nothing produced a file from are no usable file. So is a
+        // container nothing opened, whatever its format: a leaf whose name
+        // and front say an object reads it. What the object would unpack
+        // from it is the end file, and nothing did.
         let whole = claim == Claim::Complete
             && (refused.is_some_and(Why::disclaims)
                 || (!(self.piece)(node, member.id)
+                    && !self.unopened(node, member)
                     && self.tree.refused_by(node, member.id).is_none()));
         let delivery = &mut self.delivery;
         match (whole, unarrived) {
@@ -423,6 +427,16 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
         {
             self.member(node, below, short);
         }
+    }
+
+    // A leaf whose name and front say an object of some kind reads it: a
+    // container that no object opened, so no file of the delivery.
+    fn unopened(&self, node: NodeId, member: &Member) -> bool {
+        let front = self
+            .tree
+            .namespace(node)
+            .map_or(&[][..], |namespace| namespace.first_bytes(member.id));
+        matches!(member.said(front), Sniff::Object(_))
     }
 
     // Some volume of `node` is short and a failed repair covers it.

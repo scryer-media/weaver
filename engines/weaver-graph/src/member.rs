@@ -385,6 +385,38 @@ impl Namespace {
             .filter_map(|(copy, _)| self.members.get(copy))
     }
 
+    // Which posting brought each part of `range` of a member: a further
+    // posting where its record holds the part, the member's own posting for
+    // the rest. Bytes a member already took, delivered again by the posting
+    // that brought them, meet the first copy as they met it then and are
+    // taken again. A posting that is a further posting brought all of it.
+    pub fn brought(&self, posting: MemberId, range: ByteRange) -> Vec<(ByteRange, MemberId)> {
+        let member = self.resolve(posting);
+        if member != posting {
+            return vec![(range, posting)];
+        }
+        let mut copies: Vec<&Member> = self.copies_of(member).collect();
+        copies.sort_by_key(|copy| copy.id);
+        let mut by = Vec::new();
+        let mut claimed = Coverage::new();
+        for copy in copies {
+            for run in copy.coverage.overlapping(range) {
+                let Some(piece) = run.range.intersect(range) else {
+                    continue;
+                };
+                by.extend(
+                    gaps(piece, &claimed)
+                        .into_iter()
+                        .map(|part| (part, copy.id)),
+                );
+                claimed.write(piece, Provenance::Fresh);
+            }
+        }
+        by.extend(gaps(range, &claimed).into_iter().map(|part| (part, member)));
+        by.sort_by_key(|(part, _)| part.start);
+        by
+    }
+
     // Every posting of the member: its own record, then its copies'.
     pub fn postings(&self, member: MemberId) -> impl Iterator<Item = &Member> + '_ {
         self.members
@@ -494,18 +526,35 @@ impl Namespace {
     }
 
     // Bytes of `posting` over `range` are not in hand: a restart could not
-    // read them back, and they come again. Neither the posting nor the
-    // member it is holds them, and the member is open until they come.
-    // Returns the member.
-    pub fn uncover(&mut self, posting: MemberId, range: ByteRange) -> MemberId {
+    // read them back, and they come again. The posting holds none of them,
+    // and the member it is loses what it took of them: all of `range` from
+    // its own posting, and from a further posting only what that posting's
+    // record says the member took, since the rest came from another posting
+    // and is not this one's to lose. Both are open until they come. Returns
+    // the member and the parts of `range` it lost, in order.
+    pub fn uncover(&mut self, posting: MemberId, range: ByteRange) -> (MemberId, Vec<ByteRange>) {
         let member = self.resolve(posting);
-        for id in [posting, member] {
-            if let Some(record) = self.members.get_mut(&id) {
-                record.coverage.erase(range);
-                record.closed = false;
-            }
+        let lost: Vec<ByteRange> = if posting == member {
+            vec![range]
+        } else {
+            self.members.get(&posting).map_or_else(Vec::new, |copy| {
+                copy.coverage
+                    .overlapping(range)
+                    .filter_map(|run| run.range.intersect(range))
+                    .collect()
+            })
+        };
+        if let Some(record) = self.members.get_mut(&posting) {
+            record.coverage.erase(range);
+            record.closed = false;
         }
-        member
+        if let Some(record) = self.members.get_mut(&member) {
+            for part in &lost {
+                record.coverage.erase(*part);
+            }
+            record.closed = false;
+        }
+        (member, lost)
     }
 
     // Bytes of `posting` arrived over `range` with `provenance`. The
@@ -1076,6 +1125,80 @@ mod tests {
         assert_eq!(
             runs(&namespace.get(member).unwrap().coverage),
             vec![(0, 10, Provenance::Fresh), (30, 40, Provenance::Fresh)]
+        );
+    }
+
+    // A further posting whose bytes were not read back after a restart
+    // takes from the member only what the member took of it: bytes another
+    // posting brought first stay the member's, and they still stand against
+    // the copy when it comes again, as they did before the restart.
+    #[test]
+    fn an_uncovered_copy_loses_only_what_the_member_took_of_it() {
+        let (mut namespace, member, copy) = posted_twice();
+        namespace.arrive(member, ByteRange::new(0, 20), Provenance::Fresh);
+        namespace.arrive(copy, ByteRange::new(10, 30), Provenance::Fresh);
+        let (resolved, lost) = namespace.uncover(copy, ByteRange::new(0, 30));
+        assert_eq!(resolved, member);
+        assert_eq!(lost, vec![ByteRange::new(20, 30)]);
+        assert_eq!(
+            runs(&namespace.get(member).unwrap().coverage),
+            vec![(0, 20, Provenance::Fresh), (30, 40, Provenance::Fresh)]
+        );
+        assert!(
+            namespace
+                .get(copy)
+                .unwrap()
+                .coverage
+                .runs()
+                .next()
+                .is_none()
+        );
+        let (_, taken) = namespace.arrive(copy, ByteRange::new(0, 30), Provenance::Fresh);
+        assert_eq!(taken, landed(&[(20, 30, Provenance::Fresh)]));
+        let (_, taken) = namespace.arrive(member, ByteRange::new(0, 20), Provenance::Fresh);
+        assert_eq!(
+            taken,
+            landed(&[(0, 20, Provenance::Fresh)]),
+            "its own bytes again"
+        );
+        let (_, lost) = namespace.uncover(member, ByteRange::new(0, 40));
+        assert_eq!(lost, vec![ByteRange::new(0, 40)]);
+        assert!(
+            namespace
+                .get(member)
+                .unwrap()
+                .coverage
+                .runs()
+                .next()
+                .is_none()
+        );
+    }
+
+    // Bytes a member took, delivered again by the posting that brought each
+    // part, are all taken again, where the member's own posting delivering
+    // all of them would meet the copy's bytes as a first copy.
+    #[test]
+    fn a_member_delivered_again_by_who_brought_it_takes_all_of_it() {
+        let (mut namespace, member, copy) = posted_twice();
+        namespace.arrive(copy, ByteRange::new(0, 20), Provenance::Fresh);
+        namespace.arrive(member, ByteRange::new(20, 30), Provenance::Fresh);
+        let (_, taken) = namespace.taking(member, ByteRange::new(0, 40), Provenance::Fresh);
+        assert_eq!(taken, landed(&[(20, 40, Provenance::Fresh)]));
+        let brought = namespace.brought(member, ByteRange::new(0, 40));
+        assert_eq!(
+            brought,
+            vec![
+                (ByteRange::new(0, 20), copy),
+                (ByteRange::new(20, 40), member)
+            ]
+        );
+        for (part, posting) in brought {
+            let (_, taken) = namespace.taking(posting, part, Provenance::Fresh);
+            assert_eq!(taken, vec![(part, Provenance::Fresh)], "{posting:?}");
+        }
+        assert_eq!(
+            namespace.brought(copy, ByteRange::new(0, 40)),
+            vec![(ByteRange::new(0, 40), copy)]
         );
     }
 

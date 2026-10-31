@@ -151,6 +151,37 @@ async fn a_7z_in_three_hash_named_pieces_under_one_set_is_joined_in_order() {
     }
 }
 
+// A 7z in two pieces, the first under the archive's own name and the second
+// numbered after it, one set over both. The numbered piece founds a split
+// store by its name that is never whole, and the first is refused by the 7z
+// store it founds; the set then joins the two whichever object gave up its
+// piece last, so the second arriving first joins the same.
+#[tokio::test]
+async fn a_7z_whose_second_piece_alone_is_numbered_under_one_set_is_joined_in_either_order() {
+    let pieces = halved(sevenz());
+    let names = ["lantern.7z", "lantern.7z.002"];
+    for backwards in [false, true] {
+        let mut posts: Vec<Post> = names
+            .iter()
+            .zip(&pieces)
+            .map(|(name, bytes)| Post::plain(name, bytes.clone()))
+            .collect();
+        let described: Vec<(&str, &[u8])> = names
+            .iter()
+            .zip(&pieces)
+            .map(|(name, bytes)| (*name, bytes.as_slice()))
+            .collect();
+        posts.extend(par2_set(SET, &described, 2));
+        let mut scenario = Scenario::new(posts);
+        if backwards {
+            scenario = scenario.backwards();
+        }
+        let outcome = run(&scenario).await;
+        assert_joined(&outcome, backwards, &pieces);
+        assert_sevenz_members(&outcome, backwards);
+    }
+}
+
 // A RAR cut in bytes, not in volumes.
 #[tokio::test]
 async fn a_rar_cut_in_hash_named_pieces_under_one_set_is_joined_and_unpacked() {

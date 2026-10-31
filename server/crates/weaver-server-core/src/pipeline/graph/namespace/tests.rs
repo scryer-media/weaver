@@ -1832,6 +1832,52 @@ fn a_refusal_keeps_the_member_it_closed_and_replaces_the_open_one_with_the_volum
     assert!(job.root().get(member).unwrap().is_leaf());
 }
 
+// A store that gave up is gone, and its envelopes with it, but their files
+// stay until the checkpoint that records it gone has committed. Until then
+// the checkpoint the database holds names them, and a crash comes back to
+// it with the bytes they hold still on disk.
+#[test]
+fn a_gone_stores_envelope_file_stays_until_the_checkpoint_saying_so_commits() {
+    let mut job = Job::new(PLENTY);
+    let (_, child) = bound_store(&mut job);
+    let kept = job.writer.envelopes.records(child);
+    assert_eq!(kept.len(), 1);
+    let envelope = job.dir.path().join(kept[0].file.clone().unwrap_or_else(|| {
+        crate::pipeline::graph::envelope::envelope_name(child, kept[0].envelope)
+    }));
+    assert!(envelope.exists());
+    // The checkpoint that names the envelope has committed.
+    job.writer.recorded(1);
+    job.writer.commit_moves(&mut job.tree, 1).expect("commit");
+    let mut build = job.build();
+    job.writer
+        .said(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            child,
+            Emit::Refuse(Why::Compressed),
+            &mut job.out,
+        )
+        .expect("refuse");
+    assert!(job.tree.buried(child));
+    assert!(job.writer.envelopes.records(child).is_empty());
+    assert!(
+        envelope.exists(),
+        "no checkpoint has said the store is gone"
+    );
+    assert!(job.writer.awaits_commit());
+    job.writer.recorded(2);
+    job.writer.commit_moves(&mut job.tree, 1).expect("commit");
+    assert!(
+        envelope.exists(),
+        "the committed checkpoint still names the envelope"
+    );
+    job.writer.commit_moves(&mut job.tree, 2).expect("commit");
+    assert!(!envelope.exists());
+    assert!(!job.writer.awaits_commit());
+}
+
 // A root member recognised as the name a store's member was written under
 // takes it, since it sits higher; the store's file moves aside on disk and
 // keeps its bytes.

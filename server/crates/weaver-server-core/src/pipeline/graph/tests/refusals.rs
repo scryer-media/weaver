@@ -156,6 +156,13 @@ impl Refusing {
         }
     }
 
+    // The checkpoint `stamp`, taken of the job as it stands, has committed:
+    // a file waiting for it moves to its name.
+    fn checkpoint(&mut self, stamp: u64) {
+        self.job.recorded(stamp);
+        self.job.committed(stamp).unwrap();
+    }
+
     fn refused(&self, member: u32) -> Option<Why> {
         self.job.writer().refused(NodeId::ROOT, MemberId(member))
     }
@@ -341,18 +348,31 @@ fn a_store_no_candidate_opens_refuses_after_the_last() {
     assert_eq!(refusing.offers(), WRONG.to_vec());
     assert!(refusing.is_leaf(0));
     assert_eq!(refusing.refused(0), Some(Why::EncryptedHeader));
+    refusing.checkpoint(1);
     assert_eq!(refusing.file("lantern.part1.rar"), refusing.volumes[0]);
     assert_eq!(refusing.job.phase(), RootPhase::Done);
 }
 
 // A store that kept every byte as envelope and then refused gave them all
-// back to its leaf: buried, its envelopes go with it, so the posted bytes are
-// on disk once, in the leaf.
+// back to its leaf in the envelope's own file: the posted bytes are on disk
+// once, and the file moves to the leaf's name once the checkpoint that
+// records it as the leaf's has committed, leaving nothing behind.
 #[test]
 fn a_store_that_refuses_after_keeping_everything_as_envelope_leaves_none_behind() {
     let mut refusing = refusing(Mode::Locked, 1, &WRONG);
     refusing.deliver(0);
     assert_eq!(refusing.refused(0), Some(Why::EncryptedHeader));
+    assert!(
+        !refusing.exists("lantern.part1.rar"),
+        "no checkpoint has recorded the leaf"
+    );
+    assert_eq!(
+        refusing.internal().len(),
+        1,
+        "one file holds the posted bytes"
+    );
+    assert!(refusing.job.moves_waiting());
+    refusing.checkpoint(1);
     assert_eq!(refusing.file("lantern.part1.rar"), refusing.volumes[0]);
     assert_eq!(refusing.internal(), Vec::<String>::new());
 }
@@ -376,6 +396,7 @@ async fn an_engine_that_refuses_leaves_a_leaf_nothing_is_bound_over() {
     assert_eq!(refusing.refused(0), Some(Why::Unsupported));
     assert!(refusing.is_leaf(0));
     assert!(refusing.job.tree().engines().is_empty());
+    refusing.checkpoint(1);
     assert_eq!(refusing.file("lantern.part1.rar"), refusing.volumes[0]);
     assert_eq!(refusing.starts.load(Ordering::SeqCst), 1);
     assert_eq!(refusing.job.phase(), RootPhase::Done);

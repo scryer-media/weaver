@@ -1642,10 +1642,13 @@ impl Tree {
     // Whether the object at `child` still holds `member` as `volume` by the
     // name the member carries now. It asks what founding asks, whichever
     // came first, the name or the bytes: a kind the name and the front say
-    // the member is answers, and only where they say no kind yet does the
-    // object's own claim on the name keep it. So a numbered name moves a
-    // piece to the split store from an owner its bytes founded, as it would
-    // have founded the split store had it come before them.
+    // the member is, other than the object's, ends the hold, so a numbered
+    // name moves a piece to the split store from an owner its bytes
+    // founded, as it would have founded the split store had it come before
+    // them. A member whose front signs is held by its bytes. One whose
+    // front signs nothing is held by its name alone, and the object's own
+    // claim on that name answers: a name that places it elsewhere in the
+    // object, or nowhere in it, ends the hold.
     fn still_holds(
         &mut self,
         node: NodeId,
@@ -1668,14 +1671,18 @@ impl Tree {
         };
         // An engine reads the kind of store it stands in for.
         let owner = self.kind(child);
-        match said {
+        let kind_agrees = match said {
             Sniff::Object(kind) => owner == Some(kind) || owner == kind.engine_for(),
-            Sniff::Leaf | Sniff::Pending => self
-                .nodes
-                .get_mut(&child)
-                .and_then(|found| found.object.as_mut())
-                .is_none_or(|object| object.claim(&name, &front, length).contains(&volume)),
-        }
+            Sniff::Leaf | Sniff::Pending => true,
+        };
+        let signs = matches!(signed(&front, length), Sniff::Object(_));
+        kind_agrees
+            && (signs
+                || self
+                    .nodes
+                    .get_mut(&child)
+                    .and_then(|found| found.object.as_mut())
+                    .is_none_or(|object| object.claim(&name, &front, length).contains(&volume)))
     }
 
     // A name was all that held `member` as `volume` of the object at
@@ -4020,7 +4027,18 @@ impl Tree {
             let mut read = |placement: &Placement, into: &mut Vec<u8>| {
                 reader.read(tree, node, volume, placement, into)
             };
-            for (piece, provenance) in runs {
+            // A range held as damage may count bytes that never arrived: a
+            // lost range is held as damage above, and nothing of it sits
+            // below. Only what sits below goes again.
+            let pieces = runs.into_iter().flat_map(|(piece, provenance)| {
+                let sitting = if provenance.is_damaged() {
+                    tree.sitting(node, object.as_ref(), volume, piece)
+                } else {
+                    vec![piece]
+                };
+                sitting.into_iter().map(move |piece| (piece, provenance))
+            });
+            for (piece, provenance) in pieces {
                 let mut bytes = Vec::new();
                 if object.posted(volume, piece, &mut read, &mut bytes) {
                     again.push((
@@ -4039,6 +4057,54 @@ impl Tree {
             self.uncover(node, *volume, piece);
         }
         again
+    }
+
+    // The parts of a range of the node's volume whose bytes sit below it,
+    // in order: as far as the record of the member the object placed them
+    // in says they arrived, and the whole of what it placed anywhere else.
+    fn sitting(
+        &self,
+        node: NodeId,
+        object: &dyn Object,
+        volume: VolumeIndex,
+        range: ByteRange,
+    ) -> Vec<ByteRange> {
+        let mut placements = Vec::new();
+        object.locate(volume, range, &mut placements);
+        if placements.iter().map(Placement::len).sum::<u64>() != range.len() {
+            return vec![range];
+        }
+        let mut parts: Vec<ByteRange> = Vec::new();
+        let mut at = range.start;
+        for placement in &placements {
+            let piece = ByteRange::at(at, placement.len());
+            at = piece.end;
+            let sat: Vec<ByteRange> = match placement {
+                Placement::Member {
+                    member,
+                    range: within,
+                } => self
+                    .namespace(node)
+                    .and_then(|namespace| namespace.get(*member))
+                    .map(|record| {
+                        record
+                            .coverage
+                            .overlapping(*within)
+                            .filter_map(|run| run.range.intersect(*within))
+                            .map(|part| part.shift(piece.start as i64 - within.start as i64))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                _ => vec![piece],
+            };
+            for part in sat.into_iter().filter(|part| !part.is_empty()) {
+                match parts.last_mut() {
+                    Some(last) if last.end == part.start => last.end = part.end,
+                    _ => parts.push(part),
+                }
+            }
+        }
+        parts
     }
 
     // One piece whose posted bytes the owner staged before uncovering the
@@ -4127,18 +4193,22 @@ impl Tree {
         let Some(found) = self.nodes.members_mut(node) else {
             return;
         };
-        let member = found.namespace.uncover(member, range);
+        // Only what the member lost goes unsaid below it: what it holds from
+        // another posting still stands there.
+        let (member, lost) = found.namespace.uncover(member, range);
         let Some((child, volume)) = found.children.get(&member).copied() else {
             return;
         };
-        if let Some(object) = self
-            .nodes
-            .get_mut(&child)
-            .and_then(|found| found.object.as_mut())
-        {
-            object.unposted(volume, range);
+        for range in lost {
+            if let Some(object) = self
+                .nodes
+                .get_mut(&child)
+                .and_then(|found| found.object.as_mut())
+            {
+                object.unposted(volume, range);
+            }
+            pending.push((child, volume, range));
         }
-        pending.push((child, volume, range));
     }
 
     fn mark(

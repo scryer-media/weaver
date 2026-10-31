@@ -169,6 +169,7 @@ fn kind(interruption: Interruption) -> (u8, BoundaryAction, BoundaryAction, bool
         Interruption::Combined { action, .. } => (3, action, Action::None, false),
         Interruption::Starved { .. } => (4, Action::None, Action::None, false),
         Interruption::Withheld { .. } => (7, Action::None, Action::None, false),
+        Interruption::Moving(_) => (8, Action::Crash, Action::None, false),
         Interruption::Twice {
             mask,
             first,

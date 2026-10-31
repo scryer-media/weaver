@@ -374,6 +374,53 @@ fn hold_rows_come_back_as_the_holds_a_restore_adopts() {
     ));
 }
 
+// A restore keeps under the chunk directory what its checkpoint names,
+// and nothing else: a step's file whose checkpoint never committed, a
+// recovery's scratch and its repaired file go; every envelope, waiting
+// file, holds scratch and spooled part the rows name stays.
+#[test]
+fn a_restore_removes_what_its_checkpoint_does_not_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let internal = dir.path().join(weaver_graph::names::INTERNAL_DIR);
+    std::fs::create_dir(&internal).unwrap();
+    let named = [
+        "graph-envelope-1-0",
+        "graph-envelope-1-1-1",
+        "graph-holds-0.scratch",
+        "graph-holds-1.scratch",
+        "graph-waiting-0-1",
+        "held-0-1.uu",
+    ];
+    let unnamed = [
+        "graph-envelope-1-2",
+        "graph-holds-2.scratch",
+        "graph-recovery-0-3.repaired",
+        "graph-waiting-0-2",
+    ];
+    for name in named.iter().chain(&unnamed) {
+        std::fs::write(internal.join(name), b"bytes").unwrap();
+    }
+    std::fs::create_dir(internal.join("graph-recovery-0-3")).unwrap();
+    std::fs::write(internal.join("graph-recovery-0-3/set.par2"), b"bytes").unwrap();
+    let mut rows = rows(&full());
+    rows.held_parts
+        .push(crate::jobs::graph_checkpoint::HeldPartRow {
+            file: 0,
+            ordinal: 1,
+            decoded_len: 5,
+            spool_path: format!("{}/held-0-1.uu", weaver_graph::names::INTERNAL_DIR),
+            article: None,
+        });
+    let restored = snapshot(&rows).unwrap();
+    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts);
+    let mut left: Vec<String> = std::fs::read_dir(&internal)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    left.sort();
+    assert_eq!(left, named);
+}
+
 #[test]
 fn the_phase_last_reported_comes_back_with_the_root() {
     let taken = full();

@@ -184,6 +184,20 @@ pub(super) enum Interruption {
         volume: u32,
         index_first: bool,
     },
+    // The process dies the first time a member's file waits to move, with
+    // the move in the state given.
+    Moving(MoveState),
+}
+
+// Where a member's file stands in its move when the process dies. The
+// checkpoint that records the name it wants has not committed; it has, and
+// the database's word of it is not yet heard, so the file has not moved; or
+// the file moved, and the checkpoint that records the move is not written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum MoveState {
+    Uncommitted,
+    Unheard,
+    Unrecorded,
 }
 
 // Which slice of a campaign one test runs.
@@ -233,6 +247,14 @@ impl Interruption {
     pub(super) fn fits(self, volumes: usize) -> bool {
         self.withheld()
             .is_none_or(|(volume, _)| volumes > 1 && (volume as usize) < volumes)
+    }
+
+    // The state of a move the process dies in, for a crash at a move.
+    pub(super) fn moving(self) -> Option<MoveState> {
+        match self {
+            Self::Moving(state) => Some(state),
+            _ => None,
+        }
     }
 
     // The job cannot finish: what was lost is beyond the recovery it has.
@@ -493,6 +515,18 @@ pub(super) fn schedules() -> Vec<(Vec<(u32, u32)>, Interruption)> {
                     index_first,
                 },
             ));
+        }
+    }
+    // Appended for the same reason: every arrival order, the process dying
+    // the first time a member's file waits to move, in each state of the
+    // move.
+    for order in arrival_orders() {
+        for state in [
+            MoveState::Uncommitted,
+            MoveState::Unheard,
+            MoveState::Unrecorded,
+        ] {
+            result.push((order.clone(), Interruption::Moving(state)));
         }
     }
     if let Ok(case) = std::env::var("WEAVER_ARCHIVE_SCHEDULE_CASE") {

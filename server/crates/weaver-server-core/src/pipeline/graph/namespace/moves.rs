@@ -105,8 +105,8 @@ impl NamespaceWriter {
         Ok(())
     }
 
-    // The checkpoint `stamp` records every name wanted and every name left
-    // so far.
+    // The checkpoint `stamp` records every name wanted, every name left and
+    // every gone node so far.
     pub(crate) fn recorded(&mut self, stamp: u64) {
         for waiting in &mut self.moves {
             waiting.stamp.get_or_insert(stamp);
@@ -114,12 +114,21 @@ impl NamespaceWriter {
         for left in self.left.values_mut() {
             left.get_or_insert(stamp);
         }
+        for (_, gone) in &mut self.forgotten {
+            gone.get_or_insert(stamp);
+        }
     }
 
     // Whether a file still waits to move, or a name a file left waits for
-    // the checkpoint that frees it: either may still move a member's file.
+    // the checkpoint that frees it.
     pub(crate) fn moves_waiting(&self) -> bool {
         !self.moves.is_empty() || !self.left.is_empty()
+    }
+
+    // Whether anything waits for a checkpoint to commit: a move, a name a
+    // file left, or a gone node's file the one the database holds may name.
+    pub(crate) fn awaits_commit(&self) -> bool {
+        self.moves_waiting() || !self.forgotten.is_empty()
     }
 
     // The checkpoint whose commit lets every waiting move run, as far as
@@ -127,7 +136,8 @@ impl NamespaceWriter {
     pub(crate) fn awaited(&self) -> u64 {
         let moves = self.moves.iter().filter_map(|waiting| waiting.stamp);
         let left = self.left.values().filter_map(|stamp| *stamp);
-        moves.chain(left).max().unwrap_or(0)
+        let gone = self.forgotten.iter().filter_map(|(_, stamp)| *stamp);
+        moves.chain(left).chain(gone).max().unwrap_or(0)
     }
 
     // The checkpoints through `stamp` have committed. Every name a file
@@ -148,8 +158,23 @@ impl NamespaceWriter {
             }
             shut
         });
-        let moved = self.run_moves(committed);
+        let moved = self
+            .remove_forgotten(committed)
+            .and_then(|()| self.run_moves(committed));
         (freed, moved)
+    }
+
+    // Remove every gone node's file that the checkpoints through
+    // `committed` stop naming.
+    fn remove_forgotten(&mut self, committed: u64) -> Result<(), WriteError> {
+        let (gone, kept) = std::mem::take(&mut self.forgotten)
+            .into_iter()
+            .partition(|(_, stamp)| stamp.is_some_and(|stamp| stamp <= committed));
+        self.forgotten = kept;
+        for (leaf, _) in gone {
+            leaf.remove()?;
+        }
+        Ok(())
     }
 
     // Run every waiting move the checkpoints through `committed` record

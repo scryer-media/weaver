@@ -193,6 +193,10 @@ pub(crate) struct NamespaceWriter {
     // The names files left, by the ledger's key, each with the checkpoint
     // that records it left once one is taken.
     left: BTreeMap<String, Option<u64>>,
+    // The files of envelopes a gone node kept, each with the checkpoint
+    // that records the node gone once one is taken. Until that checkpoint
+    // commits, the one the database holds may name them.
+    forgotten: Vec<(Leaf, Option<u64>)>,
     // The latest checkpoint the database has committed.
     committed: u64,
     segments: Vec<Segment>,
@@ -236,6 +240,7 @@ impl NamespaceWriter {
             renamed: Vec::new(),
             moves: Vec::new(),
             left: BTreeMap::new(),
+            forgotten: Vec::new(),
             committed: 0,
             segments: Vec::new(),
             effects: Vec::new(),
@@ -1426,7 +1431,7 @@ impl NamespaceWriter {
                 bytes: bytes.slice(start..end).into(),
                 provenance,
             };
-            self.route(tree, builder, segments, arrival, out)?;
+            self.route_as_brought(tree, builder, segments, arrival, out)?;
         }
         Ok(())
     }
@@ -1718,7 +1723,9 @@ impl NamespaceWriter {
         let shelved: Vec<NodeId> = self.envelopes.nodes().collect();
         for node in shelved {
             if tree.buried(node) {
-                self.envelopes.forget(node)?;
+                let files = self.envelopes.forget(node);
+                self.forgotten
+                    .extend(files.into_iter().map(|leaf| (leaf, None)));
             }
         }
         let nodes: Vec<NodeId> = self.files.keys().copied().collect();
@@ -2200,7 +2207,7 @@ fn in_own_file(tree: &Tree, node: NodeId, member: MemberId) -> bool {
 }
 
 // The node's holds scratch file, under the working directory.
-fn scratch_name(node: NodeId) -> String {
+pub(crate) fn scratch_name(node: NodeId) -> String {
     format!(
         "{}/graph-holds-{}.scratch",
         weaver_graph::names::INTERNAL_DIR,

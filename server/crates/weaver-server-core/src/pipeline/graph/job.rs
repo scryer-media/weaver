@@ -259,6 +259,11 @@ impl GraphJob {
         self.writer.moves_waiting()
     }
 
+    // Whether anything of the job waits for a checkpoint to commit.
+    pub(crate) fn awaits_commit(&self) -> bool {
+        self.writer.awaits_commit()
+    }
+
     // The checkpoint whose commit lets every waiting move run.
     pub(crate) fn awaited(&self) -> u64 {
         self.writer.awaited()

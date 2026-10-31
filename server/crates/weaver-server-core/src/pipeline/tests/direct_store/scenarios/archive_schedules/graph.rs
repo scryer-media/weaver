@@ -616,6 +616,142 @@ pub(super) async fn restore(
     (pipeline, true)
 }
 
+// Whether a member's file of the job waits to move to the name it wants.
+fn file_waits(pipeline: &Pipeline) -> bool {
+    pipeline
+        .graph_jobs
+        .get(&JOB)
+        .is_some_and(|job| !job.writer().waiting().is_empty())
+}
+
+// The database files under `from` replace those under `to`: the main file
+// and its write-ahead log. The shared-memory index goes, and the next open
+// builds it again from the log.
+fn copy_database(from: &std::path::Path, to: &std::path::Path) {
+    for name in ["weaver.db", "weaver.db-wal"] {
+        let (source, target) = (from.join(name), to.join(name));
+        if source.exists() {
+            std::fs::copy(&source, &target).unwrap();
+        } else if target.exists() {
+            std::fs::remove_file(&target).unwrap();
+        }
+    }
+    let index = to.join("weaver.db-shm");
+    if index.exists() {
+        std::fs::remove_file(index).unwrap();
+    }
+}
+
+// A crash at a move. While no member's file waits to move, each step keeps
+// the database as the queued writes leave it, and the articles it does not
+// account for: those the job held only in memory then, and every one served
+// since. A crash before the next move's checkpoint commits comes back to
+// that database, and those articles are not on disk by its account.
+struct MoveCrash {
+    state: Option<MoveState>,
+    quiet: tempfile::TempDir,
+    since: Vec<(u32, u32)>,
+}
+
+impl MoveCrash {
+    fn new(interruption: Interruption) -> Self {
+        Self {
+            state: interruption.moving(),
+            quiet: tempfile::tempdir().unwrap(),
+            since: Vec::new(),
+        }
+    }
+
+    async fn settle(&mut self, pipeline: &Pipeline, root: &std::path::Path) {
+        if self.state.is_none() || file_waits(pipeline) {
+            return;
+        }
+        pipeline.db.flush_write_queue().await.unwrap();
+        copy_database(root, self.quiet.path());
+        self.since = pipeline
+            .graph_jobs
+            .get(&JOB)
+            .map(|job| job.in_memory())
+            .unwrap_or_default();
+    }
+
+    fn served(&mut self, article: (u32, u32)) {
+        if self.state.is_some() {
+            self.since.push(article);
+        }
+    }
+
+    // The process dies the first time a member's file waits to move, with
+    // the move in the schedule's state: the checkpoint naming where the file
+    // goes rolled back, committed with its word unheard, or heard so the file
+    // moved and the checkpoint saying so rolled back. Returns the pipeline
+    // that goes on, and the status the job went down with when it did not
+    // restore.
+    async fn crash(
+        &mut self,
+        mut pipeline: Pipeline,
+        root: &tempfile::TempDir,
+        spec: &JobSpec,
+        run: &mut Run<'_>,
+    ) -> (Pipeline, Option<Option<JobStatus>>) {
+        let Some(state) = self.state.filter(|_| file_waits(&pipeline)) else {
+            return (pipeline, None);
+        };
+        self.state = None;
+        pipeline.db.flush_write_queue().await.unwrap();
+        let waiting = pipeline
+            .graph_jobs
+            .get(&JOB)
+            .map(|job| job.writer().waiting())
+            .unwrap_or_default();
+        let kept = tempfile::tempdir().unwrap();
+        let back_to = match state {
+            MoveState::Uncommitted => {
+                for article in self.since.drain(..) {
+                    run.delivered.remove(&article);
+                }
+                Some(self.quiet.path())
+            }
+            MoveState::Unheard => None,
+            MoveState::Unrecorded => {
+                copy_database(root.path(), kept.path());
+                pipeline.hear_graph_runs();
+                let still = pipeline
+                    .graph_jobs
+                    .get(&JOB)
+                    .map(|job| job.writer().waiting())
+                    .unwrap_or_default();
+                assert!(
+                    waiting.iter().any(|file| !still.contains(file)),
+                    "the commit's word moves a waiting file: {waiting:?} still {still:?}: {:?}",
+                    run.trace
+                );
+                Some(kept.path())
+            }
+        };
+        let status = job_status_for_assert(&pipeline, JOB);
+        if let Some(job) = pipeline.graph_jobs.get(&JOB) {
+            for article in job.in_memory() {
+                run.delivered.remove(&article);
+            }
+        }
+        run.trace.push(format!(
+            "Crash at a move {state:?}: waiting={waiting:?} status={status:?}"
+        ));
+        retire_pipeline_database(pipeline).await;
+        if let Some(from) = back_to {
+            copy_database(from, root.path());
+        }
+        let (mut pipeline, restored) = restore(root, spec, &mut run.trace).await;
+        if !restored {
+            return (pipeline, Some(status));
+        }
+        run.note_asks(&mut pipeline);
+        run.look(&pipeline);
+        (pipeline, None)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_graph_schedule(
     options: ScheduleOptions,
@@ -664,6 +800,7 @@ async fn drive_graph_schedule(
         run.look(&pipeline);
     }
     let mut retired = None;
+    let mut moving = MoveCrash::new(interruption);
     for (step, action, arrives) in interruption.boundaries(order.len()) {
         match action {
             BoundaryAction::None => {}
@@ -702,10 +839,24 @@ async fn drive_graph_schedule(
         let Some(&article) = order.get(step) else {
             break;
         };
+        moving.settle(&pipeline, root.path()).await;
         run.serve(&mut pipeline, article).await;
+        moving.served(article);
+        let gone;
+        (pipeline, gone) = moving.crash(pipeline, &root, &spec, &mut run).await;
+        if let Some(status) = gone {
+            retired = Some(status);
+            break;
+        }
         turns.turn(&mut pipeline).await;
         run.look(&pipeline);
         run.note_asks(&mut pipeline);
+        let gone;
+        (pipeline, gone) = moving.crash(pipeline, &root, &spec, &mut run).await;
+        if let Some(status) = gone {
+            retired = Some(status);
+            break;
+        }
     }
     if let Some(index) = index
         && !index_first
@@ -729,9 +880,26 @@ async fn drive_graph_schedule(
             if run.delivered.contains(&article) {
                 run.rerequested.insert(article);
             }
+            moving.settle(&pipeline, root.path()).await;
             run.serve(&mut pipeline, article).await;
+            moving.served(article);
+            let gone;
+            (pipeline, gone) = moving.crash(pipeline, &root, &spec, &mut run).await;
+            if gone.is_some() {
+                retired = gone;
+                break;
+            }
             turns.turn(&mut pipeline).await;
             run.look(&pipeline);
+            let gone;
+            (pipeline, gone) = moving.crash(pipeline, &root, &spec, &mut run).await;
+            if gone.is_some() {
+                retired = gone;
+                break;
+            }
+        }
+        if retired.is_some() {
+            break;
         }
         if turns.release(&mut pipeline).await {
             run.look(&pipeline);
@@ -779,6 +947,11 @@ async fn drive_graph_schedule(
         if before == after && stalled.replace(after.clone()) == Some(after.clone()) {
             panic!("graph schedule stalled at {after}: trace={:?}", run.trace);
         }
+    }
+    if let Some(state) = moving.state {
+        run.trace.push(format!(
+            "no member's file waited to move: {state:?} never came"
+        ));
     }
     let status = retired.unwrap_or_else(|| job_status_for_assert(&pipeline, JOB));
     run.trace.push(format!(

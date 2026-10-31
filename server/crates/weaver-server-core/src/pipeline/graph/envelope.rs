@@ -78,6 +78,19 @@ pub(crate) struct Kept {
 }
 
 impl Kept {
+    // An envelope with nothing kept yet, in `leaf`'s file.
+    fn in_file(leaf: Leaf) -> Self {
+        Self {
+            leaf,
+            coverage: Coverage::new(),
+            closed: None,
+            closed_at: None,
+            settled: false,
+            reached: 0,
+            length_read: None,
+        }
+    }
+
     pub(crate) fn path(&self) -> &Path {
         self.leaf.path()
     }
@@ -195,6 +208,35 @@ impl Envelopes {
         self.shelves.get(&node).map(Arc::clone)
     }
 
+    // The file an envelope sits in, relative to the working directory, and
+    // how many bytes it keeps there.
+    pub(crate) fn kept_file(&self, node: NodeId, envelope: u32) -> Option<(String, u64)> {
+        let shelf = self.shelves.get(&node)?;
+        let state = shelf.lock();
+        state
+            .kept
+            .get(&envelope)
+            .map(|kept| (kept.leaf.name().to_owned(), kept.coverage.bytes_covered()))
+    }
+
+    // The envelope starts in `name`, a file that already holds its bytes at
+    // their own offsets: nothing is cleared, and what is kept in it is
+    // written over the same bytes. False when the envelope started already.
+    pub(crate) fn start_in(&mut self, node: NodeId, envelope: u32, name: &str) -> bool {
+        let shelf = self.shelf(node);
+        let started = shelf.update(|state| match state.kept.entry(envelope) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(free) => {
+                free.insert(Kept::in_file(Leaf::at(&shelf.dir, name)));
+                true
+            }
+        });
+        if started {
+            self.marks.mark(node);
+        }
+        started
+    }
+
     // An envelope the object at `node` gave back with its volume leaves the
     // shelf, file and all: the file, at the volume's own offsets, is what
     // the object kept of the volume. Nothing is read or copied.
@@ -237,20 +279,18 @@ impl Envelopes {
     }
 
     // The node is gone, and its envelopes with it. A run still reading them
-    // is stopped first.
-    pub(crate) fn forget(&mut self, node: NodeId) -> Result<(), LeafError> {
+    // is stopped first. Their files are returned, not removed: the last
+    // checkpoint the database holds may still name them.
+    pub(crate) fn forget(&mut self, node: NodeId) -> Vec<Leaf> {
         let Some(shelf) = self.shelves.remove(&node) else {
-            return Ok(());
+            return Vec::new();
         };
         self.marks.mark(node);
         let kept = shelf.update(|state| {
             state.generation += 1;
             std::mem::take(&mut state.kept)
         });
-        for (_, kept) in kept {
-            kept.leaf.remove()?;
-        }
-        Ok(())
+        kept.into_values().map(|kept| kept.leaf).collect()
     }
 }
 
@@ -318,15 +358,7 @@ impl Shelf {
                 let name = free_envelope_name(&self.dir, self.node, envelope);
                 let mut leaf = Leaf::at(&self.dir, &name);
                 leaf.truncate()?;
-                Ok(free.insert(Kept {
-                    leaf,
-                    coverage: Coverage::new(),
-                    closed: None,
-                    closed_at: None,
-                    settled: false,
-                    reached: 0,
-                    length_read: None,
-                }))
+                Ok(free.insert(Kept::in_file(leaf)))
             }
         }
     }
