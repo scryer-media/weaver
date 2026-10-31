@@ -6,7 +6,7 @@ use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Duration};
 use weaver_tunnel::{
     Http3ProxyCredentials, Http3TunnelProvider, Http3TunnelSpec, TunnelError, TunnelSpec,
     WireGuardSpec, parse_key,
-    pipe::{Egress, Naming},
+    pipe::{Egress, Naming, PortForwarding, gateway_of},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +59,14 @@ pub struct ProxyProfile {
     pub timeout_seconds: u32,
     pub host_key_fingerprint: Option<String>,
     pub revision: u64,
+    // WireGuard: the gateway at the tunnel's far end forwards a port of its
+    // choosing over NAT-PMP.
+    #[serde(default)]
+    pub natpmp: bool,
+    // WireGuard: the port the provider forwards to the tunnel, always the
+    // same one. Unused with NAT-PMP.
+    #[serde(default)]
+    pub forwarded_port: Option<u16>,
     #[serde(skip)]
     pub secrets: ProxySecrets,
 }
@@ -228,6 +236,30 @@ impl ProxyProfile {
                 .transpose()?,
             request_timeout: self.timeout(),
         })
+    }
+    // How the provider at this WireGuard proxy's far end forwards a port to
+    // the tunnel. Its NAT-PMP gateway is host 1 of the network of the
+    // tunnel's first IPv4 address; a tunnel without one has no gateway to ask.
+    pub fn port_forwarding(&self) -> PortForwarding {
+        if self.kind != ProxyKind::WireGuard {
+            return PortForwarding::None;
+        }
+        if self.natpmp {
+            return self
+                .tunnel_addresses
+                .iter()
+                .filter_map(|address| address.parse::<weaver_tunnel::IpCidr>().ok())
+                .find_map(|cidr| match cidr.address {
+                    IpAddr::V4(address) => Some(PortForwarding::NatPmp {
+                        gateway: gateway_of(address),
+                    }),
+                    IpAddr::V6(_) => None,
+                })
+                .unwrap_or(PortForwarding::None);
+        }
+        self.forwarded_port
+            .filter(|port| *port != 0)
+            .map_or(PortForwarding::None, PortForwarding::Fixed)
     }
     pub fn wireguard_spec(&self) -> Result<WireGuardSpec, TunnelError> {
         Ok(WireGuardSpec {

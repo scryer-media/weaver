@@ -39,6 +39,7 @@ export type ProxyProfile = {
   id: number; name: string; kind: ProxyKind; enabled: boolean; host: string; port: number;
   resolver: ProxyResolver; dnsServers: string[]; tunnelAddresses: string[]; peerPublicKey: string | null; tunnelPublicKey: string | null;
   mtu: number; keepaliveSeconds: number | null; timeoutSeconds: number; hostKeyFingerprint: string | null;
+  natpmp: boolean; forwardedPort: number | null;
   hasUsername: boolean; hasPassword: boolean; hasPrivateKey: boolean; hasPassphrase: boolean; hasPresharedKey: boolean;
 };
 type ChainProfile = Pick<ProxyProfile, "id" | "kind">;

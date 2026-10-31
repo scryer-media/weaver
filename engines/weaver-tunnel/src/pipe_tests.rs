@@ -490,6 +490,7 @@ async fn a_session_hop_is_failing_only_while_its_own_path_fails() {
         timeout: Duration::from_secs(30),
         naming: Naming::Proxy,
         resolver: None,
+        forwarding: Default::default(),
         failure: Default::default(),
     };
     let target = target(hop.endpoint.unwrap());
@@ -609,6 +610,7 @@ async fn idle_retirement_preserves_channels_shared_by_other_consumers() {
         timeout: Duration::from_secs(30),
         naming: Naming::Proxy,
         resolver: None,
+        forwarding: Default::default(),
         failure: Default::default(),
     };
     let first = hop.dial(&target(hop.endpoint.unwrap())).await.unwrap();
@@ -670,6 +672,7 @@ async fn only_a_path_failure_retires_an_idle_session() {
         timeout: Duration::from_secs(30),
         naming: Naming::Proxy,
         resolver: None,
+        forwarding: Default::default(),
         failure: Default::default(),
     };
     let target = target(hop.endpoint.unwrap());
@@ -916,6 +919,7 @@ async fn a_wireguard_session_carries_another_and_stays_up_while_it_rides() {
             timeout: Duration::from_secs(30),
             naming: Naming::proxy_servers(vec!["10.0.0.2".parse().unwrap()]),
             resolver: Some(provider),
+            forwarding: Default::default(),
             failure: Default::default(),
         })
     };
@@ -1044,6 +1048,7 @@ fn wireguard_session(
         timeout: Duration::from_secs(30),
         naming: Naming::proxy_servers(vec!["10.0.0.2".parse().unwrap()]),
         resolver: Some(resolver),
+        forwarding: Default::default(),
         failure: Default::default(),
     })
 }
@@ -1825,4 +1830,378 @@ async fn a_full_tunnel_waits_for_room_without_cooling_its_rung() {
     };
     assert!(Arc::ptr_eq(&waits[0], &freed.notify()));
     assert_eq!(ladder.rung_states(), ["STANDBY"]);
+}
+
+// A WireGuard session over the test peer, as the runtime builds one.
+fn listening_session(near: &crate::test_support::WireGuardTestPeer) -> Arc<SessionHop> {
+    let provider = Arc::new(
+        crate::WireGuardTunnelProvider::new(
+            near.client_spec("1"),
+            Arc::new(crate::NoopTunnelObserver),
+        )
+        .with_udp_factory(bottom()),
+    );
+    wireguard_session(1, provider.clone(), provider, bottom(), vec![], 1)
+}
+
+// A peer inside the tunnel connects to the session's listener: the
+// connection carries bytes both ways, names the session's path, and holds
+// the session up, as the listener does while it lives.
+#[tokio::test]
+async fn a_wireguard_listener_takes_a_peer_connection_inside_its_tunnel() {
+    use crate::test_support::{TEST_CLIENT_ADDRESS, TEST_PEER_ADDRESS, WireGuardTestPeer};
+    let near = WireGuardTestPeer::start().await;
+    let session = listening_session(&near);
+    let listener = Arc::clone(&session)
+        .inbound()
+        .expect("a WireGuard session takes connections")
+        .listen(0, true)
+        .await
+        .unwrap();
+    let local = listener.local_addr();
+    assert_eq!(local.ip(), IpAddr::V4(TEST_CLIENT_ADDRESS));
+    assert_ne!(local.port(), 0);
+
+    let (accepted, peer) = tokio::join!(listener.accept(), near.dial_client(local.port()));
+    let mut accepted = accepted.unwrap();
+    let mut peer = peer.unwrap();
+    assert_eq!(accepted.path.proxies, vec![1]);
+    assert_eq!(accepted.path.egress, 4);
+    assert_eq!(accepted.source, Some(local));
+    assert_eq!(
+        accepted.peer.map(|peer| peer.ip()),
+        Some(IpAddr::V4(TEST_PEER_ADDRESS))
+    );
+    peer.write_all(b"handshake").await.unwrap();
+    let mut heard = [0u8; 9];
+    accepted.stream.read_exact(&mut heard).await.unwrap();
+    assert_eq!(&heard, b"handshake");
+    accepted.stream.write_all(b"bitfield").await.unwrap();
+    let mut answer = [0u8; 8];
+    peer.read_exact(&mut answer).await.unwrap();
+    assert_eq!(&answer, b"bitfield");
+
+    // The connection and the listener each hold the session; it retires
+    // only once both are gone, and the connection's close is reported.
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    accepted.outcome.on_close({
+        let closed = closed.clone();
+        move || closed.store(true, std::sync::atomic::Ordering::SeqCst)
+    });
+    drop(listener);
+    assert!(!session.retire_idle().await);
+    drop(accepted);
+    assert!(closed.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(session.retire_idle().await);
+    assert_eq!(
+        session
+            .capacity
+            .budget
+            .as_ref()
+            .unwrap()
+            .available_permits(),
+        1
+    );
+}
+
+// The tunnel is replaced under a listener: its next accept listens again
+// on the same port inside the new tunnel, and a peer reaches it there.
+#[tokio::test]
+async fn a_wireguard_listener_listens_again_inside_a_replaced_tunnel() {
+    use crate::test_support::WireGuardTestPeer;
+    let near = WireGuardTestPeer::start().await;
+    let session = listening_session(&near);
+    let listener = Arc::clone(&session)
+        .inbound()
+        .unwrap()
+        .listen(0, true)
+        .await
+        .unwrap();
+    let port = listener.local_addr().port();
+
+    // Retire the tunnel the listener sits in, and bring its replacement up.
+    session.provider.retire().await;
+    session.prepare().await.unwrap();
+
+    // The accept finds its tunnel stopped and listens in the new one; the
+    // peer dials once the new tunnel listens on the port.
+    let provider = session.resolver.as_ref().unwrap();
+    let (accepted, peer) = tokio::join!(listener.accept(), async {
+        while !provider.listens_on(port).await {
+            tokio::task::yield_now().await;
+        }
+        near.dial_client(port).await
+    });
+    let mut accepted = accepted.unwrap();
+    let mut peer = peer.unwrap();
+    assert_eq!(listener.local_addr().port(), port);
+    assert_eq!(accepted.source.map(|source| source.port()), Some(port));
+    peer.write_all(b"again").await.unwrap();
+    let mut heard = [0u8; 5];
+    accepted.stream.read_exact(&mut heard).await.unwrap();
+    assert_eq!(&heard, b"again");
+}
+
+// Only a WireGuard hop at the top of a path takes connections: a chain ends
+// in one or it listens nowhere, and an SSH session or a SOCKS or HTTP hop
+// takes none, whatever runs beneath it.
+#[tokio::test]
+async fn only_a_path_ending_in_wireguard_takes_connections() {
+    use crate::test_support::WireGuardTestPeer;
+    let near = WireGuardTestPeer::start().await;
+    let wireguard = listening_session(&near);
+    assert!(Arc::clone(&wireguard).inbound().is_some());
+
+    // WireGuard on WireGuard: the top hop listens.
+    let stacked = carried_by(&wireguard, near.client_spec("2"));
+    assert!(stacked.inbound().is_some());
+
+    // SOCKS and HTTP CONNECT over WireGuard: no listener.
+    let socks = Arc::new(TransportHop {
+        id: 7,
+        spec: TransportProxy {
+            kind: crate::transport::TransportKind::Socks5,
+            host: "192.0.2.1".into(),
+            port: 1080,
+            username: None,
+            password: None,
+        },
+        inner: wireguard.clone(),
+        timeout: Duration::from_secs(30),
+        naming: Naming::Proxy,
+        failure: Default::default(),
+    });
+    assert!(socks.inbound().is_none());
+    let connect = hop(8, "192.0.2.2:8080".parse().unwrap(), wireguard.clone());
+    assert!(connect.inbound().is_none());
+
+    // An SSH session over WireGuard: no listener.
+    let ssh = Arc::new(SessionHop {
+        capacity: SessionCapacity::default(),
+        activity: Default::default(),
+        id: 9,
+        provider: wireguard.provider.clone(),
+        inner: wireguard.clone(),
+        transport: None,
+        path: DialPath::default(),
+        endpoint: None,
+        timeout: Duration::from_secs(30),
+        naming: Naming::Proxy,
+        resolver: None,
+        forwarding: Default::default(),
+        failure: Default::default(),
+    });
+    assert!(ssh.inbound().is_none());
+
+    // A direct egress listens nowhere through a dialer.
+    assert!(bottom().inbound().is_none());
+}
+
+// A ladder takes the connections of the rung a dial would try, and a
+// revoked leg takes none.
+#[tokio::test]
+async fn a_ladder_listens_on_the_rung_a_dial_would_try_and_a_revoked_leg_nowhere() {
+    use crate::test_support::WireGuardTestPeer;
+    let near = WireGuardTestPeer::start().await;
+    let wireguard: Arc<dyn Dialer> = listening_session(&near);
+    let ladder = Arc::new(Fallback::new(vec![wireguard.clone(), bottom()]));
+    assert!(Arc::clone(&ladder).inbound().is_some());
+    ladder.report_rung(0, Some(&DialError::Egress(io::Error::other("path down"))));
+    assert!(Arc::clone(&ladder).inbound().is_none());
+
+    let leg = Arc::new(Revocable::new(wireguard));
+    assert!(Arc::clone(&leg).inbound().is_some());
+    leg.revoke();
+    assert!(leg.inbound().is_none());
+}
+
+// `session`, its provider forwarding a port as `forwarding` says.
+fn forwarding(session: Arc<SessionHop>, forwarding: PortForwarding) -> Arc<SessionHop> {
+    let mut session = Arc::try_unwrap(session)
+        .ok()
+        .expect("a session nobody holds yet");
+    session.forwarding = forwarding;
+    Arc::new(session)
+}
+
+// A WireGuard hop stacked on `lower` as hop `id` of a chain, aimed at the
+// address inside `lower`'s tunnel that relays to `peer`.
+fn chained_on(
+    lower: &Arc<SessionHop>,
+    peer: &crate::test_support::WireGuardTestPeer,
+    id: u32,
+    proxies: Vec<u32>,
+) -> Arc<SessionHop> {
+    let carrier = lower
+        .clone()
+        .datagrams()
+        .expect("a WireGuard session carries datagrams");
+    let provider = Arc::new(
+        crate::WireGuardTunnelProvider::new(
+            crate::WireGuardSpec {
+                endpoint_host: crate::test_support::TEST_PEER_ADDRESS.to_string(),
+                endpoint_port: CHAINED_PORT,
+                ..peer.client_spec(&id.to_string())
+            },
+            Arc::new(crate::NoopTunnelObserver),
+        )
+        .with_datagram_transport(carrier),
+    );
+    wireguard_session(id, provider.clone(), provider, lower.clone(), proxies, 1)
+}
+
+// The port inside each tunnel that relays the next hop's WireGuard.
+const CHAINED_PORT: u16 = 51820;
+
+// Accept one connection from `peer` on `port`, carry bytes both ways, and
+// return the accepted connection's path. The peer dials once the current
+// tunnel of `hop` holds a listener on `port`, so after a tunnel replacement
+// it waits for the listener to bind inside the new tunnel.
+async fn accept_from(
+    listener: &dyn InboundListener,
+    hop: &SessionHop,
+    peer: &crate::test_support::WireGuardTestPeer,
+    port: u16,
+) -> Dialed {
+    let provider = hop.resolver.as_ref().expect("a WireGuard hop");
+    let (accepted, dialed) = tokio::join!(listener.accept(), async {
+        while listener.local_addr().port() != port || !provider.listens_on(port).await {
+            tokio::task::yield_now().await;
+        }
+        peer.dial_client(port).await
+    });
+    let mut accepted = accepted.unwrap();
+    let mut dialed = dialed.unwrap();
+    dialed.write_all(b"handshake").await.unwrap();
+    let mut heard = [0u8; 9];
+    accepted.stream.read_exact(&mut heard).await.unwrap();
+    assert_eq!(&heard, b"handshake");
+    accepted.stream.write_all(b"bitfield").await.unwrap();
+    let mut answer = [0u8; 8];
+    dialed.read_exact(&mut answer).await.unwrap();
+    assert_eq!(&answer, b"bitfield");
+    accepted
+}
+
+// A chain of three WireGuard hops, each tunnel carried inside the one
+// before. Only the chain's last hop listens: a peer beyond it connects and
+// bytes cross both ways, while the outer hops' far sides find nothing on
+// that port. The last hop's gateway forwards the port over NAT-PMP asked
+// inside the last tunnel, and names resolve there too. Replacing the
+// tunnel of any hop brings the listener down and back on the same port.
+#[tokio::test]
+async fn a_three_hop_wireguard_chain_listens_only_on_its_last_hop() {
+    use crate::test_support::{
+        TEST_CLIENT_ADDRESS, WireGuardTestPeer, WireGuardTestPeerOptions, test_key,
+    };
+    const MAPPED: u16 = 47001;
+    let gateway = crate::test_support::natpmp::NatPmpGateway::start(MAPPED).await;
+    let exit = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
+        private_key: test_key(43),
+        udp_forward: Some((natpmp::NATPMP_PORT, gateway.address())),
+        ..WireGuardTestPeerOptions::default()
+    })
+    .await;
+    let middle = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
+        private_key: test_key(42),
+        udp_forward: Some((CHAINED_PORT, exit.endpoint())),
+        ..WireGuardTestPeerOptions::default()
+    })
+    .await;
+    let entry = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
+        private_key: test_key(41),
+        udp_forward: Some((CHAINED_PORT, middle.endpoint())),
+        ..WireGuardTestPeerOptions::default()
+    })
+    .await;
+
+    let first = listening_session(&entry);
+    let second = chained_on(&first, &middle, 2, vec![1]);
+    let last = forwarding(
+        chained_on(&second, &exit, 3, vec![1, 2]),
+        PortForwarding::NatPmp {
+            gateway: gateway_of(TEST_CLIENT_ADDRESS),
+        },
+    );
+
+    let listener = Arc::clone(&last)
+        .inbound()
+        .expect("the chain's last hop takes connections")
+        .listen(0, true)
+        .await
+        .unwrap();
+    let mut mapping = listener.mapping().expect("its gateway forwards a port");
+    mapping
+        .wait_for(|mapping| mapping.external_port == Some(MAPPED))
+        .await
+        .unwrap();
+
+    let accepted = accept_from(&*listener, &last, &exit, MAPPED).await;
+    assert_eq!(accepted.path.proxies, vec![1, 2, 3]);
+    assert_eq!(accepted.source.map(|source| source.port()), Some(MAPPED));
+    drop(accepted);
+
+    // The outer hops' far sides find no listener on that port.
+    assert!(entry.dial_client(MAPPED).await.is_err());
+    assert!(middle.dial_client(MAPPED).await.is_err());
+
+    // The gateway was asked inside the last tunnel only: the outer hops'
+    // relays carried nothing but WireGuard, and the exit's relay carried
+    // the NAT-PMP requests from the last tunnel's address.
+    assert!(gateway.heard() >= 3);
+    for relay in [&entry, &middle] {
+        for (source, seen) in relay.udp_forwarded() {
+            assert_eq!(seen.wireguard_datagrams, seen.datagrams, "{source}");
+        }
+    }
+    let asked = exit.udp_forwarded();
+    assert!(!asked.is_empty());
+    for (source, seen) in &asked {
+        assert_eq!(source.ip(), IpAddr::V4(TEST_CLIENT_ADDRESS));
+        assert_eq!(seen.wireguard_datagrams, 0, "{source}");
+    }
+
+    // Datagrams ride the last hop's UDP: names resolve beyond the exit.
+    let Resolution::Addresses(_) = last.resolve("origin.tunnel.test").await.unwrap() else {
+        panic!("the last hop resolves names");
+    };
+    assert_eq!(exit.dns_queries(), vec!["origin.tunnel.test"]);
+    assert!(entry.dns_queries().is_empty());
+    assert!(middle.dns_queries().is_empty());
+
+    // Replace each hop's tunnel in turn, outermost first. Each replacement
+    // stops the tunnels stacked on it; the gateway is asked again inside the
+    // rebuilt last tunnel, and the listener comes back on the same port.
+    // The re-map proves the last hop's current tunnel is the rebuilt one, so
+    // the peer dials only once the listener is bound inside it.
+    for hop in [&first, &second, &last] {
+        mapping.borrow_and_update();
+        hop.provider.retire().await;
+        mapping.changed().await.unwrap();
+        assert_eq!(mapping.borrow().external_port, Some(MAPPED));
+        let accepted = accept_from(&*listener, &last, &exit, MAPPED).await;
+        assert_eq!(accepted.path.proxies, vec![1, 2, 3]);
+        assert_eq!(listener.local_addr().port(), MAPPED);
+    }
+}
+
+// A provider that always forwards the same port: the listener peers reach
+// through it listens on that port, any other listener where it asked.
+#[tokio::test]
+async fn a_fixed_forwarded_port_is_listened_on_by_the_forwarded_listener_only() {
+    use crate::test_support::WireGuardTestPeer;
+    const FORWARDED: u16 = 46001;
+    let near = WireGuardTestPeer::start().await;
+    let session = forwarding(listening_session(&near), PortForwarding::Fixed(FORWARDED));
+    let inbound = Arc::clone(&session).inbound().unwrap();
+
+    let forwarded = inbound.listen(0, true).await.unwrap();
+    assert_eq!(forwarded.local_addr().port(), FORWARDED);
+    assert!(forwarded.mapping().is_none());
+    let accepted = accept_from(&*forwarded, &session, &near, FORWARDED).await;
+    assert_eq!(accepted.path.proxies, vec![1]);
+
+    let other = inbound.listen(0, false).await.unwrap();
+    assert_ne!(other.local_addr().port(), FORWARDED);
+    assert_ne!(other.local_addr().port(), 0);
 }

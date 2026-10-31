@@ -145,6 +145,7 @@ impl ListenerOptions {
             utp_opts.clone(),
             bind_device,
             socket_factory,
+            true,
         )
         .await?;
         let listen_addr = bound.addr;
@@ -160,6 +161,7 @@ impl ListenerOptions {
                     utp_opts,
                     bind_device,
                     socket_factory,
+                    false,
                 )
                 .await
                 .context("error starting the SSL listener")?,
@@ -191,7 +193,8 @@ impl ListenerOptions {
 }
 
 // A listener's sockets on `listen_addr`, as `mode` says; a port of 0 takes
-// TCP's free port, and uTP binds the port TCP took.
+// TCP's free port, and uTP binds the port TCP took. The session's `peers`
+// listener is the one a factory's forwarded port reaches.
 async fn bind(
     mode: ListenerMode,
     mut listen_addr: SocketAddr,
@@ -199,13 +202,16 @@ async fn bind(
     utp_opts: librqbit_utp::SocketOpts,
     bind_device: Option<&BindDevice>,
     socket_factory: Option<&Arc<dyn SocketFactory>>,
+    peers: bool,
 ) -> anyhow::Result<Listening> {
     let mut custom_tcp_socket = None;
     let tcp_socket = if let (true, Some(factory)) = (mode.tcp_enabled(), socket_factory) {
-        let listener = factory
-            .listen_tcp(listen_addr)
-            .await
-            .context("error starting TCP listener")?;
+        let listening = if peers {
+            factory.listen_peers_tcp(listen_addr)
+        } else {
+            factory.listen_tcp(listen_addr)
+        };
+        let listener = listening.await.context("error starting TCP listener")?;
         listen_addr = listener.local_addr();
         info!(
             "Listening on TCP {:?} for incoming peer connections",

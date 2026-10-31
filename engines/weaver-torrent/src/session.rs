@@ -47,7 +47,7 @@ use crate::tracker::{
     TrackerHandover, TrackerStatus, TrackerTask, UdpTrackerClient, Unreachable,
 };
 use crate::upnp::{
-    PortMapEvents, PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport,
+    PortMapEvents, PortMapReceiver, PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport,
     UpnpPortForwarder, UpnpPortForwarderOptions,
 };
 use crate::{
@@ -1658,6 +1658,10 @@ impl Session {
             if let Some(mut listen) = listen_result {
                 let protocols = listening_protocols(&listen);
                 let max = listen.max_pending_incoming_handshake_checks;
+                let forwarded = listen
+                    .custom_tcp_socket
+                    .as_ref()
+                    .and_then(|listener| listener.port_mappings());
                 let plain = crate::listen::Listening {
                     tcp_socket: listen.tcp_socket.take(),
                     custom_tcp_socket: listen.custom_tcp_socket.take(),
@@ -1668,6 +1672,7 @@ impl Session {
                 if let Some(ssl) = listen.ssl.take() {
                     session.spawn_listeners(ssl, true, max);
                 }
+                let port_map_events = opts.port_map_events.take();
                 if listen.enable_upnp_port_forwarding
                     && let Some(announce_port) = listen.announce_port
                 {
@@ -1682,8 +1687,11 @@ impl Session {
                     session.start_port_mapping(
                         requests,
                         opts.bind_device_name.as_deref(),
-                        opts.port_map_events.take(),
+                        port_map_events.clone(),
                     );
+                }
+                if let Some(forwarded) = forwarded {
+                    session.follow_port_mappings(forwarded, port_map_events);
                 }
             }
 
@@ -2017,7 +2025,7 @@ impl Session {
             ?interface,
             "starting UPnP and NAT-PMP / PCP port mapping"
         );
-        let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
         let upnp_opts = UpnpPortForwarderOptions {
             description: self.identity.user_agent.clone(),
             ..Default::default()
@@ -2035,6 +2043,13 @@ impl Session {
             NatPmpMapper::new(route, requests, None)
                 .run(self.cancellation_token.clone(), events_tx),
         );
+        self.follow_port_mappings(events, forward);
+    }
+
+    /// Announce the TCP port each of `events` reports, count the address
+    /// the gateway gave as the router's vote (`on_port_mapping`), and pass
+    /// each report on to `forward`, until every sender of reports is gone.
+    fn follow_port_mappings(&self, mut events: PortMapReceiver, forward: Option<PortMapEvents>) {
         let announce_port = self.announce_port.clone();
         let external_ips = self.external_ips.clone();
         self.spawn_port_mapper("port_mapping", async move {
@@ -3393,6 +3408,12 @@ impl Session {
     /// gateway, else the configured one.
     pub fn announce_port(&self) -> Option<u16> {
         self.announce_port.get()
+    }
+
+    /// Each change of [`Self::announce_port`], for a test to wait on.
+    #[cfg(test)]
+    pub(crate) fn announce_port_changes(&self) -> ListenPort {
+        self.announce_port.subscribe()
     }
 
     /// The address the SSL listener took, when the session listens for SSL

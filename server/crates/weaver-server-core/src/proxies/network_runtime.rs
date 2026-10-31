@@ -693,6 +693,7 @@ impl NetworkRuntime {
                     timeout: profile.timeout(),
                     naming: profile.naming(bottom.clone()),
                     resolver,
+                    forwarding: profile.port_forwarding(),
                     failure: Default::default(),
                 })
             }

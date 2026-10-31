@@ -1519,6 +1519,8 @@ async fn the_routes_and_trackers_say_who_resolves_their_names() {
             keepalive_seconds: None,
             timeout_seconds: 30,
             host_key_fingerprint: None,
+            natpmp: false,
+            forwarded_port: None,
             revision: 1,
             secrets: ProxySecrets::default(),
         })

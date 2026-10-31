@@ -231,6 +231,8 @@ pub(crate) fn loopback_proxy(port: u16) -> crate::proxies::ProxyProfile {
         keepalive_seconds: None,
         timeout_seconds: 30,
         host_key_fingerprint: None,
+        natpmp: false,
+        forwarded_port: None,
         revision: 1,
         secrets: crate::proxies::ProxySecrets::default(),
     }
@@ -1427,6 +1429,50 @@ fn the_peer_protocol_picks_the_transports_the_leg_carries() {
             (None, false)
         ));
     }
+}
+
+// A ladder leg that listens inside its tunnel takes peers over TCP alone,
+// as the tunnel carries no uTP, and announces the port it listens on, or the
+// announce port when one is set; it still maps none.
+#[test]
+fn a_listening_ladder_takes_tcp_peers_and_announces_its_port() {
+    use crate::settings::TorrentPeerProtocol;
+    let dir = tempfile::tempdir().unwrap();
+    let mut tunnel = leg(LegKind::Ladder);
+    tunnel.shape.listen = true;
+    assert!(!tunnel.shape.utp);
+    let built = |protocol, announce_port| {
+        let torrent = TorrentConfig {
+            peer_protocol: protocol,
+            announce_port,
+            upnp: true,
+            ..TorrentConfig::default()
+        };
+        session_options(
+            &tunnel,
+            6885,
+            dir.path(),
+            100,
+            &torrent,
+            IpFilter::default(),
+            &IDENTITY.identity(),
+        )
+    };
+    for protocol in [TorrentPeerProtocol::Tcp, TorrentPeerProtocol::Both] {
+        let options = built(protocol, None);
+        let listen = options.listen.expect("a listening ladder listens");
+        assert!(matches!(listen.mode, ListenerMode::TcpOnly));
+        assert_eq!(listen.listen_addr.port(), 6885);
+        assert_eq!(listen.announce_port, None);
+        assert!(!listen.enable_upnp_port_forwarding);
+        assert!(options.connect.unwrap().enable_tcp);
+    }
+    let listen = built(TorrentPeerProtocol::Tcp, Some(51413)).listen.unwrap();
+    assert_eq!(listen.announce_port, Some(51413));
+    // Asked for uTP alone, it has no transport the tunnel carries.
+    let options = built(TorrentPeerProtocol::Utp, None);
+    assert!(options.listen.is_none());
+    assert!(!options.connect.unwrap().enable_tcp);
 }
 
 fn leg(kind: LegKind) -> OpenLeg {

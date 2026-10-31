@@ -30,6 +30,15 @@ impl WireGuardTunnelProvider {
                 .with_download_tuning(),
         )
     }
+    // Accept stream connections on `port` inside the tunnel, bringing it up
+    // first; 0 takes a free port.
+    pub async fn listen(&self, port: u16, backlog: usize) -> Result<WgTcpListener, TunnelError> {
+        self.0.listen(port, backlog).await
+    }
+    // Whether the live tunnel that is current now holds a listener on `port`.
+    pub async fn listens_on(&self, port: u16) -> bool {
+        self.0.listens_on(port).await
+    }
     pub async fn resolve_host(&self, host: &str) -> Result<Vec<std::net::IpAddr>, TunnelError> {
         self.0.resolve_host(host).await
     }

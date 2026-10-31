@@ -837,6 +837,8 @@ export const nextIt: LocaleDictionary = {
   "next.proxies.mtuHelp": "Vuoto usa {{value}}.",
   "next.proxies.keepalive": "Keepalive",
   "next.proxies.keepaliveHelp": "Vuoto usa {{seconds}} secondi; 0 lo disattiva.",
+  "next.proxies.natpmp": "Inoltro porta NAT-PMP",
+  "next.proxies.forwardedPort": "Porta inoltrata",
   "next.proxies.username": "Nome utente",
   "next.proxies.password": "Password",
   "next.proxies.sshKeyHelp": "Solo chiavi Ed25519.",

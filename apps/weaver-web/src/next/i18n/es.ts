@@ -837,6 +837,8 @@ export const nextEs: LocaleDictionary = {
   "next.proxies.mtuHelp": "En blanco usa {{value}}.",
   "next.proxies.keepalive": "Keepalive",
   "next.proxies.keepaliveHelp": "En blanco usa {{seconds}} segundos; 0 lo desactiva.",
+  "next.proxies.natpmp": "Reenvío de puertos por NAT-PMP",
+  "next.proxies.forwardedPort": "Puerto reenviado",
   "next.proxies.username": "Usuario",
   "next.proxies.password": "Contraseña",
   "next.proxies.sshKeyHelp": "Solo claves Ed25519.",
