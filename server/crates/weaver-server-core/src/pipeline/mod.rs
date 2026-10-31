@@ -938,10 +938,11 @@ impl ParkedBytes {
 }
 
 // A uuencode part held ahead of its file's cursor, with what its decode
-// found, so it is placed as it arrived.
+// found and the server it came from, so it is placed as it arrived.
 pub(super) struct ParkedUu {
     pub(super) bytes: ParkedBytes,
     pub(super) facts: UuSegmentFacts,
+    pub(super) source: SegmentSource,
 }
 
 // An article that declared no usable start, held until the ordinal before

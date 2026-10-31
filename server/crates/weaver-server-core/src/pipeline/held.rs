@@ -270,7 +270,8 @@ impl Pipeline {
                         continue;
                     }
                     // The spool keeps a part's bytes, not what its decode
-                    // found: a part taken back is placed as clean.
+                    // found or where it came from: a part taken back is
+                    // placed as clean.
                     uu.parked.insert(
                         ordinal,
                         ParkedUu {
@@ -278,6 +279,10 @@ impl Pipeline {
                             facts: crate::pipeline::UuSegmentFacts {
                                 damaged: false,
                                 ended: false,
+                            },
+                            source: SegmentSource {
+                                source_server_idx: None,
+                                exclude_servers: Vec::new(),
                             },
                         },
                     );

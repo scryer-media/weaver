@@ -22,6 +22,28 @@ const SLICE: usize = 1048;
 enum Shape {
     TruncatedMiddle,
     WrongFinalLength { mixed: bool },
+    // The truncated article of `TruncatedMiddle`, posted right behind the
+    // missing article of `WrongFinalLength`, so it arrives ahead of its
+    // file's cursor and waits there.
+    TruncatedBehindAMissingArticle,
+}
+
+impl Shape {
+    fn lost(self) -> Option<(u32, u32)> {
+        matches!(
+            self,
+            Self::WrongFinalLength { .. } | Self::TruncatedBehindAMissingArticle
+        )
+        .then_some((0, 16))
+    }
+
+    fn cut(self) -> Option<(u32, u32)> {
+        match self {
+            Self::TruncatedMiddle => Some((1, 16)),
+            Self::TruncatedBehindAMissingArticle => Some((0, 17)),
+            Self::WrongFinalLength { .. } => None,
+        }
+    }
 }
 
 struct Fixture {
@@ -63,8 +85,8 @@ impl Fixture {
             .collect();
         posts.extend(recovery(&posts, blocks));
         let mut scenario = Scenario::new(posts).framed(ARTICLE);
-        if matches!(shape, Shape::WrongFinalLength { .. }) {
-            scenario = scenario.lost(0, 16);
+        if let Some((file, ordinal)) = shape.lost() {
+            scenario = scenario.lost(file, ordinal);
         }
         Self {
             scenario,
@@ -85,7 +107,7 @@ impl Fixture {
                 data,
                 ordinal,
                 count,
-                matches!(self.shape, Shape::TruncatedMiddle) && (file, ordinal) == (1, 16),
+                self.shape.cut() == Some((file, ordinal)),
                 matches!(self.shape, Shape::WrongFinalLength { .. }),
             );
         }
@@ -282,7 +304,7 @@ async fn witness(shape: Shape) {
         .sum();
     insert_active_job(&mut pipeline, JOB, spec).await;
     let index = 4;
-    let index_first = matches!(shape, Shape::WrongFinalLength { .. });
+    let index_first = shape.lost().is_some();
     if index_first {
         for ordinal in 0..fixture.scenario.posts[index].articles(ARTICLE).count() as u32 {
             article(&mut pipeline, &fixture, index as u32, ordinal).await;
@@ -391,4 +413,12 @@ async fn wrong_final_uu_lengths_and_a_missing_middle_article_repair() {
 #[tokio::test]
 async fn wrong_final_uu_lengths_in_a_mixed_set_repair() {
     witness(Shape::WrongFinalLength { mixed: true }).await;
+}
+
+// A damaged article that waited ahead of its file's cursor is sent on only
+// to a server that has not served it. With one server its bytes stand, the
+// file closes, and the recovery set repairs it.
+#[tokio::test]
+async fn a_truncated_uu_article_behind_a_missing_one_reaches_repair() {
+    witness(Shape::TruncatedBehindAMissingArticle).await;
 }
