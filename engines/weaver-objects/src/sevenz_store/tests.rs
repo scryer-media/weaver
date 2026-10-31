@@ -384,6 +384,33 @@ fn an_encrypted_header_no_candidate_opens_is_refused_at_quiet() {
     assert!(owner.members.is_empty());
 }
 
+// An encrypted header read on bytes that came whole but are not the posted
+// ones, its end header untouched, does not open under the right password.
+// That rules the password wrong for those bytes only: another store sharing
+// the key cache reads the same container as posted and opens it under the
+// same password.
+#[test]
+fn an_encrypted_header_read_on_other_bytes_condemns_the_password_for_those_bytes_only() {
+    let keys = Arc::new(Keys::new(16));
+    let bytes = archive(aes(), true);
+    let end = end_header(&bytes);
+    let mut other = bytes.clone();
+    for byte in &mut other[end.start as usize - 16..end.start as usize] {
+        *byte ^= 0x5a;
+    }
+    let mut first = Owner::single(SevenZipStore::with_keys(keys.clone()), other);
+    first.frames(0, 4096);
+    first.offer(PASSWORD);
+    first.close(0);
+    assert!(first.members.is_empty());
+    let mut second = Owner::single(SevenZipStore::with_keys(keys), bytes);
+    second.frames(0, 4096);
+    second.offer(PASSWORD);
+    second.close(0);
+    no_trouble(&second);
+    streamed(&second);
+}
+
 // The end header: the last bytes of a container with nothing after it.
 fn end_header(bytes: &[u8]) -> ByteRange {
     let offset = u64::from_le_bytes(bytes[12..20].try_into().unwrap());

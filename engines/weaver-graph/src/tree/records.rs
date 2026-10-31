@@ -237,6 +237,7 @@ impl Tree {
                 crc32: member.crc32,
                 fronted: member.fronted,
                 refuted: member.refuted,
+                reached: None,
             });
             if member.undecided {
                 // Its front comes again with the replay.

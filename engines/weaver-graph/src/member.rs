@@ -52,6 +52,12 @@ pub struct Member {
     // after a restart: its bytes say (`said`). Only a retraction takes it
     // back.
     pub refuted: Option<Kind>,
+    // How far its own articles reached, when their producer said so: past
+    // what arrived where it lost bytes, short of its length where they
+    // declared more than they held. Its coverage cannot tell the two apart,
+    // as both are damage there. Not kept: a restore tells its close again at
+    // its coverage's end.
+    pub reached: Option<u64>,
 }
 
 impl Member {
@@ -308,6 +314,7 @@ impl Namespace {
                 crc32: None,
                 fronted: false,
                 refuted: None,
+                reached: None,
             },
         );
         id
@@ -777,6 +784,7 @@ impl Namespace {
             found.crc32 = None;
             found.fronted = false;
             found.refuted = None;
+            found.reached = None;
         }
         self.ended.remove(&member);
         self.first_bytes.remove(&member);

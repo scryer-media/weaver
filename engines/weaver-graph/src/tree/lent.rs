@@ -62,6 +62,7 @@ pub(super) enum Told {
     Closed {
         volume: VolumeIndex,
         length: u64,
+        reached: u64,
     },
     Lost {
         volume: VolumeIndex,
@@ -295,8 +296,13 @@ impl Tree {
             .and_then(|found| found.object.as_mut())
         {
             match told {
-                Told::Closed { volume, length } => {
+                Told::Closed {
+                    volume,
+                    length,
+                    reached,
+                } => {
                     object.sized(volume, length, &mut emits);
+                    object.volume_reached(volume, reached, &mut emits);
                     object.volume_closed(volume, &mut emits);
                 }
                 Told::Lost { volume, range } => object.volume_lost(volume, range, &mut emits),

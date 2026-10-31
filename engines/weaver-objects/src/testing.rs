@@ -420,6 +420,7 @@ impl<O: Object> Job<O> {
             self.again(volume, bytes, &mut out);
         }
         self.object.sized(volume, length, &mut out);
+        self.object.volume_reached(volume, length, &mut out);
         self.object.volume_closed(volume, &mut out);
         self.again(volume, bytes, &mut out);
         volume

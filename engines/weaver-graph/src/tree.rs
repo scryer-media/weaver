@@ -774,8 +774,23 @@ impl Tree {
         });
     }
 
+    // How far a posting's own articles reached, which their producer knows
+    // and the member's coverage does not (`Member::reached`). Told before the
+    // posting closes; the member keeps the furthest its postings reached.
+    pub fn reached(&mut self, node: NodeId, posting: MemberId, end: u64) {
+        let Some(namespace) = self.nodes.namespace_mut(node) else {
+            return;
+        };
+        let member = namespace.resolve(posting);
+        if let Some(record) = namespace.get_mut(member) {
+            record.reached = Some(record.reached.map_or(end, |was| was.max(end)));
+        }
+    }
+
     // The object a closed member is a volume of hears it closed, at its
-    // length.
+    // length, and how far its bytes reached: as far as its producer said,
+    // or else the end of its coverage, what arrived of it and what was lost
+    // of it alike.
     fn volume_closed(
         &mut self,
         node: NodeId,
@@ -786,18 +801,26 @@ impl Tree {
         let Some(found) = self.nodes.get(&node) else {
             return;
         };
-        let Some(length) = found
+        let Some((length, reached)) = found
             .namespace
             .get(member)
             .filter(|record| record.closed)
-            .and_then(|record| record.length)
+            .and_then(|record| {
+                let covered = record.coverage.runs().last().map_or(0, |run| run.range.end);
+                Some((record.length?, record.reached.unwrap_or(covered)))
+            })
         else {
             return;
         };
         let Some((child, volume)) = found.children.get(&member).copied() else {
             return;
         };
-        self.reach(child, Told::Closed { volume, length }, builder, effects);
+        let told = Told::Closed {
+            volume,
+            length,
+            reached,
+        };
+        self.reach(child, told, builder, effects);
     }
 
     // The object a closed member of `node`'s namespace is a volume of hears
@@ -857,8 +880,12 @@ impl Tree {
         let Some(length) = self.window(window).map(|range| range.len()) else {
             return;
         };
-        let volume = VolumeIndex(0);
-        self.reach(window, Told::Closed { volume, length }, builder, effects);
+        let told = Told::Closed {
+            volume: VolumeIndex(0),
+            length,
+            reached: length,
+        };
+        self.reach(window, told, builder, effects);
     }
 
     // Lend the object at `node` out of the tree, so the owner can run it

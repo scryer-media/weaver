@@ -32,7 +32,6 @@ use crate::keys::{Derived, Tuple};
 pub(super) const PROOF_CAP: u64 = 4 * 1024 * 1024;
 
 const FOLDER_TAG: &str = "7z-aes";
-const HEADER_TAG: &str = "7z-header";
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct Proof {
@@ -97,17 +96,15 @@ impl SevenZipStore {
         }
     }
 
+    // A header that does not open under a candidate rules the candidate
+    // wrong for these bytes, not for its key, as a folder's proof does: the
+    // parse reads far more of the container than the end header, and bytes
+    // that read whole there yet lay elsewhere fail every candidate. Another
+    // job reads the header again on bytes of its own.
     pub(super) fn open_header(&mut self, start: Start, out: &mut Vec<Emit>) {
         let total = start.total();
         for index in 0..self.candidates.len() {
             if self.candidates[index].header_wrong {
-                continue;
-            }
-            if self
-                .header_tuple(index, start)
-                .is_some_and(|tuple| self.keys.is_wrong(&tuple))
-            {
-                self.candidates[index].header_wrong = true;
                 continue;
             }
             let parsed = header::parse(
@@ -121,9 +118,6 @@ impl SevenZipStore {
                 header::Parsed::Missing(range) => return self.want_header(range),
                 header::Parsed::Unverified => return,
                 header::Parsed::Locked | header::Parsed::Broken => {
-                    if let Some(tuple) = self.header_tuple(index, start) {
-                        self.keys.mark_wrong(&tuple);
-                    }
                     self.candidates[index].header_wrong = true;
                 }
                 header::Parsed::Archive { archive, read } => {
@@ -134,18 +128,6 @@ impl SevenZipStore {
             }
         }
         self.ask(out);
-    }
-
-    // The key the cache files this candidate under for this header, once
-    // the header is in hand. The header's own bytes stand for its salt:
-    // sevenz-turbo derives the header's key inside its parse.
-    fn header_tuple(&self, index: usize, start: Start) -> Option<Tuple<'_>> {
-        Some(Tuple {
-            format: HEADER_TAG,
-            password: &self.candidates[index].secret,
-            salt: &[],
-            params: self.kept.read(start.end_header)?,
-        })
     }
 
     pub(super) fn open_folders(&mut self, out: &mut Vec<Emit>) {
