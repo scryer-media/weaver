@@ -147,25 +147,32 @@ impl NameLedger {
         );
     }
 
-    // A holder leaves the ledger. Each name it was moving off is no longer
-    // kept for it: the holder that wanted the name while it was left, the
-    // highest ranked when several were, takes it now, and its move is pushed
-    // to `moved`, as when the name is vacated. Whether a file still sits at
-    // the name on disk is not the ledger's to say; the move waits for that.
+    // A holder leaves the ledger. No name it held or was moving off is kept
+    // for it any more: the holder that wanted each one, the highest ranked
+    // when several did, takes it now, and its move is pushed to `moved`, as
+    // when the name is vacated. Whether a file still sits at the name on
+    // disk is not the ledger's to say; the move waits for that.
     pub fn release(&mut self, holder: Holder, moved: &mut Vec<Moved>) {
-        if let Some(entry) = self.entries.remove(&holder) {
-            self.taken.remove(&key(&entry.name));
-        }
-        let mut left: Vec<String> = self
+        let mut freed: Vec<String> = self
             .leaving
             .iter()
             .filter(|(_, leaving)| **leaving == holder)
             .map(|(name, _)| name.clone())
             .collect();
-        left.sort();
-        for name in left {
-            self.leaving.remove(&name);
-            self.take_wanted(name, moved);
+        for name in &freed {
+            self.leaving.remove(name);
+        }
+        if let Some(entry) = self.entries.remove(&holder) {
+            let name = key(&entry.name);
+            self.taken.remove(&name);
+            freed.push(name);
+        }
+        freed.sort();
+        freed.dedup();
+        for name in freed {
+            if !self.leaving.contains_key(&name) {
+                self.take_wanted(name, moved);
+            }
         }
     }
 
@@ -431,6 +438,40 @@ mod tests {
         root(&mut ledger, 1, "a.bin");
         ledger.release((ROOT, MemberId(1)), &mut Vec::new());
         assert_eq!(root(&mut ledger, 2, "a.bin"), "a.bin");
+    }
+
+    // Two stores over one set at one position: the first holds the name, the
+    // second is given a suffix. When the first leaves, the second takes the
+    // name it wanted, as when a name is vacated.
+    #[test]
+    fn a_holder_leaving_hands_its_name_to_the_member_that_wanted_it() {
+        let mut ledger = NameLedger::new();
+        let (first, second) = ((STORE, MemberId(0)), (NodeId(3), MemberId(0)));
+        let mut moved = Vec::new();
+        assert_eq!(
+            ledger.allocate(first, at(&[0, 0]), "harbour/lantern.mkv", &mut moved),
+            "harbour/lantern.mkv"
+        );
+        assert_eq!(
+            ledger.allocate(second, at(&[0, 0]), "harbour/lantern.mkv", &mut moved),
+            "harbour/lantern (1).mkv"
+        );
+        assert_eq!(moved, Vec::new());
+        ledger.release(first, &mut moved);
+        assert_eq!(ledger.given(second), Some("harbour/lantern.mkv"));
+        assert_eq!(
+            moved,
+            vec![Moved {
+                holder: second,
+                old: "harbour/lantern (1).mkv".into(),
+                new: "harbour/lantern.mkv".into(),
+            }]
+        );
+        // The suffixed name it left is shut until its file has moved.
+        assert_eq!(
+            root(&mut ledger, 1, "harbour/lantern (1).mkv"),
+            "harbour/lantern (1) (1).mkv"
+        );
     }
 
     #[test]
