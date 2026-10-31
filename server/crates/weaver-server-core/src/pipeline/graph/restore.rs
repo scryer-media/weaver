@@ -252,8 +252,8 @@ impl RestoreSeat {
 // or one a committed checkpoint stopped naming before it was removed, goes
 // before the job is rebuilt, so no file the job opens again meets bytes it
 // never recorded and no file it never recorded is delivered. The checkpoint
-// names each member's file, at the name it sits at and the name it waits
-// for, every envelope, every holds scratch and every spooled part. The
+// names each member's file at the one place the restore opens it, every
+// envelope, every holds scratch and every spooled part. The
 // directory's own marker and the run's cache are the directory's, never the
 // job's, and stay. A file that cannot be removed stays; the job does not
 // read it.
@@ -265,9 +265,14 @@ pub(super) fn sweep_unnamed(
     let members = snapshot.tree.nodes.iter().flat_map(|node| {
         node.members.iter().filter_map(|record| {
             let state = snapshot.files.get(&(node.node, record.member))?;
-            state
-                .has_file
-                .then(|| std::iter::once(record.output_name.clone()).chain(state.on_disk.clone()))
+            state.has_file.then(|| {
+                super::namespace::restored_at(
+                    working_dir,
+                    &record.output_name,
+                    state.on_disk.as_deref(),
+                )
+                .to_owned()
+            })
         })
     });
     let envelopes = snapshot.kept.iter().map(|kept| {
@@ -281,7 +286,6 @@ pub(super) fn sweep_unnamed(
         .map(|hold| super::namespace::scratch_name(hold.node));
     let spooled = held_parts.iter().map(|part| part.spool_path.clone());
     let named: HashSet<PathBuf> = members
-        .flatten()
         .chain(envelopes)
         .chain(holds)
         .chain(spooled)

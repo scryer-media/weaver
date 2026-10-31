@@ -657,7 +657,9 @@ impl Echoing {
 
     fn bid(&mut self) -> Vec<Seek> {
         self.bids.lock().unwrap().clear();
-        self.job.seek_round(|_| true).unwrap();
+        self.job
+            .seek_round(|_| true, &mut RepairSlots::default(), 1)
+            .unwrap();
         std::mem::take(&mut *self.bids.lock().unwrap())
     }
 

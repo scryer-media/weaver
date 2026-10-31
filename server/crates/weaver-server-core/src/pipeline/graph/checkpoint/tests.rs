@@ -377,9 +377,10 @@ fn hold_rows_come_back_as_the_holds_a_restore_adopts() {
 // A restore keeps in the working directory what its checkpoint names, and
 // nothing else: a step's file whose checkpoint never committed, a member's
 // file a committed checkpoint stopped naming, a recovery's scratch and its
-// repaired file go; every member's file, at the name it sits at and the
-// name it waits for, every envelope, holds scratch and spooled part the
-// rows name stays, and so do the directory's marker and the run's cache.
+// repaired file go, and so does a file at the name a member waits for while
+// the member's own file still sits where it sat; every member's file, every
+// envelope, holds scratch and spooled part the rows name stays, and so do
+// the directory's marker and the run's cache.
 #[test]
 fn a_restore_removes_what_its_checkpoint_does_not_name() {
     use weaver_graph::names::{CACHE_DIR, INTERNAL_DIR};
@@ -396,7 +397,6 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
         format!("{INTERNAL_DIR}/held-0-1.uu"),
         crate::jobs::working_dir::WORKING_DIR_MARKER.to_owned(),
         "inner/inner.bin".to_owned(),
-        "set.par2".to_owned(),
     ];
     let unnamed = [
         format!("{INTERNAL_DIR}/graph-envelope-1-2"),
@@ -405,6 +405,7 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
         format!("{INTERNAL_DIR}/graph-recovery-0-3/set.par2"),
         format!("{INTERNAL_DIR}/graph-waiting-0-2"),
         "inner/stray.bin".to_owned(),
+        "set.par2".to_owned(),
         "set.part1.rar".to_owned(),
         "stray/deeper/file.bin".to_owned(),
     ];
@@ -441,6 +442,43 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
     left.sort();
     assert_eq!(left, named);
     assert!(!dir.path().join("stray").exists());
+}
+
+// A member's file the checkpoint says waits to move, gone from where it sat
+// and found at the name it wants, moved before the checkpoint that would
+// have said so: the restore keeps it there, opens it there, and the name it
+// sat at stays empty.
+#[test]
+fn a_restore_keeps_a_file_that_moved_before_its_checkpoint_said_so() {
+    use weaver_graph::names::INTERNAL_DIR;
+    let dir = tempfile::tempdir().unwrap();
+    let taken = full();
+    let waiting = format!("{INTERNAL_DIR}/graph-waiting-0-1");
+    std::fs::write(dir.path().join("set.par2"), b"bytes").unwrap();
+    let rows = rows(&taken);
+    let restored = snapshot(&rows).unwrap();
+    assert_eq!(
+        crate::pipeline::graph::namespace::restored_at(
+            dir.path(),
+            "set.par2",
+            Some(waiting.as_str())
+        ),
+        "set.par2"
+    );
+    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts);
+    assert!(dir.path().join("set.par2").exists());
+    assert!(!dir.path().join(&waiting).exists());
+
+    std::fs::create_dir_all(dir.path().join(INTERNAL_DIR)).unwrap();
+    std::fs::write(dir.path().join(&waiting), b"bytes").unwrap();
+    assert_eq!(
+        crate::pipeline::graph::namespace::restored_at(
+            dir.path(),
+            "set.par2",
+            Some(waiting.as_str())
+        ),
+        waiting
+    );
 }
 
 #[test]
@@ -785,13 +823,6 @@ fn a_step_builds_and_writes_only_the_member_it_changed() {
 // one of the fifty members as the job does.
 #[test]
 fn a_restore_after_single_member_steps_has_every_member() {
-    use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
-
-    use crate::operations::disk::CapacityReader;
-    use crate::pipeline::graph::engine::RunMail;
-    use crate::pipeline::graph::job::Storage;
-    use crate::pipeline::graph::limits::Caps;
-
     let (mut job, dir, files) = fifty_members();
     let pending = Pending::default();
     assert!(pending.put(&job, Vec::new()));
@@ -806,13 +837,48 @@ fn a_restore_after_single_member_steps_has_every_member() {
     assert!(fresh.put(&job, Vec::new()));
     assert_eq!(read, snapshot(&held(&fresh.take().0.unwrap())).unwrap());
 
+    let (restored, _mail) = restored(&read, &files, dir.path());
+    let members = |job: &GraphJob| {
+        let record = job.tree().record(NodeId::ROOT).unwrap();
+        (record.members, record.coverage)
+    };
+    let (now, coverage) = members(&job);
+    assert_eq!(now.len(), 50);
+    assert_eq!(members(&restored.job), (now, coverage));
+    for volume in 0..50 {
+        let member = MemberId(root_member(&job, volume) as u32);
+        assert_eq!(
+            restored.job.writer().file_state(NodeId::ROOT, member),
+            job.writer().file_state(NodeId::ROOT, member),
+            "member {volume}"
+        );
+    }
+}
+
+// The job a restore makes from `read`, in `dir`, with the mail its runs
+// write to, which must outlive it.
+fn restored(
+    read: &Snapshot,
+    files: &[RootFile],
+    dir: &std::path::Path,
+) -> (
+    crate::pipeline::graph::job::restore::Restored,
+    crate::pipeline::graph::engine::RunMail,
+) {
+    use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
+
+    use crate::operations::disk::CapacityReader;
+    use crate::pipeline::graph::engine::RunMail;
+    use crate::pipeline::graph::job::Storage;
+    use crate::pipeline::graph::limits::Caps;
+
     let mail = RunMail::default();
     let restored = GraphJob::restore(
-        &read,
-        &files,
+        read,
+        files,
         2,
         Storage {
-            working_dir: dir.path().to_owned(),
+            working_dir: dir.to_owned(),
             accountant: Arc::new(HoldsAccountant::new(HoldBudgets {
                 resident_limit: u64::MAX,
                 scratch_total: u64::MAX,
@@ -831,19 +897,51 @@ fn a_restore_after_single_member_steps_has_every_member() {
         0,
     )
     .unwrap();
-    let members = |job: &GraphJob| {
-        let record = job.tree().record(NodeId::ROOT).unwrap();
-        (record.members, record.coverage)
-    };
-    let (now, coverage) = members(&job);
-    assert_eq!(now.len(), 50);
-    assert_eq!(members(&restored.job), (now, coverage));
-    for volume in 0..50 {
-        let member = MemberId(root_member(&job, volume) as u32);
-        assert_eq!(
-            restored.job.writer().file_state(NodeId::ROOT, member),
-            job.writer().file_state(NodeId::ROOT, member),
-            "member {volume}"
-        );
-    }
+    (restored, mail)
+}
+
+// A member whose first article came damaged closes before its front says
+// what it is, and its close decides it a leaf. A checkpoint can still name
+// it undecided, as it names a member an object gave back, whose parse a
+// restore does not keep; the damaged front reads back as damage it holds,
+// and no lost article is told again. The close the restore tells again
+// decides it as the first close did, or every run waiting on what the
+// namespace still decides waits for good.
+#[test]
+fn a_restored_member_that_closed_before_its_front_said_is_decided() {
+    let files = vec![file("lonely.bin", &[64, 64])];
+    let (mut job, dir, _) = job_with(&files, Vec::new());
+    let mut damaged = decoded(0, 0, 0, &[3; 64], Some(128));
+    damaged.intact = false;
+    job.intake(damaged, &mut RepairSlots::default(), 1).unwrap();
+    arrive(&mut job, 0, 1);
+    let member = job
+        .tree()
+        .namespace(NodeId::ROOT)
+        .unwrap()
+        .records()
+        .find(|record| record.name == "lonely.bin")
+        .unwrap()
+        .id;
+    assert!(!job.tree().is_undecided(NodeId::ROOT, member));
+
+    let pending = Pending::default();
+    assert!(pending.put(&job, Vec::new()));
+    let mut read = snapshot(&held(&pending.take().0.unwrap())).unwrap();
+    let record = read
+        .tree
+        .nodes
+        .iter_mut()
+        .find(|node| node.node == NodeId::ROOT)
+        .unwrap()
+        .members
+        .iter_mut()
+        .find(|record| record.member == member)
+        .unwrap();
+    assert!(record.closed);
+    record.undecided = true;
+
+    let (restored, _mail) = restored(&read, &files, dir.path());
+    assert!(!restored.job.tree().is_undecided(NodeId::ROOT, member));
+    assert!(!restored.job.tree().deciding(NodeId::ROOT));
 }

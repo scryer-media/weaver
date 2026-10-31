@@ -508,6 +508,7 @@ impl Pipeline {
     // After anything reached the tree: answer the objects' seeks, move the
     // articles they moved, and report the phase if it changed.
     fn after_graph_step(&mut self, job_id: JobId) {
+        let limit = self.graph_job_slot_limit(job_id);
         let (Some(graph), Some(state)) =
             (self.graph_jobs.get_mut(&job_id), self.jobs.get_mut(&job_id))
         else {
@@ -518,16 +519,22 @@ impl Pipeline {
         };
         let round = {
             let (download, recovery) = (&active.download_queue, &active.recovery_queue);
-            graph.seek_round(|volume| {
-                let file_id = file(job_id, volume);
-                download.queued_count_for_file(file_id) + recovery.queued_count_for_file(file_id)
-                    > 0
-            })
+            graph.seek_round(
+                |volume| {
+                    let file_id = file(job_id, volume);
+                    download.queued_count_for_file(file_id)
+                        + recovery.queued_count_for_file(file_id)
+                        > 0
+                },
+                &mut self.graph_status.repairs,
+                limit,
+            )
         };
         match round {
             Ok(moves) => apply_moves(state, &moves),
             Err(error) => warn!(job_id = job_id.0, error = %error, "graph seek round failed"),
         }
+        self.wake_repair_waiters();
         // What the step landed is said before the stage it moved the job to,
         // so a file landed by the step that ends the job is said first.
         self.publish_graph_notes(job_id);

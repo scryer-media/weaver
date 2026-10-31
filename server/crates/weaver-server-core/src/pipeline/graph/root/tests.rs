@@ -382,7 +382,9 @@ fn a_data_seek_moves_the_articles_that_cover_it_into_the_window() {
     )
     .unwrap();
 
-    let moves = job.seek_round(|_| true).unwrap();
+    let moves = job
+        .seek_round(|_| true, &mut RepairSlots::default(), 1)
+        .unwrap();
 
     // The seek moves its article; the bootstrap leads the bound set's
     // first volume, so the rest of it follows into the window.
@@ -491,7 +493,9 @@ async fn a_recovery_seek_lands_in_the_promoted_class() {
         1,
     )
     .unwrap();
-    let moves = job.seek_round(|_| true).unwrap();
+    let moves = job
+        .seek_round(|_| true, &mut RepairSlots::default(), 1)
+        .unwrap();
     assert_eq!(*answers.lock().unwrap(), vec![Pull::Moved(1)]);
     assert!(!moves.is_empty());
     assert!(moves.iter().all(|found| found.class == Class::Recovery));
@@ -1508,7 +1512,8 @@ fn forty_nine_in_hand() -> (GraphJob, tempfile::TempDir) {
     }
     job.intake(part_article(49, 0), &mut RepairSlots::default(), 1)
         .unwrap();
-    job.seek_round(|_| true).unwrap();
+    job.seek_round(|_| true, &mut RepairSlots::default(), 1)
+        .unwrap();
     (job, dir)
 }
 
@@ -1536,7 +1541,8 @@ fn an_arrival_reads_only_the_volumes_still_open() {
 
     job.intake(part_article(49, 1), &mut RepairSlots::default(), 1)
         .unwrap();
-    job.seek_round(|_| true).unwrap();
+    job.seek_round(|_| true, &mut RepairSlots::default(), 1)
+        .unwrap();
 
     // The last volume, once each: whether it still waits once the article
     // is in, whether the payload is still to come for the step's quiet and

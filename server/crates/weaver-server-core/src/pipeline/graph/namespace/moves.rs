@@ -17,12 +17,37 @@
 // while its name is shut opens its file under the internal directory and
 // moves to its name the same way.
 
+use std::path::Path;
+
 use weaver_graph::names::{INTERNAL_DIR, key};
 use weaver_graph::{MemberId, NodeId, Tree};
 
 use super::{NamespaceWriter, WriteError};
 use crate::pipeline::graph::envelope::free_name;
 use crate::pipeline::graph::leaf::Leaf;
+
+// Where a restored member's file is: the one name of it the checkpoint
+// holds to. A file the checkpoint says waits to move is where it sat while
+// it is still there, or while nothing is at the name it wants. When it is
+// gone from where it sat and a file is at the name it wants, the move ran
+// before the checkpoint that would have said so, and that file is the
+// member's. A file at the name it wants while it still sits where it sat
+// is not the member's: the member's file never reached it.
+pub(crate) fn restored_at<'a>(
+    working_dir: &Path,
+    output_name: &'a str,
+    on_disk: Option<&'a str>,
+) -> &'a str {
+    match on_disk {
+        Some(sat)
+            if Leaf::path_at(working_dir, sat).exists()
+                || !Leaf::path_at(working_dir, output_name).exists() =>
+        {
+            sat
+        }
+        _ => output_name,
+    }
+}
 
 // A member whose file waits to move to the name it wants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,12 +259,9 @@ impl NamespaceWriter {
         Ok(moved? || !freed.is_empty())
     }
 
-    // A restored member's file, where the checkpoint says it sits. A file
-    // the checkpoint says waits to move is opened where it sat when it is
-    // still there; when it is not but is at the name it wants, the move ran
-    // before the checkpoint that would have said so, and the file is
-    // adopted there. Anywhere else it is lost, and its bytes are fetched
-    // again where it sat.
+    // A restored member's file, where `restored_at` finds it. One found
+    // at the name it wants has moved there and leaves the name it sat at
+    // shut until a commit; one still where it sat waits to move again.
     pub(super) fn restored_leaf(
         &mut self,
         node: NodeId,
@@ -247,14 +269,14 @@ impl NamespaceWriter {
         output_name: &str,
         on_disk: Option<&str>,
     ) -> Leaf {
+        let at = restored_at(&self.working_dir, output_name, on_disk);
+        let mut leaf = Leaf::at(&self.working_dir, at);
         let Some(sat) = on_disk else {
-            return Leaf::at(&self.working_dir, output_name);
+            return leaf;
         };
-        let mut leaf = Leaf::at(&self.working_dir, sat);
-        let wanted = Leaf::at(&self.working_dir, output_name);
-        if !leaf.path().exists() && wanted.path().exists() {
+        if at != sat {
             self.left.insert(key(sat), None);
-            return wanted;
+            return leaf;
         }
         leaf.intend(output_name);
         self.moves.push(Waiting {

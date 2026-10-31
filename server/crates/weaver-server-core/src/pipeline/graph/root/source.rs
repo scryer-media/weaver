@@ -929,6 +929,19 @@ impl ArticleMap {
         }
     }
 
+    // How many class changes wait for the queue.
+    pub(crate) fn moves_pending(&self) -> usize {
+        self.moves.len()
+    }
+
+    // Whether a class change after the first `from` still waiting for the
+    // queue parked an article.
+    pub(crate) fn parked_since(&self, from: usize) -> bool {
+        self.moves[from.min(self.moves.len())..]
+            .iter()
+            .any(|found| found.class == Class::Parked)
+    }
+
     // The class changes since the last call, soonest first.
     pub(crate) fn take_moves(&mut self) -> Vec<Move> {
         let mut moves = std::mem::take(&mut self.moves);
