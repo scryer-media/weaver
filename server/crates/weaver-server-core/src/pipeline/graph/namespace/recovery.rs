@@ -53,7 +53,36 @@ pub(crate) struct SetState {
     pub(crate) outcome: Option<RepairOutcome>,
 }
 
+// What the root still fetches unasked: whether a payload volume has an
+// article to come, and the sets one of whose own volumes has. A set rules
+// on what it has read, so one whose own volume is still arriving has its
+// ruling still to come, whatever it said of the part that came first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Coming {
+    pub(crate) payload: bool,
+    pub(crate) sets: BTreeSet<NodeId>,
+}
+
 impl NamespaceWriter {
+    // What is still to come, from the root members with an article the
+    // queue fetches unasked: a member that is a set's own volume names its
+    // set, and any other is payload.
+    pub(crate) fn coming(&self, tree: &Tree, members: impl Iterator<Item = MemberId>) -> Coming {
+        let mut coming = Coming::default();
+        let Some(root) = tree.namespace(NodeId::ROOT) else {
+            return coming;
+        };
+        for member in members.filter(|member| root.get(*member).is_some()) {
+            match tree.child_of(NodeId::ROOT, member) {
+                Some((set, _)) if tree.recovers(set) => {
+                    coming.sets.insert(set);
+                }
+                _ => coming.payload = true,
+            }
+        }
+        coming
+    }
+
     // Every set in the tree with the namespace it lives in, parents first.
     pub(crate) fn sets(&self, tree: &Tree) -> Vec<(NodeId, NodeId)> {
         tree.live()
@@ -97,10 +126,12 @@ impl NamespaceWriter {
 
     // Every set of the namespace has ruled on something other than waiting:
     // nothing a set of it will rebuild is still to come. A set whose repair
-    // is out has its ruling still to come.
-    pub(crate) fn ruled(&self, tree: &Tree, node: NodeId) -> bool {
+    // is out has its ruling still to come, and so has one whose own volume
+    // still has an article coming.
+    pub(crate) fn ruled(&self, tree: &Tree, node: NodeId, coming: &Coming) -> bool {
         tree.recovery_nodes(node).into_iter().all(|set| {
             !tree.lent(set)
+                && !coming.sets.contains(&set)
                 && tree.recovery(set).is_none_or(|recovery| {
                     recovery
                         .outcome()
@@ -114,8 +145,8 @@ impl NamespaceWriter {
     // that has not may cover a member yet, since it binds what it covers as
     // its own volumes arrive, and those can come after the member closed,
     // or rebuild a member that never came at all.
-    pub(crate) fn ended(&self, tree: &Tree, node: NodeId, payload_waiting: bool) -> bool {
-        !payload_waiting && self.ruled(tree, node)
+    pub(crate) fn ended(&self, tree: &Tree, node: NodeId, coming: &Coming) -> bool {
+        !coming.payload && self.ruled(tree, node, coming)
     }
 
     // Some member of a namespace holds damage a set of that namespace
@@ -174,8 +205,10 @@ impl NamespaceWriter {
 
     // Every set of every namespace has ruled on something other than
     // waiting.
-    pub(crate) fn all_ruled(&self, tree: &Tree) -> bool {
-        tree.live().into_iter().all(|node| self.ruled(tree, node))
+    pub(crate) fn all_ruled(&self, tree: &Tree, coming: &Coming) -> bool {
+        tree.live()
+            .into_iter()
+            .all(|node| self.ruled(tree, node, coming))
     }
 
     // What each set last ruled, parents first; `None` for one that has not.

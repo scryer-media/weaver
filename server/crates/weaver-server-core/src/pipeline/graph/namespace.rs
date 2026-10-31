@@ -2205,6 +2205,6 @@ pub(crate) use verification::{Verification, Verified};
 
 pub(crate) use loan::replay::{Replay, Replayed};
 pub(crate) use loan::{Loan, Returned};
-pub(crate) use recovery::{Lender, SetState};
+pub(crate) use recovery::{Coming, Lender, SetState};
 #[cfg(test)]
 mod tests;

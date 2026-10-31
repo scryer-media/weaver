@@ -14,7 +14,7 @@ use weaver_graph::{Emit, Engine, MemberId, NodeId, Why};
 
 use super::{GraphError, GraphJob};
 use crate::pipeline::graph::engine::{Heard, Reservation, Said};
-use crate::pipeline::graph::namespace::{Returned, WriteError};
+use crate::pipeline::graph::namespace::{Coming, Returned, WriteError};
 use crate::pipeline::graph::status::RepairSlots;
 
 impl GraphJob {
@@ -311,7 +311,7 @@ impl GraphJob {
         touched.extend(self.writer.kept_changed_since(at.kept));
         touched.extend(self.passwords.changed_since(at.offered));
         touched.extend(self.runs.changed_since(at.runs));
-        let mut waiting = None;
+        let mut coming = None;
         let mut engines = BTreeMap::new();
         let mut parents = BTreeMap::new();
         let mut gone = Vec::new();
@@ -324,7 +324,7 @@ impl GraphJob {
             };
             let facts = *parents
                 .entry(parent)
-                .or_insert_with(|| self.facts(parent, &mut waiting));
+                .or_insert_with(|| self.facts(parent, &mut coming));
             engines.insert(node, facts);
         }
         let told: BTreeSet<NodeId> = self
@@ -341,7 +341,7 @@ impl GraphJob {
             }
             let facts = match parents.get(&parent) {
                 Some(facts) => *facts,
-                None => self.facts(parent, &mut waiting),
+                None => self.facts(parent, &mut coming),
             };
             if self.fed.told.insert(parent, facts) == Some(facts) {
                 continue;
@@ -359,12 +359,14 @@ impl GraphJob {
         self.tree.is_live(node) && self.tree.engine(node).is_some()
     }
 
-    // What the parent tells every engine bound in it. `waiting` is whether
-    // the payload is still to come, asked once a step and only when a
-    // parent's sets have all ruled.
-    fn facts(&self, parent: NodeId, waiting: &mut Option<bool>) -> Facts {
-        let ended = self.writer.ruled(&self.tree, parent)
-            && !*waiting.get_or_insert_with(|| self.payload_waiting());
+    // What the parent tells every engine bound in it. `coming` is what the
+    // root still fetches unasked, asked once a step.
+    fn facts(&self, parent: NodeId, coming: &mut Option<Coming>) -> Facts {
+        let ended = self.writer.ended(
+            &self.tree,
+            parent,
+            coming.get_or_insert_with(|| self.coming()),
+        );
         // A volume can still join while a member's front has yet to decide
         // its owner, and while anything more can come: a recovery object yet
         // to rule may rebuild a volume never posted.
