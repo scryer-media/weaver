@@ -34,6 +34,15 @@ pub(super) fn joined_posting<'a>(
     ))
 }
 
+// The file a numbered piece was cut from, as the job joins it: the piece's
+// name with its last extension taken off when that extension is all digits.
+// A partial job may publish it beside the members its unpack delivered.
+pub(super) fn joined_container(name: &str) -> Option<&str> {
+    let (stem, number) = name.rsplit_once('.')?;
+    (!stem.is_empty() && !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit()))
+        .then_some(stem)
+}
+
 pub(super) fn signatureless_join(name: &str, bytes: &[u8]) -> bool {
     matches!(
         FileRole::from_filename(name),
@@ -64,6 +73,17 @@ fn numbered_posting_requires_one_contiguous_unambiguous_sequence() {
         ["opaque.001", "opaque.001"],
     ] {
         assert!(joined_posting(names.map(|name| (name, b"ab".as_slice()))).is_none());
+    }
+    assert_eq!(joined_container("Bundle.7z.001"), Some("Bundle.7z"));
+    assert_eq!(joined_container("opaque.10"), Some("opaque"));
+    for name in [
+        "bundle.7z",
+        "bundle.part01.rar",
+        "bundle.r00",
+        ".001",
+        "bundle.",
+    ] {
+        assert_eq!(joined_container(name), None, "{name}");
     }
     assert!(!signatureless_join("bundle.7z", b"ab"));
     assert!(!signatureless_join("opaque", b"Rar!\x1a\x07\x00"));

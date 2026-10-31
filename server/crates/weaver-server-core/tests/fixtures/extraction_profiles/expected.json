@@ -20,15 +20,15 @@
       }
     },
     "rar4_lz_solid_mv.rar": {
-      "lz_part0.bin": {
+      "lz_part0.mkv": {
         "size": 307200,
         "sha256": "80676d9487c569d8be8468e9f681099511738da7c452c1b143795263d39951db"
       },
-      "lz_part1.bin": {
+      "lz_part1.mkv": {
         "size": 307200,
         "sha256": "eee3b0a5ab988494785b07f8f838438ab50833bfbe519edb10af9d21b19c9abb"
       },
-      "lz_part2.bin": {
+      "lz_part2.mkv": {
         "size": 307200,
         "sha256": "cefa91b919334cad4cba3c85c3fb5781ad43ef6f86be5da0d5c53e5584e24b34"
       }

@@ -202,7 +202,9 @@ fn loses(interruption: Interruption) -> bool {
 // partial when a whole piece is of a known type, failed otherwise. A job that
 // delivered nothing leaves nothing in its output directory; one that
 // delivered anything moved all of itself there. Only the members and the
-// post's own files are published. Nothing on disk is asked for again. A
+// post's own files are published, and on a partial job the container joined
+// from the post's numbered pieces as well: an unpack that ended short leaves
+// it beside the members it delivered. Nothing on disk is asked for again. A
 // starved recovery set that leaves nothing deliverable fails the job as a
 // repair.
 pub(in super::super) fn graph_disagreements(
@@ -276,10 +278,25 @@ pub(in super::super) fn graph_disagreements(
             outcome.leftovers
         ));
     }
+    let joined: BTreeSet<&str> = if outcome.status == Some(JobStatus::Partial) {
+        outcome
+            .own
+            .iter()
+            .filter_map(|name| {
+                crate::pipeline::tests::archive_output_contract::joined_container(name)
+            })
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
     let foreign: Vec<_> = outcome
         .published
         .iter()
-        .filter(|path| !post.members.contains_key(*path) && !outcome.own.contains(*path))
+        .filter(|path| {
+            !post.members.contains_key(*path)
+                && !outcome.own.contains(*path)
+                && !joined.contains(path.as_str())
+        })
         .collect();
     if !foreign.is_empty() {
         said.push(format!(

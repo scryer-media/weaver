@@ -411,9 +411,11 @@ impl Ran {
     // partial job delivered at least one expected file whole; a failed job
     // is named and published none of them; a job that delivered anything
     // left nothing outside its output directory and published only the
-    // expected files, the files it may publish, and the post's own files;
-    // and a starved recovery set that leaves nothing delivered fails the
-    // job as a repair.
+    // expected files, the files it may publish, and the post's own files,
+    // and on a partial job the container joined from the post's numbered
+    // pieces as well, which an unpack that ended short leaves beside what it
+    // delivered; and a starved recovery set that leaves nothing delivered
+    // fails the job as a repair.
     pub(in super::super) fn assert(
         &self,
         post: &Post,
@@ -428,13 +430,22 @@ impl Ran {
             .filter(|(name, bytes)| self.files[name].as_deref() == Some(bytes.as_slice()))
             .map(|(name, _)| name)
             .collect();
-        let delivered = || {
+        let delivered = |partial: bool| {
+            let joined = post
+                .files
+                .iter()
+                .filter(|_| partial)
+                .filter_map(|posted| {
+                    crate::pipeline::tests::archive_output_contract::joined_container(&posted.name)
+                })
+                .map(str::to_owned);
             let allowed: BTreeSet<String> = post
                 .expected
                 .iter()
                 .map(|(name, _)| name.clone())
                 .chain(post.allowed.iter().map(|allowed| allowed.name.clone()))
                 .chain(post.files.iter().map(|posted| posted.name.clone()))
+                .chain(joined)
                 .collect();
             let unexpected: Vec<_> = self.published.difference(&allowed).collect();
             assert!(
@@ -457,7 +468,7 @@ impl Ran {
                         bytes.len()
                     );
                 }
-                delivered();
+                delivered(false);
                 assert_ne!(
                     verdict,
                     Verdict::Fails,
@@ -478,7 +489,7 @@ impl Ran {
                     !whole.is_empty() || allowed_whole,
                     "{context}: partial with no expected or allowed file whole: {trace:?}"
                 );
-                delivered();
+                delivered(true);
                 assert_ne!(
                     verdict,
                     Verdict::Completes,

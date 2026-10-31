@@ -128,16 +128,31 @@
     },
     {
       "file": "rar4_lz_solid_mv.rar",
-      "sha256": "86b9f32732e071023737e476f1d8f5ce8bd8e002666c0de1533e34e5716d9b40",
-      "size": 199355,
-      "source_path": "crates/unrar-rs/tests/fixtures/rar4/rar4_lz_solid_mv.rar",
+      "sha256": "7aafcef0401ff1f51a145d63ab89b897cfe32b3ed6b8db2824911086244cb6e9",
+      "size": 199331,
       "provenance": {
         "kind": "generated",
-        "generator": "core_sets",
-        "toolchains": [
-          "rarlab-6.24"
+        "writer": "RAR 6.24 linux/amd64 (weaver-e2e-rarlab:6.24 image)",
+        "writer_url": "https://www.rarlab.com/rar/rarlinux-x64-624.tar.gz",
+        "writer_archive_blake3": "1c8637956b820293888027977818f408c07e3d42e885813496fc41fddef55bb2",
+        "arguments": [
+          "a",
+          "-cfg-",
+          "-ma4",
+          "-s",
+          "-m3",
+          "-md1m",
+          "-mt1",
+          "-ep1",
+          "-ts-",
+          "-ai",
+          "-idq",
+          "rar4_lz_solid_mv.rar",
+          "lz_part0.mkv",
+          "lz_part1.mkv",
+          "lz_part2.mkv"
         ],
-        "notes": "Three 307 200-byte solid `-m3` members. Despite the name it is a single-volume, multi-member archive. tests/integration.rs pins each member's length and its first eight bytes, so the generator writes those eight bytes literally."
+        "inputs": "The three 307 200-byte members of the earlier core_sets archive, extracted unchanged and renamed from lz_part{index}.bin to lz_part{index}.mkv, so each keeps its bytes, its length and its first eight bytes. Despite the name it is a single-volume, multi-member archive."
       }
     },
     {
