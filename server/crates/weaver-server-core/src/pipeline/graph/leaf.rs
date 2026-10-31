@@ -142,6 +142,12 @@ impl Leaf {
         self.wants.as_deref()
     }
 
+    // Whether the file is on disk: nothing is created until the first byte
+    // arrives.
+    pub(crate) fn on_disk(&self) -> bool {
+        self.file.is_some() || self.path.exists()
+    }
+
     #[cfg(test)]
     pub(crate) fn is_open(&self) -> bool {
         self.file.is_some()

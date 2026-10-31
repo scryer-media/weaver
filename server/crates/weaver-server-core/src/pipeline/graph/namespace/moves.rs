@@ -100,13 +100,12 @@ impl NamespaceWriter {
     // The file goes once the checkpoint that stops naming it has committed,
     // and the name it sat at stays shut until then, when the ledger may
     // give it again. Until that commit the database may still name the
-    // file where it sits, so a restore finds it there. A leaf none of whose
-    // bytes were written has no file, so nothing goes: a file that sits at
-    // its path by the time that checkpoint commits is a newer one, such as
-    // the envelope of the volume's next holder, and stays.
+    // file where it sits, so a restore finds it there. A file never written
+    // is not on disk and leaves nothing: its name may be given again before
+    // that commit, and removing it then would remove the file given it.
     pub(super) fn discard(&mut self, leaf: Leaf) -> Result<(), WriteError> {
         self.left.insert(key(leaf.name()), None);
-        if leaf.path().exists() {
+        if leaf.on_disk() {
             self.leaving.push((leaf, None));
         }
         Ok(())
