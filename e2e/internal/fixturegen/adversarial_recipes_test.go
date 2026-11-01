@@ -227,7 +227,7 @@ func lyingSet() []byte {
 		description[index] = byte(index)
 	}
 	binary.LittleEndian.PutUint64(description[48:], 3*65536)
-	copy(description[56:], "lie-payload.bin")
+	copy(description[56:], adversarialPAR2PayloadName)
 	check := make([]byte, 16+3*20)
 	check[16] = 0x55
 	var set []byte

@@ -44,10 +44,12 @@ var adversarialPAR2Lies = []string{
 }
 
 // adversarialPAR2Slice is the lying sets' block size; the payload is a few
-// blocks long and ends inside one.
+// blocks long and ends inside one. The payload is of a known type, so its
+// whole bytes count as a usable file whatever the set says of them.
 const (
-	adversarialPAR2Slice   = 65536
-	adversarialPAR2Payload = 2<<20 + 12345
+	adversarialPAR2Slice       = 65536
+	adversarialPAR2Payload     = 2<<20 + 12345
+	adversarialPAR2PayloadName = "lie-payload.mkv"
 )
 
 // AdversarialRecipes is the adversarial family.
@@ -196,20 +198,20 @@ func AdversarialRecipes() []Recipe {
 				" lie from the graph engine's breadth campaign. The payload is intact, so the job either completes with its exact bytes or fails named with none of them.",
 			Build: sequence(
 				func(_ context.Context, env *Env) error {
-					return WritePRNG(env.OutputPath("lie-payload.bin"), "adversarial/par2-lie", adversarialPAR2Payload)
+					return WritePRNG(env.OutputPath(adversarialPAR2PayloadName), "adversarial/par2-lie", adversarialPAR2Payload)
 				},
 				par2(PAR2Spec{
-					Base: "lie-payload.par2", Sources: []string{"lie-payload.bin"},
+					Base: "lie-payload.par2", Sources: []string{adversarialPAR2PayloadName},
 					SliceSize: adversarialPAR2Slice, RecoveryBlocks: 8, RecoveryFiles: 1,
 				}),
 				tellPAR2LieInOutputs(lie),
 			),
 			ExpectedOutputs: func(_ context.Context, env *Env) (map[string]string, error) {
-				name := "lie-payload.bin"
+				name := adversarialPAR2PayloadName
 				if lie == "name-other" {
-					name = "mie-payload.bin"
+					name = "m" + name[1:]
 				}
-				return map[string]string{name: env.OutputPath("lie-payload.bin")}, nil
+				return map[string]string{name: env.OutputPath(adversarialPAR2PayloadName)}, nil
 			},
 		})
 	}

@@ -200,10 +200,10 @@ func boundaryTarXZRecipe(partial bool) Recipe {
 	}
 	return Recipe{
 		Slug: slug, Family: "graph stream boundary", ByteReproducible: true,
-		Notes: "Valid XZ around a TAR with a damaged first or second header; a whole earlier member makes Partial, otherwise Failed.",
+		Notes: "Valid XZ around a TAR with a damaged first or second header; its members are of a known type, so a whole earlier member makes Partial, otherwise Failed.",
 		Build: func(ctx context.Context, env *Env) error {
 			var members []Member
-			for _, name := range []string{"first.bin", "second.bin"} {
+			for _, name := range []string{"first.mkv", "second.mkv"} {
 				if err := WritePRNG(env.StagePath(name), slug+"/"+name, 32768); err != nil {
 					return err
 				}
@@ -223,7 +223,7 @@ func boundaryTarXZRecipe(partial bool) Recipe {
 		},
 		ExpectedOutputs: func(_ context.Context, env *Env) (map[string]string, error) {
 			if partial {
-				return map[string]string{"first.bin": env.StagePath("first.bin"), "bundle.tar": env.StagePath("bundle.tar")}, nil
+				return map[string]string{"first.mkv": env.StagePath("first.mkv"), "bundle.tar": env.StagePath("bundle.tar")}, nil
 			}
 			return map[string]string{"bundle.tar": env.StagePath("bundle.tar")}, nil
 		},
@@ -291,9 +291,9 @@ func boundaryHeldRecipe(kind string) Recipe {
 func boundaryFeedVerdictRecipe() Recipe {
 	return Recipe{
 		Slug: "feed-verdict-restart", Family: "graph feed restart", ByteReproducible: true,
-		Notes: "Two plain 64 KiB files. The restart case withholds every broken-file article and holds the survivor until the abandoned-file verdict commits. Its oracle derives the retained zero-filled damaged placeholder from the NZB's encoded sizes; only the survivor is usable.",
+		Notes: "Two plain 64 KiB files of a known type. The restart case withholds every broken-file article and holds the survivor until the abandoned-file verdict commits. Its oracle derives the retained zero-filled damaged placeholder from the NZB's encoded sizes; only the survivor is usable.",
 		Build: func(_ context.Context, env *Env) error {
-			for _, name := range []string{"broken.bin", "survivor.bin"} {
+			for _, name := range []string{"broken.mkv", "survivor.mkv"} {
 				if err := WritePRNG(env.OutputPath(name), "feed-verdict/"+name, 65536); err != nil {
 					return err
 				}
@@ -301,7 +301,7 @@ func boundaryFeedVerdictRecipe() Recipe {
 			return nil
 		},
 		ExpectedOutputs: func(_ context.Context, env *Env) (map[string]string, error) {
-			return map[string]string{"survivor.bin": env.OutputPath("survivor.bin")}, nil
+			return map[string]string{"survivor.mkv": env.OutputPath("survivor.mkv")}, nil
 		},
 	}
 }
