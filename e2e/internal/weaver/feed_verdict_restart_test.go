@@ -11,15 +11,15 @@ import (
 )
 
 func TestFeedVerdictOracleDerivesDamageFromPostedSizes(t *testing.T) {
-	broken := `<file subject="&quot;broken.bin&quot;"><segments><segment bytes="5">a</segment><segment bytes="7">b</segment></segments></file>`
-	survivor := `<file subject="&quot;survivor.bin&quot;"><segments><segment bytes="19">c</segment></segments></file>`
+	broken := `<file subject="&quot;broken.mkv&quot;"><segments><segment bytes="5">a</segment><segment bytes="7">b</segment></segments></file>`
+	survivor := `<file subject="&quot;survivor.mkv&quot;"><segments><segment bytes="19">c</segment></segments></file>`
 	for index, files := range []string{broken + survivor, survivor + broken} {
 		nzb := []byte("<nzb>" + files + "</nzb>")
 		gotIndex, length, expected, err := feedVerdictOutputOracle(nzb, "known-survivor-hash")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if gotIndex != index || length != 12 || len(expected) != 1 || expected["broken.bin"] != "" || expected["survivor.bin"] != "known-survivor-hash" {
+		if gotIndex != index || length != 12 || len(expected) != 1 || expected["broken.mkv"] != "" || expected["survivor.mkv"] != "known-survivor-hash" {
 			t.Fatalf("input-derived oracle: index=%d, length=%d, hashes=%v", gotIndex, length, expected)
 		}
 	}
@@ -32,7 +32,7 @@ func TestFeedVerdictRequiresPersistedDamageWithoutBacking(t *testing.T) {
 				length := uint64(12)
 				verdict := restartFeedVerdict{Version: 1, Reason: "missing", AbandonedFiles: []int{index}}
 				proof := checkpointEvidence{
-					Members:  []checkpointMember{{FileIndex: index, OutputName: "broken.bin"}},
+					Members:  []checkpointMember{{FileIndex: index, OutputName: "broken.mkv"}},
 					Coverage: []fileCoverageRow{{FileIndex: index, Length: &length, Coverage: fileCoverage{Runs: []fileCoverageRun{{Start: 0, End: 12, Provenance: "damaged"}}}}},
 				}
 				switch bad {
@@ -41,11 +41,11 @@ func TestFeedVerdictRequiresPersistedDamageWithoutBacking(t *testing.T) {
 				case "wrong file":
 					verdict.AbandonedFiles = []int{1 - index}
 				case "wrong name":
-					proof.Members[0].OutputName = "survivor.bin"
+					proof.Members[0].OutputName = "survivor.mkv"
 				case "member":
 					proof.Members = nil
 				case "backing":
-					proof.Backing = map[string]checkpointBacking{"broken.bin": {Size: 12}}
+					proof.Backing = map[string]checkpointBacking{"broken.mkv": {Size: 12}}
 				case "owned":
 					proof.Members[0].HasFile = true
 				case "coverage":
@@ -69,7 +69,7 @@ func TestFeedVerdictRejectsFabricatedOutput(t *testing.T) {
 	if err := requireAbsentFeedOutput(dir); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "broken.bin"), make([]byte, 12), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "broken.mkv"), make([]byte, 12), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := requireAbsentFeedOutput(dir); err == nil {

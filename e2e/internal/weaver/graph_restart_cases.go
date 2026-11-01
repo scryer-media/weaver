@@ -672,8 +672,12 @@ func (ctx *restartCaseContext) judgeUpgrade(seed upgradeSeed, from int) (restart
 	if err != nil {
 		return restartCaseResult{}, err
 	}
+	latest, err := latestMigration(weaverMigrationsDir())
+	if err != nil {
+		return restartCaseResult{}, err
+	}
 	var missing []int
-	for version := from; version <= graphLatestMigration; version++ {
+	for version := from; version <= latest; version++ {
 		if !versions[version] {
 			missing = append(missing, version)
 		}
@@ -748,15 +752,25 @@ func runUpgradeFromEngineStampedDatabase(ctx *restartCaseContext) (restartCaseRe
 		fmt.Sprintf(`UPDATE job_history SET engine = 'classic' WHERE job_id = %d`, seed.history[0]),
 		fmt.Sprintf(`UPDATE job_history SET engine = 'graph' WHERE job_id = %d`, seed.history[1]),
 	}
-	// A classic job never wrote a graph checkpoint.
+	later, err := readLaterMigrations(weaverMigrationsDir(), graphEngineMigration)
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	rewind := preGraphEngineRewind(later)
+	added := map[string]bool{}
+	for _, table := range rewind.DropTables {
+		added[table] = true
+	}
+	// A classic job never wrote a graph checkpoint. A table a later
+	// migration created is not in this historical schema at all.
 	for _, table := range graphTables {
-		if table == "graph_held_parts" {
-			continue // Migration 76 has not run in this historical schema.
+		if added[table] {
+			continue
 		}
 		plant = append(plant, fmt.Sprintf(`DELETE FROM %s WHERE job_id = %d`, table, classic))
 	}
 	plant = append(plant, plantClassicRows(classic)...)
-	if err := applySchemaRewind(caseDBPath(ctx), rewindToPreGraphEngine, plant); err != nil {
+	if err := applySchemaRewind(caseDBPath(ctx), rewind, plant); err != nil {
 		return restartCaseResult{}, fmt.Errorf("rewind to the engine-stamped schema: %w", err)
 	}
 	return ctx.judgeUpgrade(seed, 66)

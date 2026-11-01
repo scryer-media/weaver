@@ -45,14 +45,14 @@ func readRestartFeedVerdict(dbPath string, jobID int) (restartFeedVerdict, error
 func runCommittedFeedVerdictRestart(ctx *restartCaseContext) (restartCaseResult, error) {
 	const slug = "feed-verdict-restart"
 	scenario := ctx.Scenarios[slug]
-	if scenario == nil || len(scenario.ExpectedOutputBLAKE3) != 1 || scenario.ExpectedOutputBLAKE3["survivor.bin"] == "" {
+	if scenario == nil || len(scenario.ExpectedOutputBLAKE3) != 1 || scenario.ExpectedOutputBLAKE3["survivor.mkv"] == "" {
 		return restartCaseResult{}, fmt.Errorf("feed verdict fixture requires the survivor digest")
 	}
 	nzb, err := os.ReadFile(filepath.Join(fixturesDir(), slug, slug+".nzb"))
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	abandonedIndex, missingLength, expected, err := feedVerdictOutputOracle(nzb, scenario.ExpectedOutputBLAKE3["survivor.bin"])
+	abandonedIndex, missingLength, expected, err := feedVerdictOutputOracle(nzb, scenario.ExpectedOutputBLAKE3["survivor.mkv"])
 	if err != nil {
 		return restartCaseResult{}, err
 	}
@@ -61,7 +61,7 @@ func runCommittedFeedVerdictRestart(ctx *restartCaseContext) (restartCaseResult,
 		return restartCaseResult{}, err
 	}
 	// Nyuu may finish either file first and write its NZB entry first.
-	// Withhold broken.bin by identity and hold survivor.bin so a committed
+	// Withhold broken.mkv by identity and hold survivor.mkv so a committed
 	// verdict cannot race terminalization.
 	var abandonedIDs, survivorIDs []string
 	for _, segment := range segments {
@@ -215,16 +215,16 @@ func feedVerdictOutputOracle(nzb []byte, survivorHash string) (int, uint64, map[
 	abandonedIndex, survivorIndex := -1, -1
 	for index, file := range post.Files {
 		switch {
-		case strings.Contains(file.Subject, `"broken.bin"`) && abandonedIndex == -1:
+		case strings.Contains(file.Subject, `"broken.mkv"`) && abandonedIndex == -1:
 			abandonedIndex = index
-		case strings.Contains(file.Subject, `"survivor.bin"`) && survivorIndex == -1:
+		case strings.Contains(file.Subject, `"survivor.mkv"`) && survivorIndex == -1:
 			survivorIndex = index
 		default:
 			return 0, 0, nil, fmt.Errorf("unexpected or duplicate feed fixture subject %q", file.Subject)
 		}
 	}
 	if abandonedIndex < 0 || survivorIndex < 0 || len(post.Files[abandonedIndex].Segments) == 0 {
-		return 0, 0, nil, fmt.Errorf("feed verdict oracle requires broken.bin and survivor.bin")
+		return 0, 0, nil, fmt.Errorf("feed verdict oracle requires broken.mkv and survivor.mkv")
 	}
 	var length uint64
 	for _, segment := range post.Files[abandonedIndex].Segments {
@@ -235,7 +235,7 @@ func feedVerdictOutputOracle(nzb []byte, survivorHash string) (int, uint64, map[
 		}
 		length += segment.Bytes
 	}
-	return abandonedIndex, length, map[string]string{"survivor.bin": survivorHash}, nil
+	return abandonedIndex, length, map[string]string{"survivor.mkv": survivorHash}, nil
 }
 
 func requireFeedVerdictAbsence(proof checkpointEvidence, verdict restartFeedVerdict, index int, length uint64) error {
@@ -245,13 +245,13 @@ func requireFeedVerdictAbsence(proof checkpointEvidence, verdict restartFeedVerd
 	memberFound := false
 	for _, member := range proof.Members {
 		if member.FileIndex == index {
-			if member.HasFile || member.OutputName != "broken.bin" || member.OnDisk != "" {
+			if member.HasFile || member.OutputName != "broken.mkv" || member.OnDisk != "" {
 				return fmt.Errorf("abandoned file has unexpected backing ownership: %+v", member)
 			}
 			memberFound = true
 		}
 	}
-	if _, backed := proof.Backing["broken.bin"]; !memberFound || backed {
+	if _, backed := proof.Backing["broken.mkv"]; !memberFound || backed {
 		return fmt.Errorf("abandoned file must have a member and no backing file")
 	}
 	for _, row := range proof.Coverage {
@@ -272,12 +272,12 @@ func requireFeedVerdictAbsence(proof checkpointEvidence, verdict restartFeedVerd
 }
 
 func requireAbsentFeedOutput(outputDir string) error {
-	_, err := os.Lstat(filepath.Join(outputDir, "broken.bin"))
+	_, err := os.Lstat(filepath.Join(outputDir, "broken.mkv"))
 	if os.IsNotExist(err) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	return fmt.Errorf("abandoned file has an unexpected fabricated broken.bin")
+	return fmt.Errorf("abandoned file has an unexpected fabricated broken.mkv")
 }

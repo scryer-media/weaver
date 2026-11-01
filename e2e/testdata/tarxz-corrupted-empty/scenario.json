@@ -5,10 +5,10 @@
   "category": "2000",
   "expected_outcome": "extraction_failure",
   "expectedRetainedOutputBLAKE3": {
-    "bundle.tar": "cf6428b6c8fb21416d279f44f4665311af9ae64e608faaae2eb552244afc7464"
+    "bundle.tar": "6039d3e7eceada63a814b85fb613a8246495d866ea624a9862575d743d01a847"
   },
   "forbiddenOutputPaths": [
     ".weaver-chunks",
-    "second.bin"
+    "second.mkv"
   ]
 }

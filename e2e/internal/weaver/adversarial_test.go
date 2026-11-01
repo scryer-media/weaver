@@ -44,6 +44,38 @@ func TestExtractsNothingAllowsOnlyUnchangedPostedFilesAfterFailure(t *testing.T)
 	}
 }
 
+// A failed job's whole files stay in its working directory; only a job whose
+// output directory lies under the complete directory published them.
+func TestFailedJobPublishesOnlyUnderTheCompleteDirectory(t *testing.T) {
+	t.Setenv("E2E_RUN_DIR", t.TempDir())
+	tc := adversarialCase{
+		Scenario: &Scenario{ExpectedOutputBLAKE3: map[string]string{"lie-payload.mkv": "digest"}},
+		Spec:     adversarialSpec{Outcome: "settles"},
+	}
+	for _, check := range []struct {
+		name      string
+		outputDir string
+		published bool
+	}{
+		{"retained in the working directory", filepath.Join(adversarialIntermediateDir(), "job"), false},
+		{"moved under the complete directory", filepath.Join(adversarialCompleteDir(), "2000", "job"), true},
+		{"a sibling named like the complete directory", adversarialCompleteDir() + "-other", false},
+	} {
+		t.Run(check.name, func(t *testing.T) {
+			problems := checkAdversarialVerdict(tc, adversarialSettled{
+				Status: "FAILED", Error: "refused", OutputDir: check.outputDir, Outputs: []string{"lie-payload.mkv"},
+			})
+			named := false
+			for _, problem := range problems {
+				named = named || strings.Contains(problem.Error(), "failed but published lie-payload.mkv")
+			}
+			if named != check.published {
+				t.Fatalf("published=%v, problems=%v", check.published, problems)
+			}
+		})
+	}
+}
+
 func TestOverlappingZipPinsOnlyItsUsableFirstMember(t *testing.T) {
 	cases, err := loadAdversarialCases(testdataDir())
 	if err != nil {

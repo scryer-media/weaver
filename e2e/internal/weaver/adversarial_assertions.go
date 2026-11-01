@@ -63,6 +63,16 @@ func adversarialCompleteDir() string {
 	return filepath.Join(localWeaverDir(), "complete")
 }
 
+// adversarialPublished is whether a job's output directory lies under the
+// complete directory, where only a delivery moves what it hands over.
+func adversarialPublished(outputDir string) bool {
+	if outputDir == "" {
+		return false
+	}
+	relative, err := filepath.Rel(adversarialCompleteDir(), outputDir)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
 func adversarialStagingDir(jobID int) string {
 	return filepath.Join(adversarialCompleteDir(), ".weaver-staging", strconv.Itoa(jobID))
 }
@@ -165,9 +175,14 @@ func checkAdversarialVerdict(tc adversarialCase, settled adversarialSettled) []e
 		if spec.FailureKind != "" && settled.FailureKind != spec.FailureKind {
 			problems = append(problems, fmt.Errorf("failure kind %q, want %q", settled.FailureKind, spec.FailureKind))
 		}
-		for name := range expected {
-			if adversarialHas(settled.Outputs, name) {
-				problems = append(problems, fmt.Errorf("failed but published %s", name))
+		// A failed job publishes nothing: its whole files stay in its
+		// working directory, and only a directory under the complete
+		// directory is one it published to.
+		if adversarialPublished(settled.OutputDir) {
+			for name := range expected {
+				if adversarialHas(settled.Outputs, name) {
+					problems = append(problems, fmt.Errorf("failed but published %s", name))
+				}
 			}
 		}
 	case "COMPLETE", "PARTIAL":
