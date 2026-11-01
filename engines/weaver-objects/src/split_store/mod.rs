@@ -223,12 +223,10 @@ impl SplitStore {
     }
 
     // Where a piece starts in the member: the sum of every piece before it,
-    // once each of them is bound and declared. A set missing a number has
-    // no places at all.
+    // once each of them is bound and declared, as the forward map counts it
+    // (`extent`). A number missing after a piece moves nothing of it: what
+    // it placed stays where it sits, and the map says so.
     fn offset(&self, index: u32) -> Option<u64> {
-        if !self.contiguous() {
-            return None;
-        }
         (0..index).try_fold(0u64, |at, before| {
             Some(at + self.pieces.get(&before)?.declared?)
         })
@@ -238,11 +236,16 @@ impl SplitStore {
     // anywhere once its start is known and it declared none, but never
     // into a place any piece's bytes still sit in until they come again,
     // its own among them, wherever that place starts: they are read back
-    // from there. Nothing while its start is unknown.
+    // from there. Nothing while its start is unknown. A set missing a number
+    // is no file, so nothing more is placed in it: a piece reaches only as
+    // far as the bytes it placed before the number went missing.
     fn placeable(&self, index: u32) -> u64 {
         let (Some(start), Some(piece)) = (self.offset(index), self.pieces.get(&index)) else {
             return 0;
         };
+        if !self.contiguous() {
+            return piece.placed;
+        }
         let declared = piece.declared.unwrap_or(u64::MAX);
         let end = start.saturating_add(declared);
         self.awaiting

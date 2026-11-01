@@ -852,7 +852,10 @@ impl NamespaceWriter {
     // under what a set proved of it: the one write path then marks it here
     // and in every namespace below. A set read those bytes to rule on them,
     // and reads take held custody first, so bytes that do not read back now
-    // are gone: an error, never a proof dropped.
+    // are gone: an error, never a proof dropped. Bytes the member's record
+    // says were lost may never have come: where none read back the range
+    // stays the loss it is, which a repair mends or the set's verdict
+    // answers.
     fn redeliver(
         &mut self,
         tree: &mut Tree,
@@ -861,27 +864,39 @@ impl NamespaceWriter {
         (node, member, range, provenance): (NodeId, MemberId, ByteRange, Provenance),
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
-        let mut at = range.start;
-        while at < range.end {
-            let chunk = ByteRange::new(at, range.end.min(at.saturating_add(READ_BACK)));
-            at = chunk.end;
-            let mut bytes = Vec::new();
-            if !self.access(tree).read_at(node, member, chunk, &mut bytes) {
-                return Err(WriteError::ProofUnreadable {
+        let parts = tree
+            .namespace(node)
+            .and_then(|namespace| namespace.get(member))
+            .map_or_else(
+                || vec![(range, true)],
+                |record| record.coverage.by_arrival(range),
+            );
+        for (piece, arrived) in parts {
+            let mut at = piece.start;
+            while at < piece.end {
+                let chunk = ByteRange::new(at, piece.end.min(at.saturating_add(READ_BACK)));
+                at = chunk.end;
+                let mut bytes = Vec::new();
+                if !self.access(tree).read_at(node, member, chunk, &mut bytes) {
+                    if !arrived {
+                        continue;
+                    }
+                    return Err(WriteError::ProofUnreadable {
+                        node,
+                        member,
+                        range: chunk,
+                    });
+                }
+                let arrival = Arrival {
                     node,
                     member,
-                    range: chunk,
-                });
+                    offset: chunk.start,
+                    // Read back: no evidence comes with it.
+                    bytes: Bytes::from(bytes).into(),
+                    provenance,
+                };
+                self.arrive(tree, builder, segments, Write::new(&arrival), arrival, out)?;
             }
-            let arrival = Arrival {
-                node,
-                member,
-                offset: chunk.start,
-                // Read back: no evidence comes with it.
-                bytes: Bytes::from(bytes).into(),
-                provenance,
-            };
-            self.arrive(tree, builder, segments, Write::new(&arrival), arrival, out)?;
         }
         Ok(())
     }
