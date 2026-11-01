@@ -1029,12 +1029,18 @@ impl NamespaceWriter {
                 self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
             }
             // Read back into its own file as a refused member is, nothing
-            // refused, and then claimed by what its own bytes sign: its
-            // object's claim on it was the name its bytes refuted.
-            Effect::Disclaimed { node, member } => {
+            // refused, and then claimed again for the reason its object's
+            // hold ended.
+            Effect::Disclaimed { node, member, why } => {
                 self.materialise(tree, builder, segments, *node, *member, out)?;
                 let mut effects = Vec::new();
-                tree.claim_by_bytes(*node, *member, &mut self.placing(builder), &mut effects);
+                tree.claim_again(
+                    *node,
+                    *member,
+                    *why,
+                    &mut self.placing(builder),
+                    &mut effects,
+                );
                 self.prune(tree)?;
                 self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
             }

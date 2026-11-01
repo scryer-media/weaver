@@ -46,7 +46,8 @@ impl RootFacts {
     // 4: a sealed value encodes as nothing, numbered by its owner's walk.
     // 5: sparse outstanding namespace checksum checks in the root row.
     // 6: the reasons a checkpoint names lost one.
-    pub(crate) const VERSION: u16 = 6;
+    // 7: a checkpoint names a provenance more: a range that never came.
+    pub(crate) const VERSION: u16 = 7;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

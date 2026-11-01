@@ -63,7 +63,7 @@ pub struct Plain {
 pub fn worse(left: Provenance, right: Provenance) -> Provenance {
     match (left, right) {
         (Provenance::Refuted, _) | (_, Provenance::Refuted) => Provenance::Refuted,
-        (Provenance::Damaged, _) | (_, Provenance::Damaged) => Provenance::Damaged,
+        (left, right) if left.is_damaged() || right.is_damaged() => Provenance::Damaged,
         (Provenance::Repaired, _) | (_, Provenance::Repaired) => Provenance::Repaired,
         _ => Provenance::Fresh,
     }

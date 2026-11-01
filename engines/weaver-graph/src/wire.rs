@@ -47,6 +47,7 @@ enum ProvenanceMirror {
     Damaged,
     Repaired,
     Refuted,
+    Lost,
 }
 through!(Provenance, ProvenanceMirror);
 

@@ -112,6 +112,15 @@ impl NamespaceWriter {
                     if arrival.provenance == provenance {
                         self.route_as_brought(tree, builder, segments, arrival, out)?;
                     } else {
+                        // The member no longer holds what its record says
+                        // came there, a repair's bytes too: the damage is
+                        // what lies there now.
+                        if let Some(record) = tree
+                            .namespace_mut(node)
+                            .and_then(|namespace| namespace.get_mut(member))
+                        {
+                            record.coverage.erase(piece);
+                        }
                         self.arrive(tree, builder, segments, Write::new(&arrival), arrival, out)?;
                     }
                 }

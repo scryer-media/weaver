@@ -5,7 +5,8 @@
 // first: the piece is the split store's. Posted under its numbered name, it
 // founds the split store at once; posted under a name that numbers nothing,
 // its bytes found the store they sign, and the numbered name a recovery set
-// gives it later ends that hold, the piece read back and claimed again.
+// gives it later ends that hold, the piece read back and claimed again. A
+// name moves a piece and never refutes a kind.
 
 use super::*;
 use crate::deliver::Posted;
@@ -22,13 +23,25 @@ fn front() -> Bytes {
 
 // A piece posted at the root under `name`, its front delivered.
 fn post(tree: &mut Tree, name: &str, effects: &mut Vec<Effect>) -> MemberId {
-    let member = tree.announce_root(name, None, &mut Vec::new());
+    post_with(tree, name, None, front(), effects)
+}
+
+// A piece posted at the root under `name`, of `length` when known, with
+// these bytes as its front.
+fn post_with(
+    tree: &mut Tree,
+    name: &str,
+    length: Option<u64>,
+    bytes: Bytes,
+    effects: &mut Vec<Effect>,
+) -> MemberId {
+    let member = tree.announce_root(name, length, &mut Vec::new());
     tree.deliver(
         NodeId::ROOT,
         member,
         Posted {
             offset: 0,
-            bytes: front().into(),
+            bytes: bytes.into(),
             provenance: Provenance::Fresh,
         },
         &mut Build,
@@ -37,14 +50,21 @@ fn post(tree: &mut Tree, name: &str, effects: &mut Vec<Effect>) -> MemberId {
     member
 }
 
-// What the owner does with a member whose reading was refuted: read back,
-// then claimed again by the tree.
+// What the owner does with a member its object holds no more: read back,
+// then claimed again by the tree for the reason the hold ended.
 fn claim_disclaimed(tree: &mut Tree, effects: &[Effect]) {
     for effect in effects {
-        if let Effect::Disclaimed { node, member } = effect {
-            tree.claim_by_bytes(*node, *member, &mut Build, &mut Vec::new());
+        if let Effect::Disclaimed { node, member, why } = effect {
+            tree.claim_again(*node, *member, *why, &mut Build, &mut Vec::new());
         }
     }
+}
+
+// The kind whose reading of the piece was refuted.
+fn refuted(tree: &Tree, member: MemberId) -> Option<Kind> {
+    tree.namespace(NodeId::ROOT)
+        .and_then(|namespace| namespace.get(member))
+        .and_then(|record| record.refuted)
 }
 
 // Where the piece ends, and which kind holds it.
@@ -76,12 +96,39 @@ fn a_numbered_name_after_the_bytes_moves_the_piece_to_the_split_store() {
         effects.contains(&Effect::Disclaimed {
             node: NodeId::ROOT,
             member: piece,
+            why: Disclaim::Moved,
         }),
-        "the store's reading of the piece is refuted: {effects:?}"
+        "the name moves the piece from the store: {effects:?}"
     );
     claim_disclaimed(&mut tree, &effects);
     assert_eq!(holder(&tree, piece), (Some(Kind::Split), VolumeIndex(0)));
-    assert!(tree.namespace(store).is_none(), "the refuted store goes");
+    assert!(tree.namespace(store).is_none(), "the store it left goes");
+    assert_eq!(refuted(&tree, piece), None, "a name refutes no kind");
+}
+
+// A name that numbers a piece elsewhere moves it within its kind: the split
+// store's place for it was wrong, never the kind, so a split store holds it
+// where its new name says. Its whole body is its front, and signs nothing.
+#[test]
+fn a_name_that_numbers_the_piece_elsewhere_keeps_it_a_split_piece() {
+    let mut tree = Tree::new();
+    let plain = Bytes::from_static(b"plain bytes, no sign");
+    let length = Some(plain.len() as u64);
+    let piece = post_with(&mut tree, NUMBERED, length, plain, &mut Vec::new());
+    assert_eq!(holder(&tree, piece), (Some(Kind::Split), VolumeIndex(0)));
+    let mut effects = Vec::new();
+    tree.rename(NodeId::ROOT, piece, "show.002", &mut Build, &mut effects);
+    assert!(
+        effects.contains(&Effect::Disclaimed {
+            node: NodeId::ROOT,
+            member: piece,
+            why: Disclaim::Moved,
+        }),
+        "{effects:?}"
+    );
+    claim_disclaimed(&mut tree, &effects);
+    assert_eq!(holder(&tree, piece), (Some(Kind::Split), VolumeIndex(1)));
+    assert_eq!(refuted(&tree, piece), None, "a name refutes no kind");
 }
 
 // A name that says the kind the bytes founded keeps the hold: nothing is

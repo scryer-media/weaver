@@ -256,15 +256,16 @@ pub enum Effect {
         member: MemberId,
         why: Why,
     },
-    // A member's object read it as what it is not: a volume's own bytes
-    // refuted the claim its name made, or a name a recovery set gave it
-    // says another kind. Nothing failed. The owner materialises the
-    // member's bytes into its own file through the retired object's inverse
-    // map, as a refused member's, has the tree claim it again
-    // (`Tree::claim_by_bytes`), then buries it.
+    // A member's object holds it no more, and nothing failed: a volume's
+    // own bytes refuted the claim its name made, or a name a recovery set
+    // gave it moved it. The owner materialises the member's bytes into its
+    // own file through the retired object's inverse map, as a refused
+    // member's, has the tree claim it again for that reason
+    // (`Tree::claim_again`), then buries it.
     Disclaimed {
         node: NodeId,
         member: MemberId,
+        why: Disclaim,
     },
     // The object at `from` gave this member back, which was its `volume`:
     // its own headers say the member is not its there. The member is a leaf
@@ -366,11 +367,21 @@ enum Unbinding {
     Refused(Why),
     // Only an engine reads them, bound in the object's place.
     Engine(Why),
-    // The object's reading was refuted, by a volume's own bytes against
-    // the claim its name made, or by a name that says a volume is another
-    // kind: each is claimed again (`Tree::claim_by_bytes`), and nothing
-    // failed.
+    // The object's hold ended and nothing failed: each is claimed again
+    // (`Tree::claim_again`), as the reason says.
+    Disclaimed(Disclaim),
+}
+
+// Why an object's hold on its members ended with nothing failed, which says
+// how each is claimed again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Disclaim {
+    // A verdict about a volume's own bytes said the object's kind is wrong:
+    // that kind is no answer to who owns its members (`Member::refuted`).
     Refuted,
+    // A name moved a member: the place was wrong, never the kind, so each
+    // member's name and front say who owns it, as founding asks.
+    Moved,
 }
 
 pub struct Tree {
@@ -1064,9 +1075,12 @@ impl Tree {
     // delivered, and the rest of it goes: the posted volumes stand in for
     // that. When an engine took the volumes it reads them again and makes
     // every member over, so nothing of the node stays. A refused node stays
-    // whatever it keeps, to claim the rest of its set.
+    // whatever it keeps, to claim the rest of its set. A volume a refused
+    // set held, now in its member's own file, is given back as every volume
+    // of the set is: offered to the objects beside the set, with nothing
+    // carried, and the set's still only when none takes it.
     pub fn bury(&mut self, node: NodeId, member: MemberId, effects: &mut Vec<Effect>) {
-        let Some((retired, true)) = self.unbury(node, member) else {
+        let Some((retired, last)) = self.unbury(node, member) else {
             return;
         };
         let read_again = self.child_of(node, member).is_some();
@@ -1074,6 +1088,12 @@ impl Tree {
             .nodes
             .get(&retired)
             .is_some_and(|found| found.refused.is_some());
+        if refused && self.give_read_back(node, (retired, member), effects) {
+            return;
+        }
+        if !last {
+            return;
+        }
         if read_again || !(self.keep_closed(retired, effects) || refused) {
             self.drop_subtree(retired, effects);
             self.remove_node(retired, effects);
@@ -1646,11 +1666,13 @@ impl Tree {
         if self.child_of(node, member) != Some((child, volume)) {
             return;
         }
-        // A name that says the member is another kind ends the hold, however
-        // the object was founded: its reading of the member is refuted and
-        // read back, and the member is claimed again as founding claims it.
+        // A name that no longer places the member there ends the hold,
+        // however the object was founded: the member is read back and
+        // claimed again as founding claims it. A name says where, never
+        // that a kind was wrong, so nothing is refuted.
         if !self.still_holds(node, child, member, volume) {
-            return self.unbind(child, Unbinding::Refuted, builder, effects);
+            let moved = Unbinding::Disclaimed(Disclaim::Moved);
+            return self.unbind(child, moved, builder, effects);
         }
         let unowned: Vec<(MemberId, Vec<u8>)> = self
             .namespace(node)
@@ -2224,35 +2246,39 @@ impl Tree {
         self.identify(node, member, &front, builder, effects);
     }
 
-    // A member whose object's reading of it was refuted, once the owner has
-    // read its bytes back into its own file: a volume's own bytes refuted
-    // the claim its set's names made (`Emit::Refuted`), or the name a
-    // recovery set gave it says another kind than the object's (`renamed`).
-    // Nothing gave it up: it is a member no object has claimed, and the
-    // object goes once the last of its volumes is read back, with
-    // everything under it, since nothing of a refuted reading stays.
+    // A member its object holds no more, once the owner has read its bytes
+    // back into its own file: a volume's own bytes refuted the claim its
+    // set's names made (`Emit::Refuted`), or the name a recovery set gave
+    // it no longer places it there (`renamed`). Nothing gave it up: it is a
+    // member no object has claimed, and the object goes once the last of
+    // its volumes is read back, with everything under it, since nothing of
+    // an ended reading stays.
     //
-    // It is claimed as founding claims it, by its name and its front,
-    // except that the kind whose reading was refuted is no answer: then its
-    // own bytes say what it is. The member keeps that kind (`Member::said`),
-    // so a front read back or fetched again later, or after a restart, is
-    // asked the same and founds no object of it from the name. Only the
-    // objects of the kind it is beside it are
+    // It is claimed as founding claims it, by its name and its front.
+    // Where the bytes refuted the object's kind, that kind is no answer:
+    // then its own bytes say what it is. The member keeps that kind
+    // (`Member::said`), so a front read back or fetched again later, or
+    // after a restart, is asked the same and founds no object of it from
+    // the name. A name that moved it refutes nothing: its new name says
+    // where it goes. Only the objects of the kind it is beside it are
     // offered it, so the set it is takes it where that set places it, and
     // nothing of another kind holding members by their names can take it
     // instead. A member whose bytes have not said yet stays the leaf it was
     // read back as: its file has its bytes, a front fetched again joins them
     // there, and it is asked again once they are in it, as any leaf whose
     // front comes is.
-    pub fn claim_by_bytes(
+    pub fn claim_again(
         &mut self,
         node: NodeId,
         member: MemberId,
+        why: Disclaim,
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
         let buried = self.unbury(node, member);
-        let refuted_kind = buried.and_then(|(refuted, _)| self.kind(refuted));
+        let refuted_kind = buried
+            .filter(|_| why == Disclaim::Refuted)
+            .and_then(|(refuted, _)| self.kind(refuted));
         self.nodes.unretire(&(node, member));
         if let Some((refuted, true)) = buried {
             self.drop_subtree(refuted, effects);
@@ -3402,7 +3428,10 @@ impl Tree {
                     self.unbind(node, Unbinding::Engine(why), builder, effects);
                 }
                 Emit::Refuse(why) => self.unbind(node, Unbinding::Refused(why), builder, effects),
-                Emit::Refuted => self.unbind(node, Unbinding::Refuted, builder, effects),
+                Emit::Refuted => {
+                    let refuted = Unbinding::Disclaimed(Disclaim::Refuted);
+                    self.unbind(node, refuted, builder, effects);
+                }
                 Emit::GiveBack(volume) => given.push(volume),
             }
             if self.nodes.get(&node).is_none_or(|found| found.retired) {
@@ -3499,6 +3528,19 @@ impl Tree {
             return;
         }
         let parent = binding.parent;
+        // A refused set gives back first every volume it can carry, as any
+        // object gives a volume back: what is left is refused with it.
+        let given = match unbinding {
+            Unbinding::Refused(_) => self.give_carried(node, effects),
+            Unbinding::Engine(_) | Unbinding::Disclaimed(_) => Vec::new(),
+        };
+        let Some(binding) = self
+            .nodes
+            .get(&node)
+            .and_then(|found| found.binding.clone())
+        else {
+            return;
+        };
         if let Some(found) = self.nodes.get_mut(&parent) {
             for member in binding.volumes.values() {
                 found.disown(*member);
@@ -3511,13 +3553,14 @@ impl Tree {
         let (why, engine) = match unbinding {
             Unbinding::Refused(why) => (why, false),
             Unbinding::Engine(why) => (why, true),
-            // Nothing holds the set's volumes now: each is claimed by its
-            // own bytes once the owner has them back, and nothing failed.
-            Unbinding::Refuted => {
+            // Nothing holds the set's volumes now: each is claimed again
+            // once the owner has them back, and nothing failed.
+            Unbinding::Disclaimed(why) => {
                 for member in binding.volumes.into_values() {
                     effects.push(Effect::Disclaimed {
                         node: parent,
                         member,
+                        why,
                     });
                 }
                 return;
@@ -3581,7 +3624,107 @@ impl Tree {
                 node
             }
         };
+        // What the set gave back is offered to the objects beside it first,
+        // by the one offer, and only what none takes is the refused set's.
+        let beside = self.beside(parent, node);
+        for member in given {
+            if self.unowned(parent, member) {
+                let front = self.front(parent, member).to_vec();
+                self.offer(parent, member, &front, &beside, effects);
+            }
+        }
         self.offer_unowned(parent, holder, effects);
+        let empty = self
+            .nodes
+            .get(&node)
+            .and_then(|found| found.binding.as_ref())
+            .is_some_and(|binding| binding.volumes.is_empty());
+        self.forget_empty(node, empty, effects);
+    }
+
+    // The volumes the object at `node` can carry leave it, each parked
+    // beside its namespace as a member given back, as `give_back` parks
+    // them. The members parked, for the caller to offer.
+    fn give_carried(&mut self, node: NodeId, effects: &mut Vec<Effect>) -> Vec<MemberId> {
+        let Some(parent) = self
+            .nodes
+            .get(&node)
+            .and_then(|found| found.binding.as_ref())
+            .map(|binding| binding.parent)
+        else {
+            return Vec::new();
+        };
+        let mut parked = Vec::new();
+        for (volume, member) in self.transferable(node, false) {
+            if let Some(binding) = self
+                .nodes
+                .get_mut(&node)
+                .and_then(|found| found.binding.as_mut())
+            {
+                binding.volumes.remove(&volume);
+                binding.awaiting.remove(&volume);
+            }
+            if self.park(parent, (node, volume), member, effects) {
+                parked.push(member);
+            }
+        }
+        parked
+    }
+
+    // The objects of `parent`'s namespace beside `node` that an offer of a
+    // volume it gives back goes to.
+    fn beside(&self, parent: NodeId, node: NodeId) -> Vec<NodeId> {
+        self.bound_below(parent)
+            .into_iter()
+            .filter(|sibling| *sibling != node && !self.lent(*sibling))
+            .collect()
+    }
+
+    // A volume the refused set at `set` held by what its headers mapped, now
+    // read back into its member's own file: the set gives it back, and it is
+    // offered beside the set as a volume given back is, with nothing
+    // carried, so it is claimed fresh by its name and front and a further
+    // posting folds into the volume it is. None taking it, it stays the
+    // set's, refused with it. A set left with no volume goes, as one that
+    // gave back every volume it held goes. Whether it went.
+    fn give_read_back(
+        &mut self,
+        parent: NodeId,
+        (set, member): (NodeId, MemberId),
+        effects: &mut Vec<Effect>,
+    ) -> bool {
+        let Some(volume) = self.volumes(set).and_then(|(_, volumes)| {
+            volumes
+                .iter()
+                .find(|(_, held)| **held == member)
+                .map(|(volume, _)| *volume)
+        }) else {
+            return false;
+        };
+        self.nodes.unretire(&(parent, member));
+        let beside = self.beside(parent, set);
+        let front = self.front(parent, member).to_vec();
+        self.offer(parent, member, &front, &beside, effects);
+        let taken = self.child_of(parent, member).is_some()
+            || self
+                .namespace(parent)
+                .is_some_and(|namespace| namespace.copy_of(member).is_some());
+        if !taken {
+            self.nodes.retire((parent, member), None);
+            return false;
+        }
+        let Some(binding) = self
+            .nodes
+            .get_mut(&set)
+            .and_then(|found| found.binding.as_mut())
+        else {
+            return false;
+        };
+        binding.volumes.remove(&volume);
+        binding.awaiting.remove(&volume);
+        let empty = binding.volumes.is_empty();
+        self.forget_empty(set, empty, effects);
+        empty
     }
 
     fn retire(&mut self, node: NodeId) {
@@ -3699,11 +3842,13 @@ impl Tree {
         pulled
     }
 
-    // Damage at a range of `node`'s volume. The tree asks the node's object
-    // where those bytes went and reports damage on each member they landed
-    // in; a damaged member bound to a child becomes damage on the child's
-    // volume, and so on down. The owner, told of each damaged member, finds
-    // the nearest recovery object that covers it.
+    // A range of `node`'s volume that will never arrive. The tree asks the
+    // node's object where those bytes would have gone and records the loss
+    // on each member they land in; a member bound to a child loses that
+    // range of the child's volume, and so on down. A loss is recorded as
+    // the loss it is at every depth, never as bytes that came damaged. The
+    // owner, told of each member that lost bytes, finds the nearest
+    // recovery object that covers it.
     pub fn damage(
         &mut self,
         node: NodeId,
@@ -3711,7 +3856,7 @@ impl Tree {
         range: ByteRange,
         effects: &mut Vec<Effect>,
     ) {
-        self.descend(vec![(node, volume, range)], Provenance::Damaged, effects);
+        self.descend(vec![(node, volume, range)], Provenance::Lost, effects);
     }
 
     // The member's bytes, every one of them in, fail the checksum its
@@ -3929,7 +4074,7 @@ impl Tree {
     }
 
     // Damage descends with the provenance it was marked with: a loss as
-    // `Damaged`, a checksum's verdict as `Refuted`.
+    // `Lost`, a checksum's verdict as `Refuted`.
     fn descend(
         &mut self,
         pending: Vec<(NodeId, VolumeIndex, ByteRange)>,
@@ -4045,6 +4190,7 @@ impl Tree {
                     record
                         .coverage
                         .overlapping(within)
+                        .filter(|run| run.provenance.arrived())
                         .filter_map(|run| {
                             let piece = run.range.intersect(within)?;
                             (!piece.is_empty()).then(|| (piece.shift(-shift), run.provenance))
@@ -4063,9 +4209,9 @@ impl Tree {
             let mut read = |placement: &Placement, into: &mut Vec<u8>| {
                 reader.read(tree, node, volume, placement, into)
             };
-            // A range held as damage may count bytes that never arrived: a
-            // lost range is held as damage above, and nothing of it sits
-            // below. Only what sits below goes again.
+            // Bytes held as damage above may not all sit below: an object
+            // that placed them only after they came holds none of them.
+            // Only what sits below goes again, and a loss never does.
             let pieces = runs.into_iter().flat_map(|(piece, provenance)| {
                 let sitting = if provenance.is_damaged() {
                     tree.sitting(node, object.as_ref(), volume, piece)
@@ -4097,7 +4243,8 @@ impl Tree {
 
     // The parts of a range of the node's volume whose bytes sit below it,
     // in order: as far as the record of the member the object placed them
-    // in says they arrived, and the whole of what it placed anywhere else.
+    // in says they arrived, a loss not, and the whole of what it placed
+    // anywhere else.
     fn sitting(
         &self,
         node: NodeId,
@@ -4126,6 +4273,7 @@ impl Tree {
                         record
                             .coverage
                             .overlapping(*within)
+                            .filter(|run| run.provenance.arrived())
                             .filter_map(|run| run.range.intersect(*within))
                             .map(|part| part.shift(piece.start as i64 - within.start as i64))
                             .collect()

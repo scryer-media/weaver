@@ -70,7 +70,7 @@ impl CrcRuns {
         match provenance {
             Provenance::Repaired => self.overwrite(range, crc),
             Provenance::Fresh if mends => self.overwrite(range, crc),
-            Provenance::Fresh | Provenance::Damaged | Provenance::Refuted => {
+            Provenance::Fresh | Provenance::Damaged | Provenance::Refuted | Provenance::Lost => {
                 self.insert(Run {
                     start: range.start,
                     len: range.len(),
