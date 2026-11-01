@@ -260,25 +260,29 @@ impl NamespaceWriter {
             if matches!(placement, Placement::Held { .. }) {
                 continue;
             }
-            // Each part the placement's source holds is posted on its own,
-            // so a gap in the source costs that gap, not the piece around it.
+            // Each part the placement's source holds, and each gap between
+            // them, is posted on its own, so a gap costs that gap, not the
+            // piece around it. The object is asked for every part: bytes it
+            // took and never placed in its source, a cipher block still short
+            // of its end, are its to give back.
             let mut skip = 0;
+            let mut parts = Vec::new();
             for kept in self.kept(tree, retired, placement) {
                 if kept.start > skip {
-                    pieces.push((
-                        ByteRange::new(piece.start + skip, piece.start + kept.start),
-                        None,
-                    ));
+                    parts.push(ByteRange::new(skip, kept.start));
                 }
-                let part = kept.shift(piece.start as i64);
+                parts.push(kept);
+                skip = kept.end;
+            }
+            if skip < piece.len() {
+                parts.push(ByteRange::new(skip, piece.len()));
+            }
+            for part in parts {
+                let part = part.shift(piece.start as i64);
                 let mut into = Vec::new();
                 let posted = object.posted(volume, part, &mut read, &mut into)
                     && into.len() as u64 == part.len();
                 pieces.push((part, posted.then(|| Bytes::from(into))));
-                skip = kept.end;
-            }
-            if skip < piece.len() {
-                pieces.push((ByteRange::new(piece.start + skip, piece.end), None));
             }
         }
         tree.put_object(retired, object);
@@ -287,7 +291,8 @@ impl NamespaceWriter {
 
     // The parts of a placement its source holds, as offsets into the
     // placement, in order: what the envelope kept, or what reached the
-    // member. Only those can be posted again.
+    // member. They cut the placement's parts; the object says which it can
+    // post again.
     fn kept(&self, tree: &Tree, retired: NodeId, placement: &Placement) -> Vec<ByteRange> {
         let held = |coverage: &Coverage, range: ByteRange| {
             let mut parts: Vec<ByteRange> = Vec::new();
