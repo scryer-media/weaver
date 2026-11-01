@@ -391,6 +391,64 @@ fn a_volume_given_back_that_nothing_takes_is_refused_with_its_set() {
     );
 }
 
+// A store founded on `y.part002.rar`, whose headers map it and which
+// refuses its set once the job is quiet, and beside it a store founded on
+// `x.part001.rar`, which takes any volume offered when `taker`.
+fn refusing_mapped(taker: bool) -> (Tree, Stores, NodeId, NodeId, MemberId) {
+    let mut stores = Stores(vec![
+        Holder {
+            refuses: true,
+            stem: Some("y".to_owned()),
+            ..Holder::default()
+        },
+        Holder {
+            taker,
+            ..Holder::default()
+        },
+    ]);
+    let mut tree = Tree::new();
+    let second = post(&mut tree, "y.part002.rar", &mut stores);
+    let (refusing, volume) = tree.child_of(NodeId::ROOT, second).expect("bound");
+    assert_eq!(volume, VolumeIndex(1));
+    let first = post(&mut tree, "x.part001.rar", &mut stores);
+    let (beside, _) = tree.child_of(NodeId::ROOT, first).expect("bound");
+    assert_ne!(beside, refusing);
+    (tree, stores, beside, refusing, second)
+}
+
+// A mapped volume of a refused set, once read back into its member's own
+// file, is offered to the store beside the set with nothing carried, and
+// the set left with no volume goes.
+#[test]
+fn a_refused_set_gives_back_a_mapped_volume_once_read_back() {
+    let (mut tree, mut stores, beside, refusing, second) = refusing_mapped(true);
+    let mut effects = Vec::new();
+    tree.quiet(refusing, &mut stores, &mut effects);
+    assert_eq!(tree.child_of(NodeId::ROOT, second), None, "{effects:?}");
+    tree.bury(NodeId::ROOT, second, &mut effects);
+    assert_eq!(
+        tree.child_of(NodeId::ROOT, second),
+        Some((beside, VolumeIndex(1))),
+        "{effects:?}"
+    );
+    assert!(tree.volumes(refusing).is_none(), "the emptied set goes");
+}
+
+// A read-back volume no store beside the set takes stays the refused set's.
+#[test]
+fn a_read_back_volume_nothing_takes_stays_with_its_refused_set() {
+    let (mut tree, mut stores, _, refusing, second) = refusing_mapped(false);
+    let mut effects = Vec::new();
+    tree.quiet(refusing, &mut stores, &mut effects);
+    tree.bury(NodeId::ROOT, second, &mut effects);
+    assert_eq!(tree.child_of(NodeId::ROOT, second), None, "{effects:?}");
+    assert_eq!(
+        tree.volumes(refusing).map(|(_, volumes)| volumes.len()),
+        Some(1),
+        "the set keeps its volume"
+    );
+}
+
 // A volume whose bytes route output is not given back: it is refused with
 // the set, and the store beside it never hears of it.
 #[test]

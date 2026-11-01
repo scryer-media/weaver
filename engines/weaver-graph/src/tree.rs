@@ -1064,9 +1064,12 @@ impl Tree {
     // delivered, and the rest of it goes: the posted volumes stand in for
     // that. When an engine took the volumes it reads them again and makes
     // every member over, so nothing of the node stays. A refused node stays
-    // whatever it keeps, to claim the rest of its set.
+    // whatever it keeps, to claim the rest of its set. A volume a refused
+    // set held, now in its member's own file, is given back as every volume
+    // of the set is: offered to the objects beside the set, with nothing
+    // carried, and the set's still only when none takes it.
     pub fn bury(&mut self, node: NodeId, member: MemberId, effects: &mut Vec<Effect>) {
-        let Some((retired, true)) = self.unbury(node, member) else {
+        let Some((retired, last)) = self.unbury(node, member) else {
             return;
         };
         let read_again = self.child_of(node, member).is_some();
@@ -1074,6 +1077,12 @@ impl Tree {
             .nodes
             .get(&retired)
             .is_some_and(|found| found.refused.is_some());
+        if refused && self.give_read_back(node, (retired, member), effects) {
+            return;
+        }
+        if !last {
+            return;
+        }
         if read_again || !(self.keep_closed(retired, effects) || refused) {
             self.drop_subtree(retired, effects);
             self.remove_node(retired, effects);
@@ -3596,11 +3605,7 @@ impl Tree {
         };
         // What the set gave back is offered to the objects beside it first,
         // by the one offer, and only what none takes is the refused set's.
-        let beside: Vec<NodeId> = self
-            .bound_below(parent)
-            .into_iter()
-            .filter(|sibling| *sibling != node && !self.lent(*sibling))
-            .collect();
+        let beside = self.beside(parent, node);
         for member in given {
             if self.unowned(parent, member) {
                 let front = self.front(parent, member).to_vec();
@@ -3643,6 +3648,62 @@ impl Tree {
             }
         }
         parked
+    }
+
+    // The objects of `parent`'s namespace beside `node` that an offer of a
+    // volume it gives back goes to.
+    fn beside(&self, parent: NodeId, node: NodeId) -> Vec<NodeId> {
+        self.bound_below(parent)
+            .into_iter()
+            .filter(|sibling| *sibling != node && !self.lent(*sibling))
+            .collect()
+    }
+
+    // A volume the refused set at `set` held by what its headers mapped, now
+    // read back into its member's own file: the set gives it back, and it is
+    // offered beside the set as a volume given back is, with nothing
+    // carried, so it is claimed fresh by its name and front and a further
+    // posting folds into the volume it is. None taking it, it stays the
+    // set's, refused with it. A set left with no volume goes, as one that
+    // gave back every volume it held goes. Whether it went.
+    fn give_read_back(
+        &mut self,
+        parent: NodeId,
+        (set, member): (NodeId, MemberId),
+        effects: &mut Vec<Effect>,
+    ) -> bool {
+        let Some(volume) = self.volumes(set).and_then(|(_, volumes)| {
+            volumes
+                .iter()
+                .find(|(_, held)| **held == member)
+                .map(|(volume, _)| *volume)
+        }) else {
+            return false;
+        };
+        self.nodes.unretire(&(parent, member));
+        let beside = self.beside(parent, set);
+        let front = self.front(parent, member).to_vec();
+        self.offer(parent, member, &front, &beside, effects);
+        let taken = self.child_of(parent, member).is_some()
+            || self
+                .namespace(parent)
+                .is_some_and(|namespace| namespace.copy_of(member).is_some());
+        if !taken {
+            self.nodes.retire((parent, member), None);
+            return false;
+        }
+        let Some(binding) = self
+            .nodes
+            .get_mut(&set)
+            .and_then(|found| found.binding.as_mut())
+        else {
+            return false;
+        };
+        binding.volumes.remove(&volume);
+        binding.awaiting.remove(&volume);
+        let empty = binding.volumes.is_empty();
+        self.forget_empty(set, empty, effects);
+        empty
     }
 
     fn retire(&mut self, node: NodeId) {
