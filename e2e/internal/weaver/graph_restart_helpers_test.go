@@ -4,6 +4,7 @@
 package weaver
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -94,12 +95,124 @@ func TestSchemaRewindPlanTouchesOnlyWhatIsThere(t *testing.T) {
 	}
 }
 
+// testMigrationsDir is the migration folder of the weaver this harness
+// lives in.
+var testMigrationsDir = filepath.Join("..", "..", "..", "server", "crates", "weaver-server-core", "src", "db", "migrations")
+
+// What the rewind drops is read from the migrations after the graph-engine
+// one, so a migration that adds a table or a column needs no line here.
+func TestLaterMigrationsNameWhatTheGraphEngineRewindDrops(t *testing.T) {
+	later, err := readLaterMigrations(testMigrationsDir, graphEngineMigration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantColumns := []tableColumn{
+		{"graph_members", "crc32"},
+		{"graph_members", "on_disk"},
+		{"graph_envelopes", "file"},
+		{"active_jobs", "feed_verdict"},
+		{"graph_members", "refuted_kind"},
+	}
+	for _, column := range wantColumns {
+		found := false
+		for _, got := range later.Columns {
+			found = found || got == column
+		}
+		if !found {
+			t.Fatalf("later columns = %v, missing %v", later.Columns, column)
+		}
+	}
+	heldParts := false
+	for _, table := range later.Tables {
+		heldParts = heldParts || table == "graph_held_parts"
+	}
+	if !heldParts {
+		t.Fatalf("later tables = %v, want graph_held_parts among them", later.Tables)
+	}
+}
+
+// A later migration whose step the rewind cannot undo is named, not skipped.
+func TestLaterMigrationsRefuseAStepTheRewindCannotUndo(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "migrations")
+	if err := os.MkdirAll(filepath.Join(dir, "0002_b"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `format_version = 1
+
+[[migration]]
+version = 1
+description = "a"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "a"
+
+[[migration]]
+version = 2
+description = "b"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0002_b/schema.sql"
+scope = "all"
+`
+	if err := os.WriteFile(filepath.Join(dir, "manifest.toml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sql := "-- a comment; with a semicolon\nALTER TABLE t ADD COLUMN c TEXT;\nUPDATE t SET c = 'x';\n"
+	if err := os.WriteFile(filepath.Join(dir, "0002_b", "schema.sql"), []byte(sql), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if latest, err := latestMigration(dir); err != nil || latest != 2 {
+		t.Fatalf("latest = %d, %v; want 2", latest, err)
+	}
+	if _, err := readLaterMigrations(dir, 0); err == nil || !strings.Contains(err.Error(), `migration 1 has a "rust" step`) {
+		t.Fatalf("from 0 = %v, want the rust step named", err)
+	}
+	if _, err := readLaterMigrations(dir, 1); err == nil || !strings.Contains(err.Error(), "UPDATE t SET c = 'x'") {
+		t.Fatalf("from 1 = %v, want the update named", err)
+	}
+}
+
 func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
 	t.Setenv(weaverDatastoreEnv, string(weaverDatastoreSQLite))
 	dbPath := filepath.Join(t.TempDir(), "state.db")
+	entries, err := readMigrationManifest(testMigrationsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest, err := latestMigration(testMigrationsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ledger := []string{"(73, 1)"}
+	var migrations []string
+	for _, entry := range entries {
+		if entry.Version < graphEngineMigration {
+			continue
+		}
+		ledger = append(ledger, fmt.Sprintf("(%d, 1)", entry.Version))
+		if entry.Version == graphEngineMigration {
+			continue
+		}
+		for _, step := range entry.Steps {
+			if strings.Contains(step.File, "postgres") {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(filepath.Dir(testMigrationsDir), filepath.FromSlash(step.File)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			migrations = append(migrations, string(data))
+		}
+	}
+	if len(ledger) != latest-73+1 {
+		t.Fatalf("ledger rows = %v, want every version from 73 to %d", ledger, latest)
+	}
 	if err := execAll(dbPath, []string{
 		`CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY, success BOOLEAN NOT NULL)`,
-		`INSERT INTO _sqlx_migrations VALUES (73, 1), (74, 1), (75, 1), (76, 1), (77, 1), (78, 1)`,
+		`INSERT INTO _sqlx_migrations VALUES ` + strings.Join(ledger, ", "),
 		`CREATE TABLE active_jobs (job_id INTEGER PRIMARY KEY)`,
 		`CREATE TABLE job_history (job_id INTEGER PRIMARY KEY)`,
 		`CREATE TABLE graph_members (job_id INTEGER, member_id INTEGER)`,
@@ -107,18 +220,14 @@ func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	var migrations []string
-	for _, path := range []string{"0075_graph_member_crc32/sqlite.sql", "0076_graph_held_parts/sqlite.sql", "0077_graph_file_on_disk/sqlite.sql", "0078_feed_verdict/schema.sql"} {
-		data, err := os.ReadFile(filepath.Join("..", "..", "..", "server", "crates", "weaver-server-core", "src", "db", "migrations", path))
-		if err != nil {
-			t.Fatal(err)
-		}
-		migrations = append(migrations, string(data))
-	}
 	if err := execAll(dbPath, migrations); err != nil {
 		t.Fatal(err)
 	}
-	if err := applySchemaRewind(dbPath, rewindToPreGraphEngine, nil); err != nil {
+	later, err := readLaterMigrations(testMigrationsDir, graphEngineMigration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := applySchemaRewind(dbPath, preGraphEngineRewind(later), nil); err != nil {
 		t.Fatal(err)
 	}
 	if err := execAll(dbPath, migrations); err != nil {

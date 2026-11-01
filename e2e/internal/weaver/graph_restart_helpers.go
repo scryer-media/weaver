@@ -606,24 +606,172 @@ var rewindTo0165 = schemaRewind{
 // engine: it drops active_jobs.engine, job_history.engine and the ten
 // classicOnlyTables.
 const graphEngineMigration = 74
-const graphLatestMigration = 78
 
-// rewindToPreGraphEngine is a database written before that migration: the
-// engine stamps and every classic-only table are there.
-var rewindToPreGraphEngine = schemaRewind{
-	DropTables: []string{"graph_held_parts"},
-	DropColumns: []tableColumn{
-		{"active_jobs", "feed_verdict"},
-		{"graph_members", "crc32"},
-		{"graph_members", "on_disk"},
-		{"graph_envelopes", "file"},
-	},
-	RestoreTables: classicOnlyTables,
-	AddColumns: []columnAdd{
-		{"active_jobs", "engine", "TEXT NOT NULL DEFAULT 'classic'"},
-		{"job_history", "engine", "TEXT NOT NULL DEFAULT 'classic'"},
-	},
-	LedgerFrom: graphEngineMigration,
+// weaverMigrationsDir is the migration folder of the weaver under test, the
+// one its manifest and SQL steps are read from.
+func weaverMigrationsDir() string {
+	return filepath.Join(weaverRepoPath(), "server", "crates", "weaver-server-core", "src", "db", "migrations")
+}
+
+// migrationStep is one step of a migration as the manifest lists it: its kind
+// and, for an SQL step, its file relative to the migration folder's parent.
+type migrationStep struct {
+	Kind string
+	File string
+}
+
+// migrationEntry is one migration the manifest lists, with its steps.
+type migrationEntry struct {
+	Version int
+	Steps   []migrationStep
+}
+
+var (
+	manifestMigrationLine = regexp.MustCompile(`^\[\[migration\]\]$`)
+	manifestStepLine      = regexp.MustCompile(`^\[\[migration\.steps\]\]$`)
+	manifestVersionLine   = regexp.MustCompile(`^version\s*=\s*(\d+)$`)
+	manifestFileLine      = regexp.MustCompile(`^file\s*=\s*"([^"]+)"$`)
+	manifestKindLine      = regexp.MustCompile(`^kind\s*=\s*"([^"]+)"$`)
+	sqlLineComment        = regexp.MustCompile(`--[^\n]*`)
+	sqlCreateTable        = regexp.MustCompile(`(?is)^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\(`)
+	sqlAddColumn          = regexp.MustCompile(`(?is)^ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\b`)
+)
+
+// readMigrationManifest is every migration the manifest in dir lists, in its
+// order.
+func readMigrationManifest(dir string) ([]migrationEntry, error) {
+	path := filepath.Join(dir, "manifest.toml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var entries []migrationEntry
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		switch {
+		case manifestMigrationLine.MatchString(line):
+			entries = append(entries, migrationEntry{})
+			continue
+		case len(entries) == 0:
+			continue
+		}
+		entry := &entries[len(entries)-1]
+		if manifestStepLine.MatchString(line) {
+			entry.Steps = append(entry.Steps, migrationStep{})
+			continue
+		}
+		if match := manifestVersionLine.FindStringSubmatch(line); match != nil && len(entry.Steps) == 0 {
+			entry.Version, _ = strconv.Atoi(match[1])
+			continue
+		}
+		if len(entry.Steps) == 0 {
+			continue
+		}
+		step := &entry.Steps[len(entry.Steps)-1]
+		if match := manifestKindLine.FindStringSubmatch(line); match != nil {
+			step.Kind = match[1]
+		} else if match := manifestFileLine.FindStringSubmatch(line); match != nil {
+			step.File = match[1]
+		}
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("%s lists no migration", path)
+	}
+	for _, entry := range entries {
+		if entry.Version == 0 {
+			return nil, fmt.Errorf("%s lists a migration with no version", path)
+		}
+	}
+	return entries, nil
+}
+
+// latestMigration is the last version the manifest in dir lists.
+func latestMigration(dir string) (int, error) {
+	entries, err := readMigrationManifest(dir)
+	if err != nil {
+		return 0, err
+	}
+	latest := 0
+	for _, entry := range entries {
+		if entry.Version > latest {
+			latest = entry.Version
+		}
+	}
+	return latest, nil
+}
+
+// laterMigrations is what the migrations after a version add: the tables
+// they create and the columns they add, each named once.
+type laterMigrations struct {
+	Tables  []string
+	Columns []tableColumn
+}
+
+// readLaterMigrations reads every SQL step of each migration the manifest in
+// dir lists after the given version. A rewind can undo only a table created
+// or a column added, so a later step of any other kind is an error naming it,
+// never something the rewind leaves in place.
+func readLaterMigrations(dir string, after int) (laterMigrations, error) {
+	entries, err := readMigrationManifest(dir)
+	if err != nil {
+		return laterMigrations{}, err
+	}
+	var out laterMigrations
+	seenTable := map[string]bool{}
+	seenColumn := map[tableColumn]bool{}
+	for _, entry := range entries {
+		if entry.Version <= after {
+			continue
+		}
+		for _, step := range entry.Steps {
+			if step.Kind != "sql" {
+				return laterMigrations{}, fmt.Errorf("migration %d has a %q step the rewind cannot undo", entry.Version, step.Kind)
+			}
+			data, err := os.ReadFile(filepath.Join(filepath.Dir(dir), filepath.FromSlash(step.File)))
+			if err != nil {
+				return laterMigrations{}, fmt.Errorf("migration %d: %w", entry.Version, err)
+			}
+			for _, statement := range strings.Split(sqlLineComment.ReplaceAllString(string(data), ""), ";") {
+				statement = strings.TrimSpace(statement)
+				if statement == "" {
+					continue
+				}
+				if create := sqlCreateTable.FindStringSubmatch(statement); create != nil {
+					if !seenTable[create[1]] {
+						seenTable[create[1]] = true
+						out.Tables = append(out.Tables, create[1])
+					}
+					continue
+				}
+				if add := sqlAddColumn.FindStringSubmatch(statement); add != nil {
+					column := tableColumn{add[1], add[2]}
+					if !seenColumn[column] {
+						seenColumn[column] = true
+						out.Columns = append(out.Columns, column)
+					}
+					continue
+				}
+				return laterMigrations{}, fmt.Errorf("migration %d has a statement the rewind cannot undo: %s", entry.Version, statement)
+			}
+		}
+	}
+	return out, nil
+}
+
+// preGraphEngineRewind is a database written before the graph-engine
+// migration: the engine stamps and every classic-only table are there, and
+// nothing a later migration added is.
+func preGraphEngineRewind(later laterMigrations) schemaRewind {
+	return schemaRewind{
+		DropTables:    later.Tables,
+		DropColumns:   later.Columns,
+		RestoreTables: classicOnlyTables,
+		AddColumns: []columnAdd{
+			{"active_jobs", "engine", "TEXT NOT NULL DEFAULT 'classic'"},
+			{"job_history", "engine", "TEXT NOT NULL DEFAULT 'classic'"},
+		},
+		LedgerFrom: graphEngineMigration,
+	}
 }
 
 // cloneHistoryRow copies a history row under another job id, every column
