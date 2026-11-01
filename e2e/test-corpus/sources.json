@@ -3616,9 +3616,9 @@
       }
     },
     {
-      "path": "testdata/feed-verdict-restart/broken.bin",
+      "path": "testdata/feed-verdict-restart/broken.mkv",
       "size": 65536,
-      "blake3": "2b04d7dada1d621f604dd37071ea6a6064617acf0c100c39fd18e18ad9500b78",
+      "blake3": "d1ef8eff77a402cfc149378e5e9906a1d779b1122139448212418aad8233a62b",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
@@ -3628,9 +3628,9 @@
       }
     },
     {
-      "path": "testdata/feed-verdict-restart/survivor.bin",
+      "path": "testdata/feed-verdict-restart/survivor.mkv",
       "size": 65536,
-      "blake3": "8dee7011d1ca0d3360dd391ba9382aec193a6960f09785955f916732a1d67666",
+      "blake3": "d299cafa4921b8037d348db7833863e31a4511d285be0cd97e462412fd7cdc72",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
