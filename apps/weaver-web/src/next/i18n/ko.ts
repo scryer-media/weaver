@@ -924,6 +924,7 @@ export const nextKo: LocaleDictionary = {
   "next.security.scopeHelp": "읽기는 대기열 보기, 제어는 작업 추가와 삭제, 관리는 설정 변경까지 할 수 있습니다.",
   "next.security.keyCreated": "API 키를 만들었습니다",
   "next.security.copied": "복사됨",
+  "next.security.copyFailed": "복사하지 못했습니다. Ctrl+C 또는 ⌘C를 누르세요",
   "next.security.copyKey": "키 복사",
   "next.security.done": "완료",
   "next.security.copyNow": "지금 복사하세요. Weaver는 해시만 저장하므로 다시 표시할 수 없습니다.",

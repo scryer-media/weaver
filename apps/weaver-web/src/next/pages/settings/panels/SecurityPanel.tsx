@@ -23,6 +23,7 @@ import { authHeaders } from "@/graphql/client";
 import { useTranslate } from "@/lib/context/translate-context";
 import { noteLoginEnabled } from "@/lib/login-required";
 import { takeApiKeyLink } from "@/lib/api-key-link";
+import { copyText } from "@/lib/clipboard";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Dialog } from "../../../components/Dialog";
@@ -445,7 +446,7 @@ function SecurityPanelBody({
   const [keyForm, setKeyForm] = useState({ name: "", scope: "CONTROL" });
   const [keyError, setKeyError] = useState<string | null>(null);
   const [createdKey, setCreatedKey] = useState<{ name: string; rawKey: string } | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState<"idle" | "copied" | "failed">("idle");
   const [removeKey, setRemoveKey] = useState<ApiKey | null>(null);
   const keyFieldRef = useRef<HTMLInputElement | null>(null);
 
@@ -460,11 +461,21 @@ function SecurityPanelBody({
     return () => window.cancelAnimationFrame(frame);
   }, [createdKey]);
 
-  const copyCreatedKey = () => {
+  // The key is selected either way: a copy the browser refuses leaves the
+  // user's own copy keystroke as the next thing to do.
+  const copyCreatedKey = async () => {
     if (!createdKey) return;
+    const taken = await copyText(createdKey.rawKey);
+    setCopied(taken ? "copied" : "failed");
+    keyFieldRef.current?.focus();
     keyFieldRef.current?.select();
-    void navigator.clipboard?.writeText(createdKey.rawKey).then(() => setCopied(true));
   };
+  const copyLabel =
+    copied === "copied"
+      ? t("next.security.copied")
+      : copied === "failed"
+        ? t("next.security.copyFailed")
+        : t("next.security.copyKey");
 
   const submitEnable = async (): Promise<"done" | "password"> => {
     if (enableForm.password !== enableForm.confirm) {
@@ -534,7 +545,7 @@ function SecurityPanelBody({
     }
     setKeyOpen(false);
     setCreatedKey({ name: trimmed, rawKey: result.data.createApiKey.rawKey });
-    setCopied(false);
+    setCopied("idle");
     setKeyForm({ name: "", scope: "CONTROL" });
     void refetchKeys({ requestPolicy: "network-only" });
     return "done";
@@ -1069,8 +1080,8 @@ function SecurityPanelBody({
         onDismiss={() => setCreatedKey(null)}
         footer={
           <>
-            <SecondaryButton icon={copied ? "copied" : "copy"} onClick={copyCreatedKey}>
-              {copied ? t("next.security.copied") : t("next.security.copyKey")}
+            <SecondaryButton icon={copied === "copied" ? "copied" : "copy"} onClick={() => void copyCreatedKey()}>
+              {copyLabel}
             </SecondaryButton>
             <PrimaryButton onClick={() => setCreatedKey(null)}>{t("next.security.done")}</PrimaryButton>
           </>
@@ -1092,12 +1103,12 @@ function SecurityPanelBody({
             />
             <button
               type="button"
-              title={copied ? t("next.security.copied") : t("next.security.copyKey")}
-              aria-label={copied ? t("next.security.copied") : t("next.security.copyKey")}
-              onClick={copyCreatedKey}
+              title={copyLabel}
+              aria-label={copyLabel}
+              onClick={() => void copyCreatedKey()}
               className="absolute inset-y-0 right-0 flex w-10 cursor-pointer items-center justify-center text-wv-dim hover:text-wv-fg"
             >
-              <Icon name={copied ? "copied" : "copy"} size={15} />
+              <Icon name={copied === "copied" ? "copied" : "copy"} size={15} />
             </button>
           </div>
         </div>

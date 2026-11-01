@@ -924,6 +924,7 @@ export const nextZh: LocaleDictionary = {
   "next.security.scopeHelp": "只读可查看队列;控制可添加和移除任务;管理可修改设置。",
   "next.security.keyCreated": "API 密钥已创建",
   "next.security.copied": "已复制",
+  "next.security.copyFailed": "无法复制，请按 Ctrl+C 或 ⌘C",
   "next.security.copyKey": "复制密钥",
   "next.security.done": "完成",
   "next.security.copyNow": "请立即复制。Weaver 只保存它的哈希值,因此无法再次显示。",

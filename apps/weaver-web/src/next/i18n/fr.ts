@@ -924,6 +924,7 @@ export const nextFr: LocaleDictionary = {
   "next.security.scopeHelp": "Lecture voit la file ; Contrôle peut ajouter et retirer du travail ; Administration peut modifier les paramètres.",
   "next.security.keyCreated": "Clé d'API créée",
   "next.security.copied": "Copiée",
+  "next.security.copyFailed": "Copie impossible ; appuyez sur Ctrl+C ou ⌘C",
   "next.security.copyKey": "Copier la clé",
   "next.security.done": "Terminé",
   "next.security.copyNow": "Copiez-la maintenant. Weaver n'en stocke qu'un hachage, elle ne pourra donc plus être affichée.",

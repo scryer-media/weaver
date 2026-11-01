@@ -924,6 +924,7 @@ export const nextJa: LocaleDictionary = {
   "next.security.scopeHelp": "読み取りはキューを参照、操作は処理の追加と削除、管理は設定の変更ができます。",
   "next.security.keyCreated": "API キーを作成しました",
   "next.security.copied": "コピーしました",
+  "next.security.copyFailed": "コピーできませんでした。Ctrl+C または ⌘C を押してください",
   "next.security.copyKey": "鍵をコピー",
   "next.security.done": "完了",
   "next.security.copyNow": "今すぐコピーしてください。Weaver はハッシュしか保存しないため、再表示できません。",
