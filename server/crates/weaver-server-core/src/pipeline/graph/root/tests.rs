@@ -197,6 +197,22 @@ fn damaged_ranges(job: &GraphJob, member: u32) -> Vec<ByteRange> {
         .unwrap_or_default()
 }
 
+// What the member holds as damage, each run with how it came to be held.
+fn held_as_damage(job: &GraphJob, member: u32) -> Vec<(ByteRange, Provenance)> {
+    job.tree()
+        .namespace(NodeId::ROOT)
+        .and_then(|namespace| namespace.get(MemberId(member)))
+        .map(|member| {
+            member
+                .coverage
+                .runs()
+                .filter(|run| run.provenance.is_damaged())
+                .map(|run| (run.range, run.provenance))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn data_bid(volume: u32, weight: u32, bidder: u32, in_order: bool) -> Ask {
     Ask {
         seek: Seek::data(VolumeIndex(volume), ByteRange::new(0, 100), Weight(weight)),
@@ -808,7 +824,8 @@ async fn a_lost_article_marks_its_range_damaged() {
 
 // An article that decoded short of where the bytes after it begin, or of
 // the file's declared end for the last, lost the bytes between: they are
-// damage told as a lost article's are, in whichever order the edges came.
+// a loss told as a lost article's is, held as damage apart from the bytes
+// that came damaged, in whichever order the edges came.
 #[test]
 fn a_short_article_loses_its_missing_tail() {
     let intake = |job: &mut GraphJob, article: Decoded| {
@@ -831,13 +848,31 @@ fn a_short_article_loses_its_missing_tail() {
     let (mut job, _dir, _) = job_with(&[file("carrier.bin", &[100, 100])], Vec::new());
     intake(&mut job, decoded(0, 0, 0, &[7; 100], Some(200)));
     intake(&mut job, cut(1, 100, 200, 40, 200));
-    assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(100, 200)]);
+    assert_eq!(
+        held_as_damage(&job, 0),
+        vec![
+            (ByteRange::new(100, 160), Provenance::Damaged),
+            (ByteRange::new(160, 200), Provenance::Lost)
+        ]
+    );
     // The same, the end declared by the first to arrive.
     let (mut job, _dir, _) = job_with(&[file("carrier.bin", &[100, 100])], Vec::new());
     intake(&mut job, cut(1, 100, 200, 40, 200));
-    assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(100, 200)]);
+    assert_eq!(
+        held_as_damage(&job, 0),
+        vec![
+            (ByteRange::new(100, 160), Provenance::Damaged),
+            (ByteRange::new(160, 200), Provenance::Lost)
+        ]
+    );
     intake(&mut job, decoded(0, 0, 0, &[7; 100], Some(200)));
-    assert_eq!(damaged_ranges(&job, 0), vec![ByteRange::new(100, 200)]);
+    assert_eq!(
+        held_as_damage(&job, 0),
+        vec![
+            (ByteRange::new(100, 160), Provenance::Damaged),
+            (ByteRange::new(160, 200), Provenance::Lost)
+        ]
+    );
     // A middle article, before and after the one beyond it.
     for next_first in [false, true] {
         let (mut job, _dir, _) = job_with(&[file("carrier.bin", &[100, 100, 100])], Vec::new());
@@ -852,8 +887,11 @@ fn a_short_article_loses_its_missing_tail() {
         }
         intake(&mut job, decoded(0, 2, 200, &[7; 100], Some(300)));
         assert_eq!(
-            damaged_ranges(&job, 0),
-            vec![ByteRange::new(0, 100)],
+            held_as_damage(&job, 0),
+            vec![
+                (ByteRange::new(0, 60), Provenance::Damaged),
+                (ByteRange::new(60, 100), Provenance::Lost),
+            ],
             "next_first={next_first}"
         );
     }

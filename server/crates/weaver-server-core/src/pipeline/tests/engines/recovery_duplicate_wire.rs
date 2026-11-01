@@ -652,7 +652,7 @@ async fn article_copies(
                     && record
                         .coverage
                         .overlapping(gap)
-                        .all(|run| run.provenance == weaver_graph::Provenance::Damaged),
+                        .all(|run| run.provenance == weaver_graph::Provenance::Lost),
                 "the settled article's absent suffix is stated lost: {:?}",
                 record.coverage
             );

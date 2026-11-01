@@ -278,7 +278,7 @@ async fn a_lost_article_under_a_par2_set_is_repaired_through_the_tree() {
     // The repair waits for blocks, and its seek promoted the volume's
     // parked articles ahead of everything.
     let lost = ByteRange::new(ARTICLE as u64, 2 * ARTICLE as u64);
-    assert!(runs(&pipeline, job_id, 0).contains(&(lost, Provenance::Damaged)));
+    assert!(runs(&pipeline, job_id, 0).contains(&(lost, Provenance::Lost)));
     let job = pipeline.graph_jobs.get_mut(&job_id).unwrap();
     assert_eq!(
         job.recovery_summary()[0].outcome,
@@ -317,7 +317,7 @@ async fn a_lost_article_under_a_par2_set_is_repaired_through_the_tree() {
         decode(&mut pipeline, job_id, &posts, 2, ordinal, true).await;
     }
     assert!(pipeline.graph_jobs[&job_id].repair_out());
-    assert!(runs(&pipeline, job_id, 0).contains(&(lost, Provenance::Damaged)));
+    assert!(runs(&pipeline, job_id, 0).contains(&(lost, Provenance::Lost)));
     let job = pipeline.graph_jobs.get_mut(&job_id).unwrap();
     assert!(!matches!(
         job.recovery_summary()[0].outcome,

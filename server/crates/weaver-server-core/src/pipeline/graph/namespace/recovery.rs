@@ -1007,7 +1007,7 @@ impl NamespaceWriter {
         for run in record.coverage.runs() {
             let verified = match run.provenance {
                 Provenance::Fresh => true,
-                Provenance::Damaged | Provenance::Refuted => false,
+                Provenance::Damaged | Provenance::Refuted | Provenance::Lost => false,
                 Provenance::Repaired => continue,
             };
             found.clear();

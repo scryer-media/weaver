@@ -1453,6 +1453,7 @@ fn provenance_name(provenance: Provenance) -> &'static str {
         Provenance::Damaged => "damaged",
         Provenance::Repaired => "repaired",
         Provenance::Refuted => "refuted",
+        Provenance::Lost => "lost",
     }
 }
 
@@ -1462,6 +1463,7 @@ fn provenance_named(name: &str) -> Option<Provenance> {
         Provenance::Damaged,
         Provenance::Repaired,
         Provenance::Refuted,
+        Provenance::Lost,
     ]
     .into_iter()
     .find(|provenance| provenance_name(*provenance) == name)

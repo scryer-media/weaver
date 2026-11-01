@@ -3699,11 +3699,13 @@ impl Tree {
         pulled
     }
 
-    // Damage at a range of `node`'s volume. The tree asks the node's object
-    // where those bytes went and reports damage on each member they landed
-    // in; a damaged member bound to a child becomes damage on the child's
-    // volume, and so on down. The owner, told of each damaged member, finds
-    // the nearest recovery object that covers it.
+    // A range of `node`'s volume that will never arrive. The tree asks the
+    // node's object where those bytes would have gone and records the loss
+    // on each member they land in; a member bound to a child loses that
+    // range of the child's volume, and so on down. A loss is recorded as
+    // the loss it is at every depth, never as bytes that came damaged. The
+    // owner, told of each member that lost bytes, finds the nearest
+    // recovery object that covers it.
     pub fn damage(
         &mut self,
         node: NodeId,
@@ -3711,7 +3713,7 @@ impl Tree {
         range: ByteRange,
         effects: &mut Vec<Effect>,
     ) {
-        self.descend(vec![(node, volume, range)], Provenance::Damaged, effects);
+        self.descend(vec![(node, volume, range)], Provenance::Lost, effects);
     }
 
     // The member's bytes, every one of them in, fail the checksum its
@@ -3929,7 +3931,7 @@ impl Tree {
     }
 
     // Damage descends with the provenance it was marked with: a loss as
-    // `Damaged`, a checksum's verdict as `Refuted`.
+    // `Lost`, a checksum's verdict as `Refuted`.
     fn descend(
         &mut self,
         pending: Vec<(NodeId, VolumeIndex, ByteRange)>,
@@ -4045,6 +4047,7 @@ impl Tree {
                     record
                         .coverage
                         .overlapping(within)
+                        .filter(|run| run.provenance.arrived())
                         .filter_map(|run| {
                             let piece = run.range.intersect(within)?;
                             (!piece.is_empty()).then(|| (piece.shift(-shift), run.provenance))
@@ -4063,9 +4066,9 @@ impl Tree {
             let mut read = |placement: &Placement, into: &mut Vec<u8>| {
                 reader.read(tree, node, volume, placement, into)
             };
-            // A range held as damage may count bytes that never arrived: a
-            // lost range is held as damage above, and nothing of it sits
-            // below. Only what sits below goes again.
+            // Bytes held as damage above may not all sit below: an object
+            // that placed them only after they came holds none of them.
+            // Only what sits below goes again, and a loss never does.
             let pieces = runs.into_iter().flat_map(|(piece, provenance)| {
                 let sitting = if provenance.is_damaged() {
                     tree.sitting(node, object.as_ref(), volume, piece)
@@ -4097,7 +4100,8 @@ impl Tree {
 
     // The parts of a range of the node's volume whose bytes sit below it,
     // in order: as far as the record of the member the object placed them
-    // in says they arrived, and the whole of what it placed anywhere else.
+    // in says they arrived, a loss not, and the whole of what it placed
+    // anywhere else.
     fn sitting(
         &self,
         node: NodeId,
@@ -4126,6 +4130,7 @@ impl Tree {
                         record
                             .coverage
                             .overlapping(*within)
+                            .filter(|run| run.provenance.arrived())
                             .filter_map(|run| run.range.intersect(*within))
                             .map(|part| part.shift(piece.start as i64 - within.start as i64))
                             .collect()

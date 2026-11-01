@@ -37,6 +37,11 @@ pub enum Provenance {
     // as `Damaged` is, and a verdict on bytes in hand: only proof displaces
     // it, never the same bytes, or another copy of them, arriving again.
     Refuted,
+    // Never came, and never will: a range the source lost. Held as damage,
+    // which a repair mends, but no bytes are there: a record of it is a
+    // record of a loss, never of bytes that arrived. Only a record says it;
+    // no bytes are posted with it.
+    Lost,
 }
 
 impl Provenance {
@@ -49,7 +54,16 @@ impl Provenance {
     // Whether the bytes are held as damage: what clean bytes over them
     // would mend, and what a decoder refuses to consume.
     pub fn is_damaged(self) -> bool {
-        matches!(self, Provenance::Damaged | Provenance::Refuted)
+        matches!(
+            self,
+            Provenance::Damaged | Provenance::Refuted | Provenance::Lost
+        )
+    }
+
+    // Whether bytes are held where a record says this: everything but a
+    // loss, whose bytes never came.
+    pub fn arrived(self) -> bool {
+        self != Provenance::Lost
     }
 
     // Whether a record of bytes with this provenance already answers the

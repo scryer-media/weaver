@@ -644,7 +644,7 @@ impl Namespace {
     ) -> Coverage {
         let mut standing = match provenance {
             Provenance::Repaired => Coverage::new(),
-            Provenance::Fresh | Provenance::Damaged | Provenance::Refuted => {
+            Provenance::Fresh | Provenance::Damaged | Provenance::Refuted | Provenance::Lost => {
                 self.first_elsewhere(posting, member, range)
             }
         };
@@ -676,7 +676,7 @@ impl Namespace {
         {
             let mut held = Coverage::new();
             for run in record.coverage.overlapping(range) {
-                if run.provenance != Provenance::Damaged
+                if !matches!(run.provenance, Provenance::Damaged | Provenance::Lost)
                     && let Some(piece) = run.range.intersect(range)
                 {
                     held.write(piece, Provenance::Fresh);
