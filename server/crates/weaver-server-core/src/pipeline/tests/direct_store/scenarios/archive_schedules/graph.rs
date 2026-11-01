@@ -477,11 +477,14 @@ impl Answers {
     }
 }
 
-// The orchestrator turns of one schedule, and the repair answer a held
-// schedule keeps back.
+// The orchestrator turns of one schedule, the repair answer a held
+// schedule keeps back, and the database's word that checkpoints committed
+// when a crash at a move is still to come.
 pub(in super::super) struct Turns {
     answers: Answers,
     held: Vec<Said>,
+    holds_written: bool,
+    written: Vec<Said>,
 }
 
 impl Turns {
@@ -489,20 +492,43 @@ impl Turns {
         Self {
             answers,
             held: Vec::new(),
+            holds_written: false,
+            written: Vec::new(),
         }
     }
 
-    // What an orchestrator turn does after an article: the runs' mail is
-    // heard, every completion check a step scheduled runs, and the runtime
-    // queues settle. Whatever is lent out is then waited for, so its answer
-    // is heard before the next article, or kept back when the schedule
-    // holds repairs' answers.
+    // A crash at a move comes back to the database as it stood before the
+    // article that made a file wait, so the job must not have acted on a
+    // checkpoint the step committed after it: a file the step's first
+    // checkpoint stops naming would be gone while that database still names
+    // it. The word that a checkpoint committed is kept back from the turn
+    // that heard it and given to the next one, after the crash checks
+    // between them, so a crash at a move always finds the commits of its
+    // own article unheard, as they are when the process dies before the
+    // database's word reaches the job. A word for a checkpoint before the
+    // article is heard before the job acts on the article's own.
+    pub(in super::super) fn holding_written(mut self, holds: bool) -> Self {
+        self.holds_written = holds;
+        self
+    }
+
+    // What an orchestrator turn does after an article: the commits a crash
+    // check was kept from are heard first, then the runs' mail, every
+    // completion check a step scheduled runs, and the runtime queues
+    // settle. Whatever is lent out is then waited for, so its answer is
+    // heard before the next article, or kept back when the schedule holds
+    // repairs' answers.
     pub(in super::super) async fn turn(&mut self, pipeline: &mut Pipeline) {
+        for said in std::mem::take(&mut self.written) {
+            pipeline.graph_run_said(said);
+        }
         let mut mail = pipeline.graph_runs.waiting();
         loop {
             for said in mail {
                 if self.answers == Answers::Held && matches!(said.heard, Heard::Repaired(_)) {
                     self.held.push(said);
+                } else if self.holds_written && matches!(said.heard, Heard::Written { .. }) {
+                    self.written.push(said);
                 } else {
                     pipeline.graph_run_said(said);
                 }
@@ -519,10 +545,11 @@ impl Turns {
     // Hears what is held back, before the schedule stops the pipeline or
     // once it has no articles left to hold it behind.
     pub(in super::super) async fn release(&mut self, pipeline: &mut Pipeline) -> bool {
-        if self.held.is_empty() {
+        if self.held.is_empty() && self.written.is_empty() {
             return false;
         }
-        for said in std::mem::take(&mut self.held) {
+        let written = std::mem::take(&mut self.written);
+        for said in written.into_iter().chain(std::mem::take(&mut self.held)) {
             pipeline.graph_run_said(said);
         }
         settle(pipeline).await;
@@ -686,18 +713,20 @@ impl MoveCrash {
     // goes rolled back, committed with its word unheard, or heard so the file
     // moved and the checkpoint saying so rolled back. Returns the pipeline
     // that goes on, and the status the job went down with when it did not
-    // restore.
+    // restore. The commits' word the turns kept back dies with the process,
+    // or is heard first when the commit's word is.
     async fn crash(
         &mut self,
         mut pipeline: Pipeline,
         root: &tempfile::TempDir,
         spec: &JobSpec,
-        run: &mut Run<'_>,
+        (run, turns): (&mut Run<'_>, &mut Turns),
     ) -> (Pipeline, Option<Option<JobStatus>>) {
         let Some(state) = self.state.filter(|_| file_waits(&pipeline)) else {
             return (pipeline, None);
         };
         self.state = None;
+        let written = std::mem::take(&mut turns.written);
         pipeline.db.flush_write_queue().await.unwrap();
         let waiting = pipeline
             .graph_jobs
@@ -723,6 +752,9 @@ impl MoveCrash {
                     for article in job.in_memory() {
                         run.delivered.remove(&article);
                     }
+                }
+                for said in written {
+                    pipeline.graph_run_said(said);
                 }
                 pipeline.hear_graph_runs();
                 let still = pipeline
@@ -772,7 +804,7 @@ async fn drive_graph_schedule(
     (interruption, answers): (Interruption, Answers),
 ) -> GraphOutcome {
     enable_schedule_trace();
-    let mut turns = Turns::new(answers);
+    let mut turns = Turns::new(answers).holding_written(interruption.moving().is_some());
     // Every volume the set is written as: what a recovery set or a listing
     // describes. The run serves the ones the post carries.
     let written = volumes;
@@ -852,7 +884,9 @@ async fn drive_graph_schedule(
         run.serve(&mut pipeline, article).await;
         moving.served(article);
         let gone;
-        (pipeline, gone) = moving.crash(pipeline, &root, &spec, &mut run).await;
+        (pipeline, gone) = moving
+            .crash(pipeline, &root, &spec, (&mut run, &mut turns))
+            .await;
         if let Some(status) = gone {
             retired = Some(status);
             break;
@@ -861,7 +895,9 @@ async fn drive_graph_schedule(
         run.look(&pipeline);
         run.note_asks(&mut pipeline);
         let gone;
-        (pipeline, gone) = moving.crash(pipeline, &root, &spec, &mut run).await;
+        (pipeline, gone) = moving
+            .crash(pipeline, &root, &spec, (&mut run, &mut turns))
+            .await;
         if let Some(status) = gone {
             retired = Some(status);
             break;
@@ -893,7 +929,9 @@ async fn drive_graph_schedule(
             run.serve(&mut pipeline, article).await;
             moving.served(article);
             let gone;
-            (pipeline, gone) = moving.crash(pipeline, &root, &spec, &mut run).await;
+            (pipeline, gone) = moving
+                .crash(pipeline, &root, &spec, (&mut run, &mut turns))
+                .await;
             if gone.is_some() {
                 retired = gone;
                 break;
@@ -901,7 +939,9 @@ async fn drive_graph_schedule(
             turns.turn(&mut pipeline).await;
             run.look(&pipeline);
             let gone;
-            (pipeline, gone) = moving.crash(pipeline, &root, &spec, &mut run).await;
+            (pipeline, gone) = moving
+                .crash(pipeline, &root, &spec, (&mut run, &mut turns))
+                .await;
             if gone.is_some() {
                 retired = gone;
                 break;
