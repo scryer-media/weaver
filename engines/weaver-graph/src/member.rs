@@ -165,10 +165,11 @@ impl Coverage {
             .any(|run| run.provenance.is_damaged())
     }
 
-    // The parts of `range` a record does not say were lost, in offset
-    // order: where bytes are held, or may be, to read back. A loss holds
-    // none.
-    pub fn arrived(&self, range: ByteRange) -> Vec<ByteRange> {
+    // `range` cut where the record's word on arrival changes, in offset
+    // order, each part with whether the record says its bytes arrived. A
+    // part it says was lost may still hold bytes placed over the loss; one
+    // it says arrived holds them.
+    pub fn by_arrival(&self, range: ByteRange) -> Vec<(ByteRange, bool)> {
         let mut parts = Vec::new();
         let mut at = range.start;
         for run in self.overlapping(range) {
@@ -179,12 +180,15 @@ impl Coverage {
                 continue;
             };
             if at < lost.start {
-                parts.push(ByteRange::new(at, lost.start));
+                parts.push((ByteRange::new(at, lost.start), true));
+            }
+            if lost.start.max(at) < lost.end {
+                parts.push((ByteRange::new(lost.start.max(at), lost.end), false));
             }
             at = at.max(lost.end);
         }
         if at < range.end {
-            parts.push(ByteRange::new(at, range.end));
+            parts.push((ByteRange::new(at, range.end), true));
         }
         parts
     }
@@ -1032,24 +1036,29 @@ mod tests {
     // A loss holds no bytes: what is read back of a range is everything
     // else in it, damaged bytes and bytes nothing recorded among them.
     #[test]
-    fn what_arrived_of_a_range_is_all_of_it_but_its_losses() {
+    fn a_range_is_cut_where_the_record_says_its_bytes_were_lost() {
         let mut coverage = Coverage::new();
         coverage.write(ByteRange::new(0, 10), Provenance::Fresh);
         coverage.write(ByteRange::new(10, 20), Provenance::Lost);
         coverage.write(ByteRange::new(20, 30), Provenance::Damaged);
         coverage.write(ByteRange::new(30, 40), Provenance::Lost);
         assert_eq!(
-            coverage.arrived(ByteRange::new(5, 45)),
+            coverage.by_arrival(ByteRange::new(5, 45)),
             vec![
-                ByteRange::new(5, 10),
-                ByteRange::new(20, 30),
-                ByteRange::new(40, 45)
+                (ByteRange::new(5, 10), true),
+                (ByteRange::new(10, 20), false),
+                (ByteRange::new(20, 30), true),
+                (ByteRange::new(30, 40), false),
+                (ByteRange::new(40, 45), true),
             ]
         );
-        assert!(coverage.arrived(ByteRange::new(12, 18)).is_empty());
         assert_eq!(
-            coverage.arrived(ByteRange::new(0, 10)),
-            vec![ByteRange::new(0, 10)]
+            coverage.by_arrival(ByteRange::new(12, 18)),
+            vec![(ByteRange::new(12, 18), false)]
+        );
+        assert_eq!(
+            coverage.by_arrival(ByteRange::new(0, 10)),
+            vec![(ByteRange::new(0, 10), true)]
         );
     }
 
