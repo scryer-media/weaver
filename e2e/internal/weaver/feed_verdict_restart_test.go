@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-func TestFeedVerdictOracleDerivesDamageFromPostedSizes(t *testing.T) {
+func TestFeedVerdictOracleDerivesLostBoundsFromPostedSizes(t *testing.T) {
 	broken := `<file subject="&quot;broken.mkv&quot;"><segments><segment bytes="5">a</segment><segment bytes="7">b</segment></segments></file>`
 	survivor := `<file subject="&quot;survivor.mkv&quot;"><segments><segment bytes="19">c</segment></segments></file>`
 	for index, files := range []string{broken + survivor, survivor + broken} {
@@ -25,15 +25,15 @@ func TestFeedVerdictOracleDerivesDamageFromPostedSizes(t *testing.T) {
 	}
 }
 
-func TestFeedVerdictRequiresPersistedDamageWithoutBacking(t *testing.T) {
+func TestFeedVerdictRequiresPersistedLossWithoutBacking(t *testing.T) {
 	for _, index := range []int{0, 1} {
-		for _, bad := range []string{"", "verdict", "wrong file", "member", "wrong name", "backing", "owned", "coverage", "bounds", "verified"} {
+		for _, bad := range []string{"", "verdict", "wrong file", "member", "wrong name", "backing", "owned", "coverage", "bounds", "verified", "damaged"} {
 			t.Run(fmt.Sprintf("%d/%s", index, bad), func(t *testing.T) {
 				length := uint64(12)
 				verdict := restartFeedVerdict{Version: 1, Reason: "missing", AbandonedFiles: []int{index}}
 				proof := checkpointEvidence{
 					Members:  []checkpointMember{{FileIndex: index, OutputName: "broken.mkv"}},
-					Coverage: []fileCoverageRow{{FileIndex: index, Length: &length, Coverage: fileCoverage{Runs: []fileCoverageRun{{Start: 0, End: 12, Provenance: "damaged"}}}}},
+					Coverage: []fileCoverageRow{{FileIndex: index, Length: &length, Coverage: fileCoverage{Runs: []fileCoverageRun{{Start: 0, End: 12, Provenance: "lost"}}}}},
 				}
 				switch bad {
 				case "verdict":
@@ -54,6 +54,8 @@ func TestFeedVerdictRequiresPersistedDamageWithoutBacking(t *testing.T) {
 					proof.Coverage[0].Coverage.Runs[0].End = 11
 				case "verified":
 					proof.Coverage[0].Coverage.Runs[0].Provenance = "fresh"
+				case "damaged":
+					proof.Coverage[0].Coverage.Runs[0].Provenance = "damaged"
 				}
 				err := requireFeedVerdictAbsence(proof, verdict, index, length)
 				if (err == nil) != (bad == "") {

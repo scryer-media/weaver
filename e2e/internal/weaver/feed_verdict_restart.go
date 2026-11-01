@@ -195,7 +195,7 @@ func runCommittedFeedVerdictRestart(ctx *restartCaseContext) (restartCaseResult,
 	return restartCaseResult{Classification: restartPass, Summary: "Committed feed verdict restored before dispatch; abandoned articles were not fetched after becoming available; healthy survivor delivered whole"}, nil
 }
 
-// No broken-file article is decoded. Its damaged coverage is bounded by the
+// No broken-file article is decoded. Its lost coverage is bounded by the
 // posted NZB's encoded sizes, but no physical file may be fabricated for it.
 func feedVerdictOutputOracle(nzb []byte, survivorHash string) (int, uint64, map[string]string, error) {
 	var post struct {
@@ -229,7 +229,7 @@ func feedVerdictOutputOracle(nzb []byte, survivorHash string) (int, uint64, map[
 	var length uint64
 	for _, segment := range post.Files[abandonedIndex].Segments {
 		// This recipe contains a 64 KiB source; reject an unexpected oversized
-		// fixture before accepting its independently computed damaged bounds.
+		// fixture before accepting its independently computed lost bounds.
 		if segment.Bytes == 0 || segment.Bytes > 1<<20 || length > 1<<20-segment.Bytes {
 			return 0, 0, nil, fmt.Errorf("unexpected feed fixture encoded size")
 		}
@@ -259,11 +259,11 @@ func requireFeedVerdictAbsence(proof checkpointEvidence, verdict restartFeedVerd
 			continue
 		}
 		if row.Length == nil || *row.Length != length || !row.Coverage.Covers(0, length) {
-			return fmt.Errorf("abandoned file does not cover its encoded damaged bounds")
+			return fmt.Errorf("abandoned file does not cover its encoded lost bounds")
 		}
 		for _, run := range row.Coverage.Runs {
-			if run.Provenance != "damaged" || run.End <= run.Start || run.End > length {
-				return fmt.Errorf("abandoned file has non-damaged coverage: %+v", run)
+			if run.Provenance != "lost" || run.End <= run.Start || run.End > length {
+				return fmt.Errorf("abandoned file has coverage that is not lost: %+v", run)
 			}
 		}
 		return nil
