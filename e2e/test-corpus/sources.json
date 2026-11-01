@@ -55,7 +55,7 @@
       }
     },
     {
-      "path": "testdata/adv-par2-lie-file-hash/lie-payload.bin",
+      "path": "testdata/adv-par2-lie-file-hash/lie-payload.mkv",
       "size": 2109497,
       "blake3": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c",
       "format": "bin",
@@ -63,7 +63,7 @@
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
@@ -71,13 +71,13 @@
     {
       "path": "testdata/adv-par2-lie-file-hash/lie-payload.par2",
       "size": 1076,
-      "blake3": "8557a60c55678dfe166c2d4a041961c9b40e22443572a57087a17801887de00e",
+      "blake3": "c343c851ad90d442e8e4275281a3383053b4f6b8b272a9f2a08c40ade00861e4",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
@@ -85,19 +85,19 @@
     {
       "path": "testdata/adv-par2-lie-file-hash/lie-payload.vol0+8.par2",
       "size": 528812,
-      "blake3": "073cfdf81ee1d036a25282b519118268679d15bdddfb4f2e87a2eaac3a4c9b25",
+      "blake3": "a4ce87066f158cfcf703f79a5b953afb54a3630f3965e375ecc69fc01cdac126",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
     },
     {
-      "path": "testdata/adv-par2-lie-hash16k/lie-payload.bin",
+      "path": "testdata/adv-par2-lie-hash16k/lie-payload.mkv",
       "size": 2109497,
       "blake3": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c",
       "format": "bin",
@@ -105,7 +105,7 @@
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
@@ -113,13 +113,13 @@
     {
       "path": "testdata/adv-par2-lie-hash16k/lie-payload.par2",
       "size": 1076,
-      "blake3": "d7f0def3366a0c171d9ca7f642c8797780bf0e7acdd8e4d39a6b92227a4b3c52",
+      "blake3": "9d14d23d71708fe518d9263234425b43cb38b9d1c15220ccfd40b223e4afbec5",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
@@ -127,19 +127,19 @@
     {
       "path": "testdata/adv-par2-lie-hash16k/lie-payload.vol0+8.par2",
       "size": 528812,
-      "blake3": "27cc801847e6ac53904d58dad6b8f87b7399a38ada0943385614e41aa0525838",
+      "blake3": "2a0c9a23b9328a08e9505b7c2bc6f07bcb6aee48b3d912d9b3fd139cdf4dbcc6",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
     },
     {
-      "path": "testdata/adv-par2-lie-length-long/lie-payload.bin",
+      "path": "testdata/adv-par2-lie-length-long/lie-payload.mkv",
       "size": 2109497,
       "blake3": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c",
       "format": "bin",
@@ -147,7 +147,7 @@
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
@@ -155,13 +155,13 @@
     {
       "path": "testdata/adv-par2-lie-length-long/lie-payload.par2",
       "size": 1076,
-      "blake3": "ffed19d5ea2687e89f48a87b8a8073ddf433a0ce109da5bbfb8f3316b822de07",
+      "blake3": "1f324c5a84c413b34e9c7113951bf2238fb387b7f6f91709395e52d25a3705ef",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
@@ -169,19 +169,19 @@
     {
       "path": "testdata/adv-par2-lie-length-long/lie-payload.vol0+8.par2",
       "size": 528812,
-      "blake3": "915a005a0a507d91d136055a61534ee6f5248a1da8846470d461802f996f1314",
+      "blake3": "4a188d03c9d1609dc82e06e34c523932893449602f05a1eb79f11c1bdf3b8d75",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
     },
     {
-      "path": "testdata/adv-par2-lie-length-short/lie-payload.bin",
+      "path": "testdata/adv-par2-lie-length-short/lie-payload.mkv",
       "size": 2109497,
       "blake3": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c",
       "format": "bin",
@@ -189,7 +189,7 @@
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
@@ -197,13 +197,13 @@
     {
       "path": "testdata/adv-par2-lie-length-short/lie-payload.par2",
       "size": 1076,
-      "blake3": "af0811a564b0c23f0103082cd3fa05d7d534583504563d0f98944c102ee53821",
+      "blake3": "b87d66c0ac5524479920badab403e0b48a42f8ec72242fb1918b79edcc172086",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
@@ -211,19 +211,19 @@
     {
       "path": "testdata/adv-par2-lie-length-short/lie-payload.vol0+8.par2",
       "size": 528812,
-      "blake3": "996dd0c9e45927948aad1778a9d4e4f5fd72fc1d55fe9a341f77f812cc3da489",
+      "blake3": "1259e5cc67dbc1cc339527e4e2bf87c3d69e6b82e62f69a1cf33c1bbacfb300d",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
     },
     {
-      "path": "testdata/adv-par2-lie-name-case/lie-payload.bin",
+      "path": "testdata/adv-par2-lie-name-case/lie-payload.mkv",
       "size": 2109497,
       "blake3": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c",
       "format": "bin",
@@ -231,7 +231,7 @@
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
@@ -239,13 +239,13 @@
     {
       "path": "testdata/adv-par2-lie-name-case/lie-payload.par2",
       "size": 1076,
-      "blake3": "ac511c2c138f657a80d58ceadb3ac748ce6252e3b32ea6686211163556e18594",
+      "blake3": "0b47c29df005791c1c344ebb0a9699b497b531e2665514761b3e75b085fff24f",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
@@ -253,19 +253,19 @@
     {
       "path": "testdata/adv-par2-lie-name-case/lie-payload.vol0+8.par2",
       "size": 528812,
-      "blake3": "816b94d9dbf074389e146b3eefd0e13cac0869e2e3d36326ae233dd4be664fe1",
+      "blake3": "6837d9bba64c0cca83d451e9548c78dd5eef132cace97f180772c7969b3db96a",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
     },
     {
-      "path": "testdata/adv-par2-lie-name-other/lie-payload.bin",
+      "path": "testdata/adv-par2-lie-name-other/lie-payload.mkv",
       "size": 2109497,
       "blake3": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c",
       "format": "bin",
@@ -273,7 +273,7 @@
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
@@ -281,13 +281,13 @@
     {
       "path": "testdata/adv-par2-lie-name-other/lie-payload.par2",
       "size": 1076,
-      "blake3": "c7f1d6df8cdaa4fe48f22d2125d38aecdf2b9ffed7f8140cc5d4d8dc1d4b6785",
+      "blake3": "65a302a75eda175ff8fd3aae5df775b7fb68ef5787c069f593070d30e06a18c2",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
@@ -295,19 +295,19 @@
     {
       "path": "testdata/adv-par2-lie-name-other/lie-payload.vol0+8.par2",
       "size": 528812,
-      "blake3": "147ca5739c7fdde3acb35bae5ac5d988f463c57a4fee72926621227191879bf7",
+      "blake3": "a75bc3b9ce2633fd81e1c773d423a45992b985e66d49cfc778a618efc39d0f6f",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
     },
     {
-      "path": "testdata/adv-par2-lie-slice-hash/lie-payload.bin",
+      "path": "testdata/adv-par2-lie-slice-hash/lie-payload.mkv",
       "size": 2109497,
       "blake3": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c",
       "format": "bin",
@@ -315,7 +315,7 @@
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
@@ -323,13 +323,13 @@
     {
       "path": "testdata/adv-par2-lie-slice-hash/lie-payload.par2",
       "size": 1076,
-      "blake3": "9ec9c904f5dc6c60edc6266eb073432d8969804b0f97e44a0ce92ae5f1b8b423",
+      "blake3": "37f7a0d7cd6b1e442032bc7cdde64bf22106286b9b95a1063deab0a4aff30901",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
@@ -337,19 +337,19 @@
     {
       "path": "testdata/adv-par2-lie-slice-hash/lie-payload.vol0+8.par2",
       "size": 528812,
-      "blake3": "ae5d6be5dea95ac41005526bcfd5c12f945c496501bfcf59f3c031c8c998f380",
+      "blake3": "545b19e74016b420d9a678748257bc1986b140f79ecbbaf70c81d5fdcd3efe9b",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
     },
     {
-      "path": "testdata/adv-par2-lie-slice-size/lie-payload.bin",
+      "path": "testdata/adv-par2-lie-slice-size/lie-payload.mkv",
       "size": 2109497,
       "blake3": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c",
       "format": "bin",
@@ -357,7 +357,7 @@
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
@@ -365,13 +365,13 @@
     {
       "path": "testdata/adv-par2-lie-slice-size/lie-payload.par2",
       "size": 1076,
-      "blake3": "fe63676ce1f6947f4cc56059841ef7a99d70c46688e659ebc6fea5f67d3565c9",
+      "blake3": "10c86f34a32b51b51966dc6940238a00bbddbaac0009064ba0dc7790ca8d485b",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
@@ -379,13 +379,13 @@
     {
       "path": "testdata/adv-par2-lie-slice-size/lie-payload.vol0+8.par2",
       "size": 528812,
-      "blake3": "59d63fa45818bbfcbc06af9537854e19a5f6985cf3ece18848ba74f44eb46777",
+      "blake3": "e8bfdd25e9d6c2a1ca5c7bb8b54eff375f99099fce8af3e1d4b327798ca0b399",
       "format": "par2",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
         "toolchains": [
-          "go-fixture-bytes",
+          "go-fixture-bytes@go1.27.3",
           "par2cmdline-turbo-1.4.0"
         ]
       }
@@ -13110,8 +13110,8 @@
     },
     {
       "path": "testdata/tarxz-corrupted-empty/bundle.tar.xz",
-      "size": 66676,
-      "blake3": "7ba2cb1792c92d71fc96acdb6484fca3e54eea1bcc02efb9084793b2cce7b361",
+      "size": 66680,
+      "blake3": "90cf3f6cf2aeedd9d2efe7d32976741310a384f7a9a67bc9bb4ea7c30b73a75d",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
@@ -13124,8 +13124,8 @@
     },
     {
       "path": "testdata/tarxz-corrupted-partial/bundle.tar.xz",
-      "size": 66688,
-      "blake3": "bc9daaa299429a2c6d95607836213bac8cebaea1af20531c6d9ea123e0fd0a05",
+      "size": 66664,
+      "blake3": "85848c4d4564079cd00c1db37c76d196cc321ca6cbb8dce49f3d20c8a35a4d3d",
       "source": {
         "kind": "generated",
         "generator": "fixturegen",
