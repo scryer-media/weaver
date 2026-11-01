@@ -165,6 +165,30 @@ impl Coverage {
             .any(|run| run.provenance.is_damaged())
     }
 
+    // The parts of `range` a record does not say were lost, in offset
+    // order: where bytes are held, or may be, to read back. A loss holds
+    // none.
+    pub fn arrived(&self, range: ByteRange) -> Vec<ByteRange> {
+        let mut parts = Vec::new();
+        let mut at = range.start;
+        for run in self.overlapping(range) {
+            if run.provenance.arrived() {
+                continue;
+            }
+            let Some(lost) = run.range.intersect(range) else {
+                continue;
+            };
+            if at < lost.start {
+                parts.push(ByteRange::new(at, lost.start));
+            }
+            at = at.max(lost.end);
+        }
+        if at < range.end {
+            parts.push(ByteRange::new(at, range.end));
+        }
+        parts
+    }
+
     pub fn damaged_ranges(&self) -> impl Iterator<Item = ByteRange> + '_ {
         self.runs
             .values()
@@ -1003,6 +1027,30 @@ mod tests {
         assert!(!coverage.verified(ByteRange::new(0, 30)));
         assert!(coverage.verified(ByteRange::new(10, 20)));
         assert_eq!(coverage.damaged_ranges().count(), 2);
+    }
+
+    // A loss holds no bytes: what is read back of a range is everything
+    // else in it, damaged bytes and bytes nothing recorded among them.
+    #[test]
+    fn what_arrived_of_a_range_is_all_of_it_but_its_losses() {
+        let mut coverage = Coverage::new();
+        coverage.write(ByteRange::new(0, 10), Provenance::Fresh);
+        coverage.write(ByteRange::new(10, 20), Provenance::Lost);
+        coverage.write(ByteRange::new(20, 30), Provenance::Damaged);
+        coverage.write(ByteRange::new(30, 40), Provenance::Lost);
+        assert_eq!(
+            coverage.arrived(ByteRange::new(5, 45)),
+            vec![
+                ByteRange::new(5, 10),
+                ByteRange::new(20, 30),
+                ByteRange::new(40, 45)
+            ]
+        );
+        assert!(coverage.arrived(ByteRange::new(12, 18)).is_empty());
+        assert_eq!(
+            coverage.arrived(ByteRange::new(0, 10)),
+            vec![ByteRange::new(0, 10)]
+        );
     }
 
     // A member posted short of the length its set describes takes that

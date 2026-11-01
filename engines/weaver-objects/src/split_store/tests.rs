@@ -570,6 +570,50 @@ fn a_set_missing_a_number_goes_back_at_quiet() {
     );
 }
 
+// A number that goes missing after a piece placed its bytes moves none of
+// them: the map still finds them where they sit, as the forward map does,
+// so they read back from there; nothing more is placed in a set missing a
+// number, and bytes past what was placed are held.
+#[test]
+fn a_number_missing_after_a_piece_placed_keeps_its_bytes_where_they_sit() {
+    let mut object = set(&["vessel.bin.001"]);
+    sized(&mut *object, 0, 100);
+    let out = deliver(&mut *object, 0, 0, &[7; 60]);
+    assert_eq!(placed(&out), vec![(0, 60)]);
+    let places = object.claim("vessel.bin.003", &[], None);
+    assert_eq!(places, vec![VolumeIndex(2)]);
+    object.bound(VolumeIndex(2), "vessel.bin.003", &[], Some(100));
+    assert_eq!(
+        locate(&*object, 0, ByteRange::at(0, 80)),
+        vec![
+            Placement::Member {
+                member: MEMBER,
+                range: ByteRange::at(0, 60),
+            },
+            Placement::Held {
+                range: ByteRange::new(60, 80),
+            },
+        ]
+    );
+    let mut extents = Vec::new();
+    object.extent(MEMBER, ByteRange::at(0, 60), &mut extents);
+    assert_eq!(
+        extents,
+        vec![Extent {
+            volume: VolumeIndex(0),
+            range: ByteRange::at(0, 60),
+        }]
+    );
+    let out = deliver(&mut *object, 0, 60, &[7; 20]);
+    assert!(placed(&out).is_empty(), "{out:?}");
+    assert_eq!(
+        locate(&*object, 2, ByteRange::at(0, 10)),
+        vec![Placement::Held {
+            range: ByteRange::at(0, 10)
+        }]
+    );
+}
+
 const RAR5: &[u8] = b"Rar!\x1a\x07\x01\x00";
 
 // A piece's front: `head`, then plain bytes to `len`.
