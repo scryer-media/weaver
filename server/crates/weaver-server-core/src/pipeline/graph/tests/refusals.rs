@@ -280,6 +280,33 @@ fn what_a_refused_store_closed_whole_is_delivered_whole() {
     }
 }
 
+// The store took the last bytes of each body and placed them in its member's
+// map, but never wrote them to the member, as a cipher keeps a block short of
+// its end. Refused, it gives them back itself: the volumes come back whole
+// and no byte of them is said to be damaged.
+#[test]
+fn a_refused_store_gives_back_bytes_it_took_and_never_placed() {
+    let mut refusing = refusing(Mode::Staging, 2, &[]);
+    refusing.deliver_all();
+    for member in 0..2 {
+        assert!(refusing.is_leaf(member));
+        assert_eq!(refusing.refused(member), Some(Why::Unsupported));
+        assert_eq!(
+            refusing.file(&format!("lantern.part{}.rar", member + 1)),
+            refusing.volumes[member as usize]
+        );
+    }
+    let damaged: Vec<_> = refusing
+        .job
+        .tree()
+        .namespace(NodeId::ROOT)
+        .unwrap()
+        .damaged_ranges()
+        .collect();
+    assert_eq!(damaged, Vec::new());
+    assert_eq!(refusing.job.phase(), RootPhase::Done);
+}
+
 #[tokio::test]
 async fn a_store_that_needs_an_engine_hands_its_volumes_to_one() {
     let mut refusing = refusing(Mode::NeedsEngine, 2, &[]);

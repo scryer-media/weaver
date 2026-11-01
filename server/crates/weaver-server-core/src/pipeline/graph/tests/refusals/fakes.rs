@@ -8,7 +8,7 @@
 // password opens it; an engine reads its first volume's body as
 // `unlocked.bin`, or refuses it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -22,6 +22,9 @@ use crate::pipeline::graph::engine::echo::{Echoes, HEADER};
 
 pub(super) const OPENS: &str = "lantern-three";
 
+// How many bytes at the end of each body a staging store keeps to itself.
+pub(super) const STAGED: usize = 5;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Mode {
     // The store refuses once its last volume closed.
@@ -31,6 +34,10 @@ pub(super) enum Mode {
     NeedsEngine,
     // The store places nothing and refuses once its last volume closed.
     Hold,
+    // The store keeps the last `STAGED` bytes of each body to itself, as a
+    // cipher keeps a block short of its end, though its map places them in
+    // its member, and refuses once its last volume closed.
+    Staging,
     // The store's body is locked until `OPENS` is offered.
     Locked,
     // The store is built as an engine whose run needs `OPENS`.
@@ -63,6 +70,7 @@ impl Builder for Fakes {
                 volumes: self.volumes,
                 announced: BTreeSet::new(),
                 body: Vec::new(),
+                staged: BTreeMap::new(),
                 asked: false,
                 opened: false,
                 offers: Arc::clone(&self.offers),
@@ -93,12 +101,29 @@ struct Store {
     volumes: u32,
     announced: BTreeSet<u32>,
     body: Vec<u8>,
+    // What a staging store keeps of each volume, by volume: where it starts
+    // in the volume, and its bytes.
+    staged: BTreeMap<u32, (u64, Vec<u8>)>,
     asked: bool,
     opened: bool,
     offers: Arc<Mutex<Vec<String>>>,
 }
 
 impl Store {
+    // The posted bytes of `range` of `volume`, read through its placements.
+    fn read_placed(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        let mut placements = Vec::new();
+        self.locate(volume, range, &mut placements);
+        placements.iter().map(Placement::len).sum::<u64>() == range.len()
+            && placements.iter().all(|placement| read(placement, into))
+    }
+
     // Whether the body is the store's member: not while it is locked or
     // places nothing.
     fn streams(&self) -> bool {
@@ -142,6 +167,15 @@ impl Object for Store {
             }
             _ => {
                 let member = MemberId(delivery.volume.0);
+                let mut body = body;
+                if self.mode == Mode::Staging {
+                    let keep = body.len().saturating_sub(STAGED);
+                    self.staged.insert(
+                        delivery.volume.0,
+                        (start + keep as u64, body[keep..].to_vec()),
+                    );
+                    body = &body[..keep];
+                }
                 if self.announced.insert(delivery.volume.0) {
                     out.push(Emit::Member {
                         member,
@@ -160,14 +194,15 @@ impl Object for Store {
     }
 
     fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
-        if self.announced.contains(&volume.0) {
+        // A staging store's members never reached their end: it closes none.
+        if self.announced.contains(&volume.0) && self.mode != Mode::Staging {
             out.push(Emit::MemberClosed(MemberId(volume.0)));
         }
         if volume.0 + 1 < self.volumes {
             return;
         }
         match self.mode {
-            Mode::Refuse | Mode::Hold => out.push(Emit::Refuse(Why::Unsupported)),
+            Mode::Refuse | Mode::Hold | Mode::Staging => out.push(Emit::Refuse(Why::Unsupported)),
             Mode::NeedsEngine => out.push(Emit::NeedsEngine(Why::Compressed)),
             _ => {}
         }
@@ -214,6 +249,37 @@ impl Object for Store {
 
     fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
         Located::Never
+    }
+
+    // The bytes it kept to itself it gives back as they came; the rest it
+    // reads through its placements.
+    fn posted(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        let Some((at, staged)) = self.staged.get(&volume.0) else {
+            return self.read_placed(volume, range, read, into);
+        };
+        let held = ByteRange::new(*at, at + staged.len() as u64);
+        if range.end <= held.start {
+            return self.read_placed(volume, range, read, into);
+        }
+        if range.start < held.start
+            && !self.read_placed(volume, ByteRange::new(range.start, held.start), read, into)
+        {
+            return false;
+        }
+        let from = range.start.max(held.start);
+        if range.end > held.end {
+            return false;
+        }
+        into.extend_from_slice(
+            &staged[(from - held.start) as usize..(range.end - held.start) as usize],
+        );
+        true
     }
 
     fn offer_password(&mut self, secret: &str, out: &mut Vec<Emit>) {
