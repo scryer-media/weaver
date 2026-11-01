@@ -715,6 +715,15 @@ impl MoveCrash {
             MoveState::Unheard => None,
             MoveState::Unrecorded => {
                 copy_database(root.path(), kept.path());
+                // The job comes back to the database kept here: what it held
+                // only in memory now is not on disk by that database's
+                // account, wherever the steps the commit's word lets run
+                // then write it.
+                if let Some(job) = pipeline.graph_jobs.get(&JOB) {
+                    for article in job.in_memory() {
+                        run.delivered.remove(&article);
+                    }
+                }
                 pipeline.hear_graph_runs();
                 let still = pipeline
                     .graph_jobs
