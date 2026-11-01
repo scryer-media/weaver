@@ -3,7 +3,9 @@
 
 // A store its bytes founded, renamed, takes from a store beside it only the
 // volumes that store says it can carry: a volume whose bytes route output
-// stays where it is, and the store holding it hears nothing.
+// stays where it is, and the store holding it hears nothing. A store that
+// refuses its set gives back first the volumes it can carry, which a store
+// beside it may take; only what none takes is refused with the set.
 
 use std::collections::BTreeSet;
 
@@ -20,10 +22,13 @@ const VOLUMES: u32 = 200;
 // first volume's. Its `loose` volume is one its headers have not mapped
 // yet, and can travel; every other routes output once bound and carries
 // nothing. A taker also places any name, or any volume handed to it, at
-// its first free place.
+// its first free place, and one that reclaims places any volume handed to
+// it there. One that refuses gives its set up once the job is quiet.
 #[derive(Default, Serialize, Deserialize)]
 struct Holder {
     taker: bool,
+    reclaims: bool,
+    refuses: bool,
     loose: Option<VolumeIndex>,
     stem: Option<String>,
     held: BTreeMap<VolumeIndex, String>,
@@ -142,10 +147,15 @@ impl Object for Holder {
         };
         match self.place(name) {
             Some(place) => vec![place],
-            None if self.taker => vec![self.free()],
+            None if self.taker || self.reclaims => vec![self.free()],
             None => Vec::new(),
         }
         .into()
+    }
+    fn quiet(&mut self, _: &dyn crate::object::Standing, out: &mut Vec<Emit>) {
+        if self.refuses {
+            out.push(Emit::Refuse(Why::FirstBytesLost));
+        }
     }
 }
 
@@ -300,5 +310,106 @@ fn a_rename_takes_only_the_volume_its_sibling_can_carry() {
             from: big,
             volume: VolumeIndex(VOLUMES),
         }]
+    );
+}
+
+// A store founded on `x.part001.rar`, whose headers map it, and beside it
+// a store founded on `y.part002.rar` alone, which refuses its set once the
+// job is quiet. The second's volume is loose when `loose`, and the first
+// takes a volume handed to it when `reclaims`.
+fn beside_refusing(loose: bool, reclaims: bool) -> (Tree, Stores, NodeId, NodeId, MemberId) {
+    let mut stores = Stores(vec![
+        Holder {
+            reclaims,
+            ..Holder::default()
+        },
+        Holder {
+            refuses: true,
+            stem: Some("y".to_owned()),
+            loose: loose.then_some(VolumeIndex(1)),
+            ..Holder::default()
+        },
+    ]);
+    let mut tree = Tree::new();
+    let first = post(&mut tree, "x.part001.rar", &mut stores);
+    let (kept, _) = tree.child_of(NodeId::ROOT, first).expect("bound");
+    let second = post(&mut tree, "y.part002.rar", &mut stores);
+    let (refusing, volume) = tree.child_of(NodeId::ROOT, second).expect("bound");
+    assert_ne!(refusing, kept);
+    assert_eq!(volume, VolumeIndex(1));
+    (tree, stores, kept, refusing, second)
+}
+
+// The refused set's loose volume goes to the store beside it that takes it,
+// as any volume given back goes, and nothing is refused.
+#[test]
+fn a_refused_set_gives_back_what_it_can_carry_to_the_store_beside_it() {
+    let (mut tree, mut stores, kept, refusing, second) = beside_refusing(true, true);
+    let mut effects = Vec::new();
+    tree.quiet(refusing, &mut stores, &mut effects);
+    assert_eq!(
+        tree.child_of(NodeId::ROOT, second),
+        Some((kept, VolumeIndex(1))),
+        "{effects:?}"
+    );
+    assert!(effects.contains(&Effect::GivenBack {
+        node: NodeId::ROOT,
+        member: second,
+        from: refusing,
+        volume: VolumeIndex(1),
+    }));
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Refused { .. })),
+        "{effects:?}"
+    );
+    assert!(tree.volumes(refusing).is_none(), "the emptied set goes");
+}
+
+// A loose volume no store beside it takes is refused with the set, for the
+// set's reason.
+#[test]
+fn a_volume_given_back_that_nothing_takes_is_refused_with_its_set() {
+    let (mut tree, mut stores, _, refusing, second) = beside_refusing(true, false);
+    let mut effects = Vec::new();
+    tree.quiet(refusing, &mut stores, &mut effects);
+    assert_eq!(tree.child_of(NodeId::ROOT, second), None);
+    assert!(effects.contains(&Effect::GivenBack {
+        node: NodeId::ROOT,
+        member: second,
+        from: refusing,
+        volume: VolumeIndex(1),
+    }));
+    assert!(
+        effects.contains(&Effect::Refused {
+            node: NodeId::ROOT,
+            member: second,
+            why: Why::FirstBytesLost,
+        }),
+        "{effects:?}"
+    );
+}
+
+// A volume whose bytes route output is not given back: it is refused with
+// the set, and the store beside it never hears of it.
+#[test]
+fn a_refused_set_keeps_the_volumes_it_cannot_carry() {
+    let (mut tree, mut stores, _, refusing, second) = beside_refusing(false, true);
+    let mut effects = Vec::new();
+    tree.quiet(refusing, &mut stores, &mut effects);
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::GivenBack { .. })),
+        "{effects:?}"
+    );
+    assert!(
+        effects.contains(&Effect::Refused {
+            node: NodeId::ROOT,
+            member: second,
+            why: Why::FirstBytesLost,
+        }),
+        "{effects:?}"
     );
 }

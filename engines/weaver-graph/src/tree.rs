@@ -3499,6 +3499,19 @@ impl Tree {
             return;
         }
         let parent = binding.parent;
+        // A refused set gives back first every volume it can carry, as any
+        // object gives a volume back: what is left is refused with it.
+        let given = match unbinding {
+            Unbinding::Refused(_) => self.give_carried(node, effects),
+            Unbinding::Engine(_) | Unbinding::Refuted => Vec::new(),
+        };
+        let Some(binding) = self
+            .nodes
+            .get(&node)
+            .and_then(|found| found.binding.clone())
+        else {
+            return;
+        };
         if let Some(found) = self.nodes.get_mut(&parent) {
             for member in binding.volumes.values() {
                 found.disown(*member);
@@ -3581,7 +3594,55 @@ impl Tree {
                 node
             }
         };
+        // What the set gave back is offered to the objects beside it first,
+        // by the one offer, and only what none takes is the refused set's.
+        let beside: Vec<NodeId> = self
+            .bound_below(parent)
+            .into_iter()
+            .filter(|sibling| *sibling != node && !self.lent(*sibling))
+            .collect();
+        for member in given {
+            if self.unowned(parent, member) {
+                let front = self.front(parent, member).to_vec();
+                self.offer(parent, member, &front, &beside, effects);
+            }
+        }
         self.offer_unowned(parent, holder, effects);
+        let empty = self
+            .nodes
+            .get(&node)
+            .and_then(|found| found.binding.as_ref())
+            .is_some_and(|binding| binding.volumes.is_empty());
+        self.forget_empty(node, empty, effects);
+    }
+
+    // The volumes the object at `node` can carry leave it, each parked
+    // beside its namespace as a member given back, as `give_back` parks
+    // them. The members parked, for the caller to offer.
+    fn give_carried(&mut self, node: NodeId, effects: &mut Vec<Effect>) -> Vec<MemberId> {
+        let Some(parent) = self
+            .nodes
+            .get(&node)
+            .and_then(|found| found.binding.as_ref())
+            .map(|binding| binding.parent)
+        else {
+            return Vec::new();
+        };
+        let mut parked = Vec::new();
+        for (volume, member) in self.transferable(node, false) {
+            if let Some(binding) = self
+                .nodes
+                .get_mut(&node)
+                .and_then(|found| found.binding.as_mut())
+            {
+                binding.volumes.remove(&volume);
+                binding.awaiting.remove(&volume);
+            }
+            if self.park(parent, (node, volume), member, effects) {
+                parked.push(member);
+            }
+        }
+        parked
     }
 
     fn retire(&mut self, node: NodeId) {
