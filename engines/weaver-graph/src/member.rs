@@ -46,11 +46,11 @@ pub struct Member {
     // more than its name placed it, whether or not the front is kept now.
     // Only a retraction, which starts the member over, takes it back.
     pub fronted: bool,
-    // The kind whose reading of it was refuted: by a later piece's own
-    // bytes against the claim its set's names made, or by the name a
-    // recovery set gave it. That kind is no answer to who owns it, now or
-    // after a restart: its bytes say (`said`). Only a retraction takes it
-    // back.
+    // The kind whose reading of it was refuted: a verdict about its bytes,
+    // or a later piece's, said that kind was wrong against the claim its
+    // set's names made. A name that moves it refutes nothing. That kind is
+    // no answer to who owns it, now or after a restart: its bytes say
+    // (`said`). Only a retraction takes it back.
     pub refuted: Option<Kind>,
     // How far its own articles reached, when their producer said so: past
     // what arrived where it lost bytes, short of its length where they

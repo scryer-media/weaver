@@ -185,17 +185,8 @@ fn refuted() -> (Tree, MemberId) {
     assert_eq!(bound(&tree), vec![Some(Kind::Split)], "the names found it");
     let mut effects = Vec::new();
     front(&mut tree, second, signing(), &mut effects);
-    let disclaimed: Vec<MemberId> = effects
-        .iter()
-        .filter_map(|effect| match effect {
-            Effect::Disclaimed { member, .. } => Some(*member),
-            _ => None,
-        })
-        .collect();
+    let disclaimed = claim_disclaimed(&mut tree, &effects);
     assert_eq!(disclaimed, vec![first, second], "{effects:?}");
-    for member in disclaimed {
-        tree.claim_by_bytes(NodeId::ROOT, member, &mut Pieces, &mut Vec::new());
-    }
     assert_eq!(bound(&tree), vec![Some(Kind::RarStore)]);
     assert_eq!(tree.child_of(NodeId::ROOT, first), None);
     (tree, first)
@@ -209,20 +200,20 @@ fn a_refuted_piece_whose_front_comes_again_founds_no_set_from_its_name() {
     assert_eq!(bound(&tree), vec![Some(Kind::RarStore)]);
 }
 
-// The members the set gave back, each then claimed by its own bytes, as
-// the owner claims them once it has read them back.
+// The members the set gave back, each then claimed again for the reason
+// its hold ended, as the owner claims them once it has read them back.
 fn claim_disclaimed(tree: &mut Tree, effects: &[Effect]) -> Vec<MemberId> {
-    let disclaimed: Vec<MemberId> = effects
+    let disclaimed: Vec<(MemberId, Disclaim)> = effects
         .iter()
         .filter_map(|effect| match effect {
-            Effect::Disclaimed { member, .. } => Some(*member),
+            Effect::Disclaimed { member, why, .. } => Some((*member, *why)),
             _ => None,
         })
         .collect();
-    for member in &disclaimed {
-        tree.claim_by_bytes(NodeId::ROOT, *member, &mut Pieces, &mut Vec::new());
+    for (member, why) in &disclaimed {
+        tree.claim_again(NodeId::ROOT, *member, *why, &mut Pieces, &mut Vec::new());
     }
-    disclaimed
+    disclaimed.into_iter().map(|(member, _)| member).collect()
 }
 
 // Each root member by name: the kind of the object that owns it, and the

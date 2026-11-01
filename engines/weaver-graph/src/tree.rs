@@ -256,15 +256,16 @@ pub enum Effect {
         member: MemberId,
         why: Why,
     },
-    // A member's object read it as what it is not: a volume's own bytes
-    // refuted the claim its name made, or a name a recovery set gave it
-    // says another kind. Nothing failed. The owner materialises the
-    // member's bytes into its own file through the retired object's inverse
-    // map, as a refused member's, has the tree claim it again
-    // (`Tree::claim_by_bytes`), then buries it.
+    // A member's object holds it no more, and nothing failed: a volume's
+    // own bytes refuted the claim its name made, or a name a recovery set
+    // gave it moved it. The owner materialises the member's bytes into its
+    // own file through the retired object's inverse map, as a refused
+    // member's, has the tree claim it again for that reason
+    // (`Tree::claim_again`), then buries it.
     Disclaimed {
         node: NodeId,
         member: MemberId,
+        why: Disclaim,
     },
     // The object at `from` gave this member back, which was its `volume`:
     // its own headers say the member is not its there. The member is a leaf
@@ -366,11 +367,21 @@ enum Unbinding {
     Refused(Why),
     // Only an engine reads them, bound in the object's place.
     Engine(Why),
-    // The object's reading was refuted, by a volume's own bytes against
-    // the claim its name made, or by a name that says a volume is another
-    // kind: each is claimed again (`Tree::claim_by_bytes`), and nothing
-    // failed.
+    // The object's hold ended and nothing failed: each is claimed again
+    // (`Tree::claim_again`), as the reason says.
+    Disclaimed(Disclaim),
+}
+
+// Why an object's hold on its members ended with nothing failed, which says
+// how each is claimed again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Disclaim {
+    // A verdict about a volume's own bytes said the object's kind is wrong:
+    // that kind is no answer to who owns its members (`Member::refuted`).
     Refuted,
+    // A name moved a member: the place was wrong, never the kind, so each
+    // member's name and front say who owns it, as founding asks.
+    Moved,
 }
 
 pub struct Tree {
@@ -1655,11 +1666,13 @@ impl Tree {
         if self.child_of(node, member) != Some((child, volume)) {
             return;
         }
-        // A name that says the member is another kind ends the hold, however
-        // the object was founded: its reading of the member is refuted and
-        // read back, and the member is claimed again as founding claims it.
+        // A name that no longer places the member there ends the hold,
+        // however the object was founded: the member is read back and
+        // claimed again as founding claims it. A name says where, never
+        // that a kind was wrong, so nothing is refuted.
         if !self.still_holds(node, child, member, volume) {
-            return self.unbind(child, Unbinding::Refuted, builder, effects);
+            let moved = Unbinding::Disclaimed(Disclaim::Moved);
+            return self.unbind(child, moved, builder, effects);
         }
         let unowned: Vec<(MemberId, Vec<u8>)> = self
             .namespace(node)
@@ -2233,35 +2246,39 @@ impl Tree {
         self.identify(node, member, &front, builder, effects);
     }
 
-    // A member whose object's reading of it was refuted, once the owner has
-    // read its bytes back into its own file: a volume's own bytes refuted
-    // the claim its set's names made (`Emit::Refuted`), or the name a
-    // recovery set gave it says another kind than the object's (`renamed`).
-    // Nothing gave it up: it is a member no object has claimed, and the
-    // object goes once the last of its volumes is read back, with
-    // everything under it, since nothing of a refuted reading stays.
+    // A member its object holds no more, once the owner has read its bytes
+    // back into its own file: a volume's own bytes refuted the claim its
+    // set's names made (`Emit::Refuted`), or the name a recovery set gave
+    // it no longer places it there (`renamed`). Nothing gave it up: it is a
+    // member no object has claimed, and the object goes once the last of
+    // its volumes is read back, with everything under it, since nothing of
+    // an ended reading stays.
     //
-    // It is claimed as founding claims it, by its name and its front,
-    // except that the kind whose reading was refuted is no answer: then its
-    // own bytes say what it is. The member keeps that kind (`Member::said`),
-    // so a front read back or fetched again later, or after a restart, is
-    // asked the same and founds no object of it from the name. Only the
-    // objects of the kind it is beside it are
+    // It is claimed as founding claims it, by its name and its front.
+    // Where the bytes refuted the object's kind, that kind is no answer:
+    // then its own bytes say what it is. The member keeps that kind
+    // (`Member::said`), so a front read back or fetched again later, or
+    // after a restart, is asked the same and founds no object of it from
+    // the name. A name that moved it refutes nothing: its new name says
+    // where it goes. Only the objects of the kind it is beside it are
     // offered it, so the set it is takes it where that set places it, and
     // nothing of another kind holding members by their names can take it
     // instead. A member whose bytes have not said yet stays the leaf it was
     // read back as: its file has its bytes, a front fetched again joins them
     // there, and it is asked again once they are in it, as any leaf whose
     // front comes is.
-    pub fn claim_by_bytes(
+    pub fn claim_again(
         &mut self,
         node: NodeId,
         member: MemberId,
+        why: Disclaim,
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
         let buried = self.unbury(node, member);
-        let refuted_kind = buried.and_then(|(refuted, _)| self.kind(refuted));
+        let refuted_kind = buried
+            .filter(|_| why == Disclaim::Refuted)
+            .and_then(|(refuted, _)| self.kind(refuted));
         self.nodes.unretire(&(node, member));
         if let Some((refuted, true)) = buried {
             self.drop_subtree(refuted, effects);
@@ -3411,7 +3428,10 @@ impl Tree {
                     self.unbind(node, Unbinding::Engine(why), builder, effects);
                 }
                 Emit::Refuse(why) => self.unbind(node, Unbinding::Refused(why), builder, effects),
-                Emit::Refuted => self.unbind(node, Unbinding::Refuted, builder, effects),
+                Emit::Refuted => {
+                    let refuted = Unbinding::Disclaimed(Disclaim::Refuted);
+                    self.unbind(node, refuted, builder, effects);
+                }
                 Emit::GiveBack(volume) => given.push(volume),
             }
             if self.nodes.get(&node).is_none_or(|found| found.retired) {
@@ -3512,7 +3532,7 @@ impl Tree {
         // object gives a volume back: what is left is refused with it.
         let given = match unbinding {
             Unbinding::Refused(_) => self.give_carried(node, effects),
-            Unbinding::Engine(_) | Unbinding::Refuted => Vec::new(),
+            Unbinding::Engine(_) | Unbinding::Disclaimed(_) => Vec::new(),
         };
         let Some(binding) = self
             .nodes
@@ -3533,13 +3553,14 @@ impl Tree {
         let (why, engine) = match unbinding {
             Unbinding::Refused(why) => (why, false),
             Unbinding::Engine(why) => (why, true),
-            // Nothing holds the set's volumes now: each is claimed by its
-            // own bytes once the owner has them back, and nothing failed.
-            Unbinding::Refuted => {
+            // Nothing holds the set's volumes now: each is claimed again
+            // once the owner has them back, and nothing failed.
+            Unbinding::Disclaimed(why) => {
                 for member in binding.volumes.into_values() {
                     effects.push(Effect::Disclaimed {
                         node: parent,
                         member,
+                        why,
                     });
                 }
                 return;
