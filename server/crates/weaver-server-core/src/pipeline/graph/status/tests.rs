@@ -543,8 +543,8 @@ fn a_delivery_ends_complete_partial_or_failed_by_its_short_files() {
 }
 
 // A short delivery is partial only when a whole file is of a type people
-// open, posted plainly or unpacked; a whole file of no known type ships, but
-// alone it leaves the job failed.
+// open, posted plainly or unpacked; a whole file of no known type alone
+// leaves the job failed, and stays in its working directory.
 #[test]
 fn a_short_delivery_is_partial_only_by_a_whole_file_of_a_known_type() {
     let error = "PAR2 recovery failed for 1 set(s)";

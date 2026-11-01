@@ -234,8 +234,9 @@ impl Delivery {
     // words a failure and rules nothing: a delivery with a whole usable
     // output and nothing short is complete. A short delivery is partial only
     // when a whole file is of a type people open (`known_type`), whatever
-    // depth it came from; whole files of no known type ship, but a job they
-    // alone stand for fails.
+    // depth it came from; a job whole files of no known type alone stand
+    // for fails, and as every failed job publishes nothing, they stay in its
+    // working directory.
     pub(crate) fn status(&self, failure: Option<&Failure>) -> JobStatus {
         let extracted = self.files.iter().any(|file| file.whole && file.depth > 0);
         let short = !(self.damaged.is_empty()
