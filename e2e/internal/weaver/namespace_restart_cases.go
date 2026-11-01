@@ -39,7 +39,7 @@ func namespaceRestartCases() []restartCase {
 			},
 		},
 		{
-			Name: "par2_destination_collision", Description: "A committed move fails without replacing an unrelated destination or losing its source",
+			Name: "par2_destination_collision", Description: "A committed move replaces unrelated bytes at its destination, as SABnzbd does, and the job completes",
 			Slugs: []string{namespaceRestartSlug},
 			Run: func(ctx *restartCaseContext) (restartCaseResult, error) {
 				return runNamespaceRestart(ctx, namespaceRestartSlug, "a.bin", false, false, true)
@@ -309,11 +309,10 @@ func runNamespaceRestart(ctx *restartCaseContext, slug, movedName string, remove
 	writeRestartJSON(filepath.Join(ctx.CaseDir, "pre_crash_checkpoint.json"), before)
 	provenBefore := directDurableArticles(segments, ranges, before)
 	proven := provenBefore
-	var collisionExpected map[string]string
 	if collision {
 		// Recreate the pre-move state named by the committed intent, then put
 		// unrelated bytes at its desired destination. Only recorded paths are
-		// touched; the source must remain available for an explicit retry.
+		// touched. The restored move replaces those bytes with the payload.
 		if filepath.Dir(move.OnDisk) != "." {
 			return restartCaseResult{}, fmt.Errorf("collision fixture source is not a posted leaf")
 		}
@@ -337,8 +336,7 @@ func runNamespaceRestart(ctx *restartCaseContext, slug, movedName string, remove
 		if err != nil {
 			return restartCaseResult{}, err
 		}
-		collisionExpected = map[string]string{move.OnDisk: move.BLAKE3, move.Wanted: digest, namespaceRestartSentinel: scenario.ExpectedOutputBLAKE3[namespaceRestartSentinel]}
-		writeRestartJSON(filepath.Join(ctx.CaseDir, "namespace_collision_expected.json"), collisionExpected)
+		writeRestartJSON(filepath.Join(ctx.CaseDir, "namespace_collision_planted.json"), map[string]string{move.OnDisk: move.BLAKE3, move.Wanted: digest})
 		after, err := readCheckpointEvidence(dbPath, jobID)
 		if err != nil {
 			return restartCaseResult{}, err
@@ -385,17 +383,7 @@ func runNamespaceRestart(ctx *restartCaseContext, slug, movedName string, remove
 	}
 	refetched := refetchedArticles(proven, preMetrics, metrics)
 	outputErr := assertExactOutputBLAKE3(dbPath, jobID, scenario.ExpectedOutputBLAKE3, false)
-	wantedStatus := "COMPLETE"
-	operationalFailure := true
-	if collision {
-		wantedStatus = "FAILED"
-		outputErr = assertOutputBLAKE3(dbPath, jobID, collisionExpected)
-		if outputErr == nil {
-			outputErr = assertForbiddenOutputPaths(dbPath, jobID, []string{".weaver-chunks"})
-		}
-		operationalFailure = logContains(ctx.caseLogPath, "graph job step failed")
-	}
-	detail := fmt.Sprintf("deleted_recorded_leaf=%t collision=%t durable_before=%d surviving_durable=%d refetched=%v output=%v operational_error=%t final=%s", removeMoved, collision, len(provenBefore), len(proven), refetched, outputErr, operationalFailure, statuses[jobID])
-	pass := statuses[jobID] == wantedStatus && len(refetched) == 0 && outputErr == nil && operationalFailure
+	detail := fmt.Sprintf("deleted_recorded_leaf=%t collision=%t durable_before=%d surviving_durable=%d refetched=%v output=%v final=%s", removeMoved, collision, len(provenBefore), len(proven), refetched, outputErr, statuses[jobID])
+	pass := statuses[jobID] == "COMPLETE" && len(refetched) == 0 && outputErr == nil
 	return classifyRestartResult(ctx.Profile, pass, "recorded namespace recovery: "+detail, false, "", "recorded namespace recovery failed: "+detail), nil
 }
