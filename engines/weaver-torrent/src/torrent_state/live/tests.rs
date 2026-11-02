@@ -1365,7 +1365,7 @@ async fn a_deep_upload_queue_on_one_peer_never_holds_up_the_next() {
     // idle peer has no upload rate: the light peer's block goes out
     // alongside the deep peer's first eight, and the deep peer gets no ninth
     // until its writer has sent one.
-    let handed = (peer::SEND_BUFFER_LOW_WATERMARK / u64::from(CHUNK_SIZE)) as usize;
+    let handed = usize::try_from(peer::SEND_BUFFER_LOW_WATERMARK / u64::from(CHUNK_SIZE)).unwrap();
     assert_eq!(next_sent(&mut light_rx).await, Sent::Block(31, 0));
     for &(index, chunk) in &asked[..handed] {
         assert_eq!(

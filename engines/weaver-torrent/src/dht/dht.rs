@@ -544,7 +544,7 @@ fn announce_slot(info_hash: &Id20) -> std::time::Duration {
     let at = u64::from_be_bytes(first) as u128;
     // Whole milliseconds, the timer's grain.
     let interval = DHT_ANNOUNCE_INTERVAL.as_millis();
-    std::time::Duration::from_millis((interval * at >> 64) as u64)
+    std::time::Duration::from_millis(((interval * at) >> 64) as u64)
 }
 
 impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {

@@ -3042,7 +3042,7 @@ impl TorrentService {
             return false;
         };
         let job = self.graph_job(job_id, dir, &layout, unpack, passwords, checkpoint);
-        let attachable = match self
+        match self
             .inner
             .live
             .lock()
@@ -3055,8 +3055,7 @@ impl TorrentService {
                 torrent.held.is_none()
             }
             None => false,
-        };
-        attachable
+        }
     }
 
     // Add a torrent. A metainfo becomes a job at once; a magnet needs its

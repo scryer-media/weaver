@@ -158,7 +158,7 @@ fn build(shape: Shape) -> (bytes::Bytes, [u8; 20]) {
     let mut torrent = b"d4:info".to_vec();
     torrent.extend_from_slice(&info);
     torrent.extend_from_slice(b"12:piece layersd");
-    layers.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+    layers.sort_by_key(|a| a.0.0);
     for (root, layer) in layers {
         torrent.extend(bstr(&root.0));
         torrent.extend(bstr(&layer.iter().flat_map(|h| h.0).collect::<Vec<u8>>()));
@@ -484,20 +484,16 @@ async fn torrent_loopback_counterpart() {
                 listeners.push(listener);
             }
             println!("BENCH PORTS {}", ports.join(","));
-            let tasks: Vec<_> = listeners
-                .into_iter()
-                .map(|listener| {
-                    tokio::spawn(async move {
-                        loop {
-                            let (stream, _) = listener.accept().await.unwrap();
-                            tokio::spawn(seed(stream, info_hash, shape));
-                        }
-                    })
-                })
-                .collect();
-            for task in tasks {
-                task.await.unwrap();
+            for listener in listeners {
+                tokio::spawn(async move {
+                    loop {
+                        let (stream, _) = listener.accept().await.unwrap();
+                        tokio::spawn(seed(stream, info_hash, shape));
+                    }
+                });
             }
+            // The seeders serve until the bench kills this process.
+            std::future::pending::<()>().await;
         }
         "leech" => {
             let depth = env_u64("WEAVER_BENCH_DEPTH", 250) as usize;

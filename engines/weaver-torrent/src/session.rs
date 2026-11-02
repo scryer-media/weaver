@@ -4991,10 +4991,13 @@ mod tests {
             std::io::Result<std::sync::Arc<dyn crate::network::DatagramSocket>>,
         > {
             Box::pin(async {
-                let socket =
-                    tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
-                Ok(std::sync::Arc::new(socket)
-                    as std::sync::Arc<dyn crate::network::DatagramSocket>)
+                let kernel =
+                    crate::network::KernelSockets::new(None).map_err(std::io::Error::other)?;
+                crate::network::SocketFactory::bind_udp(
+                    &kernel,
+                    (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                )
+                .await
             })
         }
     }
