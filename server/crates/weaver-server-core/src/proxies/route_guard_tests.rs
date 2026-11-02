@@ -74,8 +74,9 @@ const LIFTED: &[(&str, usize)] = &[
     ),
     ("server/crates/weaver-server-core/src/proxies/runtime.rs", 2),
     ("server/crates/weaver-server-core/src/speed_test/http.rs", 1),
-    // A leg's tracker clients, plain and title-cased.
-    ("server/crates/weaver-server-core/src/torrents/net.rs", 2),
+    // A leg's clients, plain and title-cased, and the tracker clients it
+    // keeps, each built for the leg.
+    ("server/crates/weaver-server-core/src/torrents/net.rs", 3),
     ("xtask/src/main.rs", 1),
 ];
 

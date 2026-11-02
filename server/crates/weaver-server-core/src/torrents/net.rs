@@ -557,6 +557,7 @@ pub fn tracker_client(
         base,
         bridge,
         kind: kind.clone(),
+        trackers: Mutex::default(),
     };
     // A leg whose clients cannot be built does not open.
     let _ = clients.builder(None).map_err(|error| error.to_string())?;
@@ -569,7 +570,18 @@ pub(crate) struct LegClients<F> {
     pub(crate) base: F,
     pub(crate) bridge: Option<Arc<Bridge>>,
     pub(crate) kind: LegKind,
+    // The tracker clients built, by target and header case, so an announce
+    // to a tracker the session announced to before builds no client (its
+    // TLS roots, its connector) again.
+    pub(crate) trackers: Mutex<std::collections::HashMap<TrackerTarget, reqwest::Client>>,
 }
+
+// A tracker client's target: its host, port and checked addresses, and
+// whether it writes header names capitalised.
+pub(crate) type TrackerTarget = (String, u16, Vec<IpAddr>, bool);
+
+// The most tracker clients a session keeps; past it they are built again.
+const TRACKER_CLIENTS_KEPT: usize = 1024;
 
 impl<F> HttpClients for LegClients<F>
 where
@@ -609,6 +621,46 @@ where
     )]
     fn title_case_client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
         Ok(self.builder(target)?.http1_title_case_headers().build()?)
+    }
+
+    // One client per target, kept: it keeps no connection idle, so each
+    // announce dials and closes as a client built for it and dropped did.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a torrent session's client, built for its leg"
+    )]
+    fn tracker_client(
+        &self,
+        target: HttpTarget<'_>,
+        title_case: bool,
+    ) -> anyhow::Result<reqwest::Client> {
+        let key = (
+            target.host.to_owned(),
+            target.port,
+            target.addrs.to_vec(),
+            title_case,
+        );
+        if let Some(client) = self
+            .trackers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&key)
+        {
+            return Ok(client.clone());
+        }
+        let builder = self.builder(Some(target))?.pool_max_idle_per_host(0);
+        let client = if title_case {
+            builder.http1_title_case_headers()
+        } else {
+            builder
+        }
+        .build()?;
+        let mut kept = self.trackers.lock().unwrap_or_else(PoisonError::into_inner);
+        if kept.len() >= TRACKER_CLIENTS_KEPT {
+            kept.clear();
+        }
+        kept.insert(key, client.clone());
+        Ok(client)
     }
 
     // A request leaves as the leg's sockets do: through the bridge from
@@ -1335,6 +1387,7 @@ mod tests {
             base: || Ok(reqwest::Client::builder().no_proxy()),
             bridge: None,
             kind: LegKind::System,
+            trackers: Mutex::default(),
         };
         let client = clients
             .client(Some(HttpTarget {
