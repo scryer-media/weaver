@@ -40,6 +40,7 @@ use crate::natpmp::{GatewayRoute, NatPmpMapper};
 use crate::peer_protocol::Handshake;
 use crate::ssl::{SslHttpClients, SslIdentity, SslTorrent};
 use crate::torrent_state::live::{
+    RateTick,
     choker::{Choker, OPTIMISTIC_UNCHOKE_INTERVAL, UNCHOKE_INTERVAL},
     web_seed::WebSeeds,
 };
@@ -334,6 +335,8 @@ pub struct Session {
     pub peer_limit: Option<usize>,
     // Hands out the session's upload slots to the peers of every torrent.
     pub(crate) choker: Arc<Choker>,
+    // Samples the rates of the torrents that move bytes.
+    pub(crate) rate_tick: Arc<RateTick>,
     pub(crate) disable_pex: bool,
     // Whether the session listens on uTP, and so connects over it.
     pub(crate) utp: bool,
@@ -1650,6 +1653,7 @@ impl Session {
                 ),
                 peer_limit: opts.peer_limit,
                 choker: Arc::new(Choker::new(opts.unchoke_slots_limit)),
+                rate_tick: Arc::new(RateTick::default()),
                 disable_pex: opts.disable_pex,
                 allow_multiple_connections_per_ip: Arc::new(AtomicBool::new(
                     opts.allow_multiple_connections_per_ip,
@@ -1738,6 +1742,17 @@ impl Session {
             session.start_speed_estimator_updater();
             session.start_peer_turnover();
             session.start_choker();
+            session.spawn(
+                debug_span!(parent: session.rs(), "rate_tick"),
+                "rate_tick",
+                {
+                    let tick = session.rate_tick.clone();
+                    async move {
+                        tick.run().await;
+                        Ok(())
+                    }
+                },
+            );
 
             Ok(session)
         }

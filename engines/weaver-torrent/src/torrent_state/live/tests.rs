@@ -6784,3 +6784,43 @@ async fn a_block_owed_for_a_piece_that_failed_its_hash_is_written_into_room_gran
     assert!(h.have(0));
     assert!(!storage.held.lock().contains(&0));
 }
+
+// Idle torrents cost the session's rate tick nothing: with `n` torrents
+// and no peer, the tick samples none however long the clock runs; once one
+// torrent has a live peer, the tick samples that torrent alone (libtorrent
+// `session_impl::on_tick` visits `m_torrent_lists[torrent_want_tick]` only).
+async fn idle_torrents_cost_the_rate_tick_nothing(n: usize) {
+    let h = Harness::new("idle_rate_tick").await;
+    let mut idle = Vec::with_capacity(n);
+    for i in 0..n {
+        idle.push(h.sibling(&format!("idle_rate_tick_{i}"), 0x00).await);
+    }
+    let tick = h._session.rate_tick.clone();
+    tokio::time::pause();
+    for _ in 0..50 {
+        tokio::time::advance(peer::RATE_SAMPLE_INTERVAL).await;
+    }
+    assert_eq!(tick.samples(), 0);
+    assert_eq!(tick.ticking(), 0);
+
+    let (_peer, _rx) = h.peer("127.0.0.1:6881");
+    while tick.samples() < 10 {
+        tokio::time::advance(peer::RATE_SAMPLE_INTERVAL).await;
+    }
+    assert_eq!(tick.ticking(), 1);
+    assert!(h.live.rate_ticked.load(Ordering::SeqCst));
+    assert!(
+        idle.iter()
+            .all(|t| !t.live.rate_ticked.load(Ordering::SeqCst))
+    );
+}
+
+#[tokio::test]
+async fn a_thousand_idle_torrents_cost_the_rate_tick_nothing() {
+    idle_torrents_cost_the_rate_tick_nothing(1_000).await;
+}
+
+#[tokio::test]
+async fn ten_thousand_idle_torrents_cost_the_rate_tick_nothing() {
+    idle_torrents_cost_the_rate_tick_nothing(10_000).await;
+}

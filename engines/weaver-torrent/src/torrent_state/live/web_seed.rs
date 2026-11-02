@@ -244,6 +244,11 @@ impl WebSeeds {
         }
     }
 
+    /// Whether the torrent has no web seed.
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().seeds.is_empty()
+    }
+
     /// Returns once a seed may have become due.
     pub async fn changed(&self) {
         self.changed.notified().await

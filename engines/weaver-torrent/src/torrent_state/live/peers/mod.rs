@@ -103,6 +103,9 @@ pub(crate) struct PeerStates {
     // Wakes the connect loop when a connect candidate appears or may come due
     // sooner.
     candidates_changed: Notify,
+    // Wakes the run's rate-tick join each time a peer goes live, so a run
+    // with no connection costs the session's rate tick nothing.
+    pub(crate) went_live: Arc<Notify>,
     // Held while a piece is handed to a peer to super-seed, so two peers
     // are not handed one piece at once.
     super_seeding: Mutex<()>,
@@ -333,6 +336,7 @@ impl PeerStates {
             admission: Mutex::new(()),
             banned: RwLock::new(list.banned),
             candidates_changed: Notify::new(),
+            went_live: Arc::new(Notify::new()),
             super_seeding: Mutex::new(()),
             web_seeds: AtomicUsize::new(0),
             allow_multiple_connections_per_ip: Default::default(),
@@ -973,6 +977,7 @@ impl PeerStates {
         }
         if let PeerState::Live(live) = state {
             self.availability.add(&live.bitfield);
+            self.went_live.notify_one();
         }
     }
 

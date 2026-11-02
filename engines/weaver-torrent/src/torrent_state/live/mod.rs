@@ -51,6 +51,8 @@ pub(crate) mod choker;
 mod hash_fetch;
 pub mod peer;
 pub mod peers;
+mod rate_tick;
+pub(crate) use rate_tick::RateTick;
 mod smart_ban;
 pub mod stats;
 #[cfg(test)]
@@ -118,8 +120,7 @@ use self::{
     choker::CHOKED_REQUEST_GRACE,
     peer::{
         DisconnectRank, InflightRequest, LivePeerState, MAX_ALLOWED_IN_REQUEST_QUEUE, PeerRx,
-        PeerState, PeerTx, RATE_SAMPLE_INTERVAL, Refused, RemoveInflightRequestResult,
-        empty_bitfield,
+        PeerState, PeerTx, Refused, RemoveInflightRequestResult, empty_bitfield,
         info::PeerInfo,
         ingest_bitfield, opening_rank, rate_estimator,
         stats::{
@@ -287,6 +288,8 @@ pub struct TorrentStateLive {
 
     down_speed_estimator: Arc<SpeedEstimator>,
     up_speed_estimator: SpeedEstimator,
+    // Whether the run is on the session's rate tick.
+    rate_ticked: AtomicBool,
     cancellation_token: CancellationToken,
     // Every task of the run, its connections' among them: once each has
     // ended after the run's end, every byte a closing connection drops has
@@ -436,6 +439,7 @@ impl TorrentStateLive {
             seed_at_start,
             down_speed_estimator,
             up_speed_estimator,
+            rate_ticked: AtomicBool::new(false),
             cancellation_token,
             tasks: TaskTracker::new(),
             session_stats,
@@ -493,36 +497,23 @@ impl TorrentStateLive {
             },
         );
 
+        // Joins the session's rate tick each time a peer goes live; the
+        // tick lets the run go once it moves nothing.
         state.spawn(
-            debug_span!(parent: state.shared.span.clone(), "speed_estimator_updater"),
-            format!("[{}]speed_estimator_updater", state.shared.id),
+            debug_span!(parent: state.shared.span.clone(), "rate_tick_join"),
+            format!("[{}]rate_tick_join", state.shared.id),
             {
+                let went_live = state.peers.went_live.clone();
                 let state = Arc::downgrade(&state);
                 async move {
                     loop {
-                        let state = match state.upgrade() {
-                            Some(state) => state,
-                            None => return Ok(()),
+                        went_live.notified().await;
+                        let Some(state) = state.upgrade() else {
+                            return Ok(());
                         };
-                        let now = Instant::now();
-                        let stats = state.stats_snapshot();
-                        let fetched = stats.fetched_bytes;
-                        let remaining = state
-                            .lock_read("get_remaining_bytes")
-                            .get_chunks()?
-                            .get_remaining_bytes();
-                        state
-                            .down_speed_estimator
-                            .add_snapshot(fetched, Some(remaining), now);
-                        state
-                            .up_speed_estimator
-                            .add_snapshot(stats.uploaded_bytes, None, now);
-                        for peer in state.peers.states.iter() {
-                            if let Some(live) = peer.value().get_live() {
-                                live.sample_rates(&peer.value().stats.counters, now);
-                            }
+                        if let Some(session) = state.shared.session.upgrade() {
+                            session.rate_tick.join(&state);
                         }
-                        tokio::time::sleep(RATE_SAMPLE_INTERVAL).await;
                     }
                 }
             },
@@ -548,6 +539,39 @@ impl TorrentStateLive {
         Ok(state)
     }
 
+    /// Samples the run's rate estimators and its live peers' rates at
+    /// `now`; returns whether the run stays on the session's rate tick: it
+    /// does while it has a live peer or a rate above nothing.
+    pub(crate) fn sample_rates(&self, now: Instant) -> bool {
+        let stats = self.stats_snapshot();
+        let remaining = match self.lock_read("get_remaining_bytes").get_chunks() {
+            Ok(chunks) => chunks.get_remaining_bytes(),
+            Err(e) => {
+                debug!(error = %e, "rate tick: no chunks, leaving the tick");
+                self.rate_ticked.store(false, Ordering::SeqCst);
+                return false;
+            }
+        };
+        self.down_speed_estimator
+            .add_snapshot(stats.fetched_bytes, Some(remaining), now);
+        self.up_speed_estimator
+            .add_snapshot(stats.uploaded_bytes, None, now);
+        for peer in self.peers.states.iter() {
+            if let Some(live) = peer.value().get_live() {
+                live.sample_rates(&peer.value().stats.counters, now);
+            }
+        }
+        if self.down_speed_estimator.bps() > 0 || self.up_speed_estimator.bps() > 0 {
+            return true;
+        }
+        // Off the tick first, then look: a peer that goes live after the
+        // look finds the flag down and its join puts the run back on.
+        self.rate_ticked.store(false, Ordering::SeqCst);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        self.peers.stats.live.load(Ordering::Relaxed) > 0
+            && !self.rate_ticked.swap(true, Ordering::SeqCst)
+    }
+
     /// Connects to the web seeds that are due every WEB_SEED_TICK, and as
     /// soon as one may have become due (libtorrent `torrent::second_tick`,
     /// `maybe_connect_web_seeds`).
@@ -555,9 +579,14 @@ impl TorrentStateLive {
         let mut tick = tokio::time::interval(WEB_SEED_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tokio::select! {
-                _ = tick.tick() => {}
-                _ = self.shared.web_seeds.changed() => {}
+            // A torrent with no web seed waits for one without a timer.
+            if self.shared.web_seeds.is_empty() {
+                self.shared.web_seeds.changed().await;
+            } else {
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = self.shared.web_seeds.changed() => {}
+                }
             }
             self.maybe_connect_web_seeds()?;
         }
