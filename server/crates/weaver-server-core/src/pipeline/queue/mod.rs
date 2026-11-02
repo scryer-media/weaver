@@ -15,6 +15,8 @@ mod counters;
 mod history;
 mod intents;
 pub(crate) use admission::{AdmissionResources, PreparedAdd, RestartAdmission};
+#[cfg(test)]
+pub(crate) use counters::COUNTER_SAMPLES;
 pub(crate) use history::clear_restart_artifacts;
 
 /// The control plane's shared facts. A guard never leaves a synchronous
@@ -24,6 +26,9 @@ pub struct Queue {
     history: std::sync::RwLock<Arc<[JobInfo]>>,
     revision: watch::Sender<u64>,
     intent_wake: tokio::sync::Notify,
+    // The actor's word on whether anything is there for a periodic driver
+    // to move. The counters ticker waits on it while it says no.
+    drive: watch::Sender<bool>,
     pub(crate) resources: std::sync::OnceLock<AdmissionResources>,
     pub(crate) closed: std::sync::atomic::AtomicBool,
     ticker_started: std::sync::atomic::AtomicBool,
@@ -120,6 +125,18 @@ pub struct Globals {
     pub runtime_paths: Option<RuntimePaths>,
     pub nntp_generation: u64,
     pub nntp_active: Option<crate::jobs::handle::NntpRuntimeActivation>,
+}
+
+impl Globals {
+    // Whether a hold over the whole queue stops every download: a pause, a
+    // scheduled or speed-test pause, a schedule replay, or shutdown.
+    pub(crate) fn holds_downloads(&self) -> bool {
+        self.paused
+            || self.scheduled_pause
+            || self.speed_test_paused
+            || self.schedule_replay_paused
+            || self.shutting_down
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -396,6 +413,7 @@ impl Queue {
             }),
             revision: watch::channel(0).0,
             intent_wake: tokio::sync::Notify::new(),
+            drive: watch::channel(false).0,
             resources: std::sync::OnceLock::new(),
             closed: std::sync::atomic::AtomicBool::new(false),
             ticker_started: std::sync::atomic::AtomicBool::new(false),
@@ -464,6 +482,25 @@ impl Queue {
 
     pub(crate) async fn intent_changed(&self) {
         self.intent_wake.notified().await;
+    }
+
+    // Set by the actor at the end of each turn; a repeat of the same answer
+    // wakes no one.
+    pub(crate) fn set_driving(&self, driving: bool) {
+        self.drive.send_if_modified(|current| {
+            let changed = *current != driving;
+            *current = driving;
+            changed
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn driving(&self) -> bool {
+        *self.drive.borrow()
+    }
+
+    pub(crate) fn subscribe_drive(&self) -> watch::Receiver<bool> {
+        self.drive.subscribe()
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {

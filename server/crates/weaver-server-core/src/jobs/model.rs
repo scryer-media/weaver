@@ -186,15 +186,16 @@ impl JobSpec {
         })
     }
 
-    // Takes every file's article list out of the spec, leaving what a job
-    // waiting its turn keeps, and returns what the lists held, with none of
-    // their articles in hand.
     // Whether a file's article list was let go: a restart keeps only the
-    // files of a job it restores, and the lists are read back on install.
+    // files of a job it restores, and a job that runs reads them back on
+    // install.
     pub fn lacks_article_lists(&self) -> bool {
         self.files.iter().any(|file| file.segments.is_empty())
     }
 
+    // Takes every file's article list out of the spec, leaving what a job
+    // waiting its turn keeps, and returns what the lists held, with none of
+    // their articles in hand.
     pub fn drop_article_lists(&mut self) -> FileSummaries {
         self.drop_article_lists_with_in_hand(|_, _| false)
     }
@@ -871,6 +872,18 @@ impl FileSummary {
 // The summary of every file of a job, in the spec's file order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileSummaries(pub Vec<FileSummary>);
+
+impl FileSummaries {
+    // As `JobSpec::par2_bytes`, for the spec whose lists these summarise.
+    pub fn par2_bytes(&self, spec: &JobSpec) -> u64 {
+        spec.files
+            .iter()
+            .zip(&self.0)
+            .filter(|(file, _)| matches!(file.role, FileRole::Par2 { .. }))
+            .map(|(_, summary)| summary.bytes)
+            .sum()
+    }
+}
 
 // Everything a job holds per article, built in one place when the job is
 // first handed work and dropped with the job.

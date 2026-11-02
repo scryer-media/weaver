@@ -162,6 +162,7 @@ pub async fn recover_server_state(
 
             match parse_result {
                 Ok(nzb) => {
+                    let runtime = crate::pipeline::StoredRuntimeValues::of(&recovered);
                     let mut spec = ingest::nzb_to_spec(
                         &nzb,
                         &recovered.nzb_path,
@@ -169,7 +170,7 @@ pub async fn recover_server_state(
                         recovered.metadata,
                     );
                     drop(nzb);
-                    spec.drop_article_lists();
+                    let summaries = spec.drop_article_lists();
                     // Apply a persisted password override on top of the
                     // NZB-derived password ('' = explicitly none).
                     match recovered.password_override.as_deref() {
@@ -218,6 +219,7 @@ pub async fn recover_server_state(
                             paused_resume_download_state,
                             paused_resume_post_state,
                             working_dir: recovered.output_dir,
+                            restart: Some(crate::RestartRead { runtime, summaries }),
                         },
                     });
                 }

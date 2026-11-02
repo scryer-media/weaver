@@ -193,6 +193,8 @@ async fn metrics_refresh_advances_without_pipeline_turns() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     tokio::time::pause();
+    // Bytes move only while the actor says there is something to drive.
+    pipeline.shared_state.queue.set_driving(true);
     let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
     let mut changes = handle.subscribe_job_changes();
     for downloaded in [1, 2, 99] {

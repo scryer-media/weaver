@@ -23,6 +23,24 @@ fn compute_uu_spool_max_segments(write_buf_max_pending: usize) -> usize {
         .clamp(UU_SPOOL_MIN_SEGMENTS, UU_SPOOL_MAX_SEGMENTS)
 }
 
+// Counts the decode results the actor heard while a restart's restores
+// still waited, so a test can pin that a restore does not hold them back.
+#[cfg(test)]
+pub(crate) static DECODES_HEARD_RESTORING: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+// Counts the actor's periodic ticks, so a test can pin that parked drivers
+// take none.
+#[cfg(test)]
+pub(crate) static PERIODIC_TICKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[inline]
+fn count_periodic_tick() {
+    #[cfg(test)]
+    PERIODIC_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 impl Pipeline {
     const METRICS_SNAPSHOT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
     // The metrics tick while nothing is moving: often enough for the speed
@@ -253,6 +271,7 @@ impl Pipeline {
             restores_waiting: false,
             dispatch_hold_watch: Vec::new(),
             queue_positions: None,
+            queue_positions_lost: Arc::default(),
             semantic_terminal_causes: HashMap::new(),
             pipeline_failure_stages: HashMap::new(),
             job_order: Vec::new(),
@@ -784,6 +803,32 @@ impl Pipeline {
             || self.post_download_phases > 0
     }
 
+    // Whether any periodic driver has something to move: the snapshot and
+    // tuning ticks, the stall and reconcile checks, and the counters ticker.
+    // Anything live moves on its own. A walk left due, such as a slot write
+    // that failed, is retried by the next tick. A job holding a slot can be
+    // handed work the moment a gate lifts with time, unless a hold over the
+    // whole queue stops every download. With none of these, every tick
+    // would find what the last one found, so the drivers stay parked until
+    // a turn changes this answer: an intent, a resume, or a slot taken.
+    pub(crate) fn has_work_to_drive(&self) -> bool {
+        self.pipeline_is_live()
+            || self.queue_walk_due
+            || (!self.nzb_admitted.is_empty()
+                && !self
+                    .shared_state
+                    .queue
+                    .read(|inner| inner.globals.holds_downloads()))
+    }
+
+    // Leave the gauges the parked drivers would publish saying what the
+    // pipeline holds now, since no tick will refresh them.
+    fn settle_parked_gauges(&mut self) {
+        self.refresh_periodic_snapshot();
+        self.refresh_download_pressure();
+        self.publish_download_transport_health();
+    }
+
     fn metrics_snapshot_period(live: bool) -> std::time::Duration {
         if live {
             Self::METRICS_SNAPSHOT_INTERVAL
@@ -825,6 +870,8 @@ impl Pipeline {
     pub async fn run(&mut self) {
         let mut metrics_live = true;
         let mut metrics_snapshot_interval = Self::metrics_snapshot_timer(metrics_live);
+        // Whether the periodic drivers ran through the previous turn.
+        let mut driving = true;
         // Whether the previous turn did anything that dispatch must follow.
         let mut dispatch_due = true;
         let mut tune_interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -984,166 +1031,194 @@ impl Pipeline {
                 )
                 .await;
             turn_active |= processed_results > 0;
-            if processed_results == 0 && !self.restores_waiting {
+            if processed_results == 0 {
                 // Set by the periodic arms that found nothing to do; every
                 // other arm is an event.
                 let mut idle_tick = false;
+                // The periodic arms below wait only while there is something
+                // for them to move; otherwise the loop sleeps until an event.
+                let drive = self.has_work_to_drive();
+                // While a restart's restores wait, the wait does not block:
+                // whatever is ready is heard first, else the next batch goes.
+                let restoring = self.restores_waiting;
                 turn_timer.pause();
-                tokio::select! {
-                    _ = queue.intent_changed() => { turn_timer.resume(); }
-                    Some(result) = self.download_done_rx.recv() => {
-                        turn_timer.resume();
-                        if !self.release_download_result(&result) { continue; }
-                        self.note_released_download_result_pending(
-                            result.job_id,
-                            Self::released_download_result_lead_bytes(&result),
-                        );
-                        pending_download_results.push_back(result);
-                    }
-                    Some(request) = self.download_refill_rx.recv() => {
-                        turn_timer.resume();
-                        self.drain_ready_download_results(&mut pending_download_results);
-                        self.handle_download_lane_refill_request(request);
-                    }
-                    Some(parked) = self.download_lane_parked_rx.recv() => {
-                        turn_timer.resume();
-                        self.handle_download_lane_parked(parked);
-                    }
-                    Some(event) = self.owned_download_lane_event_rx.recv() => {
-                        turn_timer.resume();
-                        self.handle_owned_download_lane_event(
-                            event,
-                            &mut pending_download_results,
-                        );
-                    }
-                    Some(said) = self.graph_runs.recv() => {
-                        self.graph_run_said(said);
-                    }
-                    Some(mail) = self.post_probes.recv() => {
-                        turn_timer.resume();
-                        self.post_probe_mail(mail);
-                    }
-                    Some(result) = self.decode_done_rx.recv() => {
-                        turn_timer.resume();
-                        crate::runtime::perf_probe::record(
-                            "download.decode.done_rx.received",
-                            std::time::Duration::from_nanos(1),
-                        );
-                        self.handle_decode_done(result).await;
-                    }
-                    Some(generation) = self.nntp_handoff_drained_rx.recv() => {
-                        turn_timer.resume();
-                        self.handle_nntp_handoff_drained(generation);
-                    }
-                    Some(done) = self.job_activated_rx.recv() => {
-                        turn_timer.resume();
-                        self.handle_job_activated(done);
-                    }
-                    Some(done) = self.move_done_rx.recv() => {
-                        turn_timer.resume();
-                        let reported_job = done.job_id;
-                        self.handle_move_to_complete_done(done).await;
-                        self.report_job(reported_job);
-                    }
-                    Some(released) = self.failed_release_rx.recv() => {
-                        turn_timer.resume();
-                        self.handle_failed_job_released(released);
-                    }
-                    Ok(()) = self.script_effects_rx.changed() => {
-                        turn_timer.resume();
-                        for job_id in self.db.take_script_effects() {
-                            self.apply_queue_script_effects(JobId(job_id));
-                            self.report_job(JobId(job_id));
-                        }
-                    }
-                    Some(event) = self.terminal_post_processing_done_rx.recv() => {
-                        turn_timer.resume();
-                        self.handle_terminal_post_processing_event(event).await;
-                    }
-                    Some(retry) = self.retry_rx.recv() => {
-                        turn_timer.resume();
-                        let reported_job = retry.work.segment_id.file_id.job_id;
-                        self.receive_retry_work(retry);
-                        self.report_job(reported_job);
-                    }
-                    _ = metrics_snapshot_interval.tick() => {
-                        turn_timer.resume();
-                        idle_tick = true;
-                        self.refresh_periodic_snapshot();
-                        // Lanes whose refill found nothing wait here for the
-                        // next wake; the tick is what ends the wait when no
-                        // wake comes.
-                        self.service_held_download_refills();
-                    }
-                    _ = rate_sleep, if !rate_delay.is_zero() => { turn_timer.resume(); }
-                    _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {
-                        turn_timer.resume();
-                        self.consume_due_checkpoint_rechecks();
-                    }
-                    _ = propagation_sleep, if propagation_delay.is_some() => { turn_timer.resume(); }
-                    _ = infrastructure_retry_sleep, if infrastructure_retry_deadline.is_some() => {
-                        turn_timer.resume();
-                        self.requeue_due_infrastructure_retries();
-                    }
-                    () = server_health.changed() => {
-                        turn_timer.resume();
-                        self.download_dispatch_wake = true;
-                    }
-                    _ = connection_hold_sleep, if connection_hold_deadline.is_some() => {
-                        turn_timer.resume();
-                        self.download_dispatch_wake = true;
-                    }
-                    _ = tune_interval.tick() => {
-                        turn_timer.resume();
-                        idle_tick = true;
-                        self.refresh_download_pressure();
-                        self.publish_download_transport_health();
+                macro_rules! turn_select {
+                    ($($biased:tt)?) => {
+                        tokio::select! {
+                            $($biased;)?
+                            _ = queue.intent_changed() => { turn_timer.resume(); }
+                            Some(result) = self.download_done_rx.recv() => {
+                                turn_timer.resume();
+                                if !self.release_download_result(&result) { continue; }
+                                self.note_released_download_result_pending(
+                                    result.job_id,
+                                    Self::released_download_result_lead_bytes(&result),
+                                );
+                                pending_download_results.push_back(result);
+                            }
+                            Some(request) = self.download_refill_rx.recv() => {
+                                turn_timer.resume();
+                                self.drain_ready_download_results(&mut pending_download_results);
+                                self.handle_download_lane_refill_request(request);
+                            }
+                            Some(parked) = self.download_lane_parked_rx.recv() => {
+                                turn_timer.resume();
+                                self.handle_download_lane_parked(parked);
+                            }
+                            Some(event) = self.owned_download_lane_event_rx.recv() => {
+                                turn_timer.resume();
+                                self.handle_owned_download_lane_event(
+                                    event,
+                                    &mut pending_download_results,
+                                );
+                            }
+                            Some(said) = self.graph_runs.recv() => {
+                                self.graph_run_said(said);
+                            }
+                            Some(mail) = self.post_probes.recv() => {
+                                turn_timer.resume();
+                                self.post_probe_mail(mail);
+                            }
+                            Some(result) = self.decode_done_rx.recv() => {
+                                turn_timer.resume();
+                                #[cfg(test)]
+                                if restoring {
+                                    DECODES_HEARD_RESTORING.fetch_add(1, Ordering::Relaxed);
+                                }
+                                crate::runtime::perf_probe::record(
+                                    "download.decode.done_rx.received",
+                                    std::time::Duration::from_nanos(1),
+                                );
+                                self.handle_decode_done(result).await;
+                            }
+                            Some(generation) = self.nntp_handoff_drained_rx.recv() => {
+                                turn_timer.resume();
+                                self.handle_nntp_handoff_drained(generation);
+                            }
+                            Some(done) = self.job_activated_rx.recv() => {
+                                turn_timer.resume();
+                                self.handle_job_activated(done);
+                            }
+                            Some(done) = self.move_done_rx.recv() => {
+                                turn_timer.resume();
+                                let reported_job = done.job_id;
+                                self.handle_move_to_complete_done(done).await;
+                                self.report_job(reported_job);
+                            }
+                            Some(released) = self.failed_release_rx.recv() => {
+                                turn_timer.resume();
+                                self.handle_failed_job_released(released);
+                            }
+                            Ok(()) = self.script_effects_rx.changed() => {
+                                turn_timer.resume();
+                                for job_id in self.db.take_script_effects() {
+                                    self.apply_queue_script_effects(JobId(job_id));
+                                    self.report_job(JobId(job_id));
+                                }
+                            }
+                            Some(event) = self.terminal_post_processing_done_rx.recv() => {
+                                turn_timer.resume();
+                                self.handle_terminal_post_processing_event(event).await;
+                            }
+                            Some(retry) = self.retry_rx.recv() => {
+                                turn_timer.resume();
+                                let reported_job = retry.work.segment_id.file_id.job_id;
+                                self.receive_retry_work(retry);
+                                self.report_job(reported_job);
+                            }
+                            _ = metrics_snapshot_interval.tick(), if drive => {
+                                turn_timer.resume();
+                                idle_tick = true;
+                                count_periodic_tick();
+                                self.refresh_periodic_snapshot();
+                                // Lanes whose refill found nothing wait here for the
+                                // next wake; the tick is what ends the wait when no
+                                // wake comes.
+                                self.service_held_download_refills();
+                            }
+                            _ = rate_sleep, if !rate_delay.is_zero() => { turn_timer.resume(); }
+                            _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {
+                                turn_timer.resume();
+                                self.consume_due_checkpoint_rechecks();
+                            }
+                            _ = propagation_sleep, if propagation_delay.is_some() => { turn_timer.resume(); }
+                            _ = infrastructure_retry_sleep, if infrastructure_retry_deadline.is_some() => {
+                                turn_timer.resume();
+                                self.requeue_due_infrastructure_retries();
+                            }
+                            () = server_health.changed() => {
+                                turn_timer.resume();
+                                self.download_dispatch_wake = true;
+                            }
+                            _ = connection_hold_sleep, if connection_hold_deadline.is_some() => {
+                                turn_timer.resume();
+                                self.download_dispatch_wake = true;
+                            }
+                            _ = tune_interval.tick(), if drive => {
+                                turn_timer.resume();
+                                idle_tick = true;
+                                count_periodic_tick();
+                                self.refresh_download_pressure();
+                                self.publish_download_transport_health();
 
-                        if tracing::enabled!(tracing::Level::DEBUG) {
-                        let live = self.pipeline_is_live();
-                        let snapshot = self.metrics.raw_snapshot();
-                        let not_found = snapshot.articles_not_found;
-                        // Folded over every job, so only while something
-                        // is moving; an idle pipeline's health is unchanged.
-                        let min_health: Option<u32> = live.then(|| self.jobs.values()
-                            .filter(|s| !matches!(s.status, JobStatus::Failed { .. } | JobStatus::Complete | JobStatus::Partial))
-                            .filter(|s| s.spec.total_bytes > 0)
-                            .map(|s| (s.spec.total_bytes.saturating_sub(s.failed_bytes) * 1000 / s.spec.total_bytes) as u32)
-                            .min()).flatten();
-                        debug!(
-                            active = self.active_downloads,
-                            queue = snapshot.download_queue_depth,
-                            speed_mbps = format!("{:.1}", snapshot.current_download_speed as f64 / (1024.0 * 1024.0)),
-                            downloaded_mb = snapshot.bytes_downloaded / (1024 * 1024),
-                            segments = snapshot.segments_downloaded,
-                            decode_pending = snapshot.decode_pending,
-                            decode_pending_mb = snapshot.decode_pending_bytes / (1024 * 1024),
-                            decode_active_mb = snapshot.decode_active_bytes / (1024 * 1024),
-                            write_backlog_mb = snapshot.write_buffered_bytes / (1024 * 1024),
-                            write_backlog_segments = snapshot.write_buffered_segments,
-                            pressure_state = snapshot.download_pressure_state.as_str(),
-                            pressure_reason = snapshot.download_pressure_reason.as_str(),
-                            direct_write_evictions = snapshot.direct_write_evictions,
-                            not_found,
-                            health = min_health.map(|h| format!("{:.1}%", h as f64 / 10.0)).unwrap_or_default(),
-                            "pipeline tick"
-                        );
+                                if tracing::enabled!(tracing::Level::DEBUG) {
+                                let live = self.pipeline_is_live();
+                                let snapshot = self.metrics.raw_snapshot();
+                                let not_found = snapshot.articles_not_found;
+                                // Folded over every job, so only while something
+                                // is moving; an idle pipeline's health is unchanged.
+                                let min_health: Option<u32> = live.then(|| self.jobs.values()
+                                    .filter(|s| !matches!(s.status, JobStatus::Failed { .. } | JobStatus::Complete | JobStatus::Partial))
+                                    .filter(|s| s.spec.total_bytes > 0)
+                                    .map(|s| (s.spec.total_bytes.saturating_sub(s.failed_bytes) * 1000 / s.spec.total_bytes) as u32)
+                                    .min()).flatten();
+                                debug!(
+                                    active = self.active_downloads,
+                                    queue = snapshot.download_queue_depth,
+                                    speed_mbps = format!("{:.1}", snapshot.current_download_speed as f64 / (1024.0 * 1024.0)),
+                                    downloaded_mb = snapshot.bytes_downloaded / (1024 * 1024),
+                                    segments = snapshot.segments_downloaded,
+                                    decode_pending = snapshot.decode_pending,
+                                    decode_pending_mb = snapshot.decode_pending_bytes / (1024 * 1024),
+                                    decode_active_mb = snapshot.decode_active_bytes / (1024 * 1024),
+                                    write_backlog_mb = snapshot.write_buffered_bytes / (1024 * 1024),
+                                    write_backlog_segments = snapshot.write_buffered_segments,
+                                    pressure_state = snapshot.download_pressure_state.as_str(),
+                                    pressure_reason = snapshot.download_pressure_reason.as_str(),
+                                    direct_write_evictions = snapshot.direct_write_evictions,
+                                    not_found,
+                                    health = min_health.map(|h| format!("{:.1}%", h as f64 / 10.0)).unwrap_or_default(),
+                                    "pipeline tick"
+                                );
+                                }
+                            }
+                            _ = stalled_download_interval.tick(), if drive => {
+                                turn_timer.resume();
+                                count_periodic_tick();
+                                // A stall needs a transfer in flight; with none the
+                                // walk over every job would find nothing.
+                                idle_tick = self.active_downloads_by_job.is_empty();
+                                if !idle_tick {
+                                    self.auto_pause_stalled_downloads();
+                                }
+                            }
+                            _ = state_reconcile_interval.tick(), if drive => {
+                                turn_timer.resume();
+                                idle_tick = true;
+                                count_periodic_tick();
+                                self.reconcile_candidate_jobs().await;
+                            }
+                            () = std::future::ready(()), if restoring => {
+                                turn_timer.resume();
+                                idle_tick = true;
+                            }
                         }
-                    }
-                    _ = stalled_download_interval.tick() => {
-                        turn_timer.resume();
-                        // A stall needs a transfer in flight; with none the
-                        // walk over every job would find nothing.
-                        idle_tick = self.active_downloads_by_job.is_empty();
-                        if !idle_tick {
-                            self.auto_pause_stalled_downloads();
-                        }
-                    }
-                    _ = state_reconcile_interval.tick() => {
-                        turn_timer.resume();
-                        idle_tick = true;
-                        self.reconcile_candidate_jobs().await;
-                    }
+                    };
+                }
+                if restoring {
+                    turn_select!(biased)
+                } else {
+                    turn_select!()
                 }
                 turn_active |= !idle_tick;
             }
@@ -1154,6 +1229,19 @@ impl Pipeline {
                 self.reconcile_clean = false;
             }
             dispatch_due = turn_active;
+            let now_driving = self.has_work_to_drive();
+            self.shared_state.queue.set_driving(now_driving);
+            if !now_driving {
+                if driving {
+                    // The reconcile tick's safety net runs once as the work
+                    // stops, rather than on a tick nobody will take.
+                    self.reconcile_candidate_jobs().await;
+                }
+                if driving || turn_active {
+                    self.settle_parked_gauges();
+                }
+            }
+            driving = now_driving;
             if live != metrics_live {
                 metrics_live = live;
                 metrics_snapshot_interval = Self::metrics_snapshot_timer(live);

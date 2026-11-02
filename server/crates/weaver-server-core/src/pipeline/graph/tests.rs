@@ -364,9 +364,27 @@ async fn a_hex_named_member_bound_by_its_prefix_is_renamed_and_its_file_moves() 
     // payload in, the set rules as its index is founded, before it is read;
     // the bind that names the member follows once that run is heard. The
     // file moves once the checkpoint that records its name has committed.
+    // That commit runs beside the repair and may be heard with it, so what
+    // stands then is read against what the database holds.
     hear_repair(&mut pipeline, job_id).await;
-    assert!(pipeline.graph_jobs[&job_id].moves_waiting());
-    assert!(hex.exists());
+    if pipeline.graph_jobs[&job_id].moves_waiting() {
+        assert!(hex.exists());
+    } else {
+        let stored = pipeline.db.load_graph_checkpoint(job_id).unwrap().unwrap();
+        let root = stored
+            .nodes
+            .iter()
+            .find(|node| node.parent.is_none())
+            .unwrap()
+            .node;
+        assert!(
+            stored
+                .members
+                .iter()
+                .any(|row| row.node == root && row.member == 0 && row.name == "lantern.bin")
+        );
+        assert!(!hex.exists());
+    }
     hear_graph_mail(&mut pipeline, job_id).await;
     assert!(!pipeline.graph_jobs[&job_id].moves_waiting());
 
@@ -1397,6 +1415,7 @@ async fn a_restart_parks_the_volume_again_from_the_objects_wants() {
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             working_dir,
+            restart: None,
         })
         .await
         .unwrap();

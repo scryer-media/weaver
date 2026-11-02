@@ -740,6 +740,7 @@ mod restore_ticket_tests {
                     paused_resume_download_state: None,
                     paused_resume_post_state: None,
                     working_dir: PathBuf::from(format!("restore-fixture/{}", job_id.0)),
+                    restart: None,
                 },
             });
 

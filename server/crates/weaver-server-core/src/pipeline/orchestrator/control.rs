@@ -36,17 +36,34 @@ impl Pipeline {
         // restart, under any pause and with every slot taken; only a shutdown
         // installs nothing. Admission decides only whether its articles go
         // out. A restore whose row carries a pause installs parked.
-        // A restart's restores install a bounded batch a turn, in queue
-        // order, so the first jobs download while the rest still install.
+        // A restart's restores install a bounded batch a turn: the jobs
+        // holding a slot first, wherever they stand, then the rest in queue
+        // order, so the jobs that download start while the rest install.
         let restores = self.shared_state.queue.write(|inner| {
             if inner.globals.shutting_down {
                 return Change::unchanged(Vec::new());
             }
+            let mut holders: Vec<usize> = self
+                .nzb_admitted
+                .iter()
+                .filter_map(|id| inner.job_position(*id))
+                .filter(|position| inner.jobs[*position].intents.restore.is_some())
+                .collect();
+            holders.sort_unstable();
+            let order: Vec<usize> = holders
+                .into_iter()
+                .chain(
+                    (0..inner.jobs.len())
+                        .filter(|position| inner.jobs[*position].intents.restore.is_some())
+                        .filter(|position| !self.nzb_admitted.contains(&inner.jobs[*position].id)),
+                )
+                .take(RESTORE_BATCH)
+                .collect();
             Change::unchanged(
-                inner
-                    .jobs
-                    .iter_mut()
-                    .filter_map(|row| {
+                order
+                    .into_iter()
+                    .filter_map(|position| {
+                        let row = &mut inner.jobs[position];
                         let paused = row.intents.paused == Some(true);
                         row.intents.restore.take().map(|mut request| {
                             if paused && request.status != JobStatus::Paused {
@@ -59,7 +76,6 @@ impl Pipeline {
                             request
                         })
                     })
-                    .take(RESTORE_BATCH)
                     .collect::<Vec<_>>(),
             )
         });
@@ -322,6 +338,12 @@ impl Pipeline {
     // through the ordered writer queue, which the shutdown drain flushes
     // within its bound and warns about if it cannot.
     async fn persist_queue_order(&mut self, order: &[JobId]) {
+        if self
+            .queue_positions_lost
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.queue_positions = None;
+        }
         let persisted = match self.queue_positions.take() {
             Some(persisted) => persisted,
             None => match self
@@ -345,10 +367,14 @@ impl Pipeline {
             self.queue_positions = Some(positions);
             return;
         }
+        // A write that does not commit leaves the database holding other
+        // positions than these, so the next order change reads them back.
+        let lost = Arc::clone(&self.queue_positions_lost);
         match self
             .db
             .try_queue_write("update_active_job_queue_positions", move |db| {
                 db.update_active_job_queue_positions(&writes)
+                    .inspect_err(|_| lost.store(true, std::sync::atomic::Ordering::Release))
             }) {
             Ok(()) => self.queue_positions = Some(positions),
             // Read back from the database before the next order is written.

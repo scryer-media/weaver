@@ -24,30 +24,49 @@ pub(crate) struct ActiveRuntimeValues {
     pub(crate) paused_resume_post_state: Option<&'static str>,
 }
 
-impl ActiveRuntimeValues {
-    // The columns a restore was read from. Only a failed status carries its
-    // error back, so a stored error beside any other status reads as none.
-    pub(crate) fn stored(request: &crate::RestoreJobRequest) -> Self {
+// A job's runtime columns as its active row holds them, read by a restart.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StoredRuntimeValues {
+    status: String,
+    download_state: Option<String>,
+    post_state: Option<String>,
+    run_state: Option<String>,
+    error: Option<String>,
+    queued_repair_at_epoch_ms: Option<f64>,
+    queued_extract_at_epoch_ms: Option<f64>,
+    paused_resume_status: Option<String>,
+    paused_resume_download_state: Option<String>,
+    paused_resume_post_state: Option<String>,
+}
+
+impl StoredRuntimeValues {
+    pub(crate) fn of(row: &crate::jobs::record::RecoveredJob) -> Self {
         Self {
-            status: Pipeline::persist_active_status_for(&request.status),
-            download_state: request.download_state.map(|value| value.as_str()),
-            post_state: request.post_state.map(|value| value.as_str()),
-            run_state: request.run_state.map(|value| value.as_str()),
-            error: match &request.status {
-                JobStatus::Failed { error } => Some(error.clone()),
-                _ => None,
-            },
-            queued_repair_at_epoch_ms: request.queued_repair_at_epoch_ms,
-            queued_extract_at_epoch_ms: request.queued_extract_at_epoch_ms,
-            paused_resume_status: request
-                .paused_resume_status
-                .as_ref()
-                .map(Pipeline::persist_active_status_for),
-            paused_resume_download_state: request
-                .paused_resume_download_state
-                .map(|value| value.as_str()),
-            paused_resume_post_state: request.paused_resume_post_state.map(|value| value.as_str()),
+            status: row.status.clone(),
+            download_state: row.download_state.clone(),
+            post_state: row.post_state.clone(),
+            run_state: row.run_state.clone(),
+            error: row.error.clone(),
+            queued_repair_at_epoch_ms: row.queued_repair_at_epoch_ms,
+            queued_extract_at_epoch_ms: row.queued_extract_at_epoch_ms,
+            paused_resume_status: row.paused_resume_status.clone(),
+            paused_resume_download_state: row.paused_resume_download_state.clone(),
+            paused_resume_post_state: row.paused_resume_post_state.clone(),
         }
+    }
+
+    // Whether the row already holds every one of `values`.
+    pub(crate) fn holds(&self, values: &ActiveRuntimeValues) -> bool {
+        self.status == values.status
+            && self.download_state.as_deref() == values.download_state
+            && self.post_state.as_deref() == values.post_state
+            && self.run_state.as_deref() == values.run_state
+            && self.error == values.error
+            && self.queued_repair_at_epoch_ms == values.queued_repair_at_epoch_ms
+            && self.queued_extract_at_epoch_ms == values.queued_extract_at_epoch_ms
+            && self.paused_resume_status.as_deref() == values.paused_resume_status
+            && self.paused_resume_download_state.as_deref() == values.paused_resume_download_state
+            && self.paused_resume_post_state.as_deref() == values.paused_resume_post_state
     }
 }
 

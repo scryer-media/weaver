@@ -259,6 +259,19 @@ impl Pipeline {
             .iter()
             .filter_map(|(_, _, id)| self.propagation_hold_until(*id).map(|_| *id))
             .collect();
+        // A hold that ran out on a job that is not a candidate, such as a
+        // paused one, holds nothing. It goes once seen, so it never calls for
+        // a walk on every turn; a candidate's went just above.
+        let now = Instant::now();
+        let expired: Vec<_> = self
+            .propagation_ready_at
+            .iter()
+            .filter(|(_, (ready_at, _))| *ready_at <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            self.propagation_hold_until(id);
+        }
         for (_, _, id) in candidates {
             // A settings edit or global hold can arrive while the previous
             // acquisition awaits its durable commit. Re-read before admitting
@@ -270,11 +283,7 @@ impl Pipeline {
                         .max_concurrent_nzbs
                         .unwrap_or(crate::settings::model::DEFAULT_MAX_CONCURRENT_NZBS)
                         .get() as usize
-                    && !globals.paused
-                    && !globals.scheduled_pause
-                    && !globals.speed_test_paused
-                    && !globals.shutting_down
-                    && !globals.schedule_replay_paused
+                    && !globals.holds_downloads()
             });
             if !allowed {
                 break;

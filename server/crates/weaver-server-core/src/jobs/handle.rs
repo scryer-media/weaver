@@ -785,6 +785,18 @@ pub struct RestoreJobRequest {
     pub paused_resume_download_state: Option<crate::jobs::model::DownloadState>,
     pub paused_resume_post_state: Option<crate::jobs::model::PostState>,
     pub working_dir: PathBuf,
+    // What a restart read of the job's row, when the request comes from one.
+    pub restart: Option<RestartRead>,
+}
+
+// What a restart read of a job's active row besides its request: the runtime
+// columns as stored, so the install writes back only what it changes, and
+// the summaries of the article lists it let go, so a job waiting its turn
+// installs without reading them back.
+#[derive(Clone, Debug)]
+pub struct RestartRead {
+    pub(crate) runtime: crate::pipeline::StoredRuntimeValues,
+    pub(crate) summaries: crate::jobs::model::FileSummaries,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

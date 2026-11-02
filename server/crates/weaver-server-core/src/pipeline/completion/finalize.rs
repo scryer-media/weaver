@@ -15,6 +15,6 @@ mod output;
 #[cfg(test)]
 pub(in crate::pipeline) use output::member_crc32_by_path;
 mod status;
-pub(crate) use status::ActiveRuntimeValues;
 #[cfg(test)]
 pub(crate) use status::RUNTIME_WRITES;
+pub(crate) use status::{ActiveRuntimeValues, StoredRuntimeValues};

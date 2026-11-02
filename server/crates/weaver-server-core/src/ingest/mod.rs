@@ -5,6 +5,8 @@ mod import;
 pub mod metadata;
 pub mod naming;
 mod persisted_nzb;
+#[cfg(test)]
+pub(crate) use persisted_nzb::NZB_PARSES;
 mod submission;
 mod xz;
 

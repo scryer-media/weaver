@@ -2,8 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 mod activation;
-pub(crate) use activation::read_stored_spec;
-pub(crate) use completion::finalize::ActiveRuntimeValues;
+pub(crate) use activation::read_stored_spec_and_passwords;
+pub(crate) use completion::finalize::{ActiveRuntimeValues, StoredRuntimeValues};
 pub mod archive;
 mod capacity;
 mod completion;
@@ -1302,12 +1302,16 @@ pub struct Pipeline {
     pub(crate) queue_walk_mark: Option<nzb_admission::QueueWalkMark>,
     pub(crate) queue_walk_due: bool,
     // Restores are installed a batch a turn; while some still wait, the
-    // loop takes its next turn without waiting for an event, so dispatch
-    // runs between batches.
+    // loop's wait does not block, so dispatch and every ready event run
+    // between batches.
     pub(crate) restores_waiting: bool,
     // Each row's stored queue position as last written, loaded from the
     // database on the first order change.
     pub(crate) queue_positions: Option<HashMap<JobId, i64>>,
+    // Set by a position write that did not commit: the positions above are
+    // then not what the database holds, and the next order change reads
+    // them back first.
+    pub(crate) queue_positions_lost: Arc<std::sync::atomic::AtomicBool>,
     // The jobs the last dispatch pass checked for a changed hold, sorted.
     pub(crate) dispatch_hold_watch: Vec<JobId>,
     // Typed terminal provenance retained until the ordered history archive has

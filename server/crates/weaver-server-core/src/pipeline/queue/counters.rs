@@ -11,6 +11,12 @@ use crate::jobs::JobId;
 use crate::jobs::phase_progress::{JobPhase, JobPhaseProgress, PhaseCounters};
 use crate::operations::metrics::{PipelineMetrics, RateSeries};
 
+// Counts the ticker's samples, so a test can pin that a parked ticker takes
+// none.
+#[cfg(test)]
+pub(crate) static COUNTER_SAMPLES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) struct PhaseSample {
     counters: Arc<PhaseCounters>,
     started: f64,
@@ -77,11 +83,37 @@ impl Queue {
             return;
         }
         let queue = Arc::downgrade(self);
+        let mut drive = self.subscribe_drive();
         runtime.spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(250));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                interval.tick().await;
+                if !*drive.borrow_and_update() {
+                    // Nothing moves, so a sample would find what the last
+                    // one found. Write out the bandwidth the last samples
+                    // recorded, then wait for a turn that finds work.
+                    let Some(queue) = queue.upgrade() else { break };
+                    if let Err(error) = queue.sample_bandwidth(true) {
+                        tracing::warn!(%error, "failed to flush bandwidth usage");
+                    }
+                    drop(queue);
+                    if drive.changed().await.is_err() {
+                        break;
+                    }
+                    interval.reset_immediately();
+                    continue;
+                }
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    // A turn that finds nothing to drive parks the ticker now,
+                    // not after one more sample.
+                    changed = drive.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
                 let Some(queue) = queue.upgrade() else { break };
                 if queue.closed.load(Ordering::Acquire) {
                     break;
@@ -96,6 +128,8 @@ impl Queue {
         events: &tokio::sync::broadcast::Sender<PipelineEvent>,
         now: Instant,
     ) {
+        #[cfg(test)]
+        COUNTER_SAMPLES.fetch_add(1, Ordering::Relaxed);
         if let Err(error) = self.sample_bandwidth(false) {
             tracing::warn!(%error, "failed to sample bandwidth usage");
         }
