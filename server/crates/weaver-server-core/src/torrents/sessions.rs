@@ -508,9 +508,11 @@ fn transports(torrent: &TorrentConfig, shape: Shape) -> (Option<ListenerMode>, b
 }
 
 /// The limits `torrent` holds a session to, no limit as libtorrent counts
-/// it: as many connections as files may be open
-/// (`session_impl::update_connections_limit`), and every peer unchoked
-/// (`session_impl::preemptive_unchoke`).
+/// it: connections within the files that may be open, less twenty kept for
+/// files and four in five of the rest (libtorrent `session_impl` sets
+/// `connections_limit` to `max(5, (max_files - 20) * 8 / 10)`), so peers
+/// never take the descriptors files and the database need, and every peer
+/// unchoked (`session_impl::preemptive_unchoke`).
 pub fn session_limits(torrent: &TorrentConfig) -> SessionLimits {
     let count = |limit: TorrentLimit, unlimited: usize| {
         limit
@@ -520,11 +522,17 @@ pub fn session_limits(torrent: &TorrentConfig) -> SessionLimits {
     SessionLimits {
         connections_limit: count(
             torrent.connections_limit,
-            crate::runtime::resource_limits::open_file_limit(),
+            connections_within(crate::runtime::resource_limits::open_file_limit()),
         ),
         unchoke_slots_limit: count(torrent.unchoke_slots_limit, usize::MAX),
         connection_speed: torrent.connection_speed,
     }
+}
+
+// The connections `files` open files leave room for (libtorrent
+// `session_impl`: `max(5, (max_files - 20) * 8 / 10)`).
+pub(crate) fn connections_within(files: usize) -> usize {
+    (files.saturating_sub(20) * 8 / 10).max(5)
 }
 
 /// The options of a session on `leg`, listening on `port` when it listens,
