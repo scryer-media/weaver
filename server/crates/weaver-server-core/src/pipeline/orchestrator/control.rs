@@ -84,6 +84,9 @@ impl Pipeline {
         self.queue_walk_due |= self.restores_waiting;
         if !restores.is_empty() {
             self.download_dispatch_wake = true;
+            self.restore_pass
+                .get_or_insert_with(|| (Instant::now(), 0))
+                .1 += restores.len();
         }
         for request in restores {
             let id = request.job_id;
@@ -99,6 +102,15 @@ impl Pipeline {
                 }
                 Change::changed(())
             });
+        }
+        if !self.restores_waiting
+            && let Some((started, installed)) = self.restore_pass.take()
+        {
+            info!(
+                installed,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "installed every job a restart restored"
+            );
         }
         let mut deferred = false;
         let admissions = self.shared_state.queue.write(|inner| {

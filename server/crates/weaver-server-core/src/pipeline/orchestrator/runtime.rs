@@ -269,6 +269,7 @@ impl Pipeline {
             queue_walk_mark: None,
             queue_walk_due: false,
             restores_waiting: false,
+            restore_pass: None,
             dispatch_hold_watch: Vec::new(),
             queue_positions: None,
             queue_positions_lost: Arc::default(),

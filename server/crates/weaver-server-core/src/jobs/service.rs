@@ -813,6 +813,26 @@ impl Pipeline {
                     })
             }),
         );
+        // A restart reads only each job's row before it serves; the job's file
+        // rows are read here, as it installs, a batch of jobs a turn.
+        if restart.is_some() {
+            let id = request.job_id;
+            match self.db_blocking(move |db| db.load_active_job(id)).await {
+                Ok(Some(recovered)) => {
+                    request.file_identities = recovered.file_identities;
+                    request.detected_archives = recovered.detected_archives;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    self.install_blocked_restore(
+                        request,
+                        format!("its file state could not be read: {error}"),
+                    )
+                    .await;
+                    return Ok(());
+                }
+            }
+        }
         let root = self.intermediate_dir.clone();
         let path = request.working_dir.clone();
         let id = request.job_id;

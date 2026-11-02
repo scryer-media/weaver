@@ -1305,6 +1305,9 @@ pub struct Pipeline {
     // loop's wait does not block, so dispatch and every ready event run
     // between batches.
     pub(crate) restores_waiting: bool,
+    // When a restart's installs began, and how many have gone in since: the
+    // pass is logged once, when the last restore is in.
+    pub(crate) restore_pass: Option<(Instant, usize)>,
     // Each row's stored queue position as last written, loaded from the
     // database on the first order change.
     pub(crate) queue_positions: Option<HashMap<JobId, i64>>,

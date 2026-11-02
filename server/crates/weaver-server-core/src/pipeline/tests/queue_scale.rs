@@ -346,6 +346,90 @@ async fn a_restart_restores_a_long_queue_a_batch_a_turn_holding_no_article_lists
     assert_eq!(pipeline.nzb_admitted.len(), 2);
 }
 
+// A restart reads each job's file rows as it installs the job, not before
+// the server answers: a row written after recovery is the one installed,
+// for a job that was downloading and for one waiting its turn alike. The
+// pass ends once, when the last restore is in.
+#[tokio::test]
+async fn a_restart_reads_each_jobs_file_rows_when_it_installs_it() {
+    const DOWNLOADING: JobId = JobId(1);
+    const WAITING: JobId = JobId(QUEUED);
+    let temp = tempfile::tempdir().unwrap();
+    let (pipeline, _handle) = long_queue(&temp, 2).await;
+    pipeline
+        .db
+        .set_active_job_runtime(
+            DOWNLOADING,
+            "downloading",
+            Some("downloading"),
+            Some("idle"),
+            Some("active"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    retire_pipeline_database(pipeline).await;
+
+    let (mut pipeline, intermediate, _) = new_direct_pipeline(&temp).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let recovered = crate::operations::recover_server_state(
+        &pipeline.db,
+        &temp.path().join("data"),
+        &intermediate,
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered.to_restore.len(), QUEUED as usize);
+    assert!(
+        recovered
+            .to_restore
+            .iter()
+            .all(|candidate| candidate.request.file_identities.is_empty())
+    );
+    for candidate in recovered.to_restore {
+        handle.restore_job(candidate.request).await.unwrap();
+    }
+    let identity = |job_id: JobId| crate::jobs::ActiveFileIdentity {
+        file_index: 0,
+        source_filename: "payload.bin".to_string(),
+        current_filename: "payload.bin".to_string(),
+        canonical_filename: Some(format!("written-after-recovery-{}.bin", job_id.0)),
+        classification: None,
+        classification_source: crate::jobs::FileIdentitySource::Declared,
+    };
+    for job_id in [DOWNLOADING, WAITING] {
+        pipeline
+            .db
+            .save_file_identities(job_id, &[identity(job_id)])
+            .unwrap();
+    }
+
+    pipeline.apply_queue_intents().await;
+    assert!(pipeline.restores_waiting);
+    assert!(pipeline.restore_pass.is_some());
+    while pipeline.restores_waiting {
+        pipeline.apply_queue_intents().await;
+    }
+    assert!(pipeline.restore_pass.is_none());
+    assert_eq!(pipeline.jobs.len(), QUEUED as usize);
+    assert_eq!(pipeline.jobs[&DOWNLOADING].status, JobStatus::Downloading);
+    for job_id in [DOWNLOADING, WAITING] {
+        assert_eq!(
+            pipeline.jobs[&job_id].file_identities.get(&0),
+            Some(&identity(job_id)),
+            "job {}",
+            job_id.0
+        );
+    }
+    // Later turns start no second pass.
+    pipeline.apply_queue_intents().await;
+    assert!(pipeline.restore_pass.is_none());
+}
+
 // Between a restart's batches the actor still hears what is ready: a decode
 // that completes while restores wait is heard before they are done.
 #[tokio::test]

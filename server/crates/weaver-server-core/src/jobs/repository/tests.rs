@@ -754,7 +754,7 @@ fn prune_orphan_active_state_removes_only_orphans() {
         &db,
         "INSERT INTO active_file_progress
          (job_id, file_index, coverage)
-         VALUES (1, 0, x'00'), (100, 0, x'00')",
+         VALUES (1, 0, x'00'), (100, 0, x'00'), (1000, 0, x'00')",
         vec![],
     );
     execute_sql(
@@ -765,10 +765,27 @@ fn prune_orphan_active_state_removes_only_orphans() {
         vec![],
     );
 
-    let counts = db.prune_orphan_active_state().unwrap();
+    // Job 1000 is numbered at the floor: a job created after the floor was
+    // taken, whose own row may not be written yet. It is left alone.
+    let counts = db.prune_orphan_active_state(JobId(1000)).unwrap();
     assert_eq!(counts.active_file_progress, 1);
     assert_eq!(counts.active_detected_archives, 1);
     assert_eq!(counts.total_removed(), 2);
+    assert_eq!(
+        fetch_i64(
+            &db,
+            "SELECT COUNT(*) FROM active_file_progress WHERE job_id = 1000",
+            vec![],
+        ),
+        1
+    );
+    // Run once more, it finds nothing left below the floor.
+    assert_eq!(
+        db.prune_orphan_active_state(JobId(1000))
+            .unwrap()
+            .total_removed(),
+        0
+    );
 
     let remaining_progress = fetch_i64(
         &db,
