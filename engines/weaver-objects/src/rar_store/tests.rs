@@ -1806,6 +1806,16 @@ fn a_stored_split_file_handed_its_evidence_is_judged_without_hashing_its_data() 
         plan.object.entries[0].pieces.len() > 1,
         "alpha spans volumes"
     );
+    // The pieces filed by volume are the pieces every entry holds there.
+    for volume in 0..plan.volumes.len() {
+        let whole = ByteRange::new(0, u64::MAX);
+        let volume = VolumeIndex(volume as u32);
+        assert_eq!(
+            plan.object.parts_in(volume, whole),
+            plan.object.parts_scanned(volume, whole),
+        );
+        assert!(!plan.object.parts_in(volume, whole).is_empty());
+    }
     let total: u64 = data.iter().map(|(_, range)| range.len()).sum();
     let run = |articles: Option<u64>| {
         let mut owner = Owner::named(store(), volumes.clone());

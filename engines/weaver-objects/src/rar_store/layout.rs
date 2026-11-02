@@ -328,6 +328,11 @@ impl RarStore {
                 break;
             };
             self.unmapped.remove(&VolumeIndex(part.volume));
+            let at_piece = self.entries[id].pieces.len();
+            self.pieces_in
+                .entry(VolumeIndex(part.volume))
+                .or_default()
+                .push((id, at_piece));
             self.entries[id].pieces.push(Piece {
                 volume: VolumeIndex(part.volume),
                 data: ByteRange::at(part.data_offset, part.data_size),
