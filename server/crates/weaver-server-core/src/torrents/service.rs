@@ -2224,7 +2224,7 @@ impl TorrentService {
     // them: one reading of each torrent.
     async fn publish(&self) {
         let now = self.inner.clock.now_ms();
-        let listed = self.listed(None, now).await;
+        let listed = self.listed(None, false, now).await;
         let sessions = self
             .inner
             .sessions_read
@@ -5631,7 +5631,18 @@ impl TorrentService {
     /// with its trackers.
     pub async fn torrents(&self, category: Option<&str>) -> Vec<TorrentView> {
         let now = self.inner.clock.now_ms();
-        self.listed(category, now)
+        self.listed(category, false, now)
+            .await
+            .into_iter()
+            .map(|(view, _)| view)
+            .collect()
+    }
+
+    /// Every torrent with its files, from one pass over them: what
+    /// `torrent` gives one at a time.
+    pub async fn torrents_with_files(&self) -> Vec<TorrentView> {
+        let now = self.inner.clock.now_ms();
+        self.listed(None, true, now)
             .await
             .into_iter()
             .map(|(view, _)| view)
@@ -5641,7 +5652,12 @@ impl TorrentService {
     // Every torrent, or a category's, in the order they were added, each
     // with its trackers, and its figures as the exporter reads them: both
     // from one reading of its session.
-    async fn listed(&self, category: Option<&str>, now: i64) -> Vec<(TorrentView, TorrentSeries)> {
+    async fn listed(
+        &self,
+        category: Option<&str>,
+        files: bool,
+        now: i64,
+    ) -> Vec<(TorrentView, TorrentSeries)> {
         let settings = self.settings();
         let mut listed = self.inner.db.torrent_trackers_by_job().unwrap_or_default();
         let mut views: Vec<(TorrentView, Vec<TrackerAnnounce>, Unviewed)> = {
@@ -5650,7 +5666,10 @@ impl TorrentService {
                 .map(|torrent| {
                     let reading = torrent.reading(now);
                     let unviewed = self.unviewed(&settings, torrent, &reading, now);
-                    let view = self.view_of(&settings, torrent, reading, now);
+                    let mut view = self.view_of(&settings, torrent, reading, now);
+                    if files {
+                        view.files = torrent.files();
+                    }
                     (view, torrent.announces(), unviewed)
                 })
                 .filter(|(view, ..)| {

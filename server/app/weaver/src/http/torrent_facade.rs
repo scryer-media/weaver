@@ -180,11 +180,7 @@ impl TorrentFacadeContext {
         let Some(torrents) = &self.inner.torrents else {
             return Vec::new();
         };
-        let mut views = Vec::new();
-        for view in torrents.torrents(None).await {
-            views.extend(torrents.torrent(view.job_id).await);
-        }
-        views
+        torrents.torrents_with_files().await
     }
 
     async fn by_hash(&self, hash: &str) -> Option<TorrentView> {
