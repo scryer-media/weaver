@@ -39,9 +39,11 @@ pub(super) use encode::{Encoder, escape_prometheus_label_value};
 pub(super) use render::PrometheusRenderInput;
 #[cfg(test)]
 pub(super) use render::{
-    JobStatusCounts, OBSERVED_LIMITERS, job_status_label, render_post_processing,
-    render_prometheus_metrics, render_prometheus_metrics_input,
+    OBSERVED_LIMITERS, job_status_label, render_post_processing, render_prometheus_metrics,
+    render_prometheus_metrics_input,
 };
+#[cfg(test)]
+pub(super) use weaver_server_core::operations::metrics_store::JobStatusCounts;
 
 // Reasons the extraction guardrails refuse an archive entry, in the order
 // `SchedulerHandle::get_extraction_rejections` returns their counters.
@@ -154,9 +156,6 @@ impl Default for BuildInfo {
 #[derive(Clone)]
 pub(crate) struct PrometheusMetricsExporter {
     handle: SchedulerHandle,
-    // The queue the handle drives, read in place so a scrape copies only the
-    // jobs it exports a series for.
-    state: weaver_server_core::SharedPipelineState,
     db: Database,
     nntp_pool: Arc<NntpPool>,
     transfer_policy:
@@ -172,7 +171,6 @@ pub(crate) struct PrometheusMetricsExporter {
 impl PrometheusMetricsExporter {
     pub(crate) fn new(
         handle: SchedulerHandle,
-        state: weaver_server_core::SharedPipelineState,
         db: Database,
         nntp_pool: Arc<NntpPool>,
         transfer_policy: Arc<
@@ -185,7 +183,6 @@ impl PrometheusMetricsExporter {
         process_start_epoch_seconds();
         Self {
             handle,
-            state,
             db,
             nntp_pool,
             transfer_policy,
@@ -211,29 +208,11 @@ impl PrometheusMetricsExporter {
     ) -> String {
         let snapshot = self.handle.get_metrics();
         let per_job_series = self.config.read().await.metrics.per_job_series;
-        // Every job is counted by status in place; only the jobs that get a
-        // series of their own are copied, and none at all when that is off.
-        // Queue and history under one queue lock (history is replaced under
-        // it), so a job moving into history is counted exactly once.
-        let (history, (mut job_counts, mut jobs)) = self.state.read_queue(|inner| {
-            let history = self.state.history_rows();
-            let mut counts = render::JobStatusCounts::default();
-            let mut jobs = Vec::new();
-            for row in &inner.jobs {
-                let view = row.view(&inner.globals);
-                counts.add(view.status());
-                if job_is_exported(view.status(), per_job_series) {
-                    jobs.push(view.list_info());
-                }
-            }
-            (history, (counts, jobs))
-        });
-        for job in history.iter() {
-            job_counts.add(&job.status);
-            if job_is_exported(&job.status, per_job_series) {
-                jobs.push(job.clone());
-            }
-        }
+        // The queue counts every job by status in place, history from its
+        // running summary, and copies only the jobs that get a series of
+        // their own under the configured mode.
+        let job_counts = self.handle.job_status_counts();
+        let jobs = self.handle.metrics_jobs(per_job_series);
         let download_block = self.handle.get_download_block();
         let nntp_pool = self
             .handle
