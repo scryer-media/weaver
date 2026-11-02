@@ -28,6 +28,7 @@ use weaver_torrent::storage::{
     BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage,
 };
 
+#[cfg(unix)]
 mod bench;
 
 fn accountant(resident_limit: u64) -> Arc<HoldsAccountant> {
