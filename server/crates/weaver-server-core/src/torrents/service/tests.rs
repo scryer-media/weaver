@@ -19,6 +19,8 @@ use crate::torrents::sessions::tests::{
 };
 use crate::torrents::storage::PieceStorage;
 
+mod scale_bench;
+
 const EPOCH_MS: i64 = 1_700_000_000_000;
 
 // A clock the test sets.
