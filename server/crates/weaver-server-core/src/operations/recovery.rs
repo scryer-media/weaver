@@ -758,6 +758,61 @@ mod tests {
         assert_eq!(count_rows(&db, "active_files", 1), 1);
     }
 
+    // A history retry reuses the job's id, which sits below the after-boot
+    // prune's floor, so it can land before the prune reaches that id. The
+    // retry clears what the earlier run left in the active tables itself.
+    #[tokio::test]
+    async fn a_retry_before_the_prune_starts_without_the_earlier_runs_rows() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        db.insert_job_history(&JobHistoryRow {
+            job_id: 2,
+            job_hash: None,
+            name: "job-2".into(),
+            status: "failed".into(),
+            error_message: None,
+            total_bytes: 10,
+            downloaded_bytes: 0,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 10,
+            health: 0,
+            category: None,
+            output_dir: None,
+            nzb_path: None,
+            created_at: 1,
+            completed_at: 2,
+            metadata: None,
+            server_attribution: None,
+        })
+        .unwrap();
+        execute_sql(
+            &db,
+            "INSERT INTO active_files (job_id, file_index, filename, md5)
+             VALUES ({}, 0, 'stale', x'00112233445566778899aabbccddeeff')",
+            vec![SqlArg::I64(2)],
+        );
+        execute_sql(
+            &db,
+            "INSERT INTO active_file_progress (job_id, file_index, coverage)
+             VALUES ({}, 0, x'00')",
+            vec![SqlArg::I64(2)],
+        );
+        let recovered = recover_server_state(&db, temp.path(), &temp.path().join("intermediate"))
+            .await
+            .unwrap();
+        // The retry lands first: same id, new active row.
+        let retry = sample_active_job(2, temp.path().join("job-2.nzb"), temp.path().join("job-2"));
+        assert!(
+            db.materialize_admission(&retry, &[], None, None, true)
+                .unwrap()
+        );
+        assert_eq!(count_rows(&db, "active_files", 2), 0);
+        assert_eq!(count_rows(&db, "active_file_progress", 2), 0);
+        recovered.after_boot.run().expect("prune runs");
+        assert_eq!(count_rows(&db, "active_jobs", 2), 1);
+    }
+
     // Recovery reads a job's row and NZB, never its file rows: those are
     // read as the job installs. The queue's rows come back whole and in
     // order, with the names and sizes their NZBs give.

@@ -570,6 +570,7 @@ impl Database {
                             if deleted.is_empty() {
                                 return Err(StateError::Database("restart history row disappeared".into()));
                             }
+                            crate::jobs::repository::delete_active_job_child_rows_tx(tx, job_id).await?;
                         }
                         if let Some(generation) = semantic_materialization_generation {
                             let lock = match tx {
