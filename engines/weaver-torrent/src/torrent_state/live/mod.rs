@@ -564,12 +564,13 @@ impl TorrentStateLive {
         if self.down_speed_estimator.bps() > 0 || self.up_speed_estimator.bps() > 0 {
             return true;
         }
-        // Off the tick first, then look: a peer that goes live after the
-        // look finds the flag down and its join puts the run back on.
-        self.rate_ticked.store(false, Ordering::SeqCst);
-        std::sync::atomic::fence(Ordering::SeqCst);
-        self.peers.stats.live.load(Ordering::Relaxed) > 0
-            && !self.rate_ticked.swap(true, Ordering::SeqCst)
+        // Off the tick first, then look. The flag is taken down with a
+        // swap, which reads the last join's write: a peer whose join came
+        // before it is counted by the look, and one whose join comes after
+        // finds the flag down and its join puts the run back on.
+        self.rate_ticked.swap(false, Ordering::AcqRel);
+        self.peers.stats.live.load(Ordering::Acquire) > 0
+            && !self.rate_ticked.swap(true, Ordering::AcqRel)
     }
 
     /// Connects to the web seeds that are due every WEB_SEED_TICK, and as

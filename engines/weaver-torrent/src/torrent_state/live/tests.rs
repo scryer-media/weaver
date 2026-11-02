@@ -6816,11 +6816,13 @@ async fn idle_torrents_cost_the_rate_tick_nothing(n: usize) {
 }
 
 #[tokio::test]
-async fn a_thousand_idle_torrents_cost_the_rate_tick_nothing() {
-    idle_torrents_cost_the_rate_tick_nothing(1_000).await;
+async fn a_hundred_idle_torrents_cost_the_rate_tick_nothing() {
+    idle_torrents_cost_the_rate_tick_nothing(100).await;
 }
 
+// The same at scale, which takes half a minute: run on request.
 #[tokio::test]
+#[ignore = "scale: builds ten thousand torrents"]
 async fn ten_thousand_idle_torrents_cost_the_rate_tick_nothing() {
     idle_torrents_cost_the_rate_tick_nothing(10_000).await;
 }

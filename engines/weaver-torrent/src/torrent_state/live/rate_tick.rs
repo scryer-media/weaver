@@ -7,10 +7,9 @@
 //! nothing, so idle torrents cost no wake at all (libtorrent
 //! `session_impl::on_tick` visits only `m_torrent_lists[torrent_want_tick]`).
 
-use std::sync::{
-    Arc, Weak,
-    atomic::{AtomicU64, Ordering},
-};
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Weak, atomic::Ordering};
 
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -23,7 +22,8 @@ pub(crate) struct RateTick {
     // `rate_ticked` flag says whether it is.
     ticking: Mutex<Vec<Weak<TorrentStateLive>>>,
     joined: Notify,
-    // How many runs the tick has sampled, for metrics and tests.
+    // How many runs the tick has sampled, for tests.
+    #[cfg(test)]
     samples: AtomicU64,
 }
 
@@ -64,6 +64,7 @@ impl RateTick {
                 let Some(torrent) = weak.upgrade() else {
                     continue;
                 };
+                #[cfg(test)]
                 self.samples.fetch_add(1, Ordering::Relaxed);
                 if torrent.sample_rates(now) {
                     kept.push(weak);
