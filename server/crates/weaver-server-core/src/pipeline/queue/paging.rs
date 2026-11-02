@@ -187,6 +187,45 @@ impl JobView<'_> {
             Cow::Borrowed(_) => self.phases,
         }
     }
+
+    /// The row as [`JobRow::info`] presents it, less the per-file remaining
+    /// bytes, server attribution and terminal discards: what a listing copies.
+    pub fn list_info(&self) -> JobInfo {
+        let job = self.job();
+        JobInfo {
+            job_id: job.job_id,
+            job_hash: job.job_hash,
+            name: job.name.clone(),
+            status: self.status().clone(),
+            download_state: self.download_state(),
+            finalizing_download: job.finalizing_download,
+            fetching_repair_data: job.fetching_repair_data,
+            post_state: job.post_state,
+            run_state: self.run_state(),
+            progress: job.progress,
+            total_bytes: job.total_bytes,
+            downloaded_bytes: job.downloaded_bytes,
+            optional_recovery_bytes: job.optional_recovery_bytes,
+            optional_recovery_downloaded_bytes: job.optional_recovery_downloaded_bytes,
+            phase_progress: self.phase_progress().to_vec(),
+            failed_bytes: job.failed_bytes,
+            health: job.health,
+            terminal_discards: Vec::new(),
+            total_files: job.total_files,
+            completed_files: job.completed_files,
+            file_remaining_bytes: Vec::new(),
+            remaining_par_files: job.remaining_par_files,
+            password: job.password.clone(),
+            category: job.category.clone(),
+            metadata: job.metadata.clone(),
+            output_dir: job.output_dir.clone(),
+            server_attribution: Vec::new(),
+            error: job.error.clone(),
+            download_wait_reason: self.download_wait_reason().map(str::to_owned),
+            download_retry_at_epoch_ms: self.download_retry_at_epoch_ms(),
+            created_at_epoch_ms: job.created_at_epoch_ms,
+        }
+    }
 }
 
 #[cfg(test)]

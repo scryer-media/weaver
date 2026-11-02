@@ -1272,7 +1272,7 @@ pub fn queue_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
 
 // Projects just the display data needed by queue tables. Full release parsing
 // stays on detail/snapshot paths, where callers actually render it.
-pub(crate) fn queue_table_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
+pub fn queue_table_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
     let (client_request_id, attributes) = split_attributes(&info.metadata);
     let state = queue_item_state_from_job_info(info);
     let (original_title, display_title) = queue_display_titles_from_job(info);

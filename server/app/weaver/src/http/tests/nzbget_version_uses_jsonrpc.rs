@@ -2440,6 +2440,51 @@ async fn nzbget_editqueue_applies_every_found_id_past_a_missing_one() {
 }
 
 #[tokio::test]
+async fn nzbget_listgroups_lists_many_groups_in_queue_order_with_one_database_read() {
+    // More groups than one chunk, half of them post-processing, so the
+    // answer spans chunks and asks when post-processing began.
+    let jobs = (1..=600)
+        .map(|id| {
+            let status = if id % 2 == 0 {
+                JobStatus::Extracting
+            } else {
+                JobStatus::Queued
+            };
+            let (download_state, post_state, run_state) =
+                weaver_server_core::runtime_lanes_from_status_snapshot(&status);
+            JobInfo {
+                download_state,
+                post_state,
+                run_state,
+                ..nzbget_test_job(id, status, download_state, 100, 0, vec![])
+            }
+        })
+        .collect::<Vec<_>>();
+    let handle = scheduler_handle_with_jobs(jobs).await;
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let before =
+        super::super::nzbget::LISTGROUPS_DB_READS.load(std::sync::atomic::Ordering::Relaxed);
+    let groups = rpc_result(app, "listgroups", serde_json::json!([])).await;
+    let after =
+        super::super::nzbget::LISTGROUPS_DB_READS.load(std::sync::atomic::Ordering::Relaxed);
+
+    let ids = groups
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|group| group["NZBID"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, (1..=600).collect::<Vec<_>>());
+    assert_eq!(after - before, 1);
+}
+
+#[tokio::test]
 async fn nzbget_editqueue_rejects_more_than_max_ids() {
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
