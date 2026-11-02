@@ -195,11 +195,27 @@ impl TorrentJob {
     }
 }
 
+impl TorrentJob {
+    // A piece's shares taken in. The repair slots every torrent job shares
+    // are held only for the lend the shares made due: the file writes and
+    // the runs' step take this job's lock alone, so one torrent's commit
+    // never holds up another's. A step another thread takes between the
+    // two sees the shares in hand and lends for them itself, as this lend
+    // would.
+    fn commit(&self, shares: Vec<Verified>, write: bool) -> anyhow::Result<()> {
+        let taken = self.with(|job| job.verified_unlent(shares, write, self.limit));
+        Ok(self.step(self.limit, |job, repairs, limit| {
+            if taken? {
+                job.lend(repairs, limit)?;
+            }
+            Ok(())
+        })?)
+    }
+}
+
 impl Pieces for TorrentJob {
     fn verified(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
-        Ok(self.step(self.limit, |job, repairs, limit| {
-            job.verified(shares, repairs, limit)
-        })?)
+        self.commit(shares, true)
     }
 
     fn failed(&self, piece: u32) -> anyhow::Result<bool> {
@@ -238,9 +254,7 @@ impl Pieces for TorrentJob {
     }
 
     fn adopted(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
-        Ok(self.step(self.limit, |job, repairs, limit| {
-            job.adopted(shares, repairs, limit)
-        })?)
+        self.commit(shares, false)
     }
 }
 
