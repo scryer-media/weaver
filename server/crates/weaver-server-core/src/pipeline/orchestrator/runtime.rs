@@ -251,6 +251,7 @@ impl Pipeline {
             queue_walk_mark: None,
             queue_walk_due: false,
             dispatch_hold_watch: Vec::new(),
+            queue_positions: None,
             semantic_terminal_causes: HashMap::new(),
             pipeline_failure_stages: HashMap::new(),
             job_order: Vec::new(),

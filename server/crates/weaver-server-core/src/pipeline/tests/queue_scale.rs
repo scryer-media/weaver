@@ -153,4 +153,12 @@ async fn a_reorder_keeps_every_row_where_its_index_says() {
     });
     pipeline.apply_queue_intents().await;
     assert_eq!(pipeline.job_order, expected);
+
+    // The stored positions sort the rows into the same order, which is the
+    // order a restart restores.
+    pipeline.db.flush_write_queue().await.unwrap();
+    let stored = pipeline.db.load_active_job_queue_positions().unwrap();
+    let mut restored: Vec<JobId> = stored.keys().copied().collect();
+    restored.sort_by_key(|id| stored[id]);
+    assert_eq!(restored, expected);
 }

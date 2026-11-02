@@ -125,27 +125,13 @@ impl Pipeline {
             )
         });
         let installed_order: Vec<_> = order
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|id| self.jobs.contains_key(id))
             .collect();
         if installed_order != self.job_order {
             self.job_order = installed_order;
-            let positions: Vec<_> = self.shared_state.queue.read(|inner| {
-                inner
-                    .jobs
-                    .iter()
-                    .enumerate()
-                    .map(|(index, row)| (row.id, index as i64))
-                    .collect()
-            });
-            if let Err(error) = self
-                .db
-                .try_queue_write("update_active_job_queue_positions", move |db| {
-                    db.update_active_job_queue_positions(&positions)
-                })
-            {
-                error!(%error, "failed to persist queue order");
-            }
+            self.persist_queue_order(&order).await;
         }
         use crate::jobs::handle::CancellationOrigin;
         for origin in [
@@ -316,6 +302,45 @@ impl Pipeline {
                 // Renamed once the job is quiet; the next turn looks again.
                 self.queue_walk_due = true;
             }
+        }
+    }
+
+    // Stores the queue's order by writing a new position only for the rows
+    // whose stored one no longer sorts where the row stands. The write goes
+    // through the ordered writer queue, which the shutdown drain flushes
+    // within its bound and warns about if it cannot.
+    async fn persist_queue_order(&mut self, order: &[JobId]) {
+        let persisted = match self.queue_positions.take() {
+            Some(persisted) => persisted,
+            None => match self
+                .db_blocking(|db| db.load_active_job_queue_positions())
+                .await
+            {
+                Ok(persisted) => persisted,
+                Err(error) => {
+                    error!(%error, "failed to read stored queue order");
+                    HashMap::new()
+                }
+            },
+        };
+        let writes = queue_position_writes(order, &persisted);
+        let mut positions: HashMap<JobId, i64> = order
+            .iter()
+            .filter_map(|id| persisted.get(id).map(|position| (*id, *position)))
+            .collect();
+        positions.extend(writes.iter().copied());
+        if writes.is_empty() {
+            self.queue_positions = Some(positions);
+            return;
+        }
+        match self
+            .db
+            .try_queue_write("update_active_job_queue_positions", move |db| {
+                db.update_active_job_queue_positions(&writes)
+            }) {
+            Ok(()) => self.queue_positions = Some(positions),
+            // Read back from the database before the next order is written.
+            Err(error) => error!(%error, "failed to persist queue order"),
         }
     }
 
@@ -517,5 +542,154 @@ impl Pipeline {
             }
             self.resume_graph_work(job_id);
         }
+    }
+}
+
+// Spacing between positions given out fresh, so later moves usually find
+// room between two neighbours without renumbering.
+const QUEUE_POSITION_STRIDE: i64 = 1024;
+
+// The position writes that make stored positions ascend along `order`. The
+// longest run of rows whose stored positions already ascend keeps them; each
+// other row gets a position between its kept neighbours. Only when two kept
+// neighbours leave no room does every row get a fresh, spaced position.
+pub(crate) fn queue_position_writes(
+    order: &[JobId],
+    persisted: &HashMap<JobId, i64>,
+) -> Vec<(JobId, i64)> {
+    let keys: Vec<Option<i64>> = order.iter().map(|id| persisted.get(id).copied()).collect();
+    // Longest strictly ascending run of stored positions, by patience
+    // sorting: `tails[k]` is the index ending the best run of length k + 1.
+    let mut tails: Vec<usize> = Vec::new();
+    let mut previous: Vec<Option<usize>> = vec![None; order.len()];
+    for (index, key) in keys.iter().enumerate() {
+        let Some(key) = *key else { continue };
+        let at = tails.partition_point(|&tail| keys[tail].expect("kept rows have positions") < key);
+        previous[index] = at.checked_sub(1).map(|before| tails[before]);
+        if at == tails.len() {
+            tails.push(index);
+        } else {
+            tails[at] = index;
+        }
+    }
+    let mut kept = vec![false; order.len()];
+    let mut cursor = tails.last().copied();
+    while let Some(index) = cursor {
+        kept[index] = true;
+        cursor = previous[index];
+    }
+    let mut writes = Vec::new();
+    let mut index = 0;
+    let mut low: Option<i64> = None;
+    while index < order.len() {
+        if kept[index] {
+            low = keys[index];
+            index += 1;
+            continue;
+        }
+        let end = (index..order.len())
+            .find(|&at| kept[at])
+            .unwrap_or(order.len());
+        let high = keys.get(end).copied().flatten();
+        let count = (end - index) as i64;
+        let fresh: Vec<i64> = match (low, high) {
+            (None, None) => (0..count)
+                .map(|step| step * QUEUE_POSITION_STRIDE)
+                .collect(),
+            (Some(low), None) => (1..=count)
+                .map(|step| low + step * QUEUE_POSITION_STRIDE)
+                .collect(),
+            (None, Some(high)) => (0..count)
+                .map(|step| high - (count - step) * QUEUE_POSITION_STRIDE)
+                .collect(),
+            (Some(low), Some(high)) if high - low > count => {
+                let gap = (high - low) / (count + 1);
+                (1..=count).map(|step| low + step * gap).collect()
+            }
+            (Some(_), Some(_)) => {
+                return order
+                    .iter()
+                    .enumerate()
+                    .map(|(at, id)| (*id, at as i64 * QUEUE_POSITION_STRIDE))
+                    .filter(|(id, position)| persisted.get(id) != Some(position))
+                    .collect();
+            }
+        };
+        writes.extend(order[index..end].iter().copied().zip(fresh));
+        index = end;
+    }
+    writes
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::*;
+
+    fn ids(range: std::ops::Range<u64>) -> Vec<JobId> {
+        range.map(JobId).collect()
+    }
+
+    // Applies `writes` and checks the stored positions ascend along `order`.
+    fn assert_sorted(
+        order: &[JobId],
+        persisted: &mut HashMap<JobId, i64>,
+        writes: &[(JobId, i64)],
+    ) {
+        persisted.extend(writes.iter().copied());
+        let stored: Vec<i64> = order.iter().map(|id| persisted[id]).collect();
+        assert!(
+            stored.windows(2).all(|pair| pair[0] < pair[1]),
+            "{stored:?}"
+        );
+    }
+
+    #[test]
+    fn a_queue_written_once_is_not_written_again() {
+        let order = ids(0..10_000);
+        let mut persisted = HashMap::new();
+        let writes = queue_position_writes(&order, &persisted);
+        assert_eq!(writes.len(), order.len());
+        assert_sorted(&order, &mut persisted, &writes);
+        assert!(queue_position_writes(&order, &persisted).is_empty());
+    }
+
+    #[test]
+    fn moving_one_job_writes_one_row_once_the_positions_are_spaced() {
+        let mut order = ids(0..10_000);
+        let mut persisted = HashMap::new();
+        let writes = queue_position_writes(&order, &persisted);
+        assert_sorted(&order, &mut persisted, &writes);
+
+        // To the top, to the bottom, and into the middle.
+        for (from, to) in [(9_999, 0), (0, 9_999), (5_000, 1_234)] {
+            let id = order.remove(from);
+            order.insert(to, id);
+            let writes = queue_position_writes(&order, &persisted);
+            assert_eq!(writes, vec![(id, writes[0].1)]);
+            assert_sorted(&order, &mut persisted, &writes);
+        }
+
+        // Removing rows and appending one writes only the new row.
+        order.retain(|id| id.0 % 3 != 0);
+        order.push(JobId(20_000));
+        let writes = queue_position_writes(&order, &persisted);
+        assert_eq!(writes.len(), 1);
+        assert_sorted(&order, &mut persisted, &writes);
+    }
+
+    #[test]
+    fn dense_positions_with_no_room_are_respaced_once() {
+        let mut order = ids(0..100);
+        let mut persisted: HashMap<JobId, i64> =
+            order.iter().map(|id| (*id, id.0 as i64)).collect();
+        let id = order.remove(50);
+        order.insert(10, id);
+        let writes = queue_position_writes(&order, &persisted);
+        assert_sorted(&order, &mut persisted, &writes);
+        let id = order.remove(70);
+        order.insert(20, id);
+        let writes = queue_position_writes(&order, &persisted);
+        assert_eq!(writes.len(), 1);
+        assert_sorted(&order, &mut persisted, &writes);
     }
 }

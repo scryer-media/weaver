@@ -1299,6 +1299,9 @@ pub struct Pipeline {
     // anything for the next turn to look at again.
     pub(crate) queue_walk_mark: Option<nzb_admission::QueueWalkMark>,
     pub(crate) queue_walk_due: bool,
+    // Each row's stored queue position as last written, loaded from the
+    // database on the first order change.
+    pub(crate) queue_positions: Option<HashMap<JobId, i64>>,
     // The jobs the last dispatch pass checked for a changed hold, sorted.
     pub(crate) dispatch_hold_watch: Vec<JobId>,
     // Typed terminal provenance retained until the ordered history archive has
