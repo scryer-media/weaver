@@ -4909,6 +4909,8 @@ mod tests {
         accepts:
             std::sync::Mutex<std::collections::VecDeque<std::io::Result<tokio::io::DuplexStream>>>,
         asked: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        // A scripted failure waits for this before it fails the accept.
+        fail_when: std::sync::Arc<tokio::sync::Notify>,
         errored: std::sync::Arc<tokio::sync::Notify>,
         listener: std::sync::Mutex<Option<Box<dyn crate::network::StreamListener>>>,
     }
@@ -4931,6 +4933,9 @@ mod tests {
             Box::pin(async move {
                 self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let next = self.accepts.lock().unwrap().pop_front();
+                if matches!(next, Some(Err(_))) {
+                    self.fail_when.notified().await;
+                }
                 match next {
                     Some(Ok(stream)) => {
                         let (reader, writer) = crate::peer_info_reader::tests::halves(stream);
@@ -4996,7 +5001,9 @@ mod tests {
 
     // A failed accept (out of descriptors, say) rests the listener, not the
     // handshakes it already took: one taken before the failure is answered
-    // while the listener rests, before it is asked to accept again.
+    // while the listener rests, before it is asked to accept again. The
+    // accept fails only once the torrent is complete, and the answer comes
+    // before the clock reaches the end of the rest.
     // libtorrent `session_impl::on_accept_connection` likewise goes on with
     // its connections after a failed accept.
     #[tokio::test(start_paused = true)]
@@ -5023,17 +5030,20 @@ mod tests {
         let (ours, mut theirs) = tokio::io::duplex(1 << 16);
         let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let errored = std::sync::Arc::new(tokio::sync::Notify::new());
+        let fail_when = std::sync::Arc::new(tokio::sync::Notify::new());
         let scripted = std::sync::Arc::new(Scripted {
             accepts: std::sync::Mutex::new(
                 [Ok(ours), Err(std::io::Error::from_raw_os_error(24))].into(),
             ),
             asked: asked.clone(),
+            fail_when: fail_when.clone(),
             errored: errored.clone(),
             listener: std::sync::Mutex::new(None),
         });
         let factory = std::sync::Arc::new(Scripted {
             accepts: Default::default(),
             asked: Default::default(),
+            fail_when: Default::default(),
             errored: Default::default(),
             listener: std::sync::Mutex::new(Some(Box::new(scripted))),
         });
@@ -5072,7 +5082,9 @@ mod tests {
         handle.wait_until_completed().await.unwrap();
 
         // The connection was taken, then the next accept failed.
+        fail_when.notify_one();
         errored_once.await;
+        let rest_ends = tokio::time::Instant::now() + super::ACCEPT_BACKOFF;
         assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
 
         // Its handshake is answered with the listener resting.
@@ -5084,6 +5096,7 @@ mod tests {
         let mut answer = [0u8; 68];
         theirs.read_exact(&mut answer).await.unwrap();
         assert!(is_handshake_for(&answer, &handle));
+        assert!(tokio::time::Instant::now() < rest_ends);
         assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
 
         session.stop().await;
