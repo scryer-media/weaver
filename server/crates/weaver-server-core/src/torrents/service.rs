@@ -87,8 +87,16 @@ pub mod updates;
 pub const TICK: Duration = Duration::from_secs(10);
 
 /// The longest a torrent's peers go unwritten while they change. Its ledger
-/// is written at every tick it changed, as its checkpoint is.
+/// is written at every tick its bytes or activity changed, as its
+/// checkpoint is.
 pub const PEERS_EVERY_MS: i64 = 60_000;
+
+/// The longest a torrent's ledger goes unwritten while only its times run
+/// on: an idle seed's durations count up at every tick, and writing them at
+/// each would be one write per torrent per tick. A clean stop writes them
+/// all; a crash loses at most this much of them (qBittorrent saves resume
+/// data every `SaveResumeDataInterval`, 60 minutes, by default).
+pub const TIMES_EVERY_MS: i64 = 30 * 60_000;
 
 /// The most pieces a torrent's checkpoint goes without between ticks: once
 /// this many pieces reached its job, or left it, since the checkpoint was
@@ -1326,6 +1334,9 @@ impl Live {
     ) -> Self {
         let written = counters;
         counters.consecutive_seeding_s = 0;
+        // Spread by job, so torrents restored together do not all write
+        // their times at one tick.
+        let times_at_ms = now - (record.job_id.0 as i64).rem_euclid(TIMES_EVERY_MS);
         Self {
             record,
             identity: TorrentIdentity::fresh(),
@@ -1334,6 +1345,7 @@ impl Live {
             ledger: Ledger {
                 written: Some((written, resume.clone())),
                 peers_at_ms: now,
+                times_at_ms,
                 lost: Arc::default(),
             },
             resume,
@@ -1431,14 +1443,27 @@ impl Live {
             }
             self.ledger.peers_at_ms = now;
         }
+        let times_due = at_once || now - self.ledger.times_at_ms >= TIMES_EVERY_MS;
         let (counters, peers) = match &self.ledger.written {
             Some((counters, peers)) => (
-                (*counters != self.counters).then_some(self.counters),
+                (if times_due {
+                    *counters != self.counters
+                } else {
+                    !same_but_times(counters, &self.counters)
+                })
+                .then_some(self.counters),
                 (!same_peers(peers, &self.resume)).then(|| self.resume.clone()),
             ),
             None => (Some(self.counters), Some(self.resume.clone())),
         };
-        self.ledger.written = Some((self.counters, self.resume.clone()));
+        if counters.is_some() {
+            self.ledger.times_at_ms = now;
+        }
+        let kept = match (&counters, &self.ledger.written) {
+            (None, Some((written, _))) => *written,
+            _ => self.counters,
+        };
+        self.ledger.written = Some((kept, self.resume.clone()));
         (counters.is_some() || peers.is_some()).then(|| Resume {
             counters,
             peers,
@@ -1759,6 +1784,15 @@ impl Timed {
     }
 }
 
+// Whether two ledgers differ at most in the times that run on by themselves
+// while a torrent sits: its durations and when a complete copy was last
+// seen. Bytes moved and activity are written at the tick they change.
+fn same_but_times(a: &TorrentCounters, b: &TorrentCounters) -> bool {
+    a.uploaded_bytes == b.uploaded_bytes
+        && a.downloaded_bytes == b.downloaded_bytes
+        && a.last_activity_ms == b.last_activity_ms
+}
+
 // What the database holds of a torrent's ledger and peers, and when its
 // peers were last taken.
 struct Ledger {
@@ -1766,6 +1800,9 @@ struct Ledger {
     written: Option<(TorrentCounters, ResumePeers)>,
     // When the peers were last taken from the session to be written.
     peers_at_ms: i64,
+    // When the ledger was last written: its times alone go unwritten until
+    // TIMES_EVERY_MS has passed since.
+    times_at_ms: i64,
     // Set by a write that failed, so the next one writes all of it.
     lost: Arc<AtomicBool>,
 }
