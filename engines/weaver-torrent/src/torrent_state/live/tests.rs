@@ -1334,7 +1334,7 @@ async fn a_cancel_of_an_unsent_block_is_answered_with_a_reject_on_a_fast_connect
 
 // libtorrent `peer_connection::fill_send_buffer`: each peer is served from
 // its own send buffer, held to its watermark, so however many blocks one
-// peer asked for, the next peer waits one block of it.
+// peer asked for, the next peer waits no more than that watermark of it.
 #[tokio::test]
 async fn a_deep_upload_queue_on_one_peer_never_holds_up_the_next() {
     // 32 pieces of four blocks, all had.
@@ -1361,22 +1361,30 @@ async fn a_deep_upload_queue_on_one_peer_never_holds_up_the_next() {
         .await
         .unwrap();
 
-    // One round hands each peer one block: the light peer's goes out
-    // alongside the deep peer's first, and the deep peer gets no second
-    // until its writer takes the first.
+    // One round fills each peer's send buffer to the low watermark, as an
+    // idle peer has no upload rate: the light peer's block goes out
+    // alongside the deep peer's first eight, and the deep peer gets no ninth
+    // until its writer has sent one.
+    let handed = (peer::SEND_BUFFER_LOW_WATERMARK / u64::from(CHUNK_SIZE)) as usize;
     assert_eq!(next_sent(&mut light_rx).await, Sent::Block(31, 0));
-    assert_eq!(next_sent(&mut deep_rx).await, Sent::Block(0, 0));
+    for &(index, chunk) in &asked[..handed] {
+        assert_eq!(
+            next_sent(&mut deep_rx).await,
+            Sent::Block(index, chunk * CHUNK_SIZE)
+        );
+    }
     assert!(deep_rx.is_empty());
 
-    // The writer takes each in turn, and the rest follow in the order asked.
+    // The writer sends each in turn, and the rest follow in the order asked.
     for (n, &(index, chunk)) in asked.iter().enumerate() {
-        if n > 0 {
+        if n >= handed {
             assert_eq!(
                 next_sent(&mut deep_rx).await,
                 Sent::Block(index, chunk * CHUNK_SIZE)
             );
         }
         assert!(deep.claim_upload(&h.chunk(index, chunk)));
+        deep.upload_done(&h.chunk(index, chunk));
     }
     assert!(deep_rx.is_empty());
 }
@@ -1397,8 +1405,9 @@ async fn a_fast_peer_we_choke_is_sent_a_reject_for_every_block_it_will_not_get()
             .await
             .unwrap();
     }
-    // The first is with the writer, the second waits for it.
+    // Both are with the writer, unsent.
     assert_eq!(next_sent(&mut held_rx).await, Sent::Block(0, 0));
+    assert_eq!(next_sent(&mut held_rx).await, Sent::Block(0, CHUNK_SIZE));
 
     // The slot passes to the other peer. The Choke goes first, then a Reject
     // for each unsent block.
@@ -1535,8 +1544,9 @@ async fn a_fast_peer_we_choke_is_still_served_its_allowed_fast_pieces() {
             .await
             .unwrap();
     }
-    // Piece 0's block is with the writer, piece 1's waits for it.
+    // Both blocks are with the writer, unsent.
     assert_eq!(next_sent(&mut fast_rx).await, Sent::Block(0, 0));
+    assert_eq!(next_sent(&mut fast_rx).await, Sent::Block(1, 0));
 
     // The slot passes to the other peer: the Choke rejects the unsent block
     // of piece 1 and keeps piece 0's.
@@ -1589,6 +1599,7 @@ async fn a_choked_peer_may_ask_for_an_allowed_fast_piece_three_times_over() {
         );
         // The writer sends it, so the peer may ask for it again.
         assert!(fast.claim_upload(&h.chunk(0, chunk)));
+        fast.upload_done(&h.chunk(0, chunk));
     }
     assert!(
         fast.on_received_message(Message::Request(request(0, 0)))
@@ -2065,6 +2076,7 @@ async fn a_choked_peer_loses_its_unsent_blocks_and_its_requests_are_ignored() {
             .unwrap();
     }
     assert_eq!(next_sent(&mut held_rx).await, Sent::Block(0, 0));
+    assert_eq!(next_sent(&mut held_rx).await, Sent::Block(0, CHUNK_SIZE));
 
     // The one slot is the optimistic one: at the first round it passes to
     // the other peer, which never held it.
@@ -2075,8 +2087,7 @@ async fn a_choked_peer_loses_its_unsent_blocks_and_its_requests_are_ignored() {
     assert_eq!(next_sent(&mut other_rx).await, Sent::Unchoke);
     assert_eq!(next_sent(&mut held_rx).await, Sent::Choke);
 
-    // One block was with the writer and one waited for it, both unsent:
-    // neither goes out.
+    // Both blocks were with the writer, unsent: neither goes out.
     assert!(!held.claim_upload(&h.chunk(0, 0)));
     assert!(!held.claim_upload(&h.chunk(0, 1)));
 
@@ -4537,9 +4548,11 @@ async fn a_seed_ends_a_connection_whose_unchoked_peer_asks_for_nothing_for_a_min
     assert_eq!(next_sent(&mut rx).await, Sent::Block(0, 0));
     let chunk = h.chunk(0, 0);
     let sent = tokio::time::Instant::now();
-    let claimed = h
-        .peers
-        .with_live_mut(peer.addr, "send", |live| live.claim_upload(&chunk));
+    let claimed = h.peers.with_live_mut(peer.addr, "send", |live| {
+        let claimed = live.claim_upload(&chunk);
+        live.upload_done(&chunk);
+        claimed
+    });
     assert_eq!(claimed, Some(true));
 
     peer.time_out_idle().await.unwrap();

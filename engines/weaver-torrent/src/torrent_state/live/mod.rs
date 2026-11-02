@@ -824,13 +824,14 @@ impl TorrentStateLive {
         self: Arc<Self>,
         mut turns: tokio::sync::mpsc::UnboundedReceiver<PeerHandle>,
     ) -> crate::Result<()> {
-        // The peers take turns in the order they became ready for one, and a
-        // turn hands one block. A peer is ready again only once its writer
-        // takes the block, and then waits behind every peer that became
-        // ready meanwhile: however many blocks one peer asked for, the next
-        // peer waits one block of it (libtorrent `fill_send_buffer`, one
+        // The peers take turns in the order they became ready, and a turn
+        // fills the peer's send buffer to its watermark. A peer is ready
+        // again once its writer sends enough to fall below it, and then
+        // waits behind every peer that became ready meanwhile: however many
+        // blocks one peer asked for, the next peer waits at most one send
+        // buffer of it (libtorrent `peer_connection::fill_send_buffer`, one
         // send buffer per peer, each held to its watermark). The writer pays
-        // for the block as it sends it.
+        // for each block as it sends it.
         while let Some(addr) = turns.recv().await {
             self.peers
                 .with_live_mut(addr, "hand_upload", |live| live.hand_upload());
@@ -2387,19 +2388,37 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             .fetch_add(bytes as u64, Ordering::Relaxed);
     }
 
+    // A block cancelled or choked off while the writer held it gave its
+    // room back then, and the writer's claim of it is the next word from
+    // the writer: the peer may want a turn by now.
     fn claim_upload(&self, chunk: &ChunkInfo) -> bool {
-        let (claimed, ready) = self
+        let (claimed, turn) = self
             .state
             .peers
             .with_live_mut(self.addr, "claim_upload", |live| {
-                (live.claim_upload(chunk), live.ready_to_hand())
+                (live.claim_upload(chunk), live.wants_turn())
             })
             .unwrap_or_default();
-        // The writer has room again: the peer's next block waits its turn.
-        if ready {
+        if turn {
             self.state.upload_turn(self.addr);
         }
         claimed
+    }
+
+    fn upload_done(&self, chunk: &ChunkInfo) {
+        let turn = self
+            .state
+            .peers
+            .with_live_mut(self.addr, "upload_done", |live| {
+                live.upload_done(chunk);
+                live.wants_turn()
+            })
+            .unwrap_or_default();
+        // The send buffer fell below its watermark: the peer's next blocks
+        // wait their turn.
+        if turn {
+            self.state.upload_turn(self.addr);
+        }
     }
 
     // A seed-mode piece is checked on a blocking thread, and the peer's
