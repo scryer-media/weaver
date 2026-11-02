@@ -1316,20 +1316,26 @@ fn queued(settings: &TorrentSettings, rules: &[TrackerRule], torrent: &Live, now
     }
 }
 
+// A torrent's files under `layout`: the metainfo's names and lengths, at
+// `levels`.
+fn files_of(layout: Option<&PieceLayout>, levels: &[FilePriority]) -> Vec<TorrentFile> {
+    layout
+        .iter()
+        .flat_map(|layout| layout.files())
+        .enumerate()
+        .map(|(index, file)| TorrentFile {
+            index: index as u32,
+            path: file.name.clone(),
+            length: file.length,
+            priority: levels.get(index).copied().unwrap_or_default(),
+        })
+        .collect()
+}
+
 impl Live {
     // Its files: the metainfo's names and lengths, at the levels it holds.
     fn files(&self) -> Vec<TorrentFile> {
-        self.layout
-            .iter()
-            .flat_map(|layout| layout.files())
-            .enumerate()
-            .map(|(index, file)| TorrentFile {
-                index: index as u32,
-                path: file.name.clone(),
-                length: file.length,
-                priority: self.levels.get(index).copied().unwrap_or_default(),
-            })
-            .collect()
+        files_of(self.layout.as_deref(), &self.levels)
     }
 
     // The tracker rule it is under, while that rule stands.
@@ -5694,17 +5700,18 @@ impl TorrentService {
     ) -> Vec<(TorrentView, TorrentSeries)> {
         let settings = self.settings();
         let mut listed = self.inner.db.torrent_trackers_by_job().unwrap_or_default();
-        let mut views: Vec<(TorrentView, Vec<TrackerAnnounce>, Unviewed)> = {
+        // Under the lock, each torrent's files are only taken by reference
+        // with its levels: the list is built after the lock is let go.
+        type Files = Option<(Option<Arc<PieceLayout>>, Vec<FilePriority>)>;
+        let mut views: Vec<(TorrentView, Vec<TrackerAnnounce>, Unviewed, Files)> = {
             let live = self.inner.live.lock().await;
             live.values()
                 .map(|torrent| {
                     let reading = torrent.reading(now);
                     let unviewed = self.unviewed(&settings, torrent, &reading, now);
-                    let mut view = self.view_of(&settings, torrent, reading, now);
-                    if files {
-                        view.files = torrent.files();
-                    }
-                    (view, torrent.announces(), unviewed)
+                    let view = self.view_of(&settings, torrent, reading, now);
+                    let files = files.then(|| (torrent.layout.clone(), torrent.levels.clone()));
+                    (view, torrent.announces(), unviewed, files)
                 })
                 .filter(|(view, ..)| {
                     category.is_none_or(|name| {
@@ -5716,13 +5723,16 @@ impl TorrentService {
                 .collect()
         };
         let mut names = HashMap::new();
-        for (view, announces, _) in &mut views {
+        for (view, announces, _, files) in &mut views {
+            if let Some((layout, levels)) = files.take() {
+                view.files = files_of(layout.as_deref(), &levels);
+            }
             let listed = listed.remove(&view.job_id).unwrap_or_default();
             self.track(view, listed, announces, &mut names);
         }
         let mut views: Vec<(TorrentView, TorrentSeries)> = views
             .into_iter()
-            .map(|(view, announces, unviewed)| {
+            .map(|(view, announces, unviewed, _)| {
                 let series = unviewed.series(&view, &announces);
                 (view, series)
             })
