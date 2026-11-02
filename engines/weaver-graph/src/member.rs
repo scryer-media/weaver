@@ -293,6 +293,9 @@ pub struct Namespace {
     // of what arrived under its name and whether it ended; everywhere else
     // it is the member, and the namespace lists it nowhere.
     copies: BTreeMap<MemberId, MemberId>,
+    // How many further postings fold into each member that has any, filed
+    // with `copies`, so a member posted once asks nothing of them.
+    folded: BTreeMap<MemberId, usize>,
     // The members posted more than once whose own posting ended. Such a
     // member closes once its own posting and every further one have.
     ended: BTreeSet<MemberId>,
@@ -412,6 +415,38 @@ impl Namespace {
         self.copies.get(&copy).copied()
     }
 
+    // `copy` is a further posting of `into` from now on.
+    fn link(&mut self, copy: MemberId, into: MemberId) {
+        if let Some(was) = self.copies.insert(copy, into) {
+            self.unfold(was);
+        }
+        *self.folded.entry(into).or_default() += 1;
+    }
+
+    // `copy` is no further posting of anything.
+    fn unlink(&mut self, copy: MemberId) {
+        if let Some(was) = self.copies.remove(&copy) {
+            self.unfold(was);
+        }
+    }
+
+    fn unfold(&mut self, member: MemberId) {
+        if let Some(count) = self.folded.get_mut(&member) {
+            *count -= 1;
+            if *count == 0 {
+                self.folded.remove(&member);
+            }
+        }
+    }
+
+    // Whether any further posting folds into the member.
+    fn has_copies(&self, member: MemberId) -> bool {
+        let has = self.folded.contains_key(&member);
+        #[cfg(test)]
+        assert_eq!(has, self.copies.values().any(|of| *of == member));
+        has
+    }
+
     // The further postings of the member, by their own records.
     pub fn copies_of(&self, member: MemberId) -> impl Iterator<Item = &Member> + '_ {
         self.copies
@@ -513,7 +548,7 @@ impl Namespace {
         if self.members.get(&into).is_some_and(|record| record.closed) {
             self.ended.insert(into);
         }
-        self.copies.insert(copy, into);
+        self.link(copy, into);
         self.members
             .get_mut(&copy)
             .map(|record| std::mem::take(&mut record.coverage))
@@ -528,7 +563,7 @@ impl Namespace {
             && self.members.contains_key(&into)
             && !self.copies.contains_key(&into);
         if folds {
-            self.copies.insert(copy, into);
+            self.link(copy, into);
             self.members.mark(copy);
         }
         folds
@@ -634,7 +669,12 @@ impl Namespace {
         provenance: Provenance,
     ) -> (MemberId, Vec<(ByteRange, Provenance)>) {
         let member = self.resolve(posting);
-        let held = self.members.get(&member).map(|record| &record.coverage);
+        // A member that holds nothing over `range` has nothing to land on.
+        let held = self
+            .members
+            .get(&member)
+            .map(|record| &record.coverage)
+            .filter(|held| held.overlapping(range).next().is_some());
         let mut taken: Vec<(ByteRange, Provenance)> = Vec::new();
         let mut take = |piece: ByteRange, landed: Provenance| match taken.last_mut() {
             Some((last, was)) if last.end == piece.start && *was == landed => last.end = piece.end,
@@ -695,6 +735,11 @@ impl Namespace {
     // copy, and only a repair displaces it.
     fn first_elsewhere(&self, posting: MemberId, member: MemberId, range: ByteRange) -> Coverage {
         let mut clean = Coverage::new();
+        // A member no further posting folds into has none to ask, and is
+        // the posting itself.
+        if !self.has_copies(member) {
+            return clean;
+        }
         for copy in self.copies_of(member).filter(|copy| copy.id != posting) {
             clean_within(&copy.coverage, range, &mut clean);
         }
@@ -823,11 +868,11 @@ impl Namespace {
     pub fn remove(&mut self, member: MemberId) -> Option<Member> {
         let copies: Vec<MemberId> = self.copies_of(member).map(|copy| copy.id).collect();
         for copy in copies {
-            self.copies.remove(&copy);
+            self.unlink(copy);
             self.first_bytes.remove(&copy);
             self.members.remove(&copy);
         }
-        self.copies.remove(&member);
+        self.unlink(member);
         self.ended.remove(&member);
         self.first_bytes.remove(&member);
         self.members.remove(&member)
