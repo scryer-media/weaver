@@ -197,6 +197,12 @@
       "oracle": "api-metrics"
     },
     {
+      "name": "cancelQueueItems",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "The release flow asserts individual queue controls; the server API tests cover this batch by ids and by selection, and no release spec calls it."
+    },
+    {
       "name": "forgetDuplicateIdentity",
       "owner": "duplicate-and-queue-policy",
       "oracle": "unit-only",
@@ -235,6 +241,12 @@
       "oracle": "api-metrics"
     },
     {
+      "name": "pauseQueueItems",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "The release flow asserts individual queue controls; the server API tests cover this batch by ids and by selection, and no release spec calls it."
+    },
+    {
       "name": "promoteDuplicateCandidate",
       "owner": "duplicate-and-queue-policy",
       "oracle": "unit-only",
@@ -268,10 +280,28 @@
       "oracle": "api-metrics"
     },
     {
+      "name": "resumeQueueItems",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "The release flow asserts individual queue controls; the server API tests cover this batch by ids and by selection, and no release spec calls it."
+    },
+    {
       "name": "updateJobs",
       "owner": "duplicate-and-queue-policy",
       "oracle": "unit-only",
       "rationale": "The release flow asserts individual queue controls; the bulk compatibility mutation is not called."
+    },
+    {
+      "name": "setQueueItemsCategory",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "The release flow asserts individual queue controls; the server API tests cover this batch by ids and by selection, and no release spec calls it."
+    },
+    {
+      "name": "setQueueItemsPriority",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "The release flow asserts individual queue controls; the server API tests cover this batch by ids and by selection, and no release spec calls it."
     },
     {
       "name": "testConfiguredServerConnection",
