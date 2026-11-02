@@ -79,8 +79,10 @@ impl GraphJob {
         }
         self.seal_proven();
         // An ended namespace's obligations nothing can check end here.
-        self.writer
-            .drop_unmet_verifications(&self.tree, &self.coming());
+        if self.writer.verifications_waiting() {
+            self.writer
+                .drop_unmet_verifications(&self.tree, &self.coming());
+        }
         if !self.writer.rechecks_waiting() && !self.writer.verifications_waiting() {
             return Ok(());
         }
@@ -208,12 +210,12 @@ impl GraphJob {
     // namespace's sets have ruled on something other than waiting, none
     // with a volume of its own still arriving.
     fn quiet(&self) -> bool {
+        if self.runs.live() || self.loans.out() || self.writer.rechecks_waiting() {
+            return false;
+        }
         let coming = self.coming();
         !coming.payload
-            && !self.runs.live()
-            && !self.loans.out()
-            && !self.writer.rechecks_waiting()
-            && !self.verifications_due()
+            && !self.writer.verifications_due(&self.tree, &coming)
             && self.writer.all_ruled(&self.tree, &coming)
     }
 

@@ -1583,9 +1583,10 @@ fn an_arrival_reads_only_the_volumes_still_open() {
         .unwrap();
 
     // The last volume, once each: whether it still waits once the article
-    // is in, whether the payload is still to come for the step's quiet and
-    // for its lend, and which set it leads. No damage is untold.
-    assert_eq!(job.article_visits(), (4, 0));
+    // is in, whether the payload is still to come for the step's quiet, and
+    // which set it leads. With no checksum held, the walk asks nothing of
+    // what is to come. No damage is untold.
+    assert_eq!(job.article_visits(), (3, 0));
 }
 
 // A lost article is told from its own volume: the walk for damage visits

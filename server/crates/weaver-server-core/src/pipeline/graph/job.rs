@@ -695,7 +695,10 @@ impl GraphJob {
     // numbered as the volumes they are; a further posting of a member is
     // a volume of its own whose articles are the member's.
     fn payload_waiting(&self) -> bool {
-        self.coming().payload
+        self.writer.payload_coming(
+            &self.tree,
+            self.root.map.coming().map(|volume| MemberId(volume.0)),
+        )
     }
 
     // What the root still fetches unasked, payload and the sets whose own
