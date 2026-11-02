@@ -196,6 +196,7 @@ pub(crate) async fn run(
     let initial_history = recovered_state.initial_history;
     let to_restore = recovered_state.to_restore;
     let initial_global_paused = recovered_state.initial_global_paused;
+    let after_boot = recovered_state.after_boot;
 
     // Publish recovered history to shared state so the API has data immediately.
     shared_state.load_history(initial_history.clone());
@@ -505,6 +506,9 @@ pub(crate) async fn run(
         restart: restart_controller.clone(),
     };
     let mut server_task = tokio::spawn(http::run_server(server_runtime, listener));
+    // Start-up housekeeping nothing serving a request waits on runs once the
+    // server answers.
+    let _after_boot_task = after_boot.spawn();
 
     // The disk measurement affects extraction admission only, so take it
     // after HTTP startup and apply the result to the live tuner without

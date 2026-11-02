@@ -160,17 +160,26 @@ impl Database {
     // Every active job's row, without its stored NZB: a restart reads each
     // NZB on its own, so the queue's NZBs are never all in memory at once.
     pub fn load_active_jobs(&self) -> Result<HashMap<JobId, RecoveredJob>, StateError> {
-        self.load_active_jobs_where(None)
+        self.load_active_jobs_where(None, true)
+    }
+
+    // Every active job's row alone: no file identities, detected archives or
+    // completed files. A restart reads those for each job as it installs it.
+    pub fn load_active_job_rows(&self) -> Result<HashMap<JobId, RecoveredJob>, StateError> {
+        self.load_active_jobs_where(None, false)
     }
 
     // One active job's row, without its stored NZB.
     pub fn load_active_job(&self, job_id: JobId) -> Result<Option<RecoveredJob>, StateError> {
-        Ok(self.load_active_jobs_where(Some(job_id))?.remove(&job_id))
+        Ok(self
+            .load_active_jobs_where(Some(job_id), true)?
+            .remove(&job_id))
     }
 
     fn load_active_jobs_where(
         &self,
         only: Option<JobId>,
+        with_files: bool,
     ) -> Result<HashMap<JobId, RecoveredJob>, StateError> {
         let datastore = self.datastore();
         let key = self.encryption_key().cloned();
@@ -225,6 +234,9 @@ impl Database {
                     )?,
                 };
                 jobs.insert(job_id, job);
+            }
+            if !with_files {
+                return Ok(jobs);
             }
 
             let rows = SqlRuntime::fetch_all(

@@ -48,25 +48,31 @@ const ACTIVE_JOB_CHILD_TABLES: [&str; 14] = [
     "graph_held_parts",
 ];
 
-async fn delete_orphan_rows(tx: &mut SqlTx<'_>, table: &'static str) -> Result<usize, StateError> {
+async fn delete_orphan_rows(
+    tx: &mut SqlTx<'_>,
+    table: &'static str,
+    job_id: i64,
+) -> Result<usize, StateError> {
     let deleted = tx
         .execute(
             &format!(
                 "DELETE FROM {table}
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM active_jobs WHERE active_jobs.job_id = {table}.job_id
+                 WHERE job_id = {{}} AND NOT EXISTS (
+                     SELECT 1 FROM active_jobs WHERE active_jobs.job_id = {{}}
                  )"
             ),
-            &[],
+            &[SqlArg::I64(job_id), SqlArg::I64(job_id)],
         )
         .await?;
     Ok(deleted as usize)
 }
 
-async fn delete_active_job_rows(tx: &mut SqlTx<'_>, id: i64) -> Result<(), StateError> {
+// Deletes one job's rows from each table, in order. PostgreSQL takes them in
+// one statement.
+async fn delete_job_rows(tx: &mut SqlTx<'_>, tables: &[&str], id: i64) -> Result<(), StateError> {
     if matches!(&*tx, SqlTx::Postgres(_)) {
         let mut sql = String::from("WITH ");
-        for (idx, table) in ACTIVE_JOB_CHILD_TABLES.iter().enumerate() {
+        for (idx, table) in tables.iter().enumerate() {
             if idx > 0 {
                 sql.push_str(", ");
             }
@@ -74,25 +80,35 @@ async fn delete_active_job_rows(tx: &mut SqlTx<'_>, id: i64) -> Result<(), State
                 "d{idx} AS (DELETE FROM {table} WHERE job_id = {{}})"
             ));
         }
-        sql.push_str(", d_job AS (DELETE FROM active_jobs WHERE job_id = {}) SELECT 1");
-        let args = vec![SqlArg::I64(id); ACTIVE_JOB_CHILD_TABLES.len() + 1];
+        sql.push_str(" SELECT 1");
+        let args = vec![SqlArg::I64(id); tables.len()];
         tx.execute(&sql, &args).await?;
         return Ok(());
     }
 
-    for table in ACTIVE_JOB_CHILD_TABLES {
+    for table in tables {
         tx.execute(
             &format!("DELETE FROM {table} WHERE job_id = {{}}"),
             &[SqlArg::I64(id)],
         )
         .await?;
     }
-    tx.execute(
-        "DELETE FROM active_jobs WHERE job_id = {}",
-        &[SqlArg::I64(id)],
-    )
-    .await?;
     Ok(())
+}
+
+async fn delete_active_job_rows(tx: &mut SqlTx<'_>, id: i64) -> Result<(), StateError> {
+    let mut tables = ACTIVE_JOB_CHILD_TABLES.to_vec();
+    tables.push("active_jobs");
+    delete_job_rows(tx, &tables, id).await
+}
+
+// Clears what an earlier run of this job id left in the child tables, so a
+// job written again under the same id starts with none of it.
+pub(crate) async fn delete_active_job_child_rows_tx(
+    tx: &mut SqlTx<'_>,
+    job_id: JobId,
+) -> Result<(), StateError> {
+    delete_job_rows(tx, &ACTIVE_JOB_CHILD_TABLES, job_id.0 as i64).await
 }
 
 fn history_args(history: &history::JobHistoryRow, job_id: JobId) -> Vec<SqlArg> {
@@ -295,35 +311,71 @@ impl Database {
         result
     }
 
-    pub fn prune_orphan_active_state(&self) -> Result<OrphanActiveStateCounts, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "prune_orphan_active_state", |tx| {
-                Box::pin(async move {
-                    Ok(OrphanActiveStateCounts {
-                        active_file_progress: delete_orphan_rows(tx, "active_file_progress")
-                            .await?,
-                        active_files: delete_orphan_rows(tx, "active_files").await?,
-                        active_file_identities: delete_orphan_rows(tx, "active_file_identities")
-                            .await?,
-                        active_extracted: delete_orphan_rows(tx, "active_extracted").await?,
-                        active_detected_archives: delete_orphan_rows(
-                            tx,
-                            "active_detected_archives",
-                        )
-                        .await?,
-                        graph_checkpoint: {
-                            let mut removed = 0;
-                            for table in crate::jobs::graph_checkpoint::TABLES {
-                                removed += delete_orphan_rows(tx, table).await?;
-                            }
-                            removed
-                        },
+    // Removes the rows a job left in the active tables after its own row
+    // went, for jobs numbered below `below`: the jobs that existed when the
+    // caller took that number, so a job created since is never looked at.
+    // The orphans are found by reads, and each job's rows then go in a
+    // transaction of their own, so the writer is never held across a table.
+    pub fn prune_orphan_active_state(
+        &self,
+        below: JobId,
+    ) -> Result<OrphanActiveStateCounts, StateError> {
+        const ACTIVE_TABLES: [&str; 5] = [
+            "active_file_progress",
+            "active_files",
+            "active_file_identities",
+            "active_extracted",
+            "active_detected_archives",
+        ];
+        let below = i64::try_from(below.0).unwrap_or(i64::MAX);
+        let mut orphans = std::collections::BTreeSet::new();
+        for table in ACTIVE_TABLES
+            .into_iter()
+            .chain(crate::jobs::graph_checkpoint::TABLES)
+        {
+            let datastore = self.datastore();
+            let sql = format!(
+                "SELECT DISTINCT job_id FROM {table}
+                 WHERE job_id < {{}} AND NOT EXISTS (
+                     SELECT 1 FROM active_jobs WHERE active_jobs.job_id = {table}.job_id
+                 )"
+            );
+            let ids = self.run_sql_blocking_read(async move {
+                SqlRuntime::fetch_all(datastore.read_exec(), &sql, &[SqlArg::I64(below)])
+                    .await?
+                    .into_iter()
+                    .map(|row| row.i64("job_id"))
+                    .collect::<Result<Vec<_>, _>>()
+            })?;
+            orphans.extend(ids);
+        }
+
+        let mut counts = OrphanActiveStateCounts::default();
+        for job_id in orphans {
+            let datastore = self.datastore();
+            let removed = self.run_sql_blocking(async move {
+                SqlRuntime::run_in_transaction(&datastore, "prune_orphan_active_state", |tx| {
+                    Box::pin(async move {
+                        let mut removed = Vec::new();
+                        for table in ACTIVE_TABLES
+                            .into_iter()
+                            .chain(crate::jobs::graph_checkpoint::TABLES)
+                        {
+                            removed.push(delete_orphan_rows(tx, table, job_id).await?);
+                        }
+                        Ok(removed)
                     })
                 })
-            })
-            .await
-        })
+                .await
+            })?;
+            counts.active_file_progress += removed[0];
+            counts.active_files += removed[1];
+            counts.active_file_identities += removed[2];
+            counts.active_extracted += removed[3];
+            counts.active_detected_archives += removed[4];
+            counts.graph_checkpoint += removed[5..].iter().sum::<usize>();
+        }
+        Ok(counts)
     }
 }
 
