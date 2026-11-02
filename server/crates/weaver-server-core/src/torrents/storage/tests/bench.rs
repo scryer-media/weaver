@@ -434,7 +434,18 @@ async fn torrent_loopback_throughput() {
     drop(seeder_lines);
     seeders.kill().await.unwrap();
 
-    // Upload: every scripted leecher asks for every block.
+    // Upload: every scripted leecher asks for every block, at most
+    // WEAVER_BENCH_UPLOAD_MIB_S a second when set, so two builds can be held
+    // to one rate.
+    if let Ok(rate) = std::env::var("WEAVER_BENCH_UPLOAD_MIB_S") {
+        let bps = rate.parse::<u32>().unwrap() << 20;
+        _handle.set_ratelimits(weaver_torrent::limits::LimitsConfig {
+            upload_bps: weaver_torrent::limits::LimitKind::Bps(
+                std::num::NonZeroU32::new(bps).unwrap(),
+            ),
+            download_bps: Default::default(),
+        });
+    }
     let listen = leecher.listen_addr().unwrap();
     let mut leechers = counterpart("leech", &info_hash, shape)
         .env("WEAVER_BENCH_PEERS", peers.to_string())
