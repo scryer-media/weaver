@@ -201,15 +201,21 @@ impl TorrentJob {
     // the runs' step take this job's lock alone, so one torrent's commit
     // never holds up another's. A step another thread takes between the
     // two sees the shares in hand and lends for them itself, as this lend
-    // would.
+    // would. Shares that made nothing due take no slot lock at all.
     fn commit(&self, shares: Vec<Verified>, write: bool) -> anyhow::Result<()> {
-        let taken = self.with(|job| job.verified_unlent(shares, write, self.limit));
-        Ok(self.step(self.limit, |job, repairs, limit| {
-            if taken? {
-                job.lend(repairs, limit)?;
+        let taken = self.with(|job| {
+            let taken = job.verified_unlent(shares, write, self.limit);
+            if !matches!(taken, Ok(true)) {
+                // As a step would: a move asked for while something was
+                // out happens once nothing is.
+                job.try_relocate();
             }
-            Ok(())
-        })?)
+            taken
+        })?;
+        if taken {
+            self.step(self.limit, |job, repairs, limit| job.lend(repairs, limit))?;
+        }
+        Ok(())
     }
 }
 
@@ -641,14 +647,18 @@ impl TorrentStorage for PieceStorage {
     // A whole piece is hashed where its blocks landed, under its own lock
     // alone; one already verified, from its bytes.
     fn hash_held_piece(&self, piece: ValidPieceIndex, update: &mut dyn FnMut(&[u8])) -> bool {
-        let writing = match self.flight().get(&piece.get()) {
-            Some(Flight::Writing(writing)) => Arc::clone(writing),
-            Some(Flight::Verified(bytes)) => {
-                let bytes = bytes.clone();
+        // Taken out of the map first, so the hash runs with the map free.
+        let held = match self.flight().get(&piece.get()) {
+            Some(Flight::Writing(writing)) => Flight::Writing(Arc::clone(writing)),
+            Some(Flight::Verified(bytes)) => Flight::Verified(bytes.clone()),
+            None => return false,
+        };
+        let writing = match held {
+            Flight::Writing(writing) => writing,
+            Flight::Verified(bytes) => {
                 update(&bytes);
                 return true;
             }
-            None => return false,
         };
         let bytes = writing.read();
         // Emptied: it completed meanwhile, and is read from where it went.
