@@ -144,6 +144,8 @@ export const nextEn: LocaleDictionary = {
   "next.downloads.sortBy": "Sort by",
   "next.downloads.sortMenu": "Sort downloads",
   "next.downloads.showingPage": "showing {{shown}} of {{total}} downloads",
+  "next.downloads.selectAllMatching": "Select all {{count}}",
+  "next.downloads.selectionChanged": "The selection changed",
   "next.downloads.shown": "{{shown}} of {{total}} downloads shown",
   "next.downloads.loadingBody": "Fetching the queue.",
   "next.downloads.emptyTitle": "No active downloads",

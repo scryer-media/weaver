@@ -137,6 +137,8 @@ export const nextZh: LocaleDictionary = {
   "next.downloads.sortBy": "排序方式",
   "next.downloads.sortMenu": "排序下载",
   "next.downloads.showingPage": "显示 {{total}} 个下载中的 {{shown}} 个",
+  "next.downloads.selectAllMatching": "全选 {{count}} 个",
+  "next.downloads.selectionChanged": "所选内容已变化",
   "next.downloads.shown": "显示 {{total}} 个下载中的 {{shown}} 个",
   "next.downloads.loadingBody": "正在获取队列。",
   "next.downloads.emptyTitle": "没有活动的下载",

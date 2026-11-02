@@ -137,6 +137,8 @@ export const nextJa: LocaleDictionary = {
   "next.downloads.sortBy": "並べ替え",
   "next.downloads.sortMenu": "ダウンロードを並べ替え",
   "next.downloads.showingPage": "{{total}} 件中 {{shown}} 件のダウンロードを表示",
+  "next.downloads.selectAllMatching": "{{count}} 件すべて選択",
+  "next.downloads.selectionChanged": "選択内容が変わりました",
   "next.downloads.shown": "{{total}} 件中 {{shown}} 件のダウンロードを表示",
   "next.downloads.loadingBody": "キューを取得しています。",
   "next.downloads.emptyTitle": "アクティブなダウンロードはありません",

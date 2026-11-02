@@ -3,7 +3,7 @@
 
 import { useCallback } from "react";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { isActiveStatus, statusI18nKey, statusToken } from "@/lib/status-tokens";
+import { statusI18nKey } from "@/lib/status-tokens";
 import type { JobData } from "@/lib/job-types";
 import { latestPhase } from "./phase-bars";
 
@@ -14,7 +14,9 @@ import { latestPhase } from "./phase-bars";
  * weaver's pipeline states the same way.
  */
 
-export type DownloadGroup = "active" | "paused" | "queued" | "attention";
+import type { DownloadGroup } from "./queue-page";
+
+export { downloadGroup, type DownloadGroup } from "./queue-page";
 
 export const DOWNLOAD_GROUP_ORDER: readonly DownloadGroup[] = [
   "active",
@@ -38,14 +40,6 @@ export const DOWNLOAD_GROUP_NOTE: Record<DownloadGroup, string | null> = {
   queued: "next.group.note.queued",
   attention: "next.group.note.attention",
 };
-
-export function downloadGroup(status: string): DownloadGroup {
-  const token = statusToken(status);
-  if (token === "paused") return "paused";
-  if (token === "failed") return "attention";
-  if (isActiveStatus(status)) return "active";
-  return "queued";
-}
 
 export function useStatusLabel(): (status: string) => string {
   const t = useTranslate();

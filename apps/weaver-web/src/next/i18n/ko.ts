@@ -137,6 +137,8 @@ export const nextKo: LocaleDictionary = {
   "next.downloads.sortBy": "정렬 기준",
   "next.downloads.sortMenu": "다운로드 정렬",
   "next.downloads.showingPage": "다운로드 {{total}}개 중 {{shown}}개 표시",
+  "next.downloads.selectAllMatching": "{{count}}개 모두 선택",
+  "next.downloads.selectionChanged": "선택 항목이 바뀌었습니다",
   "next.downloads.shown": "다운로드 {{total}}개 중 {{shown}}개 표시",
   "next.downloads.loadingBody": "대기열을 불러오는 중입니다.",
   "next.downloads.emptyTitle": "활성 다운로드 없음",

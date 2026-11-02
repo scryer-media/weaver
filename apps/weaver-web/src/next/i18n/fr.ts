@@ -137,6 +137,8 @@ export const nextFr: LocaleDictionary = {
   "next.downloads.sortBy": "Trier par",
   "next.downloads.sortMenu": "Trier les téléchargements",
   "next.downloads.showingPage": "{{shown}} téléchargements affichés sur {{total}}",
+  "next.downloads.selectAllMatching": "Tout sélectionner ({{count}})",
+  "next.downloads.selectionChanged": "La sélection a changé",
   "next.downloads.shown": "{{shown}} téléchargements affichés sur {{total}}",
   "next.downloads.loadingBody": "Chargement de la file.",
   "next.downloads.emptyTitle": "Aucun téléchargement actif",
