@@ -714,12 +714,63 @@ pub struct NetworkPoolMemberFlow {
     pub blocked: Option<String>,
     pub handshake_ms: Option<f64>,
     pub connect_ms: Option<f64>,
+    // Where the pool's plan dials the member: 0 is the pin. None when the
+    // plan does not hold the member.
+    pub rank: Option<u32>,
     // The delivery rate the pool judges the member by, per connection.
     pub bytes_per_second: Option<f64>,
     pub samples: u32,
     pub failures: u32,
     // What the member's open connections carry now, all together.
     pub live_bytes_per_second: u64,
+}
+// One pool on one egress as its plan and members report it. Members keep
+// their id order; `rank` carries where the plan dials each one.
+fn pool_flow(
+    pool_id: u32,
+    egress_id: u32,
+    plan: weaver_nntp::candidate_plan::PlanSnapshot<u32>,
+    members: Vec<core::PoolMemberStatus>,
+) -> NetworkPoolFlow {
+    NetworkPoolFlow {
+        pool_id,
+        egress_id,
+        pinned_member: plan.pinned,
+        members: members
+            .into_iter()
+            .map(|m| {
+                let evidence = plan.candidates.iter().find(|c| c.candidate == m.id);
+                NetworkPoolMemberFlow {
+                    id: m.id,
+                    state: if m.blocked.is_some() {
+                        "BLOCKED"
+                    } else if m.opening > 0 {
+                        "PROBING"
+                    } else {
+                        evidence.map_or("UNMEASURED", |candidate| candidate.state)
+                    }
+                    .into(),
+                    open: m.open,
+                    opening: m.opening,
+                    warmed: m.warmed,
+                    blocked: m.blocked,
+                    handshake_ms: m.session_handshake.map(|d| d.as_secs_f64() * 1000.0),
+                    connect_ms: evidence
+                        .and_then(|c| c.connect_time)
+                        .map(|d| d.as_secs_f64() * 1000.0),
+                    rank: plan
+                        .dial_order
+                        .iter()
+                        .position(|&candidate| candidate == m.id)
+                        .map(|rank| rank as u32),
+                    bytes_per_second: evidence.and_then(|c| c.bytes_per_second),
+                    samples: evidence.map_or(0, |c| c.samples),
+                    failures: evidence.map_or(0, |c| c.failures),
+                    live_bytes_per_second: m.bytes_per_second,
+                }
+            })
+            .collect(),
+    }
 }
 pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
     let mut legs = Vec::new();
@@ -827,40 +878,7 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
         .network
         .pool_status()
         .into_iter()
-        .map(|(pool_id, egress_id, plan, members)| NetworkPoolFlow {
-            pool_id,
-            egress_id,
-            pinned_member: plan.pinned,
-            members: members
-                .into_iter()
-                .map(|m| {
-                    let evidence = plan.candidates.iter().find(|c| c.candidate == m.id);
-                    NetworkPoolMemberFlow {
-                        id: m.id,
-                        state: if m.blocked.is_some() {
-                            "BLOCKED"
-                        } else if m.opening > 0 {
-                            "PROBING"
-                        } else {
-                            evidence.map_or("UNMEASURED", |candidate| candidate.state)
-                        }
-                        .into(),
-                        open: m.open,
-                        opening: m.opening,
-                        warmed: m.warmed,
-                        blocked: m.blocked,
-                        handshake_ms: m.session_handshake.map(|d| d.as_secs_f64() * 1000.0),
-                        connect_ms: evidence
-                            .and_then(|c| c.connect_time)
-                            .map(|d| d.as_secs_f64() * 1000.0),
-                        bytes_per_second: evidence.and_then(|c| c.bytes_per_second),
-                        samples: evidence.map_or(0, |c| c.samples),
-                        failures: evidence.map_or(0, |c| c.failures),
-                        live_bytes_per_second: m.bytes_per_second,
-                    }
-                })
-                .collect(),
-        })
+        .map(|(pool_id, egress_id, plan, members)| pool_flow(pool_id, egress_id, plan, members))
         .collect();
     pools.sort_by_key(|p| (p.pool_id, p.egress_id));
     legs.sort_by_key(|leg| (leg.consumer.clone(), leg.position));
@@ -886,6 +904,7 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
                         blocked: None,
                         handshake_ms: None,
                         connect_ms: None,
+                        rank: None,
                         bytes_per_second: None,
                         samples: 0,
                         failures: 0,
@@ -1368,3 +1387,7 @@ fn same_flow(a: &NetworkFlow, b: &NetworkFlow) -> bool {
         && a.proxies == b.proxies
         && a.proxy_pools == b.proxy_pools
 }
+
+#[cfg(test)]
+#[path = "networking_tests.rs"]
+mod tests;
