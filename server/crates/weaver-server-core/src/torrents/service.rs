@@ -2937,8 +2937,8 @@ impl TorrentService {
     }
 
     // The jobs of the torrents brought back at start with their records
-    // only, each restored from its checkpoint in turn. A torrent reads as it
-    // was kept until its job is back.
+    // only, each restored from its checkpoint, RESTORES_AT_ONCE at a time. A
+    // torrent reads as it was kept until its job is back.
     async fn restore_jobs(&self) {
         let waiting: Vec<JobId> = self
             .inner
@@ -2970,11 +2970,24 @@ impl TorrentService {
     }
 
     // The job of a torrent that waits for one, restored on a blocking thread
-    // under no lock but the one that keeps restores one at a time, and given
+    // under no lock but its own job's and a restore permit, and given
     // to the torrent if it still waits: one removed meanwhile drops it. A
     // restore that panics is a checkpoint that does not restore. Whether it
     // gave the torrent its job, unheld, so it may attach now.
     async fn restore_job(&self, job_id: JobId) -> bool {
+        // However the restore ends, even cancelled or with the runtime, its
+        // entry goes: a torrent with its job, or gone, waits for no restore.
+        struct Done<'a>(&'a TorrentService, JobId);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0
+                    .inner
+                    .restoring
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&self.1);
+            }
+        }
         let this_job = Arc::clone(
             self.inner
                 .restoring
@@ -2990,6 +3003,7 @@ impl TorrentService {
                 .await
                 .expect("the restore permits are never closed"),
         );
+        let _done = Done(self, job_id);
         let waiting = {
             let live = self.inner.live.lock().await;
             live.get(&job_id)
@@ -3004,11 +3018,6 @@ impl TorrentService {
                 })
         };
         let Some((dir, layout, unpack, passwords)) = waiting else {
-            self.inner
-                .restoring
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&job_id);
             return false;
         };
         let restoring = {
@@ -3041,12 +3050,6 @@ impl TorrentService {
             }
             None => false,
         };
-        // A torrent with its job, or gone, waits for no restore.
-        self.inner
-            .restoring
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&job_id);
         attachable
     }
 
@@ -3865,6 +3868,26 @@ impl TorrentService {
             }
         };
         let mut live = self.inner.live.lock().await;
+        // Another attach of this torrent may have finished while this one
+        // waited: the session it put the torrent in keeps it, and a second
+        // copy in another session is let go.
+        let attached_meanwhile = live
+            .get(&job_id)
+            .and_then(|torrent| torrent.attached.as_ref())
+            .map(|attached| {
+                Arc::ptr_eq(&attached.session, &session) && attached.handle.id() == handle.id()
+            });
+        if let Some(same) = attached_meanwhile {
+            drop(live);
+            if !same
+                && let Err(error) = session
+                    .delete(TorrentIdOrHash::Id(handle.id()), false)
+                    .await
+            {
+                tracing::debug!(job_id = job_id.0, error = %error, "a second copy of a torrent was already gone from its session");
+            }
+            return;
+        }
         match live.get_mut(&job_id) {
             Some(torrent) => {
                 // A ban made while the session took the torrent holds in
