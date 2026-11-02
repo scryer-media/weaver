@@ -22,7 +22,7 @@ pub use weaver_torrent::upnp::{PortMapped, PortmapProtocol, PortmapTransport};
 use weaver_torrent::{
     ConnectionOptions, DhtSessionConfig, HttpClients, Identity, IpFilter, ListenFailed,
     ListenerMode, ListenerOptions, PeerConnectionOptions, Session, SessionLimits, SessionOptions,
-    SocketFactory,
+    SharedLimits, SocketFactory,
 };
 use weaver_tunnel::bridge::Bridge;
 use weaver_tunnel::pipe::Dialer;
@@ -755,6 +755,10 @@ pub struct Sessions {
     // Rung by every session as an announce table or a metadata fetch's
     // phase changes.
     trackers_changed: Arc<tokio::sync::Notify>,
+    // The connection budget and check turns every session shares, made
+    // with the first session: the process has one descriptor limit and
+    // one disk however many routes it runs.
+    shared_limits: std::sync::OnceLock<SharedLimits>,
 }
 
 impl Sessions {
@@ -773,6 +777,7 @@ impl Sessions {
             closing: Closing::default(),
             revoked: Arc::default(),
             trackers_changed: Arc::default(),
+            shared_limits: std::sync::OnceLock::new(),
         }
     }
 
@@ -1108,11 +1113,20 @@ impl Sessions {
         self.closing
             .released(plan, [Some(port), ssl_port, maps].into_iter().flatten())
             .await;
-        let mut options = SessionOptions {
-            port_map_events: Some(mappings.follow()),
-            trackers_changed: Some(Arc::clone(&self.trackers_changed)),
-            ..session_options(&leg, port, &dir, peers, &torrent, ip_filter, opener)
-        };
+        let mut options = session_options(&leg, port, &dir, peers, &torrent, ip_filter, opener);
+        options.port_map_events = Some(mappings.follow());
+        options.trackers_changed = Some(Arc::clone(&self.trackers_changed));
+        options.shared_limits = Some(
+            self.shared_limits
+                .get_or_init(|| {
+                    SharedLimits::new(
+                        session_limits(&torrent),
+                        options.connections_slack,
+                        options.concurrent_init_limit.unwrap_or(1),
+                    )
+                })
+                .clone(),
+        );
         // SSL torrents' peers come to a port of the route's own beside its
         // peer port.
         if let Some(listen) = options.listen.as_mut() {

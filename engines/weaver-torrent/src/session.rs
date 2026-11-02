@@ -858,6 +858,33 @@ pub struct SessionLimits {
     pub connection_speed: NonZeroU32,
 }
 
+/// The limits the sessions of one process share: one connection budget
+/// within the process's open files, and one turn at a time to hash a
+/// torrent's files (libtorrent's `connections_limit`, `connection_speed`
+/// and `active_checking`, which its one session holds for the process).
+/// Setting a sharing session's limits sets them for all.
+#[derive(Clone)]
+pub struct SharedLimits {
+    slots: Arc<ConnectionSlots>,
+    checks: Arc<tokio::sync::Semaphore>,
+}
+
+impl SharedLimits {
+    /// Connections within `limits`, the slack past them as
+    /// [`SessionOptions::connections_slack`], and `concurrent_checks`
+    /// torrents hashing their files at once (at least one).
+    pub fn new(limits: SessionLimits, connections_slack: usize, concurrent_checks: usize) -> Self {
+        Self {
+            slots: Arc::new(ConnectionSlots::new(
+                limits.connections_limit,
+                connections_slack,
+                limits.connection_speed,
+            )),
+            checks: Arc::new(tokio::sync::Semaphore::new(concurrent_checks.max(1))),
+        }
+    }
+}
+
 /// What the session refuses to reach, taken as it changes (libtorrent
 /// `session_impl::set_ip_filter`, with `no_connect_privileged_ports` and
 /// `apply_ip_filter_to_trackers`).
@@ -999,6 +1026,14 @@ pub struct SessionOptions {
     /// to 30.
     pub connection_speed: NonZeroU32,
 
+    /// The connection budget and check turns this session shares with the
+    /// other sessions of its process, in place of its own: the process
+    /// has one descriptor limit and one disk, as libtorrent's one session
+    /// does. Its `connections_limit`, `connections_slack`,
+    /// `connection_speed` and `concurrent_init_limit` are then the shared
+    /// ones'.
+    pub shared_limits: Option<SharedLimits>,
+
     /// Disable LSD multicast
     pub disable_local_service_discovery: bool,
 
@@ -1068,6 +1103,7 @@ impl Default for SessionOptions {
             default_storage_factory: None,
             cancellation_token: None,
             concurrent_init_limit: None,
+            shared_limits: None,
             runtime_worker_threads: None,
             root_span: None,
             ratelimits: LimitsConfig::default(),
@@ -1636,15 +1672,21 @@ impl Session {
                 connector: stream_connector,
                 root_span: opts.root_span,
                 stats: Arc::new(SessionStats::new()),
-                concurrent_initialize_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                    opts.concurrent_init_limit.unwrap_or(1).max(1),
-                )),
+                concurrent_initialize_semaphore: match &opts.shared_limits {
+                    Some(shared) => Arc::clone(&shared.checks),
+                    None => Arc::new(tokio::sync::Semaphore::new(
+                        opts.concurrent_init_limit.unwrap_or(1).max(1),
+                    )),
+                },
                 udp_tracker_client,
-                connection_slots: Arc::new(ConnectionSlots::new(
-                    opts.connections_limit,
-                    opts.connections_slack,
-                    opts.connection_speed,
-                )),
+                connection_slots: match &opts.shared_limits {
+                    Some(shared) => Arc::clone(&shared.slots),
+                    None => Arc::new(ConnectionSlots::new(
+                        opts.connections_limit,
+                        opts.connections_slack,
+                        opts.connection_speed,
+                    )),
+                },
                 ratelimits: Limits::new(opts.ratelimits),
                 ipv4_only: opts.ipv4_only,
                 trackers: opts.trackers,
@@ -5045,6 +5087,62 @@ mod tests {
         assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
 
         session.stop().await;
+    }
+
+    // Sessions given one SharedLimits draw on one connection budget and
+    // one turn at hashing files: a connection one opens leaves the other
+    // none under a cap of one, and a check turn one holds the other waits
+    // for. A limit set on one is set on both.
+    #[tokio::test]
+    async fn sessions_sharing_limits_share_one_budget_and_one_check_turn() {
+        let shared = super::SharedLimits::new(
+            super::SessionLimits {
+                connections_limit: 1,
+                unchoke_slots_limit: usize::MAX,
+                connection_speed: std::num::NonZeroU32::new(30).unwrap(),
+            },
+            0,
+            1,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let open = |name: &str| {
+            let shared = shared.clone();
+            let dir = dir.path().join(name);
+            async move {
+                Session::new_with_opts(
+                    dir,
+                    SessionOptions {
+                        dht: None,
+                        persistence: None,
+                        disable_trackers: true,
+                        disable_local_service_discovery: true,
+                        listen: None,
+                        shared_limits: Some(shared),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let (a, b) = (open("a").await, open("b").await);
+
+        let held = a.connection_slots.try_open().unwrap();
+        assert!(b.connection_slots.try_open().is_none());
+        drop(held);
+        assert!(b.connection_slots.try_open().is_some());
+
+        let turn = a.concurrent_initialize_semaphore.try_acquire().unwrap();
+        assert!(b.concurrent_initialize_semaphore.try_acquire().is_err());
+        drop(turn);
+
+        let mut limits = b.limits();
+        limits.connections_limit = 3;
+        b.set_limits(limits);
+        assert_eq!(a.connection_slots.limit(), 3);
+
+        a.stop().await;
+        b.stop().await;
     }
 
     // A connection from `addr` the listener took and checked, for the
