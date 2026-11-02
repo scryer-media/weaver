@@ -250,6 +250,7 @@ impl Pipeline {
             nzb_reprocess_pending: HashSet::new(),
             queue_walk_mark: None,
             queue_walk_due: false,
+            restores_waiting: false,
             dispatch_hold_watch: Vec::new(),
             queue_positions: None,
             semantic_terminal_causes: HashMap::new(),
@@ -983,7 +984,7 @@ impl Pipeline {
                 )
                 .await;
             turn_active |= processed_results > 0;
-            if processed_results == 0 {
+            if processed_results == 0 && !self.restores_waiting {
                 // Set by the periodic arms that found nothing to do; every
                 // other arm is an event.
                 let mut idle_tick = false;

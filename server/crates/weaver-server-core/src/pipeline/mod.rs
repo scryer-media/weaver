@@ -2,6 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 mod activation;
+pub(crate) use activation::read_stored_spec;
+pub(crate) use completion::finalize::ActiveRuntimeValues;
 pub mod archive;
 mod capacity;
 mod completion;
@@ -1299,6 +1301,10 @@ pub struct Pipeline {
     // anything for the next turn to look at again.
     pub(crate) queue_walk_mark: Option<nzb_admission::QueueWalkMark>,
     pub(crate) queue_walk_due: bool,
+    // Restores are installed a batch a turn; while some still wait, the
+    // loop takes its next turn without waiting for an event, so dispatch
+    // runs between batches.
+    pub(crate) restores_waiting: bool,
     // Each row's stored queue position as last written, loaded from the
     // database on the first order change.
     pub(crate) queue_positions: Option<HashMap<JobId, i64>>,

@@ -189,6 +189,12 @@ impl JobSpec {
     // Takes every file's article list out of the spec, leaving what a job
     // waiting its turn keeps, and returns what the lists held, with none of
     // their articles in hand.
+    // Whether a file's article list was let go: a restart keeps only the
+    // files of a job it restores, and the lists are read back on install.
+    pub fn lacks_article_lists(&self) -> bool {
+        self.files.iter().any(|file| file.segments.is_empty())
+    }
+
     pub fn drop_article_lists(&mut self) -> FileSummaries {
         self.drop_article_lists_with_in_hand(|_, _| false)
     }

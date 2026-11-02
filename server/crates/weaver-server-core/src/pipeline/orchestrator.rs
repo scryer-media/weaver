@@ -13,6 +13,8 @@ mod scripts;
 mod state;
 
 pub(super) use commands::{CancelJobsDone, CancelledJobCleanup};
+#[cfg(test)]
+pub(super) use control::RESTORE_BATCH;
 pub(crate) use runtime::is_terminal_status;
 pub(super) use runtime::timestamp_secs;
 #[cfg(test)]

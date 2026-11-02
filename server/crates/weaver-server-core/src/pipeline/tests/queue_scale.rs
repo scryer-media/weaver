@@ -189,3 +189,91 @@ async fn per_job_metrics_cover_the_jobs_holding_a_slot() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn a_restart_restores_a_long_queue_a_batch_a_turn_holding_no_article_lists() {
+    use crate::pipeline::completion::finalize::RUNTIME_WRITES;
+    use crate::pipeline::orchestrator::RESTORE_BATCH;
+    let temp = tempfile::tempdir().unwrap();
+    let (pipeline, _handle) = long_queue(&temp, 2).await;
+    let expected: HashMap<JobId, Vec<crate::jobs::model::FileSummary>> = pipeline
+        .jobs
+        .iter()
+        .map(|(id, state)| {
+            let summaries = match &state.articles {
+                crate::jobs::model::JobArticles::Queued(summaries) => summaries.0.clone(),
+                _ => state
+                    .spec
+                    .files
+                    .iter()
+                    .map(crate::jobs::model::FileSummary::of)
+                    .collect(),
+            };
+            (*id, summaries)
+        })
+        .collect();
+    retire_pipeline_database(pipeline).await;
+
+    let (mut pipeline, intermediate, _) = new_direct_pipeline(&temp).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    handle
+        .set_max_concurrent_nzbs(std::num::NonZeroU32::new(2).unwrap())
+        .await
+        .unwrap();
+    let recovered = crate::operations::recover_server_state(
+        &pipeline.db,
+        &temp.path().join("data"),
+        &intermediate,
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered.to_restore.len(), QUEUED as usize);
+    // Recovery holds each job's files, never its article lists.
+    for candidate in &recovered.to_restore {
+        assert!(
+            candidate
+                .request
+                .spec
+                .files
+                .iter()
+                .all(|file| file.segments.is_empty()),
+            "job {}",
+            candidate.job_id.0
+        );
+    }
+    let order: Vec<JobId> = recovered.to_restore.iter().map(|c| c.job_id).collect();
+    for candidate in recovered.to_restore {
+        handle.restore_job(candidate.request).await.unwrap();
+    }
+
+    // Each turn installs one batch, first in queue order, and says more wait.
+    let writes = RUNTIME_WRITES.load(Ordering::Relaxed);
+    pipeline.apply_queue_intents().await;
+    assert_eq!(pipeline.jobs.len(), RESTORE_BATCH);
+    assert!(pipeline.restores_waiting);
+    assert!(
+        order[..RESTORE_BATCH]
+            .iter()
+            .all(|id| pipeline.jobs.contains_key(id))
+    );
+    let mut turns = 1;
+    while pipeline.restores_waiting {
+        pipeline.apply_queue_intents().await;
+        turns += 1;
+    }
+    assert_eq!(pipeline.jobs.len(), QUEUED as usize);
+    assert_eq!(turns, (QUEUED as usize).div_ceil(RESTORE_BATCH));
+    // A restore that changes nothing in its row writes nothing back.
+    assert_eq!(RUNTIME_WRITES.load(Ordering::Relaxed), writes);
+    // Every job waits its turn holding the summaries its lists gave.
+    for (id, state) in &pipeline.jobs {
+        match &state.articles {
+            crate::jobs::model::JobArticles::Queued(summaries) => {
+                assert_eq!(summaries.0, expected[id], "job {}", id.0)
+            }
+            _ => assert!(pipeline.nzb_admitted.contains(id), "job {}", id.0),
+        }
+    }
+    pipeline.apply_queue_intents().await;
+    assert_eq!(pipeline.nzb_admitted.len(), 2);
+}

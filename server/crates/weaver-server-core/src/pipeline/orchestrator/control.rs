@@ -4,6 +4,9 @@
 use super::*;
 use crate::pipeline::queue::Change;
 
+// How many restores one turn installs.
+pub(crate) const RESTORE_BATCH: usize = 32;
+
 impl Pipeline {
     pub(crate) async fn apply_queue_intents(&mut self) {
         self.answer_diagnostics_request();
@@ -33,6 +36,8 @@ impl Pipeline {
         // restart, under any pause and with every slot taken; only a shutdown
         // installs nothing. Admission decides only whether its articles go
         // out. A restore whose row carries a pause installs parked.
+        // A restart's restores install a bounded batch a turn, in queue
+        // order, so the first jobs download while the rest still install.
         let restores = self.shared_state.queue.write(|inner| {
             if inner.globals.shutting_down {
                 return Change::unchanged(Vec::new());
@@ -54,9 +59,16 @@ impl Pipeline {
                             request
                         })
                     })
+                    .take(RESTORE_BATCH)
                     .collect::<Vec<_>>(),
             )
         });
+        // A full batch may have left more behind; the next turn looks.
+        self.restores_waiting = restores.len() == RESTORE_BATCH;
+        self.queue_walk_due |= self.restores_waiting;
+        if !restores.is_empty() {
+            self.download_dispatch_wake = true;
+        }
         for request in restores {
             let id = request.job_id;
             if let Err(error) = self.install_restored_job(request).await {

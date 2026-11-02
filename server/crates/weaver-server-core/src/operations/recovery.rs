@@ -141,18 +141,24 @@ pub async fn recover_server_state(
                 created_at_epoch_ms: recovered.created_at as f64 * 1000.0,
             });
         } else {
-            // In-progress job - need to re-parse NZB and restore.
-            let parse_result = recovered
-                .nzb_zstd
-                .as_deref()
+            // In-progress job: its NZB is read and parsed on its own, so one
+            // job's article lists are in memory at a time, and only its
+            // files are kept. The install reads the lists back from the same
+            // stored NZB, and a job waiting its turn lets them go again.
+            let missing = || {
+                ingest::PersistedNzbError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("persisted NZB missing from database for job {}", job_id.0),
+                ))
+            };
+            // A read that fails stops the start, as the read of every row
+            // did; only a missing or unreadable NZB archives the job.
+            let parse_result = db
+                .load_active_job_persisted_nzb(job_id)?
+                .and_then(|(_, nzb_zstd)| nzb_zstd)
                 .filter(|nzb_zstd| !nzb_zstd.is_empty())
-                .ok_or_else(|| {
-                    ingest::PersistedNzbError::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("persisted NZB missing from database for job {}", job_id.0),
-                    ))
-                })
-                .and_then(ingest::parse_persisted_nzb_bytes);
+                .ok_or_else(missing)
+                .and_then(|nzb_zstd| ingest::parse_persisted_nzb_bytes(&nzb_zstd));
 
             match parse_result {
                 Ok(nzb) => {
@@ -162,6 +168,8 @@ pub async fn recover_server_state(
                         recovered.category,
                         recovered.metadata,
                     );
+                    drop(nzb);
+                    spec.drop_article_lists();
                     // Apply a persisted password override on top of the
                     // NZB-derived password ('' = explicitly none).
                     match recovered.password_override.as_deref() {

@@ -789,6 +789,9 @@ impl Pipeline {
         if self.jobs.contains_key(&request.job_id) {
             return Err(crate::SchedulerError::JobExists(request.job_id));
         }
+        // What the job's row holds now: an install that changes none of it
+        // writes nothing back.
+        let stored = crate::pipeline::ActiveRuntimeValues::stored(&request);
         // The status the job goes back to when unpaused: the stored one, else
         // the one its stored resume lanes name, else the one its lanes at
         // shutdown name. Read here once, so the job installs with it whether
@@ -833,7 +836,9 @@ impl Pipeline {
         match self.restore_job_inner(request).await {
             Ok(()) => {
                 self.blocked_restores.remove(&original.job_id);
-                self.persist_active_runtime(original.job_id);
+                if self.active_runtime_values(original.job_id) != Some(stored) {
+                    self.persist_active_runtime(original.job_id);
+                }
             }
             Err(error) => {
                 self.install_blocked_restore(original, error.to_string())
@@ -947,10 +952,9 @@ impl Pipeline {
     ) -> Result<(), crate::SchedulerError> {
         if let Some(mut request) = self.blocked_restores.get(&job_id).cloned() {
             let recovered = self
-                .db_blocking(move |db| db.load_active_jobs())
+                .db_blocking(move |db| db.load_active_job(job_id))
                 .await
                 .map_err(crate::SchedulerError::State)?
-                .remove(&job_id)
                 .ok_or(crate::SchedulerError::JobNotFound(job_id))?;
             request.file_identities = recovered.file_identities;
             request.detected_archives = recovered.detected_archives;
@@ -1004,6 +1008,32 @@ impl Pipeline {
             return Err(crate::SchedulerError::JobExists(job_id));
         }
         let mut spec = spec;
+        if spec.lacks_article_lists() {
+            // Read back from the stored NZB the restart kept only the files
+            // of, off the pipeline thread.
+            let category = spec.category.clone();
+            let metadata = spec.metadata.clone();
+            let stored = self
+                .db_blocking(move |db| {
+                    crate::pipeline::read_stored_spec(db, job_id, category, metadata)
+                })
+                .await
+                .map_err(crate::SchedulerError::Internal)?;
+            if stored.files.len() != spec.files.len()
+                || stored
+                    .files
+                    .iter()
+                    .zip(&spec.files)
+                    .any(|(stored, kept)| stored.filename != kept.filename)
+            {
+                return Err(crate::SchedulerError::Internal(
+                    "stored NZB no longer matches the job's files".to_string(),
+                ));
+            }
+            for (file, stored) in spec.files.iter_mut().zip(stored.files) {
+                file.segments = stored.segments;
+            }
+        }
         if working_dir.starts_with(&self.intermediate_dir)
             && tokio::fs::try_exists(&working_dir).await.unwrap_or(false)
             && let Err(error) =
@@ -1017,6 +1047,8 @@ impl Pipeline {
             );
         }
 
+        // The identities the row holds; only ones that differ are written.
+        let stored_identities = file_identities.clone();
         let file_identities = if file_identities.is_empty() {
             Self::build_initial_file_identities(&spec, &detected_archives)
         } else {
@@ -1290,7 +1322,9 @@ impl Pipeline {
         if let Some(file_identities) = self
             .jobs
             .get(&job_id)
-            .map(|state| state.file_identities.clone())
+            .map(|state| &state.file_identities)
+            .filter(|identities| **identities != stored_identities)
+            .cloned()
         {
             self.persist_file_identities(job_id, &file_identities).await;
         }
