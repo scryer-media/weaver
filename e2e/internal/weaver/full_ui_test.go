@@ -794,7 +794,7 @@ func TestFullDashboardRendersOneBarPerReleaseGateFlow(t *testing.T) {
 	barColumn := -1
 	bars := 0
 	for _, line := range strings.Split(frame, "\n") {
-		// Skip the cursor-home/clear escape, which also contains a bare "[".
+		// Skip the title and blank lines, which carry no bar.
 		if !strings.Contains(line, "]") {
 			continue
 		}
@@ -1063,5 +1063,84 @@ func TestFullRunNarrowsTheReleaseGateUnlessTheOperatorSetsAWidth(t *testing.T) {
 	t.Setenv("E2E_WEAVER_RELEASE_GATE_JOBS", "12")
 	if got, ok := phase.env()["E2E_WEAVER_RELEASE_GATE_JOBS"]; ok {
 		t.Fatalf("release-gate jobs = %q, want the operator's width left in place", got)
+	}
+}
+
+// recordingWriter keeps each Write call separately so a test can count them.
+type recordingWriter struct {
+	writes []string
+}
+
+func (w *recordingWriter) Write(p []byte) (int, error) {
+	w.writes = append(w.writes, string(p))
+	return len(p), nil
+}
+
+func TestFramePainterRewritesOnlyChangedRowsInOneWrite(t *testing.T) {
+	out := &recordingWriter{}
+	painter := framePainter{out: out}
+
+	painter.paint("title   elapsed 9s\n\nSeeding [##  ] 1/2\nPhase A [    ] 0/1\n")
+	if len(out.writes) != 1 {
+		t.Fatalf("first frame took %d writes, want 1", len(out.writes))
+	}
+	want := "\x1b[H\x1b[J" +
+		"\x1b[1;1Htitle   elapsed 9s\x1b[K" +
+		"\x1b[2;1H\x1b[K" +
+		"\x1b[3;1HSeeding [##  ] 1/2\x1b[K" +
+		"\x1b[4;1HPhase A [    ] 0/1\x1b[K" +
+		"\x1b[5;1H"
+	if out.writes[0] != want {
+		t.Fatalf("first frame bytes:\n got %q\nwant %q", out.writes[0], want)
+	}
+
+	// An unchanged frame writes nothing at all.
+	painter.paint("title   elapsed 9s\n\nSeeding [##  ] 1/2\nPhase A [    ] 0/1\n")
+	if len(out.writes) != 1 {
+		t.Fatalf("unchanged frame wrote %q", out.writes[1:])
+	}
+
+	// A tick that moves only the clock rewrites only the title row, with no
+	// screen clear before it.
+	painter.paint("title   elapsed 10s\n\nSeeding [##  ] 1/2\nPhase A [    ] 0/1\n")
+	if len(out.writes) != 2 {
+		t.Fatalf("clock tick took %d writes, want 1", len(out.writes)-1)
+	}
+	if got, want := out.writes[1], "\x1b[1;1Htitle   elapsed 10s\x1b[K\x1b[5;1H"; got != want {
+		t.Fatalf("clock tick bytes:\n got %q\nwant %q", got, want)
+	}
+
+	// A frame that grows by a row paints the changed row and the new one.
+	painter.paint("title   elapsed 10s\n\nSeeding [####] 2/2\nPhase A [    ] 0/1\n  flow [    ] 0/1\n")
+	if got, want := out.writes[2], "\x1b[3;1HSeeding [####] 2/2\x1b[K\x1b[5;1H  flow [    ] 0/1\x1b[K\x1b[6;1H"; got != want {
+		t.Fatalf("growing frame bytes:\n got %q\nwant %q", got, want)
+	}
+
+	// A frame that shrinks blanks the rows it no longer uses.
+	painter.paint("title   elapsed 10s\n\nSeeding [####] 2/2\n")
+	if got, want := out.writes[3], "\x1b[4;1H\x1b[K\x1b[5;1H\x1b[K\x1b[4;1H"; got != want {
+		t.Fatalf("shrinking frame bytes:\n got %q\nwant %q", got, want)
+	}
+
+	if len(out.writes) != 4 {
+		t.Fatalf("got %d writes for 4 changed frames", len(out.writes))
+	}
+	for i, write := range out.writes[1:] {
+		if strings.Contains(write, "\x1b[J") || strings.Contains(write, "\x1b[2J") {
+			t.Fatalf("write %d after the first clears the screen: %q", i+1, write)
+		}
+	}
+}
+
+func TestFullDashboardFrameCarriesNoScreenClear(t *testing.T) {
+	dashboard := &fullDashboard{
+		start:  time.Now(),
+		seed:   dashboardBar{Label: "Seeding", Total: 1, Status: "running"},
+		phases: map[string]*dashboardBar{"Phase A": {Label: "Phase A", Status: "waiting"}},
+		order:  []string{"Phase A"},
+	}
+	frame := dashboard.buildFrameLocked()
+	if strings.Contains(frame, "\x1b[J") || strings.Contains(frame, "\x1b[H") {
+		t.Fatalf("frame text carries a clear or cursor-home: %q", frame)
 	}
 }
