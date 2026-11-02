@@ -162,3 +162,30 @@ async fn a_reorder_keeps_every_row_where_its_index_says() {
     restored.sort_by_key(|id| stored[id]);
     assert_eq!(restored, expected);
 }
+
+#[tokio::test]
+async fn per_job_metrics_cover_the_jobs_holding_a_slot() {
+    use crate::settings::PerJobSeries;
+    let temp = tempfile::tempdir().unwrap();
+    let (pipeline, _handle) = long_queue(&temp, 2).await;
+    let mut exported: Vec<JobId> = pipeline
+        .shared_state
+        .metrics_jobs(PerJobSeries::Active)
+        .into_iter()
+        .map(|job| job.job_id)
+        .collect();
+    exported.sort_unstable();
+    let mut admitted: Vec<JobId> = pipeline.nzb_admitted.iter().copied().collect();
+    admitted.sort_unstable();
+    assert_eq!(exported, admitted);
+    assert_eq!(
+        pipeline.shared_state.metrics_jobs(PerJobSeries::All).len(),
+        QUEUED as usize
+    );
+    assert!(
+        pipeline
+            .shared_state
+            .metrics_jobs(PerJobSeries::Off)
+            .is_empty()
+    );
+}

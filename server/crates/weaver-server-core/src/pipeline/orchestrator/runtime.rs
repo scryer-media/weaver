@@ -1738,8 +1738,5 @@ pub(crate) fn timestamp_secs() -> u64 {
 }
 
 pub(crate) fn is_terminal_status(status: &JobStatus) -> bool {
-    matches!(
-        status,
-        JobStatus::Complete | JobStatus::Partial | JobStatus::Failed { .. }
-    )
+    status.finished()
 }

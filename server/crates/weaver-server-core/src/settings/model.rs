@@ -283,7 +283,9 @@ pub struct MetricsConfig {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PerJobSeries {
-    // Only jobs that are still moving (everything but complete and failed).
+    // Only jobs the pipeline is working on: those holding an NZB slot and
+    // those past their download, until they finish. Jobs waiting their turn
+    // get none.
     #[default]
     Active,
     // Every job the runtime still remembers, finished ones included.

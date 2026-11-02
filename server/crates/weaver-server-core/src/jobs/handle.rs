@@ -186,6 +186,30 @@ impl SharedPipelineState {
         })
     }
 
+    // The jobs that get their own `weaver_job_*` series under `mode`,
+    // copied under the read lock; nothing else in the queue is copied.
+    // `Active` is the jobs the pipeline is working on: those holding an NZB
+    // slot and those past their download, until they finish. A job waiting
+    // its turn moves no value a series would show, and at ten thousand
+    // queued jobs its series were most of the scrape.
+    pub fn metrics_jobs(&self, mode: crate::settings::PerJobSeries) -> Vec<JobInfo> {
+        use crate::settings::PerJobSeries;
+        self.queue.read(|inner| match mode {
+            PerJobSeries::Off => Vec::new(),
+            PerJobSeries::All => inner
+                .visible_jobs()
+                .chain(self.queue.history().iter().cloned())
+                .collect(),
+            PerJobSeries::Active => inner
+                .jobs
+                .iter()
+                .filter(|row| row.report.nzb_admitted || row.report.job.status.past_download())
+                .map(|row| row.info(&inner.globals))
+                .filter(|job| !job.status.finished())
+                .collect(),
+        })
+    }
+
     // The revision of the published job list; it moves on every publish.
     pub fn job_revision(&self) -> u64 {
         self.queue.revision()
@@ -1227,6 +1251,12 @@ impl SchedulerHandle {
     // job).
     pub fn job_status_counts(&self) -> crate::operations::metrics_store::JobStatusCounts {
         self.state.job_status_counts()
+    }
+
+    // The jobs that get their own `weaver_job_*` series under `mode`. See
+    // [`SharedPipelineState::metrics_jobs`].
+    pub fn metrics_jobs(&self, mode: crate::settings::PerJobSeries) -> Vec<JobInfo> {
+        self.state.metrics_jobs(mode)
     }
 
     // The revision of the published job list; it moves on every publish.

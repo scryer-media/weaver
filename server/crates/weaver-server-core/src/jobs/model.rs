@@ -425,6 +425,27 @@ impl JobStatus {
         )
     }
 
+    // Whether the download is over and the job is in verify, repair,
+    // extraction, the move or post-processing, or waits for one of them.
+    pub fn past_download(&self) -> bool {
+        matches!(
+            self,
+            Self::Verifying
+                | Self::QueuedRepair
+                | Self::Repairing
+                | Self::QueuedExtract
+                | Self::Extracting
+                | Self::Moving
+                | Self::QueuedPostProcessing
+                | Self::PostProcessing
+        )
+    }
+
+    // Whether the job has its outcome: complete, partial or failed.
+    pub fn finished(&self) -> bool {
+        matches!(self, Self::Complete | Self::Partial | Self::Failed { .. })
+    }
+
     pub fn persisted_status(&self) -> &'static str {
         match self {
             Self::AwaitingQueueScripts => "awaiting_queue_scripts",
