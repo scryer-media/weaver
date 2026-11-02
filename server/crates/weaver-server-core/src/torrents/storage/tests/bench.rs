@@ -304,11 +304,19 @@ async fn line<R: tokio::io::AsyncBufRead + Unpin>(
 
 // A session on loopback alone, as the tests' own, that takes every scripted
 // peer: they all come from one address (libtorrent
-// `allow_multiple_connections_per_ip`).
+// `allow_multiple_connections_per_ip`). Its peers time out as production's
+// do: a scripted leecher we choke says nothing until we unchoke it.
 async fn bench_session(dir: &Path) -> Arc<Session> {
     Session::new_with_opts(
         dir.to_path_buf(),
         SessionOptions {
+            connect: Some(weaver_torrent::ConnectionOptions {
+                peer_opts: Some(weaver_torrent::PeerConnectionOptions {
+                    read_write_timeout: Some(crate::torrents::sessions::PEER_TIMEOUT),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
             dht: None,
             disable_trackers: true,
             disable_local_service_discovery: true,
@@ -327,9 +335,45 @@ async fn bench_session(dir: &Path) -> Arc<Session> {
     .unwrap()
 }
 
+// With WEAVER_BENCH_TRACE set, the engine's debug events whose text holds
+// it go to stderr: why a connection ended, say.
+struct Trace(String);
+
+struct Text(String);
+
+impl tracing::field::Visit for Text {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write;
+        let _ = write!(self.0, " {}={value:?}", field.name());
+    }
+}
+
+impl tracing::Subscriber for Trace {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= tracing::Level::DEBUG
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        let mut text = Text(String::new());
+        event.record(&mut text);
+        if text.0.contains(&self.0) {
+            eprintln!("bench trace {}:{}", event.metadata().target(), text.0);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "a throughput bench: run on request, optimised"]
 async fn torrent_loopback_throughput() {
+    if let Ok(needle) = std::env::var("WEAVER_BENCH_TRACE") {
+        tracing::subscriber::set_global_default(Trace(needle)).unwrap();
+    }
     let shape = Shape::from_env();
     let peers = env_u64("WEAVER_BENCH_PEERS", 8);
     let depth = env_u64("WEAVER_BENCH_DEPTH", 250);
@@ -454,10 +498,13 @@ async fn torrent_loopback_counterpart() {
                     tokio::spawn(leech(port, info_hash, shape, start, depth, at as u8))
                 })
                 .collect();
-            let mut served = 0;
+            let (mut served, mut lost) = (0, 0);
             for task in tasks {
-                served += task.await.unwrap();
+                let (taken, dropped) = task.await.unwrap();
+                served += taken;
+                lost += dropped;
             }
+            eprintln!("leechers lost {lost} connections");
             eprintln!("leechers took {:.2} s", started.elapsed().as_secs_f64());
             println!("BENCH SERVED {served}");
         }
@@ -555,7 +602,9 @@ async fn seed(stream: TcpStream, info_hash: [u8; 20], shape: Shape) {
 }
 
 // A leecher that wants every block from `start` on, around to `start` again,
-// keeping `depth` requests out while unchoked. Returns the payload it took.
+// keeping `depth` requests out while unchoked. A connection the session
+// ends is made again, and what it had out is asked for again. Returns the
+// payload it took and the connections it lost.
 async fn leech(
     port: u16,
     info_hash: [u8; 20],
@@ -563,85 +612,112 @@ async fn leech(
     start: u32,
     depth: usize,
     tag: u8,
-) -> u64 {
-    let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
-        .await
-        .unwrap();
-    stream.set_nodelay(true).unwrap();
-    let (read, mut write) = stream.into_split();
-    let mut read = BufReader::with_capacity(256 * 1024, read);
-    let mut out = handshake(&info_hash, tag);
-    frame(&mut out, 2, &[]);
-    write.write_all(&out).await.unwrap();
-    out.clear();
-    read_handshake(&mut read, &info_hash).await;
-
+) -> (u64, u64) {
     let pieces = shape.pieces();
     let blocks_per_piece = (shape.piece_length / u64::from(BLOCK)) as u32;
     let total = u64::from(pieces) * u64::from(blocks_per_piece);
     let mut next = 0u64;
     let mut again: VecDeque<(u32, u32)> = VecDeque::new();
     let mut out_now: HashSet<(u32, u32)> = HashSet::new();
-    let mut unchoked = false;
     let mut taken = 0u64;
+    let mut lost = 0u64;
+    let mut duplicates = 0u64;
     let mut payload = Vec::new();
     let mut expect = [0u8; 8];
     loop {
-        let id = message(&mut read, &mut payload).await.unwrap();
-        match id {
-            Some(0) => {
-                unchoked = false;
-                again.extend(out_now.drain());
+        let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            .await
+            .unwrap();
+        stream.set_nodelay(true).unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut read = BufReader::with_capacity(256 * 1024, read);
+        let mut out = handshake(&info_hash, tag);
+        frame(&mut out, 2, &[]);
+        write.write_all(&out).await.unwrap();
+        out.clear();
+        read_handshake(&mut read, &info_hash).await;
+        let mut unchoked = false;
+        let ended = loop {
+            let id = match message(&mut read, &mut payload).await {
+                Ok(id) => id,
+                Err(error) => break error,
+            };
+            match id {
+                Some(0) => {
+                    unchoked = false;
+                    again.extend(out_now.drain());
+                }
+                Some(1) => unchoked = true,
+                Some(7) => {
+                    let piece = u32::from_be_bytes(payload[0..4].try_into().unwrap());
+                    let begin = u32::from_be_bytes(payload[4..8].try_into().unwrap());
+                    // A block the session sent as it choked us was given up
+                    // for lost: it is taken all the same, and when it was
+                    // asked for again meanwhile, the second copy is a
+                    // duplicate. Either way the session sent it.
+                    let asked = out_now.remove(&(piece, begin))
+                        || again
+                            .iter()
+                            .position(|block| *block == (piece, begin))
+                            .and_then(|at| again.remove(at))
+                            .is_some();
+                    duplicates += u64::from(!asked);
+                    fill(
+                        u64::from(piece) * shape.piece_length + u64::from(begin),
+                        &mut expect,
+                    );
+                    assert_eq!(payload[8..16], expect, "block {piece}/{begin}");
+                    taken += (payload.len() - 8) as u64;
+                }
+                _ => {}
             }
-            Some(1) => unchoked = true,
-            Some(7) => {
-                let piece = u32::from_be_bytes(payload[0..4].try_into().unwrap());
-                let begin = u32::from_be_bytes(payload[4..8].try_into().unwrap());
-                assert!(
-                    out_now.remove(&(piece, begin)),
-                    "unasked block {piece}/{begin}"
-                );
-                fill(
-                    u64::from(piece) * shape.piece_length + u64::from(begin),
-                    &mut expect,
-                );
-                assert_eq!(payload[8..16], expect, "block {piece}/{begin}");
-                taken += (payload.len() - 8) as u64;
+            if unchoked {
+                while out_now.len() < depth {
+                    let block = match again.pop_front() {
+                        Some(block) => block,
+                        None if next < total => {
+                            let index =
+                                (next + u64::from(start) * u64::from(blocks_per_piece)) % total;
+                            next += 1;
+                            (
+                                (index / u64::from(blocks_per_piece)) as u32,
+                                (index % u64::from(blocks_per_piece)) as u32 * BLOCK,
+                            )
+                        }
+                        None => break,
+                    };
+                    out_now.insert(block);
+                    frame(
+                        &mut out,
+                        6,
+                        &[
+                            &block.0.to_be_bytes(),
+                            &block.1.to_be_bytes(),
+                            &BLOCK.to_be_bytes(),
+                        ],
+                    );
+                }
             }
-            _ => {}
-        }
-        if unchoked {
-            while out_now.len() < depth {
-                let block = match again.pop_front() {
-                    Some(block) => block,
-                    None if next < total => {
-                        let index = (next + u64::from(start) * u64::from(blocks_per_piece)) % total;
-                        next += 1;
-                        (
-                            (index / u64::from(blocks_per_piece)) as u32,
-                            (index % u64::from(blocks_per_piece)) as u32 * BLOCK,
-                        )
-                    }
-                    None => break,
-                };
-                out_now.insert(block);
-                frame(
-                    &mut out,
-                    6,
-                    &[
-                        &block.0.to_be_bytes(),
-                        &block.1.to_be_bytes(),
-                        &BLOCK.to_be_bytes(),
-                    ],
-                );
+            if next == total && again.is_empty() && out_now.is_empty() {
+                if duplicates > 0 {
+                    eprintln!("bench leecher {tag}: {duplicates} blocks came twice");
+                }
+                return (taken, lost);
             }
-        }
-        if next == total && again.is_empty() && out_now.is_empty() {
-            return taken;
-        }
-        if !out.is_empty() && read.buffer().is_empty() {
-            write.write_all(&out).await.unwrap();
-            out.clear();
-        }
+            if !out.is_empty() && read.buffer().is_empty() {
+                if let Err(error) = write.write_all(&out).await {
+                    break error;
+                }
+                out.clear();
+            }
+        };
+        lost += 1;
+        eprintln!(
+            "bench leecher {tag}: connection lost ({ended}) with {} MiB taken, {} out",
+            taken >> 20,
+            out_now.len()
+        );
+        again.extend(out_now.drain());
     }
 }
+
