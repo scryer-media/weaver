@@ -442,6 +442,7 @@ pub(crate) async fn run(
 
     let metrics_exporter = http::PrometheusMetricsExporter::new(
         handle.clone(),
+        pipeline_state.clone(),
         db.clone(),
         nntp_pool,
         Arc::clone(&server_transfer_policy),

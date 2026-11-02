@@ -39,8 +39,8 @@ pub(super) use encode::{Encoder, escape_prometheus_label_value};
 pub(super) use render::PrometheusRenderInput;
 #[cfg(test)]
 pub(super) use render::{
-    OBSERVED_LIMITERS, job_status_label, render_post_processing, render_prometheus_metrics,
-    render_prometheus_metrics_input,
+    JobStatusCounts, OBSERVED_LIMITERS, job_status_label, render_post_processing,
+    render_prometheus_metrics, render_prometheus_metrics_input,
 };
 
 // Reasons the extraction guardrails refuse an archive entry, in the order
@@ -154,6 +154,9 @@ impl Default for BuildInfo {
 #[derive(Clone)]
 pub(crate) struct PrometheusMetricsExporter {
     handle: SchedulerHandle,
+    // The queue the handle drives, read in place so a scrape copies only the
+    // jobs it exports a series for.
+    state: weaver_server_core::SharedPipelineState,
     db: Database,
     nntp_pool: Arc<NntpPool>,
     transfer_policy:
@@ -169,6 +172,7 @@ pub(crate) struct PrometheusMetricsExporter {
 impl PrometheusMetricsExporter {
     pub(crate) fn new(
         handle: SchedulerHandle,
+        state: weaver_server_core::SharedPipelineState,
         db: Database,
         nntp_pool: Arc<NntpPool>,
         transfer_policy: Arc<
@@ -181,6 +185,7 @@ impl PrometheusMetricsExporter {
         process_start_epoch_seconds();
         Self {
             handle,
+            state,
             db,
             nntp_pool,
             transfer_policy,
@@ -205,7 +210,28 @@ impl PrometheusMetricsExporter {
         http_metrics: &super::HttpMetricsHandle,
     ) -> String {
         let snapshot = self.handle.get_metrics();
-        let jobs = self.handle.list_jobs();
+        let per_job_series = self.config.read().await.metrics.per_job_series;
+        // Every job is counted by status in place; only the jobs that get a
+        // series of their own are copied, and none at all when that is off.
+        let history = self.state.history_rows();
+        let (mut job_counts, mut jobs) = self.state.read_queue(|inner| {
+            let mut counts = render::JobStatusCounts::default();
+            let mut jobs = Vec::new();
+            for row in &inner.jobs {
+                let view = row.view(&inner.globals);
+                counts.add(view.status());
+                if job_is_exported(view.status(), per_job_series) {
+                    jobs.push(view.list_info());
+                }
+            }
+            (counts, jobs)
+        });
+        for job in history.iter() {
+            job_counts.add(&job.status);
+            if job_is_exported(&job.status, per_job_series) {
+                jobs.push(job.clone());
+            }
+        }
         let download_block = self.handle.get_download_block();
         let nntp_pool = self
             .handle
@@ -219,7 +245,6 @@ impl PrometheusMetricsExporter {
         let server_health = collect_server_health(&nntp_pool).await;
         let server_transfers = self.transfer_policy.transfer_registry().snapshots();
         let egress_transfers = self.transfer_policy.egress_transfer_registry().snapshots();
-        let per_job_series = self.config.read().await.metrics.per_job_series;
 
         let extraction_rejections: Vec<(&'static str, u64)> = EXTRACTION_REJECTION_REASONS
             .into_iter()
@@ -275,6 +300,7 @@ impl PrometheusMetricsExporter {
 
         let mut input = PrometheusRenderInput::new(&snapshot, &download_block);
         input.jobs = &jobs;
+        input.job_counts = &job_counts;
         input.pipeline_paused = self.handle.is_globally_paused();
         input.server_health = &server_health;
         input.runtime_generation = runtime_generation;
