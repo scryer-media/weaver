@@ -889,9 +889,10 @@ impl Database {
         })
     }
 
-    // Persist the manual queue order as one transaction. Positions are the
-    // full current order (small: one row per queued job) so restores sort by
-    // `queue_position` and land in the exact user-arranged sequence.
+    // Persist queue positions as one write transaction through the writer
+    // gate. The caller passes only the rows whose position changed; each
+    // statement binds a bounded number of them, so a long queue never builds
+    // one unbounded statement.
     pub fn update_active_job_queue_positions(
         &self,
         positions: &[(JobId, i64)],
@@ -899,31 +900,54 @@ impl Database {
         if positions.is_empty() {
             return Ok(());
         }
-        // One statement instead of one UPDATE per job: a CASE expression maps
-        // each job id to its new position. Ids/positions are internal
-        // integers, inlined as decimals directly in the SQL text (no user
-        // strings), the same way `get_job_event_stage_bounds` inlines trusted
-        // integer ids. Plain CASE/WHEN/END and WHERE IN are portable across
-        // both sqlite and postgres.
-        let case_arms = positions
-            .iter()
-            .map(|(job_id, position)| format!("WHEN {} THEN {}", job_id.0, position))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let ids = positions
-            .iter()
-            .map(|(job_id, _)| job_id.0.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "UPDATE active_jobs
-                SET queue_position = CASE job_id {case_arms} END
-              WHERE job_id IN ({ids})"
-        );
+        let datastore = self.datastore();
+        let positions = std::sync::Arc::new(positions.to_vec());
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "update_active_job_queue_positions", |tx| {
+                let positions = positions.clone();
+                Box::pin(async move {
+                    // Three binds a row: the CASE arm's id and position, and
+                    // the id in the IN list.
+                    let chunk_size = max_rows_for_tx(tx, 3);
+                    for chunk in positions.chunks(chunk_size) {
+                        let arms = "WHEN {} THEN {} ".repeat(chunk.len());
+                        let ids = vec!["{}"; chunk.len()].join(",");
+                        let sql = format!(
+                            "UPDATE active_jobs
+                                SET queue_position = CASE job_id {arms}END
+                              WHERE job_id IN ({ids})"
+                        );
+                        let mut args = Vec::with_capacity(chunk.len() * 3);
+                        for (job_id, position) in chunk {
+                            args.push(SqlArg::I64(job_id.0 as i64));
+                            args.push(SqlArg::I64(*position));
+                        }
+                        args.extend(chunk.iter().map(|(job_id, _)| SqlArg::I64(job_id.0 as i64)));
+                        tx.execute(&sql, &args).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    // Every active job's stored queue position, for the actor to compare a
+    // new order against.
+    pub fn load_active_job_queue_positions(
+        &self,
+    ) -> Result<std::collections::HashMap<JobId, i64>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
-            SqlRuntime::execute(datastore.read_exec(), &sql, &[]).await?;
-            Ok(())
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT job_id, queue_position FROM active_jobs WHERE queue_position IS NOT NULL",
+                &[],
+            )
+            .await?;
+            rows.into_iter()
+                .map(|row| Ok((JobId(row.i64("job_id")? as u64), row.i64("queue_position")?)))
+                .collect()
         })
     }
 

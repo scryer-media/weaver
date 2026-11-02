@@ -119,7 +119,7 @@ impl Queue {
             {
                 return Change::unchanged(Err(SchedulerError::ChannelClosed));
             }
-            if inner.jobs.iter().any(|row| row.id == id) || inner.admissions.contains(&id) {
+            if inner.contains_job(id) || inner.admissions.contains(&id) {
                 return Change::unchanged(Err(SchedulerError::Conflict(
                     "job is still in the queue".into(),
                 )));
@@ -257,7 +257,7 @@ impl Queue {
             .db
             .clone();
         self.write(|inner| {
-            if inner.jobs.iter().any(|row| row.id == id) || inner.admissions.contains(&id) {
+            if inner.contains_job(id) || inner.admissions.contains(&id) {
                 return Change::unchanged(Err(SchedulerError::Conflict(
                     "the job is still in the queue".into(),
                 )));
@@ -315,7 +315,7 @@ impl Queue {
             let mut accepted = BTreeSet::new();
             let mut refused = BTreeMap::new();
             for id in ids {
-                if inner.jobs.iter().any(|row| row.id == id) || inner.admissions.contains(&id) {
+                if inner.contains_job(id) || inner.admissions.contains(&id) {
                     refused.insert(
                         id,
                         SchedulerError::Conflict(

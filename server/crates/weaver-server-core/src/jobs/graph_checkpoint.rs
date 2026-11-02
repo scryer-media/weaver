@@ -594,6 +594,26 @@ impl Database {
         })
     }
 
+    // Whether the job has a checkpoint, without reading it.
+    pub(crate) fn has_graph_checkpoint(&self, job_id: JobId) -> Result<bool, LoadError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "has_graph_checkpoint", |tx| {
+                Box::pin(async move {
+                    Ok(tx
+                        .fetch_optional(
+                            "SELECT 1 AS present FROM graph_nodes WHERE job_id = {} LIMIT 1",
+                            &[SqlArg::I64(job_id.0 as i64)],
+                        )
+                        .await?
+                        .is_some())
+                })
+            })
+            .await
+        })
+        .map_err(LoadError::Read)
+    }
+
     // The job's checkpoint, or `None` when it has no rows. Read in one
     // transaction, so it is one checkpoint even beside a writer.
     pub(crate) fn load_graph_checkpoint(

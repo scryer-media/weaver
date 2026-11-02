@@ -65,6 +65,7 @@ mod post_processing_completion;
 mod post_processing_pause;
 mod provider_scheduling;
 mod queue;
+mod queue_scale;
 mod restore_history;
 mod script_events;
 mod server_attribution;
@@ -106,7 +107,7 @@ impl Pipeline {
         }
         // Some crash fixtures reuse the stopped runtime's shared queue.
         self.shared_state.queue.write(|inner| {
-            inner.retain_jobs(|row| row.id != id);
+            inner.remove_job(id);
             crate::pipeline::queue::Change::changed(())
         });
         self.shared_state.queue.restore(request)?;

@@ -90,9 +90,16 @@ pub fn parse_persisted_nzb_bytes(bytes: &[u8]) -> Result<Nzb, PersistedNzbError>
     parse_and_hash_persisted_nzb_bytes(bytes).map(|(nzb, _)| nzb)
 }
 
+// Stored NZBs parsed, for tests that pin how many a path parses. Each test
+// runs in its own process, so a count is the test's own.
+#[cfg(test)]
+pub(crate) static NZB_PARSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn parse_and_hash_persisted_nzb_bytes(
     bytes: &[u8],
 ) -> Result<(Nzb, [u8; 32]), PersistedNzbError> {
+    #[cfg(test)]
+    NZB_PARSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (nzb, _, raw_hash) = if bytes.starts_with(&ZSTD_MAGIC) {
         let decoder =
             zstd::stream::read::Decoder::new(Cursor::new(bytes)).map_err(PersistedNzbError::Io)?;

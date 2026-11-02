@@ -789,6 +789,10 @@ impl Pipeline {
         if self.jobs.contains_key(&request.job_id) {
             return Err(crate::SchedulerError::JobExists(request.job_id));
         }
+        // What a restart read of the job's row. An install that changes none
+        // of its runtime columns writes nothing back. A job installed again
+        // later reads its row afresh.
+        let restart = request.restart.take();
         // The status the job goes back to when unpaused: the stored one, else
         // the one its stored resume lanes name, else the one its lanes at
         // shutdown name. Read here once, so the job installs with it whether
@@ -830,10 +834,21 @@ impl Pipeline {
             }
         }
         let original = request.clone();
-        match self.restore_job_inner(request).await {
+        let (stored, summaries) = restart.map_or((None, None), |read| {
+            (Some(read.runtime), Some(read.summaries))
+        });
+        match self.restore_job_inner(request, summaries).await {
             Ok(()) => {
                 self.blocked_restores.remove(&original.job_id);
-                self.persist_active_runtime(original.job_id);
+                let holds = |values: &crate::pipeline::ActiveRuntimeValues| {
+                    stored.as_ref().is_some_and(|stored| stored.holds(values))
+                };
+                if !self
+                    .active_runtime_values(original.job_id)
+                    .is_some_and(|values| holds(&values))
+                {
+                    self.persist_active_runtime(original.job_id);
+                }
             }
             Err(error) => {
                 self.install_blocked_restore(original, error.to_string())
@@ -947,10 +962,9 @@ impl Pipeline {
     ) -> Result<(), crate::SchedulerError> {
         if let Some(mut request) = self.blocked_restores.get(&job_id).cloned() {
             let recovered = self
-                .db_blocking(move |db| db.load_active_jobs())
+                .db_blocking(move |db| db.load_active_job(job_id))
                 .await
                 .map_err(crate::SchedulerError::State)?
-                .remove(&job_id)
                 .ok_or(crate::SchedulerError::JobNotFound(job_id))?;
             request.file_identities = recovered.file_identities;
             request.detected_archives = recovered.detected_archives;
@@ -979,9 +993,12 @@ impl Pipeline {
         self.resume_job_runtime(job_id)
     }
 
+    // `summaries` are those of the article lists a restart let go, which a
+    // job waiting its turn installs with in place of the lists.
     async fn restore_job_inner(
         &mut self,
         request: RestoreJobRequest,
+        summaries: Option<FileSummaries>,
     ) -> Result<(), crate::SchedulerError> {
         let RestoreJobRequest {
             job_id,
@@ -999,11 +1016,74 @@ impl Pipeline {
             paused_resume_download_state,
             paused_resume_post_state,
             working_dir,
+            restart: _,
         } = request;
         if self.jobs.contains_key(&job_id) {
             return Err(crate::SchedulerError::JobExists(job_id));
         }
+        // A job that never started waits its turn: queued, or paused to go
+        // back to queued, with no checkpoint.
+        let fresh = match &status {
+            JobStatus::Queued => true,
+            JobStatus::Paused => paused_resume_status
+                .as_ref()
+                .is_none_or(|resume| matches!(resume, JobStatus::Queued)),
+            _ => false,
+        };
         let mut spec = spec;
+        // The summaries a job waiting its turn installs with when the
+        // restart let its lists go, and the password candidates read with
+        // the lists when they are read back.
+        let mut waiting_summaries = None;
+        let mut read_passwords = None;
+        if spec.lacks_article_lists() {
+            // Read back from the stored NZB the restart kept only the files
+            // of, off the pipeline thread, with one parse that also gives
+            // the job's password candidates. A job that waits its turn reads
+            // nothing: its lists are read when it is handed a slot.
+            enum Stored {
+                Waits(FileSummaries),
+                Read(JobSpec, Option<Vec<crate::jobs::ArchivePasswordCandidate>>),
+            }
+            let category = spec.category.clone();
+            let metadata = spec.metadata.clone();
+            let summaries =
+                summaries.filter(|summaries| fresh && summaries.0.len() == spec.files.len());
+            let stored = self
+                .db_blocking(move |db| {
+                    if let Some(summaries) = summaries
+                        && !db
+                            .has_graph_checkpoint(job_id)
+                            .map_err(|error| format!("checkpoint could not be read: {error}"))?
+                    {
+                        return Ok(Stored::Waits(summaries));
+                    }
+                    crate::pipeline::read_stored_spec_and_passwords(db, job_id, category, metadata)
+                        .map(|(spec, passwords)| Stored::Read(spec, passwords))
+                })
+                .await
+                .map_err(crate::SchedulerError::Internal)?;
+            match stored {
+                Stored::Waits(summaries) => waiting_summaries = Some(summaries),
+                Stored::Read(stored, passwords) => {
+                    if stored.files.len() != spec.files.len()
+                        || stored
+                            .files
+                            .iter()
+                            .zip(&spec.files)
+                            .any(|(stored, kept)| stored.filename != kept.filename)
+                    {
+                        return Err(crate::SchedulerError::Internal(
+                            "stored NZB no longer matches the job's files".to_string(),
+                        ));
+                    }
+                    for (file, stored) in spec.files.iter_mut().zip(stored.files) {
+                        file.segments = stored.segments;
+                    }
+                    read_passwords = Some(passwords);
+                }
+            }
+        }
         if working_dir.starts_with(&self.intermediate_dir)
             && tokio::fs::try_exists(&working_dir).await.unwrap_or(false)
             && let Err(error) =
@@ -1017,6 +1097,8 @@ impl Pipeline {
             );
         }
 
+        // The identities the row holds; only ones that differ are written.
+        let stored_identities = file_identities.clone();
         let file_identities = if file_identities.is_empty() {
             Self::build_initial_file_identities(&spec, &detected_archives)
         } else {
@@ -1026,7 +1108,9 @@ impl Pipeline {
         // articles are on disk, so the queue skips exactly those. A job with
         // no checkpoint has nothing that says what its files hold: it is
         // admitted afresh from its spec and fetches from the start.
-        let (graph_restore, skip, held_parts) =
+        let (graph_restore, skip, held_parts) = if waiting_summaries.is_some() {
+            (None, HashSet::new(), Vec::new())
+        } else {
             match self.restore_graph_job(job_id, &spec, &working_dir).await {
                 Ok(restored) => {
                     self.post_probes
@@ -1037,7 +1121,8 @@ impl Pipeline {
                     (None, HashSet::new(), Vec::new())
                 }
                 Err(error) => return Err(crate::SchedulerError::Internal(error.to_string())),
-            };
+            }
+        };
         // The parts that arrived and wait to be placed are in hand too, but
         // not yet on the job's files.
         let held: HashSet<SegmentId> = held_parts
@@ -1048,33 +1133,29 @@ impl Pipeline {
         // article: no checkpoint, and nothing that says it was ever handed
         // work. Every other job is built as it ran, and a paused one then
         // lets its articles go, as a pause does.
-        let waits_its_turn = graph_restore.is_none()
-            && match &status {
-                JobStatus::Queued => true,
-                JobStatus::Paused => paused_resume_status
-                    .as_ref()
-                    .is_none_or(|resume| matches!(resume, JobStatus::Queued)),
-                _ => false,
-            };
+        let waits_its_turn = graph_restore.is_none() && fresh;
         // Every article not in hand is queued again.
-        let queue_depth: usize = spec
-            .files
-            .iter()
-            .zip(0u32..)
-            .map(|(file_spec, file_index)| {
-                file_spec
-                    .segments
-                    .iter()
-                    .filter(|seg| {
-                        let segment_id = SegmentId {
-                            file_id: NzbFileId { job_id, file_index },
-                            segment_number: seg.ordinal,
-                        };
-                        !skip.contains(&segment_id) && !held.contains(&segment_id)
-                    })
-                    .count()
-            })
-            .sum();
+        let queue_depth: usize = match &waiting_summaries {
+            Some(summaries) => summaries.0.iter().map(|file| file.remaining as usize).sum(),
+            None => spec
+                .files
+                .iter()
+                .zip(0u32..)
+                .map(|(file_spec, file_index)| {
+                    file_spec
+                        .segments
+                        .iter()
+                        .filter(|seg| {
+                            let segment_id = SegmentId {
+                                file_id: NzbFileId { job_id, file_index },
+                                segment_number: seg.ordinal,
+                            };
+                            !skip.contains(&segment_id) && !held.contains(&segment_id)
+                        })
+                        .count()
+                })
+                .sum(),
+        };
         let nothing_queued = queue_depth == 0;
         let status = Self::normalize_restored_status(status, nothing_queued);
 
@@ -1119,8 +1200,14 @@ impl Pipeline {
         // the persisted NZB per restored job, off the pipeline thread, instead
         // of one per archive file. Anything short of a parsed NZB leaves the
         // harvest to read the row itself, as before.
-        let nzb_password_candidates = self
-            .db_blocking(
+        let nzb_password_candidates = if let Some(passwords) = read_passwords {
+            passwords
+        } else if waiting_summaries.is_some() {
+            // Its NZB is parsed once it is handed a slot; the harvest reads
+            // the row itself.
+            None
+        } else {
+            self.db_blocking(
                 move |db| match db.load_active_job_password_sources(job_id) {
                     Ok(Some(((nzb_path, Some(nzb_zstd)), supplied))) => {
                         crate::pipeline::persisted_nzb_password_candidates(&nzb_path, &nzb_zstd)
@@ -1132,7 +1219,8 @@ impl Pipeline {
                     _ => None,
                 },
             )
-            .await;
+            .await
+        };
 
         self.emit_job_event(PipelineEvent::JobCreated {
             job_id,
@@ -1148,7 +1236,10 @@ impl Pipeline {
             .metrics
             .job_lifecycle
             .category_bytes_counter(spec.category.as_deref());
-        let par2_bytes = spec.par2_bytes();
+        let par2_bytes = match &waiting_summaries {
+            Some(summaries) => summaries.par2_bytes(&spec),
+            None => spec.par2_bytes(),
+        };
         // A job that waits its turn holds only its summaries. Any other is
         // built from the lists its spec holds the moment it is in place
         // below, by the same call that builds an activated job, so what it
@@ -1161,7 +1252,9 @@ impl Pipeline {
             };
             skip.contains(&segment_id) || held.contains(&segment_id)
         };
-        let articles = JobArticles::Queued(if waits_its_turn {
+        let articles = JobArticles::Queued(if let Some(summaries) = waiting_summaries {
+            summaries
+        } else if waits_its_turn {
             spec.drop_article_lists_with_in_hand(in_hand)
         } else {
             FileSummaries(
@@ -1290,7 +1383,9 @@ impl Pipeline {
         if let Some(file_identities) = self
             .jobs
             .get(&job_id)
-            .map(|state| state.file_identities.clone())
+            .map(|state| &state.file_identities)
+            .filter(|identities| **identities != stored_identities)
+            .cloned()
         {
             self.persist_file_identities(job_id, &file_identities).await;
         }

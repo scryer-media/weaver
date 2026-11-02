@@ -1157,6 +1157,7 @@ async fn an_article_held_across_a_restart_is_placed_without_being_fetched_again(
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             working_dir,
+            restart: None,
         })
         .await
         .unwrap();
@@ -1230,6 +1231,7 @@ async fn an_article_held_across_two_restarts_keeps_its_checkpoint_row() {
         paused_resume_download_state: None,
         paused_resume_post_state: None,
         working_dir,
+        restart: None,
     };
     insert_active_job(&mut pipeline, job_id, spec()).await;
     pipeline.uu_spool_available_bytes_for_test = Some(Some(u64::MAX));

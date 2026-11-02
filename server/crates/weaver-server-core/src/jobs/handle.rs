@@ -186,6 +186,30 @@ impl SharedPipelineState {
         })
     }
 
+    // The jobs that get their own `weaver_job_*` series under `mode`,
+    // copied under the read lock; nothing else in the queue is copied.
+    // `Active` is the jobs the pipeline is working on: those holding an NZB
+    // slot and those past their download, until they finish. A job waiting
+    // its turn moves no value a series would show, and at ten thousand
+    // queued jobs its series were most of the scrape.
+    pub fn metrics_jobs(&self, mode: crate::settings::PerJobSeries) -> Vec<JobInfo> {
+        use crate::settings::PerJobSeries;
+        self.queue.read(|inner| match mode {
+            PerJobSeries::Off => Vec::new(),
+            PerJobSeries::All => inner
+                .visible_jobs()
+                .chain(self.queue.history().iter().cloned())
+                .collect(),
+            PerJobSeries::Active => inner
+                .jobs
+                .iter()
+                .filter(|row| row.report.nzb_admitted || row.report.job.status.past_download())
+                .map(|row| row.info(&inner.globals))
+                .filter(|job| !job.status.finished())
+                .collect(),
+        })
+    }
+
     // The revision of the published job list; it moves on every publish.
     pub fn job_revision(&self) -> u64 {
         self.queue.revision()
@@ -225,9 +249,7 @@ impl SharedPipelineState {
     pub fn get_job(&self, job_id: JobId) -> Option<JobInfo> {
         self.queue.read(|inner| {
             inner
-                .jobs
-                .iter()
-                .find(|row| row.id == job_id)
+                .job(job_id)
                 .map(|row| row.info(&inner.globals))
                 .or_else(|| {
                     self.queue
@@ -763,6 +785,18 @@ pub struct RestoreJobRequest {
     pub paused_resume_download_state: Option<crate::jobs::model::DownloadState>,
     pub paused_resume_post_state: Option<crate::jobs::model::PostState>,
     pub working_dir: PathBuf,
+    // What a restart read of the job's row, when the request comes from one.
+    pub restart: Option<RestartRead>,
+}
+
+// What a restart read of a job's active row besides its request: the runtime
+// columns as stored, so the install writes back only what it changes, and
+// the summaries of the article lists it let go, so a job waiting its turn
+// installs without reading them back.
+#[derive(Clone, Debug)]
+pub struct RestartRead {
+    pub(crate) runtime: crate::pipeline::StoredRuntimeValues,
+    pub(crate) summaries: crate::jobs::model::FileSummaries,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1012,6 +1046,25 @@ impl SchedulerHandle {
         self.state.queue.set_job_paused(job_id, false)
     }
 
+    // Pause or resume every job named as one queue change: one revision for
+    // the batch, each job answered on its own.
+    pub async fn set_jobs_paused(
+        &self,
+        job_ids: impl IntoIterator<Item = JobId>,
+        paused: bool,
+    ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
+        self.state.queue.set_jobs_paused(job_ids, paused)
+    }
+
+    // Apply every job update named as one queue change: one revision for the
+    // batch, each job answered on its own.
+    pub async fn update_jobs(
+        &self,
+        updates: impl IntoIterator<Item = (JobId, JobUpdate)>,
+    ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
+        self.state.queue.update_jobs(updates)
+    }
+
     // Cancel a job.
     pub async fn cancel_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
         self.cancel_job_with_origin(job_id, CancellationOrigin::User)
@@ -1210,6 +1263,12 @@ impl SchedulerHandle {
     // job).
     pub fn job_status_counts(&self) -> crate::operations::metrics_store::JobStatusCounts {
         self.state.job_status_counts()
+    }
+
+    // The jobs that get their own `weaver_job_*` series under `mode`. See
+    // [`SharedPipelineState::metrics_jobs`].
+    pub fn metrics_jobs(&self, mode: crate::settings::PerJobSeries) -> Vec<JobInfo> {
+        self.state.metrics_jobs(mode)
     }
 
     // The revision of the published job list; it moves on every publish.

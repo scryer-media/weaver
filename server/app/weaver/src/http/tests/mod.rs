@@ -1536,6 +1536,7 @@ fn compress_request_body(encoding: &str, payload: &[u8]) -> Vec<u8> {
     }
 }
 
+mod graphql_handler_tests;
 mod graphql_socket_tests;
 mod nzbget_version_uses_jsonrpc;
 mod renders_prometheus_metrics_for;

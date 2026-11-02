@@ -157,22 +157,42 @@ impl Database {
         })
     }
 
+    // Every active job's row, without its stored NZB: a restart reads each
+    // NZB on its own, so the queue's NZBs are never all in memory at once.
     pub fn load_active_jobs(&self) -> Result<HashMap<JobId, RecoveredJob>, StateError> {
+        self.load_active_jobs_where(None)
+    }
+
+    // One active job's row, without its stored NZB.
+    pub fn load_active_job(&self, job_id: JobId) -> Result<Option<RecoveredJob>, StateError> {
+        Ok(self.load_active_jobs_where(Some(job_id))?.remove(&job_id))
+    }
+
+    fn load_active_jobs_where(
+        &self,
+        only: Option<JobId>,
+    ) -> Result<HashMap<JobId, RecoveredJob>, StateError> {
         let datastore = self.datastore();
         let key = self.encryption_key().cloned();
         self.run_sql_blocking_read(async move {
             let mut jobs = HashMap::new();
+            let (filter, args) = match only {
+                Some(job_id) => (" WHERE job_id = {}", vec![SqlArg::I64(job_id.0 as i64)]),
+                None => ("", Vec::new()),
+            };
 
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT job_id, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, error,
+                &format!(
+                    "SELECT job_id, nzb_path, output_dir, status, download_state, post_state, run_state, error,
                         nzb_hash,
                         created_at, queued_repair_at_epoch_ms,
                         queued_extract_at_epoch_ms, paused_resume_status,
                         paused_resume_download_state, paused_resume_post_state,
                         category, metadata, queue_position, password
-                 FROM active_jobs",
-                &[],
+                 FROM active_jobs{filter}"
+                ),
+                &args,
             )
             .await?;
             for row in rows {
@@ -181,7 +201,6 @@ impl Database {
                     job_id,
                     nzb_hash: nzb_hash_from_bytes(row.bytes("nzb_hash")?),
                     nzb_path: PathBuf::from(row.text("nzb_path")?),
-                    nzb_zstd: row.opt_bytes("nzb_zstd")?,
                     output_dir: PathBuf::from(row.text("output_dir")?),
                     detected_archives: HashMap::new(),
                     file_identities: HashMap::new(),
@@ -210,11 +229,13 @@ impl Database {
 
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT job_id, file_index, source_filename, current_filename,
+                &format!(
+                    "SELECT job_id, file_index, source_filename, current_filename,
                         canonical_filename, classification_kind, classification_set_name,
                         classification_volume_index, classification_source
-                 FROM active_file_identities",
-                &[],
+                 FROM active_file_identities{filter}"
+                ),
+                &args,
             )
             .await?;
             for row in rows {
@@ -247,9 +268,11 @@ impl Database {
 
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT job_id, file_index, kind, set_name, volume_index
-                 FROM active_detected_archives",
-                &[],
+                &format!(
+                    "SELECT job_id, file_index, kind, set_name, volume_index
+                 FROM active_detected_archives{filter}"
+                ),
+                &args,
             )
             .await?;
             for row in rows {
@@ -269,8 +292,8 @@ impl Database {
 
             let rows = SqlRuntime::fetch_all(
                 datastore.read_exec(),
-                "SELECT job_id, file_index FROM active_files",
-                &[],
+                &format!("SELECT job_id, file_index FROM active_files{filter}"),
+                &args,
             )
             .await?;
             for row in rows {

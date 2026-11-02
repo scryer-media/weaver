@@ -21,7 +21,7 @@ pub(in crate::pipeline) use worker::{
     DOWNLOAD_DISPATCH_STALL_RELEASE_AFTER,
 };
 pub(crate) use worker::{
-    DOWNLOAD_STALL_RECOVERY_ENV, DispatchStallWatch, JobLogThrottle,
+    DOWNLOAD_STALL_RECOVERY_ENV, DispatchStallWatch, JobLogThrottle, KeyedLogThrottle,
     download_stall_recovery_from_env_value,
 };
 

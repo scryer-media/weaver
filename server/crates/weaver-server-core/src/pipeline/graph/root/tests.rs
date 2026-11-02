@@ -1725,6 +1725,7 @@ async fn a_restored_job_keeps_its_graph_job_and_root_phase() {
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             working_dir,
+            restart: None,
         })
         .await
         .unwrap();
