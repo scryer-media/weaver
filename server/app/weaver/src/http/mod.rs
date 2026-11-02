@@ -105,6 +105,17 @@ fn error_response(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
+// The `error_response` body with a stable `code` beside the sentence, for a
+// refusal a machine client has to tell apart. Clients match the code; the
+// sentence is for people and may be reworded.
+fn coded_error_response(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({ "code": code, "error": message })),
+    )
+        .into_response()
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct NotForAttachment;
 
