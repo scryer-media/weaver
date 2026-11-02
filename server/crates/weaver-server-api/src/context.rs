@@ -42,6 +42,9 @@ pub fn apply_graphql_query_guards<Query, Mutation, Subscription>(
 
 pub struct SchemaContext {
     pub handle: weaver_server_core::SchedulerHandle,
+    // The queue the handle drives, read in place by paged and single-job
+    // answers so they never copy the whole queue.
+    pub pipeline_state: weaver_server_core::SharedPipelineState,
     pub scheduled_resume: crate::ScheduledResumeCoordinator,
     pub config: SharedConfig,
     pub db: Database,
@@ -157,6 +160,7 @@ pub fn build_schema_with_backup(
     ))
     .data(backup)
     .data(context.handle)
+    .data(context.pipeline_state)
     .data(context.scheduled_resume)
     .data(context.config)
     .data(context.db)

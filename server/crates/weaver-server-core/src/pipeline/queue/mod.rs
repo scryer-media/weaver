@@ -14,6 +14,7 @@ mod admission;
 mod counters;
 mod history;
 mod intents;
+pub mod paging;
 pub(crate) use admission::{AdmissionResources, PreparedAdd, RestartAdmission};
 #[cfg(test)]
 pub(crate) use counters::COUNTER_SAMPLES;

@@ -190,6 +190,7 @@ impl TestHarness {
             );
         let schema = build_schema(SchemaContext {
             handle: handle.clone(),
+            pipeline_state: shared_state.clone(),
             scheduled_resume: scheduled_resume.clone(),
             config: shared_config.clone(),
             db: db.clone(),

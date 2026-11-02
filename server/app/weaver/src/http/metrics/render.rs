@@ -62,7 +62,10 @@ pub(crate) const OBSERVED_LIMITERS: [&str; 8] = [
 #[derive(Clone, Copy)]
 pub(crate) struct PrometheusRenderInput<'a> {
     pub(crate) snapshot: &'a MetricsSnapshot,
+    // The jobs exported a series of their own.
     pub(crate) jobs: &'a [JobInfo],
+    // Every job the runtime holds, counted by status.
+    pub(crate) job_counts: &'a JobStatusCounts,
     pub(crate) pipeline_paused: bool,
     pub(crate) download_block: &'a DownloadBlockState,
     pub(crate) server_health: &'a [ServerHealthInfo],
@@ -106,6 +109,7 @@ impl<'a> PrometheusRenderInput<'a> {
         Self {
             snapshot,
             jobs: &[],
+            job_counts: &JobStatusCounts::EMPTY,
             pipeline_paused: false,
             download_block,
             server_health: &[],
@@ -155,8 +159,10 @@ pub(crate) fn render_prometheus_metrics(
     server_health: &[ServerHealthInfo],
     runtime_generation: u64,
 ) -> String {
+    let job_counts = JobStatusCounts::of(jobs.iter().map(|job| &job.status));
     let mut input = PrometheusRenderInput::new(snapshot, download_block);
     input.jobs = jobs;
+    input.job_counts = &job_counts;
     input.pipeline_paused = pipeline_paused;
     input.server_health = server_health;
     input.runtime_generation = runtime_generation;
@@ -168,6 +174,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     let PrometheusRenderInput {
         snapshot,
         jobs,
+        job_counts,
         pipeline_paused,
         download_block,
         server_health,
@@ -229,11 +236,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         out.sample(&f::SEMANTIC_DUPLICATE_LIFECYCLE, &[("event", event)], count);
     }
 
-    for status in JOB_STATUS_KEYS {
-        let count = jobs
-            .iter()
-            .filter(|job| job_status_label(&job.status) == status)
-            .count();
+    for (status, count) in JOB_STATUS_KEYS.into_iter().zip(job_counts.0) {
         out.sample(&f::PIPELINE_JOBS, &[("status", status)], count);
     }
 
@@ -1671,6 +1674,30 @@ fn observed_download_limiter(
         return "active";
     }
     "dispatch_limited"
+}
+
+/// How many jobs are in each status, in `JOB_STATUS_KEYS` order.
+#[derive(Default)]
+pub(crate) struct JobStatusCounts([usize; JOB_STATUS_KEYS.len()]);
+
+impl JobStatusCounts {
+    pub(crate) const EMPTY: Self = Self([0; JOB_STATUS_KEYS.len()]);
+
+    pub(crate) fn add(&mut self, status: &JobStatus) {
+        let label = job_status_label(status);
+        if let Some(index) = JOB_STATUS_KEYS.iter().position(|key| *key == label) {
+            self.0[index] += 1;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn of<'a>(statuses: impl Iterator<Item = &'a JobStatus>) -> Self {
+        let mut counts = Self::default();
+        for status in statuses {
+            counts.add(status);
+        }
+        counts
+    }
 }
 
 pub(crate) fn job_status_label(status: &JobStatus) -> &'static str {

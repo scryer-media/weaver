@@ -137,6 +137,8 @@ export const nextIt: LocaleDictionary = {
   "next.downloads.sortBy": "Ordina per",
   "next.downloads.sortMenu": "Ordina i download",
   "next.downloads.showingPage": "{{shown}} di {{total}} download mostrati",
+  "next.downloads.selectAllMatching": "Seleziona tutti ({{count}})",
+  "next.downloads.selectionChanged": "La selezione è cambiata",
   "next.downloads.shown": "{{shown}} di {{total}} download mostrati",
   "next.downloads.loadingBody": "Caricamento della coda.",
   "next.downloads.emptyTitle": "Nessun download attivo",

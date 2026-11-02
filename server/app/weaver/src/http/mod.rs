@@ -57,6 +57,9 @@ struct RequestAuthContext {
 pub struct ServerRuntime {
     pub schema: WeaverSchema,
     pub handle: SchedulerHandle,
+    // The queue the handle drives, read in place by the facades and the
+    // scrape so they never copy the whole queue.
+    pub pipeline_state: weaver_server_core::SharedPipelineState,
     pub scheduled_resume: weaver_server_api::ScheduledResumeCoordinator,
     pub db: Database,
     pub auth_cache: LoginAuthCache,

@@ -1208,7 +1208,7 @@ async fn nzbget_status_and_listgroups_support_sonarr_progress_queries() {
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
     shared_state.record_wire_bytes(1_048_576);
     shared_state.refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
-    let handle = SchedulerHandle::new(event_tx, shared_state);
+    let handle = TestQueue::new(event_tx, shared_state);
     let config = test_config();
     config
         .write()
@@ -1355,7 +1355,7 @@ async fn nzbget_status_clamps_download_rate_to_arr_int() {
     shared_state.record_wire_bytes(1 << 60);
     shared_state.refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
     assert!(shared_state.metrics_snapshot().current_download_speed > i32::MAX as u64);
-    let handle = SchedulerHandle::new(event_tx, shared_state);
+    let handle = TestQueue::new(event_tx, shared_state);
     let config = test_config();
     {
         let mut config_write = config.write().await;
@@ -2388,6 +2388,100 @@ async fn nzbget_editqueue_unsupported_commands_return_false_without_fault() {
         assert_eq!(payload["result"], false, "{command}");
         assert!(payload["error"].is_null(), "{command}");
     }
+}
+
+#[tokio::test]
+async fn nzbget_editqueue_applies_every_found_id_past_a_missing_one() {
+    let job = |id| {
+        nzbget_test_job(
+            id,
+            JobStatus::Queued,
+            weaver_server_core::DownloadState::Queued,
+            100,
+            0,
+            vec![],
+        )
+    };
+    let handle = scheduler_handle_with_jobs(vec![job(1), job(2)]).await;
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupPause", 0, "", [1, 99, 2]],
+            "id": "pause"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"], true);
+    wait_for_job_status(&handle, JobId(1), JobStatus::Paused).await;
+    wait_for_job_status(&handle, JobId(2), JobStatus::Paused).await;
+
+    // NZBGet answers false only when it finds none of the ids.
+    let (_, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupResume", 0, "", [98, 99]],
+            "id": "resume"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"], false);
+}
+
+#[tokio::test]
+async fn nzbget_listgroups_lists_many_groups_in_queue_order_with_one_database_read() {
+    // More groups than one chunk, half of them post-processing, so the
+    // answer spans chunks and asks when post-processing began.
+    let jobs = (1..=600)
+        .map(|id| {
+            let status = if id % 2 == 0 {
+                JobStatus::Extracting
+            } else {
+                JobStatus::Queued
+            };
+            let (download_state, post_state, run_state) =
+                weaver_server_core::runtime_lanes_from_status_snapshot(&status);
+            JobInfo {
+                download_state,
+                post_state,
+                run_state,
+                ..nzbget_test_job(id, status, download_state, 100, 0, vec![])
+            }
+        })
+        .collect::<Vec<_>>();
+    let handle = scheduler_handle_with_jobs(jobs).await;
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let before =
+        super::super::nzbget::LISTGROUPS_DB_READS.load(std::sync::atomic::Ordering::Relaxed);
+    let groups = rpc_result(app, "listgroups", serde_json::json!([])).await;
+    let after =
+        super::super::nzbget::LISTGROUPS_DB_READS.load(std::sync::atomic::Ordering::Relaxed);
+
+    let ids = groups
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|group| group["NZBID"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, (1..=600).collect::<Vec<_>>());
+    assert_eq!(after - before, 1);
 }
 
 #[tokio::test]
@@ -4205,7 +4299,7 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
         },
     )
     .unwrap();
-    let app = job_nzb_test_router(db, handle);
+    let app = job_nzb_test_router(db, handle.handle.clone());
 
     let response = app
         .oneshot(
@@ -4278,7 +4372,7 @@ async fn job_output_file_download_handler_streams_history_file() {
         server_attribution: None,
     })
     .unwrap();
-    let app = job_nzb_test_router(db, handle);
+    let app = job_nzb_test_router(db, handle.handle.clone());
 
     let response = app
         .oneshot(

@@ -230,7 +230,9 @@ export function useSpeedTestRun(onFinished: () => void) {
   // Jobs, not the header gauge: a Usenet run's own bytes drive the gauge, and it can still read them after the run.
   // Only the answer is read, so a queue that changes without changing it draws nothing.
   const downloading = useNextDataSelector(
-    (data) => !data.isPaused && data.queue.jobs.some((job) => FETCHING.has(job.status.toUpperCase())),
+    (data) =>
+      !data.isPaused
+      && data.queue.stateCounts.some((entry) => entry.count > 0 && FETCHING.has(entry.state)),
   );
   const runningId = run?.status === "RUNNING" ? run.id : null;
   // The poll outlives renders, so it reads the latest callback rather than restarting for each.

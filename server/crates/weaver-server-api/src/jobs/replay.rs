@@ -19,6 +19,11 @@ use weaver_server_core::settings::SharedConfig;
 
 const QUEUE_EVENT_REPLAY_CAPACITY: usize = 2048;
 const QUEUE_EVENT_CHANNEL_CAPACITY: usize = 256;
+/// The most pipeline events the producer takes as one burst.
+const QUEUE_EVENT_BURST_DRAIN: usize = 4096;
+/// A burst with more per-item changes than this publishes one
+/// `GLOBAL_STATE_CHANGED` notice in their place.
+const QUEUE_EVENT_BURST_COALESCE: usize = 64;
 
 type DetailSignature = (
     QueueItemState,
@@ -186,27 +191,58 @@ impl QueueEventReplay {
         mut caches: QueueEventCaches,
     ) {
         loop {
-            match rx.recv().await {
-                Ok(event) => {
-                    for record in queue_event_records_from_pipeline_event(
-                        &event,
-                        &handle,
-                        &config,
-                        &mut caches,
-                    )
-                    .await
-                    {
-                        self.append(record).await;
-                    }
-                }
+            let first = match rx.recv().await {
+                Ok(event) => Some(event),
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::debug!(
                         skipped,
                         "queue event replay producer lagged; reseeding local cache"
                     );
                     caches.seed_from_handle(&handle);
+                    None
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
+            };
+            // Take everything already waiting as one burst, so a change to many
+            // jobs at once publishes as one notice instead of one per job.
+            let mut lagged = first.is_none();
+            let mut burst: Vec<PipelineEvent> = first.into_iter().collect();
+            let mut closed = false;
+            while burst.len() < QUEUE_EVENT_BURST_DRAIN {
+                match rx.try_recv() {
+                    Ok(event) => burst.push(event),
+                    Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                        tracing::debug!(
+                            skipped,
+                            "queue event replay producer lagged; reseeding local cache"
+                        );
+                        caches.seed_from_handle(&handle);
+                        lagged = true;
+                    }
+                    Err(broadcast::error::TryRecvError::Empty) => break,
+                    Err(broadcast::error::TryRecvError::Closed) => {
+                        closed = true;
+                        break;
+                    }
+                }
+            }
+            let mut records = Vec::new();
+            for event in &burst {
+                records.extend(
+                    queue_event_records_from_pipeline_event(event, &handle, &config, &mut caches)
+                        .await,
+                );
+            }
+            let marker = if lagged || droppable_count(&records) > QUEUE_EVENT_BURST_COALESCE {
+                Some(global_state_record(&handle, &config).await)
+            } else {
+                None
+            };
+            for record in coalesce_burst(records, marker) {
+                self.append(record).await;
+            }
+            if closed {
+                break;
             }
         }
     }
@@ -296,21 +332,7 @@ async fn queue_event_records_from_pipeline_event(
         event,
         PipelineEvent::GlobalPaused | PipelineEvent::GlobalResumed
     ) {
-        let cfg = config.read().await;
-        queue_events.push(PersistedQueueEvent {
-            occurred_at_ms,
-            kind: QueueEventKind::GlobalStateChanged,
-            item_id: None,
-            item: None,
-            state: None,
-            previous_state: None,
-            attention: None,
-            global_state: Some(global_queue_state(
-                handle.is_globally_paused(),
-                &handle.get_download_block(),
-                cfg.max_download_speed.unwrap_or(0),
-            )),
-        });
+        queue_events.push(global_state_record(handle, config).await);
     }
 
     let Some(job_id) = pipeline_job_id(event) else {
@@ -461,6 +483,59 @@ async fn queue_event_records_from_pipeline_event(
     }
 
     queue_events
+}
+
+/// A `GLOBAL_STATE_CHANGED` record carrying the queue's state now.
+async fn global_state_record(
+    handle: &SchedulerHandle,
+    config: &SharedConfig,
+) -> PersistedQueueEvent {
+    let max_download_speed = config.read().await.max_download_speed.unwrap_or(0);
+    PersistedQueueEvent {
+        occurred_at_ms: chrono::Utc::now().timestamp_millis(),
+        kind: QueueEventKind::GlobalStateChanged,
+        item_id: None,
+        item: None,
+        state: None,
+        previous_state: None,
+        attention: None,
+        global_state: Some(global_queue_state(
+            handle.is_globally_paused(),
+            &handle.get_download_block(),
+            max_download_speed,
+        )),
+    }
+}
+
+// A per-item change a reader can take from a re-read instead: anything but
+// an arrival, a completion or a failure.
+fn is_droppable(record: &PersistedQueueEvent) -> bool {
+    match record.kind {
+        QueueEventKind::ItemProgress | QueueEventKind::ItemAttention => true,
+        QueueEventKind::ItemStateChanged => record.state != Some(QueueItemState::Failed),
+        _ => false,
+    }
+}
+
+fn droppable_count(records: &[PersistedQueueEvent]) -> usize {
+    records.iter().filter(|record| is_droppable(record)).count()
+}
+
+/// With a marker, a burst keeps its arrivals, completions and failures and
+/// publishes the marker once in place of every other per-item change.
+fn coalesce_burst(
+    records: Vec<PersistedQueueEvent>,
+    marker: Option<PersistedQueueEvent>,
+) -> Vec<PersistedQueueEvent> {
+    let Some(marker) = marker else {
+        return records;
+    };
+    let mut kept: Vec<PersistedQueueEvent> = records
+        .into_iter()
+        .filter(|record| !is_droppable(record))
+        .collect();
+    kept.push(marker);
+    kept
 }
 
 fn queue_event_detail_signature(item: &QueueItem) -> DetailSignature {
@@ -795,5 +870,47 @@ mod tests {
             replayed.is_empty(),
             "a terminal event must publish once, not per repeat"
         );
+    }
+
+    // A change to many jobs at once reaches the replay as one burst; it must
+    // publish one notice, not one record per job.
+    #[tokio::test]
+    async fn a_burst_of_item_changes_publishes_one_notice() {
+        let (event_tx, _event_rx) = broadcast::channel(1024);
+        let queued = |id: u64| JobInfo {
+            job_id: JobId(id),
+            status: JobStatus::Queued,
+            download_state: DownloadState::Queued,
+            post_state: PostState::Idle,
+            run_state: RunState::Active,
+            progress: 0.0,
+            ..finalizing_job_info()
+        };
+        let jobs: Vec<JobInfo> = (1..=200).map(queued).collect();
+        let state = SharedPipelineState::new(PipelineMetrics::new(), jobs.clone());
+        let handle = SchedulerHandle::new(event_tx.clone(), state.clone());
+        let replay = QueueEventReplay::new(64);
+        let mut notifications = replay.subscribe();
+        replay.spawn_producer(handle, test_config());
+
+        let paused: Vec<JobInfo> = jobs
+            .into_iter()
+            .map(|job| JobInfo {
+                status: JobStatus::Paused,
+                run_state: RunState::Paused,
+                ..job
+            })
+            .collect();
+        state.publish_jobs(paused);
+        for id in 1..=200 {
+            event_tx
+                .send(PipelineEvent::JobPaused { job_id: JobId(id) })
+                .unwrap();
+        }
+
+        let first = notifications.recv().await.unwrap();
+        assert_eq!(first.event.kind, QueueEventKind::GlobalStateChanged);
+        assert_eq!(first.id, 1);
+        assert!(replay.replay_after(None).await.unwrap().len() == 1);
     }
 }

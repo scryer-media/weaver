@@ -19,6 +19,50 @@ pub mod settings;
 pub mod speed_test;
 pub mod system;
 
+// Allocation counter for the tests that assert a page push allocates by its
+// page, not by the queue. Test builds only; it counts per thread, so tests
+// running beside one another do not disturb each other's count.
+#[cfg(test)]
+pub(crate) mod alloc_probe {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    fn record() {
+        let _ = ALLOCATIONS.try_with(|count| count.set(count.get().wrapping_add(1)));
+    }
+
+    pub(crate) struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record();
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            record();
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    // Allocations the calling thread has made so far.
+    pub(crate) fn allocations() -> u64 {
+        ALLOCATIONS.try_with(Cell::get).unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: alloc_probe::Counting = alloc_probe::Counting;
+
 pub use auth::types::*;
 pub use backup::{
     BackupArtifact, BackupInspectResult, BackupManifest, BackupService, BackupServiceError,
