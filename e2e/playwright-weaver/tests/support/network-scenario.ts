@@ -191,6 +191,8 @@ export class NetworkWorld {
    * snapshots pacing when a BODY starts: release affects later requests,
    * so individual articles must still finish promptly. More parts keep work
    * available through recovery without making one BODY take many minutes.
+   * A BODY started before release still takes its 128-byte lines times
+   * `slowMs`, so release waits that long: a slow pace takes small parts.
    * Every assertion waits on an observable, never on the pacing interval.
    */
   async pacedDownload(name: string, options: { parts?: number; partBytes?: number; slowMs?: number; chaos?: string } = {}) {

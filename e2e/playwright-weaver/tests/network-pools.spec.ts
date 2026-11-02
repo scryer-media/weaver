@@ -45,7 +45,7 @@ async function pinned(request: Parameters<typeof flowMark>[0], view: (flow: Netw
 test("P01 a pool pins its fastest member and prewarms the rest", async ({ request }, info) => {
   test.setTimeout(0);
   const { view, connect1, connect2, connect3 } = await latencyPool(request);
-  const download = await world.pacedDownload("p01-fastest", { parts: 64, slowMs: 500 });
+  const download = await world.pacedDownload("p01-fastest", { parts: 256, partBytes: 16 * 1024, slowMs: 500 });
   const flow = await flowAfter(request, await flowMark(request), sample => {
     const pool = view(sample);
     // A selected member is still PROBING while its connections are opening.

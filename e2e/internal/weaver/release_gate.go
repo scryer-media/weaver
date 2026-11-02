@@ -86,10 +86,17 @@ var weaverReleaseFlowSpecs = []weaverReleaseFlowSpec{
 	// advanced networking partitions each bring up their own proxy and tunnel
 	// stacks and run longest, and starting them first keeps the tail of a run
 	// short instead of leaving one of them running alone at the end.
-	advancedNetworkingPartition("egress", []string{"network-egress.spec.ts", "network-legs.spec.ts", "network-reload.spec.ts"}, true),
-	advancedNetworkingPartition("routes", []string{"network-ladders.spec.ts", "network-sessions.spec.ts", "network-rss.spec.ts"}, false),
-	advancedNetworkingPartition("pools", []string{"network-pools.spec.ts"}, false),
-	advancedNetworkingPartition("pool-reselection", []string{"network-pools.spec.ts"}, false),
+	// Each partition's npm script selects its tests; the minutes are what one
+	// takes on a loaded host.
+	advancedNetworkingPartition("pool-reselection", []string{"network-pools.spec.ts"}, false, 25*time.Minute),                   // P02, ~7-11 min
+	advancedNetworkingPartition("routes", []string{"network-ladders.spec.ts"}, false, 25*time.Minute),                           // F01-F08, ~6-8 min
+	advancedNetworkingPartition("egress-link", []string{"network-egress.spec.ts"}, false, 20*time.Minute),                       // E07, ~7-8 min
+	advancedNetworkingPartition("pools", []string{"network-pools.spec.ts"}, false, 25*time.Minute),                              // P01, P03, P05, P06, ~5-9 min
+	advancedNetworkingPartition("legs", []string{"network-legs.spec.ts"}, false, 20*time.Minute),                                // ~5-7 min
+	advancedNetworkingPartition("sessions", []string{"network-sessions.spec.ts", "network-rss.spec.ts"}, false, 15*time.Minute), // ~5-6 min
+	advancedNetworkingPartition("egress", []string{"network-egress.spec.ts", "network-reload.spec.ts"}, true, 20*time.Minute),   // all but E07, ~4-6 min
+	advancedNetworkingPartition("routes-hops", []string{"network-ladders.spec.ts"}, false, 15*time.Minute),                      // F09-F17, ~3-4 min
+	advancedNetworkingPartition("pool-members", []string{"network-pools.spec.ts"}, false, 15*time.Minute),                       // P08-P14, ~3-5 min
 	advancedNetworkingNoNetRawReleaseFlow(),
 	advancedNetworkingExtendedReleaseFlow(),
 	browserReleaseFlow("ui-settings-crud", 6*time.Minute),
@@ -589,7 +596,7 @@ func resolveWeaverReleaseGateSpecs(mode string) ([]weaverReleaseFlowSpec, error)
 	switch mode {
 	case "advanced-networking":
 		var out []weaverReleaseFlowSpec
-		for _, name := range []string{"egress", "routes", "pools", "pool-reselection"} {
+		for _, name := range advancedNetworkingPartitionNames {
 			spec, ok := weaverReleaseFlowSpecFor("advanced-networking-" + name)
 			if !ok {
 				return nil, fmt.Errorf("missing advanced networking partition %q", name)

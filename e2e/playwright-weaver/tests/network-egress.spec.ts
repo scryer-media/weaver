@@ -112,8 +112,9 @@ test("E07 taking an interface down moves its share to the other leg and the egre
   const linkB = await ifaceFor(request, egressAddress("b"));
   const server = await world.server({ connections: 4, route: { legs: [directLeg(a.id, 50), directLeg(b.id, 50)] } });
   // Retain the original watchdog regression: a BODY receives bytes steadily
-  // for longer than five minutes before the article can finish.
-  const download = await world.pacedDownload("e07-paced", { slowMs: 1500 });
+  // for longer than five minutes before the article can finish. A 64 KiB
+  // part is 512 lines; at 700 ms a line one BODY takes at least six minutes.
+  const download = await world.pacedDownload("e07-paced", { slowMs: 700 });
   await flowAfter(request, await flowMark(request), sample => {
     const legs = [legOn(sample, serverKey(server), a.id), legOn(sample, serverKey(server), b.id)];
     return legs.every(leg => leg && leg.open === leg.target && leg.target === 2);

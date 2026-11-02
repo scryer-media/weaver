@@ -72,7 +72,7 @@ test("F01 a ladder uses its first rung while that rung works", async ({ request 
   test.setTimeout(0);
   const { connect1, leg } = await twoRungLadder();
   const mark = await fixtureMark(request);
-  const download = await world.pacedDownload("f01-first-rung", { parts: 64, slowMs: 500 });
+  const download = await world.pacedDownload("f01-first-rung", { parts: 256, partBytes: 16 * 1024, slowMs: 500 });
   const flow = await onRung(request, leg, 0, "leg on rung 0");
   expect(leg(flow)).toMatchObject({ selectedRung: 0, selectedProxyId: connect1.id, rungStates: ["STANDBY", "STANDBY"] });
   expect(await download.release()).toBe("COMPLETED");
@@ -108,7 +108,7 @@ test("F03 the leg returns to rung 0 once its cooldown ends and it works again", 
 test("F04 with every rung down, direct fallback carries the leg", async ({ request }) => {
   test.setTimeout(0);
   const { leg } = await twoRungLadder({ directFallback: true });
-  const download = await world.pacedDownload("f04-direct-fallback", { parts: 64, slowMs: 500 });
+  const download = await world.pacedDownload("f04-direct-fallback", { parts: 256, partBytes: 16 * 1024, slowMs: 500 });
   await onRung(request, leg, 0, "leg on rung 0");
   const mark = await fixtureMark(request);
   const flowStart = await flowMark(request);
@@ -163,7 +163,7 @@ test("F06 a 503 from rung 0 is hop evidence and the leg recovers once it clears"
 test("F07 a rejected proxy password cools rung 0 and a test via its egress reports it", async ({ request }) => {
   test.setTimeout(0);
   const { a, leg, connect1 } = await twoRungLadder({ connect1Password: "wrong" });
-  const download = await world.pacedDownload("f07-auth", { parts: 64, slowMs: 500 });
+  const download = await world.pacedDownload("f07-auth", { parts: 256, partBytes: 16 * 1024, slowMs: 500 });
   const flow = await onRung(request, leg, 1, "leg on rung 1 after the 407");
   expect(leg(flow)?.rungStates[0]).toBe("COOLDOWN");
   const results = await testVia(request, { legs: [directLeg(a.id, 100)] }, { proxy: connect1.id }, { host: PROXIED_HOST, port: 119 });
@@ -236,7 +236,8 @@ test("F11 server over-limit refusals never fail the leg or its rung", async ({ r
     const window = subscription.since(start);
     expect(window.map(leg).filter(flow => flow && (flow.state === "DOWN" || flow.rungStates.includes("COOLDOWN")))).toEqual([]);
     expect(Math.max(...window.map(flow => leg(flow)?.open ?? 0))).toBeLessThanOrEqual(2);
-    await world.setChaos("slow_body=1500");
+    // A 64 KiB BODY paced at 200 ms a line holds its connection about 100 s.
+    await world.setChaos("slow_body=200");
     await subscription.next(start, flow => leg(flow)?.open === 4, "leg reaches 4 once the limit lifts");
   } finally {
     subscription.close();
