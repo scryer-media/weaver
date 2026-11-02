@@ -6837,10 +6837,40 @@ async fn a_restart_during_a_check_shows_what_its_job_will_hold() {
         )
     );
 
-    again.restore_jobs().await;
+    // The restore alone, before the torrent attaches and its session checks
+    // on.
+    assert!(again.restore_job(job_id).await);
     assert_eq!(written.borrow().checkpoints_read, 1);
     assert!(again.inner.live.lock().await[&job_id].job.is_some());
     assert_eq!(in_hand(&again.torrent(job_id).await.unwrap()), kept);
+    again.stop().await;
+    seeding.stop().await;
+}
+
+// A torrent whose job is restored at start is given its session as soon as
+// that job is back, not at the routes pass of a later tick: the first
+// torrent restored seeds without waiting for the rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restored_torrent_attaches_as_soon_as_its_job_is_back() {
+    let PartlyFetched {
+        rig,
+        job_id,
+        seeding,
+        ..
+    } = partly_fetched().await;
+    rig.service.stop().await;
+    rig.db.prune_orphan_active_state().unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    assert!(again.inner.live.lock().await[&job_id].attached.is_none());
+    again.restore_jobs().await;
+    {
+        let live = again.inner.live.lock().await;
+        assert!(live[&job_id].job.is_some());
+        assert!(live[&job_id].attached.is_some());
+    }
+    assert!(again.inner.restoring.lock().unwrap().is_empty());
     again.stop().await;
     seeding.stop().await;
 }

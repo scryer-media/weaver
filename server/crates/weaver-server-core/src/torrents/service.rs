@@ -98,6 +98,9 @@ pub const PEERS_EVERY_MS: i64 = 60_000;
 /// data every `SaveResumeDataInterval`, 60 minutes, by default).
 pub const TIMES_EVERY_MS: i64 = 30 * 60_000;
 
+// How many torrents' jobs are restored from their checkpoints at once.
+const RESTORES_AT_ONCE: usize = 8;
+
 /// The most pieces a torrent's checkpoint goes without between ticks: once
 /// this many pieces reached its job, or left it, since the checkpoint was
 /// last written, it is written at once, so a crash fetches again at most
@@ -1944,9 +1947,11 @@ struct Inner {
     clock: Arc<dyn Clock>,
     live: tokio::sync::Mutex<BTreeMap<JobId, Live>>,
     // Held while a torrent's job is restored, from the check that it waits
-    // for one to the job given: one restore at a time. The blocking restore
-    // owns it, so a restore whose awaiting task ends still holds it.
-    restoring: Arc<tokio::sync::Mutex<()>>,
+    // for one to the job given: one restore of a torrent at a time, and at
+    // most RESTORES_AT_ONCE torrents restoring. The blocking restore owns
+    // both, so a restore whose awaiting task ends still holds them.
+    restoring: std::sync::Mutex<HashMap<JobId, Arc<tokio::sync::Mutex<()>>>>,
+    restore_permits: Arc<tokio::sync::Semaphore>,
     signal: Arc<Signal>,
     ticks: watch::Sender<u64>,
     retired: watch::Sender<u64>,
@@ -1991,7 +1996,8 @@ impl TorrentService {
                 env,
                 clock,
                 live: tokio::sync::Mutex::new(BTreeMap::new()),
-                restoring: Arc::new(tokio::sync::Mutex::new(())),
+                restoring: std::sync::Mutex::new(HashMap::new()),
+                restore_permits: Arc::new(tokio::sync::Semaphore::new(RESTORES_AT_ONCE)),
                 signal: Arc::new(Signal::default()),
                 ticks: watch::channel(0).0,
                 retired: watch::channel(0).0,
@@ -2932,17 +2938,47 @@ impl TorrentService {
             .filter(|torrent| torrent.job.is_none() && torrent.layout.is_some())
             .map(|torrent| torrent.record.job_id)
             .collect();
+        // RESTORES_AT_ONCE in flight, each torrent attached as soon as its
+        // job is back rather than at the next tick, so the first seeds
+        // without waiting for the last to restore (qBittorrent's
+        // startUpTorrents keeps MAX_PROCESSING_RESUMEDATA_COUNT in flight
+        // into libtorrent's async_add_torrent).
+        let mut restoring = tokio::task::JoinSet::new();
         for job_id in waiting {
-            self.restore_job(job_id).await;
+            if restoring.len() >= RESTORES_AT_ONCE {
+                restoring.join_next().await;
+            }
+            let service = self.clone();
+            restoring.spawn(async move {
+                if service.restore_job(job_id).await {
+                    service.attach(job_id, None).await;
+                }
+            });
         }
+        while restoring.join_next().await.is_some() {}
     }
 
     // The job of a torrent that waits for one, restored on a blocking thread
     // under no lock but the one that keeps restores one at a time, and given
     // to the torrent if it still waits: one removed meanwhile drops it. A
-    // restore that panics is a checkpoint that does not restore.
-    async fn restore_job(&self, job_id: JobId) {
-        let guard = Arc::clone(&self.inner.restoring).lock_owned().await;
+    // restore that panics is a checkpoint that does not restore. Whether it
+    // gave the torrent its job, unheld, so it may attach now.
+    async fn restore_job(&self, job_id: JobId) -> bool {
+        let this_job = Arc::clone(
+            self.inner
+                .restoring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(job_id)
+                .or_default(),
+        );
+        let guard = (
+            this_job.lock_owned().await,
+            Arc::clone(&self.inner.restore_permits)
+                .acquire_owned()
+                .await
+                .expect("the restore permits are never closed"),
+        );
         let waiting = {
             let live = self.inner.live.lock().await;
             live.get(&job_id)
@@ -2957,7 +2993,12 @@ impl TorrentService {
                 })
         };
         let Some((dir, layout, unpack, passwords)) = waiting else {
-            return;
+            self.inner
+                .restoring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&job_id);
+            return false;
         };
         let restoring = {
             let (service, dir, layout) = (self.clone(), dir.clone(), Arc::clone(&layout));
@@ -2972,10 +3013,10 @@ impl TorrentService {
         };
         // The blocking task ends only with its result, or with the runtime.
         let Ok((_restoring, checkpoint)) = restoring.await else {
-            return;
+            return false;
         };
         let job = self.graph_job(job_id, dir, &layout, unpack, passwords, checkpoint);
-        if let Some(torrent) = self
+        let attachable = match self
             .inner
             .live
             .lock()
@@ -2983,8 +3024,19 @@ impl TorrentService {
             .get_mut(&job_id)
             .filter(|torrent| torrent.job.is_none())
         {
-            self.give_job(torrent, job);
-        }
+            Some(torrent) => {
+                self.give_job(torrent, job);
+                torrent.held.is_none()
+            }
+            None => false,
+        };
+        // A torrent with its job, or gone, waits for no restore.
+        self.inner
+            .restoring
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&job_id);
+        attachable
     }
 
     // Add a torrent. A metainfo becomes a job at once; a magnet needs its
