@@ -395,6 +395,7 @@ impl SharedPipelineState {
     fn publish_torrent_jobs(&self, torrents: Vec<JobInfo>) -> Vec<PipelineEvent> {
         self.queue.write(|inner| {
             let events = owned_job_events(&inner.torrents, &torrents);
+            inner.torrent_ids = torrents.iter().map(|job| job.job_id).collect();
             inner.torrents = torrents;
             Change::changed(events)
         })
@@ -407,9 +408,7 @@ impl SharedPipelineState {
 
     // The owner that answers for `job_id`; `None` is the pipeline.
     fn owner_of(&self, job_id: JobId) -> Option<Arc<dyn QueueOwner>> {
-        let owned = self
-            .queue
-            .read(|inner| inner.torrents.iter().any(|job| job.job_id == job_id));
+        let owned = self.queue.read(|inner| inner.torrent_ids.contains(&job_id));
         owned.then(|| self.owner.read().unwrap().clone()).flatten()
     }
 
@@ -1529,6 +1528,7 @@ impl SchedulerHandle {
             let ended = info.ended_event();
             let job_id = info.job_id;
             inner.torrents.retain(|job| job.job_id != job_id);
+            inner.torrent_ids.remove(&job_id);
             let mut history: Vec<_> = queue
                 .history()
                 .iter()
