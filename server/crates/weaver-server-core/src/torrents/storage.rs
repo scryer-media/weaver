@@ -242,11 +242,7 @@ impl Pieces for TorrentJob {
     // happens in one of its steps, so the read finds the file where it
     // was or where it went, never between.
     fn placed(&self, volume: VolumeIndex, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        self.with(|job| {
-            let path = job.kept_path(volume).ok_or(std::io::ErrorKind::NotFound)?;
-            let file = std::fs::File::open(path)?;
-            crate::pipeline::graph::leaf::read_exact_at(&file, offset, buf)
-        })
+        self.look(|job| job.read_kept(volume, offset, buf))
     }
 
     fn had(&self, piece: u32) -> bool {

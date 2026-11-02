@@ -46,7 +46,7 @@ use weaver_graph::{
 
 use super::checkpoint::why_name;
 use super::envelope::{Envelopes, Shelf, Shelved};
-use super::leaf::{Leaf, LeafError};
+use super::leaf::{Leaf, LeafError, readers};
 use super::limits::Caps;
 use crate::operations::disk::CapacityReader;
 use crate::pipeline::extraction::ExtractionFailure;
@@ -149,6 +149,18 @@ pub(crate) struct NamespaceWriter {
     // Where the kept members' files are, when not under the working
     // directory: files placed there before the job began, which stay there.
     kept_dir: Option<PathBuf>,
+    // The shared read handle's key of each kept member read where it was
+    // placed, renewed whenever the kept files may move, so a seed's peers
+    // and a check read a placed file through one open handle.
+    kept_readers: std::sync::Mutex<std::collections::HashMap<MemberId, u64>>,
+}
+
+// A job let go of holds no handle on its kept files, so deleting them frees
+// their space at once.
+impl Drop for NamespaceWriter {
+    fn drop(&mut self) {
+        self.forget_kept_readers();
+    }
 }
 
 impl NamespaceWriter {
@@ -173,6 +185,7 @@ impl NamespaceWriter {
             placements: Vec::new(),
             kept: Vec::new(),
             kept_dir: None,
+            kept_readers: Default::default(),
         }
     }
 
@@ -203,6 +216,36 @@ impl NamespaceWriter {
         Leaf::at(dir, name)
             .ok()
             .map(|leaf| leaf.path().to_path_buf())
+    }
+
+    // The bytes of a kept root member's file from `offset`, as the file on
+    // disk holds them, through the shared read handle of its kept file.
+    pub(crate) fn read_kept(
+        &self,
+        member: MemberId,
+        offset: u64,
+        out: &mut [u8],
+    ) -> std::io::Result<()> {
+        let path = self.kept_path(member).ok_or(std::io::ErrorKind::NotFound)?;
+        let key = *self
+            .kept_readers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(member)
+            .or_insert_with(readers::key);
+        let file = readers::open(key, &path)?;
+        super::leaf::read_exact_at(&file, offset, out)
+    }
+
+    // The kept files may move or go: no handle opened on them is read again.
+    fn forget_kept_readers(&mut self) {
+        let readers = self
+            .kept_readers
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (_, key) in readers.drain() {
+            readers::forget(key);
+        }
     }
 
     // The name a kept member's file has; none for a member not kept.
@@ -269,6 +312,7 @@ impl NamespaceWriter {
     // The job's directory moved from `from` to `to`: every path the writer
     // holds follows, so nothing of the job points under `from` any more.
     pub(crate) fn relocate(&mut self, from: &Path, to: &Path) {
+        self.forget_kept_readers();
         self.working_dir = to.to_path_buf();
         for node in self.files.keys().copied().collect::<Vec<_>>() {
             let Some(files) = self.files.get_mut(&node) else {
@@ -300,6 +344,7 @@ impl NamespaceWriter {
 
     // Let go of every kept file's handle ahead of the kept files moving.
     pub(crate) fn release_kept(&mut self) {
+        self.forget_kept_readers();
         let kept = self.kept.len();
         if let Some(files) = self.files.get_mut(&NodeId::ROOT) {
             for (_, leaf) in files
@@ -317,6 +362,7 @@ impl NamespaceWriter {
     // written follow. Nothing else of the job moved, even what sits under
     // the old directory.
     pub(crate) fn rekeep(&mut self, to: &Path) {
+        self.forget_kept_readers();
         let Some(from) = self.kept_dir.replace(to.to_path_buf()) else {
             return;
         };

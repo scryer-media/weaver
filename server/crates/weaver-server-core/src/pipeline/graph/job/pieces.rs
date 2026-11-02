@@ -181,8 +181,19 @@ impl GraphJob<PieceRoot> {
     }
 
     // Where the volume's file is kept, written or not.
+    #[cfg(test)]
     pub(crate) fn kept_path(&self, volume: VolumeIndex) -> Option<std::path::PathBuf> {
         self.writer.kept_path(MemberId(volume.0))
+    }
+
+    // The volume's bytes from `offset` as its kept file on disk holds them.
+    pub(crate) fn read_kept(
+        &self,
+        volume: VolumeIndex,
+        offset: u64,
+        out: &mut [u8],
+    ) -> std::io::Result<()> {
+        self.writer.read_kept(MemberId(volume.0), offset, out)
     }
 
     // Each file's bytes in hand, by torrent index.

@@ -1176,3 +1176,35 @@ fn a_piece_handed_on_is_written_into_the_room_it_holds() {
     );
     assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
 }
+
+// A placed file is read through one shared handle, which never outlives a
+// move of the kept files: once they move, a read opens the file where it is
+// now, not the one the handle was opened on (libtorrent `file_pool`, which
+// `storage::move_storage` clears).
+#[test]
+fn a_placed_file_is_read_through_one_handle_that_does_not_follow_a_move() {
+    let shim = placed_shim(1024, vec![file("a.bin", 1000), file("b.bin", 1000)]);
+    let torrent = noise(2000, 9);
+    shim.complete(0, &torrent);
+    shim.complete(1, &torrent);
+    let mut buf = vec![0; 1000];
+    shim.job.placed(VolumeIndex(0), 0, &mut buf).unwrap();
+    assert_eq!(buf, torrent[..1000]);
+    shim.job.placed(VolumeIndex(0), 0, &mut buf).unwrap();
+    assert_eq!(buf, torrent[..1000]);
+
+    let root = shim.dir.path().to_path_buf();
+    let moved = root.join("moved");
+    std::fs::create_dir_all(&moved).unwrap();
+    let outcome = shim.job.with(|job| {
+        job.relocate_kept(moved.clone(), Existing::Keep);
+        job.relocated()
+    });
+    assert_eq!(outcome.unwrap().unwrap(), moved);
+    // Another file now stands where a.bin went: a handle kept from before
+    // the move would still read the old one.
+    std::fs::remove_file(moved.join("a.bin")).unwrap();
+    std::fs::write(moved.join("a.bin"), vec![0x5a; 1000]).unwrap();
+    shim.job.placed(VolumeIndex(0), 0, &mut buf).unwrap();
+    assert_eq!(buf, vec![0x5a; 1000]);
+}
