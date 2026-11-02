@@ -19,7 +19,7 @@ use weaver_server_core::operations::instrumentation::{
     JobLifecycleMetricsSnapshot, PipelineHistogramsSnapshot, ProcessMetricsSnapshot,
     ServerMetricsSnapshot,
 };
-use weaver_server_core::operations::metrics_store::JOB_STATUS_KEYS;
+use weaver_server_core::operations::metrics_store::{JOB_STATUS_KEYS, JobStatusCounts};
 use weaver_server_core::post_processing::executor::PostProcessingMetricsSnapshot;
 use weaver_server_core::post_processing::run_metrics::{
     RunStatus, ScriptMetrics, ScriptRunMetricsSnapshot,
@@ -159,7 +159,7 @@ pub(crate) fn render_prometheus_metrics(
     server_health: &[ServerHealthInfo],
     runtime_generation: u64,
 ) -> String {
-    let job_counts = JobStatusCounts::of(jobs.iter().map(|job| &job.status));
+    let job_counts = JobStatusCounts::from_statuses(jobs.iter().map(|job| &job.status));
     let mut input = PrometheusRenderInput::new(snapshot, download_block);
     input.jobs = jobs;
     input.job_counts = &job_counts;
@@ -236,8 +236,12 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         out.sample(&f::SEMANTIC_DUPLICATE_LIFECYCLE, &[("event", event)], count);
     }
 
-    for (status, count) in JOB_STATUS_KEYS.into_iter().zip(job_counts.0) {
-        out.sample(&f::PIPELINE_JOBS, &[("status", status)], count);
+    for status in JOB_STATUS_KEYS {
+        out.sample(
+            &f::PIPELINE_JOBS,
+            &[("status", status)],
+            job_counts.count(status),
+        );
     }
 
     let observed_limiter =
@@ -1674,30 +1678,6 @@ fn observed_download_limiter(
         return "active";
     }
     "dispatch_limited"
-}
-
-/// How many jobs are in each status, in `JOB_STATUS_KEYS` order.
-#[derive(Default)]
-pub(crate) struct JobStatusCounts([usize; JOB_STATUS_KEYS.len()]);
-
-impl JobStatusCounts {
-    pub(crate) const EMPTY: Self = Self([0; JOB_STATUS_KEYS.len()]);
-
-    pub(crate) fn add(&mut self, status: &JobStatus) {
-        let label = job_status_label(status);
-        if let Some(index) = JOB_STATUS_KEYS.iter().position(|key| *key == label) {
-            self.0[index] += 1;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn of<'a>(statuses: impl Iterator<Item = &'a JobStatus>) -> Self {
-        let mut counts = Self::default();
-        for status in statuses {
-            counts.add(status);
-        }
-        counts
-    }
 }
 
 pub(crate) fn job_status_label(status: &JobStatus) -> &'static str {

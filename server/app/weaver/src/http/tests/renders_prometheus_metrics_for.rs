@@ -696,7 +696,7 @@ fn per_job_series_knob_controls_job_cardinality() {
         ),
     ];
 
-    let job_counts = metrics::JobStatusCounts::of(jobs.iter().map(|job| &job.status));
+    let job_counts = metrics::JobStatusCounts::from_statuses(jobs.iter().map(|job| &job.status));
     let render_with = |mode| {
         let mut input = metrics::PrometheusRenderInput::new(&snapshot, &block);
         input.jobs = &jobs;
