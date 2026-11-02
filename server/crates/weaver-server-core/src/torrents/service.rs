@@ -98,6 +98,17 @@ pub const PEERS_EVERY_MS: i64 = 60_000;
 /// data every `SaveResumeDataInterval`, 60 minutes, by default).
 pub const TIMES_EVERY_MS: i64 = 30 * 60_000;
 
+// How far into its TIMES_EVERY_MS period a torrent's times start. Job ids
+// are sequential, so the id is mixed first: torrents added one after
+// another land anywhere in the period, not in its first few seconds.
+pub(crate) fn times_offset_ms(job_id: JobId) -> i64 {
+    let mut z = job_id.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    (z % TIMES_EVERY_MS as u64) as i64
+}
+
 // How many torrents' jobs are restored from their checkpoints at once.
 const RESTORES_AT_ONCE: usize = 8;
 
@@ -1339,7 +1350,7 @@ impl Live {
         counters.consecutive_seeding_s = 0;
         // Spread by job, so torrents restored together do not all write
         // their times at one tick.
-        let times_at_ms = now - (record.job_id.0 as i64).rem_euclid(TIMES_EVERY_MS);
+        let times_at_ms = now - times_offset_ms(record.job_id);
         Self {
             record,
             identity: TorrentIdentity::fresh(),

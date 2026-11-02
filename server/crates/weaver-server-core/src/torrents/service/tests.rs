@@ -8546,3 +8546,22 @@ async fn an_idle_seeds_times_are_written_on_the_long_timer_not_each_tick() {
         at_stop
     );
 }
+
+// Ten thousand torrents added one after another write their times spread
+// over the whole period: no tick takes more than twice its even share.
+#[test]
+fn sequential_jobs_spread_their_times_over_the_whole_period() {
+    let ticks = (TIMES_EVERY_MS / TICK.as_millis() as i64) as usize;
+    let mut per_tick = vec![0usize; ticks];
+    let jobs = 10_000u64;
+    for id in 1..=jobs {
+        let offset = times_offset_ms(JobId(id));
+        assert!((0..TIMES_EVERY_MS).contains(&offset));
+        per_tick[(offset / TICK.as_millis() as i64) as usize] += 1;
+    }
+    let even = jobs as usize / ticks;
+    let most = *per_tick.iter().max().unwrap();
+    let least = *per_tick.iter().min().unwrap();
+    assert!(most <= 2 * even, "{most} in one tick, even share {even}");
+    assert!(least > 0, "a tick took none");
+}
