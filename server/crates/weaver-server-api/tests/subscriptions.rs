@@ -35,6 +35,18 @@ async fn wait_for_queue_cursor_change(harness: &TestHarness, previous: &str) -> 
     }
 }
 
+// Publish a download speed above zero on the paused clock. Nothing downloads
+// in the harness, so the counters ticker stays parked; the rate window's two
+// samples are taken here instead: a baseline, then one 250 ms later after
+// wire bytes are booked.
+async fn publish_live_speed(harness: &TestHarness) {
+    let now = || tokio::time::Instant::now().into_std();
+    harness.shared_state.refresh_metrics_snapshot(now());
+    harness.shared_state.record_wire_bytes(256 * 1024);
+    tokio::time::advance(Duration::from_millis(250)).await;
+    assert!(harness.shared_state.refresh_metrics_snapshot(now()));
+}
+
 #[tokio::test]
 async fn queue_snapshots_subscription_emits_snapshot() {
     let h = TestHarness::new().await;
@@ -242,19 +254,8 @@ async fn queue_snapshots_use_published_speed_on_unrelated_events() {
     let h = TestHarness::new().await;
     let job_id = h.submit_test_nzb("speed-cache-snapshot").await;
 
-    // Establish the independent ticker's baseline with the controlled clock.
-    tokio::time::advance(Duration::from_millis(250)).await;
-    tokio::task::yield_now().await;
-    h.shared_state.record_wire_bytes(256 * 1024);
-    let mut revisions = h.handle.subscribe_job_changes();
-    tokio::time::advance(Duration::from_millis(250)).await;
-    loop {
-        revisions.mark_unchanged();
-        if h.handle.get_metrics().current_download_speed > 0 {
-            break;
-        }
-        revisions.changed().await.unwrap();
-    }
+    publish_live_speed(&h).await;
+    assert!(h.handle.get_metrics().current_download_speed > 0);
 
     let request = Request::new(
         "subscription { queueSnapshots { items { id state } summary { currentDownloadSpeed } } }",
@@ -433,10 +434,7 @@ async fn system_metrics_updates_emit_metrics_and_global_state() {
         "no pool means no servers to count"
     );
 
-    h.shared_state.record_wire_bytes(256 * 1024);
-    tokio::time::advance(Duration::from_millis(250)).await;
-    h.shared_state
-        .refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
+    publish_live_speed(&h).await;
 
     let second = stream.next().await.expect("stream should stay open");
     assert!(second.errors.is_empty());
@@ -488,10 +486,7 @@ async fn system_metrics_updates_share_metrics_snapshot_speed() {
         .expect("second stream should stay open");
     assert!(first_b.errors.is_empty());
 
-    h.shared_state.record_wire_bytes(256 * 1024);
-    tokio::time::advance(Duration::from_millis(250)).await;
-    h.shared_state
-        .refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
+    publish_live_speed(&h).await;
 
     async fn next_nonzero_speed<S>(stream: &mut S, label: &str) -> u64
     where
