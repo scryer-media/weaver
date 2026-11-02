@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::io::IoSlice;
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use anyhow::{Context, bail};
 use bitvec::boxed::BitBox;
@@ -61,6 +61,16 @@ pub(crate) trait Pieces: Send + Sync {
     // The volume's posted bytes of the range, appended to `into`; false
     // when they are not all in hand.
     fn posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool;
+    // `posted` straight into `out`, which is the range's length; false, and
+    // `out` left as it may be, when they are not all in hand.
+    fn posted_exact(&self, volume: VolumeIndex, range: ByteRange, out: &mut [u8]) -> bool {
+        let mut into = Vec::with_capacity(out.len());
+        let read = self.posted(volume, range, &mut into) && into.len() == out.len();
+        if read {
+            out.copy_from_slice(&into);
+        }
+        read
+    }
     // The volume's bytes from `offset` as its file on disk holds them,
     // whether or not they are in hand: files placed before the torrent was
     // added are read so, for a check to find them or a peer to be served.
@@ -84,7 +94,7 @@ pub(crate) trait Pieces: Send + Sync {
 // due; and `signal` where a job those slots woke is marked, so the service
 // lends for it.
 pub(crate) struct TorrentJob {
-    job: Mutex<GraphJob<PieceRoot>>,
+    job: RwLock<GraphJob<PieceRoot>>,
     repairs: Arc<Mutex<RepairSlots>>,
     signal: Arc<Signal>,
     limit: usize,
@@ -98,7 +108,7 @@ impl TorrentJob {
         limit: usize,
     ) -> Self {
         Self {
-            job: Mutex::new(job),
+            job: RwLock::new(job),
             repairs,
             signal,
             limit,
@@ -106,7 +116,13 @@ impl TorrentJob {
     }
 
     pub(crate) fn with<T>(&self, read: impl FnOnce(&mut GraphJob<PieceRoot>) -> T) -> T {
-        read(&mut self.job.lock().unwrap_or_else(PoisonError::into_inner))
+        read(&mut self.job.write().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    // A look at the job that changes nothing: reads of what it has run
+    // side by side, and wait only for a step.
+    fn look<T>(&self, look: impl FnOnce(&GraphJob<PieceRoot>) -> T) -> T {
+        look(&self.job.read().unwrap_or_else(PoisonError::into_inner))
     }
 
     // One step of the job under the shared repair slots, at `limit`. A slot
@@ -199,7 +215,11 @@ impl Pieces for TorrentJob {
     }
 
     fn posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool {
-        self.with(|job| job.posted(volume, range, into))
+        self.look(|job| job.posted(volume, range, into))
+    }
+
+    fn posted_exact(&self, volume: VolumeIndex, range: ByteRange, out: &mut [u8]) -> bool {
+        self.look(|job| job.posted_exact(volume, range, out))
     }
 
     // Read under the job, as a read of what it has is: a move of its files
@@ -214,7 +234,7 @@ impl Pieces for TorrentJob {
     }
 
     fn had(&self, piece: u32) -> bool {
-        self.with(|job| job.has_piece(piece))
+        self.look(|job| job.has_piece(piece))
     }
 
     fn adopted(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
@@ -439,10 +459,8 @@ impl TorrentStorage for PieceStorage {
             buf.fill(0);
             return Ok(());
         };
-        let mut read = Vec::with_capacity(buf.len());
         let range = ByteRange::at(offset, buf.len() as u64);
-        if self.inner.pieces.posted(volume, range, &mut read) {
-            buf.copy_from_slice(&read);
+        if self.inner.pieces.posted_exact(volume, range, buf) {
             return Ok(());
         }
         // Not in hand: what the file on disk holds, which the session's

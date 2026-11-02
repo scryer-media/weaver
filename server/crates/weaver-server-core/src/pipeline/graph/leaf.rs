@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 
 use crate::pipeline::direct_store::sparse::{SparseCreateError, SparseMarking, create_sparse};
 
+pub(crate) mod readers;
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LeafError {
     #[error("output name {0:?} would escape the directory it is written under")]
@@ -44,6 +46,10 @@ pub(crate) struct Leaf {
     // Open while bytes are still arriving; dropped when the member is
     // covered, and reopened only for a repair.
     file: Option<File>,
+    // The key its shared read handle is kept under once `file` is let go:
+    // a fresh one whenever the file may have moved, been replaced or must
+    // not be held open, so no handle reads a file the leaf no longer names.
+    reader: u64,
 }
 
 impl Leaf {
@@ -54,6 +60,7 @@ impl Leaf {
             path: dir.join(relative_path(output_name)?),
             directory: Self::is_directory(output_name),
             file: None,
+            reader: readers::key(),
         })
     }
 
@@ -109,18 +116,26 @@ impl Leaf {
     ) -> Result<(), LeafError> {
         let start = into.len();
         into.resize(start + len, 0);
-        let read = match &self.file {
-            Some(file) => read_exact_at(file, offset, &mut into[start..]),
-            None => File::open(&self.path)
-                .and_then(|file| read_exact_at(&file, offset, &mut into[start..])),
-        };
-        read.map_err(|source| {
-            into.truncate(start);
-            LeafError::Io {
-                path: self.path.clone(),
-                source,
-            }
-        })
+        self.read_exact(offset, &mut into[start..])
+            .inspect_err(|_| into.truncate(start))
+    }
+
+    // Fill `out` from `offset`, as `read` does, straight into the caller's
+    // buffer. A file no longer open for writing is read through its shared
+    // read handle, opened at its first read.
+    pub(crate) fn read_exact(&self, offset: u64, out: &mut [u8]) -> Result<(), LeafError> {
+        match &self.file {
+            Some(file) => read_exact_at(file, offset, out),
+            None => readers::open(self.reader, &self.path)
+                .and_then(|file| read_exact_at(&file, offset, out)),
+        }
+        .map_err(LeafError::io(&self.path))
+    }
+
+    // The shared read handle, if one is open, is let go of.
+    fn forget_reader(&mut self) {
+        readers::forget(self.reader);
+        self.reader = readers::key();
     }
 
     // Every byte is in: the file takes its final length and its handle is
@@ -146,12 +161,18 @@ impl Leaf {
         file.set_len(0).map_err(LeafError::io(&self.path))
     }
 
+    #[cfg(test)]
+    pub(crate) fn reader_is_open(&self) -> bool {
+        readers::is_open(self.reader)
+    }
+
     // The member was renamed; the file follows it.
     pub(crate) fn rename(&mut self, dir: &Path, output_name: &str) -> Result<(), LeafError> {
         let path = dir.join(relative_path(output_name)?);
         if path == self.path {
             return Ok(());
         }
+        self.forget_reader();
         let had_file = self.file.take().is_some() || self.path.exists();
         if had_file {
             create_parent(&path)?;
@@ -165,6 +186,7 @@ impl Leaf {
     // and the next write opens it where it then is.
     pub(crate) fn release(&mut self) {
         self.file = None;
+        self.forget_reader();
     }
 
     // The job's directory moved from `from` to `to`, the file with it: the
@@ -173,15 +195,17 @@ impl Leaf {
     pub(crate) fn relocate(&mut self, from: &Path, to: &Path) {
         if let Ok(rest) = self.path.strip_prefix(from) {
             self.path = to.join(rest);
+            self.forget_reader();
         }
     }
 
     // The member is gone with its subtree.
     pub(crate) fn remove(mut self) -> Result<(), LeafError> {
         self.file = None;
+        self.forget_reader();
         match std::fs::remove_file(&self.path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(LeafError::Io {
-                path: self.path,
+                path: self.path.clone(),
                 source: error,
             }),
             _ => Ok(()),
@@ -190,6 +214,9 @@ impl Leaf {
 
     fn open(&mut self, length: Option<u64>) -> Result<&File, LeafError> {
         if self.file.is_none() {
+            // Written again: reads go through the write handle until it is
+            // let go, and the file it names may be a new one.
+            self.forget_reader();
             create_parent(&self.path)?;
             let file = create_sparse(&self.path, &SparseMarking::Platform).map_err(|error| {
                 let source = match error {
@@ -209,6 +236,13 @@ impl Leaf {
             self.file = Some(file);
         }
         Ok(self.file.as_ref().expect("opened above"))
+    }
+}
+
+// A leaf gone with its job lets go of its shared read handle.
+impl Drop for Leaf {
+    fn drop(&mut self) {
+        readers::forget(self.reader);
     }
 }
 
@@ -271,3 +305,6 @@ pub(crate) fn read_exact_at(file: &File, offset: u64, out: &mut [u8]) -> io::Res
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

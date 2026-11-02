@@ -224,4 +224,17 @@ impl GraphJob<PieceRoot> {
                 .writer
                 .read_in_hand(&self.tree, MemberId(volume.0), range, into)
     }
+
+    // `posted` straight into `out`, the range's length.
+    pub(crate) fn posted_exact(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        out: &mut [u8],
+    ) -> bool {
+        self.root.holds(volume, range)
+            && self
+                .writer
+                .read_in_hand_exact(&self.tree, MemberId(volume.0), range, out)
+    }
 }

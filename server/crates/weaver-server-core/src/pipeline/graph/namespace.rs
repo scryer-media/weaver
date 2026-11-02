@@ -1780,6 +1780,34 @@ impl Access<'_> {
         read
     }
 
+    // The range of a member no object reads, straight from its own file
+    // into `out`, as `read_at` would give it: false, `out` left as it may
+    // be, when it is not all in that file, so the caller reads it the long
+    // way.
+    pub(crate) fn read_own_exact(
+        &self,
+        node: NodeId,
+        member: MemberId,
+        range: ByteRange,
+        out: &mut [u8],
+    ) -> bool {
+        if self.bound(node, member).is_some() || range.len() != out.len() as u64 {
+            return false;
+        }
+        let written = self
+            .tree
+            .namespace(node)
+            .and_then(|namespace| namespace.get(member))
+            .is_some_and(|record| record.coverage.covered(range));
+        written
+            && self
+                .writer
+                .files
+                .get(&node)
+                .and_then(|files| files.leaves.get(&member))
+                .is_some_and(|leaf| leaf.read_exact(range.start, out).is_ok())
+    }
+
     // Whether the range of a member no object reads is in its own file,
     // found without reading it: its coverage says it was written, and the
     // file reaches past it.
