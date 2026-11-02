@@ -1208,3 +1208,32 @@ fn a_placed_file_is_read_through_one_handle_that_does_not_follow_a_move() {
     shim.job.placed(VolumeIndex(0), 0, &mut buf).unwrap();
     assert_eq!(buf, vec![0x5a; 1000]);
 }
+
+// A whole piece is hashed where its blocks landed: the bytes handed are the
+// piece as a read back would find it, across the files it spans, and a
+// piece not in memory hands nothing, so the session reads it instead.
+#[test]
+fn a_piece_in_memory_is_handed_whole_for_hashing_and_one_not_is_not() {
+    let shim = shim(1024, vec![file("a.bin", 1000), file("b.bin", 1500)]);
+    let torrent = noise(2500, 10);
+    assert!(
+        !shim
+            .storage
+            .hash_held_piece(shim.index(0), &mut |_| panic!("nothing held"))
+    );
+    shim.write(0, &torrent);
+    let mut handed = Vec::new();
+    assert!(
+        shim.storage
+            .hash_held_piece(shim.index(0), &mut |bytes| handed.extend_from_slice(bytes))
+    );
+    assert_eq!(handed, torrent[..1024]);
+    assert_eq!(handed, shim.read(0));
+    shim.storage.on_piece_completed(shim.index(0)).unwrap();
+    assert!(
+        !shim
+            .storage
+            .hash_held_piece(shim.index(0), &mut |_| panic!("piece left memory"))
+    );
+    assert!(shim.storage.pwrite_all(0, 0, &torrent[..16]).is_err());
+}

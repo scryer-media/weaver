@@ -209,6 +209,19 @@ pub trait TorrentStorage: Send + Sync {
         Ok(())
     }
 
+    /// Hands `update` the whole piece, in order, straight from where the
+    /// storage holds it in memory, and returns true; false, having handed it
+    /// nothing, when the storage holds no copy of the piece in memory, so
+    /// the caller reads it. A downloaded piece is then hashed where its
+    /// blocks landed, with no read back.
+    fn hash_held_piece(
+        &self,
+        _piece_index: ValidPieceIndex,
+        _update: &mut dyn FnMut(&[u8]),
+    ) -> bool {
+        false
+    }
+
     /// Callback called every time a piece failed its hash check, before it is queued again:
     /// a downloaded piece, or one a check of the files did not find, which the storage then
     /// holds no longer. Default implementation does nothing, but can be override in trait
@@ -291,6 +304,10 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn on_piece_completed(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
         (**self).on_piece_completed(piece_id)
+    }
+
+    fn hash_held_piece(&self, piece_id: ValidPieceIndex, update: &mut dyn FnMut(&[u8])) -> bool {
+        (**self).hash_held_piece(piece_id, update)
     }
 
     fn on_piece_hash_failed(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
