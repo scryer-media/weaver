@@ -115,38 +115,14 @@ pub(crate) async fn apply(
                     .collect(),
             }
         }
-        QueueBatchOp::Pause => set_paused(handle, ids, true).await,
-        QueueBatchOp::Resume => set_paused(handle, ids, false).await,
+        QueueBatchOp::Pause => handle.set_jobs_paused(ids, true).await,
+        QueueBatchOp::Resume => handle.set_jobs_paused(ids, false).await,
         QueueBatchOp::Update(update) => {
-            update_jobs(handle, ids.into_iter().map(|id| (id, update.clone()))).await
+            handle
+                .update_jobs(ids.into_iter().map(|id| (id, update.clone())))
+                .await
         }
     }
-}
-
-// The core takes a batch of pauses or updates as one queue change once its
-// batch entry points land; until then each job is one intent.
-async fn set_paused(handle: &SchedulerHandle, ids: Vec<JobId>, paused: bool) -> BatchOutcome {
-    let mut outcome = BatchOutcome::new();
-    for id in ids {
-        let result = if paused {
-            handle.pause_job(id).await
-        } else {
-            handle.resume_job(id).await
-        };
-        outcome.insert(id, result);
-    }
-    outcome
-}
-
-async fn update_jobs(
-    handle: &SchedulerHandle,
-    updates: impl IntoIterator<Item = (JobId, JobUpdate)>,
-) -> BatchOutcome {
-    let mut outcome = BatchOutcome::new();
-    for (id, update) in updates {
-        outcome.insert(id, handle.update_job(id, update).await);
-    }
-    outcome
 }
 
 /// The answer a batch returns: how many it named, how many took, and why
