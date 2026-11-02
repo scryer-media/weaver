@@ -3221,12 +3221,17 @@ async fn delete_as_duplicate(
 // The live queue in listing order, with each job's reported category and
 // priority.
 fn queue_order(ctx: &NzbgetFacadeContext) -> Vec<(QueueItem, String, i64)> {
-    ctx.handle
-        .list_jobs()
-        .iter()
+    let jobs = ctx.queue.read_queue(|inner| {
+        inner
+            .jobs
+            .iter()
+            .map(|row| row.view(&inner.globals).list_info())
+            .collect::<Vec<_>>()
+    });
+    jobs.iter()
         .map(|job| {
             (
-                queue_item_from_job(job),
+                queue_table_item_from_job(job),
                 reported_category(job.category.as_deref(), &job.metadata),
                 nzbget_priority(&job.metadata),
             )
@@ -3459,10 +3464,16 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
         return Ok(Value::Array(Vec::new()));
     };
     let targets: Vec<_> = ctx
-        .handle
-        .list_jobs()
+        .queue
+        .read_queue(|inner| inner.row(job_id).map(|row| row.info(&inner.globals)))
+        .or_else(|| {
+            ctx.queue
+                .history_rows()
+                .iter()
+                .find(|job| job.job_id == job_id)
+                .cloned()
+        })
         .into_iter()
-        .filter(|job| job.job_id == job_id)
         .collect();
     if targets.is_empty() {
         return Err(RpcError::invalid_parameter("nzb id not found in queue"));
@@ -3547,17 +3558,24 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
 }
 
 async fn postqueue(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
-    let items = ctx
-        .handle
-        .list_jobs()
+    // Only the queue's rows can be post-processing; history rows are done.
+    let jobs = ctx.queue.read_queue(|inner| {
+        inner
+            .jobs
+            .iter()
+            .filter_map(|row| {
+                let view = row.view(&inner.globals);
+                (matches!(view.status(), JobStatus::QueuedPostProcessing)
+                    || queue_item_state_in_post_processing(queue_item_state(
+                        QueueStateFacts::of_view(&view),
+                    )))
+                .then(|| view.list_info())
+            })
+            .collect::<Vec<_>>()
+    });
+    let items = jobs
         .iter()
-        .filter(|job| {
-            matches!(job.status, JobStatus::QueuedPostProcessing)
-                || queue_item_state_in_post_processing(
-                    weaver_server_api::queue_item_state_from_job_info(job),
-                )
-        })
-        .map(queue_item_from_job)
+        .map(queue_table_item_from_job)
         .collect::<Vec<_>>();
     let post_started = post_started_at(ctx, items.iter().map(|item| item.id).collect()).await;
     let entries = items
@@ -3821,12 +3839,15 @@ async fn log_entries(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result
     let id_from = optional_i64_param(&params, 0)?.unwrap_or(0).max(0) as u64;
     let limit = optional_i64_param(&params, 1)?.unwrap_or(0).max(0) as usize;
 
-    let jobs = ctx.handle.list_jobs();
-    let names: std::collections::HashMap<u64, String> = jobs
-        .iter()
-        .map(|job| (job.job_id.0, job.name.clone()))
-        .collect();
-    let ids: Vec<u64> = jobs.iter().map(|job| job.job_id.0).collect();
+    let history = ctx.queue.history_rows();
+    let ids: Vec<u64> = ctx.queue.read_queue(|inner| {
+        inner
+            .jobs
+            .iter()
+            .map(|row| row.id.0)
+            .chain(history.iter().map(|job| job.job_id.0))
+            .collect()
+    });
     let db = ctx.db.clone();
     // `limit == 0` means "no cap" everywhere else in this RPC surface, but an
     // unbounded fetch across every queued job in one query is not a
@@ -3838,6 +3859,27 @@ async fn log_entries(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result
     .await
     .map_err(|error| RpcError::invalid_parameter(format!("log unavailable: {error}")))?
     .map_err(|error| RpcError::invalid_parameter(format!("log unavailable: {error}")))?;
+    // Names only for the jobs the returned events name.
+    let wanted = events
+        .iter()
+        .map(|event| event.job_id)
+        .collect::<HashSet<_>>();
+    let mut names: HashMap<u64, String> = ctx.queue.read_queue(|inner| {
+        wanted
+            .iter()
+            .filter_map(|id| {
+                let row = inner.row(JobId(*id))?;
+                Some((*id, row.view(&inner.globals).job().name.clone()))
+            })
+            .collect()
+    });
+    for job in history.iter() {
+        if wanted.contains(&job.job_id.0) {
+            names
+                .entry(job.job_id.0)
+                .or_insert_with(|| job.name.clone());
+        }
+    }
 
     Ok(Value::Array(job_events_to_log_entries(
         events,

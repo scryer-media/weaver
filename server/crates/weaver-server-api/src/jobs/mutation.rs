@@ -590,17 +590,27 @@ impl JobsMutation {
             .await
             .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
             .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
+        let finished = |status: &weaver_server_core::JobStatus| {
+            matches!(
+                status,
+                weaver_server_core::JobStatus::Complete
+                    | weaver_server_core::JobStatus::Failed { .. }
+            )
+        };
+        ids.extend(state.read_queue(|inner| {
+            inner
+                .jobs
+                .iter()
+                .filter(|row| finished(row.view(&inner.globals).status()))
+                .map(|row| row.id.0)
+                .collect::<Vec<_>>()
+        }));
         ids.extend(
-            handle
-                .list_jobs()
-                .into_iter()
-                .filter(|info| {
-                    matches!(
-                        info.status,
-                        weaver_server_core::JobStatus::Complete
-                            | weaver_server_core::JobStatus::Failed { .. }
-                    )
-                })
+            state
+                .history_rows()
+                .iter()
+                .filter(|info| finished(&info.status))
                 .map(|info| info.job_id.0),
         );
         // The jobs listed above, in batches: a refused id never holds back the

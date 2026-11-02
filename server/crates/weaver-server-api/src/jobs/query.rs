@@ -198,37 +198,41 @@ impl JobsQuery {
         limit: Option<u32>,
         offset: Option<u32>,
     ) -> Result<Vec<Job>> {
-        let handle = ctx.data::<SchedulerHandle>()?;
-        let infos = handle.list_jobs();
-        let filtered = infos.iter().filter(|info| {
-            if let Some(ref statuses) = status {
-                let gql_status = JobStatusGql::from(&info.status);
-                if !statuses.contains(&gql_status) {
-                    return false;
-                }
-            }
-            if let Some(ref cat) = category
-                && info.category.as_ref() != Some(cat)
-            {
-                return false;
-            }
-            if let Some(ref key) = has_metadata_key
-                && !info.metadata.iter().any(|(k, _)| k == key)
-            {
-                return false;
-            }
-            true
-        });
-        let jobs = if let Some(lim) = limit {
-            filtered
-                .skip(offset.unwrap_or(0) as usize)
-                .take(lim as usize)
-                .map(Job::from)
-                .collect()
-        } else {
-            filtered.map(Job::from).collect()
+        let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
+        let filter = JobFilter {
+            status,
+            category,
+            has_metadata_key,
         };
-        Ok(jobs)
+        let offset = offset.unwrap_or(0) as usize;
+        let limit = limit.map_or(usize::MAX, |limit| limit as usize);
+        let history = state.history_rows();
+        // Only the jobs on the page are copied; the rest are matched in place.
+        let (mut infos, queued_matches) = state.read_queue(|inner| {
+            let mut infos = Vec::new();
+            let mut matched = 0usize;
+            for row in &inner.jobs {
+                let view = row.view(&inner.globals);
+                if !filter.matches(view.status(), view.job()) {
+                    continue;
+                }
+                if matched >= offset && infos.len() < limit {
+                    infos.push(row.info(&inner.globals));
+                }
+                matched += 1;
+            }
+            (infos, matched)
+        });
+        let room = limit - infos.len();
+        infos.extend(
+            history
+                .iter()
+                .filter(|info| filter.matches(&info.status, info))
+                .skip(offset.saturating_sub(queued_matches))
+                .take(room)
+                .cloned(),
+        );
+        Ok(infos.iter().map(Job::from).collect())
     }
     /// Count jobs matching the given filters (same filters as `jobs`).
     async fn job_count(
@@ -238,29 +242,25 @@ impl JobsQuery {
         category: Option<String>,
         has_metadata_key: Option<String>,
     ) -> Result<u32> {
-        let handle = ctx.data::<SchedulerHandle>()?;
-        let infos = handle.list_jobs();
-        let count = infos
+        let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
+        let filter = JobFilter {
+            status,
+            category,
+            has_metadata_key,
+        };
+        let history = state.history_rows();
+        let count = state.read_queue(|inner| {
+            inner
+                .jobs
+                .iter()
+                .filter(|row| {
+                    let view = row.view(&inner.globals);
+                    filter.matches(view.status(), view.job())
+                })
+                .count()
+        }) + history
             .iter()
-            .filter(|info| {
-                if let Some(ref statuses) = status {
-                    let gql_status = JobStatusGql::from(&info.status);
-                    if !statuses.contains(&gql_status) {
-                        return false;
-                    }
-                }
-                if let Some(ref cat) = category
-                    && info.category.as_ref() != Some(cat)
-                {
-                    return false;
-                }
-                if let Some(ref key) = has_metadata_key
-                    && !info.metadata.iter().any(|(k, _)| k == key)
-                {
-                    return false;
-                }
-                true
-            })
+            .filter(|info| filter.matches(&info.status, info))
             .count();
         Ok(count as u32)
     }
@@ -406,4 +406,37 @@ fn collect_files_recursive(dir: &std::path::Path, out: &mut Vec<JobOutputFile>) 
         }
     }
     Ok(())
+}
+
+// The filters `jobs` and `jobCount` share.
+struct JobFilter {
+    status: Option<Vec<JobStatusGql>>,
+    category: Option<String>,
+    has_metadata_key: Option<String>,
+}
+
+impl JobFilter {
+    // `status` is the job's status as published; `job` carries the rest.
+    fn matches(
+        &self,
+        status: &weaver_server_core::JobStatus,
+        job: &weaver_server_core::JobInfo,
+    ) -> bool {
+        if let Some(statuses) = &self.status
+            && !statuses.contains(&JobStatusGql::from(status))
+        {
+            return false;
+        }
+        if let Some(category) = &self.category
+            && job.category.as_ref() != Some(category)
+        {
+            return false;
+        }
+        if let Some(key) = &self.has_metadata_key
+            && !job.metadata.iter().any(|(k, _)| k == key)
+        {
+            return false;
+        }
+        true
+    }
 }

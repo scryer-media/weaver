@@ -47,7 +47,7 @@ static ALLOC: Counting = Counting;
 const CHUNK: usize = 256;
 
 fn job(id: u64) -> JobInfo {
-    let downloading = id % 10 == 0;
+    let downloading = id.is_multiple_of(10);
     let status = if downloading {
         JobStatus::Downloading
     } else {
