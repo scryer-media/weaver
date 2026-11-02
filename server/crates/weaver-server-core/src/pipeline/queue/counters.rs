@@ -87,12 +87,24 @@ impl Queue {
         runtime.spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(250));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Whether the ticker has driven since it last parked.
+            let mut drove = false;
             loop {
                 if !*drive.borrow_and_update() {
                     // Nothing moves, so a sample would find what the last
-                    // one found. Write out the bandwidth the last samples
-                    // recorded, then wait for a turn that finds work.
+                    // one found. Parking after driving takes one sample, so
+                    // bytes counted since the last tick, such as a speed
+                    // test's last articles, are published. Write out the
+                    // bandwidth the samples recorded, then wait for a turn
+                    // that finds work.
                     let Some(queue) = queue.upgrade() else { break };
+                    if std::mem::take(&mut drove) && !queue.closed.load(Ordering::Acquire) {
+                        queue.sample_counters(
+                            &metrics,
+                            &events,
+                            tokio::time::Instant::now().into_std(),
+                        );
+                    }
                     if let Err(error) = queue.sample_bandwidth(true) {
                         tracing::warn!(%error, "failed to flush bandwidth usage");
                     }
@@ -103,10 +115,11 @@ impl Queue {
                     interval.reset_immediately();
                     continue;
                 }
+                drove = true;
                 tokio::select! {
                     _ = interval.tick() => {}
                     // A turn that finds nothing to drive parks the ticker now,
-                    // not after one more sample.
+                    // not after one more tick.
                     changed = drive.changed() => {
                         if changed.is_err() {
                             break;

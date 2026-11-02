@@ -571,3 +571,56 @@ async fn a_paused_queue_takes_no_tick_and_no_sample_between_events() {
     handle.shutdown().await.unwrap();
     runner.await.unwrap();
 }
+
+// A speed test books its bytes outside the pipeline while it holds the
+// queue. That hold is work to drive, so the counters ticker publishes the
+// bytes to the metrics snapshot even with the queue paused. Once the test
+// lets go, the ticker publishes the bytes booked since its last tick and
+// parks again.
+#[tokio::test(start_paused = true)]
+async fn a_speed_test_on_a_paused_queue_publishes_its_bytes_then_parks() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let queue = pipeline.shared_state.queue.clone();
+    let mut drive = queue.subscribe_drive();
+    let mut revisions = queue.subscribe();
+    let runner = tokio::spawn(async move { pipeline.run().await });
+    handle.pause_all().await.unwrap();
+    handle.pipeline_diagnostics().await.unwrap();
+    assert!(!queue.driving());
+
+    let booked = handle.pipeline_metrics();
+    let published = || handle.get_metrics().bytes_downloaded;
+    let before = published();
+    handle.set_speed_test_pause(true).await.unwrap();
+    drive.wait_for(|driving| *driving).await.unwrap();
+    booked.bytes_downloaded.fetch_add(4_096, Ordering::Relaxed);
+    revisions
+        .wait_for(|_| published() >= before + 4_096)
+        .await
+        .unwrap();
+
+    // The last articles land, then the test lets go of the queue.
+    booked.bytes_downloaded.fetch_add(1_024, Ordering::Relaxed);
+    handle.set_speed_test_pause(false).await.unwrap();
+    drive.wait_for(|driving| !driving).await.unwrap();
+    revisions
+        .wait_for(|_| published() == before + 5_120)
+        .await
+        .unwrap();
+    handle.pipeline_diagnostics().await.unwrap();
+
+    let samples = || crate::pipeline::queue::COUNTER_SAMPLES.load(Ordering::Relaxed);
+    let samples_parked = samples();
+    for round in 1..=3 {
+        tokio::time::advance(STALLED_DOWNLOAD_CHECK_INTERVAL + Duration::from_secs(1)).await;
+        handle.pipeline_diagnostics().await.unwrap();
+        assert_eq!(samples(), samples_parked, "round {round}");
+        assert!(!queue.driving(), "round {round}");
+    }
+    assert_eq!(published(), before + 5_120);
+
+    handle.shutdown().await.unwrap();
+    runner.await.unwrap();
+}

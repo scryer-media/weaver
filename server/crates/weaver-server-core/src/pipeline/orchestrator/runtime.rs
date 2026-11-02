@@ -808,17 +808,18 @@ impl Pipeline {
     // Anything live moves on its own. A walk left due, such as a slot write
     // that failed, is retried by the next tick. A job holding a slot can be
     // handed work the moment a gate lifts with time, unless a hold over the
-    // whole queue stops every download. With none of these, every tick
-    // would find what the last one found, so the drivers stay parked until
-    // a turn changes this answer: an intent, a resume, or a slot taken.
+    // whole queue stops every download. A speed test holding the queue
+    // books its bytes outside the pipeline, so it is work too: the counters
+    // ticker publishes them. With none of these, every tick would find what
+    // the last one found, so the drivers stay parked until a turn changes
+    // this answer: an intent, a resume, or a slot taken.
     pub(crate) fn has_work_to_drive(&self) -> bool {
         self.pipeline_is_live()
             || self.queue_walk_due
-            || (!self.nzb_admitted.is_empty()
-                && !self
-                    .shared_state
-                    .queue
-                    .read(|inner| inner.globals.holds_downloads()))
+            || self.shared_state.queue.read(|inner| {
+                inner.globals.speed_test_paused
+                    || (!self.nzb_admitted.is_empty() && !inner.globals.holds_downloads())
+            })
     }
 
     // Leave the gauges the parked drivers would publish saying what the
