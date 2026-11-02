@@ -405,3 +405,87 @@ fn history_attribute_filters_exclude_hidden_metadata_keys() {
         1
     );
 }
+
+// Id lists bind one parameter per id, and SQLite takes at most 32,766 in a
+// statement. A list of 40,000 ids is split, and every reader gives what one
+// statement would have given.
+#[test]
+fn id_filters_past_the_parameter_limit_give_the_rows_one_statement_would() {
+    let db = Database::open_in_memory().unwrap();
+    for id in 1..=60u64 {
+        db.insert_job_history(&JobHistoryRow {
+            job_id: id,
+            name: format!("job-{id}.nzb"),
+            category: Some(if id % 3 == 0 { "tv" } else { "movies" }.to_string()),
+            // Ties on the completion time order by id.
+            completed_at: 1_700_000_000 + (id as i64 / 2),
+            ..sample_history()
+        })
+        .unwrap();
+    }
+    let wanted: Vec<u64> = (1..=40u64).chain(100_000..139_960).collect();
+    let left_out: Vec<u64> = (1..=20u64).chain(200_000..239_980).collect();
+    assert!(wanted.len() > 32_766 && left_out.len() > 32_766);
+
+    // What one statement would return: newest first, then by id.
+    let expected = |keep: &dyn Fn(u64) -> bool| -> Vec<u64> {
+        let mut ids: Vec<u64> = (1..=60u64).filter(|id| keep(*id)).collect();
+        ids.sort_by_key(|id| std::cmp::Reverse((1_700_000_000 + (*id as i64 / 2), *id)));
+        ids
+    };
+    let by_category = |ids: &[u64]| -> Vec<(String, u32)> {
+        let tv = ids.iter().filter(|id| *id % 3 == 0).count() as u32;
+        let movies = ids.len() as u32 - tv;
+        [("movies", movies), ("tv", tv)]
+            .into_iter()
+            .filter(|(_, count)| *count > 0)
+            .map(|(category, count)| (category.to_string(), count))
+            .collect()
+    };
+    let ids_of =
+        |rows: Vec<JobHistoryRow>| rows.into_iter().map(|row| row.job_id).collect::<Vec<_>>();
+
+    for (filter, expected) in [
+        (
+            HistoryFilter {
+                item_ids: Some(wanted.clone()),
+                ..Default::default()
+            },
+            expected(&|id| id <= 40),
+        ),
+        (
+            HistoryFilter {
+                item_ids_not_in: Some(left_out.clone()),
+                ..Default::default()
+            },
+            expected(&|id| id > 20),
+        ),
+        (
+            HistoryFilter {
+                item_ids: Some(wanted.clone()),
+                item_ids_not_in: Some(left_out.clone()),
+                ..Default::default()
+            },
+            expected(&|id| id > 20 && id <= 40),
+        ),
+    ] {
+        assert_eq!(ids_of(db.list_job_history(&filter).unwrap()), expected);
+        assert_eq!(
+            db.count_job_history(&filter).unwrap() as usize,
+            expected.len()
+        );
+        assert_eq!(
+            db.count_job_history_by_category(&filter).unwrap(),
+            by_category(&expected)
+        );
+        let page = HistoryFilter {
+            limit: Some(7),
+            offset: Some(5),
+            ..filter.clone()
+        };
+        assert_eq!(
+            ids_of(db.list_job_history(&page).unwrap()),
+            expected.iter().copied().skip(5).take(7).collect::<Vec<_>>()
+        );
+    }
+}

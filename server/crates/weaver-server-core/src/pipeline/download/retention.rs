@@ -39,6 +39,17 @@ impl Pipeline {
     // the anchor is the newest date the NZB does carry, because that is the
     // article most likely still in flight.
     pub(in crate::pipeline) fn propagation_hold_until(&mut self, job_id: JobId) -> Option<Instant> {
+        // A hold that ran out goes once seen, whatever the delay is now, so
+        // it never calls for another walk.
+        if self
+            .propagation_ready_at
+            .get(&job_id)
+            .is_some_and(|(ready_at, _)| *ready_at <= Instant::now())
+        {
+            self.propagation_ready_at.remove(&job_id);
+            self.emit_job_event(PipelineEvent::PhaseProgressUpdated { job_id });
+            return None;
+        }
         let delay = self.propagation_delay;
         #[cfg(test)]
         let delay = self.propagation_delay_forced.unwrap_or(delay);
@@ -46,12 +57,7 @@ impl Pipeline {
             return None;
         }
         if let Some((ready_at, _)) = self.propagation_ready_at.get(&job_id).copied() {
-            if ready_at > Instant::now() {
-                return Some(ready_at);
-            }
-            self.propagation_ready_at.remove(&job_id);
-            self.emit_job_event(PipelineEvent::PhaseProgressUpdated { job_id });
-            return None;
+            return Some(ready_at);
         }
 
         let posted_at = self
@@ -60,7 +66,7 @@ impl Pipeline {
             .and_then(|state| Self::job_posted_at_epoch(&state.spec))
             .or_else(|| {
                 self.shared_state.queue.read(|inner| {
-                    let row = inner.jobs.iter().find(|row| row.id == job_id)?;
+                    let row = inner.job(job_id)?;
                     row.admission
                         .as_ref()
                         .map(|job| &job.spec)

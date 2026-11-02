@@ -343,6 +343,7 @@ async fn restart_heard(
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             working_dir,
+            restart: None,
         })
         .await
         .unwrap();
@@ -848,6 +849,7 @@ async fn a_job_with_no_checkpoint_is_admitted_afresh_at_restore() {
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             working_dir,
+            restart: None,
         })
         .await;
     assert!(!pipeline.blocked_restores.contains_key(&JOB));
@@ -1580,6 +1582,7 @@ fn request_for(
         paused_resume_download_state: None,
         paused_resume_post_state: None,
         working_dir,
+        restart: None,
     }
 }
 
@@ -2556,6 +2559,7 @@ async fn a_job_restored_under_paused_post_processing_starts_no_run_until_resume(
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             working_dir,
+            restart: None,
         })
         .await
         .unwrap();

@@ -67,6 +67,11 @@ impl ActiveDecodes {
         previous
     }
 
+    // The jobs with a decode in flight.
+    pub(in crate::pipeline) fn jobs(&self) -> impl Iterator<Item = &JobId> {
+        self.by_job.keys()
+    }
+
     // Every job's count, one walk of the map.
     #[cfg(test)]
     pub(in crate::pipeline) fn values(&self) -> impl Iterator<Item = &usize> {

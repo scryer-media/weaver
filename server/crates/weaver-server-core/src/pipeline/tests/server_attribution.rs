@@ -51,6 +51,7 @@ async fn attribution_checkpoint_survives_repeated_active_job_restores() {
                 paused_resume_download_state: None,
                 paused_resume_post_state: None,
                 working_dir: saved.output_dir,
+                restart: None,
             })
             .await
             .unwrap();

@@ -1404,11 +1404,7 @@ pub(super) fn job_work_is_current(
 ) -> bool {
     state.queue.read(|inner| {
         let globals = &inner.globals;
-        !globals.paused
-            && !globals.scheduled_pause
-            && !globals.speed_test_paused
-            && !globals.schedule_replay_paused
-            && !globals.shutting_down
+        !globals.holds_downloads()
             && globals.nntp_generation == generation
             && inner.job(job_id).is_some_and(|row| {
                 row.report.nzb_admitted

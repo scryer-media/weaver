@@ -2,6 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 mod activation;
+pub(crate) use activation::read_stored_spec_and_passwords;
+pub(crate) use completion::finalize::{ActiveRuntimeValues, StoredRuntimeValues};
 pub mod archive;
 mod capacity;
 mod completion;
@@ -1295,6 +1297,23 @@ pub struct Pipeline {
     pub(crate) nzb_seen: HashSet<JobId>,
     pub(crate) nzb_pause_releases: HashSet<JobId>,
     pub(crate) nzb_reprocess_pending: HashSet<JobId>,
+    // What the last walk over every queue row saw, and whether it left
+    // anything for the next turn to look at again.
+    pub(crate) queue_walk_mark: Option<nzb_admission::QueueWalkMark>,
+    pub(crate) queue_walk_due: bool,
+    // Restores are installed a batch a turn; while some still wait, the
+    // loop's wait does not block, so dispatch and every ready event run
+    // between batches.
+    pub(crate) restores_waiting: bool,
+    // Each row's stored queue position as last written, loaded from the
+    // database on the first order change.
+    pub(crate) queue_positions: Option<HashMap<JobId, i64>>,
+    // Set by a position write that did not commit: the positions above are
+    // then not what the database holds, and the next order change reads
+    // them back first.
+    pub(crate) queue_positions_lost: Arc<std::sync::atomic::AtomicBool>,
+    // The jobs the last dispatch pass checked for a changed hold, sorted.
+    pub(crate) dispatch_hold_watch: Vec<JobId>,
     // Typed terminal provenance retained until the ordered history archive has
     // durably updated duplicate-promotion eligibility.
     pub(super) semantic_terminal_causes: HashMap<JobId, crate::jobs::SemanticTerminalCause>,
@@ -1578,6 +1597,9 @@ pub struct Pipeline {
     // warning. Every dispatch wake re-visits every job, so this one fires as
     // fast as the actor is woken until the job leaves the phase it is in.
     pub(super) dispatch_ineligible_log_throttle: download::JobLogThrottle,
+    // Rate limiter for the one warning about jobs waiting for a slot while
+    // no job holding one downloads.
+    pub(super) dispatch_slot_wait_log_throttle: download::KeyedLogThrottle<()>,
     // Last time an owned blocking lane failed to be acquired at all, warned
     // about or not. The under-cap report below is gated on it: lanes below
     // their cap are only a fault when a lane actually failed to open.

@@ -3,6 +3,73 @@
 
 use super::*;
 
+// Runtime row writes queued, for tests that pin how many a path makes. Each
+// test runs in its own process, so a count is the test's own.
+#[cfg(test)]
+pub(crate) static RUNTIME_WRITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+// A job's runtime columns in its active row, as the pipeline writes them.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ActiveRuntimeValues {
+    pub(crate) status: &'static str,
+    pub(crate) download_state: Option<&'static str>,
+    pub(crate) post_state: Option<&'static str>,
+    pub(crate) run_state: Option<&'static str>,
+    pub(crate) error: Option<String>,
+    pub(crate) queued_repair_at_epoch_ms: Option<f64>,
+    pub(crate) queued_extract_at_epoch_ms: Option<f64>,
+    pub(crate) paused_resume_status: Option<&'static str>,
+    pub(crate) paused_resume_download_state: Option<&'static str>,
+    pub(crate) paused_resume_post_state: Option<&'static str>,
+}
+
+// A job's runtime columns as its active row holds them, read by a restart.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StoredRuntimeValues {
+    status: String,
+    download_state: Option<String>,
+    post_state: Option<String>,
+    run_state: Option<String>,
+    error: Option<String>,
+    queued_repair_at_epoch_ms: Option<f64>,
+    queued_extract_at_epoch_ms: Option<f64>,
+    paused_resume_status: Option<String>,
+    paused_resume_download_state: Option<String>,
+    paused_resume_post_state: Option<String>,
+}
+
+impl StoredRuntimeValues {
+    pub(crate) fn of(row: &crate::jobs::record::RecoveredJob) -> Self {
+        Self {
+            status: row.status.clone(),
+            download_state: row.download_state.clone(),
+            post_state: row.post_state.clone(),
+            run_state: row.run_state.clone(),
+            error: row.error.clone(),
+            queued_repair_at_epoch_ms: row.queued_repair_at_epoch_ms,
+            queued_extract_at_epoch_ms: row.queued_extract_at_epoch_ms,
+            paused_resume_status: row.paused_resume_status.clone(),
+            paused_resume_download_state: row.paused_resume_download_state.clone(),
+            paused_resume_post_state: row.paused_resume_post_state.clone(),
+        }
+    }
+
+    // Whether the row already holds every one of `values`.
+    pub(crate) fn holds(&self, values: &ActiveRuntimeValues) -> bool {
+        self.status == values.status
+            && self.download_state.as_deref() == values.download_state
+            && self.post_state.as_deref() == values.post_state
+            && self.run_state.as_deref() == values.run_state
+            && self.error == values.error
+            && self.queued_repair_at_epoch_ms == values.queued_repair_at_epoch_ms
+            && self.queued_extract_at_epoch_ms == values.queued_extract_at_epoch_ms
+            && self.paused_resume_status.as_deref() == values.paused_resume_status
+            && self.paused_resume_download_state.as_deref() == values.paused_resume_download_state
+            && self.paused_resume_post_state.as_deref() == values.paused_resume_post_state
+    }
+}
+
 impl Pipeline {
     #[cfg(test)]
     pub(crate) fn status_enter_failpoint_for_transition(
@@ -51,49 +118,24 @@ impl Pipeline {
         job_id: JobId,
         output_dir: Option<std::path::PathBuf>,
     ) {
-        let Some(state) = self.jobs.get(&job_id) else {
+        let Some(values) = self.active_runtime_values(job_id) else {
             return;
         };
+        #[cfg(test)]
+        RUNTIME_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let output_dir = output_dir.map(|dir| dir.to_string_lossy().into_owned());
-        let status = Self::persist_active_status_for(&state.status).to_string();
-        let error = match &state.status {
-            JobStatus::Failed { error } => Some(error.clone()),
-            _ => state.failure_error.clone(),
-        };
-        let queued_repair_at_epoch_ms = state.queued_repair_at_epoch_ms;
-        let queued_extract_at_epoch_ms = state.queued_extract_at_epoch_ms;
-        let paused_resume_status = state
-            .paused_resume_status
-            .as_ref()
-            .map(Self::persist_active_status_for)
-            .map(str::to_string);
-        let download_state = state.download_state.as_str().to_string();
-        let post_state = state.post_state.as_str().to_string();
-        let run_state = state.run_state.as_str().to_string();
-        let paused_resume_download_state = state
-            .paused_resume_download_state
-            .as_ref()
-            .map(|download_state| download_state.as_str())
-            .map(str::to_string)
-            .or_else(|| {
-                state
-                    .paused_resume_status
-                    .as_ref()
-                    .map(crate::jobs::model::runtime_lanes_from_status_snapshot)
-                    .map(|(download_state, _, _)| download_state.as_str().to_string())
-            });
-        let paused_resume_post_state = state
-            .paused_resume_post_state
-            .as_ref()
-            .map(|post_state| post_state.as_str())
-            .map(str::to_string)
-            .or_else(|| {
-                state
-                    .paused_resume_status
-                    .as_ref()
-                    .map(crate::jobs::model::runtime_lanes_from_status_snapshot)
-                    .map(|(_, post_state, _)| post_state.as_str().to_string())
-            });
+        let ActiveRuntimeValues {
+            status,
+            download_state,
+            post_state,
+            run_state,
+            error,
+            queued_repair_at_epoch_ms,
+            queued_extract_at_epoch_ms,
+            paused_resume_status,
+            paused_resume_download_state,
+            paused_resume_post_state,
+        } = values;
 
         // Route through the ordered writer queue rather than a detached
         // fire-and-forget task: two rapid runtime transitions for the same job
@@ -105,16 +147,16 @@ impl Pipeline {
                     db.set_active_job_runtime_at(
                         job_id,
                         output_dir.as_deref(),
-                        &status,
-                        Some(&download_state),
-                        Some(&post_state),
-                        Some(&run_state),
+                        status,
+                        download_state,
+                        post_state,
+                        run_state,
                         error.as_deref(),
                         queued_repair_at_epoch_ms,
                         queued_extract_at_epoch_ms,
-                        paused_resume_status.as_deref(),
-                        paused_resume_download_state.as_deref(),
-                        paused_resume_post_state.as_deref(),
+                        paused_resume_status,
+                        paused_resume_download_state,
+                        paused_resume_post_state,
                     )
                 })
         {
@@ -123,6 +165,39 @@ impl Pipeline {
                 "failed to queue active job runtime write"
             );
         }
+    }
+
+    // What [`Self::persist_active_runtime`] writes for the job.
+    pub(crate) fn active_runtime_values(&self, job_id: JobId) -> Option<ActiveRuntimeValues> {
+        let state = self.jobs.get(&job_id)?;
+        let resume_lanes = state
+            .paused_resume_status
+            .as_ref()
+            .map(crate::jobs::model::runtime_lanes_from_status_snapshot);
+        Some(ActiveRuntimeValues {
+            status: Self::persist_active_status_for(&state.status),
+            download_state: Some(state.download_state.as_str()),
+            post_state: Some(state.post_state.as_str()),
+            run_state: Some(state.run_state.as_str()),
+            error: match &state.status {
+                JobStatus::Failed { error } => Some(error.clone()),
+                _ => state.failure_error.clone(),
+            },
+            queued_repair_at_epoch_ms: state.queued_repair_at_epoch_ms,
+            queued_extract_at_epoch_ms: state.queued_extract_at_epoch_ms,
+            paused_resume_status: state
+                .paused_resume_status
+                .as_ref()
+                .map(Self::persist_active_status_for),
+            paused_resume_download_state: state
+                .paused_resume_download_state
+                .map(|download_state| download_state.as_str())
+                .or_else(|| resume_lanes.map(|(download_state, _, _)| download_state.as_str())),
+            paused_resume_post_state: state
+                .paused_resume_post_state
+                .map(|post_state| post_state.as_str())
+                .or_else(|| resume_lanes.map(|(_, post_state, _)| post_state.as_str())),
+        })
     }
 
     pub(crate) fn schedule_job_completion_check(&mut self, job_id: JobId) {

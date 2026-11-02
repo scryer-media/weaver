@@ -306,6 +306,7 @@ async fn late_rar_index(lost_tail: bool) {
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             working_dir: recovered.output_dir,
+            restart: None,
         })
         .await
         .unwrap();
@@ -578,6 +579,7 @@ async fn solid_rar_after_nonfirst_half(encrypted: bool) {
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             working_dir: recovered.output_dir,
+            restart: None,
         })
         .await
         .unwrap();

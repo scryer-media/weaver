@@ -15,6 +15,8 @@ mod counters;
 mod history;
 mod intents;
 pub(crate) use admission::{AdmissionResources, PreparedAdd, RestartAdmission};
+#[cfg(test)]
+pub(crate) use counters::COUNTER_SAMPLES;
 pub(crate) use history::clear_restart_artifacts;
 
 /// The control plane's shared facts. A guard never leaves a synchronous
@@ -24,6 +26,9 @@ pub struct Queue {
     history: std::sync::RwLock<Arc<[JobInfo]>>,
     revision: watch::Sender<u64>,
     intent_wake: tokio::sync::Notify,
+    // The actor's word on whether anything is there for a periodic driver
+    // to move. The counters ticker waits on it while it says no.
+    drive: watch::Sender<bool>,
     pub(crate) resources: std::sync::OnceLock<AdmissionResources>,
     pub(crate) closed: std::sync::atomic::AtomicBool,
     ticker_started: std::sync::atomic::AtomicBool,
@@ -71,6 +76,8 @@ pub struct QueueInner {
     pub jobs: Vec<JobRow>,
     // Each row's position in `jobs`, so a lookup by id is one probe.
     job_positions: HashMap<JobId, usize>,
+    // The rows in a phase, the only ones the metrics tick samples.
+    phased_jobs: std::collections::HashSet<JobId>,
     pub history_summary: crate::operations::metrics_store::JobStatusCounts,
     pub(crate) admissions: std::collections::HashSet<JobId>,
     pub(crate) history_operations: std::collections::HashSet<JobId>,
@@ -81,6 +88,20 @@ pub struct QueueInner {
     pub(crate) diagnostics_requested: u64,
     pub(crate) diagnostics: Option<(u64, crate::pipeline::diagnostics::PipelineDiagnostics)>,
     pub(crate) metrics: Option<crate::operations::metrics::MetricsSnapshot>,
+    // Bumped by every intent write, so the actor can tell a turn with no new
+    // intent from one that needs a walk over the rows.
+    intent_epoch: u64,
+}
+
+// Counts the actor's walks over every queue row, so a test can pin how many
+// a pass makes.
+#[cfg(test)]
+pub(crate) static ROW_WALKS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn count_walk() {
+    #[cfg(test)]
+    ROW_WALKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[derive(Clone, Default)]
@@ -104,6 +125,18 @@ pub struct Globals {
     pub runtime_paths: Option<RuntimePaths>,
     pub nntp_generation: u64,
     pub nntp_active: Option<crate::jobs::handle::NntpRuntimeActivation>,
+}
+
+impl Globals {
+    // Whether a hold over the whole queue stops every download: a pause, a
+    // scheduled or speed-test pause, a schedule replay, or shutdown.
+    pub(crate) fn holds_downloads(&self) -> bool {
+        self.paused
+            || self.scheduled_pause
+            || self.speed_test_paused
+            || self.schedule_replay_paused
+            || self.shutting_down
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -292,16 +325,56 @@ impl QueueInner {
         self.jobs.iter().map(|row| row.info(&self.globals))
     }
 
+    pub(crate) fn intent_epoch(&self) -> u64 {
+        self.intent_epoch
+    }
+
     // The row for `id`, found through the position index.
     pub(crate) fn job(&self, id: JobId) -> Option<&JobRow> {
-        let row = self.jobs.get(*self.job_positions.get(&id)?)?;
+        self.jobs.get(self.job_position(id)?)
+    }
+
+    // The row for `id` to change, found through the position index.
+    pub(crate) fn job_mut(&mut self, id: JobId) -> Option<&mut JobRow> {
+        let position = self.job_position(id)?;
+        self.jobs.get_mut(position)
+    }
+
+    pub(crate) fn contains_job(&self, id: JobId) -> bool {
+        self.job_position(id).is_some()
+    }
+
+    // Where `id` stands in `jobs`, found through the position index.
+    pub(crate) fn job_position(&self, id: JobId) -> Option<usize> {
+        let position = *self.job_positions.get(&id)?;
+        let row = self.jobs.get(position)?;
         debug_assert_eq!(row.id, id, "the queue's position index is out of step");
-        (row.id == id).then_some(row)
+        (row.id == id).then_some(position)
+    }
+
+    // The rows in a phase.
+    pub(crate) fn phased_jobs(&self) -> impl Iterator<Item = JobId> + '_ {
+        self.phased_jobs.iter().copied()
     }
 
     pub(crate) fn push_job(&mut self, row: JobRow) {
+        if !row.phases.is_empty() {
+            self.phased_jobs.insert(row.id);
+        }
         self.job_positions.insert(row.id, self.jobs.len());
         self.jobs.push(row);
+    }
+
+    // Removes one row, moving up only the rows after it in the index.
+    pub(crate) fn remove_job(&mut self, id: JobId) -> Option<JobRow> {
+        let position = self.job_position(id)?;
+        self.job_positions.remove(&id);
+        self.phased_jobs.remove(&id);
+        let row = self.jobs.remove(position);
+        for (offset, later) in self.jobs[position..].iter().enumerate() {
+            self.job_positions.insert(later.id, position + offset);
+        }
+        Some(row)
     }
 
     pub(crate) fn retain_jobs(&mut self, keep: impl FnMut(&JobRow) -> bool) {
@@ -316,6 +389,12 @@ impl QueueInner {
             .iter()
             .enumerate()
             .map(|(position, row)| (row.id, position))
+            .collect();
+        self.phased_jobs = self
+            .jobs
+            .iter()
+            .filter(|row| !row.phases.is_empty())
+            .map(|row| row.id)
             .collect();
     }
 }
@@ -334,6 +413,7 @@ impl Queue {
             }),
             revision: watch::channel(0).0,
             intent_wake: tokio::sync::Notify::new(),
+            drive: watch::channel(false).0,
             resources: std::sync::OnceLock::new(),
             closed: std::sync::atomic::AtomicBool::new(false),
             ticker_started: std::sync::atomic::AtomicBool::new(false),
@@ -351,13 +431,7 @@ impl Queue {
     }
 
     pub(crate) fn job_counters(&self, id: JobId) -> Option<Arc<JobCounters>> {
-        self.read(|inner| {
-            inner
-                .jobs
-                .iter()
-                .find(|row| row.id == id)
-                .map(|row| row.counters.clone())
-        })
+        self.read(|inner| inner.job(id).map(|row| row.counters.clone()))
     }
 
     // Called while changing queue membership, so retirement, summary and
@@ -398,13 +472,35 @@ impl Queue {
     }
 
     pub fn write_intent<T>(&self, write: impl FnOnce(&mut QueueInner) -> Change<T>) -> T {
-        let result = self.write(write);
+        let result = self.write(|inner| {
+            inner.intent_epoch = inner.intent_epoch.wrapping_add(1);
+            write(inner)
+        });
         self.intent_wake.notify_one();
         result
     }
 
     pub(crate) async fn intent_changed(&self) {
         self.intent_wake.notified().await;
+    }
+
+    // Set by the actor at the end of each turn; a repeat of the same answer
+    // wakes no one.
+    pub(crate) fn set_driving(&self, driving: bool) {
+        self.drive.send_if_modified(|current| {
+            let changed = *current != driving;
+            *current = driving;
+            changed
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn driving(&self) -> bool {
+        *self.drive.borrow()
+    }
+
+    pub(crate) fn subscribe_drive(&self) -> watch::Receiver<bool> {
+        self.drive.subscribe()
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {

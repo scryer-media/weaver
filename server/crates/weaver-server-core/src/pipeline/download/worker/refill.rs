@@ -78,24 +78,34 @@ impl Pipeline {
     // underneath them), the earliest in dispatch order is the one named.
     pub(in crate::pipeline) fn spill_job_in_flight_on(&self, server_idx: usize) -> Option<JobId> {
         let hot = self.current_hot_job();
-        let mut chosen: Option<(usize, JobId)> = None;
-        for owner in self.download_lane_owners.values() {
-            if owner.server_idx != Some(server_idx)
-                || owner.outstanding.is_empty()
-                || Some(owner.job_id) == hot
-            {
-                continue;
-            }
-            if chosen.is_some_and(|(_, job_id)| job_id == owner.job_id) {
-                continue;
-            }
-            let Some(index) = self.job_order.iter().position(|id| *id == owner.job_id) else {
-                continue;
-            };
-            if chosen.is_none_or(|(best, _)| index < best) {
-                chosen = Some((index, owner.job_id));
-            }
-        }
+        let mut owners: Vec<JobId> = self
+            .download_lane_owners
+            .values()
+            .filter(|owner| {
+                owner.server_idx == Some(server_idx)
+                    && !owner.outstanding.is_empty()
+                    && Some(owner.job_id) != hot
+            })
+            .map(|owner| owner.job_id)
+            .collect();
+        owners.sort_unstable();
+        owners.dedup();
+        // The owner standing first in the queue, each found by its index.
+        let chosen: Option<(usize, JobId)> = self.shared_state.queue.read(|inner| {
+            owners
+                .into_iter()
+                .filter(|job_id| self.jobs.contains_key(job_id))
+                .filter_map(|job_id| {
+                    let index = inner.job_position(job_id).or_else(|| {
+                        self.job_order
+                            .iter()
+                            .position(|id| *id == job_id)
+                            .map(|index| inner.jobs.len() + index)
+                    })?;
+                    Some((index, job_id))
+                })
+                .min()
+        });
         chosen.map(|(_, job_id)| job_id)
     }
 

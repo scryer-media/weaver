@@ -123,40 +123,54 @@ impl Pipeline {
         }
     }
 
+    // The dispatcher's word on a job: the wait it recorded, else the gate
+    // holding it.
+    pub(in crate::pipeline) fn dispatch_wait_reason(&self, job_id: JobId) -> Option<&'static str> {
+        self.download_wait_by_job
+            .get(&job_id)
+            .map(|wait| wait.reason)
+            .or_else(|| self.job_dispatch_hold_reason(job_id))
+    }
+
     // A hold lands or lifts, and a job gains or loses its lanes, with no job
     // event of its own, so each dispatch pass re-reports the jobs whose queue
-    // row no longer says what the dispatcher sees.
-    pub(in crate::pipeline) fn report_changed_dispatch_holds(&self) {
-        let current: Vec<(JobId, Option<&'static str>, bool)> = self
-            .job_order
+    // row no longer says what the dispatcher sees. Only a job holding a slot,
+    // a recorded wait or download activity can move that way, so the pass
+    // looks at those and at the ones the last pass looked at, which catches a
+    // job the moment it leaves them. A job without a slot reads its slot
+    // wait, which the admission pass restates.
+    pub(in crate::pipeline) fn report_changed_dispatch_holds(&mut self) {
+        let mut watched: Vec<JobId> = self
+            .nzb_admitted
             .iter()
-            .map(|job_id| {
-                let reason = self
-                    .download_wait_by_job
-                    .get(job_id)
-                    .map(|wait| wait.reason)
-                    .or_else(|| self.job_dispatch_hold_reason(*job_id));
-                (
-                    *job_id,
-                    reason,
-                    self.job_has_current_download_activity(*job_id),
-                )
-            })
+            .chain(self.download_wait_by_job.keys())
+            .chain(self.active_download_connections_by_job.keys())
+            .chain(self.active_downloads_by_job.keys())
+            .chain(self.active_decodes_by_job.jobs())
+            .chain(self.pending_released_download_results_by_job.keys())
+            .copied()
             .collect();
+        watched.sort_unstable();
+        watched.dedup();
+        let previous = std::mem::take(&mut self.dispatch_hold_watch);
+        let mut ids = watched.clone();
+        ids.extend(
+            previous
+                .into_iter()
+                .filter(|id| watched.binary_search(id).is_err()),
+        );
+        self.dispatch_hold_watch = watched;
         let stale: Vec<JobId> = self.shared_state.queue.read(|inner| {
-            current
-                .iter()
-                .filter(|(job_id, reason, active)| {
-                    inner
-                        .jobs
-                        .iter()
-                        .find(|row| row.id == *job_id)
-                        .is_some_and(|row| {
-                            row.report.job.download_wait_reason.as_deref() != *reason
-                                || row.report.download_active != *active
+            ids.into_iter()
+                .filter(|job_id| {
+                    self.jobs.contains_key(job_id)
+                        && inner.job(*job_id).is_some_and(|row| {
+                            row.report.job.download_wait_reason.as_deref()
+                                != self.stored_wait_reason(row)
+                                || row.report.download_active
+                                    != self.job_has_current_download_activity(*job_id)
                         })
                 })
-                .map(|(job_id, _, _)| *job_id)
                 .collect()
         });
         for job_id in stale {
@@ -165,20 +179,6 @@ impl Pipeline {
     }
 
     pub(in crate::pipeline::download) fn job_dispatch_priority(state: &JobState) -> u8 {
-        state
-            .spec
-            .metadata
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case("priority"))
-            .map(|(_, value)| {
-                if value.eq_ignore_ascii_case("high") {
-                    0
-                } else if value.eq_ignore_ascii_case("low") {
-                    2
-                } else {
-                    1
-                }
-            })
-            .unwrap_or(1)
+        crate::pipeline::nzb_admission::metadata_priority(&state.spec.metadata)
     }
 }

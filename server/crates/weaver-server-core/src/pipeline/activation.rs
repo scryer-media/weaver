@@ -383,6 +383,52 @@ impl Pipeline {
     }
 }
 
+// One job's spec read back from its stored NZB, every article list in it.
+pub(crate) fn read_stored_spec(
+    db: &crate::Database,
+    job_id: JobId,
+    category: Option<String>,
+    metadata: Vec<(String, String)>,
+) -> Result<JobSpec, String> {
+    let (nzb_path, nzb_zstd) = db
+        .load_active_job_persisted_nzb(job_id)
+        .map_err(|error| format!("stored NZB could not be loaded: {error}"))?
+        .ok_or_else(|| "the job has no stored row".to_string())?;
+    let nzb_zstd = nzb_zstd.ok_or_else(|| "the job has no stored NZB".to_string())?;
+    let nzb = crate::ingest::parse_persisted_nzb_bytes(&nzb_zstd)
+        .map_err(|error| format!("stored NZB could not be parsed: {error}"))?;
+    drop(nzb_zstd);
+    Ok(crate::ingest::nzb_to_spec(
+        &nzb, &nzb_path, category, metadata,
+    ))
+}
+
+// As `read_stored_spec`, with the password candidates the job carries taken
+// from the same parse. The candidates are None when the row's password
+// sources do not load, which leaves the harvest to read the row itself.
+pub(crate) fn read_stored_spec_and_passwords(
+    db: &crate::Database,
+    job_id: JobId,
+    category: Option<String>,
+    metadata: Vec<(String, String)>,
+) -> Result<(JobSpec, Option<Vec<crate::jobs::ArchivePasswordCandidate>>), String> {
+    let Ok(sources) = db.load_active_job_password_sources(job_id) else {
+        return read_stored_spec(db, job_id, category, metadata).map(|spec| (spec, None));
+    };
+    let ((nzb_path, nzb_zstd), supplied) =
+        sources.ok_or_else(|| "the job has no stored row".to_string())?;
+    let nzb_zstd = nzb_zstd.ok_or_else(|| "the job has no stored NZB".to_string())?;
+    let nzb = crate::ingest::parse_persisted_nzb_bytes(&nzb_zstd)
+        .map_err(|error| format!("stored NZB could not be parsed: {error}"))?;
+    drop(nzb_zstd);
+    let passwords = crate::pipeline::job_carried_password_candidates(
+        &supplied,
+        crate::ingest::nzb_password_candidates(&nzb, &nzb_path, None),
+    );
+    let spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
+    Ok((spec, Some(passwords)))
+}
+
 // Read one job's article lists back from its stored NZB, check they are the
 // ones the job was admitted with, and rebuild its graph from its checkpoint
 // when it has one.
@@ -395,16 +441,7 @@ fn read_job_articles(
     memory: Arc<ProcessMemoryBudget>,
     seat: RestoreSeat,
 ) -> Result<ReadArticles, String> {
-    let (nzb_path, nzb_zstd) = db
-        .load_active_job_persisted_nzb(job_id)
-        .map_err(|error| format!("stored NZB could not be loaded: {error}"))?
-        .ok_or_else(|| "the job has no stored row".to_string())?;
-    let nzb_zstd = nzb_zstd.ok_or_else(|| "the job has no stored NZB".to_string())?;
-    let nzb = crate::ingest::parse_persisted_nzb_bytes(&nzb_zstd)
-        .map_err(|error| format!("stored NZB could not be parsed: {error}"))?;
-    drop(nzb_zstd);
-    let spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
-    drop(nzb);
+    let spec = read_stored_spec(db, job_id, category, metadata)?;
     let read: Vec<FileSummary> = spec.files.iter().map(FileSummary::of).collect();
     if read.len() != expected.0.len()
         || !read

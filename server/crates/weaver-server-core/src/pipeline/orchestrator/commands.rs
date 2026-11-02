@@ -251,9 +251,11 @@ impl Pipeline {
         };
         // Taken: the rows are being archived, and these intents are acted on.
         self.shared_state.queue.write(|inner| {
-            for row in inner.jobs.iter_mut().filter(|row| ids.contains(&row.id)) {
-                row.report.retiring = true;
-                row.report.seen_intent_seq = row.intents.seq;
+            for &id in ids.iter() {
+                if let Some(row) = inner.job_mut(id) {
+                    row.report.retiring = true;
+                    row.report.seen_intent_seq = row.intents.seq;
+                }
             }
             crate::pipeline::queue::Change::changed(())
         });
@@ -343,7 +345,7 @@ impl Pipeline {
             if !keep_files {
                 inner.pending_cleanup.insert(job_id);
             }
-            inner.retain_jobs(|row| row.id != job_id);
+            inner.remove_job(job_id);
             let _ = self.event_tx.send(PipelineEvent::JobCancelled { job_id });
             crate::pipeline::queue::Change::changed(delete_history)
         });
@@ -382,10 +384,12 @@ impl Pipeline {
             return;
         }
         self.shared_state.queue.write(|inner| {
-            for row in inner.jobs.iter_mut().filter(|row| ids.contains(&row.id)) {
-                row.intents.cancelled = None;
-                row.intents.delete_history_after_cancel = false;
-                row.report.retiring = false;
+            for &id in ids {
+                if let Some(row) = inner.job_mut(id) {
+                    row.intents.cancelled = None;
+                    row.intents.delete_history_after_cancel = false;
+                    row.report.retiring = false;
+                }
             }
             crate::pipeline::queue::Change::changed(())
         });

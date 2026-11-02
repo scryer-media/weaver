@@ -1029,6 +1029,7 @@ async fn restore_job_rehydrates_existing_deterministic_staging_dir() {
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             working_dir,
+            restart: None,
         })
         .await
         .unwrap();
@@ -1074,6 +1075,7 @@ async fn restore_job_normalizes_persisted_checking_to_queued_when_work_remains()
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             working_dir,
+            restart: None,
         })
         .await
         .unwrap();
@@ -1122,6 +1124,7 @@ async fn restore_job_normalizes_persisted_checking_to_complete_when_no_work_rema
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             working_dir,
+            restart: None,
         })
         .await
         .unwrap();
@@ -1159,6 +1162,7 @@ async fn restore_queued_postprocessing_schedules_completion_check() {
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             working_dir,
+            restart: None,
         })
         .await
         .unwrap();
@@ -1234,6 +1238,7 @@ async fn restore_job_reemits_open_download_finalization_and_drains_it() {
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             working_dir,
+            restart: None,
         })
         .await
         .unwrap();

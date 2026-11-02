@@ -20,28 +20,188 @@ struct AdmissionRow {
     intake: bool,
 }
 
+// What a walk over every queue row answers to besides the actor's own state:
+// the intents written since, the rows held, and the globals that gate a slot.
+// A turn that finds the same mark, and nothing deferred by the last walk,
+// skips the walks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct QueueWalkMark {
+    intent_epoch: u64,
+    rows: usize,
+    paused: bool,
+    scheduled_pause: bool,
+    speed_test_paused: bool,
+    schedule_replay_paused: bool,
+    shutting_down: bool,
+    max_concurrent_nzbs: Option<std::num::NonZeroU32>,
+    propagation_delay: std::time::Duration,
+}
+
+impl QueueWalkMark {
+    pub(crate) fn of(inner: &crate::pipeline::queue::QueueInner) -> Self {
+        let globals = &inner.globals;
+        Self {
+            intent_epoch: inner.intent_epoch(),
+            rows: inner.jobs.len(),
+            paused: globals.paused,
+            scheduled_pause: globals.scheduled_pause,
+            speed_test_paused: globals.speed_test_paused,
+            schedule_replay_paused: globals.schedule_replay_paused,
+            shutting_down: globals.shutting_down,
+            max_concurrent_nzbs: globals.max_concurrent_nzbs,
+            propagation_delay: globals.propagation_delay,
+        }
+    }
+}
+
+// A job's priority from its metadata: high 0, normal 1, low 2.
+pub(crate) fn metadata_priority(metadata: &[(String, String)]) -> u8 {
+    metadata
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("priority"))
+        .map_or(1, |(_, value)| {
+            if value.eq_ignore_ascii_case("high") {
+                0
+            } else if value.eq_ignore_ascii_case("low") {
+                2
+            } else {
+                1
+            }
+        })
+}
+
 impl Pipeline {
+    // Whether the row's job counts as paused for its slot.
+    fn admission_paused(&self, row: &crate::pipeline::queue::JobRow) -> bool {
+        row.intents.paused.unwrap_or_else(|| {
+            row.admission
+                .as_ref()
+                .is_some_and(|job| job.options.initially_paused)
+                || row
+                    .intents
+                    .restore
+                    .as_ref()
+                    .is_some_and(|job| job.status == JobStatus::Paused)
+                || row.report.job.run_state == crate::RunState::Paused
+                || self
+                    .jobs
+                    .get(&row.id)
+                    .is_some_and(|state| state.run_state == crate::RunState::Paused)
+        })
+    }
+
+    fn admission_row(
+        &self,
+        globals: &crate::pipeline::queue::Globals,
+        position: usize,
+        row: &crate::pipeline::queue::JobRow,
+    ) -> AdmissionRow {
+        let pending = row.admission.is_some()
+            || row.intents.restore.is_some()
+            || row.intents.paused == Some(false)
+            || self.jobs.contains_key(&row.id);
+        // Only a pending edit can move the priority off the reported metadata.
+        let priority = if row.intents.update.is_some() {
+            metadata_priority(&row.info(globals).metadata)
+        } else {
+            metadata_priority(&row.report.job.metadata)
+        };
+        AdmissionRow {
+            id: row.id,
+            position,
+            priority,
+            paused: self.admission_paused(row),
+            pending,
+            cancelled_or_retiring: row.intents.cancelled.is_some() || row.report.retiring,
+            intake: row.admission.is_some(),
+        }
+    }
+
     // Ownership survives empty queues, retries and all downstream processing.
     // Intake remains in the shared queue until its durable admission commits.
-    pub(crate) async fn reconcile_nzb_admission(&mut self) {
+    //
+    // The slots held are checked every turn by looking up their rows. The
+    // walk over every row, which finds new candidates, retires forgotten ids
+    // and restates each row's slot, runs when `walk` asks for it or a slot
+    // was released this turn. Returns whether it walked.
+    pub(crate) async fn reconcile_nzb_admission(&mut self, walk: bool) -> bool {
         // A crash between accepting pause and draining work must not turn
         // the interrupted pause into an automatic resume.
-        self.shared_state.queue.write(|inner| {
-            let mut changed = false;
-            for row in &mut inner.jobs {
-                if row.intents.restore.is_some() && self.nzb_pause_releases.contains(&row.id) {
-                    row.intents.paused = Some(true);
-                    row.intents.seq = row.intents.seq.wrapping_add(1);
-                    row.intents.pause_seq = row.intents.seq;
-                    changed = true;
+        if !self.nzb_pause_releases.is_empty() {
+            self.shared_state.queue.write(|inner| {
+                let mut changed = false;
+                for id in &self.nzb_pause_releases {
+                    if let Some(row) = inner.job_mut(*id)
+                        && row.intents.restore.is_some()
+                    {
+                        row.intents.paused = Some(true);
+                        row.intents.seq = row.intents.seq.wrapping_add(1);
+                        row.intents.pause_seq = row.intents.seq;
+                        changed = true;
+                    }
                 }
-            }
-            if changed {
-                Change::changed(())
-            } else {
-                Change::unchanged(())
-            }
+                if changed {
+                    Change::changed(())
+                } else {
+                    Change::unchanged(())
+                }
+            });
+        }
+        // The rows of the jobs holding a slot, as (paused, intake), or None
+        // where the row is gone.
+        let held: Vec<(JobId, Option<(bool, bool)>)> = self.shared_state.queue.read(|inner| {
+            self.nzb_admitted
+                .iter()
+                .map(|id| {
+                    (
+                        *id,
+                        inner
+                            .job(*id)
+                            .map(|row| (self.admission_paused(row), row.admission.is_some())),
+                    )
+                })
+                .collect()
         });
+        let releases: Vec<_> = held
+            .iter()
+            .filter(|(id, row)| {
+                let gone = self.nzb_seen.contains(id) && row.is_none();
+                // History retry/reprocess can reuse an ID before this actor
+                // observes the old row's removal. The new run must compete
+                // for a slot and commit its own ownership flag.
+                let replaced = !self.jobs.contains_key(id) && row.is_some_and(|(_, intake)| intake);
+                let paused =
+                    self.nzb_pause_releases.contains(id) && row.is_some_and(|(paused, _)| paused);
+                (gone || replaced || paused) && !self.nzb_work_in_flight(*id)
+            })
+            .map(|(id, row)| {
+                (
+                    *id,
+                    !self.jobs.contains_key(id) && row.is_some_and(|(_, intake)| intake),
+                )
+            })
+            .collect();
+        let mut released = false;
+        for (id, replaced) in releases {
+            // A replacement's old record has already been durably archived.
+            // Its new record starts unowned and must acquire independently.
+            if !replaced
+                && let Err(error) = self
+                    .db_blocking(move |db| db.set_nzb_admitted(id, false))
+                    .await
+            {
+                error!(job_id = id.0, %error, "failed to release NZB admission");
+                self.queue_walk_due = true;
+                continue;
+            }
+            self.nzb_admitted.remove(&id);
+            self.nzb_pause_releases.remove(&id);
+            released = true;
+        }
+        if !walk && !released {
+            return false;
+        }
+        crate::pipeline::queue::count_walk();
         let (shutting_down, rows) = self.shared_state.queue.read(|inner| {
             (
                 inner.globals.shutting_down,
@@ -49,98 +209,24 @@ impl Pipeline {
                     .jobs
                     .iter()
                     .enumerate()
-                    .map(|(position, row)| {
-                        let paused = row.intents.paused.unwrap_or_else(|| {
-                            row.admission
-                                .as_ref()
-                                .is_some_and(|job| job.options.initially_paused)
-                                || row
-                                    .intents
-                                    .restore
-                                    .as_ref()
-                                    .is_some_and(|job| job.status == JobStatus::Paused)
-                                || row.report.job.run_state == crate::RunState::Paused
-                                || self
-                                    .jobs
-                                    .get(&row.id)
-                                    .is_some_and(|state| state.run_state == crate::RunState::Paused)
-                        });
-                        let pending = row.admission.is_some()
-                            || row.intents.restore.is_some()
-                            || row.intents.paused == Some(false)
-                            || self.jobs.contains_key(&row.id);
-                        let info = row.info(&inner.globals);
-                        let priority = info
-                            .metadata
-                            .iter()
-                            .find(|(key, _)| key.eq_ignore_ascii_case("priority"))
-                            .map_or(1, |(_, value)| {
-                                if value.eq_ignore_ascii_case("high") {
-                                    0
-                                } else if value.eq_ignore_ascii_case("low") {
-                                    2
-                                } else {
-                                    1
-                                }
-                            });
-                        AdmissionRow {
-                            id: row.id,
-                            position,
-                            priority,
-                            paused,
-                            pending,
-                            cancelled_or_retiring: row.intents.cancelled.is_some()
-                                || row.report.retiring,
-                            intake: row.admission.is_some(),
-                        }
-                    })
+                    .map(|(position, row)| self.admission_row(&inner.globals, position, row))
                     .collect::<Vec<_>>(),
             )
         });
-        self.nzb_seen.extend(rows.iter().map(|row| row.id));
-        let releases: Vec<_> = self
-            .nzb_admitted
-            .iter()
-            .copied()
-            .filter(|id| {
-                let gone = self.nzb_seen.contains(id) && !rows.iter().any(|row| row.id == *id);
-                // History retry/reprocess can reuse an ID before this actor
-                // observes the old row's removal. The new run must compete
-                // for a slot and commit its own ownership flag.
-                let replaced = !self.jobs.contains_key(id)
-                    && rows.iter().any(|row| row.id == *id && row.intake);
-                let paused = self.nzb_pause_releases.contains(id)
-                    && rows.iter().any(|row| row.id == *id && row.paused);
-                (gone || replaced || paused) && !self.nzb_work_in_flight(*id)
-            })
-            .collect();
-        for id in releases {
-            // A replacement's old record has already been durably archived.
-            // Its new record starts unowned and must acquire independently.
-            let replaced =
-                !self.jobs.contains_key(&id) && rows.iter().any(|row| row.id == id && row.intake);
-            if !replaced
-                && let Err(error) = self
-                    .db_blocking(move |db| db.set_nzb_admitted(id, false))
-                    .await
-            {
-                error!(job_id = id.0, %error, "failed to release NZB admission");
-                continue;
-            }
-            self.nzb_admitted.remove(&id);
-            self.nzb_pause_releases.remove(&id);
-        }
+        let present: HashSet<JobId> = rows.iter().map(|row| row.id).collect();
+        self.nzb_seen.extend(present.iter().copied());
         let retired: Vec<_> = self
             .nzb_seen
             .iter()
             .copied()
-            .filter(|id| {
-                !self.nzb_admitted.contains(id)
-                    && !rows.iter().any(|row| row.id == *id)
-                    && !self.nzb_work_in_flight(*id)
-            })
+            .filter(|id| !self.nzb_admitted.contains(id) && !present.contains(id))
             .collect();
         for id in retired {
+            if self.nzb_work_in_flight(id) {
+                // Looked at again once its work drains.
+                self.queue_walk_due = true;
+                continue;
+            }
             self.nzb_seen.remove(&id);
             self.nzb_pause_releases.remove(&id);
             self.nzb_reprocess_pending.remove(&id);
@@ -155,7 +241,7 @@ impl Pipeline {
         // Only a shutdown stops admission; the pauses and the slot count are
         // read per candidate below.
         if shutting_down {
-            return;
+            return true;
         }
         let mut candidates: Vec<_> = rows
             .iter()
@@ -167,11 +253,25 @@ impl Pipeline {
             })
             .map(|row| (row.priority, row.position, row.id))
             .collect();
+        drop(rows);
         candidates.sort_unstable();
         let propagating: HashSet<_> = candidates
             .iter()
             .filter_map(|(_, _, id)| self.propagation_hold_until(*id).map(|_| *id))
             .collect();
+        // A hold that ran out on a job that is not a candidate, such as a
+        // paused one, holds nothing. It goes once seen, so it never calls for
+        // a walk on every turn; a candidate's went just above.
+        let now = Instant::now();
+        let expired: Vec<_> = self
+            .propagation_ready_at
+            .iter()
+            .filter(|(_, (ready_at, _))| *ready_at <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            self.propagation_hold_until(id);
+        }
         for (_, _, id) in candidates {
             // A settings edit or global hold can arrive while the previous
             // acquisition awaits its durable commit. Re-read before admitting
@@ -183,11 +283,7 @@ impl Pipeline {
                         .max_concurrent_nzbs
                         .unwrap_or(crate::settings::model::DEFAULT_MAX_CONCURRENT_NZBS)
                         .get() as usize
-                    && !globals.paused
-                    && !globals.scheduled_pause
-                    && !globals.speed_test_paused
-                    && !globals.shutting_down
-                    && !globals.schedule_replay_paused
+                    && !globals.holds_downloads()
             });
             if !allowed {
                 break;
@@ -200,6 +296,7 @@ impl Pipeline {
                 .await
             {
                 error!(job_id = id.0, %error, "failed to acquire NZB admission");
+                self.queue_walk_due = true;
                 continue;
             }
             self.nzb_admitted.insert(id);
@@ -217,26 +314,19 @@ impl Pipeline {
                     changed = true;
                 }
                 if propagating.contains(&row.id) {
-                    row.report.job.download_wait_reason = None;
                     row.report.job.download_state = crate::DownloadState::Queued;
                     row.report.propagation_until_epoch_ms = self
                         .propagation_ready_at
                         .get(&row.id)
                         .map(|(_, epoch)| *epoch as f64);
                     changed = true;
-                    continue;
                 }
-                let waiting = self.waits_for_nzb_slot(row);
-                if waiting
-                    && row.report.job.download_wait_reason.as_deref() != Some(NZB_SLOT_WAIT_REASON)
-                {
-                    row.report.job.download_wait_reason = Some(NZB_SLOT_WAIT_REASON.into());
-                    row.report.job.download_state = crate::DownloadState::Queued;
-                    changed = true;
-                } else if !waiting
-                    && row.report.job.download_wait_reason.as_deref() == Some(NZB_SLOT_WAIT_REASON)
-                {
-                    row.report.job.download_wait_reason = None;
+                let reason = self.stored_wait_reason(row);
+                if row.report.job.download_wait_reason.as_deref() != reason {
+                    row.report.job.download_wait_reason = reason.map(str::to_owned);
+                    if reason == Some(NZB_SLOT_WAIT_REASON) {
+                        row.report.job.download_state = crate::DownloadState::Queued;
+                    }
                     changed = true;
                 }
             }
@@ -246,6 +336,22 @@ impl Pipeline {
                 Change::unchanged(())
             }
         });
+        true
+    }
+
+    // The wait reason a queue row stores, the one answer every writer of the
+    // row gives: a slot while the job would download but holds none (not
+    // while its post is still propagating, which the row states by its
+    // deadline), else the dispatcher's wait or hold.
+    pub(crate) fn stored_wait_reason(
+        &self,
+        row: &crate::pipeline::queue::JobRow,
+    ) -> Option<&'static str> {
+        if self.waits_for_nzb_slot(row) {
+            return (!self.propagation_ready_at.contains_key(&row.id))
+                .then_some(NZB_SLOT_WAIT_REASON);
+        }
+        self.dispatch_wait_reason(row.id)
     }
 
     // Whether the row's job would download now but holds no slot: an intake,
