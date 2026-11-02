@@ -256,7 +256,7 @@ type fullDashboard struct {
 	flowOrder   map[string][]string
 	seedByPhase map[string]int
 	dirty       bool
-	lastFrame   string
+	painter     framePainter
 	stopCh      chan struct{}
 	doneCh      chan struct{}
 	mu          sync.Mutex
@@ -290,6 +290,7 @@ const (
 func newFullDashboard(title string, phaseNames []string, seedTotal int) *fullDashboard {
 	d := &fullDashboard{
 		interactive: isInteractiveTerminal(),
+		painter:     framePainter{out: os.Stdout},
 		title:       title,
 		start:       time.Now(),
 		seed: dashboardBar{
@@ -526,14 +527,44 @@ func (d *fullDashboard) renderLocked() {
 }
 
 func (d *fullDashboard) renderFrameLocked() {
-	frame := d.buildFrameLocked()
-	if frame == d.lastFrame {
-		d.dirty = false
+	d.painter.paint(d.buildFrameLocked())
+	d.dirty = false
+}
+
+// framePainter puts dashboard frames on the terminal without flicker. The
+// first frame clears the screen once; after that only the rows that changed
+// are rewritten in place, each erased to its end so a shorter line leaves no
+// tail, and rows a shorter frame no longer uses are blanked. Every paint is a
+// single write, and an unchanged frame writes nothing. The cursor is parked on
+// the row below the frame, where a trailing newline would have left it.
+type framePainter struct {
+	out     io.Writer
+	last    []string
+	painted bool
+}
+
+func (p *framePainter) paint(frame string) {
+	lines := strings.Split(strings.TrimSuffix(frame, "\n"), "\n")
+	var b strings.Builder
+	if !p.painted {
+		b.WriteString("\x1b[H\x1b[J")
+	}
+	for row, line := range lines {
+		if p.painted && row < len(p.last) && p.last[row] == line {
+			continue
+		}
+		fmt.Fprintf(&b, "\x1b[%d;1H%s\x1b[K", row+1, line)
+	}
+	for row := len(lines); row < len(p.last); row++ {
+		fmt.Fprintf(&b, "\x1b[%d;1H\x1b[K", row+1)
+	}
+	p.painted = true
+	p.last = lines
+	if b.Len() == 0 {
 		return
 	}
-	fmt.Fprint(os.Stdout, frame)
-	d.lastFrame = frame
-	d.dirty = false
+	fmt.Fprintf(&b, "\x1b[%d;1H", len(lines)+1)
+	_, _ = io.WriteString(p.out, b.String())
 }
 
 func (d *fullDashboard) scheduleRenderLocked() {
@@ -545,7 +576,6 @@ func (d *fullDashboard) scheduleRenderLocked() {
 
 func (d *fullDashboard) buildFrameLocked() string {
 	var b strings.Builder
-	b.WriteString("\x1b[H\x1b[J")
 	layout := d.dashboardLayoutLocked()
 	elapsed := time.Since(d.start).Truncate(time.Second)
 	title := d.title
