@@ -17,6 +17,7 @@ use tokio::sync::Semaphore;
 pub struct BlockingSpawner {
     allow_block_in_place: bool,
     concurrent_block_in_place_semaphore: Arc<Semaphore>,
+    permits: usize,
 }
 
 impl BlockingSpawner {
@@ -32,6 +33,7 @@ impl BlockingSpawner {
             concurrent_block_in_place_semaphore: Arc::new(Semaphore::new(
                 max_blocking_threads.max(1),
             )),
+            permits: max_blocking_threads.max(1),
         }
     }
 
@@ -81,7 +83,29 @@ impl BlockingSpawner {
         f(threads)
     }
 
+    /// The most threads a check hashes on: half the blocking permits, at
+    /// least one, so peers' reads and piece writes always find the rest.
+    /// libtorrent hashes on its own `hashing_threads` pool (default 1)
+    /// beside the disk threads; here the two share one pool, and the cap
+    /// keeps the share a check takes of it bounded.
+    pub fn check_threads(&self) -> usize {
+        (self.permits / 2).max(1)
+    }
+
     pub fn semaphore(&self) -> Arc<Semaphore> {
         self.concurrent_block_in_place_semaphore.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BlockingSpawner;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_check_hashes_on_at_most_half_the_blocking_permits() {
+        assert_eq!(BlockingSpawner::new(16).check_threads(), 8);
+        assert_eq!(BlockingSpawner::new(3).check_threads(), 1);
+        assert_eq!(BlockingSpawner::new(1).check_threads(), 1);
+        assert_eq!(BlockingSpawner::new(0).check_threads(), 1);
     }
 }

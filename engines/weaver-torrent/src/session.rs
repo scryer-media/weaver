@@ -944,7 +944,10 @@ pub struct SessionOptions {
 
     pub cancellation_token: Option<CancellationToken>,
 
-    /// how many concurrent torrent initializations can happen
+    /// How many torrents hash their files at once (libtorrent
+    /// `settings_pack::active_checking`, qBittorrent
+    /// `MaxActiveCheckingTorrents`); 1 when unset, both their default. A
+    /// torrent its resume data vouches for does not wait for it.
     pub concurrent_init_limit: Option<usize>,
 
     /// How many blocking threads does the tokio runtime have.
@@ -1628,7 +1631,7 @@ impl Session {
                 root_span: opts.root_span,
                 stats: Arc::new(SessionStats::new()),
                 concurrent_initialize_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                    opts.concurrent_init_limit.unwrap_or(3),
+                    opts.concurrent_init_limit.unwrap_or(1).max(1),
                 )),
                 udp_tracker_client,
                 connection_slots: Arc::new(ConnectionSlots::new(
