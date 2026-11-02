@@ -9,9 +9,11 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func advancedTestPhase(t *testing.T, spec weaverReleaseFlowSpec, egress ...string) *weaverReleasePhase {
@@ -409,12 +411,11 @@ func TestFetchableNetworkCandidatesAreOutsideTheBlockedRanges(t *testing.T) {
 
 func TestAdvancedNetworkingTimeScaleReachesOnlyItsFlows(t *testing.T) {
 	scaled := map[string]bool{
-		"advanced-networking-egress":           true,
-		"advanced-networking-routes":           true,
-		"advanced-networking-pools":            true,
-		"advanced-networking-pool-reselection": true,
-		"advanced-networking-no-net-raw":       true,
-		"speed-test":                           true,
+		"advanced-networking-no-net-raw": true,
+		"speed-test":                     true,
+	}
+	for _, name := range advancedNetworkingPartitionNames {
+		scaled["advanced-networking-"+name] = true
 	}
 	t.Setenv("E2E_WEAVER_NETWORK_TIME_SCALE", "99")
 	for _, spec := range weaverReleaseFlowSpecs {
@@ -430,16 +431,93 @@ func TestAdvancedNetworkingTimeScaleReachesOnlyItsFlows(t *testing.T) {
 	}
 }
 
+// playwrightSelection is the spec files and test-title filters one npm
+// script hands Playwright.
+type playwrightSelection struct {
+	files       []string
+	grep        *regexp.Regexp
+	grepInverts []*regexp.Regexp
+}
+
+var (
+	selectionFile   = regexp.MustCompile(`tests/([\w.-]+\.spec\.ts)`)
+	selectionFilter = regexp.MustCompile(`--grep(-invert)? (?:"([^"]*)"|(\S+))`)
+	specTestTitle   = regexp.MustCompile(`(?m)^\s*test(?:\.skip|\.fixme)?\("([^"]+)"`)
+)
+
+func parsePlaywrightSelection(t *testing.T, script string) playwrightSelection {
+	t.Helper()
+	var selection playwrightSelection
+	for _, match := range selectionFile.FindAllStringSubmatch(script, -1) {
+		selection.files = append(selection.files, match[1])
+	}
+	for _, match := range selectionFilter.FindAllStringSubmatch(script, -1) {
+		pattern := regexp.MustCompile(match[2] + match[3])
+		if match[1] == "" {
+			selection.grep = pattern
+		} else {
+			selection.grepInverts = append(selection.grepInverts, pattern)
+		}
+	}
+	return selection
+}
+
+func (selection playwrightSelection) runs(file, title string) bool {
+	if !slices.Contains(selection.files, file) {
+		return false
+	}
+	if selection.grep != nil && !selection.grep.MatchString(title) {
+		return false
+	}
+	for _, invert := range selection.grepInverts {
+		if invert.MatchString(title) {
+			return false
+		}
+	}
+	return true
+}
+
+func playwrightScripts(t *testing.T) map[string]string {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join(weaverE2ETestRoot(t), "playwright-weaver", "package.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest struct {
+		Scripts map[string]string `json:"scripts"`
+	}
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	return manifest.Scripts
+}
+
+// Every networking test outside @extended and @no-net-raw runs in exactly one
+// partition, and the restart stage runs only tests its own partition ran.
 func TestAdvancedNetworkingPartitionsPreserveCoverageAndRestart(t *testing.T) {
 	parts, err := resolveWeaverReleaseGateSpecs("advanced-networking")
-	if err != nil || len(parts) != 4 {
+	if err != nil || len(parts) != len(advancedNetworkingPartitionNames) {
 		t.Fatalf("networking group = %#v, %v", parts, err)
 	}
 	all, err := resolveWeaverReleaseGateSpecs("all")
 	if err != nil {
 		t.Fatal(err)
 	}
-	seen := map[string]int{}
+	scripts := playwrightScripts(t)
+	titles := map[string][]string{}
+	for _, file := range advancedNetworkingSpecFiles {
+		body, err := os.ReadFile(filepath.Join(weaverE2ETestRoot(t), "playwright-weaver", "tests", file))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, match := range specTestTitle.FindAllStringSubmatch(string(body), -1) {
+			titles[file] = append(titles[file], match[1])
+		}
+		if len(titles[file]) == 0 {
+			t.Fatalf("no tests found in %s", file)
+		}
+	}
+	owners := map[string][]string{}
 	for _, part := range parts {
 		if !slices.ContainsFunc(all, func(spec weaverReleaseFlowSpec) bool { return spec.Name == part.Name }) {
 			t.Fatalf("%s missing from default gate", part.Name)
@@ -447,24 +525,56 @@ func TestAdvancedNetworkingPartitionsPreserveCoverageAndRestart(t *testing.T) {
 		if !slices.Equal(part.Datastores, releaseDatastoreMatrix()) {
 			t.Fatalf("%s lost datastore coverage", part.Name)
 		}
+		if part.Timeout <= 0 || part.Timeout > 25*time.Minute {
+			t.Fatalf("%s timeout %v is outside a partition's size", part.Name, part.Timeout)
+		}
+		selection := parsePlaywrightSelection(t, scripts["test:"+part.PlaywrightScript])
+		if !slices.Equal(selection.files, part.SpecFiles) {
+			t.Fatalf("%s runs %v, its spec files are %v", part.Name, selection.files, part.SpecFiles)
+		}
 		for _, file := range part.SpecFiles {
-			seen[file]++
+			for _, title := range titles[file] {
+				if selection.runs(file, title) {
+					owners[file+" › "+title] = append(owners[file+" › "+title], part.Name)
+				}
+			}
 		}
 		if part.Name == "advanced-networking-egress" {
 			if !slices.Equal(part.Stages, []string{"initial", "restarted"}) || part.StageScripts["restarted"] != "advanced-networking-egress-restarted" {
 				t.Fatal("egress/reload partition lost restart coverage")
+			}
+			restarted := parsePlaywrightSelection(t, scripts["test:"+part.StageScripts["restarted"]])
+			ran := 0
+			for _, file := range restarted.files {
+				for _, title := range titles[file] {
+					if !restarted.runs(file, title) {
+						continue
+					}
+					ran++
+					if !strings.Contains(title, "@restart") || !selection.runs(file, title) {
+						t.Errorf("the restarted stage runs %s › %s, which its initial stage does not set up", file, title)
+					}
+				}
+			}
+			if ran == 0 {
+				t.Fatal("the restarted stage runs no test")
 			}
 		} else if !slices.Equal(part.Stages, []string{"initial"}) {
 			t.Fatalf("%s has an unnecessary restart stage", part.Name)
 		}
 	}
 	for _, file := range advancedNetworkingSpecFiles {
-		want := 1
-		if file == "network-pools.spec.ts" {
-			want = 2 // complementary P02 and non-P02 selectors
-		}
-		if seen[file] != want {
-			t.Errorf("%s appears in %d partitions, want %d", file, seen[file], want)
+		for _, title := range titles[file] {
+			key := file + " › " + title
+			if strings.Contains(title, "@extended") || strings.Contains(title, "@no-net-raw") {
+				if len(owners[key]) != 0 {
+					t.Errorf("%s runs in %v", key, owners[key])
+				}
+				continue
+			}
+			if len(owners[key]) != 1 {
+				t.Errorf("%s runs in %v, want exactly one partition", key, owners[key])
+			}
 		}
 	}
 }

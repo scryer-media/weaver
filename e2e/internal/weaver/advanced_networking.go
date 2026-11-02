@@ -92,6 +92,12 @@ var advancedNetworkingSpecFiles = []string{
 	"network-rss.spec.ts",
 }
 
+// The partitions the "advanced-networking" gate mode runs, by name after the
+// "advanced-networking-" prefix.
+var advancedNetworkingPartitionNames = []string{
+	"pool-reselection", "routes", "egress-link", "pools", "legs", "sessions", "egress", "routes-hops", "pool-members",
+}
+
 func advancedNetworkingArtifacts() []string {
 	return append(defaultWeaverReleaseArtifacts(), "captures", "network-evidence.json")
 }
@@ -119,12 +125,17 @@ func advancedNetworkingReleaseFlow() weaverReleaseFlowSpec {
 	}
 }
 
-// Each partition owns a fresh stack. Pool reselection is separated because
-// it spends several minutes collecting delivery evidence before changing pins.
-func advancedNetworkingPartition(name string, files []string, restart bool) weaverReleaseFlowSpec {
+// Each partition owns a fresh stack, so the gate runs them side by side. A
+// partition is a spec file or a group of its tests, chosen so none runs much
+// past ten minutes; its npm script carries the test selector. Pool
+// reselection is separated because it spends several minutes collecting
+// delivery evidence before changing pins, and E07 because its paced BODY
+// must outlast five minutes.
+func advancedNetworkingPartition(name string, files []string, restart bool, timeout time.Duration) weaverReleaseFlowSpec {
 	spec := advancedNetworkingReleaseFlow()
 	spec.Name = "advanced-networking-" + name
 	spec.PlaywrightScript = spec.Name
+	spec.Timeout = timeout
 	spec.SpecFiles = files
 	spec.Stages = []string{"initial"}
 	spec.StageScripts = nil
@@ -138,10 +149,12 @@ func advancedNetworkingPartition(name string, files []string, restart bool) weav
 // The speed test runs on the networking stack, a fresh one of its own: it
 // tests a laddered route against the proxy fixture and pauses the queue.
 func speedTestReleaseFlow() weaverReleaseFlowSpec {
-	spec := advancedNetworkingPartition("speed-test", []string{"speed-test.spec.ts"}, false)
+	// The whole spec passes in under two minutes. Its waits have no bound of
+	// their own, so the flow's deadline is what ends a run that stops
+	// progressing, and it is kept near the spec's size.
+	spec := advancedNetworkingPartition("speed-test", []string{"speed-test.spec.ts"}, false, 10*time.Minute)
 	spec.Name = "speed-test"
 	spec.PlaywrightScript = "speed-test"
-	spec.Timeout = 30 * time.Minute
 	// The reference posting a Usenet run is pointed at.
 	spec.SeedFixtures = []string{"speed-test-100mb"}
 	// The public endpoint a bandwidth run is pointed at.

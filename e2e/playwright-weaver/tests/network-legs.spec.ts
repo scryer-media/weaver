@@ -200,7 +200,7 @@ test("L07 a changed SSH host key blocks the leg until the key is reset", async (
     .not.toBeNull();
   await controlTunnel(request, { endpoint: "ssh-switch", hostKey: "other" });
   const switched = await flowMark(request);
-  const download = await world.pacedDownload("l07-mismatch", { parts: 64, slowMs: 500 });
+  const download = await world.pacedDownload("l07-mismatch", { parts: 256, partBytes: 16 * 1024, slowMs: 500 });
   const blocked = await flowAfter(request, switched, sample => legOn(sample, serverKey(server), b.id)?.state === "BLOCKED", "leg B Blocked on the changed key");
   expect(legOn(blocked, serverKey(server), b.id)?.reason).toContain("host key changed");
   expect(await download.release()).toBe("COMPLETED");
