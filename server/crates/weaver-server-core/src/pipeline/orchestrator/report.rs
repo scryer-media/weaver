@@ -32,11 +32,11 @@ impl Pipeline {
                 row.report.job = job;
                 row.report.moving = moving;
                 row.report.nzb_admitted = self.nzb_admitted.contains(&job_id);
-                if self.waits_for_nzb_slot(row) {
-                    row.report.job.download_wait_reason =
-                        Some(crate::pipeline::nzb_admission::NZB_SLOT_WAIT_REASON.into());
+                let reason = self.stored_wait_reason(row);
+                if reason == Some(crate::pipeline::nzb_admission::NZB_SLOT_WAIT_REASON) {
                     row.report.job.download_state = crate::DownloadState::Queued;
                 }
+                row.report.job.download_wait_reason = reason.map(str::to_owned);
                 row.report.download_active = download_active;
                 row.report.download_work_pending = download_work_pending;
                 row.report.observed_byte_at_ms = row
@@ -180,10 +180,7 @@ impl Pipeline {
             } else {
                 None
             },
-            download_wait_reason: download_wait
-                .map(|wait| wait.reason)
-                .or_else(|| self.job_dispatch_hold_reason(state.job_id))
-                .map(str::to_owned),
+            download_wait_reason: self.dispatch_wait_reason(state.job_id).map(str::to_owned),
             download_retry_at_epoch_ms: download_wait.and_then(|wait| wait.retry_at_epoch_ms),
             status,
             download_state,

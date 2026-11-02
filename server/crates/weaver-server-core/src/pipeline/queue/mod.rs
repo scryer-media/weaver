@@ -81,6 +81,20 @@ pub struct QueueInner {
     pub(crate) diagnostics_requested: u64,
     pub(crate) diagnostics: Option<(u64, crate::pipeline::diagnostics::PipelineDiagnostics)>,
     pub(crate) metrics: Option<crate::operations::metrics::MetricsSnapshot>,
+    // Bumped by every intent write, so the actor can tell a turn with no new
+    // intent from one that needs a walk over the rows.
+    intent_epoch: u64,
+}
+
+// Counts the actor's walks over every queue row, so a test can pin how many
+// a pass makes.
+#[cfg(test)]
+pub(crate) static ROW_WALKS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn count_walk() {
+    #[cfg(test)]
+    ROW_WALKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[derive(Clone, Default)]
@@ -292,6 +306,10 @@ impl QueueInner {
         self.jobs.iter().map(|row| row.info(&self.globals))
     }
 
+    pub(crate) fn intent_epoch(&self) -> u64 {
+        self.intent_epoch
+    }
+
     // The row for `id`, found through the position index.
     pub(crate) fn job(&self, id: JobId) -> Option<&JobRow> {
         self.jobs.get(self.job_position(id)?)
@@ -419,7 +437,10 @@ impl Queue {
     }
 
     pub fn write_intent<T>(&self, write: impl FnOnce(&mut QueueInner) -> Change<T>) -> T {
-        let result = self.write(write);
+        let result = self.write(|inner| {
+            inner.intent_epoch = inner.intent_epoch.wrapping_add(1);
+            write(inner)
+        });
         self.intent_wake.notify_one();
         result
     }

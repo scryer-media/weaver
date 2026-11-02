@@ -8,7 +8,27 @@ impl Pipeline {
     pub(crate) async fn apply_queue_intents(&mut self) {
         self.answer_diagnostics_request();
         self.apply_queue_globals().await;
-        self.reconcile_nzb_admission().await;
+        // The walks below visit every row. They run when an intent was
+        // written, a row came or went, a global gate moved, a propagation
+        // hold ran out, or the last walk left something to look at again;
+        // otherwise nothing they would find has changed.
+        let mark = self
+            .shared_state
+            .queue
+            .read(crate::pipeline::nzb_admission::QueueWalkMark::of);
+        let now = Instant::now();
+        let walk = std::mem::take(&mut self.queue_walk_due)
+            || self.queue_walk_mark != Some(mark)
+            || self
+                .propagation_ready_at
+                .values()
+                .any(|(ready_at, _)| *ready_at <= now);
+        self.queue_walk_mark = Some(mark);
+        if !self.reconcile_nzb_admission(walk).await {
+            self.settle_reprocess_pending().await;
+            return;
+        }
+        crate::pipeline::queue::count_walk();
         // Installing a job is its add, whether it comes from intake or from a
         // restart, under any pause and with every slot taken; only a shutdown
         // installs nothing. Admission decides only whether its articles go
@@ -42,6 +62,8 @@ impl Pipeline {
             if let Err(error) = self.install_restored_job(request).await {
                 error!(job_id = id.0, %error, "failed to install restore ticket");
             }
+            // An installed job is a new candidate for a slot.
+            self.queue_walk_due = true;
             self.report_job(id);
             self.shared_state.queue.write(|inner| {
                 if let Some(row) = inner.job_mut(id) {
@@ -50,6 +72,7 @@ impl Pipeline {
                 Change::changed(())
             });
         }
+        let mut deferred = false;
         let admissions = self.shared_state.queue.write(|inner| {
             if inner.globals.shutting_down {
                 return Change::unchanged(Vec::new());
@@ -61,12 +84,16 @@ impl Pipeline {
                     .filter(|row| {
                         // A history retry can reuse the ID while the previous
                         // graph run is still draining its terminal workers.
-                        !self.awaits_job_articles(row.id)
+                        // The next turn looks again.
+                        let waits = row.admission.is_some() && self.awaits_job_articles(row.id);
+                        deferred |= waits;
+                        !waits
                     })
                     .filter_map(|row| row.admission.take().map(|job| (row.id, job)))
                     .collect::<Vec<_>>(),
             )
         });
+        self.queue_walk_due |= deferred || !admissions.is_empty();
         for (id, job) in admissions {
             let reprocess = job
                 .restart
@@ -156,8 +183,9 @@ impl Pipeline {
             // intent the pipeline did not act on.
             let mut refused = false;
             if let Some(paused) = intents.paused.filter(|_| apply_pause) {
+                // A resume waits for its slot; the admission pass states the
+                // wait, and the walk after the slot is taken applies it.
                 if !paused && !self.nzb_admitted.contains(&job_id) {
-                    self.report_job(job_id);
                     continue;
                 }
                 if paused
@@ -166,6 +194,7 @@ impl Pipeline {
                         .await
                 {
                     error!(job_id = job_id.0, %error, "failed to persist NZB pause release");
+                    self.queue_walk_due = true;
                     continue;
                 }
                 let result = if paused {
@@ -228,6 +257,7 @@ impl Pipeline {
                                 .await
                             {
                                 error!(job_id = job_id.0, %error, "failed to persist refused NZB resume");
+                                self.queue_walk_due = true;
                                 continue;
                             }
                             self.nzb_pause_releases.insert(job_id);
@@ -262,23 +292,7 @@ impl Pipeline {
             });
             self.report_job(job_id);
         }
-        let reprocess: Vec<_> = self
-            .nzb_reprocess_pending
-            .iter()
-            .copied()
-            .filter(|id| {
-                self.nzb_admitted.contains(id)
-                    && self.jobs.get(id).is_some_and(|state| {
-                        state.run_state == crate::jobs::model::RunState::Active
-                    })
-            })
-            .collect();
-        for id in reprocess {
-            self.nzb_reprocess_pending.remove(&id);
-            self.check_job_completion(id).await;
-        }
-        self.nzb_reprocess_pending
-            .retain(|id| self.jobs.contains_key(id));
+        self.settle_reprocess_pending().await;
         let renames = self.shared_state.queue.read(|inner| {
             inner
                 .jobs
@@ -298,8 +312,32 @@ impl Pipeline {
                     Change::changed(())
                 });
                 self.report_job(id);
+            } else {
+                // Renamed once the job is quiet; the next turn looks again.
+                self.queue_walk_due = true;
             }
         }
+    }
+
+    // A reprocessed job is judged once it holds a slot and runs.
+    async fn settle_reprocess_pending(&mut self) {
+        let reprocess: Vec<_> = self
+            .nzb_reprocess_pending
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.nzb_admitted.contains(id)
+                    && self.jobs.get(id).is_some_and(|state| {
+                        state.run_state == crate::jobs::model::RunState::Active
+                    })
+            })
+            .collect();
+        for id in reprocess {
+            self.nzb_reprocess_pending.remove(&id);
+            self.check_job_completion(id).await;
+        }
+        self.nzb_reprocess_pending
+            .retain(|id| self.jobs.contains_key(id));
     }
 
     pub(crate) fn apply_pending_job_update(&mut self, job_id: JobId) {

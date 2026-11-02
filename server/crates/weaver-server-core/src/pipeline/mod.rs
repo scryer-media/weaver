@@ -1295,6 +1295,12 @@ pub struct Pipeline {
     pub(crate) nzb_seen: HashSet<JobId>,
     pub(crate) nzb_pause_releases: HashSet<JobId>,
     pub(crate) nzb_reprocess_pending: HashSet<JobId>,
+    // What the last walk over every queue row saw, and whether it left
+    // anything for the next turn to look at again.
+    pub(crate) queue_walk_mark: Option<nzb_admission::QueueWalkMark>,
+    pub(crate) queue_walk_due: bool,
+    // The jobs the last dispatch pass checked for a changed hold, sorted.
+    pub(crate) dispatch_hold_watch: Vec<JobId>,
     // Typed terminal provenance retained until the ordered history archive has
     // durably updated duplicate-promotion eligibility.
     pub(super) semantic_terminal_causes: HashMap<JobId, crate::jobs::SemanticTerminalCause>,
