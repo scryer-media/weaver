@@ -143,6 +143,11 @@ impl<K: std::hash::Hash + Eq + Copy> KeyedLogThrottle<K> {
         }
     }
 
+    // Keeps only the windows whose key `keep` accepts.
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&K) -> bool) {
+        self.windows.retain(|key, _| keep(key));
+    }
+
     #[cfg(test)]
     pub(crate) fn last_emitted_at(&self, job_id: K) -> Option<Instant> {
         self.windows.get(&job_id).map(|window| window.emitted_at)
@@ -763,11 +768,20 @@ impl Pipeline {
         // A probe batch still waiting for a seat is retried the same way.
         self.download_dispatch_retry = !eligible.is_empty() || !self.post_probes.waiting.is_empty();
         if eligible.is_empty() && self.active_downloads == 0 {
-            // Collected rather than logged in place: the warning is throttled
-            // per job, and the throttle needs `&mut self` while this walk
-            // borrows `job_order`.
+            // Only a job holding a slot can download, so only those are
+            // looked at one by one; the jobs waiting for a slot are one
+            // condition, reported once a window below. Collected rather than
+            // logged in place: the warning is throttled per job, and the
+            // throttle needs `&mut self` while this walk borrows the jobs.
+            let mut slot_holders: Vec<(usize, JobId)> = self.shared_state.queue.read(|inner| {
+                self.nzb_admitted
+                    .iter()
+                    .map(|id| (inner.job_position(*id).unwrap_or(usize::MAX), *id))
+                    .collect()
+            });
+            slot_holders.sort_unstable();
             let mut ineligible_jobs = Vec::new();
-            for (i, jid) in self.job_order.iter().enumerate() {
+            for (i, jid) in slot_holders.iter().map(|(i, jid)| (*i, jid)) {
                 if let Some(s) = self.jobs.get(jid) {
                     let status_allows_dispatch = Self::status_allows_download_dispatch(&s.status);
                     let download_pipeline_draining = !s.articles.has_queued_download_work()
@@ -862,6 +876,25 @@ impl Pipeline {
                     "dispatch stall: job not eligible"
                 );
                 self.dump_job_debug_ring(job_id, "dispatch stall: job not eligible");
+            }
+            // A window kept for a job that has left the pipeline is dropped,
+            // so the map holds only jobs that can still stall.
+            self.dispatch_ineligible_log_throttle
+                .retain(|job_id| self.jobs.contains_key(job_id));
+            let waiting = self.jobs.len().saturating_sub(self.nzb_admitted.len());
+            if waiting > 0
+                && let Some(suppressed_since_last) = self.dispatch_slot_wait_log_throttle.admit_at(
+                    (),
+                    DISPATCH_INELIGIBLE_LOG_INTERVAL,
+                    now,
+                )
+            {
+                warn!(
+                    waiting,
+                    slots_held = self.nzb_admitted.len(),
+                    suppressed_since_last,
+                    "dispatch stall: jobs wait for a slot while no job holding one downloads"
+                );
             }
         }
 

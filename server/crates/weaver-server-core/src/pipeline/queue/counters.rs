@@ -36,6 +36,7 @@ impl Queue {
                     first: None,
                     rate: RateSeries::new(),
                 });
+                inner.phased_jobs.insert(id);
                 return Change::changed(());
             }
             Change::unchanged(())
@@ -51,6 +52,12 @@ impl Queue {
                     .job
                     .phase_progress
                     .retain(|sample| sample.phase != phase);
+                if row.phases.is_empty() {
+                    // A row out of every phase is no longer sampled; a later
+                    // phase starts its download series afresh from the gauge.
+                    row.download_rate = None;
+                    inner.phased_jobs.remove(&id);
+                }
                 return Change::changed(());
             }
             Change::unchanged(())
@@ -107,11 +114,17 @@ impl Queue {
             });
             inner.metrics = Some(snapshot);
             let epoch = crate::jobs::epoch_ms_now();
-            for row in &mut inner.jobs {
-                // Every row's download series advances on every tick, whatever
-                // its phase, and starts from the gauge's own sample instants:
-                // the gauge integrates the transfer total each row's counter is
-                // credited beside, so the rows' rates sum to the gauge.
+            let phased: Vec<JobId> = inner.phased_jobs().collect();
+            for id in phased {
+                let Some(row) = inner.job_mut(id) else {
+                    continue;
+                };
+                // A row's download series advances on every tick while the
+                // row is in a phase, and starts from the gauge's own sample
+                // instants: the gauge integrates the transfer total each
+                // row's counter is credited beside, so the rows' rates sum
+                // to the gauge. A row in no phase moves no bytes and shows
+                // no rate, so the tick leaves it alone.
                 let downloaded = row.counters.downloaded.load(Ordering::Relaxed);
                 let download_rate = row
                     .download_rate

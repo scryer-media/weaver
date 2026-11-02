@@ -379,6 +379,7 @@ impl Pipeline {
             download_retry_storm_window: None,
             owned_lane_acquire_failure_log_throttle: Default::default(),
             dispatch_ineligible_log_throttle: Default::default(),
+            dispatch_slot_wait_log_throttle: Default::default(),
             last_owned_lane_acquire_failure_at: None,
             download_lanes_under_cap_since: None,
             last_download_lanes_under_cap_log_at: None,
@@ -872,11 +873,22 @@ impl Pipeline {
                 self.apply_queue_intents().await;
                 // A recorded cancel is settled before exit: its archive decides
                 // the job, and that answer returns on the done channel.
-                while queue.read(|inner| {
+                // No cancel is taken once shutdown starts, so the ones to wait
+                // for are found once and then looked up.
+                let settling: Vec<JobId> = queue.read(|inner| {
                     inner
                         .jobs
                         .iter()
-                        .any(|row| row.intents.cancelled.is_some() && row.report.retiring)
+                        .filter(|row| row.intents.cancelled.is_some() && row.report.retiring)
+                        .map(|row| row.id)
+                        .collect()
+                });
+                while queue.read(|inner| {
+                    settling.iter().any(|id| {
+                        inner.job(*id).is_some_and(|row| {
+                            row.intents.cancelled.is_some() && row.report.retiring
+                        })
+                    })
                 }) {
                     tokio::select! {
                         Some(event) = self.terminal_post_processing_done_rx.recv() => {

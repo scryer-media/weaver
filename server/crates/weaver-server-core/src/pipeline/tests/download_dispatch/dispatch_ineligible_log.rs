@@ -19,9 +19,14 @@ async fn an_ineligible_job_reports_at_most_once_a_window() {
     )
     .await;
 
-    // Articles queued, a status that dispatches, and still nothing handed out:
-    // this is the shape the stall reports. Here the job holds no admission.
-    pipeline.nzb_admitted.remove(&job_id);
+    // Articles queued, a status that dispatches, a slot held, and still
+    // nothing handed out: this is the shape the stall reports. Here the
+    // job's row carries a pause the pipeline has not applied yet.
+    pipeline.nzb_admitted.insert(job_id);
+    pipeline.shared_state.queue.write(|inner| {
+        inner.job_mut(job_id).unwrap().intents.paused = Some(true);
+        crate::pipeline::queue::Change::changed(())
+    });
     assert!(
         !pipeline.jobs[&job_id]
             .articles
@@ -64,6 +69,52 @@ async fn an_ineligible_job_reports_at_most_once_a_window() {
             .last_emitted_at(job_id),
         Some(now + window),
         "the first pass of the next window reports it again"
+    );
+}
+
+// Jobs waiting for a slot while no job holding one downloads are one
+// condition: one line a window for all of them, and no window of their own.
+// A line a job, at ten thousand queued jobs, was ten thousand warnings and
+// debug dumps a minute.
+#[tokio::test]
+async fn jobs_waiting_for_a_slot_report_once_a_window_together() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let waiting: Vec<JobId> = (0..300).map(|offset| JobId(41700 + offset)).collect();
+    for job_id in &waiting {
+        insert_active_job(
+            &mut pipeline,
+            *job_id,
+            standalone_job_spec("Waiting Job", &many_standalone_files("waiting", 1)),
+        )
+        .await;
+        pipeline.nzb_admitted.remove(job_id);
+    }
+
+    let now = std::time::Instant::now();
+    pipeline.dispatch_downloads_at(now);
+    assert_eq!(
+        pipeline.dispatch_slot_wait_log_throttle.last_emitted_at(()),
+        Some(now)
+    );
+    for job_id in &waiting {
+        assert_eq!(
+            pipeline
+                .dispatch_ineligible_log_throttle
+                .last_emitted_at(*job_id),
+            None
+        );
+    }
+    let window = crate::pipeline::download::DISPATCH_INELIGIBLE_LOG_INTERVAL;
+    pipeline.dispatch_downloads_at(now + window - std::time::Duration::from_millis(1));
+    assert_eq!(
+        pipeline.dispatch_slot_wait_log_throttle.last_emitted_at(()),
+        Some(now)
+    );
+    pipeline.dispatch_downloads_at(now + window);
+    assert_eq!(
+        pipeline.dispatch_slot_wait_log_throttle.last_emitted_at(()),
+        Some(now + window)
     );
 }
 

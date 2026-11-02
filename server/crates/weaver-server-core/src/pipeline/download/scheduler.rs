@@ -259,31 +259,42 @@ impl Pipeline {
 
     // Every job that could be downloaded from, in the order the hot job and
     // then each spill candidate are drawn from: dispatch priority first,
-    // submission order within a priority.
+    // queue order within a priority. Only a job holding a slot can download,
+    // so the walk is over the slots, each found in the queue by its index.
     pub(in crate::pipeline) fn download_scheduler_eligible_jobs(&self) -> Vec<JobId> {
-        let held = self.shared_state.queue.read(|inner| {
-            inner
-                .jobs
+        let candidates: Vec<(JobId, usize)> = self.shared_state.queue.read(|inner| {
+            self.nzb_admitted
                 .iter()
-                .filter(|row| row.intents.cancelled.is_some() || row.intents.paused == Some(true))
-                .map(|row| row.id)
-                .collect::<HashSet<_>>()
+                .filter_map(|job_id| {
+                    let position = match inner.job_position(*job_id) {
+                        Some(position) => {
+                            let row = &inner.jobs[position];
+                            if row.intents.cancelled.is_some() || row.intents.paused == Some(true) {
+                                return None;
+                            }
+                            position
+                        }
+                        // A job installed without a queue row ranks after
+                        // every row, in install order.
+                        None => {
+                            inner.jobs.len() + self.job_order.iter().position(|id| id == job_id)?
+                        }
+                    };
+                    Some((*job_id, position))
+                })
+                .collect()
         });
-        let mut eligible = self
-            .job_order
-            .iter()
-            .enumerate()
-            .filter_map(|(index, job_id)| {
-                let state = self.jobs.get(job_id)?;
-                if !self.nzb_admitted.contains(job_id)
-                    || held.contains(job_id)
-                    || !state.articles.has_queued_download_work()
+        let mut eligible = candidates
+            .into_iter()
+            .filter_map(|(job_id, position)| {
+                let state = self.jobs.get(&job_id)?;
+                if !state.articles.has_queued_download_work()
                     || !Self::status_allows_download_dispatch(&state.status)
-                    || self.held_for_added_scripts(*job_id)
+                    || self.held_for_added_scripts(job_id)
                 {
                     return None;
                 }
-                Some((Self::job_dispatch_priority(state), index, *job_id))
+                Some((Self::job_dispatch_priority(state), position, job_id))
             })
             .collect::<Vec<_>>();
         eligible.sort_unstable();

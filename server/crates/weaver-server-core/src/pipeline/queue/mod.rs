@@ -71,6 +71,8 @@ pub struct QueueInner {
     pub jobs: Vec<JobRow>,
     // Each row's position in `jobs`, so a lookup by id is one probe.
     job_positions: HashMap<JobId, usize>,
+    // The rows in a phase, the only ones the metrics tick samples.
+    phased_jobs: std::collections::HashSet<JobId>,
     pub history_summary: crate::operations::metrics_store::JobStatusCounts,
     pub(crate) admissions: std::collections::HashSet<JobId>,
     pub(crate) history_operations: std::collections::HashSet<JobId>,
@@ -333,7 +335,15 @@ impl QueueInner {
         (row.id == id).then_some(position)
     }
 
+    // The rows in a phase.
+    pub(crate) fn phased_jobs(&self) -> impl Iterator<Item = JobId> + '_ {
+        self.phased_jobs.iter().copied()
+    }
+
     pub(crate) fn push_job(&mut self, row: JobRow) {
+        if !row.phases.is_empty() {
+            self.phased_jobs.insert(row.id);
+        }
         self.job_positions.insert(row.id, self.jobs.len());
         self.jobs.push(row);
     }
@@ -342,6 +352,7 @@ impl QueueInner {
     pub(crate) fn remove_job(&mut self, id: JobId) -> Option<JobRow> {
         let position = self.job_position(id)?;
         self.job_positions.remove(&id);
+        self.phased_jobs.remove(&id);
         let row = self.jobs.remove(position);
         for (offset, later) in self.jobs[position..].iter().enumerate() {
             self.job_positions.insert(later.id, position + offset);
@@ -361,6 +372,12 @@ impl QueueInner {
             .iter()
             .enumerate()
             .map(|(position, row)| (row.id, position))
+            .collect();
+        self.phased_jobs = self
+            .jobs
+            .iter()
+            .filter(|row| !row.phases.is_empty())
+            .map(|row| row.id)
             .collect();
     }
 }
