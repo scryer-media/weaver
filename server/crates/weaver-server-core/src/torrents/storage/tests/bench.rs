@@ -721,3 +721,127 @@ async fn leech(
     }
 }
 
+// Idle torrents at scale: one session seeds WEAVER_BENCH_TORRENTS small
+// torrents (counts separated by commas, default "1000,2000,4000"), with no
+// peer, tracker or DHT, and at each count reports the process's resident
+// memory, the runtime's live tasks and open descriptors, and what the idle
+// session costs over WEAVER_BENCH_IDLE_SECS (default 5): CPU, system calls
+// and context switches. The slope between counts is the per-torrent cost.
+//
+//   cargo nextest run --locked --cargo-profile matrix -p weaver-server-core \
+//     --run-ignored only --no-capture -E 'test(=torrents::storage::tests::bench::torrent_idle_scale)'
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "a scale bench: run on request, optimised"]
+async fn torrent_idle_scale() {
+    let counts: Vec<usize> = std::env::var("WEAVER_BENCH_TORRENTS")
+        .unwrap_or_else(|_| "1000,2000,4000".into())
+        .split(',')
+        .map(|count| count.trim().parse().unwrap())
+        .collect();
+    let idle = std::time::Duration::from_secs(env_u64("WEAVER_BENCH_IDLE_SECS", 5));
+    let dir = match std::env::var_os("WEAVER_BENCH_DIR") {
+        Some(base) => tempfile::tempdir_in(base).unwrap(),
+        None => tempfile::tempdir().unwrap(),
+    };
+    let spawner = BlockingSpawner::new(4);
+    let session = bench_session(&dir.path().join("session")).await;
+    let runtime = tokio::runtime::Handle::current().metrics();
+    let mut previous: Option<(usize, u64, usize)> = None;
+    let mut added = 0;
+    let mut handles = Vec::new();
+    for count in counts {
+        let adding = Instant::now();
+        while added < count {
+            let set = dir.path().join(format!("set-{added}"));
+            std::fs::create_dir(&set).unwrap();
+            let mut bytes = vec![0u8; 2 * BLOCK as usize];
+            fill(splitmix(SEED ^ added as u64), &mut bytes);
+            std::fs::write(set.join(format!("{added}.bin")), &bytes).unwrap();
+            let created = create_torrent(
+                &set,
+                CreateTorrentOptions {
+                    name: None,
+                    trackers: Vec::new(),
+                    piece_length: Some(BLOCK),
+                    ssl_cert: None,
+                },
+                &spawner,
+            )
+            .await
+            .unwrap();
+            let handle = session
+                .add_torrent(
+                    AddTorrent::from_bytes(created.as_bytes().unwrap()),
+                    Some(AddTorrentOptions {
+                        output_folder: Some(set.to_string_lossy().into_owned()),
+                        overwrite: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap()
+                .into_handle()
+                .unwrap();
+            handle.wait_until_completed().await.unwrap();
+            handles.push(handle);
+            added += 1;
+        }
+        let added_in = adding.elapsed();
+        let resident = resident_bytes().unwrap_or(0);
+        let tasks = runtime.num_alive_tasks();
+        let fds = std::fs::read_dir("/dev/fd").map_or(0, |dir| dir.count());
+        let from = usage();
+        tokio::time::sleep(idle).await;
+        let to = usage();
+        let secs = to.at.duration_since(from.at).as_secs_f64();
+        let per_sec = |a: u64, b: u64| (b - a) as f64 / secs;
+        let slope = previous.map_or(String::new(), |(n, rss, t)| {
+            let more = (count - n) as f64;
+            format!(
+                "; per added torrent {:.1} KiB, {:.2} tasks",
+                (resident as f64 - rss as f64) / more / 1024.0,
+                (tasks as f64 - t as f64) / more
+            )
+        });
+        println!(
+            "BENCH idle {count} torrents: added in {:.1} s; resident {} MiB; tasks {tasks}; fds {fds}; \
+             idle cpu {:.1} ms/s, syscalls {}/s, csw vol {:.0}/s invol {:.0}/s{slope}",
+            added_in.as_secs_f64(),
+            resident >> 20,
+            (per_sec(from.user_us, to.user_us) + per_sec(from.system_us, to.system_us)) / 1000.0,
+            from.syscalls
+                .zip(to.syscalls)
+                .map_or("?".into(), |(a, b)| format!("{:.0}", per_sec(a, b))),
+            per_sec(from.voluntary_switches, to.voluntary_switches),
+            per_sec(from.involuntary_switches, to.involuntary_switches),
+        );
+        previous = Some((count, resident, tasks));
+    }
+    drop(handles);
+    session.stop().await;
+}
+
+// This process's resident memory, from the task's own counters.
+#[cfg(target_os = "macos")]
+fn resident_bytes() -> Option<u64> {
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // SAFETY: `info` is a valid, writable proc_taskinfo of `size` bytes.
+    let got = unsafe {
+        libc::proc_pidinfo(
+            std::process::id() as libc::c_int,
+            libc::PROC_PIDTASKINFO,
+            0,
+            (&mut info as *mut libc::proc_taskinfo).cast(),
+            size,
+        )
+    };
+    (got == size).then_some(info.pti_resident_size)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn resident_bytes() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(pages * 4096)
+}
