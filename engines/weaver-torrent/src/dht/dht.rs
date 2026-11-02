@@ -490,8 +490,8 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
     }
 
     // One search at a time, from the table (see `start`): the
-    // first as soon as the torrent asks for peers, that is when the stream
-    // starts, then one at the torrent's own point in the interval (see
+    // first as soon as the torrent asks for peers and one of the DHT's
+    // WALKS_AT_ONCE turns is free, that is when the stream starts, then one at the torrent's own point in the interval (see
     // `announce_slot`) and one every DHT_ANNOUNCE_INTERVAL after. Each announces us when it
     // ends (libtorrent `torrent::start_announcing` asks
     // `session_impl::prioritize_dht` for a search at once, and
@@ -509,12 +509,20 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
                 loop {
                     let mut next_entered = std::pin::pin!(entered.notified());
                     next_entered.as_mut().enable();
+                    let turn = self
+                        .dht
+                        .walks
+                        .acquire()
+                        .await
+                        .expect("the DHT's walk turns are never closed");
                     let candidates = self.start(is_v4, std::iter::empty());
                     if candidates.list.is_empty() {
+                        drop(turn);
                         next_entered.await;
                         continue;
                     }
                     let outcome = self.walk(candidates).await?;
+                    drop(turn);
                     trace!(?outcome, "search finished");
                     tokio::time::sleep(wait).await;
                     wait = DHT_ANNOUNCE_INTERVAL;
@@ -707,7 +715,18 @@ pub struct DhtState {
 
     // BEP 5 "v": sent with every outgoing message when set.
     client_version: Option<ByteBufOwned>,
+
+    // The torrents' peer searches walking at once; the rest wait their
+    // turn, so a session that starts ten thousand torrents does not walk
+    // for all of them in its first seconds.
+    walks: tokio::sync::Semaphore,
 }
+
+// libtorrent queues the torrents that want a DHT announce now
+// (`session_impl::prioritize_dht`) and starts one per `on_dht_announce`;
+// this keeps a few walking at once instead, so a lone torrent added to an
+// idle session starts at once.
+const WALKS_AT_ONCE: usize = 16;
 
 impl DhtState {
     fn new_internal(
@@ -735,6 +754,7 @@ impl DhtState {
             query_limiter: parking_lot::Mutex::new(QueryLimiter::new()),
             cancellation_token,
             client_version,
+            walks: tokio::sync::Semaphore::new(WALKS_AT_ONCE),
         }
     }
 
