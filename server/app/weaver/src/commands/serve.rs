@@ -180,6 +180,7 @@ pub(crate) async fn run(
     // SharedPipelineState starts empty; initial_history is published below after recovery.
     let shared_state = weaver_server_core::SharedPipelineState::new(metrics, vec![]);
     let handle = SchedulerHandle::new(event_tx.clone(), shared_state.clone());
+    let pipeline_state = shared_state.clone();
     handle.set_server_transfer_policy(Arc::clone(&server_transfer_policy));
     handle.set_proxy_runtime(proxies.clone());
     handle.set_nntp_pool(Arc::clone(nntp.pool()));
@@ -414,6 +415,7 @@ pub(crate) async fn run(
     let schema = weaver_server_api::context::build_schema_with_backup(
         weaver_server_api::SchemaContext {
             handle: handle.clone(),
+            pipeline_state: pipeline_state.clone(),
             scheduled_resume: scheduled_resume.clone(),
             config: shared_config.clone(),
             db: db.clone(),
@@ -486,6 +488,7 @@ pub(crate) async fn run(
     let server_runtime = http::ServerRuntime {
         schema,
         handle: handle.clone(),
+        pipeline_state,
         scheduled_resume,
         db: db.clone(),
         auth_cache: login_auth_cache,

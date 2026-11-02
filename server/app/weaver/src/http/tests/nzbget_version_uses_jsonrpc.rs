@@ -1208,7 +1208,7 @@ async fn nzbget_status_and_listgroups_support_sonarr_progress_queries() {
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
     shared_state.record_wire_bytes(1_048_576);
     shared_state.refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
-    let handle = SchedulerHandle::new(event_tx, shared_state);
+    let handle = TestQueue::new(event_tx, shared_state);
     let config = test_config();
     config
         .write()
@@ -1355,7 +1355,7 @@ async fn nzbget_status_clamps_download_rate_to_arr_int() {
     shared_state.record_wire_bytes(1 << 60);
     shared_state.refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
     assert!(shared_state.metrics_snapshot().current_download_speed > i32::MAX as u64);
-    let handle = SchedulerHandle::new(event_tx, shared_state);
+    let handle = TestQueue::new(event_tx, shared_state);
     let config = test_config();
     {
         let mut config_write = config.write().await;
@@ -4205,7 +4205,7 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
         },
     )
     .unwrap();
-    let app = job_nzb_test_router(db, handle);
+    let app = job_nzb_test_router(db, handle.handle.clone());
 
     let response = app
         .oneshot(
@@ -4278,7 +4278,7 @@ async fn job_output_file_download_handler_streams_history_file() {
         server_attribution: None,
     })
     .unwrap();
-    let app = job_nzb_test_router(db, handle);
+    let app = job_nzb_test_router(db, handle.handle.clone());
 
     let response = app
         .oneshot(

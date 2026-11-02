@@ -173,10 +173,38 @@ fn nzbget_history_row(
     }
 }
 
-fn test_scheduler_handle() -> SchedulerHandle {
+// A scheduler handle with the queue it drives, which the facades read in
+// place.
+#[derive(Clone)]
+struct TestQueue {
+    handle: SchedulerHandle,
+    state: SharedPipelineState,
+}
+
+impl TestQueue {
+    fn new(
+        event_tx: broadcast::Sender<weaver_server_core::events::model::PipelineEvent>,
+        state: SharedPipelineState,
+    ) -> Self {
+        Self {
+            handle: SchedulerHandle::new(event_tx, state.clone()),
+            state,
+        }
+    }
+}
+
+impl std::ops::Deref for TestQueue {
+    type Target = SchedulerHandle;
+
+    fn deref(&self) -> &SchedulerHandle {
+        &self.handle
+    }
+}
+
+fn test_scheduler_handle() -> TestQueue {
     let (event_tx, _) = broadcast::channel(1);
     let shared_state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
-    SchedulerHandle::new(event_tx, shared_state)
+    TestQueue::new(event_tx, shared_state)
 }
 
 fn test_config() -> SharedConfig {
@@ -204,16 +232,16 @@ fn test_config() -> SharedConfig {
 
 fn nzbget_test_router(
     db: Database,
-    handle: SchedulerHandle,
+    queue: TestQueue,
     config: SharedConfig,
     api_key_cache: ApiKeyCache,
 ) -> Router {
-    nzbget_test_router_with_base_url(db, handle, config, api_key_cache, "")
+    nzbget_test_router_with_base_url(db, queue, config, api_key_cache, "")
 }
 
 fn nzbget_test_router_with_base_url(
     db: Database,
-    handle: SchedulerHandle,
+    queue: TestQueue,
     config: SharedConfig,
     api_key_cache: ApiKeyCache,
     base_url: &str,
@@ -223,6 +251,10 @@ fn nzbget_test_router_with_base_url(
     let data_dir = std::env::temp_dir().join("weaver-nzbget-http-tests");
     db.initialize_post_processing_script_directory(&data_dir, None)
         .unwrap();
+    let TestQueue {
+        handle,
+        state: queue_state,
+    } = queue;
     let auth_cache = LoginAuthCache::default();
     let session_token = SessionToken(Arc::new("browser-session-token".to_string()));
     // Historical facade fixtures used the process token as a stand-in. Keep
@@ -247,6 +279,7 @@ fn nzbget_test_router_with_base_url(
     let context = nzbget::NzbgetFacadeContext::new(
         db,
         handle,
+        queue_state,
         config,
         auth_cache,
         api_key_cache,
@@ -295,19 +328,16 @@ fn api_key_cache(raw_key: &str, scope: &str) -> ApiKeyCache {
     cache
 }
 
-async fn scheduler_handle_with_jobs(jobs: Vec<JobInfo>) -> SchedulerHandle {
+async fn scheduler_handle_with_jobs(jobs: Vec<JobInfo>) -> TestQueue {
     scheduler_handle_with_jobs_and_db(jobs, Database::open_in_memory().unwrap()).await
 }
 
-async fn scheduler_handle_with_jobs_and_db(
-    jobs: Vec<JobInfo>,
-    mut db: Database,
-) -> SchedulerHandle {
+async fn scheduler_handle_with_jobs_and_db(jobs: Vec<JobInfo>, mut db: Database) -> TestQueue {
     let root = tempfile::tempdir().unwrap();
     db.set_encryption_key(weaver_server_core::persistence::encryption::EncryptionKey::generate());
     let config = test_config();
     config.write().await.data_dir = root.path().to_string_lossy().into_owned();
-    let (mut pipeline, handle, _) =
+    let (mut pipeline, handle, state) =
         weaver_server_core::pipeline::test_support::idle_pipeline(db, config).await;
     for job in jobs {
         weaver_server_core::pipeline::test_support::seed_job(&mut pipeline, job).await;
@@ -316,7 +346,7 @@ async fn scheduler_handle_with_jobs_and_db(
         let _root = root;
         pipeline.run().await;
     });
-    handle
+    TestQueue { handle, state }
 }
 
 async fn wait_for_job_status(handle: &SchedulerHandle, id: JobId, status: JobStatus) {
@@ -1516,7 +1546,7 @@ mod setup_handler_tests;
 async fn stored_backup_create_challenges_only_expired_administrators() {
     let db = Database::open_in_memory().unwrap();
     let config = test_config();
-    let handle = test_scheduler_handle();
+    let handle = test_scheduler_handle().handle;
     let rss = weaver_server_api::RssService::new(handle.clone(), config.clone(), db.clone());
     let service = weaver_server_api::BackupService::new(
         handle,

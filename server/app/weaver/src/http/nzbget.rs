@@ -34,6 +34,9 @@ use weaver_server_core::{
 pub(super) struct NzbgetFacadeContext {
     db: Database,
     handle: SchedulerHandle,
+    // The queue the handle drives, read in place so a poll borrows rows
+    // instead of copying the queue.
+    queue: weaver_server_core::SharedPipelineState,
     config: SharedConfig,
     auth_cache: LoginAuthCache,
     api_key_cache: ApiKeyCache,
@@ -65,6 +68,7 @@ impl NzbgetFacadeContext {
     pub(super) fn new(
         db: Database,
         handle: SchedulerHandle,
+        queue: weaver_server_core::SharedPipelineState,
         config: SharedConfig,
         auth_cache: LoginAuthCache,
         api_key_cache: ApiKeyCache,
@@ -78,6 +82,7 @@ impl NzbgetFacadeContext {
         Self {
             db,
             handle,
+            queue,
             config,
             auth_cache,
             api_key_cache,
