@@ -50,6 +50,8 @@ pub(crate) struct Leaf {
     // a fresh one whenever the file may have moved, been replaced or must
     // not be held open, so no handle reads a file the leaf no longer names.
     reader: u64,
+    // The pool that handle is kept in.
+    readers: &'static readers::ReaderPool,
 }
 
 impl Leaf {
@@ -61,7 +63,16 @@ impl Leaf {
             directory: Self::is_directory(output_name),
             file: None,
             reader: readers::key(),
+            readers: &readers::SHARED,
         })
+    }
+
+    // The leaf, its read handle kept in `readers` rather than the shared
+    // pool.
+    #[cfg(test)]
+    pub(crate) fn with_readers(mut self, readers: &'static readers::ReaderPool) -> Self {
+        self.readers = readers;
+        self
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -121,12 +132,25 @@ impl Leaf {
     }
 
     // Fill `out` from `offset`, as `read` does, straight into the caller's
-    // buffer. A file no longer open for writing is read through its shared
-    // read handle, opened at its first read.
+    // buffer. A file no longer open for writing is opened for this read
+    // alone.
     pub(crate) fn read_exact(&self, offset: u64, out: &mut [u8]) -> Result<(), LeafError> {
         match &self.file {
             Some(file) => read_exact_at(file, offset, out),
-            None => readers::open(self.reader, &self.path)
+            None => File::open(&self.path).and_then(|file| read_exact_at(&file, offset, out)),
+        }
+        .map_err(LeafError::io(&self.path))
+    }
+
+    // `read_exact` for a seed's peers, which read the same files again and
+    // again: a file no longer open for writing is read through its shared
+    // read handle, opened at its first read and kept for the next.
+    pub(crate) fn read_shared_exact(&self, offset: u64, out: &mut [u8]) -> Result<(), LeafError> {
+        match &self.file {
+            Some(file) => read_exact_at(file, offset, out),
+            None => self
+                .readers
+                .open(self.reader, &self.path)
                 .and_then(|file| read_exact_at(&file, offset, out)),
         }
         .map_err(LeafError::io(&self.path))
@@ -134,7 +158,7 @@ impl Leaf {
 
     // The shared read handle, if one is open, is let go of.
     fn forget_reader(&mut self) {
-        readers::forget(self.reader);
+        self.readers.forget(self.reader);
         self.reader = readers::key();
     }
 
@@ -163,7 +187,7 @@ impl Leaf {
 
     #[cfg(test)]
     pub(crate) fn reader_is_open(&self) -> bool {
-        readers::is_open(self.reader)
+        self.readers.is_open(self.reader)
     }
 
     // The member was renamed; the file follows it.
@@ -242,14 +266,14 @@ impl Leaf {
 // A leaf gone with its job lets go of its shared read handle.
 impl Drop for Leaf {
     fn drop(&mut self) {
-        readers::forget(self.reader);
+        self.readers.forget(self.reader);
     }
 }
 
 // An output name as a path relative to the directory it is written under,
 // refused when it would leave it. The same validator the extractor uses, so
 // the two never disagree on which names are safe.
-fn relative_path(output_name: &str) -> Result<PathBuf, LeafError> {
+pub(crate) fn relative_path(output_name: &str) -> Result<PathBuf, LeafError> {
     let normalized = output_name.replace('\\', "/");
     crate::pipeline::extraction::validate_relative_output_path(normalized.trim_end_matches('/'))
         .map_err(|_| LeafError::UnsafeName(output_name.to_owned()))

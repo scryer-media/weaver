@@ -213,9 +213,10 @@ impl NamespaceWriter {
     pub(crate) fn kept_path(&self, member: MemberId) -> Option<PathBuf> {
         let name = self.kept(NodeId::ROOT, member)?;
         let dir = self.kept_dir.as_deref().unwrap_or(&self.working_dir);
-        Leaf::at(dir, name)
+        // The leaf's path, without making a leaf: this runs at every read.
+        super::leaf::relative_path(name)
             .ok()
-            .map(|leaf| leaf.path().to_path_buf())
+            .map(|relative| dir.join(relative))
     }
 
     // The bytes of a kept root member's file from `offset`, as the file on
@@ -233,7 +234,7 @@ impl NamespaceWriter {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entry(member)
             .or_insert_with(readers::key);
-        let file = readers::open(key, &path)?;
+        let file = readers::SHARED.open(key, &path)?;
         super::leaf::read_exact_at(&file, offset, out)
     }
 
@@ -244,7 +245,7 @@ impl NamespaceWriter {
             .get_mut()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for (_, key) in readers.drain() {
-            readers::forget(key);
+            readers::SHARED.forget(key);
         }
     }
 
@@ -1851,7 +1852,7 @@ impl Access<'_> {
                 .files
                 .get(&node)
                 .and_then(|files| files.leaves.get(&member))
-                .is_some_and(|leaf| leaf.read_exact(range.start, out).is_ok())
+                .is_some_and(|leaf| leaf.read_shared_exact(range.start, out).is_ok())
     }
 
     // Whether the range of a member no object reads is in its own file,

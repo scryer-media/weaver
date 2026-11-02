@@ -45,11 +45,17 @@ struct Readers {
     sweeping: bool,
 }
 
-static READERS: Mutex<Readers> = Mutex::new(Readers {
-    open: Vec::new(),
-    turns: 0,
-    sweeping: false,
-});
+// A pool of read handles. Every job reads through `SHARED`; a test makes
+// its own, so no other test's reads or clock reach it.
+pub(crate) struct ReaderPool(Mutex<Readers>);
+
+pub(crate) static SHARED: ReaderPool = ReaderPool::new();
+
+impl std::fmt::Debug for ReaderPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReaderPool").finish_non_exhaustive()
+    }
+}
 
 static NEXT_KEY: AtomicU64 = AtomicU64::new(1);
 
@@ -65,78 +71,89 @@ impl Readers {
     }
 }
 
-fn readers() -> std::sync::MutexGuard<'static, Readers> {
-    READERS.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
-// A key no handle is open under.
+// A key no handle is open under, in any pool.
 pub(crate) fn key() -> u64 {
     NEXT_KEY.fetch_add(1, Ordering::Relaxed)
 }
 
-// The handle open under `key`, opened on `path` when none is.
-pub(crate) fn open(key: u64, path: &Path) -> io::Result<Arc<File>> {
-    let now = Instant::now();
-    {
-        let mut readers = readers();
+impl ReaderPool {
+    pub(crate) const fn new() -> Self {
+        Self(Mutex::new(Readers {
+            open: Vec::new(),
+            turns: 0,
+            sweeping: false,
+        }))
+    }
+
+    fn readers(&self) -> std::sync::MutexGuard<'_, Readers> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // The handle open under `key`, opened on `path` when none is.
+    pub(crate) fn open(&'static self, key: u64, path: &Path) -> io::Result<Arc<File>> {
+        let now = Instant::now();
+        {
+            let mut readers = self.readers();
+            if let Some(file) = readers.used(key, now) {
+                return Ok(file);
+            }
+        }
+        // Opened outside the lock: another reader's open never waits on it.
+        let file = Arc::new(File::open(path)?);
+        let mut readers = self.readers();
         if let Some(file) = readers.used(key, now) {
             return Ok(file);
         }
+        if readers.open.len() >= CAPACITY
+            && let Some(oldest) = (0..readers.open.len()).min_by_key(|&at| readers.open[at].turn)
+        {
+            readers.open.swap_remove(oldest);
+        }
+        readers.turns += 1;
+        let turn = readers.turns;
+        readers.open.push(Reader {
+            key,
+            file: Arc::clone(&file),
+            used: now,
+            turn,
+        });
+        if !readers.sweeping
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            readers.sweeping = true;
+            runtime.spawn(self.sweep());
+        }
+        Ok(file)
     }
-    // Opened outside the lock: another reader's open never waits on it.
-    let file = Arc::new(File::open(path)?);
-    let mut readers = readers();
-    if let Some(file) = readers.used(key, now) {
-        return Ok(file);
-    }
-    if readers.open.len() >= CAPACITY
-        && let Some(oldest) = (0..readers.open.len()).min_by_key(|&at| readers.open[at].turn)
-    {
-        readers.open.swap_remove(oldest);
-    }
-    readers.turns += 1;
-    let turn = readers.turns;
-    readers.open.push(Reader {
-        key,
-        file: Arc::clone(&file),
-        used: now,
-        turn,
-    });
-    if !readers.sweeping
-        && let Ok(runtime) = tokio::runtime::Handle::try_current()
-    {
-        readers.sweeping = true;
-        runtime.spawn(sweep());
-    }
-    Ok(file)
-}
 
-// The handle under `key`, if one is open, is closed once its last read ends.
-pub(crate) fn forget(key: u64) {
-    readers().open.retain(|reader| reader.key != key);
-}
+    // The handle under `key`, if one is open, is closed once its last read
+    // ends.
+    pub(crate) fn forget(&self, key: u64) {
+        self.readers().open.retain(|reader| reader.key != key);
+    }
 
-#[cfg(test)]
-pub(crate) fn is_open(key: u64) -> bool {
-    readers().open.iter().any(|reader| reader.key == key)
-}
+    #[cfg(test)]
+    pub(crate) fn is_open(&self, key: u64) -> bool {
+        self.readers().open.iter().any(|reader| reader.key == key)
+    }
 
-// Closes each handle once it has gone `IDLE` unread, sleeping until the
-// first one could, and ends when none is open.
-async fn sweep() {
-    loop {
-        let next = {
-            let mut readers = readers();
-            let now = Instant::now();
-            readers
-                .open
-                .retain(|reader| now.duration_since(reader.used) < IDLE);
-            let Some(oldest) = readers.open.iter().map(|reader| reader.used).min() else {
-                readers.sweeping = false;
-                return;
+    // Closes each handle once it has gone `IDLE` unread, sleeping until the
+    // first one could, and ends when none is open.
+    async fn sweep(&'static self) {
+        loop {
+            let next = {
+                let mut readers = self.readers();
+                let now = Instant::now();
+                readers
+                    .open
+                    .retain(|reader| now.duration_since(reader.used) < IDLE);
+                let Some(oldest) = readers.open.iter().map(|reader| reader.used).min() else {
+                    readers.sweeping = false;
+                    return;
+                };
+                oldest + IDLE
             };
-            oldest + IDLE
-        };
-        tokio::time::sleep_until(next).await;
+            tokio::time::sleep_until(next).await;
+        }
     }
 }
