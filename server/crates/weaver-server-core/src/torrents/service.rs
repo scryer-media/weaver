@@ -4955,12 +4955,18 @@ impl TorrentService {
         let mut reattach = Vec::new();
         let mut down = BTreeMap::new();
         let mut unresolved = Vec::new();
+        // One plan per scope a pass: the torrents of a scope share it, and a
+        // plan reads the scope's routing policy from the database.
+        let mut plans: HashMap<TorrentScope, Result<RoutePlan, String>> = HashMap::new();
         {
             let mut live = self.inner.live.lock().await;
             for torrent in live.values_mut() {
                 let rule = torrent.rule(&rules);
                 let scope = settings.scope(torrent.record.category_id, rule);
-                let plan = self.inner.sessions.routes().plan(scope);
+                let plan = plans
+                    .entry(scope)
+                    .or_insert_with(|| self.inner.sessions.routes().plan(scope))
+                    .clone();
                 if torrent.layout.is_none() {
                     let moved = matches!(torrent.resolving, Some(Resolving::Fetching(_)))
                         && plan.as_ref().ok().is_none_or(|plan| {
