@@ -80,8 +80,9 @@ pub(crate) const MAX_ALLOWED_IN_REQUEST_QUEUE: u32 = 2000;
 // `send_buffer_watermark` and `send_buffer_watermark_factor`: a peer's writer
 // is handed blocks until what it holds unsent reaches the payload it took over
 // the last second times the factor, within these bounds
-// (`peer_connection::fill_send_buffer`). The values are qBittorrent 5's
-// defaults; libtorrent's own are 10 KiB, 500 KiB and 50.
+// (`peer_connection::fill_send_buffer`). The values are qBittorrent's
+// defaults after 5.1, on its master branch; 5.0 and 5.1 keep libtorrent's
+// own, 10 KiB, 500 KiB and 50.
 pub(crate) const SEND_BUFFER_LOW_WATERMARK: u64 = 128 * 1024;
 const SEND_BUFFER_WATERMARK: u64 = 4 * 1024 * 1024;
 const SEND_BUFFER_WATERMARK_FACTOR: u64 = 100;
@@ -1572,11 +1573,15 @@ impl LivePeerState {
     /// The peer asked us for `chunk`, a block of a piece of `chunks_per_piece`
     /// blocks (libtorrent `peer_connection::incoming_request`). A block
     /// queued already stays queued once. Past [`MAX_ALLOWED_IN_REQUEST_QUEUE`]
-    /// blocks queued and not yet handed to the writer, any other is refused. While we choke the peer only a
-    /// block of a piece it may fetch is queued, until it has asked for three
-    /// times the piece's blocks; any other is refused. A refused block gets a
-    /// Reject on a fast connection. True when the block makes the peer
-    /// to be given a turn with the upload scheduler ([`Self::wants_turn`]).
+    /// blocks queued and not yet handed to the writer, any other is refused;
+    /// the blocks handed and not yet sent are not counted, so a peer may
+    /// have that many more asked and unsent, at most a send watermark's
+    /// worth (libtorrent likewise counts only `m_requests`). While we choke
+    /// the peer only a block of a piece it may fetch is queued, until it has
+    /// asked for three times the piece's blocks; any other is refused. A
+    /// refused block gets a Reject on a fast connection. True when the block
+    /// makes the peer to be given a turn with the upload scheduler
+    /// ([`Self::wants_turn`]).
     pub fn queue_upload(
         &mut self,
         chunk: ChunkInfo,
