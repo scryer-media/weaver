@@ -66,6 +66,9 @@ pub struct CandidateSnapshot<C> {
 #[derive(Clone, Debug)]
 pub struct PlanSnapshot<C> {
     pub pinned: Option<C>,
+    // The order the plan dials its candidates in: the pin first, then the
+    // rest as `dial_order` ranks them.
+    pub dial_order: Vec<C>,
     pub candidates: Vec<CandidateSnapshot<C>>,
     pub races_won: u64,
     pub races_failed: u64,
@@ -784,6 +787,7 @@ impl<C: Candidate> CandidatePlan<C> {
     pub fn snapshot(&self) -> PlanSnapshot<C> {
         PlanSnapshot {
             pinned: self.pinned,
+            dial_order: self.dial_order(),
             races_won: self.races_won,
             races_failed: self.races_failed,
             candidates: self

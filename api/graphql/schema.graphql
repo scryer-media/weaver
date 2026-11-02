@@ -2110,6 +2110,7 @@ type NetworkPoolMemberFlow {
 	blocked: String
 	handshakeMs: Float
 	connectMs: Float
+	rank: Int
 	bytesPerSecond: Float
 	samples: Int!
 	failures: Int!
