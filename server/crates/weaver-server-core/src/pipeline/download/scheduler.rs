@@ -513,7 +513,7 @@ impl Pipeline {
             return Handout::Idle;
         };
         let counters = self.shared_state.queue.read(|inner| {
-            inner.jobs.iter().find(|row| row.id == job_id).map(|row| {
+            inner.job(job_id).map(|row| {
                 row.counters
                     .totals
                     .get_or_init(|| self.shared_state.queue.counters.clone());

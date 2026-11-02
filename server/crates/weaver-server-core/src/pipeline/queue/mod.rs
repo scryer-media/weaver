@@ -294,14 +294,41 @@ impl QueueInner {
 
     // The row for `id`, found through the position index.
     pub(crate) fn job(&self, id: JobId) -> Option<&JobRow> {
-        let row = self.jobs.get(*self.job_positions.get(&id)?)?;
+        self.jobs.get(self.job_position(id)?)
+    }
+
+    // The row for `id` to change, found through the position index.
+    pub(crate) fn job_mut(&mut self, id: JobId) -> Option<&mut JobRow> {
+        let position = self.job_position(id)?;
+        self.jobs.get_mut(position)
+    }
+
+    pub(crate) fn contains_job(&self, id: JobId) -> bool {
+        self.job_position(id).is_some()
+    }
+
+    // Where `id` stands in `jobs`, found through the position index.
+    pub(crate) fn job_position(&self, id: JobId) -> Option<usize> {
+        let position = *self.job_positions.get(&id)?;
+        let row = self.jobs.get(position)?;
         debug_assert_eq!(row.id, id, "the queue's position index is out of step");
-        (row.id == id).then_some(row)
+        (row.id == id).then_some(position)
     }
 
     pub(crate) fn push_job(&mut self, row: JobRow) {
         self.job_positions.insert(row.id, self.jobs.len());
         self.jobs.push(row);
+    }
+
+    // Removes one row, moving up only the rows after it in the index.
+    pub(crate) fn remove_job(&mut self, id: JobId) -> Option<JobRow> {
+        let position = self.job_position(id)?;
+        self.job_positions.remove(&id);
+        let row = self.jobs.remove(position);
+        for (offset, later) in self.jobs[position..].iter().enumerate() {
+            self.job_positions.insert(later.id, position + offset);
+        }
+        Some(row)
     }
 
     pub(crate) fn retain_jobs(&mut self, keep: impl FnMut(&JobRow) -> bool) {
@@ -351,13 +378,7 @@ impl Queue {
     }
 
     pub(crate) fn job_counters(&self, id: JobId) -> Option<Arc<JobCounters>> {
-        self.read(|inner| {
-            inner
-                .jobs
-                .iter()
-                .find(|row| row.id == id)
-                .map(|row| row.counters.clone())
-        })
+        self.read(|inner| inner.job(id).map(|row| row.counters.clone()))
     }
 
     // Called while changing queue membership, so retirement, summary and

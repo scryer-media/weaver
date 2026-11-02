@@ -106,7 +106,7 @@ impl Pipeline {
         }
         // Some crash fixtures reuse the stopped runtime's shared queue.
         self.shared_state.queue.write(|inner| {
-            inner.retain_jobs(|row| row.id != id);
+            inner.remove_job(id);
             crate::pipeline::queue::Change::changed(())
         });
         self.shared_state.queue.restore(request)?;

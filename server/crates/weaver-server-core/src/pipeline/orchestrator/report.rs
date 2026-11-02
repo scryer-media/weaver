@@ -26,13 +26,10 @@ impl Pipeline {
                 .has_cancellable_job(job_id.0);
         self.shared_state.queue.write(|inner| {
             if let Some(job) = report {
-                let row = if let Some(index) = inner.jobs.iter().position(|row| row.id == job_id) {
-                    let row = &mut inner.jobs[index];
-                    row.report.job = job;
-                    row
-                } else {
+                let Some(row) = inner.job_mut(job_id) else {
                     return Change::unchanged(());
                 };
+                row.report.job = job;
                 row.report.moving = moving;
                 row.report.nzb_admitted = self.nzb_admitted.contains(&job_id);
                 if self.waits_for_nzb_slot(row) {

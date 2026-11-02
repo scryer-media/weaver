@@ -59,7 +59,7 @@ impl Pipeline {
         // A row already retiring is a cancel whose archive is in flight; its
         // done event decides the job.
         let cancelled = self.shared_state.queue.write(|inner| {
-            let Some(row) = inner.jobs.iter_mut().find(|row| row.id == job_id) else {
+            let Some(row) = inner.job_mut(job_id) else {
                 return crate::pipeline::queue::Change::unchanged(None);
             };
             if row.report.retiring {
@@ -249,7 +249,7 @@ impl Pipeline {
             Err(e) => {
                 tracing::error!(job_id = job_id.0, error = %e, "failed to queue job history archival");
                 self.shared_state.queue.write(|inner| {
-                    if let Some(row) = inner.jobs.iter_mut().find(|row| row.id == job_id) {
+                    if let Some(row) = inner.job_mut(job_id) {
                         row.report.retiring = false;
                     }
                     crate::pipeline::queue::Change::changed(())
@@ -266,7 +266,7 @@ impl Pipeline {
         // snapshot must already list the job as finished when a subscriber
         // reacts, or the history facade rejects the lookup as a still-live job.
         self.shared_state.queue.write(|inner| {
-            let row = if let Some(index) = inner.jobs.iter().position(|row| row.id == job_id) {
+            let row = if let Some(index) = inner.job_position(job_id) {
                 &mut inner.jobs[index]
             } else {
                 inner.push_job(crate::pipeline::queue::JobRow::new(finished.clone()));
@@ -298,7 +298,7 @@ impl Pipeline {
                 return;
             }
             queue.write(|inner| {
-                inner.retain_jobs(|row| row.id != job_id);
+                inner.remove_job(job_id);
                 if let Some(job) = finished {
                     let mut history: Vec<_> = queue
                         .history()

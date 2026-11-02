@@ -225,9 +225,7 @@ impl SharedPipelineState {
     pub fn get_job(&self, job_id: JobId) -> Option<JobInfo> {
         self.queue.read(|inner| {
             inner
-                .jobs
-                .iter()
-                .find(|row| row.id == job_id)
+                .job(job_id)
                 .map(|row| row.info(&inner.globals))
                 .or_else(|| {
                     self.queue
@@ -1010,6 +1008,25 @@ impl SchedulerHandle {
     // Resume a paused job.
     pub async fn resume_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
         self.state.queue.set_job_paused(job_id, false)
+    }
+
+    // Pause or resume every job named as one queue change: one revision for
+    // the batch, each job answered on its own.
+    pub async fn set_jobs_paused(
+        &self,
+        job_ids: impl IntoIterator<Item = JobId>,
+        paused: bool,
+    ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
+        self.state.queue.set_jobs_paused(job_ids, paused)
+    }
+
+    // Apply every job update named as one queue change: one revision for the
+    // batch, each job answered on its own.
+    pub async fn update_jobs(
+        &self,
+        updates: impl IntoIterator<Item = (JobId, JobUpdate)>,
+    ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
+        self.state.queue.update_jobs(updates)
     }
 
     // Cancel a job.

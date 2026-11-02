@@ -60,7 +60,7 @@ impl Pipeline {
             .and_then(|state| Self::job_posted_at_epoch(&state.spec))
             .or_else(|| {
                 self.shared_state.queue.read(|inner| {
-                    let row = inner.jobs.iter().find(|row| row.id == job_id)?;
+                    let row = inner.job(job_id)?;
                     row.admission
                         .as_ref()
                         .map(|job| &job.spec)

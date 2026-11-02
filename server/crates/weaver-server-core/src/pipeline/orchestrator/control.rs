@@ -44,7 +44,7 @@ impl Pipeline {
             }
             self.report_job(id);
             self.shared_state.queue.write(|inner| {
-                if let Some(row) = inner.jobs.iter_mut().find(|row| row.id == id) {
+                if let Some(row) = inner.job_mut(id) {
                     row.report.restoring = false;
                 }
                 Change::changed(())
@@ -248,7 +248,7 @@ impl Pipeline {
             }
             self.apply_pending_job_update(job_id);
             self.shared_state.queue.write(|inner| {
-                if let Some(row) = inner.jobs.iter_mut().find(|row| row.id == job_id) {
+                if let Some(row) = inner.job_mut(job_id) {
                     row.report.seen_intent_seq = intents.seq;
                     if refused && row.intents.pause_seq == intents.pause_seq {
                         row.intents.paused = None;
@@ -290,7 +290,7 @@ impl Pipeline {
         for (id, name) in renames {
             if self.rename_working_dir_when_quiet(id, &name).await {
                 self.shared_state.queue.write(|inner| {
-                    if let Some(row) = inner.jobs.iter_mut().find(|row| row.id == id)
+                    if let Some(row) = inner.job_mut(id)
                         && row.intents.rename_to.as_ref() == Some(&name)
                     {
                         row.intents.rename_to = None;
@@ -307,7 +307,7 @@ impl Pipeline {
             return;
         };
         let update = self.shared_state.queue.write(|inner| {
-            let Some(row) = inner.jobs.iter_mut().find(|row| row.id == job_id) else {
+            let Some(row) = inner.job_mut(job_id) else {
                 return Change::unchanged(None);
             };
             let Some(update) = row.intents.update.take() else {
@@ -467,9 +467,8 @@ impl Pipeline {
         let jobs: Vec<_> = self.graph_jobs.keys().copied().collect();
         for job_id in jobs {
             if self.shared_state.queue.read(|inner| {
-                inner.jobs.iter().any(|row| {
-                    row.id == job_id
-                        && (row.intents.paused == Some(true) || row.intents.cancelled.is_some())
+                inner.job(job_id).is_some_and(|row| {
+                    row.intents.paused == Some(true) || row.intents.cancelled.is_some()
                 })
             }) {
                 continue;

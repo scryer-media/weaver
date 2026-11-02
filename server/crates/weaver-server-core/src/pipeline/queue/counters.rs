@@ -27,7 +27,7 @@ impl Queue {
         started: f64,
     ) {
         self.write(|inner| {
-            if let Some(row) = inner.jobs.iter_mut().find(|row| row.id == id)
+            if let Some(row) = inner.job_mut(id)
                 && let std::collections::hash_map::Entry::Vacant(entry) = row.phases.entry(phase)
             {
                 entry.insert(PhaseSample {
@@ -44,7 +44,7 @@ impl Queue {
 
     pub(crate) fn end_phase(&self, id: JobId, phase: JobPhase) {
         self.write(|inner| {
-            if let Some(row) = inner.jobs.iter_mut().find(|row| row.id == id) {
+            if let Some(row) = inner.job_mut(id) {
                 row.phases.remove(&phase);
                 row.sampled_phases.retain(|sample| sample.phase != phase);
                 row.report

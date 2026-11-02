@@ -57,7 +57,7 @@ impl Queue {
                 return Change::unchanged(Err(SchedulerError::ChannelClosed));
             }
             let id = request.job_id;
-            if inner.jobs.iter().any(|row| row.id == id) || inner.admissions.contains(&id) {
+            if inner.contains_job(id) || inner.admissions.contains(&id) {
                 return Change::unchanged(Err(SchedulerError::JobExists(id)));
             }
             let mut info = initial_info(
@@ -103,7 +103,7 @@ impl Queue {
                     "a history operation is still running".into(),
                 )));
             }
-            if inner.jobs.iter().any(|row| row.id == id) || !inner.admissions.insert(id) {
+            if inner.contains_job(id) || !inner.admissions.insert(id) {
                 return Change::unchanged(Err(SchedulerError::JobExists(id)));
             }
             Change::unchanged(Ok(()))
