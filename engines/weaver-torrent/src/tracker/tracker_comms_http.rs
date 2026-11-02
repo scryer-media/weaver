@@ -549,15 +549,12 @@ async fn reach(
     if let Some(why) = ssrf_refusal(url, ask, &addrs) {
         anyhow::bail!("SSRF mitigation: {why}");
     }
-    let target = Some(HttpTarget {
+    let target = HttpTarget {
         host: &host,
         port: url.port_or_known_default().unwrap_or(0),
         addrs: &addrs,
-    });
-    let client = match shape {
-        Shape::Weaver => clients.client(target)?,
-        Shape::Libtorrent => clients.title_case_client(target)?,
     };
+    let client = clients.tracker_client(target, shape == Shape::Libtorrent)?;
     Ok((client, addrs))
 }
 

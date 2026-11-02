@@ -364,6 +364,38 @@ impl<'a> FileOps<'a> {
     /// (libtorrent `torrent::on_piece_verified`).
     pub fn check_piece(&self, piece_index: ValidPieceIndex) -> anyhow::Result<Verdict> {
         let mut h = self.digest(piece_index);
+        if !self
+            .files
+            .hash_held_piece(piece_index, &mut |bytes| h.update(bytes))
+        {
+            self.hash_from_files(piece_index, &mut h)?;
+        }
+
+        let (v1, v2) = self.hashes_match(piece_index, h);
+        let verdict = Verdict::of(v1, v2);
+        match verdict {
+            Verdict::Passed => trace!("piece={} hash matches", piece_index),
+            _ => {
+                let piece_length = self.torrent.lengths().piece_length(piece_index);
+                let absolute_offset = self.torrent.lengths().piece_offset(piece_index);
+                warn!(
+                    piece_length,
+                    absolute_offset,
+                    ?verdict,
+                    "the piece={} hash does not match",
+                    piece_index
+                );
+            }
+        }
+        Ok(verdict)
+    }
+
+    // The piece's bytes, read from the storage's files into `h`.
+    fn hash_from_files(
+        &self,
+        piece_index: ValidPieceIndex,
+        h: &mut PieceDigest,
+    ) -> anyhow::Result<()> {
         let piece_length = self.torrent.lengths().piece_length(piece_index);
         let mut absolute_offset = self.torrent.lengths().piece_offset(piece_index);
         let mut buf = vec![0u8; std::cmp::min(65536, piece_length as usize)];
@@ -389,7 +421,7 @@ impl<'a> FileOps<'a> {
                 fi,
                 absolute_offset,
                 self.files,
-                &mut h,
+                h,
                 &mut buf,
                 to_read_in_file,
             )
@@ -408,24 +440,7 @@ impl<'a> FileOps<'a> {
 
             absolute_offset = 0;
         }
-
-        let (v1, v2) = self.hashes_match(piece_index, h);
-        let verdict = Verdict::of(v1, v2);
-        match verdict {
-            Verdict::Passed => trace!("piece={} hash matches", piece_index),
-            _ => {
-                let piece_length = self.torrent.lengths().piece_length(piece_index);
-                let absolute_offset = self.torrent.lengths().piece_offset(piece_index);
-                warn!(
-                    piece_length,
-                    absolute_offset,
-                    ?verdict,
-                    "the piece={} hash does not match",
-                    piece_index
-                );
-            }
-        }
-        Ok(verdict)
+        Ok(())
     }
 
     pub fn read_chunk(

@@ -19,6 +19,8 @@ use crate::torrents::sessions::tests::{
 };
 use crate::torrents::storage::PieceStorage;
 
+mod scale_bench;
+
 const EPOCH_MS: i64 = 1_700_000_000_000;
 
 // A clock the test sets.
@@ -2849,7 +2851,7 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
     rig.service.tick().await;
     clock.0.fetch_add(30_000, Ordering::SeqCst);
     rig.service.tick().await;
-    let kept = rig.db.get_torrent_counters(job_id).unwrap().unwrap();
+    let kept = rig.service.inner.live.lock().await[&job_id].counters;
     assert_eq!(kept.active_duration_s, 30);
     rig.service.stop().await;
     let ledger = rig.db.get_torrent_counters(job_id).unwrap().unwrap();
@@ -2953,7 +2955,15 @@ impl Seeded {
         self.rig.service.torrent(self.job_id).await.unwrap()
     }
 
-    fn kept(&self) -> TorrentCounters {
+    // The ledger as the service keeps it: what the next write of it lands.
+    // Its times alone are written once TIMES_EVERY_MS has passed, or at a
+    // stop, so the database may hold older times between.
+    async fn kept(&self) -> TorrentCounters {
+        self.rig.service.inner.live.lock().await[&self.job_id].counters
+    }
+
+    // The ledger as the database holds it.
+    fn stored(&self) -> TorrentCounters {
         self.rig
             .db
             .get_torrent_counters(self.job_id)
@@ -2999,7 +3009,7 @@ async fn a_torrents_active_time_reads_as_of_now_between_ticks() {
     seeded.advance(1_000);
     seeded.rig.service.tick().await;
     let at_tick = seeded.view().await;
-    let kept = seeded.kept();
+    let kept = seeded.kept().await;
     assert_eq!(at_tick.active_seconds, 1);
     assert_eq!(
         (
@@ -3034,7 +3044,7 @@ async fn a_torrents_active_time_reads_as_of_now_between_ticks() {
         (after.active_seconds, after.download_avg_bps),
         (before.active_seconds, before.download_avg_bps)
     );
-    let kept = seeded.kept();
+    let kept = seeded.kept().await;
     assert_eq!(
         (kept.active_duration_s, kept.finished_duration_s),
         (after.active_seconds, after.active_seconds)
@@ -3056,7 +3066,7 @@ async fn a_pause_credits_the_time_before_it_and_nothing_after() {
     let paused = seeded.view().await;
     assert_eq!(paused.state, TorrentState::Paused);
     assert_eq!(paused.active_seconds, at_tick.active_seconds + 7);
-    let kept = seeded.kept();
+    let kept = seeded.kept().await;
     assert_eq!(
         (kept.active_duration_s, kept.finished_duration_s),
         (paused.active_seconds, paused.active_seconds)
@@ -3066,7 +3076,7 @@ async fn a_pause_credits_the_time_before_it_and_nothing_after() {
     seeded.advance(3_000);
     seeded.rig.service.tick().await;
     assert_eq!(seeded.view().await.active_seconds, paused.active_seconds);
-    let kept = seeded.kept();
+    let kept = seeded.kept().await;
     assert_eq!(
         (kept.active_duration_s, kept.finished_duration_s),
         (paused.active_seconds, paused.active_seconds)
@@ -3082,8 +3092,8 @@ async fn a_pause_ends_the_seeding_run_and_keeps_the_whole() {
     let seeded = seeded().await;
     seeded.advance(10_000);
     seeded.rig.service.tick().await;
-    let whole = seeded.kept().finished_duration_s;
-    assert_eq!(seeded.kept().consecutive_seeding_s, whole);
+    let whole = seeded.kept().await.finished_duration_s;
+    assert_eq!(seeded.kept().await.consecutive_seeding_s, whole);
     let view = seeded.view().await;
     assert_eq!(
         (view.seeding_seconds, view.consecutive_seeding_seconds),
@@ -3093,10 +3103,10 @@ async fn a_pause_ends_the_seeding_run_and_keeps_the_whole() {
     // The pause takes the torrent's reading first, so the run it ends goes
     // to zero at the first reading that finds it paused.
     seeded.rig.service.pause(seeded.job_id).await.unwrap();
-    assert_eq!(seeded.kept().finished_duration_s, whole);
+    assert_eq!(seeded.kept().await.finished_duration_s, whole);
     seeded.advance(6_000);
     seeded.rig.service.tick().await;
-    let kept = seeded.kept();
+    let kept = seeded.kept().await;
     assert_eq!(
         (kept.finished_duration_s, kept.consecutive_seeding_s),
         (whole, 0)
@@ -3111,7 +3121,7 @@ async fn a_pause_ends_the_seeding_run_and_keeps_the_whole() {
     seeded.rig.service.tick().await;
     seeded.advance(4_000);
     seeded.rig.service.tick().await;
-    let kept = seeded.kept();
+    let kept = seeded.kept().await;
     assert_eq!(
         (kept.finished_duration_s, kept.consecutive_seeding_s),
         (whole + 4, 4)
@@ -3126,18 +3136,18 @@ async fn a_route_going_down_ends_the_seeding_run() {
     let seeded = seeded().await;
     seeded.advance(10_000);
     seeded.rig.service.tick().await;
-    let whole = seeded.kept().finished_duration_s;
+    let whole = seeded.kept().await.finished_duration_s;
 
     seeded.rig.routes.set_down(Some("tunnel gone"));
     seeded.rig.service.tick().await;
-    let kept = seeded.kept();
+    let kept = seeded.kept().await;
     assert_eq!(
         (kept.finished_duration_s, kept.consecutive_seeding_s),
         (whole, 0)
     );
     seeded.advance(5_000);
     seeded.rig.service.tick().await;
-    let kept = seeded.kept();
+    let kept = seeded.kept().await;
     assert_eq!(
         (kept.finished_duration_s, kept.consecutive_seeding_s),
         (whole, 0)
@@ -3153,8 +3163,8 @@ async fn a_restart_keeps_the_whole_and_starts_the_seeding_run_again() {
     let seeded = seeded().await;
     seeded.advance(10_000);
     seeded.rig.service.tick().await;
-    let whole = seeded.kept().finished_duration_s;
-    assert_eq!(seeded.kept().consecutive_seeding_s, whole);
+    let whole = seeded.kept().await.finished_duration_s;
+    assert_eq!(seeded.kept().await.consecutive_seeding_s, whole);
     seeded.rig.service.stop().await;
 
     seeded.advance(600_000);
@@ -3173,7 +3183,7 @@ async fn a_restart_keeps_the_whole_and_starts_the_seeding_run_again() {
     );
     seeded.advance(3_000);
     again.tick().await;
-    let kept = seeded.kept();
+    let kept = again.inner.live.lock().await[&seeded.job_id].counters;
     assert_eq!(
         (kept.finished_duration_s, kept.consecutive_seeding_s),
         (whole + 3, 3)
@@ -3226,7 +3236,7 @@ async fn a_torrent_that_wants_nothing_seeds_until_it_wants_a_file() {
     rig.service.tick().await;
     clock.0.fetch_add(5_000, Ordering::SeqCst);
     rig.service.tick().await;
-    let kept = rig.db.get_torrent_counters(job_id).unwrap().unwrap();
+    let kept = rig.service.inner.live.lock().await[&job_id].counters;
     assert_eq!((kept.active_duration_s, kept.finished_duration_s), (5, 5));
 
     rig.service
@@ -3240,7 +3250,7 @@ async fn a_torrent_that_wants_nothing_seeds_until_it_wants_a_file() {
     );
     clock.0.fetch_add(5_000, Ordering::SeqCst);
     rig.service.tick().await;
-    let kept = rig.db.get_torrent_counters(job_id).unwrap().unwrap();
+    let kept = rig.service.inner.live.lock().await[&job_id].counters;
     assert_eq!((kept.active_duration_s, kept.finished_duration_s), (10, 5));
     rig.service.stop().await;
 }
@@ -3257,7 +3267,7 @@ async fn turning_torrents_off_keeps_the_time_they_ran_since_the_tick() {
     let mut settings = seeded.rig.service.settings();
     settings.torrent.enabled = false;
     seeded.rig.service.set_settings(settings).await;
-    let kept = seeded.kept();
+    let kept = seeded.kept().await;
     assert_eq!(
         (
             kept.active_duration_s,
@@ -3287,11 +3297,11 @@ async fn a_clock_stepped_back_credits_nothing_and_counts_on() {
     let at_tick = seeded.view().await.active_seconds;
     seeded.advance(-60_000);
     seeded.rig.service.tick().await;
-    assert_eq!(seeded.kept().active_duration_s, at_tick);
+    assert_eq!(seeded.kept().await.active_duration_s, at_tick);
     seeded.advance(7_000);
     assert_eq!(seeded.view().await.active_seconds, at_tick + 7);
     seeded.rig.service.tick().await;
-    assert_eq!(seeded.kept().active_duration_s, at_tick + 7);
+    assert_eq!(seeded.kept().await.active_duration_s, at_tick + 7);
     seeded.stop().await;
 }
 
@@ -3306,12 +3316,12 @@ async fn ticks_lose_no_part_of_a_second() {
         seeded.advance(ms);
         seeded.rig.service.tick().await;
     }
-    assert_eq!(seeded.kept().active_duration_s, base + 4);
+    assert_eq!(seeded.kept().await.active_duration_s, base + 4);
     for ms in [1_600, 1_600] {
         seeded.advance(ms);
         seeded.rig.service.tick().await;
     }
-    assert_eq!(seeded.kept().active_duration_s, base + 8);
+    assert_eq!(seeded.kept().await.active_duration_s, base + 8);
     assert_eq!(seeded.view().await.active_seconds, base + 8);
     seeded.stop().await;
 }
@@ -6829,10 +6839,40 @@ async fn a_restart_during_a_check_shows_what_its_job_will_hold() {
         )
     );
 
-    again.restore_jobs().await;
+    // The restore alone, before the torrent attaches and its session checks
+    // on.
+    assert!(again.restore_job(job_id).await);
     assert_eq!(written.borrow().checkpoints_read, 1);
     assert!(again.inner.live.lock().await[&job_id].job.is_some());
     assert_eq!(in_hand(&again.torrent(job_id).await.unwrap()), kept);
+    again.stop().await;
+    seeding.stop().await;
+}
+
+// A torrent whose job is restored at start is given its session as soon as
+// that job is back, not at the routes pass of a later tick: the first
+// torrent restored seeds without waiting for the rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restored_torrent_attaches_as_soon_as_its_job_is_back() {
+    let PartlyFetched {
+        rig,
+        job_id,
+        seeding,
+        ..
+    } = partly_fetched().await;
+    rig.service.stop().await;
+    rig.db.prune_orphan_active_state().unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    assert!(again.inner.live.lock().await[&job_id].attached.is_none());
+    again.restore_jobs().await;
+    {
+        let live = again.inner.live.lock().await;
+        assert!(live[&job_id].job.is_some());
+        assert!(live[&job_id].attached.is_some());
+    }
+    assert!(again.inner.restoring.lock().unwrap().is_empty());
     again.stop().await;
     seeding.stop().await;
 }
@@ -6947,11 +6987,23 @@ async fn a_torrent_stopped_part_way_restarts_with_its_ledger() {
 }
 
 // As its pieces do, a torrent's ledger outlives a crash: the restart shows
-// what the last tick knew.
+// the bytes the last tick knew, and the times last written with them, which
+// a tick that moved no byte does not write (TIMES_EVERY_MS).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_torrent_that_crashed_part_way_restarts_with_its_last_ticks_ledger() {
     let fetched = partly_fetched().await;
     let shown = ticked(&fetched).await;
+    let written = fetched
+        .rig
+        .db
+        .get_torrent_counters(fetched.job_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (written.downloaded_bytes, written.uploaded_bytes),
+        (shown.0, shown.1)
+    );
+    let shown = (shown.0, shown.1, written.active_duration_s);
     // The process ends here: its sessions go with it, and nothing else is
     // written.
     fetched.rig.service.inner.sessions.stop_all().await;
@@ -8457,4 +8509,61 @@ async fn a_restored_torrent_retries_its_passwords_from_the_top() {
         [(weaver_graph::NodeId(1), 0), (weaver_graph::NodeId(2), 0)]
     );
     rig.service.stop().await;
+}
+
+// An idle seed's times run on at every tick, but its ledger is not written
+// at every tick for them: they go once TIMES_EVERY_MS has passed since it
+// was last written, and a stop writes them as they stand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_seeds_times_are_written_on_the_long_timer_not_each_tick() {
+    let seeded = seeded().await;
+    seeded.advance(super::TIMES_EVERY_MS);
+    seeded.rig.service.tick().await;
+    let written = seeded.stored();
+    assert_eq!(written, seeded.kept().await);
+    let ticks = TICK.as_millis() as i64;
+    seeded.advance(ticks);
+    seeded.rig.service.tick().await;
+    seeded.advance(ticks);
+    seeded.rig.service.tick().await;
+    assert_eq!(seeded.stored(), written);
+    assert_eq!(
+        seeded.kept().await.active_duration_s,
+        written.active_duration_s + 2 * TICK.as_secs()
+    );
+    seeded.advance(super::TIMES_EVERY_MS);
+    seeded.rig.service.tick().await;
+    assert_eq!(seeded.stored(), seeded.kept().await);
+    seeded.advance(ticks);
+    let at_stop = seeded.view().await.active_seconds;
+    let rig_db = seeded.rig.db.clone();
+    let job_id = seeded.job_id;
+    seeded.stop().await;
+    assert_eq!(
+        rig_db
+            .get_torrent_counters(job_id)
+            .unwrap()
+            .unwrap()
+            .active_duration_s,
+        at_stop
+    );
+}
+
+// Ten thousand torrents added one after another write their times spread
+// over the whole period: no tick takes more than twice its even share.
+#[test]
+fn sequential_jobs_spread_their_times_over_the_whole_period() {
+    let ticks = (TIMES_EVERY_MS / TICK.as_millis() as i64) as usize;
+    let mut per_tick = vec![0usize; ticks];
+    let jobs = 10_000u64;
+    for id in 1..=jobs {
+        let offset = times_offset_ms(JobId(id));
+        assert!((0..TIMES_EVERY_MS).contains(&offset));
+        per_tick[(offset / TICK.as_millis() as i64) as usize] += 1;
+    }
+    let even = jobs as usize / ticks;
+    let most = *per_tick.iter().max().unwrap();
+    let least = *per_tick.iter().min().unwrap();
+    assert!(most <= 2 * even, "{most} in one tick, even share {even}");
+    assert!(least > 0, "a tick took none");
 }

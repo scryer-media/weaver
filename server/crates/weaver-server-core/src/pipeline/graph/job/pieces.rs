@@ -79,36 +79,37 @@ impl GraphJob<PieceRoot> {
     // whole, so one fetched again for a share that did not read back also
     // carries shares already in hand: only the ones still to come go down.
     // A repair a share makes due is lent under `slots`.
+    #[cfg(test)]
     pub(crate) fn verified(
         &mut self,
         shares: Vec<Verified>,
         slots: &mut RepairSlots,
         limit: usize,
     ) -> Result<(), GraphError> {
-        for share in shares {
-            if self.root.waiting(share.volume, share.piece) {
-                self.intake(share, slots, limit)?;
-            }
+        if self.verified_unlent(shares, true, limit)? {
+            self.lend(slots, limit)?;
         }
         Ok(())
     }
 
-    // A piece a check found where the files were placed, as its files'
-    // shares: in hand as a verified piece is, and nothing is written, since
-    // the files hold it already (libtorrent `torrent::on_piece_hashed` has
-    // the piece and writes nothing).
-    pub(crate) fn adopted(
+    // A verified piece's shares taken in, `verified` short of the lend: the
+    // shares are written (`write`) or found where they are, and the runs
+    // stepped, with no repair slot in hand. True when any share was taken,
+    // so a lend is due.
+    pub(crate) fn verified_unlent(
         &mut self,
         shares: Vec<Verified>,
-        slots: &mut RepairSlots,
+        write: bool,
         limit: usize,
-    ) -> Result<(), GraphError> {
+    ) -> Result<bool, GraphError> {
+        let mut taken = false;
         for share in shares {
             if self.root.waiting(share.volume, share.piece) {
-                self.intake_found(share, slots, limit)?;
+                self.take_in_unlent(share, write, limit)?;
+                taken = true;
             }
         }
-        Ok(())
+        Ok(taken)
     }
 
     // A piece that failed its hash, fetched or checked on disk: every
@@ -180,8 +181,19 @@ impl GraphJob<PieceRoot> {
     }
 
     // Where the volume's file is kept, written or not.
+    #[cfg(test)]
     pub(crate) fn kept_path(&self, volume: VolumeIndex) -> Option<std::path::PathBuf> {
         self.writer.kept_path(MemberId(volume.0))
+    }
+
+    // The volume's bytes from `offset` as its kept file on disk holds them.
+    pub(crate) fn read_kept(
+        &self,
+        volume: VolumeIndex,
+        offset: u64,
+        out: &mut [u8],
+    ) -> std::io::Result<()> {
+        self.writer.read_kept(MemberId(volume.0), offset, out)
     }
 
     // Each file's bytes in hand, by torrent index.
@@ -223,5 +235,18 @@ impl GraphJob<PieceRoot> {
             && self
                 .writer
                 .read_in_hand(&self.tree, MemberId(volume.0), range, into)
+    }
+
+    // `posted` straight into `out`, the range's length.
+    pub(crate) fn posted_exact(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        out: &mut [u8],
+    ) -> bool {
+        self.root.holds(volume, range)
+            && self
+                .writer
+                .read_in_hand_exact(&self.tree, MemberId(volume.0), range, out)
     }
 }

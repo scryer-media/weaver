@@ -69,6 +69,8 @@ pub struct QueueInner {
     pub jobs: Vec<JobRow>,
     // The jobs another owner publishes beside the pipeline's, in its order.
     pub torrents: Vec<JobInfo>,
+    // The ids of `torrents`, so asking whose a job is costs no walk of them.
+    pub(crate) torrent_ids: std::collections::HashSet<JobId>,
     pub history_summary: crate::operations::metrics_store::JobStatusCounts,
     pub(crate) admissions: std::collections::HashSet<JobId>,
     pub(crate) history_operations: std::collections::HashSet<JobId>,

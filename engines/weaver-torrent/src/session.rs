@@ -40,6 +40,7 @@ use crate::natpmp::{GatewayRoute, NatPmpMapper};
 use crate::peer_protocol::Handshake;
 use crate::ssl::{SslHttpClients, SslIdentity, SslTorrent};
 use crate::torrent_state::live::{
+    RateTick,
     choker::{Choker, OPTIMISTIC_UNCHOKE_INTERVAL, UNCHOKE_INTERVAL},
     web_seed::WebSeeds,
 };
@@ -127,6 +128,9 @@ const FIRST_PEER_TURNOVER: Duration = Duration::from_secs(90);
 // The share of a connection cap, in percent, at which peers are turned over
 // (libtorrent `peer_turnover_cutoff`).
 const PEER_TURNOVER_CUTOFF: usize = 90;
+
+// How long a listener rests after a failed accept before it accepts again.
+const ACCEPT_BACKOFF: Duration = Duration::from_secs(10);
 
 struct ParsedTorrentFile {
     meta: TorrentMetaV1Owned,
@@ -334,6 +338,8 @@ pub struct Session {
     pub peer_limit: Option<usize>,
     // Hands out the session's upload slots to the peers of every torrent.
     pub(crate) choker: Arc<Choker>,
+    // Samples the rates of the torrents that move bytes.
+    pub(crate) rate_tick: Arc<RateTick>,
     pub(crate) disable_pex: bool,
     // Whether the session listens on uTP, and so connects over it.
     pub(crate) utp: bool,
@@ -852,6 +858,33 @@ pub struct SessionLimits {
     pub connection_speed: NonZeroU32,
 }
 
+/// The limits the sessions of one process share: one connection budget
+/// within the process's open files, and one turn at a time to hash a
+/// torrent's files (libtorrent's `connections_limit`, `connection_speed`
+/// and `active_checking`, which its one session holds for the process).
+/// Setting a sharing session's limits sets them for all.
+#[derive(Clone)]
+pub struct SharedLimits {
+    slots: Arc<ConnectionSlots>,
+    checks: Arc<tokio::sync::Semaphore>,
+}
+
+impl SharedLimits {
+    /// Connections within `limits`, the slack past them as
+    /// [`SessionOptions::connections_slack`], and `concurrent_checks`
+    /// torrents hashing their files at once (at least one).
+    pub fn new(limits: SessionLimits, connections_slack: usize, concurrent_checks: usize) -> Self {
+        Self {
+            slots: Arc::new(ConnectionSlots::new(
+                limits.connections_limit,
+                connections_slack,
+                limits.connection_speed,
+            )),
+            checks: Arc::new(tokio::sync::Semaphore::new(concurrent_checks.max(1))),
+        }
+    }
+}
+
 /// What the session refuses to reach, taken as it changes (libtorrent
 /// `session_impl::set_ip_filter`, with `no_connect_privileged_ports` and
 /// `apply_ip_filter_to_trackers`).
@@ -944,7 +977,10 @@ pub struct SessionOptions {
 
     pub cancellation_token: Option<CancellationToken>,
 
-    /// how many concurrent torrent initializations can happen
+    /// How many torrents hash their files at once (libtorrent
+    /// `settings_pack::active_checking`, qBittorrent
+    /// `MaxActiveCheckingTorrents`); 1 when unset, both their default. A
+    /// torrent its resume data vouches for does not wait for it.
     pub concurrent_init_limit: Option<usize>,
 
     /// How many blocking threads does the tokio runtime have.
@@ -989,6 +1025,14 @@ pub struct SessionOptions {
     /// torrents, handed to the torrents that want peers in turn. Defaults
     /// to 30.
     pub connection_speed: NonZeroU32,
+
+    /// The connection budget and check turns this session shares with the
+    /// other sessions of its process, in place of its own: the process
+    /// has one descriptor limit and one disk, as libtorrent's one session
+    /// does. Its `connections_limit`, `connections_slack`,
+    /// `connection_speed` and `concurrent_init_limit` are then the shared
+    /// ones'.
+    pub shared_limits: Option<SharedLimits>,
 
     /// Disable LSD multicast
     pub disable_local_service_discovery: bool,
@@ -1059,6 +1103,7 @@ impl Default for SessionOptions {
             default_storage_factory: None,
             cancellation_token: None,
             concurrent_init_limit: None,
+            shared_limits: None,
             runtime_worker_threads: None,
             root_span: None,
             ratelimits: LimitsConfig::default(),
@@ -1627,15 +1672,21 @@ impl Session {
                 connector: stream_connector,
                 root_span: opts.root_span,
                 stats: Arc::new(SessionStats::new()),
-                concurrent_initialize_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                    opts.concurrent_init_limit.unwrap_or(3),
-                )),
+                concurrent_initialize_semaphore: match &opts.shared_limits {
+                    Some(shared) => Arc::clone(&shared.checks),
+                    None => Arc::new(tokio::sync::Semaphore::new(
+                        opts.concurrent_init_limit.unwrap_or(1).max(1),
+                    )),
+                },
                 udp_tracker_client,
-                connection_slots: Arc::new(ConnectionSlots::new(
-                    opts.connections_limit,
-                    opts.connections_slack,
-                    opts.connection_speed,
-                )),
+                connection_slots: match &opts.shared_limits {
+                    Some(shared) => Arc::clone(&shared.slots),
+                    None => Arc::new(ConnectionSlots::new(
+                        opts.connections_limit,
+                        opts.connections_slack,
+                        opts.connection_speed,
+                    )),
+                },
                 ratelimits: Limits::new(opts.ratelimits),
                 ipv4_only: opts.ipv4_only,
                 trackers: opts.trackers,
@@ -1647,6 +1698,7 @@ impl Session {
                 ),
                 peer_limit: opts.peer_limit,
                 choker: Arc::new(Choker::new(opts.unchoke_slots_limit)),
+                rate_tick: Arc::new(RateTick::default()),
                 disable_pex: opts.disable_pex,
                 allow_multiple_connections_per_ip: Arc::new(AtomicBool::new(
                     opts.allow_multiple_connections_per_ip,
@@ -1735,6 +1787,17 @@ impl Session {
             session.start_speed_estimator_updater();
             session.start_peer_turnover();
             session.start_choker();
+            session.spawn(
+                debug_span!(parent: session.rs(), "rate_tick"),
+                "rate_tick",
+                {
+                    let tick = session.rate_tick.clone();
+                    async move {
+                        tick.run().await;
+                        Ok(())
+                    }
+                },
+            );
 
             Ok(session)
         }
@@ -1953,10 +2016,16 @@ impl Session {
         let mut futs = FuturesUnordered::new();
         let session = Arc::downgrade(&self);
         drop(self);
+        // After a failed accept (out of descriptors, say) the listener rests
+        // for ACCEPT_BACKOFF while the handshakes in hand go on, so one that
+        // completes frees its descriptor or takes its slot meanwhile.
+        let mut backoff = std::pin::pin!(tokio::time::sleep(Duration::ZERO));
+        let mut resting = false;
 
         loop {
             tokio::select! {
-                r = l.accept(), if futs.len() < max_pending_incoming_handshake_checks => {
+                () = backoff.as_mut(), if resting => resting = false,
+                r = l.accept(), if !resting && futs.len() < max_pending_incoming_handshake_checks => {
                     match r {
                         Ok((addr, (read, write))) => {
                             trace!("accepted connection from {addr}");
@@ -1980,10 +2049,8 @@ impl Session {
                         }
                         Err(e) => {
                             warn!("error accepting: {e:#}");
-                            // Whatever is the reason, ensure we are not stuck trying to
-                            // accept indefinitely.
-                            tokio::time::sleep(Duration::from_secs(10)).await;
-                            continue
+                            backoff.as_mut().reset(tokio::time::Instant::now() + ACCEPT_BACKOFF);
+                            resting = true;
                         }
                     }
                 },
@@ -4833,6 +4900,265 @@ mod tests {
         assert!(is_handshake_for(&answer(&session, &handle).await, &handle));
 
         session.stop().await;
+    }
+
+    // A listener that hands out the connections and errors it is given, in
+    // order, then waits for ever; it counts the accepts asked of it and says
+    // when it has handed out an error.
+    struct Scripted {
+        accepts:
+            std::sync::Mutex<std::collections::VecDeque<std::io::Result<tokio::io::DuplexStream>>>,
+        asked: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        // A scripted failure waits for this before it fails the accept.
+        fail_when: std::sync::Arc<tokio::sync::Notify>,
+        errored: std::sync::Arc<tokio::sync::Notify>,
+        listener: std::sync::Mutex<Option<Box<dyn crate::network::StreamListener>>>,
+    }
+
+    impl crate::network::StreamListener for std::sync::Arc<Scripted> {
+        fn local_addr(&self) -> std::net::SocketAddr {
+            (std::net::Ipv4Addr::LOCALHOST, 6881).into()
+        }
+
+        fn accept<'a>(
+            &'a self,
+        ) -> crate::network::BoxFuture<
+            'a,
+            std::io::Result<(
+                std::net::SocketAddr,
+                crate::network::BoxAsyncReadVectored,
+                crate::network::BoxAsyncWrite,
+            )>,
+        > {
+            Box::pin(async move {
+                self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let next = self.accepts.lock().unwrap().pop_front();
+                if matches!(next, Some(Err(_))) {
+                    self.fail_when.notified().await;
+                }
+                match next {
+                    Some(Ok(stream)) => {
+                        let (reader, writer) = crate::peer_info_reader::tests::halves(stream);
+                        Ok((
+                            (std::net::Ipv4Addr::new(10, 0, 0, 2), 6881).into(),
+                            reader,
+                            writer,
+                        ))
+                    }
+                    Some(Err(e)) => {
+                        self.errored.notify_one();
+                        Err(e)
+                    }
+                    None => std::future::pending().await,
+                }
+            })
+        }
+    }
+
+    impl crate::network::SocketFactory for Scripted {
+        fn connect_tcp<'a>(
+            &'a self,
+            _: std::net::SocketAddr,
+        ) -> crate::network::BoxFuture<
+            'a,
+            std::io::Result<(
+                crate::network::BoxAsyncReadVectored,
+                crate::network::BoxAsyncWrite,
+            )>,
+        > {
+            Box::pin(async { Err(std::io::ErrorKind::Unsupported.into()) })
+        }
+
+        fn listen_tcp<'a>(
+            &'a self,
+            _: std::net::SocketAddr,
+        ) -> crate::network::BoxFuture<'a, std::io::Result<Box<dyn crate::network::StreamListener>>>
+        {
+            Box::pin(async {
+                self.listener
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| std::io::ErrorKind::AddrInUse.into())
+            })
+        }
+
+        fn bind_udp<'a>(
+            &'a self,
+            _: std::net::SocketAddr,
+        ) -> crate::network::BoxFuture<
+            'a,
+            std::io::Result<std::sync::Arc<dyn crate::network::DatagramSocket>>,
+        > {
+            Box::pin(async {
+                let kernel =
+                    crate::network::KernelSockets::new(None).map_err(std::io::Error::other)?;
+                crate::network::SocketFactory::bind_udp(
+                    &kernel,
+                    (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                )
+                .await
+            })
+        }
+    }
+
+    // A failed accept (out of descriptors, say) rests the listener, not the
+    // handshakes it already took: one taken before the failure is answered
+    // while the listener rests, before it is asked to accept again. The
+    // accept fails only once the torrent is complete, and the answer comes
+    // before the clock reaches the end of the rest.
+    // libtorrent `session_impl::on_accept_connection` likewise goes on with
+    // its connections after a failed accept.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_accept_rests_the_listener_but_not_the_handshakes_in_hand() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = crate::tests::test_util::create_default_random_dir_with_torrents(
+            1,
+            16384,
+            Some("failed_accept"),
+        );
+        let torrent = crate::create_torrent(
+            dir.path(),
+            crate::CreateTorrentOptions {
+                piece_length: Some(16384),
+                ..Default::default()
+            },
+            &crate::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap()
+        .as_bytes()
+        .unwrap();
+        let (ours, mut theirs) = tokio::io::duplex(1 << 16);
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let errored = std::sync::Arc::new(tokio::sync::Notify::new());
+        let fail_when = std::sync::Arc::new(tokio::sync::Notify::new());
+        let scripted = std::sync::Arc::new(Scripted {
+            accepts: std::sync::Mutex::new(
+                [Ok(ours), Err(std::io::Error::from_raw_os_error(24))].into(),
+            ),
+            asked: asked.clone(),
+            fail_when: fail_when.clone(),
+            errored: errored.clone(),
+            listener: std::sync::Mutex::new(None),
+        });
+        let factory = std::sync::Arc::new(Scripted {
+            accepts: Default::default(),
+            asked: Default::default(),
+            fail_when: Default::default(),
+            errored: Default::default(),
+            listener: std::sync::Mutex::new(Some(Box::new(scripted))),
+        });
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                listen: Some(crate::ListenerOptions {
+                    mode: crate::ListenerMode::TcpOnly,
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    ..Default::default()
+                }),
+                socket_factory: Some(factory),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let errored_once = errored.notified();
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(torrent),
+                Some(AddTorrentOptions {
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_completed().await.unwrap();
+
+        // The connection was taken, then the next accept failed.
+        fail_when.notify_one();
+        errored_once.await;
+        let rest_ends = tokio::time::Instant::now() + super::ACCEPT_BACKOFF;
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // Its handshake is answered with the listener resting.
+        let mut handshake = [0u8; 68];
+        let len =
+            crate::peer_protocol::Handshake::new(handle.info_hash(), super::Id20::new([7; 20]))
+                .serialize_unchecked_len(&mut handshake);
+        theirs.write_all(&handshake[..len]).await.unwrap();
+        let mut answer = [0u8; 68];
+        theirs.read_exact(&mut answer).await.unwrap();
+        assert!(is_handshake_for(&answer, &handle));
+        assert!(tokio::time::Instant::now() < rest_ends);
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        session.stop().await;
+    }
+
+    // Sessions given one SharedLimits draw on one connection budget and
+    // one turn at hashing files: a connection one opens leaves the other
+    // none under a cap of one, and a check turn one holds the other waits
+    // for. A limit set on one is set on both.
+    #[tokio::test]
+    async fn sessions_sharing_limits_share_one_budget_and_one_check_turn() {
+        let shared = super::SharedLimits::new(
+            super::SessionLimits {
+                connections_limit: 1,
+                unchoke_slots_limit: usize::MAX,
+                connection_speed: std::num::NonZeroU32::new(30).unwrap(),
+            },
+            0,
+            1,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let open = |name: &str| {
+            let shared = shared.clone();
+            let dir = dir.path().join(name);
+            async move {
+                Session::new_with_opts(
+                    dir,
+                    SessionOptions {
+                        dht: None,
+                        persistence: None,
+                        disable_trackers: true,
+                        disable_local_service_discovery: true,
+                        listen: None,
+                        shared_limits: Some(shared),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let (a, b) = (open("a").await, open("b").await);
+
+        let held = a.connection_slots.try_open().unwrap();
+        assert!(b.connection_slots.try_open().is_none());
+        drop(held);
+        assert!(b.connection_slots.try_open().is_some());
+
+        let turn = a.concurrent_initialize_semaphore.try_acquire().unwrap();
+        assert!(b.concurrent_initialize_semaphore.try_acquire().is_err());
+        drop(turn);
+
+        let mut limits = b.limits();
+        limits.connections_limit = 3;
+        b.set_limits(limits);
+        assert_eq!(a.connection_slots.limit(), 3);
+
+        a.stop().await;
+        b.stop().await;
     }
 
     // A connection from `addr` the listener took and checked, for the

@@ -87,8 +87,30 @@ pub mod updates;
 pub const TICK: Duration = Duration::from_secs(10);
 
 /// The longest a torrent's peers go unwritten while they change. Its ledger
-/// is written at every tick it changed, as its checkpoint is.
+/// is written at every tick its bytes or activity changed, as its
+/// checkpoint is.
 pub const PEERS_EVERY_MS: i64 = 60_000;
+
+/// The longest a torrent's ledger goes unwritten while only its times run
+/// on: an idle seed's durations count up at every tick, and writing them at
+/// each would be one write per torrent per tick. A clean stop writes them
+/// all; a crash loses at most this much of them (qBittorrent saves resume
+/// data every `SaveResumeDataInterval`, 60 minutes, by default).
+pub const TIMES_EVERY_MS: i64 = 30 * 60_000;
+
+// How far into its TIMES_EVERY_MS period a torrent's times start. Job ids
+// are sequential, so the id is mixed first: torrents added one after
+// another land anywhere in the period, not in its first few seconds.
+pub(crate) fn times_offset_ms(job_id: JobId) -> i64 {
+    let mut z = job_id.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^= z >> 31;
+    (z % TIMES_EVERY_MS as u64) as i64
+}
+
+// How many torrents' jobs are restored from their checkpoints at once.
+const RESTORES_AT_ONCE: usize = 8;
 
 /// The most pieces a torrent's checkpoint goes without between ticks: once
 /// this many pieces reached its job, or left it, since the checkpoint was
@@ -1294,20 +1316,26 @@ fn queued(settings: &TorrentSettings, rules: &[TrackerRule], torrent: &Live, now
     }
 }
 
+// A torrent's files under `layout`: the metainfo's names and lengths, at
+// `levels`.
+fn files_of(layout: Option<&PieceLayout>, levels: &[FilePriority]) -> Vec<TorrentFile> {
+    layout
+        .iter()
+        .flat_map(|layout| layout.files())
+        .enumerate()
+        .map(|(index, file)| TorrentFile {
+            index: index as u32,
+            path: file.name.clone(),
+            length: file.length,
+            priority: levels.get(index).copied().unwrap_or_default(),
+        })
+        .collect()
+}
+
 impl Live {
     // Its files: the metainfo's names and lengths, at the levels it holds.
     fn files(&self) -> Vec<TorrentFile> {
-        self.layout
-            .iter()
-            .flat_map(|layout| layout.files())
-            .enumerate()
-            .map(|(index, file)| TorrentFile {
-                index: index as u32,
-                path: file.name.clone(),
-                length: file.length,
-                priority: self.levels.get(index).copied().unwrap_or_default(),
-            })
-            .collect()
+        files_of(self.layout.as_deref(), &self.levels)
     }
 
     // The tracker rule it is under, while that rule stands.
@@ -1326,6 +1354,9 @@ impl Live {
     ) -> Self {
         let written = counters;
         counters.consecutive_seeding_s = 0;
+        // Spread by job, so torrents restored together do not all write
+        // their times at one tick.
+        let times_at_ms = now - times_offset_ms(record.job_id);
         Self {
             record,
             identity: TorrentIdentity::fresh(),
@@ -1334,6 +1365,7 @@ impl Live {
             ledger: Ledger {
                 written: Some((written, resume.clone())),
                 peers_at_ms: now,
+                times_at_ms,
                 lost: Arc::default(),
             },
             resume,
@@ -1431,14 +1463,27 @@ impl Live {
             }
             self.ledger.peers_at_ms = now;
         }
+        let times_due = at_once || now - self.ledger.times_at_ms >= TIMES_EVERY_MS;
         let (counters, peers) = match &self.ledger.written {
             Some((counters, peers)) => (
-                (*counters != self.counters).then_some(self.counters),
+                (if times_due {
+                    *counters != self.counters
+                } else {
+                    !same_but_times(counters, &self.counters)
+                })
+                .then_some(self.counters),
                 (!same_peers(peers, &self.resume)).then(|| self.resume.clone()),
             ),
             None => (Some(self.counters), Some(self.resume.clone())),
         };
-        self.ledger.written = Some((self.counters, self.resume.clone()));
+        if counters.is_some() {
+            self.ledger.times_at_ms = now;
+        }
+        let kept = match (&counters, &self.ledger.written) {
+            (None, Some((written, _))) => *written,
+            _ => self.counters,
+        };
+        self.ledger.written = Some((kept, self.resume.clone()));
         (counters.is_some() || peers.is_some()).then(|| Resume {
             counters,
             peers,
@@ -1759,6 +1804,15 @@ impl Timed {
     }
 }
 
+// Whether two ledgers differ at most in the times that run on by themselves
+// while a torrent sits: its durations and when a complete copy was last
+// seen. Bytes moved and activity are written at the tick they change.
+fn same_but_times(a: &TorrentCounters, b: &TorrentCounters) -> bool {
+    a.uploaded_bytes == b.uploaded_bytes
+        && a.downloaded_bytes == b.downloaded_bytes
+        && a.last_activity_ms == b.last_activity_ms
+}
+
 // What the database holds of a torrent's ledger and peers, and when its
 // peers were last taken.
 struct Ledger {
@@ -1766,6 +1820,9 @@ struct Ledger {
     written: Option<(TorrentCounters, ResumePeers)>,
     // When the peers were last taken from the session to be written.
     peers_at_ms: i64,
+    // When the ledger was last written: its times alone go unwritten until
+    // TIMES_EVERY_MS has passed since.
+    times_at_ms: i64,
     // Set by a write that failed, so the next one writes all of it.
     lost: Arc<AtomicBool>,
 }
@@ -1907,9 +1964,11 @@ struct Inner {
     clock: Arc<dyn Clock>,
     live: tokio::sync::Mutex<BTreeMap<JobId, Live>>,
     // Held while a torrent's job is restored, from the check that it waits
-    // for one to the job given: one restore at a time. The blocking restore
-    // owns it, so a restore whose awaiting task ends still holds it.
-    restoring: Arc<tokio::sync::Mutex<()>>,
+    // for one to the job given: one restore of a torrent at a time, and at
+    // most RESTORES_AT_ONCE torrents restoring. The blocking restore owns
+    // both, so a restore whose awaiting task ends still holds them.
+    restoring: std::sync::Mutex<HashMap<JobId, Arc<tokio::sync::Mutex<()>>>>,
+    restore_permits: Arc<tokio::sync::Semaphore>,
     signal: Arc<Signal>,
     ticks: watch::Sender<u64>,
     retired: watch::Sender<u64>,
@@ -1954,7 +2013,8 @@ impl TorrentService {
                 env,
                 clock,
                 live: tokio::sync::Mutex::new(BTreeMap::new()),
-                restoring: Arc::new(tokio::sync::Mutex::new(())),
+                restoring: std::sync::Mutex::new(HashMap::new()),
+                restore_permits: Arc::new(tokio::sync::Semaphore::new(RESTORES_AT_ONCE)),
                 signal: Arc::new(Signal::default()),
                 ticks: watch::channel(0).0,
                 retired: watch::channel(0).0,
@@ -2181,7 +2241,7 @@ impl TorrentService {
     // them: one reading of each torrent.
     async fn publish(&self) {
         let now = self.inner.clock.now_ms();
-        let listed = self.listed(None, now).await;
+        let listed = self.listed(None, false, now).await;
         let sessions = self
             .inner
             .sessions_read
@@ -2883,8 +2943,8 @@ impl TorrentService {
     }
 
     // The jobs of the torrents brought back at start with their records
-    // only, each restored from its checkpoint in turn. A torrent reads as it
-    // was kept until its job is back.
+    // only, each restored from its checkpoint, RESTORES_AT_ONCE at a time. A
+    // torrent reads as it was kept until its job is back.
     async fn restore_jobs(&self) {
         let waiting: Vec<JobId> = self
             .inner
@@ -2895,17 +2955,61 @@ impl TorrentService {
             .filter(|torrent| torrent.job.is_none() && torrent.layout.is_some())
             .map(|torrent| torrent.record.job_id)
             .collect();
+        // RESTORES_AT_ONCE in flight, each torrent attached as soon as its
+        // job is back rather than at the next tick, so the first seeds
+        // without waiting for the last to restore (qBittorrent's
+        // startUpTorrents keeps MAX_PROCESSING_RESUMEDATA_COUNT in flight
+        // into libtorrent's async_add_torrent).
+        let mut restoring = tokio::task::JoinSet::new();
         for job_id in waiting {
-            self.restore_job(job_id).await;
+            if restoring.len() >= RESTORES_AT_ONCE {
+                restoring.join_next().await;
+            }
+            let service = self.clone();
+            restoring.spawn(async move {
+                if service.restore_job(job_id).await {
+                    service.attach(job_id, None).await;
+                }
+            });
         }
+        while restoring.join_next().await.is_some() {}
     }
 
     // The job of a torrent that waits for one, restored on a blocking thread
-    // under no lock but the one that keeps restores one at a time, and given
+    // under no lock but its own job's and a restore permit, and given
     // to the torrent if it still waits: one removed meanwhile drops it. A
-    // restore that panics is a checkpoint that does not restore.
-    async fn restore_job(&self, job_id: JobId) {
-        let guard = Arc::clone(&self.inner.restoring).lock_owned().await;
+    // restore that panics is a checkpoint that does not restore. Whether it
+    // gave the torrent its job, unheld, so it may attach now.
+    async fn restore_job(&self, job_id: JobId) -> bool {
+        // However the restore ends, even cancelled or with the runtime, its
+        // entry goes: a torrent with its job, or gone, waits for no restore.
+        struct Done<'a>(&'a TorrentService, JobId);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0
+                    .inner
+                    .restoring
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&self.1);
+            }
+        }
+        let this_job = Arc::clone(
+            self.inner
+                .restoring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(job_id)
+                .or_default(),
+        );
+        let guard = (
+            this_job.lock_owned().await,
+            Arc::clone(&self.inner.restore_permits)
+                .acquire_owned()
+                .await
+                .expect("the restore permits are never closed"),
+        );
+        let _done = Done(self, job_id);
         let waiting = {
             let live = self.inner.live.lock().await;
             live.get(&job_id)
@@ -2920,7 +3024,7 @@ impl TorrentService {
                 })
         };
         let Some((dir, layout, unpack, passwords)) = waiting else {
-            return;
+            return false;
         };
         let restoring = {
             let (service, dir, layout) = (self.clone(), dir.clone(), Arc::clone(&layout));
@@ -2935,10 +3039,10 @@ impl TorrentService {
         };
         // The blocking task ends only with its result, or with the runtime.
         let Ok((_restoring, checkpoint)) = restoring.await else {
-            return;
+            return false;
         };
         let job = self.graph_job(job_id, dir, &layout, unpack, passwords, checkpoint);
-        if let Some(torrent) = self
+        match self
             .inner
             .live
             .lock()
@@ -2946,7 +3050,11 @@ impl TorrentService {
             .get_mut(&job_id)
             .filter(|torrent| torrent.job.is_none())
         {
-            self.give_job(torrent, job);
+            Some(torrent) => {
+                self.give_job(torrent, job);
+                torrent.held.is_none()
+            }
+            None => false,
         }
     }
 
@@ -3765,6 +3873,26 @@ impl TorrentService {
             }
         };
         let mut live = self.inner.live.lock().await;
+        // Another attach of this torrent may have finished while this one
+        // waited: the session it put the torrent in keeps it, and a second
+        // copy in another session is let go.
+        let attached_meanwhile = live
+            .get(&job_id)
+            .and_then(|torrent| torrent.attached.as_ref())
+            .map(|attached| {
+                Arc::ptr_eq(&attached.session, &session) && attached.handle.id() == handle.id()
+            });
+        if let Some(same) = attached_meanwhile {
+            drop(live);
+            if !same
+                && let Err(error) = session
+                    .delete(TorrentIdOrHash::Id(handle.id()), false)
+                    .await
+            {
+                tracing::debug!(job_id = job_id.0, error = %error, "a second copy of a torrent was already gone from its session");
+            }
+            return;
+        }
         match live.get_mut(&job_id) {
             Some(torrent) => {
                 // A ban made while the session took the torrent holds in
@@ -4918,12 +5046,18 @@ impl TorrentService {
         let mut reattach = Vec::new();
         let mut down = BTreeMap::new();
         let mut unresolved = Vec::new();
+        // One plan per scope a pass: the torrents of a scope share it, and a
+        // plan reads the scope's routing policy from the database.
+        let mut plans: HashMap<TorrentScope, Result<RoutePlan, String>> = HashMap::new();
         {
             let mut live = self.inner.live.lock().await;
             for torrent in live.values_mut() {
                 let rule = torrent.rule(&rules);
                 let scope = settings.scope(torrent.record.category_id, rule);
-                let plan = self.inner.sessions.routes().plan(scope);
+                let plan = plans
+                    .entry(scope)
+                    .or_insert_with(|| self.inner.sessions.routes().plan(scope))
+                    .clone();
                 if torrent.layout.is_none() {
                     let moved = matches!(torrent.resolving, Some(Resolving::Fetching(_)))
                         && plan.as_ref().ok().is_none_or(|plan| {
@@ -5536,7 +5670,18 @@ impl TorrentService {
     /// with its trackers.
     pub async fn torrents(&self, category: Option<&str>) -> Vec<TorrentView> {
         let now = self.inner.clock.now_ms();
-        self.listed(category, now)
+        self.listed(category, false, now)
+            .await
+            .into_iter()
+            .map(|(view, _)| view)
+            .collect()
+    }
+
+    /// Every torrent with its files, from one pass over them: what
+    /// `torrent` gives one at a time.
+    pub async fn torrents_with_files(&self) -> Vec<TorrentView> {
+        let now = self.inner.clock.now_ms();
+        self.listed(None, true, now)
             .await
             .into_iter()
             .map(|(view, _)| view)
@@ -5546,17 +5691,26 @@ impl TorrentService {
     // Every torrent, or a category's, in the order they were added, each
     // with its trackers, and its figures as the exporter reads them: both
     // from one reading of its session.
-    async fn listed(&self, category: Option<&str>, now: i64) -> Vec<(TorrentView, TorrentSeries)> {
+    async fn listed(
+        &self,
+        category: Option<&str>,
+        files: bool,
+        now: i64,
+    ) -> Vec<(TorrentView, TorrentSeries)> {
         let settings = self.settings();
         let mut listed = self.inner.db.torrent_trackers_by_job().unwrap_or_default();
-        let mut views: Vec<(TorrentView, Vec<TrackerAnnounce>, Unviewed)> = {
+        // Under the lock, each torrent's files are only taken by reference
+        // with its levels: the list is built after the lock is let go.
+        type Files = Option<(Option<Arc<PieceLayout>>, Vec<FilePriority>)>;
+        let mut views: Vec<(TorrentView, Vec<TrackerAnnounce>, Unviewed, Files)> = {
             let live = self.inner.live.lock().await;
             live.values()
                 .map(|torrent| {
                     let reading = torrent.reading(now);
                     let unviewed = self.unviewed(&settings, torrent, &reading, now);
                     let view = self.view_of(&settings, torrent, reading, now);
-                    (view, torrent.announces(), unviewed)
+                    let files = files.then(|| (torrent.layout.clone(), torrent.levels.clone()));
+                    (view, torrent.announces(), unviewed, files)
                 })
                 .filter(|(view, ..)| {
                     category.is_none_or(|name| {
@@ -5568,13 +5722,16 @@ impl TorrentService {
                 .collect()
         };
         let mut names = HashMap::new();
-        for (view, announces, _) in &mut views {
+        for (view, announces, _, files) in &mut views {
+            if let Some((layout, levels)) = files.take() {
+                view.files = files_of(layout.as_deref(), &levels);
+            }
             let listed = listed.remove(&view.job_id).unwrap_or_default();
             self.track(view, listed, announces, &mut names);
         }
         let mut views: Vec<(TorrentView, TorrentSeries)> = views
             .into_iter()
-            .map(|(view, announces, unviewed)| {
+            .map(|(view, announces, unviewed, _)| {
                 let series = unviewed.series(&view, &announces);
                 (view, series)
             })

@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::io::IoSlice;
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use anyhow::{Context, bail};
 use bitvec::boxed::BitBox;
@@ -61,6 +61,16 @@ pub(crate) trait Pieces: Send + Sync {
     // The volume's posted bytes of the range, appended to `into`; false
     // when they are not all in hand.
     fn posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool;
+    // `posted` straight into `out`, which is the range's length; false, and
+    // `out` left as it may be, when they are not all in hand.
+    fn posted_exact(&self, volume: VolumeIndex, range: ByteRange, out: &mut [u8]) -> bool {
+        let mut into = Vec::with_capacity(out.len());
+        let read = self.posted(volume, range, &mut into) && into.len() == out.len();
+        if read {
+            out.copy_from_slice(&into);
+        }
+        read
+    }
     // The volume's bytes from `offset` as its file on disk holds them,
     // whether or not they are in hand: files placed before the torrent was
     // added are read so, for a check to find them or a peer to be served.
@@ -84,7 +94,7 @@ pub(crate) trait Pieces: Send + Sync {
 // due; and `signal` where a job those slots woke is marked, so the service
 // lends for it.
 pub(crate) struct TorrentJob {
-    job: Mutex<GraphJob<PieceRoot>>,
+    job: RwLock<GraphJob<PieceRoot>>,
     repairs: Arc<Mutex<RepairSlots>>,
     signal: Arc<Signal>,
     limit: usize,
@@ -98,7 +108,7 @@ impl TorrentJob {
         limit: usize,
     ) -> Self {
         Self {
-            job: Mutex::new(job),
+            job: RwLock::new(job),
             repairs,
             signal,
             limit,
@@ -106,7 +116,13 @@ impl TorrentJob {
     }
 
     pub(crate) fn with<T>(&self, read: impl FnOnce(&mut GraphJob<PieceRoot>) -> T) -> T {
-        read(&mut self.job.lock().unwrap_or_else(PoisonError::into_inner))
+        read(&mut self.job.write().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    // A look at the job that changes nothing: reads of what it has run
+    // side by side, and wait only for a step.
+    fn look<T>(&self, look: impl FnOnce(&GraphJob<PieceRoot>) -> T) -> T {
+        look(&self.job.read().unwrap_or_else(PoisonError::into_inner))
     }
 
     // One step of the job under the shared repair slots, at `limit`. A slot
@@ -179,11 +195,33 @@ impl TorrentJob {
     }
 }
 
+impl TorrentJob {
+    // A piece's shares taken in. The repair slots every torrent job shares
+    // are held only for the lend the shares made due: the file writes and
+    // the runs' step take this job's lock alone, so one torrent's commit
+    // never holds up another's. A step another thread takes between the
+    // two sees the shares in hand and lends for them itself, as this lend
+    // would. Shares that made nothing due take no slot lock at all.
+    fn commit(&self, shares: Vec<Verified>, write: bool) -> anyhow::Result<()> {
+        let taken = self.with(|job| {
+            let taken = job.verified_unlent(shares, write, self.limit);
+            if !matches!(taken, Ok(true)) {
+                // As a step would: a move asked for while something was
+                // out happens once nothing is.
+                job.try_relocate();
+            }
+            taken
+        })?;
+        if taken {
+            self.step(self.limit, |job, repairs, limit| job.lend(repairs, limit))?;
+        }
+        Ok(())
+    }
+}
+
 impl Pieces for TorrentJob {
     fn verified(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
-        Ok(self.step(self.limit, |job, repairs, limit| {
-            job.verified(shares, repairs, limit)
-        })?)
+        self.commit(shares, true)
     }
 
     fn failed(&self, piece: u32) -> anyhow::Result<bool> {
@@ -199,28 +237,26 @@ impl Pieces for TorrentJob {
     }
 
     fn posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool {
-        self.with(|job| job.posted(volume, range, into))
+        self.look(|job| job.posted(volume, range, into))
+    }
+
+    fn posted_exact(&self, volume: VolumeIndex, range: ByteRange, out: &mut [u8]) -> bool {
+        self.look(|job| job.posted_exact(volume, range, out))
     }
 
     // Read under the job, as a read of what it has is: a move of its files
     // happens in one of its steps, so the read finds the file where it
     // was or where it went, never between.
     fn placed(&self, volume: VolumeIndex, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        self.with(|job| {
-            let path = job.kept_path(volume).ok_or(std::io::ErrorKind::NotFound)?;
-            let file = std::fs::File::open(path)?;
-            crate::pipeline::graph::leaf::read_exact_at(&file, offset, buf)
-        })
+        self.look(|job| job.read_kept(volume, offset, buf))
     }
 
     fn had(&self, piece: u32) -> bool {
-        self.with(|job| job.has_piece(piece))
+        self.look(|job| job.has_piece(piece))
     }
 
     fn adopted(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
-        Ok(self.step(self.limit, |job, repairs, limit| {
-            job.adopted(shares, repairs, limit)
-        })?)
+        self.commit(shares, false)
     }
 }
 
@@ -264,21 +300,55 @@ pub(crate) fn layout_of<B: AsRef<[u8]>>(
 // then the whole piece while its shares go to the job. Only a piece still
 // being written holds room: a verified one's bytes are the job's.
 enum Flight {
-    Writing(Vec<u8>),
+    Writing(Arc<Writing>),
     Verified(Bytes),
 }
 
+// A piece being written: its blocks land here, and it is hashed here once
+// whole, under its own lock, so hashing one piece holds up no other's
+// blocks.
+struct Writing {
+    // The room it holds.
+    len: usize,
+    bytes: std::sync::RwLock<Vec<u8>>,
+}
+
+impl Writing {
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Vec<u8>> {
+        self.bytes.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Vec<u8>> {
+        self.bytes.write().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 impl Flight {
-    fn bytes(&self) -> &[u8] {
+    fn writing(len: usize) -> Self {
+        Self::Writing(Arc::new(Writing {
+            len,
+            bytes: std::sync::RwLock::new(vec![0; len]),
+        }))
+    }
+
+    // `out` filled from `at` of the piece; false when the piece has left.
+    fn read(&self, at: usize, out: &mut [u8]) -> bool {
+        let mut copy = |bytes: &[u8]| match bytes.get(at..at + out.len()) {
+            Some(from) => {
+                out.copy_from_slice(from);
+                true
+            }
+            None => false,
+        };
         match self {
-            Self::Writing(bytes) => bytes,
-            Self::Verified(bytes) => bytes,
+            Self::Writing(writing) => copy(&writing.read()),
+            Self::Verified(bytes) => copy(bytes),
         }
     }
 
     fn held(&self) -> u64 {
         match self {
-            Self::Writing(bytes) => bytes.len() as u64,
+            Self::Writing(writing) => writing.len as u64,
             Self::Verified(_) => 0,
         }
     }
@@ -431,7 +501,9 @@ impl TorrentStorage for PieceStorage {
             && let Some(held) = self.flight().get(&piece)
         {
             let at = (start - self.inner.layout.piece_range(piece).start) as usize;
-            buf.copy_from_slice(&held.bytes()[at..at + buf.len()]);
+            if !held.read(at, buf) {
+                bail!("piece {piece} left memory as it was read");
+            }
             return Ok(());
         }
         let Some(volume) = self.inner.layout.file_volume(file_id) else {
@@ -439,10 +511,8 @@ impl TorrentStorage for PieceStorage {
             buf.fill(0);
             return Ok(());
         };
-        let mut read = Vec::with_capacity(buf.len());
         let range = ByteRange::at(offset, buf.len() as u64);
-        if self.inner.pieces.posted(volume, range, &mut read) {
-            buf.copy_from_slice(&read);
+        if self.inner.pieces.posted_exact(volume, range, buf) {
             return Ok(());
         }
         // Not in hand: what the file on disk holds, which the session's
@@ -464,11 +534,16 @@ impl TorrentStorage for PieceStorage {
         };
         let range = self.inner.layout.piece_range(piece);
         let at = (start - range.start) as usize;
-        let mut flight = self.flight();
-        let Some(Flight::Writing(held)) = flight.get_mut(&piece) else {
-            bail!("piece {piece} is written while the session holds no room for it");
+        let held = match self.flight().get(&piece) {
+            Some(Flight::Writing(writing)) => Arc::clone(writing),
+            _ => bail!("piece {piece} is written while the session holds no room for it"),
         };
-        held[at..at + buf.len()].copy_from_slice(buf);
+        // Outside the map's lock: another piece's blocks land meanwhile.
+        let mut bytes = held.write();
+        let Some(to) = bytes.get_mut(at..at + buf.len()) else {
+            bail!("piece {piece} is written after it completed");
+        };
+        to.copy_from_slice(buf);
         Ok(())
     }
 
@@ -525,7 +600,7 @@ impl TorrentStorage for PieceStorage {
         if let Reserve::Breached(_) = holds.accountant.reserve_resident(holds.namespace, length) {
             return false;
         }
-        flight.insert(index, Flight::Writing(vec![0; length as usize]));
+        flight.insert(index, Flight::writing(length as usize));
         true
     }
 
@@ -541,7 +616,7 @@ impl TorrentStorage for PieceStorage {
             };
             let released = entry.held();
             let held = match std::mem::replace(entry, Flight::Verified(Bytes::new())) {
-                Flight::Writing(bytes) => Bytes::from(bytes),
+                Flight::Writing(writing) => Bytes::from(std::mem::take(&mut *writing.write())),
                 Flight::Verified(bytes) => bytes,
             };
             *entry = Flight::Verified(held.clone());
@@ -567,6 +642,31 @@ impl TorrentStorage for PieceStorage {
         self.inner.pieces.verified(shares)?;
         self.flight().remove(&index);
         Ok(())
+    }
+
+    // A whole piece is hashed where its blocks landed, under its own lock
+    // alone; one already verified, from its bytes.
+    fn hash_held_piece(&self, piece: ValidPieceIndex, update: &mut dyn FnMut(&[u8])) -> bool {
+        // Taken out of the map first, so the hash runs with the map free.
+        let held = match self.flight().get(&piece.get()) {
+            Some(Flight::Writing(writing)) => Flight::Writing(Arc::clone(writing)),
+            Some(Flight::Verified(bytes)) => Flight::Verified(bytes.clone()),
+            None => return false,
+        };
+        let writing = match held {
+            Flight::Writing(writing) => writing,
+            Flight::Verified(bytes) => {
+                update(&bytes);
+                return true;
+            }
+        };
+        let bytes = writing.read();
+        // Emptied: it completed meanwhile, and is read from where it went.
+        if bytes.len() != writing.len {
+            return false;
+        }
+        update(&bytes);
+        true
     }
 
     // What failed is dropped, from memory and from the job, and the piece

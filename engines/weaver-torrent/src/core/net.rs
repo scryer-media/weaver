@@ -220,6 +220,22 @@ pub trait HttpClients: Send + Sync + 'static {
         Ok(self.builder(target)?.http1_title_case_headers().build()?)
     }
 
+    /// The client for one tracker request to `target`: as [`Self::client`],
+    /// or [`Self::title_case_client`] when `title_case`. A session may hand
+    /// the same client to every announce to a target, so long as it keeps
+    /// no connection open after a request, as a client used once does not.
+    fn tracker_client(
+        &self,
+        target: HttpTarget<'_>,
+        title_case: bool,
+    ) -> anyhow::Result<reqwest::Client> {
+        if title_case {
+            self.title_case_client(Some(target))
+        } else {
+            self.client(Some(target))
+        }
+    }
+
     /// Where a request from these clients to `to` leaves. Clients that do
     /// not say are a proxy's: the proxy picks how it reaches `to`.
     fn egress(&self, _to: SocketAddr) -> Egress {

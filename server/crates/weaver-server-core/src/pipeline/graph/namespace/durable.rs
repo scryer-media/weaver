@@ -203,6 +203,29 @@ impl NamespaceWriter {
         self.read_root(tree, member, range, true, into)
     }
 
+    // `read_in_hand` straight into `out`, which is the range's length: a
+    // member read from its own file is read into it with no copy between.
+    pub(crate) fn read_in_hand_exact(
+        &self,
+        tree: &Tree,
+        member: MemberId,
+        range: ByteRange,
+        out: &mut [u8],
+    ) -> bool {
+        if self
+            .access(tree)
+            .read_own_exact(NodeId::ROOT, member, range, out)
+        {
+            return true;
+        }
+        let mut into = Vec::with_capacity(out.len());
+        let read = self.read_root(tree, member, range, true, &mut into) && into.len() == out.len();
+        if read {
+            out.copy_from_slice(&into);
+        }
+        read
+    }
+
     fn read_root(
         &self,
         tree: &Tree,

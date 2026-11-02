@@ -22,7 +22,7 @@ pub use weaver_torrent::upnp::{PortMapped, PortmapProtocol, PortmapTransport};
 use weaver_torrent::{
     ConnectionOptions, DhtSessionConfig, HttpClients, Identity, IpFilter, ListenFailed,
     ListenerMode, ListenerOptions, PeerConnectionOptions, Session, SessionLimits, SessionOptions,
-    SocketFactory,
+    SharedLimits, SocketFactory,
 };
 use weaver_tunnel::bridge::Bridge;
 use weaver_tunnel::pipe::Dialer;
@@ -508,9 +508,11 @@ fn transports(torrent: &TorrentConfig, shape: Shape) -> (Option<ListenerMode>, b
 }
 
 /// The limits `torrent` holds a session to, no limit as libtorrent counts
-/// it: as many connections as files may be open
-/// (`session_impl::update_connections_limit`), and every peer unchoked
-/// (`session_impl::preemptive_unchoke`).
+/// it: connections within the files that may be open, less twenty kept for
+/// files and four in five of the rest (libtorrent `session_impl` sets
+/// `connections_limit` to `max(5, (max_files - 20) * 8 / 10)`), so peers
+/// never take the descriptors files and the database need, and every peer
+/// unchoked (`session_impl::preemptive_unchoke`).
 pub fn session_limits(torrent: &TorrentConfig) -> SessionLimits {
     let count = |limit: TorrentLimit, unlimited: usize| {
         limit
@@ -520,11 +522,17 @@ pub fn session_limits(torrent: &TorrentConfig) -> SessionLimits {
     SessionLimits {
         connections_limit: count(
             torrent.connections_limit,
-            crate::runtime::resource_limits::open_file_limit(),
+            connections_within(crate::runtime::resource_limits::open_file_limit()),
         ),
         unchoke_slots_limit: count(torrent.unchoke_slots_limit, usize::MAX),
         connection_speed: torrent.connection_speed,
     }
+}
+
+// The connections `files` open files leave room for (libtorrent
+// `session_impl`: `max(5, (max_files - 20) * 8 / 10)`).
+pub(crate) fn connections_within(files: usize) -> usize {
+    (files.saturating_sub(20) * 8 / 10).max(5)
 }
 
 /// The options of a session on `leg`, listening on `port` when it listens,
@@ -747,6 +755,10 @@ pub struct Sessions {
     // Rung by every session as an announce table or a metadata fetch's
     // phase changes.
     trackers_changed: Arc<tokio::sync::Notify>,
+    // The connection budget and check turns every session shares, made
+    // with the first session: the process has one descriptor limit and
+    // one disk however many routes it runs.
+    shared_limits: std::sync::OnceLock<SharedLimits>,
 }
 
 impl Sessions {
@@ -765,6 +777,7 @@ impl Sessions {
             closing: Closing::default(),
             revoked: Arc::default(),
             trackers_changed: Arc::default(),
+            shared_limits: std::sync::OnceLock::new(),
         }
     }
 
@@ -1100,11 +1113,20 @@ impl Sessions {
         self.closing
             .released(plan, [Some(port), ssl_port, maps].into_iter().flatten())
             .await;
-        let mut options = SessionOptions {
-            port_map_events: Some(mappings.follow()),
-            trackers_changed: Some(Arc::clone(&self.trackers_changed)),
-            ..session_options(&leg, port, &dir, peers, &torrent, ip_filter, opener)
-        };
+        let mut options = session_options(&leg, port, &dir, peers, &torrent, ip_filter, opener);
+        options.port_map_events = Some(mappings.follow());
+        options.trackers_changed = Some(Arc::clone(&self.trackers_changed));
+        options.shared_limits = Some(
+            self.shared_limits
+                .get_or_init(|| {
+                    SharedLimits::new(
+                        session_limits(&torrent),
+                        options.connections_slack,
+                        options.concurrent_init_limit.unwrap_or(1),
+                    )
+                })
+                .clone(),
+        );
         // SSL torrents' peers come to a port of the route's own beside its
         // peer port.
         if let Some(listen) = options.listen.as_mut() {

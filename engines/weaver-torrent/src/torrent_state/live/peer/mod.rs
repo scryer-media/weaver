@@ -76,6 +76,17 @@ const MAX_SUGGEST_PIECES: usize = 16;
 /// handshake advertises it as `reqq`.
 pub(crate) const MAX_ALLOWED_IN_REQUEST_QUEUE: u32 = 2000;
 
+// libtorrent `settings_pack::send_buffer_low_watermark`,
+// `send_buffer_watermark` and `send_buffer_watermark_factor`: a peer's writer
+// is handed blocks until what it holds unsent reaches the payload it took over
+// the last second times the factor, within these bounds
+// (`peer_connection::fill_send_buffer`). The values are qBittorrent's
+// defaults after 5.1, on its master branch; 5.0 and 5.1 keep libtorrent's
+// own, 10 KiB, 500 KiB and 50.
+pub(crate) const SEND_BUFFER_LOW_WATERMARK: u64 = 128 * 1024;
+const SEND_BUFFER_WATERMARK: u64 = 4 * 1024 * 1024;
+const SEND_BUFFER_WATERMARK_FACTOR: u64 = 100;
+
 // libtorrent `settings_pack::request_queue_time`: the requests outstanding to
 // a peer cover this long of its delivery.
 const REQUEST_QUEUE_TIME: Duration = Duration::from_secs(3);
@@ -990,11 +1001,16 @@ pub(crate) struct LivePeerState {
     // The blocks the peer asked us for and that are not handed to the
     // writer yet, in the order asked (libtorrent `m_requests`).
     upload_queue: VecDeque<ChunkInfo>,
-    // The block handed to the writer and not yet taken by it: the peer's
-    // send buffer, one block deep (libtorrent `send_buffer_low_watermark`).
-    // The writer sends a block only by taking it from here, so a Cancel or
-    // a Choke that drops it first keeps it from going out.
-    upload_handed: Option<ChunkInfo>,
+    // The blocks handed to the writer and not yet taken by it, in the order
+    // handed. The writer sends a block only by taking it from here, so a
+    // Cancel or a Choke that drops it first keeps it from going out.
+    upload_handed: VecDeque<ChunkInfo>,
+    // The payload handed to the writer and not yet sent, taken or not: the
+    // peer's send buffer, held to its watermark (libtorrent
+    // `peer_connection::m_reading_bytes` and `send_buffer_size`).
+    upload_unsent: u64,
+    // Whether the peer has a turn with the upload scheduler on its way.
+    upload_turn_due: bool,
 
     // The requests the peer sent that we could not serve since we last
     // choked it (libtorrent `peer_connection::m_num_invalid_requests`).
@@ -1138,7 +1154,9 @@ impl LivePeerState {
             snubbed: false,
             request_slots_changed: Default::default(),
             upload_queue: Default::default(),
-            upload_handed: None,
+            upload_handed: VecDeque::new(),
+            upload_unsent: 0,
+            upload_turn_due: false,
             invalid_requests: 0,
             super_seeded: [None; 2],
             supports_holepunch: false,
@@ -1555,21 +1573,24 @@ impl LivePeerState {
     /// The peer asked us for `chunk`, a block of a piece of `chunks_per_piece`
     /// blocks (libtorrent `peer_connection::incoming_request`). A block
     /// queued already stays queued once. Past [`MAX_ALLOWED_IN_REQUEST_QUEUE`]
-    /// queued blocks, any other is refused. While we choke the peer only a
-    /// block of a piece it may fetch is queued, until it has asked for three
-    /// times the piece's blocks; any other is refused. A refused block gets a
-    /// Reject on a fast connection. True when the block makes the peer
-    /// [ready to be handed one](Self::hand_upload), which it was not.
+    /// blocks queued and not yet handed to the writer, any other is refused;
+    /// the blocks handed and not yet sent are not counted, so a peer may
+    /// have that many more asked and unsent, at most a send watermark's
+    /// worth (libtorrent likewise counts only `m_requests`). While we choke
+    /// the peer only a block of a piece it may fetch is queued, until it has
+    /// asked for three times the piece's blocks; any other is refused. A
+    /// refused block gets a Reject on a fast connection. True when the block
+    /// makes the peer to be given a turn with the upload scheduler
+    /// ([`Self::wants_turn`]).
     pub fn queue_upload(
         &mut self,
         chunk: ChunkInfo,
         chunks_per_piece: u32,
     ) -> Result<bool, Refused> {
-        if self.upload_handed == Some(chunk) || self.upload_queue.contains(&chunk) {
+        if self.upload_handed.contains(&chunk) || self.upload_queue.contains(&chunk) {
             return Err(Refused::Queued);
         }
-        let unsent = self.upload_queue.len() + usize::from(self.upload_handed.is_some());
-        if unsent >= MAX_ALLOWED_IN_REQUEST_QUEUE as usize {
+        if self.upload_queue.len() >= MAX_ALLOWED_IN_REQUEST_QUEUE as usize {
             self.reject(&chunk);
             return Err(Refused::QueueFull);
         }
@@ -1590,29 +1611,74 @@ impl LivePeerState {
             (_, Some(asked)) => *asked += 1,
             (None, None) => {}
         }
-        let was_ready = self.ready_to_hand();
         self.upload_queue.push_back(chunk);
         self.last_upload = Instant::now();
-        Ok(!was_ready && self.ready_to_hand())
+        Ok(self.wants_turn())
     }
 
-    /// Whether the writer has room for a block and the peer asked for one:
-    /// the upload scheduler owes the peer a turn.
+    /// What the peer's send buffer may hold unsent: the payload it took
+    /// over the last [`RATE_WINDOW`], per second, times the watermark
+    /// factor, within the low and high watermarks (libtorrent
+    /// `peer_connection::fill_send_buffer`, which takes the last second's
+    /// payload alone).
+    fn send_buffer_watermark(&self) -> u64 {
+        (self.upload_rate.bps() * SEND_BUFFER_WATERMARK_FACTOR / 100)
+            .clamp(SEND_BUFFER_LOW_WATERMARK, SEND_BUFFER_WATERMARK)
+    }
+
+    /// Whether the writer has room under its watermark and the peer asked
+    /// for a block: the upload scheduler owes the peer a turn.
     pub(crate) fn ready_to_hand(&self) -> bool {
-        self.upload_handed.is_none() && !self.upload_queue.is_empty()
+        !self.upload_queue.is_empty() && self.upload_unsent < self.send_buffer_watermark()
     }
 
-    /// The peer's turn with the upload scheduler: the block it asked for
-    /// first goes to the writer when the writer holds none of the peer's
-    /// already (libtorrent `peer_connection::fill_send_buffer`, the send
-    /// buffer held to one block). The block handed, if any.
-    pub(crate) fn hand_upload(&mut self) -> Option<ChunkInfo> {
-        if self.upload_handed.is_some() {
-            return None;
+    /// Whether the peer is to be given a turn with the upload scheduler:
+    /// it is [ready](Self::ready_to_hand) and has none on its way. True
+    /// once, until the turn is taken. The watermark follows the upload
+    /// rate, so a peer can become ready with nothing happening to it; the
+    /// next event that asks finds it so.
+    pub(crate) fn wants_turn(&mut self) -> bool {
+        let wants = !self.upload_turn_due && self.ready_to_hand();
+        self.upload_turn_due |= wants;
+        wants
+    }
+
+    /// The peer's turn with the upload scheduler: the blocks it asked for
+    /// go to the writer, first asked first, until what the writer holds
+    /// unsent reaches its watermark (libtorrent
+    /// `peer_connection::fill_send_buffer`). How many were handed.
+    pub(crate) fn hand_upload(&mut self) -> usize {
+        self.upload_turn_due = false;
+        let watermark = self.send_buffer_watermark();
+        let mut handed = 0;
+        while self.upload_unsent < watermark {
+            let Some(chunk) = self.upload_queue.pop_front() else {
+                break;
+            };
+            self.upload_unsent += u64::from(chunk.size);
+            self.upload_handed.push_back(chunk);
+            let _ = self.tx.send(WriterRequest::ReadChunkRequest(chunk));
+            handed += 1;
         }
-        let chunk = self.upload_queue.pop_front()?;
-        self.upload_handed = Some(chunk);
-        let _ = self.tx.send(WriterRequest::ReadChunkRequest(chunk));
+        handed
+    }
+
+    /// The handed `chunk` is off the writer's hands, sent or not served:
+    /// its room in the send buffer is free (libtorrent
+    /// `peer_connection::on_send_data`).
+    pub(crate) fn upload_done(&mut self, chunk: &ChunkInfo) {
+        self.upload_unsent = self.upload_unsent.saturating_sub(u64::from(chunk.size));
+    }
+
+    /// Takes `chunk` off the blocks handed to the writer, if it is there,
+    /// with its room in the send buffer.
+    fn unhand(&mut self, chunk: &ChunkInfo) -> Option<ChunkInfo> {
+        let at = self
+            .upload_handed
+            .iter()
+            .position(|handed| handed == chunk)?;
+        let chunk = self.upload_handed.remove(at)?;
+        self.upload_done(&chunk);
         Some(chunk)
     }
 
@@ -1714,10 +1780,13 @@ impl LivePeerState {
         self.choked_at = Some(now);
         self.invalid_requests = 0;
         let _ = self.tx.send(WriterRequest::Message(Message::Choke));
-        let handed = match self.upload_handed {
-            Some(chunk) if !self.allows_fast(chunk.piece_index) => self.upload_handed.take(),
-            _ => None,
-        };
+        let (kept, handed): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.upload_handed)
+            .into_iter()
+            .partition(|chunk| self.allows_fast(chunk.piece_index));
+        self.upload_handed = kept;
+        for chunk in &handed {
+            self.upload_done(chunk);
+        }
         let (kept, dropped): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut self.upload_queue)
             .into_iter()
             .partition(|chunk| self.allows_fast(chunk.piece_index));
@@ -1770,7 +1839,7 @@ impl LivePeerState {
     /// with a Reject on a fast connection (libtorrent
     /// `peer_connection::incoming_cancel`).
     pub fn cancel_upload(&mut self, chunk: &ChunkInfo) {
-        let handed = self.upload_handed.take_if(|handed| handed == chunk);
+        let handed = self.unhand(chunk);
         let queued = self.upload_queue.iter().position(|queued| queued == chunk);
         let queued = queued.and_then(|at| self.upload_queue.remove(at));
         if handed.or(queued).is_some() {
@@ -1779,13 +1848,11 @@ impl LivePeerState {
     }
 
     /// The writer takes the handed `chunk` to send it. False when a Cancel or
-    /// a Choke dropped it first, and it is not sent. Either way the writer
-    /// has room for the peer's next block.
+    /// a Choke dropped it first, and it is not sent. A block taken keeps its
+    /// room in the send buffer until [it is done](Self::upload_done).
     pub fn claim_upload(&mut self, chunk: &ChunkInfo) -> bool {
-        let claimed = self
-            .upload_handed
-            .take_if(|handed| handed == chunk)
-            .is_some();
+        let at = self.upload_handed.iter().position(|handed| handed == chunk);
+        let claimed = at.and_then(|at| self.upload_handed.remove(at)).is_some();
         if claimed {
             self.last_upload = Instant::now();
         }
@@ -1843,7 +1910,7 @@ impl LivePeerState {
             && self.peer_interested
             && !self.is_choked()
             && self.upload_queue.is_empty()
-            && self.upload_handed.is_none()
+            && self.upload_unsent == 0
             && now.saturating_duration_since(served) > NO_REQUEST_TIMEOUT
         {
             return Some(TimedOut::NoRequest);
@@ -2093,6 +2160,45 @@ mod tests {
         assert_eq!(live.request_deadline(), Some(Instant::now() + secs(2)));
     }
 
+    // The watermark follows the upload rate, so a peer can become ready to
+    // be handed more with nothing happening to it: the next word from its
+    // writer finds it so and gives it its turn, once.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_the_rising_rate_made_ready_gets_its_turn_at_the_next_word() {
+        let lengths = Lengths::new(64 * 16384, 64 * 16384).unwrap();
+        let piece = lengths.validate_piece_index(0).unwrap();
+        let chunk = |n: u32| {
+            lengths
+                .chunk_info_from_received_data(piece, n * 16384, 16384)
+                .unwrap()
+        };
+        let (tx, _rx) = unbounded_channel();
+        let counters = stats::atomic::PeerStats::default().counters;
+        let mut live =
+            LivePeerState::new(Id20::default(), tx, ConnectionKind::Tcp, &counters, true);
+        live.unchoke(Instant::now(), 0);
+        for n in 0..32 {
+            let wants = live.queue_upload(chunk(n), 64).ok().unwrap();
+            assert_eq!(wants, n == 0);
+        }
+        let low = (super::SEND_BUFFER_LOW_WATERMARK / 16384) as usize;
+        assert_eq!(live.hand_upload(), low);
+        assert!(!live.wants_turn());
+
+        // 1 MiB/s: the watermark rises to 1 MiB.
+        let start = std::time::Instant::now();
+        live.upload_rate.add_snapshot(0, None, start);
+        live.upload_rate
+            .add_snapshot(1 << 20, None, start + Duration::from_secs(1));
+        assert!(live.ready_to_hand());
+        assert!(live.claim_upload(&chunk(0)));
+        assert!(live.wants_turn());
+        assert!(!live.wants_turn());
+        live.upload_done(&chunk(0));
+        assert!(!live.wants_turn());
+        assert_eq!(live.hand_upload(), 32 - low);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn an_unchoked_peer_of_a_seed_times_out_a_minute_after_it_was_last_served() {
         let lengths = Lengths::new(2 * 16384, 16384).unwrap();
@@ -2125,11 +2231,18 @@ mod tests {
         tokio::time::advance(Duration::from_secs(30)).await;
         assert!(live.queue_upload(chunk, 1).is_ok());
         assert_eq!(live.timed_out(past(past(minute)), true, false), None);
-        assert_eq!(live.hand_upload(), Some(chunk));
+        assert_eq!(live.hand_upload(), 1);
         assert_eq!(live.timed_out(past(past(minute)), true, false), None);
         tokio::time::advance(Duration::from_secs(10)).await;
         assert!(live.claim_upload(&chunk));
         let sent = Instant::now();
+        // Taken by the writer and not yet sent, it still holds it.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(
+            live.timed_out(past(sent + NO_REQUEST_TIMEOUT), true, false),
+            None
+        );
+        live.upload_done(&chunk);
         assert_eq!(live.timed_out(sent + NO_REQUEST_TIMEOUT, true, false), None);
         assert_eq!(
             live.timed_out(past(sent + NO_REQUEST_TIMEOUT), true, false),

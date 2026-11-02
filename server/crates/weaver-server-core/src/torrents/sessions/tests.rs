@@ -1056,7 +1056,9 @@ async fn the_torrent_settings_reach_the_sessions() {
     assert_eq!(
         session.limits(),
         SessionLimits {
-            connections_limit: crate::runtime::resource_limits::open_file_limit(),
+            connections_limit: super::connections_within(
+                crate::runtime::resource_limits::open_file_limit()
+            ),
             unchoke_slots_limit: 3,
             connection_speed: speed(40),
         }
@@ -2312,4 +2314,13 @@ async fn a_route_plans_who_resolves_its_names() {
     let laddered = routes.plan(category).unwrap();
     assert_eq!(laddered.kind, LegKind::Ladder);
     assert_eq!(laddered.names, Some(ResolvedBy::Proxy));
+}
+
+// No limit leaves twenty files and a fifth of the rest to files, never
+// fewer than five connections (libtorrent `session_impl`).
+#[test]
+fn unlimited_connections_leave_room_for_files() {
+    assert_eq!(super::connections_within(1_024), 803);
+    assert_eq!(super::connections_within(256), 188);
+    assert_eq!(super::connections_within(10), 5);
 }

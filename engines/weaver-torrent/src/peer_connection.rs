@@ -102,13 +102,15 @@ pub trait PeerConnectionHandler {
     fn download_wanted(&self) -> u64 {
         0
     }
-    /// Takes the block `chunk` the writer was handed, to send it, which
-    /// makes room for the peer's next. False when a Cancel or a Choke
-    /// dropped it first, and the block is not sent. A handler that queues
-    /// no uploads has none to take.
+    /// Takes the block `chunk` the writer was handed, to send it. False
+    /// when a Cancel or a Choke dropped it first, and the block is not sent.
+    /// A handler that queues no uploads has none to take.
     fn claim_upload(&self, _chunk: &ChunkInfo) -> bool {
         false
     }
+    /// The block `chunk` the writer took is sent, or dropped unserved: its
+    /// room in the peer's send buffer is free for the next.
+    fn upload_done(&self, _chunk: &ChunkInfo) {}
     /// Whether the block `chunk` the writer took is read and sent. False
     /// drops it unsent and keeps the connection; an error ends it. A
     /// handler with nothing to check first serves every block.
@@ -164,7 +166,7 @@ pub struct PeerConnectionOptions {
     #[serde(default, with = "optional_seconds")]
     pub handshake_timeout: Option<Duration>,
 
-    /// The most chunk requests to keep outstanding per peer (default 128, and
+    /// The most chunk requests to keep outstanding per peer (default 500, and
     /// never more than the peer's reqq). A newly needed piece, such as the
     /// one at a stream's read position after a seek, is requested only after
     /// those, so a smaller window makes streams react faster to seeks.
@@ -709,6 +711,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                             .map_err(Error::ReadChunk)?
                         {
                             trace!(?chunk, "upload not served");
+                            self.handler.upload_done(&chunk);
                             continue;
                         }
 
@@ -756,7 +759,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                                 .map_err(Error::ReadChunk)?;
                         }
 
-                        uploaded_add = Some(chunk.size);
+                        uploaded_add = Some(chunk);
                         full_len
                     }
                     WriterRequest::Disconnect(res) => {
@@ -770,11 +773,12 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
                 send(&mut up, &mut write, &write_buf[..len], "writing", rwtimeout).await?;
 
-                let payload = uploaded_add.unwrap_or(0);
+                let payload = uploaded_add.map_or(0, |chunk| chunk.size);
                 self.handler
                     .on_protocol_bytes(Channel::Upload, (len - payload as usize) as u64);
-                if let Some(uploaded_add) = uploaded_add {
-                    self.handler.on_uploaded_bytes(uploaded_add)
+                if let Some(chunk) = uploaded_add {
+                    self.handler.on_uploaded_bytes(chunk.size);
+                    self.handler.upload_done(&chunk);
                 }
             }
 

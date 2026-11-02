@@ -417,12 +417,26 @@ impl TorrentStateInitializing {
             return Ok(h);
         }
 
+        // Torrents hash their files one at a time by default, each waiting
+        // its turn here (libtorrent `active_checking`).
+        let session = self.shared.session.upgrade();
+        let _turn = match &session {
+            Some(session) => Some(
+                session
+                    .concurrent_initialize_semaphore
+                    .acquire()
+                    .await
+                    .context("bug: concurrent check semaphore was closed")?,
+            ),
+            None => None,
+        };
         info!("Doing initial checksum validation, this might take a while...");
         let have_pieces = self
             .shared
             .spawner
             .block_in_place_with_permits(
-                self.metadata.lengths().total_pieces() as usize,
+                (self.metadata.lengths().total_pieces() as usize)
+                    .min(self.shared.spawner.check_threads()),
                 |threads| {
                     self.check.store(CHECK_READING, Ordering::Release);
                     FileOps::new(
@@ -789,6 +803,23 @@ mod tests {
             };
             let handle = added(&session, &t, Some(trusted), false).await?;
             assert_eq!(have(&handle), [0, 1, 2, 4, 5, 6, 7]);
+            Ok(())
+        }
+
+        // libtorrent `active_checking` limits only torrents that hash their
+        // files: one whose resume data holds up starts while every check
+        // turn is taken.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_vouched_torrent_starts_while_another_holds_the_check_turn() -> anyhow::Result<()>
+        {
+            let (t, _out, session) = torrent("vouched_beside_a_check").await?;
+            let checkpoint = checkpointed(&session, &t).await?;
+            let turns = session.concurrent_initialize_semaphore.clone();
+            assert_eq!(turns.available_permits(), 1);
+            let _held = turns.clone().acquire_many_owned(1).await?;
+
+            let handle = added(&session, &t, Some(checkpoint), false).await?;
+            assert_eq!(have(&handle), (0..PIECES).collect::<Vec<_>>());
             Ok(())
         }
 

@@ -921,13 +921,10 @@ impl ManagedTorrent {
                         "initialize_and_start",
                         token.clone(),
                         async move {
-                            let concurrent_init_semaphore =
-                                session.concurrent_initialize_semaphore.clone();
-                            let _permit = concurrent_init_semaphore
-                                .acquire()
-                                .await
-                                .context("bug: concurrent init semaphore was closed")?;
-
+                            // Only hashing the files waits its turn
+                            // (`TorrentStateInitializing::resume_or_check`):
+                            // a torrent its resume data vouches for starts
+                            // beside the others.
                             let check_result = init.check().await;
 
                             match check_result {

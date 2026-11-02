@@ -18,27 +18,16 @@ pub fn spawn<E: Display + Send + 'static>(
     fut: impl std::future::Future<Output = Result<(), E>> + Send + 'static,
 ) -> tokio::task::JoinHandle<()> {
     let name = name.into();
+    // No timer of its own: a "still running" trace every few seconds per
+    // task was a wake per task whatever the task did, ~8 per idle torrent.
     let fut = async move {
         trace!("started");
-        tokio::pin!(fut);
-        let mut trace_interval = tokio::time::interval(std::time::Duration::from_secs(5));
-
-        loop {
-            tokio::select! {
-                _ = trace_interval.tick() => {
-                    trace!("still running");
-                },
-                r = &mut fut => {
-                    match r {
-                        Ok(_) => {
-                            trace!("finished");
-                        }
-                        Err(e) => {
-                            error!("{name} finished with error: {:#}", e)
-                        }
-                    }
-                    return;
-                }
+        match fut.await {
+            Ok(_) => {
+                trace!("finished");
+            }
+            Err(e) => {
+                error!("{name} finished with error: {:#}", e)
             }
         }
     }

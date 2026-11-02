@@ -514,23 +514,27 @@ impl<R: Root> GraphJob<R> {
         self.take_in(decoded, true, slots, limit)
     }
 
-    // Bytes the member's file holds already, found there: they arrive as
-    // an intake's do, and a kept member's are not written to it again, as
-    // a restore's read-back is not.
-    pub(crate) fn intake_found(
-        &mut self,
-        decoded: R::Intake,
-        slots: &mut RepairSlots,
-        limit: usize,
-    ) -> Result<(), GraphError> {
-        self.take_in(decoded, false, slots, limit)
-    }
-
     fn take_in(
         &mut self,
         decoded: R::Intake,
         write: bool,
         slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<(), GraphError> {
+        self.take_in_unlent(decoded, write, limit)?;
+        self.lend(slots, limit)
+    }
+
+    // `take_in` short of lending the repairs it made due. Unwritten
+    // (`write` false), the bytes are what the member's file holds already,
+    // found there: they arrive as an intake's do, and a kept member's are
+    // not written to it again, as a restore's read-back is not: the bytes are
+    // written and the runs stepped with no repair slot in hand, so a caller
+    // that shares the slots with other jobs takes them for the lend alone.
+    pub(crate) fn take_in_unlent(
+        &mut self,
+        decoded: R::Intake,
+        write: bool,
         limit: usize,
     ) -> Result<(), GraphError> {
         let (arrival, length) = self.root.receive(decoded);
@@ -564,7 +568,7 @@ impl<R: Root> GraphJob<R> {
             )?;
         }
         self.heard(out)?;
-        self.after_units([volume], slots, limit)
+        self.settle_units([volume], limit)
     }
 
     // Every server failed the article; nothing will fetch it again.
@@ -589,12 +593,21 @@ impl<R: Root> GraphJob<R> {
         slots: &mut RepairSlots,
         limit: usize,
     ) -> Result<(), GraphError> {
+        self.settle_units(volumes, limit)?;
+        self.lend(slots, limit)
+    }
+
+    // `after_units` short of the lend.
+    fn settle_units(
+        &mut self,
+        volumes: impl IntoIterator<Item = VolumeIndex>,
+        limit: usize,
+    ) -> Result<(), GraphError> {
         self.mark_damage()?;
         for volume in volumes {
             self.after_member(volume)?;
         }
-        self.step_runs(Vec::new(), limit)?;
-        self.lend(slots, limit)
+        self.step_runs(Vec::new(), limit)
     }
 
     // After an article of `volume` was settled: a member with nothing left
