@@ -298,7 +298,7 @@ async fn batch_by_selection_reaches_every_matching_job_only() {
     let resp = h
         .execute(
             r#"mutation { setQueueItemsPriority(
-                target: { selection: { categories: ["tv"] } }, priority: HIGH
+                target: { selection: { categories: ["tv"] }, expectedMatched: 2 }, priority: HIGH
             ) { matched applied } }"#,
         )
         .await;
@@ -351,4 +351,74 @@ async fn batch_refuses_too_many_ids_and_an_ambiguous_target() {
         .execute(r#"mutation { resumeQueueItems(target: {}) { matched } }"#)
         .await;
     assert_has_errors(&resp);
+
+    // Repeats are dropped before the cap: 1,001 ids naming 600 jobs fit.
+    let repeated = (1..=1_001u64)
+        .map(|id| (id % 600 + 1).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let resp = h
+        .execute(&format!(
+            r#"mutation {{ cancelQueueItems(target: {{ ids: [{repeated}] }}) {{ matched }} }}"#
+        ))
+        .await;
+    assert_no_errors(&resp);
+    assert_eq!(response_data(&resp)["cancelQueueItems"]["matched"], 600);
+}
+
+fn error_extension(resp: &async_graphql::Response, key: &str) -> Option<Value> {
+    resp.errors[0]
+        .extensions
+        .as_ref()
+        .and_then(|extensions| extensions.get(key))
+        .cloned()
+}
+
+#[tokio::test]
+async fn a_selection_acts_only_on_the_count_the_caller_confirmed() {
+    let h = TestHarness::new().await;
+    let first = h.submit_test_nzb("confirm-sel-1").await;
+    let second = h.submit_test_nzb("confirm-sel-2").await;
+
+    // No filter at all names the whole queue only when it says so.
+    let resp = h
+        .execute(r#"mutation { pauseQueueItems(target: { selection: {}, expectedMatched: 2 }) { matched } }"#)
+        .await;
+    assert_has_errors(&resp);
+    assert_eq!(
+        error_extension(&resp, "code"),
+        Some(Value::from("INVALID_INPUT"))
+    );
+
+    // The operator confirmed one job; a second has joined since, so nothing
+    // is paused and the answer carries the count to confirm again.
+    let resp = h
+        .execute(r#"mutation { pauseQueueItems(target: { selection: { all: true }, expectedMatched: 1 }) { matched } }"#)
+        .await;
+    assert_has_errors(&resp);
+    assert_eq!(
+        error_extension(&resp, "code"),
+        Some(Value::from("CONFLICT"))
+    );
+    assert_eq!(error_extension(&resp, "matched"), Some(Value::from(2)));
+    for id in [first, second] {
+        let resp = h
+            .execute(&format!("{{ queueItem(id: {id}) {{ state }} }}"))
+            .await;
+        assert_no_errors(&resp);
+        assert_ne!(
+            response_data(&resp)["queueItem"]["state"],
+            "PAUSED",
+            "job {id}"
+        );
+    }
+
+    // Confirmed again at the current count, the batch goes through.
+    let resp = h
+        .execute(r#"mutation { pauseQueueItems(target: { selection: { all: true }, expectedMatched: 2 }) { matched applied } }"#)
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert_eq!(data["pauseQueueItems"]["matched"], 2, "{data:?}");
+    assert_eq!(data["pauseQueueItems"]["applied"], 2, "{data:?}");
 }

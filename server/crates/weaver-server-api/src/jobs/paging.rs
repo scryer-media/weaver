@@ -4,9 +4,9 @@
 //! Queue pages, totals and batch selections, read in place.
 //!
 //! A walk reads every queue row once under the queue lock and keeps a few
-//! scalars per row; it copies no report. Searching, counting and sorting run
-//! on those scalars after the lock is let go, and only the rows a page
-//! returns are copied whole, each found through the queue's position index.
+//! scalars per row; it copies no report. A page is planned on those scalars
+//! and its rows are copied whole, each found through the queue's position
+//! index, under the same lock, so the rows agree with the counts beside them.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -65,6 +65,29 @@ pub(crate) struct WalkedRow {
 }
 
 impl WalkedRow {
+    // The section the Downloads screen draws the row in, in the screen's
+    // order: active (any phase from downloading to the final move), paused,
+    // queued, then failed. Matches the screen's own grouping of a status.
+    fn group_rank(&self) -> u8 {
+        match self.state {
+            QueueItemState::Paused => 1,
+            QueueItemState::Failed => 3,
+            QueueItemState::Queued | QueueItemState::Completed => 2,
+            // A held propagation reads as queued on the screen.
+            QueueItemState::Downloading if self.propagating => 2,
+            QueueItemState::AwaitingQueueScripts
+            | QueueItemState::Downloading
+            | QueueItemState::FetchingRepairData
+            | QueueItemState::FinalizingDownload
+            | QueueItemState::Checking
+            | QueueItemState::Verifying
+            | QueueItemState::Repairing
+            | QueueItemState::Extracting
+            | QueueItemState::Finalizing
+            | QueueItemState::PostProcessing => 0,
+        }
+    }
+
     // Queue order puts transferring jobs first, fastest first.
     fn download_rank(&self) -> u8 {
         match self.state {
@@ -108,6 +131,8 @@ impl WalkedRow {
 pub(crate) struct QueueWalk {
     pub(crate) rows: Vec<WalkedRow>,
     category_names: Vec<String>,
+    // Rows that lead queue order, so their list is sized once.
+    leading: usize,
 }
 
 /// What the walk copies beyond the scalars.
@@ -142,6 +167,7 @@ impl QueueWalk {
         let mut walk = QueueWalk {
             rows: Vec::with_capacity(inner.jobs.len()),
             category_names: Vec::new(),
+            leading: 0,
         };
         let mut category_index: HashMap<String, u32> = HashMap::new();
         for row in &inner.jobs {
@@ -182,6 +208,7 @@ impl QueueWalk {
                     )
                 }),
             });
+            walk.leading += usize::from(walk.rows.last().is_some_and(WalkedRow::leads));
         }
         walk
     }
@@ -213,29 +240,35 @@ impl QueueWalk {
         summary
     }
 
-    /// Row indexes in queue order as the default page shows it:
-    /// transferring jobs first, fastest first, then the rest as queued.
-    fn queue_order(&self, indexes: &[usize]) -> Vec<usize> {
-        let mut lead: Vec<usize> = indexes
-            .iter()
-            .copied()
-            .filter(|&index| self.rows[index].leads())
-            .collect();
-        lead.sort_by(|&left, &right| {
-            let (left_row, right_row) = (&self.rows[left], &self.rows[right]);
-            right_row
-                .download_rank()
-                .cmp(&left_row.download_rank())
-                .then_with(|| right_row.rate.cmp(&left_row.rate))
-                .then_with(|| left.cmp(&right))
+    /// Queue order: transferring jobs first, fastest first, then the rest
+    /// as queued. Time left counts in this order.
+    fn download_cmp(&self, left: usize, right: usize) -> Ordering {
+        let (left_row, right_row) = (&self.rows[left], &self.rows[right]);
+        right_row
+            .leads()
+            .cmp(&left_row.leads())
+            .then_with(|| {
+                if !left_row.leads() {
+                    return Ordering::Equal;
+                }
+                right_row
+                    .download_rank()
+                    .cmp(&left_row.download_rank())
+                    .then_with(|| right_row.rate.cmp(&left_row.rate))
+            })
+            .then_with(|| left.cmp(&right))
+    }
+
+    /// The default page order: section by section as the screen draws them
+    /// (active, paused, queued, failed), queue order within each. Sorted in
+    /// place, with no copy of the indexes.
+    fn display_order(&self, indexes: &mut [usize]) {
+        indexes.sort_unstable_by(|&left, &right| {
+            self.rows[left]
+                .group_rank()
+                .cmp(&self.rows[right].group_rank())
+                .then_with(|| self.download_cmp(left, right))
         });
-        lead.extend(
-            indexes
-                .iter()
-                .copied()
-                .filter(|&index| !self.rows[index].leads()),
-        );
-        lead
     }
 }
 
@@ -287,6 +320,15 @@ impl<'a> QueueSelection<'a> {
             priorities: non_empty(priorities),
             categories: non_empty(categories),
         }
+    }
+
+    /// Whether the selection keeps every job: no search, state, priority or
+    /// category filter.
+    pub(crate) fn is_unfiltered(&self) -> bool {
+        self.search.is_none()
+            && self.states.is_none()
+            && self.priorities.is_none()
+            && self.categories.is_none()
     }
 
     pub(crate) fn needs(&self, sort: Option<QueueSortField>) -> WalkNeeds {
@@ -390,15 +432,29 @@ fn display_state(state: QueueItemState) -> &'static str {
     }
 }
 
+/// What a page answer carries beyond its counts.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PageWants {
+    /// The page's rows and their time left. A totals-only answer (the
+    /// screen-wide counts every screen reads) asks for neither, and is then
+    /// planned without listing, ordering or copying any row.
+    pub(crate) rows: bool,
+}
+
 impl PagePlan {
-    pub(crate) fn plan(walk: &QueueWalk, input: &QueuePageInput) -> Self {
+    pub(crate) fn plan(walk: &QueueWalk, input: &QueuePageInput, wants: PageWants) -> Self {
         let selection = QueueSelection::of_page(input);
 
         // Everything a page counts follows from three nested stages: search
         // (with priorities), then categories, then states.
         let mut category_counts: HashMap<&str, u32> = HashMap::new();
         let mut state_counts: Vec<(QueueItemState, u32)> = Vec::new();
-        let mut matching: Vec<usize> = Vec::new();
+        let mut matching: Vec<usize> = if wants.rows {
+            Vec::with_capacity(walk.rows.len())
+        } else {
+            Vec::new()
+        };
+        let mut total_count = 0u32;
         for (index, row) in walk.rows.iter().enumerate() {
             if !selection.matches_search(row) {
                 continue;
@@ -415,45 +471,29 @@ impl PagePlan {
                 None => state_counts.push((row.state, 1)),
             }
             if selection.matches_state(row) {
-                matching.push(index);
+                total_count = total_count.saturating_add(1);
+                if wants.rows {
+                    matching.push(index);
+                }
             }
         }
 
-        let ordered = match input.sort_field {
-            None => walk.queue_order(&matching),
-            Some(field) => sorted(walk, matching, field, input.sort_direction),
+        let page: &[usize] = if wants.rows {
+            match input.sort_field {
+                None => walk.display_order(&mut matching),
+                Some(field) => sorted(walk, &mut matching, field, input.sort_direction),
+            }
+            let page_size = (input.page_size as usize).clamp(1, MAX_QUEUE_PAGE_SIZE);
+            let offset = (input.page_index as usize)
+                .saturating_mul(page_size)
+                .min(matching.len());
+            let end = offset.saturating_add(page_size).min(matching.len());
+            &matching[offset..end]
+        } else {
+            &[]
         };
-        let page_size = (input.page_size as usize).clamp(1, MAX_QUEUE_PAGE_SIZE);
-        let offset = (input.page_index as usize).saturating_mul(page_size);
-        let page: Vec<usize> = ordered
-            .iter()
-            .copied()
-            .skip(offset)
-            .take(page_size)
-            .collect();
 
-        // Time left counts every job ahead in queue order, filters aside.
-        let every_row: Vec<usize> = (0..walk.rows.len()).collect();
-        let mut through = HashMap::new();
-        let (mut eta_total_bytes, mut eta_downloaded_bytes, mut ahead) = (0u64, 0u64, 0u64);
-        for index in walk.queue_order(&every_row) {
-            let row = &walk.rows[index];
-            if row.counts_toward_eta() {
-                eta_total_bytes += row.total_bytes;
-                eta_downloaded_bytes += row.downloaded_bytes;
-                ahead += row.remaining_bytes();
-                through.insert(index, ahead);
-            }
-        }
-        let eta_through = page
-            .iter()
-            .filter_map(|index| {
-                through.get(index).map(|bytes_through| QueueEtaBytes {
-                    id: walk.rows[*index].id.0,
-                    bytes_through: *bytes_through,
-                })
-            })
-            .collect();
+        let eta = EtaTotals::of(walk, page);
 
         let mut category_counts: Vec<QueueCategoryCount> = category_counts
             .into_iter()
@@ -466,36 +506,124 @@ impl PagePlan {
 
         PagePlan {
             ids: page.iter().map(|&index| walk.rows[index].id).collect(),
-            total_count: u32::try_from(ordered.len()).unwrap_or(u32::MAX),
+            total_count,
             category_counts,
             state_counts: state_counts
                 .into_iter()
                 .map(|(state, count)| QueueStateCount { state, count })
                 .collect(),
-            remaining_bytes: walk
-                .rows
+            remaining_bytes: eta.remaining_bytes,
+            eta_total_bytes: eta.total_bytes,
+            eta_downloaded_bytes: eta.downloaded_bytes,
+            eta_through: eta.through,
+        }
+    }
+}
+
+/// The queue's byte totals and each page row's bytes through, in one pass
+/// over the rows. Time left counts every job ahead in queue order, filters
+/// aside; only the jobs that lead the queue (transferring, or with a rate)
+/// are listed, to be ranked, and nothing is kept per row.
+struct EtaTotals {
+    remaining_bytes: u64,
+    total_bytes: u64,
+    downloaded_bytes: u64,
+    through: Vec<QueueEtaBytes>,
+}
+
+impl EtaTotals {
+    fn of(walk: &QueueWalk, page: &[usize]) -> Self {
+        // A page row's slot by its row index. An empty page allocates none.
+        let slots: HashMap<usize, usize> = page
+            .iter()
+            .enumerate()
+            .map(|(slot, &index)| (index, slot))
+            .collect();
+        let slot = |index: usize| slots.get(&index).copied();
+        let mut through: Vec<Option<u64>> = vec![None; page.len()];
+        // Only a page ranks the leading jobs; a totals answer lists none.
+        let mut leads: Vec<usize> = if page.is_empty() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(walk.leading)
+        };
+        let (mut remaining_bytes, mut total_bytes, mut downloaded_bytes) = (0u64, 0u64, 0u64);
+        // Bytes of the waiting jobs that do not lead, ahead of and including
+        // each one, in queue position.
+        let mut trailing = 0u64;
+        for (index, row) in walk.rows.iter().enumerate() {
+            if row.awaits_download() {
+                remaining_bytes += row.remaining_bytes();
+            }
+            if !row.counts_toward_eta() {
+                continue;
+            }
+            total_bytes += row.total_bytes;
+            downloaded_bytes += row.downloaded_bytes;
+            if row.leads() {
+                if !page.is_empty() {
+                    leads.push(index);
+                }
+                continue;
+            }
+            trailing += row.remaining_bytes();
+            if !page.is_empty()
+                && let Some(slot) = slot(index)
+            {
+                through[slot] = Some(trailing);
+            }
+        }
+        if !page.is_empty() {
+            leads.sort_unstable_by(|&left, &right| walk.download_cmp(left, right));
+            let mut ahead = 0u64;
+            for &index in &leads {
+                ahead += walk.rows[index].remaining_bytes();
+                if let Some(slot) = slot(index) {
+                    through[slot] = Some(ahead);
+                }
+            }
+            // Every leading job is ahead of every one that does not lead.
+            for (slot, bytes) in through.iter_mut().enumerate() {
+                if let Some(bytes) = bytes
+                    && !walk.rows[page[slot]].leads()
+                {
+                    *bytes += ahead;
+                }
+            }
+        }
+        EtaTotals {
+            remaining_bytes,
+            total_bytes,
+            downloaded_bytes,
+            through: page
                 .iter()
-                .filter(|row| row.awaits_download())
-                .map(WalkedRow::remaining_bytes)
-                .sum(),
-            eta_total_bytes,
-            eta_downloaded_bytes,
-            eta_through,
+                .zip(through)
+                .filter_map(|(&index, bytes)| {
+                    bytes.map(|bytes_through| QueueEtaBytes {
+                        id: walk.rows[index].id.0,
+                        bytes_through,
+                    })
+                })
+                .collect(),
         }
     }
 }
 
 fn sorted(
     walk: &QueueWalk,
-    mut indexes: Vec<usize>,
+    indexes: &mut [usize],
     field: QueueSortField,
     direction: Option<QueueSortDirection>,
-) -> Vec<usize> {
-    // Names are worked out once per row, never per comparison.
-    let names: HashMap<usize, String> = if field == QueueSortField::Name {
+) {
+    // Names are worked out once per row, never per comparison, each as a
+    // folded key and the raw name that breaks a tie between equal keys.
+    let names: HashMap<usize, (String, String)> = if field == QueueSortField::Name {
         indexes
             .iter()
-            .map(|&index| (index, sort_name(&walk.rows[index])))
+            .map(|&index| {
+                let name = sort_name(&walk.rows[index]);
+                (index, (fold_name(&name), name))
+            })
             .collect()
     } else {
         HashMap::new()
@@ -519,27 +647,133 @@ fn sorted(
             QueueSortField::Size => left_row.total_bytes.cmp(&right_row.total_bytes),
         }
     };
-    indexes.sort_by(|&left, &right| {
+    // Section by section as the screen draws them, the field within each.
+    indexes.sort_unstable_by(|&left, &right| {
         let (left_row, right_row) = (&walk.rows[left], &walk.rows[right]);
         let order = match direction.unwrap_or(QueueSortDirection::Desc) {
             QueueSortDirection::Asc => by_field(left, right),
             QueueSortDirection::Desc => by_field(left, right).reverse(),
         };
-        right_row
-            .download_rank()
-            .cmp(&left_row.download_rank())
+        left_row
+            .group_rank()
+            .cmp(&right_row.group_rank())
             .then(order)
             .then_with(|| left_row.id.0.cmp(&right_row.id.0))
     });
-    indexes
 }
 
-/// Copies the named rows, found through the position index, in the order
-/// given. A row that has left the queue since it was planned is skipped.
-pub(crate) fn read_rows(state: &SharedPipelineState, ids: &[JobId]) -> Vec<JobInfo> {
+/// A name as a sort compares it: lower case, with the accents of Latin
+/// letters dropped, so "alpha", "Beta", "Émile" and "Zulu" sort in that
+/// order, as a reader's alphabet has them.
+pub(crate) fn fold_name(name: &str) -> String {
+    let mut folded = String::with_capacity(name.len());
+    for lower in name.chars().flat_map(char::to_lowercase) {
+        match lower {
+            // Combining accents, as a decomposed name carries them.
+            '\u{0300}'..='\u{036F}' => {}
+            'ß' => folded.push_str("ss"),
+            'ĳ' => folded.push_str("ij"),
+            'æ' => folded.push_str("ae"),
+            'œ' => folded.push_str("oe"),
+            _ => folded.push(base_letter(lower)),
+        }
+    }
+    folded
+}
+
+// The Latin-1 and Latin Extended-A letters, in code point order from
+// U+0100, as the letter each is an accented form of: one run per letter.
+const EXTENDED_A: [(char, u8); 21] = [
+    ('a', 6),
+    ('c', 8),
+    ('d', 4),
+    ('e', 10),
+    ('g', 8),
+    ('h', 4),
+    ('i', 10),
+    ('i', 2),
+    ('j', 2),
+    ('k', 3),
+    ('l', 10),
+    ('n', 9),
+    ('o', 8),
+    ('r', 6),
+    ('s', 8),
+    ('t', 6),
+    ('u', 12),
+    ('w', 2),
+    ('y', 3),
+    ('z', 6),
+    ('s', 1),
+];
+
+fn base_letter(letter: char) -> char {
+    match letter {
+        'à'..='å' => 'a',
+        'ç' => 'c',
+        'è'..='ë' => 'e',
+        'ì'..='ï' => 'i',
+        'ð' => 'd',
+        'ñ' => 'n',
+        'ò'..='ö' | 'ø' => 'o',
+        'ù'..='ü' => 'u',
+        'ý' | 'ÿ' => 'y',
+        '\u{0100}'..='\u{017F}' => {
+            let mut offset = letter as u32 - 0x0100;
+            for (base, run) in EXTENDED_A {
+                if offset < u32::from(run) {
+                    return base;
+                }
+                offset -= u32::from(run);
+            }
+            letter
+        }
+        _ => letter,
+    }
+}
+
+/// One page as a page answer reads it: the walk, the plan and the page's
+/// rows, all read under one queue lock, with the queue revision they show.
+pub(crate) struct PageRead {
+    pub(crate) walk: QueueWalk,
+    pub(crate) plan: PagePlan,
+    pub(crate) rows: Vec<JobInfo>,
+    pub(crate) revision: u64,
+}
+
+impl PageRead {
+    pub(crate) fn read(
+        state: &SharedPipelineState,
+        input: &QueuePageInput,
+        wants: PageWants,
+    ) -> Self {
+        let needs = QueueSelection::of_page(input).needs(input.sort_field);
+        state.read_queue(|inner| {
+            let walk = QueueWalk::of(inner, needs);
+            let plan = PagePlan::plan(&walk, input, wants);
+            let rows = plan
+                .ids
+                .iter()
+                .filter_map(|id| inner.row(*id).map(|row| row.info(&inner.globals)))
+                .collect();
+            PageRead {
+                walk,
+                plan,
+                rows,
+                revision: state.queue_revision(),
+            }
+        })
+    }
+}
+
+/// Copies every queued row in queue order, as a listing shows it: no per-file
+/// bytes, server attribution or discards.
+pub(crate) fn read_listing(state: &SharedPipelineState) -> Vec<JobInfo> {
     state.read_queue(|inner| {
-        ids.iter()
-            .filter_map(|id| inner.row(*id).map(|row| row.info(&inner.globals)))
+        inner
+            .jobs
+            .iter()
+            .map(|row| row.view(&inner.globals).list_info())
             .collect()
     })
 }
@@ -573,10 +807,20 @@ mod tests {
     use weaver_server_core::{DownloadState, JobStatus, PipelineMetrics, PostState, RunState};
 
     fn job(id: u64, status: JobStatus, category: Option<&str>, total_bytes: u64) -> JobInfo {
-        let (download_state, run_state) = match status {
-            JobStatus::Downloading => (DownloadState::Downloading, RunState::Active),
-            JobStatus::Paused => (DownloadState::Queued, RunState::Paused),
-            _ => (DownloadState::Queued, RunState::Active),
+        let (download_state, run_state, post_state) = match status {
+            JobStatus::Downloading => (
+                DownloadState::Downloading,
+                RunState::Active,
+                PostState::Idle,
+            ),
+            JobStatus::Paused => (DownloadState::Queued, RunState::Paused, PostState::Idle),
+            JobStatus::Extracting => (
+                DownloadState::Complete,
+                RunState::Active,
+                PostState::Extracting,
+            ),
+            JobStatus::Failed { .. } => (DownloadState::Failed, RunState::Active, PostState::Idle),
+            _ => (DownloadState::Queued, RunState::Active, PostState::Idle),
         };
         JobInfo {
             job_id: JobId(id),
@@ -586,7 +830,7 @@ mod tests {
             download_state,
             finalizing_download: false,
             fetching_repair_data: false,
-            post_state: PostState::Idle,
+            post_state,
             run_state,
             progress: 0.0,
             total_bytes,
@@ -626,6 +870,9 @@ mod tests {
         }
     }
 
+    const ROWS: PageWants = PageWants { rows: true };
+    const TOTALS: PageWants = PageWants { rows: false };
+
     fn ids(plan: &PagePlan) -> Vec<u64> {
         plan.ids.iter().map(|id| id.0).collect()
     }
@@ -646,13 +893,13 @@ mod tests {
         let walk = QueueWalk::read(&state, WalkNeeds::default());
         assert_eq!(walk.rows.len(), 1_200);
 
-        let first = PagePlan::plan(&walk, &page_input(0, 500));
+        let first = PagePlan::plan(&walk, &page_input(0, 500), ROWS);
         assert_eq!(first.total_count, 1_200);
         let mut expected = vec![700, 900];
         expected.extend((1..=498).collect::<Vec<_>>());
         assert_eq!(ids(&first), expected);
 
-        let last = PagePlan::plan(&walk, &page_input(2, 500));
+        let last = PagePlan::plan(&walk, &page_input(2, 500), ROWS);
         let expected: Vec<u64> = (1_001..=1_200).collect();
         assert_eq!(ids(&last), expected);
 
@@ -698,7 +945,7 @@ mod tests {
         input.sort_direction = Some(QueueSortDirection::Desc);
         let selection = QueueSelection::of_page(&input);
         let walk = QueueWalk::read(&state, selection.needs(input.sort_field));
-        let plan = PagePlan::plan(&walk, &input);
+        let plan = PagePlan::plan(&walk, &input, ROWS);
 
         // "show 0001" finds ids 10..=19 through the display name.
         let searched: Vec<u64> = (10..=19).collect();
@@ -756,7 +1003,7 @@ mod tests {
             &state,
             QueueSelection::of_page(&input).needs(input.sort_field),
         );
-        assert_eq!(ids(&PagePlan::plan(&walk, &input)), vec![1, 2, 3]);
+        assert_eq!(ids(&PagePlan::plan(&walk, &input, ROWS)), vec![1, 2, 3]);
     }
 
     #[test]
@@ -798,10 +1045,201 @@ mod tests {
             Some(JobId(37))
         );
         assert!(read_row(&state, JobId(51)).is_none());
-        let rows = read_rows(&state, &[JobId(9), JobId(99), JobId(3)]);
+    }
+
+    #[test]
+    fn a_page_is_read_with_its_rows_under_one_lock() {
+        let jobs = (1..=50u64)
+            .map(|id| job(id, JobStatus::Queued, None, 1))
+            .collect();
+        let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
+        let read = PageRead::read(&state, &page_input(1, 20), ROWS);
+        assert_eq!(ids(&read.plan), (21..=40).collect::<Vec<_>>());
         assert_eq!(
-            rows.iter().map(|job| job.job_id.0).collect::<Vec<_>>(),
-            vec![9, 3]
+            read.rows.iter().map(|job| job.job_id.0).collect::<Vec<_>>(),
+            (21..=40).collect::<Vec<_>>()
         );
+        assert_eq!(read.revision, state.queue_revision());
+    }
+
+    #[test]
+    fn every_active_job_leads_the_default_page_then_paused_queued_and_failed() {
+        // Queue position 1 500 extracts, 1 600 is paused, 1 700 failed and
+        // 1 800 downloads; everything else waits.
+        let jobs = (1..=2_000)
+            .map(|id| {
+                let status = match id {
+                    1_500 => JobStatus::Extracting,
+                    1_600 => JobStatus::Paused,
+                    1_700 => JobStatus::Failed {
+                        error: "lost".to_string(),
+                    },
+                    1_800 => JobStatus::Downloading,
+                    _ => JobStatus::Queued,
+                };
+                job(id, status, None, 10)
+            })
+            .collect();
+        let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
+        let walk = QueueWalk::read(&state, WalkNeeds::default());
+        let first = PagePlan::plan(&walk, &page_input(0, 4), ROWS);
+        assert_eq!(ids(&first), vec![1_800, 1_500, 1_600, 1]);
+        let last = PagePlan::plan(&walk, &page_input(499, 4), ROWS);
+        assert_eq!(ids(&last), vec![1_998, 1_999, 2_000, 1_700]);
+
+        // A sort keeps the sections and orders by its field within each.
+        let mut by_size = page_input(0, 3);
+        by_size.sort_field = Some(QueueSortField::Size);
+        assert_eq!(
+            ids(&PagePlan::plan(&walk, &by_size, ROWS)),
+            vec![1_500, 1_800, 1_600]
+        );
+    }
+
+    #[test]
+    fn a_name_sort_ignores_case_and_accents() {
+        let names = ["Zulu", "Émile", "alpha", "Beta", "émile", "Alpha"];
+        let jobs = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let mut job = job(index as u64 + 1, JobStatus::Queued, None, 1);
+                job.name = (*name).to_string();
+                job
+            })
+            .collect();
+        let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
+        let mut input = page_input(0, 10);
+        input.sort_field = Some(QueueSortField::Name);
+        input.sort_direction = Some(QueueSortDirection::Asc);
+        let walk = QueueWalk::read(
+            &state,
+            QueueSelection::of_page(&input).needs(input.sort_field),
+        );
+        let ordered: Vec<&str> = ids(&PagePlan::plan(&walk, &input, ROWS))
+            .iter()
+            .map(|id| names[*id as usize - 1])
+            .collect();
+        // Equal folded names fall back to the raw name, capitals first.
+        assert_eq!(
+            ordered,
+            ["Alpha", "alpha", "Beta", "Émile", "émile", "Zulu"]
+        );
+        assert_eq!(
+            fold_name("Ĳssel Łódź Straße Œuvre"),
+            "ijssel lodz strasse oeuvre"
+        );
+    }
+
+    #[test]
+    fn time_left_counts_leading_jobs_then_the_queue_ahead() {
+        let jobs = (1..=6)
+            .map(|id| {
+                let status = if id == 5 {
+                    JobStatus::Downloading
+                } else {
+                    JobStatus::Queued
+                };
+                job(id, status, None, id * 100)
+            })
+            .collect();
+        let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
+        let walk = QueueWalk::read(&state, WalkNeeds::default());
+        let plan = PagePlan::plan(&walk, &page_input(0, 6), ROWS);
+        let through: Vec<(u64, u64)> = plan
+            .eta_through
+            .iter()
+            .map(|eta| (eta.id, eta.bytes_through))
+            .collect();
+        assert_eq!(
+            through,
+            [
+                (5, 500),
+                (1, 600),
+                (2, 800),
+                (3, 1_100),
+                (4, 1_500),
+                (6, 2_100)
+            ]
+        );
+        assert_eq!(plan.eta_total_bytes, 2_100);
+    }
+
+    // Allocations the totals answer makes, at `rows` queued jobs.
+    fn totals_allocations(rows: u64) -> u64 {
+        let jobs = (1..=rows)
+            .map(|id| {
+                let status = if id % 50 == 0 {
+                    JobStatus::Downloading
+                } else {
+                    JobStatus::Queued
+                };
+                job(id, status, (id % 3 == 0).then_some("tv"), 10)
+            })
+            .collect();
+        let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
+        let walk = QueueWalk::read(&state, WalkNeeds::default());
+        let before = crate::alloc_probe::allocations();
+        let plan = PagePlan::plan(&walk, &page_input(0, 1), TOTALS);
+        let made = crate::alloc_probe::allocations() - before;
+        assert_eq!(plan.total_count as u64, rows);
+        assert!(plan.ids.is_empty() && plan.eta_through.is_empty());
+        made
+    }
+
+    // Allocations a 50-row page makes, at `rows` queued jobs.
+    fn page_allocations(rows: u64) -> u64 {
+        let jobs = (1..=rows)
+            .map(|id| {
+                let status = if id % 50 == 0 {
+                    JobStatus::Downloading
+                } else {
+                    JobStatus::Queued
+                };
+                job(id, status, None, 10)
+            })
+            .collect();
+        let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
+        let walk = QueueWalk::read(&state, WalkNeeds::default());
+        let before = crate::alloc_probe::allocations();
+        let plan = PagePlan::plan(&walk, &page_input(3, 50), ROWS);
+        let made = crate::alloc_probe::allocations() - before;
+        assert_eq!(plan.ids.len(), 50);
+        made
+    }
+
+    #[test]
+    fn a_push_allocates_by_its_page_not_by_the_queue() {
+        // The totals answer lists no row: the same few allocations whether
+        // the queue holds two thousand jobs or four thousand.
+        let small = totals_allocations(2_000);
+        assert_eq!(totals_allocations(4_000), small);
+        assert!(small <= 8, "{small} allocations for the totals");
+        // A page lists the matching rows once and its own rows' time left;
+        // nothing is allocated per queued job.
+        let small = page_allocations(2_000);
+        assert_eq!(page_allocations(4_000), small);
+        assert!(small <= 16, "{small} allocations for a page");
+    }
+
+    #[tokio::test]
+    async fn a_page_push_reads_duplicate_summaries_once_per_queue_revision() {
+        let db = weaver_server_core::Database::open_in_memory().unwrap();
+        let rows: Vec<JobInfo> = (1..=3_000)
+            .map(|id| job(id, JobStatus::Queued, None, 1))
+            .collect();
+        let mut page: Vec<_> = rows[100..150]
+            .iter()
+            .map(crate::jobs::types::queue_table_item_from_job)
+            .collect();
+        let mut cache = crate::jobs::query::DuplicateSummaryCache::default();
+        cache.attach(db.clone(), 7, &mut page).await.unwrap();
+        cache.attach(db.clone(), 7, &mut page).await.unwrap();
+        assert_eq!(cache.reads(), 1, "the same revision reads once");
+        // A totals push carries no row and reads nothing.
+        cache.attach(db.clone(), 8, &mut []).await.unwrap();
+        assert_eq!(cache.reads(), 1);
+        cache.attach(db.clone(), 8, &mut page).await.unwrap();
+        assert_eq!(cache.reads(), 2, "a new revision reads again");
     }
 }

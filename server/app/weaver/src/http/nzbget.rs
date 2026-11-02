@@ -2054,9 +2054,11 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
     // history(Hidden): rows a client removed with HistoryDelete are listed
     // only when the first parameter is true.
     let include_hidden = optional_bool_param(&positional_params(params)?, 0)?.unwrap_or(false);
-    // The queue's finished rows, copied, and the in-memory history, shared.
-    let finished_rows = ctx.queue.read_queue(|inner| {
-        inner
+    // The queue's finished rows, copied, and the in-memory history, shared,
+    // under one queue lock: history is replaced under that lock, so a job
+    // moving from the queue into history is listed exactly once.
+    let (finished_rows, history_rows) = ctx.queue.read_queue(|inner| {
+        let finished = inner
             .jobs
             .iter()
             .filter_map(|row| {
@@ -2067,9 +2069,9 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
                 )
                 .then(|| view.list_info())
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (finished, ctx.queue.history_rows())
     });
-    let history_rows = ctx.queue.history_rows();
     let terminal_items = finished_rows
         .iter()
         .chain(history_rows.iter())

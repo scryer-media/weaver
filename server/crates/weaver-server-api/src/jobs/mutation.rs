@@ -598,21 +598,23 @@ impl JobsMutation {
                     | weaver_server_core::JobStatus::Failed { .. }
             )
         };
+        // Queue and history under one queue lock: history is replaced under
+        // it, so a job moving between them is never missed.
         ids.extend(state.read_queue(|inner| {
+            let history = state.history_rows();
             inner
                 .jobs
                 .iter()
                 .filter(|row| finished(row.view(&inner.globals).status()))
                 .map(|row| row.id.0)
+                .chain(
+                    history
+                        .iter()
+                        .filter(|info| finished(&info.status))
+                        .map(|info| info.job_id.0),
+                )
                 .collect::<Vec<_>>()
         }));
-        ids.extend(
-            state
-                .history_rows()
-                .iter()
-                .filter(|info| finished(&info.status))
-                .map(|info| info.job_id.0),
-        );
         // The jobs listed above, in batches: a refused id never holds back the
         // rest, and a job that reaches history after the listing stays.
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?;

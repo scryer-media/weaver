@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::jobs::paging::{PagePlan, QueueSelection, QueueWalk, read_row, read_rows};
+use crate::jobs::paging::{PageRead, PageWants, read_row};
 use crate::jobs::types::{
     DuplicateIdentitySnapshotInfo, DuplicateSummaryInfo, PreparedQueueFilter,
     load_duplicate_summaries_chunked, matches_queue_filter_prepared, queue_table_item_from_job,
@@ -46,60 +46,36 @@ impl JobsQuery {
         first: Option<u32>,
         after: Option<String>,
     ) -> Result<Vec<QueueItem>> {
-        let handle = ctx.data::<SchedulerHandle>()?;
         let offset = decode_offset_cursor(after.as_deref())
             .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
         let limit = first.unwrap_or(u32::MAX) as usize;
         let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
 
-        let mut items: Vec<QueueItem> = handle
-            .queue_jobs()
-            .into_iter()
-            .map(|info| queue_item_from_job(&info))
-            .filter(|item| matches_queue_filter_prepared(item, prepared_filter.as_ref()))
-            .skip(offset)
-            .take(limit)
-            .collect();
+        let mut items: Vec<QueueItem> = crate::jobs::paging::read_listing(
+            ctx.data::<weaver_server_core::SharedPipelineState>()?,
+        )
+        .iter()
+        .map(queue_item_from_job)
+        .filter(|item| matches_queue_filter_prepared(item, prepared_filter.as_ref()))
+        .skip(offset)
+        .take(limit)
+        .collect();
         attach_duplicate_summaries(ctx.data::<Database>()?.clone(), &mut items).await?;
         Ok(items)
     }
     /// Server-paginated queue rows for the interactive queue table.
     #[graphql(guard = "ReadGuard")]
     async fn queue_page(&self, ctx: &Context<'_>, input: QueuePageInput) -> Result<QueuePage> {
-        let handle = ctx.data::<SchedulerHandle>()?.clone();
-        let state = ctx
-            .data::<weaver_server_core::SharedPipelineState>()?
-            .clone();
-        let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
-        // Capture before reading the scheduler so events produced while this page
-        // is assembled remain eligible for replay by queueEvents(after: ...).
-        let latest_cursor = replay.latest_cursor().await;
-        let selection = QueueSelection::of_page(&input);
-        let walk = QueueWalk::read(&state, selection.needs(input.sort_field));
-        let metrics = handle.get_metrics();
-        let summary = walk.summary(&metrics);
-        let categories = walk.categories();
-        let plan = PagePlan::plan(&walk, &input);
-        drop(walk);
-        let mut items = read_rows(&state, &plan.ids)
-            .iter()
-            .map(queue_table_item_from_job)
-            .collect::<Vec<_>>();
-        attach_duplicate_summaries(ctx.data::<Database>()?.clone(), &mut items).await?;
-
-        Ok(QueuePage {
-            items,
-            total_count: plan.total_count,
-            summary,
-            categories,
-            category_counts: plan.category_counts,
-            state_counts: plan.state_counts,
-            remaining_bytes: plan.remaining_bytes,
-            eta_total_bytes: plan.eta_total_bytes,
-            eta_downloaded_bytes: plan.eta_downloaded_bytes,
-            eta_through: plan.eta_through,
-            latest_cursor,
-        })
+        build_queue_page(
+            ctx.data::<SchedulerHandle>()?,
+            ctx.data::<weaver_server_core::SharedPipelineState>()?,
+            ctx.data::<crate::jobs::replay::QueueEventReplay>()?,
+            ctx.data::<Database>()?.clone(),
+            &input,
+            page_wants(ctx),
+            &mut DuplicateSummaryCache::default(),
+        )
+        .await
     }
     /// Public queue facade for one active item.
     #[graphql(guard = "ReadGuard")]
@@ -135,12 +111,13 @@ impl JobsQuery {
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
         let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
 
-        let mut items: Vec<QueueItem> = handle
-            .queue_jobs()
-            .into_iter()
-            .map(|info| queue_item_from_job(&info))
-            .filter(|item| matches_queue_filter_prepared(item, prepared_filter.as_ref()))
-            .collect();
+        let mut items: Vec<QueueItem> = crate::jobs::paging::read_listing(
+            ctx.data::<weaver_server_core::SharedPipelineState>()?,
+        )
+        .iter()
+        .map(queue_item_from_job)
+        .filter(|item| matches_queue_filter_prepared(item, prepared_filter.as_ref()))
+        .collect();
         attach_duplicate_summaries(ctx.data::<Database>()?.clone(), &mut items).await?;
         let metrics = handle.get_metrics();
         let latest_cursor = replay.latest_cursor().await;
@@ -362,6 +339,117 @@ fn list_output_files(dir: &std::path::Path) -> Result<JobOutputResult> {
         output_dir,
         files,
         total_bytes,
+    })
+}
+
+/// What a page request selects beyond the counts: a selection that names no
+/// row field (the screen-wide totals) is planned without any row.
+pub(crate) fn page_wants(ctx: &Context<'_>) -> PageWants {
+    let fields = ctx.look_ahead();
+    PageWants {
+        rows: fields.field("items").exists() || fields.field("etaThrough").exists(),
+    }
+}
+
+/// The duplicate summaries a page answer last read, kept while the queue
+/// revision they were read at stands. A job's summary changes only with the
+/// queue (an add, a removal or a retirement moves the revision), so a push
+/// at the same revision reads nothing, and a page with no rows never reads.
+#[derive(Default)]
+pub(crate) struct DuplicateSummaryCache {
+    revision: Option<u64>,
+    by_id: std::collections::HashMap<u64, Option<DuplicateSummaryInfo>>,
+    reads: u32,
+}
+
+impl DuplicateSummaryCache {
+    pub(crate) async fn attach(
+        &mut self,
+        db: Database,
+        revision: u64,
+        items: &mut [QueueItem],
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        if self.revision != Some(revision) {
+            self.by_id.clear();
+            self.revision = Some(revision);
+        }
+        let missing = items
+            .iter()
+            .filter(|item| !self.by_id.contains_key(&item.id))
+            .map(|item| weaver_server_core::jobs::ids::JobId(item.id))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            self.reads += 1;
+            let wanted = missing.clone();
+            let summaries =
+                tokio::task::spawn_blocking(move || load_duplicate_summaries_chunked(&db, wanted))
+                    .await
+                    .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+                    .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+            for id in missing {
+                self.by_id.insert(
+                    id.0,
+                    summaries.get(&id).map(DuplicateSummaryInfo::from_summary),
+                );
+            }
+        }
+        for item in items {
+            item.duplicate_summary = self.by_id.get(&item.id).cloned().flatten();
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reads(&self) -> u32 {
+        self.reads
+    }
+}
+
+/// One queue page: the rows `input` asks for, and the counts and totals
+/// over every row it matches.
+pub(crate) async fn build_queue_page(
+    handle: &SchedulerHandle,
+    state: &weaver_server_core::SharedPipelineState,
+    replay: &crate::jobs::replay::QueueEventReplay,
+    db: Database,
+    input: &QueuePageInput,
+    wants: PageWants,
+    duplicates: &mut DuplicateSummaryCache,
+) -> Result<QueuePage> {
+    // Capture before reading the scheduler so events produced while this page
+    // is assembled remain eligible for replay by queueEvents(after: ...).
+    let latest_cursor = replay.latest_cursor().await;
+    let PageRead {
+        walk,
+        plan,
+        rows,
+        revision,
+    } = PageRead::read(state, input, wants);
+    let metrics = handle.get_metrics();
+    let summary = walk.summary(&metrics);
+    let categories = walk.categories();
+    drop(walk);
+    let mut items = rows
+        .iter()
+        .map(queue_table_item_from_job)
+        .collect::<Vec<_>>();
+    duplicates.attach(db, revision, &mut items).await?;
+
+    Ok(QueuePage {
+        items,
+        total_count: plan.total_count,
+        summary,
+        categories,
+        category_counts: plan.category_counts,
+        state_counts: plan.state_counts,
+        remaining_bytes: plan.remaining_bytes,
+        eta_total_bytes: plan.eta_total_bytes,
+        eta_downloaded_bytes: plan.eta_downloaded_bytes,
+        eta_through: plan.eta_through,
+        latest_cursor,
     })
 }
 

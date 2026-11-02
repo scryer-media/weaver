@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use async_graphql::ErrorExtensions;
 use weaver_server_core::jobs::handle::CancellationOrigin;
 use weaver_server_core::{JobId, JobUpdate, SchedulerError, SchedulerHandle, SharedPipelineState};
 
@@ -27,14 +28,28 @@ pub(crate) enum QueueBatchOp {
 /// Each job's answer, by id.
 pub(crate) type BatchOutcome = BTreeMap<JobId, Result<(), SchedulerError>>;
 
-/// The jobs a target names: its ids as given, or every queued job its
-/// selection matches, in queue order.
+/// The jobs a target names: its distinct ids as given, or every queued job
+/// its selection matches, in queue order, provided the selection still
+/// matches the count the caller confirmed.
 pub(crate) fn resolve_target(
     state: &SharedPipelineState,
     target: &QueueBatchTarget,
 ) -> async_graphql::Result<Vec<JobId>> {
     match (&target.ids, &target.selection) {
         (Some(ids), None) => {
+            if target.expected_matched.is_some() {
+                return Err(graphql_error(
+                    "INVALID_INPUT",
+                    "expectedMatched goes with a selection, not with ids",
+                ));
+            }
+            let mut seen = BTreeSet::new();
+            let ids: Vec<JobId> = ids
+                .iter()
+                .copied()
+                .filter(|id| seen.insert(*id))
+                .map(JobId)
+                .collect();
             if ids.len() > MAX_QUEUE_BATCH_IDS {
                 return Err(graphql_error(
                     "BATCH_TOO_LARGE",
@@ -43,18 +58,35 @@ pub(crate) fn resolve_target(
                     ),
                 ));
             }
-            let mut seen = BTreeSet::new();
-            Ok(ids
-                .iter()
-                .copied()
-                .filter(|id| seen.insert(*id))
-                .map(JobId)
-                .collect())
+            Ok(ids)
         }
-        (None, Some(selection)) => {
-            let selection = QueueSelection::of_input(selection);
+        (None, Some(input)) => {
+            let selection = QueueSelection::of_input(input);
+            if selection.is_unfiltered() && input.all != Some(true) {
+                return Err(graphql_error(
+                    "INVALID_INPUT",
+                    "a selection with no filter names the whole queue only with all: true",
+                ));
+            }
+            let Some(expected) = target.expected_matched else {
+                return Err(graphql_error(
+                    "INVALID_INPUT",
+                    "a selection carries expectedMatched, the count the caller confirmed",
+                ));
+            };
             let walk = QueueWalk::read(state, selection.needs(None));
-            Ok(selection.ids(&walk))
+            let ids = selection.ids(&walk);
+            let matched = u32::try_from(ids.len()).unwrap_or(u32::MAX);
+            if matched != expected {
+                return Err(async_graphql::Error::new(format!(
+                    "the selection now matches {matched} jobs, not {expected}; confirm again"
+                ))
+                .extend_with(|_, extensions| {
+                    extensions.set("code", "CONFLICT");
+                    extensions.set("matched", matched);
+                }));
+            }
+            Ok(ids)
         }
         _ => Err(graphql_error(
             "INVALID_INPUT",

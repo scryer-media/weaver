@@ -17,7 +17,7 @@ use weaver_server_core::jobs::{
 use weaver_server_core::operations::metrics::MetricsSnapshot;
 use weaver_server_core::{is_public_history_attribute_key, split_history_metadata};
 
-use super::release_display::{ReleaseDisplayInput, release_display_info};
+use super::release_display::{ReleaseDisplayCache, ReleaseDisplayInput, release_display_info};
 use crate::system::types::{DownloadBlock, Metrics};
 
 pub use weaver_server_core::CLIENT_REQUEST_ID_ATTRIBUTE_KEY;
@@ -377,7 +377,8 @@ pub struct QueuePageInput {
 }
 
 /// Which queued jobs a batch acts on: every job matching all the given
-/// fields. No field at all means the whole queue.
+/// fields. A selection with no filter names the whole queue only when it says
+/// so with `all: true`; otherwise it is refused.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, InputObject)]
 pub struct QueueSelectionInput {
     pub search: Option<String>,
@@ -385,14 +386,20 @@ pub struct QueueSelectionInput {
     pub priorities: Option<Vec<QueuePriority>>,
     /// The empty string names jobs with no category.
     pub categories: Option<Vec<String>>,
+    /// The whole queue, stated outright. Required when no filter is given.
+    pub all: Option<bool>,
 }
 
-/// The jobs a batch acts on: `ids` (at most 1,000) or a `selection` that
-/// names every queued job it matches. Give exactly one.
+/// The jobs a batch acts on: `ids` (at most 1,000 distinct) or a `selection`
+/// that names every queued job it matches. Give exactly one. A selection
+/// carries `expectedMatched`, the count the caller saw; when the queue now
+/// matches a different count the whole batch is refused with `CONFLICT`,
+/// whose `matched` extension carries the current count to confirm again.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, InputObject)]
 pub struct QueueBatchTarget {
     pub ids: Option<Vec<u64>>,
     pub selection: Option<QueueSelectionInput>,
+    pub expected_matched: Option<u32>,
 }
 
 /// One job a batch did not change, and why: `NOT_FOUND` for an id the queue
@@ -1083,6 +1090,7 @@ impl From<&weaver_server_core::JobInfo> for Job {
             job_name: &info.name,
             metadata: &info.metadata,
             category: info.category.as_deref(),
+            cache: ReleaseDisplayCache::Queue(info.job_id.0),
         });
 
         Self {
@@ -1258,6 +1266,7 @@ pub fn queue_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
         job_name: &info.name,
         metadata: &info.metadata,
         category: info.category.as_deref(),
+        cache: ReleaseDisplayCache::Queue(info.job_id.0),
     });
     queue_item_from_display(
         info,
@@ -1358,6 +1367,7 @@ pub fn queue_item_from_submission(
         job_name: &submitted.summary.name,
         metadata: &submitted.summary.metadata,
         category: submitted.summary.category.as_deref(),
+        cache: ReleaseDisplayCache::Queue(submitted.job_id.0),
     });
     QueueItem {
         id: submitted.job_id.0,

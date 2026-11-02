@@ -213,8 +213,10 @@ impl PrometheusMetricsExporter {
         let per_job_series = self.config.read().await.metrics.per_job_series;
         // Every job is counted by status in place; only the jobs that get a
         // series of their own are copied, and none at all when that is off.
-        let history = self.state.history_rows();
-        let (mut job_counts, mut jobs) = self.state.read_queue(|inner| {
+        // Queue and history under one queue lock (history is replaced under
+        // it), so a job moving into history is counted exactly once.
+        let (history, (mut job_counts, mut jobs)) = self.state.read_queue(|inner| {
+            let history = self.state.history_rows();
             let mut counts = render::JobStatusCounts::default();
             let mut jobs = Vec::new();
             for row in &inner.jobs {
@@ -224,7 +226,7 @@ impl PrometheusMetricsExporter {
                     jobs.push(view.list_info());
                 }
             }
-            (counts, jobs)
+            (history, (counts, jobs))
         });
         for job in history.iter() {
             job_counts.add(&job.status);

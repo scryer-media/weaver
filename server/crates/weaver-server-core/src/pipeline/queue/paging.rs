@@ -28,6 +28,12 @@ impl SharedPipelineState {
     pub fn history_rows(&self) -> Arc<[JobInfo]> {
         self.queue.history()
     }
+
+    /// The queue's revision. Read inside [`Self::read_queue`], it names the
+    /// rows that closure saw.
+    pub fn queue_revision(&self) -> u64 {
+        self.queue.revision()
+    }
 }
 
 impl QueueInner {
