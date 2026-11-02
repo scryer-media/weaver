@@ -256,6 +256,10 @@ pub struct RarStore {
     // the ones that can travel to another owner. Filed where a volume comes
     // or goes and where pieces do, so no question about one scans pieces.
     unmapped: BTreeSet<VolumeIndex>,
+    // Every entry's pieces by the volume they lie in, as (entry, piece),
+    // filed where `unmapped` is, so finding a volume's parts scans no other
+    // volume's pieces.
+    pieces_in: BTreeMap<VolumeIndex, Vec<(usize, usize)>>,
     // The volumes to look at again: walk their headers, hold them to the
     // layout, say their recovery records. Filed wherever something a walk
     // or the layout reads of a volume changes, so a look visits only them.
@@ -307,6 +311,7 @@ impl RarStore {
             volumes: BTreeMap::new(),
             giving: BTreeMap::new(),
             unmapped: BTreeSet::new(),
+            pieces_in: BTreeMap::new(),
             dirty: BTreeSet::new(),
             lasts: BTreeSet::new(),
             formats: Default::default(),
@@ -379,12 +384,16 @@ impl RarStore {
     // The volumes no piece lies in, from every entry again: where pieces
     // went, at a retraction or a restore.
     fn remap(&mut self) {
-        let mapped: BTreeSet<VolumeIndex> = self
-            .entries
-            .iter()
-            .flat_map(|entry| &entry.pieces)
-            .map(|piece| piece.volume)
-            .collect();
+        self.pieces_in.clear();
+        for (id, entry) in self.entries.iter().enumerate() {
+            for (at, piece) in entry.pieces.iter().enumerate() {
+                self.pieces_in
+                    .entry(piece.volume)
+                    .or_default()
+                    .push((id, at));
+            }
+        }
+        let mapped: BTreeSet<VolumeIndex> = self.pieces_in.keys().copied().collect();
         self.unmapped = self
             .volumes
             .keys()

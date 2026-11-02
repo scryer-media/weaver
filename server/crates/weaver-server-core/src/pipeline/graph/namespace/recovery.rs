@@ -63,6 +63,13 @@ pub(crate) struct Coming {
     pub(crate) sets: BTreeSet<NodeId>,
 }
 
+// The set a root member is an own volume of, if it is one.
+fn own_set(tree: &Tree, member: MemberId) -> Option<NodeId> {
+    tree.child_of(NodeId::ROOT, member)
+        .map(|(set, _)| set)
+        .filter(|set| tree.recovers(*set))
+}
+
 impl NamespaceWriter {
     // What is still to come, from the root members with an article the
     // queue fetches unasked: a member that is a set's own volume names its
@@ -73,14 +80,27 @@ impl NamespaceWriter {
             return coming;
         };
         for member in members.filter(|member| root.get(*member).is_some()) {
-            match tree.child_of(NodeId::ROOT, member) {
-                Some((set, _)) if tree.recovers(set) => {
+            match own_set(tree, member) {
+                Some(set) => {
                     coming.sets.insert(set);
                 }
-                _ => coming.payload = true,
+                None => coming.payload = true,
             }
         }
         coming
+    }
+
+    // Whether `coming` would say payload is still to come, stopping at the
+    // first payload member.
+    pub(crate) fn payload_coming(
+        &self,
+        tree: &Tree,
+        mut members: impl Iterator<Item = MemberId>,
+    ) -> bool {
+        let Some(root) = tree.namespace(NodeId::ROOT) else {
+            return false;
+        };
+        members.any(|member| root.get(member).is_some() && own_set(tree, member).is_none())
     }
 
     // Every set in the tree with the namespace it lives in, parents first.

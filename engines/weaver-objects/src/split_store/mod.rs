@@ -65,6 +65,12 @@ pub struct SplitStore {
     // The length the member was last announced with, once it was.
     #[serde(skip)]
     said: Option<Option<u64>>,
+    // Where each piece starts (`offset`), for every place from the first up
+    // to the first piece not bound or not declared, counted again wherever
+    // a piece is bound, sized or taken. Not kept: a restored store counts
+    // from its pieces until its first change counts them again.
+    #[serde(skip)]
+    starts: Option<Vec<u64>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,9 +233,35 @@ impl SplitStore {
     // (`extent`). A number missing after a piece moves nothing of it: what
     // it placed stays where it sits, and the map says so.
     fn offset(&self, index: u32) -> Option<u64> {
+        match &self.starts {
+            Some(starts) => starts.get(usize::try_from(index).ok()?).copied(),
+            None => self.counted(index),
+        }
+    }
+
+    // `offset` from the pieces themselves.
+    fn counted(&self, index: u32) -> Option<u64> {
         (0..index).try_fold(0u64, |at, before| {
             Some(at + self.pieces.get(&before)?.declared?)
         })
+    }
+
+    // Every piece's start counted again: a piece was bound, sized or taken.
+    fn count_starts(&mut self) {
+        let mut starts = vec![0u64];
+        let mut at = 0u64;
+        for index in 0u32.. {
+            let Some(declared) = self.pieces.get(&index).and_then(|piece| piece.declared) else {
+                break;
+            };
+            at += declared;
+            starts.push(at);
+        }
+        self.starts = Some(starts);
+        #[cfg(test)]
+        for index in 0..=u32::try_from(self.pieces.len() + 1).unwrap_or(u32::MAX) {
+            assert_eq!(self.offset(index), self.counted(index));
+        }
     }
 
     // How far a piece's bytes can be placed: to its declared length, or
@@ -265,12 +297,24 @@ impl SplitStore {
     }
 
     // Whether the places held run from the first with no number missing.
+    // The places are distinct and ascending, so they run from the first
+    // with none missing exactly when the last is one short of their count.
     fn contiguous(&self) -> bool {
-        self.pieces
+        let contiguous = self
+            .pieces
             .keys()
-            .copied()
-            .zip(0u32..)
-            .all(|(index, expected)| index == expected)
+            .next_back()
+            .is_none_or(|last| u64::from(*last) + 1 == self.pieces.len() as u64);
+        #[cfg(test)]
+        assert_eq!(
+            contiguous,
+            self.pieces
+                .keys()
+                .copied()
+                .zip(0u32..)
+                .all(|(index, expected)| index == expected)
+        );
+        contiguous
     }
 
     // The member, announced or announced again when its length changed. A
@@ -343,6 +387,7 @@ impl SplitStore {
         if let Some(piece) = self.pieces.get_mut(&index) {
             piece.declared = Some(length);
         }
+        self.count_starts();
         for (at, start) in before.into_iter().rev() {
             let now = self.offset(at);
             let Some(piece) = self.pieces.get_mut(&at) else {
@@ -394,6 +439,9 @@ impl Object for SplitStore {
         out: &mut Vec<Emit>,
     ) {
         let index = delivery.volume.0;
+        if self.starts.is_none() {
+            self.count_starts();
+        }
         let refuted = self.refutes(index, &delivery);
         let range = delivery.range();
         let Some(before) = self.before(index) else {
@@ -600,6 +648,7 @@ impl Object for SplitStore {
         if held.declared.is_none() {
             held.declared = length.filter(|length| *length > 0);
         }
+        self.count_starts();
     }
 
     // The piece a recovery set named again names the member again when it
@@ -629,6 +678,7 @@ impl Object for SplitStore {
     fn taken(&mut self, volume: VolumeIndex) {
         self.pieces.remove(&volume.0);
         self.awaiting.remove(&volume.0);
+        self.count_starts();
     }
 
     fn facts(&self) -> Facts {

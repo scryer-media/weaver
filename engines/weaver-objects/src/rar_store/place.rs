@@ -346,8 +346,39 @@ impl RarStore {
     }
 
     // The parts the entries hold in a volume range, in volume order: the
-    // member, the volume range and the packed-stream range it is.
-    fn parts_in(
+    // member, the volume range and the packed-stream range it is. Only the
+    // volume's own pieces are looked at; parts starting at the same byte
+    // keep entry and piece order.
+    pub(super) fn parts_in(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+    ) -> Vec<(usize, ByteRange, ByteRange)> {
+        let mut parts: Vec<(u64, usize, usize, ByteRange, ByteRange)> = self
+            .pieces_in
+            .get(&volume)
+            .into_iter()
+            .flatten()
+            .filter_map(|&(id, at)| {
+                let piece = self.entries.get(id)?.pieces.get(at)?;
+                let part = piece.data.intersect(range)?;
+                let stream = ByteRange::at(piece.at + (part.start - piece.data.start), part.len());
+                Some((part.start, id, at, part, stream))
+            })
+            .collect();
+        parts.sort_unstable_by_key(|&(start, id, at, _, _)| (start, id, at));
+        let parts: Vec<(usize, ByteRange, ByteRange)> = parts
+            .into_iter()
+            .map(|(_, id, _, part, stream)| (id, part, stream))
+            .collect();
+        #[cfg(test)]
+        assert_eq!(parts, self.parts_scanned(volume, range));
+        parts
+    }
+
+    // The scan the index stands for: every entry's every piece.
+    #[cfg(test)]
+    pub(super) fn parts_scanned(
         &self,
         volume: VolumeIndex,
         range: ByteRange,
