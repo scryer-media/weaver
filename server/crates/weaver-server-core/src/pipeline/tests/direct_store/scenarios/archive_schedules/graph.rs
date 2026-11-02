@@ -727,6 +727,10 @@ impl MoveCrash {
         };
         self.state = None;
         let written = std::mem::take(&mut turns.written);
+        // No crash is still to come, so nothing is kept back from here on:
+        // a job that fails on the restore waits for its commits' word
+        // before it goes, and a word kept back would never reach it.
+        turns.holds_written = false;
         pipeline.db.flush_write_queue().await.unwrap();
         let waiting = pipeline
             .graph_jobs
