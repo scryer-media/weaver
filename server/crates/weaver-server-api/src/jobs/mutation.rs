@@ -11,14 +11,16 @@ use crate::history::types::{
     AcceptHistoryDeleteInput, HistoryCommandResult, HistoryDeleteAcceptance, HistoryItem,
     history_delete_row_state_from_core, history_item_from_row,
 };
+use crate::jobs::batch::{QueueBatchOp, batch_result};
 use crate::jobs::staging::{StagedUploadManager, normalize_uploaded_nzb_reader};
 use crate::jobs::types::{
     CancelJobResult, DuplicateDecisionInfo, DuplicateModeGql, PRIORITY_ATTRIBUTE_KEY,
-    PersistedQueueEvent, QueueCommandResult, QueueEventKind, QueueMoveKind,
-    SemanticDuplicateAdmissionInfo, SemanticPromotionResult, StageNzbUploadInput,
-    StagedNzbSubmissionResult, StagedNzbUploadResult, SubmissionResult, SubmissionStatus,
-    SubmitNzbInput, SubmitStagedNzbsInput, SubmitStagedNzbsResult, global_queue_state,
-    normalize_priority_value, queue_item_from_job, queue_item_from_submission, submit_metadata,
+    PersistedQueueEvent, QueueBatchResult, QueueBatchTarget, QueueCommandResult, QueueEventKind,
+    QueueMoveKind, QueuePriority, SemanticDuplicateAdmissionInfo, SemanticPromotionResult,
+    StageNzbUploadInput, StagedNzbSubmissionResult, StagedNzbUploadResult, SubmissionResult,
+    SubmissionStatus, SubmitNzbInput, SubmitStagedNzbsInput, SubmitStagedNzbsResult,
+    global_queue_state, normalize_priority_value, queue_item_from_job, queue_item_from_submission,
+    submit_metadata,
 };
 use crate::{ScheduledResumeCoordinator, ScheduledResumeError};
 use weaver_server_core::ingest::{
@@ -617,34 +619,67 @@ impl JobsMutation {
         priority: Option<String>,
     ) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        let mut base_update = JobUpdate::default();
-        if let Some(category) = category.as_deref() {
-            let resolved = weaver_server_core::ingest::resolve_submission_category(
-                ctx.data::<SharedConfig>()?,
-                Some(category),
-            )
-            .await
-            .map_err(|error| graphql_error("INVALID_INPUT", error.to_string()))?;
-            base_update.category = resolved.map_or(FieldUpdate::Clear, FieldUpdate::Set);
-        }
-
-        let normalized_priority = priority
-            .map(|value| {
-                normalize_priority_value(&value)
-                    .map_err(|message| graphql_error("INVALID_INPUT", message))
-            })
-            .transpose()?;
-
+        let update = job_update(ctx, category.as_deref(), priority.as_deref()).await?;
         for &id in &ids {
-            let mut update = base_update.clone();
-            if let Some(priority) = normalized_priority.as_ref() {
-                update
-                    .metadata_edits
-                    .push((PRIORITY_ATTRIBUTE_KEY.to_string(), Some(priority.clone())));
-            }
             handle.update_job(JobId(id), update.clone()).await?;
         }
         Ok(true)
+    }
+    /// Pause every job the target names, as one queue change. A job that is
+    /// missing or refuses is listed in `refused` and holds back nothing.
+    #[graphql(guard = "ControlGuard")]
+    async fn pause_queue_items(
+        &self,
+        ctx: &Context<'_>,
+        target: QueueBatchTarget,
+    ) -> Result<QueueBatchResult> {
+        run_batch(ctx, &target, QueueBatchOp::Pause).await
+    }
+    /// Resume every job the target names, as one queue change.
+    #[graphql(guard = "ControlGuard")]
+    async fn resume_queue_items(
+        &self,
+        ctx: &Context<'_>,
+        target: QueueBatchTarget,
+    ) -> Result<QueueBatchResult> {
+        run_batch(ctx, &target, QueueBatchOp::Resume).await
+    }
+    /// Cancel and remove every job the target names, as one queue change.
+    #[graphql(guard = "ControlGuard")]
+    async fn cancel_queue_items(
+        &self,
+        ctx: &Context<'_>,
+        target: QueueBatchTarget,
+    ) -> Result<QueueBatchResult> {
+        run_batch(ctx, &target, QueueBatchOp::Cancel).await
+    }
+    /// Move every job the target names into `category`; the empty string
+    /// clears it.
+    #[graphql(guard = "ControlGuard")]
+    async fn set_queue_items_category(
+        &self,
+        ctx: &Context<'_>,
+        target: QueueBatchTarget,
+        category: String,
+    ) -> Result<QueueBatchResult> {
+        let update = job_update(ctx, Some(&category), None).await?;
+        run_batch(ctx, &target, QueueBatchOp::Update(update)).await
+    }
+    /// Give every job the target names `priority`.
+    #[graphql(guard = "ControlGuard")]
+    async fn set_queue_items_priority(
+        &self,
+        ctx: &Context<'_>,
+        target: QueueBatchTarget,
+        priority: QueuePriority,
+    ) -> Result<QueueBatchResult> {
+        let priority = match priority {
+            QueuePriority::High => "HIGH",
+            QueuePriority::Normal => "NORMAL",
+            QueuePriority::Low => "LOW",
+        };
+        let update = job_update(ctx, None, Some(priority)).await?;
+        run_batch(ctx, &target, QueueBatchOp::Update(update)).await
     }
     /// Set or clear a queued job's archive/unpack password. Passing null or
     /// an empty string removes the password (even one that came from the NZB
@@ -994,6 +1029,46 @@ async fn delete_history_ids(
             .await;
     }
     first_failure.map_or(Ok(()), Err)
+}
+
+// The edit a category and/or priority change makes to a job. The category
+// resolves as a submission's does; the empty string clears it.
+async fn job_update(
+    ctx: &Context<'_>,
+    category: Option<&str>,
+    priority: Option<&str>,
+) -> Result<JobUpdate> {
+    let mut update = JobUpdate::default();
+    if let Some(category) = category {
+        let resolved = weaver_server_core::ingest::resolve_submission_category(
+            ctx.data::<SharedConfig>()?,
+            Some(category),
+        )
+        .await
+        .map_err(|error| graphql_error("INVALID_INPUT", error.to_string()))?;
+        update.category = resolved.map_or(FieldUpdate::Clear, FieldUpdate::Set);
+    }
+    if let Some(priority) = priority {
+        let priority = normalize_priority_value(priority)
+            .map_err(|message| graphql_error("INVALID_INPUT", message))?;
+        update
+            .metadata_edits
+            .push((PRIORITY_ATTRIBUTE_KEY.to_string(), Some(priority)));
+    }
+    Ok(update)
+}
+
+async fn run_batch(
+    ctx: &Context<'_>,
+    target: &QueueBatchTarget,
+    op: QueueBatchOp,
+) -> Result<QueueBatchResult> {
+    let handle = ctx.data::<SchedulerHandle>()?;
+    let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
+    let ids = crate::jobs::batch::resolve_target(state, target)?;
+    Ok(batch_result(
+        crate::jobs::batch::apply(handle, ids, op).await,
+    ))
 }
 
 fn map_scheduler_result<T>(result: std::result::Result<T, SchedulerError>) -> Result<T> {

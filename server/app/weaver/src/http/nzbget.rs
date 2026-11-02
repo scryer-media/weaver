@@ -2724,6 +2724,10 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
         _ => {}
     }
 
+    // NZBGet applies an edit to every id it finds and answers true when it
+    // found at least one; a missing id holds back none of the others.
+    let mut applied = 0usize;
+    let mut missing = Vec::new();
     for job_id in request.ids {
         let result = match command.as_str() {
             "grouppause" => ctx.handle.pause_job(job_id).await,
@@ -2798,8 +2802,8 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
             other => return Err(RpcError::invalid_action(other)),
         };
         match result {
-            Ok(()) => {}
-            Err(SchedulerError::JobNotFound(_)) => return Ok(json!(false)),
+            Ok(()) => applied += 1,
+            Err(SchedulerError::JobNotFound(_)) => missing.push(job_id.0),
             Err(error) => {
                 return Err(RpcError::invalid_parameter(format!(
                     "{} failed: {error}",
@@ -2808,8 +2812,16 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
             }
         }
     }
+    if !missing.is_empty() {
+        tracing::debug!(
+            command = %request.command,
+            applied,
+            ?missing,
+            "editqueue named ids the queue does not hold"
+        );
+    }
 
-    Ok(json!(true))
+    Ok(json!(applied > 0))
 }
 
 // HistoryDelete hides the row from the client's default history listing but

@@ -387,6 +387,33 @@ pub struct QueueSelectionInput {
     pub categories: Option<Vec<String>>,
 }
 
+/// The jobs a batch acts on: `ids` (at most 1,000) or a `selection` that
+/// names every queued job it matches. Give exactly one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, InputObject)]
+pub struct QueueBatchTarget {
+    pub ids: Option<Vec<u64>>,
+    pub selection: Option<QueueSelectionInput>,
+}
+
+/// One job a batch did not change, and why: `NOT_FOUND` for an id the queue
+/// does not hold, `CONFLICT` for a job that refuses the change now,
+/// `INTERNAL` otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct QueueBatchRefusal {
+    pub id: u64,
+    pub code: String,
+    pub message: String,
+}
+
+/// What a batch did: how many jobs it named, how many took the change, and
+/// each one that did not.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct QueueBatchResult {
+    pub matched: u32,
+    pub applied: u32,
+    pub refused: Vec<QueueBatchRefusal>,
+}
+
 /// Jobs matching the search and priorities, counted by category before the
 /// category and state filters apply. The empty string is no category.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
@@ -437,6 +464,9 @@ pub enum QueueEventKind {
     ItemAttention,
     ItemCompleted,
     ItemRemoved,
+    /// The global state changed, or many items changed at once: their
+    /// per-item progress and state changes are not sent one by one, so
+    /// re-read the queue. Arrivals, completions and failures are still sent.
     GlobalStateChanged,
 }
 

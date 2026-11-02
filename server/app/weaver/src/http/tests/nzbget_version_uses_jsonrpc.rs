@@ -2391,6 +2391,55 @@ async fn nzbget_editqueue_unsupported_commands_return_false_without_fault() {
 }
 
 #[tokio::test]
+async fn nzbget_editqueue_applies_every_found_id_past_a_missing_one() {
+    let job = |id| {
+        nzbget_test_job(
+            id,
+            JobStatus::Queued,
+            weaver_server_core::DownloadState::Queued,
+            100,
+            0,
+            vec![],
+        )
+    };
+    let handle = scheduler_handle_with_jobs(vec![job(1), job(2)]).await;
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupPause", 0, "", [1, 99, 2]],
+            "id": "pause"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"], true);
+    wait_for_job_status(&handle, JobId(1), JobStatus::Paused).await;
+    wait_for_job_status(&handle, JobId(2), JobStatus::Paused).await;
+
+    // NZBGet answers false only when it finds none of the ids.
+    let (_, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupResume", 0, "", [98, 99]],
+            "id": "resume"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"], false);
+}
+
+#[tokio::test]
 async fn nzbget_editqueue_rejects_more_than_max_ids() {
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
