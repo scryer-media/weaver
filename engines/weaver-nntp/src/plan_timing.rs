@@ -30,6 +30,12 @@ use crate::pool::{OVER_LIMIT_HOLDOFF_INITIAL, OVER_LIMIT_PROBE_WINDOW};
 // Shortest any scaled duration may become, so no timer collapses to zero.
 const SCALED_FLOOR: Duration = Duration::from_millis(1);
 
+// How long a warmed pool member may sit idle before it is retired, so its
+// next use dials and measures it again.
+const POOL_IDLE_RETIRE: Duration = Duration::from_secs(600);
+// How often a pool looks for members idle past `POOL_IDLE_RETIRE`.
+const POOL_IDLE_SWEEP: Duration = Duration::from_secs(30);
+
 // Every time-based threshold the connection plans wait on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlanTiming {
@@ -60,6 +66,11 @@ pub struct PlanTiming {
     pub leg_cooldown_initial: Duration,
     // How long a fallback ladder leaves a rung alone after its path failed.
     pub rung_cooldown: Duration,
+    // How long a warmed pool member may sit idle before it is retired, so its
+    // next use dials and measures it again.
+    pub pool_idle_retire: Duration,
+    // How often a pool looks for members idle past `pool_idle_retire`.
+    pub pool_idle_sweep: Duration,
 }
 
 impl PlanTiming {
@@ -77,6 +88,8 @@ impl PlanTiming {
         route_cooldown: weaver_tunnel::pipe::PATH_COOLDOWN,
         leg_cooldown_initial: weaver_tunnel::pipe::PATH_COOLDOWN,
         rung_cooldown: weaver_tunnel::pipe::PATH_COOLDOWN,
+        pool_idle_retire: POOL_IDLE_RETIRE,
+        pool_idle_sweep: POOL_IDLE_SWEEP,
     };
 
     // [`Self::PRODUCTION`] with every waiting duration divided by `scale`,
@@ -99,6 +112,8 @@ impl PlanTiming {
             route_cooldown: s(p.route_cooldown),
             leg_cooldown_initial: s(p.leg_cooldown_initial),
             rung_cooldown: s(p.rung_cooldown),
+            pool_idle_retire: s(p.pool_idle_retire),
+            pool_idle_sweep: s(p.pool_idle_sweep),
         }
     }
 }
@@ -128,7 +143,7 @@ mod tests {
     use crate::address_plan::{DELIVERY_MIN_SAMPLES, SHADOW_EVERY_CONNECTS, SHADOW_RETRIES};
 
     // The durations scaling divides: everything but the two evidence bounds.
-    fn waiting_fields(t: &PlanTiming) -> [Duration; 10] {
+    fn waiting_fields(t: &PlanTiming) -> [Duration; 12] {
         [
             t.failed_race_holdoff,
             t.delivery_min_wire,
@@ -140,6 +155,8 @@ mod tests {
             t.route_cooldown,
             t.leg_cooldown_initial,
             t.rung_cooldown,
+            t.pool_idle_retire,
+            t.pool_idle_sweep,
         ]
     }
 
@@ -160,6 +177,8 @@ mod tests {
         assert_eq!(scaled.delivery_verdict_interval, Duration::from_secs(6));
         assert_eq!(scaled.shadow_interval, Duration::from_secs(3));
         assert_eq!(scaled.rung_cooldown, Duration::from_secs(3));
+        assert_eq!(scaled.pool_idle_retire, Duration::from_secs(60));
+        assert_eq!(scaled.pool_idle_sweep, Duration::from_secs(3));
     }
 
     #[test]

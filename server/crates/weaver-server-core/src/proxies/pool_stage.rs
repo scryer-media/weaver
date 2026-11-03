@@ -23,7 +23,6 @@ use weaver_tunnel::{
     resolution::record::Recording,
 };
 
-const POOL_IDLE_RETIRE: Duration = Duration::from_secs(600);
 // How far back a member's rate looks, as far as a leg's does.
 const MEMBER_RATE_WINDOW: Duration = Duration::from_secs(4);
 
@@ -195,7 +194,8 @@ impl Member {
             status.warmed
                 && status.open == 0
                 && status.opening == 0
-                && self.idle_since.lock().expect("member idle").elapsed() >= POOL_IDLE_RETIRE
+                && self.idle_since.lock().expect("member idle").elapsed()
+                    >= weaver_nntp::plan_timing::timing().pool_idle_retire
         };
         if retire && self.dialer.retire_idle().await {
             self.status.lock().expect("pool member").warmed = false;
@@ -580,10 +580,10 @@ impl PoolStage {
         });
         let weak = Arc::downgrade(&state);
         let retirement = handle.spawn(async move {
-            // Only sweeps for members idle past POOL_IDLE_RETIRE; it never
-            // decides which member new connections use, so it stays outside
-            // the plan timing.
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            // Only sweeps for members idle past the plan timing's idle
+            // retire; it never decides which member new connections use.
+            let mut interval =
+                tokio::time::interval(weaver_nntp::plan_timing::timing().pool_idle_sweep);
             loop {
                 interval.tick().await;
                 let Some(state) = weak.upgrade() else {

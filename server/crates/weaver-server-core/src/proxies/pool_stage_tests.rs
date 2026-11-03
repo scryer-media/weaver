@@ -171,7 +171,7 @@ async fn feed_lease_prevents_idle_retirement_until_released() {
     lease.resolve("news.invalid").await.unwrap();
     assert_eq!(pool.snapshot().1[0].opening, 1);
     assert_eq!(pool.snapshot().1[1].opening, 0);
-    tokio::time::advance(POOL_IDLE_RETIRE).await;
+    tokio::time::advance(weaver_nntp::plan_timing::timing().pool_idle_retire).await;
     member.retire_if_idle().await;
     assert_eq!(members[0].retired.load(Ordering::SeqCst), 0);
     drop(lease);
