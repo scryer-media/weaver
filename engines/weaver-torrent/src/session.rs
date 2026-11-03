@@ -1447,10 +1447,10 @@ impl Session {
                     Some(shared) => shared.slots.limit(),
                     None => opts.connections_limit,
                 };
-                let utp = listen_opts.utp_opts.get_or_insert_with(Default::default);
-                if utp.connections_limit.is_none() {
-                    utp.connections_limit = std::num::NonZeroUsize::new(connections_limit);
-                }
+                session_utp_opts(
+                    listen_opts.utp_opts.get_or_insert_with(Default::default),
+                    connections_limit,
+                );
                 Some(
                     listen_opts
                         .start(
@@ -3838,6 +3838,19 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
     }
 }
 
+// What the session sets on its uTP socket where the caller left it unset:
+// the connection limit SYNs are capped by, and each stream's receive buffer
+// at the per-peer size.
+fn session_utp_opts(utp: &mut weaver_utp::SocketOpts, connections_limit: usize) {
+    if utp.connections_limit.is_none() {
+        utp.connections_limit = std::num::NonZeroUsize::new(connections_limit);
+    }
+    if utp.vsock_rx_bufsize_bytes.is_none() {
+        utp.vsock_rx_bufsize_bytes =
+            std::num::NonZeroUsize::new(crate::torrent_state::live::peer::UTP_RECEIVE_BUFFER);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{collections::HashSet, sync::Arc};
@@ -6115,5 +6128,24 @@ mod tests {
                 "{table:?}, unable {unable:?}, discovery {discovery}"
             );
         }
+    }
+
+    #[test]
+    fn the_session_sizes_each_utp_streams_receive_buffer_and_caps_syns() {
+        let mut utp = weaver_utp::SocketOpts::default();
+        super::session_utp_opts(&mut utp, 200);
+        assert_eq!(
+            utp.vsock_rx_bufsize_bytes.map(|n| n.get()),
+            Some(crate::torrent_state::live::peer::UTP_RECEIVE_BUFFER)
+        );
+        assert_eq!(utp.connections_limit.map(|n| n.get()), Some(200));
+
+        // What the caller set stands.
+        let mut utp = weaver_utp::SocketOpts {
+            vsock_rx_bufsize_bytes: std::num::NonZeroUsize::new(4096),
+            ..Default::default()
+        };
+        super::session_utp_opts(&mut utp, 200);
+        assert_eq!(utp.vsock_rx_bufsize_bytes.map(|n| n.get()), Some(4096));
     }
 }
