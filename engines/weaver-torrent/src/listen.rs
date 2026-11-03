@@ -111,12 +111,17 @@ impl Default for ListenerOptions {
 }
 
 impl ListenerOptions {
+    /// Bind the listener's sockets. Its uTP socket's receive buffer holds a
+    /// receive window for each of the `connections_limit` connections the
+    /// session may hold, as far as the host allows.
     pub(crate) async fn start(
         mut self,
         parent_span: Option<tracing::Id>,
         cancellation_token: CancellationToken,
         socket_factory: &Arc<dyn SocketFactory>,
+        connections_limit: usize,
     ) -> anyhow::Result<ListenResult> {
+        let receive_buffer = crate::udp_options::receive_buffer_for(connections_limit);
         let mut utp_opts = self.utp_opts.take().unwrap_or_default();
         utp_opts.cancellation_token = cancellation_token.clone();
         utp_opts.parent_span = parent_span;
@@ -137,6 +142,7 @@ impl ListenerOptions {
             self.mode,
             listen_addr,
             utp_opts.clone(),
+            receive_buffer,
             socket_factory,
             true,
         )
@@ -150,6 +156,7 @@ impl ListenerOptions {
                     self.mode,
                     SocketAddr::new(listen_addr.ip(), port),
                     utp_opts,
+                    receive_buffer,
                     socket_factory,
                     false,
                 )
@@ -183,11 +190,13 @@ impl ListenerOptions {
 
 // A listener's sockets on `listen_addr`, as `mode` says; a port of 0 takes
 // TCP's free port, and uTP binds the port TCP took. The session's `peers`
-// listener is the one a factory's forwarded port reaches.
+// listener is the one a factory's forwarded port reaches. Its uTP socket
+// asks for a receive buffer of `receive_buffer` bytes.
 async fn bind(
     mode: ListenerMode,
     mut listen_addr: SocketAddr,
     utp_opts: librqbit_utp::SocketOpts,
+    receive_buffer: usize,
     factory: &Arc<dyn SocketFactory>,
     peers: bool,
 ) -> anyhow::Result<Listening> {
@@ -209,7 +218,7 @@ async fn bind(
     };
 
     let utp_socket = if mode.utp_enabled() {
-        match bind_utp(factory.as_ref(), listen_addr, utp_opts).await {
+        match bind_utp(factory.as_ref(), listen_addr, utp_opts, receive_buffer).await {
             Ok(sock) => {
                 listen_addr = sock.bind_addr();
                 info!(
@@ -236,14 +245,16 @@ async fn bind(
     })
 }
 
-/// A uTP socket over a datagram socket `factory` binds on `listen_addr`.
+/// A uTP socket over a datagram socket `factory` binds for uTP on
+/// `listen_addr`, asking for a receive buffer of `receive_buffer` bytes.
 pub(crate) async fn bind_utp(
     factory: &dyn SocketFactory,
     listen_addr: SocketAddr,
     utp_opts: librqbit_utp::SocketOpts,
+    receive_buffer: usize,
 ) -> anyhow::Result<UtpSocket> {
     let transport = factory
-        .bind_udp(listen_addr)
+        .bind_utp(listen_addr, receive_buffer)
         .await
         .context("error binding UDP socket")?;
     let sock = librqbit_utp::UtpSocket::new_with_opts(

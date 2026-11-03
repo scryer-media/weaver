@@ -17,7 +17,7 @@
 use std::{
     future::Future,
     io::{self, IoSlice},
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, SocketAddr, SocketAddrV6},
     sync::Arc,
     task::{Context, Poll},
 };
@@ -103,6 +103,19 @@ pub trait SocketFactory: Send + Sync + 'static {
         &'a self,
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>>;
+
+    /// Bind the datagram socket uTP runs over on `addr`, with a receive
+    /// buffer of `receive_buffer` bytes where the factory sets one, and its
+    /// datagrams never fragmented. A factory that sets neither binds it as
+    /// any other.
+    fn bind_utp<'a>(
+        &'a self,
+        addr: SocketAddr,
+        receive_buffer: usize,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        let _ = receive_buffer;
+        self.bind_udp(addr)
+    }
 
     /// The local address traffic toward `to` leaves from on this route, or
     /// why it has none. None when the route does not say, as one through a
@@ -235,11 +248,10 @@ impl KernelSockets {
         }
     }
 
-    /// A datagram socket at `addr`, set for uTP to run over it.
+    /// A datagram socket at `addr`, at the kernel's defaults.
     fn kernel_udp(&self, addr: SocketAddr) -> io::Result<KernelUdp> {
         let socket = librqbit_dualstack_sockets::UdpSocket::bind_udp(addr, self.bind_opts())
             .map_err(io::Error::other)?;
-        crate::udp_options::set_for_utp(socket.socket(), addr);
         Ok(KernelUdp(socket))
     }
 }
@@ -286,6 +298,18 @@ impl SocketFactory for KernelSockets {
         Box::pin(async move { Ok(Arc::new(self.kernel_udp(addr)?) as Arc<dyn DatagramSocket>) })
     }
 
+    fn bind_utp<'a>(
+        &'a self,
+        addr: SocketAddr,
+        receive_buffer: usize,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        Box::pin(async move {
+            let socket = self.kernel_udp(addr)?;
+            crate::udp_options::set_for_utp(socket.0.socket(), addr, receive_buffer);
+            Ok(Arc::new(socket) as Arc<dyn DatagramSocket>)
+        })
+    }
+
     // The port mapper asks the gateway from a socket of its own, bound as
     // every other socket here is.
     fn gateway_socket<'a>(
@@ -320,11 +344,34 @@ impl StreamListener for KernelListener {
 
 pub(crate) struct KernelUdp(librqbit_dualstack_sockets::UdpSocket);
 
+/// Set a kernel datagram socket bound at `requested` for uTP to run over it,
+/// as [`SocketFactory::bind_utp`] asks: its datagrams never fragmented, and
+/// its receive buffer `receive_buffer` bytes as far as the host allows.
+pub fn set_for_utp(socket: &tokio::net::UdpSocket, requested: SocketAddr, receive_buffer: usize) {
+    crate::udp_options::set_for_utp(socket, requested, receive_buffer);
+}
+
+/// Datagrams the kernel sockets sent from slices, each in one system call.
+#[cfg(test)]
+pub(crate) static VECTORED_SENDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(test)]
 impl KernelSockets {
     /// A datagram socket at `addr`, bound at once, as the kernel socket it is.
     pub(crate) fn bind_kernel_udp(&self, addr: SocketAddr) -> io::Result<Arc<KernelUdp>> {
         self.kernel_udp(addr).map(Arc::new)
+    }
+
+    /// [`Self::bind_kernel_udp`], set for uTP with `receive_buffer`.
+    pub(crate) fn bind_kernel_utp(
+        &self,
+        addr: SocketAddr,
+        receive_buffer: usize,
+    ) -> io::Result<Arc<KernelUdp>> {
+        let socket = self.kernel_udp(addr)?;
+        crate::udp_options::set_for_utp(socket.0.socket(), addr, receive_buffer);
+        Ok(Arc::new(socket))
     }
 }
 
@@ -371,13 +418,35 @@ impl DatagramSocket for KernelUdp {
     }
 
     // One datagram from every slice, in one system call, without joining
-    // them first.
+    // them first. A send the kernel cannot take yet clears the socket's
+    // readiness, so the task waits for room instead of trying again at once.
     fn poll_send_to_vectored(
         &self,
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
         target: SocketAddr,
     ) -> Poll<io::Result<usize>> {
-        self.0.poll_send_to_vectored(cx, bufs, target)
+        let target = match target {
+            SocketAddr::V4(v4) if self.0.is_dualstack() => {
+                SocketAddr::V6(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0))
+            }
+            target => target,
+        };
+        let socket = self.0.socket();
+        loop {
+            std::task::ready!(socket.poll_send_ready(cx))?;
+            match socket.try_io(tokio::io::Interest::WRITABLE, || {
+                socket2::SockRef::from(socket).send_to_vectored(bufs, &target.into())
+            }) {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                sent => {
+                    #[cfg(test)]
+                    if sent.is_ok() {
+                        VECTORED_SENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return Poll::Ready(sent);
+                }
+            }
+        }
     }
 }

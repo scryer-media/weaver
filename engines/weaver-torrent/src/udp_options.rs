@@ -3,21 +3,35 @@
 
 //! What a kernel datagram socket is set to before uTP runs over it: its
 //! datagrams are never fragmented, so a path-MTU probe larger than the path
-//! is dropped rather than split, and its receive buffer is as large as the
-//! host allows, so a burst across however many streams the socket carries
-//! waits in the kernel instead of being dropped while the engine is busy.
+//! is dropped rather than split, and its receive buffer holds a full receive
+//! window for every connection the session may hold, as far as the host
+//! allows, so a burst across them waits in the kernel instead of being
+//! dropped while the engine is busy.
 
 use std::{io, net::SocketAddr};
 
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
-/// The most a socket's receive buffer can be asked for.
-const LARGEST_ASK: usize = i32::MAX as usize;
+/// The receive window each uTP stream is given.
+pub(crate) const STREAM_WINDOW: usize = 1024 * 1024;
 
-/// Set `socket`, asked for at `requested`, for uTP. Neither setting is
-/// needed for the socket to work: one the host refuses is logged, and the
-/// socket is used as it is.
-pub(crate) fn set_for_utp(socket: &tokio::net::UdpSocket, requested: SocketAddr) {
+/// The receive buffer a uTP socket asks for when the session may hold
+/// `connections_limit` connections: a full window for each, up to the
+/// largest size the option can carry.
+pub(crate) fn receive_buffer_for(connections_limit: usize) -> usize {
+    connections_limit
+        .saturating_mul(STREAM_WINDOW)
+        .min(i32::MAX as usize)
+}
+
+/// Set `socket`, asked for at `requested`, for uTP, with a receive buffer of
+/// `receive_buffer` bytes. Neither setting is needed for the socket to work:
+/// one the host refuses is logged, and the socket is used as it is.
+pub(crate) fn set_for_utp(
+    socket: &tokio::net::UdpSocket,
+    requested: SocketAddr,
+    receive_buffer: usize,
+) {
     if requested.is_ipv4() {
         if let Err(error) = set_dont_fragment(socket, Family::V4) {
             warn!(%requested, %error, "the socket's IPv4 datagrams may be fragmented");
@@ -28,30 +42,46 @@ pub(crate) fn set_for_utp(socket: &tokio::net::UdpSocket, requested: SocketAddr)
 
     let socket = socket2::SockRef::from(socket);
     let before = socket.recv_buffer_size().ok();
-    match raise_receive_buffer(&socket) {
-        Ok(now) => info!(?before, now, "the socket's receive buffer was raised"),
-        Err(error) => warn!(?before, %error, "the socket's receive buffer was not raised"),
+    match raise_receive_buffer(&socket, receive_buffer) {
+        Ok(now) if before != Some(now) => {
+            debug!(
+                ?before,
+                now,
+                asked = receive_buffer,
+                "the socket's receive buffer was raised"
+            );
+        }
+        Ok(now) => debug!(
+            now,
+            asked = receive_buffer,
+            "the socket's receive buffer was kept"
+        ),
+        Err(error) => {
+            debug!(?before, asked = receive_buffer, %error, "the socket's receive buffer was not raised");
+        }
     }
 }
 
-/// Raise `socket`'s receive buffer as far as the host allows, and read back
-/// what it holds. A host that clamps an ask grants its limit at once; one
-/// that refuses an ask above its limit is asked for the largest size it
-/// accepts.
-pub(crate) fn raise_receive_buffer(socket: &socket2::SockRef<'_>) -> io::Result<usize> {
-    if socket.set_recv_buffer_size(LARGEST_ASK).is_err() {
-        // Accepted at `low`, refused above `high`.
-        let (mut low, mut high) = (socket.recv_buffer_size()?, LARGEST_ASK);
-        socket.set_recv_buffer_size(low)?;
+/// Ask for `socket`'s receive buffer to hold `ask` bytes, and read back what
+/// it holds. A buffer already that large is kept. A host that clamps the ask
+/// grants its limit at once; one that refuses it is asked for the largest
+/// size between the current one and `ask` that it accepts.
+pub(crate) fn raise_receive_buffer(socket: &socket2::SockRef<'_>, ask: usize) -> io::Result<usize> {
+    let before = socket.recv_buffer_size()?;
+    if before >= ask {
+        return Ok(before);
+    }
+    if socket.set_recv_buffer_size(ask).is_err() {
+        // The socket holds `low`; `high` was refused.
+        let (mut low, mut high) = (before, ask);
         while high - low > 1 {
-            let ask = low + (high - low) / 2;
-            if socket.set_recv_buffer_size(ask).is_ok() {
-                low = ask;
+            let mid = low + (high - low) / 2;
+            if socket.set_recv_buffer_size(mid).is_ok() {
+                low = mid;
             } else {
-                high = ask;
+                high = mid;
             }
         }
-        socket.set_recv_buffer_size(low)?;
     }
     socket.recv_buffer_size()
 }
@@ -299,7 +329,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_kernel_datagram_socket_is_set_for_utp() {
+    async fn a_utp_socket_is_set_for_utp() {
+        let ask = super::receive_buffer_for(crate::connection_slots::DEFAULT_CONNECTIONS_LIMIT);
+        assert_eq!(ask, 200 * 1024 * 1024);
+        for (addr, family) in [
+            (SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), Family::V4),
+            (SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), Family::V6),
+        ] {
+            let socket = crate::test_support::sockets()
+                .bind_kernel_utp(addr, ask)
+                .unwrap();
+            match dont_fragment(socket.socket(), family) {
+                Ok(set) => assert!(set, "{family:?} datagrams may be fragmented"),
+                // A host with no such option keeps its default.
+                Err(error) => eprintln!("{family:?}: no option to forbid fragmenting: {error}"),
+            }
+            let granted = socket2::SockRef::from(socket.socket())
+                .recv_buffer_size()
+                .unwrap();
+            // What the host grants a socket asked for the window per
+            // connection; a host that reads back twice what it holds may
+            // report up to twice the ask.
+            let other = fresh(family);
+            let other_granted = super::raise_receive_buffer(&(&other).into(), ask).unwrap();
+            assert_eq!(granted, other_granted, "{family:?}");
+            assert!(granted <= 2 * ask, "{family:?}: {granted}");
+            if granted < ask {
+                // The host's bound: a larger ask is granted no more.
+                let larger = fresh(family);
+                let larger_granted =
+                    super::raise_receive_buffer(&(&larger).into(), 2 * ask).unwrap();
+                assert_eq!(larger_granted, granted, "{family:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_buffer_already_as_large_as_the_ask_is_kept() {
+        let socket = fresh(Family::V4);
+        let before = socket.recv_buffer_size().unwrap();
+        assert_eq!(
+            super::raise_receive_buffer(&(&socket).into(), 1).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn the_dht_and_tracker_sockets_keep_the_kernels_defaults() {
+        // The factory's plain datagram socket, which the DHT and the UDP
+        // trackers bind.
         for (addr, family) in [
             (SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), Family::V4),
             (SocketAddr::from((Ipv6Addr::LOCALHOST, 0)), Family::V6),
@@ -307,33 +385,35 @@ mod tests {
             let socket = crate::test_support::sockets()
                 .bind_kernel_udp(addr)
                 .unwrap();
-            match dont_fragment(socket.socket(), family) {
-                Ok(set) => assert!(set, "{family:?} datagrams may be fragmented"),
-                // A host with no such option keeps its default.
-                Err(error) => eprintln!("{family:?}: no option to forbid fragmenting: {error}"),
+            if let Ok(set) = dont_fragment(socket.socket(), family) {
+                assert!(!set, "{family:?} datagrams may not be fragmented");
             }
             let buffer = socket2::SockRef::from(socket.socket())
                 .recv_buffer_size()
                 .unwrap();
-            // At least the host's default, and nothing larger is granted.
-            let other = fresh(family);
-            assert!(buffer >= other.recv_buffer_size().unwrap(), "{family:?}");
-            if other.set_recv_buffer_size(buffer * 2).is_ok() {
-                assert!(other.recv_buffer_size().unwrap() <= buffer, "{family:?}");
-            }
+            assert_eq!(
+                buffer,
+                fresh(family).recv_buffer_size().unwrap(),
+                "{family:?}"
+            );
         }
     }
 
     #[tokio::test]
     async fn a_vectored_send_is_one_datagram() {
+        use std::sync::atomic::Ordering;
+
         let receiver = crate::test_support::loopback_kernel_udp();
-        let sender = crate::test_support::loopback_udp().await;
+        let sender = crate::test_support::loopback_kernel_udp();
         let to = receiver.bind_addr();
         let parts = [IoSlice::new(b"ab"), IoSlice::new(b"cde")];
+        let before = crate::network::VECTORED_SENDS.load(Ordering::Relaxed);
         let sent = std::future::poll_fn(|cx| sender.poll_send_to_vectored(cx, &parts, to))
             .await
             .unwrap();
         assert_eq!(sent, 5);
+        // Sent from the slices by the kernel socket itself.
+        assert!(crate::network::VECTORED_SENDS.load(Ordering::Relaxed) > before);
         let mut buf = [0u8; 16];
         let (len, from) = receiver.recv_from(&mut buf).await.unwrap();
         assert_eq!((&buf[..len], from), (&b"abcde"[..], sender.bind_addr()));

@@ -265,6 +265,48 @@ fn halves(stream: DialedStream) -> (BoxAsyncReadVectored, BoxAsyncWrite) {
     }
 }
 
+impl LegSockets {
+    // The leg's datagram socket for `addr`; one the leg binds at its source
+    // address is set for uTP with `utp`'s receive buffer when it holds one.
+    fn bind_datagrams<'a>(
+        &'a self,
+        addr: SocketAddr,
+        utp: Option<usize>,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        if let Some(ip) = self.source {
+            // The leg's route binds it at the leg's source address, as it
+            // binds every socket the leg dials from.
+            let requested = SocketAddr::new(ip, addr.port());
+            let bound = self.dialer.bind_local_udp(requested);
+            return Box::pin(async move {
+                let socket = bound.unwrap_or_else(|| {
+                    Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "the leg binds no socket of its own",
+                    ))
+                })?;
+                let socket = tokio::net::UdpSocket::from_std(socket)?;
+                if let Some(receive_buffer) = utp {
+                    weaver_torrent::network::set_for_utp(&socket, requested, receive_buffer);
+                }
+                Ok(Arc::new(socket) as Arc<dyn DatagramSocket>)
+            });
+        }
+        let Some(carrier) = self.carrier() else {
+            return Box::pin(async move {
+                Ok(Arc::new(NoDatagrams::new(addr)) as Arc<dyn DatagramSocket>)
+            });
+        };
+        shared(async move {
+            let socket = carrier.bind(addr).await.map_err(io::Error::other)?;
+            Ok(Arc::new(Carried {
+                bind_addr: socket.local_addr().unwrap_or(addr),
+                socket,
+            }) as Arc<dyn DatagramSocket>)
+        })
+    }
+}
+
 impl SocketFactory for LegSockets {
     fn connect_tcp<'a>(
         &'a self,
@@ -312,32 +354,15 @@ impl SocketFactory for LegSockets {
         &'a self,
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
-        if let Some(ip) = self.source {
-            // The leg's route binds it at the leg's source address, as it
-            // binds every socket the leg dials from.
-            let bound = self.dialer.bind_local_udp(SocketAddr::new(ip, addr.port()));
-            return Box::pin(async move {
-                let socket = bound.unwrap_or_else(|| {
-                    Err(io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "the leg binds no socket of its own",
-                    ))
-                })?;
-                Ok(Arc::new(tokio::net::UdpSocket::from_std(socket)?) as Arc<dyn DatagramSocket>)
-            });
-        }
-        let Some(carrier) = self.carrier() else {
-            return Box::pin(async move {
-                Ok(Arc::new(NoDatagrams::new(addr)) as Arc<dyn DatagramSocket>)
-            });
-        };
-        shared(async move {
-            let socket = carrier.bind(addr).await.map_err(io::Error::other)?;
-            Ok(Arc::new(Carried {
-                bind_addr: socket.local_addr().unwrap_or(addr),
-                socket,
-            }) as Arc<dyn DatagramSocket>)
-        })
+        self.bind_datagrams(addr, None)
+    }
+
+    fn bind_utp<'a>(
+        &'a self,
+        addr: SocketAddr,
+        receive_buffer: usize,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        self.bind_datagrams(addr, Some(receive_buffer))
     }
 
     // Where the leg's route sends traffic toward `to` from, as its requests

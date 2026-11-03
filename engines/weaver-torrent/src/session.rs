@@ -1449,6 +1449,7 @@ impl Session {
                             opts.root_span.as_ref().and_then(|s| s.id()),
                             swarm.child_token(),
                             &opts.socket_factory,
+                            opts.connections_limit,
                         )
                         .await
                         .context(crate::listen::ListenFailed)?,
@@ -4017,12 +4018,95 @@ mod tests {
                 listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
                 ..Default::default()
             }
-            .start(None, token.clone(), &crate::test_support::socket_factory())
+            .start(
+                None,
+                token.clone(),
+                &crate::test_support::socket_factory(),
+                super::DEFAULT_CONNECTIONS_LIMIT,
+            )
             .await
             .unwrap();
             assert_eq!(listening_protocols(&listen), expected, "{mode:?}");
             token.cancel();
         }
+    }
+
+    /// Kernel sockets that note each receive buffer a uTP socket asks for.
+    struct NotingAsks {
+        kernel: Arc<dyn crate::network::SocketFactory>,
+        asked: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl crate::network::SocketFactory for NotingAsks {
+        fn connect_tcp<'a>(
+            &'a self,
+            addr: std::net::SocketAddr,
+        ) -> crate::network::BoxFuture<
+            'a,
+            std::io::Result<(
+                crate::network::BoxAsyncReadVectored,
+                crate::network::BoxAsyncWrite,
+            )>,
+        > {
+            self.kernel.connect_tcp(addr)
+        }
+
+        fn listen_tcp<'a>(
+            &'a self,
+            addr: std::net::SocketAddr,
+        ) -> crate::network::BoxFuture<'a, std::io::Result<Box<dyn crate::network::StreamListener>>>
+        {
+            self.kernel.listen_tcp(addr)
+        }
+
+        fn bind_udp<'a>(
+            &'a self,
+            addr: std::net::SocketAddr,
+        ) -> crate::network::BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>>
+        {
+            self.kernel.bind_udp(addr)
+        }
+
+        fn bind_utp<'a>(
+            &'a self,
+            addr: std::net::SocketAddr,
+            receive_buffer: usize,
+        ) -> crate::network::BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>>
+        {
+            self.asked.lock().unwrap().push(receive_buffer);
+            self.kernel.bind_utp(addr, receive_buffer)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sessions_utp_socket_asks_for_a_window_per_connection() {
+        let dir = TempDir::new().unwrap();
+        let sockets = Arc::new(NotingAsks {
+            kernel: crate::test_support::socket_factory(),
+            asked: Default::default(),
+        });
+        let _session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                listen: Some(crate::ListenerOptions {
+                    mode: crate::ListenerMode::TcpAndUtp,
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    ..Default::default()
+                }),
+                connections_limit: 7,
+                ..SessionOptions::new(sockets.clone())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *sockets.asked.lock().unwrap(),
+            [7 * crate::udp_options::STREAM_WINDOW]
+        );
     }
 
     /// A one-piece torrent whose announce-list is `[[a1, a2], [b1]]`.

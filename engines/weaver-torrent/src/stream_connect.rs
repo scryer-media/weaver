@@ -449,6 +449,7 @@ mod tests {
                     sockets.as_ref(),
                     (Ipv4Addr::LOCALHOST, 0).into(),
                     Default::default(),
+                    crate::udp_options::STREAM_WINDOW,
                 )
                 .await
                 .unwrap(),
