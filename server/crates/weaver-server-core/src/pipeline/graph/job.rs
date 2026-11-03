@@ -682,7 +682,7 @@ impl GraphJob {
     ) -> Result<bool, GraphError> {
         let volume = decoded.volume;
         let member = MemberId(volume.0);
-        let length = decoded.length;
+        let length = self.root.accepted_length(&decoded);
         let Some(arrival) = self.root.receive(decoded) else {
             return Ok(false);
         };
