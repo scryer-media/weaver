@@ -6,6 +6,7 @@ mod delay;
 mod delayed_ack;
 mod fast_retransmit;
 mod flow_control;
+mod guards;
 mod inactivity_timeout;
 mod mtu_probing;
 mod nagle;

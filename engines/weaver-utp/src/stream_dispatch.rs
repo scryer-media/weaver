@@ -164,6 +164,9 @@ struct VirtualSocket<T, Env> {
     // This is used to rewind state back for retransmission.
     // All packets after this number will get resent (ST_DATA, ST_FIN).
     last_sent_seq_nr: SeqNr,
+    // The highest seq_nr we ever sent, kept through a rewind: an ACK past
+    // it acks nothing we sent.
+    highest_sent_seq_nr: SeqNr,
 
     // Last remote sequence number that we fully processed.
     last_consumed_remote_seq_nr: SeqNr,
@@ -292,6 +295,7 @@ macro_rules! send_data {
                 $self.last_sent_seq_nr = $segment_iter_item.seq_nr();
                 $self.seq_nr = $segment_iter_item.seq_nr() + 1;
             }
+            $self.highest_sent_seq_nr = $self.highest_sent_seq_nr.max($self.last_sent_seq_nr);
 
             // Data sent: start the timer if it is not running.
             $self.timers.retransmit.arm(
@@ -778,6 +782,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 "data sent",
             );
             self.last_sent_seq_nr = seq_nr;
+            self.highest_sent_seq_nr = self.highest_sent_seq_nr.max(seq_nr);
             return Ok(true);
         }
         Ok(false)
@@ -1067,6 +1072,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let hdr = &msg.header;
 
         let previously_seen_remote_fin = self.state.is_remote_fin_or_later();
+
+        // An ACK of a packet we never sent is a third party's: ignored,
+        // a reset among them.
+        if hdr.htype != ST_SYN && hdr.ack_nr > self.highest_sent_seq_nr {
+            trace!(%self.highest_sent_seq_nr, "dropping packet, it acks what we never sent");
+            return Ok(Default::default());
+        }
 
         match (self.state, hdr.get_type()) {
             // From real world packets: if ST_RESET acks our FIN, it's ok
@@ -1773,6 +1785,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             last_remote_window: remote_window,
             seq_nr,
             last_sent_seq_nr,
+            highest_sent_seq_nr: last_sent_seq_nr,
             last_consumed_remote_seq_nr,
             last_sent_ack_nr,
             rto_retransmissions: 0,

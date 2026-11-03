@@ -1441,7 +1441,16 @@ impl Session {
                 None => None,
             };
 
-            let listen_result = if let Some(listen_opts) = opts.listen.take() {
+            let listen_result = if let Some(mut listen_opts) = opts.listen.take() {
+                // uTP drops a SYN once its streams pass twice the limit.
+                let connections_limit = match &opts.shared_limits {
+                    Some(shared) => shared.slots.limit(),
+                    None => opts.connections_limit,
+                };
+                let utp = listen_opts.utp_opts.get_or_insert_with(Default::default);
+                if utp.connections_limit.is_none() {
+                    utp.connections_limit = std::num::NonZeroUsize::new(connections_limit);
+                }
                 Some(
                     listen_opts
                         .start(

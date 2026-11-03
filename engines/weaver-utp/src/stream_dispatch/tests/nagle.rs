@@ -1,4 +1,5 @@
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
+// Modified by the Weaver authors, 2026-11-03.
 
 use tokio::io::AsyncWriteExt;
 use tracing::trace;
@@ -31,7 +32,7 @@ async fn test_nagle_algorithm() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.seq_nr,
+            ack_nr: t.vsock.seq_nr - 1,
             wnd_size: 1024,
             ..Default::default()
         },

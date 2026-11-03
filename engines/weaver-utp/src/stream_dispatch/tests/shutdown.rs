@@ -31,7 +31,7 @@ async fn test_no_writes_allowed_after_explicit_shutdown() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.seq_nr,
+            ack_nr: t.vsock.seq_nr - 1,
             wnd_size: 1024,
             ..Default::default()
         },
@@ -110,7 +110,7 @@ async fn test_resource_cleanup_both_sides_dropped_normally() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.seq_nr,
+            ack_nr: t.vsock.seq_nr - 1,
             wnd_size: 1024,
             ..Default::default()
         },
@@ -173,7 +173,7 @@ async fn test_resource_cleanup_both_sides_dropped_abruptly() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.seq_nr,
+            ack_nr: t.vsock.seq_nr - 1,
             wnd_size: 1024,
             ..Default::default()
         },
@@ -323,7 +323,7 @@ async fn test_finack_not_sent_until_all_data_consumed() {
     let mut header = UtpHeader {
         htype: ST_DATA,
         seq_nr: 2.into(),
-        ack_nr: t.vsock.seq_nr,
+        ack_nr: t.vsock.seq_nr - 1,
         wnd_size: 1024,
         ..Default::default()
     };
@@ -380,7 +380,7 @@ async fn test_fin_sent_when_both_halves_dropped() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.seq_nr,
+            ack_nr: t.vsock.seq_nr - 1,
             wnd_size: 1024,
             ..Default::default()
         },
@@ -468,7 +468,7 @@ async fn test_fin_sent_when_reader_dead_first() {
     t.poll_once_assert_pending().await;
 
     // Remote sends some data - it should accumulate in OOQ, but be ACKed.
-    t.send_data(1, t.vsock.seq_nr, "ignored data");
+    t.send_data(1, t.vsock.seq_nr - 1, "ignored data");
     t.poll_once_assert_pending().await;
     t.assert_sent_empty();
 

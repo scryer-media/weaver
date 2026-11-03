@@ -105,7 +105,7 @@ async fn test_out_of_order_delivery() {
         UtpHeader {
             htype: ST_DATA,
             seq_nr: 3.into(),
-            ack_nr: t.vsock.seq_nr,
+            ack_nr: t.vsock.seq_nr - 1,
             ..Default::default()
         },
         "test!",
@@ -126,7 +126,7 @@ async fn test_out_of_order_delivery() {
         UtpHeader {
             htype: ST_DATA,
             seq_nr: 1.into(),
-            ack_nr: t.vsock.seq_nr,
+            ack_nr: t.vsock.seq_nr - 1,
             ..Default::default()
         },
         "hello",
@@ -172,7 +172,7 @@ async fn test_data_integrity_manual_packets() {
     let mut header = UtpHeader {
         htype: ST_DATA,
         seq_nr: 0.into(),
-        ack_nr: t.vsock.seq_nr,
+        ack_nr: t.vsock.seq_nr - 1,
         wnd_size: 64 * 1024,
         ..Default::default()
     };

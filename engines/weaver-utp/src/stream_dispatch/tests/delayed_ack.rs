@@ -1,4 +1,5 @@
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
+// Modified by the Weaver authors, 2026-11-03.
 
 use std::time::Duration;
 
@@ -20,7 +21,7 @@ async fn test_delayed_ack_sent_once() {
         UtpHeader {
             htype: ST_DATA,
             seq_nr: 1.into(),
-            ack_nr: t.vsock.seq_nr,
+            ack_nr: t.vsock.seq_nr - 1,
             ..Default::default()
         },
         "hello",

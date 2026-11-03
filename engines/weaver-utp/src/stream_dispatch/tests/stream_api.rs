@@ -1,4 +1,5 @@
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
+// Modified by the Weaver authors, 2026-11-03.
 
 // Tests for stream API.
 
@@ -24,7 +25,8 @@ async fn test_st_reset_error_propagation() {
         UtpHeader {
             htype: ST_RESET,
             seq_nr: 1.into(),
-            ack_nr: t.vsock.seq_nr,
+            // Our SYN's: a reset acks only what we sent.
+            ack_nr: t.vsock.seq_nr - 1,
             ..Default::default()
         },
         "",
@@ -113,7 +115,7 @@ async fn test_flush_works() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.seq_nr,
+            ack_nr: t.vsock.seq_nr - 1,
             wnd_size: 1024,
             ..Default::default()
         },

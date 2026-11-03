@@ -146,6 +146,11 @@ pub struct SocketOpts {
     /// resources (memory, tokio tasks).
     pub max_live_vsocks: Option<NonZeroUsize>,
 
+    /// The connections the owner holds open at once. A SYN arriving while
+    /// the socket holds more than twice as many streams is dropped
+    /// unanswered; with none set, every SYN is taken up.
+    pub connections_limit: Option<NonZeroUsize>,
+
     /// If true, will wait for ACK of FIN. By default we don't wait
     /// as it's not required for torrents.
     pub dont_wait_for_lastack: bool,
@@ -202,6 +207,9 @@ impl SocketOpts {
             max_active_streams: self
                 .max_live_vsocks
                 .unwrap_or(DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET),
+            syn_flood_streams: self
+                .connections_limit
+                .map(|limit| limit.get().saturating_mul(2)),
             wait_for_last_ack: !self.dont_wait_for_lastack,
             mtu_probe_max_retransmissions: self.mtu_probe_max_retransmissions.unwrap_or(1),
         })
@@ -224,6 +232,8 @@ pub(crate) struct ValidatedSocketOpts {
 
     pub remote_inactivity_timeout: Duration,
     pub max_active_streams: NonZeroUsize,
+    // Streams past which a SYN is dropped unanswered.
+    pub syn_flood_streams: Option<usize>,
 
     pub wait_for_last_ack: bool,
 
@@ -640,6 +650,16 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     }
 
     async fn on_syn(&mut self, remote: SocketAddr, msg: UtpMessage) -> crate::Result<()> {
+        if let Some(limit) = self.socket.opts.syn_flood_streams
+            && self.streams.len() > limit
+        {
+            trace!(
+                streams = self.streams.len(),
+                "dropping SYN, too many streams"
+            );
+            self.socket.stats.cant_accept_syn.increment(1);
+            return Ok(());
+        }
         let mut syn = Syn {
             remote,
             header: msg.header,
@@ -939,6 +959,65 @@ mod tests {
     use tracing::{Instrument, debug_span, info};
 
     use crate::test_util::{MockUtpStream, setup_test_logging, transport::MockInterface};
+
+    // A SYN while more than twice the connections limit of streams are
+    // open is dropped unanswered; at twice the limit it is still taken up.
+    #[tokio::test]
+    async fn a_syn_past_twice_the_connections_limit_is_dropped() {
+        use std::num::NonZeroUsize;
+
+        use crate::{
+            SocketOpts, UtpSocket,
+            message::UtpMessage,
+            raw::{Type, UtpHeader},
+            test_util::{ADDR_1, ADDR_2, env::MockUtpEnvironment, transport::RememberingTransport},
+        };
+
+        setup_test_logging();
+        let transport = RememberingTransport::new(ADDR_1);
+        let (socket, mut dispatcher) = UtpSocket::new_with_opts_and_dispatcher(
+            transport.clone(),
+            MockUtpEnvironment::new(),
+            SocketOpts {
+                connections_limit: NonZeroUsize::new(1),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let syn = |id: u16| {
+            UtpMessage::new_test(
+                UtpHeader {
+                    htype: Type::ST_SYN,
+                    connection_id: id.into(),
+                    ..Default::default()
+                },
+                b"",
+            )
+        };
+        let mut open = Vec::new();
+        for id in 0..2u16 {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            dispatcher.streams.insert((ADDR_2, (1000 + id).into()), tx);
+            open.push(rx);
+        }
+
+        dispatcher.on_recv(ADDR_2, syn(1)).await.unwrap();
+        assert_eq!(dispatcher.accept_queue.syns.len(), 1, "taken up");
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        dispatcher.streams.insert((ADDR_2, 2000.into()), tx);
+        open.push(rx);
+        dispatcher.on_recv(ADDR_2, syn(3)).await.unwrap();
+        assert_eq!(dispatcher.accept_queue.syns.len(), 1, "dropped");
+        assert_eq!(
+            socket
+                .stats()
+                .cant_accept_syn
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(transport.take_sent_utpmessages().is_empty(), "unanswered");
+    }
 
     #[tokio::test]
     async fn test_echo() -> anyhow::Result<()> {

@@ -375,7 +375,7 @@ async fn test_basic_retransmission_1() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.seq_nr,
+            ack_nr: t.vsock.seq_nr - 1,
             wnd_size: 1024,
             ..Default::default()
         },
@@ -491,7 +491,7 @@ async fn test_rto_single_packet_retransmission_mss_sized() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 1.into(),
-            ack_nr: t.vsock.seq_nr,
+            ack_nr: t.vsock.seq_nr - 1,
             wnd_size: 1024,
             ..Default::default()
         },
@@ -630,7 +630,7 @@ async fn test_rto_single_packet_retransmission_smaller_than_mss() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 1.into(),
-            ack_nr: t.vsock.seq_nr,
+            ack_nr: t.vsock.seq_nr - 1,
             wnd_size: 1024,
             ..Default::default()
         },

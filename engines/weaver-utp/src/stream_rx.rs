@@ -1,4 +1,5 @@
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
+// Modified by the Weaver authors, 2026-11-03.
 
 /// The receiving side of uTP stream abstraction.
 ///
@@ -322,10 +323,7 @@ impl UserRx {
             shared: shared.clone(),
             is_eof: false,
         };
-        let ooq_capacity = max_rx_bytes.get() / max_incoming_payload.get();
-        let out_of_order_queue = OutOfOrderQueue::new(
-            NonZeroUsize::new(ooq_capacity).unwrap_or_else(|| NonZeroUsize::new(64).unwrap()),
-        );
+        let out_of_order_queue = OutOfOrderQueue::new(reorder_capacity(max_rx_bytes));
         let write_half = UserRx {
             shared,
             ooq: out_of_order_queue,
@@ -498,6 +496,12 @@ impl UserRx {
         let mut g = self.shared.locked.lock();
         g.queue.push_back(msg);
     }
+}
+
+// Packets held out of order: one per 1100 bytes of the receive buffer,
+// never fewer than 16. One further out is dropped.
+fn reorder_capacity(max_rx_bytes: NonZeroUsize) -> NonZeroUsize {
+    NonZeroUsize::new((max_rx_bytes.get() / 1100).max(16)).unwrap_or(NonZeroUsize::MIN)
 }
 
 pub struct OutOfOrderQueue {
@@ -725,6 +729,38 @@ mod tests {
             },
             payload,
         )
+    }
+
+    #[tokio::test]
+    async fn the_reorder_window_holds_one_packet_per_1100_bytes_and_never_fewer_than_16() {
+        setup_test_logging();
+        // 16 KiB holds 14 packets at 1100 bytes each: the floor of 16 stands.
+        let (mut rx, _read) = user_rx(16 * 1024);
+        assert!(matches!(
+            rx.add_remove_test(msg(16, b"a"), 15).await.unwrap(),
+            AssemblerAddRemoveResult::Consumed {
+                sequence_numbers: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            rx.add_remove_test(msg(17, b"a"), 16).await.unwrap(),
+            AssemblerAddRemoveResult::Unavailable(_)
+        ));
+
+        // 1 MiB holds 953.
+        let (mut rx, _read) = user_rx(1024 * 1024);
+        assert!(matches!(
+            rx.add_remove_test(msg(953, b"a"), 952).await.unwrap(),
+            AssemblerAddRemoveResult::Consumed {
+                sequence_numbers: 0,
+                ..
+            }
+        ));
+        assert!(matches!(
+            rx.add_remove_test(msg(954, b"a"), 953).await.unwrap(),
+            AssemblerAddRemoveResult::Unavailable(_)
+        ));
     }
 
     fn user_rx(capacity_bytes: usize) -> (UserRx, UtpStreamReadHalf) {

@@ -35,7 +35,7 @@ async fn test_flow_control() {
     // Send packets out of order to fill assembly queue
     t.send_data(3, 100, "third"); // Out of order
     t.send_data(4, 100, "fourth"); // Out of order
-    t.send_data(6, 100, "sixth"); // Should be dropped - assembly queue full
+    t.send_data(17, 100, "past"); // Dropped: past the 16-packet reorder window
 
     t.poll_once_assert_pending().await;
 
@@ -43,7 +43,7 @@ async fn test_flow_control() {
     assert_eq!(t.vsock.user_rx.assembler_packets(), 2);
 
     // Send in-order packet to trigger processing
-    t.send_data(1, t.vsock.seq_nr, "first");
+    t.send_data(1, t.vsock.seq_nr - 1, "first");
     t.poll_once_assert_pending().await;
 
     // Read available data
@@ -53,7 +53,7 @@ async fn test_flow_control() {
     // Now test user rx channel limit
     // Send several packets that exceed the rx buffer size
     for i in 6..15 {
-        t.send_data(i, t.vsock.seq_nr, "data!");
+        t.send_data(i, t.vsock.seq_nr - 1, "data!");
         t.poll_once_assert_pending().await;
     }
 
@@ -68,7 +68,7 @@ async fn test_flow_control() {
     assert!(window < 1024); // Window should be reduced
 
     // Send more data - should be dropped due to full rx buffer
-    t.send_data(15, t.vsock.seq_nr, "dropped");
+    t.send_data(15, t.vsock.seq_nr - 1, "dropped");
     t.poll_once_assert_pending().await;
 
     // Verify data was dropped
@@ -86,7 +86,7 @@ async fn test_sender_flow_control() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.seq_nr,
+            ack_nr: t.vsock.seq_nr - 1,
             wnd_size: 5, // Only allow 5 bytes
             ..Default::default()
         },
@@ -168,7 +168,7 @@ async fn test_zero_window_handling() {
         UtpHeader {
             htype: ST_STATE,
             seq_nr: 0.into(),
-            ack_nr: t.vsock.seq_nr,
+            ack_nr: t.vsock.seq_nr - 1,
             wnd_size: 5,
             ..Default::default()
         },
@@ -251,14 +251,14 @@ async fn test_window_update_sent_when_window_less_than_mss() {
     let mut t = make_test_vsock(opts, false);
 
     // Fill buffer to just under MSS to get a small window
-    t.send_data(1, t.vsock.seq_nr, "aaaaa");
+    t.send_data(1, t.vsock.seq_nr - 1, "aaaaa");
     t.poll_once_assert_pending().await;
     // We shouldn't have registered the flush waker yet.
     assert!(!t.vsock.user_rx.is_flush_waker_registered());
     assert_eq!(t.take_sent(), Vec::<UtpMessage>::new());
 
     // Now the window should be less than MSS.
-    t.send_data(2, t.vsock.seq_nr, "b");
+    t.send_data(2, t.vsock.seq_nr - 1, "b");
     t.poll_once_assert_pending().await;
     assert!(t.vsock.user_rx.is_flush_waker_registered());
 
