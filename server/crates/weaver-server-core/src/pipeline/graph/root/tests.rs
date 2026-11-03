@@ -2088,3 +2088,39 @@ async fn the_field_checkpoint_restores_and_the_job_goes_on() {
     ));
     retire_pipeline_database(pipeline).await;
 }
+
+// The field post with only its first two articles in hand, exactly the
+// 1536000 bytes its headers declare, and the other twenty-six lost: the
+// lost run's edges meet at the declared end, and the run is still told,
+// from there as far as its encoded bytes reach, never as nothing.
+#[test]
+fn a_lost_run_meeting_the_declared_size_is_told_not_empty() {
+    const ARTICLE: u64 = 768_000;
+    const ENCODED: u32 = 787_000;
+    let (mut job, _dir, _) = job_with(&[file("payload.bin", &[ENCODED; 28])], Vec::new());
+    for ordinal in 0..2u32 {
+        job.intake(
+            decoded(
+                0,
+                ordinal,
+                u64::from(ordinal) * ARTICLE,
+                &vec![ordinal as u8; ARTICLE as usize],
+                Some(2 * ARTICLE),
+            ),
+            &mut RepairSlots::default(),
+            1,
+        )
+        .unwrap();
+    }
+    for ordinal in 2..28 {
+        job.lost(VolumeIndex(0), ordinal, &mut RepairSlots::default(), 1)
+            .unwrap();
+    }
+    assert_eq!(
+        damaged_ranges(&job, 0),
+        vec![ByteRange::new(
+            2 * ARTICLE,
+            2 * ARTICLE + 26 * u64::from(ENCODED)
+        )]
+    );
+}

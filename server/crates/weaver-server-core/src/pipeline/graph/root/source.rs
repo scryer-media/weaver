@@ -417,11 +417,12 @@ impl Volume {
 
     // Where the bytes of the articles from boundary `start` to boundary
     // `end` can lie: from the lowest place of the first to the highest of
-    // the last. A post's headers can fall across the run, a declared file
-    // length or a part's end below an earlier part's start; the parts
+    // the last. A post's headers can fall across the run or meet at it, a
+    // declared file length at or below an earlier part's end; the parts
     // before the run then stand, as every reference decoder writes each
     // part where its own header puts it, and the run reaches as far past
-    // its start as its encoded bytes can decode to.
+    // its start as its encoded bytes can decode to. A run holds a lost
+    // article, so it is never told empty while its articles carry bytes.
     //
     // A range the post's data derives is checked, never asserted: should
     // the map still hold one inverted, the job fails on it and the daemon
@@ -430,7 +431,7 @@ impl Volume {
         let low = self.bounds(start).0;
         let high = self.bounds(end).1;
         let reach = low.saturating_add(self.encoded_at(end) - self.encoded_at(start));
-        ByteRange::try_from([low, if high < low { reach } else { high }]).map_err(|_| {
+        ByteRange::try_from([low, if high <= low { reach } else { high }]).map_err(|_| {
             Inconsistent {
                 volume: self.at,
                 start,
