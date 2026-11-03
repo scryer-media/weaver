@@ -616,15 +616,65 @@ pub(crate) struct LegClients<F> {
     bridge: Option<Arc<Bridge>>,
     kind: LegKind,
     dialer: Arc<dyn Dialer>,
-    kept: Mutex<HashMap<ClientKey, reqwest::Client>>,
+    kept: Mutex<Kept>,
     built: AtomicUsize,
 }
 
 // A client's target, its host, port and checked addresses, and its shape.
 type ClientKey = (String, u16, Vec<IpAddr>, ClientShape);
 
-// The most clients a session keeps; past it they are built again.
+// The most clients a leg keeps of each kind; past it the one asked for
+// longest ago is dropped, and built again when next asked for.
 const CLIENTS_KEPT: usize = 1024;
+
+// A leg's clients: those one torrent's web seeds use apart from the rest,
+// so however many torrents a queue holds, their clients never push out the
+// leg's tracker, metainfo and gateway clients.
+#[derive(Default)]
+struct Kept {
+    shared: Recent,
+    per_torrent: Recent,
+}
+
+impl Kept {
+    fn of(&mut self, shape: &ClientShape) -> &mut Recent {
+        if shape.torrent.is_some() {
+            &mut self.per_torrent
+        } else {
+            &mut self.shared
+        }
+    }
+}
+
+// Clients by key, each stamped with when it was last asked for.
+#[derive(Default)]
+struct Recent {
+    clients: HashMap<ClientKey, (reqwest::Client, u64)>,
+    asked: u64,
+}
+
+impl Recent {
+    fn get(&mut self, key: &ClientKey) -> Option<reqwest::Client> {
+        self.asked += 1;
+        let (client, asked) = self.clients.get_mut(key)?;
+        *asked = self.asked;
+        Some(client.clone())
+    }
+
+    fn insert(&mut self, key: ClientKey, client: reqwest::Client) {
+        if self.clients.len() >= CLIENTS_KEPT {
+            let oldest = self
+                .clients
+                .iter()
+                .min_by_key(|(_, (_, asked))| *asked)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.clients.remove(&oldest);
+            }
+        }
+        self.clients.insert(key, (client, self.asked));
+    }
+}
 
 impl<F> LegClients<F>
 where
@@ -708,14 +758,12 @@ where
         );
         // Built under the lock, so callers racing for one key build it once.
         let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        let kept = kept.of(shape);
         if let Some(client) = kept.get(&key) {
-            return Ok(client.clone());
+            return Ok(client);
         }
         let client = self.builder(target, shape)?.build()?;
         self.built.fetch_add(1, Ordering::Relaxed);
-        if kept.len() >= CLIENTS_KEPT {
-            kept.clear();
-        }
         kept.insert(key, client.clone());
         Ok(client)
     }
@@ -1562,6 +1610,48 @@ mod tests {
             }
         });
         assert_eq!(clients.built(), 1);
+    }
+
+    // A queue's web seeds, one client per torrent past the most a leg
+    // keeps, drop their own oldest clients and leave the tracker's alone.
+    #[test]
+    fn web_seed_clients_never_push_out_the_trackers() {
+        let clients = LegClients::new(
+            || Ok(reqwest::Client::builder().no_proxy()),
+            None,
+            LegKind::System,
+            system_dialer(),
+        );
+        let checked = [IpAddr::from([127, 0, 0, 1])];
+        let target = |host| {
+            Some(HttpTarget {
+                host,
+                port: 80,
+                addrs: &checked,
+            })
+        };
+        let announce = ClientShape::of(ClientUse::Tracker { title_case: false });
+        let seed = |n: usize| {
+            let mut hash = [0u8; 20];
+            hash[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            ClientShape::FETCH.for_torrent(weaver_torrent::core::Id20::new(hash))
+        };
+        clients.client(target("tracker.test"), &announce).unwrap();
+        for n in 1..=CLIENTS_KEPT + 1 {
+            clients.client(target("seed.test"), &seed(n)).unwrap();
+        }
+        let built = clients.built();
+        assert_eq!(built, CLIENTS_KEPT + 2);
+
+        // The tracker's client is still kept, and so is the latest web seed's.
+        clients.client(target("tracker.test"), &announce).unwrap();
+        clients
+            .client(target("seed.test"), &seed(CLIENTS_KEPT + 1))
+            .unwrap();
+        assert_eq!(clients.built(), built);
+        // The web seed asked for longest ago was dropped.
+        clients.client(target("seed.test"), &seed(1)).unwrap();
+        assert_eq!(clients.built(), built + 1);
     }
 
     // Two legs asked for the same target and shape each build their own
