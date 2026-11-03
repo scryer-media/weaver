@@ -449,7 +449,9 @@ async fn test_ssl_peers_refuse_a_certificate_issued_to_another_torrent() -> anyh
         .await
         .err()
         .context("the TLS to a seeder issued to another torrent completed")?;
-    let err = err.get_ref().and_then(|e| e.downcast_ref::<rustls::Error>());
+    let err = err
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<rustls::Error>());
     assert!(
         matches!(
             err,

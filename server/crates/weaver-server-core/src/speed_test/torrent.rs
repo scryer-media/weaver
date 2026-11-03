@@ -374,11 +374,7 @@ impl TestTorrent {
                 let tiers = if torrent.announce_list.iter().flatten().next().is_some() {
                     torrent.announce_list.clone()
                 } else {
-                    torrent
-                        .announce
-                        .iter()
-                        .map(|url| vec![url.clone()])
-                        .collect()
+                    torrent.announce.iter().map(|url| vec![*url]).collect()
                 };
                 let trackers = tiers
                     .iter()

@@ -177,7 +177,7 @@ mod tests {
         fn good() -> Self {
             Self(
                 (0..BLOCKS)
-                    .map(|b| vec![b as u8; CHUNK_SIZE as usize])
+                    .map(|b| vec![u8::try_from(b & 0xff).unwrap(); CHUNK_SIZE as usize])
                     .collect(),
             )
         }

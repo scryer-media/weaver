@@ -69,7 +69,6 @@ async fn setting(conn: &mut SqlConn<'_>, key: &str) -> Result<Option<String>, St
     .next()
     .map(|row| row.text("value"))
     .transpose()
-    .map_err(Into::into)
 }
 
 // A limit saved before 69, where 0 meant no limit.
@@ -298,7 +297,7 @@ mod tests {
 
         upgrade_to_69(&pool).await;
 
-        let rows: Vec<(
+        type Row = (
             i64,
             Option<i64>,
             Option<i64>,
@@ -309,7 +308,8 @@ mod tests {
             i64,
             String,
             i64,
-        )> = sqlx::query_as(
+        );
+        let rows: Vec<Row> = sqlx::query_as(
             "SELECT id, download_bps, upload_bps, quota_download_bytes, quota_download_enabled,
                         quota_upload_trickle_bps, quota_period, quota_reset_time_minutes_local,
                         quota_weekly_reset_weekday, quota_monthly_reset_day

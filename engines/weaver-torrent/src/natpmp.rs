@@ -1419,9 +1419,9 @@ mod tests {
             }
             // SAFETY: an all-zero rt_msghdr is valid.
             let mut rtm: libc::rt_msghdr = unsafe { std::mem::zeroed() };
-            rtm.rtm_msglen = (header + body.len()) as u16;
-            rtm.rtm_version = libc::RTM_VERSION as u8;
-            rtm.rtm_type = libc::RTM_GET as u8;
+            rtm.rtm_msglen = u16::try_from(header + body.len()).unwrap();
+            rtm.rtm_version = u8::try_from(libc::RTM_VERSION).unwrap();
+            rtm.rtm_type = u8::try_from(libc::RTM_GET).unwrap();
             rtm.rtm_index = index;
             rtm.rtm_flags = flags;
             rtm.rtm_addrs = libc::RTA_DST | libc::RTA_GATEWAY | libc::RTA_NETMASK;
@@ -1434,7 +1434,7 @@ mod tests {
             m
         }
         fn sin(ip: [u8; 4]) -> Vec<u8> {
-            let mut sa = vec![16, libc::AF_INET as u8, 0, 0];
+            let mut sa = vec![16, u8::try_from(libc::AF_INET).unwrap(), 0, 0];
             sa.extend_from_slice(&ip);
             sa.resize(16, 0);
             sa
@@ -1442,7 +1442,7 @@ mod tests {
         // A link-layer gateway (sockaddr_dl) is no router.
         let link = vec![
             20,
-            libc::AF_LINK as u8,
+            u8::try_from(libc::AF_LINK).unwrap(),
             4,
             0,
             0,

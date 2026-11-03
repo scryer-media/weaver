@@ -6,12 +6,12 @@
 // Weaver authors from 2026-10-20 onward.
 
 pub(crate) mod bprotocol;
-mod dht;
 mod error;
 mod peer_store;
 mod persistence;
 mod query_limiter;
 mod routing_table;
+mod state;
 mod utils;
 
 use std::sync::Arc;
@@ -20,8 +20,8 @@ use std::time::Duration;
 pub use error::{Error, Result};
 
 pub use crate::core::hash_id::Id20;
-pub use crate::dht::dht::DhtStats;
-pub use crate::dht::dht::{DhtConfig, DhtState, RequestPeersStream};
+pub use crate::dht::state::DhtStats;
+pub use crate::dht::state::{DhtConfig, DhtState, RequestPeersStream};
 pub use persistence::{DhtPersistenceConfig, PersistentDht, dht_listen_addr};
 
 pub type Dht = Arc<DhtState>;

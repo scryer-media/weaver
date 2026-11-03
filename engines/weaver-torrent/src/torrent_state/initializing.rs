@@ -46,6 +46,14 @@ const CHECK_IDLE: u8 = 0;
 const CHECK_STARTED: u8 = 1;
 const CHECK_READING: u8 = 2;
 
+/// What a torrent's check trusts of what was saved.
+pub(crate) enum InitialCheck {
+    /// Nothing: every piece is read back.
+    Full,
+    /// The checkpoint, when there is one and the files are as it recorded.
+    From(Option<Checkpoint>),
+}
+
 pub struct TorrentStateInitializing {
     pub(crate) files: FileStorage,
     pub(crate) shared: Arc<ManagedTorrentShared>,
@@ -148,11 +156,14 @@ impl TorrentStateInitializing {
         metadata: Arc<TorrentMetadata>,
         only_files: Option<Vec<usize>>,
         files: FileStorage,
-        full_check: bool,
-        checkpoint: Option<Checkpoint>,
+        check: InitialCheck,
         piece_priorities: Option<Vec<PiecePriority>>,
         peers: PeerList,
     ) -> Self {
+        let (full_check, checkpoint) = match check {
+            InitialCheck::Full => (true, None),
+            InitialCheck::From(checkpoint) => (false, checkpoint),
+        };
         Self {
             shared,
             metadata,
@@ -984,7 +995,7 @@ mod tests {
             let checks = session.concurrent_initialize_semaphore.clone();
             let held = checks
                 .clone()
-                .acquire_many_owned(checks.available_permits() as u32)
+                .acquire_many_owned(u32::try_from(checks.available_permits()).unwrap())
                 .await?;
             let (reading_tx, mut reading) = tokio::sync::mpsc::unbounded_channel();
             let (go, gate) = std::sync::mpsc::channel();

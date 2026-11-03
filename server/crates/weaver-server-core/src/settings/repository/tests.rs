@@ -567,7 +567,10 @@ fn a_tracker_rules_private_key_is_encrypted_at_rest() {
             1,
         )
         .unwrap();
-    assert_eq!(db.list_tracker_rules().unwrap(), [kept.clone()]);
+    assert_eq!(
+        db.list_tracker_rules().unwrap(),
+        std::slice::from_ref(&kept)
+    );
     assert_eq!(kept.ssl.as_ref(), Some(&issued));
 
     let stored = |column: &'static str| {
@@ -688,7 +691,10 @@ fn a_bound_rule_refuses_a_change_to_a_locked_field() {
             )
         );
     }
-    assert_eq!(db.list_tracker_rules().unwrap(), [rule.clone()]);
+    assert_eq!(
+        db.list_tracker_rules().unwrap(),
+        std::slice::from_ref(&rule)
+    );
 
     let changed = crate::settings::model::TrackerRule {
         pex: Some(true),
@@ -726,7 +732,10 @@ fn a_bound_rule_refuses_a_change_to_its_host_pattern() {
         refusal,
         "host_pattern is locked by Example Tracker's tracker file; unbind the rule to change it."
     );
-    assert_eq!(db.list_tracker_rules().unwrap(), [rule.clone()]);
+    assert_eq!(
+        db.list_tracker_rules().unwrap(),
+        std::slice::from_ref(&rule)
+    );
 
     assert!(db.unbind_tracker_rule(rule.id, 12).unwrap());
     let saved = db
@@ -794,7 +803,10 @@ seeding = { ratio_goal = 3.0, seed_time_goal_minutes = 200 }",
     assert_eq!(seeding.ratio_goal, Leaf::Set(2.0));
     assert_eq!(seeding.seed_time_goal_minutes, Leaf::Set(200));
     assert_eq!(again.bound.as_ref().unwrap().revision, "2");
-    assert_eq!(db.list_tracker_rules().unwrap(), [again.clone()]);
+    assert_eq!(
+        db.list_tracker_rules().unwrap(),
+        std::slice::from_ref(&again)
+    );
 
     let other = tracker_file("revision = \"1\"", None);
     let other = crate::settings::tracker_file::TrackerFile {

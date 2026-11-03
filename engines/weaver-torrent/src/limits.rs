@@ -614,13 +614,13 @@ mod tests {
     async fn the_rate_bounds_what_passes() {
         const RATE: u64 = 1000;
         for ask in [100, 300, 5000] {
-            let limits = down(bps(RATE as u32));
+            let limits = down(bps(u32::try_from(RATE).unwrap()));
             let start = Instant::now();
             let mut total = 0;
             while start.elapsed() < Duration::from_secs(30) {
                 total += limits.request(Channel::Download, ask).await;
             }
-            let rate_allows = RATE * start.elapsed().as_millis() as u64 / 1000;
+            let rate_allows = RATE * u64::try_from(start.elapsed().as_millis()).unwrap() / 1000;
             assert!(total <= rate_allows, "{ask}: {total} > {rate_allows}");
             assert!(
                 total + RATE + ask + RATE / 2 >= rate_allows,
@@ -782,7 +782,7 @@ mod tests {
     async fn a_tighter_session_limit_holds_every_torrent() {
         const RATE: u64 = 1000;
         const ASK: u64 = 500;
-        let session = down(bps(RATE as u32));
+        let session = down(bps(u32::try_from(RATE).unwrap()));
         let limited = down(bps(4000));
         let unlimited = Limits::default();
         let start = Instant::now();
@@ -792,7 +792,7 @@ mod tests {
         );
         let total = |grants: &[(Duration, u64)]| grants.iter().map(|(_, g)| g).sum::<u64>();
         let (limited_total, unlimited_total) = (total(&limited_grants), total(&unlimited_grants));
-        let session_allows = RATE * start.elapsed().as_millis() as u64 / 1000;
+        let session_allows = RATE * u64::try_from(start.elapsed().as_millis()).unwrap() / 1000;
         assert!(limited_total > 0 && unlimited_total > 0);
         assert!(
             limited_total + unlimited_total <= session_allows,

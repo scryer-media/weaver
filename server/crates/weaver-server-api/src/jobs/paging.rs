@@ -16,9 +16,9 @@ use weaver_server_core::pipeline::queue::paging::JobView;
 use weaver_server_core::{JobId, JobInfo, SharedPipelineState};
 
 use super::types::{
-    ProtocolGql, QueueCategoryCount, QueueEtaBytes, QueueItemState, QueuePageInput,
-    QueuePriority, QueueProtocolCount, QueueSelectionInput, QueueSortDirection, QueueSortField,
-    QueueStateCount, QueueStateFacts, QueueSummary, queue_item_state,
+    ProtocolGql, QueueCategoryCount, QueueEtaBytes, QueueItemState, QueuePageInput, QueuePriority,
+    QueueProtocolCount, QueueSelectionInput, QueueSortDirection, QueueSortField, QueueStateCount,
+    QueueStateFacts, QueueSummary, queue_item_state,
 };
 
 pub(crate) const MAX_QUEUE_PAGE_SIZE: usize = 500;
@@ -225,8 +225,8 @@ impl QueueWalk {
         for row in &inner.jobs {
             let view = row.view(&inner.globals);
             let job = view.job();
-            while let Some((index, torrent)) =
-                torrents.next_if(|(_, torrent)| torrent.created_at_epoch_ms < job.created_at_epoch_ms)
+            while let Some((index, torrent)) = torrents
+                .next_if(|(_, torrent)| torrent.created_at_epoch_ms < job.created_at_epoch_ms)
             {
                 push_torrent(&mut walk, &mut category_index, index, torrent);
             }
@@ -438,7 +438,8 @@ impl<'a> QueueSelection<'a> {
 
     // Protocol: counted beside categories, each under the other's filter.
     fn matches_protocol(&self, row: &WalkedRow) -> bool {
-        self.protocol.is_none_or(|protocol| protocol == row.protocol)
+        self.protocol
+            .is_none_or(|protocol| protocol == row.protocol)
     }
 
     fn matches_state(&self, row: &WalkedRow) -> bool {

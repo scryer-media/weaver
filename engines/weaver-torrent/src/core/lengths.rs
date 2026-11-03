@@ -101,8 +101,11 @@ impl Lengths {
             return Err(Error::TooManyPieces);
         }
         // At most MAX_NUM_PIECES + 1, and a piece is at most `piece_length`.
-        let total_pieces = total_length.div_ceil(u64::from(piece_length)) as u32;
-        let last_piece_length = last_element_size(total_length, u64::from(piece_length)) as u32;
+        let total_pieces = u32::try_from(total_length.div_ceil(u64::from(piece_length)))
+            .expect("at most MAX_NUM_PIECES + 1 pieces");
+        let last_piece_length =
+            u32::try_from(last_element_size(total_length, u64::from(piece_length)))
+                .expect("the last piece is at most a piece long");
         let chunks_per_piece = piece_length.div_ceil(CHUNK_SIZE);
         // Chunks are counted across the torrent in a u32.
         let total_chunks = u64::from(total_pieces - 1) * u64::from(chunks_per_piece)
@@ -187,11 +190,13 @@ impl Lengths {
         let offset_bytes = offset_bytes.min(self.total_length);
         let end_bytes = (offset_bytes + len).min(self.total_length);
 
-        let start_piece_id = (offset_bytes / self.piece_length as u64) as u32;
+        let start_piece_id = u32::try_from(offset_bytes / self.piece_length as u64)
+            .expect("piece indexes fit in u32");
         let end_piece_id = if end_bytes == offset_bytes {
             start_piece_id
         } else {
-            end_bytes.div_ceil(self.piece_length as u64) as u32
+            u32::try_from(end_bytes.div_ceil(self.piece_length as u64))
+                .expect("piece indexes fit in u32")
         };
         start_piece_id..end_piece_id
     }

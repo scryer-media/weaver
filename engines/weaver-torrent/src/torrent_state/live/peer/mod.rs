@@ -329,13 +329,13 @@ impl Peer {
         let stats = stats::atomic::PeerStats::default();
         Self {
             addr,
-            state: PeerState::Live(LivePeerState::new(
+            state: PeerState::Live(Box::new(LivePeerState::new(
                 peer_id,
                 tx,
                 connection_kind,
                 &stats.counters,
                 false,
-            )),
+            ))),
             stats,
             outgoing_address: listen_address(addr, connection_kind),
             failcount: 0,
@@ -774,7 +774,7 @@ pub(crate) enum PeerState {
     // time has come.
     Queued,
     Connecting(PeerTx),
-    Live(LivePeerState),
+    Live(Box<LivePeerState>),
     // Not a connect candidate: it failed MAX_FAILCOUNT times in a row, or we do
     // not know where it listens. Kept until someone names it again or the list
     // needs the room.
@@ -871,7 +871,7 @@ impl Peer {
             PeerState::Queued | PeerState::Dead | PeerState::NotNeeded => {
                 let live =
                     LivePeerState::new(peer_id, tx, connection_kind, &self.stats.counters, false);
-                self.set_state(PeerState::Live(live), counters);
+                self.set_state(PeerState::Live(Box::new(live)), counters);
             }
             PeerState::Connecting(..) | PeerState::Live(..) => unreachable!(),
         }
@@ -890,7 +890,7 @@ impl Peer {
                 _ => unreachable!(),
             };
             let live = LivePeerState::new(peer_id, tx, conn_kind, &self.stats.counters, true);
-            self.set_state(PeerState::Live(live), counters);
+            self.set_state(PeerState::Live(Box::new(live)), counters);
             self.get_live_mut()
         } else {
             None
@@ -1689,7 +1689,7 @@ impl LivePeerState {
     /// (libtorrent `peer_connection::incoming_request`).
     pub fn invalid_request(&mut self, peer_chokes_us: bool) -> bool {
         self.invalid_requests = self.invalid_requests.saturating_add(1);
-        if self.peer_interested || !self.is_choked() || self.invalid_requests % 10 != 0 {
+        if self.peer_interested || !self.is_choked() || !self.invalid_requests.is_multiple_of(10) {
             return true;
         }
         if self.invalid_requests > 300 && !peer_chokes_us {

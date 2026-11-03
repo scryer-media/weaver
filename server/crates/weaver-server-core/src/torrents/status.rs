@@ -978,8 +978,8 @@ mod tests {
             let active = active_seconds(whole, part_ms);
             let bps = average_bps(bytes, active);
             assert_eq!((active, bps), (seconds, average), "{whole} s {part_ms} ms");
-            if active > 0 {
-                assert_eq!(bytes / active, bps);
+            if let Some(per) = bytes.checked_div(active) {
+                assert_eq!(per, bps);
             }
         }
     }

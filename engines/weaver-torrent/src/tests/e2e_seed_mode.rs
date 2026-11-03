@@ -204,7 +204,9 @@ async fn test_seed_mode_piece_that_fails_its_check_ends_seed_mode_and_checks_eve
     }
     assert!(!seed.seed_mode());
     assert!(
-        !got.log.completed_pieces().contains(&(DAMAGED as u32)),
+        !got.log
+            .completed_pieces()
+            .contains(&u32::try_from(DAMAGED).unwrap()),
         "the damaged piece was not sent"
     );
     Ok(())

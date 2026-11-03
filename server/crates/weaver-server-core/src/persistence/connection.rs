@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -1070,6 +1070,7 @@ async fn run_postgres_write_lanes(
     let mut in_flight = tokio::task::JoinSet::new();
     // The completion signal of the last command taken on each lane.
     let mut tails: HashMap<WriteLane, watch::Receiver<bool>> = HashMap::new();
+    let counts = writer_db.writer_counts.clone();
     loop {
         // Bound ownership of taken commands as well as the incoming queue.
         // A paused checkpoint retains its lane until resumed or cancelled.
@@ -1082,6 +1083,7 @@ async fn run_postgres_write_lanes(
         while in_flight.try_join_next().is_some() {}
         prune_finished_lane_tails(&mut tails);
         let Some((also_after, lane)) = command.lanes() else {
+            counts.taken.fetch_add(1, Ordering::Release);
             let mut command = command;
             let abandoned = if let DbWriteCommand::Flush { reply } = &mut command {
                 loop {
@@ -1109,6 +1111,10 @@ async fn run_postgres_write_lanes(
             .chain(also_after)
             .filter_map(|lane| tails.get(lane).cloned())
             .collect();
+        if !waits.is_empty() {
+            counts.parked.fetch_add(1, Ordering::Relaxed);
+        }
+        counts.taken.fetch_add(1, Ordering::Release);
         let (done_tx, done_rx) = watch::channel(false);
         tails.insert(lane, done_rx);
         let permits = permits.clone();
@@ -1128,6 +1134,16 @@ async fn run_postgres_write_lanes(
         });
     }
     while in_flight.join_next().await.is_some() {}
+}
+
+// What the ordered writer has taken from its queue so far.
+#[derive(Default)]
+struct WriterCounts {
+    // Every command taken.
+    taken: AtomicU64,
+    // The lane writes among them taken while a write before them on one of
+    // their lanes was still unfinished, so they waited for it.
+    parked: AtomicU64,
 }
 
 // Forget the lanes whose last taken write has finished, so the table holds
@@ -1222,6 +1238,7 @@ pub struct Database {
     // own `Flush` so a re-send in progress is not skipped at shutdown.
     pending_write_retries: Arc<AtomicUsize>,
     pending_write_notify: Arc<Notify>,
+    writer_counts: Arc<WriterCounts>,
     // The writes waiting, in the order they were queued, for room in the
     // full writer queue: some while the re-send empties them into it.
     write_overflow: Arc<Mutex<Option<VecDeque<QueuedWrite>>>>,
@@ -1263,6 +1280,7 @@ impl Database {
             checkpoint_failures: Arc::new(watch::channel(BTreeMap::new()).0),
             pending_write_retries: Arc::new(AtomicUsize::new(0)),
             pending_write_notify: Arc::new(Notify::new()),
+            writer_counts: Arc::default(),
             write_overflow: Arc::new(Mutex::new(None)),
             history_delete_wake: Arc::new(Notify::new()),
             job_history_cache: Arc::new(Mutex::new(JobHistoryCache::default())),
@@ -1292,6 +1310,7 @@ impl Database {
             checkpoint_failures: Arc::new(watch::channel(BTreeMap::new()).0),
             pending_write_retries: Arc::new(AtomicUsize::new(0)),
             pending_write_notify: Arc::new(Notify::new()),
+            writer_counts: Arc::default(),
             write_overflow: Arc::new(Mutex::new(None)),
             history_delete_wake: Arc::new(Notify::new()),
             job_history_cache: Arc::new(Mutex::new(JobHistoryCache::default())),
@@ -1512,6 +1531,7 @@ impl Database {
             checkpoint_failures: self.checkpoint_failures.clone(),
             pending_write_retries: self.pending_write_retries.clone(),
             pending_write_notify: self.pending_write_notify.clone(),
+            writer_counts: self.writer_counts.clone(),
             write_overflow: Arc::new(Mutex::new(None)),
             history_delete_wake: self.history_delete_wake.clone(),
             job_history_cache: self.job_history_cache.clone(),
@@ -1772,6 +1792,20 @@ impl Database {
         self.writer_tx
             .max_capacity()
             .saturating_sub(self.writer_tx.capacity())
+    }
+
+    // How many commands the ordered writer has taken from its queue. A
+    // write's `parked` count is settled before its `taken` count shows it.
+    #[cfg(test)]
+    pub(crate) fn writes_taken(&self) -> u64 {
+        self.writer_counts.taken.load(Ordering::Acquire)
+    }
+
+    // How many lane writes the ordered writer took while a write before them
+    // on their lane was unfinished.
+    #[cfg(test)]
+    pub(crate) fn writes_parked(&self) -> u64 {
+        self.writer_counts.parked.load(Ordering::Relaxed)
     }
 
     // Stamp a command with its enqueue instant and sample how full the ordered

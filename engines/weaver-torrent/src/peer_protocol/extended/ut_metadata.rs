@@ -97,7 +97,7 @@ impl<'a> UtMetadataData<ByteBuf<'a>> {
         }
         if self.len() > CHUNK_SIZE as usize {
             return Err(MessageDeserializeError::UtMetadataTooLarge(
-                self.len() as u32
+                u32::try_from(self.len()).unwrap_or(u32::MAX),
             ));
         }
         let total_pieces = self.total_size.div_ceil(CHUNK_SIZE);
@@ -111,10 +111,10 @@ impl<'a> UtMetadataData<ByteBuf<'a>> {
             .total_size
             .saturating_sub(self.piece * CHUNK_SIZE)
             .min(CHUNK_SIZE);
-        if self.len() as u32 != expected_size {
+        if u32::try_from(self.len()) != Ok(expected_size) {
             return Err(MessageDeserializeError::UtMetadataSizeMismatch {
                 expected_size,
-                received_size: self.len() as u32,
+                received_size: u32::try_from(self.len()).unwrap_or(u32::MAX),
             });
         }
         Ok(())

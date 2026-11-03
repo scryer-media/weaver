@@ -95,7 +95,7 @@ impl<const N: usize> FromStr for Id<N> {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let mut out = [0u8; N];
-        let base32_encoded_size = (N as f64 / 5f64).ceil() as usize * 8;
+        let base32_encoded_size = N.div_ceil(5) * 8;
         if s.len() == N * 2 {
             hex::decode_to_slice(s, &mut out)?;
             Ok(Id(out))

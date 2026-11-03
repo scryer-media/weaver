@@ -504,7 +504,7 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
     let info = job_info(view.clone(), EPOCH_MS + 1000);
     assert_eq!(info.status, JobStatus::Downloading);
     assert_eq!(
-        crate::jobs::handle::job_download_rates(&[info.clone()]),
+        crate::jobs::handle::job_download_rates(std::slice::from_ref(&info)),
         [(JobId(7), 500)]
     );
     assert_eq!(info.phase_progress[0].estimated_remaining_ms, Some(6000));
@@ -2807,10 +2807,8 @@ async fn the_global_pause_reaches_the_torrents() {
             (view.state, view.detail)
         }
     };
-    let held = |job_id| {
-        let state = state.clone();
-        async move { matches!(state(job_id).await, (TorrentState::Queued, Some(_))) }
-    };
+    let held =
+        |job_id| async move { matches!(state(job_id).await, (TorrentState::Queued, Some(_))) };
     let scheduled = |scope, owner| Hold {
         origin: HoldOrigin::Scheduled,
         scope,
@@ -5093,7 +5091,7 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         move_to: None,
         queue_position: 0,
     };
-    let mut rules = vec![TrackerRule {
+    let mut rules = [TrackerRule {
         archive_passwords: Default::default(),
         bound: None,
         id: 1,
@@ -5614,16 +5612,19 @@ async fn a_save_on_its_way_at_stop_lands_before_stops_own() {
         })
         .unwrap();
     run.await.unwrap();
+    let taken = rig.db.writes_taken();
+    let parked = rig.db.writes_parked();
 
     let service = rig.service.clone();
     let stopping = tokio::spawn(async move { service.stop().await });
-    // Stop's save reaches the queue, after the service's lock, and waits
-    // there behind the one on its way: the wait is on the queue holding
-    // it, not on how far one poll of stop got.
-    while rig.db.queued_writes() == 0 {
+    // Stop's save is the next write the writer takes, and it takes it onto
+    // the torrent's lane, parked behind the one on its way; stop waits for
+    // it to land, so it queues nothing more meanwhile.
+    while rig.db.writes_taken() == taken {
         tokio::task::yield_now().await;
     }
-    assert_eq!(rig.db.queued_writes(), 1);
+    assert_eq!(rig.db.writes_taken(), taken + 1);
+    assert_eq!(rig.db.writes_parked(), parked + 1);
     assert!(!stopping.is_finished());
     release.send(()).unwrap();
     stopping.await.unwrap();

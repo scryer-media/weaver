@@ -196,14 +196,14 @@ mod tests {
     /// Files of the given lengths laid end to end; `pad` names the padding.
     fn layout(lens: &[u64], pad: &[usize]) -> (Lengths, FileInfos) {
         let total: u64 = lens.iter().sum();
-        let lengths = Lengths::new(total, PIECE as u32).unwrap();
+        let lengths = Lengths::new(total, u32::try_from(PIECE).unwrap()).unwrap();
         let mut offset = 0;
         let files = lens
             .iter()
             .enumerate()
             .map(|(index, &len)| {
-                let start = (offset / PIECE) as u32;
-                let end = (offset + len).div_ceil(PIECE) as u32;
+                let start = u32::try_from(offset / PIECE).unwrap();
+                let end = u32::try_from((offset + len).div_ceil(PIECE)).unwrap();
                 let file = FileInfo {
                     relative_filename: format!("f{index}").into(),
                     offset_in_torrent: offset,

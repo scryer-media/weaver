@@ -137,7 +137,7 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
                 out.write_u32::<BE>(*index)?;
             }
         }
-        Ok(out.position() as usize)
+        Ok(usize::try_from(out.position()).expect("the cursor stays within its buffer"))
     }
 
     pub fn deserialize(mut buf: DoubleBufHelper<'a>) -> Result<Self, MessageDeserializeError> {
@@ -173,7 +173,9 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
             MY_EXTENDED_UPLOAD_ONLY => match buf.get_contiguous(buf.len()) {
                 Some(&[byte]) => Ok(ExtendedMessage::UploadOnly(byte != 0)),
                 _ => Err(MessageDeserializeError::IncorrectMsgLen {
-                    received: buf.len() as u32 + 1,
+                    received: u32::try_from(buf.len())
+                        .unwrap_or(u32::MAX)
+                        .saturating_add(1),
                     expected: 2,
                     msg_id,
                 }),
@@ -185,7 +187,9 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
                     Ok(ExtendedMessage::DontHave(u32::from_be_bytes([a, b, c, d])))
                 }
                 _ => Err(MessageDeserializeError::IncorrectMsgLen {
-                    received: buf.len() as u32 + 1,
+                    received: u32::try_from(buf.len())
+                        .unwrap_or(u32::MAX)
+                        .saturating_add(1),
                     expected: 5,
                     msg_id,
                 }),

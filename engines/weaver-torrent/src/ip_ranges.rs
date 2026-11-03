@@ -109,6 +109,10 @@ impl IpRanges {
         self.v4.len + self.v6.len
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub async fn load_from_url(client: &reqwest::Client, url: &str) -> Result<Self> {
         let parsed_url = Url::parse(url).context("failed to parse URL")?;
 
@@ -305,10 +309,8 @@ mod tests {
     fn a_union_holds_every_range_of_every_list() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         let v4 = |a: &str, b: &str| a.parse::<Ipv4Addr>().unwrap()..b.parse().unwrap();
-        let list = IpRanges::new(
-            [v4("10.0.0.0", "10.0.1.0")],
-            ["2001:db8::".parse::<Ipv6Addr>().unwrap().."2001:db8::10".parse().unwrap()],
-        );
+        let v6 = "2001:db8::".parse::<Ipv6Addr>().unwrap().."2001:db8::10".parse().unwrap();
+        let list = IpRanges::new([v4("10.0.0.0", "10.0.1.0")], [v6]);
         let bans = IpRanges::of_inclusive([
             (ip("10.0.0.200"), ip("10.0.1.255")),
             (ip("192.0.2.7"), ip("192.0.2.7")),

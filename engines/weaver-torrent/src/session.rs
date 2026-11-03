@@ -63,7 +63,7 @@ use crate::{
     },
     create_torrent,
     create_torrent_file::CreateTorrentResult,
-    dht_utils::{ReadMetainfoResult, read_metainfo_from_peer_receiver},
+    dht_utils::{MetadataPeers, ReadMetainfoResult, read_metainfo_from_peer_receiver},
     ip_ranges::IpRanges,
     limits::{Limits, LimitsConfig},
     listen::{Accept, ListenerOptions},
@@ -85,7 +85,7 @@ use crate::{
     torrent_state::{
         AddIncomingPeerResult, ManagedTorrentHandle, ManagedTorrentLocked, ManagedTorrentOptions,
         ManagedTorrentState, TorrentMetadata, TorrentStateLive, TorrentTotals,
-        initializing::{Checkpoint, TorrentStateInitializing, normalize_checkpoint},
+        initializing::{Checkpoint, InitialCheck, TorrentStateInitializing, normalize_checkpoint},
         live::peers::PeerList,
         seed_mode::SeedMode,
     },
@@ -822,6 +822,7 @@ pub enum SessionPersistenceConfig {
 
 /// Configuration for the DHT subsystem.
 /// Set to `None` in `SessionOptions::dht` to disable DHT entirely.
+#[derive(Default)]
 pub struct DhtSessionConfig {
     /// Bootstrap nodes (host:port or ip:port). Uses built-in defaults if None.
     pub bootstrap_addrs: Option<Vec<String>>,
@@ -833,16 +834,6 @@ pub struct DhtSessionConfig {
     pub port: Option<u16>,
     /// Persistence behavior. If None, persistence is disabled.
     pub persistence: Option<DhtPersistenceConfig>,
-}
-
-impl Default for DhtSessionConfig {
-    fn default() -> Self {
-        Self {
-            bootstrap_addrs: None,
-            port: None,
-            persistence: None,
-        }
-    }
 }
 
 /// The limits a running session takes as they change (libtorrent
@@ -1387,6 +1378,24 @@ fn merge_tracker_tiers(
 ) -> Vec<Vec<Tracker>> {
     let extra = (!trackers_only).then(|| extra.into_iter().map(|t| vec![Tracker::operator(t)]));
     crate::tracker::tidy_tiers(own.into_iter().chain(extra.into_iter().flatten()))
+}
+
+/// What a torrent asks for peers with: the hashes and identity it goes by,
+/// the trackers and sources it asks, and whether it announces itself.
+struct PeerRequest<'a> {
+    info_hashes: InfoHashes,
+    identity: &'a Identity,
+    tracker_tiers: Vec<Vec<Tracker>>,
+    announce: bool,
+    force_tracker_interval: Option<Duration>,
+    initial_peers: Vec<SocketAddr>,
+    trackers_only: bool,
+    discovery: Discovery,
+    dht_announce: tokio::sync::watch::Receiver<()>,
+    ssl: Option<&'a Arc<SslTorrent>>,
+    // A tracker task already running for the torrent, taken over in place
+    // of starting its own.
+    trackers: Option<TrackerTask>,
 }
 
 impl Session {
@@ -2671,23 +2680,23 @@ impl Session {
                             identity: &Identity,
                             private: bool,
                             trackers: Option<TrackerTask>| {
-            self.make_peer_rx(
+            self.make_peer_rx(PeerRequest {
                 info_hashes,
                 identity,
-                tracker_tiers.clone(),
-                !opts.paused && !opts.list_only,
-                opts.force_tracker_interval,
-                opts.initial_peers.clone().unwrap_or_default(),
-                trackers_only(private, opts.trackers_only),
-                Discovery::of(
+                tracker_tiers: tracker_tiers.clone(),
+                announce: !opts.paused && !opts.list_only,
+                force_tracker_interval: opts.force_tracker_interval,
+                initial_peers: opts.initial_peers.clone().unwrap_or_default(),
+                trackers_only: trackers_only(private, opts.trackers_only),
+                discovery: Discovery::of(
                     trackers_only(private, opts.trackers_only),
                     opts.disable_dht,
                     opts.disable_lsd,
                 ),
-                dht_announce.subscribe(),
-                None,
+                dht_announce: dht_announce.subscribe(),
+                ssl: None,
                 trackers,
-            )
+            })
         };
 
         let mut seen_peers = Vec::new();
@@ -2780,8 +2789,10 @@ impl Session {
                     .resolve_magnet(
                         info_hashes,
                         &identity,
-                        peers,
-                        peer_list,
+                        MetadataPeers {
+                            list: peer_list,
+                            stream: peers,
+                        },
                         &unable_tx,
                         &tracker_tiers,
                         opts.peer_opts,
@@ -3003,8 +3014,7 @@ impl Session {
                 only_files,
                 self.spawner
                     .block_in_place(|| minfo.storage_factory.create_and_init(&minfo, &metadata))?,
-                false,
-                checkpoint,
+                InitialCheck::From(checkpoint),
                 Some(piece_priorities.clone()),
                 peer_list,
             ));
@@ -3161,19 +3171,19 @@ impl Session {
         t: &ManagedTorrentHandle,
         announce: bool,
     ) -> Option<PeerSource> {
-        self.make_peer_rx(
-            t.info_hashes(),
-            &t.shared().identity(),
-            t.shared().tracker_tiers(),
+        self.make_peer_rx(PeerRequest {
+            info_hashes: t.info_hashes(),
+            identity: &t.shared().identity(),
+            tracker_tiers: t.shared().tracker_tiers(),
             announce,
-            t.shared().options.force_tracker_interval,
-            t.shared().options.initial_peers.clone(),
-            t.takes_peers_from_trackers_only(),
-            t.discovery(),
-            t.shared().dht_announce.subscribe(),
-            t.shared().ssl.as_ref(),
-            None,
-        )
+            force_tracker_interval: t.shared().options.force_tracker_interval,
+            initial_peers: t.shared().options.initial_peers.clone(),
+            trackers_only: t.takes_peers_from_trackers_only(),
+            discovery: t.discovery(),
+            dht_announce: t.shared().dht_announce.subscribe(),
+            ssl: t.shared().ssl.as_ref(),
+            trackers: None,
+        })
     }
 
     /// The tiers a torrent announces to: its own, then the session's trackers
@@ -3294,20 +3304,20 @@ impl Session {
     // Get a peer stream from both DHT and trackers, under every hash the
     // torrent goes by (libtorrent `torrent::dht_announce`, `lsd_announce`
     // and `announce_with_tracker` each loop over `info_hash_t::for_each`).
-    fn make_peer_rx(
-        self: &Arc<Self>,
-        info_hashes: InfoHashes,
-        identity: &Identity,
-        tracker_tiers: Vec<Vec<Tracker>>,
-        announce: bool,
-        force_tracker_interval: Option<Duration>,
-        initial_peers: Vec<SocketAddr>,
-        trackers_only: bool,
-        discovery: Discovery,
-        dht_announce: tokio::sync::watch::Receiver<()>,
-        ssl: Option<&Arc<SslTorrent>>,
-        trackers: Option<TrackerTask>,
-    ) -> Option<PeerSource> {
+    fn make_peer_rx(self: &Arc<Self>, request: PeerRequest<'_>) -> Option<PeerSource> {
+        let PeerRequest {
+            info_hashes,
+            identity,
+            tracker_tiers,
+            announce,
+            force_tracker_interval,
+            initial_peers,
+            trackers_only,
+            discovery,
+            dht_announce,
+            ssl,
+            trackers,
+        } = request;
         // An SSL torrent with no identity asks no one for peers.
         if ssl.is_some_and(|ssl| !ssl.has_identity()) {
             return None;
@@ -3543,8 +3553,7 @@ impl Session {
         self: &Arc<Self>,
         info_hashes: InfoHashes,
         identity: &Identity,
-        peer_rx: PeerStream,
-        peer_list: PeerList,
+        peers: MetadataPeers<PeerStream>,
         unable: &tokio::sync::watch::Sender<HashSet<SocketAddr>>,
         tracker_tiers: &[Vec<Tracker>],
         peer_opts: Option<PeerConnectionOptions>,
@@ -3552,8 +3561,7 @@ impl Session {
         match read_metainfo_from_peer_receiver(
             identity.peer_id,
             info_hashes,
-            peer_list,
-            peer_rx,
+            peers,
             unable,
             Some(self.merge_peer_opts(peer_opts)),
             self.connector.clone(),
@@ -4579,7 +4587,7 @@ mod tests {
         let torrent = crate::create_torrent(
             dir.path(),
             crate::CreateTorrentOptions {
-                piece_length: Some(PIECE as u32),
+                piece_length: Some(u32::try_from(PIECE).unwrap()),
                 ..Default::default()
             },
             &crate::spawn_utils::BlockingSpawner::new(1),
@@ -4675,7 +4683,7 @@ mod tests {
         let torrent = crate::create_torrent(
             dir.path(),
             crate::CreateTorrentOptions {
-                piece_length: Some(PIECE as u32),
+                piece_length: Some(u32::try_from(PIECE).unwrap()),
                 ..Default::default()
             },
             &crate::spawn_utils::BlockingSpawner::new(1),
@@ -5646,7 +5654,9 @@ mod tests {
             // The next sends the plaintext one and gets the metadata.
             let (_, stream) = dials.recv().await.unwrap();
             let mut fetched = MockPeer::greet(stream, hashes).await;
-            fetched.send_extended_handshake(info.len() as u32).await;
+            fetched
+                .send_extended_handshake(u32::try_from(info.len()).unwrap())
+                .await;
             let piece = fetched.next_request().await.unwrap();
             fetched.send_piece(&info, piece).await;
             // Then the torrent connects.
@@ -5746,7 +5756,7 @@ mod tests {
         let checks = session.concurrent_initialize_semaphore.clone();
         let held = checks
             .clone()
-            .acquire_many_owned(checks.available_permits() as u32)
+            .acquire_many_owned(u32::try_from(checks.available_permits()).unwrap())
             .await?;
 
         let handle = session
@@ -5955,10 +5965,8 @@ mod tests {
         assert_eq!(check_once(&session, "10.0.0.1:6881"), None);
         assert_eq!(check_once(&session, "10.0.0.2:80"), None);
 
-        let blocked = Arc::new(crate::IpRanges::new(
-            ["10.0.0.1".parse().unwrap().."10.0.0.2".parse().unwrap()],
-            [],
-        ));
+        let range = "10.0.0.1".parse().unwrap().."10.0.0.2".parse().unwrap();
+        let blocked = Arc::new(crate::IpRanges::new([range], []));
         session.set_ip_filter(IpFilter {
             blocked: Arc::clone(&blocked),
             no_privileged_ports: true,
@@ -5995,11 +6003,9 @@ mod tests {
         .await;
         let reachable = session.reachable();
         let blocked: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let range = "10.0.0.1".parse().unwrap().."10.0.0.2".parse().unwrap();
         let filter = |trackers| IpFilter {
-            blocked: Arc::new(crate::IpRanges::new(
-                ["10.0.0.1".parse().unwrap().."10.0.0.2".parse().unwrap()],
-                [],
-            )),
+            blocked: Arc::new(crate::IpRanges::new([range.clone()], [])),
             no_privileged_ports: false,
             trackers,
         };

@@ -104,7 +104,7 @@ impl V1 {
 
     fn bytes(&self) -> Vec<u8> {
         let total: u64 = self.files.iter().map(|(_, len)| len).sum();
-        let count = total.div_ceil(self.piece_length as u64) as usize;
+        let count = usize::try_from(total.div_ceil(self.piece_length as u64)).unwrap();
         let pieces = vec![7u8; 20 * self.pieces.unwrap_or(count)];
         let mut info: Vec<(&'static str, B)> = Vec::new();
         if !self.single {

@@ -739,12 +739,7 @@ impl PieceTracker {
         let info = self.inflight.get(&piece);
         let owner = info.is_some_and(|info| info.peer == peer);
         self.missing_chunks(piece).filter(move |chunk| {
-            owner
-                || info.is_some_and(|info| {
-                    info.duplicates
-                        .iter()
-                        .any(|d| *d == (chunk.chunk_index, peer))
-                })
+            owner || info.is_some_and(|info| info.duplicates.contains(&(chunk.chunk_index, peer)))
         })
     }
 
@@ -892,8 +887,11 @@ mod tests {
     /// A tracker of `wanted` pieces we lack, followed by the
     /// INITIAL_PICKER_THRESHOLD pieces we have: it picks rarest first.
     fn rarest_first_tracker(wanted: u32, seed: u64) -> PieceTracker {
-        let mut tracker = seeded(wanted + INITIAL_PICKER_THRESHOLD as u32, seed);
-        for p in wanted..wanted + INITIAL_PICKER_THRESHOLD as u32 {
+        let mut tracker = seeded(
+            wanted + u32::try_from(INITIAL_PICKER_THRESHOLD).unwrap(),
+            seed,
+        );
+        for p in wanted..wanted + u32::try_from(INITIAL_PICKER_THRESHOLD).unwrap() {
             let p = index(&tracker, p);
             tracker.reserve_piece(p, peer(99));
             tracker.take_inflight(p);
@@ -1977,7 +1975,7 @@ mod tests {
             .catch_up(moved, |p| counts[p.get_usize()].get());
         tracker.chunks.check_index();
         for (id, count) in counts.iter().enumerate() {
-            let piece = index(tracker, id as u32);
+            let piece = index(tracker, u32::try_from(id).unwrap());
             assert_eq!(tracker.chunks.peers_with(piece), count.get(), "piece {id}");
         }
     }
@@ -2162,7 +2160,7 @@ mod tests {
         const WANTED: u32 = 48;
         let mut tracker = rarest_first_tracker(WANTED, 1);
         let mut rng = StdRng::seed_from_u64(7);
-        let counts: Vec<Cell<u32>> = (0..WANTED + INITIAL_PICKER_THRESHOLD as u32)
+        let counts: Vec<Cell<u32>> = (0..WANTED + u32::try_from(INITIAL_PICKER_THRESHOLD).unwrap())
             .map(|_| Cell::new(0))
             .collect();
         let all = Moved {

@@ -27,7 +27,7 @@ use crate::{
         constants::CHUNK_SIZE,
         hash_id::{Id20, InfoHashes},
     },
-    dht_utils::{ReadMetainfoResult, read_metainfo_from_peer_receiver},
+    dht_utils::{MetadataPeers, ReadMetainfoResult, read_metainfo_from_peer_receiver},
     mse::EncryptionPolicy,
     network::{
         AsyncReadVectoredIntoCompat, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture,
@@ -380,7 +380,8 @@ async fn metadata_data_and_reject_before_the_extended_handshake_are_ignored() {
         peer.send_piece(&metadata, 0).await;
         peer.send_reject(0).await;
         let rejected = Instant::now();
-        peer.send_extended_handshake(metadata.len() as u32).await;
+        peer.send_extended_handshake(u32::try_from(metadata.len()).unwrap())
+            .await;
         let piece = peer.next_request().await.unwrap();
         assert!(Instant::now() >= rejected + REJECTED_WAIT);
         peer.send_piece(&metadata, piece).await;
@@ -400,7 +401,8 @@ async fn a_metadata_piece_sent_again_is_ignored() {
     let peer = async {
         let (_, stream) = dials.recv().await.unwrap();
         let mut peer = MockPeer::greet(stream, hashes).await;
-        peer.send_extended_handshake(metadata.len() as u32).await;
+        peer.send_extended_handshake(u32::try_from(metadata.len()).unwrap())
+            .await;
         let mut asked = vec![
             peer.next_request().await.unwrap(),
             peer.next_request().await.unwrap(),
@@ -526,7 +528,8 @@ async fn two_peers_send_the_metadata_between_them() {
             let metadata = mock.clone();
             tokio::spawn(async move {
                 let mut peer = MockPeer::greet(stream, hashes).await;
-                peer.send_extended_handshake(metadata.len() as u32).await;
+                peer.send_extended_handshake(u32::try_from(metadata.len()).unwrap())
+                    .await;
                 while let Some(piece) = peer.next_request().await {
                     if piece == has {
                         peer.send_piece(&metadata, piece).await;
@@ -541,8 +544,10 @@ async fn two_peers_send_the_metadata_between_them() {
     let found = read_metainfo_from_peer_receiver(
         Id20::new([1; 20]),
         hashes,
-        PeerList::resumed([addr(1), addr(2)], []),
-        futures::stream::pending(),
+        MetadataPeers {
+            list: PeerList::resumed([addr(1), addr(2)], []),
+            stream: futures::stream::pending(),
+        },
         &tokio::sync::watch::Sender::new(Default::default()),
         None,
         connector,
@@ -591,7 +596,8 @@ async fn a_plaintext_only_peer_sends_the_metadata_over_the_next_connection_at_on
         let (_, stream) = dials.recv().await.unwrap();
         assert_eq!(Instant::now(), refused);
         let mut peer = MockPeer::greet(stream, hashes).await;
-        peer.send_extended_handshake(metadata.len() as u32).await;
+        peer.send_extended_handshake(u32::try_from(metadata.len()).unwrap())
+            .await;
         let piece = peer.next_request().await.unwrap();
         peer.send_piece(&metadata, piece).await;
         peer
@@ -600,8 +606,10 @@ async fn a_plaintext_only_peer_sends_the_metadata_over_the_next_connection_at_on
     let fetch = read_metainfo_from_peer_receiver(
         Id20::new([1; 20]),
         hashes,
-        PeerList::resumed([addr(1)], []),
-        futures::stream::pending(),
+        MetadataPeers {
+            list: PeerList::resumed([addr(1)], []),
+            stream: futures::stream::pending(),
+        },
         &unable,
         None,
         connector.clone(),
@@ -813,7 +821,8 @@ async fn a_metadata_request_left_unanswered_ends_the_connection() {
     let peer = async {
         let (_, stream) = dials.recv().await.unwrap();
         let mut peer = MockPeer::greet(stream, hashes).await;
-        peer.send_extended_handshake(metadata.len() as u32).await;
+        peer.send_extended_handshake(u32::try_from(metadata.len()).unwrap())
+            .await;
         assert_eq!(peer.next_request().await, Some(0));
         let asked = Instant::now();
         // Keeps reading, so the connection stays up from our side.

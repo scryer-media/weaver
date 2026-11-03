@@ -11,7 +11,12 @@ use crate::sha1w::{ISha1, Sha1};
 /// A payload whose every byte depends on its position and `seed`.
 pub fn payload(len: usize, seed: u8) -> Vec<u8> {
     (0..len)
-        .map(|i| (i as u8).wrapping_mul(31) ^ (i >> 8) as u8 ^ (i >> 16) as u8 ^ seed)
+        .map(|i| {
+            u8::try_from(i & 0xff).unwrap().wrapping_mul(31)
+                ^ u8::try_from((i >> 8) & 0xff).unwrap()
+                ^ u8::try_from((i >> 16) & 0xff).unwrap()
+                ^ seed
+        })
         .collect()
 }
 
@@ -21,10 +26,10 @@ pub fn file_hashes(data: &[u8], piece_length: u64) -> (Option<Id32>, Option<Vec<
         return (None, None);
     }
     let layer: Vec<Id32> = data
-        .chunks(piece_length as usize)
+        .chunks(usize::try_from(piece_length).unwrap())
         .map(|piece| {
             let blocks: Vec<Id32> = piece
-                .chunks(merkle::BLOCK_SIZE as usize)
+                .chunks(usize::try_from(merkle::BLOCK_SIZE).unwrap())
                 .map(merkle::hash_block)
                 .collect();
             merkle::piece_root(&blocks, data.len() as u64, piece_length)
@@ -79,7 +84,11 @@ impl TestTorrent {
         let mut out = Vec::new();
         for (_, data) in &self.files {
             out.extend_from_slice(data);
-            out.resize(out.len().next_multiple_of(self.piece_length as usize), 0);
+            out.resize(
+                out.len()
+                    .next_multiple_of(usize::try_from(self.piece_length).unwrap()),
+                0,
+            );
         }
         out
     }
@@ -87,7 +96,7 @@ impl TestTorrent {
     /// The piece hashes of a hybrid's v1 listing.
     pub fn v1_pieces(&self) -> Vec<u8> {
         self.v1_payload()
-            .chunks(self.piece_length as usize)
+            .chunks(usize::try_from(self.piece_length).unwrap())
             .flat_map(|piece| {
                 let mut h = Sha1::new();
                 h.update(piece);
@@ -154,7 +163,7 @@ impl TestTorrent {
                 _ => None,
             })
             .collect();
-        out.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        out.sort_by_key(|a| a.0.0);
         out
     }
 

@@ -678,8 +678,10 @@ pub(crate) struct WebSeedConnection<'a> {
     user_agent: &'a str,
     // The clients built for this connection, by host, port and address, so
     // its requests to one address share their connections.
-    pinned: Mutex<HashMap<(String, u16, Option<IpAddr>), reqwest::Client>>,
+    pinned: Mutex<PinnedClients>,
 }
+
+type PinnedClients = HashMap<(String, u16, Option<IpAddr>), reqwest::Client>;
 
 impl<'a> WebSeedConnection<'a> {
     pub fn new(
@@ -894,7 +896,7 @@ impl<'a> WebSeedConnection<'a> {
                     }
                 }
             }
-            None => return Err(anyhow!("{url}: no host").into()),
+            None => return Err(anyhow!("{url}: no host")),
         };
         let addr = match addrs.map(|addrs| endpoint(&addrs, port, target, self.allowed)) {
             None => None,
@@ -969,7 +971,10 @@ impl<'a> WebSeedConnection<'a> {
                 moved: file,
             };
         }
-        Err(anyhow!("{}: more than {MAX_REDIRECTS} redirects", target.url).into())
+        Err(anyhow!(
+            "{}: more than {MAX_REDIRECTS} redirects",
+            target.url
+        ))
     }
 
     // BEP 19: the slice's bytes of its file, by range (libtorrent
@@ -1249,7 +1254,9 @@ mod tests {
                         "Content-Range",
                         format!("bytes {first}-{last}/{}", content.len()),
                     )
-                    .body(&content[first as usize..=last as usize]),
+                    .body(
+                        &content[usize::try_from(first).unwrap()..=usize::try_from(last).unwrap()],
+                    ),
                 None => Reply::status(200).body(content),
             }
         }
@@ -1428,7 +1435,9 @@ mod tests {
     const PIECE: u32 = 32768;
 
     fn content(len: usize, salt: u8) -> Vec<u8> {
-        (0..len).map(|i| (i % 251) as u8 ^ salt).collect()
+        (0..len)
+            .map(|i| u8::try_from(i % 251).unwrap() ^ salt)
+            .collect()
     }
 
     // Files `(name, len, pad)` of a torrent named `t`, multi-file unless
@@ -2561,7 +2570,7 @@ mod tests {
         assert!(!server.seen().is_empty());
         assert!(server.seen().iter().all(|h| h.target.ends_with("/0.data")));
 
-        assert_eq!(handle.web_seeds(), [seed.clone()]);
+        assert_eq!(handle.web_seeds(), std::slice::from_ref(&seed));
         assert!(!handle.add_web_seed(seed.clone()));
         let http_seed = WebSeed {
             url: "http://h.example/s.php".into(),
@@ -2569,7 +2578,7 @@ mod tests {
             named_by: NamedBy::Operator,
         };
         assert!(handle.add_web_seed(http_seed.clone()));
-        assert_eq!(handle.magnet().web_seeds, [seed.url.clone()]);
+        assert_eq!(handle.magnet().web_seeds, std::slice::from_ref(&seed.url));
         assert!(handle.remove_web_seed(&seed));
         assert!(!handle.remove_web_seed(&seed));
         assert_eq!(handle.web_seeds(), [http_seed]);
