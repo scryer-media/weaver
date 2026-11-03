@@ -1837,9 +1837,10 @@ fn facts_of_the_previous_version_are_refused() {
 
 // The field post: 750 KiB articles, the twenty-seventh of twenty-eight in
 // hand with its part ending at 20736000 while its header declares the
-// file 1536000 bytes long, and the last article lost. The known boundaries
-// fall across the lost run, and its damage is told from the start the
-// parts agree on, as far as its encoded bytes reach, never inverted.
+// file 1536000 bytes long, and the last article lost. A length that ends
+// before the article's own part is no length, so nothing falls across the
+// lost run, and its damage is told from the start the parts agree on, as
+// far as its encoded bytes reach, never inverted.
 #[test]
 fn a_lost_run_across_falling_boundaries_is_told_not_inverted() {
     const ARTICLE: u64 = 768_000;
@@ -1854,17 +1855,22 @@ fn a_lost_run_across_falling_boundaries_is_told_not_inverted() {
     ));
     assert_eq!(
         root.map.known_in(0, 1),
-        vec![(26, 19_968_000), (27, 20_736_000), (28, 1_536_000)]
+        vec![(26, 19_968_000), (27, 20_736_000)]
     );
     root.map.lost(VolumeIndex(0), 27);
-    // Every other article still waits, so only the agreeing start and the
-    // falling end tell the run.
-    assert_eq!(
-        root.damage().unwrap(),
-        vec![(
+    // Every other article still waits, and nothing tells where the file
+    // ends, so the run waits to be told.
+    assert!(root.damage().unwrap().is_empty());
+    for ordinal in 0..26 {
+        root.map.lost(VolumeIndex(0), ordinal);
+    }
+    let damage = root.damage().unwrap();
+    assert!(
+        damage.contains(&(
             VolumeIndex(0),
             ByteRange::new(20_736_000, 20_736_000 + u64::from(ENCODED))
-        )]
+        )),
+        "{damage:?}"
     );
 }
 
@@ -2123,4 +2129,138 @@ fn a_lost_run_meeting_the_declared_size_is_told_not_empty() {
             2 * ARTICLE + 26 * u64::from(ENCODED)
         )]
     );
+}
+
+// A post of `volumes` files of `parts` articles of `part` decoded bytes,
+// each posted at `posted` encoded bytes, every article declaring `declared`
+// as its file's length, laid down whole through the job. Hands back the
+// job, its directory and the furthest any file on disk reached while the
+// articles landed.
+fn lay_down_declaring(
+    volumes: u32,
+    parts: u32,
+    part: usize,
+    posted: u32,
+    declared: u64,
+) -> (GraphJob, tempfile::TempDir, u64, Vec<Vec<u8>>) {
+    let names: Vec<String> = (0..volumes).map(|at| format!("part{at}.bin")).collect();
+    let files: Vec<RootFile> = names
+        .iter()
+        .map(|name| file(name, &vec![posted; parts as usize]))
+        .collect();
+    let (mut job, dir, _) = job_with(&files, Vec::new());
+    let bodies: Vec<Vec<u8>> = (0..volumes)
+        .map(|volume| {
+            (0..part * parts as usize)
+                .map(|at| (at as u32 ^ volume.wrapping_mul(131)) as u8)
+                .collect()
+        })
+        .collect();
+    let mut furthest = 0;
+    for volume in 0..volumes {
+        for ordinal in 0..parts {
+            let offset = u64::from(ordinal) * part as u64;
+            let body = &bodies[volume as usize][offset as usize..offset as usize + part];
+            job.intake(
+                decoded(volume, ordinal, offset, body, Some(declared)),
+                &mut RepairSlots::default(),
+                1,
+            )
+            .unwrap();
+            for name in &names {
+                if let Ok(found) = std::fs::metadata(dir.path().join(name)) {
+                    furthest = furthest.max(found.len());
+                }
+            }
+        }
+    }
+    (job, dir, furthest, bodies)
+}
+
+// Every member closed whole, and each file on disk is its bytes, no more.
+fn assert_whole(job: &GraphJob, dir: &tempfile::TempDir, bodies: &[Vec<u8>]) {
+    for (volume, body) in bodies.iter().enumerate() {
+        let record = job
+            .tree()
+            .namespace(NodeId::ROOT)
+            .and_then(|namespace| namespace.get(MemberId(volume as u32)))
+            .unwrap();
+        assert!(record.closed && record.is_complete(), "member {volume}");
+        assert!(
+            damaged_ranges(job, volume as u32).is_empty(),
+            "member {volume}"
+        );
+        assert_eq!(record.length, Some(body.len() as u64), "member {volume}");
+        let path = dir.path().join(format!("part{volume}.bin"));
+        assert_eq!(&std::fs::read(&path).unwrap(), body, "member {volume}");
+    }
+}
+
+// Four volumes of about 130 KB whose every header declares 600 GiB: the
+// lie sizes no file. Nothing on disk ever reaches past the post's bytes,
+// nothing is booked past them, and every file closes at its real length.
+#[tokio::test]
+async fn a_declared_length_past_the_posted_bytes_sizes_no_file() {
+    const PART: usize = 65_000;
+    const POSTED: u32 = 66_400;
+    let (job, dir, furthest, bodies) =
+        lay_down_declaring(4, 2, PART, POSTED, 600 * 1024 * 1024 * 1024);
+    assert!(
+        furthest <= 2 * u64::from(POSTED),
+        "a file reached {furthest} bytes"
+    );
+    assert_whole(&job, &dir, &bodies);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let booked: u64 = (0..4)
+            .map(|volume| {
+                std::fs::metadata(dir.path().join(format!("part{volume}.bin")))
+                    .unwrap()
+                    .blocks()
+                    * 512
+            })
+            .sum();
+        assert!(booked <= 4 * 1024 * 1024, "{booked} bytes booked on disk");
+    }
+}
+
+// The field post's shape: every header declares two parts' worth, far
+// below where the later parts begin. Every byte arrives: each part lands
+// where its own header puts it, and the file is whole.
+#[tokio::test]
+async fn a_declared_length_below_the_parts_still_completes() {
+    const PART: usize = 7_680;
+    let (job, dir, _, bodies) = lay_down_declaring(1, 28, PART, 7_900, 2 * PART as u64);
+    assert_whole(&job, &dir, &bodies);
+}
+
+// A post that lists no encoded sizes bounds a declared length by its
+// articles times the largest one seen.
+#[tokio::test]
+async fn a_post_without_sizes_bounds_a_length_by_its_articles() {
+    const PART: usize = 65_000;
+    let (job, dir, furthest, bodies) = lay_down_declaring(2, 2, PART, 0, 1 << 40);
+    assert!(
+        furthest <= 2 * PART as u64,
+        "a file reached {furthest} bytes"
+    );
+    assert_whole(&job, &dir, &bodies);
+    let root = ArticleRoot::new(&[file("plain.bin", &[0, 0, 0])]);
+    let article = decoded(0, 0, 0, &[7; 90], Some(270));
+    assert_eq!(root.accepted_length(&article), Some(270));
+    let article = decoded(0, 0, 0, &[7; 90], Some(271));
+    assert_eq!(root.accepted_length(&article), None);
+}
+
+// Every byte arrives and every header declares a mebibyte more than the
+// file: the file closes at its real length, with no trailing zeros, and
+// the member is whole.
+#[tokio::test]
+async fn a_declared_length_a_mebibyte_long_closes_at_the_real_length() {
+    const PART: usize = 65_000;
+    let real = 2 * PART as u64;
+    let (job, dir, furthest, bodies) = lay_down_declaring(1, 2, PART, 66_400, real + (1 << 20));
+    assert!(furthest <= 2 * 66_400, "the file reached {furthest} bytes");
+    assert_whole(&job, &dir, &bodies);
 }

@@ -80,6 +80,7 @@ impl ArticleRoot {
         if self.map.holds_intact(decoded.volume, decoded.ordinal) {
             return None;
         }
+        let length = self.accepted_length(&decoded);
         let decoded = decoded.declared();
         let range = decoded.range();
         self.map.arrived(
@@ -89,7 +90,7 @@ impl ArticleRoot {
             decoded.declared_end,
             decoded.intact,
         );
-        if let Some(length) = decoded.length {
+        if let Some(length) = length {
             self.map.set_length(decoded.volume, length);
         }
         if decoded.positioned {
@@ -100,6 +101,21 @@ impl ArticleRoot {
             self.map.set_ordered_only(decoded.volume);
         }
         Some(decoded.into_arrival())
+    }
+
+    // The file length the article declares, when it can be the file's: no
+    // more than the post can deliver, and no less than where the article's
+    // own part ends. Either way a length is a lie and sizes nothing; the
+    // file reaches as far as its bytes land, each part where its own header
+    // puts it (nzbfast `crates/nzbfast-engine/src/get/workers.rs:777-867`).
+    pub(crate) fn accepted_length(&self, decoded: &Decoded) -> Option<u64> {
+        let cap = self
+            .map
+            .posted_cap(decoded.volume, decoded.bytes.len() as u64);
+        let own_end = decoded.declared_end.filter(|_| decoded.positioned);
+        decoded
+            .length
+            .filter(|length| *length <= cap && own_end.is_none_or(|end| end <= *length))
     }
 
     // Answer one round of seeks. A deferred seek parks; a recovery seek is
