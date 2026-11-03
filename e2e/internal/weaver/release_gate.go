@@ -976,6 +976,7 @@ func (phase *weaverReleasePhase) env() map[string]string {
 		"E2E_WEAVER_DATABASE_URL":                   "",
 		"E2E_WEAVER_MODE":                           "1",
 		"E2E_WEAVER_CLOCK_FILE":                     "/e2e-clock/now",
+		weaverE2EClockInitialEnv:                    weaverE2EClockStart,
 		"E2E_WEAVER_NETWORK_TIME_SCALE":             "1",
 		"E2E_WEAVER_BACKUP_SOURCE_DATASTORE":        phase.Spec.Env["E2E_WEAVER_BACKUP_SOURCE_DATASTORE"],
 		"E2E_WEAVER_BACKUP_TARGET_DATASTORE":        phase.Spec.Env["E2E_WEAVER_BACKUP_TARGET_DATASTORE"],
@@ -1130,7 +1131,7 @@ func runWeaverBrowserReleaseFlow(ctx context.Context, spec weaverReleaseFlowSpec
 			}
 		}
 	}()
-	if downErr := timeWeaverReleaseStage("reset", weaverReleaseStageLifecycle, dockerComposeDown); downErr != nil {
+	if downErr := timeWeaverReleaseStage("reset", weaverReleaseStageLifecycle, resetWeaverReleaseProject); downErr != nil {
 		log.Printf("warning: reset Weaver release flow stack: %v", downErr)
 	}
 	if strings.HasPrefix(spec.Name, "ui-backup-restore-") {
@@ -1371,7 +1372,9 @@ func runWeaverRuntimeObservabilityReleaseFlow(
 
 func startWeaverReleaseStack(spec weaverReleaseFlowSpec, datastore weaverDatastore) (err error) {
 	setEnv(weaverDatastoreEnv, string(datastore))
-	if envBool("E2E_WEAVER_MODE", false) {
+	if weaverReleaseStackSetsItsOwnClock(weaverReleaseStacksStarted.Add(1)) {
+		log.Printf("the Weaver service writes the e2e clock (%s) as it starts", weaverE2EClockStart)
+	} else if envBool("E2E_WEAVER_MODE", false) {
 		if err := timeWeaverReleaseStage("clock", weaverReleaseStageLifecycle, initializeWeaverE2EClock); err != nil {
 			return err
 		}
@@ -1476,6 +1479,53 @@ func probeHostPortHeld(port int) error {
 
 func releaseHostPortPoll() { time.Sleep(250 * time.Millisecond) }
 
+// weaverE2EClockStart is the instant every release flow's e2e clock starts at.
+const weaverE2EClockStart = "2032-06-01T00:00:00Z"
+
+// weaverE2EClockInitialEnv asks the Weaver service to write the e2e clock
+// itself, as it starts, when the clock file is absent. The flow's first stack
+// starts on a fresh clock volume, so the service writing it saves a container
+// start per flow.
+const weaverE2EClockInitialEnv = "E2E_WEAVER_CLOCK_INITIAL"
+
+// weaverReleaseStacksStarted counts the stacks this flow has brought up.
+var weaverReleaseStacksStarted atomic.Int64
+
+// weaverReleaseStackSetsItsOwnClock reports whether the stack about to start
+// leaves the e2e clock to the Weaver service. Only the flow's first stack
+// does: a later one may start on a clock volume an earlier stack kept (a
+// down that retains volumes), which the service would leave where it was,
+// so it is reset to the start explicitly as before.
+func weaverReleaseStackSetsItsOwnClock(stack int64) bool {
+	return stack == 1 && envBool("E2E_WEAVER_MODE", false) &&
+		strings.TrimSpace(os.Getenv(weaverE2EClockInitialEnv)) != ""
+}
+
+// resetWeaverReleaseProject takes down whatever an earlier attempt left in
+// this flow's project. A flow's project is new to the run, so there is
+// almost never anything; a ps and a volume list answer that without a full
+// down. A volume left without its containers still holds an old clock, so
+// it counts as something to reset.
+func resetWeaverReleaseProject() error {
+	ps := containerengine.Command(dockerComposeArgs("ps", "-a", "-q")...)
+	ps.Dir = e2eDir()
+	containers, psErr := ps.Output()
+	volumes, volumeErr := containerengine.Command(
+		"volume", "ls", "-q", "--filter", "label=com.docker.compose.project="+composeProject(),
+	).Output()
+	if psErr == nil && volumeErr == nil && !weaverReleaseProjectHolds(string(containers), string(volumes)) {
+		log.Printf("project %s holds no containers or volumes; nothing to reset", composeProject())
+		return nil
+	}
+	return dockerComposeDown()
+}
+
+// weaverReleaseProjectHolds reports whether a project's container and volume
+// listings name anything.
+func weaverReleaseProjectHolds(containers, volumes string) bool {
+	return strings.TrimSpace(containers) != "" || strings.TrimSpace(volumes) != ""
+}
+
 func initializeWeaverE2EClock() error {
 	args := dockerComposeArgs(
 		"run",
@@ -1485,7 +1535,7 @@ func initializeWeaverE2EClock() error {
 		"/bin/sh",
 		"weaver",
 		"-c",
-		"umask 077; printf '%s\\n' '2032-06-01T00:00:00Z' > /e2e-clock/now; chown \"${PUID:-1000}:${PGID:-1000}\" /e2e-clock/now",
+		"umask 077; printf '%s\\n' '"+weaverE2EClockStart+"' > /e2e-clock/now; chown \"${PUID:-1000}:${PGID:-1000}\" /e2e-clock/now",
 	)
 	cmd := containerengine.Command(args...)
 	cmd.Dir = e2eDir()
@@ -2562,14 +2612,40 @@ func captureWeaverReleaseStageDiagnostics(stage string) (err error) {
 	return captureWeaverReleaseDiagnostics(dir)
 }
 
+// The four pulls of a stage's evidence share nothing, so they run side by
+// side: a stage waits for the slowest instead of the sum. Their errors are
+// joined in the order the pulls are listed, whatever order they finish in.
 func captureWeaverReleaseDiagnostics(dir string) error {
-	var errs []error
-	if err := captureDockerComposeOutput(filepath.Join(dir, "docker-compose.log"), "logs", "--no-color", "--timestamps"); err != nil {
-		errs = append(errs, err)
+	pulls := []func() error{
+		func() error {
+			return captureDockerComposeOutput(filepath.Join(dir, "docker-compose.log"), "logs", "--no-color", "--timestamps")
+		},
+		func() error {
+			return captureDockerComposeOutput(filepath.Join(dir, "docker-compose.ps.txt"), "ps", "-a")
+		},
+		func() error { return captureWeaverReleaseMetrics(dir) },
+		func() error { return captureWeaverReleaseNntpCounters(dir) },
 	}
-	if err := captureDockerComposeOutput(filepath.Join(dir, "docker-compose.ps.txt"), "ps", "-a"); err != nil {
-		errs = append(errs, err)
+	return runWeaverReleasePulls(pulls)
+}
+
+func runWeaverReleasePulls(pulls []func() error) error {
+	errs := make([]error, len(pulls))
+	var wg sync.WaitGroup
+	for index, pull := range pulls {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[index] = pull()
+		}()
 	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
+// Weaver's Prometheus page, when it answers. A Weaver that is down leaves
+// no metrics file and no error: the compose log says why.
+func captureWeaverReleaseMetrics(dir string) error {
 	basePath := strings.Trim(strings.TrimSpace(os.Getenv("E2E_WEAVER_BASE_URL")), "/")
 	metricsURL := strings.TrimRight(defaultWeaverURL(), "/")
 	if basePath != "" {
@@ -2577,14 +2653,22 @@ func captureWeaverReleaseDiagnostics(dir string) error {
 	}
 	metricsURL += "/metrics"
 	client := &http.Client{Timeout: 5 * time.Second}
-	if response, err := client.Get(metricsURL); err == nil {
-		defer response.Body.Close()
-		if body, readErr := io.ReadAll(response.Body); readErr == nil {
-			if writeErr := os.WriteFile(filepath.Join(dir, "weaver-metrics.prom"), body, 0o644); writeErr != nil {
-				errs = append(errs, writeErr)
-			}
-		}
+	response, err := client.Get(metricsURL)
+	if err != nil {
+		return nil
 	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return nil
+	}
+	return os.WriteFile(filepath.Join(dir, "weaver-metrics.prom"), body, 0o644)
+}
+
+// The fake NNTP server's counters, asked one after another on its own
+// connections.
+func captureWeaverReleaseNntpCounters(dir string) error {
+	var errs []error
 	evidence := struct {
 		Body        restartNntpMetrics           `json:"body"`
 		Stat        restartNntpMetrics           `json:"stat"`

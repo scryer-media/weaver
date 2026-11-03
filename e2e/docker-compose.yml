@@ -149,6 +149,10 @@ services:
       WEAVER_E2E_MODE: "${E2E_WEAVER_MODE:-0}"
       WEAVER_E2E_NETWORK_TIME_SCALE: "${E2E_WEAVER_NETWORK_TIME_SCALE:-1}"
       WEAVER_E2E_CLOCK_FILE: "${E2E_WEAVER_CLOCK_FILE:-}"
+      # The release gate starts each flow's e2e clock here instead of in a
+      # container of its own: written once, only when the clock file is
+      # absent, so a restart never moves it.
+      WEAVER_E2E_CLOCK_INITIAL: "${E2E_WEAVER_CLOCK_INITIAL:-}"
       WEAVER_RSS_ALLOW_PRIVATE_NETWORK: "${WEAVER_RSS_ALLOW_PRIVATE_NETWORK:-true}"
       WEAVER_BASE_URL: "${E2E_WEAVER_BASE_URL:-/}"
       # This grants loginless administration to every isolated test-network
@@ -168,7 +172,7 @@ services:
       WEAVER_HTTP_ALLOWED_HOSTS: "${E2E_WEAVER_ALLOWED_HOSTS:-weaver}"
     entrypoint: ["/bin/sh", "-lc"]
     command:
-      - mkdir -p /config /data /data/complete /watch-folder && chown -R "${PUID:-1000}:${PGID:-1000}" /config /data /watch-folder && cp /config-src/weaver.toml /config/weaver.toml && sed -i -e "s/host = \"nntp\"/host = \"$${WEAVER_NNTP_HOST:-nntp}\"/g" -e "s/host = \"nntp2\"/host = \"$${WEAVER_NNTP_BACKUP_HOST:-nntp2}\"/g" -e "0,/port = 119/s/port = 119/port = $${WEAVER_NNTP_PORT:-119}/" -e "0,/port = 119/s/port = 119/port = $${WEAVER_NNTP_BACKUP_PORT:-119}/" /config/weaver.toml && exec /entrypoint.sh -c /config/weaver.toml serve --port 9090 --base-url "$${WEAVER_BASE_URL:-/}"
+      - if [ -n "$${WEAVER_E2E_CLOCK_INITIAL:-}" ] && [ ! -f /e2e-clock/now ]; then (umask 077 && printf '%s\n' "$${WEAVER_E2E_CLOCK_INITIAL}" > /e2e-clock/now) && chown "${PUID:-1000}:${PGID:-1000}" /e2e-clock/now; fi && mkdir -p /config /data /data/complete /watch-folder && chown -R "${PUID:-1000}:${PGID:-1000}" /config /data /watch-folder && cp /config-src/weaver.toml /config/weaver.toml && sed -i -e "s/host = \"nntp\"/host = \"$${WEAVER_NNTP_HOST:-nntp}\"/g" -e "s/host = \"nntp2\"/host = \"$${WEAVER_NNTP_BACKUP_HOST:-nntp2}\"/g" -e "0,/port = 119/s/port = 119/port = $${WEAVER_NNTP_PORT:-119}/" -e "0,/port = 119/s/port = 119/port = $${WEAVER_NNTP_BACKUP_PORT:-119}/" /config/weaver.toml && exec /entrypoint.sh -c /config/weaver.toml serve --port 9090 --base-url "$${WEAVER_BASE_URL:-/}"
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider \"http://127.0.0.1:9090$${WEAVER_BASE_URL:-/}\""]
       interval: 5s
