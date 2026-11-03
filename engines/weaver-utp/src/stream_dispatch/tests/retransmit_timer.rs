@@ -779,12 +779,15 @@ async fn fin_retransmit() {
     t.poll_once_assert_pending().await;
     t.assert_sent_empty();
 
-    // Trigger RTO again. Ensure it gets resent only once.
+    // The next RTO is a second further off, past the remote's last chance
+    // to answer: no third FIN.
     let rto_1 = t.vsock.rtte.retransmission_timeout();
     assert!(rto_1 > rto_0);
     t.env.increment_now(rto_1);
-    t.poll_once_assert_pending().await;
-    assert_eq!(t.take_sent(), vec![cmphead!(ST_FIN, seq_nr = 101)]);
-    t.poll_once_assert_pending().await;
-    t.assert_sent_empty();
+    assert!(t.poll_once_assert_ready().await.is_err());
+    assert!(
+        t.take_sent()
+            .iter()
+            .all(|m| m.header.htype != ST_DATA && m.header.htype != ST_FIN)
+    );
 }

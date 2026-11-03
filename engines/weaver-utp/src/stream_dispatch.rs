@@ -152,6 +152,15 @@ struct VirtualSocket<T, Env> {
     // How many consecutive RTO retransmissions happened.
     rto_retransmissions: usize,
 
+    // The remote has sent a packet other than its SYN: it is there, not a
+    // spoofed address. A stream that is not fails on its first timeout.
+    confirmed: bool,
+    // Sends of our FIN.
+    fin_sends: usize,
+    // Since when nothing of ours has been in flight, the window decaying
+    // once per timeout that passes so.
+    idle_since: Option<Instant>,
+
     // This is used to rewind state back for retransmission.
     // All packets after this number will get resent (ST_DATA, ST_FIN).
     last_sent_seq_nr: SeqNr,
@@ -241,13 +250,6 @@ macro_rules! send_data {
     ($self:expr, $cx:expr, $header:expr, $segment_iter_item:expr) => {{
         // A closure so that we can use "?" inside the block.
         let mut tmp_closure = || {
-            if $segment_iter_item.retransmit_count()
-                == $self.socket_opts.max_segment_retransmissions.get()
-            {
-                $self.socket.stats.max_retransmissions_reached.increment(1);
-                return Err(Error::MaxRetransmissionsReached);
-            }
-
             $header.set_type(Type::ST_DATA);
             $header.seq_nr = $segment_iter_item.seq_nr();
             $header.timestamp_microseconds =
@@ -357,6 +359,18 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             let seg = self.user_tx_segments.iter_mut_for_sending(None).next();
             if let Some(mut seg) = seg {
+                // A lost probe is too large, not a sign of a dead remote.
+                if !seg.is_mtu_probe() {
+                    let timeouts = self.rtte.timeouts() as usize + 1;
+                    if timeouts > self.socket_opts.num_resends || !self.confirmed {
+                        debug!(timeouts, confirmed = self.confirmed, "timed out");
+                        return Err(Error::TimedOut);
+                    }
+                }
+                if seg.send_count() >= self.socket_opts.num_resends {
+                    self.socket.stats.max_retransmissions_reached.increment(1);
+                    return Err(Error::MaxRetransmissionsReached);
+                }
                 if send_data!(self, cx, header, seg)? {
                     trace!(
                         %header.seq_nr,
@@ -398,11 +412,18 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 // There's no data to send. Maybe we need to resend FIN? Check.
                 match self.state.our_fin_if_unacked() {
                     Some(our_fin_seq_nr) if self.last_sent_seq_nr == our_fin_seq_nr => {
+                        let timeouts = self.rtte.timeouts() as usize + 1;
+                        if timeouts > self.socket_opts.num_resends
+                            || self.fin_sends >= self.socket_opts.fin_resends
+                        {
+                            debug!(timeouts, self.fin_sends, "FIN unacknowledged, giving up");
+                            return Err(Error::TimedOut);
+                        }
                         trace!("RTO: rewinding self.last_sent_seq_nr to retransmit FIN");
                         self.last_sent_seq_nr -= 1;
                         if self.maybe_send_fin(cx)? {
-                            self.congestion_controller
-                                .on_retransmission_timeout(self.this_poll.now);
+                            // Nothing but the FIN is out: the window decays.
+                            self.congestion_controller.on_idle_timeout();
                             self.rtte.on_rto_timeout();
                             self.recovery
                                 .on_rto_timeout(self.last_sent_seq_nr, &self.socket.stats);
@@ -435,6 +456,23 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         if self.user_tx_segments.is_empty() {
             return Ok(());
+        }
+
+        // Each timeout that passed with nothing in flight decays the window.
+        if let Some(since) = self.idle_since.take() {
+            let rto = self
+                .rtte
+                .retransmission_timeout()
+                .max(Duration::from_millis(1));
+            let periods = self
+                .this_poll
+                .now
+                .saturating_duration_since(since)
+                .as_nanos()
+                / rto.as_nanos();
+            for _ in 0..periods.min(IDLE_DECAYS_MAX) {
+                self.congestion_controller.on_idle_timeout();
+            }
         }
 
         let mut in_recovery = false;
@@ -732,6 +770,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         fin.set_type(Type::ST_FIN);
         fin.seq_nr = seq_nr;
         if self.send_control_packet(cx, &fin)? {
+            self.fin_sends += 1;
             self.timers.retransmit.arm(
                 self.this_poll.now,
                 self.rtte.retransmission_timeout(),
@@ -957,6 +996,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             if self.user_tx_segments.is_empty() && self.state.our_fin_if_unacked().is_none() {
                 // If all outstanding data ACKed, turn off the timer.
                 self.timers.retransmit.turn_off("all data acknowledged");
+                self.idle_since = Some(self.this_poll.now);
 
                 self.timers.remote_inactivity_timer.turn_off("TX is empty");
             } else {
@@ -1133,6 +1173,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             (LastAck { .. }, _) => {}
         }
+
+        // A packet past every check: the remote is there.
+        self.confirmed = true;
+        self.rtte.on_valid_packet();
 
         let in_flight_before = self
             .user_tx_segments
@@ -1384,7 +1428,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 return Ok(());
             }
         };
-        if sent_count == self.socket_opts.max_segment_retransmissions.get() {
+        if sent_count >= self.socket_opts.syn_resends {
             return Err(Error::MaxSynAckRetransmissionsReached);
         }
         if self.send_ack(cx)? {
@@ -1395,12 +1439,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             if sent_count > 0 {
                 self.socket.stats.synack_retransmissions.increment(1);
             }
-            self.timers.syn_ack_resend.arm(
-                self.this_poll.now,
-                SYNACK_RESEND_INTERNAL,
-                true,
-                "retransmitted SYN-ACK",
-            );
+            // After the last, the remote has the connect timeout to answer.
+            let wait = if sent_count + 1 >= self.socket_opts.syn_resends {
+                self.socket_opts.connect_timeout
+            } else {
+                SYNACK_RESEND_INTERNAL
+            };
+            self.timers
+                .syn_ack_resend
+                .arm(self.this_poll.now, wait, true, "retransmitted SYN-ACK");
         }
         Ok(())
     }
@@ -1729,12 +1776,18 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             last_consumed_remote_seq_nr,
             last_sent_ack_nr,
             rto_retransmissions: 0,
+            confirmed: !matches!(
+                state,
+                VirtualSocketState::SynReceived | VirtualSocketState::SynAckSent { .. }
+            ),
+            fin_sends: 0,
+            idle_since: None,
             consumed_but_unacked_bytes: 0,
             rx,
             user_tx_segments: Segments::new(seq_nr),
             user_tx,
             rtte: {
-                let mut rtte = RttEstimator::default();
+                let mut rtte = RttEstimator::new(socket.opts().min_timeout);
                 if let Some(rtt) = rtt {
                     rtte.sample(rtt);
                 }
@@ -1784,6 +1837,9 @@ const TIMER_RETRANSMIT: u8 = 0;
 const TIMER_INACTIVITY: u8 = 1;
 const TIMER_ACK_DELAY: u8 = 2;
 const TIMER_RECOVERY_PIPE: u8 = 3;
+// Decays past this many leave the window at its floor whatever it was.
+const IDLE_DECAYS_MAX: u128 = 64;
+
 const TIMER_SYN_ACK_RESEND: u8 = 4;
 
 #[derive(Default, Debug, Clone, Copy, PartialEq)]

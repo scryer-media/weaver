@@ -27,8 +27,9 @@ use crate::{UtpStream, spawn_utils::spawn_with_cancel};
 use crate::{
     congestion::{CongestionController, ledbat::LedbatParams},
     constants::{
-        DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET, DEFAULT_REMOTE_INACTIVITY_TIMEOUT, IPV4_HEADER,
-        RX_BUF_SIZE_PER_VSOCK_DEFAULT, UDP_HEADER, UTP_HEADER,
+        DEFAULT_CONNECT_TIMEOUT, DEFAULT_FIN_RESENDS, DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET,
+        DEFAULT_MIN_TIMEOUT, DEFAULT_NUM_RESENDS, DEFAULT_REMOTE_INACTIVITY_TIMEOUT,
+        DEFAULT_SYN_RESENDS, IPV4_HEADER, RX_BUF_SIZE_PER_VSOCK_DEFAULT, UDP_HEADER, UTP_HEADER,
     },
     message::UtpMessage,
     raw::{Type, UtpHeader},
@@ -118,9 +119,24 @@ pub struct SocketOpts {
     /// If provided, this can be used to abruptly terminate all spawned tasks.
     pub cancellation_token: CancellationToken,
 
-    /// How many times to retry retransmitting a packet before terminating
-    /// the virtual socket.
-    pub max_retransmissions: Option<NonZeroUsize>,
+    /// The least retransmission timeout once a round trip is known;
+    /// 500 ms when unset.
+    pub min_timeout: Option<Duration>,
+
+    /// Sends of one data packet, and timeouts in a row, before the
+    /// connection gives up; 3 when unset.
+    pub num_resends: Option<NonZeroUsize>,
+
+    /// Sends of a SYN-ACK before an incoming connection gives up; 2 when
+    /// unset.
+    pub syn_resends: Option<NonZeroUsize>,
+
+    /// Sends of our FIN before the connection gives up on its ACK; 2 when
+    /// unset.
+    pub fin_resends: Option<NonZeroUsize>,
+
+    /// How long a connect waits for the remote's answer; 3 s when unset.
+    pub connect_timeout: Option<Duration>,
 
     /// How many seconds to wait for incoming data
     /// before terminating the connection.
@@ -141,7 +157,7 @@ pub struct SocketOpts {
 }
 
 impl SocketOpts {
-    fn validate(&self) -> crate::Result<ValidatedSocketOpts> {
+    pub(crate) fn validate(&self) -> crate::Result<ValidatedSocketOpts> {
         let max_user_rx_buffered_bytes = self
             .vsock_rx_bufsize_bytes
             .unwrap_or(RX_BUF_SIZE_PER_VSOCK_DEFAULT);
@@ -163,9 +179,17 @@ impl SocketOpts {
             vsock_rx_bufsize: max_user_rx_buffered_bytes,
             nagle: !self.disable_nagle,
             congestion: self.congestion,
-            max_segment_retransmissions: self
-                .max_retransmissions
-                .unwrap_or(NonZeroUsize::new(5).unwrap()),
+            min_timeout: self.min_timeout.unwrap_or(DEFAULT_MIN_TIMEOUT),
+            num_resends: self
+                .num_resends
+                .map_or(DEFAULT_NUM_RESENDS, NonZeroUsize::get),
+            syn_resends: self
+                .syn_resends
+                .map_or(DEFAULT_SYN_RESENDS, NonZeroUsize::get),
+            fin_resends: self
+                .fin_resends
+                .map_or(DEFAULT_FIN_RESENDS, NonZeroUsize::get),
+            connect_timeout: self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT),
             vsock_tx_bufsize_bytes_initial: self
                 .vsock_tx_bufsize_bytes_initial
                 .unwrap_or(TX_BUF_SIZE_PER_VSOCK_INITIAL_DEFAULT),
@@ -192,7 +216,11 @@ pub(crate) struct ValidatedSocketOpts {
     pub vsock_tx_bufsize_bytes_max: NonZeroUsize,
     pub nagle: bool,
     pub congestion: CongestionConfig,
-    pub max_segment_retransmissions: NonZeroUsize,
+    pub min_timeout: Duration,
+    pub num_resends: usize,
+    pub syn_resends: usize,
+    pub fin_resends: usize,
+    pub connect_timeout: Duration,
 
     pub remote_inactivity_timeout: Duration,
     pub max_active_streams: NonZeroUsize,
@@ -815,7 +843,11 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             &self.control_requests,
         );
 
-        let stream_or_err = rx.await.ok().ok_or(Error::DispatcherDead)?;
+        let stream_or_err = tokio::time::timeout(self.opts.connect_timeout, rx)
+            .await
+            .map_err(|_| Error::ConnectTimedOut)?
+            .ok()
+            .ok_or(Error::DispatcherDead)?;
         send_drop_guard.disarm();
         if stream_or_err.is_ok() {
             fail_guard.disarm();

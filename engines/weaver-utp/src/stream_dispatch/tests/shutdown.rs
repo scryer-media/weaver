@@ -581,7 +581,13 @@ async fn test_wait_for_remote_fin_both_halves_dropped_slow_reply() {
 #[tokio::test]
 async fn test_fin_retransmission() {
     setup_test_logging();
-    let mut t = make_test_vsock(Default::default(), false);
+    let mut t = make_test_vsock(
+        SocketOpts {
+            fin_resends: Some(non_zero_const!(3)),
+            ..Default::default()
+        },
+        false,
+    );
 
     // Set a specific retransmission timeout for predictable testing
     let retransmit_timeout = Duration::from_millis(100);

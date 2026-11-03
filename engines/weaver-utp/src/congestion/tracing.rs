@@ -62,6 +62,17 @@ where
         );
     }
 
+    fn on_idle_timeout(&mut self) {
+        let before = self.inner.window();
+        self.inner.on_idle_timeout();
+        tracing::event!(
+            CONGESTION_TRACING_LOG_LEVEL,
+            before,
+            after = self.inner.window(),
+            "on_idle_timeout"
+        );
+    }
+
     fn on_delay_sample(&mut self, sample: super::DelaySample) {
         let before = self.inner.window();
         self.inner.on_delay_sample(sample);

@@ -162,10 +162,6 @@ impl SegmentForSending<'_> {
         self.payload_offset
     }
 
-    pub fn retransmit_count(&self) -> usize {
-        self.segment.retransmit_count()
-    }
-
     pub fn on_sent(&mut self, now: Instant, stats: &UtpStats) {
         let ps = self.segment.payload_size as u64;
         self.segment.sent = match self.segment.sent {

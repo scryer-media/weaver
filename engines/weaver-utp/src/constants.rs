@@ -49,6 +49,17 @@ pub const DEFAULT_REMOTE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub const DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET: NonZeroUsize = non_zero_const!(128);
 
+// The least retransmission timeout once a round trip is known.
+pub const DEFAULT_MIN_TIMEOUT: Duration = Duration::from_millis(500);
+// Sends of one data packet before the connection gives up.
+pub const DEFAULT_NUM_RESENDS: usize = 3;
+// Sends of a SYN-ACK before an incoming connection gives up.
+pub const DEFAULT_SYN_RESENDS: usize = 2;
+// Sends of our FIN before the connection gives up on its ACK.
+pub const DEFAULT_FIN_RESENDS: usize = 2;
+// How long a connect waits for the remote's answer to its SYN.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 pub const SACK_DUP_THRESH: u8 = 3;
 pub const SACK_DEPTH: usize = 64;
 

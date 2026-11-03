@@ -13,6 +13,7 @@ mod retransmit_timer;
 mod rtte;
 mod shutdown;
 mod stream_api;
+mod timeouts;
 
 use std::{
     num::{NonZero, NonZeroUsize},

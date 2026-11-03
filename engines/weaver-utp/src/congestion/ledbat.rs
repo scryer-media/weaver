@@ -175,6 +175,13 @@ impl CongestionController for Ledbat {
         self.slow_start = true;
     }
 
+    // An idle direction keeps two thirds of its window, then slow-starts.
+    fn on_idle_timeout(&mut self) {
+        self.cwnd = self.cwnd * 2 / 3;
+        self.floor();
+        self.slow_start = true;
+    }
+
     fn on_enter_recovery(&mut self, _now: Instant) {
         self.cut();
     }
@@ -304,5 +311,23 @@ mod tests {
             l.on_delay_sample(sample(10, MSS, w));
         }
         assert!(l.window() <= threshold + MSS);
+    }
+
+    #[test]
+    fn an_idle_timeout_keeps_two_thirds_and_slow_starts() {
+        let mut l = ledbat();
+        for _ in 0..8 {
+            let w = l.window();
+            l.on_delay_sample(sample(10, MSS, w));
+        }
+        l.on_enter_recovery(Instant::now());
+        let before = l.window();
+        l.on_idle_timeout();
+        assert!(l.window().abs_diff(before * 2 / 3) <= 1, "{l:?}");
+        assert!(l.is_slow_start());
+        for _ in 0..20 {
+            l.on_idle_timeout();
+        }
+        assert_eq!(l.window(), MSS);
     }
 }

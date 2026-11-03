@@ -75,6 +75,10 @@ pub enum Error {
     MaxRetransmissionsReached,
     #[error("max syn-ack retransmissions reached")]
     MaxSynAckRetransmissionsReached,
+    #[error("the remote stopped acknowledging")]
+    TimedOut,
+    #[error("the remote did not answer the connect")]
+    ConnectTimedOut,
 
     #[error("dispatcher dead")]
     DispatcherDead,

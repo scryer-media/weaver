@@ -48,4 +48,7 @@ pub trait CongestionController: Send + Sync + core::fmt::Debug {
     fn set_remote_window(&mut self, win: usize);
 
     fn on_delay_sample(&mut self, sample: DelaySample) {}
+
+    /// A timeout passed with nothing of ours in flight.
+    fn on_idle_timeout(&mut self) {}
 }
