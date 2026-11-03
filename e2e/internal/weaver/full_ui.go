@@ -400,6 +400,17 @@ func (d *fullDashboard) setPhaseRunning(name string, detail string) {
 	d.scheduleRenderLocked()
 }
 
+// setPhaseDetail says what a phase is waiting on before it runs, leaving
+// its status as it is.
+func (d *fullDashboard) setPhaseDetail(name string, detail string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if phase, ok := d.phases[name]; ok {
+		phase.Detail = detail
+	}
+	d.scheduleRenderLocked()
+}
+
 func (d *fullDashboard) setSeedDetail(status, detail string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -1275,6 +1286,7 @@ func runFullPipeline(
 			phase.WeaverBin = weaverBin
 			if fullPhaseNeedsLocalWeaverImage(phase) && awaitWeaverImage != nil {
 				setupStarted = time.Now()
+				dashboard.setPhaseDetail(phase.Name, "waiting for Weaver image")
 				if err := awaitWeaverImage(); err != nil {
 					setupErr := fmt.Errorf("prepare local Weaver image: %w", err)
 					phaseResults <- recordPhaseSetupFailure(phase, phase.Command, setupStarted, setupErr)
@@ -2002,6 +2014,11 @@ func pruneFullRunBundles(tempDir string, alive func(int) bool, cleanup func(*ful
 		retained := index < 3
 		teardown := !manifest.StacksReleased && !(retained && manifest.KeepStacks)
 		if retained && !teardown {
+			if manifest.StacksReleased && !manifest.KeepStacks {
+				if err := dropFullRunDownloads(manifest); err != nil {
+					errs = append(errs, err)
+				}
+			}
 			continue
 		}
 		phases := manifest.Phases
@@ -2028,8 +2045,30 @@ func pruneFullRunBundles(tempDir string, alive func(int) bool, cleanup func(*ful
 			if err := markFullRunStacksReleased(filepath.Join(candidate.path, "full-run.json")); err != nil {
 				errs = append(errs, err)
 			}
+			if err := dropFullRunDownloads(manifest); err != nil {
+				errs = append(errs, err)
+			}
 		default:
 			if err := os.RemoveAll(candidate.path); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// dropFullRunDownloads removes what Weaver downloaded in each phase of a
+// retained bundle whose stacks are gone: its complete and intermediate
+// directories, nearly all of a bundle's size. The logs, database, compose
+// evidence and Playwright artifacts stay.
+func dropFullRunDownloads(manifest fullRunManifest) error {
+	var errs []error
+	for _, entry := range manifest.Phases {
+		if strings.TrimSpace(entry.RunDir) == "" {
+			continue
+		}
+		for _, dir := range []string{"complete", "intermediate"} {
+			if err := os.RemoveAll(filepath.Join(entry.RunDir, "weaver", dir)); err != nil {
 				errs = append(errs, err)
 			}
 		}

@@ -68,8 +68,14 @@ pub(super) fn rar5_revs(base: &str, volumes: &[&[u8]], count: usize) -> Vec<Post
             rev.extend_from_slice(&crc(&[size.as_slice(), raw.as_slice()].concat()).to_le_bytes());
             rev.extend_from_slice(&size);
             rev.extend_from_slice(&raw);
+            // A poster's article holds the whole header, which grows with
+            // the volume count, so the set's geometry arrives in the first.
+            let header = rev.len();
             rev.extend_from_slice(&parity);
-            Post::plain(&format!("{base}.part{}.rev", index + 1), rev)
+            Post {
+                least_article: header.div_ceil(ARTICLE) * ARTICLE,
+                ..Post::plain(&format!("{base}.part{}.rev", index + 1), rev)
+            }
         })
         .collect()
 }

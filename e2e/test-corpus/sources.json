@@ -13742,6 +13742,61 @@
       }
     },
     {
+      "path": "testdata/yenc-lie-field-size/lantern.reach.s01e03.mkv",
+      "size": 21504000,
+      "blake3": "49647069b2641d8f67d3fea64dc0ca4f1ee04d4edd4154a935565293a20bf46e",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/yenc-lie-overlap-par2/copper.mesa.s01e02.mkv",
+      "size": 0,
+      "blake3": "0000000000000000000000000000000000000000000000000000000000000000",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/yenc-lie-overlap-par2/copper.mesa.s01e02.mkv.par2",
+      "size": 0,
+      "blake3": "0000000000000000000000000000000000000000000000000000000000000000",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
+      "path": "testdata/yenc-lie-overlap-par2/copper.mesa.s01e02.mkv.vol0+3.par2",
+      "size": 0,
+      "blake3": "0000000000000000000000000000000000000000000000000000000000000000",
+      "format": "par2",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "par2cmdline-turbo-1.4.0"
+        ]
+      }
+    },
+    {
       "path": "testdata/zip-corrupted/archive.zip",
       "size": 85923219,
       "blake3": "40badf7682d195e911e51f5bc1daf0a8e5c302de9e0a4867fba68342b252e047",

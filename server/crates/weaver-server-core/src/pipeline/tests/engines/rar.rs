@@ -245,8 +245,7 @@ fn recovery_articles(scenario: &Scenario) -> Vec<(u32, u32)> {
             )
         })
         .flat_map(|(post, file)| {
-            (0..post.bytes.len().div_ceil(scenario.article) as u32)
-                .map(move |ordinal| (file, ordinal))
+            (0..post.articles(scenario.article).count() as u32).map(move |ordinal| (file, ordinal))
         })
         .collect()
 }

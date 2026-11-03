@@ -40,7 +40,7 @@ async fn served_in(scenario: Scenario, arrival: &[u32]) -> Restarted {
     let order: Vec<(u32, u32)> = arrival
         .iter()
         .flat_map(|file| {
-            let count = scenario.posts[*file as usize].bytes.len().div_ceil(article) as u32;
+            let count = scenario.posts[*file as usize].articles(article).count() as u32;
             (0..count).map(move |ordinal| (*file, ordinal))
         })
         .collect();
