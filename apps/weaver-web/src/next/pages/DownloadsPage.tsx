@@ -121,7 +121,7 @@ function sortJobs(
 }
 
 export function DownloadsPage() {
-  const { queue, categories: configured, speed, isPaused, downloadBlock } = useNextData();
+  const { queue, categories: configured, speed, isPaused, speedLimit, downloadBlock } = useNextData();
   const statusLabel = useStatusLabel();
   const t = useTranslate();
 
@@ -202,11 +202,20 @@ export function DownloadsPage() {
   const etaSample = useMemo(
     () =>
       page.etaTotalBytes > page.etaDownloadedBytes
-        ? [{ id: 0, status: "DOWNLOADING", totalBytes: page.etaTotalBytes, downloadedBytes: page.etaDownloadedBytes }]
+        ? [
+            {
+              id: 0,
+              status: "DOWNLOADING",
+              totalBytes: page.etaTotalBytes,
+              downloadedBytes: page.etaDownloadedBytes,
+              remainingBytes: page.etaTotalBytes - page.etaDownloadedBytes,
+            },
+          ]
         : [],
     [page.etaDownloadedBytes, page.etaTotalBytes],
   );
-  const etaSpeed = useStableEtaSpeed(etaSample, speed);
+  const etaConditions = useMemo(() => ({ paused: isPaused, speedLimit }), [isPaused, speedLimit]);
+  const etaSpeed = useStableEtaSpeed(etaSample, speed, etaConditions);
   const estimates = useMemo(
     () => etaByIdFrom(page.etaThrough, etaSpeed, formatEtaFromRemainingBytes),
     [etaSpeed, page.etaThrough],

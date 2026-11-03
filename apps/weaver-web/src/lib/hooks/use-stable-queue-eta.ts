@@ -8,15 +8,28 @@ export interface EtaJobInput {
   status: string;
   totalBytes: number;
   downloadedBytes: number;
+  /** What the daemon says is still to come, recovery it holds back left out. */
+  remainingBytes: number;
 }
+
+/** What the estimate cannot see in the bytes: the queue held, or a new limit. */
+export interface EtaConditions {
+  /** Everything is held: nothing moves until it resumes. */
+  paused: boolean;
+  /** The download speed limit in bytes per second, 0 for none. */
+  speedLimit: number;
+}
+
+const FREE_RUNNING: EtaConditions = { paused: false, speedLimit: 0 };
 
 interface EtaSample {
   at: number;
   downloadedBytes: number;
 }
 
-interface EtaEstimatorState {
+export interface EtaEstimatorState {
   signature: string;
+  speedLimit: number;
   samples: EtaSample[];
   smoothedSpeed: number;
   displayedSpeed: number;
@@ -78,14 +91,37 @@ function observedSpeed(samples: EtaSample[], now: number): number {
   return deltaBytes / deltaSeconds;
 }
 
-function nextEtaSpeed(
+export function createEtaEstimator(): EtaEstimatorState {
+  return {
+    signature: "",
+    speedLimit: 0,
+    samples: [],
+    smoothedSpeed: 0,
+    displayedSpeed: 0,
+    displayedAt: 0,
+  };
+}
+
+// No speed is shown above the limit, which the daemon holds the wire to.
+function capped(speed: number, speedLimit: number): number {
+  return speedLimit > 0 ? Math.min(speed, speedLimit) : speed;
+}
+
+export function nextEtaSpeed(
   state: EtaEstimatorState,
   jobs: EtaJobInput[],
   instantaneousSpeed: number,
   now: number,
+  conditions: EtaConditions = FREE_RUNNING,
 ): number {
+  // A new limit makes the bytes before it no guide to the speed after it,
+  // so the estimate starts again from the next samples.
+  const limitChanged = conditions.speedLimit !== state.speedLimit;
+  state.speedLimit = conditions.speedLimit;
   const activeJobs = activeEtaJobs(jobs);
-  if (activeJobs.length === 0) {
+  // Held, nothing moves: the speed is 0 now, not once the easing decays,
+  // and a resume starts from fresh samples.
+  if (conditions.paused || activeJobs.length === 0) {
     state.signature = "";
     state.samples = [];
     state.smoothedSpeed = 0;
@@ -100,10 +136,10 @@ function nextEtaSpeed(
   const queueChanged = signature !== state.signature;
   const bytesWentBackwards = !!lastSample && downloadedBytes < lastSample.downloadedBytes;
 
-  if (queueChanged || bytesWentBackwards || state.samples.length === 0) {
+  if (queueChanged || bytesWentBackwards || limitChanged || state.samples.length === 0) {
     state.signature = signature;
     state.samples = [{ at: now, downloadedBytes }];
-    state.smoothedSpeed = Math.max(instantaneousSpeed, 0);
+    state.smoothedSpeed = capped(Math.max(instantaneousSpeed, 0), conditions.speedLimit);
     state.displayedSpeed = state.smoothedSpeed;
     state.displayedAt = now;
     return state.displayedSpeed;
@@ -152,6 +188,7 @@ function nextEtaSpeed(
 
   const settled = clamp(elapsedMs / WARMUP_MS, 0, 1);
   const alpha = 0.22 - settled * 0.14;
+  targetSpeed = capped(targetSpeed, conditions.speedLimit);
   state.smoothedSpeed = state.smoothedSpeed > 0
     ? state.smoothedSpeed + alpha * (targetSpeed - state.smoothedSpeed)
     : targetSpeed;
@@ -170,7 +207,7 @@ export function formatEtaFromRemainingBytes(remainingBytes: number, speed: numbe
   return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
 }
 
-function buildQueueEtaById(jobs: EtaJobInput[], speed: number): Map<number, string> {
+export function buildQueueEtaById(jobs: EtaJobInput[], speed: number): Map<number, string> {
   const etaById = new Map<number, string>();
   if (speed <= 0) {
     return etaById;
@@ -178,31 +215,32 @@ function buildQueueEtaById(jobs: EtaJobInput[], speed: number): Map<number, stri
 
   let bytesAhead = 0;
   for (const job of activeEtaJobs(jobs)) {
-    const remaining = Math.max(job.totalBytes - job.downloadedBytes, 0);
-    bytesAhead += remaining;
+    bytesAhead += Math.max(job.remainingBytes, 0);
     etaById.set(job.id, formatEtaFromRemainingBytes(bytesAhead, speed));
   }
 
   return etaById;
 }
 
-export function useStableEtaSpeed(jobs: EtaJobInput[], instantaneousSpeed: number): number {
+export function useStableEtaSpeed(
+  jobs: EtaJobInput[],
+  instantaneousSpeed: number,
+  conditions: EtaConditions = FREE_RUNNING,
+): number {
   // Every render is a sample, the same jobs and speed included: the estimate
   // settles with the time between them, so it must not be cached by its inputs.
   "use no memo";
-  const [state] = useState<EtaEstimatorState>(() => ({
-    signature: "",
-    samples: [],
-    smoothedSpeed: 0,
-    displayedSpeed: 0,
-    displayedAt: 0,
-  }));
+  const [state] = useState<EtaEstimatorState>(createEtaEstimator);
 
   // eslint-disable-next-line react-hooks/purity -- sampling is intentionally driven by wall-clock time
-  return nextEtaSpeed(state, jobs, instantaneousSpeed, Date.now());
+  return nextEtaSpeed(state, jobs, instantaneousSpeed, Date.now(), conditions);
 }
 
-export function useStableQueueEta(jobs: EtaJobInput[], instantaneousSpeed: number): Map<number, string> {
-  const etaSpeed = useStableEtaSpeed(jobs, instantaneousSpeed);
+export function useStableQueueEta(
+  jobs: EtaJobInput[],
+  instantaneousSpeed: number,
+  conditions: EtaConditions = FREE_RUNNING,
+): Map<number, string> {
+  const etaSpeed = useStableEtaSpeed(jobs, instantaneousSpeed, conditions);
   return useMemo(() => buildQueueEtaById(jobs, etaSpeed), [jobs, etaSpeed]);
 }
