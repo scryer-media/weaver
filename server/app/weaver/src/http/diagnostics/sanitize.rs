@@ -612,6 +612,16 @@ impl Table {
                 if dir {
                     self.dir_keys.push(key.clone());
                 }
+                // A log record writes the name JSON-escaped, and its text line
+                // quotes a value holding a space with Rust's escapes: a
+                // backslash doubled, a quote escaped. Each spelling gets the
+                // same stand-in.
+                for spelling in escaped_spellings(&key) {
+                    if self.index.insert(spelling.clone()) {
+                        self.keys.push(spelling);
+                        self.names.push((stand_in.clone(), dir));
+                    }
+                }
                 self.index.insert(key.clone());
                 self.keys.push(key);
                 self.names.push((stand_in.clone(), dir));
@@ -620,6 +630,22 @@ impl Table {
         self.stand_ins.insert(stand_in);
         new
     }
+}
+
+// A name as a JSON string and as a Rust `{:?}` string spell it, without the
+// quotes, where that differs from the name itself.
+fn escaped_spellings(key: &str) -> Vec<String> {
+    let unquote = |quoted: String| quoted[1..quoted.len() - 1].to_string();
+    let mut spellings = Vec::new();
+    for spelling in [
+        serde_json::to_string(key).map(unquote).unwrap_or_default(),
+        unquote(format!("{key:?}")),
+    ] {
+        if spelling != key && !spellings.contains(&spelling) {
+            spellings.push(spelling);
+        }
+    }
+    spellings
 }
 
 // Where a spelling is matched: only as a whole JSON or TOML string, as a
@@ -1731,5 +1757,104 @@ mod tests {
             Some("provider.co.uk")
         );
         assert_eq!(registrable_domain("provider.example"), None);
+    }
+}
+
+// The log file is JSON records by default. A Windows directory reaches it with
+// its backslashes doubled, as JSON escapes them, and a name holding a quote
+// with the quote escaped; the text lines built from those records quote a
+// value holding a space with Rust's escapes. Every spelling is replaced.
+#[cfg(test)]
+mod json_log_spellings {
+    use super::*;
+
+    #[test]
+    fn a_windows_directory_in_a_json_record_is_replaced_as_in_a_text_line() {
+        let local = LocalNames {
+            data_dir: PathBuf::from(r"D:\Media\WeaverData"),
+            intermediate_dir: PathBuf::from(r"D:\Media\WeaverData\intermediate"),
+            complete_dir: PathBuf::from(r"D:\Media\WeaverData\complete"),
+            watch_dir: None,
+            log_file: None,
+            home_dir: None,
+            user: None,
+            hostname: Some("host-name".to_string()),
+        };
+        let table = StandIns::build(&[], &local, &StoredNames::default()).expect("table");
+        let path = r"D:\Media\WeaverData\complete\Some.Show";
+        // The old text line: `path=D:\Media\...` as `%` wrote it.
+        let text_line = format!("2026-11-03T08:10:00.123456-07:00  INFO weaver: moved path={path}");
+        let text = table.sanitize_str(&text_line);
+        assert!(!text.contains("WeaverData"), "text line: {text}");
+        // The JSON record JsonRecord writes for the same event.
+        let record = format!(
+            r#"{{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"INFO","target":"weaver","fields":{{"message":"moved","path":{}}}}}"#,
+            serde_json::to_string(path).unwrap()
+        );
+        let json = table.sanitize_str(&record);
+        assert!(!json.contains("WeaverData"), "json record: {json}");
+    }
+
+    #[test]
+    fn a_windows_path_with_a_space_is_replaced_in_a_quoted_text_line() {
+        let local = LocalNames {
+            data_dir: PathBuf::from(r"D:\My Media\WeaverData"),
+            intermediate_dir: PathBuf::from(r"D:\My Media\WeaverData\intermediate"),
+            complete_dir: PathBuf::from(r"D:\My Media\WeaverData\complete"),
+            watch_dir: None,
+            log_file: None,
+            home_dir: None,
+            user: None,
+            hostname: Some("host-name".to_string()),
+        };
+        let table = StandIns::build(&[], &local, &StoredNames::default()).expect("table");
+        let path = r"D:\My Media\WeaverData\complete\Some.Show";
+        let line = format!("2026-11-03T08:10:00.123456-07:00  INFO weaver: moved path={path:?}");
+        let text = table.sanitize_str(&line);
+        assert!(!text.contains("WeaverData"), "text line: {text}");
+        assert!(
+            text.contains(r#"path="<complete>\\Some.Show""#),
+            "text line: {text}"
+        );
+    }
+
+    #[test]
+    fn a_name_holding_a_quote_and_a_backslash_is_replaced_in_a_json_record() {
+        let name = r#"Olaf "Live" \ Encore.S01E01"#;
+        let stored = StoredNames {
+            jobs: BTreeMap::from([(
+                4,
+                JobNameRecord {
+                    name: Some(name.to_string()),
+                    ..JobNameRecord::default()
+                },
+            )]),
+            ..StoredNames::default()
+        };
+        let table = StandIns::build(&[], &local_unix(), &stored).expect("table");
+        let record = format!(
+            r#"{{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"INFO","target":"weaver","fields":{{"message":"job added","name":{}}}}}"#,
+            serde_json::to_string(name).unwrap()
+        );
+        let json = table.sanitize_str(&record);
+        assert!(!json.contains("Olaf"), "json record: {json}");
+        assert!(json.contains(r#""name":"job-4""#), "json record: {json}");
+        let line =
+            format!("2026-11-03T08:10:00.123456-07:00  INFO weaver: job added name={name:?}");
+        let text = table.sanitize_str(&line);
+        assert!(text.ends_with(r#"name="job-4""#), "text line: {text}");
+    }
+
+    fn local_unix() -> LocalNames {
+        LocalNames {
+            data_dir: PathBuf::from("/srv/weaver-data"),
+            intermediate_dir: PathBuf::from("/srv/weaver-data/intermediate"),
+            complete_dir: PathBuf::from("/srv/weaver-data/complete"),
+            watch_dir: None,
+            log_file: None,
+            home_dir: None,
+            user: None,
+            hostname: Some("host-name".to_string()),
+        }
     }
 }
