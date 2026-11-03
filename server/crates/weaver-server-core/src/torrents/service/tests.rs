@@ -1807,13 +1807,40 @@ async fn an_archive_torrent_unpacks_beside_its_files_and_seeds_from_them() {
         std::env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/rar5/rar5_store.rar"
     ));
-    let member = include_bytes!(concat!(
-        std::env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/originals/small.txt"
-    ));
+    unpacks_beside_and_seeds("set.rar", archive).await;
+}
+
+// A torrent of a gzipped tar is an archive's too: its pieces feed the graph,
+// which unpacks the tar's member beside it, and the torrent keeps the
+// `.tar.gz` as it came and seeds from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tar_gz_torrent_unpacks_beside_its_file_and_seeds_from_it() {
+    let mut tar = tar::Builder::new(Vec::new());
+    let mut header = tar::Header::new_gnu();
+    header.set_size(SMALL_TXT.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append_data(&mut header, "small.txt", SMALL_TXT)
+        .unwrap();
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut gzip, &tar.into_inner().unwrap()).unwrap();
+    unpacks_beside_and_seeds("set.tar.gz", &gzip.finish().unwrap()).await;
+}
+
+const SMALL_TXT: &[u8] = include_bytes!(concat!(
+    std::env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/originals/small.txt"
+));
+
+// Adds a torrent of one file, `name`, whose bytes are `archive` holding
+// `small.txt`, and downloads it whole: the torrent gets a tee, completes
+// without a history row, keeps `archive` as it came, unpacks `small.txt`
+// beside it, and with that file gone still reads every piece from `archive`.
+async fn unpacks_beside_and_seeds(name: &str, archive: &[u8]) {
+    let member = SMALL_TXT;
     let rig = rig(set_clock());
     rig.service.open().await.unwrap();
-    let bytes = metainfo("set.rar", &[("set.rar", archive)], 128, false);
+    let bytes = metainfo(name, &[(name, archive)], 128, false);
     let job_id = rig
         .service
         .add(request(AddSource::Metainfo(bytes)))
@@ -1822,6 +1849,7 @@ async fn an_archive_torrent_unpacks_beside_its_files_and_seeds_from_them() {
     let (layout, intake) = {
         let live = rig.service.inner.live.lock().await;
         let torrent = &live[&job_id];
+        assert!(torrent.store.as_ref().unwrap().tee().is_some(), "{name}");
         (
             torrent.layout.clone().unwrap(),
             torrent.intake.clone().unwrap(),
@@ -1869,7 +1897,7 @@ async fn an_archive_torrent_unpacks_beside_its_files_and_seeds_from_them() {
     assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
     let view = rig.service.torrent(job_id).await.unwrap();
     let dir = PathBuf::from(view.storage_dir.unwrap());
-    assert_eq!(std::fs::read(dir.join("set.rar")).unwrap(), archive);
+    assert_eq!(std::fs::read(dir.join(name)).unwrap(), archive);
     assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), member);
 
     // The unpacked file gone, every piece still reads from the archive.
