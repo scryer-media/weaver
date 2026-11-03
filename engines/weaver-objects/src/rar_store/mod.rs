@@ -48,6 +48,12 @@ use walk::{Step, Walk};
 // streams here, so only the non-solid window applies.
 const WINDOW: u32 = 8;
 
+// The most volumes a set may number. RAR 1.5 to 4.x number a volume in 16
+// bits, so no set they write runs past it, and a RAR5 set that long is far
+// past any post. A set whose last volume is numbered beyond it is refused
+// before its gaps are said one by one.
+pub(super) const MOST_VOLUMES: u32 = 1 << 16;
+
 // One volume as the store holds it: everything it read of it, the headers
 // walked and the bytes kept for that, which is what travels with the member
 // when the store gives the volume back.
@@ -610,6 +616,9 @@ impl RarStore {
         else {
             return;
         };
+        if last.0 >= MOST_VOLUMES {
+            return self.give_up(Emit::Refuse(Why::InvalidArchive), out);
+        }
         for index in 0..last.0 {
             let volume = VolumeIndex(index);
             let missing = self

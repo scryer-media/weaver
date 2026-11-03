@@ -461,6 +461,75 @@ fn sparse_and_continued_entries_are_not_extracted() {
     assert_eq!(owner.posted().as_deref(), Some(archive.as_slice()));
 }
 
+// A pax sparse entry is a regular header behind pax records carrying GNU's
+// sparse keys: its data is packed extents, in the 1.0 format behind a map
+// its size counts. Neither shape is a file: both stay envelope and the walk
+// finds the regular entry behind them.
+#[test]
+fn pax_sparse_entries_are_not_extracted() {
+    let mut writer = Writer::default();
+    // 0.1: the map in the records, the data the packed extents alone.
+    let mut records = pax_record("GNU.sparse.size", "4096");
+    records.extend(pax_record("GNU.sparse.numblocks", "2"));
+    records.extend(pax_record("GNU.sparse.map", "0,512,2048,512"));
+    records.extend(pax_record("path", "holes-0.1.bin"));
+    writer.raw(
+        header(
+            "PaxHeaders/holes",
+            "",
+            records.len() as u64,
+            b'x',
+            Dialect::Ustar,
+        ),
+        &records,
+    );
+    writer.raw(
+        header("holes-0.1.bin", "", 1_024, b'0', Dialect::Ustar),
+        &payload(7, 1_024),
+    );
+    // 1.0: the map at the front of the data, padded to a block.
+    let mut records = pax_record("GNU.sparse.major", "1");
+    records.extend(pax_record("GNU.sparse.minor", "0"));
+    records.extend(pax_record("GNU.sparse.name", "holes-1.0.bin"));
+    records.extend(pax_record("GNU.sparse.realsize", "4096"));
+    writer.raw(
+        header(
+            "PaxHeaders/holes",
+            "",
+            records.len() as u64,
+            b'x',
+            Dialect::Ustar,
+        ),
+        &records,
+    );
+    let mut data = b"2\n0\n512\n2048\n512\n".to_vec();
+    data.resize(BLOCK, 0);
+    data.extend_from_slice(&payload(8, 1_024));
+    writer.raw(
+        header(
+            "GNUSparseFile.0/holes-1.0.bin",
+            "",
+            data.len() as u64,
+            b'0',
+            Dialect::Ustar,
+        ),
+        &data,
+    );
+    writer.file("after.bin", &payload(9, 800));
+    let archive = writer.finish().bytes;
+    for frame in [archive.len(), 4096, 1] {
+        let mut owner = Owner::new(archive.clone());
+        owner.whole(frame);
+        clean(&owner);
+        assert_eq!(
+            owner.files(),
+            vec![("after.bin".to_owned(), payload(9, 800))],
+            "frames of {frame}"
+        );
+        assert_eq!(owner.posted().as_deref(), Some(archive.as_slice()));
+    }
+}
+
 #[test]
 fn bytes_that_arrive_before_their_headers_are_held_until_the_walk_reaches_them() {
     let archive = mixed().bytes;

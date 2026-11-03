@@ -1554,6 +1554,54 @@ fn a_volume_numbered_last_of_all_numbers_is_placed_nowhere() {
     assert_eq!(place(&facts, &held), None);
 }
 
+// A last volume held far past every number a set may have is refused at its
+// close, not answered with a gap for every number before it.
+#[test]
+fn a_last_volume_numbered_past_every_set_is_refused_not_gapped() {
+    use weaver_graph::{Delivery, Evidenced};
+    let volumes = write(&items(), &split(Version::Rar4));
+    assert_eq!(volumes.len(), 3);
+    let far = VolumeIndex(u32::MAX - 1);
+    let mut object = store();
+    let mut out = Vec::new();
+    let mut read = |_: &Placement, _: &mut Vec<u8>| false;
+    for (volume, bytes) in [(VolumeIndex(0), &volumes[0]), (far, &volumes[2])] {
+        object.bound(volume, &format!("alpha.part{}.rar", volume.0), &[], None);
+        object.sized(volume, bytes.len() as u64, &mut out);
+        object.deliver(
+            Delivery {
+                volume,
+                offset: 0,
+                bytes: &Evidenced::from(bytes.clone()),
+                provenance: Provenance::Fresh,
+            },
+            &mut read,
+            &mut out,
+        );
+    }
+    object.volume_closed(VolumeIndex(0), &mut out);
+    object.volume_closed(far, &mut out);
+    assert!(
+        !out.iter().any(|emit| matches!(emit, Emit::Damaged { .. })),
+        "{out:?}"
+    );
+    assert_eq!(out.last(), Some(&Emit::Refuse(Why::InvalidArchive)));
+    // The same set held where its numbers are kept says its one gap.
+    let mut owner = Owner::named(store(), volumes);
+    owner.frames(0, 4096);
+    owner.frames(2, 4096);
+    owner.close(0);
+    owner.close(2);
+    assert!(owner.said.iter().any(|emit| matches!(
+        emit,
+        Emit::Damaged {
+            volume: VolumeIndex(1),
+            ..
+        }
+    )));
+    assert!(!owner.said.contains(&Emit::Refuse(Why::InvalidArchive)));
+}
+
 // A fixture written by RAR itself streams to what unrar-rs extracts from it.
 fn real_fixture(name: &str, password: &str) -> Owner {
     let bytes = fixture(&format!("rar5/{name}"));
