@@ -43,6 +43,18 @@ pub trait Transport: PollSendToVectored + Send + Sync + Unpin + 'static {
 
     // The local address transport is bound to. Used only for logging.
     fn bind_addr(&self) -> SocketAddr;
+
+    /// Bytes the transport adds to each datagram to `target` on its way,
+    /// such as a proxy's header; uTP's packets are that much smaller.
+    fn datagram_overhead(&self, _target: SocketAddr) -> usize {
+        0
+    }
+
+    /// Whether the transport's datagrams leave with don't-fragment set, so
+    /// an MTU probe too large for the path is lost rather than split.
+    fn dont_fragment(&self) -> bool {
+        false
+    }
 }
 
 // The clock and randomness a socket uses; tests swap in a mock.

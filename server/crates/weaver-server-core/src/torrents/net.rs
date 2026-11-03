@@ -362,6 +362,13 @@ impl DatagramSocket for Carried {
         })
     }
 
+    // The proxy's UDP header: reserved, fragment and address type, the
+    // target's address and its port.
+    fn datagram_overhead(&self, target: SocketAddr) -> usize {
+        let address = if target.is_ipv4() { 4 } else { 16 };
+        6 + address
+    }
+
     // Only uTP polls a send, and a ladder leg runs no uTP.
     fn poll_send_to(
         &self,

@@ -5,6 +5,43 @@
 // delivered payloads so far. Binary searches (probes) the payload size until convergence.
 use crate::constants::{IPV4_HEADER, IPV6_HEADER, UDP_HEADER, UTP_HEADER};
 
+// The MTUs of the last three streams that died on a packet larger than
+// they had seen delivered. Later streams probe no higher than the largest
+// of them; until three have died, no higher than the link.
+#[derive(Debug)]
+pub(crate) struct MtuCeiling {
+    failed: [u16; 3],
+    next: usize,
+}
+
+impl Default for MtuCeiling {
+    fn default() -> Self {
+        Self {
+            failed: [u16::MAX; 3],
+            next: 0,
+        }
+    }
+}
+
+impl MtuCeiling {
+    pub fn restrict(&mut self, mtu: u16) {
+        self.failed[self.next] = mtu;
+        self.next = (self.next + 1) % self.failed.len();
+    }
+
+    pub fn get(&self) -> u16 {
+        self.failed.iter().copied().max().unwrap_or(u16::MAX)
+    }
+}
+
+// The size on the link of a packet of `payload` bytes.
+pub(crate) fn packet_mtu(payload: usize, is_ipv4: bool) -> u16 {
+    let ip = if is_ipv4 { IPV4_HEADER } else { IPV6_HEADER };
+    u16::try_from(payload)
+        .unwrap_or(u16::MAX)
+        .saturating_add(ip + UDP_HEADER + UTP_HEADER)
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentSizes {
     // The minimum uTP payload size that we know can go through the link.

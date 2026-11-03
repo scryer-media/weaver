@@ -25,7 +25,7 @@ use crate::{
     },
     delay::DelayTracker,
     message::UtpMessage,
-    mtu::{SegmentSizes, SegmentSizesConfig},
+    mtu::{SegmentSizes, SegmentSizesConfig, packet_mtu},
     raw::{Type, UtpHeader},
     recovery::Recovery,
     rtte::RttEstimator,
@@ -363,16 +363,27 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             let seg = self.user_tx_segments.iter_mut_for_sending(None).next();
             if let Some(mut seg) = seg {
+                // A stream that dies on a packet larger than any it saw
+                // delivered leaves later streams probing no higher.
+                let mss = usize::from(self.segment_sizes.mss());
+                let is_ipv4 = self.remote.is_ipv4();
+                let restrict = |socket: &UtpSocket<T, Env>, payload: usize| {
+                    if payload > mss {
+                        socket.restrict_mtu(packet_mtu(payload, is_ipv4));
+                    }
+                };
                 // A lost probe is too large, not a sign of a dead remote.
                 if !seg.is_mtu_probe() {
                     let timeouts = self.rtte.timeouts() as usize + 1;
                     if timeouts > self.socket_opts.num_resends || !self.confirmed {
                         debug!(timeouts, confirmed = self.confirmed, "timed out");
+                        restrict(&self.socket, seg.payload_size());
                         return Err(Error::TimedOut);
                     }
                 }
                 if seg.send_count() >= self.socket_opts.num_resends {
                     self.socket.stats.max_retransmissions_reached.increment(1);
+                    restrict(&self.socket, seg.payload_size());
                     return Err(Error::MaxRetransmissionsReached);
                 }
                 if send_data!(self, cx, header, seg)? {
@@ -1726,7 +1737,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
 
         let ss = SegmentSizes::new(SegmentSizesConfig {
             is_ipv4: remote.is_ipv4(),
-            link_mtu: socket.opts().link_mtu,
+            link_mtu: socket.link_mtu_for(remote),
             ..Default::default()
         });
 

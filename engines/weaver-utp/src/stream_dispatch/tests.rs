@@ -1,4 +1,5 @@
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
+// Modified by the Weaver authors, 2026-11-03.
 
 mod basics;
 mod congestion;
@@ -8,6 +9,7 @@ mod fast_retransmit;
 mod flow_control;
 mod guards;
 mod inactivity_timeout;
+mod mtu_ceiling;
 mod mtu_probing;
 mod nagle;
 mod retransmit_timer;

@@ -154,6 +154,14 @@ impl Transport for DatagramTransport {
     fn bind_addr(&self) -> SocketAddr {
         self.0.bind_addr()
     }
+
+    fn datagram_overhead(&self, target: SocketAddr) -> usize {
+        self.0.datagram_overhead(target)
+    }
+
+    fn dont_fragment(&self) -> bool {
+        self.0.dont_fragment()
+    }
 }
 
 /// The session's uTP socket, over a datagram socket from a

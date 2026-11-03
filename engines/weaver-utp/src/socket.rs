@@ -19,6 +19,7 @@ use crate::{
     constants::{TX_BUF_SIZE_PER_VSOCK_INITIAL_DEFAULT, TX_BUF_SIZE_PER_VSOCK_MAX_DEFAULT},
     stats::{Counter, UtpStats},
 };
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -32,6 +33,7 @@ use crate::{
         DEFAULT_SYN_RESENDS, IPV4_HEADER, RX_BUF_SIZE_PER_VSOCK_DEFAULT, UDP_HEADER, UTP_HEADER,
     },
     message::UtpMessage,
+    mtu::MtuCeiling,
     raw::{Type, UtpHeader},
     seq_nr::SeqNr,
     stream_dispatch::{StreamArgs, UtpStreamStarter},
@@ -737,6 +739,8 @@ pub struct UtpSocket<T, E> {
     pub(crate) cancellation_token: CancellationToken,
 
     pub(crate) stats: UtpStats,
+
+    mtu_ceiling: Mutex<MtuCeiling>,
 }
 
 impl<T: Transport, E: UtpEnvironment> std::fmt::Debug for UtpSocket<T, E> {
@@ -782,6 +786,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             accept_requests: accept_tx,
             cancellation_token: opts.cancellation_token.clone(),
             stats: UtpStats::default(),
+            mtu_ceiling: Default::default(),
         });
 
         let dispatcher = Dispatcher {
@@ -799,6 +804,28 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         };
 
         Ok((sock, dispatcher))
+    }
+
+    // The link MTU a new stream to `remote` probes up to: the link's, less
+    // what the transport adds, no higher than the streams that died on
+    // large packets allow.
+    pub(crate) fn link_mtu_for(&self, remote: SocketAddr) -> u16 {
+        let overhead = u16::try_from(self.transport.datagram_overhead(remote)).unwrap_or(u16::MAX);
+        self.opts
+            .link_mtu
+            .saturating_sub(overhead)
+            .min(self.mtu_ceiling.lock().get())
+    }
+
+    // A stream died on a packet of `mtu` bytes larger than it had seen
+    // delivered.
+    pub(crate) fn restrict_mtu(&self, mtu: u16) {
+        self.mtu_ceiling.lock().restrict(mtu);
+    }
+
+    /// Whether the transport sends with don't-fragment set.
+    pub fn dont_fragment(&self) -> bool {
+        self.transport.dont_fragment()
     }
 
     pub(crate) fn opts(&self) -> &ValidatedSocketOpts {

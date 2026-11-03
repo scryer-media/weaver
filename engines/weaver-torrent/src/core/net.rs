@@ -65,6 +65,18 @@ pub trait DatagramSocket: Send + Sync + 'static {
         }
         self.poll_send_to(cx, &joined, target)
     }
+
+    /// Bytes the socket's route adds to each datagram to `target`, such as
+    /// a proxy's header. uTP sizes its packets that much smaller.
+    fn datagram_overhead(&self, _target: SocketAddr) -> usize {
+        0
+    }
+
+    /// Whether the socket's datagrams leave with don't-fragment set, so a
+    /// uTP probe too large for the path is lost rather than split.
+    fn dont_fragment(&self) -> bool {
+        false
+    }
 }
 
 impl DatagramSocket for tokio::net::UdpSocket {

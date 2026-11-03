@@ -151,6 +151,7 @@ impl PollSendToVectored for MockUtpTransport {
 struct RememberingTransportLocked {
     messages: Vec<Msg>,
     max_payload_len: Option<usize>,
+    overhead: usize,
 }
 
 #[derive(Clone)]
@@ -165,6 +166,10 @@ impl RememberingTransport {
             bind_addr,
             locked: Default::default(),
         }
+    }
+
+    pub fn set_overhead(&self, overhead: usize) {
+        self.locked.lock().overhead = overhead;
     }
 
     pub fn set_max_payload_len(&mut self, len: usize) {
@@ -219,6 +224,10 @@ impl Transport for RememberingTransport {
 
     fn bind_addr(&self) -> SocketAddr {
         self.bind_addr
+    }
+
+    fn datagram_overhead(&self, _target: SocketAddr) -> usize {
+        self.locked.lock().overhead
     }
 }
 
