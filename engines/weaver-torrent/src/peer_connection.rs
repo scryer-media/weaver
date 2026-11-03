@@ -1485,7 +1485,7 @@ mod tests {
             index: 0,
             begin: BLOCK,
             len: BLOCK,
-            received: RECEIVED as u32,
+            received: u32::try_from(RECEIVED).unwrap(),
         };
         let have = {
             let mut wire = [0u8; 9];
@@ -1601,7 +1601,7 @@ mod tests {
                 index: 0,
                 begin: 2 * BLOCK,
                 len: BLOCK,
-                received: RECEIVED as u32,
+                received: u32::try_from(RECEIVED).unwrap(),
             }]
         );
     }

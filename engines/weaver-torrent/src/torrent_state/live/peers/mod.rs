@@ -1124,7 +1124,11 @@ mod tests {
     const OUR_PORT: u16 = 6881;
 
     fn make_peer_states() -> PeerStates {
-        PeerStates::founded_on(PeerList::default(), Default::default(), TOTAL_PIECES as u32)
+        PeerStates::founded_on(
+            PeerList::default(),
+            Default::default(),
+            u32::try_from(TOTAL_PIECES).unwrap(),
+        )
     }
 
     // Returns the peer handle, keeping the receiving end of the peer channel alive.
@@ -1172,7 +1176,13 @@ mod tests {
 
         for piece in 0..TOTAL_PIECES {
             peers
-                .peer_has(addr, self::piece(TOTAL_PIECES as u32, piece as u32))
+                .peer_has(
+                    addr,
+                    self::piece(
+                        u32::try_from(TOTAL_PIECES).unwrap(),
+                        u32::try_from(piece).unwrap(),
+                    ),
+                )
                 .unwrap();
             let expected = u32::from(piece == TOTAL_PIECES - 1);
             assert_eq!(live_seeders(&peers), (expected, expected));
@@ -1290,12 +1300,18 @@ mod tests {
         let (a, _rx_a) = add_live_peer(&peers, "127.0.0.1:1234");
         peers.update_bitfield(a, bitfield_of(&[0])).unwrap();
 
-        peers.peer_has(a, piece(TOTAL_PIECES as u32, 5)).unwrap();
+        peers
+            .peer_has(a, piece(u32::try_from(TOTAL_PIECES).unwrap(), 5))
+            .unwrap();
         assert_eq!(availability(&peers), [1, 0, 0, 0, 0, 1, 0, 0]);
 
         // libtorrent incoming_have: a HAVE for a piece the peer has is ignored.
-        peers.peer_has(a, piece(TOTAL_PIECES as u32, 5)).unwrap();
-        peers.peer_has(a, piece(TOTAL_PIECES as u32, 0)).unwrap();
+        peers
+            .peer_has(a, piece(u32::try_from(TOTAL_PIECES).unwrap(), 5))
+            .unwrap();
+        peers
+            .peer_has(a, piece(u32::try_from(TOTAL_PIECES).unwrap(), 0))
+            .unwrap();
         assert_eq!(availability(&peers), [1, 0, 0, 0, 0, 1, 0, 0]);
     }
 
@@ -1308,7 +1324,15 @@ mod tests {
             .update_bitfield(a, bitfield_of(&all_but_last))
             .unwrap();
 
-        let have = |index: usize| peers.peer_has(a, piece(TOTAL_PIECES as u32, index as u32));
+        let have = |index: usize| {
+            peers.peer_has(
+                a,
+                piece(
+                    u32::try_from(TOTAL_PIECES).unwrap(),
+                    u32::try_from(index).unwrap(),
+                ),
+            )
+        };
         assert_eq!(have(0), Some(Have::Known));
         assert_eq!(have(TOTAL_PIECES - 1), Some(Have::Completed));
         assert_eq!(have(TOTAL_PIECES - 1), Some(Have::Known));
@@ -1316,7 +1340,7 @@ mod tests {
         let (b, _rx_b) = add_live_peer(&peers, "127.0.0.2:1235");
         peers.update_bitfield(b, bitfield_of(&[])).unwrap();
         assert_eq!(
-            peers.peer_has(b, piece(TOTAL_PIECES as u32, 3)),
+            peers.peer_has(b, piece(u32::try_from(TOTAL_PIECES).unwrap(), 3)),
             Some(Have::Gained)
         );
     }
@@ -1338,7 +1362,9 @@ mod tests {
         let (b, _rx_b) = add_live_peer(&peers, "127.0.0.2:1235");
         peers.update_bitfield(a, bitfield_of(&[0, 1])).unwrap();
         peers.update_bitfield(b, bitfield_of(&[1])).unwrap();
-        peers.peer_has(a, piece(TOTAL_PIECES as u32, 7)).unwrap();
+        peers
+            .peer_has(a, piece(u32::try_from(TOTAL_PIECES).unwrap(), 7))
+            .unwrap();
 
         // As the peer's task does when the connection ends: take the live
         // state, then settle the peer.
@@ -1402,7 +1428,7 @@ mod tests {
         peers.update_bitfield(seeder, full_bitfield()).unwrap();
         peers.update_bitfield(leecher, empty_bitfield()).unwrap();
 
-        peers.announce_have(piece(TOTAL_PIECES as u32, 3));
+        peers.announce_have(piece(u32::try_from(TOTAL_PIECES).unwrap(), 3));
 
         // The peer that sent no bitfield has nothing, so it is told.
         assert_eq!(haves_queued(&mut silent_rx), vec![3]);
@@ -1426,7 +1452,15 @@ mod tests {
     }
 
     fn peer_addr(i: usize) -> SocketAddr {
-        SocketAddr::from(([10, 0, (i >> 8) as u8, i as u8], 6881))
+        SocketAddr::from((
+            [
+                10,
+                0,
+                u8::try_from((i >> 8) & 0xff).unwrap(),
+                u8::try_from(i & 0xff).unwrap(),
+            ],
+            6881,
+        ))
     }
 
     fn state_of(peers: &PeerStates, addr: SocketAddr) -> Option<&'static str> {
@@ -1877,7 +1911,11 @@ mod tests {
             MAX_PAUSED_PEERLIST_SIZE - queued.len() - 1
         );
 
-        let next = PeerStates::founded_on(list, Default::default(), TOTAL_PIECES as u32);
+        let next = PeerStates::founded_on(
+            list,
+            Default::default(),
+            u32::try_from(TOTAL_PIECES).unwrap(),
+        );
         assert_eq!(next.listed(), MAX_PAUSED_PEERLIST_SIZE);
     }
 
@@ -2021,8 +2059,11 @@ mod tests {
         let failed = read_back(&lengths, piece, &senders, filled(0));
         assert!(peers.piece_failed(piece, failed).is_empty());
 
-        let next =
-            PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
+        let next = PeerStates::founded_on(
+            peers.idle_list(),
+            Default::default(),
+            u32::try_from(TOTAL_PIECES).unwrap(),
+        );
         let failed = read_back(&lengths, piece, &senders, filled(1));
         assert_eq!(next.piece_failed(piece, failed), BTreeSet::from([sender]));
     }
@@ -2050,8 +2091,11 @@ mod tests {
             Some(connecting)
         );
 
-        let next =
-            PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
+        let next = PeerStates::founded_on(
+            peers.idle_list(),
+            Default::default(),
+            u32::try_from(TOTAL_PIECES).unwrap(),
+        );
         assert!(next.is_banned(banned.ip()));
         next.add_peer(banned, PeerSourceFlag::Tracker);
         assert_eq!(state_of(&next, banned), None);
@@ -2073,8 +2117,11 @@ mod tests {
     #[test]
     fn a_dial_counts_as_connecting_until_it_ends() {
         let session: Arc<AggregatePeerStatsAtomic> = Default::default();
-        let peers =
-            PeerStates::founded_on(PeerList::default(), session.clone(), TOTAL_PIECES as u32);
+        let peers = PeerStates::founded_on(
+            PeerList::default(),
+            session.clone(),
+            u32::try_from(TOTAL_PIECES).unwrap(),
+        );
         let t0 = Instant::now();
         let dialled = [peer_addr(1), peer_addr(2)];
         for addr in dialled {
@@ -2120,8 +2167,11 @@ mod tests {
 
         let paused_at = t0 + Duration::from_secs(10);
         peers.close_all(paused_at);
-        let next =
-            PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
+        let next = PeerStates::founded_on(
+            peers.idle_list(),
+            Default::default(),
+            u32::try_from(TOTAL_PIECES).unwrap(),
+        );
         let reconnect_at = |addr| next.with_peer(addr, |p| p.reconnect_at()).unwrap();
         assert_eq!(reconnect_at(connecting), Some(paused_at));
         assert_eq!(reconnect_at(live), Some(paused_at));
@@ -2155,8 +2205,11 @@ mod tests {
 
         let paused_at = t0 + Duration::from_secs(10);
         peers.close_all(paused_at);
-        let next =
-            PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
+        let next = PeerStates::founded_on(
+            peers.idle_list(),
+            Default::default(),
+            u32::try_from(TOTAL_PIECES).unwrap(),
+        );
         let reconnect_at = |addr| next.with_peer(addr, |p| p.reconnect_at()).unwrap();
         assert_eq!(reconnect_at(seed), Some(paused_at));
         assert_eq!(reconnect_at(leecher), Some(paused_at));
@@ -2180,8 +2233,11 @@ mod tests {
         assert_eq!(peers.with_peer(seed, |p| p.needed(true)), Some(true));
 
         peers.close_all(Instant::now());
-        let next =
-            PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
+        let next = PeerStates::founded_on(
+            peers.idle_list(),
+            Default::default(),
+            u32::try_from(TOTAL_PIECES).unwrap(),
+        );
         assert_eq!(next.with_peer(seed, |p| p.needed(true)), Some(false));
         assert_eq!(next.with_peer(seed, |p| p.needed(false)), Some(true));
     }
@@ -2211,8 +2267,11 @@ mod tests {
         }
         peers.close_all(t0);
 
-        let next =
-            PeerStates::founded_on(peers.idle_list(), Default::default(), TOTAL_PIECES as u32);
+        let next = PeerStates::founded_on(
+            peers.idle_list(),
+            Default::default(),
+            u32::try_from(TOTAL_PIECES).unwrap(),
+        );
         next.set_finished(true);
         let now = Instant::now();
         let quiet = |next: &PeerStates| {
@@ -2468,7 +2527,19 @@ mod tests {
                         let addr = if v4 {
                             peer_addr(i)
                         } else {
-                            SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, i as u16], 6881))
+                            SocketAddr::from((
+                                [
+                                    0x2001,
+                                    0xdb8,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    u16::try_from(i & 0xffff).unwrap(),
+                                ],
+                                6881,
+                            ))
                         };
                         live.was_introduced(addr)
                     })
@@ -2928,7 +2999,7 @@ mod tests {
         let peers = PeerStates::founded_on(
             PeerList::resumed([], [banned.ip()]),
             Default::default(),
-            TOTAL_PIECES as u32,
+            u32::try_from(TOTAL_PIECES).unwrap(),
         );
         assert!(peers.is_banned(banned.ip()));
         peers.add_peer(banned, PeerSourceFlag::ResumeData);

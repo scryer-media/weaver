@@ -600,8 +600,8 @@ mod tests {
                     .file_infos
                     .iter()
                     .map(|fi| {
-                        let start = fi.offset_in_torrent as usize;
-                        payload[start..start + fi.len as usize].to_vec()
+                        let start = usize::try_from(fi.offset_in_torrent).unwrap();
+                        payload[start..start + usize::try_from(fi.len).unwrap()].to_vec()
                     })
                     .collect(),
                 AtomicU64::new(0),
@@ -630,7 +630,7 @@ mod tests {
             {
                 bail!("not in hand");
             }
-            let start = offset as usize;
+            let start = usize::try_from(offset).unwrap();
             buf.copy_from_slice(
                 self.0[file_id]
                     .get(start..start + buf.len())
@@ -971,7 +971,9 @@ mod tests {
                 .iter()
                 .zip(sizes)
                 .enumerate()
-                .map(|(i, (name, len))| (name.as_str(), payload(len, i as u8)))
+                .map(|(i, (name, len))| {
+                    (name.as_str(), payload(len, u8::try_from(i & 0xff).unwrap()))
+                })
                 .collect(),
             16384,
         );
@@ -1059,13 +1061,13 @@ mod tests {
             assert_eq!(have, expected, "{threads}");
             let mut failed = std::mem::take(&mut *files.2.lock().unwrap());
             failed.sort_unstable();
-            let missing: Vec<u32> = (0..expected.len() as u32)
+            let missing: Vec<u32> = (0..u32::try_from(expected.len()).unwrap())
                 .filter(|piece| !expected[*piece as usize])
                 .collect();
             assert_eq!(failed, missing, "{threads}");
             let mut found = std::mem::take(&mut *files.4.lock().unwrap());
             found.sort_unstable();
-            let had: Vec<u32> = (0..expected.len() as u32)
+            let had: Vec<u32> = (0..u32::try_from(expected.len()).unwrap())
                 .filter(|piece| expected[*piece as usize])
                 .collect();
             assert_eq!(found, had, "{threads}");

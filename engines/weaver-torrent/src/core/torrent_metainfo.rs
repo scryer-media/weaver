@@ -1348,7 +1348,7 @@ mod tests {
         TorrentMetaV1Info {
             name: Some(b"hybrid"[..].into()),
             piece_length: 16384,
-            pieces: Some(vec![0; 20 * total.div_ceil(16384) as usize].into()),
+            pieces: Some(vec![0; 20 * usize::try_from(total.div_ceil(16384)).unwrap()].into()),
             files: Some(files),
             ..Default::default()
         }
@@ -1488,7 +1488,7 @@ mod tests {
             );
         }
         let longest = too_long - 1;
-        let hashes = 20 * longest.div_ceil(u64::from(piece_length)) as usize;
+        let hashes = 20 * usize::try_from(longest.div_ceil(u64::from(piece_length))).unwrap();
         single_file_info(longest, piece_length, hashes)
             .validate()
             .unwrap();
@@ -1776,10 +1776,10 @@ mod tests {
             return (None, None);
         }
         let layer: Vec<Id32> = data
-            .chunks(piece_length as usize)
+            .chunks(usize::try_from(piece_length).unwrap())
             .map(|piece| {
                 let blocks: Vec<Id32> = piece
-                    .chunks(BLOCK_SIZE as usize)
+                    .chunks(usize::try_from(BLOCK_SIZE).unwrap())
                     .map(merkle::hash_block)
                     .collect();
                 merkle::piece_root(&blocks, data.len() as u64, piece_length)
@@ -1807,7 +1807,7 @@ mod tests {
         let piece_length = 65536u64;
         let payload = |len: usize, seed: u8| -> Vec<u8> {
             (0..len)
-                .map(|i| (i as u8).wrapping_mul(31) ^ seed)
+                .map(|i| u8::try_from(i & 0xff).unwrap().wrapping_mul(31) ^ seed)
                 .collect()
         };
         // Under a block, between a block and a piece, many pieces, empty,

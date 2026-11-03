@@ -279,14 +279,14 @@ mod tests {
     /// The root of `len` zero bytes cut into pieces of `piece_length`, as
     /// a test payload: the file's pieces, then its layer root.
     fn zero_file_root(len: u64, piece_length: u64) -> (Vec<Id32>, Id32) {
-        let zeros = vec![0u8; piece_length as usize];
+        let zeros = vec![0u8; usize::try_from(piece_length).unwrap()];
         let blocks_per_piece = piece_length / BLOCK_SIZE;
         let mut layer = Vec::new();
         let mut at = 0;
         while at < len {
             let piece = (len - at).min(piece_length);
-            let blocks: Vec<Id32> = zeros[..piece as usize]
-                .chunks(BLOCK_SIZE as usize)
+            let blocks: Vec<Id32> = zeros[..usize::try_from(piece).unwrap()]
+                .chunks(usize::try_from(BLOCK_SIZE).unwrap())
                 .map(hash_block)
                 .collect();
             layer.push(piece_root(&blocks, len, piece_length));
@@ -337,7 +337,10 @@ mod tests {
         // A file between a block and a piece pads to its own power of two
         // of blocks, not to the piece.
         let data = vec![7u8; 40000];
-        let blocks: Vec<Id32> = data.chunks(BLOCK_SIZE as usize).map(hash_block).collect();
+        let blocks: Vec<Id32> = data
+            .chunks(usize::try_from(BLOCK_SIZE).unwrap())
+            .map(hash_block)
+            .collect();
         assert_eq!(blocks.len(), 3);
         let zero = Id32::default();
         let want = hash_pair(
@@ -355,7 +358,10 @@ mod tests {
     #[test]
     fn the_last_piece_of_a_large_file_pads_to_the_piece() {
         let data = vec![9u8; 65536 + 20000];
-        let blocks: Vec<Id32> = data.chunks(BLOCK_SIZE as usize).map(hash_block).collect();
+        let blocks: Vec<Id32> = data
+            .chunks(usize::try_from(BLOCK_SIZE).unwrap())
+            .map(hash_block)
+            .collect();
         let last = piece_root(&blocks[4..], data.len() as u64, 65536);
         let zero = Id32::default();
         let pad1 = hash_pair(&zero, &zero);

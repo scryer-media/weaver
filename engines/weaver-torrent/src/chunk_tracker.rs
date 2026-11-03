@@ -704,11 +704,11 @@ impl ChunkTracker {
             assert!(ladder.ends.is_sorted(), "{:?}", ladder.ends);
             assert_eq!(
                 ladder.ends.last().copied().unwrap_or(0),
-                ladder.pieces.len() as u32
+                u32::try_from(ladder.pieces.len()).unwrap()
             );
             for (slot, piece) in ladder.pieces.iter().enumerate() {
                 let key = index.keys[piece.get_usize()].expect("a piece in the order has a key");
-                let slot = slot as u32;
+                let slot = u32::try_from(slot).unwrap();
                 assert_eq!(key.level as usize, rank, "piece {piece}");
                 assert_eq!(index.at[piece.get_usize()], slot, "piece {piece}");
                 let bucket = key.bucket as usize;

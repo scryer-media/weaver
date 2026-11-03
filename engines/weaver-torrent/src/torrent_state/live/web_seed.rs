@@ -1254,7 +1254,9 @@ mod tests {
                         "Content-Range",
                         format!("bytes {first}-{last}/{}", content.len()),
                     )
-                    .body(&content[first as usize..=last as usize]),
+                    .body(
+                        &content[usize::try_from(first).unwrap()..=usize::try_from(last).unwrap()],
+                    ),
                 None => Reply::status(200).body(content),
             }
         }
@@ -1433,7 +1435,9 @@ mod tests {
     const PIECE: u32 = 32768;
 
     fn content(len: usize, salt: u8) -> Vec<u8> {
-        (0..len).map(|i| (i % 251) as u8 ^ salt).collect()
+        (0..len)
+            .map(|i| u8::try_from(i % 251).unwrap() ^ salt)
+            .collect()
     }
 
     // Files `(name, len, pad)` of a torrent named `t`, multi-file unless

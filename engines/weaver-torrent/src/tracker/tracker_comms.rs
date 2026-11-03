@@ -3785,7 +3785,13 @@ mod tests {
         let TrackerTask { mut peers, status } = task;
 
         let v4: Vec<SocketAddr> = (1..=120u16)
-            .map(|i| (Ipv4Addr::new(10, 0, (i >> 8) as u8, i as u8), 6000 + i).into())
+            .map(|i| {
+                (
+                    Ipv4Addr::new(10, 0, (i >> 8) as u8, u8::try_from(i & 0xff).unwrap()),
+                    6000 + i,
+                )
+                    .into()
+            })
             .collect();
         let v6: Vec<SocketAddr> = (1..=40u16)
             .map(|i| (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, i), 7000 + i).into())

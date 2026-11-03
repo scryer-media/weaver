@@ -995,7 +995,7 @@ mod tests {
             let checks = session.concurrent_initialize_semaphore.clone();
             let held = checks
                 .clone()
-                .acquire_many_owned(checks.available_permits() as u32)
+                .acquire_many_owned(u32::try_from(checks.available_permits()).unwrap())
                 .await?;
             let (reading_tx, mut reading) = tokio::sync::mpsc::unbounded_channel();
             let (go, gate) = std::sync::mpsc::channel();

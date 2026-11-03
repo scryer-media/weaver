@@ -290,7 +290,7 @@ mod tests {
 
         // More peers for one info-hash than it keeps: the earliest announced go.
         let crowded = near_info_hash(0);
-        let flood = MAX_PEERS_PER_INFO_HASH as u32 + 100;
+        let flood = u32::try_from(MAX_PEERS_PER_INFO_HASH).unwrap() + 100;
         for n in 0..flood {
             assert!(announce(&store, crowded, source(n)));
             tokio::time::advance(tick).await;
@@ -299,7 +299,7 @@ mod tests {
 
         // More info-hashes than the store keeps: those announced to least
         // recently go, `crowded` first.
-        let flood = MAX_INFO_HASHES as u32 + 10;
+        let flood = u32::try_from(MAX_INFO_HASHES).unwrap() + 10;
         for n in 1..=flood {
             assert!(announce(&store, near_info_hash(n), source(n)));
             tokio::time::advance(tick).await;

@@ -4587,7 +4587,7 @@ mod tests {
         let torrent = crate::create_torrent(
             dir.path(),
             crate::CreateTorrentOptions {
-                piece_length: Some(PIECE as u32),
+                piece_length: Some(u32::try_from(PIECE).unwrap()),
                 ..Default::default()
             },
             &crate::spawn_utils::BlockingSpawner::new(1),
@@ -4683,7 +4683,7 @@ mod tests {
         let torrent = crate::create_torrent(
             dir.path(),
             crate::CreateTorrentOptions {
-                piece_length: Some(PIECE as u32),
+                piece_length: Some(u32::try_from(PIECE).unwrap()),
                 ..Default::default()
             },
             &crate::spawn_utils::BlockingSpawner::new(1),
@@ -5654,7 +5654,9 @@ mod tests {
             // The next sends the plaintext one and gets the metadata.
             let (_, stream) = dials.recv().await.unwrap();
             let mut fetched = MockPeer::greet(stream, hashes).await;
-            fetched.send_extended_handshake(info.len() as u32).await;
+            fetched
+                .send_extended_handshake(u32::try_from(info.len()).unwrap())
+                .await;
             let piece = fetched.next_request().await.unwrap();
             fetched.send_piece(&info, piece).await;
             // Then the torrent connects.
@@ -5754,7 +5756,7 @@ mod tests {
         let checks = session.concurrent_initialize_semaphore.clone();
         let held = checks
             .clone()
-            .acquire_many_owned(checks.available_permits() as u32)
+            .acquire_many_owned(u32::try_from(checks.available_permits()).unwrap())
             .await?;
 
         let handle = session

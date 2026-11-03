@@ -572,9 +572,9 @@ mod tests {
     // frame is read (libtorrent `receive_buffer::grow`, `normalize`).
     #[tokio::test(start_paused = true)]
     async fn a_bitfield_longer_than_the_buffer_is_read() {
-        const PIECES: u32 = 8 * (BUFLEN as u32 + 1000);
-        let bits = vec![0x5au8; (PIECES / 8) as usize];
-        let mut wire = vec![0u8; max_frame_len(Some(PIECES)) + 9];
+        let pieces: u32 = 8 * (u32::try_from(BUFLEN).unwrap() + 1000);
+        let bits = vec![0x5au8; (pieces / 8) as usize];
+        let mut wire = vec![0u8; max_frame_len(Some(pieces)) + 9];
         let len = Message::Bitfield(ByteBuf(&bits))
             .serialize(&mut wire, &Default::default)
             .unwrap();
@@ -587,7 +587,7 @@ mod tests {
         let mut rb = ReadBuf::new();
         let timeout = Duration::from_secs(10);
         match rb
-            .read_message(&mut reader, timeout, Some(PIECES), &mut Unlimited)
+            .read_message(&mut reader, timeout, Some(pieces), &mut Unlimited)
             .await
         {
             Ok(Message::Bitfield(b)) => assert_eq!(b.as_ref(), &bits[..]),
@@ -595,7 +595,7 @@ mod tests {
         }
         assert!(rb.buf.len() > BUFLEN);
         match rb
-            .read_message(&mut reader, timeout, Some(PIECES), &mut Unlimited)
+            .read_message(&mut reader, timeout, Some(pieces), &mut Unlimited)
             .await
         {
             Ok(Message::Have(7)) => {}
@@ -648,8 +648,11 @@ mod tests {
     async fn a_frame_past_its_rule_is_refused_before_it_is_read() {
         let timeout = Duration::from_secs(10);
         for (len_prefix, num_pieces) in [
-            (MAX_PACKET_LEN as u32 + 1, None),
-            (1 + BUFLEN as u32 * 2, Some(8 * BUFLEN as u32 * 2 + 8)),
+            (u32::try_from(MAX_PACKET_LEN).unwrap() + 1, None),
+            (
+                1 + u32::try_from(BUFLEN).unwrap() * 2,
+                Some(8 * u32::try_from(BUFLEN).unwrap() * 2 + 8),
+            ),
         ] {
             let mut header = len_prefix.to_be_bytes().to_vec();
             header.push(5); // bitfield

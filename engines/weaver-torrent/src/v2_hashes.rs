@@ -289,7 +289,7 @@ mod tests {
     };
 
     fn blocks(data: &[u8]) -> Vec<Id32> {
-        data.chunks(BLOCK_SIZE as usize)
+        data.chunks(usize::try_from(BLOCK_SIZE).unwrap())
             .map(merkle::hash_block)
             .collect()
     }
@@ -331,16 +331,19 @@ mod tests {
         assert_eq!(v2.expected(0), file_hashes(&t.files[0].1, piece_length).0);
         assert_eq!(v2.compare_hash(0, &blocks(&t.files[0].1)), Some(true));
         assert_eq!(v2.compare_hash(1, &blocks(&t.files[1].1)), Some(true));
-        for (i, piece) in c.chunks(piece_length as usize).enumerate() {
-            assert_eq!(v2.compare_hash(2 + i as u32, &blocks(piece)), Some(true));
+        for (i, piece) in c.chunks(usize::try_from(piece_length).unwrap()).enumerate() {
+            assert_eq!(
+                v2.compare_hash(2 + u32::try_from(i).unwrap(), &blocks(piece)),
+                Some(true)
+            );
         }
         // A block hashed wrong fails its piece.
-        let mut bad = blocks(&c[..piece_length as usize]);
+        let mut bad = blocks(&c[..usize::try_from(piece_length).unwrap()]);
         bad[1].0[0] ^= 1;
         assert_eq!(v2.compare_hash(2, &bad), Some(false));
         // The blocks of another piece of the file fail it.
         assert_eq!(
-            v2.compare_hash(3, &blocks(&c[..piece_length as usize])),
+            v2.compare_hash(3, &blocks(&c[..usize::try_from(piece_length).unwrap()])),
             Some(false)
         );
     }

@@ -119,7 +119,7 @@ impl Harness {
         let session = Session::new_with_opts(out.path().into(), isolated_session_opts(false))
             .await
             .unwrap();
-        let pieces = 8 * bytes as u32;
+        let pieces = 8 * u32::try_from(bytes).unwrap();
         Self::added_to(session, out, name, pieces, &vec![0xff; bytes], add).await
     }
 
@@ -896,7 +896,7 @@ async fn a_timed_out_peer_keeps_its_requests_and_is_asked_for_no_more() {
         .unwrap();
     assert_eq!(
         next_requests(&mut task, &mut rx, depth).await,
-        chunks(other, 0..depth as u32)
+        chunks(other, 0..u32::try_from(depth).unwrap())
     );
 }
 
@@ -2521,7 +2521,10 @@ mod v2 {
     fn layerless() -> V2TestTorrent {
         let mut torrent = V2TestTorrent::new(
             vec![
-                ("a", payload(PIECES as usize * PIECE as usize, 1)),
+                (
+                    "a",
+                    payload(PIECES as usize * usize::try_from(PIECE).unwrap(), 1),
+                ),
                 ("b", payload(100, 2)),
             ],
             PIECE,
@@ -2540,7 +2543,10 @@ mod v2 {
             let pieces: usize = torrent
                 .files
                 .iter()
-                .map(|(_, data)| data.len().div_ceil(torrent.piece_length as usize))
+                .map(|(_, data)| {
+                    data.len()
+                        .div_ceil(usize::try_from(torrent.piece_length).unwrap())
+                })
                 .sum();
             let have = BF::from_boxed_slice(vec![0u8; pieces.div_ceil(8)].into_boxed_slice());
             let handle = session
@@ -3636,7 +3642,15 @@ async fn a_pex_message_past_500_kib_ends_the_connection() {
     let named = |n: usize| {
         let added = (0..n).map(|i| PexPeerInfo {
             flags: 0,
-            addr: SocketAddr::from(([10, (i >> 16) as u8, (i >> 8) as u8, i as u8], 6881)),
+            addr: SocketAddr::from((
+                [
+                    10,
+                    u8::try_from((i >> 16) & 0xff).unwrap(),
+                    u8::try_from((i >> 8) & 0xff).unwrap(),
+                    u8::try_from(i & 0xff).unwrap(),
+                ],
+                6881,
+            )),
         });
         UtPex::from_peers(added, std::iter::empty())
     };
@@ -3919,7 +3933,10 @@ impl crate::network::SocketFactory for HeldUdp {
         let (sent, sent_rx) = tokio::sync::mpsc::unbounded_channel();
         let (arriving_tx, arriving) = tokio::sync::mpsc::unbounded_channel();
         let mut held = self.held.lock();
-        let addr = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 50000 + held.len() as u16));
+        let addr = SocketAddr::from((
+            std::net::Ipv4Addr::LOCALHOST,
+            50000 + u16::try_from(held.len()).unwrap(),
+        ));
         held.push(HeldEnds {
             addr,
             sent: sent_rx,

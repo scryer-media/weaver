@@ -1027,11 +1027,11 @@ mod tests {
 
         #[allow(clippy::needless_range_loop)]
         for id in 0..buf.len() {
-            buf[id] = id as u8;
+            buf[id] = u8::try_from(id & 0xff).unwrap();
         }
 
         let block_len = LEN - PREAMBLE_LEN - INTEGER_LEN * 2;
-        let len_prefix: u32 = (block_len + INTEGER_LEN * 2 + MSGID_LEN) as u32;
+        let len_prefix: u32 = u32::try_from(block_len + INTEGER_LEN * 2 + MSGID_LEN).unwrap();
         let index: u32 = 42;
         let begin: u32 = 43;
 
@@ -1075,7 +1075,7 @@ mod tests {
     fn test_deserialize_request() {
         let mut buf = [0u8; 100];
 
-        let len_prefix: u32 = (MSGID_LEN + INTEGER_LEN * 3) as u32;
+        let len_prefix: u32 = u32::try_from(MSGID_LEN + INTEGER_LEN * 3).unwrap();
         let index: u32 = 42;
         let begin: u32 = 43;
         let length: u32 = 44;
@@ -1425,7 +1425,7 @@ mod tests {
 
         // One hash short of the request's nodes and uncles.
         let short = len - 32;
-        out[..4].copy_from_slice(&((short - 4) as u32).to_be_bytes());
+        out[..4].copy_from_slice(&u32::try_from(short - 4).unwrap().to_be_bytes());
         assert!(matches!(
             Message::deserialize(&out[..short], &[], None),
             Err(MessageDeserializeError::IncorrectMsgLen { .. })
@@ -1438,7 +1438,7 @@ mod tests {
     fn the_largest_hashes_reply_fits_a_frame() {
         let request = HashRequest {
             count: MAX_HASHES_IN_REPLY,
-            proof_layers: 9 + MAX_UNCLES_IN_REPLY as u32 - 1,
+            proof_layers: 9 + u32::try_from(MAX_UNCLES_IN_REPLY).unwrap() - 1,
             ..hash_request(0, 0)
         };
         assert_eq!(request.uncles(), MAX_UNCLES_IN_REPLY as u64);
@@ -1510,11 +1510,11 @@ mod tests {
         };
         let refused = |len: u32, id: u8| Message::deserialize(&header(len, id), &[], None).err();
         assert!(matches!(
-            refused(MAX_PACKET_LEN as u32 + 1, MSGID_EXTENDED),
+            refused(u32::try_from(MAX_PACKET_LEN).unwrap() + 1, MSGID_EXTENDED),
             Some(MessageDeserializeError::PacketTooLarge(..))
         ));
         assert!(matches!(
-            refused(MAX_PACKET_LEN as u32, MSGID_EXTENDED),
+            refused(u32::try_from(MAX_PACKET_LEN).unwrap(), MSGID_EXTENDED),
             Some(MessageDeserializeError::NotEnoughData(..))
         ));
         assert!(matches!(
