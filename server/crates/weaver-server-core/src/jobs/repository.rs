@@ -59,7 +59,11 @@ async fn delete_orphan_rows(
                 "DELETE FROM {table} WHERE job_id = {{}} AND NOT {}",
                 crate::jobs::graph_checkpoint::live_job("{}")
             ),
-            &[SqlArg::I64(job_id), SqlArg::I64(job_id), SqlArg::I64(job_id)],
+            &[
+                SqlArg::I64(job_id),
+                SqlArg::I64(job_id),
+                SqlArg::I64(job_id),
+            ],
         )
         .await?;
     Ok(deleted as usize)

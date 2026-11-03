@@ -138,7 +138,8 @@ async fn run(count: usize) {
     let at = Instant::now();
     service.stop().await;
     let stopped = ms(at);
-    db.prune_orphan_active_state(crate::jobs::ids::JobId(u64::MAX)).unwrap();
+    db.prune_orphan_active_state(crate::jobs::ids::JobId(u64::MAX))
+        .unwrap();
 
     let again = bench_service(&db, dir.path(), &routes);
     let handle = queue();

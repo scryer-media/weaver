@@ -557,7 +557,10 @@ fn a_step_writes_only_the_rows_and_parts_it_changed() {
         !step.nodes.contains_key(&i64::from(NodeId::ROOT.0)),
         "{step:?}"
     );
-    assert!(!pending.put(&mut job, Vec::new()), "an unchanged job writes nothing");
+    assert!(
+        !pending.put(&mut job, Vec::new()),
+        "an unchanged job writes nothing"
+    );
     // The parts it wrote over the ones before are a fresh checkpoint's, and
     // the whole job's rows are the rows of its snapshot.
     let mut written: BTreeMap<i64, Option<Arc<[u8]>>> = root_parts(&first);

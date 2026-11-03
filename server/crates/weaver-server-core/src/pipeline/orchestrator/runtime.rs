@@ -822,11 +822,10 @@ impl Pipeline {
         self.pipeline_is_live()
             || self.queue_walk_due
             || self.shared_state.queue.read(|inner| {
-                inner
-                    .globals
-                    .holds
-                    .held_by(crate::jobs::HoldOrigin::SpeedTest, crate::jobs::HoldOwner::All)
-                    || (!self.nzb_admitted.is_empty() && !inner.globals.holds_downloads())
+                inner.globals.holds.held_by(
+                    crate::jobs::HoldOrigin::SpeedTest,
+                    crate::jobs::HoldOwner::All,
+                ) || (!self.nzb_admitted.is_empty() && !inner.globals.holds_downloads())
             })
     }
 

@@ -17,8 +17,8 @@ use weaver_graph::slots::Ticket;
 use weaver_graph::{MemberId, NodeId, VolumeIndex};
 
 use super::{GraphError, GraphJob};
-use crate::pipeline::graph::root::Root;
 use crate::pipeline::graph::namespace::{Lender, WriteError};
+use crate::pipeline::graph::root::Root;
 use crate::pipeline::graph::status::RepairSlots;
 
 impl<R: Root> GraphJob<R> {

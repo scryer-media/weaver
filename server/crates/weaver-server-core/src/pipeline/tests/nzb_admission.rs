@@ -623,13 +623,13 @@ async fn nzb_added_under_scheduled_pause_is_installed_and_announced_before_resum
         .apply_schedule_action(crate::bandwidth::ScheduleAction::Pause)
         .await
         .unwrap();
-    assert!(
-        pipeline
-            .shared_state
-            .queue
-            .read(|inner| inner.globals.holds.reason(crate::jobs::HoldOwner::All, false)
-                == Some(crate::jobs::HoldOrigin::Scheduled))
-    );
+    assert!(pipeline.shared_state.queue.read(|inner| {
+        inner
+            .globals
+            .holds
+            .reason(crate::jobs::HoldOwner::All, false)
+            == Some(crate::jobs::HoldOrigin::Scheduled)
+    }));
     enqueue(&mut pipeline, 1).await;
     assert_added_but_not_dispatched(&mut pipeline, JobId(1)).await;
     handle

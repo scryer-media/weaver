@@ -234,7 +234,13 @@ impl HeldNode {
     // Bring the rows up to what the job has now of what `touched` says
     // changed, and put what changed into `delta`. `node` is `None` for an
     // id no tree could have, which names a node the job does not have.
-    fn step<R: Root>(&mut self, job: &GraphJob<R>, node: Option<NodeId>, touched: Touched, delta: &mut Delta) {
+    fn step<R: Root>(
+        &mut self,
+        job: &GraphJob<R>,
+        node: Option<NodeId>,
+        touched: Touched,
+        delta: &mut Delta,
+    ) {
         let id = node.map(|node| i64::from(node.0));
         if touched.own {
             let now = node
@@ -361,11 +367,7 @@ impl Pending {
     // Queue what this checkpoint changes, the job's spooled held parts
     // `held_parts` with it, in key order; true when a write must be queued
     // to take it.
-    pub(crate) fn put<R: Root>(
-        &self,
-        job: &mut GraphJob<R>,
-        held_parts: Vec<HeldPartRow>,
-    ) -> bool {
+    pub(crate) fn put<R: Root>(&self, job: &mut GraphJob<R>, held_parts: Vec<HeldPartRow>) -> bool {
         self.put_with_feed(job, held_parts, None)
     }
 
