@@ -730,6 +730,10 @@ pub struct DownloadBlockState {
     // Speed limit imposed by the active schedule (0 = no scheduled limit).
     #[serde(default)]
     pub scheduled_speed_limit: u64,
+    // Speed limit the downloads run under now: the schedule's while one
+    // holds, even one set to unlimited, else the configured one (0 = none).
+    #[serde(default)]
+    pub speed_limit_in_force: u64,
     // Why a schedule rule is holding new downloads, while one is.
     #[serde(default)]
     pub schedule_hold_reason: Option<String>,
@@ -762,6 +766,7 @@ impl Default for DownloadBlockState {
             window_ends_at_epoch_ms: None,
             timezone_name: chrono::Local::now().offset().to_string(),
             scheduled_speed_limit: 0,
+            speed_limit_in_force: 0,
             schedule_hold_reason: None,
         }
     }
@@ -952,6 +957,23 @@ pub struct JobInfo {
     // the post declares their sizes. Empty when no download runs for the job.
     #[serde(default)]
     pub file_remaining_bytes: Vec<u64>,
+    // Of each NZB file's bytes not yet downloaded, those of recovery held
+    // back until a loss asks for it, in the same order. Empty when no
+    // download runs for the job.
+    #[serde(default)]
+    pub file_parked_bytes: Vec<u64>,
+    // The post's encoded bytes still to come: every article neither in hand
+    // nor lost for good, less the recovery parked until something asks for
+    // it. A clean post ends its download at zero; recovery fetched after a
+    // loss counts from the moment it is asked for.
+    #[serde(default)]
+    pub remaining_bytes: u64,
+    // The post's encoded bytes the download is out to bring: every article
+    // but the recovery still parked. What is done of it is this less
+    // `remaining_bytes`, so the two measure the same declared bytes and the
+    // download ends at exactly 100%.
+    #[serde(default)]
+    pub wanted_bytes: u64,
     // PAR2 recovery volumes not yet fetched (fetched on demand).
     #[serde(default)]
     pub remaining_par_files: u32,

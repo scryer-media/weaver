@@ -433,6 +433,9 @@ fn nzbget_test_job(
         completed_files: 1,
         remaining_par_files: 1,
         file_remaining_bytes: Vec::new(),
+        file_parked_bytes: Vec::new(),
+        remaining_bytes: total_bytes.saturating_sub(downloaded_bytes),
+        wanted_bytes: total_bytes,
         password: None,
         category: Some("tv".into()),
         metadata,
@@ -892,6 +895,9 @@ fn sample_job(job_id: u64, name: &str, status: JobStatus) -> JobInfo {
         completed_files: 0,
         remaining_par_files: 0,
         file_remaining_bytes: Vec::new(),
+        file_parked_bytes: Vec::new(),
+        remaining_bytes: 50,
+        wanted_bytes: 100,
         password: Some("secret".into()),
         category: Some("tv".into()),
         metadata: Vec::new(),
@@ -1203,6 +1209,7 @@ fn manual_pause_block() -> DownloadBlockState {
         window_ends_at_epoch_ms: None,
         timezone_name: "MDT".into(),
         scheduled_speed_limit: 4_096,
+        speed_limit_in_force: 4_096,
         schedule_hold_reason: None,
     }
 }

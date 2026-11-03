@@ -443,6 +443,9 @@ impl Pipeline {
     pub(crate) fn publish_download_block(&mut self) {
         let mut block = self.global_pause().to_download_block_state();
         block.scheduled_speed_limit = self.scheduled_rate_limit.unwrap_or(0);
+        block.speed_limit_in_force = self
+            .scheduled_rate_limit
+            .unwrap_or(self.configured_rate_limit);
         self.shared_state.set_download_block(block);
     }
 }

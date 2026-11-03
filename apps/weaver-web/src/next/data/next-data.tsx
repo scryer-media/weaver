@@ -156,6 +156,7 @@ const DEFAULT_DOWNLOAD_BLOCK: DownloadBlockState = {
   windowEndsAtEpochMs: null,
   timezoneName: "",
   scheduledSpeedLimit: 0,
+  speedLimitInForce: 0,
 };
 
 const EMPTY_CATEGORIES: ConfiguredCategory[] = [];

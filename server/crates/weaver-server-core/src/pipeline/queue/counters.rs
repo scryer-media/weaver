@@ -207,14 +207,30 @@ impl Queue {
                     if download && !downloading {
                         continue;
                     }
-                    let completed = if download {
+                    let job = &row.report.job;
+                    // The download counts in the post's declared bytes: what
+                    // it is out to bring, less what is still to come, so it
+                    // ends at its total whatever recovery stayed parked and
+                    // its time left is what is still to come at the wire
+                    // rate, which counts the same encoded bytes.
+                    let (completed, total) = if download && job.wanted_bytes > 0 {
+                        (
+                            job.wanted_bytes.saturating_sub(job.remaining_bytes),
+                            job.wanted_bytes,
+                        )
+                    } else if download {
                         // Decoder throughput includes replacement articles.
                         // Only the report accounts for unique accepted bytes.
-                        row.report.job.downloaded_bytes
+                        (
+                            job.downloaded_bytes,
+                            sample.counters.total_bytes.load(Ordering::Relaxed),
+                        )
                     } else {
-                        sample.counters.completed_bytes.load(Ordering::Relaxed)
+                        (
+                            sample.counters.completed_bytes.load(Ordering::Relaxed),
+                            sample.counters.total_bytes.load(Ordering::Relaxed),
+                        )
                     };
-                    let total = sample.counters.total_bytes.load(Ordering::Relaxed);
                     // A download with nothing to fetch is not shown. A later
                     // phase with no byte total, such as a repair, is still
                     // shown with its start, so its time can be read.

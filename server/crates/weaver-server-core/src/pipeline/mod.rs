@@ -1556,6 +1556,10 @@ pub struct Pipeline {
     pub(super) download_restart_durable_lead_retry_after: HashMap<JobId, Instant>,
     // The one over-limit article reserved until its result is processed or returned.
     pub(super) checkpoint_progress_articles: HashMap<JobId, (u64, SegmentId)>,
+    // The bytes still to come and the bytes wanted of each paused job, as its
+    // graph root last said them before its articles were released, so a
+    // paused job reports the figures it stopped at.
+    pub(super) released_remaining: HashMap<JobId, (u64, u64)>,
     pub(super) download_lane_owners: HashMap<u64, DownloadLaneOwner>,
     // Set by the download-dispatch test fixtures: every dispatch pass and
     // every lane result batch then checks that the in-flight gauges are what

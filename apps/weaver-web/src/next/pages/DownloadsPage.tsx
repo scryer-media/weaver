@@ -69,7 +69,7 @@ import { countLabel } from "../i18n/labels";
 import { NextShell } from "../shell/NextShell";
 import { AttentionBlock, CategoryListBlock, ProvidersBlock } from "../shell/rail-blocks";
 import { AddNzbDialog } from "../features/AddNzbDialog";
-import { SpeedLimitControl } from "../features/SpeedLimitDialog";
+import { SpeedLimitControl, useSpeedLimitInForce } from "../features/SpeedLimitDialog";
 import { DownloadInspector } from "./downloads/DownloadInspector";
 import { DownloadRow } from "./downloads/DownloadRow";
 import { QueueEtaContext } from "./downloads/queue-eta";
@@ -122,6 +122,7 @@ function sortJobs(
 
 export function DownloadsPage() {
   const { queue, categories: configured, speed, isPaused, downloadBlock } = useNextData();
+  const { inForce: speedLimit } = useSpeedLimitInForce();
   const statusLabel = useStatusLabel();
   const t = useTranslate();
 
@@ -202,11 +203,20 @@ export function DownloadsPage() {
   const etaSample = useMemo(
     () =>
       page.etaTotalBytes > page.etaDownloadedBytes
-        ? [{ id: 0, status: "DOWNLOADING", totalBytes: page.etaTotalBytes, downloadedBytes: page.etaDownloadedBytes }]
+        ? [
+            {
+              id: 0,
+              status: "DOWNLOADING",
+              totalBytes: page.etaTotalBytes,
+              downloadedBytes: page.etaDownloadedBytes,
+              remainingBytes: page.etaTotalBytes - page.etaDownloadedBytes,
+            },
+          ]
         : [],
     [page.etaDownloadedBytes, page.etaTotalBytes],
   );
-  const etaSpeed = useStableEtaSpeed(etaSample, speed);
+  const etaConditions = useMemo(() => ({ paused: isPaused, speedLimit }), [isPaused, speedLimit]);
+  const etaSpeed = useStableEtaSpeed(etaSample, speed, etaConditions);
   const estimates = useMemo(
     () => etaByIdFrom(page.etaThrough, etaSpeed, formatEtaFromRemainingBytes),
     [etaSpeed, page.etaThrough],

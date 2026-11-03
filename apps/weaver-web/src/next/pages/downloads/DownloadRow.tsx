@@ -57,7 +57,9 @@ export const DownloadRow = memo(function DownloadRow({
 }) {
   const t = useTranslate();
   const progress = useJobProgress(job);
-  const rate = useDownloadRate(job);
+  const liveRate = useDownloadRate(job);
+  // A held download moves nothing, whatever the last rate the daemon sent.
+  const rate = held === null ? liveRate : 0;
   const name = formatJobReleaseName(job);
   const isPaused = statusToken(job.status) === "paused";
   // The phase the label names, or failing that the last one with a bar; a

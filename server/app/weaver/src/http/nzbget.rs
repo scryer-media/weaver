@@ -1524,8 +1524,10 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
             let view = row.view(&inner.globals);
             let state = queue_item_state_for_download_accounting(QueueStateFacts::of_view(&view));
             let job = view.job();
+            // What is still to come, the recovery held back until a loss
+            // asks for it left out, as NZBGet leaves out its paused files.
             if !matches!(state, QueueItemState::Completed | QueueItemState::Failed) {
-                remaining += job.total_bytes.saturating_sub(job.downloaded_bytes);
+                remaining += job.remaining_bytes.min(job.wanted_bytes);
             }
             if matches!(view.status(), JobStatus::QueuedPostProcessing)
                 || queue_item_state_in_post_processing(state)
@@ -1824,13 +1826,22 @@ fn nzbget_group(
     priority: i64,
     post_started_at: Option<i64>,
 ) -> Value {
+    // NZBGet counts its paused files in the remaining size and again in the
+    // paused size, so a client reads what is still to come as the one less
+    // the other. The recovery held back until a loss asks for it is
+    // Weaver's paused files; a paused job pauses all of it. Every figure is
+    // in the post's declared bytes, so the file size is what was done plus
+    // what remains.
     let total = item.total_bytes;
-    let downloaded = item.downloaded_bytes;
-    let remaining = total.saturating_sub(downloaded);
+    let wanted = item.wanted_bytes.min(total);
+    let still = item.remaining_bytes.min(wanted);
+    let held_back = total - wanted;
+    let remaining = still + held_back;
+    let downloaded = wanted - still;
     let paused = if item.state == QueueItemState::Paused {
         remaining
     } else {
-        0
+        held_back
     };
     let (file_lo, file_hi) = size_parts(total);
     let (remaining_lo, remaining_hi) = size_parts(remaining);
@@ -3422,10 +3433,7 @@ async fn sort_groups(
                 .to_lowercase()
                 .cmp(&nzbget_release_name(&right.original_title, &right.name).to_lowercase()),
             "size" => left.total_bytes.cmp(&right.total_bytes),
-            "left" => left
-                .total_bytes
-                .saturating_sub(left.downloaded_bytes)
-                .cmp(&right.total_bytes.saturating_sub(right.downloaded_bytes)),
+            "left" => left.remaining_bytes.cmp(&right.remaining_bytes),
             "priority" => right_priority.cmp(left_priority),
             "category" => left_category
                 .to_lowercase()
@@ -3562,6 +3570,13 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
                     .unwrap_or(total)
                     .min(total)
             };
+            // Recovery held back until a loss asks for it lists as NZBGet
+            // lists its paused par files: paused, still to come.
+            let held_back = !job_done
+                && info
+                    .file_parked_bytes
+                    .get(index)
+                    .is_some_and(|parked| *parked > 0);
             let (file_lo, file_hi) = size_parts(total);
             let (remaining_lo, remaining_hi) = size_parts(remaining);
             let filename = file
@@ -3583,7 +3598,7 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
                 "RemainingSizeHi": remaining_hi,
                 "PostTime": file.date,
                 "FilenameConfirmed": true,
-                "Paused": paused,
+                "Paused": paused || held_back,
                 "ActiveDownloads": 0,
                 "Progress": (total.saturating_sub(remaining))
                     .saturating_mul(1000)

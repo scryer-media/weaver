@@ -322,6 +322,12 @@ function JobDetailContent() {
   const terminal = done || failed;
   const color = statusColor(progress.status);
   const percent = job.progress * 100;
+  // While queued, the payload is what the download is out to bring, so a
+  // clean post fills it whatever recovery stayed held back.
+  const payload =
+    job.wantedBytes && job.wantedBytes > 0
+      ? { done: job.wantedBytes - Math.min(job.remainingBytes ?? 0, job.wantedBytes), total: job.wantedBytes }
+      : { done: job.downloadedBytes, total: job.totalBytes };
   const phase = ratePhase(job.phaseProgress);
   const stageIds = new Set(timeline?.stages.map((stage) => stage.id) ?? []);
   const verified = stageIds.has("VERIFYING");
@@ -885,8 +891,8 @@ function JobDetailContent() {
           <DetailBlock id="recovery" title={t("next.job.bytes")} tone="panel" bodyClassName="gap-[11px]">
             <ShareRow
               label={t("next.job.payload")}
-              note={t("next.job.sizeOf", { done: formatSize(job.downloadedBytes), total: formatSize(job.totalBytes) })}
-              percent={job.totalBytes > 0 ? (job.downloadedBytes / job.totalBytes) * 100 : 0}
+              note={t("next.job.sizeOf", { done: formatSize(payload.done), total: formatSize(payload.total) })}
+              percent={payload.total > 0 ? (payload.done / payload.total) * 100 : 0}
               color={color}
             />
             <ShareRow

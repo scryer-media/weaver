@@ -80,7 +80,7 @@ const blockedBy = (windowEndsAtEpochMs: number | null) => ({
   version: "fixture", update: undefined, speed: 0, peakSpeed: 0, isPaused: false, speedLimit: 0,
   downloadBlock: {
     kind: "EGRESS_QUOTA", egressId: 2, egressName: "LTE standby", usedBytes: 20 * GIB, limitBytes: 20 * GIB, remainingBytes: 0,
-    windowStartsAtEpochMs: windowStart, windowEndsAtEpochMs, timezoneName: "UTC", scheduledSpeedLimit: 0,
+    windowStartsAtEpochMs: windowStart, windowEndsAtEpochMs, timezoneName: "UTC", scheduledSpeedLimit: 0, speedLimitInForce: 0,
   },
   queue: {} as NextData["queue"], categories: [], refreshCategories: () => {}, historyCount: 0, refreshHistoryCount: () => {},
   providers: [], providersLoaded: true, holdoffs: [], connection: { status: "connected", isDisconnected: false, isPolling: false },

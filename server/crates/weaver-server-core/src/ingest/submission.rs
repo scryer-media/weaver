@@ -50,6 +50,9 @@ pub struct SubmittedJobSummary {
     pub category: Option<String>,
     pub metadata: Vec<(String, String)>,
     pub total_bytes: u64,
+    // The declared bytes a run starts out to bring, the recovery volumes
+    // left out.
+    pub wanted_bytes: u64,
     pub file_count: u32,
     pub remaining_par_count: u32,
 }
@@ -62,6 +65,7 @@ impl SubmittedJobSummary {
             category: spec.category.clone(),
             metadata: spec.metadata.clone(),
             total_bytes: spec.total_bytes,
+            wanted_bytes: spec.wanted_bytes(),
             file_count: spec.files.len() as u32,
             remaining_par_count: spec.par2_volume_count() as u32,
         }

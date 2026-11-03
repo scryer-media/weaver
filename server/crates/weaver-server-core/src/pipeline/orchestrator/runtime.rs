@@ -385,6 +385,7 @@ impl Pipeline {
             reconcile_signatures: HashMap::new(),
             download_restart_durable_lead_retry_after: HashMap::new(),
             checkpoint_progress_articles: HashMap::new(),
+            released_remaining: HashMap::new(),
             download_lane_owners: HashMap::new(),
             #[cfg(test)]
             audit_lane_holdings: false,
@@ -610,6 +611,44 @@ impl Pipeline {
         (total, arrived.min(total))
     }
 
+    // The job's bytes still to come and the bytes it is out to bring, both
+    // as the post declares them: what its graph root waits on, the recovery
+    // it parked left out. A paused job holds no root and says what its root
+    // last said; a job that never ran says what a run starts out to bring.
+    pub(crate) fn remaining_figures(&self, state: &JobState) -> (u64, u64) {
+        if let Some(graph) = self.graph_jobs.get(&state.job_id) {
+            return Self::graph_remaining(graph, &state.spec);
+        }
+        if let Some(figures) = self.released_remaining.get(&state.job_id) {
+            return *figures;
+        }
+        state.unstarted_remaining()
+    }
+
+    // What the root says, less each file named as recovery that the root
+    // has not yet decided on: from the start until its first article is
+    // read, it counts as held back, as it did before the job ran, so the
+    // figures do not rise by the recovery and fall again a moment later.
+    pub(crate) fn graph_remaining(
+        graph: &crate::pipeline::graph::job::GraphJob,
+        spec: &crate::jobs::model::JobSpec,
+    ) -> (u64, u64) {
+        let (held_remaining, held_wanted) = (0u32..)
+            .zip(&spec.files)
+            .filter(|(_, file)| file.role.is_recovery())
+            .filter_map(|(index, _)| graph.undecided_recovery(index))
+            .fold((0u64, 0u64), |(remaining, wanted), (left, posted)| {
+                (remaining + left, wanted + posted)
+            });
+        let wanted = graph.wanted_bytes().saturating_sub(held_wanted);
+        let remaining: u64 = graph
+            .remaining_bytes()
+            .iter()
+            .sum::<u64>()
+            .saturating_sub(held_remaining);
+        (remaining.min(wanted), wanted)
+    }
+
     pub(crate) fn effective_downloaded_bytes(state: &JobState) -> u64 {
         state
             .downloaded_bytes
@@ -633,6 +672,7 @@ impl Pipeline {
         self.download_restart_durable_lead_retry_after
             .remove(&job_id);
         self.checkpoint_progress_articles.remove(&job_id);
+        self.released_remaining.remove(&job_id);
         self.propagation_ready_at.remove(&job_id);
     }
 

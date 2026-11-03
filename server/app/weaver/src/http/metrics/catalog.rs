@@ -248,9 +248,9 @@ metric_families! {
     JOB_PROGRESS_RATIO = ("weaver_job_progress_ratio", Gauge, ["job_id"],
         "Fractional job progress from 0 to 1.");
     JOB_TOTAL_BYTES = ("weaver_job_total_bytes", Gauge, ["job_id"],
-        "Expected total bytes for the job.");
+        "Expected total bytes for the job: while it downloads, the post's declared bytes less the recovery held back until a loss asks for it.");
     JOB_DOWNLOADED_BYTES = ("weaver_job_downloaded_bytes", Gauge, ["job_id"],
-        "Downloaded bytes for the job.");
+        "Downloaded bytes for the job: while it downloads, the declared bytes of the total no longer still to come.");
     JOB_OPTIONAL_RECOVERY_BYTES = ("weaver_job_optional_recovery_bytes", Gauge, ["job_id"],
         "Optional recovery bytes available for the job.");
     JOB_OPTIONAL_RECOVERY_DOWNLOADED_BYTES = ("weaver_job_optional_recovery_downloaded_bytes",
