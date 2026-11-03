@@ -567,13 +567,9 @@ pub fn tracker_client(
     };
     let base = {
         let kind = kind.clone();
-        move || {
-            let builder = reqwest::Client::builder();
-            Ok(match &kind {
-                LegKind::Ladder | LegKind::System => builder,
-                LegKind::SourceAddress(address) => builder.local_address(*address),
-                LegKind::Interface(name) => bound_to(builder, name)?,
-            })
+        move || match &kind {
+            LegKind::Interface(name) => bound_to(reqwest::Client::builder(), name),
+            kind => Ok(plain_builder(kind)),
         }
     };
     let clients = LegClients::new(base, bridge, kind.clone(), dialer);
@@ -582,6 +578,16 @@ pub fn tracker_client(
         .client(None, &ClientShape::FETCH)
         .map_err(|error| format!("{error:#}"))?;
     Ok(Arc::new(clients))
+}
+
+// A builder leaving from the leg's source address when it pins one, and
+// held to no device.
+fn plain_builder(kind: &LegKind) -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder();
+    match kind {
+        LegKind::SourceAddress(address) => builder.local_address(*address),
+        _ => builder,
+    }
 }
 
 // The host's loopback interface, for a leg bound to it.
@@ -713,10 +719,16 @@ where
         target: Option<HttpTarget<'_>>,
         shape: &ClientShape,
     ) -> anyhow::Result<reqwest::ClientBuilder> {
-        let builder = (self.base)().map_err(anyhow::Error::msg)?;
         if shape.used_for == ClientUse::Gateway {
+            // The port mapper asks the gateway whatever the leg's own
+            // settings make of its builder.
+            let builder = (self.base)().unwrap_or_else(|error| {
+                tracing::debug!(%error, "the leg's builder failed; the gateway's client is built plain");
+                plain_builder(&self.kind)
+            });
             return shape.apply(builder.no_proxy());
         }
+        let builder = (self.base)().map_err(anyhow::Error::msg)?;
         let (host, port, addrs) = target.map_or(("", 0, &[][..]), |target| {
             (target.host, target.port, target.addrs)
         });
@@ -1652,6 +1664,42 @@ mod tests {
         // The web seed asked for longest ago was dropped.
         clients.client(target("seed.test"), &seed(1)).unwrap();
         assert_eq!(clients.built(), built + 1);
+    }
+
+    // A source-address leg whose builder fails still builds the gateway's
+    // client, and it still leaves from the leg's address: it reaches a
+    // listener there and no IPv4 one.
+    #[tokio::test]
+    async fn a_failed_builder_leaves_the_gateway_client_on_the_legs_address() {
+        let source = IpAddr::from(std::net::Ipv6Addr::LOCALHOST);
+        let Ok(at_source) = tokio::net::TcpListener::bind((source, 0)).await else {
+            // The host has no IPv6 loopback to leave from.
+            return;
+        };
+        let v4 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let clients = LegClients::new(
+            || Err("the leg's device is gone".to_owned()),
+            None,
+            LegKind::SourceAddress(source),
+            system_dialer(),
+        );
+        assert!(clients.client(None, &ClientShape::FETCH).is_err());
+        let gateway = clients.client(None, &ClientShape::GATEWAY).unwrap();
+
+        let url = format!("http://{}/", at_source.local_addr().unwrap());
+        let asked = tokio::spawn(async move { gateway.get(url).send().await.map(drop) });
+        let (_, peer) = at_source.accept().await.unwrap();
+        assert_eq!(peer.ip(), source);
+        drop(at_source);
+        let _ = asked.await.unwrap();
+
+        let gateway = clients.client(None, &ClientShape::GATEWAY).unwrap();
+        let error = gateway
+            .get(format!("http://{}/", v4.local_addr().unwrap()))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(error.is_connect(), "{error}");
     }
 
     // Two legs asked for the same target and shape each build their own
