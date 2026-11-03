@@ -352,22 +352,45 @@ impl Queued {
 /// The torrents the queue lets run: of those no hold stops, every forced
 /// or seeding one, and the first `max_active` of the rest that are not
 /// paused. Only a torrent still downloading takes one of the `max_active`
-/// slots.
-pub fn active(torrents: &[Queued], max_active: u32, holds: &HoldSet) -> BTreeSet<JobId> {
-    let mut slots = max_active as usize;
-    let mut active = BTreeSet::new();
-    for torrent in torrents {
+/// slots. With them, the slots left at the queue's end.
+pub fn active(torrents: &[Queued], max_active: u32, holds: &HoldSet) -> (BTreeSet<JobId>, Slots) {
+    let mut slots = Slots::new(max_active);
+    let active = torrents
+        .iter()
+        .filter(|torrent| slots.admit(torrent, holds))
+        .map(|torrent| torrent.job_id)
+        .collect();
+    (active, slots)
+}
+
+/// The download slots a pass over the queue has left, in queue order. A
+/// torrent's turn depends only on those before it, so what is left at the
+/// end of the queue is all a torrent added after it needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Slots {
+    left: u32,
+}
+
+impl Slots {
+    pub fn new(max_active: u32) -> Self {
+        Self { left: max_active }
+    }
+
+    /// Whether `torrent`, next in the queue, runs: taking a slot if it is
+    /// still downloading and not forced.
+    pub fn admit(&mut self, torrent: &Queued, holds: &HoldSet) -> bool {
         if holds.reason_for(torrent.target()).is_some() {
-            continue;
+            return false;
         }
         if torrent.forced || torrent.seeding {
-            active.insert(torrent.job_id);
-        } else if !torrent.paused && slots > 0 {
-            slots -= 1;
-            active.insert(torrent.job_id);
+            return true;
         }
+        if torrent.paused || self.left == 0 {
+            return false;
+        }
+        self.left -= 1;
+        true
     }
-    active
 }
 
 /// A tracker as the views show it, from how announcing to it last went.
@@ -1015,6 +1038,7 @@ mod tests {
                 holds.hold(hold);
             }
             active(&torrents, 2, &holds)
+                .0
                 .into_iter()
                 .map(|id| id.0)
                 .collect::<Vec<_>>()
@@ -1060,6 +1084,7 @@ mod tests {
         ];
         let ids = |max_active| {
             active(&torrents, max_active, &HoldSet::default())
+                .0
                 .into_iter()
                 .map(|id| id.0)
                 .collect::<Vec<_>>()
@@ -1104,7 +1129,7 @@ mod tests {
             HoldOwner::Torrents,
         );
         assert_eq!(
-            active(&[through, plain], 3, &window),
+            active(&[through, plain], 3, &window).0,
             BTreeSet::from([JobId(1)])
         );
         assert!(window.spares(through.target()));
@@ -1124,7 +1149,7 @@ mod tests {
             ),
             held(HoldOrigin::SpeedTest, HoldScope::Everything, HoldOwner::All),
         ] {
-            assert!(active(&[through], 3, &holds).is_empty());
+            assert!(active(&[through], 3, &holds).0.is_empty());
             assert!(!holds.spares(through.target()));
         }
         // Nothing to spare when no hold reaches it.
