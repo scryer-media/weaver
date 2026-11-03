@@ -181,7 +181,8 @@ impl Pipeline {
     }
 
     // Read the parked jobs named from the database, off the actor, one parse
-    // of each stored NZB, spread over the cores.
+    // of each stored NZB, spread over the cores. Each job's queued writes
+    // land first, so an edit it was given while parked is in the row read.
     pub(crate) async fn load_parked_jobs(
         &mut self,
         ids: Vec<JobId>,
@@ -189,11 +190,20 @@ impl Pipeline {
         if ids.is_empty() {
             return Vec::new();
         }
+        let mut waited = HashMap::new();
+        for id in &ids {
+            if let Err(error) = self.db.job_writes_committed(*id).await {
+                waited.insert(*id, error.to_string());
+            }
+        }
         let db = self.db.clone();
         tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
             ids.into_par_iter()
-                .map(|id| (id, load_parked_job(&db, id)))
+                .map(|id| match waited.get(&id) {
+                    Some(error) => (id, Err(error.clone())),
+                    None => (id, load_parked_job(&db, id)),
+                })
                 .collect()
         })
         .await
