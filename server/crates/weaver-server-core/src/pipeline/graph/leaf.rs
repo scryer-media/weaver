@@ -575,9 +575,13 @@ impl Leaf {
         Ok(Some(std::mem::replace(&mut self.name, wants)))
     }
 
-    // The member is gone with its subtree.
+    // The member is gone with its subtree. A directory goes only once
+    // nothing is left in it.
     pub(crate) fn remove(mut self) -> Result<(), LeafError> {
         self.file = None;
+        if self.directory {
+            return remove_directory(&self.path);
+        }
         match std::fs::remove_file(&self.path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(LeafError::Io {
                 path: self.path,
