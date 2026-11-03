@@ -2326,7 +2326,7 @@ mod tests {
 
     use crate::core::{
         hash_id::{Id20, Id32, InfoHashes},
-        net::{DatagramSocket, Egress, HttpClients, HttpTarget, NamedBy, Resolver},
+        net::{ClientShape, Egress, HttpClients, HttpTarget, NamedBy, Resolver},
     };
     use futures::{FutureExt, StreamExt, future::BoxFuture};
     use parking_lot::Mutex;
@@ -2504,9 +2504,7 @@ mod tests {
             drop(read_request(&listener).await);
         };
         let (sent, ()) = tokio::join!(
-            reqwest::Client::builder()
-                .no_proxy()
-                .build()
+            crate::test_support::build(reqwest::Client::builder().no_proxy())
                 .unwrap()
                 .get(url.clone())
                 .send(),
@@ -2984,10 +2982,8 @@ mod tests {
         };
         let stopped = StoppedAnnounces::default();
         let token = CancellationToken::new();
-        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let udp_sock = crate::test_support::loopback_udp().await;
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
         let mut peers = TrackerComms::start_with_tiers(
             hashes,
             identity(),
@@ -2996,7 +2992,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_vote(),
-            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            crate::test_support::loopback(),
             reach_all(),
             udp_client,
             stopped.clone(),
@@ -3040,10 +3036,8 @@ mod tests {
         };
         let stopped = StoppedAnnounces::default();
         let token = CancellationToken::new();
-        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let udp_sock = crate::test_support::loopback_udp().await;
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
         let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
             v1,
             identity(),
@@ -3052,7 +3046,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_vote(),
-            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            crate::test_support::loopback(),
             reach_all(),
             udp_client,
             stopped.clone(),
@@ -3121,10 +3115,8 @@ mod tests {
         };
         let stopped = StoppedAnnounces::default();
         let token = CancellationToken::new();
-        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let udp_sock = crate::test_support::loopback_udp().await;
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
         let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
             mine,
             identity(),
@@ -3133,7 +3125,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_vote(),
-            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            crate::test_support::loopback(),
             reach_all(),
             udp_client,
             stopped.clone(),
@@ -3219,10 +3211,8 @@ mod tests {
         let (ended, _) = tokio::sync::watch::channel(false);
         let (waiting, mut stopping) = tokio::sync::watch::channel(false);
         let token = CancellationToken::new();
-        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let udp_sock = crate::test_support::loopback_udp().await;
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
         // Bounds far past the exchange, so nothing here races them.
         let stopped = StoppedAnnounces::new(DAY).run_end_within(DAY);
         let mut peers = TrackerComms::start_with_tiers(
@@ -3237,7 +3227,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_vote(),
-            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            crate::test_support::loopback(),
             reach_all(),
             udp_client,
             stopped.clone(),
@@ -3283,10 +3273,8 @@ mod tests {
         let (ended, _) = tokio::sync::watch::channel(false);
         let (waiting, _) = tokio::sync::watch::channel(false);
         let token = CancellationToken::new();
-        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let udp_sock = crate::test_support::loopback_udp().await;
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
         let stopped = StoppedAnnounces::new(DAY).run_end_within(Duration::ZERO);
         assert_eq!(stopped.whole(), DAY);
         let mut peers = TrackerComms::start_with_tiers(
@@ -3301,7 +3289,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_vote(),
-            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            crate::test_support::loopback(),
             reach_all(),
             udp_client,
             stopped.clone(),
@@ -3422,10 +3410,8 @@ mod tests {
         let (listener, url) = http_listener().await;
         let (port, listen_port) = tokio::sync::watch::channel(Some(6881));
         let token = CancellationToken::new();
-        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let udp_sock = crate::test_support::loopback_udp().await;
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
         let mut peers = TrackerComms::start_with_tiers(
             v1_hash(),
             identity(),
@@ -3434,7 +3420,7 @@ mod tests {
             None,
             listen_port,
             no_vote(),
-            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            crate::test_support::loopback(),
             reach_all(),
             udp_client,
             StoppedAnnounces::default(),
@@ -3473,10 +3459,8 @@ mod tests {
         });
         let (port, listen_port) = tokio::sync::watch::channel(Some(6881));
         let token = CancellationToken::new();
-        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let udp_sock = crate::test_support::loopback_udp().await;
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
         let mut peers = TrackerComms::start_with_tiers(
             v1_hash(),
             identity(),
@@ -3485,7 +3469,7 @@ mod tests {
             None,
             listen_port,
             no_vote(),
-            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            crate::test_support::loopback(),
             reach_all(),
             udp_client,
             StoppedAnnounces::default(),
@@ -3530,10 +3514,8 @@ mod tests {
             completed: tokio::sync::watch::channel(false).0,
         });
         let token = CancellationToken::new();
-        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let udp_sock = crate::test_support::loopback_udp().await;
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
         let stopped = StoppedAnnounces::default();
         let mut peers = TrackerComms::start_with_tiers(
             v1_hash(),
@@ -3543,7 +3525,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_vote(),
-            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            crate::test_support::loopback(),
             reach_all(),
             udp_client,
             stopped.clone(),
@@ -3605,10 +3587,8 @@ mod tests {
         // stop_tracker_timeout <= 0 the stopped event is not sent.
         let (listener, url) = http_listener().await;
         let token = CancellationToken::new();
-        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let udp_sock = crate::test_support::loopback_udp().await;
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
         let stopped = StoppedAnnounces::new(Duration::ZERO);
         let mut peers = TrackerComms::start_with_tiers(
             v1_hash(),
@@ -3618,7 +3598,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_vote(),
-            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            crate::test_support::loopback(),
             reach_all(),
             udp_client,
             stopped.clone(),
@@ -3647,10 +3627,8 @@ mod tests {
     async fn test_http_announce_carries_the_torrents_peer_id_and_user_agent() {
         let (listener, url) = http_listener().await;
         let token = CancellationToken::new();
-        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let udp_sock = crate::test_support::loopback_udp().await;
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
         let stopped = StoppedAnnounces::default();
         let mut peers = TrackerComms::start_with_tiers(
             v1_hash(),
@@ -3660,11 +3638,11 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_vote(),
-            Arc::new(|| {
+            Arc::new(crate::test_support::Loopback::with(|| {
                 reqwest::Client::builder()
                     .no_proxy()
                     .user_agent("Session/1.0")
-            }),
+            })),
             reach_all(),
             udp_client,
             stopped.clone(),
@@ -3711,10 +3689,8 @@ mod tests {
             completed: tokio::sync::watch::channel(false).0,
         });
         let token = CancellationToken::new();
-        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let udp_sock = crate::test_support::loopback_udp().await;
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
         let stopped = StoppedAnnounces::default();
         let mut peers = TrackerComms::start_with_tiers(
             v1_hash(),
@@ -3724,7 +3700,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_vote(),
-            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            crate::test_support::loopback(),
             reach_all(),
             udp_client,
             stopped.clone(),
@@ -3855,10 +3831,8 @@ mod tests {
     #[tokio::test]
     async fn test_stream_dropped_before_any_announce_sends_nothing() {
         let token = CancellationToken::new();
-        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let udp_sock = crate::test_support::loopback_udp().await;
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
         let stopped = StoppedAnnounces::default();
         let peers = TrackerComms::start_with_tiers(
             v1_hash(),
@@ -3870,7 +3844,9 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_vote(),
-            Arc::new(reqwest::Client::builder),
+            Arc::new(crate::test_support::Loopback::with(
+                reqwest::Client::builder,
+            )),
             reach_all(),
             udp_client,
             stopped.clone(),
@@ -3899,10 +3875,8 @@ mod tests {
         stopped: &StoppedAnnounces,
     ) -> (TrackerTask, CancellationToken) {
         let token = CancellationToken::new();
-        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let udp_sock = crate::test_support::loopback_udp().await;
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
         let task = TrackerComms::start_with_tiers(
             v1_hash(),
             identity(),
@@ -3911,7 +3885,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_vote(),
-            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            crate::test_support::loopback(),
             reach_all(),
             udp_client,
             stopped.clone(),
@@ -4163,10 +4137,8 @@ mod tests {
         let (refusing, refusing_url) = http_listener().await;
         let (listener, url) = http_listener().await;
         let token = CancellationToken::new();
-        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), None);
+        let udp_sock = crate::test_support::loopback_udp().await;
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
         let (votes, mut voted) = tokio::sync::mpsc::unbounded_channel();
         let stopped = StoppedAnnounces::default();
         let mut peers = TrackerComms::start_with_tiers(
@@ -4177,7 +4149,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             Arc::new(move |ours, by| votes.send((ours, by)).unwrap()),
-            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            crate::test_support::loopback(),
             reach_all(),
             udp_client,
             stopped.clone(),
@@ -4424,14 +4396,11 @@ mod tests {
         tiers.push(vec![ok_url]);
 
         let token = CancellationToken::new();
-        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
+        let udp_sock = crate::test_support::loopback_udp().await;
         let resolver = Arc::new(FixedResolver {
             at: Ipv4Addr::LOCALHOST.into(),
         });
-        let udp_client =
-            UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), Some(resolver));
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, Some(resolver));
         let stopped = StoppedAnnounces::default();
         let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
             v1_hash(),
@@ -4441,7 +4410,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(Some(6881)).1,
             no_vote(),
-            Arc::new(|| reqwest::Client::builder().no_proxy()),
+            crate::test_support::loopback(),
             reach_all(),
             udp_client,
             stopped.clone(),
@@ -4532,10 +4501,11 @@ mod tests {
     }
 
     impl HttpClients for Pinned {
-        fn builder(
+        fn client(
             &self,
             target: Option<HttpTarget<'_>>,
-        ) -> anyhow::Result<reqwest::ClientBuilder> {
+            shape: &ClientShape,
+        ) -> anyhow::Result<reqwest::Client> {
             if let Some(t) = &target {
                 self.built
                     .lock()
@@ -4544,7 +4514,7 @@ mod tests {
             let builder = reqwest::Client::builder()
                 .no_proxy()
                 .dns_resolver(Arc::new(NoNames));
-            Ok(crate::core::net::for_target(builder, target))
+            crate::test_support::client(builder, target, shape)
         }
     }
 
@@ -4559,14 +4529,11 @@ mod tests {
         let (port, moved_port) = (at.port().unwrap(), moved_at.port().unwrap());
         let url = Url::parse(&format!("http://tracker.invalid:{port}/announce")).unwrap();
         let token = CancellationToken::new();
-        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
+        let udp_sock = crate::test_support::loopback_udp().await;
         let resolver = Arc::new(FixedResolver {
             at: Ipv4Addr::LOCALHOST.into(),
         });
-        let udp_client =
-            UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), Some(resolver));
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, Some(resolver));
         let clients = Arc::new(Pinned::default());
         let mut peers = TrackerComms::start_with_tiers(
             v1_hash(),
@@ -4636,10 +4603,11 @@ mod tests {
     }
 
     impl HttpClients for Wired {
-        fn builder(
+        fn client(
             &self,
             target: Option<HttpTarget<'_>>,
-        ) -> anyhow::Result<reqwest::ClientBuilder> {
+            shape: &ClientShape,
+        ) -> anyhow::Result<reqwest::Client> {
             let at = [self.at.ip()];
             let target = target.map(|t| {
                 self.built.lock().extend(t.addrs);
@@ -4648,7 +4616,7 @@ mod tests {
             let builder = reqwest::Client::builder()
                 .no_proxy()
                 .dns_resolver(Arc::new(NoNames));
-            Ok(crate::core::net::for_target(builder, target))
+            crate::test_support::client(builder, target, shape)
         }
 
         fn egress(&self, to: SocketAddr) -> Egress {
@@ -4693,14 +4661,9 @@ mod tests {
         token: &CancellationToken,
         stopped: &StoppedAnnounces,
     ) -> TrackerTask {
-        let udp_sock = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        udp_sock.set_nonblocking(true).unwrap();
-        let udp_sock = tokio::net::UdpSocket::from_std(udp_sock).unwrap();
-        let udp_client = UdpTrackerClient::new_with_socket(
-            token.clone(),
-            Arc::new(udp_sock),
-            Some(Arc::new(names)),
-        );
+        let udp_sock = crate::test_support::loopback_udp_now();
+        let udp_client =
+            UdpTrackerClient::new_with_socket(token.clone(), udp_sock, Some(Arc::new(names)));
         TrackerComms::start_with_tiers(
             v1_hash(),
             identity(),
@@ -5088,16 +5051,11 @@ mod tests {
     async fn test_udp_tracker_hostname_through_custom_resolver() {
         const CONNECTION_ID: u64 = 0x1122_3344_5566_7788;
 
-        let tracker = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let tracker_addr = tracker.local_addr().unwrap();
+        let tracker = crate::test_support::loopback_udp().await;
+        let tracker_addr = tracker.bind_addr();
 
-        let client_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let client_addr = client_sock.local_addr().unwrap();
-        let client_sock: Arc<dyn DatagramSocket> = Arc::new(client_sock);
+        let client_sock = crate::test_support::loopback_udp().await;
+        let client_addr = client_sock.bind_addr();
 
         let resolver = Arc::new(CountingResolver {
             calls: AtomicUsize::new(0),
@@ -5152,10 +5110,8 @@ mod tests {
     async fn a_udp_answer_has_libtorrents_min_interval() {
         // libtorrent udp_tracker_connection::on_announce_response: BEP 15
         // carries no min interval, so it is 60 s.
-        let tracker = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let url = Url::parse(&format!("udp://{}/announce", tracker.local_addr().unwrap())).unwrap();
+        let tracker = crate::test_support::loopback_udp().await;
+        let url = Url::parse(&format!("udp://{}/announce", tracker.bind_addr())).unwrap();
         let stopped = StoppedAnnounces::default();
         let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
         let TrackerTask { mut peers, status } = task;
@@ -5277,10 +5233,11 @@ mod tests {
         // one the ip_filter blocks; with none left the announce fails,
         // announce_skipped or banned_by_ip_filter, before anything is sent.
         let (http, http_at) = http_listener().await;
-        let udp = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let (hp, up) = (http_at.port().unwrap(), udp.local_addr().unwrap().port());
+        let udp = crate::test_support::loopback_kernel_udp();
+        let (hp, up) = (
+            http_at.port().unwrap(),
+            crate::network::DatagramSocket::bind_addr(&*udp).port(),
+        );
         let url = |s: &str| {
             Url::parse(
                 &s.replace("HP", &hp.to_string())
@@ -5304,11 +5261,8 @@ mod tests {
             vec![Ipv6Addr::LOCALHOST.into(), loopback],
         )]));
         let token = CancellationToken::new();
-        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let udp_client =
-            UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), Some(resolver));
+        let udp_sock = crate::test_support::loopback_udp().await;
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, Some(resolver));
         let clients = Arc::new(Pinned::default());
         let stopped = StoppedAnnounces::default();
         let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(
@@ -5362,11 +5316,8 @@ mod tests {
             ("moved.invalid", vec![blocked]),
         ]));
         let token = CancellationToken::new();
-        let udp_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let udp_client =
-            UdpTrackerClient::new_with_socket(token.clone(), Arc::new(udp_sock), Some(resolver));
+        let udp_sock = crate::test_support::loopback_udp().await;
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, Some(resolver));
         let clients = Arc::new(Pinned::default());
         let stopped = StoppedAnnounces::default();
         let TrackerTask { mut peers, status } = TrackerComms::start_with_tiers(

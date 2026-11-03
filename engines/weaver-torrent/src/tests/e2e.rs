@@ -122,7 +122,7 @@ async fn _test_e2e_download(mode: ListenerMode, drop_checks: &DropChecks) {
                         }),
                         root_span: Some(error_span!(parent: None, "server", id = i)),
                         disable_local_service_discovery: true,
-                        ..Default::default()
+                        ..crate::test_support::session_options()
                     },
                 )
                 .await
@@ -237,7 +237,7 @@ async fn _test_e2e_download(mode: ListenerMode, drop_checks: &DropChecks) {
                 fastresume: true,
                 disable_local_service_discovery: true,
                 root_span: Some(error_span!("client")),
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await

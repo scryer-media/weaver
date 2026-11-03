@@ -17,8 +17,6 @@ use std::{
 use crate::core::hash_id::Id20;
 use anyhow::bail;
 use futures::TryFutureExt;
-use librqbit_dualstack_sockets::ConnectOpts;
-use librqbit_utp::BindDevice;
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
@@ -87,14 +85,28 @@ impl Default for ConnectionOptions {
     }
 }
 
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub(crate) struct StreamConnectorArgs {
     pub enable_tcp: bool,
     pub utp_socket: Option<UtpSocket>,
-    pub bind_device: Option<BindDevice>,
     pub ipv4_only: bool,
-    pub socket_factory: Option<Arc<dyn SocketFactory>>,
+    pub socket_factory: Arc<dyn SocketFactory>,
     pub encryption: EncryptionPolicy,
+}
+
+#[cfg(test)]
+impl StreamConnectorArgs {
+    /// A connector's arguments over `socket_factory`: TCP, no uTP, both
+    /// families, no encryption.
+    pub(crate) fn over(socket_factory: Arc<dyn SocketFactory>) -> Self {
+        Self {
+            enable_tcp: true,
+            utp_socket: None,
+            ipv4_only: false,
+            socket_factory,
+            encryption: EncryptionPolicy::Disabled,
+        }
+    }
 }
 
 gen_stats!(SingleStatAtomic SingleStatSnapshot, [
@@ -122,20 +134,13 @@ gen_stats!(ConnectStatsAtomic ConnectStatsSnapshot, [], [
     encryption EncryptionStatsAtomic EncryptionStatsSnapshot
 ]);
 
-/// An outgoing TCP connection: a kernel socket, or streams from a `SocketFactory`.
-enum TcpConn {
-    Kernel(tokio::net::TcpStream),
-    Custom(BoxAsyncReadVectored, BoxAsyncWrite),
-}
-
 #[derive(Debug)]
 pub(crate) struct StreamConnector {
     enable_tcp: bool,
-    bind_device: Option<BindDevice>,
     utp_socket: Option<UtpSocket>,
     stats: ConnectStatsAtomic,
     ipv4_only: bool,
-    socket_factory: Option<Arc<dyn SocketFactory>>,
+    socket_factory: Arc<dyn SocketFactory>,
     // The session's encryption, as `policy_code` writes it: a change of the
     // settings moves it while the session runs.
     encryption: AtomicU8,
@@ -167,7 +172,6 @@ impl StreamConnector {
         Ok(Self {
             enable_tcp: config.enable_tcp,
             utp_socket: config.utp_socket,
-            bind_device: config.bind_device,
             stats: Default::default(),
             ipv4_only: config.ipv4_only,
             socket_factory: config.socket_factory,
@@ -307,26 +311,6 @@ impl StreamConnector {
             .inspect_err(|_| stat.errors(1))
     }
 
-    async fn tcp_connect(
-        &self,
-        addr: SocketAddr,
-    ) -> librqbit_dualstack_sockets::Result<tokio::net::TcpStream> {
-        self.with_stat(
-            ConnectionKind::Tcp,
-            addr.is_ipv6(),
-            librqbit_dualstack_sockets::tcp_connect(
-                addr,
-                ConnectOpts {
-                    // Setting source port doesn't work with cloudflare warp on linux
-                    // source_port: self.tcp_source_port,
-                    source_port: None,
-                    bind_device: self.bind_device.as_ref(),
-                },
-            ),
-        )
-        .await
-    }
-
     pub fn stats(&self) -> &ConnectStatsAtomic {
         &self.stats
     }
@@ -359,20 +343,14 @@ impl StreamConnector {
             if !tcp {
                 return Ok(None);
             }
-            let conn = match self.socket_factory.as_ref() {
-                Some(factory) => {
-                    let (r, w) = self
-                        .with_stat(
-                            ConnectionKind::Tcp,
-                            addr.is_ipv6(),
-                            factory.connect_tcp(addr),
-                        )
-                        .await
-                        .map_err(librqbit_dualstack_sockets::Error::Connect)?;
-                    TcpConn::Custom(r, w)
-                }
-                None => TcpConn::Kernel(self.tcp_connect(addr).await?),
-            };
+            let conn = self
+                .with_stat(
+                    ConnectionKind::Tcp,
+                    addr.is_ipv6(),
+                    self.socket_factory.connect_tcp(addr),
+                )
+                .await
+                .map_err(librqbit_dualstack_sockets::Error::Connect)?;
             debug!(?addr, "connected over TCP");
             Ok::<_, librqbit_dualstack_sockets::Error>(Some(conn))
         };
@@ -421,11 +399,7 @@ impl StreamConnector {
             tokio::select! {
                 tcp_res = &mut tcp_connect, if tcp_err.is_none() => {
                     match tcp_res {
-                        Ok(Some(TcpConn::Kernel(stream))) => {
-                            let (r, w) = stream.into_split();
-                            return Ok((ConnectionKind::Tcp, Box::new(r), Box::new(w)));
-                        },
-                        Ok(Some(TcpConn::Custom(r, w))) => {
+                        Ok(Some((r, w))) => {
                             return Ok((ConnectionKind::Tcp, r, w));
                         },
                         Ok(None) => {
@@ -468,18 +442,26 @@ mod tests {
 
     /// A connector that may use TCP, and uTP when `utp` holds.
     async fn connector(utp: bool) -> StreamConnector {
+        let sockets = crate::test_support::socket_factory();
         let utp_socket = match utp {
-            true => Some(UtpSocket::Udp(
-                UtpSocketUdp::new_udp((Ipv4Addr::LOCALHOST, 0).into())
-                    .await
-                    .unwrap(),
-            )),
+            true => Some(
+                crate::listen::bind_utp(
+                    sockets.as_ref(),
+                    (Ipv4Addr::LOCALHOST, 0).into(),
+                    Default::default(),
+                    crate::udp_options::STREAM_WINDOW,
+                )
+                .await
+                .unwrap(),
+            ),
             false => None,
         };
         StreamConnector::new(StreamConnectorArgs {
             enable_tcp: true,
             utp_socket,
-            ..Default::default()
+            ipv4_only: false,
+            socket_factory: sockets,
+            encryption: EncryptionPolicy::Disabled,
         })
         .await
         .unwrap()
@@ -537,9 +519,10 @@ mod tests {
         let (tx, dialed) = tokio::sync::mpsc::unbounded_channel();
         let connector = StreamConnector::new(StreamConnectorArgs {
             enable_tcp: true,
-            socket_factory: Some(Arc::new(Dialed(tx))),
+            utp_socket: None,
+            ipv4_only: false,
+            socket_factory: Arc::new(Dialed(tx)),
             encryption,
-            ..Default::default()
         })
         .await
         .unwrap();

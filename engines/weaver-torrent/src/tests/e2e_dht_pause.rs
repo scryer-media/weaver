@@ -3,15 +3,12 @@
 
 use std::{
     io,
-    net::{Ipv4Addr, SocketAddr, UdpSocket},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
 };
 
 use anyhow::Context;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     AddTorrent, AddTorrentOptions, DhtSessionConfig, ListenerOptions, Session, SessionOptions,
@@ -62,26 +59,35 @@ impl SocketFactory for Loopback {
 
 // The blocking receive keeps the paused clock still until the test advances
 // it. Every query is answered; searches and announces are reported by hash.
+// Dropping the node drops `_stop`, which ends its receive.
 struct Node {
     addr: SocketAddr,
-    stop: Arc<AtomicBool>,
+    _stop: oneshot::Sender<()>,
     heard: mpsc::UnboundedReceiver<(Id20, bool)>,
 }
 
 impl Node {
     fn new() -> anyhow::Result<Self> {
-        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
-        let addr = socket.local_addr()?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = stop.clone();
+        // Served from the blocking pool, which holds the paused clock still
+        // while the node waits for a datagram.
+        let socket = crate::test_support::loopback_udp_now();
+        let addr = socket.bind_addr();
+        let runtime = tokio::runtime::Handle::current();
+        let (stop, mut stopped) = oneshot::channel::<()>();
         let (tx, heard) = mpsc::unbounded_channel();
         tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 4096];
             loop {
-                let (len, from) = socket.recv_from(&mut buf).unwrap();
-                if stopped.load(Ordering::SeqCst) {
+                let received = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = &mut stopped => None,
+                        received = socket.recv_from(&mut buf) => received.ok(),
+                    }
+                });
+                let Some((len, from)) = received else {
                     break;
-                }
+                };
                 let msg = bprotocol::deserialize_message::<ByteBufOwned>(&buf[..len]).unwrap();
                 match &msg.kind {
                     MessageKind::GetPeersRequest(q) => {
@@ -106,10 +112,14 @@ impl Node {
                     }),
                 )
                 .unwrap();
-                socket.send_to(&reply, from).unwrap();
+                runtime.block_on(socket.send_to(&reply, from)).unwrap();
             }
         });
-        Ok(Self { addr, stop, heard })
+        Ok(Self {
+            addr,
+            _stop: stop,
+            heard,
+        })
     }
 
     async fn announced(&mut self, hash: Id20, forbidden: Option<Id20>) -> anyhow::Result<()> {
@@ -119,15 +129,6 @@ impl Node {
             if asked == hash && announce {
                 return Ok(());
             }
-        }
-    }
-}
-
-impl Drop for Node {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Ok(socket) = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) {
-            let _ = socket.send_to(&[], self.addr);
         }
     }
 }
@@ -149,10 +150,10 @@ async fn a_paused_hash_stops_searching_and_announcing_until_resumed() -> anyhow:
                 announce_port: Some(6881),
                 ..Default::default()
             }),
-            socket_factory: Some(Arc::new(Loopback)),
+            socket_factory: Arc::new(Loopback),
             disable_local_service_discovery: true,
             persistence: None,
-            ..Default::default()
+            ..crate::test_support::session_options()
         },
     )
     .await?;

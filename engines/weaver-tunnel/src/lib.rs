@@ -40,7 +40,17 @@ pub mod wireguard;
 #[allow(clippy::disallowed_methods)]
 #[cfg(any(test, feature = "test-support"))]
 #[path = "shared_test_support.rs"]
-pub mod test_support;
+mod fixtures;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    pub use crate::fixtures::*;
+    #[cfg(feature = "test-support")]
+    #[path = "http_client.rs"]
+    pub mod http_client;
+    #[cfg(feature = "test-support")]
+    pub use http_client::system_dialer;
+}
 
 pub use error::TunnelError;
 pub use http3::{Http3ProxyCredentials, Http3TunnelProvider, Http3TunnelSpec};

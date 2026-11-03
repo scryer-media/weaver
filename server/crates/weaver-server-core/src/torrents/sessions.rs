@@ -237,7 +237,9 @@ pub struct RoutePlan {
 pub struct OpenLeg {
     pub kind: LegKind,
     pub shape: Shape,
-    pub factory: Option<Arc<dyn SocketFactory>>,
+    /// Every socket the session opens: the kernel's on an own-socket leg's
+    /// device, else the leg's dialer's.
+    pub factory: Arc<dyn SocketFactory>,
     /// Every name the session looks up, on whichever leg: the leg's
     /// dialer's naming, which records each lookup as every other dial does.
     pub names: Arc<dyn Resolver>,
@@ -250,37 +252,29 @@ pub struct OpenLeg {
 
 impl OpenLeg {
     /// A leg of `kind` over `dialer`, as every session's leg is opened. A
-    /// session on an own-socket leg opens kernel sockets itself and looks
-    /// its names up through `dialer`; on any other leg its sockets and names
-    /// come from `dialer` too, and a ladder's HTTP rides `bridge`.
+    /// session on an own-socket leg opens the kernel's sockets on the leg's
+    /// device and looks its names up through `dialer`; on any other leg its
+    /// sockets and names come from `dialer` too, and a ladder's HTTP rides
+    /// `bridge`.
     pub fn on(
         kind: LegKind,
         dialer: Arc<dyn Dialer>,
         bridge: Option<Arc<Bridge>>,
         leg: Option<Arc<TorrentLeg>>,
     ) -> Result<Self, String> {
-        let factory = (!kind.own_sockets()).then(|| {
-            Arc::new(LegSockets::new(Arc::clone(&dialer), &kind)) as Arc<dyn SocketFactory>
-        });
+        let factory: Arc<dyn SocketFactory> = if kind.own_sockets() {
+            Arc::new(KernelSockets::new(kind.bind_device()).map_err(|error| format!("{error:#}"))?)
+        } else {
+            Arc::new(LegSockets::new(Arc::clone(&dialer), &kind))
+        };
         Ok(Self {
             shape: kind.shape(Some(&dialer)),
             factory,
+            http: tracker_client(&kind, Arc::clone(&dialer), bridge)?,
             names: Arc::new(LegNames(dialer)),
-            http: tracker_client(&kind, bridge)?,
             kind,
             leg,
         })
-    }
-
-    /// The sockets a session on the leg opens: the leg's factory's, or the
-    /// kernel's on the leg's device.
-    pub fn sockets(&self) -> Result<Arc<dyn SocketFactory>, String> {
-        match &self.factory {
-            Some(factory) => Ok(Arc::clone(factory)),
-            None => KernelSockets::new(self.kind.bind_device())
-                .map(|sockets| Arc::new(sockets) as Arc<dyn SocketFactory>)
-                .map_err(|error| format!("{error:#}")),
-        }
     }
 }
 
@@ -592,10 +586,9 @@ pub fn session_options(
         )),
         ip_filter,
         disable_local_service_discovery: !shape.own_sockets,
-        socket_factory: leg.factory.clone(),
         resolver: Some(Arc::clone(&leg.names)),
         http_client: Some(leg.http.clone()),
-        ..SessionOptions::default()
+        ..SessionOptions::new(Arc::clone(&leg.factory))
     };
     apply_encryption(&mut options, torrent.encryption);
     options

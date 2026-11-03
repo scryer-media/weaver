@@ -113,7 +113,9 @@ impl IpRanges {
         self.len() == 0
     }
 
-    pub async fn load_from_url(client: &reqwest::Client, url: &str) -> Result<Self> {
+    /// The list at `url`: a file read from disk, anything else fetched
+    /// with a client from `clients`.
+    pub async fn load_from_url(clients: &dyn crate::HttpClients, url: &str) -> Result<Self> {
         let parsed_url = Url::parse(url).context("failed to parse URL")?;
 
         if parsed_url.scheme() == "file" {
@@ -124,7 +126,9 @@ impl IpRanges {
             return Self::load_from_file(path).await;
         }
 
-        let response = client
+        let response = clients
+            .client(None, &crate::ClientShape::FETCH)
+            .context("error building HTTP(S) client")?
             .get(parsed_url)
             .send()
             .await
@@ -379,8 +383,8 @@ mod tests {
     #[tokio::test]
     async fn test_list_real_url() {
         setup_test_logging();
-        let client = reqwest::Client::new();
-        let _ = IpRanges::load_from_url(&client, "https://raw.githubusercontent.com/Naunter/BT_BlockLists/refs/heads/master/bt_blocklists.gz")
+        let clients = crate::test_support::Loopback::default();
+        let _ = IpRanges::load_from_url(&clients, "https://raw.githubusercontent.com/Naunter/BT_BlockLists/refs/heads/master/bt_blocklists.gz")
             .await
             .unwrap();
     }

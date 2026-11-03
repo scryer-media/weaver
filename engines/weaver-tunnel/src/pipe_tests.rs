@@ -2205,3 +2205,17 @@ async fn a_fixed_forwarded_port_is_listened_on_by_the_forwarded_listener_only() 
     assert_ne!(other.local_addr().port(), FORWARDED);
     assert_ne!(other.local_addr().port(), 0);
 }
+
+// A revoked leg has no route and binds nothing.
+#[test]
+fn a_revoked_leg_reports_no_route() {
+    let leg = Revocable::new(bottom());
+    let to: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    assert!(matches!(leg.source_toward(to), Some(Ok(_))));
+    leg.revoke();
+    assert!(matches!(leg.source_toward(to), Some(Err(_))));
+    assert!(matches!(
+        leg.bind_local_udp("127.0.0.1:0".parse().unwrap()),
+        Some(Err(_))
+    ));
+}

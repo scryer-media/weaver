@@ -81,11 +81,7 @@ impl SocketFactory for CountingFactory {
     ) -> BoxFuture<'a, io::Result<(BoxAsyncReadVectored, BoxAsyncWrite)>> {
         Box::pin(async move {
             self.connect_tcp.fetch_add(1, Ordering::SeqCst);
-            let (r, w) = tokio::net::TcpStream::connect(addr).await?.into_split();
-            Ok((
-                Box::new(r) as BoxAsyncReadVectored,
-                Box::new(w) as BoxAsyncWrite,
-            ))
+            crate::test_support::tcp(addr).await
         })
     }
 
@@ -109,8 +105,7 @@ impl SocketFactory for CountingFactory {
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
         Box::pin(async move {
             self.bind_udp.fetch_add(1, Ordering::SeqCst);
-            let sock = tokio::net::UdpSocket::bind(addr).await?;
-            Ok(Arc::new(sock) as Arc<dyn DatagramSocket>)
+            crate::test_support::udp_at(addr).await
         })
     }
 }
@@ -130,8 +125,8 @@ fn session_opts(
         disable_local_service_discovery: true,
         listen,
         connect,
-        socket_factory: Some(factory.clone()),
-        ..Default::default()
+        socket_factory: factory.clone(),
+        ..crate::test_support::session_options()
     }
 }
 
@@ -287,8 +282,7 @@ async fn test_stream_connector_dials_through_factory() -> anyhow::Result<()> {
 
     let connector = StreamConnector::new(StreamConnectorArgs {
         enable_tcp: true,
-        socket_factory: Some(factory.clone()),
-        ..Default::default()
+        ..StreamConnectorArgs::over(factory.clone())
     })
     .await?;
 

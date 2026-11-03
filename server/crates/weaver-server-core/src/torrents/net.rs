@@ -8,10 +8,12 @@
 //! UDP trackers) and whether it can listen are the dialer's to say: a ladder
 //! leg listens inside its tunnel when it ends in a WireGuard hop.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io::{self, IoSliceMut};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 
@@ -22,7 +24,7 @@ use weaver_torrent::network::{
 };
 use weaver_torrent::upnp::{PortMapReceiver, PortMapped, PortmapProtocol, PortmapTransport};
 use weaver_torrent::{
-    Egress, HttpClients, HttpTarget, Session, SocketFactory, StreamListener, route_to,
+    ClientShape, ClientUse, Egress, HttpClients, HttpTarget, Session, SocketFactory, StreamListener,
 };
 use weaver_tunnel::bridge::{Bridge, ConnectionOutcome};
 use weaver_tunnel::endpoint::{DatagramSocket as TunnelSocket, DatagramTransport};
@@ -263,6 +265,48 @@ fn halves(stream: DialedStream) -> (BoxAsyncReadVectored, BoxAsyncWrite) {
     }
 }
 
+impl LegSockets {
+    // The leg's datagram socket for `addr`; one the leg binds at its source
+    // address is set for uTP with `utp`'s receive buffer when it holds one.
+    fn bind_datagrams<'a>(
+        &'a self,
+        addr: SocketAddr,
+        utp: Option<usize>,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        if let Some(ip) = self.source {
+            // The leg's route binds it at the leg's source address, as it
+            // binds every socket the leg dials from.
+            let requested = SocketAddr::new(ip, addr.port());
+            let bound = self.dialer.bind_local_udp(requested);
+            return Box::pin(async move {
+                let socket = bound.unwrap_or_else(|| {
+                    Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "the leg binds no socket of its own",
+                    ))
+                })?;
+                let socket = tokio::net::UdpSocket::from_std(socket)?;
+                if let Some(receive_buffer) = utp {
+                    weaver_torrent::network::set_for_utp(&socket, requested, receive_buffer);
+                }
+                Ok(Arc::new(socket) as Arc<dyn DatagramSocket>)
+            });
+        }
+        let Some(carrier) = self.carrier() else {
+            return Box::pin(async move {
+                Ok(Arc::new(NoDatagrams::new(addr)) as Arc<dyn DatagramSocket>)
+            });
+        };
+        shared(async move {
+            let socket = carrier.bind(addr).await.map_err(io::Error::other)?;
+            Ok(Arc::new(Carried {
+                bind_addr: socket.local_addr().unwrap_or(addr),
+                socket,
+            }) as Arc<dyn DatagramSocket>)
+        })
+    }
+}
+
 impl SocketFactory for LegSockets {
     fn connect_tcp<'a>(
         &'a self,
@@ -310,26 +354,28 @@ impl SocketFactory for LegSockets {
         &'a self,
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
-        if let Some(ip) = self.source {
-            return Box::pin(async move {
-                Ok(
-                    Arc::new(tokio::net::UdpSocket::bind(SocketAddr::new(ip, addr.port())).await?)
-                        as Arc<dyn DatagramSocket>,
-                )
-            });
-        }
-        let Some(carrier) = self.carrier() else {
-            return Box::pin(async move {
-                Ok(Arc::new(NoDatagrams::new(addr)) as Arc<dyn DatagramSocket>)
-            });
-        };
-        shared(async move {
-            let socket = carrier.bind(addr).await.map_err(io::Error::other)?;
-            Ok(Arc::new(Carried {
-                bind_addr: socket.local_addr().unwrap_or(addr),
-                socket,
-            }) as Arc<dyn DatagramSocket>)
-        })
+        self.bind_datagrams(addr, None)
+    }
+
+    fn bind_utp<'a>(
+        &'a self,
+        addr: SocketAddr,
+        receive_buffer: usize,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        self.bind_datagrams(addr, Some(receive_buffer))
+    }
+
+    // Where the leg's route sends traffic toward `to` from, as its requests
+    // leave.
+    fn source_toward(&self, to: SocketAddr) -> Option<io::Result<IpAddr>> {
+        self.dialer.source_toward(to)
+    }
+
+    fn gateway_socket<'a>(
+        &'a self,
+        local: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        gateway_socket(&self.dialer, local)
     }
 }
 
@@ -531,10 +577,12 @@ impl DatagramSocket for NoDatagrams {
 /// The HTTP clients of a session on a leg: the one for no target downloads
 /// metainfo, and a tracker or web seed is asked through one held to the
 /// addresses its host was checked at. A ladder leg's clients ride `bridge`,
-/// the leg's own. They name no client: each request names the client of
-/// the torrent it is for.
+/// the leg's own; a direct leg's route is `dialer`'s, which says where a
+/// request leaves and binds the port mapper's socket. They name no client:
+/// each request names the client of the torrent it is for.
 pub fn tracker_client(
     kind: &LegKind,
+    dialer: Arc<dyn Dialer>,
     bridge: Option<Arc<Bridge>>,
 ) -> Result<Arc<dyn HttpClients>, String> {
     let bridge = match (kind, bridge) {
@@ -544,54 +592,167 @@ pub fn tracker_client(
     };
     let base = {
         let kind = kind.clone();
-        move || {
-            let builder = reqwest::Client::builder();
-            Ok(match &kind {
-                LegKind::Ladder | LegKind::System => builder,
-                LegKind::SourceAddress(address) => builder.local_address(*address),
-                LegKind::Interface(name) => bound_to(builder, name)?,
-            })
+        move || match &kind {
+            LegKind::Interface(name) => bound_to(reqwest::Client::builder(), name),
+            kind => Ok(plain_builder(kind)),
         }
     };
-    let clients = LegClients {
-        base,
-        bridge,
-        kind: kind.clone(),
-        trackers: Mutex::default(),
-    };
+    let clients = LegClients::new(base, bridge, kind.clone(), dialer);
     // A leg whose clients cannot be built does not open.
-    let _ = clients.builder(None).map_err(|error| error.to_string())?;
+    let _ = clients
+        .client(None, &ClientShape::FETCH)
+        .map_err(|error| format!("{error:#}"))?;
     Ok(Arc::new(clients))
 }
 
-/// A session's HTTP clients: each from `base`, through `bridge` on a leg
-/// that has one, leaving as the leg's `kind` does.
-pub(crate) struct LegClients<F> {
-    pub(crate) base: F,
-    pub(crate) bridge: Option<Arc<Bridge>>,
-    pub(crate) kind: LegKind,
-    // The tracker clients built, by target and header case, so an announce
-    // to a tracker the session announced to before builds no client (its
-    // TLS roots, its connector) again.
-    pub(crate) trackers: Mutex<std::collections::HashMap<TrackerTarget, reqwest::Client>>,
+// A builder leaving from the leg's source address when it pins one, and
+// held to no device.
+fn plain_builder(kind: &LegKind) -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder();
+    match kind {
+        LegKind::SourceAddress(address) => builder.local_address(*address),
+        _ => builder,
+    }
 }
 
-// A tracker client's target: its host, port and checked addresses, and
-// whether it writes header names capitalised.
-pub(crate) type TrackerTarget = (String, u16, Vec<IpAddr>, bool);
+// The host's loopback interface, for a leg bound to it.
+#[cfg(test)]
+pub(crate) const LOOPBACK_DEVICE: &str = if cfg!(target_os = "linux") {
+    "lo"
+} else {
+    "lo0"
+};
 
-// The most tracker clients a session keeps; past it they are built again.
-const TRACKER_CLIENTS_KEPT: usize = 1024;
+// A leg on the host's own sockets.
+#[cfg(test)]
+pub(crate) fn system_dialer() -> Arc<dyn Dialer> {
+    Arc::new(weaver_tunnel::pipe::Revocable::new(Arc::new(
+        weaver_tunnel::pipe::Egress::new(
+            4,
+            weaver_tunnel::egress::SocketEgress::System,
+            std::time::Duration::from_secs(30),
+        ),
+    )))
+}
 
-impl<F> HttpClients for LegClients<F>
+/// A session's HTTP clients: each from `base`, through `bridge` on a leg
+/// that has one, leaving as the leg's `kind` does. One client is built for
+/// each target and shape, and handed back each time it is asked for again,
+/// so an announce or a web seed request to a host the session asked before
+/// builds no client (its TLS roots, its connector) again. The clients live
+/// with the leg: a session on a new route opens a new leg, and builds its
+/// own.
+pub(crate) struct LegClients<F> {
+    base: F,
+    bridge: Option<Arc<Bridge>>,
+    kind: LegKind,
+    dialer: Arc<dyn Dialer>,
+    kept: Mutex<Kept>,
+    built: AtomicUsize,
+}
+
+// A client's target, its host, port and checked addresses, and its shape.
+type ClientKey = (String, u16, Vec<IpAddr>, ClientShape);
+
+// The most clients a leg keeps of each kind; past it the one asked for
+// longest ago is dropped, and built again when next asked for.
+const CLIENTS_KEPT: usize = 1024;
+
+// A leg's clients: those one torrent's web seeds use apart from the rest,
+// so however many torrents a queue holds, their clients never push out the
+// leg's tracker, metainfo and gateway clients.
+#[derive(Default)]
+struct Kept {
+    shared: Recent,
+    per_torrent: Recent,
+}
+
+impl Kept {
+    fn of(&mut self, shape: &ClientShape) -> &mut Recent {
+        if shape.torrent.is_some() {
+            &mut self.per_torrent
+        } else {
+            &mut self.shared
+        }
+    }
+}
+
+// Clients by key, each stamped with when it was last asked for.
+#[derive(Default)]
+struct Recent {
+    clients: HashMap<ClientKey, (reqwest::Client, u64)>,
+    asked: u64,
+}
+
+impl Recent {
+    fn get(&mut self, key: &ClientKey) -> Option<reqwest::Client> {
+        self.asked += 1;
+        let (client, asked) = self.clients.get_mut(key)?;
+        *asked = self.asked;
+        Some(client.clone())
+    }
+
+    fn insert(&mut self, key: ClientKey, client: reqwest::Client) {
+        if self.clients.len() >= CLIENTS_KEPT {
+            let oldest = self
+                .clients
+                .iter()
+                .min_by_key(|(_, (_, asked))| *asked)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                self.clients.remove(&oldest);
+            }
+        }
+        self.clients.insert(key, (client, self.asked));
+    }
+}
+
+impl<F> LegClients<F>
 where
     F: Fn() -> Result<reqwest::ClientBuilder, String> + Send + Sync + 'static,
 {
+    pub(crate) fn new(
+        base: F,
+        bridge: Option<Arc<Bridge>>,
+        kind: LegKind,
+        dialer: Arc<dyn Dialer>,
+    ) -> Self {
+        Self {
+            base,
+            bridge,
+            kind,
+            dialer,
+            kept: Mutex::default(),
+            built: AtomicUsize::new(0),
+        }
+    }
+
+    /// How many clients the leg has built.
+    #[cfg(test)]
+    pub(crate) fn built(&self) -> usize {
+        self.built.load(Ordering::Relaxed)
+    }
+
     // A client for a target dials the host at an address it was checked
     // at, and follows no redirect. Through the leg's bridge, the bridge is
     // handed that address, so the leg dials exactly it; with none, the
-    // name, which the leg's exit resolves.
-    fn builder(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::ClientBuilder> {
+    // name, which the leg's exit resolves. The gateway a port mapper asks
+    // is on the local network: its client, the leg's otherwise, never goes
+    // through a proxy.
+    fn builder(
+        &self,
+        target: Option<HttpTarget<'_>>,
+        shape: &ClientShape,
+    ) -> anyhow::Result<reqwest::ClientBuilder> {
+        if shape.used_for == ClientUse::Gateway {
+            // The port mapper asks the gateway whatever the leg's own
+            // settings make of its builder.
+            let builder = (self.base)().unwrap_or_else(|error| {
+                tracing::debug!(%error, "the leg's builder failed; the gateway's client is built plain");
+                plain_builder(&self.kind)
+            });
+            return shape.apply(builder.no_proxy());
+        }
         let builder = (self.base)().map_err(anyhow::Error::msg)?;
         let (host, port, addrs) = target.map_or(("", 0, &[][..]), |target| {
             (target.host, target.port, target.addrs)
@@ -601,78 +762,91 @@ where
                 .map_err(anyhow::Error::msg)?,
             None => crate::proxies::pinned(builder, host, port, addrs),
         };
-        Ok(match target {
+        shape.apply(match target {
             None => builder,
             Some(_) => builder.redirect(reqwest::redirect::Policy::none()),
         })
     }
+}
 
+impl<F> HttpClients for LegClients<F>
+where
+    F: Fn() -> Result<reqwest::ClientBuilder, String> + Send + Sync + 'static,
+{
     #[expect(
         clippy::disallowed_methods,
-        reason = "a torrent session's client, built for its leg"
+        reason = "a torrent session's client, built once for its leg, target and shape"
     )]
-    fn client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
-        Ok(self.builder(target)?.build()?)
-    }
-
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a torrent session's client, built for its leg"
-    )]
-    fn title_case_client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
-        Ok(self.builder(target)?.http1_title_case_headers().build()?)
-    }
-
-    // One client per target, kept: it keeps no connection idle, so each
-    // announce dials and closes as a client built for it and dropped did.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a torrent session's client, built for its leg"
-    )]
-    fn tracker_client(
+    fn client(
         &self,
-        target: HttpTarget<'_>,
-        title_case: bool,
+        target: Option<HttpTarget<'_>>,
+        shape: &ClientShape,
     ) -> anyhow::Result<reqwest::Client> {
-        let key = (
-            target.host.to_owned(),
-            target.port,
-            target.addrs.to_vec(),
-            title_case,
+        let key = target.map_or_else(
+            || (String::new(), 0, Vec::new(), shape.clone()),
+            |target| {
+                (
+                    target.host.to_owned(),
+                    target.port,
+                    target.addrs.to_vec(),
+                    shape.clone(),
+                )
+            },
         );
-        if let Some(client) = self
-            .trackers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&key)
-        {
-            return Ok(client.clone());
+        // Built under the lock, so callers racing for one key build it once.
+        let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        let kept = kept.of(shape);
+        if let Some(client) = kept.get(&key) {
+            return Ok(client);
         }
-        let builder = self.builder(Some(target))?.pool_max_idle_per_host(0);
-        let client = if title_case {
-            builder.http1_title_case_headers()
-        } else {
-            builder
-        }
-        .build()?;
-        let mut kept = self.trackers.lock().unwrap_or_else(PoisonError::into_inner);
-        if kept.len() >= TRACKER_CLIENTS_KEPT {
-            kept.clear();
-        }
+        let client = self.builder(target, shape)?.build()?;
+        self.built.fetch_add(1, Ordering::Relaxed);
         kept.insert(key, client.clone());
         Ok(client)
     }
 
     // A request leaves as the leg's sockets do: through the bridge from
-    // wherever the proxy exits, else from the host, bound as the leg is.
+    // wherever the proxy exits, else from where the leg's route sends it.
     fn egress(&self, to: SocketAddr) -> Egress {
-        match (&self.bridge, &self.kind) {
-            (Some(_), _) | (None, LegKind::Ladder) => Egress::Proxied,
-            (None, LegKind::System) => route_to(to, None, None),
-            (None, LegKind::SourceAddress(address)) => route_to(to, Some(*address), None),
-            (None, LegKind::Interface(name)) => route_to(to, None, Some(name)),
+        if self.bridge.is_some() || self.kind == LegKind::Ladder {
+            return Egress::Proxied;
+        }
+        match self.dialer.source_toward(to) {
+            Some(Ok(from)) => Egress::From(from),
+            Some(Err(error)) => {
+                tracing::debug!(%to, %error, "the leg has no route toward the address");
+                Egress::NoRoute
+            }
+            None => Egress::Proxied,
         }
     }
+
+    // The port mapper's socket, bound by the leg's route as its own
+    // sockets are.
+    fn gateway_socket<'a>(
+        &'a self,
+        local: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        gateway_socket(&self.dialer, local)
+    }
+}
+
+// A socket at `local` that `dialer`'s route binds as it binds its own, for
+// a port mapper to ask the gateway from.
+fn gateway_socket<'a>(
+    dialer: &Arc<dyn Dialer>,
+    local: SocketAddr,
+) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+    let bound = dialer.bind_local_udp(local);
+    Box::pin(async move {
+        let socket = bound.unwrap_or_else(|| {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the leg binds no socket of its own",
+            ))
+        })?;
+        Ok(Arc::new(tokio::net::UdpSocket::from_std(socket)?) as Arc<dyn DatagramSocket>)
+    })
 }
 
 #[cfg(any(
@@ -858,6 +1032,21 @@ mod tests {
         let mut got = [0u8; 3];
         let (len, from) = other.recv_from(&mut got).await.unwrap();
         assert_eq!((&got[..len], from), (&b"dht"[..], udp.bind_addr()));
+    }
+
+    // The engine's port mapper asks the leg's sockets for its route and its
+    // gateway socket, as it asks the leg's clients.
+    #[tokio::test]
+    async fn a_source_address_legs_sockets_give_the_mapper_its_route() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let sockets = LegSockets::new(loopback_egress(), &LegKind::SourceAddress(loopback));
+        let gateway = SocketAddr::from(([127, 0, 0, 1], 5351));
+        assert_eq!(sockets.source_toward(gateway).unwrap().unwrap(), loopback);
+        let socket = sockets
+            .gateway_socket(SocketAddr::new(loopback, 0))
+            .await
+            .unwrap();
+        assert_eq!(socket.bind_addr().ip(), loopback);
     }
 
     // A tunnel's datagrams, each socket a loopback socket that stands for
@@ -1350,8 +1539,201 @@ mod tests {
 
     #[test]
     fn a_ladder_client_needs_its_bridge() {
-        assert!(tracker_client(&LegKind::Ladder, None).is_err());
-        assert!(tracker_client(&LegKind::System, None).is_ok());
+        assert!(tracker_client(&LegKind::Ladder, system_dialer(), None).is_err());
+        assert!(tracker_client(&LegKind::System, system_dialer(), None).is_ok());
+    }
+
+    // A leg builds one client for each target and shape and hands it to
+    // every request after: announces and web seed fetches to one host build
+    // one each. Other checked addresses build another, and a session on a
+    // new route, which opens a new leg, builds its own.
+    #[test]
+    fn a_leg_builds_each_client_once() {
+        let leg = || {
+            LegClients::new(
+                || Ok(reqwest::Client::builder().no_proxy()),
+                None,
+                LegKind::System,
+                system_dialer(),
+            )
+        };
+        let clients = leg();
+        let checked = [IpAddr::from([127, 0, 0, 1])];
+        let target = || {
+            Some(HttpTarget {
+                host: "tracker.test",
+                port: 6969,
+                addrs: &checked,
+            })
+        };
+        let announce = ClientShape::of(ClientUse::Tracker { title_case: false });
+        for _ in 0..16 {
+            clients.client(target(), &announce).unwrap();
+            clients.client(target(), &ClientShape::FETCH).unwrap();
+        }
+        assert_eq!(clients.built(), 2);
+
+        let moved = [IpAddr::from([127, 0, 0, 2])];
+        let elsewhere = HttpTarget {
+            host: "tracker.test",
+            port: 6969,
+            addrs: &moved,
+        };
+        clients.client(Some(elsewhere), &announce).unwrap();
+        clients.client(Some(elsewhere), &announce).unwrap();
+        assert_eq!(clients.built(), 3);
+
+        let next = leg();
+        next.client(target(), &announce).unwrap();
+        assert_eq!(next.built(), 1);
+        assert_eq!(clients.built(), 3);
+    }
+
+    // A web seed's client is its torrent's alone: a second ask for one
+    // torrent's seed takes the client built for it, another torrent's seed
+    // on the same host gets its own, so their requests never share a
+    // connection.
+    #[test]
+    fn a_web_seed_client_is_its_torrents_alone() {
+        let clients = LegClients::new(
+            || Ok(reqwest::Client::builder().no_proxy()),
+            None,
+            LegKind::System,
+            system_dialer(),
+        );
+        let checked = [IpAddr::from([127, 0, 0, 1])];
+        let target = || {
+            Some(HttpTarget {
+                host: "seed.test",
+                port: 80,
+                addrs: &checked,
+            })
+        };
+        let one = ClientShape::FETCH.for_torrent(weaver_torrent::core::Id20::new([1; 20]));
+        let other = ClientShape::FETCH.for_torrent(weaver_torrent::core::Id20::new([2; 20]));
+        clients.client(target(), &one).unwrap();
+        clients.client(target(), &one).unwrap();
+        assert_eq!(clients.built(), 1);
+        clients.client(target(), &other).unwrap();
+        assert_eq!(clients.built(), 2);
+    }
+
+    // Callers asking at once for one client get the one built for the
+    // first of them.
+    #[test]
+    fn callers_asking_at_once_build_one_client() {
+        let clients = LegClients::new(
+            || Ok(reqwest::Client::builder().no_proxy()),
+            None,
+            LegKind::System,
+            system_dialer(),
+        );
+        let checked = [IpAddr::from([127, 0, 0, 1])];
+        let announce = ClientShape::of(ClientUse::Tracker { title_case: false });
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    clients
+                        .client(
+                            Some(HttpTarget {
+                                host: "tracker.test",
+                                port: 6969,
+                                addrs: &checked,
+                            }),
+                            &announce,
+                        )
+                        .unwrap();
+                });
+            }
+        });
+        assert_eq!(clients.built(), 1);
+    }
+
+    // A queue's web seeds, one client per torrent past the most a leg
+    // keeps, drop the client asked for longest ago, keep every other, and
+    // leave the tracker's alone.
+    #[test]
+    fn web_seed_clients_never_push_out_the_trackers() {
+        let clients = LegClients::new(
+            || Ok(reqwest::Client::builder().no_proxy()),
+            None,
+            LegKind::System,
+            system_dialer(),
+        );
+        let checked = [IpAddr::from([127, 0, 0, 1])];
+        let target = |host| {
+            Some(HttpTarget {
+                host,
+                port: 80,
+                addrs: &checked,
+            })
+        };
+        let announce = ClientShape::of(ClientUse::Tracker { title_case: false });
+        let seed = |n: usize| {
+            let mut hash = [0u8; 20];
+            hash[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            ClientShape::FETCH.for_torrent(weaver_torrent::core::Id20::new(hash))
+        };
+        clients.client(target("tracker.test"), &announce).unwrap();
+        for n in 1..=CLIENTS_KEPT {
+            clients.client(target("seed.test"), &seed(n)).unwrap();
+        }
+        // The first web seed is asked for again, so the second is now the
+        // one asked for longest ago.
+        clients.client(target("seed.test"), &seed(1)).unwrap();
+        assert_eq!(clients.built(), CLIENTS_KEPT + 1);
+        clients
+            .client(target("seed.test"), &seed(CLIENTS_KEPT + 1))
+            .unwrap();
+        let built = clients.built();
+        assert_eq!(built, CLIENTS_KEPT + 2);
+
+        // The tracker's client is still kept, and so is every web seed's but
+        // the second's, the first's included.
+        clients.client(target("tracker.test"), &announce).unwrap();
+        for n in std::iter::once(1).chain(3..=CLIENTS_KEPT + 1) {
+            clients.client(target("seed.test"), &seed(n)).unwrap();
+            assert_eq!(clients.built(), built, "web seed {n}");
+        }
+        // The second was dropped, and is built again.
+        clients.client(target("seed.test"), &seed(2)).unwrap();
+        assert_eq!(clients.built(), built + 1);
+    }
+
+    // Two legs asked for the same target and shape each build their own
+    // client, from one builder that counts what it is asked for: a client
+    // built for one leg is never handed to the other.
+    #[test]
+    fn legs_never_share_a_client() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let leg = || {
+            let builds = Arc::clone(&builds);
+            LegClients::new(
+                move || {
+                    builds.fetch_add(1, Ordering::Relaxed);
+                    Ok(reqwest::Client::builder().no_proxy())
+                },
+                None,
+                LegKind::System,
+                system_dialer(),
+            )
+        };
+        let checked = [IpAddr::from([127, 0, 0, 1])];
+        let target = || {
+            Some(HttpTarget {
+                host: "seed.test",
+                port: 80,
+                addrs: &checked,
+            })
+        };
+        let last = leg();
+        last.client(target(), &ClientShape::FETCH).unwrap();
+        last.client(target(), &ClientShape::FETCH).unwrap();
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+        let next = leg();
+        next.client(target(), &ClientShape::FETCH).unwrap();
+        assert_eq!(builds.load(Ordering::Relaxed), 2);
+        assert_eq!((last.built(), next.built()), (1, 1));
     }
 
     // A leg's client for a web seed's target dials the host at the checked
@@ -1383,18 +1765,21 @@ mod tests {
         });
 
         // A direct leg's builder, kept off any proxy the host names.
-        let clients = LegClients {
-            base: || Ok(reqwest::Client::builder().no_proxy()),
-            bridge: None,
-            kind: LegKind::System,
-            trackers: Mutex::default(),
-        };
+        let clients = LegClients::new(
+            || Ok(reqwest::Client::builder().no_proxy()),
+            None,
+            LegKind::System,
+            system_dialer(),
+        );
         let client = clients
-            .client(Some(HttpTarget {
-                host: "seed.test",
-                port,
-                addrs: &[IpAddr::from([127, 0, 0, 1])],
-            }))
+            .client(
+                Some(HttpTarget {
+                    host: "seed.test",
+                    port,
+                    addrs: &[IpAddr::from([127, 0, 0, 1])],
+                }),
+                &ClientShape::FETCH,
+            )
             .unwrap();
         let response = client
             .get(format!("http://seed.test:{port}/f"))

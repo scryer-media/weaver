@@ -46,8 +46,9 @@ impl SocketFactory for LoopbackUdpOnly {
         _addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
         Box::pin(async {
-            let sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-            Ok(Arc::new(sock) as Arc<dyn DatagramSocket>)
+            crate::test_support::sockets()
+                .bind_udp((Ipv4Addr::LOCALHOST, 0).into())
+                .await
         })
     }
 }
@@ -55,7 +56,7 @@ impl SocketFactory for LoopbackUdpOnly {
 #[tokio::test]
 async fn test_session_peer_id_fingerprint_is_the_dht_node_id_prefix() -> anyhow::Result<()> {
     // The DHT's one bootstrap node: a loopback socket nobody answers on.
-    let bootstrap = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let bootstrap = crate::test_support::loopback_udp().await;
     let dir = TempDir::with_prefix("test_session_dht_identity")?;
     let peer_id = generate_azereus_style(*b"XY", (1, 2, 3, 4));
 
@@ -67,14 +68,14 @@ async fn test_session_peer_id_fingerprint_is_the_dht_node_id_prefix() -> anyhow:
                 ..Default::default()
             }),
             dht: Some(DhtSessionConfig {
-                bootstrap_addrs: Some(vec![bootstrap.local_addr()?.to_string()]),
+                bootstrap_addrs: Some(vec![bootstrap.bind_addr().to_string()]),
                 port: None,
                 persistence: None,
             }),
             persistence: None,
             disable_local_service_discovery: true,
-            socket_factory: Some(Arc::new(LoopbackUdpOnly)),
-            ..Default::default()
+            socket_factory: Arc::new(LoopbackUdpOnly),
+            ..crate::test_support::session_options()
         },
     )
     .await?;
@@ -127,21 +128,21 @@ async fn test_a_session_names_its_client_to_the_dht() -> anyhow::Result<()> {
             [b"1:v4:WV".as_slice(), &[major, minor]].concat(),
         ),
     ] {
-        let bootstrap = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let bootstrap = crate::test_support::loopback_udp().await;
         let dir = TempDir::with_prefix("test_session_dht_client")?;
         let session = Session::new_with_opts(
             dir.path().into(),
             SessionOptions {
                 identity: Some(identity),
                 dht: Some(DhtSessionConfig {
-                    bootstrap_addrs: Some(vec![bootstrap.local_addr()?.to_string()]),
+                    bootstrap_addrs: Some(vec![bootstrap.bind_addr().to_string()]),
                     port: None,
                     persistence: None,
                 }),
                 persistence: None,
                 disable_local_service_discovery: true,
-                socket_factory: Some(Arc::new(LoopbackUdpOnly)),
-                ..Default::default()
+                socket_factory: Arc::new(LoopbackUdpOnly),
+                ..crate::test_support::session_options()
             },
         )
         .await?;

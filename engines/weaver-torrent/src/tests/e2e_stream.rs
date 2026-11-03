@@ -48,7 +48,7 @@ async fn e2e_stream() -> anyhow::Result<()> {
                 listen_addr: (Ipv4Addr::LOCALHOST, 16001).into(),
                 ..Default::default()
             }),
-            ..Default::default()
+            ..crate::test_support::session_options()
         },
     )
     .await
@@ -93,7 +93,7 @@ async fn e2e_stream() -> anyhow::Result<()> {
                 peer_id: TestPeerMetadata::good().as_peer_id(),
                 ..Default::default()
             }),
-            ..Default::default()
+            ..crate::test_support::session_options()
         },
     )
     .await?;

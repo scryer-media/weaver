@@ -545,6 +545,17 @@ pub trait Dialer: Send + Sync {
     fn inbound(self: Arc<Self>) -> Option<Arc<dyn Inbound>> {
         None
     }
+    // A datagram socket a direct leg's consumer sends from itself, bound on
+    // this stage's egress at `local`'s port. Only an egress binds one: past
+    // a proxy, the consumer's datagrams ride the stage.
+    fn bind_local_udp(&self, _local: SocketAddr) -> Option<io::Result<std::net::UdpSocket>> {
+        None
+    }
+    // The address a datagram to `to` leaves this stage's egress from, or why
+    // no route reaches it. Only an egress says: past a proxy, the exit picks.
+    fn source_toward(&self, _to: SocketAddr) -> Option<io::Result<IpAddr>> {
+        None
+    }
     // The first proxy hop on this stage's path, counted from the egress,
     // whose own last attempt failed.
     fn failing_hop(&self) -> Option<FailingHop> {
@@ -722,6 +733,12 @@ impl Dialer for Egress {
     }
     fn offers(&self) -> Transports {
         Transports::TcpUdp
+    }
+    fn bind_local_udp(&self, local: SocketAddr) -> Option<io::Result<std::net::UdpSocket>> {
+        Some(self.binding.bind_udp_at(local))
+    }
+    fn source_toward(&self, to: SocketAddr) -> Option<io::Result<IpAddr>> {
+        Some(self.binding.source_toward(to))
     }
     fn budget(&self) -> Duration {
         self.timeout

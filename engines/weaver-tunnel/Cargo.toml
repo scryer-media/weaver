@@ -8,7 +8,7 @@ license-file = "LICENSE"
 default = []
 # In-process tunnel, DNS and proxy fixtures for consumer integration tests.
 # Never enabled in a product build.
-test-support = ["proxy-tunnels/test-support", "dep:bytes", "dep:http", "dep:h3", "dep:h3-quinn", "dep:quinn", "dep:tokio-rustls", "dep:rcgen"]
+test-support = ["proxy-tunnels/test-support", "dep:bytes", "dep:http", "dep:h3", "dep:h3-quinn", "dep:quinn", "dep:tokio-rustls", "dep:rcgen", "dep:reqwest"]
 
 [dependencies]
 # Shared protocols pinned to an immutable signed version tag.
@@ -30,6 +30,8 @@ h3-quinn = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"], optional = true }
 tokio-rustls = { workspace = true, optional = true }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "crypto", "pem"], optional = true }
+# Finished HTTP clients for consumers' tests.
+reqwest = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }

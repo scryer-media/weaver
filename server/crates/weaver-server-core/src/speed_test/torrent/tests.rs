@@ -353,7 +353,7 @@ fn route_fields(options: &SessionOptions) -> String {
         "dht {:?} device {:?} trackers off {} stopped {:?} fastresume {} \
          persistence {} peer id {:?} agent {} version {:?} listen {listen:?} \
          connect {connect:?} unchoke {} connections {} slack {} speed {} lsd off {} \
-         pex off {} v4 {} factory {} resolver {} http {} encryption {:?} multiple {} \
+         pex off {} v4 {} resolver {} http {} encryption {:?} multiple {} \
          trackers {:?} allowlist {:?}",
         options.dht.as_ref().map(|dht| dht.bootstrap_addrs.clone()),
         options.bind_device_name,
@@ -371,7 +371,6 @@ fn route_fields(options: &SessionOptions) -> String {
         options.disable_local_service_discovery,
         options.disable_pex,
         options.ipv4_only,
-        options.socket_factory.is_some(),
         options.resolver.is_some(),
         options.http_client.is_some(),
         options.encryption,
@@ -402,7 +401,7 @@ async fn the_probe_opens_with_a_routes_options_on_every_kind_of_leg() {
     };
     for kind in [
         LegKind::System,
-        LegKind::Interface("lo".into()),
+        LegKind::Interface(crate::torrents::net::LOOPBACK_DEVICE.into()),
         source_address(),
         LegKind::Ladder,
     ] {
@@ -434,9 +433,9 @@ async fn the_probe_opens_with_a_routes_options_on_every_kind_of_leg() {
         assert_eq!(route_fields(&probe), route_fields(&route), "{kind:?}");
         assert_eq!(probe.ip_filter, route.ip_filter, "{kind:?}");
         assert!(probe.ip_filter.blocked.has("127.0.0.1".parse().unwrap()));
-        assert_eq!(
-            probe.socket_factory.is_some(),
-            !route_leg.shape.own_sockets,
+        // The probe's sockets are its leg's.
+        assert!(
+            Arc::ptr_eq(&probe.socket_factory, &path.leg.factory),
             "{kind:?}"
         );
         assert_eq!(probe.peer_limit, Some(PEER_LIMIT));
