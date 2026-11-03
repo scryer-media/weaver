@@ -525,6 +525,7 @@ const DOWNLOAD_BLOCK_FIELDS = `
     timezoneName
     scheduledSpeedLimit
     scheduleHoldReason
+    resumeAtEpochMs
   }
 `;
 
@@ -1084,6 +1085,51 @@ export const SERVER_HEALTH_QUERY = gql`
       consecutiveFailures
       prematureDeaths
       pinnedAddress
+      down
+      serverId
+      stateSinceEpochMs
+    }
+  }
+`;
+
+const USAGE_TOTALS_FIELDS = `
+  bytes
+  articlesTried
+  articlesSucceeded
+  downSeconds
+`;
+
+export const USAGE_HISTORY_QUERY = gql`
+  query UsageHistory($range: UsageRange!, $kind: UsageConsumerKind) {
+    usageHistory(range: $range, kind: $kind) {
+      today
+      rangeStart
+      rangeEnd
+      todayStartEpochSec
+      total {
+        kind
+        id
+        today { ${USAGE_TOTALS_FIELDS} }
+        week { ${USAGE_TOTALS_FIELDS} }
+        month { ${USAGE_TOTALS_FIELDS} }
+        year { ${USAGE_TOTALS_FIELDS} }
+        allTime { ${USAGE_TOTALS_FIELDS} }
+        range { ${USAGE_TOTALS_FIELDS} }
+        days { day ${USAGE_TOTALS_FIELDS} }
+      }
+      consumers {
+        kind
+        id
+        today { ${USAGE_TOTALS_FIELDS} }
+        week { ${USAGE_TOTALS_FIELDS} }
+        month { ${USAGE_TOTALS_FIELDS} }
+        year { ${USAGE_TOTALS_FIELDS} }
+        allTime { ${USAGE_TOTALS_FIELDS} }
+        range { ${USAGE_TOTALS_FIELDS} }
+        days { day ${USAGE_TOTALS_FIELDS} }
+      }
+      finishedToday { complete partial failed }
+      finishedInRange { complete partial failed }
     }
   }
 `;

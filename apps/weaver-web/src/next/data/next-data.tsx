@@ -83,6 +83,12 @@ export interface ProviderHealth {
   failureCount: number;
   consecutiveFailures: number;
   prematureDeaths: number;
+  /** Out of use: switched off by a fault, or a transport cooldown still running. */
+  down?: boolean;
+  /** The saved server id the data-used ledger counts it under. */
+  serverId?: number | null;
+  /** When the server was first seen in its current state, epoch ms. */
+  stateSinceEpochMs?: number | null;
   /** The resolved address new connections dial, once a race has picked one. */
   pinnedAddress: string | null;
 }

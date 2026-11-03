@@ -38,8 +38,8 @@ export const nextRouter = createBrowserRouter(
           ...lazyRoute(() => import("./pages/JobDetailPage"), "JobDetailPage"),
         },
         {
-          path: "monitoring",
-          ...lazyRoute(() => import("./pages/MonitoringPage"), "MonitoringPage"),
+          path: "monitoring/:dashboard?",
+          ...lazyRoute(() => import("./pages/monitoring/dashboards"), "MonitoringRoute"),
         },
         {
           path: "system-info",

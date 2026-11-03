@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import { useCallback, useMemo, useState } from "react";
-import { useNavigate } from "react-router";
+import { useNavigate, useSearchParams } from "react-router";
 import { useMutation, useQuery } from "urql";
 import {
   REDOWNLOAD_JOB_MUTATION,
@@ -199,6 +199,19 @@ export function HistoryPage() {
   const [busy, setBusy] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const midnight = useStartOfToday();
+  // `?since=<epoch seconds>` keeps only jobs finished from then on; the
+  // Overview's finished-today count links here with today's midnight.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const sinceParam = Number(searchParams.get("since"));
+  const since = Number.isFinite(sinceParam) && sinceParam > 0 ? Math.floor(sinceParam) : null;
+  const clearSince = useCallback(() => {
+    setPageIndex(0);
+    setSearchParams((previous) => {
+      const next = new URLSearchParams(previous);
+      next.delete("since");
+      return next;
+    });
+  }, [setSearchParams]);
 
   const sortOption = SORT_OPTIONS.find((option) => option.value === sort)!;
   const categories = useMemo(() => facetsToCategories(facets), [facets]);
@@ -211,8 +224,9 @@ export function HistoryPage() {
       categories,
       sortField: sortOption.field,
       sortDirection: sortOption.direction,
+      completedSinceEpochSec: since ?? undefined,
     }),
-    [categories, pageIndex, pageSize, query, sortOption.direction, sortOption.field, tab],
+    [categories, pageIndex, pageSize, query, since, sortOption.direction, sortOption.field, tab],
   );
 
   const [{ data, fetching }, reexecute] = useQuery<HistoryPageResponse>({
@@ -560,7 +574,19 @@ export function HistoryPage() {
               )
             }
             right={
-              <div className="relative">
+              <div className="relative flex items-center gap-4">
+                {since === null ? null : (
+                  <span className="flex items-center gap-2 font-wv-mono text-[11px] text-wv-secondary">
+                    {t("next.completed.since", { time: formatClock(since * 1000) })}
+                    <button
+                      type="button"
+                      onClick={clearSince}
+                      className="cursor-pointer text-wv-muted hover:text-wv-fg"
+                    >
+                      {t("next.completed.showAll")}
+                    </button>
+                  </span>
+                )}
                 <button
                   type="button"
                   data-wv-menu-trigger=""

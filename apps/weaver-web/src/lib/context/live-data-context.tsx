@@ -40,6 +40,8 @@ export interface DownloadBlockState {
   scheduledSpeedLimit: number | null;
   /** Why a schedule rule is holding new downloads, while one is. */
   scheduleHoldReason?: string | null;
+  /** When a timed pause lifts by itself; null for a pause held until resumed. */
+  resumeAtEpochMs?: number | null;
 }
 
 export interface LiveData {
