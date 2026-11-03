@@ -274,6 +274,17 @@ impl NamespaceWriter {
         self.caps.refusal()
     }
 
+    // The job paused or resumed: its extraction deadline does not run
+    // while it is paused.
+    pub(crate) fn hold_clock(&mut self, paused: bool) {
+        self.caps.hold_clock(paused);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clock_held(&self) -> bool {
+        self.caps.clock_held()
+    }
+
     // How many member reads every repair so far needed: the evidence fed as
     // bytes passed settles the rest without one.
     pub(crate) fn read_backs(&self) -> u64 {

@@ -303,7 +303,7 @@ impl Pipeline {
                 }
             }
         };
-        let (transitioned, persisted_snapshot_changed, persist_runtime_to_db, moved) = {
+        let (transitioned, persisted_snapshot_changed, persist_runtime_to_db, moved, old_run_state) = {
             let Some(state) = self.jobs.get_mut(&job_id) else {
                 return;
             };
@@ -376,8 +376,21 @@ impl Pipeline {
                 persisted_snapshot_changed,
                 persist_runtime_to_db,
                 (old_post_state, new_post_state),
+                old_run_state,
             )
         };
+
+        // A graph job kept across a pause spends none of its extraction
+        // deadline while paused.
+        let paused = matches!(new_run_state, crate::jobs::model::RunState::Paused);
+        if paused != matches!(old_run_state, crate::jobs::model::RunState::Paused)
+            && let Some(graph) = match self.graph_jobs.get_mut(&job_id) {
+                Some(graph) => Some(graph),
+                None => self.retiring_graph_jobs.get_mut(&job_id),
+            }
+        {
+            graph.hold_clock(paused);
+        }
 
         self.metrics.post_state_moved(moved.0, moved.1);
         if let Some(persist_status) = persist_status {

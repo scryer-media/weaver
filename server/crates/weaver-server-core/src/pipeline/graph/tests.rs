@@ -554,6 +554,35 @@ async fn a_checkpoint_error_queued_before_resume_cannot_pause_the_resumed_job() 
     retire_pipeline_database(pipeline).await;
 }
 
+// A graph job kept across a pause holds its extraction clock while paused
+// and lets it run again on resume, so the pause is never charged as
+// extraction time.
+#[tokio::test]
+async fn a_graph_job_kept_across_a_pause_holds_its_extraction_clock() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_110);
+    let posts = vec![echo_volume(0, &payload(4 * ARTICLE, 8))];
+    let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
+    let control = pipeline.graph_jobs[&job_id].pending().control();
+    let revision = control.revision();
+    assert!(!pipeline.graph_jobs[&job_id].clock_held());
+    pipeline.graph_run_said(Said {
+        scope: job_id.0,
+        node: weaver_graph::NodeId::ROOT,
+        generation: 0,
+        heard: Heard::CheckpointBlocked {
+            control: control.clone(),
+            revision,
+            error: "fixture storage failure".into(),
+        },
+    });
+    assert_eq!(pipeline.jobs[&job_id].status, JobStatus::Paused);
+    assert!(pipeline.graph_jobs[&job_id].clock_held());
+    pipeline.resume_job_runtime(job_id).unwrap();
+    assert!(!pipeline.graph_jobs[&job_id].clock_held());
+    retire_pipeline_database(pipeline).await;
+}
+
 #[tokio::test]
 async fn a_closed_checkpoint_writer_pauses_with_an_actionable_error() {
     let temp_dir = tempfile::tempdir().unwrap();

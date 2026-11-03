@@ -2238,6 +2238,60 @@ async fn the_deadline_runs_from_the_first_produced_member_not_from_admission() {
     );
 }
 
+// Time the job spends paused is not extraction: a job paused past the
+// deadline after its first produced member writes on once it resumes.
+#[tokio::test(start_paused = true)]
+async fn the_deadline_does_not_run_while_the_job_is_paused() {
+    use crate::pipeline::extraction::ExtractionLimits;
+    use crate::post_processing::model::PostProcessingSettings;
+
+    const DEADLINE: u64 = 60;
+    let limits = ExtractionLimits {
+        max_job_bytes: u64::MAX,
+        max_member_bytes: u64::MAX,
+        max_entries: u64::MAX,
+        max_ratio: u64::MAX,
+        ratio_floor_bytes: u64::MAX,
+        max_seconds: DEADLINE,
+        min_free_bytes: 0,
+        max_memory_bytes: u64::MAX,
+    };
+    let policy = PostProcessingSettings {
+        unacceptable_extensions: Vec::new(),
+        ..PostProcessingSettings::default()
+    };
+    let mut job = Job::new(PLENTY);
+    job.inner = 10;
+    job.writer = job.writer.capped(Caps::new(
+        Arc::new(limits),
+        Ok(Arc::new(policy)),
+        Vec::new(),
+    ));
+
+    let store = job.member("show.rar", None);
+    let mut front = SIGNATURE.to_vec();
+    front.extend_from_slice(b"hello");
+    job.send(store, 0, &front, Provenance::Fresh);
+    assert!(job.writer.refusal().is_none());
+
+    job.writer.hold_clock(true);
+    tokio::time::advance(std::time::Duration::from_secs(DEADLINE + 1)).await;
+    job.writer.hold_clock(false);
+    let arrival = Arrival {
+        node: NodeId::ROOT,
+        member: store,
+        offset: front.len() as u64,
+        bytes: Bytes::from_static(b"world").into(),
+        provenance: Provenance::Fresh,
+    };
+    let mut build = job.build();
+    let written = job
+        .writer
+        .deliver(&mut job.tree, &mut build, &Source, arrival, &mut job.out);
+    assert!(written.is_ok());
+    assert!(job.writer.refusal().is_none());
+}
+
 // The stated checksum is checked whatever shape the writes left the fold
 // in: a write over bytes already written forgets the run it overlapped, so
 // the fold no longer spans the member, and the file is read back instead.
