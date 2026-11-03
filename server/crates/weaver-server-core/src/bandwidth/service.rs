@@ -446,6 +446,7 @@ impl Pipeline {
         block.speed_limit_in_force = self
             .scheduled_rate_limit
             .unwrap_or(self.configured_rate_limit);
+        block.speed_limit_by_schedule = self.scheduled_rate_limit.is_some();
         self.shared_state.set_download_block(block);
     }
 }

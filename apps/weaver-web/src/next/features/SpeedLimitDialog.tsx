@@ -99,7 +99,7 @@ export function useSpeedLimitInForce() {
   const { downloadBlock } = useNextData("downloadBlock");
   return {
     inForce: downloadBlock.speedLimitInForce,
-    bySchedule: downloadBlock.scheduledSpeedLimit > 0,
+    bySchedule: downloadBlock.speedLimitBySchedule,
   };
 }
 

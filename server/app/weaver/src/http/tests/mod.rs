@@ -1210,6 +1210,7 @@ fn manual_pause_block() -> DownloadBlockState {
         timezone_name: "MDT".into(),
         scheduled_speed_limit: 4_096,
         speed_limit_in_force: 4_096,
+        speed_limit_by_schedule: true,
         schedule_hold_reason: None,
     }
 }

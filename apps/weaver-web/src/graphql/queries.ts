@@ -487,6 +487,7 @@ const DOWNLOAD_BLOCK_FIELDS = `
     timezoneName
     scheduledSpeedLimit
     speedLimitInForce
+    speedLimitBySchedule
     scheduleHoldReason
   }
 `;

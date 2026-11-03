@@ -1365,6 +1365,12 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
         pipeline.shared_state.download_block().speed_limit_in_force,
         512 * 1024
     );
+    assert!(
+        !pipeline
+            .shared_state
+            .download_block()
+            .speed_limit_by_schedule
+    );
 
     pipeline.report_all_for_test();
     SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
@@ -1398,6 +1404,12 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
             pipeline.shared_state.download_block().speed_limit_in_force,
             128 * 1024
         );
+        assert!(
+            pipeline
+                .shared_state
+                .download_block()
+                .speed_limit_by_schedule
+        );
     }
 
     pipeline.report_all_for_test();
@@ -1430,6 +1442,13 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
     assert_eq!(
         pipeline.shared_state.download_block().speed_limit_in_force,
         0
+    );
+    // An unlimited window is still the schedule's limit.
+    assert!(
+        pipeline
+            .shared_state
+            .download_block()
+            .speed_limit_by_schedule
     );
 }
 

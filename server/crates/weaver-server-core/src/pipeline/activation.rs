@@ -300,6 +300,14 @@ impl Pipeline {
             !self.checkpoint_progress_articles.contains_key(&job_id),
             "a drained job has no article in flight for its checkpoint"
         );
+        // What the graph holds in RAM, bytes of a member whose front has not
+        // yet said what it is among them, goes to scratch as a stop pages
+        // it, so the checkpoint names it and the resumed job reads it back.
+        if let Some(graph) = self.graph_jobs.get_mut(&job_id)
+            && let Err(error) = graph.page_out_holds()
+        {
+            warn!(job_id = job_id.0, %error, "could not page graph holds out for a pause");
+        }
         self.checkpoint_graph_job(job_id);
         self.release_job_articles(job_id);
         self.segment_terminal_states
