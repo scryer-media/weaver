@@ -70,9 +70,6 @@ pub enum Error {
     )]
     ValidateMtuTooLow { link_mtu: u16, min_mtu: u16 },
 
-    #[error("too many active connections")]
-    TooManyActiveConnections,
-
     #[error("max number of retransmissions reached")]
     MaxRetransmissionsReached,
     #[error("max syn-ack retransmissions reached")]

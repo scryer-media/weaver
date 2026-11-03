@@ -248,6 +248,36 @@ fn ipv6(port: u16) -> SocketAddr {
     (Ipv6Addr::LOCALHOST, port).into()
 }
 
+// No cap on live streams beyond the owner's connection limit: one socket
+// holds 200 at once.
+#[tokio::test(start_paused = true)]
+async fn one_socket_holds_more_than_128_streams() {
+    setup_test_logging();
+    const STREAMS: usize = 200;
+    let (server, client) = sockets(ipv4(1), ipv4(2), 0, Duration::ZERO, SocketOpts::default());
+    let accept = async {
+        let mut held = Vec::with_capacity(STREAMS);
+        for _ in 0..STREAMS {
+            held.push(server.accept().await.unwrap());
+        }
+        held
+    };
+    let dial = async {
+        let mut held = Vec::with_capacity(STREAMS);
+        for _ in 0..STREAMS {
+            held.push(client.connect(ipv4(1)).await.unwrap());
+        }
+        held
+    };
+    let (accepted, dialled) = tokio::join!(accept, dial);
+    assert_eq!(accepted.len(), STREAMS);
+    assert_eq!(dialled.len(), STREAMS);
+    assert_eq!(
+        client.stats().connection_successes.load(Ordering::Relaxed),
+        STREAMS as u64
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn e2e_echo_ipv4() {
     test_one_echo(ipv4(1), ipv4(2), 0).await;

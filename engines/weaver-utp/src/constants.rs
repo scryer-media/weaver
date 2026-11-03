@@ -48,8 +48,6 @@ pub const RECOVERY_TRACING_LOG_LEVEL: Level = Level::TRACE;
 // How long to wait to kill the connection if the remote is non-responsive.
 pub const DEFAULT_REMOTE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub const DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET: NonZeroUsize = non_zero_const!(128);
-
 // The least retransmission timeout once a round trip is known.
 pub const DEFAULT_MIN_TIMEOUT: Duration = Duration::from_millis(500);
 // Sends of one data packet before the connection gives up.

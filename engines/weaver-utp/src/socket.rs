@@ -30,8 +30,7 @@ use crate::{UtpStream, spawn_utils::spawn_with_cancel};
 use crate::{
     congestion::ledbat::LedbatParams,
     constants::{
-        DEFAULT_CONNECT_TIMEOUT, DEFAULT_FIN_RESENDS, DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET,
-        DEFAULT_MIN_TIMEOUT, DEFAULT_NUM_RESENDS, DEFAULT_REMOTE_INACTIVITY_TIMEOUT,
+        DEFAULT_CONNECT_TIMEOUT, DEFAULT_FIN_RESENDS, DEFAULT_MIN_TIMEOUT, DEFAULT_NUM_RESENDS, DEFAULT_REMOTE_INACTIVITY_TIMEOUT,
         DEFAULT_SYN_RESENDS, IPV4_HEADER, RX_BUF_SIZE_PER_VSOCK_DEFAULT, UDP_HEADER, UTP_HEADER,
     },
     message::UtpMessage,
@@ -110,10 +109,6 @@ pub struct SocketOpts {
     /// before terminating the connection.
     pub remote_inactivity_timeout: Option<Duration>,
 
-    /// How many virtual sockets to have at the same time. Each vsock consumes
-    /// resources (memory, tokio tasks).
-    pub max_live_vsocks: Option<NonZeroUsize>,
-
     /// The connections the owner holds open at once. A SYN arriving while
     /// the socket holds more than twice as many streams is dropped
     /// unanswered; with none set, every SYN is taken up.
@@ -172,9 +167,6 @@ impl SocketOpts {
             remote_inactivity_timeout: self
                 .remote_inactivity_timeout
                 .unwrap_or(DEFAULT_REMOTE_INACTIVITY_TIMEOUT),
-            max_active_streams: self
-                .max_live_vsocks
-                .unwrap_or(DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET),
             syn_flood_streams: self
                 .connections_limit
                 .map(|limit| limit.get().saturating_mul(2)),
@@ -199,7 +191,6 @@ pub(crate) struct ValidatedSocketOpts {
     pub connect_timeout: Duration,
 
     pub remote_inactivity_timeout: Duration,
-    pub max_active_streams: NonZeroUsize,
     // Streams past which a SYN is dropped unanswered.
     pub syn_flood_streams: Option<usize>,
 
@@ -317,7 +308,6 @@ struct Syn {
 
 enum MatchSynWithAccept<T, E> {
     Matched,
-    Full(Syn, Acceptor<T, E>),
     SynInvalid(Acceptor<T, E>),
     ReceiverDead(Syn),
 }
@@ -399,9 +389,6 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
 
     // Get into a state where we can't match acceptors with cached SYNs anymore.
     fn cleanup_accept_queue(&mut self) -> crate::Result<()> {
-        if self.streams_full() {
-            return Ok(());
-        }
         while let Some(syn) = self.accept_queue.syns.pop_front() {
             let acceptor = match self.accept_queue.try_next_acceptor() {
                 Some(acc) => acc,
@@ -417,12 +404,6 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 }
                 MatchSynWithAccept::ReceiverDead(syn) => {
                     self.accept_queue.syns.push_front(syn);
-                }
-                MatchSynWithAccept::Full(syn, acceptor) => {
-                    debug!(remote=?syn.remote, connection_id=?syn.header.connection_id, "cleanup_accept_queue: full");
-                    self.accept_queue.syns.push_front(syn);
-                    self.accept_queue.next_available_acceptor = Some(acceptor);
-                    return Ok(());
                 }
             }
         }
@@ -441,11 +422,6 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     async fn on_control(&mut self, msg: ControlRequest) {
         match msg {
             ControlRequest::ConnectRequest(addr, token, sender) => {
-                if self.streams_full() {
-                    debug!(?addr, "too many connections, dropping connect request");
-                    let _ = sender.tx.send(Err(Error::TooManyActiveConnections));
-                    return;
-                }
                 let conn_id = self.get_next_free_conn_id(addr);
                 let header = UtpHeader {
                     htype: Type::ST_SYN,
@@ -507,20 +483,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         }
     }
 
-    fn streams_full(&self) -> bool {
-        self.streams.len() >= self.socket.opts.max_active_streams.get()
-    }
-
     fn on_maybe_connect_ack(&mut self, addr: SocketAddr, msg: UtpMessage) -> crate::Result<()> {
-        if self.streams_full() {
-            trace!(
-                active_streams = self.streams.len(),
-                ?msg,
-                "dropping potential SYN-ACK packet, too many active streams"
-            );
-            return Ok(());
-        }
-
         let mut occ = match self.connecting.entry(addr) {
             Entry::Occupied(occ) => occ,
             Entry::Vacant(_) => {
@@ -571,10 +534,6 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         syn: Syn,
         accept: Acceptor<T, E>,
     ) -> MatchSynWithAccept<T, E> {
-        if self.streams_full() {
-            return MatchSynWithAccept::Full(syn, accept);
-        }
-
         let recv_key = (syn.remote, syn.header.connection_id + 1);
         if self.streams.contains_key(&recv_key) {
             debug!(?recv_key, "SYN clashes with an existing stream, ignoring");
@@ -640,11 +599,6 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                     return Ok(());
                 }
                 MatchSynWithAccept::ReceiverDead(s) => syn = s,
-                MatchSynWithAccept::Full(s, acceptor) => {
-                    self.accept_queue.next_available_acceptor = Some(acceptor);
-                    syn = s;
-                    break;
-                }
             }
         }
         match self.accept_queue.try_cache_syn(syn) {
