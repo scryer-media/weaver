@@ -212,6 +212,14 @@ impl KernelSockets {
             device: self.bind_device.as_ref(),
         }
     }
+
+    /// A datagram socket at `addr`, set for uTP to run over it.
+    fn kernel_udp(&self, addr: SocketAddr) -> io::Result<KernelUdp> {
+        let socket = librqbit_dualstack_sockets::UdpSocket::bind_udp(addr, self.bind_opts())
+            .map_err(io::Error::other)?;
+        crate::udp_options::set_for_utp(socket.socket(), addr);
+        Ok(KernelUdp(socket))
+    }
 }
 
 /// The address the host's own route toward `to` leaves from. Connecting a
@@ -268,11 +276,7 @@ impl SocketFactory for KernelSockets {
         &'a self,
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
-        Box::pin(async move {
-            let socket = librqbit_dualstack_sockets::UdpSocket::bind_udp(addr, self.bind_opts())
-                .map_err(io::Error::other)?;
-            Ok(Arc::new(KernelUdp(socket)) as Arc<dyn DatagramSocket>)
-        })
+        Box::pin(async move { Ok(Arc::new(self.kernel_udp(addr)?) as Arc<dyn DatagramSocket>) })
     }
 }
 
@@ -304,9 +308,7 @@ pub(crate) struct KernelUdp(librqbit_dualstack_sockets::UdpSocket);
 impl KernelSockets {
     /// A datagram socket at `addr`, bound at once, as the kernel socket it is.
     pub(crate) fn bind_kernel_udp(&self, addr: SocketAddr) -> io::Result<Arc<KernelUdp>> {
-        let socket = librqbit_dualstack_sockets::UdpSocket::bind_udp(addr, self.bind_opts())
-            .map_err(io::Error::other)?;
-        Ok(Arc::new(KernelUdp(socket)))
+        self.kernel_udp(addr).map(Arc::new)
     }
 }
 
@@ -315,6 +317,11 @@ impl KernelUdp {
     /// A datagram already waiting, without waiting for one.
     pub(crate) fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.0.socket().try_recv_from(buf)
+    }
+
+    /// The kernel socket itself.
+    pub(crate) fn socket(&self) -> &tokio::net::UdpSocket {
+        self.0.socket()
     }
 }
 
@@ -345,5 +352,16 @@ impl DatagramSocket for KernelUdp {
         target: SocketAddr,
     ) -> Poll<io::Result<usize>> {
         self.0.poll_send_to(cx, buf, target)
+    }
+
+    // One datagram from every slice, in one system call, without joining
+    // them first.
+    fn poll_send_to_vectored(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        self.0.poll_send_to_vectored(cx, bufs, target)
     }
 }

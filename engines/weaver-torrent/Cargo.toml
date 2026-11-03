@@ -73,7 +73,7 @@ x509-parser = { version = "0.18", default-features = false }
 weaver-model = { path = "../../shared/crates/weaver-model", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = ["Win32", "Win32_System", "Win32_System_IO", "Win32_System_Ioctl"] }
+windows = { workspace = true, features = ["Win32", "Win32_System", "Win32_System_IO", "Win32_System_Ioctl", "Win32_Networking_WinSock"] }
 
 [dev-dependencies]
 # The e2e tests lift the open-file limit.

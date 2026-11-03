@@ -79,6 +79,7 @@ mod stream_connect;
 mod torrent_state;
 pub mod tracker;
 mod type_aliases;
+mod udp_options;
 pub mod upnp;
 mod v2_hashes;
 mod vectored_traits;
