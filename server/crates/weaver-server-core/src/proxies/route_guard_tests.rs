@@ -214,11 +214,15 @@ fn only_pinned_crates_carry_a_network_client() {
 fn the_tunnels_client_is_for_tests_alone() {
     let path = workspace().join("engines/weaver-tunnel/Cargo.toml");
     let manifest: toml::Table = std::fs::read_to_string(path).unwrap().parse().unwrap();
-    let reqwest = &manifest["dependencies"]["reqwest"];
+    let reqwest = manifest
+        .get("dependencies")
+        .and_then(|dependencies| dependencies.get("reqwest"));
     assert_eq!(
-        reqwest.get("optional").and_then(toml::Value::as_bool),
+        reqwest
+            .and_then(|reqwest| reqwest.get("optional"))
+            .and_then(toml::Value::as_bool),
         Some(true),
-        "weaver-tunnel's reqwest must stay optional"
+        "weaver-tunnel's reqwest must stay an optional dependency"
     );
     let elsewhere: Vec<String> = ["build-dependencies", "target"]
         .into_iter()
@@ -246,6 +250,144 @@ fn the_tunnels_client_is_for_tests_alone() {
         elsewhere.is_empty(),
         "weaver-tunnel names reqwest in {elsewhere:?}"
     );
+}
+
+// weaver-tunnel's test-support feature, which carries its client, is on
+// only where a crate's tests turn it on: never by default, and never through
+// a dependency a product build takes.
+#[test]
+fn the_tunnels_test_support_is_never_built_into_a_product() {
+    let root = workspace();
+    let workspace_manifest = manifest_at(&root.join("Cargo.toml"));
+    let members: Vec<String> = workspace_manifest["workspace"]["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|member| member.as_str().unwrap().to_owned())
+        .collect();
+    let manifests: Vec<(String, toml::Table)> = members
+        .iter()
+        .map(|member| {
+            let manifest = manifest_at(&root.join(member).join("Cargo.toml"));
+            let name = manifest["package"]["name"].as_str().unwrap().to_owned();
+            (name, manifest)
+        })
+        .collect();
+
+    // Every feature of every member that turns the tunnel's test support on.
+    let mut turning_on = BTreeSet::from([("weaver-tunnel".to_owned(), "test-support".to_owned())]);
+    loop {
+        let before = turning_on.len();
+        for (name, manifest) in &manifests {
+            let Some(features) = manifest.get("features").and_then(toml::Value::as_table) else {
+                continue;
+            };
+            for (feature, enables) in features {
+                let turns_on = enables.as_array().unwrap().iter().any(|enabled| {
+                    let enabled = enabled.as_str().unwrap();
+                    let (crate_name, enabled) = match enabled.split_once('/') {
+                        Some((dependency, enabled)) => (
+                            package_of(manifest, dependency.trim_end_matches('?')),
+                            enabled,
+                        ),
+                        None => (name.clone(), enabled),
+                    };
+                    turning_on.contains(&(crate_name, enabled.to_owned()))
+                });
+                if turns_on {
+                    turning_on.insert((name.clone(), feature.clone()));
+                }
+            }
+        }
+        if turning_on.len() == before {
+            break;
+        }
+    }
+    assert!(
+        !turning_on.contains(&("weaver-tunnel".to_owned(), "default".to_owned())),
+        "weaver-tunnel's default features turn on its test support"
+    );
+
+    let mut product_edges = Vec::new();
+    let workspace_dependencies = workspace_manifest["workspace"]
+        .get("dependencies")
+        .and_then(toml::Value::as_table);
+    if let Some(dependencies) = workspace_dependencies {
+        product_edges.extend(turning_on_through(
+            "the workspace",
+            dependencies,
+            &turning_on,
+        ));
+    }
+    for (name, manifest) in &manifests {
+        let mut tables = Vec::new();
+        for kind in ["dependencies", "build-dependencies"] {
+            tables.extend(manifest.get(kind).and_then(toml::Value::as_table));
+            for target in manifest
+                .get("target")
+                .and_then(toml::Value::as_table)
+                .into_iter()
+                .flat_map(|targets| targets.values())
+            {
+                tables.extend(target.get(kind).and_then(toml::Value::as_table));
+            }
+        }
+        for dependencies in tables {
+            product_edges.extend(turning_on_through(name, dependencies, &turning_on));
+        }
+    }
+    assert!(
+        product_edges.is_empty(),
+        "a product dependency turns weaver-tunnel's test support on: {product_edges:?}"
+    );
+}
+
+fn manifest_at(path: &Path) -> toml::Table {
+    std::fs::read_to_string(path).unwrap().parse().unwrap()
+}
+
+// The package a manifest's dependency `key` names.
+fn package_of(manifest: &toml::Table, key: &str) -> String {
+    ["dependencies", "dev-dependencies", "build-dependencies"]
+        .into_iter()
+        .filter_map(|kind| manifest.get(kind)?.get(key)?.get("package")?.as_str())
+        .next()
+        .unwrap_or(key)
+        .to_owned()
+}
+
+// Each dependency in `dependencies` whose features, its default ones among
+// them, include one of `turning_on`.
+fn turning_on_through(
+    owner: &str,
+    dependencies: &toml::Table,
+    turning_on: &BTreeSet<(String, String)>,
+) -> Vec<String> {
+    dependencies
+        .iter()
+        .filter(|(key, dependency)| {
+            let package = dependency
+                .get("package")
+                .and_then(toml::Value::as_str)
+                .unwrap_or(key);
+            let defaults = dependency
+                .get("default-features")
+                .and_then(toml::Value::as_bool)
+                .unwrap_or(true);
+            let features = dependency
+                .get("features")
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(toml::Value::as_str);
+            defaults
+                .then_some("default")
+                .into_iter()
+                .chain(features)
+                .any(|feature| turning_on.contains(&(package.to_owned(), feature.to_owned())))
+        })
+        .map(|(key, _)| format!("{owner} -> {key}"))
+        .collect()
 }
 
 // Each package in a lockfile, with the names of the packages it depends on.
