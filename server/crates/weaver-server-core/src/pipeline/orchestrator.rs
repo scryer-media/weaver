@@ -21,3 +21,5 @@ pub(super) use runtime::timestamp_secs;
 pub(super) use runtime::{DECODES_HEARD_RESTORING, PERIODIC_TICKS};
 #[cfg(test)]
 pub(super) use runtime::{compute_decode_backlog_budget_bytes, compute_write_backlog_budget_bytes};
+#[cfg(test)]
+pub(super) use scripts::ADDED_SCRIPT_RAISES;

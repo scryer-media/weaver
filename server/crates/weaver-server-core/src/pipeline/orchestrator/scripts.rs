@@ -6,6 +6,11 @@ use crate::post_processing::events::{EventContext, wait_for_event, wait_for_job_
 use crate::post_processing::model::{PipelineOutcome, QueueEvent};
 use crate::post_processing::runner::{CompatibilityFacts, JobExecutionContext};
 
+// Each arrival script event raised, counted for the tests.
+#[cfg(test)]
+pub(crate) static ADDED_SCRIPT_RAISES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 impl Pipeline {
     pub(crate) fn queue_script_context(
         &self,
@@ -13,24 +18,41 @@ impl Pipeline {
         event: QueueEvent,
     ) -> Option<EventContext> {
         let state = self.jobs.get(&job_id)?;
-        Some(EventContext::from_job(
+        Some(self.script_context_of(
+            job_id,
+            &state.spec,
+            &state.working_dir,
+            state.downloaded_bytes,
+            event,
+        ))
+    }
+
+    fn script_context_of(
+        &self,
+        job_id: JobId,
+        spec: &crate::JobSpec,
+        working_dir: &std::path::Path,
+        downloaded_bytes: u64,
+        event: QueueEvent,
+    ) -> EventContext {
+        EventContext::from_job(
             &JobExecutionContext {
                 job_id: job_id.0,
-                name: state.spec.name.clone(),
-                nzb_filename: format!("{}.nzb", state.spec.name),
-                category: state.spec.category.clone(),
+                name: spec.name.clone(),
+                nzb_filename: format!("{}.nzb", spec.name),
+                category: spec.category.clone(),
                 group: None,
-                source_url: crate::post_processing::scan::source_url(&state.spec.metadata),
-                working_directory: state.working_dir.clone(),
-                final_directory: state.working_dir.clone(),
+                source_url: crate::post_processing::scan::source_url(&spec.metadata),
+                working_directory: working_dir.to_path_buf(),
+                final_directory: working_dir.to_path_buf(),
                 pipeline_outcome: PipelineOutcome::Succeeded,
                 par_status: 0,
                 unpack_status: 0,
                 compatibility: CompatibilityFacts {
-                    parameters: state.spec.metadata.clone(),
-                    password: state.spec.password.clone(),
-                    total_bytes: state.spec.total_bytes,
-                    downloaded_bytes: state.downloaded_bytes,
+                    parameters: spec.metadata.clone(),
+                    password: spec.password.clone(),
+                    total_bytes: spec.total_bytes,
+                    downloaded_bytes,
                     intermediate_dir: Some(self.intermediate_dir.clone()),
                     complete_dir: Some(self.complete_dir.clone()),
                     data_dir: Some(self.script_data_dir.clone()),
@@ -38,7 +60,7 @@ impl Pipeline {
                 },
             },
             event,
-        ))
+        )
     }
 
     pub(crate) fn raise_queue_script_event(
@@ -80,6 +102,7 @@ impl Pipeline {
     // The category lookup uses the dispatch cache. Only a blocking script
     // holds the job; a cold cache is resolved off the actor before releasing
     // a provisional hold. A script that could not run decides nothing.
+    #[cfg(test)]
     pub(crate) fn raise_added_script_event(&mut self, job_id: JobId) {
         if !self.jobs.contains_key(&job_id) || !self.db.queue_scripts_possible() {
             return;
@@ -87,6 +110,27 @@ impl Pipeline {
         let Some(context) = self.queue_script_context(job_id, QueueEvent::NzbAdded) else {
             return;
         };
+        self.raise_added_script_context(job_id, context);
+    }
+
+    // The arrival event for an add, raised as the add is taken in, whether
+    // the job is installed or waits outside the queue window.
+    pub(crate) fn raise_added_script_event_for_add(
+        &mut self,
+        job_id: JobId,
+        add: &crate::pipeline::queue::PreparedAdd,
+    ) {
+        if !self.db.queue_scripts_possible() {
+            return;
+        }
+        let context =
+            self.script_context_of(job_id, &add.spec, &add.working_dir, 0, QueueEvent::NzbAdded);
+        self.raise_added_script_context(job_id, context);
+    }
+
+    fn raise_added_script_context(&mut self, job_id: JobId, context: EventContext) {
+        #[cfg(test)]
+        ADDED_SCRIPT_RAISES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let event = context.event.clone();
         let category = context.category.clone();
         let cached_blocks = self

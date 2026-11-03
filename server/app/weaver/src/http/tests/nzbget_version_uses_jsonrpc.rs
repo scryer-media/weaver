@@ -5692,3 +5692,50 @@ async fn nzbget_reports_nothing_remaining_once_a_clean_post_has_arrived() {
     let status = rpc_result(app, "status", serde_json::json!([])).await;
     assert_eq!(status["RemainingSizeLo"], 0);
 }
+
+#[tokio::test]
+async fn nzbget_lists_every_group_and_the_files_of_a_job_past_the_queue_window() {
+    // The pipeline installs the first 100 queued jobs; the rest are rows.
+    const WINDOW: usize = 100;
+    const QUEUED: u64 = WINDOW as u64 + 10;
+    let db = Database::open_in_memory().unwrap();
+    let handle = scheduler_handle_with_jobs_and_db(
+        (1..=QUEUED).map(reorder_test_job).collect(),
+        db.clone(),
+    )
+    .await;
+    let diagnostics = handle.pipeline_diagnostics().await.unwrap();
+    let mut installed: Vec<u64> = diagnostics.jobs.iter().map(|job| job.job_id).collect();
+    installed.sort_unstable();
+    assert_eq!(installed, (1..=WINDOW as u64).collect::<Vec<_>>());
+    let app = nzbget_test_router(
+        db,
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    // Every row is listed, in queue order.
+    assert_eq!(
+        listgroups_ids(app.clone()).await,
+        (1..=QUEUED).collect::<Vec<_>>()
+    );
+
+    // The files of a job past the window come from its stored NZB.
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "listfiles", "params": [0, 0, QUEUED], "id": "files"}),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let files = payload["result"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["NZBID"], QUEUED);
+    assert_eq!(files[0]["Filename"], "payload.bin");
+
+    // Neither read installed it.
+    let diagnostics = handle.pipeline_diagnostics().await.unwrap();
+    assert_eq!(diagnostics.jobs.len(), WINDOW);
+    assert!(diagnostics.jobs.iter().all(|job| job.job_id != QUEUED));
+}

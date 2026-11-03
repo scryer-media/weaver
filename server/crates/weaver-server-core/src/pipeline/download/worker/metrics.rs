@@ -693,6 +693,8 @@ impl Pipeline {
                 r + s.articles.queued_recovery_len(),
             )
         });
+        // A job out of the queue window still waits with its articles.
+        let total = total + self.window_parked_articles as usize;
         self.metrics
             .download_queue_depth
             .store(total, Ordering::Relaxed);

@@ -123,7 +123,11 @@ async fn twenty_four_providers_cannot_admit_more_than_ten_of_124_nzbs() {
         pipeline.db.load_nzb_admissions().unwrap(),
         pipeline.nzb_admitted
     );
-    assert_eq!(pipeline.jobs.len(), 124);
+    // Only the queue window is installed; every add keeps its row.
+    assert_eq!(
+        pipeline.jobs.len(),
+        crate::pipeline::queue_window::QUEUE_WINDOW
+    );
     assert_eq!(
         pipeline.shared_state.queue.read(|inner| inner.jobs.len()),
         124
@@ -197,7 +201,7 @@ async fn twenty_four_providers_cannot_admit_more_than_ten_of_124_nzbs() {
         );
     }
     // Empty article queues and stalled downstream processing retain the same
-    // owners. Every job is installed, but only an admitted job has had its
+    // owners. Every job in the window is installed, but only an admitted job has had its
     // articles built; the rest hold none until a slot admits them.
     for (id, state) in pipeline.jobs.iter_mut() {
         if pipeline.nzb_admitted.contains(id) {

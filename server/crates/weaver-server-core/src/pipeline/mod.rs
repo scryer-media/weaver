@@ -20,6 +20,7 @@ mod orchestrator;
 mod post_health;
 mod progress;
 pub mod queue;
+mod queue_window;
 mod server_attribution;
 mod support_facts;
 #[cfg(any(test, feature = "test-support"))]
@@ -1308,6 +1309,18 @@ pub struct Pipeline {
     // When a restart's installs began, and how many have gone in since: the
     // pass is logged once, when the last restore is in.
     pub(crate) restore_pass: Option<(Instant, usize)>,
+    // The queue window (`queue_window`): the jobs out of it, each with the
+    // articles it still counts toward the queue's depth, and their sum.
+    pub(crate) window_parked: HashMap<JobId, u64>,
+    pub(crate) window_parked_articles: u64,
+    // The runtime columns an installed job's active row is known to hold,
+    // so leaving the window writes only what changed.
+    pub(crate) window_stored: HashMap<JobId, completion::finalize::ActiveRuntimeValues>,
+    // Jobs out of the window that a script's directives call back in.
+    pub(crate) window_due: HashSet<JobId>,
+    // Jobs out of the window whose rows could not be read back; a restart
+    // reads them again.
+    pub(crate) window_unreadable: HashSet<JobId>,
     // Each row's stored queue position as last written, loaded from the
     // database on the first order change.
     pub(crate) queue_positions: Option<HashMap<JobId, i64>>,

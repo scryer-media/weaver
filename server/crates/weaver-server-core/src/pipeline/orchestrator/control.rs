@@ -2,10 +2,24 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::jobs::handle::RestoreJobRequest;
 use crate::pipeline::queue::Change;
 
 // How many restores one turn installs.
 pub(crate) const RESTORE_BATCH: usize = 32;
+
+// A restore whose row carries a pause installs paused, to go back to what it
+// was.
+fn paused_restore(mut request: RestoreJobRequest, paused: bool) -> RestoreJobRequest {
+    if paused && request.status != JobStatus::Paused {
+        request.paused_resume_status = Some(request.status.clone());
+        request.paused_resume_download_state = request.download_state;
+        request.paused_resume_post_state = request.post_state;
+        request.status = JobStatus::Paused;
+        request.run_state = Some(crate::RunState::Paused);
+    }
+    request
+}
 
 impl Pipeline {
     pub(crate) async fn apply_queue_intents(&mut self) {
@@ -32,66 +46,125 @@ impl Pipeline {
             return;
         }
         crate::pipeline::queue::count_walk();
+        // The queue window: the jobs it ranks first in dispatch order. A job
+        // out of it waits as its row and its database rows alone.
+        let (ranked, gone) = self.shared_state.queue.read(|inner| {
+            (
+                self.queue_window_ranks(inner),
+                self.forget_gone_parked(inner),
+            )
+        });
+        self.drop_parked(gone);
         // Installing a job is its add, whether it comes from intake or from a
         // restart, under any pause and with every slot taken; only a shutdown
         // installs nothing. Admission decides only whether its articles go
         // out. A restore whose row carries a pause installs parked.
-        // A restart's restores install a bounded batch a turn: the jobs
-        // holding a slot first, wherever they stand, then the rest in queue
-        // order, so the jobs that download start while the rest install.
-        let restores = self.shared_state.queue.write(|inner| {
+        // A restart's restores, and the jobs entering the window, install a
+        // bounded batch a turn: the jobs holding a slot first, wherever they
+        // stand, then the rest in queue order, so the jobs that download
+        // start while the rest install. A restore out of the window is not
+        // installed: its job is read back from the database once it enters.
+        let (tickets, entering, parking) = self.shared_state.queue.write(|inner| {
             if inner.globals.shutting_down {
-                return Change::unchanged(Vec::new());
+                return Change::unchanged((Vec::new(), Vec::new(), Vec::new()));
             }
+            let enters = |row: &crate::pipeline::queue::JobRow| {
+                (row.intents.restore.is_some() || self.window_parked(row.id))
+                    && !self.window_unreadable.contains(&row.id)
+                    && self.in_queue_window(&ranked, row)
+            };
             let mut holders: Vec<usize> = self
                 .nzb_admitted
                 .iter()
                 .filter_map(|id| inner.job_position(*id))
-                .filter(|position| inner.jobs[*position].intents.restore.is_some())
+                .filter(|position| enters(&inner.jobs[*position]))
                 .collect();
             holders.sort_unstable();
             let order: Vec<usize> = holders
                 .into_iter()
-                .chain(
-                    (0..inner.jobs.len())
-                        .filter(|position| inner.jobs[*position].intents.restore.is_some())
-                        .filter(|position| !self.nzb_admitted.contains(&inner.jobs[*position].id)),
-                )
+                .chain((0..inner.jobs.len()).filter(|position| {
+                    let row = &inner.jobs[*position];
+                    !self.nzb_admitted.contains(&row.id) && enters(row)
+                }))
                 .take(RESTORE_BATCH)
                 .collect();
-            Change::unchanged(
-                order
-                    .into_iter()
-                    .filter_map(|position| {
-                        let row = &mut inner.jobs[position];
-                        let paused = row.intents.paused == Some(true);
-                        row.intents.restore.take().map(|mut request| {
-                            if paused && request.status != JobStatus::Paused {
-                                request.paused_resume_status = Some(request.status.clone());
-                                request.paused_resume_download_state = request.download_state;
-                                request.paused_resume_post_state = request.post_state;
-                                request.status = JobStatus::Paused;
-                                request.run_state = Some(crate::RunState::Paused);
-                            }
-                            request
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            )
+            let mut tickets = Vec::new();
+            let mut entering = Vec::new();
+            for position in order {
+                let row = &mut inner.jobs[position];
+                let paused = row.intents.paused == Some(true);
+                match row.intents.restore.take() {
+                    Some(request) => tickets.push(paused_restore(request, paused)),
+                    None => entering.push((row.id, paused)),
+                }
+            }
+            let mut parking = Vec::new();
+            for row in &mut inner.jobs {
+                if row.intents.restore.is_some() && !self.in_queue_window(&ranked, row) {
+                    let request = row.intents.restore.take().expect("restore ticket");
+                    let articles = match &request.restart {
+                        Some(read) => read
+                            .summaries
+                            .0
+                            .iter()
+                            .map(|file| u64::from(file.remaining))
+                            .sum(),
+                        None => request
+                            .spec
+                            .files
+                            .iter()
+                            .map(|file| file.segments.len() as u64)
+                            .sum(),
+                    };
+                    row.report.restoring = false;
+                    parking.push((row.id, articles));
+                }
+            }
+            if parking.is_empty() {
+                Change::unchanged((tickets, entering, parking))
+            } else {
+                Change::changed((tickets, entering, parking))
+            }
         });
         // A full batch may have left more behind; the next turn looks.
-        self.restores_waiting = restores.len() == RESTORE_BATCH;
+        self.restores_waiting = tickets.len() + entering.len() == RESTORE_BATCH;
         self.queue_walk_due |= self.restores_waiting;
-        if !restores.is_empty() {
-            self.download_dispatch_wake = true;
+        if !parking.is_empty() {
+            for (id, articles) in &parking {
+                self.park_window_job(*id, *articles);
+            }
+            self.update_queue_metrics();
+            self.restate_wait_reasons(parking.iter().map(|(id, _)| *id));
+        }
+        if !tickets.is_empty() {
             self.restore_pass
                 .get_or_insert_with(|| (Instant::now(), 0))
-                .1 += restores.len();
+                .1 += tickets.len();
         }
-        for request in restores {
+        let loads = self
+            .load_parked_jobs(entering.iter().map(|(id, _)| *id).collect())
+            .await;
+        let mut restores: Vec<(RestoreJobRequest, bool)> = tickets
+            .into_iter()
+            .map(|request| (request, false))
+            .collect();
+        for ((id, paused), (_, loaded)) in entering.into_iter().zip(loads) {
+            if let Some(request) = self.take_parked_load(id, loaded) {
+                restores.push((paused_restore(request, paused), true));
+            }
+        }
+        if !restores.is_empty() {
+            self.download_dispatch_wake = true;
+        }
+        for (request, entered) in restores {
             let id = request.job_id;
             if let Err(error) = self.install_restored_job(request).await {
                 error!(job_id = id.0, %error, "failed to install restore ticket");
+            }
+            if entered {
+                self.settle_window_entry(id);
+            } else if let Some(values) = self.active_runtime_values(id) {
+                self.window_stored.insert(id, values);
             }
             // An installed job is a new candidate for a slot.
             self.queue_walk_due = true;
@@ -134,11 +207,37 @@ impl Pipeline {
             )
         });
         self.queue_walk_due |= deferred || !admissions.is_empty();
+        let mut parked_adds = Vec::new();
         for (id, job) in admissions {
             let reprocess = job
                 .restart
                 .as_ref()
                 .is_some_and(|restart| restart.reprocess);
+            // The arrival's scripts run for every add as it is taken in,
+            // whether the job is installed or waits out of the window.
+            if !reprocess {
+                self.raise_added_script_event_for_add(id, &job);
+            }
+            // A fresh add out of the window is persisted already; it waits
+            // as its row until it enters.
+            let installs = job.restart.is_some()
+                || self.shared_state.queue.read(|inner| {
+                    inner
+                        .job(id)
+                        .is_none_or(|row| self.in_queue_window(&ranked, row))
+                });
+            if !installs {
+                let mut spec = job.spec;
+                let summaries = spec.drop_article_lists();
+                let articles = summaries
+                    .0
+                    .iter()
+                    .map(|file| u64::from(file.remaining))
+                    .sum();
+                self.park_window_job(id, articles);
+                parked_adds.push(id);
+                continue;
+            }
             self.install_prepared_add(id, job);
             self.nzb_reprocess_pending.remove(&id);
             if reprocess && self.nzb_admitted.contains(&id) {
@@ -146,6 +245,10 @@ impl Pipeline {
             } else if reprocess {
                 self.nzb_reprocess_pending.insert(id);
             }
+        }
+        if !parked_adds.is_empty() {
+            self.update_queue_metrics();
+            self.restate_wait_reasons(parked_adds.into_iter());
         }
         let (order, pending) = self.shared_state.queue.read(|inner| {
             (
@@ -343,6 +446,20 @@ impl Pipeline {
                 self.queue_walk_due = true;
             }
         }
+        self.evict_outside_window(&ranked);
+    }
+
+    // Restate the wait reason the rows of the jobs named store.
+    fn restate_wait_reasons(&self, ids: impl Iterator<Item = JobId>) {
+        self.shared_state.queue.write(|inner| {
+            for id in ids {
+                if let Some(row) = inner.job_mut(id) {
+                    let reason = self.stored_wait_reason(row);
+                    row.report.job.download_wait_reason = reason.map(str::to_owned);
+                }
+            }
+            Change::changed(())
+        });
     }
 
     // Stores the queue's order by writing a new position only for the rows

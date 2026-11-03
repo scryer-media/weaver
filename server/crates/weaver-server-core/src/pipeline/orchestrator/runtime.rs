@@ -270,6 +270,11 @@ impl Pipeline {
             queue_walk_due: false,
             restores_waiting: false,
             restore_pass: None,
+            window_parked: HashMap::new(),
+            window_parked_articles: 0,
+            window_stored: HashMap::new(),
+            window_due: HashSet::new(),
+            window_unreadable: HashSet::new(),
             dispatch_hold_watch: Vec::new(),
             queue_positions: None,
             queue_positions_lost: Arc::default(),
@@ -1170,8 +1175,16 @@ impl Pipeline {
                             Ok(()) = self.script_effects_rx.changed() => {
                                 turn_timer.resume();
                                 for job_id in self.db.take_script_effects() {
-                                    self.apply_queue_script_effects(JobId(job_id));
-                                    self.report_job(JobId(job_id));
+                                    let job_id = JobId(job_id);
+                                    // A job out of the queue window is called
+                                    // in, and its install applies them.
+                                    if self.window_parked(job_id) {
+                                        self.window_due.insert(job_id);
+                                        self.queue_walk_due = true;
+                                        continue;
+                                    }
+                                    self.apply_queue_script_effects(job_id);
+                                    self.report_job(job_id);
                                 }
                             }
                             Some(event) = self.terminal_post_processing_done_rx.recv() => {

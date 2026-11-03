@@ -68,6 +68,9 @@ impl Queue {
                 request.status == JobStatus::Paused,
             );
             info.download_wait_reason = Some("Restoring saved job".into());
+            if let Some(read) = &request.restart {
+                info.created_at_epoch_ms = read.created_at_epoch_ms;
+            }
             let mut row = JobRow::new(info);
             row.report.restoring = true;
             row.intents.restore = Some(request);
