@@ -3,7 +3,13 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mergeSnapshot, parseLogLine, type LogLine } from "../src/next/data/service-log-buffer.ts";
+import {
+  mergeSnapshot,
+  parseLogLine,
+  readLogLine,
+  recordJson,
+  type LogLine,
+} from "../src/next/data/service-log-buffer.ts";
 
 const stamp = (n: number) => `2026-09-17T16:21:${String(n).padStart(2, "0")}.000Z`;
 const raw = (n: number) => `${stamp(n)}  INFO weaver::jobs: line ${n} job_id=${n}`;
@@ -89,4 +95,89 @@ test("a buffer older than the whole snapshot stays ahead of it", () => {
   const merged = mergeSnapshot(held, [raw(7), raw(8)], 2, 100);
   assert.deepEqual(merged.lines.map((line) => line.raw), [1, 2, 7, 8].map(raw));
   assert.equal(merged.lines[0], held[0]);
+});
+
+const RECORD =
+  '{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"INFO","target":"weaver::jobs",' +
+  '"fields":{"message":"job added","job_id":7,"name":"My Show","path":"/data/a","size":18446744073709551615}}';
+
+test("a record reads as the line the text log writes for it", () => {
+  const line = readLogLine(4, RECORD);
+  assert.equal(
+    line.raw,
+    '2026-11-03T08:10:00.123456-07:00  INFO weaver::jobs: job added job_id=7 name="My Show" path=/data/a size=18446744073709551615',
+  );
+  assert.equal(line.source, RECORD);
+  assert.equal(line.level, "info");
+  assert.equal(line.time, "08:10:00.123");
+  assert.equal(line.target, "weaver::jobs");
+  assert.equal(line.message, 'job added job_id=7 name="My Show" path=/data/a size=18446744073709551615');
+  assert.deepEqual(
+    line.kvPairs.map((pair) => [pair.key, pair.value, line.message.slice(pair.start, pair.end)]),
+    [
+      ["job_id", "7", "job_id=7"],
+      ["name", '"My Show"', 'name="My Show"'],
+      ["path", "/data/a", "path=/data/a"],
+      ["size", "18446744073709551615", "size=18446744073709551615"],
+    ],
+  );
+});
+
+test("a record reads the same as its text line did", () => {
+  const text = parseLogLine(4, readLogLine(4, RECORD).raw);
+  const record = readLogLine(4, RECORD);
+  assert.equal(record.time, text.time);
+  assert.equal(record.level, text.level);
+  assert.equal(record.target, text.target);
+  assert.equal(record.message, text.message);
+  assert.deepEqual(record.kvPairs, text.kvPairs);
+});
+
+test("a record's spans come before its target", () => {
+  const line = readLogLine(
+    0,
+    '{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"WARN","target":"weaver::http",' +
+      '"fields":{"message":"slow"},"spans":[{"name":"request","id":3},{"name":"bare"}]}',
+  );
+  assert.equal(line.raw, "2026-11-03T08:10:00.123456-07:00  WARN request{id=3}:bare: weaver::http: slow");
+  assert.equal(line.level, "warn");
+  assert.equal(line.target, "weaver::http");
+  assert.equal(line.message, "slow");
+});
+
+test("a line that is not a record reads as text", () => {
+  const line = readLogLine(1, raw(2));
+  assert.deepEqual(line, parseLogLine(1, raw(2)));
+  assert.equal(readLogLine(2, "{not json").message, "{not json");
+});
+
+test("a selected line shows its record as indented JSON, numbers as sent", () => {
+  assert.equal(
+    recordJson(readLogLine(4, RECORD)),
+    [
+      "{",
+      '  "timestamp": "2026-11-03T08:10:00.123456-07:00",',
+      '  "level": "INFO",',
+      '  "target": "weaver::jobs",',
+      '  "fields": {',
+      '    "message": "job added",',
+      '    "job_id": 7,',
+      '    "name": "My Show",',
+      '    "path": "/data/a",',
+      '    "size": 18446744073709551615',
+      "  }",
+      "}",
+    ].join("\n"),
+  );
+  assert.equal(recordJson(readLogLine(1, raw(2))), raw(2));
+});
+
+test("a re-seed of records keeps the rows it repeats", () => {
+  const record = (n: number) =>
+    `{"timestamp":"${stamp(n)}","level":"INFO","target":"weaver::jobs","fields":{"message":"line ${n}"}}`;
+  const first = mergeSnapshot([], [record(1), record(2)], 0, 100);
+  const again = mergeSnapshot(first.lines, [record(1), record(2), record(3)], first.nextId, 100);
+  assert.equal(again.lines[0], first.lines[0]);
+  assert.equal(again.lines[1], first.lines[1]);
+  assert.deepEqual(again.lines.map((line) => line.message), ["line 1", "line 2", "line 3"]);
 });
