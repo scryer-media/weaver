@@ -497,6 +497,8 @@ pub enum SerializeError {
     NeedUploadOnly,
     #[error("the peer takes no lt_donthave")]
     NeedDontHave,
+    #[error("the frame is longer than its length prefix can state")]
+    FrameTooLong,
 }
 
 impl From<std::io::Error> for SerializeError {
@@ -523,7 +525,7 @@ impl Message<'_> {
         macro_rules! write_preamble {
             ($msg_len:expr, $msg_id:expr) => {
                 let len_prefix = u32::try_from($msg_len + MSGID_LEN)
-                    .map_err(|_| SerializeError::NoSpaceInBuffer)?;
+                    .map_err(|_| SerializeError::FrameTooLong)?;
                 out[0..4].copy_from_slice(&len_prefix.to_be_bytes());
                 out[4] = $msg_id;
             };
