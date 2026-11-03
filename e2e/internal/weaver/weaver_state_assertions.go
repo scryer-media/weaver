@@ -481,7 +481,7 @@ func assertLogLines(raw string, jobID int, assertion *ScenarioLogAssertion) erro
 		count := 0
 		previousPayload := ""
 		for _, rawLine := range strings.Split(raw, "\n") {
-			clean := ansiEscape.ReplaceAllString(rawLine, "")
+			clean := cleanWeaverLogLine(rawLine)
 			if isWeaverDebugRingReplay(clean) || directLogJobID(clean) != wantJobID || !strings.Contains(clean, message) {
 				continue
 			}

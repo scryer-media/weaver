@@ -287,7 +287,7 @@ func runPoisonExtentDoesNotSpread(ctx *restartCaseContext) (restartCaseResult, e
 	conflicts := 0
 	named := map[string]bool{}
 	segmentName := regexp.MustCompile(`segment (\S+) claims`)
-	for _, line := range strings.Split(stripANSIEscapeSequences(string(full)), "\n") {
+	for _, line := range strings.Split(cleanWeaverLog(string(full)), "\n") {
 		if !strings.Contains(line, "yEnc layout conflict") {
 			continue
 		}

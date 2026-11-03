@@ -63,7 +63,7 @@ func (ctx *restartCaseContext) waitForBodies(jobID int, ids []string, want int) 
 // logLinesAfter returns the log lines after the first line holding `marker`
 // that contain any needle.
 func logLinesAfter(log, marker string, needles ...string) (bool, []string) {
-	lines := strings.Split(stripANSIEscapeSequences(log), "\n")
+	lines := strings.Split(cleanWeaverLog(log), "\n")
 	start := -1
 	for i, line := range lines {
 		if strings.Contains(line, marker) {
@@ -88,7 +88,7 @@ func logLinesAfter(log, marker string, needles ...string) (bool, []string) {
 
 func countLogLines(log string, needles ...string) int {
 	count := 0
-	for _, line := range strings.Split(stripANSIEscapeSequences(log), "\n") {
+	for _, line := range strings.Split(cleanWeaverLog(log), "\n") {
 		matched := true
 		for _, needle := range needles {
 			if !strings.Contains(line, needle) {

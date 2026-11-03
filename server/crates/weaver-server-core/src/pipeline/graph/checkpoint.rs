@@ -1469,7 +1469,7 @@ fn provenance_named(name: &str) -> Option<Provenance> {
     .find(|provenance| provenance_name(*provenance) == name)
 }
 
-const REASONS: [Why; 13] = [
+pub(crate) const REASONS: [Why; 13] = [
     Why::Compressed,
     Why::TailUnreachable,
     Why::EncryptedHeader,

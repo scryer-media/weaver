@@ -2104,7 +2104,7 @@ func logContains(logPath string, needle string) bool {
 	if err != nil {
 		return false
 	}
-	return strings.Contains(stripANSIEscapeSequences(string(data)), needle)
+	return strings.Contains(cleanWeaverLog(string(data)), needle)
 }
 
 func stripANSIEscapeSequences(line string) string {

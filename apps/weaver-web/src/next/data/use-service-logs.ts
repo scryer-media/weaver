@@ -8,7 +8,7 @@ import { SERVICE_LOGS_QUERY } from "@/graphql/queries";
 import {
   LOG_LEVELS,
   mergeSnapshot,
-  parseLogLine,
+  readLogLine,
   type LogKeyValue,
   type LogLevel,
   type LogLine,
@@ -17,8 +17,8 @@ import {
 /**
  * The service log tail.
  *
- * Seeded from `serviceLogs` and kept current by the `serviceLogLines`
- * subscription. Lines arrive
+ * Seeded from `serviceLogs` and kept current by the `serviceLogRecords`
+ * subscription. Each line arrives as its JSON record. Lines arrive
  * far faster than React should re-render, so ingestion batches into a ref and
  * only publishes a snapshot on a timer.
  */
@@ -26,7 +26,7 @@ import {
 const BUFFER_MAX = 2_000;
 const INGEST_BATCH_MS = 50;
 const RENDER_BATCH_MS = 150;
-const SERVICE_LOG_LINES_SUB = `subscription ServiceLogLines { serviceLogLines }`;
+const SERVICE_LOG_RECORDS_SUB = `subscription ServiceLogRecords { serviceLogRecords }`;
 
 export { LOG_LEVELS };
 export type { LogKeyValue, LogLevel, LogLine };
@@ -80,21 +80,21 @@ export function useServiceLogs(level: LogLevelFilter, query: string): ServiceLog
       return;
     }
     const next = bufferRef.current.slice();
-    for (const raw of pending) {
-      next.push(parseLogLine(nextIdRef.current, raw));
+    for (const source of pending) {
+      next.push(readLogLine(nextIdRef.current, source));
       nextIdRef.current += 1;
     }
     bufferRef.current = next.length > BUFFER_MAX ? next.slice(next.length - BUFFER_MAX) : next;
     scheduleRender();
   }, [scheduleRender]);
 
-  const [{ data, fetching }] = useQuery<{ serviceLogs: { lines: string[]; count: number } }>({
+  const [{ data, fetching }] = useQuery<{ serviceLogs: { records: string[]; count: number } }>({
     query: SERVICE_LOGS_QUERY,
     variables: { limit: BUFFER_MAX },
   });
 
   useEffect(() => {
-    const seed = data?.serviceLogs?.lines;
+    const seed = data?.serviceLogs?.records;
     if (!seed) {
       return;
     }
@@ -120,12 +120,12 @@ export function useServiceLogs(level: LogLevelFilter, query: string): ServiceLog
     // A replaced subscription has nothing more to say about the tail.
     let current = true;
     const unsubscribe = client.subscribe(
-      { query: SERVICE_LOG_LINES_SUB },
+      { query: SERVICE_LOG_RECORDS_SUB },
       {
-        next(result: { data?: { serviceLogLines?: string } }) {
+        next(result: { data?: { serviceLogRecords?: string } }) {
           if (!current) return;
           setConnected(true);
-          const line = result.data?.serviceLogLines;
+          const line = result.data?.serviceLogRecords;
           // A paused tail drops new lines rather than buffering them: the
           // status bar promises "scroll freely", not "catch up later".
           if (!line || pausedRef.current) {

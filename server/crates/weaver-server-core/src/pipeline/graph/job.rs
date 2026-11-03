@@ -118,6 +118,8 @@ pub(crate) enum Note {
     Landed(VolumeIndex),
     // A set's repair came back and was applied, rebuilding these slices.
     Repaired(u64),
+    // An archive was given up on as an archive for this member.
+    GivenBack(super::namespace::GivenBack),
 }
 
 // A root member as the post lists it.
@@ -210,7 +212,14 @@ impl GraphJob {
 
     // What the job did since this was last asked.
     pub(crate) fn take_notes(&mut self) -> Vec<Note> {
-        std::mem::take(&mut self.notes)
+        let mut notes = std::mem::take(&mut self.notes);
+        notes.extend(
+            self.writer
+                .take_given_back()
+                .into_iter()
+                .map(Note::GivenBack),
+        );
+        notes
     }
 
     // The phase the job last reported, if it reported one.

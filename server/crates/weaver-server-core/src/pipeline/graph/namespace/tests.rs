@@ -707,6 +707,36 @@ fn routed_deliveries_reuse_the_writer_s_effect_room() {
     assert_eq!(job.file("notes.bin"), b"Raws, world");
 }
 
+// Members nothing held, each refused for breaching the holds, are one
+// archive given up on in their namespace: one event.
+#[test]
+fn members_nothing_held_breaching_the_holds_are_one_event() {
+    let mut job = Job::new(HoldBudgets {
+        resident_limit: 4,
+        scratch_total: 0,
+        scratch_ceiling: 0,
+        disk_reserve: 0,
+    });
+    let first = job.member("pack.r00", None);
+    let second = job.member("pack.r01", None);
+    for member in [first, second] {
+        job.send(member, 0, b"Ra", Provenance::Fresh);
+        job.send(member, 10, b"tail..", Provenance::Fresh);
+        assert_eq!(
+            job.writer.refused(NodeId::ROOT, member),
+            Some(Why::HoldsBreached)
+        );
+    }
+    assert_eq!(
+        job.writer.take_given_back(),
+        [super::GivenBack {
+            member: "pack.r00".to_string(),
+            container: String::new(),
+            why: Why::HoldsBreached,
+        }]
+    );
+}
+
 #[test]
 fn a_breach_refuses_the_member_to_a_leaf_which_receives_every_byte() {
     let mut job = Job::new(HoldBudgets {
@@ -2354,6 +2384,40 @@ fn a_member_given_back_logs_object_refused() {
         lines.of("object refused"),
         ["object refused job_id=1 node=0 kind= member=notes.bin why=holds_breached"]
     );
+}
+
+// Every reason an object can give a member back for reaches the job's
+// events, with the member and the archive that gave it back; the same
+// reason again says nothing new.
+#[test]
+fn every_reason_a_member_is_given_back_for_is_noted_once() {
+    for why in crate::pipeline::graph::checkpoint::REASONS {
+        let mut job = Job::new(PLENTY);
+        let (_, child) = bound_store(&mut job);
+        for _ in 0..2 {
+            let mut build = job.build();
+            job.writer
+                .said(
+                    &mut job.tree,
+                    &mut build,
+                    &Source,
+                    child,
+                    Emit::Refuse(why),
+                    &mut job.out,
+                )
+                .expect("refuse");
+        }
+        assert_eq!(
+            job.writer.take_given_back(),
+            [super::GivenBack {
+                member: "pack.bin".to_string(),
+                container: "rar_store".to_string(),
+                why,
+            }],
+            "{why:?}"
+        );
+        assert!(job.writer.take_given_back().is_empty(), "{why:?}");
+    }
 }
 
 // A set binding a member by what its bytes told it is said once, as the

@@ -129,7 +129,7 @@ func runHealthProbeWaitsForOwnedLane(ctx *restartCaseContext) (restartCaseResult
 			return false, err
 		}
 		armed := false
-		for _, line := range strings.Split(stripANSIEscapeSequences(string(log)), "\n") {
+		for _, line := range strings.Split(cleanWeaverLog(string(log)), "\n") {
 			if jobField.MatchString(line) && strings.Contains(line, "health probe armed: STAT sampling") {
 				armed = true
 				break

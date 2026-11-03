@@ -162,6 +162,16 @@ struct Acknowledging {
     closed: BTreeSet<(NodeId, MemberId)>,
 }
 
+// An archive given up on as an archive: its members are delivered or
+// withheld as their bytes stand. Named by the first member given back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GivenBack {
+    pub(crate) member: String,
+    // The kind of object that gave it back; empty when none held it.
+    pub(crate) container: String,
+    pub(crate) why: Why,
+}
+
 pub(crate) struct NamespaceWriter {
     // The job's process-wide id, which with a node id names a namespace to
     // the holds accountant that every job shares.
@@ -210,6 +220,12 @@ pub(crate) struct NamespaceWriter {
     // first piece of a file once the whole return is down: a later slice of
     // the same return may still rewrite the front of a piece beside it.
     refused_in_batch: BTreeSet<(NodeId, MemberId)>,
+    // Archives given up on since the job last asked, for its events.
+    given_back: Vec<GivenBack>,
+    // The archives already given up on: the object that gave its members
+    // back (true), or the namespace whose members nothing held (false). One
+    // archive is one event however many volumes it had.
+    given_up: BTreeSet<(NodeId, bool)>,
     #[cfg(test)]
     diagnostics: Vec<weaver_graph::recovery::RepairDiagnostic>,
     placements: Vec<Placement>,
@@ -246,6 +262,8 @@ impl NamespaceWriter {
             effects: Vec::new(),
             acknowledging: None,
             refused_in_batch: BTreeSet::new(),
+            given_back: Vec::new(),
+            given_up: BTreeSet::new(),
             #[cfg(test)]
             diagnostics: Vec::new(),
             placements: Vec::new(),
@@ -267,6 +285,11 @@ impl NamespaceWriter {
     ) -> Self {
         self.metrics = metrics;
         self
+    }
+
+    // The members given back since this was last asked.
+    pub(crate) fn take_given_back(&mut self) -> Vec<GivenBack> {
+        std::mem::take(&mut self.given_back)
     }
 
     // The breach of the job's extraction budget, once one stands.
@@ -1009,7 +1032,10 @@ impl NamespaceWriter {
             // Handed over as the member's, by `apply_each`.
             Effect::Folded { .. } => {}
             Effect::Refused { node, member, why } | Effect::NeedsEngine { node, member, why } => {
-                self.refuse(tree, *node, *member, *why);
+                // A member handed to an engine is read by it: the archive was
+                // not given up on.
+                let given_up = matches!(effect, Effect::Refused { .. });
+                self.refuse(tree, *node, *member, *why, given_up);
                 // The engine the refusal handed the member to took it over.
                 if matches!(effect, Effect::NeedsEngine { .. })
                     && let Some((engine, _)) = tree.child_of(*node, *member)
@@ -1308,7 +1334,7 @@ impl NamespaceWriter {
                 self.capture(tree, builder, owner, &arrival, &mut effects)?;
                 return self.apply_each(tree, builder, segments, effects, write, out);
             }
-            self.refuse(tree, node, member, Why::HoldsBreached);
+            self.refuse(tree, node, member, Why::HoldsBreached, true);
             self.write_file(tree, node, member, arrival.offset, &arrival.bytes)?;
             out.push(Effect::Refused {
                 node,
@@ -1796,22 +1822,41 @@ impl NamespaceWriter {
     }
 
     // The member is a leaf because something gave it back or never took
-    // it. Said once, when the reason is new.
-    fn refuse(&mut self, tree: &Tree, node: NodeId, member: MemberId, why: Why) {
-        if self.files_mut(node).refuse(member, why) == Some(why) {
-            return;
-        }
+    // it. Said once, when the reason is new. When `given_up`, the archive it
+    // belonged to is noted for the job's events, once per archive.
+    fn refuse(&mut self, tree: &Tree, node: NodeId, member: MemberId, why: Why, given_up: bool) {
+        // Said before: an engine handed the member gives it back for the
+        // reason it was handed over for.
+        let said = self.files_mut(node).refuse(member, why) == Some(why);
         // The object that gave the member back, if one had it.
-        let kind = tree
-            .refused_by(node, member)
+        let object = tree.refused_by(node, member);
+        let kind = object
             .and_then(|object| tree.kind(object))
             .map(|kind| kind.to_string())
             .unwrap_or_default();
+        let name = member_name(tree, node, member);
+        // Noted whether or not the reason is new: a member handed to an
+        // engine already holds the reason the engine gives it back for.
+        // Members nothing held are one archive per namespace.
+        let archive = match object {
+            Some(object) => (object, true),
+            None => (node, false),
+        };
+        if given_up && self.given_up.insert(archive) {
+            self.given_back.push(GivenBack {
+                member: name.clone(),
+                container: kind.clone(),
+                why,
+            });
+        }
+        if said {
+            return;
+        }
         tracing::info!(
             job_id = self.scope,
             node = node.0,
             kind = %kind,
-            member = %member_name(tree, node, member),
+            member = %name,
             why = %why_name(why),
             "object refused"
         );

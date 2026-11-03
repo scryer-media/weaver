@@ -49,9 +49,22 @@ impl From<CoreDirectoryBrowseListing> for DirectoryBrowseResult {
 }
 
 #[derive(Debug, Clone, SimpleObject)]
+#[graphql(complex)]
 pub struct ServiceLogsPayload {
-    pub lines: Vec<String>,
+    /// One JSON record per line, oldest first.
+    pub records: Vec<String>,
     pub count: i32,
+}
+
+#[ComplexObject]
+impl ServiceLogsPayload {
+    /// The same lines as text, rendered from the records when asked for.
+    async fn lines(&self) -> Vec<String> {
+        self.records
+            .iter()
+            .map(|record| weaver_server_core::runtime::log_buffer::text_line(record))
+            .collect()
+    }
 }
 
 /// The live log filter. Changes last until the process exits.
@@ -780,6 +793,17 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                 file_id: None,
                 message: error.clone(),
             },
+            PipelineEvent::ArchiveDemoted {
+                job_id,
+                member,
+                container,
+                reason,
+            } => Self {
+                kind: EventKind::ArchiveDemoted,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: archive_demoted_message(member, container, reason),
+            },
             PipelineEvent::MoveToCompleteStarted { job_id } => Self {
                 kind: EventKind::MoveToCompleteStarted,
                 job_id: Some(job_id.0),
@@ -833,6 +857,38 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                 message: format!("{event:?}"),
             },
         }
+    }
+}
+
+// An archive demotion as the job's event log says it: the member, why the
+// archive was given up on in plain words, and the reason's label with the
+// archive's kind for anyone matching on them.
+pub(crate) fn archive_demoted_message(member: &str, container: &str, reason: &str) -> String {
+    let why = match reason {
+        "compressed" => "its bytes are compressed",
+        "tail_unreachable" => "its index could not be reached",
+        "encrypted_header" => "its header is encrypted and no password opened it",
+        "encrypted" => "it is encrypted",
+        "unbounded_entry" => "its size is not declared",
+        "not_a_file" => "it is not a file",
+        "unrepairable" => "its damage could not be repaired",
+        "first_bytes_lost" => "its first bytes were lost",
+        "holds_breached" => "its held bytes went over budget",
+        "unsupported" => "the archive layout is not supported",
+        "unmapped" => "the archive never placed it",
+        "too_deep" => "the archive is nested too deep",
+        "invalid_archive" => "the archive failed validation",
+        _ => "of an unnamed reason",
+    };
+    let name = if member.is_empty() {
+        "a member"
+    } else {
+        member
+    };
+    if container.is_empty() {
+        format!("{name}: archive given up because {why} ({reason})")
+    } else {
+        format!("{name}: {container} archive given up because {why} ({reason})")
     }
 }
 
@@ -1467,5 +1523,38 @@ mod tests {
         assert_eq!(event.kind, EventKind::PhaseProgressUpdated);
         assert_eq!(event.job_id, Some(42));
         assert_eq!(event.file_id, None);
+    }
+}
+
+#[cfg(test)]
+mod archive_demoted_tests {
+    use super::archive_demoted_message;
+
+    // Every reason the graph can give an archive up for has words of its own.
+    #[test]
+    fn every_demotion_reason_is_said_in_words() {
+        for reason in [
+            "compressed",
+            "tail_unreachable",
+            "encrypted_header",
+            "encrypted",
+            "unbounded_entry",
+            "not_a_file",
+            "unrepairable",
+            "first_bytes_lost",
+            "holds_breached",
+            "unsupported",
+            "unmapped",
+            "too_deep",
+            "invalid_archive",
+        ] {
+            let message = archive_demoted_message("pack.bin", "rar_store", reason);
+            assert!(!message.contains("unnamed"), "{message}");
+            assert!(message.ends_with(&format!("({reason})")), "{message}");
+        }
+        assert_eq!(
+            archive_demoted_message("notes.bin", "", "holds_breached"),
+            "notes.bin: archive given up because its held bytes went over budget (holds_breached)"
+        );
     }
 }

@@ -46,7 +46,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 use crate::args::{Cli, Command};
-use crate::logging::{LocalTimer, LogColor, LogFormat};
+use crate::logging::{JsonRecord, JsonSpanFields, LocalTimer, LogColor, LogFormat};
 
 const LOG_FILE_ENV: &str = "WEAVER_LOG_FILE";
 const DOTENV_FILE: &str = ".env";
@@ -171,8 +171,12 @@ async fn async_main() {
 
     let log_ring_buffer =
         weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity();
+    // The ring buffer behind the web log viewer always holds JSON records,
+    // whatever stdout is set to: the viewer draws each line from its record
+    // and shows the record itself on selection.
     let buffer_layer = tracing_subscriber::fmt::layer()
-        .with_timer(LocalTimer)
+        .fmt_fields(JsonSpanFields)
+        .event_format(JsonRecord)
         .with_writer(LogBufferWriter(log_ring_buffer.clone()))
         .with_ansi(false);
     let env_log_file = std::env::var_os(LOG_FILE_ENV).map(PathBuf::from);
@@ -221,14 +225,13 @@ async fn async_main() {
         }
         None => None,
     };
-    // The in-memory ring buffer always keeps the human-readable line format:
-    // the web log viewer parses it, so a JSON stdout must not reformat it.
     let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![Box::new(buffer_layer)];
     layers.push(match log_format {
         LogFormat::Json => Box::new(
             tracing_subscriber::fmt::layer()
-                .with_timer(LocalTimer)
-                .json(),
+                .fmt_fields(JsonSpanFields)
+                .event_format(JsonRecord)
+                .with_ansi(false),
         ),
         LogFormat::Text => Box::new(
             tracing_subscriber::fmt::layer()
@@ -240,9 +243,10 @@ async fn async_main() {
         layers.push(match log_format {
             LogFormat::Json => Box::new(
                 tracing_subscriber::fmt::layer()
-                    .with_timer(LocalTimer)
-                    .json()
-                    .with_writer(writer),
+                    .fmt_fields(JsonSpanFields)
+                    .event_format(JsonRecord)
+                    .with_writer(writer)
+                    .with_ansi(false),
             ),
             LogFormat::Text => Box::new(
                 tracing_subscriber::fmt::layer()
