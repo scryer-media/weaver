@@ -63,7 +63,7 @@ import { buildTimelineView, downloadingMs, type JobTimelineData } from "../data/
 import { useNextData } from "../data/next-data";
 import { useSharedStructure } from "../data/share";
 import { countLabel } from "../i18n/labels";
-import { NextShell, RailBlock } from "../shell/NextShell";
+import { NextShell } from "../shell/NextShell";
 import { SupportReportActions } from "../features/SupportReportActions";
 
 /**
@@ -533,22 +533,6 @@ function JobDetailContent() {
             )}
           </div>
         </header>
-      }
-      railFooter={
-        <RailBlock eyebrow={t("next.job.savedBandwidth")}>
-          <div className="text-[20px] font-semibold tracking-[-0.02em] text-wv-accent">
-            {job.optionalRecoveryBytes > 0 ? formatSize(savedBytes) : EM_DASH}
-          </div>
-          <div className="font-wv-mono text-[10.5px] leading-[1.5] text-wv-faint">
-            {job.optionalRecoveryBytes === 0
-              ? t("next.job.saved.noSet")
-              : job.optionalRecoveryDownloadedBytes === 0
-                ? t("next.job.saved.untouched")
-                : savedBytes === 0
-                  ? t("next.job.saved.wholeSet")
-                  : t("next.job.saved.partSet")}
-          </div>
-        </RailBlock>
       }
       statusNote={
         report ?? (
