@@ -1361,6 +1361,10 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
         .await
         .unwrap();
     pipeline.apply_queue_intents().await;
+    assert_eq!(
+        pipeline.shared_state.download_block().speed_limit_in_force,
+        512 * 1024
+    );
 
     pipeline.report_all_for_test();
     SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
@@ -1388,6 +1392,10 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
         assert_eq!(pipeline.scheduled_rate_limit, Some(128 * 1024));
         assert_eq!(
             pipeline.shared_state.download_block().scheduled_speed_limit,
+            128 * 1024
+        );
+        assert_eq!(
+            pipeline.shared_state.download_block().speed_limit_in_force,
             128 * 1024
         );
     }
@@ -1418,6 +1426,11 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
     assert_eq!(pipeline.scheduled_rate_limit, Some(0));
     assert_eq!(pipeline.rate_limiter.rate(), 0);
     assert!(pipeline.global_paused);
+    // The published limit in force says so too, not the configured one.
+    assert_eq!(
+        pipeline.shared_state.download_block().speed_limit_in_force,
+        0
+    );
 }
 
 #[tokio::test]

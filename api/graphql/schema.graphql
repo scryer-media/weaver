@@ -467,6 +467,11 @@ type DownloadBlock {
 	timezoneName: String!
 	scheduledSpeedLimit: Int!
 	"""
+	Speed limit the downloads run under now: the schedule's while one
+	holds, even one set to unlimited, else the configured one. 0 is none.
+	"""
+	speedLimitInForce: Int!
+	"""
 	Why a schedule rule is holding new downloads, while one is.
 	"""
 	scheduleHoldReason: String

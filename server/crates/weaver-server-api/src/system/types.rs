@@ -107,6 +107,9 @@ pub struct DownloadBlock {
     pub window_ends_at_epoch_ms: Option<f64>,
     pub timezone_name: String,
     pub scheduled_speed_limit: u64,
+    /// Speed limit the downloads run under now: the schedule's while one
+    /// holds, even one set to unlimited, else the configured one. 0 is none.
+    pub speed_limit_in_force: u64,
     /// Why a schedule rule is holding new downloads, while one is.
     pub schedule_hold_reason: Option<String>,
 }
@@ -124,6 +127,7 @@ impl From<&DownloadBlockState> for DownloadBlock {
             window_ends_at_epoch_ms: value.window_ends_at_epoch_ms,
             timezone_name: value.timezone_name.clone(),
             scheduled_speed_limit: value.scheduled_speed_limit,
+            speed_limit_in_force: value.speed_limit_in_force,
             schedule_hold_reason: value.schedule_hold_reason.clone(),
         }
     }
