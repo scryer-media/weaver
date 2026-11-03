@@ -2356,6 +2356,40 @@ fn a_member_given_back_logs_object_refused() {
     );
 }
 
+// Every reason an object can give a member back for reaches the job's
+// events, with the member and the archive that gave it back; the same
+// reason again says nothing new.
+#[test]
+fn every_reason_a_member_is_given_back_for_is_noted_once() {
+    for why in crate::pipeline::graph::checkpoint::REASONS {
+        let mut job = Job::new(PLENTY);
+        let (_, child) = bound_store(&mut job);
+        for _ in 0..2 {
+            let mut build = job.build();
+            job.writer
+                .said(
+                    &mut job.tree,
+                    &mut build,
+                    &Source,
+                    child,
+                    Emit::Refuse(why),
+                    &mut job.out,
+                )
+                .expect("refuse");
+        }
+        assert_eq!(
+            job.writer.take_given_back(),
+            [super::GivenBack {
+                member: "pack.bin".to_string(),
+                container: "rar_store".to_string(),
+                why,
+            }],
+            "{why:?}"
+        );
+        assert!(job.writer.take_given_back().is_empty(), "{why:?}");
+    }
+}
+
 // A set binding a member by what its bytes told it is said once, as the
 // name the set describes it by.
 #[test]
