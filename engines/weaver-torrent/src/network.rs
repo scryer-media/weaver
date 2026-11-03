@@ -312,13 +312,14 @@ const PAIR_ATTEMPTS: usize = 16;
 
 // A socket for each family on one port: IPv6 alone at `addr`, then IPv4 on
 // the port it took. Port 0 lets the kernel choose, and a port it chose for
-// IPv6 that IPv4 holds is given up for another.
+// IPv6 that IPv4 holds is given up for another; the IPv6 sockets given up
+// stay bound until the pair is made, so the kernel never chooses one again.
 fn bind_pair<T>(
     addr: SocketAddr,
     bind: impl Fn(SocketAddr) -> io::Result<T>,
     port_of: impl Fn(&T) -> u16,
 ) -> io::Result<(T, T)> {
-    let mut attempts = 1;
+    let mut given_up = Vec::new();
     loop {
         let v6 = bind(addr)?;
         match bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port_of(&v6)))) {
@@ -326,9 +327,9 @@ fn bind_pair<T>(
             Err(error)
                 if addr.port() == 0
                     && error.kind() == io::ErrorKind::AddrInUse
-                    && attempts < PAIR_ATTEMPTS =>
+                    && given_up.len() + 1 < PAIR_ATTEMPTS =>
             {
-                attempts += 1;
+                given_up.push(v6);
             }
             Err(error) => return Err(error),
         }
@@ -716,5 +717,144 @@ mod tests {
             read.read_exact(&mut got).await.unwrap();
             assert_eq!(&got, b"hi");
         }
+    }
+}
+
+#[cfg(test)]
+mod pair_tests {
+    use std::{
+        cell::{Cell, RefCell},
+        collections::BTreeSet,
+        io,
+        net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+        rc::Rc,
+    };
+
+    use super::{DatagramSocket, KernelSockets, PAIR_ATTEMPTS, PairedUdp, bind_pair};
+
+    // A bound port, held until dropped.
+    struct Held {
+        port: u16,
+        bound: Rc<RefCell<BTreeSet<(bool, u16)>>>,
+        v6: bool,
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.bound.borrow_mut().remove(&(self.v6, self.port));
+        }
+    }
+
+    // A host whose IPv6 binds at port 0 take the lowest port no IPv6
+    // socket holds, from 1, and whose IPv4 binds fail with `v4` while it
+    // returns an error.
+    struct Host {
+        bound: Rc<RefCell<BTreeSet<(bool, u16)>>>,
+        v4_binds: Cell<usize>,
+        v4: Box<dyn Fn(usize) -> Option<io::ErrorKind>>,
+    }
+
+    impl Host {
+        fn new(v4: impl Fn(usize) -> Option<io::ErrorKind> + 'static) -> Self {
+            Self {
+                bound: Rc::default(),
+                v4_binds: Cell::new(0),
+                v4: Box::new(v4),
+            }
+        }
+
+        fn bind(&self, at: SocketAddr) -> io::Result<Held> {
+            let v6 = at.is_ipv6();
+            if !v6 {
+                let n = self.v4_binds.get();
+                self.v4_binds.set(n + 1);
+                if let Some(kind) = (self.v4)(n) {
+                    return Err(kind.into());
+                }
+            }
+            let port = match at.port() {
+                0 => (1..)
+                    .find(|port| !self.bound.borrow().contains(&(v6, *port)))
+                    .unwrap(),
+                port => port,
+            };
+            self.bound.borrow_mut().insert((v6, port));
+            Ok(Held {
+                port,
+                bound: Rc::clone(&self.bound),
+                v6,
+            })
+        }
+
+        fn pair(&self, port: u16) -> io::Result<(Held, Held)> {
+            bind_pair(
+                (Ipv6Addr::UNSPECIFIED, port).into(),
+                |at| self.bind(at),
+                |held| held.port,
+            )
+        }
+    }
+
+    #[test]
+    fn a_port_ipv4_holds_is_given_up_for_a_new_one() {
+        // IPv4 holds the first two ports IPv6 is given.
+        let host = Host::new(|n| (n < 2).then_some(io::ErrorKind::AddrInUse));
+        let (v6, v4) = host.pair(0).unwrap();
+        assert_eq!((v6.port, v4.port), (3, 3));
+        // The ports given up were held until the pair was made, then let go.
+        assert_eq!(
+            *host.bound.borrow(),
+            BTreeSet::from([(true, 3), (false, 3)])
+        );
+    }
+
+    #[test]
+    fn a_pair_gives_up_after_its_last_attempt() {
+        let host = Host::new(|_| Some(io::ErrorKind::AddrInUse));
+        let error = host.pair(0).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(host.v4_binds.get(), PAIR_ATTEMPTS);
+        // Nothing stays bound.
+        assert!(host.bound.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_port_asked_for_is_never_given_up() {
+        let host = Host::new(|_| Some(io::ErrorKind::AddrInUse));
+        let error = host.pair(6881).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(host.v4_binds.get(), 1);
+        assert!(host.bound.borrow().is_empty());
+    }
+
+    #[test]
+    fn any_other_ipv4_failure_is_returned_at_once() {
+        let host = Host::new(|_| Some(io::ErrorKind::PermissionDenied));
+        let error = host.pair(0).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(host.v4_binds.get(), 1);
+        assert!(host.bound.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_mapped_ipv4_target_goes_out_on_the_ipv4_socket_unmapped() {
+        let sockets = KernelSockets::new(None).unwrap();
+        let paired = PairedUdp {
+            v6: sockets.kernel_udp((Ipv6Addr::LOCALHOST, 0).into()).unwrap(),
+            v4: sockets.kernel_udp((Ipv4Addr::LOCALHOST, 0).into()).unwrap(),
+        };
+        let peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = peer.local_addr().unwrap().port();
+        let mapped = SocketAddr::from((Ipv4Addr::LOCALHOST.to_ipv6_mapped(), port));
+        let (socket, target) = paired.toward(mapped);
+        assert!(std::ptr::eq(socket, &paired.v4));
+        assert_eq!(target, SocketAddr::from((Ipv4Addr::LOCALHOST, port)));
+
+        paired.send_to(b"out", mapped).await.unwrap();
+        let mut buf = [0u8; 8];
+        let (len, from) = peer.recv_from(&mut buf).await.unwrap();
+        assert_eq!((&buf[..len], from), (&b"out"[..], paired.v4.bind_addr()));
     }
 }
