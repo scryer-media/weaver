@@ -36,7 +36,6 @@ async fn test_mtu_probing() {
             mtu_probe_max_retransmissions: Some(0),
             vsock_tx_bufsize_bytes_initial: Some(non_zero_const!(1024 * 1024)), // so that we can write the initial large payload without blocking
             disable_nagle: true,
-            congestion: super::cubic(),
             ..Default::default()
         },
         false,
@@ -46,7 +45,7 @@ async fn test_mtu_probing() {
     // Force congestion controller to have a very high window so that it doesn't interfere.
     t.vsock
         .congestion_controller
-        .on_recovered(1024 * 1024, 100 * 1024 * 1024);
+        .set_window(1024 * 1024);
 
     #[derive(Debug)]
     enum TestCommand {
@@ -187,7 +186,6 @@ async fn probe_retry_if_emsgsize() {
     let mut t = make_test_vsock(
         SocketOpts {
             disable_nagle: true,
-            congestion: super::cubic(),
             ..Default::default()
         },
         false,
@@ -205,7 +203,7 @@ async fn probe_retry_if_emsgsize() {
     // Force congestion controller to have a very high window so that it doesn't interfere.
     t.vsock
         .congestion_controller
-        .on_recovered(1024 * 1024, 100 * 1024 * 1024);
+        .set_window(1024 * 1024);
 
     let (_r, mut w) = t.stream.take().unwrap().split();
     w.write_all(make_payload(30000).as_bytes()).await.unwrap();

@@ -18,7 +18,6 @@ async fn test_rtte_set_and_updated() {
     let mut t = make_test_vsock(
         SocketOpts {
             link_mtu: Some(calc_mtu_for_mss(1)),
-            congestion: super::cubic(),
             ..Default::default()
         },
         false,
@@ -46,7 +45,10 @@ async fn test_rtte_set_and_updated() {
         t.take_sent(),
         vec![
             cmphead!(ST_DATA, seq_nr = 101, payload = "a"),
-            cmphead!(ST_DATA, seq_nr = 102, payload = "b")
+            cmphead!(ST_DATA, seq_nr = 102, payload = "b"),
+            cmphead!(ST_DATA, seq_nr = 103, payload = "c"),
+            cmphead!(ST_DATA, seq_nr = 104, payload = "d"),
+            cmphead!(ST_DATA, seq_nr = 105, payload = "e"),
         ]
     );
 

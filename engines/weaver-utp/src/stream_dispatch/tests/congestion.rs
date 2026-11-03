@@ -24,7 +24,6 @@ async fn test_congestion_control_basics() {
             vsock_tx_bufsize_bytes_initial: Some(non_zero_const!(64 * 1024)),
             // No probe: a lost probe would not cut the window.
             link_mtu: Some(non_zero_const!(576)),
-            congestion: super::cubic(),
             ..Default::default()
         },
         false,

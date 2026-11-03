@@ -18,7 +18,7 @@ use tracing::{Level, debug, debug_span, event, trace, trace_span};
 
 use crate::{
     Error, UtpSocket,
-    congestion::{CongestionController, DelaySample},
+    congestion::{DelaySample, ledbat::Ledbat},
     constants::{
         ACK_DELAY, IMMEDIATE_ACK_EVERY_RMSS, RECOVERY_TRACING_LOG_LEVEL, RTTE_TRACING_LOG_LEVEL,
         SYNACK_RESEND_INTERNAL, UTP_HEADER, calc_pipe_expiry,
@@ -195,7 +195,7 @@ struct VirtualSocket<T, Env> {
     segment_sizes: SegmentSizes,
 
     rtte: RttEstimator,
-    congestion_controller: Box<dyn CongestionController>,
+    congestion_controller: Ledbat,
 
     recovery: Recovery,
 
@@ -1228,11 +1228,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
         self.congestion_controller
             .set_remote_window(msg.header.wnd_size as usize);
-        self.congestion_controller.on_ack(
-            self.this_poll.now,
-            result.on_ack_result.acked_bytes,
-            &self.rtte,
-        );
         let sampled = self.delay.on_packet(
             self.this_poll.now,
             self.timestamp_microseconds(),
@@ -1259,7 +1254,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             &result.on_ack_result,
             &mut self.user_tx_segments,
             self.last_sent_seq_nr,
-            &mut *self.congestion_controller,
+            &mut self.congestion_controller,
             self.this_poll.now,
             self.rtte.roundtrip_time(),
             &self.socket.stats,
@@ -1765,7 +1760,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             env,
             socket_opts: socket.opts().clone(),
             congestion_controller: {
-                let mut ctrl = socket.opts().congestion.create(now, ss.mss() as usize);
+                let mut ctrl = Ledbat::new(ss.mss() as usize, socket.opts().ledbat);
                 ctrl.set_remote_window(remote_window as usize);
                 ctrl
             },

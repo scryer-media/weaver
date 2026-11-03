@@ -26,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{UtpStream, spawn_utils::spawn_with_cancel};
 use crate::{
-    congestion::{CongestionController, ledbat::LedbatParams},
+    congestion::ledbat::LedbatParams,
     constants::{
         DEFAULT_CONNECT_TIMEOUT, DEFAULT_FIN_RESENDS, DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET,
         DEFAULT_MIN_TIMEOUT, DEFAULT_NUM_RESENDS, DEFAULT_REMOTE_INACTIVITY_TIMEOUT,
@@ -50,42 +50,6 @@ type ConnectionId = SeqNr;
 
 // When we get incoming packets this connection id is used to pick the stream.
 type StreamRecvKey = (SocketAddr, ConnectionId);
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum CongestionControllerKind {
-    /// Delay-based: yields to other traffic on the link.
-    #[default]
-    Ledbat,
-    Cubic,
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct CongestionConfig {
-    pub kind: CongestionControllerKind,
-    pub tracing: bool,
-    pub ledbat: LedbatParams,
-}
-
-impl CongestionConfig {
-    pub(crate) fn create(&self, now: Instant, rmss: usize) -> Box<dyn CongestionController> {
-        use crate::congestion::cubic::Cubic;
-        use crate::congestion::ledbat::Ledbat;
-        use crate::congestion::tracing::TracingController;
-
-        match (self.kind, self.tracing) {
-            (CongestionControllerKind::Cubic, true) => {
-                tracing::debug!("enabling congestion tracing");
-                Box::new(TracingController::new(Cubic::new(now, rmss)))
-            }
-            (CongestionControllerKind::Cubic, false) => Box::new(Cubic::new(now, rmss)),
-            (CongestionControllerKind::Ledbat, true) => {
-                tracing::debug!("enabling congestion tracing");
-                Box::new(TracingController::new(Ledbat::new(rmss, self.ledbat)))
-            }
-            (CongestionControllerKind::Ledbat, false) => Box::new(Ledbat::new(rmss, self.ledbat)),
-        }
-    }
-}
 
 #[derive(Debug, Default, Clone)]
 pub struct SocketOpts {
@@ -111,8 +75,8 @@ pub struct SocketOpts {
     /// Disable Nagle's algorithm
     pub disable_nagle: bool,
 
-    /// Congestion control configuration.
-    pub congestion: CongestionConfig,
+    /// LEDBAT's tunables.
+    pub ledbat: LedbatParams,
 
     /// The parent span for spawned tokio tasks. If not provided, will use
     /// root span.
@@ -185,7 +149,7 @@ impl SocketOpts {
             link_mtu,
             vsock_rx_bufsize: max_user_rx_buffered_bytes,
             nagle: !self.disable_nagle,
-            congestion: self.congestion,
+            ledbat: self.ledbat,
             min_timeout: self.min_timeout.unwrap_or(DEFAULT_MIN_TIMEOUT),
             num_resends: self
                 .num_resends
@@ -225,7 +189,7 @@ pub(crate) struct ValidatedSocketOpts {
     pub vsock_tx_bufsize_bytes_initial: NonZeroUsize,
     pub vsock_tx_bufsize_bytes_max: NonZeroUsize,
     pub nagle: bool,
-    pub congestion: CongestionConfig,
+    pub ledbat: LedbatParams,
     pub min_timeout: Duration,
     pub num_resends: usize,
     pub syn_resends: usize,

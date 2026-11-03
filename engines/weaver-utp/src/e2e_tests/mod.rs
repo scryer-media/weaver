@@ -154,13 +154,7 @@ async fn echo(
 async fn test_one_echo(server_addr: SocketAddr, client_addr: SocketAddr, drop_every: u64) {
     setup_test_logging();
 
-    let opts = SocketOpts {
-        congestion: crate::CongestionConfig {
-            tracing: true,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    let opts = SocketOpts::default();
     let (server, client) = sockets(server_addr, client_addr, drop_every, opts);
 
     let serve = async {

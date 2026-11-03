@@ -9,7 +9,7 @@ use tokio::time::Instant;
 use tracing::event;
 
 use crate::{
-    congestion::CongestionController,
+    congestion::ledbat::Ledbat,
     constants::{RECOVERY_TRACING_LOG_LEVEL, SACK_DUP_THRESH},
     raw::{Type, UtpHeader},
     seq_nr::SeqNr,
@@ -195,7 +195,7 @@ impl Recovery {
         on_ack_result: &OnAckResult,
         tx_segs: &mut Segments,
         last_sent_seq_nr: SeqNr,
-        congestion_controller: &mut dyn CongestionController,
+        congestion_controller: &mut Ledbat,
         now: Instant,
         rtt: Duration,
         stats: &UtpStats,
@@ -263,16 +263,7 @@ impl Recovery {
             }
             RecoveryPhase::Recovering(rec) => {
                 if header.ack_nr >= rec.recovery_point {
-                    // A full acknowledgement.
-                    // On recover we set cwnd very conservatively not to cause a sudden burst of traffic.
-                    // It will very quickly reach sshthresh.
-                    let mss = congestion_controller.smss();
-                    let cwnd = congestion_controller
-                        .sshthresh()
-                        .min(tx_segs.calc_flight_size(last_sent_seq_nr).max(mss) + mss);
-                    let sshthresh = rec.cwnd;
-                    congestion_controller.on_recovered(cwnd, sshthresh);
-
+                    // A full acknowledgement: LEDBAT keeps the window the loss left.
                     event!(RECOVERY_TRACING_LOG_LEVEL, ?rec.recovery_point, ?header.ack_nr, prev_cwnd=rec.cwnd,
                         ?congestion_controller, ?rec.total_retransmitted_segments, ?rtt, "exited recovery");
                     self.phase = RecoveryPhase::CountingDuplicates { dup_acks: 0 };
@@ -311,10 +302,7 @@ mod tests {
 
     use super::Recovery;
     use crate::{
-        congestion::{
-            CongestionController,
-            ledbat::{Ledbat, LedbatParams},
-        },
+        congestion::ledbat::{Ledbat, LedbatParams},
         raw::{Type, UtpHeader},
         stats::UtpStats,
         stream_tx_segments::{OnAckResult, Segments},

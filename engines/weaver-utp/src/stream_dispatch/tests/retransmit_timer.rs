@@ -179,10 +179,6 @@ async fn test_rto_not_stuck_in_congestion_control() {
     let mut t = make_test_vsock(
         SocketOpts {
             link_mtu: Some(calc_mtu_for_mss(MSS)),
-            congestion: crate::CongestionConfig {
-                tracing: true,
-                ..super::cubic()
-            },
             ..Default::default()
         },
         false,
@@ -191,95 +187,38 @@ async fn test_rto_not_stuck_in_congestion_control() {
 
     let rto = Duration::from_millis(100);
     t.vsock.rtte.force_timeout(rto);
-    for _ in 0..20 {
-        // This should write a bunch of MSS packets
-        w.write_all(b"helloworld").await.unwrap();
-    }
+    w.write_all(b"helloworldhelloworld").await.unwrap();
 
     t.poll_once_assert_pending().await;
-
-    // 2 MSS
-    assert_eq!(t.vsock.congestion_controller.window(), 10);
-
-    // The first batch should be congestion controlled.
     assert_eq!(
         t.take_sent(),
         vec![
             cmphead!(ST_DATA, seq_nr = 101, payload = "hello"),
             cmphead!(ST_DATA, seq_nr = 102, payload = "world"),
-        ]
-    );
-
-    // Ack both
-    t.send_msg(
-        UtpHeader {
-            htype: ST_STATE,
-            wnd_size: 1024 * 1024,
-            seq_nr: 0.into(),
-            ack_nr: 102.into(),
-            ..Default::default()
-        },
-        "",
-    );
-
-    // The second batch should be congestion controlled but better.
-    t.poll_once_assert_pending().await;
-    assert_eq!(t.vsock.congestion_controller.window(), 20);
-    assert_eq!(
-        t.take_sent(),
-        vec![
             cmphead!(ST_DATA, seq_nr = 103, payload = "hello"),
             cmphead!(ST_DATA, seq_nr = 104, payload = "world"),
-            cmphead!(ST_DATA, seq_nr = 105, payload = "hello"),
-            cmphead!(ST_DATA, seq_nr = 106, payload = "world"),
         ]
     );
 
-    // Ack all
-    t.send_msg(
-        UtpHeader {
-            htype: ST_STATE,
-            wnd_size: 1024 * 1024,
-            seq_nr: 0.into(),
-            ack_nr: 106.into(),
-            ..Default::default()
-        },
-        "",
-    );
-
-    // Now let's pretend we send a bunch of data and then timeout.
-    t.poll_once_assert_pending().await;
-    assert_eq!(t.vsock.congestion_controller.window(), 40);
-    assert_eq!(
-        t.take_sent(),
-        vec![
-            cmphead!(ST_DATA, seq_nr = 107, payload = "hello"),
-            cmphead!(ST_DATA, seq_nr = 108, payload = "world"),
-            cmphead!(ST_DATA, seq_nr = 109, payload = "hello"),
-            cmphead!(ST_DATA, seq_nr = 110, payload = "world"),
-            cmphead!(ST_DATA, seq_nr = 111, payload = "hello"),
-            cmphead!(ST_DATA, seq_nr = 112, payload = "world"),
-            cmphead!(ST_DATA, seq_nr = 113, payload = "hello"),
-            cmphead!(ST_DATA, seq_nr = 114, payload = "world"),
-        ]
-    );
-
-    // Now don't ACK anything and trigger RTO.
+    // Nothing is acknowledged: the timeout resends the first and closes
+    // the window to one segment.
     t.env.increment_now(rto);
     t.poll_once_assert_pending().await;
-    // RTO should retransmit 1 packet.
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 107, payload = "hello")]
+        vec![cmphead!(ST_DATA, seq_nr = 101, payload = "hello")]
     );
+    assert_eq!(t.vsock.congestion_controller.window(), MSS);
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
 
-    // ACK the RTO packet. We then should resume normal sending from slow start.
+    // Its acknowledgement lets sending go on from the next.
     t.send_msg(
         UtpHeader {
             htype: ST_STATE,
             wnd_size: 1024 * 1024,
             seq_nr: 0.into(),
-            ack_nr: 107.into(),
+            ack_nr: 101.into(),
             ..Default::default()
         },
         "",
@@ -287,32 +226,21 @@ async fn test_rto_not_stuck_in_congestion_control() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![
-            cmphead!(ST_DATA, seq_nr = 108, payload = "world"),
-            cmphead!(ST_DATA, seq_nr = 109, payload = "hello")
-        ]
+        vec![cmphead!(ST_DATA, seq_nr = 102, payload = "world")]
     );
     t.send_msg(
         UtpHeader {
             htype: ST_STATE,
             wnd_size: 1024 * 1024,
             seq_nr: 0.into(),
-            ack_nr: 109.into(),
+            ack_nr: 104.into(),
             ..Default::default()
         },
         "",
     );
-
     t.poll_once_assert_pending().await;
-    assert_eq!(
-        t.take_sent(),
-        vec![
-            cmphead!(ST_DATA, seq_nr = 110, payload = "world"),
-            cmphead!(ST_DATA, seq_nr = 111, payload = "hello"),
-            cmphead!(ST_DATA, seq_nr = 112, payload = "world"),
-            cmphead!(ST_DATA, seq_nr = 113, payload = "hello"),
-        ]
-    );
+    t.assert_sent_empty();
+    assert!(t.vsock.user_tx_segments.is_empty());
 }
 
 #[tokio::test]
@@ -476,7 +404,6 @@ async fn test_rto_single_packet_retransmission_mss_sized() {
     let mut t = make_test_vsock(
         SocketOpts {
             link_mtu: Some(calc_mtu_for_mss(MSS)),
-            congestion: super::cubic(),
             ..Default::default()
         },
         false,
@@ -508,9 +435,14 @@ async fn test_rto_single_packet_retransmission_mss_sized() {
         t.take_sent(),
         vec![
             cmphead!(ST_DATA, seq_nr = 101, payload = "a"),
-            cmphead!(ST_DATA, seq_nr = 102, payload = "b")
+            cmphead!(ST_DATA, seq_nr = 102, payload = "b"),
+            cmphead!(ST_DATA, seq_nr = 103, payload = "c"),
+            cmphead!(ST_DATA, seq_nr = 104, payload = "d"),
+            cmphead!(ST_DATA, seq_nr = 105, payload = "e"),
+            cmphead!(ST_DATA, seq_nr = 106, payload = "f"),
+            cmphead!(ST_DATA, seq_nr = 107, payload = "g"),
         ],
-        "Initial send should be 2 MSS"
+        "The initial window takes all seven"
     );
 
     // Ensure nothing gets sent.
@@ -562,10 +494,7 @@ async fn test_rto_single_packet_retransmission_mss_sized() {
     );
     assert_eq!(
         t.take_sent(),
-        vec![
-            cmphead!(ST_DATA, seq_nr = 102, payload = "b"),
-            cmphead!(ST_DATA, seq_nr = 103, payload = "c")
-        ],
+        vec![cmphead!(ST_DATA, seq_nr = 102, payload = "b")],
         "After ACK for retransmitted packet, should continue sending"
     );
 
@@ -588,10 +517,9 @@ async fn test_rto_single_packet_retransmission_mss_sized() {
         "congestion after second ACK",
     );
 
-    // Packets 103 and 104 should be in the network. MAYBE more, that depends on congestion calculations.
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 104, payload = "d"),],
+        vec![cmphead!(ST_DATA, seq_nr = 103, payload = "c")],
         "After second ACK, should send next packet"
     );
 

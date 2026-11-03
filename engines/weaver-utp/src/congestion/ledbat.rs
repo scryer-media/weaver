@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::{CongestionController, DelaySample};
-use crate::{rtte::RttEstimator, seq_nr::SeqNr};
+use super::DelaySample;
+use crate::seq_nr::SeqNr;
 
 const FRAC: u32 = 16;
 // The window a stream starts with: one Ethernet frame.
@@ -98,6 +98,13 @@ impl Ledbat {
         }
     }
 
+    // Tests that drive the machinery around the window open it this wide.
+    #[cfg(test)]
+    pub(crate) fn set_window(&mut self, bytes: usize) {
+        self.cwnd = (bytes as i64) << FRAC;
+        self.slow_start = false;
+    }
+
     #[cfg(test)]
     fn is_slow_start(&self) -> bool {
         self.slow_start
@@ -113,33 +120,22 @@ impl Ledbat {
             self.slow_start = false;
         }
     }
-}
 
-impl CongestionController for Ledbat {
-    fn window(&self) -> usize {
+    /// Bytes that may be in flight.
+    pub fn window(&self) -> usize {
         self.cwnd_bytes().min(self.rwnd).max(self.mss)
     }
 
-    fn sshthresh(&self) -> usize {
+    pub fn sshthresh(&self) -> usize {
         self.cwnd_bytes()
     }
 
-    fn set_mss(&mut self, mss: usize) {
+    pub fn set_mss(&mut self, mss: usize) {
         self.mss = mss;
         self.floor();
     }
 
-    fn smss(&self) -> usize {
-        self.mss
-    }
-
-    // Loss recovery ends at the window the loss left.
-    fn on_recovered(&mut self, _new_cwnd_bytes: usize, _new_sshthresh: usize) {}
-
-    // The window moves on delay samples alone.
-    fn on_ack(&mut self, _now: Instant, _len: usize, _rtt: &RttEstimator) {}
-
-    fn on_delay_sample(&mut self, sample: DelaySample) {
+    pub fn on_delay_sample(&mut self, sample: DelaySample) {
         if sample.acked_bytes == 0 || sample.in_flight_before == 0 {
             return;
         }
@@ -177,7 +173,7 @@ impl CongestionController for Ledbat {
         self.floor();
     }
 
-    fn on_retransmission_timeout(&mut self, _now: Instant, sent_up_to: SeqNr) {
+    pub fn on_retransmission_timeout(&mut self, _now: Instant, sent_up_to: SeqNr) {
         self.cwnd = (self.mss as i64) << FRAC;
         self.slow_start = true;
         // What was in flight is counted lost already.
@@ -185,7 +181,7 @@ impl CongestionController for Ledbat {
     }
 
     // An idle direction keeps two thirds of its window, then slow-starts.
-    fn on_idle_timeout(&mut self) {
+    pub fn on_idle_timeout(&mut self) {
         self.cwnd = self.cwnd * 2 / 3;
         self.floor();
         self.slow_start = true;
@@ -193,7 +189,7 @@ impl CongestionController for Ledbat {
 
     // Losses come in bursts: one cut per window of packets, and no more
     // than one per cut timer.
-    fn on_enter_recovery(&mut self, now: Instant, lost: SeqNr, sent_up_to: SeqNr) {
+    pub fn on_enter_recovery(&mut self, now: Instant, lost: SeqNr, sent_up_to: SeqNr) {
         if self.loss_gate.is_some_and(|gate| lost <= gate) {
             return;
         }
@@ -205,7 +201,7 @@ impl CongestionController for Ledbat {
         self.cut();
     }
 
-    fn set_remote_window(&mut self, win: usize) {
+    pub fn set_remote_window(&mut self, win: usize) {
         self.rwnd = win;
     }
 }

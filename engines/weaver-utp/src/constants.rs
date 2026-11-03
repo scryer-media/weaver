@@ -40,7 +40,6 @@ pub const SYNACK_RESEND_INTERNAL: Duration = Duration::from_millis(200);
 // u16 SeqNrs wrap around. If they are too far apart, this is used to detect if they wrapped or not.
 pub const WRAP_TOLERANCE: u16 = 1024;
 
-pub const CONGESTION_TRACING_LOG_LEVEL: Level = Level::DEBUG;
 pub const RTTE_TRACING_LOG_LEVEL: Level = Level::TRACE;
 pub const RECOVERY_TRACING_LOG_LEVEL: Level = Level::TRACE;
 
