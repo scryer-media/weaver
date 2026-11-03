@@ -187,17 +187,20 @@ fn through(
         .bridge
         .addr()
         .expect("a system egress bridge's address");
-    let proxy = reqwest::Url::parse(&format!("socks5h://{addr}")).expect("a bridge's proxy URL");
+    let mut proxy =
+        reqwest::Url::parse(&format!("socks5h://{addr}")).expect("a bridge's proxy URL");
     let (user, password) = running.bridge.credentials();
-    let (user, password) = (user.to_owned(), password.to_owned());
+    // A SOCKS proxy takes its credentials from its URL.
+    proxy
+        .set_username(user)
+        .and_then(|()| proxy.set_password(Some(password)))
+        .expect("a bridge's credentials in its proxy URL");
     // The client holds its bridge for as long as it, or a clone, lives.
     let every_request = reqwest::Proxy::custom(move |_| {
         let _ = &running;
         Some(proxy.clone())
     });
-    builder
-        .proxy(every_request.basic_auth(&user, &password))
-        .build()
+    builder.proxy(every_request).build()
 }
 
 /// The client `builder` makes, every connection of it dialed by the
