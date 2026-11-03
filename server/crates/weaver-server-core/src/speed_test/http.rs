@@ -15,6 +15,10 @@ use crate::proxies::{AdmitError, Admitted, admit, pinned, start_bridge, through_
 pub(crate) const NZB_LIMIT: usize = 16 * 1024 * 1024;
 // Same-host redirects a speed-test GET follows.
 const REDIRECT_LIMIT: usize = 3;
+// Names a PEM file of root certificates a speed test trusts beside the
+// platform's: the way an operator whose traffic passes a TLS-intercepting
+// proxy adds that proxy's root. Read each time a speed-test client is built.
+pub(crate) const EXTRA_ROOTS_ENV: &str = "WEAVER_SPEED_TEST_EXTRA_ROOTS";
 
 // One leg of the tested route, as an HTTP fetch sees it.
 #[derive(Clone)]
@@ -25,7 +29,8 @@ pub(crate) struct HttpLeg {
 #[derive(Clone, Default)]
 pub(crate) struct HttpOptions {
     pub allow_private_network: bool,
-    // Trust only these roots. Empty uses the platform's; only tests set it.
+    // Trust only these roots; only tests set it. Empty uses the platform's
+    // and any named by `EXTRA_ROOTS_ENV`.
     pub roots: Vec<Vec<u8>>,
 }
 
@@ -172,6 +177,11 @@ impl RoutedClient {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| e.to_string())?;
             builder = builder.tls_certs_only(roots);
+        } else {
+            let extra = extra_roots(std::env::var_os(EXTRA_ROOTS_ENV).as_deref())?;
+            if !extra.is_empty() {
+                builder = builder.tls_certs_merge(extra);
+            }
         }
         pinned(builder, &admitted.host, admitted.port, &admitted.addresses)
             .build()
@@ -202,6 +212,39 @@ impl RoutedClient {
         drop(self.client);
         self.bridge.revoke().await;
     }
+}
+
+// The roots the PEM file at `path` holds, each checked to be a certificate a
+// TLS client can anchor on. No path trusts the platform's roots alone; a path
+// that cannot be read, or holds no certificate or a broken one, is refused.
+pub(crate) fn extra_roots(
+    path: Option<&std::ffi::OsStr>,
+) -> Result<Vec<reqwest::Certificate>, String> {
+    use tokio_rustls::rustls::RootCertStore;
+    use tokio_rustls::rustls::pki_types::CertificateDer;
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
+
+    let Some(path) = path.filter(|path| !path.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let shown = std::path::Path::new(path).display();
+    let refused = |reason: String| format!("{EXTRA_ROOTS_ENV} file {shown}: {reason}");
+    let pem = std::fs::read(path).map_err(|error| refused(format!("cannot be read: {error}")))?;
+    let ders = CertificateDer::pem_slice_iter(&pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| refused(format!("is not readable PEM: {error}")))?;
+    if ders.is_empty() {
+        return Err(refused("holds no certificate".into()));
+    }
+    let mut store = RootCertStore::empty();
+    ders.iter()
+        .map(|der| {
+            store.add(der.clone()).map_err(|error| {
+                refused(format!("holds a certificate that is not usable: {error}"))
+            })?;
+            reqwest::Certificate::from_der(der).map_err(|error| refused(error.to_string()))
+        })
+        .collect()
 }
 
 // Read a small body whole, refusing one larger than `limit`.
@@ -283,3 +326,7 @@ pub(crate) fn parse_test_nzb(body: &[u8]) -> Result<Vec<TestArticle>, String> {
     }
     Ok(articles)
 }
+
+#[cfg(test)]
+#[path = "http_tests.rs"]
+mod tests;

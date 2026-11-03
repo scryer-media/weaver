@@ -6,7 +6,9 @@ import { test } from "node:test";
 import net from "node:net";
 import dgram from "node:dgram";
 import { once } from "node:events";
-import { parseAddressList, parseHostTable, parseNameservers, parsePublicTargets, parseRouteList, startProxyFixture } from "../tests/support/proxy-fixture-server.mjs";
+import crypto from "node:crypto";
+import tls from "node:tls";
+import { parseAddressList, parseHostTable, parseNameservers, parsePublicTargets, parseRouteList, parseServedHosts, startProxyFixture } from "../tests/support/proxy-fixture-server.mjs";
 
 const dnsQuery = (id, name) => Buffer.concat([
   Buffer.from([0, id, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0]),
@@ -321,5 +323,110 @@ test("the state reports each route's service as the control last set it", async 
     const state = (await control(fixture, "/")).body;
     assert.deepEqual(state.routes.connect1, normal);
     assert.deepEqual(Object.keys(state.routes).sort(), ["connect1", "direct", "primary", "secondary", "tertiary"]);
+  } finally { await fixture.close(); }
+});
+
+// A self-signed P-256 certificate for one DNS name, built here because Node
+// can make keys but not certificates; the harness makes the real ones.
+function selfSignedCertificate(host) {
+  const der = (tag, ...parts) => {
+    const body = Buffer.concat(parts);
+    const length = body.length < 128 ? [body.length] : body.length < 256 ? [0x81, body.length] : [0x82, body.length >> 8, body.length & 255];
+    return Buffer.concat([Buffer.from([tag, ...length]), body]);
+  };
+  const seq = (...parts) => der(0x30, ...parts);
+  const oid = dotted => {
+    const [first, second, ...rest] = dotted.split(".").map(Number);
+    const bytes = [40 * first + second];
+    for (const arc of rest) {
+      const encoded = [arc & 127];
+      for (let value = arc >> 7; value; value >>= 7) encoded.unshift((value & 127) | 128);
+      bytes.push(...encoded);
+    }
+    return der(0x06, Buffer.from(bytes));
+  };
+  const name = seq(der(0x31, seq(oid("2.5.4.3"), der(0x0c, Buffer.from(host)))));
+  const utcTime = date => der(0x17, Buffer.from(`${date.toISOString().replace(/[-:T]/g, "").slice(2, 14)}Z`));
+  const algorithm = seq(oid("1.2.840.10045.4.3.2"));
+  const { publicKey, privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+  const now = Date.now();
+  const tbs = seq(
+    der(0xa0, der(0x02, Buffer.from([2]))), der(0x02, Buffer.from([1])), algorithm, name,
+    seq(utcTime(new Date(now - 3600_000)), utcTime(new Date(now + 86400_000))), name,
+    publicKey.export({ type: "spki", format: "der" }),
+    der(0xa3, seq(seq(oid("2.5.29.17"), der(0x04, seq(der(0x82, Buffer.from(host))))))),
+  );
+  const certificate = seq(tbs, algorithm, der(0x03, Buffer.from([0]), crypto.sign("sha256", tbs, privateKey)));
+  const lines = certificate.toString("base64").match(/.{1,64}/g).join("\n");
+  return { cert: `-----BEGIN CERTIFICATE-----\n${lines}\n-----END CERTIFICATE-----\n`, key: privateKey.export({ type: "pkcs8", format: "pem" }) };
+}
+
+test("served hosts parse strictly", () => {
+  assert.deepEqual(parseServedHosts(""), []);
+  assert.deepEqual(parseServedHosts(" Speed.Cloudflare.com, speed.cloudflare.com "), ["speed.cloudflare.com"]);
+  for (const bad of ["localhost", "speed.cloudflare.com/__down", "speed..com"]) assert.throws(() => parseServedHosts(bad));
+});
+
+test("a served host resolves to the fixture and answers its bandwidth endpoint through a CONNECT rung", async () => {
+  const host = "speed.example.test";
+  const certificate = selfSignedCertificate(host);
+  const fixture = await startProxyFixture({ ip: "127.0.0.1", ports: { ...zeroPorts, https: 0 }, served: [host], tls: certificate, nameservers: [] });
+  const authorization = Buffer.from("fixture:fixture").toString("base64");
+  // CONNECT on the primary rung, then TLS for the served name, then GET.
+  const download = async (target, bytes) => {
+    const socket = net.connect(fixture.ports.primary, "127.0.0.1");
+    socket.write(`CONNECT ${target}:${fixture.ports.https} HTTP/1.1\r\nProxy-Authorization: Basic ${authorization}\r\n\r\n`);
+    let head = Buffer.alloc(0);
+    while (!head.includes("\r\n\r\n")) head = Buffer.concat([head, (await once(socket, "data"))[0]]);
+    assert.match(head.toString(), /^HTTP\/1\.1 200 Connection Established\r\n\r\n$/);
+    const secure = tls.connect({ socket, servername: host, ca: certificate.cert });
+    await once(secure, "secureConnect");
+    secure.write(`GET /__down?bytes=${bytes} HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`);
+    const chunks = [];
+    secure.on("data", chunk => chunks.push(chunk));
+    await once(secure, "end");
+    secure.destroy();
+    const response = Buffer.concat(chunks);
+    const split = response.indexOf("\r\n\r\n");
+    return { head: response.subarray(0, split).toString(), body: response.subarray(split + 4) };
+  };
+  const socket = dgram.createSocket("udp4");
+  try {
+    const answer = once(socket, "message");
+    socket.send(dnsQuery(7, host), fixture.ports.dnsUdp, "127.0.0.1");
+    const [body] = await answer;
+    assert.equal(body.readUInt16BE(2), 0x8180);
+    assert.equal(body.readUInt16BE(6), 1);
+    assert.deepEqual([...body.subarray(-4)], [127, 0, 0, 1]);
+
+    const mark = fixture.events.at(-1)?.sequence ?? 0;
+    // A body larger than one chunk, ending part way through one.
+    const byName = await download(host, 200_001);
+    assert.match(byName.head, /^HTTP\/1\.1 200 /);
+    assert.match(byName.head, /content-length: 200001/i);
+    assert.equal(byName.body.length, 200_001);
+    // Asked for by the address the fixture answered, as a client that
+    // resolved the name itself would.
+    const byAddress = await download("127.0.0.1", 0);
+    assert.match(byAddress.head, /content-length: 0/i);
+    assert.equal(byAddress.body.length, 0);
+
+    const events = fixture.events.filter(event => event.sequence > mark);
+    assert.deepEqual(events.filter(event => event.kind === "connected").map(event => [event.route, event.host, event.port]),
+      [["primary", host, fixture.ports.https], ["primary", "127.0.0.1", fixture.ports.https]]);
+    assert.deepEqual(events.filter(event => event.kind.endsWith("-https")).map(event => [event.kind, event.path]),
+      [["routed-https", "/__down"], ["routed-https", "/__down"]]);
+  } finally { socket.close(); await fixture.close(); }
+});
+
+test("a fixture without served hosts forwards no HTTPS name", async () => {
+  const fixture = await startProxyFixture({ ip: "127.0.0.1", ports: zeroPorts });
+  try {
+    const socket = net.connect(fixture.ports.primary, "127.0.0.1");
+    const chunks = [];
+    socket.on("data", chunk => chunks.push(chunk));
+    socket.write(`CONNECT speed.cloudflare.com:443 HTTP/1.1\r\nProxy-Authorization: Basic ${Buffer.from("fixture:fixture").toString("base64")}\r\n\r\n`);
+    await once(socket, "close");
+    assert.match(Buffer.concat(chunks).toString(), /502 Bad Gateway/);
   } finally { await fixture.close(); }
 });
