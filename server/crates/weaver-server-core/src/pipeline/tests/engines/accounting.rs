@@ -10,6 +10,7 @@ use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{ARTICLE, Outcome, Post, Scenario, par2_set, par3_set, payload, run};
 use super::rar::with_par2;
+use super::restart::{Down, run_restarting_at};
 use crate::JobHistoryRow;
 use crate::jobs::JobPhase;
 use crate::jobs::ids::JobId;
@@ -341,4 +342,82 @@ async fn a_volume_with_a_lost_article_fetched_to_its_end_is_not_remaining() {
     assert!(graph.completed(), "{:?}", graph.failure);
     let report = graph.graph().report.as_ref().expect("the job was reported");
     assert_eq!(report.remaining_par_files, 0, "{:?}", graph.requests);
+}
+
+fn posted(posts: &[Post]) -> u64 {
+    posts.iter().map(|post| post.bytes.len() as u64).sum()
+}
+
+// A clean post ends its download with nothing still to come and every byte
+// it wanted done: the recovery volume, but for its head, stays parked and is
+// neither still to come nor wanted. Nothing asks for recovery, so what is
+// still to come only ever falls.
+#[tokio::test]
+async fn a_clean_post_ends_its_download_with_nothing_remaining() {
+    let scenario = Scenario::new(covered(77));
+    let posts = &scenario.posts;
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    let report = graph.graph().report.as_ref().expect("the job was reported");
+    let parked = recovery_set(posts) - recovery_fetched(posts, &graph);
+    assert!(parked > 0, "the volume holds more than its head");
+    assert_eq!(report.wanted_bytes, posted(posts) - parked);
+    assert_eq!(report.remaining_bytes, 0);
+    assert_eq!(report.progress, 1.0);
+    assert_eq!(report.file_remaining_bytes.iter().sum::<u64>(), 0);
+    let seen = &graph.graph().remaining;
+    assert!(
+        seen.windows(2).all(|pair| pair[1].0 <= pair[0].0),
+        "{seen:?}"
+    );
+}
+
+// A lost article asks for recovery: the volume's articles it asks for are
+// wanted and still to come from then on, so what is still to come grows by
+// them, and the download still ends with nothing remaining.
+#[tokio::test]
+async fn a_loss_grows_remaining_by_the_recovery_it_asks_for() {
+    let scenario = Scenario::new(covered(78)).lost(0, 2);
+    let posts = &scenario.posts;
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    let report = graph.graph().report.as_ref().expect("the job was reported");
+    let fetched = recovery_fetched(posts, &graph);
+    let unfetched = recovery_set(posts) - fetched;
+    assert_eq!(report.wanted_bytes, posted(posts) - unfetched);
+    assert_eq!(report.remaining_bytes, 0);
+    assert_eq!(report.progress, 1.0);
+    let seen = &graph.graph().remaining;
+    let parked_most = seen.iter().map(|(_, wanted)| *wanted).min().unwrap();
+    let head = posts[2].articles(ARTICLE).next().unwrap().len() as u64;
+    assert_eq!(
+        report.wanted_bytes - parked_most,
+        fetched - head,
+        "{seen:?}"
+    );
+    assert!(
+        seen.windows(2).any(|pair| pair[1].0 > pair[0].0),
+        "{seen:?}"
+    );
+}
+
+// A job shut down and restored from its checkpoint reports the bytes still
+// to come and wanted it reported before, at every restart, and still ends
+// its download with nothing remaining.
+#[tokio::test]
+async fn a_restart_reports_the_same_remaining() {
+    let scenario = Scenario::new(covered(79));
+    let restarted = run_restarting_at(&scenario, &mut |_| {}, Down::Shutdown, &|_| true).await;
+    let pairs = &restarted.graph.restored_remaining;
+    assert!(!pairs.is_empty(), "the job restarted while reported");
+    for (before, after) in pairs {
+        assert_eq!(before, after, "{pairs:?}");
+    }
+    let report = restarted
+        .graph
+        .report
+        .as_ref()
+        .expect("the job was reported");
+    assert_eq!(report.remaining_bytes, 0);
+    assert_eq!(report.progress, 1.0);
 }

@@ -798,6 +798,12 @@ pub(in crate::pipeline::tests) struct GraphView {
     pub(in crate::pipeline::tests) shown: Vec<(JobStatus, bool)>,
     // The job's report at the last look.
     pub(in crate::pipeline::tests) report: Option<crate::jobs::handle::JobInfo>,
+    // The bytes still to come and the bytes wanted the job's report showed
+    // at each look, each change once.
+    pub(in crate::pipeline::tests) remaining: Vec<(u64, u64)>,
+    // Across each restart: the bytes still to come and wanted the report
+    // showed as the pipeline went down, and as the new one restored the job.
+    pub(in crate::pipeline::tests) restored_remaining: Vec<((u64, u64), (u64, u64))>,
     // At each look, for every root member a set covers: its name, whether
     // its sets proved it (every one covering it ruled clean or repaired and
     // none is out), and whether the root still keeps its checksums.
@@ -1475,6 +1481,10 @@ pub(in crate::pipeline::tests) fn observe(
         let shown = (report.status.clone(), report.fetching_repair_data);
         if view.shown.last() != Some(&shown) {
             view.shown.push(shown);
+        }
+        let remaining = (report.remaining_bytes, report.wanted_bytes);
+        if view.remaining.last() != Some(&remaining) {
+            view.remaining.push(remaining);
         }
         view.report = Some(report);
     }
