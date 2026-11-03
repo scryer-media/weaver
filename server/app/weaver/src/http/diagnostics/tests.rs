@@ -481,9 +481,22 @@ async fn a_database_the_table_cannot_read_leaves_every_component_out() {
     let dir = tempfile::tempdir().expect("dir");
     let path = dir.path().join("weaver.db");
     let db = Database::open(&path).expect("database");
+    // Overwritten in place, never truncated: Windows refuses to truncate a
+    // file the open database has mapped. The shared-memory index is left
+    // whole, since Windows also refuses writes to the bytes SQLite holds
+    // locked there; it still points every read into the garbage.
     for entry in std::fs::read_dir(dir.path()).expect("dir") {
         let file = entry.expect("entry").path();
-        std::fs::write(&file, vec![0x5a; 64 * 1024]).expect("corrupt the database");
+        if file.to_string_lossy().ends_with("-shm") {
+            continue;
+        }
+        let len = std::fs::metadata(&file).expect("size").len();
+        let mut handle = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .expect("open the database file");
+        std::io::Write::write_all(&mut handle, &vec![0x5a; len.max(64 * 1024) as usize])
+            .expect("corrupt the database");
     }
 
     let stored = stored_names(&db).await;
