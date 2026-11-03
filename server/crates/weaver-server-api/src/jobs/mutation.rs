@@ -19,9 +19,8 @@ use crate::jobs::types::{
     QueueMoveKind, QueuePriority, SemanticDuplicateAdmissionInfo, SemanticPromotionResult,
     StageNzbUploadInput, StagedNzbSubmissionResult, StagedNzbUploadResult, SubmissionKind,
     SubmissionResult, SubmissionStatus, SubmitInput, SubmitNzbInput, SubmitStagedNzbsInput,
-    SubmitStagedNzbsResult,
-    global_queue_state, normalize_priority_value, queue_item_from_job, queue_item_from_submission,
-    submit_metadata,
+    SubmitStagedNzbsResult, global_queue_state, normalize_priority_value, queue_item_from_job,
+    queue_item_from_submission, submit_metadata,
 };
 use crate::torrents::TorrentsMutation;
 use crate::{ScheduledResumeCoordinator, ScheduledResumeError};

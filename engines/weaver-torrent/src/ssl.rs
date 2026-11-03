@@ -27,8 +27,8 @@ use base64::Engine as _;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime, pem::PemObject};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::rustls::{
-    self, CertificateError, ClientConfig, DigitallySignedStruct, DistinguishedName,
-    RootCertStore, ServerConfig, SignatureScheme,
+    self, CertificateError, ClientConfig, DigitallySignedStruct, DistinguishedName, RootCertStore,
+    ServerConfig, SignatureScheme,
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     crypto::{CryptoProvider, WebPkiSupportedAlgorithms},
     server::{
@@ -676,7 +676,10 @@ mod tests {
         let names = [0x30, 0x08, 0x81, 0x03, b'a', b'@', b'b', 0x82, 0x01, b'x'];
         assert_eq!(dns_names(&names), [&b"x"[..]]);
         // A long-form length.
-        assert_eq!(dns_names(&[0x30, 0x81, 0x03, 0x82, 0x01, b'x']), [&b"x"[..]]);
+        assert_eq!(
+            dns_names(&[0x30, 0x81, 0x03, 0x82, 0x01, b'x']),
+            [&b"x"[..]]
+        );
         // A directoryName, constructed, skipped whole.
         let names = [0x30, 0x07, 0xa4, 0x02, 0x30, 0x00, 0x82, 0x01, b'x'];
         assert_eq!(dns_names(&names), [&b"x"[..]]);
