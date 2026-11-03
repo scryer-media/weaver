@@ -300,6 +300,17 @@ pub enum PipelineEvent {
         error: String,
     },
 
+    // An archive was given up on as an archive for one of its members, which
+    // is delivered or withheld as its bytes stand. `container` is the kind
+    // of archive that gave it back, empty when none held it; `reason` is the
+    // reason's stable label, such as `compressed`.
+    ArchiveDemoted {
+        job_id: JobId,
+        member: String,
+        container: String,
+        reason: String,
+    },
+
     // ---- File classification (discovered during download) ----
     // A file's role was identified or updated.
     FileClassified {

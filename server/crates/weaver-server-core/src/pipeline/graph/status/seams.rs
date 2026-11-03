@@ -759,6 +759,15 @@ impl Pipeline {
                         slices_repaired: u32::try_from(slices).unwrap_or(u32::MAX),
                     });
                 }
+                Note::GivenBack(given_back) => {
+                    self.emit_job_event(PipelineEvent::ArchiveDemoted {
+                        job_id,
+                        member: given_back.member,
+                        container: given_back.container,
+                        reason: crate::pipeline::graph::checkpoint::why_name(given_back.why)
+                            .to_owned(),
+                    });
+                }
             }
         }
     }

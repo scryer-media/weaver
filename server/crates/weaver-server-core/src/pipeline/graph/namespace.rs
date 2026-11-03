@@ -162,6 +162,17 @@ struct Acknowledging {
     closed: BTreeSet<(NodeId, MemberId)>,
 }
 
+// A member an object gave back, or that nothing took: the archive it
+// belonged to was given up on as an archive, and the member is delivered or
+// withheld as its bytes stand.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GivenBack {
+    pub(crate) member: String,
+    // The kind of object that gave it back; empty when none held it.
+    pub(crate) container: String,
+    pub(crate) why: Why,
+}
+
 pub(crate) struct NamespaceWriter {
     // The job's process-wide id, which with a node id names a namespace to
     // the holds accountant that every job shares.
@@ -210,6 +221,8 @@ pub(crate) struct NamespaceWriter {
     // first piece of a file once the whole return is down: a later slice of
     // the same return may still rewrite the front of a piece beside it.
     refused_in_batch: BTreeSet<(NodeId, MemberId)>,
+    // Members given back since the job last asked, for its events.
+    given_back: Vec<GivenBack>,
     #[cfg(test)]
     diagnostics: Vec<weaver_graph::recovery::RepairDiagnostic>,
     placements: Vec<Placement>,
@@ -246,6 +259,7 @@ impl NamespaceWriter {
             effects: Vec::new(),
             acknowledging: None,
             refused_in_batch: BTreeSet::new(),
+            given_back: Vec::new(),
             #[cfg(test)]
             diagnostics: Vec::new(),
             placements: Vec::new(),
@@ -267,6 +281,11 @@ impl NamespaceWriter {
     ) -> Self {
         self.metrics = metrics;
         self
+    }
+
+    // The members given back since this was last asked.
+    pub(crate) fn take_given_back(&mut self) -> Vec<GivenBack> {
+        std::mem::take(&mut self.given_back)
     }
 
     // The breach of the job's extraction budget, once one stands.
@@ -1807,14 +1826,20 @@ impl NamespaceWriter {
             .and_then(|object| tree.kind(object))
             .map(|kind| kind.to_string())
             .unwrap_or_default();
+        let member = member_name(tree, node, member);
         tracing::info!(
             job_id = self.scope,
             node = node.0,
             kind = %kind,
-            member = %member_name(tree, node, member),
+            member = %member,
             why = %why_name(why),
             "object refused"
         );
+        self.given_back.push(GivenBack {
+            member,
+            container: kind,
+            why,
+        });
     }
 
     fn files_mut(&mut self, node: NodeId) -> &mut Files {
