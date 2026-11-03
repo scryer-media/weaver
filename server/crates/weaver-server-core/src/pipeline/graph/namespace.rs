@@ -10,22 +10,14 @@
 //
 // What becomes of a delivery depends only on what its member is:
 //
-//   undecided   its first bytes have not said what it is; the bytes are
-//               written to its own file at their offset, as a leaf's are,
-//               so what arrived is on disk whatever order it came in. An
-//               object that claims it takes them from that file, which then
-//               goes.
+//   undecided   its first bytes have not said what it is; the bytes are held,
+//               and replayed once it is decided. A breach of the holds
+//               budgets decides it a leaf on the spot, and nothing pauses.
 //   a leaf      the bytes are written to its file at their offset, damaged
 //               or not; the namespace's coverage is the record of which.
 //   bound       the bytes go down the tree to the object that owns it, and
 //               whatever that object says comes back as effects, applied
 //               here the same way.
-//
-// A root member the job keeps is in its own file whatever it is: every byte
-// it arrives with is written there first, under the name its root gives it,
-// and then goes on as any member's. Its file is never moved, renamed over,
-// taken back or removed, and a read of the member is a read of the file. A
-// torrent's files are kept so: they are what it seeds.
 //
 // The tree records coverage and routes; this file is where bytes touch
 // disk. It takes a node everywhere and never assumes the root.
@@ -45,7 +37,7 @@ use weaver_graph::{
 
 use super::checkpoint::why_name;
 use super::envelope::{Envelopes, Shelf, Shelved};
-use super::leaf::{Leaf, LeafError, readers};
+use super::leaf::{Leaf, LeafError};
 use super::limits::Caps;
 use crate::operations::disk::CapacityReader;
 use crate::pipeline::extraction::ExtractionFailure;
@@ -221,27 +213,9 @@ pub(crate) struct NamespaceWriter {
     #[cfg(test)]
     diagnostics: Vec<weaver_graph::recovery::RepairDiagnostic>,
     placements: Vec<Placement>,
-    // The root members the job keeps, by member id, each under the name its
-    // file has; none for a job that keeps none.
-    kept: Vec<String>,
-    // Where the kept members' files are, when not under the working
-    // directory: files placed there before the job began, which stay there.
-    kept_dir: Option<PathBuf>,
-    // The shared read handle's key of each kept member read where it was
-    // placed, renewed whenever the kept files may move, so a seed's peers
-    // and a check read a placed file through one open handle.
-    kept_readers: std::sync::Mutex<std::collections::HashMap<MemberId, u64>>,
     // Where the time a member write takes on disk is published, when the
     // job runs in a pipeline.
     metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
-}
-
-// A job let go of holds no handle on its kept files, so deleting them frees
-// their space at once.
-impl Drop for NamespaceWriter {
-    fn drop(&mut self) {
-        self.forget_kept_readers();
-    }
 }
 
 impl NamespaceWriter {
@@ -275,9 +249,6 @@ impl NamespaceWriter {
             #[cfg(test)]
             diagnostics: Vec::new(),
             placements: Vec::new(),
-            kept: Vec::new(),
-            kept_dir: None,
-            kept_readers: Default::default(),
             metrics: None,
         }
     }
@@ -287,78 +258,6 @@ impl NamespaceWriter {
     pub(crate) fn capped(mut self, caps: Caps) -> Self {
         self.caps = caps;
         self
-    }
-
-    // The root members the job keeps, by member id, under these names.
-    pub(crate) fn keeping(mut self, names: Vec<String>) -> Self {
-        self.kept = names;
-        self
-    }
-
-    // The kept members' files are under `dir`, when there is one, and not
-    // under the working directory.
-    pub(crate) fn keeping_in(mut self, dir: Option<PathBuf>) -> Self {
-        self.kept_dir = dir;
-        self
-    }
-
-    // Where a kept root member's file is, whether or not it was written.
-    pub(crate) fn kept_path(&self, member: MemberId) -> Option<PathBuf> {
-        let name = self.kept_name(NodeId::ROOT, member)?;
-        let dir = self.kept_dir.as_deref().unwrap_or(&self.working_dir);
-        // The leaf's path, without making a leaf: this runs at every read.
-        Some(Leaf::path_at(dir, name))
-    }
-
-    // The bytes of a kept root member's file from `offset`, as the file on
-    // disk holds them, through the shared read handle of its kept file.
-    pub(crate) fn read_kept(
-        &self,
-        member: MemberId,
-        offset: u64,
-        out: &mut [u8],
-    ) -> std::io::Result<()> {
-        let path = self.kept_path(member).ok_or(std::io::ErrorKind::NotFound)?;
-        let key = *self
-            .kept_readers
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(member)
-            .or_insert_with(readers::key);
-        let file = readers::SHARED.open(key, &path)?;
-        super::leaf::read_exact_at(&file, offset, out)
-    }
-
-    // The kept files may move or go: no handle opened on them is read again.
-    fn forget_kept_readers(&mut self) {
-        let readers = self
-            .kept_readers
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (_, key) in readers.drain() {
-            readers::SHARED.forget(key);
-        }
-    }
-
-    // The name a kept member's file has; none for a member not kept.
-    fn kept_name(&self, node: NodeId, member: MemberId) -> Option<&str> {
-        (node == NodeId::ROOT)
-            .then(|| self.kept.get(member.0 as usize))
-            .flatten()
-            .map(String::as_str)
-    }
-
-    // Every path the job wrote under its directory: each namespace's
-    // members' files, and the directory of what it keeps for itself.
-    pub(crate) fn written_paths(&self) -> Vec<PathBuf> {
-        let mut paths: Vec<PathBuf> = self
-            .files
-            .iter()
-            .flat_map(|(_, files)| files.leaves.values())
-            .map(|leaf| leaf.path().to_path_buf())
-            .collect();
-        paths.push(self.working_dir.join(weaver_graph::names::INTERNAL_DIR));
-        paths
     }
 
     // Publish the time each member write takes on disk.
@@ -388,114 +287,6 @@ impl NamespaceWriter {
             .into_iter()
             .flat_map(|files| files.leaves.iter())
             .map(|(member, leaf)| (*member, leaf.path()))
-    }
-
-    // The directory the job writes under.
-    pub(crate) fn working_dir(&self) -> &Path {
-        &self.working_dir
-    }
-
-    // Let go of every open file ahead of the directory moving: members,
-    // holds scratch and envelopes alike. Each is opened again where it then
-    // is by the next write.
-    pub(crate) fn release(&mut self) {
-        for node in self.files.keys().copied().collect::<Vec<_>>() {
-            let Some(files) = self.files.get_mut(&node) else {
-                continue;
-            };
-            let members: Vec<MemberId> = files.leaves.keys().copied().collect();
-            for member in members {
-                if let Some(leaf) = files.leaves.get_mut(&member) {
-                    leaf.release();
-                }
-            }
-            if let Some(leaf) = files.scratch.as_mut() {
-                leaf.release();
-            }
-        }
-        self.envelopes.release();
-    }
-
-    // The job's directory moved from `from` to `to`: every path the writer
-    // holds follows, so nothing of the job points under `from` any more.
-    pub(crate) fn relocate(&mut self, from: &Path, to: &Path) {
-        self.forget_kept_readers();
-        self.working_dir = to.to_path_buf();
-        for node in self.files.keys().copied().collect::<Vec<_>>() {
-            let Some(files) = self.files.get_mut(&node) else {
-                continue;
-            };
-            let members: Vec<MemberId> = files.leaves.keys().copied().collect();
-            for member in members {
-                if let Some(leaf) = files.leaves.get_mut(&member) {
-                    leaf.relocate(from, to);
-                }
-            }
-            if let Some(leaf) = files.scratch.as_mut() {
-                leaf.relocate(from, to);
-            }
-        }
-        self.envelopes.relocate(from, to);
-    }
-
-    // Where the kept members' files are when that is not under the working
-    // directory.
-    pub(crate) fn kept_dir(&self) -> Option<&Path> {
-        self.kept_dir.as_deref()
-    }
-
-    // The path of every kept root member's file under `dir`, whether or not
-    // it was written; a directory member has none.
-    pub(crate) fn kept_paths(&self, dir: &Path) -> Vec<PathBuf> {
-        self.kept
-            .iter()
-            .filter(|name| !Leaf::is_directory(name))
-            .map(|name| Leaf::path_at(dir, name))
-            .collect()
-    }
-
-    // Let go of every kept file's handle ahead of the kept files moving.
-    pub(crate) fn release_kept(&mut self) {
-        self.forget_kept_readers();
-        let kept = self.kept.len();
-        if let Some(files) = self.files.get_mut(&NodeId::ROOT) {
-            let members: Vec<MemberId> = files
-                .leaves
-                .keys()
-                .copied()
-                .filter(|member| (member.0 as usize) < kept)
-                .collect();
-            for member in members {
-                if let Some(leaf) = files.leaves.get_mut(&member) {
-                    leaf.release();
-                }
-            }
-        }
-    }
-
-    // The kept files moved from the directory they were placed in to `to`:
-    // they are kept there from now on, and the paths of those already
-    // written follow. Nothing else of the job moved, even what sits under
-    // the old directory.
-    pub(crate) fn rekeep(&mut self, to: &Path) {
-        self.forget_kept_readers();
-        let Some(from) = self.kept_dir.replace(to.to_path_buf()) else {
-            return;
-        };
-        let kept = self.kept.len();
-        if let Some(files) = self.files.get_mut(&NodeId::ROOT) {
-            let members: Vec<MemberId> = files
-                .leaves
-                .keys()
-                .copied()
-                .filter(|member| (member.0 as usize) < kept)
-                .collect();
-            for member in members {
-                if let Some(leaf) = files.leaves.get_mut(&member) {
-                    leaf.relocate(&from, to);
-                }
-            }
-        }
     }
 
     // The file an object at `node` keeps of its volume, at the volume's own
@@ -1566,7 +1357,7 @@ impl NamespaceWriter {
     // the bytes that arrived after it win where they overlap.
     fn release_to_leaf(
         &mut self,
-        tree: &Tree,
+        tree: &mut Tree,
         node: NodeId,
         member: MemberId,
     ) -> Result<(), WriteError> {
@@ -1769,10 +1560,6 @@ impl NamespaceWriter {
         offset: u64,
         bytes: &Evidenced,
     ) -> Result<(), WriteError> {
-        // A kept member's file has every byte it arrived with already.
-        if self.kept_name(node, member).is_some() {
-            return Ok(());
-        }
         let record = tree
             .namespace(node)
             .and_then(|namespace| namespace.get(member))
@@ -1969,8 +1756,7 @@ impl NamespaceWriter {
                 .keys()
                 .copied()
                 .filter(|member| {
-                    self.kept_name(node, *member).is_none()
-                        && (namespace.get(*member).is_none() || tree.buried_member(node, *member))
+                    namespace.get(*member).is_none() || tree.buried_member(node, *member)
                 })
                 .collect();
             for member in gone {
@@ -2320,60 +2106,10 @@ impl Access<'_> {
         }
         read
     }
-
-    // The range of a member no object reads, straight from its own file
-    // into `out`, as `read_at` would give it: false, `out` left as it may
-    // be, when it is not all in that file, so the caller reads it the long
-    // way.
-    pub(crate) fn read_own_exact(
-        &self,
-        node: NodeId,
-        member: MemberId,
-        range: ByteRange,
-        out: &mut [u8],
-    ) -> bool {
-        if self.bound(node, member).is_some() || range.len() != out.len() as u64 {
-            return false;
-        }
-        let written = self
-            .tree
-            .namespace(node)
-            .and_then(|namespace| namespace.get(member))
-            .is_some_and(|record| record.coverage.covered(range));
-        written
-            && self
-                .writer
-                .files
-                .get(&node)
-                .and_then(|files| files.leaves.get(&member))
-                .is_some_and(|leaf| leaf.read_shared_exact(range.start, out).is_ok())
-    }
-
-    // Whether the range of a member no object reads is in its own file,
-    // found without reading it: its coverage says it was written, and the
-    // file reaches past it.
-    pub(crate) fn written(&self, node: NodeId, member: MemberId, range: ByteRange) -> bool {
-        let covered = self
-            .tree
-            .namespace(node)
-            .and_then(|namespace| namespace.get(member))
-            .is_some_and(|record| record.coverage.covered(range));
-        covered
-            && self
-                .writer
-                .files
-                .get(&node)
-                .and_then(|files| files.leaves.get(&member))
-                .is_some_and(|leaf| leaf.len().is_ok_and(|length| length >= range.end))
-    }
 }
 
 impl Source for Access<'_> {
-    // A kept member is read from its own file, whatever owns it.
     fn bound(&self, node: NodeId, member: MemberId) -> Option<(NodeId, VolumeIndex)> {
-        if self.writer.kept_name(node, member).is_some() {
-            return None;
-        }
         self.tree
             .child_of(node, member)
             .filter(|(child, _)| !self.tree.recovers(*child))

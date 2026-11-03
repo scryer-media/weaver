@@ -12,43 +12,20 @@ use weaver_graph::{
 use weaver_graph::holds::ScratchHold;
 
 use super::{
-    CheckpointError, FileState, HoldRecord, Pending, Snapshot, member_rows_built, rows, snapshot,
+    CheckpointError, FileState, HoldRecord, Pending, Snapshot, envelope_rows, hold_rows,
+    member_rows_built, node_rows, part_rows, root_row, snapshot,
 };
-use crate::jobs::graph_checkpoint::{Delta, GraphCheckpoint, PartRow};
+use crate::jobs::graph_checkpoint::{Delta, GraphCheckpoint, PartRow, Row};
 use crate::pipeline::graph::envelope::durable::KeptRecord;
 use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::root::ArticleRoot;
 use crate::pipeline::graph::root::facts::{
-    ArticleFacts, ClassFacts, JobFacts, PostFacts, RootBlob, RootFactsError, RootRow, VolumeFacts,
-    decode, encode, of_ordinal,
+    ArticleFacts, ClassFacts, Encoded, Encoding, Parts, RootFacts, RootFactsError, VolumeFacts,
+    decode, of_ordinal,
 };
 use crate::pipeline::graph::root::phase::RootPhase;
-use crate::pipeline::graph::root::pieces::PieceRoot;
 use crate::pipeline::graph::root::tests::{decoded, file, job_with};
 use crate::pipeline::graph::status::RepairSlots;
-
-// The post's facts as a checkpoint encodes them: the root restored from
-// them, encoded whole.
-fn article_blob(facts: PostFacts) -> RootBlob {
-    let files: Vec<RootFile> = facts
-        .posted
-        .iter()
-        .zip(&facts.volumes)
-        .map(|(name, volume)| RootFile {
-            name: name.clone(),
-            articles: volume
-                .articles
-                .iter()
-                .map(|(ordinal, _)| (*ordinal, 64))
-                .collect(),
-        })
-        .collect();
-    RootBlob::of(&ArticleRoot::restore(&files, &facts).unwrap())
-}
-
-fn post(blob: &RootBlob) -> PostFacts {
-    blob.read::<ArticleRoot>().unwrap()
-}
 
 fn member(id: u32, name: &str) -> MemberRecord {
     MemberRecord {
@@ -151,12 +128,9 @@ fn full() -> Snapshot {
             nodes: vec![root, store, retired],
             next_node: 3,
         },
-        job: JobFacts {
-            read_backs: 7,
-            reported: Some(RootPhase::Done),
+        root: RootFacts {
             pending_verifications: Vec::new(),
-        },
-        root: article_blob(PostFacts {
+            next_node: 3,
             posted: vec!["alpha.part1.rar".to_owned(), "alpha.par2".to_owned()],
             volumes: vec![
                 VolumeFacts {
@@ -177,7 +151,9 @@ fn full() -> Snapshot {
                     raised: vec![(0, ClassFacts::Recovery)],
                 },
             ],
-        }),
+            read_backs: 7,
+            reported: Some(RootPhase::Done),
+        },
         files: BTreeMap::from([
             (
                 (NodeId(1), MemberId(0)),
@@ -253,10 +229,85 @@ fn full() -> Snapshot {
     }
 }
 
+// The root's facts as a checkpoint encodes them: the root restored from
+// them, encoded whole.
+fn encoding(facts: &RootFacts) -> Encoding {
+    let files: Vec<RootFile> = facts
+        .posted
+        .iter()
+        .zip(&facts.volumes)
+        .map(|(name, volume)| RootFile {
+            name: name.clone(),
+            articles: volume
+                .articles
+                .iter()
+                .map(|(ordinal, _)| (*ordinal, 64))
+                .collect(),
+        })
+        .collect();
+    ArticleRoot::restore(&files, facts).unwrap().encode(
+        &mut Encoded::default(),
+        facts.next_node,
+        facts.read_backs,
+        facts.reported,
+        facts.pending_verifications.clone(),
+    )
+}
+
+// Every row of the snapshot, each table in key order.
+fn rows(taken: &Snapshot) -> GraphCheckpoint {
+    let encoding = encoding(&taken.root);
+    let Parts::All(parts) = encoding.parts else {
+        panic!("a fresh encoding is whole");
+    };
+    let mut out = GraphCheckpoint {
+        nodes: vec![root_row(encoding.version, encoding.bytes)],
+        envelopes: envelope_rows(&taken.kept),
+        ..GraphCheckpoint::default()
+    };
+    for node in &taken.tree.nodes {
+        let rows = node_rows(
+            node,
+            |member| {
+                taken
+                    .files
+                    .get(&(node.node, member))
+                    .cloned()
+                    .unwrap_or_default()
+            },
+            taken.passwords.get(&node.node).map(|index| *index as i64),
+        );
+        out.nodes.extend(rows.nodes);
+        out.members.extend(rows.members);
+        out.coverage.extend(rows.coverage);
+        out.crypt.extend(rows.crypt);
+        out.parts.extend(rows.parts);
+        let holds: Vec<ScratchHold> = taken
+            .holds
+            .iter()
+            .filter(|record| record.node == node.node)
+            .map(|record| record.held)
+            .collect();
+        out.holds.extend(hold_rows(node.node, &holds));
+    }
+    out.parts
+        .extend(part_rows(i64::from(NodeId::ROOT.0), &parts));
+    out.nodes.sort_by_key(Row::key);
+    out.members.sort_by_key(Row::key);
+    out.coverage.sort_by_key(Row::key);
+    out.crypt.sort_by_key(Row::key);
+    out.parts.sort_by_key(Row::key);
+    out
+}
+
+// A restore tells every loss again, so no loss comes back as one already
+// told.
 #[test]
 fn a_snapshot_comes_back_from_its_rows() {
     let taken = full();
-    assert_eq!(snapshot(&rows(&taken)), Ok(taken));
+    let mut back = taken.clone();
+    back.root.volumes[0].articles[1] = (1, ArticleFacts::Lost { damaged: false });
+    assert_eq!(snapshot(&rows(&taken)), Ok(back));
 }
 
 // The same rows written to the database and read back: the kind a
@@ -290,7 +341,7 @@ fn a_snapshot_comes_back_from_the_database() {
     })
     .unwrap();
     let written = rows(&full());
-    db.save_graph_checkpoint(job, Arc::new(Delta::between(None, &written)))
+    db.save_graph_checkpoint(job, Arc::new(between(None, &written)))
         .unwrap();
     let read = db
         .load_graph_checkpoint(job)
@@ -311,7 +362,7 @@ fn hold_rows_come_back_as_the_holds_a_restore_adopts() {
     // A change to one hold rewrites that row alone.
     let mut moved = rows.clone();
     moved.holds[1].scratch_offset = 64;
-    let delta = Delta::between(Some(&rows), &moved);
+    let delta = between(Some(&rows), &moved);
     assert_eq!(delta.rows(), 1, "{delta:?}");
     assert_eq!(delta.holds.len(), 1);
     // A negative offset is no row a build could have written.
@@ -431,55 +482,23 @@ fn a_restore_keeps_a_file_that_moved_before_its_checkpoint_said_so() {
 }
 
 #[test]
-fn the_phase_last_reported_comes_back_with_the_job() {
+fn the_phase_last_reported_comes_back_with_the_root() {
     let taken = full();
-    let row = decode(
-        RootRow::VERSION,
-        &encode(&RootRow {
-            next_node: taken.tree.next_node,
-            job: taken.job,
-            root: taken.root.clone(),
-        }),
-        &taken.root.parts,
-    )
-    .unwrap();
-    assert_eq!(row.job.reported, Some(RootPhase::Done));
-    assert_eq!(row.root, taken.root);
-    assert_eq!(
-        post(&row.root).volumes[1].raised,
-        vec![(0, ClassFacts::Recovery)]
-    );
+    let encoding = encoding(&taken.root);
+    let Parts::All(parts) = encoding.parts else {
+        panic!("a fresh encoding is whole");
+    };
+    let facts = decode(encoding.version, &encoding.bytes, &parts).unwrap();
+    assert_eq!(facts.reported, Some(RootPhase::Done));
 }
 
-#[test]
-fn facts_are_read_only_into_the_root_that_wrote_them() {
-    let taken = full();
-    assert_eq!(
-        taken.root.read::<PieceRoot>(),
-        Err(RootFactsError::Mismatch("another kind of root"))
-    );
-    let mut newer = taken.root.clone();
-    newer.version += 1;
-    assert_eq!(
-        newer.read::<ArticleRoot>(),
-        Err(RootFactsError::Version(newer.version))
-    );
-    assert_eq!(decode(1, &[], &[]), Err(RootFactsError::Version(1)));
-    assert_eq!(decode(2, &[], &[]), Err(RootFactsError::Version(2)));
-}
-
-// A post written whole, before its facts were kept as parts, is refused by
-// its version, not misread.
+// Root facts written whole, before they were kept as parts, are refused by
+// their version, not misread.
 #[test]
 fn root_facts_of_the_whole_blob_layout_are_refused() {
-    let taken = full();
-    let whole = RootBlob {
-        root: "articles".to_owned(),
-        version: 1,
-        bytes: rmp_serde::to_vec(&post(&taken.root)).unwrap(),
-        parts: Vec::new(),
-    };
-    assert_eq!(whole.read::<ArticleRoot>(), Err(RootFactsError::Version(1)));
+    let taken = full().root;
+    let before = rmp_serde::to_vec(&taken).unwrap();
+    assert_eq!(decode(2, &before, &[]), Err(RootFactsError::Version(2)));
 }
 
 fn intake(job: &mut GraphJob, ordinal: u32) {
@@ -536,11 +555,11 @@ fn held(delta: &Delta) -> GraphCheckpoint {
 fn a_step_writes_only_the_rows_and_parts_it_changed() {
     let (mut job, _dir) = long_post(40);
     let pending = Pending::default();
-    assert!(pending.put(&mut job, Vec::new()));
+    assert!(pending.put(&job, Vec::new()));
     let first = pending.take().0.unwrap();
     assert!(first.whole);
     intake(&mut job, 40);
-    assert!(pending.put(&mut job, Vec::new()));
+    assert!(pending.put(&job, Vec::new()));
     let step = pending.take().0.unwrap();
     assert!(!step.whole);
     // The arrival's chunk alone of the root's parts; the root row only names
@@ -558,30 +577,27 @@ fn a_step_writes_only_the_rows_and_parts_it_changed() {
         "{step:?}"
     );
     assert!(
-        !pending.put(&mut job, Vec::new()),
+        !pending.put(&job, Vec::new()),
         "an unchanged job writes nothing"
     );
-    // The parts it wrote over the ones before are a fresh checkpoint's, and
-    // the whole job's rows are the rows of its snapshot.
+    // The parts it wrote over the ones before are a fresh checkpoint's.
     let mut written: BTreeMap<i64, Option<Arc<[u8]>>> = root_parts(&first);
     written.extend(changed);
     let fresh = Pending::default();
-    assert!(fresh.put(&mut job, Vec::new()));
-    let whole = fresh.take().0.unwrap();
-    assert_eq!(root_parts(&whole), written);
-    assert_eq!(held(&whole), rows(&job.snapshot()));
+    assert!(fresh.put(&job, Vec::new()));
+    assert_eq!(root_parts(&fresh.take().0.unwrap()), written);
 }
 
 #[test]
 fn a_pending_writes_what_the_database_does_not_hold() {
-    let (mut job, _dir) = long_post(20);
+    let (job, _dir) = long_post(20);
     let pending = Pending::default();
-    assert!(pending.put(&mut job, Vec::new()));
+    assert!(pending.put(&job, Vec::new()));
     let first = pending.take().0.unwrap();
     // A write that failed: the next checkpoint is the whole job again, every
     // root part with it.
     pending.forget();
-    assert!(pending.put(&mut job, Vec::new()));
+    assert!(pending.put(&job, Vec::new()));
     let again = pending.take().0.unwrap();
     assert!(again.whole);
     assert_eq!(root_parts(&again), root_parts(&first));
@@ -590,7 +606,7 @@ fn a_pending_writes_what_the_database_does_not_hold() {
     // writes nothing.
     let restored = Pending::default();
     restored.written(held(&first));
-    assert!(!restored.put(&mut job, Vec::new()));
+    assert!(!restored.put(&job, Vec::new()));
     assert!(restored.take().0.is_none());
     // A root part the database holds and the root no longer has is deleted,
     // and only it.
@@ -603,7 +619,7 @@ fn a_pending_writes_what_the_database_does_not_hold() {
     rows.parts.push(stale.clone());
     let restored = Pending::default();
     restored.written(rows);
-    assert!(restored.put(&mut job, Vec::new()));
+    assert!(restored.put(&job, Vec::new()));
     let delta = restored.take().0.unwrap();
     assert_eq!(delta.rows(), 1, "{delta:?}");
     assert_eq!(root_parts(&delta), BTreeMap::from([(stale.part, None)]));
@@ -614,11 +630,11 @@ fn checkpoint_acknowledgments_belong_to_the_owner_and_latest_awaited_stamp() {
     use crate::pipeline::graph::engine::{Heard, Said};
     let (mut job, _dir) = long_post(20);
     let pending = job.pending().clone();
-    pending.put(&mut job, Vec::new());
+    pending.put(&job, Vec::new());
     let (_, first) = pending.take();
     job.owe_mail(first);
     intake(&mut job, 20);
-    pending.put(&mut job, Vec::new());
+    pending.put(&job, Vec::new());
     let (_, latest) = pending.take();
     assert!(latest > first);
     job.owe_mail(latest);
@@ -648,6 +664,19 @@ fn checkpoint_acknowledgments_belong_to_the_owner_and_latest_awaited_stamp() {
         .unwrap();
     assert!(!job.awaits_mail());
 }
+
+// What `after` changes of `before`, which is the checkpoint the database
+// holds or will once what is queued is written; `None` when nothing says
+// what it holds. Both are in key order.
+fn between(before: Option<&GraphCheckpoint>, after: &GraphCheckpoint) -> Delta {
+    let mut out = Delta {
+        whole: before.is_none(),
+        ..Delta::default()
+    };
+    out.compare(before.unwrap_or(&GraphCheckpoint::default()), after);
+    out
+}
+
 #[test]
 fn a_change_queued_behind_another_writes_both_as_one() {
     let first = rows(&full());
@@ -656,8 +685,8 @@ fn a_change_queued_behind_another_writes_both_as_one() {
     second.coverage[0].verified = true;
     let mut third = second.clone();
     third.coverage[0].verified = false;
-    let mut queued = Delta::between(Some(&first), &second);
-    queued.absorb(Delta::between(Some(&second), &third));
+    let mut queued = between(Some(&first), &second);
+    queued.absorb(between(Some(&second), &third));
     assert_eq!(
         queued.members.values().filter(|row| row.is_none()).count(),
         1
@@ -668,12 +697,12 @@ fn a_change_queued_behind_another_writes_both_as_one() {
         Some(&Some(first.coverage[0].clone()))
     );
     // Nothing known of the database clears the job whatever follows.
-    let mut whole = Delta::between(None, &first);
-    whole.absorb(Delta::between(Some(&first), &second));
+    let mut whole = between(None, &first);
+    whole.absorb(between(Some(&first), &second));
     assert!(whole.whole);
-    queued.absorb(Delta::between(None, &third));
-    assert_eq!(queued, Delta::between(None, &third));
-    assert!(!Delta::between(Some(&GraphCheckpoint::default()), &first).is_empty());
+    queued.absorb(between(None, &third));
+    assert_eq!(queued, between(None, &third));
+    assert!(!between(Some(&GraphCheckpoint::default()), &first).is_empty());
 }
 
 #[test]
@@ -749,12 +778,12 @@ fn root_member(job: &GraphJob, volume: u32) -> i64 {
 fn a_step_builds_and_writes_only_the_member_it_changed() {
     let (mut job, _dir, _) = fifty_members();
     let pending = Pending::default();
-    assert!(pending.put(&mut job, Vec::new()));
+    assert!(pending.put(&job, Vec::new()));
     assert!(pending.take().0.unwrap().whole);
 
     arrive(&mut job, 49, 1);
     let built = member_rows_built();
-    assert!(pending.put(&mut job, Vec::new()));
+    assert!(pending.put(&job, Vec::new()));
     assert_eq!(
         member_rows_built() - built,
         1,
@@ -796,16 +825,16 @@ fn a_step_builds_and_writes_only_the_member_it_changed() {
 fn a_restore_after_single_member_steps_has_every_member() {
     let (mut job, dir, files) = fifty_members();
     let pending = Pending::default();
-    assert!(pending.put(&mut job, Vec::new()));
+    assert!(pending.put(&job, Vec::new()));
     let mut database = pending.take().0.unwrap();
     for volume in [49, 7, 23] {
         arrive(&mut job, volume, 1);
-        assert!(pending.put(&mut job, Vec::new()));
+        assert!(pending.put(&job, Vec::new()));
         database.absorb(pending.take().0.unwrap());
     }
     let read = snapshot(&held(&database)).unwrap();
     let fresh = Pending::default();
-    assert!(fresh.put(&mut job, Vec::new()));
+    assert!(fresh.put(&job, Vec::new()));
     assert_eq!(read, snapshot(&held(&fresh.take().0.unwrap())).unwrap());
 
     let (restored, _mail) = restored(&read, &files, dir.path());
@@ -850,7 +879,6 @@ fn restored(
         2,
         Storage {
             working_dir: dir.to_owned(),
-            kept_dir: None,
             accountant: Arc::new(HoldsAccountant::new(HoldBudgets {
                 resident_limit: u64::MAX,
                 scratch_total: u64::MAX,
@@ -863,7 +891,6 @@ fn restored(
             passwords: Vec::new(),
             caps: Caps::unbounded(),
             nesting: u32::MAX,
-            unpack: true,
             hardware: Default::default(),
             metrics: None,
         },
@@ -899,7 +926,7 @@ fn a_restored_member_that_closed_before_its_front_said_is_decided() {
     assert!(!job.tree().is_undecided(NodeId::ROOT, member));
 
     let pending = Pending::default();
-    assert!(pending.put(&mut job, Vec::new()));
+    assert!(pending.put(&job, Vec::new()));
     let mut read = snapshot(&held(&pending.take().0.unwrap())).unwrap();
     let record = read
         .tree

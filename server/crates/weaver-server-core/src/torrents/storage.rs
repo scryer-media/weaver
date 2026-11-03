@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The torrent session's storage, which is the piece root's intake. Nothing
-// the session writes goes to a file of its own: a piece's chunks are kept in
-// memory while it is in flight, read back from there while the session
-// checks its hash, and once it verified each file's share of it goes to the
-// job's root, which writes it to the torrent's file of its name and places
-// it where the job's tree says. After that a read of the piece is a read of
-// those files, as the metainfo lists them, whatever unpacking made of them.
+// The torrent session's storage. A piece's chunks are kept in memory while
+// it is in flight, read back from there while the session checks its hash,
+// and once it verified the whole buffer goes to the torrent's store, which
+// writes it to the torrent's files and hands the tee its archive shares.
+// After that a read of the piece is a read of those files.
 //
 // A piece's buffer is held against the resident budget every job shares from
 // the moment the session is granted the piece until it verifies, fails its
@@ -17,288 +15,52 @@
 use std::collections::HashMap;
 use std::io::IoSlice;
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context, bail};
-use bitvec::boxed::BitBox;
-use bitvec::order::Msb0;
 use bytes::Bytes;
 use tokio::sync::Notify;
 use weaver_graph::holds::Reserve;
-use weaver_graph::slots::AskerId;
-use weaver_graph::{ByteRange, VolumeIndex};
 use weaver_torrent::core::lengths::ValidPieceIndex;
 use weaver_torrent::storage::{
     BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage,
 };
-use weaver_torrent::{ManagedTorrentShared, TorrentMetadata, ValidatedTorrentMetaV1Info};
+use weaver_torrent::{ManagedTorrentShared, TorrentMetadata};
 
 use super::intake::Holds;
-use super::service::Signal;
-use crate::jobs::ids::JobId;
-use crate::pipeline::graph::job::{GraphError, GraphJob};
-use crate::pipeline::graph::root::pieces::{
-    LayoutError, PieceFile, PieceLayout, PieceRoot, Verified,
-};
-use crate::pipeline::graph::status::RepairSlots;
+use super::layout::{PieceLayout, layout_of};
 
 #[cfg(test)]
 mod tests;
 
-// Where verified pieces go and posted bytes come from.
+// Where verified pieces go and the files are read from.
 pub(crate) trait Pieces: Send + Sync {
-    // A piece verified: its files' shares, in torrent order.
-    fn verified(&self, shares: Vec<Verified>) -> anyhow::Result<()>;
-    // A piece failed its hash, fetched or checked on disk: none of it is in
-    // hand. True when any of it was.
+    // A piece verified: `held` is the whole piece, as it was hashed.
+    fn verified(&self, piece: u32, held: &Bytes) -> anyhow::Result<()>;
+    // A piece failed its hash, fetched or checked on disk: it is not had.
+    // True when it was.
     fn failed(&self, piece: u32) -> anyhow::Result<bool>;
-    // A check of every piece began: no piece in hand is had until the check
-    // finds it. True when any was had.
+    // A check of every piece began: no piece is had until the check finds
+    // it. True when any was had.
     fn checking(&self) -> anyhow::Result<bool>;
-    // The check found the piece: it is had again. True when it waited for
-    // the check.
+    // The check found the piece: it is had. True when it was not.
     fn found(&self, piece: u32) -> anyhow::Result<bool>;
-    // The volume's posted bytes of the range, appended to `into`; false
-    // when they are not all in hand.
-    fn posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool;
-    // `posted` straight into `out`, which is the range's length; false, and
-    // `out` left as it may be, when they are not all in hand.
-    fn posted_exact(&self, volume: VolumeIndex, range: ByteRange, out: &mut [u8]) -> bool {
-        let mut into = Vec::with_capacity(out.len());
-        let read = self.posted(volume, range, &mut into) && into.len() == out.len();
-        if read {
-            out.copy_from_slice(&into);
-        }
-        read
-    }
-    // The volume's bytes from `offset` as its file on disk holds them,
-    // whether or not they are in hand: files placed before the torrent was
-    // added are read so, for a check to find them or a peer to be served.
-    fn placed(&self, _: VolumeIndex, _: u64, _: &mut [u8]) -> std::io::Result<()> {
-        Err(std::io::ErrorKind::NotFound.into())
-    }
-    // Whether every share of the piece is in hand.
-    fn had(&self, _: u32) -> bool {
+    // Whether the piece's bytes, as a check of the files hashes them, are
+    // wanted: they then come to `hashed`, before the check says `found`.
+    fn wants_hashed(&self, _piece: u32) -> bool {
         false
     }
-    // A piece found on disk, where its shares already are: the job takes
-    // them in hand without writing them, and the bytes need no room.
-    fn adopted(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
-        self.verified(shares)
-    }
-}
-
-// A graph job over a piece root as the storage's other side. `limit` is the
-// slot limit every step the job takes follows; `repairs` the repair slots
-// every torrent job shares, under which a step lends the repairs it made
-// due; and `signal` where a job those slots woke is marked, so the service
-// lends for it.
-pub(crate) struct TorrentJob {
-    job: RwLock<GraphJob<PieceRoot>>,
-    repairs: Arc<Mutex<RepairSlots>>,
-    signal: Arc<Signal>,
-    limit: usize,
-}
-
-impl TorrentJob {
-    pub(super) fn new(
-        job: GraphJob<PieceRoot>,
-        repairs: Arc<Mutex<RepairSlots>>,
-        signal: Arc<Signal>,
-        limit: usize,
-    ) -> Self {
-        Self {
-            job: RwLock::new(job),
-            repairs,
-            signal,
-            limit,
-        }
-    }
-
-    pub(crate) fn with<T>(&self, read: impl FnOnce(&mut GraphJob<PieceRoot>) -> T) -> T {
-        read(&mut self.job.write().unwrap_or_else(PoisonError::into_inner))
-    }
-
-    // A look at the job that changes nothing: reads of what it has run
-    // side by side, and wait only for a step.
-    fn look<T>(&self, look: impl FnOnce(&GraphJob<PieceRoot>) -> T) -> T {
-        look(&self.job.read().unwrap_or_else(PoisonError::into_inner))
-    }
-
-    // One step of the job under the shared repair slots, at `limit`. A slot
-    // the step gave back may go to a job that waited for it: that job is
-    // marked, and the service lends for it.
-    pub(crate) fn step(
-        &self,
-        limit: usize,
-        step: impl FnOnce(&mut GraphJob<PieceRoot>, &mut RepairSlots, usize) -> Result<(), GraphError>,
-    ) -> Result<(), GraphError> {
-        let mut repairs = self.repairs.lock().unwrap_or_else(PoisonError::into_inner);
-        let result = self.with(|job| {
-            let result = step(job, &mut repairs, limit);
-            // A move asked for while something was out happens at the first
-            // step that finds nothing out.
-            job.try_relocate();
-            result
-        });
-        for woken in repairs.take_woken() {
-            self.signal.mark(JobId(woken.0));
-        }
-        result
-    }
-
-    // A step that says whether it changed the job.
-    fn stepped(
-        &self,
-        step: impl FnOnce(&mut GraphJob<PieceRoot>, &mut RepairSlots, usize) -> Result<bool, GraphError>,
-    ) -> anyhow::Result<bool> {
-        let mut changed = false;
-        self.step(self.limit, |job, repairs, limit| {
-            changed = step(job, repairs, limit)?;
-            Ok(())
-        })?;
-        Ok(changed)
-    }
-
-    // A slot handed to the job while it waited goes to the repair it could
-    // not lend for want of one. Every step lends what it made due, so a
-    // job no slot was handed to has nothing to lend here.
-    pub(crate) fn lend_handed(&self) -> Result<(), GraphError> {
-        let handed = self
-            .repairs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .handed(self.asker());
-        if !handed {
-            return Ok(());
-        }
-        self.step(self.limit, |job, repairs, limit| job.lend(repairs, limit))
-    }
-
-    // The job's repair slot, or its place in the queue, for a torrent
-    // going away.
-    pub(crate) fn forget(&self) {
-        let asker = self.asker();
-        let ticket = self.with(GraphJob::forget_slot);
-        let mut repairs = self.repairs.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(ticket) = ticket {
-            repairs.release(ticket);
-        }
-        repairs.forget(asker);
-        for woken in repairs.take_woken() {
-            self.signal.mark(JobId(woken.0));
-        }
-    }
-
-    fn asker(&self) -> AskerId {
-        AskerId(self.with(|job| job.scope()))
-    }
-}
-
-impl TorrentJob {
-    // A piece's shares taken in. The repair slots every torrent job shares
-    // are held only for the lend the shares made due: the file writes and
-    // the runs' step take this job's lock alone, so one torrent's commit
-    // never holds up another's. A step another thread takes between the
-    // two sees the shares in hand and lends for them itself, as this lend
-    // would. Shares that made nothing due take no slot lock at all.
-    fn commit(&self, shares: Vec<Verified>, write: bool) -> anyhow::Result<()> {
-        let taken = self.with(|job| {
-            let taken = job.verified_unlent(shares, write, self.limit);
-            if !matches!(taken, Ok(true)) {
-                // As a step would: a move asked for while something was
-                // out happens once nothing is.
-                job.try_relocate();
-            }
-            taken
-        })?;
-        if taken {
-            self.step(self.limit, |job, repairs, limit| job.lend(repairs, limit))?;
-        }
-        Ok(())
-    }
-}
-
-impl Pieces for TorrentJob {
-    fn verified(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
-        self.commit(shares, true)
-    }
-
-    fn failed(&self, piece: u32) -> anyhow::Result<bool> {
-        self.stepped(|job, repairs, limit| job.failed(piece, repairs, limit))
-    }
-
-    fn checking(&self) -> anyhow::Result<bool> {
-        self.stepped(|job, repairs, limit| job.checking(repairs, limit))
-    }
-
-    fn found(&self, piece: u32) -> anyhow::Result<bool> {
-        self.stepped(|job, repairs, limit| job.found(piece, repairs, limit))
-    }
-
-    fn posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool {
-        self.look(|job| job.posted(volume, range, into))
-    }
-
-    fn posted_exact(&self, volume: VolumeIndex, range: ByteRange, out: &mut [u8]) -> bool {
-        self.look(|job| job.posted_exact(volume, range, out))
-    }
-
-    // Read under the job, as a read of what it has is: a move of its files
-    // happens in one of its steps, so the read finds the file where it
-    // was or where it went, never between.
-    fn placed(&self, volume: VolumeIndex, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        self.look(|job| job.read_kept(volume, offset, buf))
-    }
-
-    fn had(&self, piece: u32) -> bool {
-        self.look(|job| job.has_piece(piece))
-    }
-
-    fn adopted(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
-        self.commit(shares, false)
-    }
-}
-
-// The pieces the job has, as the session takes them to skip checking the
-// files: one bit per piece, most significant first, the spare bits of the
-// last byte clear, as BEP 3 sends them. None while a check of every piece
-// has not found every piece in hand: the job vouches for nothing then, and
-// the session checks every piece again (libtorrent
-// `torrent::write_resume_data` saves no piece past those checked). None
-// too while the job has no piece of files that were `placed` where its
-// client asked: they may be there already, and the check finds them
-// (libtorrent checks the files of a torrent added with no resume data).
-pub(crate) fn initial_have(job: &GraphJob<PieceRoot>, placed: bool) -> Option<BitBox<u8, Msb0>> {
-    if job.unchecked() {
-        return None;
-    }
-    let mut have = job.have();
-    if placed && !have.any() {
-        return None;
-    }
-    have.set_uninitialized(false);
-    Some(have.into_boxed_bitslice())
-}
-
-// The layout of a torrent's files over its pieces, from its metainfo.
-pub(crate) fn layout_of<B: AsRef<[u8]>>(
-    info: &ValidatedTorrentMetaV1Info<B>,
-) -> Result<PieceLayout, LayoutError> {
-    let files = info
-        .iter_file_details()
-        .map(|details| PieceFile {
-            name: details.filename.to_vec().join("/"),
-            length: details.len,
-            padding: details.attrs().padding,
-        })
-        .collect();
-    PieceLayout::new(u64::from(info.lengths().default_piece_length()), files)
+    // The piece as a check of the files read and hashed it, whole.
+    fn hashed(&self, _piece: u32, _held: &Bytes) {}
+    // The file's bytes from `offset` as it holds them on disk.
+    fn read(&self, file: usize, offset: u64, out: &mut [u8]) -> std::io::Result<()>;
+    // The file made at least `length` long.
+    fn grow(&self, file: usize, length: u64) -> std::io::Result<()>;
 }
 
 // A piece in flight, the length of its piece: its chunks as they arrive,
-// then the whole piece while its shares go to the job. Only a piece still
-// being written holds room: a verified one's bytes are the job's.
+// then the whole piece while it goes to the store. Only a piece still being
+// written holds room: a verified one's bytes are on their way to disk.
 enum Flight {
     Writing(Arc<Writing>),
     Verified(Bytes),
@@ -432,62 +194,13 @@ impl PieceStorage {
         let last = (start + len as u64).saturating_sub(1) / layout.piece_length();
         Ok((start, (piece == last).then_some(piece as u32)))
     }
-
-    // A piece found on disk that the job did not have goes to it from
-    // there.
-    pub(crate) fn adopt(&self, piece: u32) -> anyhow::Result<()> {
-        adopt(&self.inner.layout, &*self.inner.pieces, piece)
-    }
-}
-
-// A piece the job did not have, found where the files were placed: the job
-// takes its shares as the files on disk hold them.
-pub(crate) fn adopt(layout: &PieceLayout, pieces: &dyn Pieces, piece: u32) -> anyhow::Result<()> {
-    adopt_under(layout, pieces, piece, |take| Some(take())).unwrap_or(Ok(()))
-}
-
-// `adopt`, the job taking the shares in under `keep` (a seed-mode session's
-// `while_seeding`), which is given only that: the files are read before it,
-// so nothing waits on the disk under it. None when `keep` did not take them.
-pub(crate) fn adopt_under(
-    layout: &PieceLayout,
-    pieces: &dyn Pieces,
-    piece: u32,
-    keep: impl FnOnce(&mut dyn FnMut() -> anyhow::Result<()>) -> Option<anyhow::Result<()>>,
-) -> Option<anyhow::Result<()>> {
-    if pieces.had(piece) {
-        return Some(Ok(()));
-    }
-    let mut bytes = vec![0; layout.piece_range(piece).len() as usize];
-    let mut spans = Vec::new();
-    for span in layout.spans(piece) {
-        let Some(volume) = span.volume else { continue };
-        let at = span.at as usize..span.at as usize + span.range.len() as usize;
-        if let Err(error) = pieces.placed(volume, span.range.start, &mut bytes[at.clone()]) {
-            return Some(Err(error.into()));
-        }
-        spans.push((volume, span.range.start, at));
-    }
-    let bytes = Bytes::from(bytes);
-    let mut shares = Some(
-        spans
-            .into_iter()
-            .map(|(volume, offset, at)| Verified {
-                volume,
-                piece,
-                offset,
-                bytes: bytes.slice(at),
-            })
-            .collect(),
-    );
-    keep(&mut || pieces.adopted(shares.take().unwrap_or_default()))
 }
 
 impl TorrentStorage for PieceStorage {
     fn init(&mut self, _: &ManagedTorrentShared, metadata: &TorrentMetadata) -> anyhow::Result<()> {
         let theirs = layout_of(&metadata.info)?;
         if theirs != *self.inner.layout {
-            bail!("the torrent is not the one the job was made for");
+            bail!("the torrent is not the one its store was made for");
         }
         Ok(())
     }
@@ -506,22 +219,20 @@ impl TorrentStorage for PieceStorage {
             }
             return Ok(());
         }
-        let Some(volume) = self.inner.layout.file_volume(file_id) else {
+        if self
+            .inner
+            .layout
+            .file(file_id)
+            .is_some_and(|file| file.padding)
+        {
             // Padding is zeros by definition.
             buf.fill(0);
             return Ok(());
-        };
-        let range = ByteRange::at(offset, buf.len() as u64);
-        if self.inner.pieces.posted_exact(volume, range, buf) {
-            return Ok(());
         }
-        // Not in hand: what the file on disk holds, which the session's
-        // check hashes and which a seed added over placed files serves. A
-        // file not there, or too short, says so as the session reads it.
         self.inner
             .pieces
-            .placed(volume, offset, buf)
-            .with_context(|| format!("{range} of file {file_id} is not in hand"))
+            .read(file_id, offset, buf)
+            .with_context(|| format!("{} bytes at {offset} of file {file_id}", buf.len()))
     }
 
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
@@ -561,7 +272,8 @@ impl TorrentStorage for PieceStorage {
         Ok((at - offset) as usize)
     }
 
-    // The job's files are the job's: the session removes nothing.
+    // The service removes a torrent's files, with what unpacking made of
+    // them: the session removes nothing.
     fn remove_file(&self, _: usize, _: &Path) -> anyhow::Result<()> {
         Ok(())
     }
@@ -570,9 +282,10 @@ impl TorrentStorage for PieceStorage {
         Ok(())
     }
 
-    // Lengths are the job's announcements, made from the metainfo.
-    fn ensure_file_length(&self, _: usize, _: u64) -> anyhow::Result<()> {
-        Ok(())
+    // A wanted file whole on disk at its length once checked, as
+    // libtorrent's storage makes it.
+    fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+        Ok(self.inner.pieces.grow(file_id, length)?)
     }
 
     fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
@@ -604,9 +317,9 @@ impl TorrentStorage for PieceStorage {
         true
     }
 
-    // The piece's shares go to the job, and only then does the piece stop
-    // being read from memory, so no read finds it in neither place. Its room
-    // is given back first: the job counts the bytes from here.
+    // The piece goes to the store, and only then does it stop being read
+    // from memory, so no read finds it in neither place. Its room is given
+    // back first: it is on its way to disk.
     fn on_piece_completed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
         let index = piece.get();
         let (held, released) = {
@@ -623,25 +336,9 @@ impl TorrentStorage for PieceStorage {
             (held, released)
         };
         self.inner.release(released);
-        let shares = self
-            .inner
-            .layout
-            .spans(index)
-            .into_iter()
-            .filter_map(|span| {
-                let volume = span.volume?;
-                let at = span.at as usize;
-                Some(Verified {
-                    volume,
-                    piece: index,
-                    offset: span.range.start,
-                    bytes: held.slice(at..at + span.range.len() as usize),
-                })
-            })
-            .collect();
-        self.inner.pieces.verified(shares)?;
+        let verified = self.inner.pieces.verified(index, &held);
         self.flight().remove(&index);
-        Ok(())
+        verified
     }
 
     // A whole piece is hashed where its blocks landed, under its own lock
@@ -669,10 +366,10 @@ impl TorrentStorage for PieceStorage {
         true
     }
 
-    // What failed is dropped, from memory and from the job, and the piece
-    // is fetched again into room granted afresh. A piece the session's
-    // check of the files did not find is one the job has no longer: the
-    // session's check is the one word on which pieces are had.
+    // What failed is dropped, from memory and from the store, and the
+    // piece is fetched again into room granted afresh. A piece the
+    // session's check of the files did not find is one the store has no
+    // longer: the session's check is the one word on which pieces are had.
     fn on_piece_hash_failed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
         let failed = self.flight().remove(&piece.get());
         self.inner.release(failed.as_ref().map_or(0, Flight::held));
@@ -685,17 +382,21 @@ impl TorrentStorage for PieceStorage {
         Ok(())
     }
 
-    // The check found the piece: had again if the job had it before, and
-    // otherwise found where the files were placed, and taken from there.
     fn on_piece_checked(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
-        if !self.inner.pieces.found(piece.get())? {
-            self.adopt(piece.get())?;
-        }
+        self.inner.pieces.found(piece.get())?;
         Ok(())
+    }
+
+    fn wants_hashed_piece(&self, piece: ValidPieceIndex) -> bool {
+        self.inner.pieces.wants_hashed(piece.get())
+    }
+
+    fn on_piece_hashed(&self, piece: ValidPieceIndex, bytes: Bytes) {
+        self.inner.pieces.hashed(piece.get(), &bytes);
     }
 }
 
-// Makes the storage of one torrent's job.
+// Makes the storage of one torrent.
 #[derive(Clone)]
 pub(crate) struct PieceStorageFactory {
     layout: Arc<PieceLayout>,

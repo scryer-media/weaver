@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// A member an object claimed after its bytes went to its own file: one whose
-// front had not yet said what it is, a volume that came before the one that
-// built its object, or one whose front only said what it is once a repair
-// rewrote it. Its bytes go down to its object from that file, each run with
-// the provenance it arrived with, by the one write path. The file is no
-// delivery of its own after that, and its bytes no longer count against the
-// job's output, unless the object is a recovery object, whose volumes live
-// in their files, or the member is one the job keeps.
+// A member an object claimed after it had been decided a leaf: a volume that
+// came before the one that built its object, or one whose front only said
+// what it is once a repair rewrote it. Its bytes went to its own file, so
+// they go down to its object again from there, each run with the
+// provenance it arrived with, by the one write path, exactly as the bytes
+// held for an undecided member go down once it is bound. The file is no
+// delivery of its own after that, unless the object is a recovery object,
+// whose volumes live in their files.
 
 use bytes::Bytes;
 use weaver_graph::{ByteRange, Coverage, Effect, MemberId, NodeId, Tree};
@@ -177,10 +177,9 @@ impl NamespaceWriter {
         node: NodeId,
         member: MemberId,
     ) -> Result<(), WriteError> {
-        let owned_elsewhere = self.kept_name(node, member).is_none()
-            && tree
-                .child_of(node, member)
-                .is_some_and(|(child, _)| !tree.recovers(child));
+        let owned_elsewhere = tree
+            .child_of(node, member)
+            .is_some_and(|(child, _)| !tree.recovers(child));
         if owned_elsewhere {
             let files = self.files_mut(node);
             files.unrefuse(member);

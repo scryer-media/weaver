@@ -401,20 +401,15 @@ async fn a_hex_named_member_bound_by_its_prefix_is_renamed_and_its_file_moves() 
 }
 
 #[tokio::test]
-async fn an_article_before_the_first_is_on_disk_and_nothing_is_held() {
+async fn dropping_a_graph_job_gives_its_holds_back() {
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_006);
-    let data = payload(2 * ARTICLE, 7);
-    let posts = [Post::plain("lantern.bin", data.clone())];
-    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let posts = [Post::plain("lantern.bin", payload(2 * ARTICLE, 7))];
+    let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
     // The second article before the first: nothing knows yet what the
-    // member is, and its bytes are in its file all the same.
+    // member is, so its bytes are held.
     decode(&mut pipeline, job_id, &posts, 0, 1, true).await;
-    assert_eq!(pipeline.graph_holds.usage().resident, 0);
-    assert_eq!(
-        read(&working_dir.join("lantern.bin"))[ARTICLE..],
-        data[ARTICLE..]
-    );
+    assert_eq!(pipeline.graph_holds.usage().resident, ARTICLE as u64);
     pipeline.graph_jobs.remove(&job_id);
     assert_eq!(pipeline.graph_holds.usage().resident, 0);
     assert_eq!(pipeline.graph_holds.usage().namespaces, 0);
@@ -556,6 +551,47 @@ async fn a_checkpoint_error_queued_before_resume_cannot_pause_the_resumed_job() 
     assert_eq!(pipeline.jobs[&job_id].status, resumed);
     pipeline.graph_run_said(error(control.revision()));
     assert_eq!(pipeline.jobs[&job_id].status, JobStatus::Paused);
+    retire_pipeline_database(pipeline).await;
+}
+
+// A job outside the pipeline whose checkpoint the database refuses hears
+// it as it hears the rest of its mail; the pipeline pauses only its own.
+#[tokio::test]
+async fn a_blocked_checkpoint_of_a_job_outside_the_pipeline_goes_to_it() {
+    use std::sync::Arc;
+
+    use super::engine::Hears;
+
+    #[derive(Default)]
+    struct Blocked(std::sync::Mutex<Vec<String>>);
+    impl Hears for Blocked {
+        fn said(&self, said: Said, _slots: usize) {
+            if let Heard::CheckpointBlocked { error, .. } = said.heard {
+                self.0.lock().unwrap().push(error);
+            }
+        }
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let outside = JobId(92_107);
+    let heard = Arc::new(Blocked::default());
+    pipeline
+        .graph_outside
+        .join(outside.0, Arc::clone(&heard) as Arc<dyn Hears>);
+    pipeline.graph_run_said(Said {
+        scope: outside.0,
+        node: weaver_graph::NodeId::ROOT,
+        generation: 0,
+        heard: Heard::CheckpointBlocked {
+            control: Default::default(),
+            revision: 0,
+            error: "fixture storage failure".into(),
+        },
+    });
+    assert_eq!(*heard.0.lock().unwrap(), ["fixture storage failure"]);
+    assert!(!pipeline.jobs.contains_key(&outside));
+    pipeline.graph_outside.leave(outside.0);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -1232,62 +1268,6 @@ async fn a_repair_of_an_article_that_passed_its_checksum_retracts_what_the_engin
 }
 
 mod refusals;
-
-// A job outside the pipeline's own hears its runs through the pipeline's
-// mail, on the pipeline's loop.
-#[tokio::test]
-async fn an_outside_job_hears_its_runs_through_the_pipelines_mail() {
-    use std::sync::{Arc, Mutex};
-
-    use crate::pipeline::graph::engine::{Hears, Said};
-
-    #[derive(Default)]
-    struct Recorder(Mutex<Vec<(u64, u64)>>);
-
-    impl Hears for Recorder {
-        fn said(&self, said: Said, _slots: usize) {
-            self.0.lock().unwrap().push((said.scope, said.generation));
-        }
-    }
-
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let recorder = Arc::new(Recorder::default());
-    let budget = pipeline.graph_budget();
-    budget
-        .outside
-        .join(4242, Arc::clone(&recorder) as Arc<dyn Hears>);
-    budget
-        .mail
-        .send(Said {
-            scope: 4242,
-            node: weaver_graph::NodeId::ROOT,
-            generation: 7,
-            heard: Heard::Ended,
-        })
-        .await
-        .unwrap();
-    let said = pipeline.graph_runs.recv().await.unwrap();
-    pipeline.graph_run_said(said);
-    assert_eq!(*recorder.0.lock().unwrap(), [(4242, 7)]);
-
-    // A job that left hears nothing more.
-    budget.outside.leave(4242);
-    budget
-        .mail
-        .send(Said {
-            scope: 4242,
-            node: weaver_graph::NodeId::ROOT,
-            generation: 8,
-            heard: Heard::Ended,
-        })
-        .await
-        .unwrap();
-    let said = pipeline.graph_runs.recv().await.unwrap();
-    pipeline.graph_run_said(said);
-    assert_eq!(recorder.0.lock().unwrap().len(), 1);
-    retire_pipeline_database(pipeline).await;
-}
 
 // The articles of a recovery volume's head: enough for its first recovery
 // packet to pass, which is what tells the PAR2 object what the volume is.

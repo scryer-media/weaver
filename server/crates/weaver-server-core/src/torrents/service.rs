@@ -7,13 +7,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
-use weaver_graph::VolumeIndex;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 use weaver_torrent::api::TorrentIdOrHash;
 use weaver_torrent::core::{Id20, Id32, InfoHashes};
@@ -24,6 +23,7 @@ use weaver_torrent::{
     TorrentVersion, TrackerAnnounce, torrent_from_bytes, tracker::Tracker,
 };
 
+use crate::LoadError;
 use crate::SchedulerError;
 use crate::StateError;
 use crate::categories::CategoryConfig;
@@ -41,15 +41,11 @@ use crate::jobs::phase_progress::{JobPhase, JobPhaseProgress};
 use crate::jobs::report::JobReport;
 use crate::operations::disk::CapacityReader;
 use crate::persistence::Database;
+use crate::pipeline::ExtractionLimits;
 use crate::pipeline::claim_complete_destination_path;
-use crate::pipeline::graph::checkpoint;
-use crate::pipeline::graph::engine::{Hears, Outside, RunMail, Said};
-use crate::pipeline::graph::job::restore::Restored;
-use crate::pipeline::graph::job::{Existing, GraphJob, Storage};
-use crate::pipeline::graph::leaf::LeafError;
-use crate::pipeline::graph::limits::{self, Caps, ExtractionLimits};
-use crate::pipeline::graph::root::phase::RootPhase;
-use crate::pipeline::graph::root::pieces::{PieceLayout, PieceRoot};
+use crate::pipeline::graph::engine::{Outside, RunMail, Said};
+use crate::pipeline::graph::job::Storage;
+use crate::pipeline::graph::limits::{self, Caps};
 use crate::pipeline::graph::status::RepairSlots;
 use crate::proxies::{
     Consumer, LegTenancy, LegTenant, NetworkRuntime, ResolvedBy, SessionTraffic, TorrentScope,
@@ -60,19 +56,24 @@ use crate::settings::{
     SeedingPolicy, TorrentConfig, TorrentEncryption,
 };
 use crate::torrents::admission::{self, Manifest, Refusal};
+use crate::torrents::files::Files;
 use crate::torrents::identity::{ClientIdentity, TorrentIdentity};
 use crate::torrents::intake::{Heard as IntakeHeard, Holds, Intake, Room};
+use crate::torrents::layout::{PieceLayout, layout_of};
 use crate::torrents::metrics::{
     Counters, FetchOutcome, Published, SeedingSeries, SessionSeries, TorrentEvent, TorrentMetrics,
     TorrentSeries,
 };
 use crate::torrents::rate::limit_kind;
+use crate::torrents::relocate::{self, Existing, MoveError};
 use crate::torrents::sessions::{
     NetworkRoutes, RouteFailure, RouteKey, RoutePlan, SessionEnv, SessionError, SessionView,
     Sessions, TorrentRouteReason, encryption_policy, unplanned_key,
 };
 use crate::torrents::status::{self, Engine, Held, Observed, Queued};
-use crate::torrents::storage::{PieceStorageFactory, Pieces, TorrentJob, initial_have, layout_of};
+use crate::torrents::storage::{PieceStorageFactory, Pieces};
+use crate::torrents::store::{Kept, Replayed, TorrentStore};
+use crate::torrents::tee::{Parts, Plan, Tee, plan_outputs};
 use crate::torrents::{
     ContentLayout, FilePriority, Infohash, NamedBy, PeerInfo, TorrentCounters, TorrentFile,
     TorrentInsert, TorrentIntent, TorrentRecord, TorrentSource, TorrentState, TorrentTracker,
@@ -473,15 +474,6 @@ fn torrent_archive_passwords(
     candidates
 }
 
-// A torrent's checkpoint names the candidate each node was offered last by
-// its place in the list, and the list may have changed since: each node is
-// offered the first candidate again, so it retries the list from the top.
-fn retry_passwords_from_top(snapshot: &mut checkpoint::Snapshot) {
-    for index in snapshot.passwords.values_mut() {
-        *index = 0;
-    }
-}
-
 // The tracker rule of id `id`, while it stands.
 fn rule_of(id: Option<u32>, rules: &[TrackerRule]) -> Option<&TrackerRule> {
     let id = id?;
@@ -540,9 +532,13 @@ pub struct JobEnv {
     pub(crate) free_disk: CapacityReader,
     pub(crate) slots: usize,
     pub(crate) limits: Arc<ExtractionLimits>,
-    // Where the jobs' runs speak, and where a job joins to hear them.
+    // Where the jobs' runs speak, where the database's word on their
+    // checkpoints comes, and where a job joins to hear both.
     pub(crate) mail: mpsc::Sender<Said>,
+    pub(crate) written: mpsc::UnboundedSender<Said>,
     pub(crate) outside: Arc<Outside>,
+    // Where a torrent's tee unpacks, each in a directory of its own.
+    pub(crate) work: PathBuf,
     // The repair slots every torrent job shares, as the pipeline's jobs
     // share theirs.
     pub(crate) repairs: Arc<Mutex<RepairSlots>>,
@@ -562,15 +558,24 @@ impl JobEnv {
             slots: budget.slots.max(1),
             limits: budget.limits,
             mail: budget.mail,
+            written: budget.written,
             outside: budget.outside,
+            work: budget.work,
             repairs: Arc::default(),
             alone: Arc::default(),
         }
     }
 
-    /// No budget at all: one slot, no limits, free space unknown.
+    /// No budget at all: one slot, no limits, free space unknown, and
+    /// unpacking under a directory of its own in the system's temporary one.
     pub fn unbounded() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let mail = RunMail::default();
+        let work = std::env::temp_dir().join(format!(
+            "weaver-torrent-work-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         Self {
             accountant: Arc::new(HoldsAccountant::new(HoldBudgets {
                 resident_limit: u64::MAX,
@@ -582,7 +587,9 @@ impl JobEnv {
             slots: 1,
             limits: Arc::new(ExtractionLimits::unbounded()),
             mail: mail.sender(),
+            written: mail.written(),
             outside: Arc::default(),
+            work,
             repairs: Arc::default(),
             alone: Arc::new(Mutex::new(Some(mail))),
         }
@@ -1238,7 +1245,8 @@ struct Live {
     names: Vec<String>,
     total: u64,
     layout: Option<Arc<PieceLayout>>,
-    job: Option<Arc<TorrentJob>>,
+    // What it has in its files, once it has metainfo.
+    store: Option<Arc<TorrentStore>>,
     intake: Option<Arc<Intake>>,
     attached: Option<Attached>,
     // A magnet's metadata fetch, while it runs: its announce table, whose
@@ -1261,6 +1269,9 @@ struct Live {
     // Why the session last refused to pause or resume the torrent, until it
     // takes the next change.
     run_error: Option<String>,
+    // Why its restore is held, while it is: a checkpoint the database did
+    // not give, tried again at each restore until it does.
+    restore_held: Option<String>,
     queued: bool,
     // Its place among the torrents still downloading, from 1, as the queue
     // was last applied; None while it seeds (qBittorrent
@@ -1274,8 +1285,7 @@ struct Live {
     // Its established peers, the seeders among them, and the peers still
     // in their handshake.
     peers: (u32, u32, u32),
-    // Where a move goes, while it waits or is under way; the job does the
-    // moving.
+    // Where a move goes, while it is under way.
     moving: Option<Moving>,
     // How many pieces had passed their check in seed mode when they were
     // last kept.
@@ -1283,7 +1293,7 @@ struct Live {
     // Each file's bytes in hand: the checkpoint's until the session has
     // checked the files, then the session's.
     file_have: Vec<u64>,
-    // The pieces its checkpoint has in hand, until its job is back.
+    // The pieces it kept, until its store is back.
     kept_pieces: u32,
     // Why unpacking refused it, as its history kept it when it was
     // restored: a restored job does not say.
@@ -1384,7 +1394,7 @@ impl Live {
             names: Vec::new(),
             total: 0,
             layout: None,
-            job: None,
+            store: None,
             intake: None,
             attached: None,
             fetching: None,
@@ -1397,6 +1407,7 @@ impl Live {
             timed: Timed::at(now),
             engine: Engine::Absent,
             run_error: None,
+            restore_held: None,
             queued: false,
             queue_rank: None,
             paused_by: None,
@@ -1416,17 +1427,22 @@ impl Live {
     }
 
     // Complete, or with every piece it wants had as the session last said.
+    // A torrent in seed mode has every piece as added and seeds from the
+    // start (libtorrent `torrent_flags::seed_mode`: the picker is created
+    // having all; qBittorrent queues it as a seed), until its session says
+    // a piece failed and it left seed mode.
     fn seeding(&self) -> bool {
-        status::seeding(self.complete(), &self.engine)
+        status::seeding(self.complete(), &self.engine) || self.record.seed_mode
     }
 
-    // What it shows until its job is back, from what was stored: what the
-    // root its checkpoint keeps has in hand, as the job restored from it
-    // will, and the failure its history keeps.
-    fn kept(&mut self, failed: Option<String>, root: Option<PieceRoot>) {
-        if let Some(root) = root {
-            self.file_have = root.file_have();
-            self.kept_pieces = root.have().count_ones() as u32;
+    // What it shows until its store is back, from what was stored: the
+    // pieces it kept, as the store restored from them will have, and the
+    // failure its history keeps.
+    fn kept(&mut self, failed: Option<String>, kept: Option<Kept>) {
+        if let (Some(kept), Some(layout)) = (kept, &self.layout) {
+            let (count, file_have) = kept.had(layout);
+            self.file_have = file_have;
+            self.kept_pieces = count;
         }
         self.failed = failed;
     }
@@ -1518,15 +1534,10 @@ impl Live {
     // Why unpacking refused the torrent's output, while that stands: the
     // job's word, or the one its history keeps.
     fn refusal(&self) -> Option<String> {
-        self.job
+        self.store
             .as_ref()
-            .and_then(|job| {
-                job.with(|job| {
-                    job.writer()
-                        .refusal()
-                        .map(|refusal| refusal.job_failure_reason())
-                })
-            })
+            .and_then(|store| store.tee())
+            .and_then(|tee| tee.refusal())
             .or_else(|| self.failed.clone())
     }
 
@@ -1542,12 +1553,12 @@ impl Live {
         )
     }
 
-    // The pieces, and how many of them the job holds verified; until its
-    // job is back, how many its checkpoint has.
+    // The pieces, and how many of them it has verified; until its store
+    // is back, how many it kept.
     fn pieces(&self) -> Option<TorrentPieces> {
         let layout = self.layout.as_ref()?;
-        let have = match &self.job {
-            Some(job) => job.with(|job| job.have().count_ones()) as u32,
+        let have = match &self.store {
+            Some(store) => store.count(),
             None => self.kept_pieces,
         };
         Some(TorrentPieces {
@@ -1668,7 +1679,11 @@ impl Live {
     // `engine`.
     fn observed(&self, engine: Engine) -> Observed {
         Observed {
-            engine: self.run_error.clone().map_or(engine, Engine::Error),
+            engine: self
+                .run_error
+                .clone()
+                .or_else(|| self.restore_held.clone())
+                .map_or(engine, Engine::Error),
             has_metadata: self.layout.is_some(),
             fetch: self.fetching.as_ref().map(|fetch| *fetch.phase.borrow()),
             complete: self.complete(),
@@ -1851,8 +1866,9 @@ struct Resume {
 struct CheckpointSave {
     job_id: JobId,
     landed: Option<oneshot::Receiver<Result<(), StateError>>>,
-    pending: Option<checkpoint::Pending>,
     lost: Option<Arc<AtomicBool>>,
+    // The store whose pieces went with it, told when the write failed.
+    pieces: Option<Arc<TorrentStore>>,
 }
 
 // A write of a torrent's ledger and peers, queued.
@@ -1893,6 +1909,12 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 impl Signal {
     pub(super) fn mark(&self, job_id: JobId) {
         self.marked(job_id, 0);
+    }
+
+    // Marked, with its checkpoint due at the settle: what changed is the
+    // whole ledger, not a piece.
+    fn due(&self, job_id: JobId) {
+        self.marked(job_id, CHECKPOINT_PIECES);
     }
 
     fn marked(&self, job_id: JobId, pieces: u32) {
@@ -1952,24 +1974,6 @@ impl Signal {
             .collect();
         unsaved.retain(|job_id, _| !due.contains(job_id));
         due
-    }
-}
-
-// A torrent job hearing its runs through the pipeline's mail.
-struct Hearer {
-    job: Arc<TorrentJob>,
-    signal: Arc<Signal>,
-}
-
-impl Hears for Hearer {
-    fn said(&self, said: Said, slots: usize) {
-        let job_id = JobId(said.scope);
-        if let Err(error) = self.job.step(slots, |job, repairs, limit| {
-            job.run_said(said, repairs, limit)
-        }) {
-            tracing::warn!(job_id = job_id.0, error = %error, "a torrent job's run failed");
-        }
-        self.signal.mark(job_id);
     }
 }
 
@@ -2475,52 +2479,201 @@ impl TorrentService {
         }));
     }
 
-    // What the jobs that spoke did: a write the job could not take fails
-    // its torrent, a refusal found while unpacking stops it, and a job that
-    // is done completes it. A job whose checkpoint fell
-    // [`CHECKPOINT_PIECES`] behind has it written.
+    // What the torrents that spoke did: a write the store could not make
+    // fails its torrent, a refusal found while unpacking stops it, and one
+    // with every file it wants whole, unpacked when it has a tee, completes.
+    // A tee whose moves wait on a checkpoint has it written, and a torrent
+    // whose pieces fell [`CHECKPOINT_PIECES`] behind has them written.
     async fn settle(&self) {
         let dirty = self.inner.signal.take();
-        for job_id in dirty {
-            let job = {
+        for &job_id in &dirty {
+            let found = {
                 let live = self.inner.live.lock().await;
-                live.get(&job_id).and_then(|torrent| torrent.job.clone())
+                live.get(&job_id).and_then(|torrent| {
+                    let store = Arc::clone(torrent.store.as_ref()?);
+                    let levels = torrent.levels.clone();
+                    Some((store, levels, torrent.complete()))
+                })
             };
-            let Some(job) = job else { continue };
-            if let Err(error) = job.lend_handed() {
-                tracing::warn!(job_id = job_id.0, error = %error, "a torrent job's repair lending failed");
-            }
-            if let Some(outcome) = job.with(GraphJob::relocated) {
-                // Nobody waits on a move that waited for the job's runs:
-                // a failed one is only logged.
-                let _ = self.moved(job_id, outcome).await;
-            }
-            let (refusal, done) = job.with(|job| {
-                (
-                    job.writer()
-                        .refusal()
-                        .map(|refusal| refusal.job_failure_reason()),
-                    job.phase() == RootPhase::Done,
-                )
-            });
-            if let Some(error) = refusal {
-                self.refused(job_id, error).await;
-            } else if let Some(error) = self.inner.signal.take_refused(job_id) {
+            let Some((store, levels, complete)) = found else {
+                continue;
+            };
+            if let Some(error) = self.inner.signal.take_refused(job_id) {
                 self.fail(job_id, error).await;
-            } else if done {
+                continue;
+            }
+            if complete {
+                continue;
+            }
+            let wanted = |file: usize| levels.get(file).copied().unwrap_or_default().wanted();
+            let whole = store.has_files(wanted);
+            let Some(tee) = store.tee() else {
+                if whole {
+                    self.completed(job_id).await;
+                }
+                continue;
+            };
+            let stepped = tee.lend_handed().and_then(|()| {
+                // Shares of a file the torrent does not want never come.
+                if whole {
+                    tee.lose_unwanted(wanted)
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(error) = stepped {
+                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacking step failed");
+            }
+            if let Some(error) = tee.refusal() {
+                // A checkpoint the tee let go for it ends, on the torrent's
+                // lane, before this: its failure goes with it.
+                let _ = self.queue_save(job_id, "torrent_checkpoint_let_go", move |db| {
+                    db.forget_checkpoint_failure(job_id);
+                    Ok(())
+                });
+                self.refused(job_id, error).await;
+                continue;
+            }
+            if tee.with(|job| job.awaits_commit() || job.moves_waiting()) {
+                self.checkpoint_tee(job_id, Arc::clone(tee)).await;
+            }
+            if whole && tee.done() && self.unpacked(job_id, &store, tee).await {
                 self.completed(job_id).await;
             }
         }
         self.save_checkpoints(self.inner.signal.take_due()).await;
+        // A pass can move any torrent, so every one is picked and shown
+        // again; otherwise only the torrents that spoke changed, and only
+        // they are (libtorrent posts a state update for the torrents that
+        // changed, not every one). The tick picks and publishes every one.
         if self.inner.signal.take_pass() {
             self.apply_queue().await;
+            self.apply_picking().await;
+            self.publish().await;
+        } else {
+            self.pick(Some(&dirty)).await;
+            for &job_id in &dirty {
+                self.publish_job(job_id).await;
+            }
         }
-        self.apply_picking().await;
-        self.publish().await;
     }
 
-    // Write the checkpoints of `jobs`, each with its torrent's ledger.
+    // Unpacking is over: what it made goes beside the torrent's files,
+    // never over one, and is kept on the torrent's row as its job's
+    // checkpoint goes. Its directory goes last, with what it spent. The
+    // torrent's files are claimed as a move claims them, so its directory
+    // stays where it is with no lock its reads and writes wait on; while a
+    // move has them, this waits for the move to end, which marks the
+    // torrent. False until it placed them.
+    async fn unpacked(&self, job_id: JobId, store: &Arc<TorrentStore>, tee: &Arc<Tee>) -> bool {
+        let claimed = self
+            .with_torrent(job_id, |torrent| {
+                if torrent.moving.is_some() {
+                    return Ok(false);
+                }
+                torrent.moving = Some(Moving::Outputs);
+                Ok(true)
+            })
+            .await;
+        if !matches!(claimed, Ok(true)) {
+            return false;
+        }
+        tee.stop_checkpoints();
+        tee.forget();
+        let work = tee.work().to_path_buf();
+        let (planned, tee) = (Arc::clone(store), Arc::clone(tee));
+        let planned = tokio::task::spawn_blocking(move || {
+            let spent = tee.spent();
+            let files = planned.files();
+            let listed: Vec<PathBuf> = files.names().flatten().map(Path::to_path_buf).collect();
+            plan_outputs(tee.work(), &files.dir(), &listed, &spent)
+        })
+        .await;
+        let outputs = match planned {
+            Ok(outputs) => Arc::new(outputs),
+            Err(error) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files were not placed");
+                self.unclaim_outputs(job_id).await;
+                return true;
+            }
+        };
+        // Kept on the row before they move, so a crash between leaves no
+        // file of the torrent's that its delete does not know of.
+        let names = outputs.names.clone();
+        let kept = self.queue_save(job_id, "keep_torrent_outputs", move |db| {
+            db.keep_torrent_outputs(job_id, &names)
+        });
+        self.recorded(job_id, kept.await);
+        let (from, moving) = (work.clone(), Arc::clone(&outputs));
+        let placed = tokio::task::spawn_blocking(move || moving.place(&from))
+            .await
+            .unwrap_or(false);
+        let names = if placed {
+            outputs.names.clone()
+        } else {
+            Vec::new()
+        };
+        let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
+            db.finish_torrent_unpack(job_id, &names)
+        });
+        self.recorded(job_id, recorded.await);
+        self.unclaim_outputs(job_id).await;
+        let removed = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(work)).await;
+        if let Ok(Err(error)) = removed
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(job_id = job_id.0, error = %error, "could not remove a torrent's unpacking directory");
+        }
+        true
+    }
+
+    fn recorded(
+        &self,
+        job_id: JobId,
+        recorded: Result<Result<(), StateError>, oneshot::error::RecvError>,
+    ) {
+        match recorded {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not record what a torrent unpacked");
+            }
+            Err(_) => {
+                tracing::warn!(
+                    job_id = job_id.0,
+                    "what a torrent unpacked was not recorded"
+                );
+            }
+        }
+    }
+
+    // The claim `unpacked` took on the torrent's files, given back.
+    async fn unclaim_outputs(&self, job_id: JobId) {
+        let _ = self
+            .with_torrent(job_id, |torrent| {
+                if matches!(torrent.moving, Some(Moving::Outputs)) {
+                    torrent.moving = None;
+                }
+                Ok(())
+            })
+            .await;
+    }
+
+    // Write the checkpoints of `jobs`, each with its torrent's ledger. The
+    // tees' checkpoints are queued first, off the service's lock: one waits
+    // on its job, which an intake writing to disk may hold.
     async fn save_checkpoints(&self, jobs: BTreeSet<JobId>) {
+        let tees: Vec<(JobId, Arc<Tee>)> = {
+            let live = self.inner.live.lock().await;
+            jobs.iter()
+                .filter_map(|&job_id| {
+                    let tee = live.get(&job_id)?.store.as_ref()?.tee()?;
+                    Some((job_id, Arc::clone(tee)))
+                })
+                .collect()
+        };
+        for (job_id, tee) in tees {
+            self.checkpoint_tee(job_id, tee).await;
+        }
         let now = self.inner.clock.now_ms();
         let saves: Vec<CheckpointSave> = {
             let mut live = self.inner.live.lock().await;
@@ -2607,53 +2760,53 @@ impl TorrentService {
         receiver
     }
 
-    // Queue a write of what the job's checkpoint changed since the database
-    // last held it, the rows that differ as the pipeline writes its jobs',
-    // with what changed in the torrent's ledger and peers as they stand now,
-    // in one transaction: what a crash recovers is the pieces and the
-    // counters of one moment. The ledger is taken in the step that queues
-    // it, as every write of it is. None when the torrent has no job.
+    // Queue a write of the pieces the torrent has, with what changed in its
+    // ledger and peers as they stand now, in one transaction: what a crash
+    // recovers is the pieces and the counters of one moment. The ledger is
+    // taken in the step that queues it, as every write of it is. Its tee's
+    // checkpoint is queued beside it, as the pipeline writes its jobs': a
+    // share the tee's checkpoint lacks of a piece kept here goes to it again
+    // from the files at the next start. None when the torrent has no store.
+    // The tee's is queued before this, by [`Self::checkpoint_tee`].
     fn queue_checkpoint(&self, torrent: &mut Live, now: i64) -> Option<CheckpointSave> {
         let job_id = torrent.record.job_id;
-        let pending = torrent.job.as_ref()?.with(|job| {
-            let pending = job.pending().clone();
-            pending.put(job, Vec::new()).then_some(pending)
-        });
+        let store = Arc::clone(torrent.store.as_ref()?);
+        let pieces = store.unsaved();
         torrent.settle(now);
         let resume = torrent.take_resume(now, false);
-        if pending.is_none() && resume.is_none() {
+        // Nothing changed since the last write: none is queued.
+        if pieces.is_none() && resume.is_none() {
             return Some(CheckpointSave {
                 job_id,
                 landed: None,
-                pending: None,
                 lost: None,
+                pieces: None,
             });
         }
         let (counters, peers, lost) = resume.map_or((None, None, None), |resume| {
             (resume.counters, resume.peers, Some(resume.lost))
         });
-        let writer = pending.clone();
+        let wrote = pieces.is_some().then(|| Arc::clone(&store));
         let landed = self.queue_save(job_id, "torrent_checkpoint", move |db| {
-            let delta = writer.as_ref().and_then(|writer| writer.take().0);
-            let written = db.save_torrent_checkpoint(
-                job_id,
-                delta.map(Arc::new),
-                counters.as_ref(),
-                peers.as_ref(),
-            );
-            if written.is_err()
-                && let Some(writer) = &writer
-            {
-                writer.forget();
-            }
-            written
+            db.save_torrent_checkpoint(job_id, pieces.as_ref(), counters.as_ref(), peers.as_ref())
         });
         Some(CheckpointSave {
             job_id,
             landed: Some(landed),
-            pending,
             lost,
+            pieces: wrote,
         })
+    }
+
+    // Queue a checkpoint of the torrent's unpacking on a blocking thread:
+    // it waits on the job, which an intake writing to disk may hold.
+    async fn checkpoint_tee(&self, job_id: JobId, tee: Arc<Tee>) {
+        let db = self.inner.db.clone();
+        let mail = self.inner.env.written.clone();
+        let queued = tokio::task::spawn_blocking(move || tee.checkpoint(&db, &mail)).await;
+        if let Ok(Err(error)) = queued {
+            tracing::warn!(job_id = job_id.0, error = %error, "could not checkpoint a torrent's unpacking");
+        }
     }
 
     // Wait for a checkpoint's write to land. One that failed leaves what
@@ -2663,33 +2816,32 @@ impl TorrentService {
         let CheckpointSave {
             job_id,
             landed,
-            pending,
             lost,
+            pieces,
         } = save;
-        if let Some(landed) = landed {
-            let failed = match landed.await {
+        let failed = match landed {
+            None => None,
+            Some(landed) => match landed.await {
                 Ok(Ok(())) => None,
                 Ok(Err(error)) => Some(error.to_string()),
-                Err(error) => {
-                    if let Some(pending) = &pending {
-                        pending.forget();
-                    }
-                    Some(error.to_string())
+                Err(error) => Some(error.to_string()),
+            },
+        };
+        match (failed, lost) {
+            (Some(error), lost) => {
+                if let Some(lost) = lost {
+                    lost.store(true, Ordering::Release);
                 }
-            };
-            match (failed, lost) {
-                (Some(error), lost) => {
-                    if let Some(lost) = lost {
-                        lost.store(true, Ordering::Release);
-                    }
-                    tracing::warn!(job_id = job_id.0, %error, "could not checkpoint a torrent job");
+                if let Some(store) = pieces {
+                    store.lost_saved();
                 }
-                (None, Some(_)) => self
-                    .inner
-                    .written
-                    .send_modify(|written| written.ledgers += 1),
-                (None, None) => {}
+                tracing::warn!(job_id = job_id.0, %error, "could not checkpoint a torrent");
             }
+            (None, Some(_)) => self
+                .inner
+                .written
+                .send_modify(|written| written.ledgers += 1),
+            (None, None) => {}
         }
         self.inner
             .written
@@ -2709,9 +2861,13 @@ impl TorrentService {
                 return;
             }
             torrent.settle(now);
+            let was_seeding = torrent.seeding();
             torrent.record.completed_at_ms = Some(now);
             // It seeds now: its slot and rank go to the torrents after it.
-            self.inner.signal.want_pass();
+            // One that seeded already, as a seed-mode add does, held none.
+            if !was_seeding {
+                self.inner.signal.want_pass();
+            }
             self.inner.counters.event(TorrentEvent::Completed);
             if let Err(error) = self.inner.db.set_torrent_completed(job_id, now) {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's completion");
@@ -2754,11 +2910,12 @@ impl TorrentService {
             .collect()
     }
 
+    // The tee's job's storage, in its own directory `work`.
     fn storage(
         &self,
-        dir: Dirs,
+        work: PathBuf,
         layout: &PieceLayout,
-        unpack: bool,
+        plan: &Plan,
         passwords: Vec<String>,
     ) -> Storage {
         let policy = self
@@ -2767,169 +2924,197 @@ impl TorrentService {
             .post_processing_settings()
             .map(Arc::new)
             .map_err(state_error);
-        let declared = (0..layout.volume_count())
-            .filter_map(|volume| layout.volume(VolumeIndex(volume as u32)))
-            .map(|file| file.length)
-            .collect();
         let env = &self.inner.env;
         Storage {
-            working_dir: dir.work,
-            kept_dir: dir.files,
+            working_dir: work,
             accountant: Arc::clone(&env.accountant),
             free_disk: env.free_disk.clone(),
             slots: env.slots,
             mail: env.mail.clone(),
             passwords,
-            caps: Caps::new(Arc::clone(&env.limits), policy, declared),
+            caps: Caps::new(Arc::clone(&env.limits), policy, plan.declared(layout)),
             nesting: limits::NESTING,
-            unpack,
             hardware: Default::default(),
             metrics: None,
         }
     }
 
-    // What the torrent's checkpoint gives back. It reads the checkpoint and
-    // the files it covers, so it runs off the tick's task.
-    fn restored(
+    // The torrent's store over its files, with the pieces it kept, and the
+    // tee its archive files go to when it unpacks and is not complete: the
+    // one its checkpoint gives back, or a new one. A checkpoint that does
+    // not restore is said, with why, and the tee starts as a new one. The
+    // pieces it kept that the tee's checkpoint lacks a share of go to the
+    // tee from the files, once; a piece whose files do not read is had no
+    // longer, and is checked or fetched again. Nothing here fails the
+    // torrent: a tee that cannot start ends its unpacking, and the torrent
+    // keeps its files. It reads the database and the files, so it runs off
+    // the tick's task. A restore whose checkpoint the database could not
+    // read makes no store: the torrent waits, its own rows as they were,
+    // and the next restore tries it again, as a usenet job's restore is
+    // held on the same error (`RestoreSeat::restore`).
+    fn store<W>(
         &self,
         job_id: JobId,
-        dir: Dirs,
-        layout: &Arc<PieceLayout>,
-        unpack: bool,
-        passwords: Vec<String>,
-    ) -> FromCheckpoint {
-        let loaded = self.inner.db.load_graph_checkpoint(job_id);
-        self.inner
-            .written
-            .send_modify(|written| written.checkpoints_read += 1);
-        let rows = match loaded {
-            Ok(Some(rows)) => rows,
-            Ok(None) => return FromCheckpoint::Nothing,
-            Err(error) => return FromCheckpoint::Unread(error.to_string()),
-        };
-        let restored = checkpoint::snapshot(&rows)
-            .map_err(|error| error.to_string())
-            .and_then(|mut snapshot| {
-                retry_passwords_from_top(&mut snapshot);
-                GraphJob::restore_torrent(
-                    &snapshot,
-                    Arc::clone(layout),
-                    job_id.0,
-                    self.storage(dir, layout, unpack, passwords),
-                    self.inner.env.slots,
-                )
-                .map_err(|error| error.to_string())
-            });
-        match restored {
-            Ok(restored) => {
-                // The database holds these rows: the next checkpoint writes
-                // only what changes from them.
-                restored.job.pending().written(rows);
-                FromCheckpoint::Restored(restored)
-            }
-            Err(error) => FromCheckpoint::Failed(error),
-        }
-    }
-
-    // The root the torrent's checkpoint keeps, from the database alone: what
-    // its job holds once restored from it. None without a checkpoint, or
-    // with one that does not restore: the job then starts fresh, and its
-    // restore says why.
-    fn kept_root(&self, job_id: JobId, layout: &Arc<PieceLayout>) -> Option<PieceRoot> {
-        let root = self
+        made: Making,
+        hold: Hold<W>,
+    ) -> Result<(TorrentStore, Vec<Note>), Unmade<W>> {
+        let Making {
+            files,
+            layout,
+            tee,
+            passwords,
+            seeded,
+        } = made;
+        // One policy for both of a restore's database reads, the pieces it
+        // kept and the tee's checkpoint: one the database fails to give
+        // holds the restore until it gives it, as a usenet job's restore is
+        // held. What it gives and this build cannot use is no record: the
+        // pieces are checked again, the tee starts fresh.
+        let kept = match self
             .inner
             .db
-            .load_graph_root(job_id)
-            .map_err(|error| error.to_string())
-            .and_then(|rows| {
-                let Some(rows) = rows else { return Ok(None) };
-                let facts = checkpoint::root(&rows)
-                    .map_err(|error| error.to_string())?
-                    .root
-                    .read::<PieceRoot>()
-                    .map_err(|error| error.to_string())?;
-                PieceRoot::restore(Arc::clone(layout), &facts)
-                    .map(Some)
-                    .map_err(|error| error.to_string())
-            });
-        root.unwrap_or_else(|error| {
-            tracing::debug!(job_id = job_id.0, %error, "a torrent's stored root does not read");
-            None
+            .torrent_pieces(job_id)
+            .map_err(|error| hold(error.to_string()))
+        {
+            Ok(kept) => kept,
+            Err(Ok(wait)) => return Err(Unmade::Waits(wait)),
+            Err(Err(error)) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's pieces; they are checked again");
+                None
+            }
+        };
+        let files = Files::new(&layout, files).map_err(|error| Unmade::Fails(error.to_string()))?;
+        let mut notes = Vec::new();
+        let tee = match tee.then(|| Plan::of(&layout)).flatten() {
+            Some(plan) => {
+                let (tee, fresh) = self.tee(job_id, &layout, plan, passwords, hold)?;
+                notes.extend(fresh);
+                Some(tee)
+            }
+            None => None,
+        };
+        let store = TorrentStore::new(layout, files, kept.as_ref(), tee);
+        if let Some(tee) = store.tee() {
+            let replayed = if seeded {
+                Replayed::default()
+            } else {
+                store.replay_had()
+            };
+            if replayed.taken > 0 {
+                tracing::debug!(
+                    job_id = job_id.0,
+                    replayed = replayed.taken,
+                    "a torrent's tee took again the pieces its checkpoint lacked"
+                );
+            }
+            if let Some(error) = replayed.unread {
+                notes.push(Note::Dropped {
+                    pieces: replayed.dropped,
+                    error: error.to_string(),
+                });
+            }
+            // A run that will not start is kept as the tee's refusal.
+            let _ = tee.resume();
+            if tee.refusal().is_some() {
+                self.inner.signal.mark(job_id);
+            }
+        }
+        Ok((store, notes))
+    }
+
+    // The tee of a torrent whose files `plan` names, restored from its
+    // checkpoint or new, and why it is new when it had a checkpoint. One
+    // whose directory cannot be made ready refuses at once, for why. Rows
+    // this build cannot read are no checkpoint; a read the database failed
+    // holds a restore, and starts a new torrent's tee fresh.
+    fn tee<W>(
+        &self,
+        job_id: JobId,
+        layout: &Arc<PieceLayout>,
+        plan: Plan,
+        passwords: Vec<String>,
+        hold: Hold<W>,
+    ) -> Result<(Arc<Tee>, Option<Note>), Unmade<W>> {
+        let work = self.inner.env.work.join(format!("torrent-{}", job_id.0));
+        let (rows, mut fresh) = match self.inner.db.load_graph_checkpoint(job_id) {
+            Ok(rows) => (rows, None),
+            Err(LoadError::Read(error)) => match hold(error.to_string()) {
+                Ok(wait) => return Err(Unmade::Waits(wait)),
+                Err(error) => (None, Some(Note::Unread(error))),
+            },
+            Err(error) => (None, Some(Note::Unread(error.to_string()))),
+        };
+        let env = &self.inner.env;
+        let parts = || Parts {
+            job_id,
+            layout: Arc::clone(layout),
+            plan: plan.clone(),
+            work: work.clone(),
+            repairs: Arc::clone(&env.repairs),
+            signal: Arc::clone(&self.inner.signal),
+            outside: Arc::clone(&env.outside),
+            limit: env.slots,
+        };
+        let storage = || self.storage(work.clone(), layout, &plan, passwords.clone());
+        if let Some(rows) = rows {
+            match Tee::restore(parts(), storage(), rows) {
+                Ok(tee) => return Ok((tee, None)),
+                // A rebuild that failed writing or stepping is held, as a
+                // usenet job's is: only a checkpoint this build cannot read
+                // starts fresh.
+                Err(error) if !error.not_this_builds() => match hold(error.to_string()) {
+                    Ok(wait) => return Err(Unmade::Waits(wait)),
+                    Err(error) => fresh = Some(Note::Unrestored(error)),
+                },
+                Err(error) => fresh = Some(Note::Unrestored(error.to_string())),
+            }
+        }
+        let tee = Tee::fresh(parts(), storage());
+        // Nothing the job wrote before is its now.
+        if let Err(error) = std::fs::remove_dir_all(&work)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tee.refuse(format!(
+                "could not clear the torrent's unpacking directory: {error}"
+            ));
+        } else if let Err(error) = std::fs::create_dir_all(&work) {
+            tee.refuse(format!(
+                "could not make the torrent's unpacking directory: {error}"
+            ));
+        }
+        Ok((tee, fresh))
+    }
+
+    // What a torrent's store is made from, read under the torrent's lock.
+    fn making(&self, torrent: &Live) -> Option<Making> {
+        Some(Making {
+            files: files_dir(torrent),
+            layout: Arc::clone(torrent.layout.as_ref()?),
+            tee: unpacks(torrent) && !torrent.complete(),
+            passwords: self.archive_passwords(torrent),
+            seeded: torrent.record.seed_mode,
         })
     }
 
-    // The job of a torrent with metainfo: the one its checkpoint gave back,
-    // or a new one. A checkpoint that does not restore is said, with why,
-    // and the torrent starts as a new one.
-    fn graph_job(
-        &self,
-        job_id: JobId,
-        dir: Dirs,
-        layout: &Arc<PieceLayout>,
-        unpack: bool,
-        passwords: Vec<String>,
-        checkpoint: FromCheckpoint,
-    ) -> GraphJob<PieceRoot> {
-        match checkpoint {
-            // What the checkpoint held, and what of it was not on disk. A
-            // piece that verified after the checkpoint was written is fetched
-            // again too, but nothing short of a check of the files can say
-            // which those are: every file has its full length from its first
-            // piece on.
-            FromCheckpoint::Restored(restored) => {
-                tracing::debug!(
-                    job_id = job_id.0,
-                    read_bytes = restored.read,
-                    in_hand = restored.job.have().count_ones(),
-                    missing = restored.refetched.len(),
-                    "a torrent's job is restored from its checkpoint"
-                );
-                return restored.job;
-            }
-            FromCheckpoint::Nothing => {}
-            FromCheckpoint::Unread(error) => {
-                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's checkpoint could not be read; it starts fresh");
-            }
-            FromCheckpoint::Failed(error) => {
-                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's checkpoint did not restore; it starts fresh");
-            }
-        }
-        GraphJob::for_torrent(
-            job_id.0,
-            Arc::clone(layout),
-            self.storage(dir, layout, unpack, passwords),
-        )
-    }
-
-    // The job joined to what feeds it: the runs' mail, and the intake the
-    // session hands its pieces to.
-    fn job(&self, job_id: JobId, job: GraphJob<PieceRoot>) -> (Arc<TorrentJob>, Arc<Intake>) {
-        let slots = self.inner.env.slots;
+    // The store joined to what feeds it: the intake the session hands its
+    // pieces to.
+    fn give_store(&self, torrent: &mut Live, store: TorrentStore) {
+        let job_id = torrent.record.job_id;
         let env = &self.inner.env;
-        let job = Arc::new(TorrentJob::new(
-            job,
-            Arc::clone(&env.repairs),
-            Arc::clone(&self.inner.signal),
-            slots,
-        ));
-        env.outside.join(
-            job_id.0,
-            Arc::new(Hearer {
-                job: Arc::clone(&job),
-                signal: Arc::clone(&self.inner.signal),
-            }),
-        );
+        let store = Arc::new(store);
         let signal = Arc::clone(&self.inner.signal);
         let intake = Arc::new(Intake::new(
-            Arc::clone(&job) as Arc<dyn Pieces>,
+            Arc::clone(&store) as Arc<dyn Pieces>,
             Room::new(Arc::clone(&env.limits), env.free_disk.clone()),
             Box::new(move |heard| signal.heard(job_id, heard)),
         ));
-        (job, intake)
+        torrent.file_have = store.file_have();
+        torrent.store = Some(store);
+        torrent.intake = Some(intake);
     }
 
     // Where a torrent's bytes in memory are counted: the accountant every
-    // job shares, under the namespace of the job's root.
+    // job shares, under the torrent's namespace.
     fn resident(&self, job_id: JobId) -> Holds {
         Holds {
             accountant: Arc::clone(&self.inner.env.accountant),
@@ -2940,28 +3125,25 @@ impl TorrentService {
         }
     }
 
-    // The torrent's metainfo and its job over it, at once.
-    fn give_metainfo(&self, torrent: &mut Live, parsed: &Parsed) {
+    // The torrent's metainfo and its store over it, at once. A store that
+    // cannot be made fails the torrent.
+    fn give_metainfo(&self, torrent: &mut Live, parsed: &Parsed) -> Result<(), String> {
         self.describe(torrent, parsed);
-        let (job_id, dir, unpack) = (torrent.record.job_id, dirs(torrent), unpacks(torrent));
-        let passwords = self.archive_passwords(torrent);
-        let checkpoint = self.restored(
-            job_id,
-            dir.clone(),
-            &parsed.layout,
-            unpack,
-            passwords.clone(),
-        );
-        let job = self.graph_job(job_id, dir, &parsed.layout, unpack, passwords, checkpoint);
-        self.give_job(torrent, job);
-    }
-
-    // The job joined, and what the torrent shows of it.
-    fn give_job(&self, torrent: &mut Live, job: GraphJob<PieceRoot>) {
-        let (job, intake) = self.job(torrent.record.job_id, job);
-        torrent.file_have = job.with(|job| job.file_have());
-        torrent.job = Some(job);
-        torrent.intake = Some(intake);
+        let job_id = torrent.record.job_id;
+        let Some(made) = self.making(torrent) else {
+            return Ok(());
+        };
+        let (store, notes) = self
+            .store::<std::convert::Infallible>(job_id, made, Err)
+            .map_err(|unmade| match unmade {
+                Unmade::Fails(error) => error,
+                Unmade::Waits(never) => match never {},
+            })?;
+        for note in notes {
+            note.say(job_id);
+        }
+        self.give_store(torrent, store);
+        Ok(())
     }
 
     // What the metainfo says of the torrent, without its job. Whether it
@@ -3007,7 +3189,7 @@ impl TorrentService {
             .lock()
             .await
             .values()
-            .filter(|torrent| torrent.job.is_none() && torrent.layout.is_some())
+            .filter(|torrent| torrent.store.is_none() && torrent.layout.is_some())
             .map(|torrent| torrent.record.job_id)
             .collect();
         // RESTORES_AT_ONCE in flight, each torrent attached as soon as its
@@ -3068,48 +3250,73 @@ impl TorrentService {
         let waiting = {
             let live = self.inner.live.lock().await;
             live.get(&job_id)
-                .filter(|torrent| torrent.job.is_none())
-                .and_then(|torrent| {
-                    Some((
-                        dirs(torrent),
-                        Arc::clone(torrent.layout.as_ref()?),
-                        unpacks(torrent),
-                        self.archive_passwords(torrent),
-                    ))
-                })
+                .filter(|torrent| torrent.store.is_none())
+                .and_then(|torrent| self.making(torrent))
         };
-        let Some((dir, layout, unpack, passwords)) = waiting else {
+        let Some(made) = waiting else {
             return false;
         };
         let restoring = {
-            let (service, dir, layout) = (self.clone(), dir.clone(), Arc::clone(&layout));
-            let passwords = passwords.clone();
+            let service = self.clone();
             tokio::task::spawn_blocking(move || {
-                let checkpoint = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    service.restored(job_id, dir, &layout, unpack, passwords)
+                service
+                    .inner
+                    .written
+                    .send_modify(|written| written.checkpoints_read += 1);
+                let store = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    service.store(job_id, made, Ok)
                 }))
-                .unwrap_or_else(|_| FromCheckpoint::Failed("the restore panicked".to_string()));
-                (guard, checkpoint)
+                .unwrap_or_else(|_| Err(Unmade::Fails("the restore panicked".to_string())));
+                (guard, store)
             })
         };
         // The blocking task ends only with its result, or with the runtime.
-        let Ok((_restoring, checkpoint)) = restoring.await else {
+        let Ok((_restoring, store)) = restoring.await else {
             return false;
         };
-        let job = self.graph_job(job_id, dir, &layout, unpack, passwords, checkpoint);
+        let store = match store {
+            Ok((store, notes)) => {
+                for note in notes {
+                    note.say(job_id);
+                }
+                store
+            }
+            Err(Unmade::Waits(error)) => {
+                // Said once while it stands; the torrent shows it as its
+                // error until a restore reads it.
+                let mut live = self.inner.live.lock().await;
+                if let Some(torrent) = live.get_mut(&job_id) {
+                    let why = format!("its restore is held: {error}");
+                    if torrent.restore_held.replace(why).is_none() {
+                        tracing::warn!(job_id = job_id.0, error = %error, "a torrent's restore is held; it is tried again");
+                    } else {
+                        tracing::debug!(job_id = job_id.0, error = %error, "a torrent's restore is still held");
+                    }
+                }
+                return false;
+            }
+            Err(Unmade::Fails(error)) => {
+                self.fail(job_id, error).await;
+                return false;
+            }
+        };
         match self
             .inner
             .live
             .lock()
             .await
             .get_mut(&job_id)
-            .filter(|torrent| torrent.job.is_none())
+            .filter(|torrent| torrent.store.is_none())
         {
             Some(torrent) => {
-                self.give_job(torrent, job);
+                torrent.restore_held = None;
+                self.give_store(torrent, store);
                 torrent.held.is_none()
             }
-            None => false,
+            None => {
+                store.forget();
+                false
+            }
         }
     }
 
@@ -3202,9 +3409,12 @@ impl TorrentService {
                         return Err(error);
                     }
                 };
-                self.give_metainfo(&mut torrent, &parsed);
+                let made = self.give_metainfo(&mut torrent, &parsed);
                 self.enqueue(torrent).await;
-                self.attach(job_id, None).await;
+                match made {
+                    Ok(()) => self.attach(job_id, None).await,
+                    Err(error) => self.fail(job_id, error).await,
+                }
                 self.inner.counters.event(TorrentEvent::Added);
                 self.publish_job(job_id).await;
                 Ok(job_id)
@@ -3305,10 +3515,11 @@ impl TorrentService {
         live.insert(torrent.record.job_id, torrent);
     }
 
-    // The job of `job_id`, just added, into the published queue beside the
-    // others as they stand: an add reads one torrent, not every one
-    // (libtorrent posts one `add_torrent_alert`). The exporter's reading
-    // takes it at the next publish of every torrent.
+    // The job of `job_id`, which changed, into the published queue beside
+    // the others as they stand: a settle reads the torrents that spoke, not
+    // every one (libtorrent posts a state update for the torrents that
+    // changed). The exporter's reading takes it at the next publish of
+    // every torrent.
     async fn publish_job(&self, job_id: JobId) {
         let Some(queue) = self.queue() else {
             return;
@@ -3732,8 +3943,12 @@ impl TorrentService {
                     .set_torrent_files_dir(job_id, files_dir.as_deref())
             })
             .map_err(|error| AddError::State(state_error(error)))?;
-        self.give_metainfo(torrent, &parsed);
+        let made = self.give_metainfo(torrent, &parsed);
         drop(live);
+        if let Err(error) = made {
+            self.fail(job_id, error).await;
+            return Ok(());
+        }
         // An SSL torrent's trackers hear it only as it goes live, under its
         // own identity: the fetch's trackers are let go here.
         let fetched = fetched.filter(|_| !parsed.ssl);
@@ -3830,11 +4045,11 @@ impl TorrentService {
             if torrent.attached.is_some() {
                 return;
             }
-            let (Some(bytes), Some(layout), Some(intake), Some(job)) = (
+            let (Some(bytes), Some(layout), Some(intake), Some(store)) = (
                 torrent.record.metainfo.clone(),
                 torrent.layout.clone(),
                 torrent.intake.clone(),
-                torrent.job.as_ref(),
+                torrent.store.clone(),
             ) else {
                 return;
             };
@@ -3855,15 +4070,16 @@ impl TorrentService {
                         .is_some(),
                 ratelimits,
                 (
-                    job.with(|job| initial_have(job, placed(&torrent.record))),
+                    store.initial_have(placed(&torrent.record)),
                     torrent.record.seed_mode,
+                    store,
                 ),
                 identity_of(rule, &torrent.identity),
                 torrent.seen,
                 PeerTerms::of(&settings, rule),
                 certificate_of(rule),
                 (
-                    fetch_levels(torrent, job),
+                    fetch_levels(torrent),
                     torrent.record.sequential,
                     torrent.record.first_last_piece_first,
                 ),
@@ -3941,7 +4157,7 @@ impl TorrentService {
         };
         terms.apply(&mut options);
         options.ssl_identity = ssl_identity(ssl.as_ref());
-        let (have, seed_mode) = have;
+        let (have, seed_mode, store) = have;
         apply_initial_have(&mut options, have);
         options.seed_mode = seed_mode;
         // The pieces that passed their check in seed mode before are passed
@@ -4037,7 +4253,7 @@ impl TorrentService {
                         ),
                     });
                 if seed_mode {
-                    adopt_placed(&handle, layout, &pieces);
+                    adopt_placed(&handle, &store, job_id, Arc::clone(&self.inner.signal));
                 }
                 torrent.attached = Some(Attached {
                     session,
@@ -4076,10 +4292,13 @@ impl TorrentService {
     async fn detach(&self, torrent: &mut Live) {
         let job_id = torrent.record.job_id;
         let now = self.inner.clock.now_ms();
-        if self.inner.signal.take_unsaved_one(job_id)
-            && let Some(save) = self.queue_checkpoint(torrent, now)
-        {
-            self.checkpoint_landed(save).await;
+        if self.inner.signal.take_unsaved_one(job_id) {
+            if let Some(tee) = torrent.store.as_ref().and_then(|store| store.tee()) {
+                self.checkpoint_tee(job_id, Arc::clone(tee)).await;
+            }
+            if let Some(save) = self.queue_checkpoint(torrent, now) {
+                self.checkpoint_landed(save).await;
+            }
         }
         torrent.settle(now);
         let landing = torrent
@@ -4147,8 +4366,8 @@ impl TorrentService {
     async fn retire(&self, torrent: Live, status: &str, error: Option<String>) {
         let job_id = torrent.record.job_id;
         self.inner.env.outside.leave(job_id.0);
-        if let Some(job) = &torrent.job {
-            job.forget();
+        if let Some(store) = &torrent.store {
+            store.forget();
         }
         let settings = self.settings();
         let now = self.inner.clock.now_ms();
@@ -4210,12 +4429,16 @@ impl TorrentService {
             fetch.abort();
             self.inner.counters.fetch(FetchOutcome::Cancelled);
         }
-        let written = torrent
-            .job
-            .as_ref()
-            .map(|job| job.with(|job| job.written_paths()))
-            .unwrap_or_default();
+        let written = self.written_paths(&torrent);
         self.detach(&mut torrent).await;
+        // Nothing of its unpacking writes as its files go.
+        if let Some(tee) = torrent.store.as_ref().and_then(|store| store.tee()) {
+            tee.stop().await;
+        }
+        // Nothing holds its files open as they go.
+        if let Some(store) = &torrent.store {
+            store.forget();
+        }
         if delete_files && let Some(dir) = torrent.record.storage_dir.clone() {
             let deleted =
                 tokio::task::spawn_blocking(move || delete_written(Path::new(&dir), &written));
@@ -4232,6 +4455,30 @@ impl TorrentService {
         self.inner.counters.event(TorrentEvent::Removed);
         self.retire(torrent, status, error).await;
         Ok(())
+    }
+
+    // What a deletion of the torrent's files removes (libtorrent
+    // `storage_utils::delete_files`): its listed files, what unpacking
+    // placed beside them, and its tee's directory, nothing else.
+    fn written_paths(&self, torrent: &Live) -> Vec<PathBuf> {
+        let Some(store) = &torrent.store else {
+            return Vec::new();
+        };
+        let mut paths = store.paths();
+        let dir = store.files().dir();
+        let outputs = self
+            .inner
+            .db
+            .torrent_outputs(torrent.record.job_id)
+            .unwrap_or_else(|error| {
+                tracing::warn!(job_id = torrent.record.job_id.0, error = %error, "could not read what a torrent unpacked");
+                Vec::new()
+            });
+        paths.extend(outputs.iter().map(|output| dir.join(output)));
+        if let Some(tee) = store.tee() {
+            paths.push(tee.work().to_path_buf());
+        }
+        paths
     }
 
     async fn with_torrent<T>(
@@ -4526,8 +4773,9 @@ impl TorrentService {
 
     /// Move the torrent's directory under `parent`, where it goes on
     /// downloading or seeding (qBittorrent `TorrentImpl::setSavePath`,
-    /// libtorrent `torrent::move_storage`). The move waits for the job's
-    /// runs and happens whole; the torrent shows as moving until it did.
+    /// libtorrent `torrent::move_storage`). The move holds off every read
+    /// and write of its files and happens whole; the torrent shows as
+    /// moving until it did.
     /// A directory of the torrent's name is claimed under `parent`, so
     /// nothing there is replaced or kept. Files placed outside the
     /// torrent's directory move straight into `parent` instead, where they
@@ -4560,16 +4808,16 @@ impl TorrentService {
                 "the location must be an absolute path".to_owned(),
             ));
         }
-        let (job, from, placed) = self
+        let (store, from, placed) = self
             .with_torrent(job_id, |torrent| {
                 if torrent.moving.is_some() {
                     return Err(ActionError::Invalid(
                         "the torrent is already moving".to_owned(),
                     ));
                 }
-                match (torrent.job.clone(), torrent.record.storage_dir.clone()) {
-                    (Some(job), Some(dir)) => Ok((
-                        job,
+                match (torrent.store.clone(), torrent.record.storage_dir.clone()) {
+                    (Some(store), Some(dir)) => Ok((
+                        store,
                         PathBuf::from(dir),
                         torrent.record.files_dir.clone().map(PathBuf::from),
                     )),
@@ -4581,7 +4829,7 @@ impl TorrentService {
             .await?;
         if let Some(placed) = placed {
             return self
-                .move_placed(job_id, job, &placed, parent, existing)
+                .move_placed(job_id, store, &placed, parent, existing)
                 .await;
         }
         if from.parent() == Some(parent.as_path()) {
@@ -4608,32 +4856,39 @@ impl TorrentService {
                 }
                 torrent.settle(self.inner.clock.now_ms());
                 torrent.moving = Some(Moving::Dir(to.clone()));
-                Ok(job.with(|job| {
-                    job.relocate(to.clone());
-                    job.relocated()
-                }))
+                Ok(())
             })
             .await;
-        let moved = match started {
-            Ok(Some(outcome)) => self.moved(job_id, outcome).await,
-            Ok(None) => Ok(()),
-            Err(error) => {
-                give_back(&to.to_string_lossy()).await;
-                return Err(error);
-            }
-        };
+        if let Err(error) = started {
+            give_back(&to.to_string_lossy()).await;
+            return Err(error);
+        }
+        let outcome = tokio::task::spawn_blocking(move || {
+            store.files().relocate(|dir| {
+                relocate::move_directory(dir, &to)?;
+                Ok((to.clone(), (to, false)))
+            })
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Err(MoveError {
+                path: from,
+                source: std::io::Error::other(error),
+            })
+        });
+        let moved = self.moved(job_id, outcome).await;
         self.publish().await;
         moved
     }
 
     // Move a torrent's files placed in `from`, outside its directory, to
     // `to` (libtorrent `torrent::move_storage` moves every file of a
-    // torrent from its save path to the new one). The job's own directory
-    // stays where it was claimed.
+    // torrent from its save path to the new one), with what unpacking
+    // placed beside them. The directory claimed for it stays where it was.
     async fn move_placed(
         &self,
         job_id: JobId,
-        job: Arc<TorrentJob>,
+        store: Arc<TorrentStore>,
         from: &Path,
         to: PathBuf,
         existing: Existing,
@@ -4646,25 +4901,32 @@ impl TorrentService {
         tokio::fs::create_dir_all(&to).await.map_err(|error| {
             ActionError::Invalid(format!("could not make the torrent's directory: {error}"))
         })?;
-        let outcome = self
-            .with_torrent(job_id, |torrent| {
-                if torrent.moving.is_some() {
-                    return Err(ActionError::Invalid(
-                        "the torrent is already moving".to_owned(),
-                    ));
-                }
-                torrent.settle(self.inner.clock.now_ms());
-                torrent.moving = Some(Moving::Files);
-                Ok(job.with(|job| {
-                    job.relocate_kept(to.clone(), existing);
-                    job.relocated()
-                }))
-            })
-            .await?;
-        let moved = match outcome {
-            Some(outcome) => self.moved(job_id, outcome).await,
-            None => Ok(()),
-        };
+        self.with_torrent(job_id, |torrent| {
+            if torrent.moving.is_some() {
+                return Err(ActionError::Invalid(
+                    "the torrent is already moving".to_owned(),
+                ));
+            }
+            torrent.settle(self.inner.clock.now_ms());
+            torrent.moving = Some(Moving::Files);
+            Ok(())
+        })
+        .await?;
+        let outputs = self.inner.db.torrent_outputs(job_id).unwrap_or_else(|error| {
+            tracing::warn!(job_id = job_id.0, error = %error, "could not read what a torrent unpacked");
+            Vec::new()
+        });
+        let from = from.to_path_buf();
+        let outcome =
+            tokio::task::spawn_blocking(move || move_listed(store.files(), &outputs, to, existing))
+                .await
+                .unwrap_or_else(|error| {
+                    Err(MoveError {
+                        path: from,
+                        source: std::io::Error::other(error),
+                    })
+                });
+        let moved = self.moved(job_id, outcome).await;
         self.publish().await;
         moved
     }
@@ -4692,24 +4954,27 @@ impl TorrentService {
         Ok(())
     }
 
-    // The job moved its directory, or could not: the record follows a
-    // move, and a failed one gives its claim back and leaves the torrent
-    // where it was. Files placed outside its directory take their save path
-    // and their directory with them. A failed move says why.
+    // The torrent's files moved, or could not: the record follows a move,
+    // and a failed one gives its claim back and leaves the torrent where it
+    // was. Files placed outside its directory take their save path and
+    // their directory with them; a file already where one of them went was
+    // kept, which the outcome says. A failed move says why.
     async fn moved(
         &self,
         job_id: JobId,
-        outcome: Result<PathBuf, LeafError>,
+        outcome: Result<(PathBuf, bool), MoveError>,
     ) -> Result<(), ActionError> {
-        let (moving, job) = self
+        let (moving, store) = self
             .with_torrent(job_id, |torrent| {
                 torrent.settle(self.inner.clock.now_ms());
-                Ok((torrent.moving.take(), torrent.job.clone()))
+                Ok((torrent.moving.take(), torrent.store.clone()))
             })
             .await
             .unwrap_or((None, None));
+        // An unpacking that waited on the move places its files now.
+        self.inner.signal.mark(job_id);
         match outcome {
-            Ok(to) => {
+            Ok((to, kept_existing)) => {
                 let to = to.to_string_lossy().into_owned();
                 let files = matches!(moving, Some(Moving::Files));
                 // Kept on its row before the torrent shows it, under the
@@ -4740,10 +5005,10 @@ impl TorrentService {
                     tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's new directory");
                 }
                 if files
-                    && let Some(job) = &job
-                    && job.with(GraphJob::kept_existing)
+                    && kept_existing
+                    && let Some(store) = &store
                 {
-                    self.check_kept(job_id, job).await;
+                    self.check_kept(job_id, store).await;
                 }
                 Ok(())
             }
@@ -4763,9 +5028,9 @@ impl TorrentService {
     // there are not all its own: every piece is checked again (libtorrent
     // `torrent::on_storage_moved` rechecks on `need_full_check`). A torrent
     // in no session forgets its pieces instead, and the session it next
-    // joins checks them, as it checks any torrent whose job vouches for
+    // joins checks them, as it checks any torrent whose store vouches for
     // nothing.
-    async fn check_kept(&self, job_id: JobId, job: &Arc<TorrentJob>) {
+    async fn check_kept(&self, job_id: JobId, store: &Arc<TorrentStore>) {
         let attached = self
             .inner
             .live
@@ -4776,7 +5041,7 @@ impl TorrentService {
         let checked = if attached {
             self.recheck(job_id).await.map_err(anyhow::Error::from)
         } else {
-            Pieces::checking(&**job).map(|_| ())
+            Pieces::checking(&**store).map(|_| ())
         };
         if let Err(error) = checked {
             tracing::warn!(job_id = job_id.0, error = %error, "could not check a torrent again after its move kept files there");
@@ -5045,8 +5310,11 @@ impl TorrentService {
             match record.metainfo.as_deref().map(parse) {
                 Some(Ok(parsed)) => {
                     self.describe(&mut torrent, &parsed);
-                    let root = self.kept_root(job_id, &parsed.layout);
-                    torrent.kept(self.stored_failure(job_id), root);
+                    let kept = self.inner.db.torrent_pieces(job_id).unwrap_or_else(|error| {
+                        tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's pieces");
+                        None
+                    });
+                    torrent.kept(self.stored_failure(job_id), kept);
                     self.inner.live.lock().await.insert(job_id, torrent);
                 }
                 Some(Err(error)) => {
@@ -5240,6 +5508,8 @@ impl TorrentService {
                 {
                     torrent.record.seed_mode = false;
                     torrent.seed_verified = 0;
+                    // Seeding no more, it may be queued again.
+                    self.inner.signal.want_pass();
                     if let Err(error) = self.inner.db.clear_torrent_seed_mode(torrent.record.job_id)
                     {
                         tracing::warn!(job_id = torrent.record.job_id.0, error = %error, "could not record that a torrent left seed mode");
@@ -5314,17 +5584,25 @@ impl TorrentService {
         }
     }
 
-    // What each session runs is what is stored: the levels the job wants
-    // the files fetched at now (the operator's, with the job's raise),
-    // sequential and first-and-last, each read from the torrent's handle and
+    // What each session runs is what is stored: the levels the operator
+    // set for the files, sequential and first-and-last, each read from the torrent's handle and
     // pushed only where it differs. A change the session refuses (while it
     // checks its files) is pushed again on the next pass. A full disk
     // leaves the levels as they are: the session stops fetching in upload
     // mode, not by lower levels.
     async fn apply_picking(&self) {
+        self.pick(None).await;
+    }
+
+    // Picking for the torrents in `only`, or for every one.
+    async fn pick(&self, only: Option<&BTreeSet<JobId>>) {
         let live = self.inner.live.lock().await;
-        for torrent in live.values() {
-            let (Some(attached), Some(job)) = (&torrent.attached, &torrent.job) else {
+        let torrents: Box<dyn Iterator<Item = &Live> + Send> = match only {
+            Some(only) => Box::new(only.iter().filter_map(|job_id| live.get(job_id))),
+            None => Box::new(live.values()),
+        };
+        for torrent in torrents {
+            let (Some(attached), Some(_)) = (&torrent.attached, &torrent.store) else {
                 continue;
             };
             let handle = &attached.handle;
@@ -5337,7 +5615,7 @@ impl TorrentService {
             {
                 tracing::debug!(job_id = record.job_id.0, error = %error, "a torrent's first and last pieces did not move");
             }
-            let wanted = fetch_levels(torrent, job);
+            let wanted = fetch_levels(torrent);
             let running = attached.handle.file_priorities();
             let changes: Vec<(usize, FilePriority)> = wanted
                 .iter()
@@ -5747,7 +6025,7 @@ impl TorrentService {
                         egress_id: leg.egress_id,
                         own_sockets: leg.own_sockets,
                     }),
-                has_job: torrent.job.is_some(),
+                has_job: torrent.store.is_some(),
                 kept_pieces: torrent.kept_pieces,
                 wanted_bytes,
                 wanted_have_bytes,
@@ -5993,26 +6271,33 @@ fn placed(record: &TorrentRecord) -> bool {
     record.save_path.is_some() || record.files_dir.is_some()
 }
 
-// A seed-mode torrent's files go to its job from where they were placed,
-// piece by piece on a blocking thread, while its session seeds them: the job
-// comes to hold what the session took as had, and completes. The session
-// leaving seed mode stops it before any check of every piece begins, and so
-// does the torrent leaving its session. A piece is read from the files
-// outside seed mode's hold, so a peer's request never waits on that read.
-fn adopt_placed(handle: &Arc<ManagedTorrent>, layout: Arc<PieceLayout>, pieces: &Arc<dyn Pieces>) {
+// A seed-mode torrent's pieces are had from where its files were placed,
+// piece by piece on a blocking thread, while its session seeds them, and
+// what its tee waits on goes to it from there: the store comes to have what
+// the session took as had. The session leaving seed mode
+// stops it before any check of every piece begins, and so does the torrent
+// leaving its session. A piece is read from the files outside seed mode's
+// hold, so a peer's request never waits on that read.
+fn adopt_placed(
+    handle: &Arc<ManagedTorrent>,
+    store: &Arc<TorrentStore>,
+    job_id: JobId,
+    signal: Arc<Signal>,
+) {
     let handle = Arc::downgrade(handle);
-    let pieces = Arc::downgrade(pieces);
+    let store = Arc::downgrade(store);
     tokio::task::spawn_blocking(move || {
-        for piece in 0..layout.piece_count() {
-            let (Some(handle), Some(pieces)) = (handle.upgrade(), pieces.upgrade()) else {
+        let Some(count) = store.upgrade().map(|store| store.layout().piece_count()) else {
+            return;
+        };
+        for piece in 0..count {
+            let (Some(handle), Some(store)) = (handle.upgrade(), store.upgrade()) else {
                 return;
             };
             if !handle.seed_mode() {
                 return;
             }
-            match crate::torrents::storage::adopt_under(&layout, &*pieces, piece, |take| {
-                handle.while_seeding(take)
-            }) {
+            match store.adopt(piece, |take| handle.while_seeding(take)) {
                 Some(Ok(())) => {}
                 Some(Err(error)) => {
                     tracing::warn!(piece, error = %format!("{error:#}"), "a seed-mode torrent's placed files could not be read");
@@ -6021,6 +6306,40 @@ fn adopt_placed(handle: &Arc<ManagedTorrent>, layout: Arc<PieceLayout>, pieces: 
                 None => return,
             }
         }
+        // The pieces the tee waits on are checked now, as a peer's request
+        // would check them, and go to it as they pass: the graph takes no
+        // byte a piece check has not passed. One that fails ends seed mode,
+        // and the check of every piece that follows gives the tee the
+        // pieces it finds and the session fetches the rest. A torrent that
+        // neither runs nor is paused has its pieces checked as peers ask.
+        if let (Some(handle), Some(store)) = (handle.upgrade(), store.upgrade())
+            && store.tee().is_some()
+        {
+            for piece in 0..count {
+                if !store.tee_wants(piece) {
+                    continue;
+                }
+                match handle.check_seeded(piece) {
+                    Some(Ok(true)) => {
+                        if let Err(error) = store.replay(piece) {
+                            tracing::warn!(piece, error = %error, "a seed-mode torrent's checked piece could not be read");
+                            break;
+                        }
+                    }
+                    Some(Ok(false)) | None => break,
+                    Some(Err(error)) => {
+                        tracing::warn!(piece, error = %format!("{error:#}"), "a seed-mode torrent's piece could not be checked");
+                        break;
+                    }
+                }
+            }
+        }
+        // The files were whole as placed: the next settle completes or
+        // unpacks the torrent, shows it seeding, and saves the pieces it
+        // adopted, as qBittorrent saves a torrent's resume data once it is
+        // added, rather than leaving every add's to one tick. Adds that come
+        // together share one settle.
+        signal.due(job_id);
     });
 }
 
@@ -6122,34 +6441,9 @@ fn downloading(view: &TorrentView, now_ms: i64) -> Option<JobPhaseProgress> {
     })
 }
 
-// The levels the session fetches a torrent's files at now.
-fn fetch_levels(torrent: &Live, job: &TorrentJob) -> Vec<FilePriority> {
-    raised_levels(&torrent.levels, job.with(|job| job.selection()))
-}
-
-// The operator's levels with the files the job raised at Maximum
-// (qBittorrent's top level); every other file keeps its stored level. A file
-// the operator ignored stays ignored.
-fn raised_levels(levels: &[FilePriority], raised: Vec<usize>) -> Vec<FilePriority> {
-    let mut levels = levels.to_vec();
-    for index in raised {
-        if let Some(level) = levels.get_mut(index)
-            && level.wanted()
-        {
-            *level = FilePriority::Maximum;
-        }
-    }
-    levels
-}
-
-// What a torrent's checkpoint gave back.
-enum FromCheckpoint {
-    // It has none.
-    Nothing,
-    Restored(Restored<PieceRoot>),
-    // It could not be read, or did not restore, and why.
-    Unread(String),
-    Failed(String),
+// The levels the session fetches a torrent's files at now: the operator's.
+fn fetch_levels(torrent: &Live) -> Vec<FilePriority> {
+    torrent.levels.clone()
 }
 
 // What a torrent's move takes.
@@ -6157,29 +6451,107 @@ enum FromCheckpoint {
 enum Moving {
     // Its directory, to the directory claimed for it.
     Dir(PathBuf),
-    // Its files placed outside its directory; the job's move names where.
+    // Its files placed outside its directory.
     Files,
+    // What its unpacking made, going beside its files.
+    Outputs,
 }
 
-// Where a torrent's job writes, and where its files are when they were
-// placed outside that directory.
-#[derive(Clone)]
-struct Dirs {
-    work: PathBuf,
-    files: Option<PathBuf>,
+// Why a torrent has no store: one that cannot be made fails the torrent,
+// and one whose checkpoint the database did not give waits to be tried
+// again.
+enum Unmade<W> {
+    Fails(String),
+    Waits(W),
 }
 
-// Where the torrent's job keeps its files.
-fn dirs(torrent: &Live) -> Dirs {
-    Dirs {
-        work: PathBuf::from(torrent.record.storage_dir.clone().unwrap_or_default()),
-        files: torrent.record.files_dir.clone().map(PathBuf::from),
+// What a store makes of a database read that failed, or of a checkpoint
+// whose rebuild failed writing or stepping: a restore waits on it (`Ok`),
+// as a usenet job's restore is held; a torrent given its metainfo now has
+// nothing saved to wait for (`Err`, with `W` uninhabited), and goes on.
+type Hold<W> = fn(String) -> Result<W, String>;
+
+// What a torrent's store made of what it found: why its tee starts fresh
+// though it had a checkpoint, and the pieces its files no longer gave.
+// Said where the restore is awaited, so the line goes where the caller's
+// lines go.
+enum Note {
+    Unread(String),
+    Unrestored(String),
+    Dropped { pieces: u32, error: String },
+}
+
+impl Note {
+    fn say(&self, job_id: JobId) {
+        match self {
+            Self::Unread(error) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacking checkpoint could not be read; it starts fresh");
+            }
+            Self::Unrestored(error) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacking checkpoint did not restore; it starts fresh");
+            }
+            Self::Dropped { pieces, error } => {
+                tracing::warn!(job_id = job_id.0, pieces, error = %error, "a torrent's pieces did not read from its files; they are fetched again");
+            }
+        }
     }
+}
+
+// What a torrent's store is made from: the directory its files are in,
+// its layout, whether it unpacks into a tee, and the archive passwords the
+// tee takes.
+struct Making {
+    files: PathBuf,
+    layout: Arc<PieceLayout>,
+    tee: bool,
+    passwords: Vec<String>,
+    // In seed mode: its pieces had are unchecked, and go to the tee only
+    // as their seed-mode check passes.
+    seeded: bool,
+}
+
+// The directory the torrent's files are in: where they were placed, or else
+// the directory claimed for it.
+fn files_dir(torrent: &Live) -> PathBuf {
+    PathBuf::from(
+        torrent
+            .record
+            .files_dir
+            .clone()
+            .or_else(|| torrent.record.storage_dir.clone())
+            .unwrap_or_default(),
+    )
 }
 
 // libtorrent `storage_utils::delete_files`: the torrent's files go, here
 // with what its job made of them, and then every directory that leaves
 // empty. Whatever else is in its directory stays.
+// The torrent's listed files and what unpacking put beside them, moved to
+// `to` under the lock no read or write gets past, and read and written
+// there from then on; where they went, and whether a file already there
+// was kept in place of one of them.
+pub(super) fn move_listed(
+    files: &Files,
+    outputs: &[String],
+    to: PathBuf,
+    existing: Existing,
+) -> Result<(PathBuf, bool), MoveError> {
+    let names: Vec<PathBuf> = files
+        .names()
+        .flatten()
+        .map(Path::to_path_buf)
+        .chain(outputs.iter().map(PathBuf::from))
+        .collect();
+    files.relocate(|dir| {
+        let moves: Vec<(PathBuf, PathBuf)> = names
+            .iter()
+            .map(|name| (dir.join(name), to.join(name)))
+            .collect();
+        let kept = relocate::move_files(dir, &moves, existing)?;
+        Ok((to.clone(), (to, kept)))
+    })
+}
+
 pub(super) fn delete_written(dir: &Path, written: &[PathBuf]) {
     for path in written {
         let removed = match std::fs::symlink_metadata(path) {

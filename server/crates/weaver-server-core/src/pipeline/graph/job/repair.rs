@@ -18,10 +18,9 @@ use weaver_graph::{MemberId, NodeId, VolumeIndex};
 
 use super::{GraphError, GraphJob};
 use crate::pipeline::graph::namespace::{Lender, WriteError};
-use crate::pipeline::graph::root::Root;
 use crate::pipeline::graph::status::RepairSlots;
 
-impl<R: Root> GraphJob<R> {
+impl GraphJob {
     // Walk the namespaces without asking for a slot: a job just restored
     // holds none, and lends what is due once the pipeline has it.
     pub(super) fn repair(&mut self) -> Result<(), GraphError> {

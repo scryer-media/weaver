@@ -57,17 +57,13 @@ pub(crate) const BOOTSTRAP_VOLUMES: usize = 4;
 // member has been bound to yet. Only the root volumes still waited on are
 // asked which set and place they are; a volume in hand is passed by its
 // place alone.
-pub(crate) fn bootstrap(
-    tree: &Tree,
-    waiting: impl IntoIterator<Item = VolumeIndex>,
-    window: &mut Window,
-) {
+pub(crate) fn bootstrap(tree: &Tree, map: &ArticleMap, window: &mut Window) {
     let Some(root) = tree.namespace(NodeId::ROOT) else {
         return;
     };
     // A further posting of a member is the member's, not a volume of its own.
-    let mut waiting: Vec<(NodeId, VolumeIndex, VolumeIndex)> = waiting
-        .into_iter()
+    let mut waiting: Vec<(NodeId, VolumeIndex, VolumeIndex)> = map
+        .waiting_volumes()
         .filter_map(|volume| {
             let member = MemberId(volume.0);
             if root.get(member).is_none() || root.copy_of(member).is_some() {

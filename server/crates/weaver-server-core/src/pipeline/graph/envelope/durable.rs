@@ -66,7 +66,7 @@ impl Envelopes {
             .file
             .clone()
             .unwrap_or_else(|| envelope_name(record.node, record.envelope));
-        let leaf = Leaf::found(&self.working_dir, &name);
+        let leaf = Leaf::found(&shelf.dir, &name);
         // The checkpoint owns this path, but its file may have been lost
         // or shortened since. Missing bytes must wait for refetch before
         // a run starts: stale coverage would let it fail on an absent

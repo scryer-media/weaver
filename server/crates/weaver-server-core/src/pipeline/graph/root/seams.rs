@@ -64,7 +64,6 @@ impl Pipeline {
         };
         let storage = Storage {
             working_dir: state.working_dir.clone(),
-            kept_dir: None,
             accountant: Arc::clone(&self.graph_holds),
             free_disk: self
                 .storage_capacity
@@ -74,7 +73,6 @@ impl Pipeline {
             passwords,
             caps,
             nesting: limits::NESTING,
-            unpack: true,
             hardware: self.graph_hardware.clone(),
             metrics: Some(Arc::clone(&self.metrics)),
         };
@@ -312,11 +310,15 @@ impl Pipeline {
     // job's next graph may be built from then on.
     pub(in crate::pipeline) fn graph_run_said(&mut self, said: Said) {
         let job_id = JobId(said.scope);
+        // A job of the pipeline's pauses for it; a job outside the pipeline
+        // hears it as it hears the rest of its mail.
         if let Heard::CheckpointBlocked {
             control,
             revision,
             error,
         } = &said.heard
+            && (self.graph_jobs.contains_key(&job_id)
+                || self.retiring_graph_jobs.contains_key(&job_id))
         {
             self.pause_graph_checkpoint(job_id, control, *revision, error);
             return;

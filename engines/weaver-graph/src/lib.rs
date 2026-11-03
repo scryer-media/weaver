@@ -67,8 +67,8 @@ pub use records::{
 pub use recovery::{Recovery, Segment, SliceVerdict};
 pub use seek::{Pull, Purpose, Seek, SeekUp, Weight, When};
 pub use sniff::{
-    HEAD_VERDICT_BYTES, Sniff, VERDICT_BYTES, names_recovery, par2_index, signed, signs_a_head,
-    sniff,
+    HEAD_VERDICT_BYTES, Listed, Sniff, VERDICT_BYTES, listed, names_recovery, par2_index, signed,
+    signs_a_head, sniff,
 };
 pub use tree::{Builder, Disclaim, Effect, NodeId, Tree};
 pub use volume::{ByteRange, VolumeIndex};

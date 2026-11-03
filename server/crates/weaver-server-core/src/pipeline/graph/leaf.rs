@@ -24,8 +24,6 @@ use weaver_graph::{Algorithm, Digest, Evidenced};
 
 use crate::pipeline::graph::sparse::{PlatformMarker, create_sparse};
 
-pub(crate) mod readers;
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LeafError {
     #[error("{}: {source}", path.display())]
@@ -33,7 +31,7 @@ pub(crate) enum LeafError {
 }
 
 impl LeafError {
-    pub(crate) fn io(path: &Path) -> impl FnOnce(io::Error) -> LeafError + '_ {
+    fn io(path: &Path) -> impl FnOnce(io::Error) -> LeafError + '_ {
         move |source| LeafError::Io {
             path: path.to_path_buf(),
             source,
@@ -59,12 +57,6 @@ pub(crate) struct Leaf {
     // Open while bytes are still arriving; dropped when the member is
     // covered, and reopened only for a repair.
     file: Option<File>,
-    // The key its shared read handle is kept under once `file` is let go:
-    // a fresh one whenever the file may have moved, been replaced or must
-    // not be held open, so no handle reads a file the leaf no longer names.
-    reader: u64,
-    // The pool that handle is kept in.
-    readers: &'static readers::ReaderPool,
     // Whether the file is on disk: the leaf made it, or was handed one
     // that sits at its name. Never read off the disk, where the name may
     // already hold a newer file another leaf was given.
@@ -128,8 +120,6 @@ impl Leaf {
             wants: None,
             directory: Self::is_directory(output_name),
             file: None,
-            reader: readers::key(),
-            readers: &readers::SHARED,
             on_disk,
             written: BTreeMap::new(),
             changed: BTreeMap::new(),
@@ -163,14 +153,6 @@ impl Leaf {
             self.changed.remove(&key);
         }
         self.changed.insert((start, self.revision), end);
-    }
-
-    // The leaf, its read handle kept in `readers` rather than the shared
-    // pool.
-    #[cfg(test)]
-    pub(crate) fn with_readers(mut self, readers: &'static readers::ReaderPool) -> Self {
-        self.readers = readers;
-        self
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -519,39 +501,18 @@ impl Leaf {
     ) -> Result<(), LeafError> {
         let start = into.len();
         into.resize(start + len, 0);
-        self.read_exact(offset, &mut into[start..])
-            .inspect_err(|_| into.truncate(start))
-    }
-
-    // Fill `out` from `offset`, as `read` does, straight into the caller's
-    // buffer. A file no longer open for writing is opened for this read
-    // alone.
-    pub(crate) fn read_exact(&self, offset: u64, out: &mut [u8]) -> Result<(), LeafError> {
-        match &self.file {
-            Some(file) => read_exact_at(file, offset, out),
-            None => File::open(&self.path).and_then(|file| read_exact_at(&file, offset, out)),
-        }
-        .map_err(LeafError::io(&self.path))
-    }
-
-    // `read_exact` for a seed's peers, which read the same files again and
-    // again: a file no longer open for writing is read through its shared
-    // read handle, opened at its first read and kept for the next.
-    pub(crate) fn read_shared_exact(&self, offset: u64, out: &mut [u8]) -> Result<(), LeafError> {
-        match &self.file {
-            Some(file) => read_exact_at(file, offset, out),
-            None => self
-                .readers
-                .open(self.reader, &self.path)
-                .and_then(|file| read_exact_at(&file, offset, out)),
-        }
-        .map_err(LeafError::io(&self.path))
-    }
-
-    // The shared read handle, if one is open, is let go of.
-    fn forget_reader(&mut self) {
-        self.readers.forget(self.reader);
-        self.reader = readers::key();
+        let read = match &self.file {
+            Some(file) => read_exact_at(file, offset, &mut into[start..]),
+            None => File::open(&self.path)
+                .and_then(|file| read_exact_at(&file, offset, &mut into[start..])),
+        };
+        read.map_err(|source| {
+            into.truncate(start);
+            LeafError::Io {
+                path: self.path.clone(),
+                source,
+            }
+        })
     }
 
     // Every byte is in: the file takes its final length and its handle is
@@ -583,11 +544,6 @@ impl Leaf {
         file.set_len(0).map_err(LeafError::io(&self.path))
     }
 
-    #[cfg(test)]
-    pub(crate) fn reader_is_open(&self) -> bool {
-        self.readers.is_open(self.reader)
-    }
-
     // The member was named again: the file is to follow it, once the
     // checkpoint that records the name has committed. Nothing on disk
     // changes here, and a name the file already sits at wants no move.
@@ -603,7 +559,6 @@ impl Leaf {
         };
         let path = dir.join(relative_path(&wants));
         let had_file = self.file.take().is_some() || self.path.exists();
-        self.forget_reader();
         if had_file && path != self.path {
             create_parent(&path)?;
             crate::runtime::fs::rename_path_exclusive(&self.path, &path)
@@ -614,30 +569,12 @@ impl Leaf {
         Ok(Some(std::mem::replace(&mut self.name, wants)))
     }
 
-    // Let go of the handle ahead of the directory moving: the file stays,
-    // and the next write opens it where it then is.
-    pub(crate) fn release(&mut self) {
-        self.file = None;
-        self.forget_reader();
-    }
-
-    // The job's directory moved from `from` to `to`, the file with it: the
-    // path follows. A kept file placed outside the job's directory did not
-    // move, and stays where it is.
-    pub(crate) fn relocate(&mut self, from: &Path, to: &Path) {
-        if let Ok(rest) = self.path.strip_prefix(from) {
-            self.path = to.join(rest);
-            self.forget_reader();
-        }
-    }
-
     // The member is gone with its subtree.
     pub(crate) fn remove(mut self) -> Result<(), LeafError> {
         self.file = None;
-        self.forget_reader();
         match std::fs::remove_file(&self.path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(LeafError::Io {
-                path: self.path.clone(),
+                path: self.path,
                 source: error,
             }),
             _ => Ok(()),
@@ -646,9 +583,6 @@ impl Leaf {
 
     fn open(&mut self, length: Option<u64>) -> Result<&File, LeafError> {
         if self.file.is_none() {
-            // Written again: reads go through the write handle until it is
-            // let go, and the file it names may be a new one.
-            self.forget_reader();
             create_parent(&self.path)?;
             let file =
                 create_sparse(&self.path, &PlatformMarker).map_err(LeafError::io(&self.path))?;
@@ -665,12 +599,6 @@ impl Leaf {
     }
 }
 
-// A leaf gone with its job lets go of its shared read handle.
-impl Drop for Leaf {
-    fn drop(&mut self) {
-        self.readers.forget(self.reader);
-    }
-}
 // An output name as a path relative to the directory it is written under.
 // Every name a leaf is given was confined by the name ledger
 // (`weaver_graph::names`), which keeps it inside that directory: never
@@ -817,8 +745,3 @@ mod tests {
         assert_eq!(short.folded(7000, crc), None);
     }
 }
-
-// The shared read handles a leaf is read through.
-#[cfg(test)]
-#[path = "leaf/tests.rs"]
-mod reader_tests;

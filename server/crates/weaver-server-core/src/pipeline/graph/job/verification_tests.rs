@@ -85,12 +85,12 @@ async fn a_blocked_verification_keeps_ownership_and_allows_checkpoints_until_ack
     ));
 
     let checkpoint = Pending::default();
-    assert!(checkpoint.put(&mut job, Vec::new()));
+    assert!(checkpoint.put(&job, Vec::new()));
     let (delta, _) = checkpoint.take();
     let snapshot = checkpoint::snapshot(&rows(delta.unwrap())).unwrap();
-    assert_eq!(snapshot.job.pending_verifications, vec![(0, 0)]);
+    assert_eq!(snapshot.root.pending_verifications, vec![(0, 0)]);
     assert!(
-        !checkpoint.put(&mut job, Vec::new()),
+        !checkpoint.put(&job, Vec::new()),
         "unchanged pending state writes nothing"
     );
 
@@ -99,7 +99,7 @@ async fn a_blocked_verification_keeps_ownership_and_allows_checkpoints_until_ack
         .intake(decoded(0, 0, 0, b"other", Some(5)), &mut slots, 1)
         .unwrap();
     let other_checkpoint = Pending::default();
-    assert!(other_checkpoint.put(&mut other, Vec::new()));
+    assert!(other_checkpoint.put(&other, Vec::new()));
     assert!(other_checkpoint.take().0.is_some());
     assert_eq!(other.phase(), RootPhase::Done);
 
@@ -139,7 +139,7 @@ async fn a_blocked_verification_keeps_ownership_and_allows_checkpoints_until_ack
     job.run_said(said, &mut slots, 1).unwrap();
     assert!(job.writer.pending_verifications().is_empty());
     assert_eq!(job.phase(), RootPhase::Done);
-    assert!(checkpoint.put(&mut job, Vec::new()));
+    assert!(checkpoint.put(&job, Vec::new()));
     let delta = checkpoint.take().0.unwrap();
     assert_eq!(delta.nodes.len(), 1, "only the sparse root state changes");
     assert!(delta.members.is_empty() && delta.coverage.is_empty() && delta.parts.is_empty());
@@ -155,7 +155,7 @@ async fn a_checkpoint_before_verification_cannot_restore_an_unchecked_crc_as_pas
         .unwrap()
         .crc32 = Some(1);
     let checkpoint = Pending::default();
-    assert!(checkpoint.put(&mut job, Vec::new()));
+    assert!(checkpoint.put(&job, Vec::new()));
     let snapshot = checkpoint::snapshot(&rows(checkpoint.take().0.unwrap())).unwrap();
     drop(job);
     let mut mail = RunMail::default();
@@ -165,7 +165,6 @@ async fn a_checkpoint_before_verification_cannot_restore_an_unchecked_crc_as_pas
         2,
         Storage {
             working_dir: dir.path().to_owned(),
-            kept_dir: None,
             accountant: Arc::new(HoldsAccountant::new(weaver_graph::holds::HoldBudgets {
                 resident_limit: u64::MAX,
                 scratch_total: u64::MAX,
@@ -178,7 +177,6 @@ async fn a_checkpoint_before_verification_cannot_restore_an_unchecked_crc_as_pas
             passwords: Vec::new(),
             caps: Caps::unbounded(),
             nesting: u32::MAX,
-            unpack: true,
             hardware: Default::default(),
             metrics: None,
         },

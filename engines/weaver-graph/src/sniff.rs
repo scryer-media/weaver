@@ -430,6 +430,71 @@ pub fn names_claimable(name: &str) -> bool {
     names_recovery(name) || numbered_piece(trimmed(name))
 }
 
+// What a file of a listing is, by the names beside it: a container volume
+// founds or joins a set, recovery data and SFVs go with one, and anything
+// else is a plain file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Listed {
+    Container,
+    Recovery,
+    Plain,
+}
+
+// Each name of a listing, told by name alone: a RAR volume, `.rar` and the
+// old `.r00` … `.y99` numbering of a set whose `.rar` is listed; a 7z or a
+// zip, and zip's `.z01` parts of a listed `.zip`; a numbered piece of a
+// split file; a recovery file (an old `.p01` of a listed `.par` or `.par2`)
+// or an SFV. A short name with a letter and digits for an extension, a
+// `.s16` or a `.p12`, is a plain file when no set of its stem is listed.
+pub fn listed(names: &[&str]) -> Vec<Listed> {
+    let lower: Vec<String> = names
+        .iter()
+        .map(|name| trimmed(name).to_ascii_lowercase())
+        .collect();
+    let has = |stem: &str, extension: &str| {
+        lower.iter().any(|name| {
+            name.strip_suffix(extension)
+                .and_then(|named| named.strip_suffix('.'))
+                .is_some_and(|named| named == stem)
+        })
+    };
+    lower
+        .iter()
+        .map(|name| {
+            let Some((stem, extension)) =
+                name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty())
+            else {
+                return Listed::Plain;
+            };
+            let (letter, digits) =
+                extension.split_at(extension.chars().next().map_or(0, char::len_utf8));
+            let numbered = !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit());
+            let container = matches!(extension, "rar" | "7z" | "zip")
+                || numbered_piece(name)
+                || (numbered
+                    && digits.len() == 2
+                    && matches!(letter, "r" | "s" | "t" | "u" | "v" | "w" | "x" | "y")
+                    && has(stem, "rar"))
+                || (numbered
+                    && (2..=3).contains(&digits.len())
+                    && letter == "z"
+                    && has(stem, "zip"));
+            if container {
+                return Listed::Container;
+            }
+            let recovery = match extension {
+                "rev" | "par2" | "par3" | "sfv" => true,
+                _ => names_recovery(name) && (has(stem, "par") || has(stem, "par2")),
+            };
+            if recovery {
+                Listed::Recovery
+            } else {
+                Listed::Plain
+            }
+        })
+        .collect()
+}
+
 // A piece of a file split into numbered pieces, `name.001`, `name.002`, …:
 // its last extension is all digits. Which piece it is, the object says.
 fn numbered_piece(name: &str) -> bool {
@@ -956,6 +1021,95 @@ mod tests {
                     assert_ne!(kind, Kind::Deflate);
                 }
             }
+        }
+    }
+
+    // A listing's names are told apart by name alone, and by the names
+    // beside them: container volumes in every numbering, recovery files and
+    // SFVs; a look-alike extension with no set of its stem is plain.
+    #[test]
+    fn a_listings_archive_names_are_told_apart_from_plain_files() {
+        let names = [
+            "a.rar",
+            "a.r00",
+            "a.s01",
+            "a.y99",
+            "b.part02.RAR",
+            "c.7z",
+            "c.7z.001",
+            "d.zip",
+            "d.z01",
+            "e.mkv.003",
+            "f.par2",
+            "f.vol00+01.PAR2",
+            "f.p01",
+            "g.par",
+            "g.p07",
+            "h.rev",
+            "h.sfv",
+            "plain.mkv",
+            "plain.nfo",
+            "plain.r",
+            "plain.rar.txt",
+            "rar",
+            "x.s16",
+            "x.r64",
+            "x.z80",
+            "x.z01",
+            "x.p12",
+            "x.p7",
+            "a.r100",
+            "a.z00x",
+            "plain.tar",
+            "plain.tar.gz",
+            "plain.xz",
+        ];
+        let listed = listed(&names);
+        let of = |name: &str| listed[names.iter().position(|named| *named == name).unwrap()];
+        for name in [
+            "a.rar",
+            "a.r00",
+            "a.s01",
+            "a.y99",
+            "b.part02.RAR",
+            "c.7z",
+            "c.7z.001",
+            "d.zip",
+            "d.z01",
+            "e.mkv.003",
+        ] {
+            assert_eq!(of(name), Listed::Container, "{name}");
+        }
+        for name in [
+            "f.par2",
+            "f.vol00+01.PAR2",
+            "f.p01",
+            "g.p07",
+            "h.rev",
+            "h.sfv",
+        ] {
+            assert_eq!(of(name), Listed::Recovery, "{name}");
+        }
+        for name in [
+            "g.par",
+            "plain.mkv",
+            "plain.nfo",
+            "plain.r",
+            "plain.rar.txt",
+            "rar",
+            "x.s16",
+            "x.r64",
+            "x.z80",
+            "x.z01",
+            "x.p12",
+            "x.p7",
+            "a.r100",
+            "a.z00x",
+            "plain.tar",
+            "plain.tar.gz",
+            "plain.xz",
+        ] {
+            assert_eq!(of(name), Listed::Plain, "{name}");
         }
     }
 }

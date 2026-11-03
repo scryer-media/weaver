@@ -5,9 +5,10 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use tokio::sync::{Notify, watch};
+use weaver_graph::NodeId;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant, HoldsNamespace};
-use weaver_graph::{ByteRange, MemberId, NodeId, VolumeIndex};
 use weaver_torrent::core::lengths::{Lengths, ValidPieceIndex};
 use weaver_torrent::spawn_utils::BlockingSpawner;
 use weaver_torrent::{
@@ -15,15 +16,13 @@ use weaver_torrent::{
     SessionOptions, create_torrent, torrent_from_bytes,
 };
 
-use super::{PieceStorage, PieceStorageFactory, Pieces, TorrentJob, initial_have, layout_of};
-use crate::operations::disk::CapacityReader;
-use crate::pipeline::graph::engine::RunMail;
-use crate::pipeline::graph::job::{Existing, GraphJob, Storage};
-use crate::pipeline::graph::limits::Caps;
-use crate::pipeline::graph::root::phase::RootPhase;
-use crate::pipeline::graph::root::pieces::{PieceFile, PieceLayout, Verified};
-use crate::pipeline::graph::status::RepairSlots;
+use super::{PieceStorage, PieceStorageFactory, Pieces};
+use crate::torrents::files::Files;
 use crate::torrents::intake::Holds;
+use crate::torrents::layout::{PieceFile, PieceLayout, layout_of};
+use crate::torrents::relocate::Existing;
+use crate::torrents::service::{delete_written, move_listed};
+use crate::torrents::store::{Kept, TorrentStore};
 use weaver_torrent::storage::{
     BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage,
 };
@@ -56,23 +55,6 @@ fn unbounded() -> Holds {
     holds(&accountant(u64::MAX))
 }
 
-fn storage(dir: &Path, mail: &RunMail) -> Storage {
-    Storage {
-        working_dir: dir.to_path_buf(),
-        kept_dir: None,
-        accountant: accountant(u64::MAX),
-        free_disk: CapacityReader::unknown(),
-        slots: 1,
-        mail: mail.sender(),
-        passwords: Vec::new(),
-        caps: Caps::unbounded(),
-        nesting: u32::MAX,
-        unpack: true,
-        hardware: Default::default(),
-        metrics: None,
-    }
-}
-
 fn file(name: &str, length: u64) -> PieceFile {
     PieceFile {
         name: name.to_owned(),
@@ -88,11 +70,16 @@ fn noise(length: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
+// The store of a torrent of plain files under `dir`, with what it kept.
+fn store_in(layout: &Arc<PieceLayout>, dir: &Path, kept: Option<&Kept>) -> Arc<TorrentStore> {
+    let files = Files::new(layout, dir.to_path_buf()).unwrap();
+    Arc::new(TorrentStore::new(Arc::clone(layout), files, kept, None))
+}
+
 struct Shim {
-    job: Arc<TorrentJob>,
+    store: Arc<TorrentStore>,
     storage: PieceStorage,
     layout: Arc<PieceLayout>,
-    mail: RunMail,
     dir: tempfile::TempDir,
     room: Arc<Notify>,
 }
@@ -100,23 +87,16 @@ struct Shim {
 fn shim(piece_length: u64, files: Vec<PieceFile>) -> Shim {
     let layout = Arc::new(PieceLayout::new(piece_length, files).unwrap());
     let dir = tempfile::tempdir().unwrap();
-    let mail = RunMail::default();
-    let job = Arc::new(TorrentJob::new(
-        GraphJob::for_torrent(1, Arc::clone(&layout), storage(dir.path(), &mail)),
-        Arc::default(),
-        Arc::default(),
-        1,
-    ));
+    let store = store_in(&layout, dir.path(), None);
     let storage = PieceStorage::new(
         Arc::clone(&layout),
-        Arc::clone(&job) as Arc<dyn Pieces>,
+        Arc::clone(&store) as Arc<dyn Pieces>,
         unbounded(),
     );
     Shim {
-        job,
+        store,
         storage,
         layout,
-        mail,
         dir,
         room: Arc::default(),
     }
@@ -167,53 +147,6 @@ impl Shim {
         self.write(piece, torrent);
         self.storage.on_piece_completed(self.index(piece)).unwrap();
     }
-
-    // Hear the job's runs until it is done.
-    async fn settle(&mut self) {
-        while self.job.with(|job| job.phase()) != RootPhase::Done {
-            let said = self.mail.recv().await.unwrap();
-            self.job
-                .with(|job| job.run_said(said, &mut RepairSlots::default(), 1))
-                .unwrap();
-        }
-    }
-}
-
-// A shim whose files are kept in `placed`, a directory of their own beside
-// the job's, and left as they are: no run is ever out.
-fn placed_shim(piece_length: u64, files: Vec<PieceFile>) -> Shim {
-    let layout = Arc::new(PieceLayout::new(piece_length, files).unwrap());
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(dir.path().join("work")).unwrap();
-    std::fs::create_dir_all(dir.path().join("placed")).unwrap();
-    let mail = RunMail::default();
-    let job = Arc::new(TorrentJob::new(
-        GraphJob::for_torrent(
-            1,
-            Arc::clone(&layout),
-            Storage {
-                kept_dir: Some(dir.path().join("placed")),
-                unpack: false,
-                ..storage(&dir.path().join("work"), &mail)
-            },
-        ),
-        Arc::default(),
-        Arc::default(),
-        1,
-    ));
-    let storage = PieceStorage::new(
-        Arc::clone(&layout),
-        Arc::clone(&job) as Arc<dyn Pieces>,
-        unbounded(),
-    );
-    Shim {
-        job,
-        storage,
-        layout,
-        mail,
-        dir,
-        room: Arc::default(),
-    }
 }
 
 fn three_files() -> (Shim, Vec<u8>) {
@@ -229,16 +162,16 @@ fn three_files() -> (Shim, Vec<u8>) {
 fn a_piece_in_flight_is_read_back_from_memory() {
     let (shim, torrent) = three_files();
     shim.write(0, &torrent);
-    // Before it verifies the piece is the session's alone: the job has
+    // Before it verifies the piece is the session's alone: the store has
     // none of it, and a read of it comes from the buffer.
-    assert!(shim.job.with(|job| job.have().not_any()));
+    assert_eq!(shim.store.count(), 0);
     assert!(!shim.dir.path().join("a.bin").exists());
     assert_eq!(shim.read(0), torrent[..1024]);
-    // A piece with nothing written and nothing posted is not in hand.
+    // A piece with nothing written is on no disk.
     let mut buf = [0; 10];
     assert!(shim.storage.pread_exact(1, 100, &mut buf).is_err());
-    // A read across two pieces is read from what was posted, and piece 1
-    // is not.
+    // A read across two pieces is read from the files, and piece 1 is not
+    // there.
     assert!(shim.storage.pread_exact(1, 20, &mut buf).is_err());
     // Nor does a write cross a piece.
     assert!(shim.storage.pwrite_all(1, 20, &[0; 10]).is_err());
@@ -246,13 +179,16 @@ fn a_piece_in_flight_is_read_back_from_memory() {
     shim.storage.pread_exact(0, 1000, &mut []).unwrap();
 }
 
+// libtorrent `disk_io_thread::async_write`: a verified piece is written to
+// the torrent's listed files under its directory, and is had.
 #[test]
-fn a_verified_piece_goes_to_the_job_as_its_files_shares() {
+fn a_verified_piece_is_written_to_the_torrents_files() {
     let (shim, torrent) = three_files();
     for piece in 0..5 {
         shim.complete(piece, &torrent);
     }
-    assert!(shim.job.with(|job| job.have().all()));
+    assert_eq!(shim.store.count(), 5);
+    assert_eq!(shim.store.file_have(), [1000, 2500, 700]);
     let dir = shim.dir.path();
     assert_eq!(std::fs::read(dir.join("a.bin")).unwrap(), torrent[..1000]);
     assert_eq!(
@@ -264,35 +200,64 @@ fn a_verified_piece_goes_to_the_job_as_its_files_shares() {
     assert!(shim.storage.on_piece_completed(shim.index(0)).is_err());
 }
 
-// The bitfield the session starts from is the restored job's pieces, in
+// The bitfield the session starts from is the pieces the store kept, in
 // the wire's bit order.
 #[test]
-fn a_restored_job_gives_the_session_the_pieces_it_has() {
+fn a_kept_store_gives_the_session_the_pieces_it_has() {
     let (shim, torrent) = three_files();
     for piece in [0, 1, 2, 4] {
         shim.complete(piece, &torrent);
     }
-    let rows = crate::pipeline::graph::checkpoint::rows(&shim.job.with(|job| job.snapshot()));
-    let snapshot = crate::pipeline::graph::checkpoint::snapshot(&rows).unwrap();
-    let restored = GraphJob::restore_torrent(
-        &snapshot,
-        Arc::clone(&shim.layout),
-        1,
-        storage(shim.dir.path(), &shim.mail),
-        1,
-    )
-    .unwrap();
-    let have = initial_have(&restored.job, false).unwrap();
+    let kept = shim.store.kept();
+    assert!(!kept.checking);
+    let again = store_in(&shim.layout, shim.dir.path(), Some(&kept));
+    let have = again.initial_have(false).unwrap();
     assert_eq!(have.len(), 5);
-    // Piece 4 came before piece 3, which carries the front of c's file: it
-    // is in c's file all the same, so the restart has it.
     assert_eq!(have.iter_ones().collect::<Vec<_>>(), vec![0, 1, 2, 4]);
     // Piece 0 is the high bit of the first byte.
     assert_eq!(have.as_raw_slice()[0], 0b1110_1000);
+    assert_eq!(again.file_have(), shim.store.file_have());
+    // A store with none of files that were placed vouches for nothing: the
+    // session checks them.
+    let placed = store_in(&shim.layout, shim.dir.path(), None);
+    assert!(placed.initial_have(true).is_none());
+    assert_eq!(placed.initial_have(false).unwrap().count_ones(), 0);
+}
+
+// libtorrent `torrent::force_recheck`: once a check of every piece began, a
+// run stopped before it gave every piece its verdict has only what it found,
+// and checks every piece again.
+#[test]
+fn a_check_stopped_part_way_is_kept_to_check_again() {
+    let (shim, torrent) = three_files();
+    for piece in 0..5 {
+        shim.complete(piece, &torrent);
+    }
+    shim.storage.on_check_everything().unwrap();
+    assert_eq!(shim.store.count(), 0);
+    shim.storage.on_piece_checked(shim.index(0)).unwrap();
+    shim.storage.on_piece_hash_failed(shim.index(1)).unwrap();
+    assert_eq!(shim.store.count(), 1);
+    let kept = shim.store.kept();
+    assert!(kept.checking);
+    let again = store_in(&shim.layout, shim.dir.path(), Some(&kept));
+    assert!(again.initial_have(false).is_none());
+    // It has what the check found, and checks every piece again.
+    assert_eq!(again.count(), 1);
+    assert!(again.has(0));
+    for piece in 2..5 {
+        shim.storage.on_piece_checked(shim.index(piece)).unwrap();
+    }
+    let kept = shim.store.kept();
+    assert!(!kept.checking);
+    let have = store_in(&shim.layout, shim.dir.path(), Some(&kept))
+        .initial_have(false)
+        .unwrap();
+    assert_eq!(have.iter_ones().collect::<Vec<_>>(), vec![0, 2, 3, 4]);
 }
 
 #[test]
-fn a_verified_piece_seeds_from_the_files_it_was_posted_to() {
+fn a_verified_piece_seeds_from_the_files_it_was_written_to() {
     let (shim, torrent) = three_files();
     for piece in 0..5 {
         shim.complete(piece, &torrent);
@@ -307,91 +272,49 @@ fn a_verified_piece_seeds_from_the_files_it_was_posted_to() {
     }
 }
 
-// The pieces of a RAR store archive: the job keeps the archive as the
-// torrent lists it, unpacks its member beside it, and seeds the archive's
-// pieces from the archive. The member is the operator's to move or delete:
-// the torrent seeds on without it, and so does its job restored.
-#[tokio::test]
-async fn a_rar_store_archive_in_pieces_is_kept_unpacked_beside_and_seeds_from_itself() {
-    let archive = include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/rar5/rar5_store.rar"
-    ));
-    let member = include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/originals/small.txt"
-    ));
-    let mut shim = shim(128, vec![file("set.rar", archive.len() as u64)]);
-    let pieces = shim.layout.piece_count();
-    assert!(pieces > 2);
-    for piece in 0..pieces {
-        shim.complete(piece, archive);
+// libtorrent `torrent::on_piece_hashed` has only the pieces that pass: a
+// piece that then fails its hash is had no longer, reads as the file on
+// disk holds it, as libtorrent's storage reads whatever the bitfield says,
+// and fetched again is had again.
+#[test]
+fn a_failed_piece_is_had_no_longer_until_fetched_again() {
+    let (shim, torrent) = three_files();
+    for piece in 0..5 {
+        shim.complete(piece, &torrent);
     }
-    shim.settle().await;
+    shim.storage.on_piece_hash_failed(shim.index(2)).unwrap();
+    assert!(!shim.store.has(2));
+    assert_eq!(shim.store.count(), 4);
+    assert_eq!(shim.store.file_have(), [1000, 2500 - 1024, 700]);
+    let range = shim.layout.piece_range(2);
     assert_eq!(
-        std::fs::read(shim.dir.path().join("small.txt")).unwrap(),
-        member
+        shim.read(2),
+        torrent[range.start as usize..range.end as usize]
     );
-    assert_eq!(
-        std::fs::read(shim.dir.path().join("set.rar")).unwrap(),
-        archive
-    );
-
-    std::fs::remove_file(shim.dir.path().join("small.txt")).unwrap();
-    for piece in 0..pieces {
-        let range = shim.layout.piece_range(piece);
-        assert_eq!(
-            shim.read(piece),
-            archive[range.start as usize..range.end as usize],
-            "piece {piece}"
-        );
-    }
-
-    let rows = crate::pipeline::graph::checkpoint::rows(&shim.job.with(|job| job.snapshot()));
-    let snapshot = crate::pipeline::graph::checkpoint::snapshot(&rows).unwrap();
-    let restored = GraphJob::restore_torrent(
-        &snapshot,
-        Arc::clone(&shim.layout),
-        1,
-        storage(shim.dir.path(), &shim.mail),
-        1,
-    )
-    .unwrap();
-    assert!(restored.refetched.is_empty());
-    assert!(restored.job.have().all());
-    for piece in 0..pieces {
-        let range = shim.layout.piece_range(piece);
-        let mut read = Vec::new();
-        assert!(restored.job.posted(VolumeIndex(0), range, &mut read));
-        assert_eq!(
-            read,
-            archive[range.start as usize..range.end as usize],
-            "piece {piece}"
-        );
-    }
+    shim.complete(2, &torrent);
+    assert_eq!(shim.store.count(), 5);
 }
 
 // libtorrent `storage_utils::delete_files`: deleting a torrent's files
-// removes them, here with what its job unpacked from them, and then each
+// removes them, here with what unpacking put beside them, and then each
 // directory that leaves empty. A file the operator put beside them stays,
 // and so does its directory until it is empty.
-#[tokio::test]
-async fn deleting_a_torrents_files_removes_them_and_its_output_and_nothing_else() {
-    let archive = include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/rar5/rar5_store.rar"
-    ));
-    let mut shim = shim(128, vec![file("sub/set.rar", archive.len() as u64)]);
-    for piece in 0..shim.layout.piece_count() {
-        shim.complete(piece, archive);
+#[test]
+fn deleting_a_torrents_files_removes_them_and_its_output_and_nothing_else() {
+    let shim = shim(1024, vec![file("sub/a.bin", 1000), file("b.bin", 500)]);
+    let torrent = noise(1500, 4);
+    for piece in 0..2 {
+        shim.complete(piece, &torrent);
     }
-    shim.settle().await;
     let dir = shim.dir.path().to_path_buf();
-    assert!(dir.join("sub/set.rar").exists());
+    std::fs::create_dir_all(dir.join("out")).unwrap();
+    std::fs::write(dir.join("out/member.txt"), b"unpacked").unwrap();
     std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
+    shim.store.forget();
 
-    let written = shim.job.with(|job| job.written_paths());
-    crate::torrents::service::delete_written(&dir, &written);
+    let mut written = shim.store.paths();
+    written.push(dir.join("out/member.txt"));
+    delete_written(&dir, &written);
     let left: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
@@ -399,189 +322,43 @@ async fn deleting_a_torrents_files_removes_them_and_its_output_and_nothing_else(
     assert_eq!(left, ["notes.txt"]);
 
     std::fs::remove_file(dir.join("notes.txt")).unwrap();
-    crate::torrents::service::delete_written(&dir, &written);
+    delete_written(&dir, &written);
     assert!(!dir.exists());
-}
-
-// libtorrent `torrent::on_piece_hashed` has only the pieces that pass: a
-// piece of a RAR store archive the job unpacked that then fails its hash is
-// in hand no longer, the job steps with the member open again, and the
-// piece fetched again settles the job with the member whole.
-#[tokio::test]
-async fn a_failed_piece_under_an_archive_reopens_it_until_fetched_again() {
-    let archive = include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/rar5/rar5_store.rar"
-    ));
-    let member = include_bytes!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/originals/small.txt"
-    ));
-    let mut shim = shim(128, vec![file("set.rar", archive.len() as u64)]);
-    let pieces = shim.layout.piece_count();
-    assert!(pieces > 2);
-    for piece in 0..pieces {
-        shim.complete(piece, archive);
-    }
-    shim.settle().await;
-
-    let piece = pieces / 2;
-    shim.storage
-        .on_piece_hash_failed(shim.index(piece))
-        .unwrap();
-    shim.job.with(|job| {
-        assert!(!job.have()[piece as usize]);
-        assert_eq!(job.have().count_ones() as u32, pieces - 1);
-        assert!(!job.namespace().get(MemberId(0)).unwrap().closed);
-        assert!(job.phase() != RootPhase::Done);
-    });
-    // Out of hand, it reads as the file on disk holds it, as libtorrent's
-    // storage reads whatever the bitfield says: the session checks what it
-    // reads and serves only the pieces it has.
-    let range = shim.layout.piece_range(piece);
-    let mut read = [0; 8];
-    shim.storage.pread_exact(0, range.start, &mut read).unwrap();
-    assert_eq!(read, archive[range.start as usize..][..8]);
-
-    shim.complete(piece, archive);
-    shim.settle().await;
-    assert!(shim.job.with(|job| job.have().all()));
-    assert_eq!(
-        std::fs::read(shim.dir.path().join("small.txt")).unwrap(),
-        member
-    );
-    for piece in 0..pieces {
-        let range = shim.layout.piece_range(piece);
-        assert_eq!(
-            shim.read(piece),
-            archive[range.start as usize..range.end as usize],
-            "piece {piece}"
-        );
-    }
-}
-
-// The job's side of the storage, where the placed files read as `placed`
-// says, whatever the file on disk holds: a write of what was adopted would
-// put those bytes on disk.
-struct Placed {
-    job: Arc<TorrentJob>,
-    placed: Vec<u8>,
-    // Held while a seed-mode session's hold would be; whether it was held at
-    // each read of the files and at each taking in.
-    hold: std::sync::Mutex<()>,
-    reads_held: std::sync::Mutex<Vec<bool>>,
-    takes_held: std::sync::Mutex<Vec<bool>>,
-}
-
-impl Placed {
-    fn new(job: &Arc<TorrentJob>, placed: Vec<u8>) -> Self {
-        Self {
-            job: Arc::clone(job),
-            placed,
-            hold: Default::default(),
-            reads_held: Default::default(),
-            takes_held: Default::default(),
-        }
-    }
-
-    fn held(&self) -> bool {
-        self.hold.try_lock().is_err()
-    }
-}
-
-impl Pieces for Placed {
-    fn verified(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
-        self.job.verified(shares)
-    }
-
-    fn failed(&self, piece: u32) -> anyhow::Result<bool> {
-        self.job.failed(piece)
-    }
-
-    fn checking(&self) -> anyhow::Result<bool> {
-        self.job.checking()
-    }
-
-    fn found(&self, piece: u32) -> anyhow::Result<bool> {
-        self.job.found(piece)
-    }
-
-    fn posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool {
-        self.job.posted(volume, range, into)
-    }
-
-    fn placed(&self, _: VolumeIndex, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        self.reads_held.lock().unwrap().push(self.held());
-        buf.copy_from_slice(&self.placed[offset as usize..][..buf.len()]);
-        Ok(())
-    }
-
-    fn had(&self, piece: u32) -> bool {
-        self.job.had(piece)
-    }
-
-    fn adopted(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
-        self.takes_held.lock().unwrap().push(self.held());
-        self.job.adopted(shares)
-    }
 }
 
 // libtorrent `torrent::on_piece_hashed`: a piece the check found on disk is
 // had (`we_have`) and nothing is written. Each piece adopted from where the
-// files were placed is in hand, the job completes, and the file keeps the
-// bytes it had.
-#[tokio::test]
-async fn an_adopted_piece_is_had_and_not_written_back() {
-    let mut shim = shim(1024, vec![file("a.bin", 3000)]);
-    let on_disk = vec![0; 3000];
+// files were placed is had, and the file keeps the bytes it had; one its
+// hold refuses, seed mode having ended, is not.
+#[test]
+fn an_adopted_piece_is_had_and_not_written_back() {
+    let shim = shim(1024, vec![file("a.bin", 3000)]);
+    let on_disk = noise(3000, 5);
     std::fs::write(shim.dir.path().join("a.bin"), &on_disk).unwrap();
-    let placed = Placed::new(&shim.job, noise(3000, 5));
+    assert!(shim.store.adopt(0, |_| None).is_none());
+    assert!(!shim.store.has(0));
     for piece in 0..shim.layout.piece_count() {
-        super::adopt(&shim.layout, &placed, piece).unwrap();
-        assert!(placed.had(piece), "piece {piece}");
+        shim.store
+            .adopt(piece, |take| Some(take()))
+            .unwrap()
+            .unwrap();
+        assert!(shim.store.has(piece), "piece {piece}");
     }
-    shim.settle().await;
-    assert!(shim.job.with(|job| job.have().all()));
+    assert_eq!(shim.store.count(), 3);
     assert_eq!(
         std::fs::read(shim.dir.path().join("a.bin")).unwrap(),
         on_disk
     );
 }
 
-// libtorrent `peer_connection::fill_send_buffer` hashes a seed-mode piece
-// on the disk thread (`disk_interface::async_hash`) and no lock of the
-// torrent waits on it. A placed piece adopted under a seed-mode hold is read
-// from the files before the hold is taken, and only taken in under it; one
-// the hold refuses, seed mode having ended, is read and not taken.
-#[tokio::test]
-async fn an_adoption_under_seed_mode_reads_the_files_outside_its_hold() {
-    let shim = shim(1024, vec![file("a.bin", 3000)]);
-    let placed = Placed::new(&shim.job, noise(3000, 6));
-    let under_hold = |take: &mut dyn FnMut() -> anyhow::Result<()>| {
-        let _held = placed.hold.lock().unwrap();
-        Some(take())
-    };
-    super::adopt_under(&shim.layout, &placed, 0, under_hold)
-        .unwrap()
-        .unwrap();
-    assert!(placed.had(0));
-    assert_eq!(*placed.reads_held.lock().unwrap(), [false]);
-    assert_eq!(*placed.takes_held.lock().unwrap(), [true]);
-
-    assert!(super::adopt_under(&shim.layout, &placed, 1, |_| None).is_none());
-    assert!(!placed.had(1));
-    assert_eq!(placed.takes_held.lock().unwrap().len(), 1);
-}
-
 // libtorrent `torrent::move_storage`: a torrent's files move from where they
-// sit to the new save path, and the torrent goes on from there. Files
-// placed outside the job's directory move part-written, a file not yet
-// begun has nothing to move, a piece in hand is served from the new place,
-// and the pieces still to come are written there. The job's own directory
-// stays.
-#[tokio::test]
-async fn placed_files_move_part_written_and_the_job_goes_on_from_there() {
-    let mut shim = placed_shim(
+// sit to the new save path, and the torrent goes on from there. Files move
+// part-written, a file not yet begun has nothing to move, a piece had is
+// served from the new place, and the pieces still to come are written
+// there.
+#[test]
+fn files_move_part_written_and_the_torrent_goes_on_from_there() {
+    let shim = shim(
         1024,
         vec![
             file("a.bin", 1000),
@@ -592,32 +369,24 @@ async fn placed_files_move_part_written_and_the_job_goes_on_from_there() {
     let torrent = noise(4200, 7);
     shim.complete(0, &torrent);
     shim.complete(1, &torrent);
-    let root = shim.dir.path().to_path_buf();
-    let (placed, moved) = (root.join("placed"), root.join("moved"));
+    let placed = shim.dir.path().to_path_buf();
+    let moved_dir = tempfile::tempdir().unwrap();
+    let moved = moved_dir.path().join("moved");
     assert!(placed.join("sub/b.bin").exists());
     assert!(!placed.join("c.bin").exists());
     std::fs::create_dir_all(&moved).unwrap();
 
-    let outcome = shim.job.with(|job| {
-        job.relocate_kept(moved.clone(), Existing::Keep);
-        job.relocated()
-    });
-    assert_eq!(outcome.unwrap().unwrap(), moved);
+    let (to, kept) = move_listed(shim.store.files(), &[], moved.clone(), Existing::Keep).unwrap();
+    assert_eq!((to, kept), (moved.clone(), false));
     assert!(!placed.join("a.bin").exists());
     assert!(!placed.join("sub").exists());
-    assert!(placed.is_dir());
     assert_eq!(std::fs::read(moved.join("a.bin")).unwrap(), torrent[..1000]);
-    assert!(root.join("work").is_dir());
     assert_eq!(shim.read(0), torrent[..1024]);
-    assert_eq!(
-        shim.job.with(|job| job.kept_path(VolumeIndex(2))),
-        Some(moved.join("c.bin"))
-    );
+    assert_eq!(shim.store.files().path(2), Some(moved.join("c.bin")));
 
     for piece in 2..5 {
         shim.complete(piece, &torrent);
     }
-    shim.settle().await;
     assert_eq!(std::fs::read(moved.join("a.bin")).unwrap(), torrent[..1000]);
     assert_eq!(
         std::fs::read(moved.join("sub/b.bin")).unwrap(),
@@ -625,31 +394,25 @@ async fn placed_files_move_part_written_and_the_job_goes_on_from_there() {
     );
     assert_eq!(std::fs::read(moved.join("c.bin")).unwrap(), torrent[3500..]);
     assert_eq!(std::fs::read_dir(&placed).unwrap().count(), 0);
-    assert!(!root.join("work/c.bin").exists());
 }
 
 // libtorrent `move_flags_t::dont_replace`: a file already at the new place
 // stays, the torrent's own copy of it stays where it was, the other files
-// move, and the job reads every file from the new place; the move tells,
-// once, that it kept one.
+// move, and the store reads every file from the new place; the move tells
+// that it kept one.
 #[test]
-fn a_file_already_where_placed_files_go_is_kept() {
-    let shim = placed_shim(1024, vec![file("a.bin", 1000), file("b.bin", 1000)]);
+fn a_file_already_where_the_files_go_is_kept() {
+    let shim = shim(1024, vec![file("a.bin", 1000), file("b.bin", 1000)]);
     let torrent = noise(2000, 8);
     shim.complete(0, &torrent);
     shim.complete(1, &torrent);
-    let root = shim.dir.path().to_path_buf();
-    let (placed, moved) = (root.join("placed"), root.join("moved"));
-    std::fs::create_dir_all(&moved).unwrap();
+    let placed = shim.dir.path().to_path_buf();
+    let moved_dir = tempfile::tempdir().unwrap();
+    let moved = moved_dir.path().to_path_buf();
     std::fs::write(moved.join("b.bin"), b"theirs").unwrap();
 
-    let outcome = shim.job.with(|job| {
-        job.relocate_kept(moved.clone(), Existing::Keep);
-        job.relocated()
-    });
-    assert_eq!(outcome.unwrap().unwrap(), moved);
-    assert!(shim.job.with(GraphJob::kept_existing));
-    assert!(!shim.job.with(GraphJob::kept_existing));
+    let (to, kept) = move_listed(shim.store.files(), &[], moved.clone(), Existing::Keep).unwrap();
+    assert_eq!((to, kept), (moved.clone(), true));
     assert_eq!(std::fs::read(moved.join("a.bin")).unwrap(), torrent[..1000]);
     assert!(!placed.join("a.bin").exists());
     assert_eq!(std::fs::read(moved.join("b.bin")).unwrap(), b"theirs");
@@ -658,48 +421,82 @@ fn a_file_already_where_placed_files_go_is_kept() {
         torrent[1000..]
     );
     assert_eq!(
-        [0, 1].map(|volume| shim.job.with(|job| job.kept_path(VolumeIndex(volume)))),
+        [0, 1].map(|file| shim.store.files().path(file)),
         [Some(moved.join("a.bin")), Some(moved.join("b.bin"))]
     );
 }
 
-// The job's side of the storage, telling the test when every piece is in.
+// A file is read through one shared handle, which never outlives a move of
+// the files: once they move, a read opens the file where it is now, not
+// the one the handle was opened on (libtorrent `file_pool`, which
+// `storage::move_storage` clears).
+#[test]
+fn a_file_is_read_through_one_handle_that_does_not_follow_a_move() {
+    let shim = shim(1024, vec![file("a.bin", 1000), file("b.bin", 1000)]);
+    let torrent = noise(2000, 9);
+    shim.complete(0, &torrent);
+    shim.complete(1, &torrent);
+    let mut buf = vec![0; 1000];
+    shim.store.files().read(0, 0, &mut buf).unwrap();
+    assert_eq!(buf, torrent[..1000]);
+    shim.store.files().read(0, 0, &mut buf).unwrap();
+    assert_eq!(buf, torrent[..1000]);
+
+    let moved_dir = tempfile::tempdir().unwrap();
+    let moved = moved_dir.path().to_path_buf();
+    move_listed(shim.store.files(), &[], moved.clone(), Existing::Keep).unwrap();
+    // Another file now stands where a.bin went: a handle kept from before
+    // the move would still read the old one.
+    std::fs::remove_file(moved.join("a.bin")).unwrap();
+    std::fs::write(moved.join("a.bin"), vec![0x5a; 1000]).unwrap();
+    shim.store.files().read(0, 0, &mut buf).unwrap();
+    assert_eq!(buf, vec![0x5a; 1000]);
+}
+
+// The torrent's store, telling the test when every piece is had.
 struct Watched {
-    job: Arc<TorrentJob>,
+    store: Arc<TorrentStore>,
     whole: watch::Sender<bool>,
 }
 
-impl Pieces for Watched {
-    fn verified(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
-        self.job.verified(shares)?;
+impl Watched {
+    fn tell(&self) {
         self.whole
-            .send_replace(self.job.with(|job| job.have().all()));
+            .send_replace(self.store.count() == self.store.layout().piece_count());
+    }
+}
+
+impl Pieces for Watched {
+    fn verified(&self, piece: u32, held: &Bytes) -> anyhow::Result<()> {
+        self.store.verified(piece, held)?;
+        self.tell();
         Ok(())
     }
 
     fn failed(&self, piece: u32) -> anyhow::Result<bool> {
-        let held = self.job.failed(piece)?;
-        self.whole
-            .send_replace(self.job.with(|job| job.have().all()));
+        let held = self.store.failed(piece)?;
+        self.tell();
         Ok(held)
     }
 
     fn checking(&self) -> anyhow::Result<bool> {
-        let had = self.job.checking()?;
-        self.whole
-            .send_replace(self.job.with(|job| job.have().all()));
+        let had = self.store.checking()?;
+        self.tell();
         Ok(had)
     }
 
     fn found(&self, piece: u32) -> anyhow::Result<bool> {
-        let found = self.job.found(piece)?;
-        self.whole
-            .send_replace(self.job.with(|job| job.have().all()));
+        let found = self.store.found(piece)?;
+        self.tell();
         Ok(found)
     }
 
-    fn posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool {
-        self.job.posted(volume, range, into)
+    fn read(&self, file: usize, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+        self.store.read(file, offset, out)
+    }
+
+    fn grow(&self, file: usize, length: u64) -> std::io::Result<()> {
+        self.store.grow(file, length)
     }
 }
 
@@ -793,17 +590,17 @@ async fn seeded() -> Seeded {
     }
 }
 
-// A graph job over the layout, with the side the storage hands pieces to.
-fn watched_job(layout: &Arc<PieceLayout>, dir: &Path) -> (Arc<Watched>, watch::Receiver<bool>) {
-    let mail = RunMail::default();
-    let job = Arc::new(TorrentJob::new(
-        GraphJob::for_torrent(1, Arc::clone(layout), storage(dir, &mail)),
-        Arc::default(),
-        Arc::default(),
-        1,
-    ));
+// The torrent's store over the layout under `dir`, with the side the
+// storage hands pieces to.
+fn watched_store(layout: &Arc<PieceLayout>, dir: &Path) -> (Arc<Watched>, watch::Receiver<bool>) {
     let (whole, in_hand) = watch::channel(false);
-    (Arc::new(Watched { job, whole }), in_hand)
+    (
+        Arc::new(Watched {
+            store: store_in(layout, dir, None),
+            whole,
+        }),
+        in_hand,
+    )
 }
 
 // The seeded torrent fetched from its seeder alone, into `factory`.
@@ -833,15 +630,15 @@ async fn fetch(
 }
 
 // One session seeds a torrent from its files; the other fetches it from
-// that peer alone into a graph job through the piece storage.
+// that peer alone into its own files through the piece storage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_torrent_fetched_from_a_loopback_peer_lands_in_the_job_and_seeds_from_it() {
+async fn a_torrent_fetched_from_a_loopback_peer_lands_in_its_files_and_seeds_from_them() {
     let seeded = seeded().await;
     let Seeded {
         originals, layout, ..
     } = &seeded;
     let fetch_dir = tempfile::tempdir().unwrap();
-    let (watched, mut in_hand) = watched_job(layout, &fetch_dir.path().join("job"));
+    let (watched, mut in_hand) = watched_store(layout, &fetch_dir.path().join("job"));
     let factory = PieceStorageFactory::new(
         Arc::clone(layout),
         Arc::clone(&watched) as Arc<dyn Pieces>,
@@ -860,7 +657,7 @@ async fn a_torrent_fetched_from_a_loopback_peer_lands_in_the_job_and_seeds_from_
         let (_, original) = originals.iter().find(|(file, _)| file == name).unwrap();
         torrent.extend_from_slice(original);
     }
-    let posted = PieceStorage::new(Arc::clone(&layout), watched as Arc<dyn Pieces>, unbounded());
+    let posted = PieceStorage::new(Arc::clone(layout), watched as Arc<dyn Pieces>, unbounded());
     for piece in 0..layout.piece_count() {
         let range = layout.piece_range(piece);
         let mut read = Vec::new();
@@ -996,7 +793,7 @@ async fn a_session_at_its_budget_waits_for_room_and_resumes_when_a_piece_lets_go
     let seeded = seeded().await;
     let layout = &seeded.layout;
     let fetch_dir = tempfile::tempdir().unwrap();
-    let (watched, mut in_hand) = watched_job(layout, &fetch_dir.path().join("job"));
+    let (watched, mut in_hand) = watched_store(layout, &fetch_dir.path().join("job"));
     let budget = accountant(layout.piece_length());
     let (go, gate) = std::sync::mpsc::channel();
     let (refused, mut refusals) = watch::channel(0);
@@ -1014,7 +811,7 @@ async fn a_session_at_its_budget_waits_for_room_and_resumes_when_a_piece_lets_go
     let leecher = fetch(&seeded, fetch_dir.path(), Some(1), factory.boxed()).await;
 
     refusals.wait_for(|refused| *refused > 0).await.unwrap();
-    assert!(watched.job.with(|job| job.have().not_any()));
+    assert_eq!(watched.store.count(), 0);
     // The one piece granted is resident, whichever the picker started from.
     let first = granted.lock().unwrap()[0];
     assert_eq!(
@@ -1030,16 +827,16 @@ async fn a_session_at_its_budget_waits_for_room_and_resumes_when_a_piece_lets_go
 }
 
 // A piece that fails its hash is dropped with the room it held, the session
-// waiting for that room is rung, the job is told, and the storage going
+// waiting for that room is rung, the store is told, and the storage going
 // gives back the rest.
 #[tokio::test]
 async fn a_piece_that_fails_its_hash_lets_go_of_its_bytes_and_its_room() {
     let layout = Arc::new(PieceLayout::new(8, vec![file("a", 16)]).unwrap());
     let budget = accountant(8);
-    let kept = Arc::new(Kept::default());
+    let recorder = Arc::new(Recorder::default());
     let storage = PieceStorage::new(
         Arc::clone(&layout),
-        Arc::clone(&kept) as Arc<dyn Pieces>,
+        Arc::clone(&recorder) as Arc<dyn Pieces>,
         holds(&budget),
     );
     let lengths = Lengths::new(16, 8).unwrap();
@@ -1054,7 +851,7 @@ async fn a_piece_that_fails_its_hash_lets_go_of_its_bytes_and_its_room() {
     let rung = room.notified();
     storage.on_piece_hash_failed(first).unwrap();
     rung.await;
-    assert_eq!(*kept.failed.lock().unwrap(), [0]);
+    assert_eq!(*recorder.failed.lock().unwrap(), [0]);
     assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
     assert!(storage.pread_exact(0, 0, &mut [0; 8]).is_err());
 
@@ -1064,19 +861,19 @@ async fn a_piece_that_fails_its_hash_lets_go_of_its_bytes_and_its_room() {
     assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
 }
 
-// The job's side that keeps what it is handed, reads the piece back
+// The store's side that keeps what it is handed, reads the piece back
 // through the storage while it is being handed over, and the pieces it was
-// told failed.
+// told failed. It has nothing on disk.
 #[derive(Default)]
-struct Kept {
+struct Recorder {
     storage: std::sync::OnceLock<PieceStorage>,
-    shares: std::sync::Mutex<Vec<Verified>>,
+    handed: std::sync::Mutex<Vec<(u32, Bytes)>>,
     read_while_handed: std::sync::Mutex<Vec<u8>>,
     failed: std::sync::Mutex<Vec<u32>>,
 }
 
-impl Pieces for Kept {
-    fn verified(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
+impl Pieces for Recorder {
+    fn verified(&self, piece: u32, held: &Bytes) -> anyhow::Result<()> {
         let storage = self.storage.get().unwrap();
         let mut read = self.read_while_handed.lock().unwrap();
         for (file, length) in [(0, 5), (1, 3)] {
@@ -1084,7 +881,7 @@ impl Pieces for Kept {
             storage.pread_exact(file, 0, &mut buf)?;
             read.extend(buf);
         }
-        self.shares.lock().unwrap().extend(shares);
+        self.handed.lock().unwrap().push((piece, held.clone()));
         Ok(())
     }
 
@@ -1101,23 +898,29 @@ impl Pieces for Kept {
         Ok(false)
     }
 
-    fn posted(&self, _: VolumeIndex, _: ByteRange, _: &mut Vec<u8>) -> bool {
-        false
+    fn read(&self, _: usize, _: u64, _: &mut [u8]) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::NotFound.into())
+    }
+
+    fn grow(&self, _: usize, _: u64) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
-// A verified piece's shares are views of the one buffer it was written
-// into, and the piece reads from memory until the job has them.
+// A verified piece goes to the store as the one buffer its blocks landed
+// in and its hash was taken over: the bytes hashed and the bytes handed are
+// the same memory, so nothing is copied between the check and the disk,
+// and the piece reads from memory until the store has it.
 #[test]
-fn a_verified_piece_goes_to_the_job_without_a_copy() {
+fn a_verified_piece_goes_to_the_store_as_the_buffer_it_was_hashed_in() {
     let layout = Arc::new(PieceLayout::new(8, vec![file("a", 5), file("b", 3)]).unwrap());
-    let kept = Arc::new(Kept::default());
+    let recorder = Arc::new(Recorder::default());
     let storage = PieceStorage::new(
         Arc::clone(&layout),
-        Arc::clone(&kept) as Arc<dyn Pieces>,
+        Arc::clone(&recorder) as Arc<dyn Pieces>,
         unbounded(),
     );
-    kept.storage.set(storage.clone()).ok().unwrap();
+    recorder.storage.set(storage.clone()).ok().unwrap();
     let index = Lengths::new(8, 8)
         .unwrap()
         .try_validate_piece_index(0)
@@ -1125,18 +928,16 @@ fn a_verified_piece_goes_to_the_job_without_a_copy() {
     assert!(storage.reserve_piece(index, &Arc::default()));
     storage.pwrite_all(0, 0, b"aaaaa").unwrap();
     storage.pwrite_all(1, 0, b"bbb").unwrap();
+    let mut hashed = Vec::new();
+    assert!(storage.hash_held_piece(index, &mut |bytes| hashed.push(bytes.as_ptr() as usize)));
     storage.on_piece_completed(index).unwrap();
 
-    assert_eq!(*kept.read_while_handed.lock().unwrap(), b"aaaaabbb");
-    let shares = kept.shares.lock().unwrap();
-    assert_eq!(
-        (&shares[0].bytes[..], &shares[1].bytes[..]),
-        (&b"aaaaa"[..], &b"bbb"[..])
-    );
-    assert_eq!(
-        shares[0].bytes.as_ptr().wrapping_add(5),
-        shares[1].bytes.as_ptr()
-    );
+    assert_eq!(*recorder.read_while_handed.lock().unwrap(), b"aaaaabbb");
+    let handed = recorder.handed.lock().unwrap();
+    assert_eq!(handed.len(), 1);
+    let (piece, held) = &handed[0];
+    assert_eq!((*piece, &held[..]), (0, &b"aaaaabbb"[..]));
+    assert_eq!(hashed, [held.as_ptr() as usize]);
     // Once handed over, the piece is no longer in memory.
     assert!(storage.pread_exact(0, 0, &mut [0; 5]).is_err());
 }
@@ -1149,13 +950,13 @@ fn a_verified_piece_goes_to_the_job_without_a_copy() {
 fn a_piece_handed_on_is_written_into_the_room_it_holds() {
     let layout = Arc::new(PieceLayout::new(8, vec![file("a", 5), file("b", 3)]).unwrap());
     let budget = accountant(8);
-    let kept = Arc::new(Kept::default());
+    let recorder = Arc::new(Recorder::default());
     let storage = PieceStorage::new(
         Arc::clone(&layout),
-        Arc::clone(&kept) as Arc<dyn Pieces>,
+        Arc::clone(&recorder) as Arc<dyn Pieces>,
         holds(&budget),
     );
-    kept.storage.set(storage.clone()).ok().unwrap();
+    recorder.storage.set(storage.clone()).ok().unwrap();
     let piece = Lengths::new(8, 8)
         .unwrap()
         .try_validate_piece_index(0)
@@ -1172,44 +973,9 @@ fn a_piece_handed_on_is_written_into_the_room_it_holds() {
     assert_eq!(budget.namespace_usage(NAMESPACE).resident, 8);
     storage.pwrite_all(0, 0, b"ab").unwrap();
     storage.on_piece_completed(piece).unwrap();
-    let shares = kept.shares.lock().unwrap();
-    assert_eq!(
-        (&shares[0].bytes[..], &shares[1].bytes[..]),
-        (&b"abcde"[..], &b"fgh"[..])
-    );
+    let handed = recorder.handed.lock().unwrap();
+    assert_eq!(&handed[0].1[..], b"abcdefgh");
     assert_eq!(budget.namespace_usage(NAMESPACE).resident, 0);
-}
-
-// A placed file is read through one shared handle, which never outlives a
-// move of the kept files: once they move, a read opens the file where it is
-// now, not the one the handle was opened on (libtorrent `file_pool`, which
-// `storage::move_storage` clears).
-#[test]
-fn a_placed_file_is_read_through_one_handle_that_does_not_follow_a_move() {
-    let shim = placed_shim(1024, vec![file("a.bin", 1000), file("b.bin", 1000)]);
-    let torrent = noise(2000, 9);
-    shim.complete(0, &torrent);
-    shim.complete(1, &torrent);
-    let mut buf = vec![0; 1000];
-    shim.job.placed(VolumeIndex(0), 0, &mut buf).unwrap();
-    assert_eq!(buf, torrent[..1000]);
-    shim.job.placed(VolumeIndex(0), 0, &mut buf).unwrap();
-    assert_eq!(buf, torrent[..1000]);
-
-    let root = shim.dir.path().to_path_buf();
-    let moved = root.join("moved");
-    std::fs::create_dir_all(&moved).unwrap();
-    let outcome = shim.job.with(|job| {
-        job.relocate_kept(moved.clone(), Existing::Keep);
-        job.relocated()
-    });
-    assert_eq!(outcome.unwrap().unwrap(), moved);
-    // Another file now stands where a.bin went: a handle kept from before
-    // the move would still read the old one.
-    std::fs::remove_file(moved.join("a.bin")).unwrap();
-    std::fs::write(moved.join("a.bin"), vec![0x5a; 1000]).unwrap();
-    shim.job.placed(VolumeIndex(0), 0, &mut buf).unwrap();
-    assert_eq!(buf, vec![0x5a; 1000]);
 }
 
 // A whole piece is hashed where its blocks landed: the bytes handed are the
@@ -1239,4 +1005,86 @@ fn a_piece_in_memory_is_handed_whole_for_hashing_and_one_not_is_not() {
             .hash_held_piece(shim.index(0), &mut |_| panic!("piece left memory"))
     );
     assert!(shim.storage.pwrite_all(0, 0, &torrent[..16]).is_err());
+}
+
+// A torrent of plain files has no tee: nothing of it reaches the graph. Each
+// piece is hashed once, from the buffer its blocks landed in, and written
+// once, to its files; the store reads nothing of the files to have it.
+#[test]
+fn a_plain_torrent_is_hashed_once_and_written_once_and_never_reaches_the_graph() {
+    let (shim, torrent) = three_files();
+    assert!(crate::torrents::tee::Plan::of(&shim.layout).is_none());
+    assert!(shim.store.tee().is_none());
+    let counted = Arc::new(Counted {
+        store: Arc::clone(&shim.store),
+        verified: Default::default(),
+        reads: Default::default(),
+    });
+    let storage = PieceStorage::new(
+        Arc::clone(&shim.layout),
+        Arc::clone(&counted) as Arc<dyn Pieces>,
+        unbounded(),
+    );
+    let mut hashed = 0;
+    for piece in 0..5 {
+        let index = shim.index(piece);
+        assert!(storage.reserve_piece(index, &shim.room));
+        let range = shim.layout.piece_range(piece);
+        for span in shim.layout.spans(piece) {
+            let at = (range.start + span.at) as usize;
+            storage
+                .pwrite_all(
+                    span.file,
+                    span.range.start,
+                    &torrent[at..at + span.range.len() as usize],
+                )
+                .unwrap();
+        }
+        assert!(storage.hash_held_piece(index, &mut |bytes| hashed += bytes.len()));
+        storage.on_piece_completed(index).unwrap();
+    }
+    assert_eq!(hashed, torrent.len());
+    assert_eq!(*counted.verified.lock().unwrap(), torrent.len());
+    assert_eq!(*counted.reads.lock().unwrap(), 0);
+    let on_disk: u64 = ["a.bin", "b.bin", "c.bin"]
+        .iter()
+        .map(|name| std::fs::metadata(shim.dir.path().join(name)).unwrap().len())
+        .sum();
+    assert_eq!(on_disk, torrent.len() as u64);
+}
+
+// The store, with the bytes handed to it and the reads of its files
+// counted.
+struct Counted {
+    store: Arc<TorrentStore>,
+    verified: std::sync::Mutex<usize>,
+    reads: std::sync::Mutex<usize>,
+}
+
+impl Pieces for Counted {
+    fn verified(&self, piece: u32, held: &Bytes) -> anyhow::Result<()> {
+        *self.verified.lock().unwrap() += held.len();
+        self.store.verified(piece, held)
+    }
+
+    fn failed(&self, piece: u32) -> anyhow::Result<bool> {
+        self.store.failed(piece)
+    }
+
+    fn checking(&self) -> anyhow::Result<bool> {
+        self.store.checking()
+    }
+
+    fn found(&self, piece: u32) -> anyhow::Result<bool> {
+        self.store.found(piece)
+    }
+
+    fn read(&self, file: usize, offset: u64, out: &mut [u8]) -> std::io::Result<()> {
+        *self.reads.lock().unwrap() += 1;
+        self.store.read(file, offset, out)
+    }
+
+    fn grow(&self, file: usize, length: u64) -> std::io::Result<()> {
+        self.store.grow(file, length)
+    }
 }

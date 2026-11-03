@@ -1,22 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Verified pieces on their way to the job, under the disk budget. A piece
+// Verified pieces on their way to the store, under the disk budget. A piece
 // the budget refuses, or whose write finds no space, is refused to the
 // session as a write that found no room: the session puts the torrent in
 // upload mode, where it fetches nothing, keeps seeding, and tries again
-// later. Any other write the job could not take fails the torrent.
+// later. Any other write the store could not make fails the torrent.
 
 use std::io;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use bytes::Bytes;
 use weaver_graph::holds::{HoldsAccountant, HoldsNamespace};
-use weaver_graph::{ByteRange, VolumeIndex};
 use weaver_torrent::storage::write_refused;
 
 use crate::operations::disk::{CapacityDebits, CapacityReader};
-use crate::pipeline::graph::limits::ExtractionLimits;
-use crate::pipeline::graph::root::pieces::Verified;
+use crate::pipeline::ExtractionLimits;
 use crate::torrents::storage::Pieces;
 
 // The disk budget the pieces are written under: the reserve the job's
@@ -60,17 +59,13 @@ pub(crate) struct Holds {
     pub(crate) namespace: HoldsNamespace,
 }
 
-fn size(shares: &[Verified]) -> u64 {
-    shares.iter().map(|share| share.bytes.len() as u64).sum()
-}
-
 // What the intake tells its owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Heard {
-    // The job's pieces changed: a piece reached it, one failed its hash and
-    // left it, a check of every piece began, or the check found one.
+    // The pieces had changed: one verified, one failed its hash, a check of
+    // every piece began, or the check found one.
     Changed,
-    // The job could not take a piece, and why: the torrent's failure. A
+    // The store could not take a piece, and why: the torrent's failure. A
     // write that found no room is not one.
     Refused(String),
 }
@@ -88,8 +83,8 @@ impl Intake {
         Self { inner, room, hear }
     }
 
-    // What the job said of a piece it was told of: a change is heard, and
-    // one the job could not make fails the torrent.
+    // What the store said of a piece it was told of: a change is heard, and
+    // one it could not make fails the torrent.
     fn heard(&self, changed: anyhow::Result<bool>) -> anyhow::Result<bool> {
         match changed {
             Ok(changed) => {
@@ -107,8 +102,8 @@ impl Intake {
 }
 
 impl Pieces for Intake {
-    fn verified(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
-        let bytes = size(&shares);
+    fn verified(&self, piece: u32, held: &Bytes) -> anyhow::Result<()> {
+        let bytes = held.len() as u64;
         if !self.room.admits(bytes) {
             return Err(
                 anyhow::Error::from(io::Error::from(io::ErrorKind::StorageFull)).context(format!(
@@ -116,7 +111,7 @@ impl Pieces for Intake {
                 )),
             );
         }
-        match self.inner.verified(shares) {
+        match self.inner.verified(piece, held) {
             Ok(()) => {
                 (self.hear)(Heard::Changed);
                 Ok(())
@@ -141,22 +136,20 @@ impl Pieces for Intake {
         self.heard(self.inner.found(piece))
     }
 
-    fn posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool {
-        self.inner.posted(volume, range, into)
+    fn wants_hashed(&self, piece: u32) -> bool {
+        self.inner.wants_hashed(piece)
     }
 
-    fn placed(&self, volume: VolumeIndex, offset: u64, buf: &mut [u8]) -> io::Result<()> {
-        self.inner.placed(volume, offset, buf)
+    fn hashed(&self, piece: u32, held: &Bytes) {
+        self.inner.hashed(piece, held);
     }
 
-    fn had(&self, piece: u32) -> bool {
-        self.inner.had(piece)
+    fn read(&self, file: usize, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        self.inner.read(file, offset, out)
     }
 
-    // The bytes are on disk already: the reserve has nothing to judge.
-    fn adopted(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
-        self.heard(self.inner.adopted(shares).map(|()| true))
-            .map(|_| ())
+    fn grow(&self, file: usize, length: u64) -> io::Result<()> {
+        self.inner.grow(file, length)
     }
 }
 
@@ -166,7 +159,7 @@ mod tests {
 
     use super::*;
 
-    // A job's side that refuses every write while the disk is full, and
+    // A store that refuses every write while the disk is full, and
     // any write or verdict at all while it is broken; the pieces it was told
     // failed, in order, and those a check has yet to find.
     #[derive(Default)]
@@ -179,7 +172,7 @@ mod tests {
     }
 
     impl Pieces for Disk {
-        fn verified(&self, shares: Vec<Verified>) -> anyhow::Result<()> {
+        fn verified(&self, piece: u32, held: &Bytes) -> anyhow::Result<()> {
             if self.full.load(Ordering::SeqCst) {
                 return Err(
                     anyhow::Error::from(io::Error::from(io::ErrorKind::StorageFull))
@@ -188,7 +181,7 @@ mod tests {
             }
             anyhow::ensure!(!self.broken.load(Ordering::SeqCst), "the tree is broken");
             let mut took = self.took.lock().unwrap();
-            took.extend(shares.iter().map(|share| (share.piece, share.offset)));
+            took.push((piece, held.len() as u64));
             Ok(())
         }
 
@@ -217,8 +210,12 @@ mod tests {
             Ok(unchecked.len() != before)
         }
 
-        fn posted(&self, _: VolumeIndex, _: ByteRange, _: &mut Vec<u8>) -> bool {
-            false
+        fn read(&self, _: usize, _: u64, _: &mut [u8]) -> io::Result<()> {
+            Err(io::ErrorKind::NotFound.into())
+        }
+
+        fn grow(&self, _: usize, _: u64) -> io::Result<()> {
+            Ok(())
         }
     }
 
@@ -238,17 +235,12 @@ mod tests {
         )
     }
 
-    fn share(piece: u32, offset: u64, bytes: &[u8]) -> Vec<Verified> {
-        vec![Verified {
-            volume: VolumeIndex(0),
-            piece,
-            offset,
-            bytes: bytes::Bytes::copy_from_slice(bytes),
-        }]
+    fn piece(bytes: &[u8]) -> Bytes {
+        Bytes::copy_from_slice(bytes)
     }
 
     // A write that finds no space goes back to the session as one, which
-    // keeps the torrent seeding; any other write the job could not take
+    // keeps the torrent seeding; any other write the store could not make
     // fails the torrent, and is said to.
     #[test]
     fn a_full_disk_is_refused_as_no_room_and_nothing_is_kept() {
@@ -259,30 +251,28 @@ mod tests {
             room(CapacityReader::unknown()),
             hear,
         );
-        intake.verified(share(0, 0, b"aaaa")).unwrap();
+        intake.verified(0, &piece(b"aaaa")).unwrap();
         disk.full.store(true, Ordering::SeqCst);
         assert!(write_refused(
-            &intake.verified(share(1, 4, b"bbbb")).unwrap_err()
+            &intake.verified(1, &piece(b"bbbb")).unwrap_err()
         ));
-        // Nothing of it is in hand to serve.
-        assert!(!intake.posted(VolumeIndex(0), ByteRange::at(5, 2), &mut Vec::new()));
         disk.full.store(false, Ordering::SeqCst);
-        intake.verified(share(1, 4, b"bbbb")).unwrap();
+        intake.verified(1, &piece(b"bbbb")).unwrap();
         disk.broken.store(true, Ordering::SeqCst);
         assert!(!write_refused(
-            &intake.verified(share(2, 8, b"cccc")).unwrap_err()
+            &intake.verified(2, &piece(b"cccc")).unwrap_err()
         ));
-        assert_eq!(*disk.took.lock().unwrap(), [(0, 0), (1, 4)]);
+        assert_eq!(*disk.took.lock().unwrap(), [(0, 4), (1, 4)]);
         let said = said.lock().unwrap().clone();
         assert_eq!(said[..2], [Heard::Changed, Heard::Changed]);
         assert!(matches!(&said[2..], [Heard::Refused(why)] if why.contains("broken")));
     }
 
-    // A piece that failed its hash goes to the job, and the job's pieces
-    // changed only when it held some of it; a job that could not let it go
+    // A piece that failed its hash goes to the store, and its pieces
+    // changed only when it held some of it; a store that could not let it go
     // fails the torrent, and is said to.
     #[test]
-    fn a_failed_piece_reaches_the_job_and_is_heard_when_it_held_some() {
+    fn a_failed_piece_reaches_the_store_and_is_heard_when_it_held_some() {
         let disk = Arc::new(Disk::default());
         let (said, hear) = heard();
         let intake = Intake::new(
@@ -290,7 +280,7 @@ mod tests {
             room(CapacityReader::unknown()),
             hear,
         );
-        intake.verified(share(0, 0, b"aaaa")).unwrap();
+        intake.verified(0, &piece(b"aaaa")).unwrap();
         assert!(intake.failed(0).unwrap());
         assert!(!intake.failed(1).unwrap());
         disk.broken.store(true, Ordering::SeqCst);
@@ -303,10 +293,10 @@ mod tests {
     }
 
     // A check of every piece beginning and each piece it finds change the
-    // job's pieces, and are heard when they did; a job that could not take
+    // store's pieces, and are heard when they did; a store that could not take
     // them fails the torrent, and is said to.
     #[test]
-    fn a_check_and_what_it_finds_reach_the_job_and_are_heard() {
+    fn a_check_and_what_it_finds_reach_the_store_and_are_heard() {
         let disk = Arc::new(Disk::default());
         let (said, hear) = heard();
         let intake = Intake::new(
@@ -315,7 +305,7 @@ mod tests {
             hear,
         );
         assert!(!intake.checking().unwrap());
-        intake.verified(share(0, 0, b"aaaa")).unwrap();
+        intake.verified(0, &piece(b"aaaa")).unwrap();
         assert!(intake.checking().unwrap());
         assert_eq!(*disk.unchecked.lock().unwrap(), [0]);
         assert!(intake.found(0).unwrap());
@@ -356,19 +346,19 @@ mod tests {
             hear,
         );
         // Two bytes fit over the reserve; the next four do not.
-        intake.verified(share(0, 0, b"aa")).unwrap();
+        intake.verified(0, &piece(b"aa")).unwrap();
         assert!(write_refused(
-            &intake.verified(share(1, 2, b"bbbb")).unwrap_err()
+            &intake.verified(1, &piece(b"bbbb")).unwrap_err()
         ));
-        assert_eq!(*disk.took.lock().unwrap(), [(0, 0)]);
+        assert_eq!(*disk.took.lock().unwrap(), [(0, 2)]);
         // A new reading with room admits them.
         {
             let mut now = reading.lock().unwrap();
             now.available_bytes = 1000;
             now.sampled_at = sampled_at + std::time::Duration::from_secs(1);
         }
-        intake.verified(share(1, 2, b"bbbb")).unwrap();
-        assert_eq!(*disk.took.lock().unwrap(), [(0, 0), (1, 2)]);
+        intake.verified(1, &piece(b"bbbb")).unwrap();
+        assert_eq!(*disk.took.lock().unwrap(), [(0, 2), (1, 4)]);
         assert_eq!(*said.lock().unwrap(), [Heard::Changed, Heard::Changed]);
     }
 }

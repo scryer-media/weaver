@@ -1967,7 +1967,7 @@ async fn a_fresh_jobs_first_checkpoint_replaces_every_stale_row() {
     let root = rows.nodes.iter().find(|row| row.node == 0).unwrap();
     assert_eq!(
         root.facts_version,
-        i64::from(crate::pipeline::graph::root::facts::RootRow::VERSION)
+        i64::from(crate::pipeline::graph::root::facts::RootFacts::VERSION)
     );
     retire_pipeline_database(pipeline).await;
 }
