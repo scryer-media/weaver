@@ -4,6 +4,8 @@
 package weaver
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -118,5 +120,42 @@ func TestWeaverJSONRecordsFeedTheGraphAndLineAssertions(t *testing.T) {
 	events := graphLogEventsOfJobs(graph, "graph member done", []int{7})
 	if len(events) != 1 || events[0]["member"] != "a b.rar" || events[0]["state"] != "done" {
 		t.Fatalf("graph events from a JSON record: %v", events)
+	}
+}
+
+func TestDelayHookFoundInAJSONRecord(t *testing.T) {
+	raw := `{"timestamp":"2026-11-03T13:27:38.145719-07:00","level":"WARN","target":"weaver_server_core::e2e_failpoint","fields":{"message":"tripping e2e delay hook","delay_ms":20000,"hook":"direct_store.post_repair_verify"}}`
+	clean := cleanWeaverLog(raw)
+	if !weaverLogHasField(clean, "hook", "direct_store.post_repair_verify") {
+		t.Fatalf("the delay hook in a JSON record must be found: %q", clean)
+	}
+	if weaverLogHasField(clean, "hook", "direct_store.post_repair") {
+		t.Fatalf("a hook whose name only begins the recorded one must not match: %q", clean)
+	}
+}
+
+func TestDelayHookFoundInATextLine(t *testing.T) {
+	raw := "2026-11-03T13:27:38.145719-07:00  \x1b[33mWARN\x1b[0m weaver_server_core::e2e_failpoint: tripping e2e delay hook delay_ms=20000 hook=\"direct_store.post_repair_verify\""
+	clean := cleanWeaverLog(raw)
+	if !weaverLogHasField(clean, "hook", "direct_store.post_repair_verify") {
+		t.Fatalf("the delay hook in a text line must be found: %q", clean)
+	}
+	if weaverLogHasField(clean, "hook", "direct_store.post_repair") {
+		t.Fatalf("a hook whose name only begins the recorded one must not match: %q", clean)
+	}
+}
+
+func TestDelayHookFoundInALogFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "weaver.log")
+	log := `{"timestamp":"2026-11-03T13:27:38.100000-07:00","level":"INFO","target":"weaver_server_core::jobs","fields":{"message":"job submitted","job_id":10000}}` + "\n" +
+		`{"timestamp":"2026-11-03T13:27:38.145719-07:00","level":"WARN","target":"weaver_server_core::e2e_failpoint","fields":{"message":"tripping e2e delay hook","delay_ms":20000,"hook":"direct_store.post_repair_verify"}}` + "\n"
+	if err := os.WriteFile(path, []byte(log), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !logHasDelayHook(path, "direct_store.post_repair_verify") {
+		t.Fatal("the delay hook must be found in the log file")
+	}
+	if logHasDelayHook(path, "repair.task_start") {
+		t.Fatal("a hook that never tripped must not be found")
 	}
 }

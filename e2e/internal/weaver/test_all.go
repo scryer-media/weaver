@@ -513,10 +513,9 @@ func waitForJobEvents(dbPath string, jobID int, required []string, timeout time.
 }
 
 func waitForLocalWeaverDelayHook(hook string, timeout time.Duration) error {
-	needle := fmt.Sprintf("hook=\"%s\"", hook)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if logContains(localWeaverLogPath(), needle) {
+		if logHasDelayHook(localWeaverLogPath(), hook) {
 			return nil
 		}
 		mustSleepWithSuspendDetection(50*time.Millisecond, fmt.Sprintf("%s delay hook", hook))

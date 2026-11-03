@@ -2077,10 +2077,9 @@ func activeSubmittedJobCount(snapshot restartDBSnapshot, jobIDs []int) int {
 
 func waitForDelayHookRestartPoint(ctx *restartCaseContext, jobIDs []int, hook string, timeout time.Duration) (restartDBSnapshot, error) {
 	deadline := time.Now().Add(timeout)
-	needle := fmt.Sprintf("hook=\"%s\"", hook)
 	var last restartDBSnapshot
 	for time.Now().Before(deadline) {
-		hookObserved := logContains(ctx.caseLogPath, needle)
+		hookObserved := logHasDelayHook(ctx.caseLogPath, hook)
 		snapshot, err := captureRestartDBSnapshot(filepath.Join(ctx.CaseDir, "weaver.db"))
 		if err == nil {
 			last = snapshot
@@ -2105,6 +2104,41 @@ func logContains(logPath string, needle string) bool {
 		return false
 	}
 	return strings.Contains(cleanWeaverLog(string(data)), needle)
+}
+
+// logHasDelayHook reports whether the log at logPath records the named delay
+// hook tripping.
+func logHasDelayHook(logPath, hook string) bool {
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return false
+	}
+	return weaverLogHasField(cleanWeaverLog(string(data)), "hook", hook)
+}
+
+// weaverLogHasField reports whether a cleaned log holds a line whose field
+// key carries value: `key=value` as a JSON record renders a plain string, or
+// `key="value"` as the text format and a Debug field write it. The match
+// starts at a line start or a space and ends at a space or the line end, so
+// one name never matches another that merely begins with it.
+func weaverLogHasField(clean, key, value string) bool {
+	for _, token := range []string{key + "=" + value, key + "=" + strconv.Quote(value)} {
+		for from := 0; ; {
+			at := strings.Index(clean[from:], token)
+			if at < 0 {
+				break
+			}
+			start := from + at
+			end := start + len(token)
+			opens := start == 0 || clean[start-1] == ' ' || clean[start-1] == '\t' || clean[start-1] == '\n'
+			closes := end == len(clean) || clean[end] == ' ' || clean[end] == '\t' || clean[end] == '\n' || clean[end] == '\r'
+			if opens && closes {
+				return true
+			}
+			from = start + 1
+		}
+	}
+	return false
 }
 
 func stripANSIEscapeSequences(line string) string {
