@@ -435,7 +435,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 let header = UtpHeader {
                     htype: Type::ST_SYN,
                     connection_id: conn_id,
-                    timestamp_microseconds: (self.env.now() - self.socket.created).as_millis()
+                    timestamp_microseconds: (self.env.now() - self.socket.created).as_micros()
                         as u32,
                     timestamp_difference_microseconds: 0,
                     wnd_size: 0,

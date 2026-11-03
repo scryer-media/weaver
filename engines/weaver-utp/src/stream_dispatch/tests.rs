@@ -2,6 +2,7 @@
 
 mod basics;
 mod congestion;
+mod delay;
 mod delayed_ack;
 mod fast_retransmit;
 mod flow_control;

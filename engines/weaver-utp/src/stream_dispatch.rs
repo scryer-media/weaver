@@ -23,6 +23,7 @@ use crate::{
         ACK_DELAY, IMMEDIATE_ACK_EVERY_RMSS, RECOVERY_TRACING_LOG_LEVEL, RTTE_TRACING_LOG_LEVEL,
         SYNACK_RESEND_INTERNAL, UTP_HEADER, calc_pipe_expiry,
     },
+    delay::DelayTracker,
     message::UtpMessage,
     mtu::{SegmentSizes, SegmentSizesConfig},
     raw::{Type, UtpHeader},
@@ -137,8 +138,8 @@ struct VirtualSocket<T, Env> {
     // Triggers delay-based operations
     timers: Timers,
 
-    // The last seen value of uTP's "last_remote_timestamp"
-    last_remote_timestamp: u32,
+    // One-way delay both ways, and the gap reported back in every header.
+    delay: DelayTracker,
     last_remote_window: u32,
 
     // The seq_nr to use in outgoing packets. It gets incremented AFTER the
@@ -251,9 +252,7 @@ macro_rules! send_data {
             $header.seq_nr = $segment_iter_item.seq_nr();
             $header.timestamp_microseconds =
                 ($self.env.now() - $self.socket_created).as_micros() as u32;
-            $header.timestamp_difference_microseconds = $header
-                .timestamp_microseconds
-                .wrapping_sub($self.last_remote_timestamp);
+            $header.timestamp_difference_microseconds = $self.delay.reply_us();
 
             let mut h = [0u8; UTP_HEADER as usize];
             let hlen = $header.serialize(&mut h)?;
@@ -323,16 +322,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
     /// Create a stub header for a new outgoing message.
     pub(crate) fn outgoing_header(&self) -> UtpHeader {
-        let mut header = UtpHeader::default();
-        header.connection_id = self.conn_id_send;
-        header.timestamp_microseconds = self.timestamp_microseconds();
-        header.timestamp_difference_microseconds = header
-            .timestamp_microseconds
-            .wrapping_sub(self.last_remote_timestamp);
-        header.seq_nr = self.seq_nr;
-        header.ack_nr = self.last_consumed_remote_seq_nr;
-        header.wnd_size = self.rx_window();
-        header
+        UtpHeader {
+            connection_id: self.conn_id_send,
+            timestamp_microseconds: self.timestamp_microseconds(),
+            timestamp_difference_microseconds: self.delay.reply_us(),
+            seq_nr: self.seq_nr,
+            ack_nr: self.last_consumed_remote_seq_nr,
+            wnd_size: self.rx_window(),
+            ..Default::default()
+        }
     }
 
     fn rx_window(&self) -> u32 {
@@ -1165,7 +1163,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             result.on_ack_result.acked_bytes,
             &self.rtte,
         );
-        self.last_remote_timestamp = msg.header.timestamp_microseconds;
+        self.delay.on_packet(
+            self.this_poll.now,
+            self.timestamp_microseconds(),
+            msg.header.timestamp_microseconds,
+            msg.header.timestamp_difference_microseconds,
+        );
         self.last_remote_window = msg.header.wnd_size;
 
         self.recovery.on_ack(
@@ -1662,6 +1665,11 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
 
         let env = socket.env.copy();
         let now = env.now();
+        // The gap on the packet that opened the stream, taken as it arrived.
+        let reply_us = match last_remote_timestamp {
+            0 => 0,
+            sent => ((now - socket.created).as_micros() as u32).wrapping_sub(sent),
+        };
 
         let cancellation_token = socket.cancellation_token.child_token();
 
@@ -1698,7 +1706,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                     timer
                 },
             },
-            last_remote_timestamp,
+            delay: DelayTracker::new(now, reply_us),
             last_remote_window: remote_window,
             seq_nr,
             last_sent_seq_nr,

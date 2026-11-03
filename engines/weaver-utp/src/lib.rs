@@ -6,6 +6,7 @@ mod macros;
 mod byte_ring;
 mod congestion;
 mod constants;
+mod delay;
 #[cfg(test)]
 mod e2e_tests;
 mod error;
