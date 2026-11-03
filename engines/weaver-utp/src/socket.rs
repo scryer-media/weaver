@@ -34,7 +34,7 @@ use crate::{
         DEFAULT_SYN_RESENDS, IPV4_HEADER, RX_BUF_SIZE_PER_VSOCK_DEFAULT, UDP_HEADER, UTP_HEADER,
     },
     message::UtpMessage,
-    mtu::MtuCeiling,
+    mtu::{MtuCeiling, floor_mtu},
     raw::{Type, UtpHeader},
     seq_nr::SeqNr,
     stream_dispatch::{StreamArgs, UtpStreamStarter},
@@ -728,12 +728,20 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
 
     // The link MTU a new stream probes up to: the link's, no larger than
     // the transport's path carries, and no higher than the streams that
-    // died on large packets allow.
-    pub(crate) fn probe_link_mtu(&self) -> u16 {
-        self.opts
+    // died on large packets allow. Where datagrams may be fragmented, a
+    // probe too large would arrive split rather than lost, so no stream
+    // probes past the floor.
+    pub(crate) fn probe_link_mtu(&self, is_ipv4: bool) -> u16 {
+        let mtu = self
+            .opts
             .link_mtu
             .min(self.transport.link_mtu().unwrap_or(u16::MAX))
-            .min(self.mtu_ceiling.lock().get())
+            .min(self.mtu_ceiling.lock().get());
+        if self.transport.dont_fragment() {
+            mtu
+        } else {
+            mtu.min(floor_mtu(is_ipv4))
+        }
     }
 
     // A stream died on a packet of `mtu` bytes larger than it had seen

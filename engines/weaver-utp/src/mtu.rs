@@ -44,6 +44,12 @@ pub(crate) fn packet_mtu(payload: usize, is_ipv4: bool) -> u16 {
         .saturating_add(ip + UDP_HEADER + UTP_HEADER)
 }
 
+// The packet every path carries: a stream starts its segments here, and
+// probes no higher where datagrams may be fragmented.
+pub(crate) fn floor_mtu(is_ipv4: bool) -> u16 {
+    if is_ipv4 { 576 } else { 1280 }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentSizes {
     // The minimum uTP payload size that we know can go through the link.
@@ -79,7 +85,7 @@ impl SegmentSizes {
         } else {
             IPV6_HEADER
         };
-        let default_min_mtu = if config.is_ipv4 { 576 } else { 1280 };
+        let default_min_mtu = floor_mtu(config.is_ipv4);
 
         let calc = |mtu: u16| mtu - ip_header_size - UTP_HEADER - UDP_HEADER;
 

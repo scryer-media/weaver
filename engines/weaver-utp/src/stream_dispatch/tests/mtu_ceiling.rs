@@ -50,6 +50,15 @@ async fn a_tunnels_mtu_caps_the_probe_ceiling() {
 }
 
 #[tokio::test]
+async fn no_probe_where_datagrams_may_be_fragmented() {
+    setup_test_logging();
+    let t = make_test_vsock(Default::default(), false);
+    t.transport.set_fragments();
+    // The IPv4 floor, 576, less IPv4, UDP and uTP headers.
+    assert_eq!(new_streams_max_ss(&t), 528);
+}
+
+#[tokio::test]
 async fn no_packet_outgrows_a_1280_byte_tunnel() {
     setup_test_logging();
     let env = MockUtpEnvironment::new();

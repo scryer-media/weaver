@@ -134,6 +134,10 @@ impl Transport for MockUtpTransport {
     fn bind_addr(&self) -> SocketAddr {
         self.bind_addr
     }
+
+    fn dont_fragment(&self) -> bool {
+        true
+    }
 }
 
 impl PollSendToVectored for MockUtpTransport {
@@ -154,6 +158,7 @@ struct RememberingTransportLocked {
     messages: Vec<Msg>,
     max_payload_len: Option<usize>,
     link_mtu: Option<u16>,
+    fragments: bool,
 }
 
 #[derive(Clone)]
@@ -172,6 +177,11 @@ impl RememberingTransport {
 
     pub fn set_link_mtu(&self, mtu: u16) {
         self.locked.lock().link_mtu = Some(mtu);
+    }
+
+    // As a socket the host may fragment datagrams on.
+    pub fn set_fragments(&self) {
+        self.locked.lock().fragments = true;
     }
 
     pub fn set_max_payload_len(&mut self, len: usize) {
@@ -230,6 +240,10 @@ impl Transport for RememberingTransport {
 
     fn link_mtu(&self) -> Option<u16> {
         self.locked.lock().link_mtu
+    }
+
+    fn dont_fragment(&self) -> bool {
+        !self.locked.lock().fragments
     }
 }
 

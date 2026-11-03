@@ -149,6 +149,10 @@ impl Transport for LinkEnd {
     fn bind_addr(&self) -> SocketAddr {
         self.addr
     }
+
+    fn dont_fragment(&self) -> bool {
+        true
+    }
 }
 
 impl PollSendToVectored for LinkEnd {
