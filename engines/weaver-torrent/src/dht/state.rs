@@ -1749,7 +1749,8 @@ mod tests {
     };
 
     use crate::bencode::ByteBufOwned;
-    use tokio::net::UdpSocket;
+    use crate::core::net::DatagramSocket;
+    use std::sync::Arc;
 
     use super::{DhtConfig, DhtState};
     use crate::dht::{
@@ -1768,7 +1769,7 @@ mod tests {
     }
 
     async fn assert_answers_ping(dht: &Dht) {
-        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let client = crate::test_support::loopback_udp().await;
         client
             .send_to(
                 b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe",
@@ -1796,10 +1797,7 @@ mod tests {
     #[tokio::test]
     async fn test_dht_answers_after_icmp_port_unreachable() {
         // Nothing listens on this port once the socket is dropped.
-        let closed = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap();
+        let closed = crate::test_support::loopback_udp().await.bind_addr();
         let dht = start_dht(closed).await;
 
         // Let the bootstrap query reach the closed port and the ICMP error come back.
@@ -1812,8 +1810,8 @@ mod tests {
     #[tokio::test]
     async fn test_dht_answers_after_oversized_datagram() {
         // Stays open, so the bootstrap query gets neither an answer nor an ICMP error.
-        let silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let dht = start_dht(silent.local_addr().unwrap()).await;
+        let silent = crate::test_support::loopback_udp().await;
+        let dht = start_dht(silent.bind_addr()).await;
 
         // Some platforms refuse to send a datagram this large, which is fine.
         let _ = silent.send_to(&[0u8; 20_000], dht.listen_addr()).await;
@@ -1822,17 +1820,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_dht_answers_ping_through_custom_socket() {
-        use crate::core::net::DatagramSocket;
-        use std::sync::Arc;
-
         // Stays open, so the bootstrap query gets neither an answer nor an ICMP error.
-        let silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let custom = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let custom_addr = custom.local_addr().unwrap();
-        let custom: Arc<dyn DatagramSocket> = Arc::new(custom);
+        let silent = crate::test_support::loopback_udp().await;
+        let custom = crate::test_support::loopback_udp().await;
+        let custom_addr = custom.bind_addr();
 
         let dht = DhtState::with_config(DhtConfig {
-            bootstrap_addrs: Some(vec![silent.local_addr().unwrap().to_string()]),
+            bootstrap_addrs: Some(vec![silent.bind_addr().to_string()]),
             socket: Some(custom),
             ..Default::default()
         })
@@ -1840,7 +1834,7 @@ mod tests {
         .unwrap();
         assert_eq!(dht.listen_addr(), custom_addr);
 
-        let client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let client = crate::test_support::loopback_udp().await;
         client
             .send_to(
                 b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe",
@@ -1889,8 +1883,8 @@ mod tests {
             }
         }
 
-        let bootstrap = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let bootstrap_addr = bootstrap.local_addr().unwrap();
+        let bootstrap = crate::test_support::loopback_udp().await;
+        let bootstrap_addr = bootstrap.bind_addr();
         let resolver = Arc::new(CountingResolver {
             target: bootstrap_addr,
             calls: AtomicUsize::new(0),
@@ -1939,8 +1933,8 @@ mod tests {
         assert!(futures::poll!(peers.next()).is_pending());
 
         // A node a peer named (BEP 5 PORT).
-        let node = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        dht.add_node(node.local_addr().unwrap());
+        let node = crate::test_support::loopback_udp().await;
+        dht.add_node(node.bind_addr());
         let ping = recv_message_from(&node, dht.listen_addr()).await;
         assert!(matches!(ping.kind, MessageKind::PingRequest(_)));
         let mut answer = Vec::new();
@@ -1970,10 +1964,13 @@ mod tests {
 
     // Start a DHT on loopback whose one bootstrap node is `bootstrap`, a socket the
     // test holds: whatever the DHT sends lands there and nowhere else.
-    async fn start_dht_with(bootstrap: &UdpSocket, config: DhtConfig<'static>) -> Dht {
+    async fn start_dht_with(
+        bootstrap: &Arc<dyn DatagramSocket>,
+        config: DhtConfig<'static>,
+    ) -> Dht {
         DhtState::with_config(DhtConfig {
             listen_addr: Some((Ipv4Addr::LOCALHOST, 0).into()),
-            bootstrap_addrs: Some(vec![bootstrap.local_addr().unwrap().to_string()]),
+            bootstrap_addrs: Some(vec![bootstrap.bind_addr().to_string()]),
             ..config
         })
         .await
@@ -1981,7 +1978,7 @@ mod tests {
     }
 
     async fn recv_message_from(
-        sock: &UdpSocket,
+        sock: &Arc<dyn DatagramSocket>,
         from: SocketAddr,
     ) -> bprotocol::Message<ByteBufOwned> {
         let mut buf = [0u8; 2048];
@@ -1995,7 +1992,7 @@ mod tests {
 
     // The "v" on the DHT's own bootstrap query and on its answer to our ping.
     async fn versions_sent(client_version: Option<Vec<u8>>) -> [Option<Vec<u8>>; 2] {
-        let bootstrap = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let bootstrap = crate::test_support::loopback_udp().await;
         let dht = start_dht_with(
             &bootstrap,
             DhtConfig {
@@ -2039,7 +2036,7 @@ mod tests {
         use crate::core::hash_id::Id20;
         use crate::dht::routing_table::RoutingTable;
 
-        let bootstrap = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let bootstrap = crate::test_support::loopback_udp().await;
 
         // By default: rqbit's own fingerprint.
         let dht = start_dht_with(&bootstrap, DhtConfig::default()).await;
@@ -2518,7 +2515,7 @@ mod tests {
     // router of the family, the ones it names among them, each once.
     #[tokio::test(start_paused = true)]
     async fn test_a_bootstrap_from_the_routers_asks_each_router_once() {
-        use crate::core::net::{BoxFuture, DatagramSocket, Resolver};
+        use crate::core::net::{BoxFuture, Resolver};
         use std::sync::Arc;
 
         struct Names(Vec<SocketAddr>);
@@ -2543,8 +2540,7 @@ mod tests {
         let new: SocketAddr = ([192, 0, 2, 2], 6881).into();
         let (dht, mut sent) = fixture_dht();
         dht.routers.write().extend([known, other]);
-        let socket: Arc<dyn DatagramSocket> =
-            Arc::new(UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap());
+        let socket = crate::test_support::loopback_udp().await;
         let worker = super::DhtWorker {
             socket: super::DhtSocket::Custom(socket),
             resolver: Arc::new(Names(vec![new, known])),

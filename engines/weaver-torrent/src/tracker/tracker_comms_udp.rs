@@ -573,12 +573,7 @@ impl UdpTrackerClient {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::Write,
-        net::{Ipv4Addr, SocketAddr},
-        str::FromStr,
-        sync::Arc,
-    };
+    use std::{io::Write, net::SocketAddr, str::FromStr, sync::Arc};
 
     use crate::core::{hash_id::Id20, net::DatagramSocket, peer_id::generate_peer_id};
     use tokio_util::sync::CancellationToken;
@@ -592,16 +587,11 @@ mod tests {
     async fn test_connect_through_custom_socket() {
         const CONNECTION_ID: u64 = 0x1122_3344_5566_7788;
 
-        let tracker = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let tracker_addr = tracker.local_addr().unwrap();
+        let tracker = crate::test_support::loopback_udp().await;
+        let tracker_addr = tracker.bind_addr();
 
-        let client_sock = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let client_addr = client_sock.local_addr().unwrap();
-        let client_sock: Arc<dyn DatagramSocket> = Arc::new(client_sock);
+        let client_sock = crate::test_support::loopback_udp().await;
+        let client_addr = client_sock.bind_addr();
 
         let token = CancellationToken::new();
         let client = UdpTrackerClient::new_with_socket(token.clone(), client_sock, None);

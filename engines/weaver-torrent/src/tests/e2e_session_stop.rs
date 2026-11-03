@@ -34,7 +34,7 @@ use crate::{
 
 /// A loopback datagram socket that says when it is dropped.
 struct Watched {
-    inner: tokio::net::UdpSocket,
+    inner: Arc<dyn DatagramSocket>,
     dropped: Arc<AtomicBool>,
 }
 
@@ -53,7 +53,7 @@ impl DatagramSocket for Watched {
         &'a self,
         buf: &'a mut [u8],
     ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
-        DatagramSocket::recv_from(&self.inner, buf)
+        self.inner.recv_from(buf)
     }
 
     fn send_to<'a>(
@@ -61,7 +61,7 @@ impl DatagramSocket for Watched {
         buf: &'a [u8],
         target: SocketAddr,
     ) -> BoxFuture<'a, io::Result<usize>> {
-        DatagramSocket::send_to(&self.inner, buf, target)
+        self.inner.send_to(buf, target)
     }
 
     fn poll_send_to(
@@ -70,7 +70,7 @@ impl DatagramSocket for Watched {
         buf: &[u8],
         target: SocketAddr,
     ) -> Poll<io::Result<usize>> {
-        DatagramSocket::poll_send_to(&self.inner, cx, buf, target)
+        self.inner.poll_send_to(cx, buf, target)
     }
 }
 
@@ -150,7 +150,7 @@ impl SocketFactory for WatchedUdp {
         _addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
         Box::pin(async move {
-            let inner = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+            let inner = crate::test_support::loopback_udp().await;
             let dropped = Arc::new(AtomicBool::new(false));
             self.bound
                 .lock()
@@ -164,7 +164,7 @@ impl SocketFactory for WatchedUdp {
 #[tokio::test]
 async fn test_stop_returns_once_the_dht_socket_is_gone() -> anyhow::Result<()> {
     // The DHT's one bootstrap node: a loopback socket nobody answers on.
-    let bootstrap = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let bootstrap = crate::test_support::loopback_udp().await;
     let dir = TempDir::with_prefix("test_session_stop")?;
     let factory = Arc::new(WatchedUdp::default());
 
@@ -172,7 +172,7 @@ async fn test_stop_returns_once_the_dht_socket_is_gone() -> anyhow::Result<()> {
         dir.path().into(),
         SessionOptions {
             dht: Some(DhtSessionConfig {
-                bootstrap_addrs: Some(vec![bootstrap.local_addr()?.to_string()]),
+                bootstrap_addrs: Some(vec![bootstrap.bind_addr().to_string()]),
                 port: None,
                 persistence: None,
             }),
@@ -217,7 +217,7 @@ async fn announced(
     Arc<Session>,
     tokio::net::TcpListener,
 )> {
-    let bootstrap = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let bootstrap = crate::test_support::loopback_udp().await;
     let t = TestTorrent::new(name, 2048, 1024).await?;
     let tracker = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let url = format!("http://{}/announce", tracker.local_addr()?);
@@ -227,7 +227,7 @@ async fn announced(
         dir.path().into(),
         SessionOptions {
             dht: Some(DhtSessionConfig {
-                bootstrap_addrs: Some(vec![bootstrap.local_addr()?.to_string()]),
+                bootstrap_addrs: Some(vec![bootstrap.bind_addr().to_string()]),
                 port: None,
                 persistence: None,
             }),

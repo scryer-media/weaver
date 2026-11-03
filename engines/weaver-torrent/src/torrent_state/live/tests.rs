@@ -4818,8 +4818,9 @@ impl crate::network::SocketFactory for UnansweredDials {
     ) -> crate::network::BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>>
     {
         Box::pin(async {
-            let socket = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
-            Ok(Arc::new(socket) as Arc<dyn crate::network::DatagramSocket>)
+            crate::test_support::sockets()
+                .bind_udp((std::net::Ipv4Addr::LOCALHOST, 0).into())
+                .await
         })
     }
 }
@@ -5122,8 +5123,9 @@ impl crate::network::SocketFactory for DialedTcp {
     ) -> crate::network::BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>>
     {
         Box::pin(async {
-            let socket = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
-            Ok(Arc::new(socket) as Arc<dyn crate::network::DatagramSocket>)
+            crate::test_support::sockets()
+                .bind_udp((std::net::Ipv4Addr::LOCALHOST, 0).into())
+                .await
         })
     }
 }

@@ -83,7 +83,7 @@ impl Tracker {
 impl Drop for Tracker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        let _ = TcpStream::connect(self.addr);
+        crate::test_support::knock(self.addr);
     }
 }
 

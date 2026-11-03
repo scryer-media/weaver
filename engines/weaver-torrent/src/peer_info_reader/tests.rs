@@ -83,8 +83,9 @@ impl SocketFactory for Dialed {
         _addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
         Box::pin(async {
-            let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-            Ok(Arc::new(socket) as Arc<dyn DatagramSocket>)
+            crate::test_support::sockets()
+                .bind_udp((std::net::Ipv4Addr::LOCALHOST, 0).into())
+                .await
         })
     }
 }
@@ -126,8 +127,9 @@ impl SocketFactory for WatchedDials {
         _addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
         Box::pin(async {
-            let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-            Ok(Arc::new(socket) as Arc<dyn DatagramSocket>)
+            crate::test_support::sockets()
+                .bind_udp((std::net::Ipv4Addr::LOCALHOST, 0).into())
+                .await
         })
     }
 }

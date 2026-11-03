@@ -122,13 +122,13 @@ async fn test_peers_listing_shows_the_peer_and_a_ban_refuses_it() -> anyhow::Res
 
     // Connecting to us from the banned address, it is turned away: the
     // connection closes, where a welcome one would stay open.
-    let mut incoming = tokio::net::TcpStream::connect(ours).await?;
+    let (mut incoming_read, mut incoming) = crate::test_support::tcp(ours).await?;
     let mut hs = vec![0u8; 68];
     let len =
         Handshake::new(handle.info_hash(), Id20::new([9; 20])).serialize_unchecked_len(&mut hs);
     incoming.write_all(&hs[..len]).await?;
     let mut rest = Vec::new();
-    incoming.read_to_end(&mut rest).await.ok();
+    incoming_read.read_to_end(&mut rest).await.ok();
     assert!(!handle.peers().iter().any(|p| p.addr.ip() == a.ip()));
     Ok(())
 }

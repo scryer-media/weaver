@@ -3,7 +3,7 @@
 
 use std::{
     io,
-    net::{Ipv4Addr, SocketAddr, UdpSocket},
+    net::{Ipv4Addr, SocketAddr},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -70,15 +70,18 @@ struct Node {
 
 impl Node {
     fn new() -> anyhow::Result<Self> {
-        let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
-        let addr = socket.local_addr()?;
+        // Served from the blocking pool, which holds the paused clock still
+        // while the node waits for a datagram.
+        let socket = crate::test_support::loopback_udp_now();
+        let addr = socket.bind_addr();
+        let runtime = tokio::runtime::Handle::current();
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let (tx, heard) = mpsc::unbounded_channel();
         tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 4096];
             loop {
-                let (len, from) = socket.recv_from(&mut buf).unwrap();
+                let (len, from) = runtime.block_on(socket.recv_from(&mut buf)).unwrap();
                 if stopped.load(Ordering::SeqCst) {
                     break;
                 }
@@ -106,7 +109,7 @@ impl Node {
                     }),
                 )
                 .unwrap();
-                socket.send_to(&reply, from).unwrap();
+                runtime.block_on(socket.send_to(&reply, from)).unwrap();
             }
         });
         Ok(Self { addr, stop, heard })
@@ -126,9 +129,9 @@ impl Node {
 impl Drop for Node {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Ok(socket) = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)) {
-            let _ = socket.send_to(&[], self.addr);
-        }
+        use futures::FutureExt;
+        let socket = crate::test_support::loopback_udp_now();
+        let _ = socket.send_to(&[], self.addr).now_or_never();
     }
 }
 
