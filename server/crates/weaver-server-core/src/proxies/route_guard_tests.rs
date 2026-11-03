@@ -303,9 +303,16 @@ fn the_tunnels_test_support_is_never_built_into_a_product() {
             break;
         }
     }
+    // A member built by default, a product binary among them, never builds
+    // it.
+    let by_default: Vec<&String> = turning_on
+        .iter()
+        .filter(|(_, feature)| feature == "default")
+        .map(|(name, _)| name)
+        .collect();
     assert!(
-        !turning_on.contains(&("weaver-tunnel".to_owned(), "default".to_owned())),
-        "weaver-tunnel's default features turn on its test support"
+        by_default.is_empty(),
+        "default features turn on the tunnel's test support: {by_default:?}"
     );
 
     let mut product_edges = Vec::new();
