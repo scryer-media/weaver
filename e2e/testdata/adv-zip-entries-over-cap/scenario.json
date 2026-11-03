@@ -1,0 +1,16 @@
+{
+  "slug": "adv-zip-entries-over-cap",
+  "title": "E2E.Adversarial.Zip.Entries.Over.Cap.2026-TESTGRP",
+  "description": "1500 stored members, run with the entry cap at 1000. The extraction budget refuses the archive once, by name.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "adversarial": {
+    "group": "tight",
+    "outcome": "failed",
+    "errorContains": "WEAVER_EXTRACTION_REJECTED[entries]",
+    "failureKind": "unpack",
+    "budgetRefusals": 1,
+    "rejectionMetric": "entries",
+    "extractsNothing": true
+  }
+}

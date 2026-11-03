@@ -68,6 +68,8 @@ fn storage(dir: &Path, mail: &RunMail) -> Storage {
         caps: Caps::unbounded(),
         nesting: u32::MAX,
         unpack: true,
+        hardware: Default::default(),
+        metrics: None,
     }
 }
 
@@ -388,7 +390,7 @@ async fn deleting_a_torrents_files_removes_them_and_its_output_and_nothing_else(
     assert!(dir.join("sub/set.rar").exists());
     std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
 
-    let written = shim.job.with(|job| job.written());
+    let written = shim.job.with(|job| job.written_paths());
     crate::torrents::service::delete_written(&dir, &written);
     let left: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()

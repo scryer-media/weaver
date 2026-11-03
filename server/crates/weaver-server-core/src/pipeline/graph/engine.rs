@@ -8,14 +8,15 @@
 // beside its other work, and is applied to the tree as if the object had said
 // it in `deliver`.
 //
-// A run has one life: queued for a slot, running, ended. Before it starts it
-// reserves the resident bytes it will hold, against the limit every job
-// shares; one that does not fit gives its slot back and waits for memory
-// instead. A repair behind what
+// A run has one life: queued for a slot, running, ended, or stopped where it
+// stands when the job goes down. Before it starts it reserves the resident
+// bytes it will hold, against the limit every job shares; one that does not
+// fit gives its slot back and waits for memory instead. A repair behind what
 // it read moves its shelf's generation on, which stops it where it stands;
 // its owner then retracts what it built and starts it again, under the slot
 // it already holds. Whatever a stopped run still says carries the old
-// generation, and is not heard.
+// generation, and is not heard: a run stopped as the job goes down keeps its
+// generation, so no run starts under it again.
 
 mod volumes;
 
@@ -30,10 +31,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use weaver_graph::holds::{HoldsAccountant, HoldsNamespace, Reserve};
 use weaver_graph::slots::{Admissions, Asked, AskerId, Slots, Ticket};
-use weaver_graph::{Emit, Extraction, NodeId, Why};
+use weaver_graph::{Emit, Extraction, Marks, NodeId, Why};
 
 use self::volumes::RunVolumes;
 use super::envelope::Shelf;
+use super::hardware::Hardware;
 use super::namespace::Returned;
 
 // How many things a run may have said before it waits for the pipeline to
@@ -66,19 +68,44 @@ pub(crate) enum Heard {
     // A recovery set's repair, lent off the loop, came back: addressed to
     // the set's node, under the loan's number for a generation.
     Repaired(Box<Returned>),
+    Replayed(Box<super::namespace::Replayed>),
+    Verified(Box<super::namespace::Verified>),
+    // The job's checkpoints committed through this stamp, or a write of
+    // them failed (`None`), while a member's file waited on them to move.
+    // Addressed to the root, under no run's generation.
+    Written {
+        stamp: Option<u64>,
+        control: crate::persistence::checkpoint_write::CheckpointControl,
+    },
+    CheckpointBlocked {
+        control: crate::persistence::checkpoint_write::CheckpointControl,
+        revision: u64,
+        error: String,
+    },
 }
 
-// Where every graph job's runs speak.
+// Where every graph job's runs speak, and where the database says a
+// checkpoint a move waits on has committed. That word comes from the
+// database's writer, which must never wait on the pipeline, so it has a
+// channel of its own without a bound: at most one word per checkpoint write.
 #[derive(Debug)]
 pub(crate) struct RunMail {
     sender: mpsc::Sender<Said>,
     receiver: mpsc::Receiver<Said>,
+    written: mpsc::UnboundedSender<Said>,
+    heard_written: mpsc::UnboundedReceiver<Said>,
 }
 
 impl Default for RunMail {
     fn default() -> Self {
         let (sender, receiver) = mpsc::channel(MAIL_CAPACITY);
-        Self { sender, receiver }
+        let (written, heard_written) = mpsc::unbounded_channel();
+        Self {
+            sender,
+            receiver,
+            written,
+            heard_written,
+        }
     }
 }
 
@@ -87,8 +114,16 @@ impl RunMail {
         self.sender.clone()
     }
 
+    pub(crate) fn written(&self) -> mpsc::UnboundedSender<Said> {
+        self.written.clone()
+    }
+
     pub(crate) async fn recv(&mut self) -> Option<Said> {
-        self.receiver.recv().await
+        tokio::select! {
+            biased;
+            Some(said) = self.heard_written.recv() => Some(said),
+            said = self.receiver.recv() => said,
+        }
     }
 
     // What the runs said that waits to be heard, at most what the mail holds
@@ -97,6 +132,9 @@ impl RunMail {
     // the turn.
     pub(crate) fn waiting(&mut self) -> Vec<Said> {
         let mut waiting = Vec::new();
+        while let Ok(said) = self.heard_written.try_recv() {
+            waiting.push(said);
+        }
         while waiting.len() < MAIL_CAPACITY {
             let Ok(said) = self.receiver.try_recv() else {
                 break;
@@ -156,6 +194,12 @@ enum Life {
     Starved { resident: u64 },
     Running { generation: u64 },
     Ended { generation: u64 },
+    // Stopped where it stood because the job is going down, under the
+    // generation it ran under, if it started. Its thread may still be out
+    // and speak under that generation, so the run keeps it: no other run
+    // starts on the node, and what the stopped one says is not heard. It did
+    // not finish reading, so the job is not quiet while it stands.
+    Stopped { generation: Option<u64> },
 }
 
 #[derive(Debug)]
@@ -169,6 +213,16 @@ struct Run {
     reserved: u64,
 }
 
+// The e2e hook for a job that is extracting, on the run's own thread: with
+// every volume the run reads in, it still has members to say or its end to
+// report, so a hold here keeps the job from finishing and stops nothing else.
+fn extracting_hook(volumes: &RunVolumes) {
+    let hook = crate::e2e_failpoint::STATUS_ENTER_EXTRACTING;
+    if crate::e2e_failpoint::armed(hook) && volumes.all_in() {
+        crate::e2e_failpoint::fire(hook);
+    }
+}
+
 // Whether a run may start on the memory it declares.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Reservation {
@@ -180,6 +234,21 @@ pub(crate) enum Reservation {
     Refused,
 }
 
+// A run's last word, said when the run's thread lets it go, however the run
+// returned.
+struct Ends {
+    mail: mpsc::Sender<Said>,
+    said: Option<Said>,
+}
+
+impl Drop for Ends {
+    fn drop(&mut self) {
+        if let Some(said) = self.said.take() {
+            let _ = self.mail.blocking_send(said);
+        }
+    }
+}
+
 // One job's runs, the slots they take, and the resident bytes they reserve.
 #[derive(Debug)]
 pub(crate) struct Runs {
@@ -188,6 +257,12 @@ pub(crate) struct Runs {
     slots: Slots,
     accountant: Arc<HoldsAccountant>,
     runs: BTreeMap<NodeId, Run>,
+    // The nodes whose run came, went, or moved on in its life, each under
+    // the generation of its latest change: a step reads again only the
+    // nodes marked since the one it read at.
+    marks: Marks<NodeId>,
+    // What a run is granted as it starts, and the job's repairs too.
+    hardware: Hardware,
 }
 
 impl Runs {
@@ -203,7 +278,19 @@ impl Runs {
             slots: Slots::new(slots),
             accountant,
             runs: BTreeMap::new(),
+            marks: Marks::default(),
+            hardware: Hardware::default(),
         }
+    }
+
+    // The runs, granted what `hardware` grants as each starts.
+    pub(crate) fn on(mut self, hardware: Hardware) -> Self {
+        self.hardware = hardware;
+        self
+    }
+
+    pub(crate) fn hardware(&self) -> Hardware {
+        self.hardware.clone()
     }
 
     // The job's id and where its runs speak, which its repairs share.
@@ -215,7 +302,8 @@ impl Runs {
         self.mail.clone()
     }
 
-    // A run is waiting for a slot, waiting for memory, or running.
+    // A run is waiting for a slot, waiting for memory, running, or stopped
+    // before it finished.
     pub(crate) fn live(&self) -> bool {
         self.runs
             .values()
@@ -232,8 +320,9 @@ impl Runs {
         self.runs.contains_key(&node)
     }
 
-    // Whether the node's run is waiting for a slot, waiting for memory, or
-    // running: it may still announce members, or close them.
+    // Whether the node's run is waiting for a slot, waiting for memory,
+    // running, or stopped before it finished: it may still announce members,
+    // or close them.
     pub(crate) fn reading(&self, node: NodeId) -> bool {
         self.runs
             .get(&node)
@@ -256,11 +345,31 @@ impl Runs {
             .collect()
     }
 
+    // The generation of the latest change to any run's life.
+    pub(crate) fn marked_at(&self) -> u64 {
+        self.marks.at()
+    }
+
+    // The nodes whose run's life changed since `at`, one forgotten among
+    // them.
+    pub(crate) fn changed_since(&self, at: u64) -> impl Iterator<Item = NodeId> + '_ {
+        self.marks.since(at)
+    }
+
+    // The nodes whose runs are reading, in node order.
+    pub(crate) fn running(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.runs
+            .iter()
+            .filter(|(_, run)| matches!(run.life, Life::Running { .. }))
+            .map(|(node, _)| *node)
+    }
+
     // The generation the node's run started under, once it started.
     pub(crate) fn generation(&self, node: NodeId) -> Option<u64> {
         match self.runs.get(&node)?.life {
             Life::Queued | Life::Starved { .. } => None,
             Life::Running { generation } | Life::Ended { generation } => Some(generation),
+            Life::Stopped { generation } => generation,
         }
     }
 
@@ -278,6 +387,7 @@ impl Runs {
     pub(crate) fn ask(&mut self, node: NodeId, limit: usize) -> Vec<NodeId> {
         let mut admitted = self.follow(limit);
         admitted.extend(self.wake());
+        self.marks.mark(node);
         let run = self.runs.entry(node).or_insert(Run {
             life: Life::Queued,
             ticket: None,
@@ -318,6 +428,7 @@ impl Runs {
         run.life = Life::Starved {
             resident: self.accountant.usage().resident,
         };
+        self.marks.mark(node);
         let admissions = run
             .ticket
             .take()
@@ -326,7 +437,8 @@ impl Runs {
         Reservation::Starved(self.admit(admissions))
     }
 
-    // Start the node's run over its shelf, on a blocking thread.
+    // Start the node's run over its shelf, on a blocking thread, with the
+    // budget in force now: a later profile reaches the next run, not this.
     pub(crate) fn start(
         &mut self,
         node: NodeId,
@@ -338,8 +450,10 @@ impl Runs {
         };
         let generation = shelf.begin();
         run.life = Life::Running { generation };
+        self.marks.mark(node);
         let volumes = Arc::new(RunVolumes::new(shelf, generation));
         run.volumes = Some(Arc::clone(&volumes));
+        let budget = self.hardware.grant().run;
         let (scope, mail) = (self.scope, self.mail.clone());
         let said = move |heard| Said {
             scope,
@@ -348,10 +462,23 @@ impl Runs {
             heard,
         };
         tokio::task::spawn_blocking(move || {
+            // Said as the run returns, and as a run that panics unwinds, so
+            // a run always ends: its slot, its memory and a stopped job's
+            // graph are waiting on it. A closed channel means the pipeline is
+            // gone, and no one is left to tell.
+            let _ends = Ends {
+                mail: mail.clone(),
+                said: Some(said(Heard::Ended)),
+            };
             let reader = Arc::clone(&volumes);
-            let mut sink =
-                |emit| volumes.current() && mail.blocking_send(said(Heard::Emit(emit))).is_ok();
-            extraction.run(reader, &mut sink);
+            let mut sink = |emit: Emit| {
+                if matches!(emit, Emit::Member { .. }) {
+                    crate::e2e_failpoint::fire(crate::e2e_failpoint::EXTRACT_MEMBER_START);
+                }
+                extracting_hook(&volumes);
+                volumes.current() && mail.blocking_send(said(Heard::Emit(emit))).is_ok()
+            };
+            extraction.run(reader, &mut sink, budget);
             // A run that read bytes nothing will bring, and did not read on
             // past them, built on less than its volumes hold and ends silent
             // on the failed read: what it said is refused as damage nothing
@@ -359,9 +486,7 @@ impl Runs {
             if volumes.lost() {
                 sink(Emit::Refuse(Why::Unrepairable));
             }
-            // A closed channel means the pipeline is gone, and no one is
-            // left to tell.
-            let _ = mail.blocking_send(said(Heard::Ended));
+            extracting_hook(&volumes);
         });
     }
 
@@ -371,31 +496,40 @@ impl Runs {
         let mut admitted = self.follow(limit);
         if let Some(run) = self.runs.get_mut(&node) {
             run.life = Life::Ended { generation };
+            self.marks.mark(node);
             admitted.extend(self.free(node));
         }
         admitted.extend(self.wake());
         admitted
     }
 
-    // Forget the runs of nodes no longer among `engines`, which are in node
-    // order: refused, retracted or unbound. Their slots and their memory go
-    // to whoever waits; returns the nodes that may start now.
-    pub(crate) fn forget_gone(&mut self, engines: &[NodeId], limit: usize) -> Vec<NodeId> {
-        let gone = self
-            .runs
-            .keys()
-            .filter(|node| engines.binary_search(node).is_err())
-            .copied()
-            .collect();
-        self.forget(gone, limit)
-    }
-
-    // Stop every run where it stands and forget it: the job is going down.
-    // What a run read is on its shelf, for the restored job to read again.
+    // Stop every run where it stands: the job is going down. What a run read
+    // is on its shelf, for the restored job to read again. Its slot and its
+    // memory are given back, but the run stays, stopped under its generation:
+    // its thread may still speak under it, and a run started in its place
+    // would read under the same generation and hear it as its own.
     pub(crate) fn stop(&mut self, limit: usize) {
         self.request_stop();
-        let all = self.runs.keys().copied().collect();
-        self.forget(all, limit);
+        self.follow(limit);
+        let all: Vec<NodeId> = self.runs.keys().copied().collect();
+        // Out of the queue first, so a slot one of them frees cannot go to
+        // another of them.
+        for node in &all {
+            self.slots.withdraw(asker(*node));
+        }
+        for node in all {
+            self.free(node);
+            if let Some(run) = self.runs.get_mut(&node) {
+                self.marks.mark(node);
+                run.life = match run.life {
+                    Life::Queued | Life::Starved { .. } => Life::Stopped { generation: None },
+                    Life::Running { generation } => Life::Stopped {
+                        generation: Some(generation),
+                    },
+                    life @ (Life::Ended { .. } | Life::Stopped { .. }) => life,
+                };
+            }
+        }
     }
 
     pub(crate) fn request_stop(&self) {
@@ -406,11 +540,13 @@ impl Runs {
         }
     }
 
-    // Forget the runs of `gone`, whose threads may still be out: what they
-    // say is under a generation no run holds, and is not heard. Their slots
-    // and their memory go to whoever waits; returns the nodes that may
-    // start now.
-    fn forget(&mut self, gone: Vec<NodeId>, limit: usize) -> Vec<NodeId> {
+    // Forget the runs of `gone`, nodes no longer engines: refused,
+    // retracted or unbound. Their threads may still be out: what they say
+    // is under a generation no run holds, and is not heard. Their slots and
+    // their memory go to whoever waits; returns the nodes that may start
+    // now, as a raised limit or released memory admits them even when
+    // nothing is gone.
+    pub(crate) fn forget(&mut self, gone: Vec<NodeId>, limit: usize) -> Vec<NodeId> {
         let mut admitted = self.follow(limit);
         // Out of the queue first, so a slot one of them frees cannot go to
         // another of them.
@@ -419,7 +555,9 @@ impl Runs {
         }
         for node in gone {
             admitted.extend(self.free(node));
-            self.runs.remove(&node);
+            if self.runs.remove(&node).is_some() {
+                self.marks.mark(node);
+            }
         }
         admitted.extend(self.wake());
         admitted
@@ -455,6 +593,7 @@ impl Runs {
     fn queue(&mut self, node: NodeId) -> Option<NodeId> {
         let run = self.runs.get_mut(&node)?;
         run.life = Life::Queued;
+        self.marks.mark(node);
         match self.slots.ask(asker(node)) {
             Asked::Admitted(ticket) => {
                 run.ticket = Some(ticket);

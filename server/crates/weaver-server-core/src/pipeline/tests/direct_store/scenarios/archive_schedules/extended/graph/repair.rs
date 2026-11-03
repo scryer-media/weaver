@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// PAR3 recovery under the graph: the archive matrix's loss cases with a PAR3
-// set posted in place of PAR2.
+// PAR3 recovery: the archive matrix's loss cases with a PAR3 set posted in
+// place of PAR2.
 //
 // Every case loses at least one article, and the PAR3 set covers each loss
 // a starved schedule does not make, so the member is delivered whole. A
 // starved schedule delivers only what the post still holds whole and fails
-// the job as a repair when that is nothing. The pool is the classic PAR3
-// pool less the demoting cases, under the same replay indices and shards.
+// the job as a repair when that is nothing.
 use super::super::repair::{
-    Fixture, LOSS_CASES, Slice, Target, campaign_cases, carries_loss, fixture, par3_shards,
+    Fixture, LOSS_CASES, Slice, campaign_cases, carries_loss, fixture, par3_shards,
 };
 use super::*;
 
@@ -21,7 +20,7 @@ async fn graph_par3_campaign(format: Format, slice: Slice) {
         described,
         members,
         ..
-    } = fixture(Target::Format(format));
+    } = fixture(format);
     let options = ScheduleOptions {
         recovery: RecoveryFormat::Par3,
         ..ScheduleOptions::MATRIX
@@ -40,9 +39,7 @@ async fn graph_par3_campaign(format: Format, slice: Slice) {
         described,
         members,
     };
-    let cases = campaign_cases(slice, carries_loss, LOSS_CASES)
-        .into_iter()
-        .filter(|(_, (_, interruption))| runs_under_graph(*interruption));
+    let cases = campaign_cases(slice, carries_loss, LOSS_CASES);
     assert_cells(&graph_fixture_cases(&fixture, cases).await);
 }
 

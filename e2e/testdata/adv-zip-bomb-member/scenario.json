@@ -1,0 +1,16 @@
+{
+  "slug": "adv-zip-bomb-member",
+  "title": "E2E.Adversarial.Zip.Bomb.Member.2026-TESTGRP",
+  "description": "256 MiB of deflated zeros in a zip of a few hundred KiB, run with the member cap at 32 MiB. The extraction budget refuses it once, by name, before scratch fills.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "adversarial": {
+    "group": "tight",
+    "outcome": "failed",
+    "errorContains": "WEAVER_EXTRACTION_REJECTED[member_bytes]",
+    "failureKind": "unpack",
+    "budgetRefusals": 1,
+    "rejectionMetric": "member_bytes",
+    "extractsNothing": true
+  }
+}

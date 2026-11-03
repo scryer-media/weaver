@@ -64,7 +64,6 @@ impl Harness {
             watch_folder: WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: None,
-            direct_unpack: None,
             delivery_naming: None,
             metrics: Default::default(),
             config_path: None,
@@ -118,6 +117,7 @@ impl Harness {
             state,
             db.clone(),
             config,
+            weaver_server_core::runtime::StartupDiskGate::opened(),
         )
         .await
         .unwrap();

@@ -58,6 +58,9 @@ struct RequestAuthContext {
 pub struct ServerRuntime {
     pub schema: WeaverSchema,
     pub handle: SchedulerHandle,
+    // The queue the handle drives, read in place by the facades and the
+    // scrape so they never copy the whole queue.
+    pub pipeline_state: weaver_server_core::SharedPipelineState,
     pub scheduled_resume: weaver_server_api::ScheduledResumeCoordinator,
     pub db: Database,
     pub auth_cache: LoginAuthCache,
@@ -106,6 +109,17 @@ impl ServerRuntime {
 
 fn error_response(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
+}
+
+// The `error_response` body with a stable `code` beside the sentence, for a
+// refusal a machine client has to tell apart. Clients match the code; the
+// sentence is for people and may be reworded.
+fn coded_error_response(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        Json(serde_json::json!({ "code": code, "error": message })),
+    )
+        .into_response()
 }
 
 #[derive(Clone, Copy, Debug, Default)]

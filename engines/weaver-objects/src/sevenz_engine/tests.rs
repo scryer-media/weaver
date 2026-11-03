@@ -8,7 +8,7 @@ use std::thread;
 
 use sevenz_turbo::encoder_options::{AesEncoderOptions, Lzma2Options};
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password};
-use weaver_graph::{ObjectId, Purpose, Volumes, Why};
+use weaver_graph::{ObjectId, Volumes, Why};
 
 use super::*;
 use crate::testing::payload;
@@ -64,6 +64,8 @@ fn store_said() -> Vec<Said> {
         Said::Member(1, "deep/second.bin".into(), Some(64)),
         Said::Bytes(1, second()),
         Said::Closed(1),
+        Said::Member(2, "deep/".into(), Some(0)),
+        Said::Closed(2),
     ]
 }
 
@@ -205,6 +207,8 @@ fn said(emits: &[Emit]) -> Vec<Said> {
             Emit::Retract(member) => out.push(Said::Retract(member.0)),
             Emit::NeedsPassword => out.push(Said::NeedsPassword),
             Emit::Refuse(why) => out.push(Said::Refuse(*why)),
+            // Said beside the walk; `checksums` reads them.
+            Emit::Checksum { .. } => {}
             other => panic!("an engine run does not say {other:?}"),
         }
     }
@@ -217,7 +221,9 @@ fn run_over(engine: &mut SevenZipEngine, gate: Arc<Gate>) -> Vec<Said> {
         emits.push(emit);
         true
     };
-    engine.start().run(gate, &mut sink);
+    engine
+        .start()
+        .run(gate, &mut sink, weaver_graph::Budget::default());
     said(&emits)
 }
 
@@ -231,10 +237,6 @@ fn named(names: &[&str]) -> SevenZipEngine {
         engine.bound(VolumeIndex(volume as u32), name, &[], None);
     }
     engine
-}
-
-fn split(bytes: &[u8], at: usize) -> Vec<Vec<u8>> {
-    vec![bytes[..at].to_vec(), bytes[at..].to_vec()]
 }
 
 #[test]
@@ -258,20 +260,10 @@ fn an_lzma2_archive_extracts_its_members() {
             Said::Member(1, "second.bin".into(), Some(5_000)),
             Said::Bytes(1, second),
             Said::Closed(1),
+            Said::Member(2, "deep/".into(), Some(0)),
+            Said::Closed(2),
         ]
     );
-}
-
-#[test]
-fn a_set_in_two_volumes_extracts_as_one() {
-    let mut engine = named(&["set.7z.001", "set.7z.002"]);
-    for at in [1, 32, 45, store().len() - 1] {
-        assert_eq!(
-            run(&mut engine, split(&store(), at)),
-            store_said(),
-            "split at {at}"
-        );
-    }
 }
 
 #[test]
@@ -283,7 +275,7 @@ fn a_run_waits_for_the_tail_and_continues_when_it_lands() {
     let volumes: Arc<dyn Volumes> = gate.clone();
     let runner = thread::spawn(move || {
         let mut sink = |emit| sent.send(emit).is_ok();
-        extraction.run(volumes, &mut sink);
+        extraction.run(volumes, &mut sink, weaver_graph::Budget::default());
     });
 
     gate.wait_for_reader(0);
@@ -293,25 +285,6 @@ fn a_run_waits_for_the_tail_and_continues_when_it_lands() {
     );
 
     gate.release(0);
-    runner.join().unwrap();
-    assert_eq!(said(&heard.try_iter().collect::<Vec<_>>()), store_said());
-}
-
-#[test]
-fn a_run_over_a_set_waits_for_the_volume_holding_the_tail() {
-    let gate = Gate::new(split(&store(), 40), vec![40, 0]);
-    let (sent, heard) = mpsc::channel();
-    let extraction = named(&["set.7z.001", "set.7z.002"]).start();
-    let volumes: Arc<dyn Volumes> = gate.clone();
-    let runner = thread::spawn(move || {
-        let mut sink = |emit| sent.send(emit).is_ok();
-        extraction.run(volumes, &mut sink);
-    });
-
-    gate.wait_for_reader(1);
-    assert!(heard.try_iter().next().is_none());
-
-    gate.release(1);
     runner.join().unwrap();
     assert_eq!(said(&heard.try_iter().collect::<Vec<_>>()), store_said());
 }
@@ -339,6 +312,8 @@ fn a_wrong_password_asks_for_another_and_the_right_one_extracts() {
             Said::Member(0, "notes.txt".into(), Some(NOTES.len() as u64)),
             Said::Bytes(0, NOTES.to_vec()),
             Said::Closed(0),
+            Said::Member(1, "deep/".into(), Some(0)),
+            Said::Closed(1),
         ]
     );
 }
@@ -377,9 +352,11 @@ fn a_sink_that_says_stop_hears_nothing_more() {
         emits.push(emit);
         !stop
     };
-    SevenZipEngine::new()
-        .start()
-        .run(Gate::whole(vec![store()]), &mut sink);
+    SevenZipEngine::new().start().run(
+        Gate::whole(vec![store()]),
+        &mut sink,
+        weaver_graph::Budget::default(),
+    );
     let said = said(&emits);
     assert_eq!(said.len(), 2);
     assert_eq!(
@@ -389,66 +366,45 @@ fn a_sink_that_says_stop_hears_nothing_more() {
     assert!(matches!(said[1], Said::Bytes(0, _)));
 }
 
+// A 7z is one file: no name numbers a piece of it, and a copy of the file
+// is the file when its signature header measures the same container.
 #[test]
-fn claim_names_the_volumes_of_its_own_set_only() {
-    let mut engine = named(&["Set.7z.001"]);
-    assert_eq!(engine.claim("set.7Z.002", b"", None), Some(VolumeIndex(1)));
-    assert_eq!(
-        engine.claim("set.7z.1000", b"", None),
-        Some(VolumeIndex(999))
+fn claim_takes_a_copy_of_its_file_and_no_numbered_piece() {
+    let bytes = store();
+    let mut engine = SevenZipEngine::new();
+    engine.bound(
+        VolumeIndex(0),
+        "set.7z",
+        &bytes[..32],
+        Some(bytes.len() as u64),
     );
     assert_eq!(
-        engine.claim("set.7z.0001", b"", None),
-        Some(VolumeIndex(0)),
-        "a piece posted again is that piece"
+        engine.claim("e93a07c1d25b4f68a0c3e1f7b9d24c85", &bytes[..32], None),
+        vec![VolumeIndex(0)]
     );
-    assert_eq!(engine.claim("set.7z.000", b"", None), None);
-    assert_eq!(engine.claim("other.7z.002", b"", None), None);
-    assert_eq!(engine.claim("set.7z", b"", None), None);
-    assert_eq!(engine.claim("set.part2.rar", b"", None), None);
-
-    let mut lone = named(&["set.7z"]);
+    for name in ["set.7z", "set.7z.001", "set.7z.002", "set.part2.rar"] {
+        assert_eq!(
+            engine.claim(name, b"", None),
+            Vec::<VolumeIndex>::new(),
+            "{name}"
+        );
+    }
+    let mut numbered = named(&["Set.7z.001"]);
     assert_eq!(
-        lone.claim("set.7z.002", b"", None),
-        None,
-        "a lone 7z has no siblings"
-    );
-}
-
-#[test]
-fn the_engine_bids_for_the_volumes_after_the_one_the_run_reached() {
-    let mut engine = named(&["set.7z.001", "set.7z.002", "set.7z.003"]);
-    let mut seeks = Vec::new();
-    engine.wants(&mut seeks);
-    assert!(
-        seeks.is_empty(),
-        "nothing is bid but where the owner says the run is"
-    );
-
-    engine.bid(VolumeIndex(0), &mut seeks);
-    let bids: Vec<_> = seeks
-        .iter()
-        .map(|seek| (seek.volume.0, seek.weight.0, seek.purpose))
-        .collect();
-    assert_eq!(bids, vec![(1, 1, Purpose::Data), (2, 2, Purpose::Data)]);
-
-    seeks.clear();
-    engine.bound(VolumeIndex(3), "set.7z.004", &[], None);
-    engine.bid(VolumeIndex(1), &mut seeks);
-    let bids: Vec<_> = seeks
-        .iter()
-        .map(|seek| (seek.volume.0, seek.weight.0))
-        .collect();
-    assert_eq!(
-        bids,
-        vec![(2, 1), (3, 2)],
-        "the bids are restated from where the run stands"
+        numbered.claim("set.7Z.002", b"", None),
+        Vec::<VolumeIndex>::new(),
+        "a numbered name founds no set of the engine's"
     );
 }
 
 #[test]
 fn the_object_is_an_engine_that_reads_in_order_and_keeps_nothing() {
-    let object = crate::build(Kind::SevenZipEngine, ObjectId(4)).unwrap();
+    let object = crate::build(
+        Kind::SevenZipEngine,
+        ObjectId(4),
+        weaver_graph::Budget::default(),
+    )
+    .unwrap();
     assert_eq!(object.kind(), Kind::SevenZipEngine);
     assert!(object.reads_in_order());
     assert!(object.engine().is_some());
@@ -465,4 +421,79 @@ fn the_object_is_an_engine_that_reads_in_order_and_keeps_nothing() {
     object.extent(MemberId(0), ByteRange::new(0, 4), &mut extents);
     assert!(extents.is_empty());
     assert_eq!(object.envelope(2, ByteRange::new(5, 9)), None);
+}
+
+// Each member's checksum as the run said it, in the order it was said.
+fn checksums(emits: &[Emit]) -> Vec<(u32, u32)> {
+    emits
+        .iter()
+        .filter_map(|emit| match emit {
+            Emit::Checksum { member, crc32 } => Some((member.0, *crc32)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn crc(bytes: &[u8]) -> u32 {
+    crate::grid::crc32(bytes)
+}
+
+#[test]
+fn a_run_says_each_files_header_checksum_and_none_for_a_directory() {
+    let mut emits = Vec::new();
+    let mut sink = |emit| {
+        emits.push(emit);
+        true
+    };
+    SevenZipEngine::new().start().run(
+        Gate::whole(vec![store()]),
+        &mut sink,
+        weaver_graph::Budget::default(),
+    );
+    assert_eq!(
+        checksums(&emits),
+        vec![(0, crc(NOTES)), (1, crc(&second()))]
+    );
+}
+
+// A read the owner failed is the owner's to explain, not a verdict on the
+// format.
+#[test]
+fn an_owner_read_failure_is_no_format_refusal() {
+    struct Failed {
+        kind: io::ErrorKind,
+    }
+    impl Volumes for Failed {
+        fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>> {
+            Ok(after.is_none().then_some(VolumeIndex(0)))
+        }
+        fn len(&self, _: VolumeIndex) -> Option<u64> {
+            Some(100)
+        }
+        fn read_at(&self, _: VolumeIndex, _: u64, _: &mut [u8]) -> io::Result<usize> {
+            Err(self.kind.into())
+        }
+    }
+    for kind in [
+        io::ErrorKind::NotFound,
+        io::ErrorKind::Interrupted,
+        io::ErrorKind::Other,
+    ] {
+        let mut object = crate::build(
+            Kind::SevenZipEngine,
+            ObjectId(1),
+            weaver_graph::Budget::default(),
+        )
+        .unwrap();
+        let mut emits = Vec::new();
+        object.engine_mut().unwrap().start().run(
+            Arc::new(Failed { kind }),
+            &mut |emit| {
+                emits.push(emit);
+                true
+            },
+            weaver_graph::Budget::default(),
+        );
+        assert!(emits.is_empty(), "{kind:?}: {emits:?}");
+    }
 }

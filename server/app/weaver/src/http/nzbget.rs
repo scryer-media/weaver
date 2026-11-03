@@ -16,9 +16,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use weaver_server_api::{
     Attribute, AttributeInput, CLIENT_REQUEST_ID_ATTRIBUTE_KEY, PRIORITY_ATTRIBUTE_KEY, QueueItem,
-    QueueItemState, QueuePhase, SubmissionOptions, SubmitNzbError, fetch_nzb_from_url,
-    history_item_from_row, normalize_priority_value, queue_item_from_job, submit_metadata,
-    submit_nzb_bytes_with_options,
+    QueueItemState, QueuePhase, QueueStateFacts, SubmissionOptions, SubmitNzbError,
+    fetch_nzb_from_url, history_item_from_row, normalize_priority_value, queue_item_from_job,
+    queue_item_state, queue_item_state_for_download_accounting, queue_table_item_from_job,
+    submit_metadata, submit_nzb_bytes_with_options,
 };
 use weaver_server_core::auth::{ApiKeyCache, CallerScope, LoginAuthCache};
 use weaver_server_core::history::{HistoryFailureKind, NzbgetMarkStatus};
@@ -34,6 +35,9 @@ use weaver_server_core::{
 pub(super) struct NzbgetFacadeContext {
     db: Database,
     handle: SchedulerHandle,
+    // The queue the handle drives, read in place so a poll borrows rows
+    // instead of copying the queue.
+    queue: weaver_server_core::SharedPipelineState,
     config: SharedConfig,
     auth_cache: LoginAuthCache,
     api_key_cache: ApiKeyCache,
@@ -65,6 +69,7 @@ impl NzbgetFacadeContext {
     pub(super) fn new(
         db: Database,
         handle: SchedulerHandle,
+        queue: weaver_server_core::SharedPipelineState,
         config: SharedConfig,
         auth_cache: LoginAuthCache,
         api_key_cache: ApiKeyCache,
@@ -78,6 +83,7 @@ impl NzbgetFacadeContext {
         Self {
             db,
             handle,
+            queue,
             config,
             auth_cache,
             api_key_cache,
@@ -224,6 +230,9 @@ async fn run_jsonrpc(
         return rpc_error_response(StatusCode::FORBIDDEN, id, RpcError::access_denied());
     }
 
+    if method == "listgroups" {
+        return listgroups_response(ctx, id).await;
+    }
     match dispatch_method(ctx, &method, params).await {
         Ok(result) => rpc_success_response(id, result),
         Err(error) => rpc_error_response(StatusCode::OK, id, error),
@@ -1501,43 +1510,33 @@ async fn append_url(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<
 }
 
 async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
-    // Iterate `JobInfo` directly instead of mapping every job through
-    // `queue_item_from_job` (which deep-clones name/metadata/phase_progress)
-    // just to sum bytes and count states. Use the download-accounting
-    // projection, not the user-facing queue state: the pipeline force-projects
-    // `download_state = Downloading` for a post-processing job with pending
-    // download work, so classifying off `status` alone would flip `ServerStandBy`
-    // and the post/par counts for those jobs.
-    let jobs = ctx.handle.list_jobs();
-    let states: Vec<(QueueItemState, u64, u64)> = jobs
-        .iter()
-        .map(|job| {
-            (
-                weaver_server_api::queue_item_state_from_job_info_for_download_accounting(job),
-                job.total_bytes,
-                job.downloaded_bytes,
-            )
-        })
-        .collect();
-    let remaining = states
-        .iter()
-        .filter(|(state, _, _)| {
-            !matches!(state, QueueItemState::Completed | QueueItemState::Failed)
-        })
-        .map(|(_, total, downloaded)| total.saturating_sub(*downloaded))
-        .sum::<u64>();
+    // Sum and count over the queue rows in place, copying no job. Use the
+    // download-accounting projection, not the user-facing queue state: the
+    // pipeline force-projects `download_state = Downloading` for a
+    // post-processing job with pending download work, so classifying off
+    // `status` alone would flip `ServerStandBy` and the post/par counts for
+    // those jobs. History rows are terminal and count toward none of these.
+    let (remaining, post_job_count, any_active) = ctx.queue.read_queue(|inner| {
+        let mut remaining = 0u64;
+        let mut post_job_count = 0usize;
+        let mut any_active = false;
+        for row in &inner.jobs {
+            let view = row.view(&inner.globals);
+            let state = queue_item_state_for_download_accounting(QueueStateFacts::of_view(&view));
+            let job = view.job();
+            if !matches!(state, QueueItemState::Completed | QueueItemState::Failed) {
+                remaining += job.total_bytes.saturating_sub(job.downloaded_bytes);
+            }
+            if matches!(view.status(), JobStatus::QueuedPostProcessing)
+                || queue_item_state_in_post_processing(state)
+            {
+                post_job_count += 1;
+            }
+            any_active |= state == QueueItemState::Downloading;
+        }
+        (remaining, post_job_count, any_active)
+    });
     let forced = 0u64;
-    let post_job_count = jobs
-        .iter()
-        .zip(&states)
-        .filter(|(job, (state, _, _))| {
-            matches!(job.status, JobStatus::QueuedPostProcessing)
-                || queue_item_state_in_post_processing(*state)
-        })
-        .count();
-    let any_active = states
-        .iter()
-        .any(|(state, _, _)| *state == QueueItemState::Downloading);
     let metrics = ctx.handle.get_metrics();
     let download_rate = metrics.current_download_speed;
     let arr_download_rate = download_rate.min(i32::MAX as u64);
@@ -1640,9 +1639,8 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     }))
 }
 
-// `status()` iterates `SchedulerHandle::list_jobs()` directly (avoiding a
-// per-job `QueueItem` deep-clone) and classifies each job with
-// `queue_item_state_from_job_info`, so it needs the check on a bare state.
+// `status()` and `listgroups` classify rows in place, so they need the check
+// on a bare state.
 fn queue_item_state_in_post_processing(state: QueueItemState) -> bool {
     matches!(
         state,
@@ -1655,39 +1653,127 @@ fn queue_item_state_in_post_processing(state: QueueItemState) -> bool {
     )
 }
 
-async fn listgroups(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
-    let jobs = ctx.handle.list_jobs();
-    let items = jobs
-        .iter()
-        .map(|job| (queue_item_from_job(job), job))
-        .filter(|(item, _)| {
-            !matches!(
+// How many groups `listgroups` reads under the queue lock at a time.
+const GROUP_CHUNK: usize = 256;
+
+// The database reads `listgroups` has made in this process, for the tests
+// that hold it to one read however many groups it lists.
+#[cfg(test)]
+pub(super) static LISTGROUPS_DB_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+// The groups `listgroups` answers with: the ids of every queue row still
+// downloading or post-processing, in queue order, read without copying a
+// row, and when each post-processing one began.
+struct GroupListing {
+    ids: Vec<JobId>,
+    post_started: HashMap<u64, i64>,
+}
+
+async fn group_listing(ctx: &NzbgetFacadeContext) -> GroupListing {
+    let (ids, post_ids) = ctx.queue.read_queue(|inner| {
+        let mut ids = Vec::with_capacity(inner.jobs.len());
+        let mut post_ids = Vec::new();
+        for row in &inner.jobs {
+            let view = row.view(&inner.globals);
+            let state = queue_item_state(QueueStateFacts::of_view(&view));
+            if matches!(state, QueueItemState::Completed | QueueItemState::Failed) {
+                continue;
+            }
+            if queue_item_state_in_post_processing(state) {
+                post_ids.push(row.id.0);
+            }
+            ids.push(row.id);
+        }
+        (ids, post_ids)
+    });
+    GroupListing {
+        ids,
+        post_started: post_started_at(ctx, post_ids).await,
+    }
+}
+
+// The groups for `ids`. The rows are copied under the lock and the groups
+// built after it is released; a job that left the queue or finished since
+// the listing is skipped.
+fn group_chunk(
+    ctx: &NzbgetFacadeContext,
+    ids: &[JobId],
+    post_started: &HashMap<u64, i64>,
+) -> Vec<Value> {
+    let jobs = ctx.queue.read_queue(|inner| {
+        ids.iter()
+            .filter_map(|id| inner.row(*id))
+            .map(|row| row.view(&inner.globals).list_info())
+            .collect::<Vec<_>>()
+    });
+    jobs.iter()
+        .filter_map(|job| {
+            let item = queue_table_item_from_job(job);
+            (!matches!(
                 item.state,
                 QueueItemState::Completed | QueueItemState::Failed
-            )
+            ))
+            .then(|| {
+                nzbget_group(
+                    &item,
+                    &reported_category(job.category.as_deref(), &job.metadata),
+                    nzbget_priority(&job.metadata),
+                    post_started.get(&item.id).copied(),
+                )
+            })
         })
-        .collect::<Vec<_>>();
-    let post_started = post_started_at(
-        ctx,
-        items
-            .iter()
-            .filter(|(item, _)| queue_item_state_in_post_processing(item.state))
-            .map(|(item, _)| item.id)
+        .collect()
+}
+
+async fn listgroups(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
+    let listing = group_listing(ctx).await;
+    Ok(Value::Array(
+        listing
+            .ids
+            .chunks(GROUP_CHUNK)
+            .flat_map(|ids| group_chunk(ctx, ids, &listing.post_started))
             .collect(),
+    ))
+}
+
+// `listgroups` over JSON-RPC: NZBGet has no paging for it, so the answer is
+// every group, written a chunk at a time as the client reads it. No chunk
+// holds the queue lock while it is serialised or sent.
+async fn listgroups_response(ctx: &NzbgetFacadeContext, id: Value) -> Response {
+    use tokio::io::AsyncWriteExt as _;
+
+    let listing = group_listing(ctx).await;
+    let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        let mut buf = Vec::with_capacity(GROUP_CHUNK * 1024);
+        buf.extend_from_slice(br#"{"version":"1.1","id":"#);
+        let _ = serde_json::to_writer(&mut buf, &id);
+        buf.extend_from_slice(br#","result":["#);
+        let mut first = true;
+        for ids in listing.ids.chunks(GROUP_CHUNK) {
+            for group in group_chunk(&ctx, ids, &listing.post_started) {
+                if !first {
+                    buf.push(b',');
+                }
+                first = false;
+                let _ = serde_json::to_writer(&mut buf, &group);
+            }
+            // The client went away; nothing is left to send it.
+            if writer.write_all(&buf).await.is_err() {
+                return;
+            }
+            buf.clear();
+        }
+        buf.extend_from_slice(b"]}");
+        let _ = writer.write_all(&buf).await;
+    });
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(reader)),
     )
-    .await;
-    let groups = items
-        .iter()
-        .map(|(item, job)| {
-            nzbget_group(
-                item,
-                &reported_category(job.category.as_deref(), &job.metadata),
-                nzbget_priority(&job.metadata),
-                post_started.get(&item.id).copied(),
-            )
-        })
-        .collect::<Vec<_>>();
-    Ok(Value::Array(groups))
+        .into_response()
 }
 
 // Events that mark a job's post-processing under way.
@@ -1705,6 +1791,8 @@ async fn post_started_at(ctx: &NzbgetFacadeContext, ids: Vec<u64>) -> HashMap<u6
     if ids.is_empty() {
         return HashMap::new();
     }
+    #[cfg(test)]
+    LISTGROUPS_DB_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let db = ctx.db.clone();
     let bounds =
         tokio::task::spawn_blocking(move || db.get_job_event_stage_bounds(&ids, POST_START_KINDS))
@@ -1969,13 +2057,30 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
     // history(Hidden): rows a client removed with HistoryDelete are listed
     // only when the first parameter is true.
     let include_hidden = optional_bool_param(&positional_params(params)?, 0)?.unwrap_or(false);
-    let terminal_items = ctx
-        .handle
-        .list_jobs()
+    // The queue's finished rows, copied, and the in-memory history, shared,
+    // under one queue lock: history is replaced under that lock, so a job
+    // moving from the queue into history is listed exactly once.
+    let (finished_rows, history_rows) = ctx.queue.read_queue(|inner| {
+        let finished = inner
+            .jobs
+            .iter()
+            .filter_map(|row| {
+                let view = row.view(&inner.globals);
+                matches!(
+                    queue_item_state(QueueStateFacts::of_view(&view)),
+                    QueueItemState::Completed | QueueItemState::Failed
+                )
+                .then(|| view.list_info())
+            })
+            .collect::<Vec<_>>();
+        (finished, ctx.queue.history_rows())
+    });
+    let terminal_items = finished_rows
         .iter()
+        .chain(history_rows.iter())
         .map(|job| {
             (
-                queue_item_from_job(job),
+                queue_table_item_from_job(job),
                 reported_category(job.category.as_deref(), &job.metadata),
                 implied_failure_kind(job),
             )
@@ -2722,6 +2827,10 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
         _ => {}
     }
 
+    // NZBGet applies an edit to every id it finds and answers true when it
+    // found at least one; a missing id holds back none of the others.
+    let mut applied = 0usize;
+    let mut missing = Vec::new();
     for job_id in request.ids {
         let result = match command.as_str() {
             "grouppause" => ctx.handle.pause_job(job_id).await,
@@ -2796,8 +2905,8 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
             other => return Err(RpcError::invalid_action(other)),
         };
         match result {
-            Ok(()) => {}
-            Err(SchedulerError::JobNotFound(_)) => return Ok(json!(false)),
+            Ok(()) => applied += 1,
+            Err(SchedulerError::JobNotFound(_)) => missing.push(job_id.0),
             Err(error) => {
                 return Err(RpcError::invalid_parameter(format!(
                     "{} failed: {error}",
@@ -2806,8 +2915,16 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
             }
         }
     }
+    if !missing.is_empty() {
+        tracing::debug!(
+            command = %request.command,
+            applied,
+            ?missing,
+            "editqueue named ids the queue does not hold"
+        );
+    }
 
-    Ok(json!(true))
+    Ok(json!(applied > 0))
 }
 
 // HistoryDelete hides the row from the client's default history listing but
@@ -3109,12 +3226,17 @@ async fn delete_as_duplicate(
 // The live queue in listing order, with each job's reported category and
 // priority.
 fn queue_order(ctx: &NzbgetFacadeContext) -> Vec<(QueueItem, String, i64)> {
-    ctx.handle
-        .list_jobs()
-        .iter()
+    let jobs = ctx.queue.read_queue(|inner| {
+        inner
+            .jobs
+            .iter()
+            .map(|row| row.view(&inner.globals).list_info())
+            .collect::<Vec<_>>()
+    });
+    jobs.iter()
         .map(|job| {
             (
-                queue_item_from_job(job),
+                queue_table_item_from_job(job),
                 reported_category(job.category.as_deref(), &job.metadata),
                 nzbget_priority(&job.metadata),
             )
@@ -3347,10 +3469,16 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
         return Ok(Value::Array(Vec::new()));
     };
     let targets: Vec<_> = ctx
-        .handle
-        .list_jobs()
+        .queue
+        .read_queue(|inner| inner.row(job_id).map(|row| row.info(&inner.globals)))
+        .or_else(|| {
+            ctx.queue
+                .history_rows()
+                .iter()
+                .find(|job| job.job_id == job_id)
+                .cloned()
+        })
         .into_iter()
-        .filter(|job| job.job_id == job_id)
         .collect();
     if targets.is_empty() {
         return Err(RpcError::invalid_parameter("nzb id not found in queue"));
@@ -3360,15 +3488,13 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
     for info in targets {
         let job_id = info.job_id;
         let db = ctx.db.clone();
-        let loaded = tokio::task::spawn_blocking(move || {
-            let nzb = db.load_active_job_persisted_nzb(job_id)?;
-            let runtime = db.load_active_file_runtime(job_id)?;
-            Ok::<_, weaver_server_core::StateError>((nzb, runtime))
-        })
-        .await
-        .map_err(|error| RpcError::invalid_parameter(format!("listfiles failed: {error}")))?
-        .map_err(|error| RpcError::invalid_parameter(format!("listfiles failed: {error}")))?;
-        let (persisted, (progress, complete)) = loaded;
+        let persisted =
+            tokio::task::spawn_blocking(move || db.load_active_job_persisted_nzb(job_id))
+                .await
+                .map_err(|error| RpcError::invalid_parameter(format!("listfiles failed: {error}")))?
+                .map_err(|error| {
+                    RpcError::invalid_parameter(format!("listfiles failed: {error}"))
+                })?;
         let Some((_, Some(nzb_zstd))) = persisted else {
             continue;
         };
@@ -3385,16 +3511,21 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
         let paused = item.state == QueueItemState::Paused;
         let output_dir = item.output_dir.clone().unwrap_or_default();
         for (index, file) in nzb.files.iter().enumerate() {
-            let index_u32 = index as u32;
             let total: u64 = file
                 .segments
                 .iter()
                 .map(|segment| segment.bytes as u64)
                 .sum();
-            let remaining = if job_done || complete.contains(&index_u32) {
+            // The job's snapshot says what of each file is still to come; a
+            // file it says nothing of has all of it to come.
+            let remaining = if job_done {
                 0
             } else {
-                total.saturating_sub(progress.get(&index_u32).copied().unwrap_or(0))
+                info.file_remaining_bytes
+                    .get(index)
+                    .copied()
+                    .unwrap_or(total)
+                    .min(total)
             };
             let (file_lo, file_hi) = size_parts(total);
             let (remaining_lo, remaining_hi) = size_parts(remaining);
@@ -3432,17 +3563,24 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
 }
 
 async fn postqueue(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
-    let items = ctx
-        .handle
-        .list_jobs()
+    // Only the queue's rows can be post-processing; history rows are done.
+    let jobs = ctx.queue.read_queue(|inner| {
+        inner
+            .jobs
+            .iter()
+            .filter_map(|row| {
+                let view = row.view(&inner.globals);
+                (matches!(view.status(), JobStatus::QueuedPostProcessing)
+                    || queue_item_state_in_post_processing(queue_item_state(
+                        QueueStateFacts::of_view(&view),
+                    )))
+                .then(|| view.list_info())
+            })
+            .collect::<Vec<_>>()
+    });
+    let items = jobs
         .iter()
-        .filter(|job| {
-            matches!(job.status, JobStatus::QueuedPostProcessing)
-                || queue_item_state_in_post_processing(
-                    weaver_server_api::queue_item_state_from_job_info(job),
-                )
-        })
-        .map(queue_item_from_job)
+        .map(queue_table_item_from_job)
         .collect::<Vec<_>>();
     let post_started = post_started_at(ctx, items.iter().map(|item| item.id).collect()).await;
     let entries = items
@@ -3706,12 +3844,15 @@ async fn log_entries(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result
     let id_from = optional_i64_param(&params, 0)?.unwrap_or(0).max(0) as u64;
     let limit = optional_i64_param(&params, 1)?.unwrap_or(0).max(0) as usize;
 
-    let jobs = ctx.handle.list_jobs();
-    let names: std::collections::HashMap<u64, String> = jobs
-        .iter()
-        .map(|job| (job.job_id.0, job.name.clone()))
-        .collect();
-    let ids: Vec<u64> = jobs.iter().map(|job| job.job_id.0).collect();
+    let history = ctx.queue.history_rows();
+    let ids: Vec<u64> = ctx.queue.read_queue(|inner| {
+        inner
+            .jobs
+            .iter()
+            .map(|row| row.id.0)
+            .chain(history.iter().map(|job| job.job_id.0))
+            .collect()
+    });
     let db = ctx.db.clone();
     // `limit == 0` means "no cap" everywhere else in this RPC surface, but an
     // unbounded fetch across every queued job in one query is not a
@@ -3723,6 +3864,27 @@ async fn log_entries(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result
     .await
     .map_err(|error| RpcError::invalid_parameter(format!("log unavailable: {error}")))?
     .map_err(|error| RpcError::invalid_parameter(format!("log unavailable: {error}")))?;
+    // Names only for the jobs the returned events name.
+    let wanted = events
+        .iter()
+        .map(|event| event.job_id)
+        .collect::<HashSet<_>>();
+    let mut names: HashMap<u64, String> = ctx.queue.read_queue(|inner| {
+        wanted
+            .iter()
+            .filter_map(|id| {
+                let row = inner.row(JobId(*id))?;
+                Some((*id, row.view(&inner.globals).job().name.clone()))
+            })
+            .collect()
+    });
+    for job in history.iter() {
+        if wanted.contains(&job.job_id.0) {
+            names
+                .entry(job.job_id.0)
+                .or_insert_with(|| job.name.clone());
+        }
+    }
 
     Ok(Value::Array(job_events_to_log_entries(
         events,

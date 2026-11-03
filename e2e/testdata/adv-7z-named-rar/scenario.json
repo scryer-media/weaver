@@ -1,0 +1,18 @@
+{
+  "slug": "adv-7z-named-rar",
+  "title": "E2E.Adversarial.7z.Named.Rar.2026-TESTGRP",
+  "description": "single-7z's archive posted under a .rar name. The graph opens it by content and delivers its member.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "fixtureAssets": [
+    "single-7z/archive.7z::adversarial.archive.rar"
+  ],
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "minOutputFiles": 1,
+    "forbiddenOutputs": [
+      "adversarial.archive.rar"
+    ]
+  }
+}

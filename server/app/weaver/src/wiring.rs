@@ -25,6 +25,7 @@ pub(crate) fn build_runtime_context(profile: SystemProfile) -> RuntimeContext {
         cores = profile.cpu.physical_cores,
         storage = ?profile.disk.storage_class,
         iops = format!("{:.0}", profile.disk.random_read_iops),
+        write_mbps = format!("{:.0}", profile.disk.sequential_write_mbps),
         "system profile"
     );
 

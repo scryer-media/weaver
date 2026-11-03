@@ -13,6 +13,12 @@ use weaver_graph::{Extraction, Kind};
 
 use crate::engine::{EngineObject, Format};
 
+// The directory is copied and decoded into entry metadata before any member
+// is emitted. Reserve its bounded peak ahead of the run.
+const ZIP_RUN_WINDOW: u64 = 60 << 20;
+pub(crate) const MAX_DIRECTORY_BYTES: u64 = 8 << 20;
+pub(crate) const MAX_DIRECTORY_ENTRIES: u64 = 50_000;
+
 pub struct ZipFormat;
 
 impl Format for ZipFormat {
@@ -26,6 +32,10 @@ impl Format for ZipFormat {
 
     fn run(password: Option<String>) -> Box<dyn Extraction> {
         Box::new(run::Run::new(password))
+    }
+
+    fn reserve() -> u64 {
+        ZIP_RUN_WINDOW
     }
 }
 

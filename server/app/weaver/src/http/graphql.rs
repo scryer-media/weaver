@@ -166,28 +166,76 @@ fn connection_init_api_key(
     }
 }
 
+// Stable codes the GraphQL endpoint sends as `code` beside `error` when it
+// refuses a request before the schema runs. Machine clients match the code,
+// never the sentence or the HTTP status alone. A released code is API: the
+// sentence may be reworded, but a code is never renamed, reused or
+// repurposed.
+pub(super) mod refusal {
+    // 401: an API key was presented (`Authorization: Bearer` or `X-API-Key`)
+    // and refused: malformed, conflicting between the two headers, unknown,
+    // or revoked.
+    pub(in crate::http) const INVALID_API_KEY: &str = "INVALID_API_KEY";
+    // 401: no API key was presented and no login or browser session the
+    // endpoint accepts came with the request.
+    pub(in crate::http) const AUTHENTICATION_REQUIRED: &str = "AUTHENTICATION_REQUIRED";
+    // 403: a browser session came with the request but failed its origin or
+    // CSRF binding.
+    pub(in crate::http) const BROWSER_VERIFICATION_REQUIRED: &str = "BROWSER_VERIFICATION_REQUIRED";
+
+    #[cfg(test)]
+    pub(in crate::http) const ALL: &[&str] = &[
+        INVALID_API_KEY,
+        AUTHENTICATION_REQUIRED,
+        BROWSER_VERIFICATION_REQUIRED,
+    ];
+}
+
+// The body for an authentication or browser-binding refusal. Only the body
+// changes: the status is the one the auth check chose, and any status that is
+// not a refusal (a storage failure, say) keeps its bare response.
+fn auth_refusal_response(status: StatusCode, headers: &HeaderMap) -> axum::response::Response {
+    match status {
+        StatusCode::UNAUTHORIZED
+            if headers.contains_key(header::AUTHORIZATION) || headers.contains_key("x-api-key") =>
+        {
+            super::coded_error_response(status, refusal::INVALID_API_KEY, "invalid API key")
+        }
+        StatusCode::UNAUTHORIZED => super::coded_error_response(
+            status,
+            refusal::AUTHENTICATION_REQUIRED,
+            "authentication required",
+        ),
+        StatusCode::FORBIDDEN => super::coded_error_response(
+            status,
+            refusal::BROWSER_VERIFICATION_REQUIRED,
+            "browser verification required",
+        ),
+        other => other.into_response(),
+    }
+}
+
 pub(super) async fn graphql_handler(
     Extension(schema): Extension<WeaverSchema>,
     Extension(request_auth): Extension<super::RequestAuthContext>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     req: GraphQLRequest,
-) -> Result<GraphQLResponse, StatusCode> {
+) -> Result<GraphQLResponse, axum::response::Response> {
     let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
     let resolved = match super::auth::resolve_script_run(&request_auth.db, &headers).await {
         Some(resolved) => resolved,
-        None => {
-            super::auth::resolve_caller(
-                &request_auth.db,
-                &request_auth.auth_cache,
-                &request_auth.api_key_cache,
-                request_auth.session_token.0.as_str(),
-                &request_auth.security,
-                super::auth::BrowserSessionPolicy::TrustedPeer(peer),
-                &headers,
-            )
-            .await?
-        }
+        None => super::auth::resolve_caller(
+            &request_auth.db,
+            &request_auth.auth_cache,
+            &request_auth.api_key_cache,
+            request_auth.session_token.0.as_str(),
+            &request_auth.security,
+            super::auth::BrowserSessionPolicy::TrustedPeer(peer),
+            &headers,
+        )
+        .await
+        .map_err(|status| auth_refusal_response(status, &headers))?,
     };
     if !matches!(
         resolved.identity,
@@ -195,7 +243,8 @@ pub(super) async fn graphql_handler(
             | weaver_server_api::auth::CallerIdentity::ScriptRun(_)
     ) {
         super::auth::validate_browser_csrf(&request_auth.db, &request_auth.security, &headers)
-            .await?;
+            .await
+            .map_err(|status| auth_refusal_response(status, &headers))?;
     }
     let mut request = req.into_inner();
     request = request

@@ -21,9 +21,12 @@
 // completes with that damage tolerated, as a damaged article does.
 
 use bytes::Bytes;
-use weaver_graph::{Builder, ByteRange, Effect, MemberId, NodeId, Placement, Provenance, Tree};
+use weaver_graph::{
+    Builder, ByteRange, Coverage, Effect, MemberId, NodeId, Placement, Provenance, Tree,
+};
 
-use super::{Arrival, NamespaceWriter, READ_BACK, Segments, WriteError};
+use super::{Arrival, NamespaceWriter, READ_BACK, Segments, Write, WriteError};
+use crate::pipeline::graph::leaf::Leaf;
 
 impl NamespaceWriter {
     pub(super) fn materialise(
@@ -46,7 +49,7 @@ impl NamespaceWriter {
             // What the object held came from the file, which still has it.
             self.take_held(node, member, super::ALL)?;
             if tree.child_of(node, member).is_some() {
-                self.replay_file(tree, builder, segments, node, member, out)?;
+                self.replay_file(tree, builder, segments, node, member, None, out)?;
             }
             self.release_subtree(tree, retired)?;
             return self.close_if_leaf(tree, node, member);
@@ -59,21 +62,36 @@ impl NamespaceWriter {
             .get(&node)
             .map(|files| files.holds.held_ranges(super::held_volume(member)))
             .unwrap_or_default();
-        if tree.child_of(node, member).is_some() {
-            self.replay(tree, builder, segments, node, member, super::ALL, out)?;
-        } else {
-            self.release_to_leaf(tree, node, member)?;
-        }
-        self.release_subtree(tree, retired)?;
         let record = tree
             .namespace(node)
             .and_then(|namespace| namespace.get(member))
             .ok_or(WriteError::UnknownMember { node, member })?;
+        let output_name = record.output_name.clone();
         let runs: Vec<_> = record
             .coverage
             .runs()
             .flat_map(|run| outside(run.range, &held).map(move |range| (range, run.provenance)))
             .collect();
+        let ranges: Vec<ByteRange> = runs.iter().map(|(range, _)| *range).collect();
+        let shared = match kept_as_volume(tree, (retired, volume), &ranges) {
+            Some(envelope) => {
+                let taken = ranges.iter().map(ByteRange::len).sum();
+                self.share_envelope(
+                    tree,
+                    (node, member),
+                    (retired, envelope),
+                    taken,
+                    &output_name,
+                )?
+            }
+            None => None,
+        };
+        if tree.child_of(node, member).is_some() {
+            self.replay(tree, builder, segments, node, member, super::ALL, None, out)?;
+        } else {
+            self.release_to_leaf(tree, node, member)?;
+        }
+        self.release_subtree(tree, retired)?;
         for (range, provenance) in runs {
             let mut at = range.start;
             while at < range.end {
@@ -86,19 +104,107 @@ impl NamespaceWriter {
                         offset: piece.start,
                         provenance: bytes.as_ref().map_or(Provenance::Damaged, |_| provenance),
                         bytes: bytes
-                            .unwrap_or_else(|| Bytes::from(vec![0; super::index(piece.len())])),
+                            .unwrap_or_else(|| Bytes::from(vec![0; super::index(piece.len())]))
+                            .into(),
                     };
                     // Reproduced bytes were evidence when they first came;
                     // damage is new, and the recovery objects hear it.
                     if arrival.provenance == provenance {
-                        self.route(tree, builder, segments, arrival, out)?;
+                        self.route_as_brought(tree, builder, segments, arrival, out)?;
                     } else {
-                        self.arrive(tree, builder, segments, arrival, out)?;
+                        // The member no longer holds what its record says
+                        // came there, a repair's bytes too: the damage is
+                        // what lies there now.
+                        if let Some(record) = tree
+                            .namespace_mut(node)
+                            .and_then(|namespace| namespace.get_mut(member))
+                        {
+                            record.coverage.erase(piece);
+                        }
+                        self.arrive(tree, builder, segments, Write::new(&arrival), arrival, out)?;
                     }
                 }
             }
         }
+        if let Some(envelope) = shared {
+            // The file is the member's now, or its engine's envelope: the
+            // retired object no longer keeps it, so it is not removed with
+            // the object's other envelopes.
+            self.envelopes.take(retired, envelope);
+        }
         self.close_if_leaf(tree, node, member)
+    }
+
+    // The retired object's envelope holds every byte the member took, at
+    // the member's own offsets, and nothing else, so the bytes go back into
+    // that same file rather than into a second one: the member's own file,
+    // which moves to its name once the checkpoint that records it there has
+    // committed, as any file waiting to move does, or the envelope of the
+    // engine bound in the object's place, which keeps it where it is. Until
+    // then the checkpoint the database holds names it as the retired
+    // object's envelope, so the bytes are on disk once, where both
+    // checkpoints look for them. The envelope, when it is shared; `None`,
+    // with nothing done, when it keeps more than the member took, or the
+    // bytes go to an object that is not an engine, which keeps only some of
+    // a volume as envelope, or to an engine whose envelope already started.
+    fn share_envelope(
+        &mut self,
+        tree: &Tree,
+        (node, member): (NodeId, MemberId),
+        (retired, envelope): (NodeId, u32),
+        taken: u64,
+        output_name: &str,
+    ) -> Result<Option<u32>, WriteError> {
+        let Some(kept) = self.envelopes.kept_file(retired, envelope) else {
+            return Ok(None);
+        };
+        if kept.covered != taken {
+            return Ok(None);
+        }
+        let shared = match tree.child_of(node, member) {
+            Some((child, at)) if tree.engine(child).is_some() => {
+                self.envelopes
+                    .start_in(child, at.0, &kept.name, kept.on_disk)
+            }
+            Some(_) => false,
+            None => {
+                let leaf = Leaf::over(&self.working_dir, &kept.name, kept.on_disk);
+                self.files_mut(node).leaves.insert(member, leaf);
+                self.intend(node, member, output_name);
+                true
+            }
+        };
+        Ok(shared.then_some(envelope))
+    }
+
+    // Bytes a member already took, placed again from where they went, each
+    // part by the posting that brought it: the first copy stands against
+    // them as it stood when they came, so all of them go down again.
+    pub(super) fn route_as_brought(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        arrival: Arrival,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let range = arrival.range();
+        let parts = tree.namespace(arrival.node).map_or_else(
+            || vec![(range, arrival.member)],
+            |namespace| namespace.brought(arrival.member, range),
+        );
+        for (part, posting) in parts {
+            let from = super::index(part.start - range.start);
+            let to = super::index(part.end - range.start);
+            let piece = Arrival {
+                member: posting,
+                offset: part.start,
+                bytes: arrival.bytes.slice(from..to),
+                ..arrival.clone()
+            };
+            self.route(tree, builder, segments, piece, out)?;
+        }
+        Ok(())
     }
 
     fn close_if_leaf(
@@ -154,13 +260,73 @@ impl NamespaceWriter {
             if matches!(placement, Placement::Held { .. }) {
                 continue;
             }
-            let mut into = Vec::new();
-            let posted = object.posted(volume, piece, &mut read, &mut into)
-                && into.len() as u64 == piece.len();
-            pieces.push((piece, posted.then(|| Bytes::from(into))));
+            // Each part the placement's source holds, and each gap between
+            // them, is posted on its own, so a gap costs that gap, not the
+            // piece around it. The object is asked for every part: bytes it
+            // took and never placed in its source, a cipher block still short
+            // of its end, are its to give back.
+            let mut skip = 0;
+            let mut parts = Vec::new();
+            for kept in self.kept(tree, retired, placement) {
+                if kept.start > skip {
+                    parts.push(ByteRange::new(skip, kept.start));
+                }
+                parts.push(kept);
+                skip = kept.end;
+            }
+            if skip < piece.len() {
+                parts.push(ByteRange::new(skip, piece.len()));
+            }
+            for part in parts {
+                let part = part.shift(piece.start as i64);
+                let mut into = Vec::new();
+                let posted = object.posted(volume, part, &mut read, &mut into)
+                    && into.len() as u64 == part.len();
+                pieces.push((part, posted.then(|| Bytes::from(into))));
+            }
         }
         tree.put_object(retired, object);
         pieces
+    }
+
+    // The parts of a placement its source holds, as offsets into the
+    // placement, in order: what the envelope kept, or what reached the
+    // member. They cut the placement's parts; the object says which it can
+    // post again.
+    fn kept(&self, tree: &Tree, retired: NodeId, placement: &Placement) -> Vec<ByteRange> {
+        let held = |coverage: &Coverage, range: ByteRange| {
+            let mut parts: Vec<ByteRange> = Vec::new();
+            for run in coverage.overlapping(range) {
+                let Some(part) = run.range.intersect(range) else {
+                    continue;
+                };
+                let part = part.shift(-(range.start as i64));
+                match parts.last_mut() {
+                    Some(last) if last.end == part.start => last.end = part.end,
+                    _ => parts.push(part),
+                }
+            }
+            parts
+        };
+        match placement {
+            Placement::Member { member, range } => tree
+                .namespace(retired)
+                .and_then(|namespace| namespace.get(*member))
+                .map(|record| held(&record.coverage, *range))
+                .unwrap_or_default(),
+            Placement::Envelope { envelope, range } => self
+                .envelopes
+                .shelf_of(retired)
+                .and_then(|shelf| {
+                    let state = shelf.lock();
+                    state
+                        .kept
+                        .get(envelope)
+                        .map(|kept| held(&kept.coverage, *range))
+                })
+                .unwrap_or_default(),
+            Placement::Held { .. } => Vec::new(),
+        }
     }
 
     // Every byte held anywhere under the retired node goes to its member's
@@ -185,8 +351,45 @@ impl NamespaceWriter {
     }
 }
 
+// The envelope in which the object at `node` places every byte of `ranges`
+// of its volume, at the volume's own offsets, if one does: that envelope's
+// file holds those bytes as the volume does.
+pub(super) fn kept_as_volume(
+    tree: &Tree,
+    (node, volume): (NodeId, weaver_graph::VolumeIndex),
+    ranges: &[ByteRange],
+) -> Option<u32> {
+    let mut placements = Vec::new();
+    let mut kept_in = None;
+    for range in ranges {
+        placements.clear();
+        tree.locate(node, volume, *range, &mut placements);
+        let mut at = range.start;
+        for placement in &placements {
+            let Placement::Envelope {
+                envelope,
+                range: kept,
+            } = placement
+            else {
+                return None;
+            };
+            if kept.start != at || *kept_in.get_or_insert(*envelope) != *envelope {
+                return None;
+            }
+            at = kept.end;
+        }
+        if at != range.end {
+            return None;
+        }
+    }
+    kept_in
+}
+
 // The parts of `range` no held range covers, in order.
-fn outside(range: ByteRange, held: &[ByteRange]) -> impl Iterator<Item = ByteRange> + '_ {
+pub(super) fn outside(
+    range: ByteRange,
+    held: &[ByteRange],
+) -> impl Iterator<Item = ByteRange> + '_ {
     let mut cuts: Vec<ByteRange> = held
         .iter()
         .filter_map(|hold| hold.intersect(range))

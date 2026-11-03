@@ -6,6 +6,8 @@ mod import;
 pub mod metadata;
 pub mod naming;
 mod persisted_nzb;
+#[cfg(test)]
+pub(crate) use persisted_nzb::NZB_PARSES;
 mod submission;
 mod torrent_fetch;
 mod xz;
@@ -41,4 +43,3 @@ pub use submission::{
 };
 pub use torrent_fetch::fetch_torrent_url;
 pub use xz::{XZ_DECODER_MEMORY_LIMIT_BYTES, xz_multistream_decoder};
-pub(crate) use xz::{XzFilesystemDecoderKind, xz_filesystem_decoder_kind, xz_parallel_decoder};

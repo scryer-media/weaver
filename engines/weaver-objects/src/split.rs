@@ -3,12 +3,9 @@
 
 // A file cut into numbered pieces, the way a split 7z or a split stream is
 // posted: `name.001`, `name.002`, … The number is the name's last
-// extension, all digits, and a set counts from its first piece's own
-// number, whatever that is: `.001`, `.10` and `.100` alike, so a set renamed
-// to numbers of its own chains as a plain one does. Only the first piece
-// says what the set is; the others carry no signature, so their names are
-// all that places them. A set known by names alone counts from the number
-// its format gives the first piece. Case never matters.
+// extension, all digits. A piece's place counts from one: the split store
+// names `.001` its first piece, and `.10` or `.100` is never a first piece.
+// Case never matters.
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Piece {
@@ -31,14 +28,6 @@ impl Piece {
             stem: self.stem.clone(),
             number,
         }
-    }
-
-    pub(crate) fn same_set(&self, other: &Piece) -> bool {
-        self.stem == other.stem
-    }
-
-    pub(crate) fn number(&self) -> u32 {
-        self.number
     }
 }
 
@@ -69,10 +58,14 @@ mod tests {
         parse(name)?.index_from(&parse(first)?)
     }
 
+    // Counted from the first piece the helper is given: the split store
+    // gives it `.001`, so `.10` is its tenth piece.
     #[test]
-    fn a_piece_counts_from_the_first_pieces_own_number() {
+    fn a_piece_counts_from_the_first_piece_its_owner_names() {
         assert_eq!(index("set.7z.001", "set.7z.001"), Some(0));
         assert_eq!(index("set.7z.001", "SET.7Z.003"), Some(2));
+        assert_eq!(index("c0ffee.001", "c0ffee.10"), Some(9));
+        assert_eq!(index("c0ffee.001", "c0ffee.100"), Some(99));
         assert_eq!(index("c0ffee.10", "c0ffee.12"), Some(2));
         assert_eq!(index("c0ffee.100", "c0ffee.101"), Some(1));
         assert_eq!(index("c0ffee.10", "c0ffee.9"), None);

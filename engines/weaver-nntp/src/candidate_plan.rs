@@ -66,6 +66,9 @@ pub struct CandidateSnapshot<C> {
 #[derive(Clone, Debug)]
 pub struct PlanSnapshot<C> {
     pub pinned: Option<C>,
+    // The order the plan dials its candidates in: the pin first, then the
+    // rest as `dial_order` ranks them.
+    pub dial_order: Vec<C>,
     pub candidates: Vec<CandidateSnapshot<C>>,
     pub races_won: u64,
     pub races_failed: u64,
@@ -259,8 +262,9 @@ pub struct CandidatePlan<C: Candidate> {
     pub(crate) pending: Option<RaceReason>,
     // Why the last race found nothing, handed to callers that waited on it.
     pub(crate) last_race_error: Option<(io::ErrorKind, String)>,
-    // When a race last found no address while nothing was pinned. Holds
-    // further races off for the timing's `failed_race_holdoff`.
+    // When a race last found no address, whether or not it kept a pin. Holds
+    // further races off for the timing's `failed_race_holdoff`: every race
+    // with nothing pinned, and a suspicion race on a kept pin.
     pub(crate) last_race_failed_at: Option<Instant>,
     pub(crate) races_won: u64,
     pub(crate) races_failed: u64,
@@ -298,6 +302,11 @@ impl<C: Candidate> CandidatePlan<C> {
                 None
             }
             (None, _) => Some(RaceReason::Initial),
+            // A race that found nothing answering kept this pin, so the pin's
+            // refusals since say nothing that race did not: the suspicion
+            // waits out the holdoff, and connects dial the pin and then the
+            // others meanwhile.
+            (Some(_), Some(RaceReason::Suspect)) if self.failed_race_is_recent(now) => None,
             (Some(_), Some(pending)) => Some(pending),
             (Some(_), None) if self.pin_is_due(now) => Some(RaceReason::Interval),
             (Some(pin), None) if self.verdict_is_allowed(now) => {
@@ -759,10 +768,9 @@ impl<C: Candidate> CandidatePlan<C> {
             Err(error) => {
                 self.races_failed += 1;
                 self.last_race_error = Some(error);
+                self.last_race_failed_at = Some(now);
                 if previous.is_some() {
                     self.chosen_at = Some(now);
-                } else {
-                    self.last_race_failed_at = Some(now);
                 }
             }
         }
@@ -779,6 +787,7 @@ impl<C: Candidate> CandidatePlan<C> {
     pub fn snapshot(&self) -> PlanSnapshot<C> {
         PlanSnapshot {
             pinned: self.pinned,
+            dial_order: self.dial_order(),
             races_won: self.races_won,
             races_failed: self.races_failed,
             candidates: self

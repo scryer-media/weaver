@@ -139,6 +139,26 @@ fn the_whole_member_grid_folds_every_piece() {
     );
 }
 
+// A piece inside a folded whole comes again with other bytes, as an article
+// sent back can: what the whole folded to before stands for bytes no longer
+// there, so the whole is not proved on it.
+#[test]
+fn a_piece_said_again_with_other_bytes_leaves_the_whole_unproved() {
+    let bytes = payload(8, 5000);
+    let mut grid = Grid::default();
+    let pieces = segments(0, &bytes, 700, 512, true);
+    for segment in &pieces {
+        grid.offer(MEMBER, WHOLE, segment);
+    }
+    let whole = ByteRange::new(0, 5000);
+    let proved = |grid: &Grid| verdict(grid.fold(MEMBER, WHOLE, 0, whole), 5000, 0, crc32(&bytes));
+    assert_eq!(proved(&grid), SliceVerdict::Intact);
+    let mut other = pieces[3];
+    other.crc32 = !other.crc32;
+    grid.offer(MEMBER, WHOLE, &other);
+    assert_ne!(proved(&grid), SliceVerdict::Intact);
+}
+
 #[test]
 fn a_file_over_its_run_budget_forgets_the_block() {
     // Unmergeable runs: every other byte of one huge block.

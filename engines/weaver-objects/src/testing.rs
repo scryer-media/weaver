@@ -8,11 +8,11 @@
 pub(crate) mod replay;
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use weaver_graph::recovery::MemberAccess;
 use weaver_graph::{
-    Beside, ByteRange, Delivery, MemberId, Namespace, Object, ObjectId, Provenance, Segment,
+    Beside, ByteRange, Delivery, Emit, MemberId, Namespace, Object, ObjectId, Provenance, Segment,
     Standing, VolumeIndex,
 };
 
@@ -100,12 +100,40 @@ pub(crate) fn zip64_end(last: &mut Vec<u8>, disks: u32, edit: impl FnOnce(&mut Z
     last.extend(0u16.to_le_bytes());
 }
 
+// A whole zip cloaked: the directory entry named `from` renamed `to`, a
+// name of the same length, while its local header keeps the old one.
+pub(crate) fn cloak(archive: &mut [u8], from: &str, to: &str) {
+    use crate::zip::records::{CENTRAL_LEN, directory, find_end};
+    assert_eq!(from.len(), to.len());
+    let end = find_end(archive).unwrap();
+    let start = end.offset as usize;
+    let entries = directory(&archive[start..start + end.size as usize], end.entries).unwrap();
+    let entry = entries
+        .iter()
+        .find(|entry| entry.header.name == from)
+        .unwrap();
+    let name = start + entry.span.start + CENTRAL_LEN;
+    archive[name..name + to.len()].copy_from_slice(to.as_bytes());
+}
+
 // A PAR2 set over `files`, made by par2-rs's creator: the index first, then
 // the recovery volumes.
 pub(crate) fn par2_set(
     stem: &str,
     files: &[(&str, &[u8])],
     block: u64,
+    recovery: u32,
+    volumes: u32,
+) -> Vec<(String, Vec<u8>)> {
+    par2_set_from(stem, files, block, 0, recovery, volumes)
+}
+
+// The same, its recovery blocks numbered from `first`.
+pub(crate) fn par2_set_from(
+    stem: &str,
+    files: &[(&str, &[u8])],
+    block: u64,
+    first: u32,
     recovery: u32,
     volumes: u32,
 ) -> Vec<(String, Vec<u8>)> {
@@ -121,6 +149,7 @@ pub(crate) fn par2_set(
     options.block_sizing = BlockSizing::Bytes(block);
     options.recovery_amount = RecoveryAmount::Count(recovery);
     options.volume_count = Some(volumes);
+    options.first_exponent = first;
     let creator = Par2Creator::new(options);
     let created = creator.create(&creator.plan().unwrap()).unwrap();
     read_outputs(&created.output_paths)
@@ -214,9 +243,17 @@ pub(crate) fn segments(
 pub(crate) struct Store {
     pub(crate) members: BTreeMap<MemberId, Vec<u8>>,
     pub(crate) volumes: BTreeMap<VolumeIndex, Vec<u8>>,
+    // Ranges of members that never arrived, in offset order: a read across
+    // one fails, as the namespace's would, and a repair over one fills it.
+    pub(crate) holes: BTreeMap<MemberId, Vec<ByteRange>>,
     pub(crate) reads: usize,
+    // The bytes of members read back.
+    pub(crate) read_bytes: u64,
     pub(crate) volume_reads: usize,
     pub(crate) writes: usize,
+    // A directory lent for work on files, as a namespace that keeps them
+    // lends one.
+    pub(crate) scratch: Option<PathBuf>,
 }
 
 impl MemberAccess for Store {
@@ -225,8 +262,13 @@ impl MemberAccess for Store {
         let Some(bytes) = self.members.get(&member) else {
             return false;
         };
+        let holes = self.holes.get(&member).map_or(&[][..], Vec::as_slice);
+        if holes.iter().any(|hole| hole.intersect(range).is_some()) {
+            return false;
+        }
         match bytes.get(range.start as usize..range.end as usize) {
             Some(piece) => {
+                self.read_bytes += piece.len() as u64;
                 into.extend_from_slice(piece);
                 true
             }
@@ -234,8 +276,16 @@ impl MemberAccess for Store {
         }
     }
 
+    fn scratch(&mut self) -> Option<PathBuf> {
+        self.scratch.clone()
+    }
+
     fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
         self.writes += 1;
+        let written = ByteRange::at(offset, bytes.len() as u64);
+        if let Some(holes) = self.holes.get_mut(&member) {
+            holes.retain(|hole| hole.intersect(written).is_none());
+        }
         if let Some(found) = self.members.get_mut(&member) {
             let start = offset as usize;
             if found.len() < start + bytes.len() {
@@ -247,6 +297,22 @@ impl MemberAccess for Store {
 
     fn length(&self, member: MemberId) -> Option<u64> {
         self.members.get(&member).map(|bytes| bytes.len() as u64)
+    }
+
+    fn arrived(&self, member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {
+        let mut start = range.start;
+        for hole in self.holes.get(&member).map_or(&[][..], Vec::as_slice) {
+            let Some(cut) = hole.intersect(range) else {
+                continue;
+            };
+            if cut.start > start {
+                out.push(ByteRange::new(start, cut.start));
+            }
+            start = start.max(cut.end);
+        }
+        if start < range.end {
+            out.push(ByteRange::new(start, range.end));
+        }
     }
 
     fn read_volume(&mut self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool {
@@ -315,10 +381,10 @@ impl<O: Object> Job<O> {
     pub(crate) fn name(&mut self, name: &str, bytes: &[u8]) -> VolumeIndex {
         let (front, length) = (&bytes[..bytes.len().min(64)], Some(bytes.len() as u64));
         let claimed = self.object.claim(name, front, length);
-        let volume = match claimed {
-            Some(volume) => volume,
-            None if self.store.volumes.is_empty() => VolumeIndex(0),
-            None => panic!("claimed"),
+        let volume = match claimed[..] {
+            [volume] => volume,
+            [] if self.store.volumes.is_empty() => VolumeIndex(0),
+            _ => panic!("claimed"),
         };
         self.object.bound(volume, name, front, length);
         self.store.volumes.insert(volume, bytes.to_vec());
@@ -347,19 +413,52 @@ impl<O: Object> Job<O> {
             pieces.reverse();
         }
         let mut out = Vec::new();
+        let length = bytes.len() as u64;
         for (offset, piece) in pieces {
-            self.object.deliver(
-                Delivery {
-                    volume,
-                    offset: offset as u64,
-                    bytes: piece,
-                    provenance: Provenance::Fresh,
-                },
-                &mut |_, _| false,
-                &mut out,
-            );
+            self.object.sized(volume, length, &mut out);
+            self.deliver(volume, offset as u64, piece, &mut out);
+            self.again(volume, bytes, &mut out);
         }
+        self.object.sized(volume, length, &mut out);
+        self.object.volume_reached(volume, length, &mut out);
         self.object.volume_closed(volume, &mut out);
+        self.again(volume, bytes, &mut out);
         volume
+    }
+
+    fn deliver(&mut self, volume: VolumeIndex, offset: u64, bytes: &[u8], out: &mut Vec<Emit>) {
+        self.object.deliver(
+            Delivery {
+                volume,
+                offset,
+                bytes: &weaver_graph::Evidenced::from(bytes.to_vec()),
+                provenance: Provenance::Fresh,
+            },
+            &mut |_, _| false,
+            out,
+        );
+    }
+
+    // What the object asked for again of its volume comes again from
+    // `bytes`, as the tree reads it back: forgotten first, then delivered.
+    fn again(&mut self, volume: VolumeIndex, bytes: &[u8], out: &mut Vec<Emit>) {
+        while let Some(at) = out
+            .iter()
+            .position(|emit| matches!(emit, Emit::Again { .. }))
+        {
+            let Emit::Again {
+                volume: asked,
+                range,
+            } = out.remove(at)
+            else {
+                unreachable!();
+            };
+            if asked != volume {
+                continue;
+            }
+            self.object.unposted(volume, range);
+            let piece = &bytes[range.start as usize..range.end as usize];
+            self.deliver(volume, range.start, piece, out);
+        }
     }
 }

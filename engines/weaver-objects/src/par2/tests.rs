@@ -1,13 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+mod carriers;
 mod facts;
+mod per_call;
+mod recovery_contracts;
 
 use weaver_graph::recovery::RepairOutcome;
-use weaver_graph::{ByteRange, MemberId, Object, ObjectId, Provenance, Recovery, SliceVerdict};
+use weaver_graph::{
+    ByteRange, MemberId, Object, ObjectId, Provenance, Recovery, SliceVerdict, VolumeIndex,
+};
 
 use super::Par2;
-use crate::testing::{Job, par2_set, payload, segments};
+use crate::testing::{Job, par2_set, par2_set_from, payload, segments};
 
 const OWN: ObjectId = ObjectId(7);
 const BLOCK: u64 = 512;
@@ -73,6 +78,98 @@ fn damaged_member(
     (member, article)
 }
 
+// Descriptions arrive before IFSC, either in the same carrier or another.
+// Only two slices are wrong: whole-file fallback would exhaust the two
+// recovery blocks before the metadata that identifies those slices arrives.
+#[test]
+fn delayed_slice_checksums_repair_with_only_the_needed_blocks() {
+    for later_carrier in [false, true] {
+        let data = payload(1, 5000);
+        let mut files = par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1);
+        let mut checksums = None;
+        for (_, bytes) in &mut files {
+            let mut kept = Vec::new();
+            let mut at = 0;
+            while at < bytes.len() {
+                let len = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap()) as usize;
+                assert!(len >= 64 && at + len <= bytes.len());
+                let packet = &bytes[at..at + len];
+                if packet[48..64].starts_with(b"PAR 2.0\0IFSC") {
+                    checksums.get_or_insert_with(|| packet.to_vec());
+                } else {
+                    kept.extend_from_slice(packet);
+                }
+                at += len;
+            }
+            *bytes = kept;
+        }
+        let checksums = checksums.expect("fixture carries IFSC");
+        let delayed = if later_carrier { files.len() - 1 } else { 0 };
+        let boundary = files[delayed].1.len();
+        files[delayed].1.extend_from_slice(&checksums);
+        let mut job = Job::new(Par2::new(OWN), OWN);
+        let mut wrong = data.clone();
+        wrong[7] ^= 0x5a;
+        wrong[BLOCK as usize + 7] ^= 0x5a;
+        let member = job.member("payload.bin", &wrong);
+        let bad = ByteRange::new(0, 2 * BLOCK);
+        job.arrive(member, 0, &wrong[..bad.end as usize], Provenance::Damaged);
+        let volumes: Vec<_> = files
+            .iter()
+            .map(|(name, bytes)| job.name(name, bytes))
+            .collect();
+        for (index, (_, bytes)) in files.iter().enumerate() {
+            let end = if index == delayed {
+                boundary
+            } else {
+                bytes.len()
+            };
+            job.object.deliver(
+                weaver_graph::Delivery {
+                    volume: volumes[index],
+                    offset: 0,
+                    bytes: &weaver_graph::Evidenced::from(bytes[..end].to_vec()),
+                    provenance: Provenance::Fresh,
+                },
+                &mut |_, _| false,
+                &mut Vec::new(),
+            );
+            if index != delayed {
+                job.object.volume_closed(volumes[index], &mut Vec::new());
+            }
+        }
+        bind(&mut job);
+        feed(&mut job, member, &wrong, Some(bad));
+        assert_eq!(
+            job.object
+                .repair(&mut job.store, weaver_graph::Budget::default()),
+            RepairOutcome::Waiting
+        );
+        assert_eq!(job.store.members[&member], wrong);
+        let mut wants = Vec::new();
+        Recovery::wants(&job.object, &mut wants);
+        assert!(!wants.is_empty());
+        job.object.deliver(
+            weaver_graph::Delivery {
+                volume: volumes[delayed],
+                offset: boundary as u64,
+                bytes: &weaver_graph::Evidenced::from(checksums.to_vec()),
+                provenance: Provenance::Fresh,
+            },
+            &mut |_, _| false,
+            &mut Vec::new(),
+        );
+        job.object.volume_closed(volumes[delayed], &mut Vec::new());
+        bind(&mut job);
+        assert!(matches!(
+            job.object
+                .repair(&mut job.store, weaver_graph::Budget::default()),
+            RepairOutcome::Repaired { .. }
+        ));
+        assert_eq!(job.store.members[&member], data);
+    }
+}
+
 #[test]
 fn binds_by_its_described_name_without_renaming() {
     let data = payload(1, 5000);
@@ -102,6 +199,116 @@ fn binds_by_prefix_and_renames_through_the_namespace() {
     assert_eq!(job.namespace.get(member).unwrap().name, "payload.bin");
     // Bound now by name, it is not renamed again.
     assert!(bind(&mut job).is_empty());
+}
+
+#[test]
+fn unique_content_outranks_another_files_exact_name() {
+    let a = payload(31, 5000);
+    let b = payload(32, 5000);
+    let mut job = job(&par2_set(
+        "set",
+        &[("a.bin", &a), ("b.bin", &b)],
+        BLOCK,
+        2,
+        1,
+    ));
+    let member = job.member("b.bin", &a);
+    assert_eq!(bind(&mut job), vec![member]);
+    assert!(job.object.covers(member));
+    assert_eq!(job.namespace.get(member).unwrap().name, "a.bin");
+}
+
+#[test]
+fn identical_files_bind_to_their_exact_described_names_without_repair() {
+    let data = payload(33, 5000);
+    let mut job = job(&par2_set(
+        "set",
+        &[("a.bin", &data), ("b.bin", &data)],
+        BLOCK,
+        2,
+        1,
+    ));
+    let a = job.member("a.bin", &data);
+    let b = job.member("b.bin", &data);
+    assert!(bind(&mut job).is_empty());
+    for member in [a, b] {
+        assert!(job.object.covers(member));
+        feed(&mut job, member, &data, None);
+        assert!(
+            verdicts(&job, member)
+                .iter()
+                .all(|v| *v == SliceVerdict::Intact)
+        );
+    }
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
+    assert_eq!(job.store.writes, 0);
+}
+
+#[test]
+fn a_content_tie_requires_an_exact_name_among_the_matching_descriptions() {
+    let data = payload(33, 5000);
+    let other = payload(34, 5000);
+    let mut job = job(&par2_set(
+        "set",
+        &[("a.bin", &data), ("b.bin", &data), ("c.bin", &other)],
+        BLOCK,
+        2,
+        1,
+    ));
+    for name in ["obfuscated", "A.BIN", "c.bin"] {
+        let member = job.member(name, &data);
+        assert!(bind(&mut job).is_empty());
+        assert!(
+            !job.object.covers(member),
+            "{name} must not resolve the tie"
+        );
+    }
+}
+
+#[test]
+fn an_exact_name_resolves_a_prefix_tie_without_hiding_later_damage() {
+    let a = payload(35, 40_000);
+    let mut b = a.clone();
+    b[20_000] ^= 0x5A;
+    let mut job = job(&par2_set(
+        "set",
+        &[("a.bin", &a), ("b.bin", &b)],
+        BLOCK,
+        2,
+        1,
+    ));
+    let member = job.member("b.bin", &a);
+    assert!(bind(&mut job).is_empty());
+    assert!(job.object.covers(member));
+    feed(&mut job, member, &a, None);
+    let seen = verdicts(&job, member);
+    assert!(seen.contains(&SliceVerdict::Damaged));
+    assert!(!seen.contains(&SliceVerdict::Intact));
+}
+
+// A member its producer started over and announced again under the name it
+// was posted with has lost the front it was known by, so nothing binds it by
+// that name; once its front arrives again it is known by its content and
+// renamed a second time.
+#[test]
+fn a_member_announced_again_under_its_posted_name_is_renamed_again_by_its_front() {
+    let data = payload(3, 40_000);
+    let mut job = job(&par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1));
+    let member = job.member("a8f3c1e09b", &data);
+    assert_eq!(bind(&mut job), vec![member]);
+    job.namespace.retract(member);
+    job.namespace.rename(member, "a8f3c1e09b");
+    job.namespace.get_mut(member).unwrap().length = Some(data.len() as u64);
+    assert!(bind(&mut job).is_empty());
+    assert!(!job.object.covers(member));
+    job.arrive(member, 0, &data, Provenance::Fresh);
+    assert_eq!(bind(&mut job), vec![member]);
+    assert!(job.object.covers(member));
+    assert_eq!(job.namespace.get(member).unwrap().name, "payload.bin");
 }
 
 #[test]
@@ -138,7 +345,11 @@ fn a_clean_set_repairs_with_zero_reads() {
             .iter()
             .all(|verdict| *verdict == SliceVerdict::Intact)
     );
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
     assert_eq!((job.store.reads, job.store.volume_reads), (0, 0));
 }
 
@@ -148,7 +359,11 @@ fn an_unfed_clean_member_is_read_back_and_found_clean() {
     let mut job = job(&par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1));
     job.member("payload.bin", &data);
     bind(&mut job);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
     assert!(job.store.reads > 0);
     assert_eq!(job.store.writes, 0);
 }
@@ -212,13 +427,84 @@ fn a_damaged_member_is_repaired_through_member_access() {
     bind(&mut job);
     let wrong = job.store.members[&member].clone();
     feed(&mut job, member, &wrong, Some(bad));
-    let outcome = job.object.repair(&mut job.store);
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
     assert!(
         matches!(outcome, RepairOutcome::Repaired { slices } if slices >= 1),
         "{outcome:?}"
     );
     assert!(job.store.members[&member] == data);
     assert!(job.store.writes > 0 && job.store.volume_reads > 0);
+}
+
+// A member that arrived with its bytes shifted along by three, so three
+// longer than described, is rebuilt, and the bind after recognises it at the
+// described length: what is left is the file, its whole-file hash the
+// description's.
+#[test]
+fn a_repaired_member_longer_than_described_is_recognised_at_its_length() {
+    let data = payload(12, 5000);
+    let mut job = job(&par2_set("set", &[("payload.bin", &data)], BLOCK, 12, 1));
+    let mut shifted = vec![0x9b, 0x7d, 0x1f];
+    shifted.extend_from_slice(&data);
+    let member = job.member("payload.bin", &shifted);
+    assert!(bind(&mut job).is_empty());
+    feed(&mut job, member, &shifted, None);
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
+    assert!(
+        matches!(outcome, RepairOutcome::Repaired { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(bind(&mut job), vec![member]);
+    let record = job.namespace.get(member).unwrap();
+    assert_eq!(record.name, "payload.bin");
+    assert_eq!(record.length, Some(data.len() as u64));
+    assert!(record.is_complete());
+    let described = job
+        .object
+        .sets
+        .values()
+        .find_map(|state| {
+            let file = state
+                .members()
+                .iter()
+                .find_map(|(file, bound)| (*bound == member).then_some(*file))?;
+            state.usable()?.file_description(&file).cloned()
+        })
+        .expect("the set describes the member");
+    assert_eq!(described.length, data.len() as u64);
+    let repaired = &job.store.members[&member][..data.len()];
+    assert_eq!(par2_rs::checksum::md5(repaired), described.hash_full);
+    // Recognised once, it is not again.
+    assert!(bind(&mut job).is_empty());
+}
+
+// A member none of whose bytes came, booked at more than the described
+// length for the articles it lost, is rebuilt at the described length and
+// takes it: what was booked never arrived, and keeps its name. The bind
+// lists it, as it lists every member it settles at another length.
+#[test]
+fn a_repaired_member_booked_longer_than_described_takes_the_described_length() {
+    let data = payload(13, 5000);
+    let mut job = job(&par2_set("set", &[("payload.bin", &data)], BLOCK, 12, 1));
+    let booked = data.len() as u64 + 300;
+    let member = job.namespace.announce("payload.bin", Some(booked));
+    job.store.members.insert(member, Vec::new());
+    assert!(bind(&mut job).is_empty());
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
+    assert!(
+        matches!(outcome, RepairOutcome::Repaired { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(bind(&mut job), vec![member]);
+    let record = job.namespace.get(member).unwrap();
+    assert_eq!(record.name, "payload.bin");
+    assert_eq!(record.length, Some(data.len() as u64));
 }
 
 #[test]
@@ -238,7 +524,8 @@ fn two_sets_in_one_namespace_bind_and_repair_apart() {
     assert_eq!(verdicts(&job, first).len(), 10);
     assert_eq!(verdicts(&job, second).len(), 6);
     assert!(matches!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { .. }
     ));
     assert!(job.store.members[&second] == two);
@@ -270,7 +557,8 @@ fn a_shared_recovery_file_feeds_both_sets() {
     feed(&mut job, right, &wrong, Some(right_bad));
     assert_eq!(reachable(&job.object), 4);
     assert!(matches!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { .. }
     ));
     assert!(job.store.members[&left] == one);
@@ -297,6 +585,33 @@ fn blocks_reachable_drops_when_a_volume_is_lost() {
     assert!(reachable(&job.object) < before);
 }
 
+// Two losses told apart, then told again as the one run they make, as a
+// restore tells them: the blocks they take from what the open volume is
+// asked to bring are counted once.
+#[test]
+fn a_loss_told_again_as_one_run_costs_its_blocks_once() {
+    let data = payload(15, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 16, 2);
+    let mut job = job(&files[..2]);
+    job.member("payload.bin", &data);
+    let later = named_volume(&mut job, &files[files.len() - 1]);
+    bind(&mut job);
+    let coming = |object: &Par2| object.volumes[later.0 as usize].coming(object.smallest_packet());
+    let whole = coming(&job.object);
+    let mut out = Vec::new();
+    job.object
+        .volume_lost(later, ByteRange::new(0, 1), &mut out);
+    job.object
+        .volume_lost(later, ByteRange::new(1, 2), &mut out);
+    let lost = coming(&job.object);
+    assert!(lost < whole, "the losses cost blocks");
+    job.object
+        .volume_lost(later, ByteRange::new(0, 2), &mut out);
+    job.object
+        .volume_lost(later, ByteRange::new(1, 2), &mut out);
+    assert_eq!(coming(&job.object), lost);
+}
+
 #[test]
 fn a_repair_short_of_blocks_reports_counts() {
     let data = payload(16, 5000);
@@ -310,7 +625,8 @@ fn a_repair_short_of_blocks_reports_counts() {
     bind(&mut job);
     feed(&mut job, member, &wrong, Some(ByteRange::new(0, 2800)));
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Impossible {
             damaged: 3,
             reachable: 2
@@ -339,7 +655,156 @@ fn wants_asks_for_recovery_while_short() {
             .iter()
             .all(|seek| seek.volume == volume && seek.purpose == weaver_graph::Purpose::Recovery)
     );
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
+}
+
+// The PAR2 file with every packet of the given types left out: an index
+// posted without the descriptions, which ride in the volumes instead.
+fn without_packets(bytes: &[u8], kinds: &[&[u8; 16]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 64 <= bytes.len() {
+        let length = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap()) as usize;
+        if !kinds.iter().any(|kind| bytes[at + 48..at + 64] == kind[..]) {
+            out.extend_from_slice(&bytes[at..at + length]);
+        }
+        at += length;
+    }
+    out
+}
+
+const FILE_DESC: &[u8; 16] = b"PAR 2.0\0FileDesc";
+const IFSC: &[u8; 16] = b"PAR 2.0\0IFSC\0\0\0\0";
+
+// An index read through with no description in it, one recovery volume
+// named and not yet in, and the member the set protects.
+fn undescribed(seed: u64, damaged: bool) -> (Job<Par2>, VolumeIndex, MemberId) {
+    let data = payload(seed, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 4, 2);
+    let mut job = Job::new(Par2::new(OWN), OWN);
+    let index = without_packets(&files[0].1, &[FILE_DESC, IFSC]);
+    job.volume(&files[0].0, &index, ARTICLE as usize, false);
+    let volume = job.name(&files[1].0, &files[1].1);
+    let member = if damaged {
+        damaged_member(&mut job, "payload.bin", &data, 300).0
+    } else {
+        job.member("payload.bin", &data)
+    };
+    bind(&mut job);
+    assert!(!job.object.sets.is_empty());
+    assert!(
+        job.object
+            .sets
+            .values()
+            .all(|state| state.usable().is_none())
+    );
+    (job, volume, member)
+}
+
+fn asked(job: &Job<Par2>) -> Vec<VolumeIndex> {
+    let mut seeks = Vec::new();
+    Recovery::wants(&job.object, &mut seeks);
+    seeks
+        .iter()
+        .filter(|seek| seek.purpose == weaver_graph::Purpose::Recovery)
+        .map(|seek| seek.volume)
+        .collect()
+}
+
+// A set whose index carries no description reads a volume for one only
+// once the namespace shows damage it may cover. On a whole post it checks
+// nothing and asks for nothing: no recovery byte is spent on it. Damage
+// that shows after it ruled so, a range refused or bytes held damaged,
+// makes it due again.
+#[test]
+fn an_undescribed_set_asks_for_a_volume_only_once_damage_shows() {
+    let (mut job, volume, member) = undescribed(23, false);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Unread
+    );
+    assert!(asked(&job).is_empty());
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Unread));
+    Recovery::refused(&mut job.object, member, ByteRange::new(0, 700));
+    assert_eq!(job.object.outcome(), None);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
+    assert_eq!(asked(&job), vec![volume]);
+
+    let (mut job, volume, _) = undescribed(23, true);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
+    let wanted = asked(&job);
+    assert!(!wanted.is_empty());
+    assert!(wanted.iter().all(|asked| *asked == volume));
+}
+
+// A set that ruled it checked nothing, with no volume left to describe
+// it, is tried again when a volume binds: the descriptions may be in it.
+// A file lost whole is refused, never fed; the refusal is the damage.
+#[test]
+fn a_volume_bound_after_an_unread_ruling_reopens_the_set() {
+    let data = payload(24, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 4, 2);
+    let mut job = Job::new(Par2::new(OWN), OWN);
+    let index = without_packets(&files[0].1, &[FILE_DESC, IFSC]);
+    job.volume(&files[0].0, &index, ARTICLE as usize, false);
+    let member = job
+        .namespace
+        .announce("payload.bin", Some(data.len() as u64));
+    Recovery::refused(
+        &mut job.object,
+        member,
+        ByteRange::new(0, data.len() as u64),
+    );
+    bind(&mut job);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Unread
+    );
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Unread));
+    let (name, bytes) = &files[1];
+    let volume = job.name(name, bytes);
+    assert_eq!(job.object.outcome(), None);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
+    assert_eq!(asked(&job), vec![volume]);
+    let mut out = Vec::new();
+    for (at, piece) in bytes.chunks(ARTICLE as usize).enumerate() {
+        job.object.deliver(
+            weaver_graph::Delivery {
+                volume,
+                offset: at as u64 * ARTICLE,
+                bytes: &weaver_graph::Evidenced::from(piece.to_vec()),
+                provenance: Provenance::Fresh,
+            },
+            &mut |_, _| false,
+            &mut out,
+        );
+    }
+    job.object.volume_closed(volume, &mut out);
+    assert!(
+        job.object
+            .sets
+            .values()
+            .all(|state| state.usable().is_some())
+    );
+    assert_eq!(job.object.outcome(), None);
 }
 
 // A set short of recovery blocks waits while the pieces that bring none
@@ -357,7 +822,11 @@ fn a_short_set_waits_until_the_blocks_it_needs_are_in_hand() {
     bind(&mut job);
     let wrong = job.store.members[&member].clone();
     feed(&mut job, member, &wrong, Some(bad));
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
     let held = |job: &Job<Par2>| -> usize {
         job.object
             .sets
@@ -372,7 +841,7 @@ fn a_short_set_waits_until_the_blocks_it_needs_are_in_hand() {
             weaver_graph::Delivery {
                 volume,
                 offset: index as u64 * ARTICLE,
-                bytes: piece,
+                bytes: &weaver_graph::Evidenced::from(piece.to_vec()),
                 provenance: Provenance::Fresh,
             },
             &mut |_, _| false,
@@ -385,7 +854,8 @@ fn a_short_set_waits_until_the_blocks_it_needs_are_in_hand() {
     }
     assert_eq!(held(&job), 1);
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 1 }
     );
     assert_eq!(
@@ -414,7 +884,7 @@ fn an_object_with_no_sets_rules_unread_once_a_volume_is_read_through() {
         weaver_graph::Delivery {
             volume,
             offset: 0,
-            bytes: header,
+            bytes: &weaver_graph::Evidenced::from(header.to_vec()),
             provenance: Provenance::Fresh,
         },
         &mut |_, _| false,
@@ -424,7 +894,11 @@ fn an_object_with_no_sets_rules_unread_once_a_volume_is_read_through() {
     assert_eq!(job.object.outcome(), None);
     job.object.volume_closed(volume, &mut out);
     assert_eq!(job.object.outcome(), Some(RepairOutcome::Unread));
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Unread);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Unread
+    );
     assert_eq!(job.object.outcome(), Some(RepairOutcome::Unread));
     job.volume(&files[1].0, &files[1].1, ARTICLE as usize, false);
     assert_eq!(job.object.outcome(), None);
@@ -443,6 +917,8 @@ fn a_lost_article_inside_a_volume_keeps_the_packets_past_it() {
     let volume = job
         .object
         .claim(name, &bytes[..64], None)
+        .last()
+        .copied()
         .expect("a PAR2 volume");
     let lost = ByteRange::at(ARTICLE, ARTICLE);
     let mut out = Vec::new();
@@ -455,7 +931,7 @@ fn a_lost_article_inside_a_volume_keeps_the_packets_past_it() {
             weaver_graph::Delivery {
                 volume,
                 offset,
-                bytes: piece,
+                bytes: &weaver_graph::Evidenced::from(piece.to_vec()),
                 provenance: Provenance::Fresh,
             },
             &mut |_, _| false,
@@ -492,6 +968,35 @@ fn wanted(job: &mut Job<Par2>) -> Vec<weaver_graph::VolumeIndex> {
     let mut volumes: Vec<_> = seeks.iter().map(|seek| seek.volume).collect();
     volumes.dedup();
     volumes
+}
+
+// No index and no set found yet: the volume read for the set's
+// descriptions is lost whole. Closed over a loss, it was never read
+// through, so another volume is read in its place.
+#[test]
+fn a_volume_lost_whole_is_not_read_through_and_another_is_read_for_the_set() {
+    let data = payload(24, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 8, 3);
+    let mut job = Job::new(Par2::new(OWN), OWN);
+    for file in &files[1..] {
+        named_volume(&mut job, file);
+    }
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
+    let first = wanted(&mut job);
+    assert_eq!(first.len(), 1, "one volume is read for the descriptions");
+    let mut out = Vec::new();
+    let length = job.store.volumes[&first[0]].len() as u64;
+    job.object
+        .volume_lost(first[0], ByteRange::new(0, length), &mut out);
+    job.object.volume_closed(first[0], &mut out);
+    let next = wanted(&mut job);
+    assert_eq!(next.len(), 1, "another volume is read in its place");
+    assert_ne!(next, first);
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Waiting));
 }
 
 // The first set's blocks in hand do not cover the second set's damage.
@@ -535,7 +1040,8 @@ fn a_shared_members_damage_counts_once() {
     feed(&mut job, member, &wrong, Some(bad));
     assert!(wanted(&mut job).is_empty());
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 1 }
     );
     assert!(job.store.members[&member] == shared);
@@ -561,7 +1067,11 @@ fn a_name_two_sets_describe_is_the_first_sets() {
         .collect();
     assert_eq!(bound, [true, false]);
     feed(&mut job, member, &quill, None);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
     assert_eq!(job.store.writes, 0);
 }
 
@@ -574,7 +1084,11 @@ fn a_set_covering_nothing_asks_for_nothing() {
     let mut job = job(&files[..1]);
     named_volume(&mut job, &files[1]);
     bind(&mut job);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
     assert!(wanted(&mut job).is_empty());
     assert_eq!(job.store.volume_reads, 0);
 }
@@ -613,7 +1127,8 @@ fn a_described_file_no_member_carries_is_named_and_rebuilt_whole() {
     assert!(named.is_empty(), "{named:?}");
 
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 3 }
     );
     assert!(job.store.members[&rebuilt] == absent);
@@ -640,7 +1155,8 @@ fn a_member_whose_front_was_lost_is_known_by_its_slices_and_mended_in_place() {
     assert!(named.is_empty(), "{named:?}");
 
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 2 }
     );
     assert!(job.store.members[&posted] == file);
@@ -675,7 +1191,8 @@ fn a_member_with_no_intact_byte_binds_by_elimination_and_is_mended_in_place() {
     assert!(named.is_empty(), "{named:?}");
 
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 3 }
     );
     assert!(job.store.members[&posted][..file.len()] == file);
@@ -716,7 +1233,11 @@ fn elimination_waits_for_the_members_still_to_come() {
         .announce("a91d07e4c3b25f86", Some(second.len() as u64));
     assert!(bind(&mut job).is_empty());
 
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
     assert!(!job.object.covers(posted));
     assert!(job.store.members[&posted] == lost);
 
@@ -724,7 +1245,8 @@ fn elimination_waits_for_the_members_still_to_come() {
     job.store.members.insert(coming, second.clone());
     assert_eq!(bind(&mut job), vec![coming]);
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 3 }
     );
     assert!(job.object.covers(posted));
@@ -820,13 +1342,32 @@ fn a_repair_larger_than_the_memory_limit_reads_one_slice_at_a_time() {
         store: &mut job.store,
         widest: 0,
     };
-    let outcome = job.object.repair(&mut access);
+    let outcome = job
+        .object
+        .repair(&mut access, weaver_graph::Budget::default());
     assert!(
         matches!(outcome, RepairOutcome::Repaired { slices } if slices >= 1),
         "{outcome:?}"
     );
     assert!(access.widest <= SLICE, "{}", access.widest);
     assert!(job.store.members[&member] == data);
+}
+
+// The memory a repair is granted is its one limit, above the object's own
+// allowance as well as below it; the allowance is what it holds to only
+// when it is granted none.
+#[test]
+fn a_repair_holds_to_the_memory_it_was_granted_not_the_objects_own() {
+    let mut object = Par2::new(OWN);
+    object.memory_limit = 64 * 1024;
+    let granted = |memory_bytes| weaver_graph::Budget {
+        memory_bytes,
+        threads: 1,
+        ..Default::default()
+    };
+    assert_eq!(object.workspace(granted(Some(1 << 30))), 1 << 30);
+    assert_eq!(object.workspace(granted(Some(4096))), 4096);
+    assert_eq!(object.workspace(granted(None)), 64 * 1024);
 }
 
 // A recovery volume whose first article arrived, the rest still to come.
@@ -837,7 +1378,7 @@ fn head(job: &mut Job<Par2>, file: &(String, Vec<u8>)) -> weaver_graph::VolumeIn
         weaver_graph::Delivery {
             volume,
             offset: 0,
-            bytes: &file.1[..end],
+            bytes: &weaver_graph::Evidenced::from(file.1[..end].to_vec()),
             provenance: Provenance::Fresh,
         },
         &mut |_, _| false,
@@ -961,4 +1502,801 @@ fn the_article_that_closes_the_gap_is_walked_with_the_hold_full() {
         "{found:?}"
     );
     assert_eq!(walker.front(), length);
+}
+
+// Every packet of a PAR2 file, by where it lies and whether it carries a
+// recovery block.
+fn packets_of(bytes: &[u8]) -> Vec<(ByteRange, bool)> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at + 64 <= bytes.len() {
+        let length = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().expect("8 bytes"));
+        let recovery = &bytes[at + 48..at + 64] == b"PAR 2.0\0RecvSlic";
+        out.push((ByteRange::at(at as u64, length), recovery));
+        at += length as usize;
+    }
+    out
+}
+
+// The articles of a volume, delivered in order, those inside `damaged`
+// with every byte wrong.
+fn deliver_articles(
+    object: &mut Par2,
+    volume: weaver_graph::VolumeIndex,
+    bytes: &[u8],
+    damaged: Option<ByteRange>,
+) {
+    for (index, piece) in bytes.chunks(ARTICLE as usize).enumerate() {
+        let offset = index as u64 * ARTICLE;
+        let mut piece = piece.to_vec();
+        let range = ByteRange::at(offset, piece.len() as u64);
+        let provenance = match damaged.and_then(|damaged| damaged.intersect(range)) {
+            Some(_) => {
+                piece.iter_mut().for_each(|byte| *byte ^= 0x5A);
+                Provenance::Damaged
+            }
+            None => Provenance::Fresh,
+        };
+        object.deliver(
+            weaver_graph::Delivery {
+                volume,
+                offset,
+                bytes: &weaver_graph::Evidenced::from(piece.to_vec()),
+                provenance,
+            },
+            &mut |_, _| false,
+            &mut Vec::new(),
+        );
+    }
+}
+
+// The articles covering the first recovery packet whose articles end before
+// the volume does, so the walk goes on past them.
+fn passed_articles(bytes: &[u8]) -> ByteRange {
+    packets_of(bytes)
+        .into_iter()
+        .filter(|(_, recovery)| *recovery)
+        .map(|(packet, _)| {
+            ByteRange::new(
+                packet.start / ARTICLE * ARTICLE,
+                packet.end.div_ceil(ARTICLE) * ARTICLE,
+            )
+        })
+        .find(|articles| articles.end < bytes.len() as u64)
+        .expect("a recovery packet clear of the last article")
+}
+
+// Recovery packets the walk can find once `range` came again: every one
+// that does not straddle its edges, whose bytes before or after it do not
+// come again.
+fn findable(bytes: &[u8], range: ByteRange) -> u64 {
+    packets_of(bytes)
+        .into_iter()
+        .filter(|(packet, recovery)| {
+            *recovery && (range.covers(*packet) || packet.intersect(range).is_none())
+        })
+        .count() as u64
+}
+
+fn redeliver(object: &mut Par2, volume: weaver_graph::VolumeIndex, bytes: &[u8], range: ByteRange) {
+    object.deliver(
+        weaver_graph::Delivery {
+            volume,
+            offset: range.start,
+            bytes: &weaver_graph::Evidenced::from(
+                bytes[range.start as usize..range.end as usize].to_vec(),
+            ),
+            provenance: Provenance::Fresh,
+        },
+        &mut |_, _| false,
+        &mut Vec::new(),
+    );
+}
+
+// A recovery volume's articles arrive damaged and the walk goes on past
+// them; their bytes come again correct, and every packet wholly inside them
+// is found from what came, each counted once.
+#[test]
+fn articles_the_walk_read_damaged_are_walked_again_when_they_come_again() {
+    let data = payload(50, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 4, 1);
+    assert_eq!(files.len(), 2);
+    let mut job = job(&files[..1]);
+    job.member("payload.bin", &data);
+    let (name, bytes) = &files[1];
+    let volume = job.name(name, bytes);
+    let range = passed_articles(bytes);
+    deliver_articles(&mut job.object, volume, bytes, Some(range));
+    bind(&mut job);
+    let in_hand = |object: &Par2| {
+        object
+            .sets
+            .values()
+            .map(|state| state.recovery.len() as u64)
+            .sum::<u64>()
+    };
+    let missed = in_hand(&job.object);
+    job.object.unposted(volume, range);
+    redeliver(&mut job.object, volume, bytes, range);
+    let named = job.object.volumes[volume.0 as usize].named_blocks;
+    let walked = job.object.volumes[volume.0 as usize].walked_blocks;
+    job.object.volume_closed(volume, &mut Vec::new());
+    bind(&mut job);
+    let expected = findable(bytes, range);
+    assert_eq!(reachable(&job.object), expected);
+    assert!(expected > missed, "the damaged articles held a packet");
+    assert_eq!(walked, expected, "every block found is counted once");
+    assert_eq!(named, Some(4));
+}
+
+// The same, the bytes coming again before and after a checkpoint taken
+// between: the checkpoint resumes at the start of the range, steps over
+// what the walk read past it, and the replay of every byte finds each
+// packet once.
+#[test]
+fn a_walk_checkpointed_after_its_range_is_unposted_resumes_at_the_range() {
+    let data = payload(51, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 4, 1);
+    let mut job = job(&files[..1]);
+    job.member("payload.bin", &data);
+    let (name, bytes) = &files[1];
+    let volume = job.name(name, bytes);
+    let range = passed_articles(bytes);
+    deliver_articles(&mut job.object, volume, bytes, Some(range));
+    job.object.unposted(volume, range);
+    let walk = &job.object.volumes[volume.0 as usize].walker;
+    assert_eq!(walk.front(), range.start, "the checkpoint's front");
+    assert!(
+        walk.lost()
+            .contains(&ByteRange::new(range.end, bytes.len() as u64)),
+        "{:?}",
+        walk.lost()
+    );
+    let mut restored = super::facts::par2(&job.object.facts()).expect("restores");
+    deliver_articles(&mut restored, volume, bytes, None);
+    let walked = restored.volumes[volume.0 as usize].walked_blocks;
+    restored.volume_closed(volume, &mut Vec::new());
+    job.object = restored;
+    bind(&mut job);
+    assert_eq!(reachable(&job.object), findable(bytes, range));
+    assert_eq!(walked, findable(bytes, range));
+}
+
+// A recovery packet built by hand: header, exponent and payload, its hash
+// over everything past the hash.
+fn recovery_packet(exponent: u32, payload: &[u8]) -> Vec<u8> {
+    use par2_rs::FileHashState;
+    use par2_rs::packet::{HEADER_SIZE, MAGIC};
+
+    let length = (HEADER_SIZE + 4 + payload.len()) as u64;
+    let mut packet = Vec::with_capacity(length as usize);
+    packet.extend_from_slice(MAGIC);
+    packet.extend_from_slice(&length.to_le_bytes());
+    packet.extend_from_slice(&[0; 16]);
+    packet.extend_from_slice(&[7; 16]);
+    packet.extend_from_slice(b"PAR 2.0\0RecvSlic");
+    packet.extend_from_slice(&exponent.to_le_bytes());
+    packet.extend_from_slice(payload);
+    let mut hasher = FileHashState::new();
+    hasher.update(&packet[32..]);
+    let hash = hasher.finalize();
+    packet[16..32].copy_from_slice(&hash);
+    packet
+}
+
+fn recovered(found: &[super::walker::Found]) -> Vec<(u32, ByteRange)> {
+    found
+        .iter()
+        .filter_map(|found| match found {
+            super::walker::Found::Recovery {
+                exponent, range, ..
+            } => Some((*exponent, *range)),
+            _ => None,
+        })
+        .collect()
+}
+
+// A recovery packet streamed when the range it is read from is unposted is
+// dropped, its hash having read the bytes that were there, and found again
+// from the bytes that come. One streamed past a range behind the front is
+// not touched: the walk past the range goes on.
+#[test]
+fn a_streamed_packet_in_an_unposted_range_is_dropped_and_found_again() {
+    use super::walker::Walker;
+
+    let first = recovery_packet(1, &payload(52, 4000));
+    let second = recovery_packet(2, &payload(53, 4000));
+    let mut volume = first.clone();
+    volume.extend_from_slice(&second);
+    let one = ByteRange::at(0, first.len() as u64);
+    let two = ByteRange::at(one.end, second.len() as u64);
+
+    // Inside the range: the front stands in it, and starts again from it.
+    let mut walker = Walker::default();
+    let mut found = Vec::new();
+    let mut wrong = volume[..2000].to_vec();
+    wrong[1000] ^= 0x01;
+    walker.deliver(0, &wrong, &mut found);
+    assert!(walker.reading_recovery());
+    walker.unposted(ByteRange::new(0, 2000), &mut found);
+    assert_eq!(walker.front(), 0);
+    walker.deliver(0, &volume[..2000], &mut found);
+    walker.deliver(2000, &volume[2000..], &mut found);
+    assert_eq!(recovered(&found), vec![(1, one), (2, two)]);
+
+    // Behind the front: the first packet is walked again on its own while
+    // the second streams on.
+    let mut walker = Walker::default();
+    let mut found = Vec::new();
+    let mut wrong = volume[..one.end as usize].to_vec();
+    wrong[1000] ^= 0x01;
+    walker.deliver(0, &wrong, &mut found);
+    walker.deliver(
+        one.end,
+        &volume[one.end as usize..two.start as usize + 2000],
+        &mut found,
+    );
+    assert!(recovered(&found).is_empty(), "the first failed its hash");
+    walker.unposted(one, &mut found);
+    assert_eq!(walker.front(), 0, "a checkpoint resumes at the range");
+    assert!(walker.lost().is_empty(), "the second starts where it ends");
+    walker.deliver(0, &volume[..one.end as usize], &mut found);
+    assert_eq!(recovered(&found), vec![(1, one)]);
+    assert_eq!(walker.front(), two.start, "the second still streams");
+    walker.deliver(
+        two.start + 2000,
+        &volume[two.start as usize + 2000..],
+        &mut found,
+    );
+    assert_eq!(recovered(&found), vec![(1, one), (2, two)]);
+    assert_eq!(walker.front(), two.end);
+}
+
+// A packet whose bytes fail its hash, or whose header claims past the
+// volume's end, was none. The walk reads what it took for the packet again
+// from the volume, from the first magic past its own, so a valid copy that
+// lies within those bytes is found, whether the volume's length was known
+// before the bytes came or only at its close.
+#[test]
+fn a_packet_that_was_none_is_read_again_from_the_next_magic() {
+    use super::walker::{Found, Walker};
+
+    let valid = recovery_packet(1, &payload(54, 4000));
+    // Its length field claims eight bytes more: into the valid copy.
+    let mut longer = valid.clone();
+    longer[8] ^= 0x08;
+    // Cut to its magic: the header read with it is the valid copy's front.
+    let magic = valid[..8].to_vec();
+    for bad in [longer, magic] {
+        for sized_first in [true, false] {
+            let mut volume = bad.clone();
+            volume.extend_from_slice(&valid);
+            let length = volume.len() as u64;
+            let copy = ByteRange::at(bad.len() as u64, valid.len() as u64);
+            let context = format!("bad of {} bytes, sized_first={sized_first}", bad.len());
+            let mut walker = Walker::default();
+            let mut found = Vec::new();
+            if sized_first {
+                walker.sized(length, &mut found);
+            }
+            walker.deliver(0, &volume, &mut found);
+            if !sized_first {
+                walker.sized(length, &mut found);
+            }
+            let again: Vec<ByteRange> = found
+                .iter()
+                .filter_map(|found| match found {
+                    Found::Again(range) => Some(*range),
+                    _ => None,
+                })
+                .collect();
+            for range in again {
+                assert_eq!(range.start, copy.start, "{context}: at the copy's magic");
+                assert_eq!(
+                    walker.front(),
+                    copy.start,
+                    "{context}: the walk starts there"
+                );
+                walker.deliver(
+                    range.start,
+                    &volume[range.start as usize..range.end as usize],
+                    &mut found,
+                );
+            }
+            assert_eq!(recovered(&found), vec![(1, copy)], "{context}");
+            assert_eq!(walker.front(), length, "{context}");
+        }
+    }
+}
+
+// A packet that was none, in whose bytes no magic begins, is read again
+// only where a magic could still begin: its last bytes, short of a whole
+// magic. Its payload is not read twice, however long it is.
+#[test]
+fn a_packet_that_was_none_reads_again_only_where_a_packet_can_begin() {
+    use super::walker::{Found, Walker};
+    use par2_rs::packet::MAGIC;
+
+    let valid = recovery_packet(1, &payload(55, 64 * 1024));
+    let mut bad = valid.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 0x01;
+    let mut volume = bad.clone();
+    volume.extend_from_slice(&valid);
+    let copy = ByteRange::at(bad.len() as u64, valid.len() as u64);
+    let mut walker = Walker::default();
+    let mut found = Vec::new();
+    walker.deliver(0, &volume, &mut found);
+    let again: Vec<ByteRange> = found
+        .iter()
+        .filter_map(|found| match found {
+            Found::Again(range) => Some(*range),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        again,
+        vec![ByteRange::new(
+            copy.start + 1 - MAGIC.len() as u64,
+            copy.start
+        )]
+    );
+    for range in again {
+        walker.deliver(
+            range.start,
+            &volume[range.start as usize..range.end as usize],
+            &mut found,
+        );
+    }
+    assert_eq!(recovered(&found), vec![(1, copy)]);
+    assert_eq!(walker.front(), volume.len() as u64);
+}
+
+// A refused slice is held only by a twin that is neither refused nor came
+// damaged: the first two slices of one file came damaged and the other
+// file was refused whole, so four slices lack their bytes and the one
+// recovery block cannot rebuild them.
+#[test]
+fn a_refused_slice_whose_twin_came_damaged_is_lost() {
+    let data = payload(41, 5000);
+    let files = par2_set(
+        "set",
+        &[("first.bin", &data), ("again.bin", &data)],
+        BLOCK,
+        1,
+        1,
+    );
+    let mut job = job(&files);
+    let mut wrong = data.clone();
+    wrong[0] ^= 0x5A;
+    wrong[600] ^= 0x5A;
+    let first = job.member("first.bin", &wrong);
+    let again = job.namespace.announce("again.bin", Some(data.len() as u64));
+    job.store.members.insert(again, vec![0; data.len()]);
+    Recovery::refused(&mut job.object, again, ByteRange::new(0, data.len() as u64));
+    bind(&mut job);
+    feed(&mut job, first, &wrong, Some(ByteRange::new(0, ARTICLE)));
+    assert_eq!(
+        verdicts(&job, first)[..2],
+        [SliceVerdict::Damaged, SliceVerdict::Damaged]
+    );
+    assert_eq!(
+        job.object.outcome(),
+        Some(RepairOutcome::Impossible {
+            damaged: 2,
+            reachable: 1
+        })
+    );
+}
+
+// A loss inside a recovery volume still open costs at most the packets it
+// touches: the set is not ruled short on the most the loss could cost, and
+// once the volume closes its walk says what it held.
+#[test]
+fn a_loss_in_an_open_volume_rules_nothing_short_before_it_closes() {
+    let data = payload(43, 5000);
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 8, 1);
+    assert_eq!(files.len(), 2);
+    let bytes = &files[1].1;
+    let lost = ByteRange::at(2 * ARTICLE, ARTICLE);
+    let hit = packets_of(bytes)
+        .into_iter()
+        .filter(|(packet, recovery)| *recovery && packet.intersect(lost).is_some())
+        .count() as u64;
+    assert!(hit > 0, "the loss lies among the recovery packets");
+    let damaged = 8 - hit;
+    let mut job = job(&files[..1]);
+    let mut short = data.clone();
+    short[..(damaged * BLOCK) as usize].fill(0);
+    let member = job
+        .namespace
+        .announce("payload.bin", Some(data.len() as u64));
+    job.store.members.insert(member, short);
+    Recovery::refused(&mut job.object, member, ByteRange::new(0, damaged * BLOCK));
+    let volume = named_volume(&mut job, &files[1]);
+    bind(&mut job);
+    let mut out = Vec::new();
+    redeliver(&mut job.object, volume, bytes, ByteRange::new(0, ARTICLE));
+    job.object.volume_lost(volume, lost, &mut out);
+    assert_eq!(job.object.outcome(), None, "the loss costs {hit} blocks");
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
+    redeliver(
+        &mut job.object,
+        volume,
+        bytes,
+        ByteRange::new(ARTICLE, lost.start),
+    );
+    redeliver(
+        &mut job.object,
+        volume,
+        bytes,
+        ByteRange::new(lost.end, bytes.len() as u64),
+    );
+    job.object.volume_closed(volume, &mut out);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Repaired { slices: damaged }
+    );
+    assert!(job.store.members[&member] == data);
+}
+
+// Not every choice of as many blocks as slices are damaged rebuilds them.
+// The constants of slices 0 and 8 have equal 4369th powers, so blocks 0
+// and 4369 cannot tell those two slices apart. The repair reads another
+// block, and rebuilds both.
+#[test]
+fn a_repair_reads_another_block_when_those_read_do_not_rebuild() {
+    let constants = par2_rs::input_slice_constants(9);
+    assert_eq!(
+        par2_rs::gf_pow(constants[0], 4369),
+        par2_rs::gf_pow(constants[8], 4369)
+    );
+    let data = payload(44, 9 * BLOCK as usize);
+    let described = [("payload.bin", data.as_slice())];
+    let low = par2_set_from("set", &described, BLOCK, 0, 1, 1);
+    let high = par2_set_from("set", &described, BLOCK, 4369, 2, 1);
+    let files = [low[0].clone(), low[1].clone(), high[1].clone()];
+    let mut wrong = data.clone();
+    for slice in [0, 8] {
+        wrong[(slice * BLOCK) as usize] ^= 0x5A;
+    }
+    let mut job = job(&files);
+    let member = job.member("payload.bin", &wrong);
+    for slice in [0, 8] {
+        let at = slice * BLOCK / ARTICLE * ARTICLE;
+        let article = ByteRange::new(at, (at + ARTICLE).min(data.len() as u64));
+        job.arrive(
+            member,
+            article.start,
+            &wrong[article.start as usize..article.end as usize],
+            Provenance::Damaged,
+        );
+    }
+    bind(&mut job);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Repaired { slices: 2 }
+    );
+    assert!(job.store.members[&member] == data);
+}
+
+// A file refused whole beside another the set describes with the same
+// bytes: every slice of it is held, so it needs no recovery block, and the
+// repair copies them from the file that holds them.
+#[test]
+fn a_file_refused_whole_is_copied_from_the_file_holding_its_slices() {
+    let data = payload(41, 5000);
+    let files = par2_set(
+        "set",
+        &[("first.bin", &data), ("again.bin", &data)],
+        BLOCK,
+        1,
+        1,
+    );
+    let mut job = job(&files);
+    let first = job.member("first.bin", &data);
+    let again = job.namespace.announce("again.bin", Some(data.len() as u64));
+    job.store.members.insert(again, vec![0; data.len()]);
+    Recovery::refused(&mut job.object, again, ByteRange::new(0, data.len() as u64));
+    bind(&mut job);
+    assert!(job.object.covers(again));
+    feed(&mut job, first, &data, None);
+    assert_eq!(job.object.outcome(), None, "nothing it lacks is lost");
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Repaired { slices: 10 }
+    );
+    assert!(job.store.members[&again] == data);
+    assert!(job.store.members[&first] == data);
+}
+#[test]
+fn staged_copy_remains_a_readable_rs_donor() {
+    use weaver_graph::recovery::MemberAccess;
+    struct Staged {
+        original: crate::testing::Store,
+        writes: Vec<(MemberId, u64, Vec<u8>)>,
+    }
+    impl MemberAccess for Staged {
+        fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
+            self.original.read(member, range, into)
+        }
+        fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
+            self.writes.push((member, offset, bytes.to_vec()));
+        }
+        fn length(&self, member: MemberId) -> Option<u64> {
+            self.original.length(member)
+        }
+        fn arrived(&self, member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {
+            self.original.arrived(member, range, out);
+        }
+        fn read_volume(
+            &mut self,
+            volume: VolumeIndex,
+            range: ByteRange,
+            into: &mut Vec<u8>,
+        ) -> bool {
+            self.original.read_volume(volume, range, into)
+        }
+    }
+    let twin = payload(91, BLOCK as usize);
+    let distinct = payload(92, BLOCK as usize);
+    let data = [twin.as_slice(), twin.as_slice(), distinct.as_slice()].concat();
+    let files = par2_set("set", &[("payload.bin", &data)], BLOCK, 1, 1);
+    let mut job = job(&files);
+    let mut wrong = data.clone();
+    wrong[BLOCK as usize..].fill(0);
+    let member = job.member("payload.bin", &wrong);
+    bind(&mut job);
+    job.store
+        .holes
+        .insert(member, vec![ByteRange::new(BLOCK, 3 * BLOCK)]);
+    let mut access = Staged {
+        original: job.store,
+        writes: Vec::new(),
+    };
+    assert_eq!(
+        job.object
+            .repair(&mut access, weaver_graph::Budget::default()),
+        RepairOutcome::Repaired { slices: 2 }
+    );
+    assert_eq!(
+        access.original.members[&member], wrong,
+        "writes remain staged"
+    );
+    for (member, offset, bytes) in access.writes {
+        access.original.write_repaired(member, offset, &bytes);
+    }
+    assert_eq!(access.original.members[&member], data);
+}
+
+#[test]
+fn changed_input_invalidates_clean_par2_ruling() {
+    let data = payload(93, 4 * BLOCK as usize);
+    let mut job = job(&par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1));
+    let member = job.member("payload.bin", &data);
+    bind(&mut job);
+    feed(&mut job, member, &data, None);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
+    feed(&mut job, member, &data, None);
+    assert_eq!(job.object.outcome(), Some(RepairOutcome::Clean));
+    job.object.feed(
+        member,
+        &segments(
+            BLOCK,
+            &data[BLOCK as usize..2 * BLOCK as usize],
+            ARTICLE,
+            BLOCK,
+            true,
+        ),
+    );
+    assert_eq!(
+        job.object.outcome(),
+        Some(RepairOutcome::Clean),
+        "aligned duplicate retains existing slice evidence"
+    );
+    job.store
+        .members
+        .get_mut(&member)
+        .unwrap()
+        .extend_from_slice(b"tail");
+    job.object.feed(
+        member,
+        &[weaver_graph::Segment {
+            range: ByteRange::at(data.len() as u64, 4),
+            crc32: crate::grid::crc32(b"tail"),
+            verified: true,
+        }],
+    );
+    assert_eq!(
+        job.object.outcome(),
+        Some(RepairOutcome::Clean),
+        "a changed suffix does not retract the described prefix proof"
+    );
+    let mut wrong = data.clone();
+    wrong[BLOCK as usize + 3] ^= 0x5a;
+    job.store.members.insert(member, wrong.clone());
+    feed(&mut job, member, &wrong, None);
+    assert!(verdicts(&job, member).contains(&SliceVerdict::Damaged));
+    assert_ne!(job.object.outcome(), Some(RepairOutcome::Clean));
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Repaired { slices: 1 }
+    );
+    assert_eq!(job.store.members[&member], data);
+    let repaired = job.object.outcome();
+    job.object
+        .feed_proven(member, &segments(0, &data, ARTICLE, BLOCK, true));
+    assert_eq!(job.object.outcome(), repaired);
+    feed(&mut job, member, &data, None);
+    assert_eq!(
+        job.object.outcome(),
+        repaired,
+        "the bytes it proved, said again, keep the proof"
+    );
+    feed(
+        &mut job,
+        member,
+        &data,
+        Some(ByteRange::new(BLOCK, 2 * BLOCK)),
+    );
+    assert_eq!(
+        job.object.outcome(),
+        None,
+        "a range said again damaged takes the proof back"
+    );
+}
+
+// A set under the tree that repaired a member, as a restart finds it: the
+// set's node, the member, and its bytes as the repair left them.
+fn repaired_under_tree() -> (weaver_graph::Tree, weaver_graph::NodeId, MemberId, Vec<u8>) {
+    use bytes::Bytes;
+    use weaver_graph::{NodeId, Posted, Tree};
+    let data = payload(97, 4 * BLOCK as usize);
+    let mut tree = Tree::new();
+    let mut effects = Vec::new();
+    let mut store = crate::testing::Store::default();
+    let mut post = |tree: &mut Tree, name: &str, bytes: &[u8]| {
+        let member = tree.announce_root(name, Some(bytes.len() as u64), &mut effects);
+        tree.deliver(
+            NodeId::ROOT,
+            member,
+            Posted {
+                offset: 0,
+                bytes: Bytes::copy_from_slice(bytes).into(),
+                provenance: Provenance::Fresh,
+            },
+            &mut crate::Objects::default(),
+            &mut effects,
+        );
+        member
+    };
+    let mut set = None;
+    for (name, bytes) in &par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1) {
+        let volume = post(&mut tree, name, bytes);
+        let (node, index) = tree.child_of(NodeId::ROOT, volume).expect("a set volume");
+        set = Some(node);
+        store.volumes.insert(index, bytes.clone());
+    }
+    let set = set.expect("a set");
+    let mut wrong = data.clone();
+    wrong[BLOCK as usize + 3] ^= 0x5a;
+    let member = post(&mut tree, "payload.bin", &wrong);
+    store.members.insert(member, wrong.clone());
+    tree.with_recovery(set, |recovery, namespace| {
+        recovery.bind(namespace, &mut Vec::new());
+    });
+    let bad = ByteRange::new(0, ARTICLE);
+    let mut pieces = segments(0, &wrong, ARTICLE, BLOCK, true);
+    for piece in &mut pieces {
+        piece.verified = piece.range.intersect(bad).is_none();
+    }
+    tree.feed(set, member, &pieces);
+    assert_eq!(
+        tree.with_recovery(set, |recovery, _| {
+            recovery.repair(&mut store, weaver_graph::Budget::default())
+        }),
+        Some(RepairOutcome::Repaired { slices: 1 })
+    );
+    assert_eq!(store.members[&member], data);
+    tree.feed_proven(set, member, &segments(0, &data, ARTICLE, BLOCK, true));
+    (tree, set, member, data)
+}
+
+#[test]
+fn a_restore_that_says_its_posted_bytes_again_keeps_the_par2_ruling_it_applied() {
+    let (mut tree, set, member, data) = repaired_under_tree();
+    let repaired = Some(RepairOutcome::Repaired { slices: 1 });
+    let outcome = |tree: &weaver_graph::Tree| tree.recovery(set).and_then(|set| set.outcome());
+    tree.uncover(
+        weaver_graph::NodeId::ROOT,
+        VolumeIndex(member.0),
+        ByteRange::new(0, data.len() as u64),
+    );
+    assert_eq!(outcome(&tree), repaired, "unknown input says nothing");
+    tree.feed(set, member, &segments(0, &data, ARTICLE, BLOCK, true));
+    assert_eq!(outcome(&tree), repaired, "the same bytes said again");
+}
+
+#[test]
+fn execution_error_reports_its_operation_and_original_cause() {
+    use weaver_graph::recovery::{MemberAccess, RepairDiagnostic};
+    struct Unreadable {
+        store: crate::testing::Store,
+        diagnostics: Vec<RepairDiagnostic>,
+        fail_reads: bool,
+    }
+    impl MemberAccess for Unreadable {
+        fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
+            !self.fail_reads && self.store.read(member, range, into)
+        }
+        fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
+            self.store.write_repaired(member, offset, bytes);
+        }
+        fn length(&self, member: MemberId) -> Option<u64> {
+            self.store.length(member)
+        }
+        fn arrived(&self, member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {
+            self.store.arrived(member, range, out);
+        }
+        fn read_volume(
+            &mut self,
+            volume: VolumeIndex,
+            range: ByteRange,
+            into: &mut Vec<u8>,
+        ) -> bool {
+            let read = self.store.read_volume(volume, range, into);
+            // Parity is fetched after verification. Inject failure into
+            // subsequent source reads, in execution rather than planning.
+            self.fail_reads = true;
+            read
+        }
+        fn repair_error(&mut self, operation: &str, context: &str, error: &dyn std::error::Error) {
+            self.diagnostics
+                .push(RepairDiagnostic::capture(operation, context, error));
+        }
+    }
+    let data = payload(95, 4 * BLOCK as usize);
+    let mut job = job(&par2_set("set", &[("payload.bin", &data)], BLOCK, 2, 1));
+    let mut wrong = data;
+    wrong[BLOCK as usize + 3] ^= 0x5a;
+    let member = job.member("payload.bin", &wrong);
+    bind(&mut job);
+    feed(
+        &mut job,
+        member,
+        &wrong,
+        Some(ByteRange::new(BLOCK, 2 * BLOCK)),
+    );
+    let mut access = Unreadable {
+        store: job.store,
+        diagnostics: Vec::new(),
+        fail_reads: false,
+    };
+    let outcome = job
+        .object
+        .repair(&mut access, weaver_graph::Budget::default());
+    assert!(matches!(outcome, RepairOutcome::Impossible { .. }));
+    let [diagnostic] = access.diagnostics.as_slice() else {
+        panic!("one execution diagnostic");
+    };
+    assert_eq!(diagnostic.operation, "execute repair");
+    assert!(!diagnostic.context.is_empty());
+    assert!(
+        std::iter::once(&diagnostic.error)
+            .chain(&diagnostic.causes)
+            .any(|message| message.contains("the namespace could not read the member")),
+        "{diagnostic:?}"
+    );
 }

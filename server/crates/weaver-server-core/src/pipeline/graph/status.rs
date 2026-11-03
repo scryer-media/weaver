@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 
 use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::slots::AskerId;
-use weaver_graph::{Kind, MemberId, Namespace, NodeId, ObjectId};
+use weaver_graph::{Kind, MemberId, Namespace, NodeId, ObjectId, Tree};
 
 use super::job::GraphJob;
 use super::root::phase::RootPhase;
@@ -34,8 +34,9 @@ use crate::jobs::model::JobStatus;
 use crate::pipeline::extraction::ExtractionFailure;
 
 #[cfg(test)]
+pub(crate) use claims::Claim;
 pub(crate) use claims::Delivered;
-pub(crate) use claims::Delivery;
+pub(crate) use claims::{Delivery, Unarrived};
 pub(in crate::pipeline) use seams::advance;
 pub(crate) use slots::RepairSlots;
 pub(crate) use summary::{RecoverySummary, SetSummary};
@@ -60,9 +61,11 @@ pub(crate) trait RootJob {
     fn unpacked(&self) -> bool;
     // The breach of the job's extraction budget, once one stands.
     fn refusal(&self) -> Option<&ExtractionFailure>;
-    // A repair of the job is out on a thread: the set it was lent from has
-    // its ruling still to come, whatever it said as it left.
-    fn repair_out(&self) -> bool;
+    // Recovery, replay or checksum work has not been acknowledged yet,
+    // including a checksum check still waiting for worker admission.
+    fn work_pending(&self) -> bool;
+    // A member's file still waits to move to its name.
+    fn moves_waiting(&self) -> bool;
 }
 
 // The job's own seams. GraphJob repairs inside its article path, once the
@@ -116,8 +119,12 @@ impl RootJob for GraphJob {
         self.writer().refusal()
     }
 
-    fn repair_out(&self) -> bool {
-        GraphJob::repair_out(self)
+    fn work_pending(&self) -> bool {
+        GraphJob::work_pending(self)
+    }
+
+    fn moves_waiting(&self) -> bool {
+        GraphJob::moves_waiting(self)
     }
 }
 
@@ -142,9 +149,9 @@ pub(crate) fn drive(
     asker: AskerId,
     limit: usize,
 ) -> Step {
-    // Nothing is ruled while a set's repair is out: what it comes back with
-    // may make whole what the job would otherwise end short of.
-    if job.repair_out() {
+    // No delivery while a worker or queued checksum still has a say about
+    // the file's bytes, even when no recovery set needs to run.
+    if job.work_pending() {
         return Step::Wait;
     }
     let summary = job.recovery_summary();
@@ -165,31 +172,11 @@ pub(crate) fn drive(
     }
     match job.phase() {
         RootPhase::Extracting => Step::Wait,
+        // The delivery takes every file from its name, so it waits for
+        // each file still moving there.
+        _ if job.moves_waiting() => Step::Wait,
         _ => Step::Deliver,
     }
-}
-
-// What the job's repair came to once every object has ruled: the slices
-// its objects rebuilt, when at least one rebuilt any and the repair held.
-// One still waiting has not ruled. The repair held when nothing fails the
-// job as a recovery failure, the one judgement `failure` makes: a set that
-// could not rebuild what another set of its namespace made whole does not
-// undo that repair.
-pub(crate) fn repaired_slices(
-    summary: &RecoverySummary,
-    outcomes: &[RepairOutcome],
-    job: &dyn RootJob,
-) -> Option<u32> {
-    if outcomes.contains(&RepairOutcome::Waiting) || failure(summary, outcomes, job).is_some() {
-        return None;
-    }
-    let repaired = outcomes
-        .iter()
-        .fold(None, |sum: Option<u64>, outcome| match outcome {
-            RepairOutcome::Repaired { slices } => Some(sum.unwrap_or(0).saturating_add(*slices)),
-            _ => sum,
-        });
-    repaired.map(|slices| u32::try_from(slices).unwrap_or(u32::MAX))
 }
 
 // The objects that could not rebuild what they found, and that failure
@@ -199,12 +186,27 @@ pub(crate) fn repaired_slices(
 // set never excuses another's. Each set is judged in the namespace it lives
 // in, at whatever depth. A breach of the job's extraction budget fails the
 // job before any of that: it carries the budget's refusal, worded as the
-// job's failure reason, and names no object.
+// job's failure reason, and names no object. When no set failed and the
+// feed gave the post up, the failure is the feed's, in its words.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Failure {
     pub(crate) objects: Vec<NodeId>,
     pub(crate) message: String,
     pub(crate) rejection: Option<ExtractionFailure>,
+    // The words are the feed's: it gave the post up.
+    pub(crate) from_feed: bool,
+}
+
+impl Failure {
+    // The feed gave the post up, in these words.
+    pub(crate) fn post_given_up(words: String) -> Self {
+        Self {
+            objects: Vec::new(),
+            message: words,
+            rejection: None,
+            from_feed: true,
+        }
+    }
 }
 
 pub(crate) fn failure(
@@ -217,6 +219,7 @@ pub(crate) fn failure(
             objects: Vec::new(),
             message: rejection.job_failure_reason(),
             rejection: Some(rejection.clone()),
+            from_feed: false,
         });
     }
     let ruled: Vec<(&SetSummary, RepairOutcome)> =
@@ -265,6 +268,71 @@ pub(crate) fn failure(
         objects: failed.iter().map(|(set, _, _)| set.node).collect(),
         message,
         rejection: None,
+        from_feed: false,
+    })
+}
+
+// The failure that settles a job before its download ends: a set of the
+// root ruled it cannot rebuild what it covers, every member of the root has
+// said what it is, and no payload member of the root can still come whole.
+// One can while it holds no damage, or while a set of the root that covers
+// it has not ruled impossible, or while an object reading it may still
+// produce a file below it (`may_come_whole_below`). A set below the root
+// that rules impossible settles nothing here: the subtree it covers is
+// short, and what else the job delivers whole is read once the job is done.
+pub(crate) fn ruled_short(job: &GraphJob) -> Option<Failure> {
+    let summary = RootJob::recovery_summary(job);
+    let outcomes = summary.outcomes();
+    let failure =
+        failure(&summary, &outcomes, job).filter(|failure| failure.rejection.is_none())?;
+    let at_root = summary
+        .sets
+        .iter()
+        .any(|set| set.namespace == NodeId::ROOT && failure.objects.contains(&set.node));
+    if !at_root || !job.identified() {
+        return None;
+    }
+    let tree = job.tree();
+    let writer = job.writer();
+    let sets = tree.recovery_nodes(NodeId::ROOT);
+    let may_come_whole = job
+        .namespace()
+        .members()
+        .filter(|member| !writer.carries_recovery(tree, NodeId::ROOT, member.id))
+        .any(|member| {
+            member.coverage.damaged_ranges().next().is_none()
+                || writer
+                    .covering(tree, &sets, member.id)
+                    .any(|set| !failure.objects.contains(&set))
+                || may_come_whole_below(tree, NodeId::ROOT, member.id)
+        });
+    (!may_come_whole).then_some(failure)
+}
+
+// Whether a member an object reads may yet be delivered whole below it,
+// whatever its own bytes hold: the payload of an archive is what it
+// unpacks, not its volumes. An object still reading has not said what it
+// produces. One that gave its volumes up kept what it closed whole, and so
+// may an object below it; the walk delivers that when the job ends. A
+// recovery object produces no file.
+fn may_come_whole_below(tree: &Tree, node: NodeId, member: MemberId) -> bool {
+    tree.readers(node, member).any(|object| {
+        if tree.recovers(object) {
+            return false;
+        }
+        if tree.is_live(object) {
+            return true;
+        }
+        tree.namespace(object).is_some_and(|namespace| {
+            namespace.members().any(|below| {
+                !tree.buried_member(object, below.id)
+                    && match tree.child_of(object, below.id) {
+                        Some((child, _)) if tree.recovers(child) => false,
+                        Some(_) => may_come_whole_below(tree, object, below.id),
+                        None => below.is_whole(),
+                    }
+            })
+        })
     })
 }
 

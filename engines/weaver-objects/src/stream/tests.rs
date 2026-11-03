@@ -226,10 +226,14 @@ fn decode<D: Decoder>(
         thread::spawn(move || {
             let mut emits = Vec::new();
             let volumes: Arc<dyn Volumes> = gate.clone();
-            extraction.run(volumes, &mut |emit| {
-                emits.push(emit);
-                true
-            });
+            extraction.run(
+                volumes,
+                &mut |emit| {
+                    emits.push(emit);
+                    true
+                },
+                weaver_graph::Budget::default(),
+            );
             gate.finish();
             emits
         })
@@ -405,8 +409,11 @@ fn xz_check_byte(bytes: &[u8], end: usize) -> usize {
     index - 1
 }
 
+// A block check speaks of what the stream reads out, never of the volume's
+// bytes: the stream is refused for its own reason, as any failed decode
+// is, and nothing in the volume is marked.
 #[test]
-fn a_failed_xz_check_names_the_stream_it_failed_in() {
+fn a_failed_xz_check_refuses_the_stream_and_marks_nothing() {
     let first = xz(&first_payload());
     let second = xz(&second_payload());
     let mut bytes = [first.clone(), second.clone()].concat();
@@ -415,10 +422,11 @@ fn a_failed_xz_check_names_the_stream_it_failed_in() {
     let said = whole(&mut stream::<Xz>("a.xz"), bytes);
     assert_eq!(
         ending(&said),
-        [
-            Said::Retract,
-            Said::Damaged(ByteRange::at(first.len() as u64, second.len() as u64)),
-        ]
+        [Said::Retract, Said::Refuse(Why::Unrepairable)]
+    );
+    assert!(
+        !said.iter().any(|said| matches!(said, Said::Damaged(_))),
+        "{said:?}"
     );
     // The first stream decoded whole before the second failed.
     let Said::Bytes(out) = &said[1] else {
@@ -459,7 +467,7 @@ fn reserve<D: Decoder>(bytes: &[u8]) -> u64 {
             Delivery {
                 volume: VolumeIndex(0),
                 offset: offset as u64,
-                bytes: std::slice::from_ref(byte),
+                bytes: &weaver_graph::Evidenced::from(std::slice::from_ref(byte).to_vec()),
                 provenance: Provenance::Fresh,
             },
             &mut |_, _| false,
@@ -467,7 +475,7 @@ fn reserve<D: Decoder>(bytes: &[u8]) -> u64 {
         );
     }
     assert!(out.is_empty());
-    D::window(&stream.first)
+    D::window(&stream.first, &stream.budget)
 }
 
 #[test]
@@ -542,12 +550,16 @@ fn emitted<D: Decoder>(name: &str, bytes: Vec<u8>, piece: usize) -> Vec<usize> {
         thread::spawn(move || {
             let mut lens = Vec::new();
             let volumes: Arc<dyn Volumes> = gate.clone();
-            extraction.run(volumes, &mut |emit| {
-                if let Emit::Bytes { bytes, .. } = emit {
-                    lens.push(bytes.len());
-                }
-                true
-            });
+            extraction.run(
+                volumes,
+                &mut |emit| {
+                    if let Emit::Bytes { bytes, .. } = emit {
+                        lens.push(bytes.len());
+                    }
+                    true
+                },
+                weaver_graph::Budget::default(),
+            );
             gate.finish();
             lens
         })
@@ -599,12 +611,10 @@ fn a_run_hands_its_output_on_in_whole_chunks() {
 }
 
 // A closed volume in memory whose bytes at `lost` nothing will bring: a read
-// ends short where they begin and fails on them, as the owner's does, and
-// what the run read on past is kept.
+// ends short where they begin and fails on them, as the owner's does.
 struct Holed {
     bytes: Vec<u8>,
     lost: ByteRange,
-    bridged: Mutex<Vec<weaver_graph::Lost>>,
 }
 
 impl Volumes for Holed {
@@ -633,70 +643,6 @@ impl Volumes for Holed {
         into[..read].copy_from_slice(&self.bytes[want.start as usize..end as usize]);
         Ok(read)
     }
-
-    fn bridged(&self, lost: weaver_graph::Lost) {
-        self.bridged.lock().unwrap().push(lost);
-    }
-}
-
-fn holed<D: Decoder>(name: &str, bytes: Vec<u8>, lost: ByteRange) -> (Vec<Emit>, Arc<Holed>) {
-    let volumes = Arc::new(Holed {
-        bytes,
-        lost,
-        bridged: Mutex::default(),
-    });
-    let mut emits = Vec::new();
-    let reader: Arc<dyn Volumes> = volumes.clone();
-    stream::<D>(name).start().run(reader, &mut |emit| {
-        emits.push(emit);
-        true
-    });
-    (emits, volumes)
-}
-
-// Pieces joined as they are lose nothing beside a lost span: the member
-// holds it as a gap marked damaged at the same offsets, every other byte as
-// posted, and closes at its full length for a recovery set to rebuild.
-#[test]
-fn a_join_reads_on_past_a_lost_span_and_marks_it_damaged() {
-    let plain = payload(9, 3 * super::run::CHUNK);
-    let lost = ByteRange::new(70_000, 75_000);
-    let (emits, volumes) = holed::<Pieces>("lantern.bin.001", plain.clone(), lost);
-    let mut joined = vec![1u8; plain.len()];
-    let mut damaged = Vec::new();
-    for emit in &emits {
-        if let Emit::Bytes {
-            offset,
-            bytes,
-            provenance,
-            ..
-        } = emit
-        {
-            let range = ByteRange::at(*offset, bytes.len() as u64);
-            joined[range.start as usize..range.end as usize].copy_from_slice(bytes);
-            if *provenance == Provenance::Damaged {
-                damaged.push(range);
-            }
-        }
-    }
-    assert_eq!(
-        damaged.iter().map(|range| range.len()).sum::<u64>(),
-        lost.len()
-    );
-    assert!(damaged.iter().all(|range| lost.contains(range.start)));
-    assert_eq!(
-        &joined[..lost.start as usize],
-        &plain[..lost.start as usize]
-    );
-    assert_eq!(&joined[lost.end as usize..], &plain[lost.end as usize..]);
-    assert_eq!(emits.last(), Some(&Emit::MemberClosed(MemberId(0))));
-    assert_eq!(
-        *volumes.bridged.lock().unwrap(),
-        vec![weaver_graph::Lost {
-            volume: VolumeIndex(0),
-            range: lost
-        }]
-    );
 }
 
 // A decoder's output is not its input's bytes: it reads on past nothing
@@ -705,37 +651,153 @@ fn a_join_reads_on_past_a_lost_span_and_marks_it_damaged() {
 fn a_decoder_reads_on_past_no_lost_span() {
     let bytes = gzip(&payload(9, 3 * super::run::CHUNK));
     let lost = ByteRange::new(100, 200);
-    let (emits, volumes) = holed::<Gzip>("a.gz", bytes, lost);
+    let volumes: Arc<dyn Volumes> = Arc::new(Holed { bytes, lost });
+    let mut emits = Vec::new();
+    stream::<Gzip>("a.gz").start().run(
+        volumes,
+        &mut |emit| {
+            emits.push(emit);
+            true
+        },
+        weaver_graph::Budget::default(),
+    );
     assert!(!emits.contains(&Emit::MemberClosed(MemberId(0))));
-    assert!(volumes.bridged.lock().unwrap().is_empty());
 }
 
-// A set known by names alone claims only its own pieces: another set's
-// piece is not one of them, whichever of its pieces founded the stream.
+fn xz_multiblock(bytes: &[u8]) -> Vec<u8> {
+    let properties = lzma_turbo::LzmaEncProps::xz_preset(0, false).unwrap();
+    let mut encoder = lzma_turbo::XzWriter::new(Vec::new(), &properties).unwrap();
+    encoder.set_block_size(u64::from(properties.dict_size()));
+    encoder.set_threads(2);
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+// A run over a volume closed before the run opens it, within `budget`.
+fn closed_run<D: Decoder>(
+    stream: &mut Stream<D>,
+    bytes: Vec<u8>,
+    budget: weaver_graph::Budget,
+) -> Vec<Said> {
+    let gate = Gate::new(bytes);
+    gate.close();
+    let volumes: Arc<dyn Volumes> = gate;
+    let mut emits = Vec::new();
+    stream.start().run(
+        volumes,
+        &mut |emit| {
+            emits.push(emit);
+            true
+        },
+        budget,
+    );
+    said(&emits)
+}
+
+fn budget(memory_bytes: u64, threads: usize) -> weaver_graph::Budget {
+    weaver_graph::Budget {
+        memory_bytes: Some(memory_bytes),
+        threads,
+        ..Default::default()
+    }
+}
+
+// A closed xz of several blocks decodes alike on one thread and on four,
+// and on four it is the run's budget that holds the decoder: one too small
+// for any block's buffers fails it, where the front-to-back decoder on one
+// thread holds only the window it reserved.
 #[test]
-fn a_split_set_claims_only_pieces_of_its_own_stem() {
-    let plain = b"plain bytes, no signature";
-    let mut founded_by_first = stream::<Pieces>("alpha.bin.001");
-    assert_eq!(
-        founded_by_first.claim("alpha.bin.002", plain, Some(100)),
-        Some(VolumeIndex(1))
+fn a_closed_multiblock_xz_decodes_its_blocks_side_by_side_within_the_budget() {
+    let plain: Vec<u8> = (0..(1024 * 1024))
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let bytes = xz_multiblock(&plain);
+    let one = closed_run(
+        &mut stream::<Xz>("ember.bin.xz"),
+        bytes.clone(),
+        budget(u64::MAX, 1),
+    );
+    let four = closed_run(
+        &mut stream::<Xz>("ember.bin.xz"),
+        bytes.clone(),
+        budget(u64::MAX, 4),
+    );
+    assert_eq!(one, decoded("ember.bin", plain.clone()));
+    assert_eq!(four, one);
+
+    let held = closed_run(
+        &mut stream::<Xz>("ember.bin.xz"),
+        bytes.clone(),
+        budget(1, 4),
     );
     assert_eq!(
-        founded_by_first.claim("beta.bin.002", plain, Some(100)),
-        None
+        ending(&held),
+        [Said::Retract, Said::Refuse(Why::Unsupported)]
     );
-    let mut founded_by_later = Stream::<Pieces>::new();
-    founded_by_later.bound(VolumeIndex(2), "alpha.bin.003", &[], None);
+    let sequential = closed_run(&mut stream::<Xz>("ember.bin.xz"), bytes, budget(1, 1));
+    assert_eq!(sequential, decoded("ember.bin", plain));
+}
+
+// A run granted less than the 128 MiB an xz decoder may hold sizes its
+// window to the grant, whether the first bytes declare more or say nothing
+// yet; one granted more still holds to the 128 MiB. A dictionary the grant
+// cannot hold is refused rather than decoded past it.
+#[test]
+fn an_xz_window_is_no_larger_than_the_memory_granted() {
+    let window = |bytes: &[u8], granted: u64| Xz::window(bytes, &budget(granted, 1));
+    let declared = xz_at(&first_payload(), 1 << 20);
+    let needs = Xz::window(&declared, &weaver_graph::Budget::default());
+    assert_eq!(window(&[], 64 << 20), 64 << 20);
+    assert_eq!(window(&declared, 64 << 20), needs);
+    assert_eq!(window(&declared, needs / 2), needs / 2);
+    assert_eq!(window(&[], 256 << 20), 128 << 20);
+
+    // The block is smaller than its dictionary, and the decoder needs only
+    // the block; a grant below even that is refused.
+    let held = budget(4 << 10, 1);
+    let mut short = stream::<Xz>("ember.bin.xz").within(held.clone());
+    let run = closed_run(&mut short, declared.clone(), held);
+    assert_eq!(ending(&run)[0], Said::Retract, "{run:?}");
+    assert!(matches!(ending(&run)[1], Said::Refuse(_)), "{run:?}");
+
+    let granted = budget(64 << 20, 1);
+    let mut room = stream::<Xz>("ember.bin.xz").within(granted.clone());
     assert_eq!(
-        founded_by_later.claim("alpha.bin.001", plain, Some(100)),
-        Some(VolumeIndex(0))
+        closed_run(&mut room, declared, granted),
+        decoded("ember.bin", first_payload())
     );
-    assert_eq!(
-        founded_by_later.claim("beta.bin.001", plain, Some(100)),
-        None
-    );
-    assert_eq!(
-        Stream::<Pieces>::new().claim("beta.bin.002", plain, Some(100)),
-        Some(VolumeIndex(1))
-    );
+}
+
+// A volume still growing when the run opens it is read from the front: its
+// tail is never waited on, so the grant's threads go unused.
+#[test]
+fn a_growing_multiblock_xz_is_read_from_the_front() {
+    let plain: Vec<u8> = (0..(1024 * 1024))
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let bytes = xz_multiblock(&plain);
+    let gate = Gate::new(bytes.clone());
+    let extraction = stream::<Xz>("ember.bin.xz").start();
+    let runner = {
+        let gate = Arc::clone(&gate);
+        thread::spawn(move || {
+            let mut emits = Vec::new();
+            let volumes: Arc<dyn Volumes> = gate.clone();
+            extraction.run(
+                volumes,
+                &mut |emit| {
+                    emits.push(emit);
+                    true
+                },
+                budget(1, 4),
+            );
+            gate.finish();
+            emits
+        })
+    };
+    // The run reads the front before the volume grows any further.
+    gate.await_reader();
+    gate.release(bytes.len());
+    gate.close();
+    assert_eq!(said(&runner.join().unwrap()), decoded("ember.bin", plain));
 }

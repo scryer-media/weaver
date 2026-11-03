@@ -15,8 +15,8 @@ pub mod tracker_file;
 
 pub use model::{
     BlocklistSource, BufferPoolOverrides, Client, Config, DeliveryNamingOverrides,
-    DirectStoreOverrides, DirectUnpackOverrides, Leaf, Level, Levels, MetricsConfig, PerJobSeries,
-    RetryOverrides, SeedTimeCounting, Seeding, SeedingAction, SeedingGoalMode, SeedingPolicy,
-    SharedConfig, TorrentConfig, TorrentEncryption, TorrentLimit, TorrentPeerProtocol,
+    DirectStoreOverrides, Leaf, Level, Levels, MetricsConfig, PerJobSeries, RetryOverrides,
+    SeedTimeCounting, Seeding, SeedingAction, SeedingGoalMode, SeedingPolicy, SharedConfig,
+    TorrentConfig, TorrentEncryption, TorrentLimit, TorrentPeerProtocol,
 };
 pub use service::HARDWARE_PROFILE_SETTING;

@@ -19,7 +19,7 @@ const WINDOW: u64 = 1 << 27;
 impl Decoder for Zstd {
     const KIND: Kind = Kind::Zstd;
 
-    fn window(_first: &[u8]) -> u64 {
+    fn window(_first: &[u8], _budget: &weaver_graph::Budget) -> u64 {
         WINDOW
     }
 

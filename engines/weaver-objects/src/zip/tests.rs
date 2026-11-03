@@ -8,11 +8,13 @@ use std::io::{Cursor, Write};
 
 use ::zip::write::SimpleFileOptions;
 use ::zip::{CompressionMethod, ZipWriter};
-use weaver_graph::{ByteRange, Emit, Kind, ObjectId, Provenance, Pull, VolumeIndex, Why};
+use weaver_graph::{
+    ByteRange, Emit, Kind, Located, MemberId, Object, ObjectId, Provenance, Pull, VolumeIndex, Why,
+};
 
 use super::Zip;
 use super::records::{self, LOCAL_LEN};
-use crate::testing::{payload, zip64_end};
+use crate::testing::{cloak, payload, zip64_end};
 use owner::Owner;
 
 fn files() -> Vec<(&'static str, Vec<u8>)> {
@@ -55,6 +57,30 @@ fn archive() -> Vec<u8> {
         .map(|(name, bytes)| Entry::File(name, bytes, stored()))
         .collect();
     write(&entries)
+}
+
+fn oversized_directory() -> Vec<u8> {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    for index in 0..129 {
+        writer.start_file(format!("f{index:03}"), stored()).unwrap();
+    }
+    let original = writer.finish().unwrap().into_inner();
+    let end = records::find_end(&original).unwrap();
+    let offset = end.offset as usize;
+    let directory = &original[offset..offset + end.size as usize];
+    let centrals = records::directory(directory, end.entries).unwrap();
+    let comment = vec![b'x'; u16::MAX as usize];
+    let mut archive = original[..offset].to_vec();
+    for central in centrals {
+        let mut record = directory[central.span].to_vec();
+        record[32..34].copy_from_slice(&u16::MAX.to_le_bytes());
+        archive.extend(record);
+        archive.extend(&comment);
+    }
+    let mut ending = original[offset + end.size as usize..].to_vec();
+    ending[12..16].copy_from_slice(&u32::try_from(archive.len() - offset).unwrap().to_le_bytes());
+    archive.extend(ending);
+    archive
 }
 
 fn has(owner: &Owner, wanted: &Emit) -> bool {
@@ -112,6 +138,14 @@ fn a_stored_archive_says_the_same_whole_in_four_kib_frames_and_a_byte_at_a_time(
     let whole = transcript(usize::MAX >> 1);
     assert_eq!(transcript(4096), whole);
     assert_eq!(transcript(1), whole);
+}
+
+#[test]
+fn an_oversized_directory_is_handed_to_the_bounded_engine_before_it_is_read() {
+    let mut owner = Owner::single(Zip::new(), oversized_directory());
+    owner.whole(usize::MAX >> 1);
+    assert!(has(&owner, &Emit::NeedsEngine(Why::Unsupported)));
+    assert!(owner.members.is_empty());
 }
 
 #[test]
@@ -195,7 +229,7 @@ fn a_spanned_set_streams_with_its_volumes_out_of_order() {
     // The `.zip` said it is disk 2: nothing numbered follows it.
     assert_eq!(
         weaver_graph::Object::claim(&mut owner.object, "alpha.z03", b"", None),
-        None
+        Vec::<VolumeIndex>::new()
     );
     no_trouble(&owner);
     streamed(&owner);
@@ -213,22 +247,22 @@ fn the_last_volume_follows_every_numbered_one_and_takes_nothing_of_another_set()
     let mut zip = Zip::new();
     zip.bound(VolumeIndex(0), "Alpha.Z01", &[], None);
     use weaver_graph::Object;
-    assert_eq!(zip.claim("alpha.z02", b"", None), Some(VolumeIndex(1)));
+    assert_eq!(zip.claim("alpha.z02", b"", None), vec![VolumeIndex(1)]);
     zip.bound(VolumeIndex(1), "alpha.z02", &[], None);
     assert_eq!(
         zip.claim("alpha.zip", b"", None),
-        Some(VolumeIndex(u32::MAX))
+        vec![VolumeIndex(u32::MAX)]
     );
     zip.bound(VolumeIndex(u32::MAX), "alpha.zip", &[], None);
     assert_eq!(
         zip.claim("alpha.z03", b"", None),
-        Some(VolumeIndex(2)),
+        vec![VolumeIndex(2)],
         "a numbered volume takes its number until the last says its disk"
     );
-    assert_eq!(zip.claim("beta.z03", b"", None), None);
+    assert_eq!(zip.claim("beta.z03", b"", None), Vec::<VolumeIndex>::new());
     assert_eq!(
         zip.claim("alpha.z02", b"", None),
-        Some(VolumeIndex(1)),
+        vec![VolumeIndex(1)],
         "a volume posted again is that volume"
     );
 
@@ -236,7 +270,7 @@ fn the_last_volume_follows_every_numbered_one_and_takes_nothing_of_another_set()
     lone.bound(VolumeIndex(0), "alpha.zip", &[], None);
     assert_eq!(
         lone.claim("alpha.z01", b"", None),
-        None,
+        Vec::<VolumeIndex>::new(),
         "a lone zip has no siblings"
     );
 }
@@ -339,6 +373,44 @@ fn an_archive_ended_by_zip64_records_streams_and_one_placing_them_past_its_bytes
 }
 
 #[test]
+fn an_entry_whose_local_header_names_another_file_goes_to_an_engine_unstreamed() {
+    let mut bytes = archive();
+    cloak(&mut bytes, "beta.bin", "bet4.bin");
+    let mut owner = Owner::single(Zip::new(), bytes);
+    owner.whole(4096);
+    assert!(has(&owner, &Emit::NeedsEngine(Why::Unsupported)));
+    assert!(owner.member("bet4.bin").bytes.is_empty());
+    assert!(!owner.members.values().any(|got| got.name == "beta.bin"));
+}
+
+#[test]
+fn a_walk_whose_headers_the_directory_contradicts_goes_to_an_engine() {
+    let mut bytes = archive();
+    cloak(&mut bytes, "gamma.bin", "gamm4.bin");
+    let mut owner = Owner::single(Zip::new(), bytes);
+    owner.pull = Pull::Unseekable;
+    owner.frames(0, 4096);
+    owner.close(0);
+    assert!(has(&owner, &Emit::NeedsEngine(Why::Unsupported)));
+}
+
+#[test]
+fn two_entries_of_one_name_are_rejected_before_any_member() {
+    let mut bytes = archive();
+    cloak(&mut bytes, "gamma.bin", "alpha.bin");
+    // Both headers of the second entry say the first's name.
+    let local = bytes
+        .windows(9)
+        .position(|window| window == b"gamma.bin")
+        .unwrap();
+    bytes[local..local + 9].copy_from_slice(b"alpha.bin");
+    let mut owner = Owner::single(Zip::new(), bytes);
+    owner.whole(4096);
+    assert_eq!(owner.said, vec![Emit::Refuse(Why::InvalidArchive)]);
+    assert!(owner.members.is_empty());
+}
+
+#[test]
 fn a_damaged_directory_is_said_and_a_repair_brings_the_members() {
     let real = archive();
     let end = records::find_end(&real).unwrap();
@@ -422,7 +494,243 @@ fn a_member_whose_checksum_fails_is_damaged_at_its_extent() {
 
 #[test]
 fn the_store_is_built_for_its_kind() {
-    let object = crate::build(Kind::Zip, ObjectId(1)).unwrap();
+    let object = crate::build(Kind::Zip, ObjectId(1), weaver_graph::Budget::default()).unwrap();
     assert_eq!(object.kind(), Kind::Zip);
     assert!(!object.reads_in_order());
+}
+
+// A stored local header for an empty entry named by `name`'s raw bytes, with
+// `extra` as its extra field.
+fn local_named(name: &[u8], flags: u16, extra: &[u8]) -> Vec<u8> {
+    let mut header = records::LOCAL.to_le_bytes().to_vec();
+    header.extend(20u16.to_le_bytes());
+    header.extend(flags.to_le_bytes());
+    header.extend([0u8; 18]);
+    header.extend((name.len() as u16).to_le_bytes());
+    header.extend((extra.len() as u16).to_le_bytes());
+    header.extend(name);
+    header.extend(extra);
+    header
+}
+
+// A Unicode path field naming `path` for a header whose name bytes have
+// `checksum`.
+fn unicode_path(checksum: u32, path: &str) -> Vec<u8> {
+    let mut field = 0x7075u16.to_le_bytes().to_vec();
+    field.extend((5 + path.len() as u16).to_le_bytes());
+    field.push(1);
+    field.extend(checksum.to_le_bytes());
+    field.extend(path.as_bytes());
+    field
+}
+
+#[test]
+fn a_name_that_is_not_utf8_reads_as_code_page_437_whatever_its_flag() {
+    let name = |bytes: &[u8], flags, extra: &[u8]| {
+        records::local(&local_named(bytes, flags, extra))
+            .unwrap()
+            .name
+    };
+    assert_eq!(name(b"caf\x82.txt", 0, &[]), "café.txt");
+    assert_eq!(name(b"\x80\x9b\xe1\xff", 0, &[]), "Ç¢ß\u{a0}");
+    assert_eq!(
+        name("café.txt".as_bytes(), 0, &[]),
+        "café.txt",
+        "valid UTF-8 without the flag stays UTF-8"
+    );
+    assert_eq!(
+        name(b"caf\x82.txt", 1 << 11, &[]),
+        "café.txt",
+        "the UTF-8 flag does not change how a name reads"
+    );
+    let checksum = crate::grid::crc32(b"cafe.txt");
+    assert_eq!(
+        name(b"cafe.txt", 0, &unicode_path(checksum, "café.txt")),
+        "café.txt",
+        "a Unicode path whose checksum matches the name stands in for it"
+    );
+    assert_eq!(
+        name(b"cafe.txt", 0, &unicode_path(!checksum, "café.txt")),
+        "cafe.txt",
+        "a Unicode path whose checksum does not match is ignored"
+    );
+}
+
+fn member_id(owner: &Owner, name: &str) -> MemberId {
+    owner
+        .members
+        .iter()
+        .find(|(_, got)| got.name == name)
+        .map(|(id, _)| MemberId(*id))
+        .unwrap()
+}
+
+// A stored entry's bytes are raw runs of the container, so a seek before the
+// central directory and the local header are read is not located yet, the
+// same seek after them lies where the map puts it, and only a range the map
+// rules out is never located.
+#[test]
+fn a_seek_before_the_central_directory_is_read_is_located_once_it_is() {
+    let bytes = archive();
+    let mut owner = Owner::single(Zip::new(), bytes.clone());
+    let mut extents = Vec::new();
+    assert_eq!(
+        owner
+            .object
+            .extent(MemberId(0), ByteRange::new(100, 200), &mut extents),
+        Located::NotYet
+    );
+    assert!(extents.is_empty());
+    owner.whole(4096);
+    no_trouble(&owner);
+    let alpha = member_id(&owner, "alpha.bin");
+    assert_eq!(
+        owner
+            .object
+            .extent(alpha, ByteRange::new(100, 200), &mut extents),
+        Located::Whole
+    );
+    let read: Vec<u8> = extents
+        .iter()
+        .flat_map(|extent| bytes[extent.range.start as usize..extent.range.end as usize].to_vec())
+        .collect();
+    assert_eq!(read, payload(1, 10_000)[100..200]);
+    extents.clear();
+    assert_eq!(
+        owner
+            .object
+            .extent(alpha, ByteRange::new(10_000, 10_100), &mut extents),
+        Located::Never
+    );
+    assert!(extents.is_empty());
+}
+
+// A deflated entry sends the whole container to an engine, whose members
+// are decoded and never lie in the volumes.
+#[test]
+fn a_seek_under_a_deflated_entry_is_unseekable() {
+    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let beta = payload(6, 2_000).repeat(4);
+    let mut owner = Owner::single(
+        Zip::new(),
+        write(&[Entry::File("beta.bin", &beta, deflated)]),
+    );
+    owner.whole(4096);
+    assert_eq!(owner.said, vec![Emit::NeedsEngine(Why::Compressed)]);
+    let engine = crate::zip_engine::ZipEngine::new();
+    let mut extents = Vec::new();
+    assert_eq!(
+        engine.extent(MemberId(0), ByteRange::new(0, 100), &mut extents),
+        Located::Never
+    );
+    assert!(extents.is_empty());
+}
+
+// Each file's checksum as the central directory states it, said as the
+// file is announced.
+#[test]
+fn a_file_carries_its_directory_checksum() {
+    let mut owner = Owner::single(Zip::new(), archive());
+    owner.whole(4096);
+    for (name, bytes) in files() {
+        assert_eq!(
+            owner.member(name).crc32,
+            Some(crate::grid::crc32(&bytes)),
+            "{name}"
+        );
+    }
+}
+
+// Three entries ahead of one longer than the tail the store reads first, so
+// the directory can be read while the payload ahead of it has yet to come.
+fn ahead_of_the_tail() -> Vec<(&'static str, Vec<u8>)> {
+    let mut files = files();
+    files.push(("delta.bin", payload(4, records::TAIL as usize)));
+    files
+}
+
+// An archive with its directory's records for two entries swapped: the same
+// bytes, the members numbered the other way.
+fn swapped_directory(single: &[u8], first: usize, second: usize) -> Vec<u8> {
+    let end = records::find_end(single).unwrap();
+    let start = end.offset as usize;
+    let directory = &single[start..start + end.size as usize];
+    let mut centrals: Vec<Vec<u8>> = records::directory(directory, end.entries)
+        .unwrap()
+        .into_iter()
+        .map(|central| directory[central.span].to_vec())
+        .collect();
+    centrals.swap(first, second);
+    let mut swapped = single.to_vec();
+    swapped[start..start + end.size as usize].copy_from_slice(&centrals.concat());
+    swapped
+}
+
+// A directory repaired into another order over bytes the store already
+// routed: the store moves them to the members the new directory gives, from
+// the bytes it routed, and asks for nothing twice.
+#[test]
+fn a_repaired_zip_directory_remaps_routed_payload_without_an_engine() {
+    let files = ahead_of_the_tail();
+    let entries: Vec<_> = files
+        .iter()
+        .map(|(name, bytes)| Entry::File(name, bytes, stored()))
+        .collect();
+    let before = write(&entries);
+    let after = swapped_directory(&before, 1, 2);
+    let end = records::find_end(&before).unwrap();
+    let directory = ByteRange::at(end.offset, end.size);
+    let beta = &files[1].1;
+    let beta_at = before
+        .windows(beta.len())
+        .position(|bytes| bytes == beta.as_slice())
+        .unwrap() as u64;
+    let cut = beta_at + 2_000;
+    let total = before.len() as u64;
+    let tail = total - records::TAIL;
+    assert!(cut < tail, "beta lies ahead of the tail");
+    let mut owner = Owner::single(Zip::new(), before.clone());
+    // Nothing is brought forward: what the store asks for is only recorded.
+    owner.pull = Pull::Moved(0);
+    // The tail with the directory, then alpha whole and beta in part.
+    owner.deliver(0, ByteRange::new(tail, total));
+    owner.deliver(0, ByteRange::new(0, cut));
+    assert!(owner.member("alpha.bin").closed);
+    assert_eq!(member_id(&owner, "beta.bin"), MemberId(1));
+    // The repair writes the directory in its other order.
+    owner.deliver_as(
+        0,
+        directory,
+        Provenance::Repaired,
+        Some(&after[directory.start as usize..directory.end as usize]),
+    );
+    assert!(owner.replays > 0, "routed bytes come again");
+    assert!(has(&owner, &Emit::Retract(MemberId(1))));
+    assert!(has(&owner, &Emit::Retract(MemberId(2))));
+    assert!(!has(&owner, &Emit::Retract(MemberId(0))), "alpha stays");
+    assert!(!has(&owner, &Emit::Retract(MemberId(3))), "delta stays");
+    // The rest of the payload.
+    owner.deliver(0, ByteRange::new(cut, tail));
+    owner.close(0);
+    assert!(
+        !owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::NeedsEngine(_) | Emit::Refuse(_))),
+        "{:?}",
+        owner.said
+    );
+    assert_eq!(member_id(&owner, "gamma.bin"), MemberId(1));
+    assert_eq!(member_id(&owner, "beta.bin"), MemberId(2));
+    assert_eq!(owner.members.len(), files.len());
+    for (name, bytes) in &files {
+        let got = owner.member(name);
+        assert_eq!(got.length, Some(bytes.len() as u64), "{name}");
+        assert!(got.closed, "{name} closed");
+        assert!(got.coverage.verified(ByteRange::new(0, bytes.len() as u64)));
+        assert_eq!(&got.bytes, bytes, "{name}");
+    }
+    assert_eq!(owner.held(), 0);
+    assert!(owner.refetched.is_empty(), "{:?}", owner.refetched);
+    assert_eq!(owner.posted(0).as_deref(), Some(after.as_slice()));
 }

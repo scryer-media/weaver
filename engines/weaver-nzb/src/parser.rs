@@ -146,8 +146,11 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
     limits: ParserLimits,
     diagnostics: &mut ParseDiagnostics,
 ) -> Result<Nzb, NzbError> {
+    // Text is taken whole: an element's text arrives as text pieces with an
+    // entity reference between each, so the pieces are joined first and the
+    // element's text is trimmed once, at its end. A password keeps its
+    // whitespace.
     let mut reader = Reader::from_reader(reader);
-    reader.config_mut().trim_text(true);
 
     let mut buf = Vec::new();
 
@@ -189,9 +192,6 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                             }
                         }
                         text_buf.clear();
-                        reader
-                            .config_mut()
-                            .trim_text(current_meta_type.as_deref() != Some("password"));
                     }
                     "file" => {
                         let mut poster = None;
@@ -202,9 +202,13 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                             match attr.key.as_ref() {
                                 "poster" => {
                                     poster = Some(
-                                        attr.normalized_value(XmlVersion::Implicit1_0)
-                                            .map_err(|e| NzbError::Xml(e.to_string()))?
-                                            .into_owned(),
+                                        attr.normalized_value_with(
+                                            XmlVersion::Implicit1_0,
+                                            1,
+                                            resolve_entity,
+                                        )
+                                        .map_err(|e| NzbError::Xml(e.to_string()))?
+                                        .into_owned(),
                                     );
                                 }
                                 "date" => {
@@ -224,9 +228,13 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                                 }
                                 "subject" => {
                                     subject = Some(
-                                        attr.normalized_value(XmlVersion::Implicit1_0)
-                                            .map_err(|e| NzbError::Xml(e.to_string()))?
-                                            .into_owned(),
+                                        attr.normalized_value_with(
+                                            XmlVersion::Implicit1_0,
+                                            1,
+                                            resolve_entity,
+                                        )
+                                        .map_err(|e| NzbError::Xml(e.to_string()))?
+                                        .into_owned(),
                                     );
                                 }
                                 _ => {}
@@ -307,10 +315,9 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                 match local {
                     "head" => in_head = false,
                     "meta" if in_head => {
-                        reader.config_mut().trim_text(true);
                         if let Some(key) = current_meta_type.take() {
                             match key.as_str() {
-                                "title" => meta_title = Some(text_buf.clone()),
+                                "title" => meta_title = Some(text_buf.trim().to_owned()),
                                 "password" => {
                                     if !text_buf.trim().is_empty()
                                         && !meta_passwords.contains(&text_buf)
@@ -321,15 +328,16 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                                         meta_passwords.push(text_buf.clone());
                                     }
                                 }
-                                _ => meta_tags.push((key, text_buf.clone())),
+                                _ => meta_tags.push((key, text_buf.trim().to_owned())),
                             }
                         }
                     }
                     "group" if in_groups => {
+                        let group = text_buf.trim();
                         if let Some(ref mut f) = current_file
-                            && !text_buf.is_empty()
+                            && !group.is_empty()
                         {
-                            f.groups.push(text_buf.clone());
+                            f.groups.push(group.to_owned());
                         }
                     }
                     "groups" => in_groups = false,
@@ -448,36 +456,17 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
             }
 
             Ok(Event::Text(e)) => {
-                let decoded = e.xml_content(XmlVersion::Implicit1_0);
-                let text = quick_xml::escape::unescape(&decoded)
-                    .map_err(|e| NzbError::Xml(e.to_string()))?;
-                if current_meta_type.as_deref() == Some("password") {
-                    text_buf.push_str(&text);
-                } else {
-                    text_buf = text.into_owned();
-                }
+                text_buf.push_str(&e.xml_content(XmlVersion::Implicit1_0));
             }
 
-            Ok(Event::GeneralRef(e)) if current_meta_type.as_deref() == Some("password") => {
+            Ok(Event::GeneralRef(e)) => {
                 if let Some(value) = e
                     .resolve_char_ref()
-                    .map_err(|_| NzbError::Xml("invalid password character reference".into()))?
+                    .map_err(|_| NzbError::Xml("invalid character reference".into()))?
                 {
                     text_buf.push(value);
-                } else {
-                    let value = match e.as_ref() {
-                        "amp" => '&',
-                        "lt" => '<',
-                        "gt" => '>',
-                        "quot" => '"',
-                        "apos" => '\'',
-                        _ => {
-                            return Err(NzbError::Xml(
-                                "unsupported password entity reference".into(),
-                            ));
-                        }
-                    };
-                    text_buf.push(value);
+                } else if let Some(value) = resolve_entity(e.as_ref()) {
+                    text_buf.push_str(value);
                 }
             }
             Ok(Event::CData(e)) if current_meta_type.as_deref() == Some("password") => {
@@ -525,6 +514,125 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
         },
         files,
     })
+}
+
+// What an NZB names: its title and the file name each `<file>` subject
+// carries, in document order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NzbNames {
+    pub title: Option<String>,
+    pub file_names: Vec<String>,
+}
+
+// Reads only the names an NZB carries. Each file's `<segments>` element is
+// skipped unread, so a large document costs a scan, not a parse of every
+// article.
+pub fn parse_nzb_names_reader<R: BufRead>(reader: R) -> Result<NzbNames, NzbError> {
+    let mut reader = Reader::from_reader(reader);
+    let mut buf = Vec::new();
+    let mut skipped = Vec::new();
+    let mut names = NzbNames::default();
+    let mut in_head = false;
+    let mut in_title = false;
+    let mut title = String::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Eof) => break,
+            Ok(Event::Start(e)) => {
+                let name = e.name();
+                match local_name(name.as_ref()) {
+                    "head" => in_head = true,
+                    "meta" if in_head => {
+                        in_title = false;
+                        for attr in e.attributes() {
+                            let attr = attr.map_err(|e| NzbError::Xml(e.to_string()))?;
+                            if attr.key.as_ref() == "type" && attr.value.as_ref() == "title" {
+                                in_title = true;
+                                title.clear();
+                            }
+                        }
+                    }
+                    "file" => {
+                        for attr in e.attributes() {
+                            let attr = attr.map_err(|e| NzbError::Xml(e.to_string()))?;
+                            if attr.key.as_ref() == "subject" {
+                                let subject = attr
+                                    .normalized_value_with(
+                                        XmlVersion::Implicit1_0,
+                                        1,
+                                        resolve_entity,
+                                    )
+                                    .map_err(|e| NzbError::Xml(e.to_string()))?
+                                    .into_owned();
+                                let file = NzbFile {
+                                    poster: String::new(),
+                                    subject,
+                                    date: 0,
+                                    groups: Vec::new(),
+                                    segments: Vec::new(),
+                                };
+                                if let Some(file_name) = file.filename() {
+                                    names.file_names.push(file_name.to_owned());
+                                }
+                            }
+                        }
+                    }
+                    "segments" => {
+                        let end = e.to_end().into_owned();
+                        reader
+                            .read_to_end_into(end.name(), &mut skipped)
+                            .map_err(|e| NzbError::Xml(e.to_string()))?;
+                        skipped.clear();
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = e.name();
+                match local_name(name.as_ref()) {
+                    "head" => in_head = false,
+                    "meta" if in_title => {
+                        in_title = false;
+                        names.title = Some(title.trim().to_owned());
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(e)) if in_title => {
+                title.push_str(&e.xml_content(XmlVersion::Implicit1_0));
+            }
+            Ok(Event::GeneralRef(e)) if in_title => {
+                if let Some(value) = e
+                    .resolve_char_ref()
+                    .map_err(|_| NzbError::Xml("invalid character reference".into()))?
+                {
+                    title.push(value);
+                } else if let Some(value) = resolve_entity(e.as_ref()) {
+                    title.push_str(value);
+                }
+            }
+            Err(e) => return Err(NzbError::Xml(e.to_string())),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(names)
+}
+
+// The text a named entity in an attribute value or element text stands for. The five XML
+// entities are the XML ones. NZBs written by web tools also carry HTML's
+// named entities, which XML does not define; a name HTML knows decodes to
+// its character, and any other name is dropped, so neither rejects the NZB.
+fn resolve_entity(name: &str) -> Option<&'static str> {
+    quick_xml::escape::resolve_xml_entity(name)
+        .or_else(|| {
+            html_escape::NAMED_ENTITIES
+                .binary_search_by(|(known, _)| (*known).cmp(name.as_bytes()))
+                .ok()
+                .map(|index| html_escape::NAMED_ENTITIES[index].1)
+        })
+        .or(Some(""))
 }
 
 // Strip namespace prefix from an element name (e.g. `nzb:file` -> `file`).
@@ -655,6 +763,47 @@ mod tests {
         assert_eq!(nzb.meta.password.as_deref(), Some("1"));
         assert_eq!(nzb.meta.passwords, ["1", "true", "  synthetic & <key> Ω  "]);
         assert!(!format!("{:?}", nzb.meta).contains("synthetic"));
+    }
+
+    #[test]
+    fn html_entities_in_a_password_decode_and_unknown_ones_drop() {
+        let input = std::str::from_utf8(MINIMAL_NZB).unwrap().replace(
+            "  <file",
+            r#"  <head>
+          <meta type="password">caf&eacute;&nbsp;&amp;&bogus;key</meta>
+        </head><file"#,
+        );
+        let nzb = parse_nzb(input.as_bytes()).unwrap();
+        assert_eq!(nzb.meta.passwords, ["caf\u{e9}\u{a0}&key"]);
+    }
+
+    #[test]
+    fn element_text_keeps_its_entities_and_trims_once() {
+        let xml = br#"<?xml version="1.0"?>
+<nzb>
+  <head>
+    <meta type="title">
+      A &amp; B
+    </meta>
+    <meta type="tag">  x&lt;y  </meta>
+  </head>
+  <file poster="p" date="0" subject="s">
+    <groups>
+      <group> alt.binaries&nbsp;caf&eacute; </group>
+      <group>   </group>
+    </groups>
+    <segments>
+      <segment bytes="1" number="1">
+        a&amp;b@host
+      </segment>
+    </segments>
+  </file>
+</nzb>"#;
+        let nzb = parse_nzb(xml).unwrap();
+        assert_eq!(nzb.meta.title.as_deref(), Some("A & B"));
+        assert_eq!(nzb.meta.tags, [("tag".to_owned(), "x<y".to_owned())]);
+        assert_eq!(nzb.files[0].groups, ["alt.binaries\u{a0}caf\u{e9}"]);
+        assert_eq!(nzb.files[0].segments[0].message_ids, ["a&b@host"]);
     }
 
     const MINIMAL_NZB: &[u8] = br#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1155,6 +1304,45 @@ mod tests {
         assert_eq!(nzb.files[0].filename(), Some("file.rar"));
     }
 
+    fn one_file(subject: &str) -> Vec<u8> {
+        format!(
+            r#"<?xml version="1.0"?>
+<nzb>
+  <file poster="p" date="0" subject="{subject}">
+    <groups><group>g</group></groups>
+    <segments><segment bytes="1" number="1">id</segment></segments>
+  </file>
+</nzb>"#
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn html_named_entities_in_a_subject_decode_to_their_character() {
+        let nzb = parse_nzb(&one_file(
+            "Caf&eacute;&nbsp;Night - &quot;Caf&eacute;&nbsp;Night.mkv&quot; yEnc (1/1)",
+        ))
+        .unwrap();
+        assert_eq!(
+            nzb.files[0].subject,
+            "Caf\u{e9}\u{a0}Night - \"Caf\u{e9}\u{a0}Night.mkv\" yEnc (1/1)"
+        );
+        assert_eq!(nzb.files[0].filename(), Some("Caf\u{e9}\u{a0}Night.mkv"));
+    }
+
+    #[test]
+    fn an_unknown_entity_in_a_subject_is_dropped() {
+        let nzb = parse_nzb(&one_file("&quot;sh&notanentity;ow.rar&quot; yEnc (1/1)")).unwrap();
+        assert_eq!(nzb.files[0].subject, "\"show.rar\" yEnc (1/1)");
+        assert_eq!(nzb.files[0].filename(), Some("show.rar"));
+    }
+
+    #[test]
+    fn xml_entities_in_a_subject_stay_the_xml_ones() {
+        let nzb = parse_nzb(&one_file("a &amp; b &lt;&gt;&apos;&#65; yEnc (1/1)")).unwrap();
+        assert_eq!(nzb.files[0].subject, "a & b <>'A yEnc (1/1)");
+    }
+
     fn test_limits() -> ParserLimits {
         ParserLimits {
             max_xml_bytes: 4096,
@@ -1440,5 +1628,32 @@ mod tests {
                 message_ids: vec![String::new()],
             }],
         }
+    }
+
+    #[test]
+    fn names_reader_reads_the_title_and_file_names_and_skips_segments() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <head><meta type="category">tv</meta><meta type="title">Some &amp; Title</meta></head>
+  <file poster="p@example.com" date="1" subject="Post - &quot;Some.Title.part01.rar&quot; yEnc (1/2)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments>
+      <segment bytes="10" number="1">a@example.com</segment>
+      <segment bytes="10" number="2">b@example.com</segment>
+    </segments>
+  </file>
+  <file poster="p@example.com" date="1" subject="Some.Title.nfo (1/1)">
+    <segments><segment bytes="5" number="1">c@example.com</segment></segments>
+  </file>
+</nzb>"#;
+        let names = parse_nzb_names_reader(Cursor::new(&xml[..])).unwrap();
+        assert_eq!(names.title.as_deref(), Some("Some & Title"));
+        assert_eq!(
+            names.file_names,
+            vec![
+                "Some.Title.part01.rar".to_string(),
+                "Some.Title.nfo".to_string()
+            ]
+        );
     }
 }

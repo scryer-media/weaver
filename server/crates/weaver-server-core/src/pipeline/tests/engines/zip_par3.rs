@@ -13,8 +13,8 @@ use par3_rs::inside::{ContainerLimits, InsertionPlan};
 use par3_rs::source::{MemorySourceAccess, SourceId};
 use weaver_graph::recovery::RepairOutcome;
 
-use super::harness::{ARTICLE, Post, Scenario, run_both};
-use super::zip::{archive, assert_members, members, stored};
+use super::harness::{ARTICLE, Post, Scenario, run};
+use super::zip::{archive, assert_members, stored};
 
 const NAME: &str = "lantern.zip";
 
@@ -48,18 +48,8 @@ fn inserted() -> Vec<u8> {
     bytes
 }
 
-// Classic repairs too, though a damaged member it first extracted may stay
-// behind in its staging directory; only the members are compared there.
 async fn assert_repaired(scenario: Scenario) {
-    let (classic, graph) = run_both(&scenario).await;
-    assert!(classic.completed(), "classic: {:?}", classic.failure);
-    for (name, bytes) in members() {
-        assert_eq!(
-            classic.files.get(&format!("lantern beacon/{name}")),
-            Some(&bytes),
-            "classic: {name}"
-        );
-    }
+    let graph = run(&scenario).await;
     assert_members(&graph);
     assert!(
         graph
@@ -75,8 +65,7 @@ async fn assert_repaired(scenario: Scenario) {
 // A hundred bytes of the first member overwritten as posted: every article
 // arrives whole, and only the set's hashes say the bytes are wrong.
 #[tokio::test]
-async fn a_zip_carrying_its_own_par3_with_member_bytes_overwritten_is_repaired_under_both_engines()
-{
+async fn a_zip_carrying_its_own_par3_with_member_bytes_overwritten_is_repaired() {
     let mut bytes = inserted();
     bytes[200..300].fill(0xA5);
     assert_repaired(Scenario::new(vec![Post::plain(NAME, bytes)])).await;
@@ -84,7 +73,7 @@ async fn a_zip_carrying_its_own_par3_with_member_bytes_overwritten_is_repaired_u
 
 // The first local header zeroed as posted: no signature opens the post.
 #[tokio::test]
-async fn a_zip_carrying_its_own_par3_with_its_first_header_zeroed_is_repaired_under_both_engines() {
+async fn a_zip_carrying_its_own_par3_with_its_first_header_zeroed_is_repaired() {
     let mut bytes = inserted();
     bytes[..64].fill(0);
     assert_repaired(Scenario::new(vec![Post::plain(NAME, bytes)])).await;
@@ -92,7 +81,49 @@ async fn a_zip_carrying_its_own_par3_with_its_first_header_zeroed_is_repaired_un
 
 // An article of the first member's data never arrives.
 #[tokio::test]
-async fn a_zip_carrying_its_own_par3_missing_an_article_is_repaired_under_both_engines() {
+async fn a_zip_carrying_its_own_par3_missing_an_article_is_repaired() {
     let scenario = Scenario::new(vec![Post::plain(NAME, inserted())]).lost(0, 3);
     assert_repaired(scenario).await;
+}
+
+// A large stored zip carrying its own PAR3 at a block of two articles, as a
+// reference writer inserts it, with one interior article of its member lost.
+#[tokio::test]
+async fn a_large_zip_carrying_its_own_par3_missing_an_interior_article_is_repaired() {
+    const POSTED: usize = 16 * 1024;
+    let member = super::harness::payload(4 << 20, 77);
+    let mut writer = ::zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    writer.start_file("azure.kiln.mkv", stored()).unwrap();
+    std::io::Write::write_all(&mut writer, &member).unwrap();
+    let original = writer.finish().unwrap().into_inner();
+    let scratch = tempfile::tempdir().unwrap();
+    let source = SourceId(0);
+    let mut access = MemorySourceAccess::default();
+    access.insert(source, 1, Arc::from(original.as_slice()));
+    let path = scratch.path().join(NAME);
+    let options = CreationOptions {
+        block_size: 2 * POSTED as u64,
+        recovery_count: 13,
+        ..CreationOptions::default()
+    };
+    InsertionPlan::build(
+        Arc::new(access),
+        source,
+        NAME,
+        options,
+        &ContainerLimits::default(),
+    )
+    .expect("an insertion plan over the stored zip")
+    .execute(&path, scratch.path())
+    .expect("the recovery set is inserted");
+    let bytes = std::fs::read(&path).unwrap();
+    let graph = run(&Scenario::new(vec![Post::plain(NAME, bytes)])
+        .framed(POSTED)
+        .lost(0, 100))
+    .await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert!(
+        graph.files["lantern beacon/azure.kiln.mkv"] == member,
+        "member bytes"
+    );
 }

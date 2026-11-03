@@ -74,6 +74,7 @@ impl JobReport {
             metadata: self.metadata,
             output_dir: self.output_dir,
             server_attribution: Vec::new(),
+            file_remaining_bytes: Vec::new(),
             download_wait_reason: self.wait_reason,
             download_retry_at_epoch_ms: None,
             created_at_epoch_ms: self.created_at_ms as f64,

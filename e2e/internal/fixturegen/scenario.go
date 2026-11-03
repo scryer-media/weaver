@@ -16,7 +16,10 @@ import (
 // it — and nothing else in the file.
 const ScenarioDigestKey = "expectedOutputBLAKE3"
 
-// RewriteScenarioDigests replaces the expectedOutputBLAKE3 block in place.
+const scenarioRetainedDigestKey = "expectedRetainedOutputBLAKE3"
+
+// RewriteScenarioDigests replaces the scenario's delivered or retained digest
+// block in place. Retained bytes stay distinct from usable delivered outputs.
 // The rest of the file is left byte for byte alone: the block is located in
 // the raw text and only its braces are replaced, so field order, spacing and
 // the trailing newline all survive untouched.
@@ -25,11 +28,25 @@ func RewriteScenarioDigests(path string, digests map[string]string) error {
 	if err != nil {
 		return err
 	}
-	start, end, indent, err := locateScenarioBlock(string(original), ScenarioDigestKey)
+	key := ScenarioDigestKey
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(original, &document); err != nil {
+		return err
+	}
+	if _, retained := document[scenarioRetainedDigestKey]; retained {
+		if _, delivered := document[ScenarioDigestKey]; delivered {
+			return fmt.Errorf("%s: cannot rewrite both retained and delivered digests", path)
+		}
+		key = scenarioRetainedDigestKey
+	}
+	start, end, indent, err := locateScenarioBlock(string(original), key)
 	if err != nil {
 		return fmt.Errorf("%s: %w", path, err)
 	}
 	replacement := renderDigestBlock(digests, indent)
+	if key != ScenarioDigestKey {
+		replacement = strings.Replace(replacement, `"`+ScenarioDigestKey+`"`, `"`+key+`"`, 1)
+	}
 	updated := string(original[:start]) + replacement + string(original[end:])
 	if updated == string(original) {
 		return nil
@@ -117,5 +134,6 @@ func ScenarioHasDigests(path string) (bool, error) {
 		return false, fmt.Errorf("%s: %w", path, err)
 	}
 	_, ok := document[ScenarioDigestKey]
-	return ok, nil
+	_, retained := document[scenarioRetainedDigestKey]
+	return ok || retained, nil
 }

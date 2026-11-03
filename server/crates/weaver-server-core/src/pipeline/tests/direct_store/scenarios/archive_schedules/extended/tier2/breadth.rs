@@ -9,7 +9,7 @@
 use super::super::super::super::sevenz_store::{Entry, build_7z_shaped, split_volumes};
 use super::damage::with_recovery;
 use super::fixtures::{Container, MEMBER, PASSWORD as KEY, SEVENZ_MEMBER, payload};
-use super::post::{Encoding, Post, Posted, Role};
+use super::post::{Allowed, Encoding, Post, Posted, Role};
 use super::recovery::{
     self, Code, Geometry, Margin, Par2Volumes, par2_packet, par2_packets, par2_set_id, par2_type,
 };
@@ -208,11 +208,7 @@ macro_rules! breadth_family {
                 units: cells
                     .into_iter()
                     .enumerate()
-                    .flat_map(|(index, cell)| {
-                        PROFILES
-                            .into_iter()
-                            .map(move |profile| (cell, profile, $pool, PER_UNIT, index))
-                    })
+                    .map(|(index, cell)| (cell, $pool, PER_UNIT, index))
                     .collect(),
             }
         }
@@ -289,8 +285,8 @@ pub(super) mod lies {
         cells
     }
 
-    // 162 cells under three profiles, 617 of the combined cases each.
-    breadth_family!(LieCell, cells(), Pool::Combined, 617, 299_862, 162);
+    // 162 cells, 617 of the combined cases each.
+    breadth_family!(LieCell, cells(), Pool::Combined, 617, 99_954, 162);
 
     // The set rewritten to tell the lie, in every file that describes.
     fn tell(lie: Lie, set: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
@@ -426,7 +422,7 @@ pub(super) mod lies {
         }
     }
 
-    // The campaign: 300 shards of about a thousand cases.
+    // The campaign: 300 shards of about three hundred cases.
     mod combined_lies {
         use super::*;
 
@@ -495,8 +491,8 @@ pub(super) mod nesting {
         cells
     }
 
-    // 128 cells under three profiles, 781 of the combined cases each.
-    breadth_family!(NestCell, cells(), Pool::Combined, 781, 299_904, 128);
+    // 128 cells, 781 of the combined cases each.
+    breadth_family!(NestCell, cells(), Pool::Combined, 781, 99_968, 128);
 
     impl NestCell {
         fn members(self) -> Vec<(String, Vec<u8>)> {
@@ -557,24 +553,34 @@ pub(super) mod nesting {
                 members.truncate(1);
             }
             let inner = self.innermost(&members);
-            let outer = match self.depth {
+            // The containers inside the outer set, by name: a damaged one is
+            // delivered as it stands beside the members, never withheld.
+            let (outer, containers) = match self.depth {
                 Depth::Two | Depth::SevenZipInside => {
                     let inner_name = if self.depth == Depth::SevenZipInside {
                         "inner.7z"
                     } else {
                         "inner.rar"
                     };
-                    stored(self.outer, inner_name, &inner, self.volumes)
+                    (
+                        stored(self.outer, inner_name, &inner, self.volumes),
+                        vec![inner_name],
+                    )
                 }
                 Depth::Three => {
                     let middle = stored(Container::Rar5, "inner.rar", &inner, 1).remove(0).1;
-                    stored(self.outer, "middle.rar", &middle, self.volumes)
+                    (
+                        stored(self.outer, "middle.rar", &middle, self.volumes),
+                        vec!["middle.rar", "inner.rar"],
+                    )
                 }
-                Depth::RarInside7z => {
-                    stored(Container::SevenZip, "inner.rar", &inner, self.volumes)
-                }
+                Depth::RarInside7z => (
+                    stored(Container::SevenZip, "inner.rar", &inner, self.volumes),
+                    vec!["inner.rar"],
+                ),
             };
             let mut post = data_post(outer, ARTICLE, members);
+            post.allowed = containers.into_iter().map(Allowed::unusable).collect();
             post.password = self.locked.then(|| KEY.to_string());
             let (post, geometry) = with(
                 post,
@@ -652,7 +658,7 @@ pub(super) mod nesting {
         }
     }
 
-    // The campaign: 300 shards of about a thousand cases.
+    // The campaign: 300 shards of about three hundred cases.
     mod combined_nesting {
         use super::*;
 
@@ -724,8 +730,8 @@ pub(super) mod scale {
         cells
     }
 
-    // 100 cells under three profiles, 1,000 of the combined cases each.
-    breadth_family!(ScaleCell, cells(), Pool::Combined, 1_000, 300_000, 100);
+    // 100 cells, 1,000 of the combined cases each.
+    breadth_family!(ScaleCell, cells(), Pool::Combined, 1_000, 100_000, 100);
 
     impl ScaleCell {
         // Volumes, articles per volume, article size.
@@ -820,7 +826,7 @@ pub(super) mod scale {
         }
     }
 
-    // The campaign: 300 shards of about a thousand cases.
+    // The campaign: 300 shards of about three hundred cases.
     mod combined_scale {
         use super::*;
 
@@ -861,8 +867,8 @@ pub(super) mod withheld {
             .collect()
     }
 
-    // 3 cells under three profiles, 200 of the combined cases each.
-    breadth_family!(WithheldCell, cells(), Pool::Combined, 200, 1_800, 3);
+    // 3 cells, 200 of the combined cases each.
+    breadth_family!(WithheldCell, cells(), Pool::Combined, 200, 600, 3);
 
     impl WithheldCell {
         // Bytes per article, articles per volume, PAR2 slice.
@@ -921,24 +927,18 @@ pub(super) mod withheld {
         }
     }
 
-    // A rebuilt volume no posted file owns must reach the chase that waits
-    // on it. The consumption deadline is lifted out of reach, so a chase
-    // left parked on that volume holds the run until the test runner ends
-    // it, instead of being rescued by the deadline.
+    // A rebuilt volume no posted file owns must reach the member that
+    // spans it, under a loss as well.
     #[tokio::test]
-    async fn a_rebuilt_withheld_volume_reaches_the_chase() {
-        use crate::pipeline::direct_unpack::wiring::PENDING_CHASE_DEADLINE_OVERRIDE;
-        *PENDING_CHASE_DEADLINE_OVERRIDE.lock().unwrap() =
-            Some(std::time::Duration::from_secs(24 * 60 * 60));
+    async fn a_rebuilt_withheld_volume_reaches_its_member() {
         loss_smoke(WithheldCell {
             container: Container::Rar5Encrypted,
             field_size: false,
         })
         .await;
-        *PENDING_CHASE_DEADLINE_OVERRIDE.lock().unwrap() = None;
     }
 
-    // The campaign: 100 shards of eighteen cases.
+    // The campaign: 100 shards of six cases.
     mod combined_withheld {
         use super::*;
 
@@ -1004,8 +1004,8 @@ pub(super) mod password {
         cells
     }
 
-    // 72 cells under three profiles, 925 of the combined cases each.
-    breadth_family!(PasswordCell, cells(), Pool::Combined, 925, 199_800, 72);
+    // 72 cells, 925 of the combined cases each.
+    breadth_family!(PasswordCell, cells(), Pool::Combined, 925, 66_600, 72);
 
     impl PasswordCell {
         fn member(self) -> &'static str {
@@ -1130,7 +1130,7 @@ pub(super) mod password {
         }
     }
 
-    // The campaign: 200 shards of about a thousand cases.
+    // The campaign: 200 shards of about three hundred cases.
     mod combined_password {
         use super::*;
 
@@ -1187,8 +1187,8 @@ pub(super) mod wire {
         cells
     }
 
-    // 80 cells under three profiles, 833 of the combined cases each.
-    breadth_family!(WireCell, cells(), Pool::Combined, 833, 199_920, 80);
+    // 80 cells, 833 of the combined cases each.
+    breadth_family!(WireCell, cells(), Pool::Combined, 833, 66_640, 80);
 
     impl Cell for WireCell {
         fn post(self, interruption: Interruption) -> Built {
@@ -1276,7 +1276,7 @@ pub(super) mod wire {
         }
     }
 
-    // The campaign: 200 shards of about a thousand cases.
+    // The campaign: 200 shards of about three hundred cases.
     mod combined_wire {
         use super::*;
 
@@ -1356,8 +1356,8 @@ pub(super) mod naming {
         cells
     }
 
-    // 96 cells under three profiles, 694 of the combined cases each.
-    breadth_family!(NameCell, cells(), Pool::Combined, 694, 199_872, 96);
+    // 96 cells, 694 of the combined cases each.
+    breadth_family!(NameCell, cells(), Pool::Combined, 694, 66_624, 96);
 
     fn rename(naming: Naming, name: &str) -> String {
         match naming {
@@ -1483,7 +1483,7 @@ pub(super) mod naming {
         }
     }
 
-    // The campaign: 200 shards of about a thousand cases.
+    // The campaign: 200 shards of about three hundred cases.
     mod combined_naming {
         use super::*;
 
@@ -1551,8 +1551,8 @@ pub(super) mod sets {
         cells
     }
 
-    // 120 cells under three profiles, 555 of the combined cases each.
-    breadth_family!(SetsCell, cells(), Pool::Combined, 555, 199_800, 120);
+    // 120 cells, 555 of the combined cases each.
+    breadth_family!(SetsCell, cells(), Pool::Combined, 555, 66_600, 120);
 
     impl SetsCell {
         fn second_member(self) -> &'static str {
@@ -1601,7 +1601,7 @@ pub(super) mod sets {
                         bytes,
                     ));
                 }
-                allowed.push(member.to_string());
+                allowed.push(Allowed::usable(member, &sample));
             }
             if self.layout == Layout::LooseMedia {
                 let trailer = payload(107, 20_000);
@@ -1616,22 +1616,25 @@ pub(super) mod sets {
                         format!("{name} {crc:08x}\r\n")
                     })
                     .collect();
-                let furniture: Vec<(String, Vec<u8>)> = vec![
+                // Each with whether a user opens it: the picture and the text
+                // are usable files, the rest only describe the post.
+                let furniture: Vec<(&str, Vec<u8>, bool)> = vec![
                     (
-                        "silver.horizon.nfo".to_string(),
+                        "silver.horizon.nfo",
                         b"Silver Horizon\r\nposted for the harbour\r\n".to_vec(),
+                        false,
                     ),
-                    ("silver.horizon.sfv".to_string(), listing.into_bytes()),
-                    ("silver.horizon.jpg".to_string(), payload(109, 2_000)),
-                    ("silver.horizon.srr".to_string(), payload(113, 1_500)),
-                    (
-                        "readme.txt".to_string(),
-                        b"nothing to see here\r\n".to_vec(),
-                    ),
+                    ("silver.horizon.sfv", listing.into_bytes(), false),
+                    ("silver.horizon.jpg", payload(109, 2_000), true),
+                    ("silver.horizon.srr", payload(113, 1_500), false),
+                    ("readme.txt", b"nothing to see here\r\n".to_vec(), true),
                 ];
-                for (name, bytes) in furniture {
-                    allowed.push(name.clone());
-                    volumes.push((name, bytes));
+                for (name, bytes, usable) in furniture {
+                    allowed.push(match usable {
+                        true => Allowed::usable(name, &bytes),
+                        false => Allowed::unusable(name),
+                    });
+                    volumes.push((name.to_string(), bytes));
                 }
             }
             let mut post = data_post(volumes, ARTICLE, expected);
@@ -1658,8 +1661,11 @@ pub(super) mod sets {
         }
     }
 
+    // The graph has no schedule-driven demotion: a crash, which loses what
+    // the job held only in memory, is the boundary that sends the 7z set
+    // back for what it had not made durable.
     #[tokio::test]
-    async fn demoted_sevenz_extracts_before_healthy_neighbour_commits() {
+    async fn crashed_sevenz_extracts_beside_healthy_neighbour() {
         run_cell(
             SetsCell {
                 layout: Layout::TwoSetsFurniture,
@@ -1668,20 +1674,21 @@ pub(super) mod sets {
                 stale_sfv: false,
                 volumes: 2,
             },
-            ExtractionProfile::DirectStore,
             vec![(
                 113487,
                 (
                     vec![(0, 0), (0, 0), (0, 1), (1, 0), (1, 1)],
-                    Interruption::Demote(1),
+                    Interruption::Crash(1),
                 ),
             )],
         )
         .await;
     }
 
+    // A set damaged past mending beside a healthy one: the healthy set's
+    // member is delivered whole and the job ends partial.
     #[tokio::test]
-    async fn damaged_neighbour_keeps_healthy_set_unfinalized() {
+    async fn damaged_neighbour_leaves_healthy_set_delivered() {
         let cell = SetsCell {
             layout: Layout::TwoSets,
             container: Container::Rar5,
@@ -1696,21 +1703,33 @@ pub(super) mod sets {
         );
         let result = super::run::run(
             &post,
-            ExtractionProfile::DirectStore,
             &slot_arrivals(4),
-            Interruption::None,
+            (
+                Interruption::None,
+                crate::pipeline::tests::direct_store::scenarios::archive_schedules::graph::Answers::Heard,
+            ),
         )
         .await;
-        result.assert(
-            &post,
-            ExtractionProfile::DirectStore,
-            Verdict::Fails,
-            "damaged neighbouring set",
+        result.assert(&post, Verdict::Fails, false, "damaged neighbouring set");
+        let (healthy, bytes) = &post.expected[0];
+        assert_eq!(
+            result.status,
+            Some(JobStatus::Partial),
+            "{:?}",
+            result.trace
+        );
+        assert_eq!(
+            result.files[healthy].as_deref(),
+            Some(bytes.as_slice()),
+            "{:?}",
+            result.trace
         );
     }
 
+    // The second set loses an article it has no recovery for: the first
+    // set's member is still delivered whole.
     #[tokio::test]
-    async fn failed_job_keeps_healthy_set_in_staging() {
+    async fn lost_neighbour_leaves_healthy_set_delivered() {
         let cell = SetsCell {
             layout: Layout::TwoSets,
             container: Container::Rar5,
@@ -1718,23 +1737,20 @@ pub(super) mod sets {
             stale_sfv: false,
             volumes: 2,
         };
-        for profile in PROFILES {
-            run_cell(
-                cell,
-                profile,
-                vec![(
-                    0,
-                    (
-                        slot_arrivals(4),
-                        Interruption::Loss {
-                            mask: 8,
-                            index_first: true,
-                        },
-                    ),
-                )],
-            )
-            .await;
-        }
+        run_cell(
+            cell,
+            vec![(
+                0,
+                (
+                    slot_arrivals(4),
+                    Interruption::Loss {
+                        mask: 8,
+                        index_first: true,
+                    },
+                ),
+            )],
+        )
+        .await;
     }
 
     mod combined_sets_smoke {
@@ -1797,7 +1813,7 @@ pub(super) mod sets {
         }
     }
 
-    // The campaign: 200 shards of about a thousand cases.
+    // The campaign: 200 shards of about three hundred cases.
     mod combined_sets {
         use super::*;
 

@@ -2,8 +2,6 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::events::model::PipelineEvent;
@@ -133,6 +131,42 @@ async fn update_random_read_iops_reaches_scheduler() {
     let (handle, task) = test_scheduler().await;
 
     handle.update_random_read_iops(1_500.0).await.unwrap();
+
+    handle.shutdown().await.unwrap();
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn update_disk_measurement_publishes_both_figures() {
+    let (handle, task) = test_scheduler().await;
+    let published = |handle: &SchedulerHandle| {
+        handle.state.queue.read(|inner| {
+            (
+                inner.globals.random_read_iops,
+                inner.globals.sequential_write_mbps,
+            )
+        })
+    };
+
+    handle
+        .update_disk_measurement(crate::runtime::DiskMeasurement {
+            sequential_write_mbps: 80.0,
+            random_read_iops: 1_500.0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(published(&handle), (Some(1_500.0), Some(80.0)));
+
+    // A pinned read figure comes with no write measurement, which leaves
+    // the last measured one in place.
+    handle
+        .update_disk_measurement(crate::runtime::DiskMeasurement {
+            sequential_write_mbps: 0.0,
+            random_read_iops: 900.0,
+        })
+        .await
+        .unwrap();
+    assert_eq!(published(&handle), (Some(900.0), Some(80.0)));
 
     handle.shutdown().await.unwrap();
     task.await.unwrap();
@@ -517,32 +551,6 @@ async fn reorder_jobs_batch_rejects_unknown_id_without_partial_application() {
 }
 
 #[test]
-fn job_cancellation_callbacks_fire_before_scheduler_work_and_can_be_cleared() {
-    let state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
-    let cancelled = Arc::new(AtomicBool::new(false));
-    let callback_cancelled = Arc::clone(&cancelled);
-    state.register_job_cancellation(
-        JobId(42),
-        Arc::new(move || callback_cancelled.store(true, Ordering::Release)),
-    );
-
-    assert!(state.cancel_active_job_work(JobId(42)));
-    assert!(cancelled.load(Ordering::Acquire));
-
-    state.clear_job_cancellations(JobId(42));
-    assert!(!state.cancel_active_job_work(JobId(42)));
-
-    assert!(!state.cancel_active_job_work(JobId(43)));
-    let late_cancelled = Arc::new(AtomicBool::new(false));
-    let late_callback_cancelled = Arc::clone(&late_cancelled);
-    state.register_job_cancellation(
-        JobId(43),
-        Arc::new(move || late_callback_cancelled.store(true, Ordering::Release)),
-    );
-    assert!(late_cancelled.load(Ordering::Acquire));
-}
-
-#[test]
 fn job_download_rates_report_only_transferring_download_phases() {
     use crate::jobs::phase_progress::{JobPhase, JobPhaseProgress};
 
@@ -583,6 +591,7 @@ fn job_download_rates_report_only_transferring_download_phases() {
             total_files: 0,
             completed_files: 0,
             remaining_par_files: 0,
+            file_remaining_bytes: Vec::new(),
             password: None,
             category: None,
             metadata: Vec::new(),
@@ -637,6 +646,7 @@ impl QueueOwner for RecordingOwner {
 fn owned_job(job_id: JobId, created_at_epoch_ms: f64) -> JobInfo {
     JobInfo {
         protocol: crate::jobs::Protocol::Torrent,
+        file_remaining_bytes: Vec::new(),
         job_id,
         job_hash: None,
         name: format!("job {}", job_id.0),

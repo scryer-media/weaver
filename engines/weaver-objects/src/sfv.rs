@@ -13,8 +13,8 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{
-    ByteRange, Delivery, Durable, Emit, Extent, Facts, Give, Kind, MemberId, Namespace, Object,
-    ObjectId, Placement, Pull, Recovery, Seek, Segment, SliceVerdict, Take, VolumeIndex,
+    ByteRange, Delivery, Durable, Emit, Extent, Facts, Give, Kind, Located, MemberId, Namespace,
+    Object, ObjectId, Placement, Pull, Recovery, Seek, Segment, SliceVerdict, Take, VolumeIndex,
 };
 
 use crate::grid::{self, Grid, WHOLE};
@@ -260,7 +260,9 @@ impl Object for Sfv {
         });
     }
 
-    fn extent(&self, _member: MemberId, _range: ByteRange, _out: &mut Vec<Extent>) {}
+    fn extent(&self, _member: MemberId, _range: ByteRange, _out: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
 
     fn envelope(&self, _envelope: u32, _range: ByteRange) -> Option<Bytes> {
         None
@@ -298,7 +300,7 @@ impl Recovery for Sfv {
             .into_iter()
             .filter_map(|(basename, member)| Some((member?, *entries.get(&basename)?)))
             .collect();
-        self.lengths = bound
+        let lengths = bound
             .keys()
             .filter_map(|member| {
                 let record = namespace.get(*member)?;
@@ -308,9 +310,10 @@ impl Recovery for Sfv {
                     .map(|length| (*member, length))
             })
             .collect();
-        if bound != self.bound {
+        if bound != self.bound || lengths != self.lengths {
             self.outcome = None;
         }
+        self.lengths = lengths;
         self.bound = bound;
     }
 
@@ -324,9 +327,14 @@ impl Recovery for Sfv {
     }
 
     fn feed(&mut self, member: MemberId, segments: &[Segment]) {
-        for segment in segments {
-            self.grid.offer(member, WHOLE, segment);
+        if self.covers(member) && !self.grid.matches(member, segments) {
+            self.outcome = None;
         }
+        self.feed_proven(member, segments);
+    }
+
+    fn feed_proven(&mut self, member: MemberId, segments: &[Segment]) {
+        self.grid.offer_all(member, WHOLE, segments);
     }
 
     // One verdict for the whole member: an SFV has no slices.
@@ -338,25 +346,27 @@ impl Recovery for Sfv {
 
     fn wants(&self, _out: &mut Vec<Seek>) {}
 
-    fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
+    fn repair(&mut self, access: &mut dyn MemberAccess, _: weaver_graph::Budget) -> RepairOutcome {
         let mut damaged = 0;
         for (&member, &expected) in &self.bound {
-            let intact = match self.verdict(member, expected) {
-                SliceVerdict::Intact => true,
-                SliceVerdict::Damaged => false,
-                SliceVerdict::Unknown => {
-                    access
-                        .length(member)
-                        .and_then(|length| read_crc32(member, length, access))
-                        == Some(expected)
-                }
+            // Whether the member's bytes matched the checksum: `None` for one
+            // that could not be read, which is not proven anything.
+            let matched = match self.verdict(member, expected) {
+                SliceVerdict::Intact => Some(true),
+                SliceVerdict::Damaged => Some(false),
+                SliceVerdict::Unknown => access
+                    .length(member)
+                    .and_then(|length| read_crc32(member, length, access))
+                    .map(|crc| crc == expected),
             };
-            if !intact {
+            if matched != Some(true) {
                 damaged += 1;
-                // One checksum over the member: all of it is what failed.
-                if let Some(length) = access.length(member) {
-                    access.found_damaged(member, ByteRange::new(0, length));
-                }
+            }
+            // One checksum over the member: all of it is what failed.
+            if matched == Some(false)
+                && let Some(length) = access.length(member)
+            {
+                access.found_damaged(member, ByteRange::new(0, length));
             }
         }
         let outcome = if damaged == 0 {

@@ -32,12 +32,19 @@ impl GraphJob<PieceRoot> {
             caps,
             nesting,
             unpack,
+            hardware,
+            metrics,
         } = storage;
-        let runs = Runs::new(scope, slots, mail, Arc::clone(&accountant));
+        let runs = Runs::new(scope, slots, mail, Arc::clone(&accountant)).on(hardware);
         let writer = NamespaceWriter::new(scope, working_dir, accountant, free_disk)
             .capped(caps)
+            .metered(metrics)
             .keeping_in(kept_dir);
-        Self::torrent(layout, super::builder(unpack), writer, runs, nesting).offering(passwords)
+        let builder: Box<dyn weaver_graph::Builder + Send + Sync> = match unpack {
+            true => Box::new(runs.hardware()),
+            false => super::builder(false),
+        };
+        Self::torrent(layout, builder, writer, runs, nesting).offering(passwords)
     }
 
     pub(crate) fn torrent(

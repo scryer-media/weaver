@@ -8,10 +8,9 @@
 // queues behind it. Taken back, the object hears what waited as if it had
 // been there, and the queued members are asked again who owns them.
 
-use bytes::Bytes;
-
 use super::{Builder, Effect, NodeId, Tree};
 use crate::deliver::{Delivery, Provenance};
+use crate::evidence::Evidenced;
 use crate::facts::Facts;
 use crate::member::MemberId;
 use crate::object::{Kind, Object};
@@ -34,7 +33,7 @@ pub(super) struct Lent {
 pub(super) struct Arrived {
     pub(super) volume: VolumeIndex,
     pub(super) offset: u64,
-    pub(super) bytes: Bytes,
+    pub(super) bytes: Evidenced,
     pub(super) provenance: Provenance,
 }
 
@@ -63,6 +62,7 @@ pub(super) enum Told {
     Closed {
         volume: VolumeIndex,
         length: u64,
+        reached: u64,
     },
     Lost {
         volume: VolumeIndex,
@@ -79,6 +79,11 @@ pub(super) enum Told {
     Fed {
         member: MemberId,
         evidence: Vec<Segment>,
+        proven: bool,
+    },
+    Refused {
+        member: MemberId,
+        range: ByteRange,
     },
 }
 
@@ -92,11 +97,9 @@ impl Tree {
     // Lend the recovery object at `node` out of the tree. `None` when the
     // node holds no recovery object.
     pub fn lend(&mut self, node: NodeId) -> Option<Box<dyn Object>> {
-        let recovery = self.recovery(node)?;
+        self.recovery(node)?;
         let covers = self
-            .home(node)
-            .and_then(|home| self.namespace(home))
-            .map(|namespace| {
+            .consult_recovery(node, |recovery, namespace| {
                 namespace
                     .members()
                     .map(|member| member.id)
@@ -140,14 +143,15 @@ impl Tree {
         Some(&self.nodes.get(&node)?.lent.as_ref()?.facts)
     }
 
-    // A lent object comes back. It hears everything that waited for it, in
-    // the order it came, and every member that queued behind it is asked
-    // again who owns it. A node retracted meanwhile has nowhere to take it,
-    // so the object is dropped with it.
+    // A lent object comes back, the one lent or one rebuilt from its facts.
+    // It is handed what its node's owner handed last, then hears everything
+    // that waited for it, in the order it came, and every member that queued
+    // behind it is asked again who owns it. A node retracted meanwhile has
+    // nowhere to take it, so the object is dropped with it.
     pub fn take_back(
         &mut self,
         node: NodeId,
-        object: Box<dyn Object>,
+        mut object: Box<dyn Object>,
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
@@ -158,6 +162,9 @@ impl Tree {
             .lent
             .take()
             .map_or_else(Default::default, |lent| (lent.waiting, lent.queued));
+        if let Some(binding) = &found.binding {
+            object.handed(&binding.handed);
+        }
         found.object = Some(object);
         for waiting in waiting {
             self.hear(node, waiting, builder, effects);
@@ -182,12 +189,36 @@ impl Tree {
 
     // Segment evidence for a member the recovery object at `set` covers.
     pub fn feed(&mut self, set: NodeId, member: MemberId, evidence: &[Segment]) {
+        self.feed_input(set, member, evidence, false);
+    }
+
+    pub fn feed_proven(&mut self, set: NodeId, member: MemberId, evidence: &[Segment]) {
+        self.feed_input(set, member, evidence, true);
+    }
+
+    fn feed_input(&mut self, set: NodeId, member: MemberId, evidence: &[Segment], proven: bool) {
         let waiting = Waiting::Told(Told::Fed {
             member,
             evidence: evidence.to_vec(),
+            proven,
         });
         if self.wait(set, waiting).is_some() {
-            self.with_recovery(set, |recovery, _| recovery.feed(member, evidence));
+            self.with_recovery(set, |recovery, _| {
+                if proven {
+                    recovery.feed_proven(member, evidence);
+                } else {
+                    recovery.feed(member, evidence);
+                }
+            });
+        }
+    }
+
+    // A range of a member the recovery object at `set` covers will never
+    // come. The object hears it through its recovery face, never as bytes.
+    pub fn refuse(&mut self, set: NodeId, member: MemberId, range: ByteRange) {
+        let waiting = Waiting::Told(Told::Refused { member, range });
+        if self.wait(set, waiting).is_some() {
+            self.with_recovery(set, |recovery, _| recovery.refused(member, range));
         }
     }
 
@@ -265,16 +296,34 @@ impl Tree {
             .and_then(|found| found.object.as_mut())
         {
             match told {
-                Told::Closed { volume, length } => {
+                Told::Closed {
+                    volume,
+                    length,
+                    reached,
+                } => {
                     object.sized(volume, length, &mut emits);
+                    object.volume_reached(volume, reached, &mut emits);
                     object.volume_closed(volume, &mut emits);
                 }
                 Told::Lost { volume, range } => object.volume_lost(volume, range, &mut emits),
-                Told::Renamed { volume, name } => object.renamed(volume, &name),
+                Told::Renamed { volume, name } => object.renamed(volume, &name, &mut emits),
                 Told::Pulled { seek, pull } => object.pulled(seek, pull, &mut emits),
-                Told::Fed { member, evidence } => {
+                Told::Fed {
+                    member,
+                    evidence,
+                    proven,
+                } => {
                     if let Some(recovery) = object.recovery_mut() {
-                        recovery.feed(member, &evidence);
+                        if proven {
+                            recovery.feed_proven(member, &evidence);
+                        } else {
+                            recovery.feed(member, &evidence);
+                        }
+                    }
+                }
+                Told::Refused { member, range } => {
+                    if let Some(recovery) = object.recovery_mut() {
+                        recovery.refused(member, range);
                     }
                 }
             }

@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The two-engine harness: the API is described in `mod.rs`. A run stands a
-// fresh pipeline up, admits the scenario's job under one engine, and plays
-// the server: every article the job's download queue hands out is answered
-// from the posts, damaged or lost as the scenario says, and whenever the
-// queue runs dry the completion gate runs the way the orchestrator runs it,
-// with every detached ticket settled before the next look. The run ends when
-// the job is complete or failed; a round that changes nothing ends it too,
-// with the job's state in the panic.
+// The harness: the API is described in `mod.rs`. A run stands a fresh
+// pipeline up, admits the scenario's job, and plays the server: every
+// article the job's download queue hands out is answered from the posts,
+// damaged or lost as the scenario says, and whenever the queue runs dry the
+// completion gate runs the way the orchestrator runs it, with every detached
+// ticket settled before the next look. The run ends when the job is complete
+// or failed; a round that changes nothing ends it too, with the job's state
+// in the panic.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -17,36 +17,34 @@ use weaver_graph::recovery::RepairOutcome;
 use weaver_model::files::FileRole;
 
 use super::super::{
-    debug_job_state, insert_active_job_on, job_status_for_assert, new_direct_pipeline_with_buffers,
-    pump_pipeline_runtime_queues, retention_client, retire_pipeline_database,
-    settle_direct_demotion_work, settle_direct_verification_read,
+    checkpoint_plan, insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
+    pump_pipeline_runtime_queues, retire_pipeline_database,
 };
 use crate::history::HistoryFailureKind;
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec, JobStatus, SegmentSpec};
 use crate::pipeline::download::DownloadWork;
 use crate::pipeline::extraction::ExtractionLimits;
-use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::status::Delivery;
 use crate::pipeline::{
     DecodeResult, DecodedChunk, Pipeline, PipelineEvent, SegmentEncoding, SegmentSource,
     YencLayoutAssertions,
 };
 
-pub(super) const ARTICLE: usize = 64;
+pub(in crate::pipeline) const ARTICLE: usize = 64;
 
 // Every run is its own pipeline, so one id serves every scenario.
 pub(in crate::pipeline::tests) const JOB: JobId = JobId(93_001);
 const JOB_NAME: &str = "lantern beacon";
 
-pub(super) struct Post {
-    pub(super) name: String,
-    pub(super) role: FileRole,
-    pub(super) bytes: Vec<u8>,
+pub(in crate::pipeline) struct Post {
+    pub(in crate::pipeline) name: String,
+    pub(in crate::pipeline) role: FileRole,
+    pub(in crate::pipeline) bytes: Vec<u8>,
 }
 
 impl Post {
-    pub(super) fn plain(name: &str, bytes: Vec<u8>) -> Self {
+    pub(in crate::pipeline) fn plain(name: &str, bytes: Vec<u8>) -> Self {
         Self {
             name: name.to_string(),
             role: FileRole::from_filename(name),
@@ -54,7 +52,7 @@ impl Post {
         }
     }
 
-    fn articles(&self, size: usize) -> impl Iterator<Item = &[u8]> {
+    pub(in crate::pipeline) fn articles(&self, size: usize) -> impl Iterator<Item = &[u8]> {
         self.bytes.chunks(size)
     }
 }
@@ -62,7 +60,7 @@ impl Post {
 // `len` bytes of a seeded xorshift: no period runs through them, so no two
 // blocks are alike and a compressing level cannot fold them, and the same
 // seed gives the same bytes every run.
-pub(super) fn payload(len: usize, seed: u8) -> Vec<u8> {
+pub(in crate::pipeline) fn payload(len: usize, seed: u8) -> Vec<u8> {
     let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ u64::from(seed);
     (0..len)
         .map(|_| {
@@ -76,7 +74,7 @@ pub(super) fn payload(len: usize, seed: u8) -> Vec<u8> {
 
 // An index and one volume of `blocks` recovery blocks over `files`, the
 // index first.
-pub(super) fn par2_set(base: &str, files: &[(&str, &[u8])], blocks: u32) -> Vec<Post> {
+pub(in crate::pipeline) fn par2_set(base: &str, files: &[(&str, &[u8])], blocks: u32) -> Vec<Post> {
     let posts = par2_volumes(base, files, blocks, 1);
     assert_eq!(posts.len(), 2, "an index and one volume");
     posts
@@ -84,7 +82,7 @@ pub(super) fn par2_set(base: &str, files: &[(&str, &[u8])], blocks: u32) -> Vec<
 
 // An index and `volumes` volumes sharing `blocks` recovery blocks, as the
 // creator spreads them, the index first and the volumes in block order.
-pub(super) fn par2_volumes(
+pub(in crate::pipeline) fn par2_volumes(
     base: &str,
     files: &[(&str, &[u8])],
     blocks: u32,
@@ -94,7 +92,7 @@ pub(super) fn par2_volumes(
 }
 
 // The same, sliced at `slice` bytes rather than ARTICLE.
-pub(super) fn par2_volumes_sliced(
+pub(in crate::pipeline::tests) fn par2_volumes_sliced(
     base: &str,
     files: &[(&str, &[u8])],
     slice: u64,
@@ -107,7 +105,10 @@ pub(super) fn par2_volumes_sliced(
     let inputs = files
         .iter()
         .map(|(name, bytes)| {
+            // A name may hold directories, as a set describing a nested
+            // file names it.
             let path = source.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, bytes).unwrap();
             path
         })
@@ -142,9 +143,35 @@ pub(super) fn par2_volumes_sliced(
     posts
 }
 
+// A single-volume stored RAR5 holding `files` and, beside them, a PAR2
+// set of `blocks` recovery blocks over them named under `base`: the set
+// is nested, reachable only once the archive opens.
+pub(in crate::pipeline::tests) fn par2_in_store(
+    base: &str,
+    files: &[(&str, &[u8])],
+    blocks: u32,
+) -> Post {
+    let mut members: Vec<(&str, Vec<u8>)> = files
+        .iter()
+        .map(|(name, bytes)| (*name, bytes.to_vec()))
+        .collect();
+    let set = par2_set(base, files, blocks);
+    members.extend(
+        set.iter()
+            .map(|post| (post.name.as_str(), post.bytes.clone())),
+    );
+    let mut volumes = crate::pipeline::tests::direct_store::multi_member_store_set(&members, 1);
+    let (name, bytes) = volumes.remove(0);
+    Post::plain(&name, bytes)
+}
+
 // A PAR3 index and its volumes over `files`, blocks of one article, named
 // as the creator names them under `base`, the index first.
-pub(super) fn par3_set(base: &str, files: &[(&str, &[u8])], blocks: u64) -> Vec<Post> {
+pub(in crate::pipeline::tests) fn par3_set(
+    base: &str,
+    files: &[(&str, &[u8])],
+    blocks: u64,
+) -> Vec<Post> {
     let source = tempfile::tempdir().unwrap();
     let names: Vec<std::path::PathBuf> = files
         .iter()
@@ -179,7 +206,7 @@ pub(super) fn par3_set(base: &str, files: &[(&str, &[u8])], blocks: u64) -> Vec<
 // A PAR3 set over `files` built as `options` say (its codec, its recovery
 // count, whether it carries its input as Data packets), blocks of one
 // article, named as the creator names them under `base`, the index first.
-pub(super) fn par3_set_with(
+pub(in crate::pipeline::tests) fn par3_set_with(
     base: &str,
     files: &[(&str, &[u8])],
     options: par3_rs::creation::CreationOptions,
@@ -221,7 +248,7 @@ pub(super) fn par3_set_with(
 
 // For each recovery block of a PAR2 volume, the ordinals of the articles
 // holding its bytes.
-pub(super) fn recovery_blocks(post: &Post) -> Vec<Vec<u32>> {
+pub(in crate::pipeline::tests) fn recovery_blocks(post: &Post) -> Vec<Vec<u32>> {
     const HEADER: usize = 64;
     const RECOVERY: &[u8; 16] = b"PAR 2.0\0RecvSlic";
     let bytes = &post.bytes;
@@ -240,8 +267,42 @@ pub(super) fn recovery_blocks(post: &Post) -> Vec<Vec<u32>> {
     blocks
 }
 
+// The packets of a PAR2 file with every slice-checksum packet left out: a
+// set that hashes its files whole and no finer.
+pub(in crate::pipeline::tests) fn without_slice_checksums(bytes: &[u8]) -> Vec<u8> {
+    const HEADER: usize = 64;
+    const SLICE_CHECKSUMS: &[u8; 16] = b"PAR 2.0\0IFSC\0\0\0\0";
+    let mut kept = Vec::new();
+    let mut at = 0;
+    while at + HEADER <= bytes.len() {
+        assert_eq!(&bytes[at..at + 8], b"PAR2\0PKT", "a packet at {at}");
+        let length = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap()) as usize;
+        if &bytes[at + 48..at + 64] != SLICE_CHECKSUMS {
+            kept.extend_from_slice(&bytes[at..at + length]);
+        }
+        at += length;
+    }
+    kept
+}
+
+// The bytes of a volume's one recovery packet, cut from it.
+pub(in crate::pipeline::tests) fn recovery_packet(volume: &Post) -> Vec<u8> {
+    const HEADER: usize = 64;
+    const RECOVERY: &[u8; 16] = b"PAR 2.0\0RecvSlic";
+    let bytes = &volume.bytes;
+    let mut at = 0;
+    while at + HEADER <= bytes.len() {
+        let length = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap()) as usize;
+        if &bytes[at + 48..at + 64] == RECOVERY {
+            return bytes[at..at + length].to_vec();
+        }
+        at += length;
+    }
+    panic!("the volume holds a recovery packet");
+}
+
 // An article of a PAR2 volume whose loss costs exactly one recovery block.
-pub(super) fn one_block_article(post: &Post) -> u32 {
+pub(in crate::pipeline::tests) fn one_block_article(post: &Post) -> u32 {
     let blocks = recovery_blocks(post);
     blocks
         .iter()
@@ -257,51 +318,230 @@ pub(super) fn one_block_article(post: &Post) -> u32 {
         .expect("an article inside one block alone")
 }
 
-pub(super) struct Scenario {
-    pub(super) posts: Vec<Post>,
-    pub(super) damage: Vec<(u32, u32)>,
-    pub(super) lost: Vec<(u32, u32)>,
+// A listener on this machine that answers each connection it is dialed on
+// a thread of its own, for as long as the test holds it, and closes the
+// connection once its answer returns. Dropped, it stops
+// taking connections, closes its socket, shuts every connection it took, and
+// joins every thread it ran, so nothing it started outlives the test.
+pub(in crate::pipeline::tests) struct Listener {
+    pub(in crate::pipeline::tests) port: u16,
+    stopping: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    accepting: Option<std::thread::JoinHandle<Vec<Answering>>>,
+}
+
+// A connection the listener took, and the thread answering it.
+type Answering = (std::net::TcpStream, std::thread::JoinHandle<()>);
+
+impl Listener {
+    pub(in crate::pipeline::tests) fn serve(
+        answer: impl Fn(std::net::TcpStream) + Send + Sync + 'static,
+    ) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the listener");
+        let port = listener.local_addr().unwrap().port();
+        let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop = std::sync::Arc::clone(&stopping);
+        let answer = std::sync::Arc::new(answer);
+        let accepting = std::thread::Builder::new()
+            .name("harness-listener".into())
+            .spawn(move || {
+                let mut answering = Vec::new();
+                for socket in listener.incoming() {
+                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    let Ok(socket) = socket else { continue };
+                    let (Ok(held), Ok(closing)) = (socket.try_clone(), socket.try_clone()) else {
+                        continue;
+                    };
+                    let answer = std::sync::Arc::clone(&answer);
+                    // The listener holds the connection too, so it is shut
+                    // here once the answer is done with it, as a server
+                    // closes a connection it is done answering.
+                    let thread = std::thread::spawn(move || {
+                        answer(socket);
+                        let _ = closing.shutdown(std::net::Shutdown::Both);
+                    });
+                    answering.push((held, thread));
+                }
+                answering
+            })
+            .expect("spawn the listener");
+        Self {
+            port,
+            stopping,
+            accepting: Some(accepting),
+        }
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // The accept loop wakes on a connection, sees it is stopping, and
+        // returns, closing the listening socket as it goes.
+        let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+        let Some(answering) = self.accepting.take().and_then(|thread| thread.join().ok()) else {
+            return;
+        };
+        for (socket, thread) in answering {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+            let _ = thread.join();
+        }
+    }
+}
+
+// The scenario's server as a health probe's STAT batches ask it on the
+// download lanes: a listener that holds every article but `missing`,
+// answering STAT and HEAD on each connection it is dialed. The harness
+// serves the articles themselves, so nothing asks it for a body.
+fn stat_server(missing: BTreeSet<String>) -> Listener {
+    Listener::serve(move |socket| answer_stat(socket, &missing))
+}
+
+fn answer_stat(socket: std::net::TcpStream, missing: &BTreeSet<String>) {
+    use std::io::{BufRead, Write};
+    let mut writer = socket.try_clone().unwrap();
+    if writer.write_all(b"200 ready\r\n").is_err() {
+        return;
+    }
+    for line in std::io::BufReader::new(socket).lines() {
+        let Ok(line) = line else { break };
+        let upper = line.to_ascii_uppercase();
+        let asked = |command: &str| {
+            upper
+                .starts_with(command)
+                .then(|| line[command.len()..].trim().to_string())
+        };
+        let held = |id: &str| !missing.contains(id.trim_matches(['<', '>']));
+        let reply = if upper == "CAPABILITIES" {
+            "101 Capability list\r\nVERSION 2\r\nREADER\r\n.\r\n".to_string()
+        } else if let Some(id) = asked("STAT ") {
+            if held(&id) {
+                format!("223 0 {id}\r\n")
+            } else {
+                "430 no such article\r\n".to_string()
+            }
+        } else if let Some(id) = asked("HEAD ") {
+            if held(&id) {
+                format!("221 0 {id}\r\nSubject: lantern\r\n.\r\n")
+            } else {
+                "430 no such article\r\n".to_string()
+            }
+        } else if upper.starts_with("QUIT") {
+            let _ = writer.write_all(b"205 closing\r\n");
+            break;
+        } else {
+            "500 command not recognized\r\n".to_string()
+        };
+        if writer.write_all(reply.as_bytes()).is_err() {
+            break;
+        }
+    }
+}
+
+// The pipeline's client for a scenario: `servers` servers, all the
+// scenario's STAT server, one connection each.
+fn scenario_client(servers: usize, port: u16) -> weaver_nntp::client::NntpClient {
+    weaver_nntp::client::NntpClient::new(weaver_nntp::client::NntpClientConfig {
+        servers: (0..servers)
+            .map(|_| weaver_nntp::ServerPoolConfig {
+                max_connections: 1,
+                ..weaver_nntp::ServerPoolConfig::new(weaver_nntp::ServerConfig {
+                    host: "127.0.0.1".into(),
+                    port,
+                    tls: false,
+                    ..Default::default()
+                })
+            })
+            .collect(),
+        ..weaver_nntp::client::NntpClientConfig::single(Default::default(), 1)
+    })
+}
+
+// A health probe out for the job is heard before the next article is
+// served: its round ends before the download moves on. Each batch waiting
+// for a seat is seated as a dispatch pass seats it, and the harness leases
+// no article to a lane, so a batch finds a seat free once the one before
+// it has answered. A batch every server has answered for is ruled on as it
+// is seated, so the round can end there, and only a round still out after
+// the seating waits for the next answer.
+pub(super) async fn hear_probe(pipeline: &mut Pipeline) {
+    loop {
+        pipeline.seat_waiting_probes(
+            &mut std::collections::HashMap::new(),
+            &mut std::collections::HashMap::new(),
+        );
+        if !pipeline.post_probes.out(JOB) {
+            return;
+        }
+        let mail = pipeline
+            .post_probes
+            .recv()
+            .await
+            .expect("a probe out speaks");
+        pipeline.post_probe_mail(mail);
+    }
+}
+
+pub(in crate::pipeline::tests) struct Scenario {
+    pub(in crate::pipeline::tests) posts: Vec<Post>,
+    pub(in crate::pipeline::tests) damage: Vec<(u32, u32)>,
+    pub(in crate::pipeline::tests) lost: Vec<(u32, u32)>,
     // Articles the first ask is refused for, as a server without them
     // answers: the article goes back on the queue the way the worker
     // retries it after a 430, and the next ask is served.
-    pub(super) refused: Vec<(u32, u32)>,
+    pub(in crate::pipeline::tests) refused: Vec<(u32, u32)>,
     // Articles the primary server serves damaged while a backup serves them
     // whole. A scenario with any has both servers, and an ask that excludes
     // the primary is the backup's.
-    pub(super) corrupt_primary: Vec<(u32, u32)>,
-    pub(super) password: Option<String>,
-    pub(super) global_passwords: Vec<String>,
+    pub(in crate::pipeline::tests) corrupt_primary: Vec<(u32, u32)>,
+    // Articles that decode this many bytes short of the part end their
+    // header declares, as a server that cut the body off serves them.
+    pub(in crate::pipeline::tests) short: Vec<(u32, u32, usize)>,
+    // Articles served whole under a checksum that disagrees with them.
+    pub(in crate::pipeline::tests) crc_wrong: Vec<(u32, u32)>,
+    // Posts whose every article declares this file size, not the post's.
+    pub(in crate::pipeline::tests) declares: Vec<(u32, u64)>,
+    pub(in crate::pipeline::tests) password: Option<String>,
+    pub(in crate::pipeline::tests) global_passwords: Vec<String>,
     // The decoded size of every article but each post's last; PAR2 slices
     // stay at ARTICLE whatever it is.
-    pub(super) article: usize,
+    pub(in crate::pipeline::tests) article: usize,
     // Every batch the download queue hands out is served last article first.
-    pub(super) backwards: bool,
+    pub(in crate::pipeline::tests) backwards: bool,
     // Every batch the download queue hands out is served as workers fetching
     // these posts at once: one article of each in turn, in this order.
-    pub(super) together: Vec<u32>,
+    pub(in crate::pipeline::tests) together: Vec<u32>,
     // A restarted run serves these articles first, in this order, each once
     // the queue holds it.
-    pub(super) first: Vec<(u32, u32)>,
+    pub(in crate::pipeline::tests) first: Vec<(u32, u32)>,
     // Every article is uuencoded: it says nothing of where its bytes go,
     // so they are placed in order.
-    pub(super) uuencoded: bool,
+    pub(in crate::pipeline::tests) uuencoded: bool,
     // Every batch is leased as a download lane leases it, and its articles'
     // checksums are cut at the slice sizes known when it was leased.
-    pub(super) leased: bool,
+    pub(in crate::pipeline::tests) leased: bool,
     // The extraction limits the pipeline holds, when not the environment's.
-    pub(super) limits: Option<ExtractionLimits>,
+    pub(in crate::pipeline::tests) limits: Option<ExtractionLimits>,
     // The operator's unacceptable extensions, when not the stored ones.
-    pub(super) unacceptable: Option<Vec<String>>,
+    pub(in crate::pipeline::tests) unacceptable: Option<Vec<String>>,
+    // The STAT server of every pipeline the scenario prepared, held as long
+    // as the scenario is.
+    stat_servers: std::sync::Mutex<Vec<Listener>>,
 }
 
 impl Scenario {
-    pub(super) fn new(posts: Vec<Post>) -> Self {
+    pub(in crate::pipeline::tests) fn new(posts: Vec<Post>) -> Self {
         Self {
             posts,
             damage: Vec::new(),
             lost: Vec::new(),
             refused: Vec::new(),
             corrupt_primary: Vec::new(),
+            short: Vec::new(),
+            crc_wrong: Vec::new(),
+            declares: Vec::new(),
             password: None,
             global_passwords: Vec::new(),
             article: ARTICLE,
@@ -312,24 +552,43 @@ impl Scenario {
             leased: false,
             limits: None,
             unacceptable: None,
+            stat_servers: std::sync::Mutex::new(Vec::new()),
         }
     }
 
     // The job runs under these extraction limits.
-    pub(super) fn limits(mut self, limits: ExtractionLimits) -> Self {
+    pub(in crate::pipeline::tests) fn limits(mut self, limits: ExtractionLimits) -> Self {
         self.limits = Some(limits);
         self
     }
 
     // The settings refuse these extensions.
-    pub(super) fn unacceptable(mut self, extensions: &[&str]) -> Self {
+    pub(in crate::pipeline::tests) fn unacceptable(mut self, extensions: &[&str]) -> Self {
         self.unacceptable = Some(extensions.iter().map(|ext| ext.to_string()).collect());
         self
     }
 
     // What the scenario sets on a pipeline before its job is admitted or
-    // restored: the settings' passwords and policy, and the limits.
-    pub(super) fn prepare(&self, pipeline: &mut Pipeline) {
+    // restored: its servers, the settings' passwords and policy, and the
+    // limits. A scenario whose primary serves some articles damaged has a
+    // backup that serves them whole, on every pipeline that runs the job,
+    // a restarted one too.
+    pub(in crate::pipeline::tests) fn prepare(&self, pipeline: &mut Pipeline) {
+        // A health probe asks the scenario's servers on the download lanes,
+        // and each holds every article but the ones the scenario lost.
+        let missing = self
+            .lost
+            .iter()
+            .map(|(file, ordinal)| format!("lantern-{file}-{ordinal}@example.com"))
+            .collect();
+        let servers = if self.corrupt_primary.is_empty() {
+            1
+        } else {
+            2
+        };
+        let server = stat_server(missing);
+        pipeline.nntp = std::sync::Arc::new(scenario_client(servers, server.port));
+        self.stat_servers.lock().unwrap().push(server);
         if !self.global_passwords.is_empty() {
             pipeline
                 .db
@@ -351,7 +610,7 @@ impl Scenario {
     }
 
     // Whatever the download queue hands out at once arrives in reverse.
-    pub(super) fn backwards(mut self) -> Self {
+    pub(in crate::pipeline::tests) fn backwards(mut self) -> Self {
         self.backwards = true;
         self
     }
@@ -359,106 +618,146 @@ impl Scenario {
     // Whatever the download queue hands out at once arrives as workers
     // fetching `posts` side by side: the first article of each, in this
     // order, then the second of each, and so on.
-    pub(super) fn together(mut self, posts: &[u32]) -> Self {
+    pub(in crate::pipeline::tests) fn together(mut self, posts: &[u32]) -> Self {
         self.together = posts.to_vec();
         self
     }
 
     // A restarted run serves these articles before any other, in this
     // order, so a restart lands between two of them.
-    pub(super) fn first(mut self, articles: &[(u32, u32)]) -> Self {
+    pub(in crate::pipeline::tests) fn first(mut self, articles: &[(u32, u32)]) -> Self {
         self.first = articles.to_vec();
         self
     }
 
     // Every article posted uuencoded rather than yEnc.
-    pub(super) fn uuencoded(mut self) -> Self {
+    pub(in crate::pipeline::tests) fn uuencoded(mut self) -> Self {
         self.uuencoded = true;
         self
     }
 
     // Every batch leased by the download scheduler, served last article
     // first, each cut at the slice sizes its lease was taken under.
-    pub(super) fn leased(mut self) -> Self {
+    pub(in crate::pipeline::tests) fn leased(mut self) -> Self {
         self.leased = true;
         self
     }
 
     // Every post cut into articles of `size` bytes instead of ARTICLE.
-    pub(super) fn framed(mut self, size: usize) -> Self {
+    pub(in crate::pipeline::tests) fn framed(mut self, size: usize) -> Self {
         self.article = size;
         self
     }
 
     // The password the job is submitted with.
-    pub(super) fn password(mut self, password: &str) -> Self {
+    pub(in crate::pipeline::tests) fn password(mut self, password: &str) -> Self {
         self.password = Some(password.to_string());
         self
     }
 
-    // A password the settings carry, not the job: classic tries it once
-    // the volumes are in, graph offers it when an object asks.
-    pub(super) fn global_password(mut self, password: &str) -> Self {
+    // A password the settings carry, not the job: the graph engine offers it
+    // when an object asks.
+    pub(in crate::pipeline::tests) fn global_password(mut self, password: &str) -> Self {
         self.global_passwords.push(password.to_string());
         self
     }
 
-    pub(super) fn damaged(mut self, file: u32, ordinal: u32) -> Self {
+    pub(in crate::pipeline::tests) fn damaged(mut self, file: u32, ordinal: u32) -> Self {
         self.damage.push((file, ordinal));
         self
     }
 
-    pub(super) fn lost(mut self, file: u32, ordinal: u32) -> Self {
+    pub(in crate::pipeline::tests) fn lost(mut self, file: u32, ordinal: u32) -> Self {
         self.lost.push((file, ordinal));
         self
     }
 
-    pub(super) fn refused_once(mut self, file: u32, ordinal: u32) -> Self {
+    // The article decodes `by` bytes short of the part end it declares.
+    pub(in crate::pipeline::tests) fn short(mut self, file: u32, ordinal: u32, by: usize) -> Self {
+        self.short.push((file, ordinal, by));
+        self
+    }
+
+    // The article's bytes are whole and its checksum is wrong.
+    pub(in crate::pipeline::tests) fn crc_wrong(mut self, file: u32, ordinal: u32) -> Self {
+        self.crc_wrong.push((file, ordinal));
+        self
+    }
+
+    // Every article of the post declares a file of `size` bytes.
+    pub(in crate::pipeline::tests) fn declares(mut self, file: u32, size: u64) -> Self {
+        self.declares.push((file, size));
+        self
+    }
+
+    pub(in crate::pipeline::tests) fn refused_once(mut self, file: u32, ordinal: u32) -> Self {
         self.refused.push((file, ordinal));
         self
     }
 
-    pub(super) fn corrupt_on_primary(mut self, file: u32, ordinal: u32) -> Self {
+    // Whether `server` answers the article with damaged bytes.
+    pub(in crate::pipeline::tests) fn spoils(&self, server: usize, article: (u32, u32)) -> bool {
+        self.damage.contains(&article) || (server == 0 && self.corrupt_primary.contains(&article))
+    }
+
+    pub(in crate::pipeline::tests) fn corrupt_on_primary(
+        mut self,
+        file: u32,
+        ordinal: u32,
+    ) -> Self {
         self.corrupt_primary.push((file, ordinal));
         self
     }
 
-    pub(super) fn spec(&self) -> JobSpec {
+    pub(in crate::pipeline::tests) fn spec(&self) -> JobSpec {
         JobSpec {
-            name: JOB_NAME.to_string(),
             password: self.password.clone(),
-            total_bytes: self.posts.iter().map(|post| post.bytes.len() as u64).sum(),
-            category: None,
-            metadata: vec![],
-            files: self
-                .posts
-                .iter()
-                .enumerate()
-                .map(|(index, post)| FileSpec {
-                    filename: post.name.clone(),
-                    role: post.role.clone(),
-                    groups: vec!["alt.binaries.test".to_string()],
-                    posted_at_epoch: None,
-                    segments: post
-                        .articles(self.article)
-                        .enumerate()
-                        .map(|(ordinal, article)| SegmentSpec {
-                            ordinal: ordinal as u32,
-                            article_number: ordinal as u32,
-                            bytes: article.len() as u32,
-                            message_ids: crate::jobs::MessageIds::new(vec![format!(
-                                "lantern-{index}-{ordinal}@example.com"
-                            )]),
-                        })
-                        .collect(),
-                })
-                .collect(),
+            ..spec(JOB_NAME, &self.posts, self.article)
         }
     }
 }
 
+// The job `posts` make posted under `name`, each cut into articles of
+// `article` bytes.
+pub(in crate::pipeline) fn spec(name: &str, posts: &[Post], article: usize) -> JobSpec {
+    // A file with no article is no file of a job: a post never lists one.
+    assert!(
+        posts.iter().all(|post| !post.bytes.is_empty()),
+        "a post with no article"
+    );
+    JobSpec {
+        name: name.to_string(),
+        password: None,
+        total_bytes: posts.iter().map(|post| post.bytes.len() as u64).sum(),
+        category: None,
+        metadata: vec![],
+        files: posts
+            .iter()
+            .enumerate()
+            .map(|(index, post)| FileSpec {
+                filename: post.name.clone(),
+                role: post.role.clone(),
+                groups: vec!["alt.binaries.test".to_string()],
+                posted_at_epoch: None,
+                segments: post
+                    .articles(article)
+                    .enumerate()
+                    .map(|(ordinal, bytes)| SegmentSpec {
+                        ordinal: ordinal as u32,
+                        article_number: ordinal as u32,
+                        bytes: bytes.len() as u32,
+                        message_ids: crate::jobs::MessageIds::new(vec![format!(
+                            "lantern-{index}-{ordinal}@example.com"
+                        )]),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Claim {
+pub(in crate::pipeline::tests) enum Claim {
     // Delivered at its length, every byte as posted.
     Complete,
     // Delivered at its length, some bytes not as posted.
@@ -469,63 +768,78 @@ pub(super) enum Claim {
 
 // The graph job as last seen before it finished.
 #[derive(Clone, Debug, Default)]
-pub(super) struct GraphView {
+pub(in crate::pipeline::tests) struct GraphView {
     // Payload members by output name, read off the namespace's marks.
-    pub(super) claims: BTreeMap<String, Claim>,
-    pub(super) blocks_reachable: u64,
-    pub(super) outcomes: Vec<Option<RepairOutcome>>,
+    pub(in crate::pipeline::tests) claims: BTreeMap<String, Claim>,
+    pub(in crate::pipeline::tests) blocks_reachable: u64,
+    pub(in crate::pipeline::tests) outcomes: Vec<Option<RepairOutcome>>,
     // What each recovery object last ruled, by the kind of object, in the
     // order of `outcomes`.
-    pub(super) rulings: Vec<(String, Option<RepairOutcome>)>,
+    pub(in crate::pipeline::tests) rulings: Vec<(String, Option<RepairOutcome>)>,
     // The kind of every object the tree held at any look, by its name.
-    pub(super) kinds: BTreeSet<String>,
+    pub(in crate::pipeline::tests) kinds: BTreeSet<String>,
     // How many password candidates each node was offered, at the last look.
-    pub(super) offered: BTreeMap<weaver_graph::NodeId, usize>,
+    pub(in crate::pipeline::tests) offered: BTreeMap<weaver_graph::NodeId, usize>,
     // The files the job hands over at every depth, by output name.
-    pub(super) delivery: Delivery,
+    pub(in crate::pipeline::tests) delivery: Delivery,
+    // Whether a failure of the job, at the last look, is its post's: what
+    // queue scripts hear as a deletion for health.
+    pub(in crate::pipeline::tests) health: bool,
     // What the job's checkpoints asked the database to write, at the last
     // look.
-    pub(super) checkpoints: crate::pipeline::graph::checkpoint::Tally,
+    pub(in crate::pipeline::tests) checkpoints: crate::pipeline::graph::checkpoint::Tally,
     // The most the live namespaces objects produced kept resident for their
     // members at any look, summed from the tree.
-    pub(super) resident: u64,
+    pub(in crate::pipeline::tests) resident: u64,
     // The time the looks themselves took, which a run's time is not.
-    pub(super) observed: std::time::Duration,
+    pub(in crate::pipeline::tests) observed: std::time::Duration,
     // What the job's report showed at each look, its status and whether it
     // was fetching repair data, each change once.
-    pub(super) shown: Vec<(JobStatus, bool)>,
+    pub(in crate::pipeline::tests) shown: Vec<(JobStatus, bool)>,
     // At each look, for every root member a set covers: its name, whether
     // its sets proved it (every one covering it ruled clean or repaired and
     // none is out), and whether the root still keeps its checksums.
-    pub(super) sealing: Vec<Vec<(String, bool, bool)>>,
+    pub(in crate::pipeline::tests) sealing: Vec<Vec<(String, bool, bool)>>,
+    // The most the job's working directory held at any look, every file
+    // under it by its length.
+    pub(in crate::pipeline::tests) scratch: u64,
 }
 
 #[derive(Debug)]
-pub(super) struct Outcome {
-    pub(super) engine: Engine,
-    pub(super) status: Option<JobStatus>,
-    pub(super) failure: Option<String>,
-    pub(super) failure_kind: Option<HistoryFailureKind>,
-    pub(super) files: BTreeMap<String, Vec<u8>>,
-    pub(super) claims: BTreeMap<String, Claim>,
-    pub(super) requests: BTreeMap<(u32, u32), usize>,
+pub(in crate::pipeline::tests) struct Outcome {
+    pub(in crate::pipeline::tests) status: Option<JobStatus>,
+    pub(in crate::pipeline::tests) failure: Option<String>,
+    pub(in crate::pipeline::tests) failure_kind: Option<HistoryFailureKind>,
+    pub(in crate::pipeline::tests) files: BTreeMap<String, Vec<u8>>,
+    pub(in crate::pipeline::tests) retained_files: BTreeMap<String, Vec<u8>>,
+    // Every directory delivered with nothing in it, by its path and a
+    // trailing slash.
+    pub(in crate::pipeline::tests) empty: BTreeSet<String>,
+    pub(in crate::pipeline::tests) claims: BTreeMap<String, Claim>,
+    pub(in crate::pipeline::tests) requests: BTreeMap<(u32, u32), usize>,
     // Every article in the order it was asked for.
-    pub(super) order: Vec<(u32, u32)>,
-    pub(super) reads: u64,
-    pub(super) graph: Option<GraphView>,
-    // The posts that are PAR2 or PAR3 recovery volumes, by file index.
-    pub(super) volumes: Vec<u32>,
+    pub(in crate::pipeline::tests) order: Vec<(u32, u32)>,
+    pub(in crate::pipeline::tests) reads: u64,
+    pub(in crate::pipeline::tests) graph: GraphView,
     // Every pipeline event the job's run sent, in order.
-    pub(super) events: Vec<PipelineEvent>,
+    pub(in crate::pipeline::tests) events: Vec<PipelineEvent>,
+    // The extraction refusals the run counted, in the metric's reason order.
+    pub(in crate::pipeline::tests) rejections: [u64; 9],
+    // The pipeline's metrics as the run left them.
+    pub(in crate::pipeline::tests) metrics: crate::operations::metrics::MetricsSnapshot,
+    // The password the job's history says an archive opened with.
+    pub(in crate::pipeline::tests) validated_password: Option<String>,
+    // The metadata the job's history row keeps, as stored.
+    pub(in crate::pipeline::tests) history_metadata: Option<String>,
 }
 
 // The kind of every object a graph run's tree held, by its name, sorted.
-pub(super) fn kinds(graph: &Outcome) -> Vec<&str> {
+pub(in crate::pipeline::tests) fn kinds(graph: &Outcome) -> Vec<&str> {
     graph.graph().kinds.iter().map(String::as_str).collect()
 }
 
 impl Outcome {
-    pub(super) fn refetched(&self) -> Vec<(u32, u32)> {
+    pub(in crate::pipeline::tests) fn refetched(&self) -> Vec<(u32, u32)> {
         self.requests
             .iter()
             .filter(|(_, count)| **count > 1)
@@ -533,30 +847,18 @@ impl Outcome {
             .collect()
     }
 
-    pub(super) fn completed(&self) -> bool {
+    pub(in crate::pipeline::tests) fn completed(&self) -> bool {
         self.status == Some(JobStatus::Complete)
     }
 
-    // The first article of a recovery volume, asked for when `other` never
-    // asked for it: the graph samples each volume's head to learn what it
-    // holds, which classic never needs while nothing is damaged.
-    pub(super) fn volume_samples(&self, other: &Outcome) -> Vec<(u32, u32)> {
-        self.requests
-            .keys()
-            .filter(|(file, ordinal)| *ordinal == 0 && self.volumes.contains(file))
-            .filter(|article| !other.requests.contains_key(article))
-            .copied()
-            .collect()
-    }
-
-    pub(super) fn graph(&self) -> &GraphView {
-        self.graph.as_ref().expect("a graph run keeps its view")
+    pub(in crate::pipeline::tests) fn graph(&self) -> &GraphView {
+        &self.graph
     }
 }
 
 // The repair and terminal events the run sent, in order, as words a row
 // can compare: `RepairComplete <slices>`, `JobCompleted`, `JobFailed`.
-pub(super) fn repair_and_terminal_events(outcome: &Outcome) -> Vec<String> {
+pub(in crate::pipeline::tests) fn repair_and_terminal_events(outcome: &Outcome) -> Vec<String> {
     outcome
         .events
         .iter()
@@ -576,98 +878,45 @@ pub(super) fn repair_and_terminal_events(outcome: &Outcome) -> Vec<String> {
         .collect()
 }
 
-pub(super) async fn run_both(scenario: &Scenario) -> (Outcome, Outcome) {
-    (
-        run(scenario, Engine::Classic).await,
-        run(scenario, Engine::Graph).await,
-    )
-}
-
-pub(super) fn assert_same(classic: &Outcome, graph: &Outcome) {
-    for outcome in [classic, graph] {
-        assert!(
-            outcome.refetched().is_empty(),
-            "{} asked for an article twice: {:?}",
-            outcome.engine,
-            outcome.refetched()
-        );
-    }
-    assert_eq!(classic.status, graph.status, "status");
-    assert_eq!(classic.failure_kind, graph.failure_kind, "failure kind");
-    assert_eq!(
-        classic.files.keys().collect::<Vec<_>>(),
-        graph.files.keys().collect::<Vec<_>>(),
-        "delivered names"
-    );
-    for (name, bytes) in &classic.files {
-        assert!(
-            graph.files[name] == *bytes,
-            "{name}: delivered bytes differ"
-        );
-    }
-    assert_eq!(classic.claims, graph.claims, "claims");
-    let samples = graph.volume_samples(classic);
-    let mut asked = graph.requests.clone();
-    asked.retain(|article, _| !samples.contains(article));
-    assert_eq!(
-        classic.requests, asked,
-        "article requests, volume samples aside"
+// Every article was asked for once.
+pub(in crate::pipeline::tests) fn assert_fetched_once(outcome: &Outcome) {
+    assert!(
+        outcome.refetched().is_empty(),
+        "asked for an article twice: {:?}",
+        outcome.refetched()
     );
 }
 
 // A run whose gate rounds stopped changing anything before the job
 // finished: the status it sat at, and the pipeline's account of the job.
 #[derive(Debug)]
-pub(super) struct Stall {
-    pub(super) engine: Engine,
-    pub(super) status: Option<JobStatus>,
-    pub(super) state: String,
+pub(in crate::pipeline::tests) struct Stall {
+    pub(in crate::pipeline::tests) status: Option<JobStatus>,
+    pub(in crate::pipeline::tests) state: String,
 }
 
-// A run that failed as `kind` with an error that starts `error`, leaving
-// exactly `left` under the complete folder.
-pub(super) fn assert_fails_leaving(
-    outcome: &Outcome,
-    kind: HistoryFailureKind,
-    error: &str,
-    left: &[&str],
-) {
-    match &outcome.status {
-        Some(JobStatus::Failed { error: said }) => assert!(
-            said.starts_with(error),
-            "{}: failed saying {said}",
-            outcome.engine
-        ),
-        other => panic!("{}: {other:?}, not a failure", outcome.engine),
-    }
-    assert_eq!(outcome.failure_kind, Some(kind), "{}: kind", outcome.engine);
-    assert_eq!(
-        outcome.files.keys().map(String::as_str).collect::<Vec<_>>(),
-        left,
-        "{}: left under the complete folder",
-        outcome.engine
-    );
+pub(in crate::pipeline::tests) async fn run(scenario: &Scenario) -> Outcome {
+    try_run(scenario)
+        .await
+        .unwrap_or_else(|stall| panic!("job stalled at {:?}: {}", stall.status, stall.state))
 }
 
-pub(super) async fn run(scenario: &Scenario, engine: Engine) -> Outcome {
-    try_run(scenario, engine).await.unwrap_or_else(|stall| {
-        panic!(
-            "{} job stalled at {:?}: {}",
-            stall.engine, stall.status, stall.state
-        )
-    })
-}
-
-// A run that may stall, for a row that asserts an engine does.
-// A fresh pipeline with the scenario's job admitted under `engine`, nothing
-// asked yet.
-pub(super) async fn admit(
+// A fresh pipeline with the scenario's job admitted, nothing asked yet.
+pub(in crate::pipeline::tests) async fn admit(
     scenario: &Scenario,
-    engine: Engine,
+) -> (tempfile::TempDir, Pipeline, std::path::PathBuf) {
+    admit_with(scenario, |_, _| {}).await
+}
+
+// [`admit`], with `setup` given the pipeline and its directory before the
+// job is admitted.
+pub(in crate::pipeline::tests) async fn admit_with(
+    scenario: &Scenario,
+    setup: impl FnOnce(&mut Pipeline, &Path),
 ) -> (tempfile::TempDir, Pipeline, std::path::PathBuf) {
     let temp_dir = tempfile::tempdir().unwrap();
     // One server: an article it serves damaged has nowhere else to come
-    // from, so both engines give it up for repair at once.
+    // from, so the job gives it up for repair at once.
     let buffers = crate::runtime::buffers::BufferPoolConfig {
         small_count: 8,
         medium_count: 4,
@@ -675,25 +924,22 @@ pub(super) async fn admit(
     };
     let (mut pipeline, _, complete_dir) =
         new_direct_pipeline_with_buffers(&temp_dir, buffers, 1).await;
-    if !scenario.corrupt_primary.is_empty() {
-        pipeline.nntp = std::sync::Arc::new(retention_client(&[0, 0]));
-    }
     scenario.prepare(&mut pipeline);
-    insert_active_job_on(&mut pipeline, JOB, scenario.spec(), engine).await;
-    pipeline.admit_graph_job(JOB, engine);
-    assert_eq!(pipeline.is_graph_job(JOB), engine == Engine::Graph);
+    setup(&mut pipeline, temp_dir.path());
+    insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
     (temp_dir, pipeline, complete_dir)
 }
 
-pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outcome, Stall> {
-    let (_temp_dir, mut pipeline, complete_dir) = admit(scenario, engine).await;
+// A run that may stall, for a row that asserts the job does.
+pub(in crate::pipeline::tests) async fn try_run(scenario: &Scenario) -> Result<Outcome, Stall> {
+    let (_temp_dir, mut pipeline, complete_dir) = admit(scenario).await;
     // Events the run sends are heard from admission on; nothing sent before
     // the job was admitted belongs to it.
     let (heard, kept) = hear(pipeline.event_tx.subscribe());
     let mut refused = BTreeSet::new();
     let mut requests = BTreeMap::new();
     let mut order = Vec::new();
-    let mut graph = (engine == Engine::Graph).then(GraphView::default);
+    let mut graph = GraphView::default();
     let mut reads = 0;
     let mut stalled = None;
     loop {
@@ -724,6 +970,7 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
                     plan.as_ref(),
                 )
                 .await;
+                hear_probe(&mut pipeline).await;
                 observe(&pipeline, &mut graph, &mut reads);
             }
         }
@@ -731,11 +978,6 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
             break;
         }
         let before = fingerprint(&pipeline, &requests);
-        // The idle tick: bytes held out of order behind an article that
-        // will never commit are written out.
-        if pipeline.write_buffered_bytes > 0 {
-            pipeline.flush_quiescent_write_backlog().await;
-        }
         if pipeline.jobs.contains_key(&JOB) {
             pipeline.check_job_completion(JOB).await;
         }
@@ -756,85 +998,19 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
             observe(&pipeline, &mut graph, &mut reads);
             continue;
         }
-        // A body a server spoiled is asked of the next server once the
-        // worker's backoff ends: the retry it scheduled is the job's next
-        // move.
-        if pipeline
-            .pending_retries_by_job
-            .get(&JOB)
-            .is_some_and(|pending| *pending > 0)
-        {
-            let retry = pipeline
-                .retry_rx
-                .recv()
-                .await
-                .expect("a scheduled retry is sent");
-            pipeline.receive_retry_work(retry);
-            continue;
-        }
-        // Classic's extraction runs out on a task too, a whole set's or a
-        // RAR member worker's, and says it is done the same way.
-        if pipeline
-            .inflight_extractions
-            .get(&JOB)
-            .is_some_and(|sets| !sets.is_empty())
-            || pipeline.has_active_rar_workers(JOB)
-        {
-            let done = pipeline
-                .extract_done_rx
-                .recv()
-                .await
-                .expect("an extraction in flight reports");
-            pipeline.handle_extraction_done(done).await;
-            continue;
-        }
-        // Classic works out a RAR set's plan off the actor too, and the
-        // orchestrator hears it back on its own channel.
-        if pipeline
-            .rar_refresh_state
-            .iter()
-            .any(|((job, _), refresh)| *job == JOB && refresh.in_flight.is_some())
-        {
-            let done = pipeline
-                .rar_refresh_done_rx
-                .recv()
-                .await
-                .expect("a RAR refresh in flight reports");
-            pipeline.handle_rar_refresh_done(done).await;
-            continue;
-        }
-        // A RAR plan or extraction classic put off for want of capacity is
-        // tried again when its retry comes back, as the orchestrator hears it.
-        if pipeline
-            .pending_rar_capacity_retries
-            .iter()
-            .any(|(job, _, _)| *job == JOB)
-        {
-            let retry = pipeline
-                .rar_capacity_retry_rx
-                .recv()
-                .await
-                .expect("a scheduled RAR retry is sent");
-            pipeline.handle_rar_capacity_retry(retry).await;
+        if take_retry(&mut pipeline).await {
             continue;
         }
         let after = fingerprint(&pipeline, &requests);
         if before == after && stalled.replace(after.clone()) == Some(after.clone()) {
             let status = job_status_for_assert(&pipeline, JOB);
-            let state = format!("{after}: {}", debug_job_state(&pipeline, JOB));
+            let state = after;
             retire_pipeline_database(pipeline).await;
-            return Err(Stall {
-                engine,
-                status,
-                state,
-            });
+            return Err(Stall { status, state });
         }
     }
 
-    if engine == Engine::Classic {
-        reads = (pipeline.par2_authoritative_verify_calls + pipeline.par2_selective_verify_calls)
-            as u64;
-    }
+    super::super::settle_failed_releases(&mut pipeline).await;
     let status = job_status_for_assert(&pipeline, JOB);
     let failure = match &status {
         Some(JobStatus::Failed { error }) => Some(error.clone()),
@@ -849,6 +1025,14 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
         .and_then(|state| state.failure_kind);
     let mut files = BTreeMap::new();
     collect(&complete_dir, &complete_dir, &mut files);
+    let mut retained_files = BTreeMap::new();
+    collect(
+        &pipeline.intermediate_dir,
+        &pipeline.intermediate_dir,
+        &mut retained_files,
+    );
+    let mut empty = BTreeSet::new();
+    collect_empty(&complete_dir, &complete_dir, &mut empty);
     let claims = scenario
         .posts
         .iter()
@@ -857,34 +1041,32 @@ pub(super) async fn try_run(scenario: &Scenario, engine: Engine) -> Result<Outco
         .collect();
     drop(heard);
     let events = kept.await.expect("every event the run sent is kept");
+    let rejections = pipeline.metrics.extraction_rejections();
+    let metrics = pipeline.metrics.raw_snapshot();
+    let validated_password = pipeline.db.validated_archive_password(JOB.0).unwrap();
+    let history_metadata = pipeline
+        .db
+        .get_job_history(JOB.0)
+        .unwrap()
+        .and_then(|row| row.metadata);
     retire_pipeline_database(pipeline).await;
     Ok(Outcome {
-        engine,
         status,
         failure,
         failure_kind,
         files,
+        retained_files,
+        empty,
         claims,
         requests,
         order,
         reads,
         graph,
-        volumes: scenario
-            .posts
-            .iter()
-            .zip(0u32..)
-            .filter(|(post, _)| {
-                matches!(
-                    post.role,
-                    FileRole::Par2 {
-                        is_index: false,
-                        ..
-                    } | FileRole::Par3 { is_index: false }
-                )
-            })
-            .map(|(_, index)| index)
-            .collect(),
         events,
+        rejections,
+        metrics,
+        validated_password,
+        history_metadata,
     })
 }
 
@@ -930,7 +1112,9 @@ fn hear(
 // check a step scheduled is run, and a live run is heard. Returns where the
 // job stands once nothing is queued, scheduled or running: the recovery
 // outcomes as last seen, and whether its delivery move is out.
-pub(super) async fn run_unprompted(scenario: &Scenario) -> (Vec<Option<RepairOutcome>>, bool) {
+pub(in crate::pipeline::tests) async fn run_unprompted(
+    scenario: &Scenario,
+) -> (Vec<Option<RepairOutcome>>, bool) {
     fn look(pipeline: &Pipeline, outcomes: &mut Vec<Option<RepairOutcome>>) {
         if let Some(job) = pipeline.graph_jobs.get(&JOB) {
             *outcomes = job
@@ -940,13 +1124,13 @@ pub(super) async fn run_unprompted(scenario: &Scenario) -> (Vec<Option<RepairOut
                 .collect();
         }
     }
-    let (_temp_dir, mut pipeline, _) = admit(scenario, Engine::Graph).await;
+    let (_temp_dir, mut pipeline, _) = admit(scenario).await;
     let mut outcomes = Vec::new();
     loop {
         while let Some(work) = pipeline
             .jobs
             .get_mut(&JOB)
-            .and_then(|state| state.download_queue.pop())
+            .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
         {
             let article = (
                 work.segment_id.file_id.file_index,
@@ -972,7 +1156,17 @@ pub(super) async fn run_unprompted(scenario: &Scenario) -> (Vec<Option<RepairOut
             .is_some_and(|job| job.awaits_mail())
         {
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+            let replayed = matches!(
+                &said.heard,
+                crate::pipeline::graph::engine::Heard::Replayed(_)
+            );
             pipeline.graph_run_said(said);
+            if replayed {
+                assert!(
+                    pipeline.pending_completion_checks.contains(&JOB),
+                    "replay acknowledgment must schedule completion without an idle look"
+                );
+            }
             look(&pipeline, &mut outcomes);
             continue;
         }
@@ -999,7 +1193,13 @@ fn handed_out(
         works.reverse();
         return Some((works, Some(lease.checkpoint_plan)));
     }
-    let queue = &mut pipeline.jobs.get_mut(&JOB)?.download_queue;
+    let queue = &mut pipeline
+        .jobs
+        .get_mut(&JOB)?
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue;
     let all = scenario.backwards || !scenario.together.is_empty();
     let mut batch = Vec::new();
     while let Some(work) = queue.pop() {
@@ -1025,13 +1225,59 @@ fn handed_out(
     (!batch.is_empty()).then_some((batch, None))
 }
 
+// A body a server spoiled is asked of the next server once the worker's
+// backoff ends: the retry it scheduled is the job's next move. True when one
+// was taken.
+pub(in crate::pipeline::tests) async fn take_retry(pipeline: &mut Pipeline) -> bool {
+    if !pipeline
+        .pending_retries_by_job
+        .get(&JOB)
+        .is_some_and(|pending| *pending > 0)
+    {
+        return false;
+    }
+    let retry = pipeline
+        .retry_rx
+        .recv()
+        .await
+        .expect("a scheduled retry is sent");
+    pipeline.receive_retry_work(retry);
+    true
+}
+
+// An ask as the worker serves it: the first server it does not exclude
+// answers.
+pub(in crate::pipeline::tests) async fn serve_work(
+    pipeline: &mut Pipeline,
+    scenario: &Scenario,
+    work: &DownloadWork,
+) {
+    let article = (
+        work.segment_id.file_id.file_index,
+        work.segment_id.segment_number,
+    );
+    serve_from(
+        pipeline,
+        JOB,
+        scenario,
+        article,
+        &work.exclude_servers,
+        None,
+    )
+    .await;
+}
+
 // One article as the scenario's server answers it.
-pub(super) async fn serve(pipeline: &mut Pipeline, scenario: &Scenario, article: (u32, u32)) {
+pub(in crate::pipeline::tests) async fn serve(
+    pipeline: &mut Pipeline,
+    scenario: &Scenario,
+    article: (u32, u32),
+) {
     serve_job(pipeline, JOB, scenario, article).await;
 }
 
 // [`serve`] for a job other than the run's own.
-pub(super) async fn serve_job(
+pub(in crate::pipeline::tests) async fn serve_job(
     pipeline: &mut Pipeline,
     job: JobId,
     scenario: &Scenario,
@@ -1062,8 +1308,7 @@ async fn serve_from(
         pipeline.book_failed_segment(segment_id);
         return;
     }
-    let intact = !scenario.damage.contains(&(file, ordinal))
-        && !(server == 0 && scenario.corrupt_primary.contains(&(file, ordinal)));
+    let intact = !scenario.spoils(server, (file, ordinal));
     let post = &scenario.posts[file as usize];
     let offset = ordinal as usize * scenario.article;
     let posted = post
@@ -1072,7 +1317,8 @@ async fn serve_from(
         .unwrap();
     // The checksum the article declares is the posted one, so damaged bytes
     // disagree with it.
-    let crc = par2_rs::checksum::crc32(posted);
+    let crc_wrong = scenario.crc_wrong.contains(&(file, ordinal));
+    let crc = par2_rs::checksum::crc32(posted) ^ u32::from(crc_wrong);
     let mut body = posted.to_vec();
     if !intact {
         body.iter_mut().take(8).for_each(|byte| *byte ^= 0x5a);
@@ -1120,13 +1366,25 @@ async fn serve_from(
             .await;
         return;
     }
+    // The part end the header declares is the posted one, whatever of it
+    // decoded.
+    let declared = body.len() as u64;
+    if let Some((.., by)) = scenario
+        .short
+        .iter()
+        .find(|(at, number, _)| (*at, *number) == (file, ordinal))
+    {
+        body.truncate(body.len().saturating_sub(*by));
+    }
     let len = body.len() as u64;
+    let truncated = len < declared;
+    let intact = intact && !truncated && !crc_wrong;
     // The decoder checksums the bytes it decoded, cut at the block
     // boundaries of the plan the article was leased under: its lease's, or
     // what the job knows now when it was handed out alone.
     let checkpoint_plan = leased
         .cloned()
-        .unwrap_or_else(|| pipeline.par2_checkpoint_plan(job));
+        .unwrap_or_else(|| checkpoint_plan(pipeline, job));
     let mut checksums = weaver_yenc::SegmentedCrc32::new(offset as u64, checkpoint_plan.clone());
     checksums.update(&body);
     let (_, segments) = checksums.finish_article();
@@ -1137,16 +1395,20 @@ async fn serve_from(
                 raw_size: len,
                 encoding: SegmentEncoding::Yenc,
                 yenc_layout: YencLayoutAssertions {
-                    file_size: post.bytes.len() as u64,
+                    file_size: scenario
+                        .declares
+                        .iter()
+                        .find(|(at, _)| *at == file)
+                        .map_or(post.bytes.len() as u64, |(_, size)| *size),
                     part: Some(ordinal + 1),
                     total: Some(post.articles(scenario.article).count() as u32),
                     begin: Some(offset as u64 + 1),
-                    end: Some(offset as u64 + len),
+                    end: Some(offset as u64 + declared),
                 },
                 crc_valid: intact,
                 part_crc_verified: intact,
                 part_crc: crc,
-                truncation_suspected: false,
+                truncation_suspected: truncated,
                 expected_file_crc: None,
                 data: DecodedChunk::from(body),
                 yenc_name: post.name.clone(),
@@ -1159,10 +1421,6 @@ async fn serve_from(
             },
         )
         .await;
-    // What the select loop would pick up after the article: the read-back a
-    // set's last article submits, and a demotion's handback.
-    settle_direct_verification_read(pipeline, job).await;
-    settle_direct_demotion_work(pipeline).await;
 }
 
 pub(in crate::pipeline::tests) fn finished(pipeline: &Pipeline) -> bool {
@@ -1176,8 +1434,8 @@ pub(in crate::pipeline::tests) fn finished(pipeline: &Pipeline) -> bool {
 fn fingerprint(pipeline: &Pipeline, requests: &BTreeMap<(u32, u32), usize>) -> String {
     let queued = pipeline.jobs.get(&JOB).map(|state| {
         (
-            state.download_queue.len(),
-            state.recovery_queue.len(),
+            state.articles.active().unwrap().download_queue.len(),
+            state.articles.active().unwrap().recovery_queue.len(),
             state.status.clone(),
         )
     });
@@ -1191,12 +1449,12 @@ fn fingerprint(pipeline: &Pipeline, requests: &BTreeMap<(u32, u32), usize>) -> S
 
 // The graph job as it stands; a finished job has left the pipeline, so the
 // last look before that is what the outcome keeps.
-pub(super) fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: &mut u64) {
-    let (Some(view), Some(job), Some(state)) = (
-        view.as_mut(),
-        pipeline.graph_jobs.get(&JOB),
-        pipeline.jobs.get(&JOB),
-    ) else {
+pub(in crate::pipeline::tests) fn observe(
+    pipeline: &Pipeline,
+    view: &mut GraphView,
+    reads: &mut u64,
+) {
+    let (Some(job), Some(state)) = (pipeline.graph_jobs.get(&JOB), pipeline.jobs.get(&JOB)) else {
         return;
     };
     let looked = std::time::Instant::now();
@@ -1216,7 +1474,7 @@ pub(super) fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: 
             .map(|member| {
                 (
                     member.name.clone(),
-                    writer.proven_whole(tree, weaver_graph::NodeId::ROOT, member.id),
+                    writer.proven_whole(tree, (weaver_graph::NodeId::ROOT, &sets), member.id),
                     job.checksums_held(member.id),
                 )
             })
@@ -1230,8 +1488,10 @@ pub(super) fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: 
             .map(|kind| kind.to_string()),
     );
     view.offered = job.passwords_offered();
+    view.scratch = view.scratch.max(tree_bytes(&state.working_dir));
     view.checkpoints = job.pending().tally();
     view.delivery = pipeline.graph_delivery(JOB).unwrap_or_default();
+    view.health = pipeline.graph_failure_is_health(JOB);
     let namespace = job.namespace();
     view.claims = state
         .spec
@@ -1239,15 +1499,20 @@ pub(super) fn observe(pipeline: &Pipeline, view: &mut Option<GraphView>, reads: 
         .iter()
         .zip(0u32..)
         .filter(|(file, _)| file.role.counts_toward_health())
-        .filter_map(|(_, index)| namespace.get(weaver_graph::MemberId(index)))
-        .map(|member| {
+        // A posting folded into the member it repeats claims what that
+        // member holds: its own record keeps only what the member took of it.
+        .filter_map(|(_, index)| {
+            let posting = namespace.get(weaver_graph::MemberId(index))?;
+            Some((posting, namespace.get(namespace.resolve(posting.id))?))
+        })
+        .map(|(posting, member)| {
             let damaged = member.coverage.damaged_ranges().next().is_some();
             let claim = match member.length {
                 Some(_) if member.is_complete() && !damaged => Claim::Complete,
                 Some(_) if member.is_complete() => Claim::Damaged,
                 _ => Claim::Missing,
             };
-            (member.output_name.clone(), claim)
+            (posting.output_name.clone(), claim)
         })
         .collect();
     let summary = job.recovery_summary();
@@ -1294,7 +1559,29 @@ fn delivered_claim(files: &BTreeMap<String, Vec<u8>>, post: &Post) -> Claim {
 
 // The delivered files, without the marker every output directory carries,
 // whose bytes name the run's own paths.
-pub(super) fn collect(root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
+// Every file under `dir` by its length, links not followed.
+fn tree_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                tree_bytes(&entry.path())
+            } else {
+                entry.metadata().map_or(0, |metadata| metadata.len())
+            }
+        })
+        .sum()
+}
+
+pub(in crate::pipeline::tests) fn collect(
+    root: &Path,
+    dir: &Path,
+    files: &mut BTreeMap<String, Vec<u8>>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1306,12 +1593,182 @@ pub(super) fn collect(root: &Path, dir: &Path, files: &mut BTreeMap<String, Vec<
         if path.is_dir() {
             collect(root, &path, files);
         } else {
-            let name = path
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
+            let name = delivered_name(path.strip_prefix(root).unwrap());
             files.insert(name, std::fs::read(&path).unwrap());
         }
+    }
+}
+
+// The delivered directories that hold nothing, the marker aside. The working
+// directories a run keeps beside the output, named with a leading
+// `.weaver-`, are not delivered.
+fn collect_empty(root: &Path, dir: &Path, empty: &mut BTreeSet<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut held = false;
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with(".weaver-"))
+        {
+            continue;
+        }
+        held = true;
+        if path.is_dir() {
+            collect_empty(root, &path, empty);
+        }
+    }
+    if !held && dir != root {
+        let name = delivered_name(dir.strip_prefix(root).unwrap());
+        empty.insert(format!("{name}/"));
+    }
+}
+
+// A delivered path below the output root, named as the engine names it:
+// its components joined by `/` on every host.
+fn delivered_name(relative: &Path) -> String {
+    relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+// Where a job stood while the server held every article of one post, and
+// how it ended once the server let them go.
+pub(in crate::pipeline::tests) struct Held {
+    // The job's report once nothing moved while the post was held.
+    pub(in crate::pipeline::tests) report: crate::JobInfo,
+    // What its recovery sets had ruled then.
+    pub(in crate::pipeline::tests) outcomes: Vec<Option<RepairOutcome>>,
+    // Its status, and whether it read as fetching repair data, at each
+    // round after the release.
+    pub(in crate::pipeline::tests) after: Vec<(JobStatus, bool)>,
+    pub(in crate::pipeline::tests) status: Option<JobStatus>,
+    pub(in crate::pipeline::tests) files: BTreeMap<String, Vec<u8>>,
+}
+
+// Plays the server, holding every article of post `held` as a server holds
+// an article a worker asked for: the worker has it out, and no answer comes.
+// Once nothing moves the job is looked at; then the held articles are
+// answered and the job runs to its end.
+pub(in crate::pipeline::tests) async fn run_holding(scenario: &Scenario, held: u32) -> Held {
+    // Every article the queue hands out is served but the held post's, and
+    // the job's checks, steps and mail run, until nothing is left to serve.
+    async fn settle(
+        pipeline: &mut Pipeline,
+        scenario: &Scenario,
+        held: u32,
+        out: &mut Vec<DownloadWork>,
+    ) {
+        loop {
+            while let Some(work) = pipeline
+                .jobs
+                .get_mut(&JOB)
+                .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
+            {
+                let article = (
+                    work.segment_id.file_id.file_index,
+                    work.segment_id.segment_number,
+                );
+                if article.0 == held {
+                    *pipeline.active_downloads_by_job.entry(JOB).or_insert(0) += 1;
+                    out.push(work);
+                    continue;
+                }
+                serve(pipeline, scenario, article).await;
+                if pipeline.job_decode_stage_drained(JOB) {
+                    pipeline.maybe_finish_download_pass(JOB);
+                }
+            }
+            if finished(pipeline) {
+                return;
+            }
+            pipeline.check_job_completion(JOB).await;
+            pump_pipeline_runtime_queues(pipeline).await;
+            if pipeline
+                .graph_jobs
+                .get(&JOB)
+                .is_some_and(|graph| graph.awaits_mail())
+            {
+                let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+                pipeline.graph_run_said(said);
+                continue;
+            }
+            if pipeline.jobs.get(&JOB).is_none_or(|state| {
+                state
+                    .articles
+                    .active()
+                    .is_none_or(|active| active.download_queue.is_empty())
+            }) {
+                return;
+            }
+        }
+    }
+    // A round that leaves the job where it stood twice over is a stall.
+    fn look(pipeline: &Pipeline) -> String {
+        let report = pipeline.job_report(JOB);
+        format!(
+            "{:?} {:?} {:?} {}",
+            report.as_ref().map(|report| &report.status),
+            report.as_ref().map(|report| report.post_state),
+            pipeline
+                .graph_jobs
+                .get(&JOB)
+                .map(crate::pipeline::graph::job::GraphJob::recovery_summary),
+            pipeline.inflight_moves.contains(&JOB),
+        )
+    }
+
+    let (_temp_dir, mut pipeline, complete_dir) = admit(scenario).await;
+    let mut out = Vec::new();
+    settle(&mut pipeline, scenario, held, &mut out).await;
+    assert!(!out.is_empty(), "the held post was never asked for");
+    let report = pipeline
+        .job_report(JOB)
+        .expect("the job waits on the held post");
+    let outcomes = pipeline.graph_jobs[&JOB]
+        .recovery_summary()
+        .iter()
+        .map(|set| set.outcome)
+        .collect();
+
+    pipeline.active_downloads_by_job.insert(JOB, 0);
+    for work in std::mem::take(&mut out) {
+        let article = (
+            work.segment_id.file_id.file_index,
+            work.segment_id.segment_number,
+        );
+        serve(&mut pipeline, scenario, article).await;
+    }
+    if pipeline.job_decode_stage_drained(JOB) {
+        pipeline.maybe_finish_download_pass(JOB);
+    }
+    let mut after = Vec::new();
+    let mut stalled = None;
+    while !finished(&pipeline) {
+        if let Some(report) = pipeline.job_report(JOB) {
+            after.push((report.status.clone(), report.fetching_repair_data));
+        }
+        let before = look(&pipeline);
+        settle(&mut pipeline, scenario, held, &mut out).await;
+        let now = look(&pipeline);
+        if before == now && stalled.replace(now.clone()) == Some(now.clone()) {
+            panic!("the job stalled: {now}");
+        }
+    }
+    assert!(out.is_empty(), "the held post was asked for again");
+    let status = job_status_for_assert(&pipeline, JOB);
+    let mut files = BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    retire_pipeline_database(pipeline).await;
+    Held {
+        report,
+        outcomes,
+        after,
+        status,
+        files,
     }
 }

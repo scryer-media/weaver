@@ -14,10 +14,10 @@ use std::sync::Arc;
 use super::ids::JobId;
 use super::persistence::lock_active_job_for_write_tx;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
-use crate::{Database, StateError};
+use crate::{Database, LoadError, StateError};
 
 // Every table a checkpoint writes. A job's rows go with the job.
-pub(crate) const TABLES: [&str; 8] = [
+pub(crate) const TABLES: [&str; 9] = [
     "graph_nodes",
     "graph_members",
     "graph_coverage",
@@ -26,6 +26,7 @@ pub(crate) const TABLES: [&str; 8] = [
     "graph_recovery",
     "graph_holds",
     "graph_facts_parts",
+    "graph_held_parts",
 ];
 
 // Rows per statement: enough to keep a large change to a few statements,
@@ -35,6 +36,8 @@ const BATCH: usize = 64;
 // Every row, each table in key order.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct GraphCheckpoint {
+    // Server-owned state read in the same transaction as its refusals.
+    pub(crate) feed_verdict: Option<super::feed_verdict::FeedVerdict>,
     pub(crate) nodes: Vec<NodeRow>,
     pub(crate) members: Vec<MemberRow>,
     pub(crate) coverage: Vec<CoverageRow>,
@@ -42,6 +45,7 @@ pub(crate) struct GraphCheckpoint {
     pub(crate) crypt: Vec<CryptRow>,
     pub(crate) parts: Vec<PartRow>,
     pub(crate) holds: Vec<HoldRow>,
+    pub(crate) held_parts: Vec<HeldPartRow>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +69,7 @@ pub(crate) struct MemberRow {
     pub(crate) member: i64,
     pub(crate) name: String,
     pub(crate) output_name: String,
+    pub(crate) crc32: Option<i64>,
     pub(crate) length: Option<i64>,
     pub(crate) closed: bool,
     pub(crate) bound: Option<i64>,
@@ -73,8 +78,13 @@ pub(crate) struct MemberRow {
     pub(crate) buried: bool,
     pub(crate) undecided: bool,
     pub(crate) has_file: bool,
+    // The name the member's file sits at while it waits to move to its
+    // output name; `None` once it sits there.
+    pub(crate) on_disk: Option<String>,
     pub(crate) refused: Option<String>,
     pub(crate) copy_of: Option<i64>,
+    // The kind whose reading of the member its own bytes refuted.
+    pub(crate) refuted_kind: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,6 +106,9 @@ pub(crate) struct EnvelopeRow {
     pub(crate) provenance: String,
     pub(crate) closed: Option<i64>,
     pub(crate) settled: bool,
+    // The file the envelope sits in, when not the one its node and volume
+    // name.
+    pub(crate) file: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -116,6 +129,40 @@ pub(crate) struct HoldRow {
     pub(crate) start: i64,
     pub(crate) end: i64,
     pub(crate) scratch_offset: i64,
+}
+
+// A part that arrived and waits to be placed, spooled to a file under the
+// job's working directory: a uuencode part ahead of its file's cursor, or an
+// article that declared no usable start ahead of the ordinal it follows.
+// `spool_path` is relative to the working directory. A held article keeps
+// the facts its decode found; a uuencode part keeps none.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeldPartRow {
+    pub(crate) file: i64,
+    pub(crate) ordinal: i64,
+    pub(crate) decoded_len: i64,
+    pub(crate) spool_path: String,
+    pub(crate) article: Option<HeldArticleRow>,
+}
+
+// What a held article's decode found, but its bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeldArticleRow {
+    pub(crate) raw_size: i64,
+    pub(crate) crc_valid: bool,
+    pub(crate) truncation_suspected: bool,
+    pub(crate) part_crc_verified: bool,
+    pub(crate) part_crc: i64,
+    pub(crate) expected_file_crc: Option<i64>,
+    pub(crate) file_size: i64,
+    pub(crate) part: Option<i64>,
+    pub(crate) total: Option<i64>,
+    pub(crate) begin: Option<i64>,
+    pub(crate) end: Option<i64>,
+    pub(crate) name: String,
+    // The decode pass's CRC32 segments, each as its offset, length and
+    // checksum, little-endian.
+    pub(crate) crc_segments: Vec<u8>,
 }
 
 // One sealed part of a node's facts. Its bytes are shared with the facts
@@ -205,9 +252,9 @@ impl Row for MemberRow {
     type Key = (i64, i64);
     const TABLE: &'static str = "graph_members";
     const KEY: &'static [&'static str] = &["node_id", "member_id"];
-    const COLUMNS: &'static str = "job_id, node_id, member_id, name, output_name, length, \
-         closed, bound_node_id, owner_node_id, owner_volume, given_up_node_id, \
-         given_up_volume, buried, undecided, has_file, refused, copy_of";
+    const COLUMNS: &'static str = "job_id, node_id, member_id, name, output_name, crc32, \
+         length, closed, bound_node_id, owner_node_id, owner_volume, given_up_node_id, \
+         given_up_volume, buried, undecided, has_file, on_disk, refused, copy_of, refuted_kind";
 
     fn key(&self) -> (i64, i64) {
         (self.node, self.member)
@@ -226,6 +273,7 @@ impl Row for MemberRow {
             SqlArg::I64(self.member),
             SqlArg::Text(self.name.clone()),
             SqlArg::Text(self.output_name.clone()),
+            SqlArg::OptI64(self.crc32),
             SqlArg::OptI64(self.length),
             SqlArg::Bool(self.closed),
             SqlArg::OptI64(self.bound),
@@ -236,8 +284,10 @@ impl Row for MemberRow {
             SqlArg::Bool(self.buried),
             SqlArg::Bool(self.undecided),
             SqlArg::Bool(self.has_file),
+            SqlArg::OptText(self.on_disk.clone()),
             SqlArg::OptText(self.refused.clone()),
             SqlArg::OptI64(self.copy_of),
+            SqlArg::OptText(self.refuted_kind.clone()),
         ]
     }
 }
@@ -275,7 +325,7 @@ impl Row for EnvelopeRow {
     const TABLE: &'static str = "graph_envelopes";
     const KEY: &'static [&'static str] = &["node_id", "volume", "range_start"];
     const COLUMNS: &'static str =
-        "job_id, node_id, volume, range_start, range_end, provenance, closed, settled";
+        "job_id, node_id, volume, range_start, range_end, provenance, closed, settled, file";
 
     fn key(&self) -> (i64, i64, i64) {
         (self.node, self.volume, self.start)
@@ -295,6 +345,7 @@ impl Row for EnvelopeRow {
             SqlArg::Text(self.provenance.clone()),
             SqlArg::OptI64(self.closed),
             SqlArg::Bool(self.settled),
+            SqlArg::OptText(self.file.clone()),
         ]
     }
 }
@@ -378,6 +429,48 @@ impl Row for PartRow {
     }
 }
 
+impl Row for HeldPartRow {
+    type Key = (i64, i64);
+    const TABLE: &'static str = "graph_held_parts";
+    const KEY: &'static [&'static str] = &["file_index", "ordinal"];
+    const COLUMNS: &'static str = "job_id, file_index, ordinal, decoded_len, spool_path, \
+        raw_size, crc_valid, truncation_suspected, part_crc_verified, part_crc, \
+        expected_file_crc, file_size, yenc_part, yenc_total, yenc_begin, yenc_end, yenc_name, \
+        crc_segments";
+
+    fn key(&self) -> (i64, i64) {
+        (self.file, self.ordinal)
+    }
+
+    fn key_args(key: &(i64, i64)) -> Vec<SqlArg> {
+        vec![SqlArg::I64(key.0), SqlArg::I64(key.1)]
+    }
+
+    fn args(&self, job: i64) -> Vec<SqlArg> {
+        let article = self.article.as_ref();
+        vec![
+            SqlArg::I64(job),
+            SqlArg::I64(self.file),
+            SqlArg::I64(self.ordinal),
+            SqlArg::I64(self.decoded_len),
+            SqlArg::Text(self.spool_path.clone()),
+            SqlArg::OptI64(article.map(|article| article.raw_size)),
+            SqlArg::OptBool(article.map(|article| article.crc_valid)),
+            SqlArg::OptBool(article.map(|article| article.truncation_suspected)),
+            SqlArg::OptBool(article.map(|article| article.part_crc_verified)),
+            SqlArg::OptI64(article.map(|article| article.part_crc)),
+            SqlArg::OptI64(article.and_then(|article| article.expected_file_crc)),
+            SqlArg::OptI64(article.map(|article| article.file_size)),
+            SqlArg::OptI64(article.and_then(|article| article.part)),
+            SqlArg::OptI64(article.and_then(|article| article.total)),
+            SqlArg::OptI64(article.and_then(|article| article.begin)),
+            SqlArg::OptI64(article.and_then(|article| article.end)),
+            SqlArg::OptText(article.map(|article| article.name.clone())),
+            SqlArg::OptBytes(article.map(|article| article.crc_segments.clone())),
+        ]
+    }
+}
+
 // The rows of one table a checkpoint changes, by key: the row as it is now,
 // or `None` for one that went away.
 pub(crate) type Changes<R> = BTreeMap<<R as Row>::Key, Option<R>>;
@@ -385,6 +478,9 @@ pub(crate) type Changes<R> = BTreeMap<<R as Row>::Key, Option<R>>;
 // What one checkpoint changes of the one before it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Delta {
+    // None leaves the verdict unchanged. New retry attempts get a new
+    // active row; ordinary checkpoint replacement must not clear it.
+    pub(crate) feed_verdict: Option<super::feed_verdict::FeedVerdict>,
     // Nothing is known of what the database holds of the job, so every row
     // of it goes before these are written.
     pub(crate) whole: bool,
@@ -395,12 +491,14 @@ pub(crate) struct Delta {
     pub(crate) crypt: Changes<CryptRow>,
     pub(crate) parts: Changes<PartRow>,
     pub(crate) holds: Changes<HoldRow>,
+    pub(crate) held_parts: Changes<HeldPartRow>,
 }
 
 impl Delta {
     // What `after` changes of `before`, which is the checkpoint the
     // database holds or will once what is queued is written; `None` when
     // nothing says what it holds. Both are in key order.
+    #[cfg(test)]
     pub(crate) fn between(before: Option<&GraphCheckpoint>, after: &GraphCheckpoint) -> Self {
         let mut out = Self {
             whole: before.is_none(),
@@ -421,13 +519,20 @@ impl Delta {
         changes(&mut self.crypt, &before.crypt, &after.crypt);
         changes(&mut self.parts, &before.parts, &after.parts);
         changes(&mut self.holds, &before.holds, &after.holds);
+        changes(&mut self.held_parts, &before.held_parts, &after.held_parts);
     }
 
     // This change followed by `later`, as one.
-    pub(crate) fn absorb(&mut self, later: Delta) {
+    pub(crate) fn absorb(&mut self, mut later: Delta) {
         if later.whole {
+            if later.feed_verdict.is_none() {
+                later.feed_verdict = self.feed_verdict.take();
+            }
             *self = later;
             return;
+        }
+        if later.feed_verdict.is_some() {
+            self.feed_verdict = later.feed_verdict;
         }
         self.nodes.extend(later.nodes);
         self.members.extend(later.members);
@@ -436,10 +541,11 @@ impl Delta {
         self.crypt.extend(later.crypt);
         self.parts.extend(later.parts);
         self.holds.extend(later.holds);
+        self.held_parts.extend(later.held_parts);
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        !self.whole && self.rows() == 0
+        !self.whole && self.rows() == 0 && self.feed_verdict.is_none()
     }
 
     // How many rows it writes or deletes.
@@ -451,6 +557,7 @@ impl Delta {
             + self.crypt.len()
             + self.parts.len()
             + self.holds.len()
+            + self.held_parts.len()
     }
 
     // How many bytes of facts it writes.
@@ -500,19 +607,42 @@ impl Database {
         })
     }
 
+    // Whether the job has a checkpoint, without reading it.
+    pub(crate) fn has_graph_checkpoint(&self, job_id: JobId) -> Result<bool, LoadError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "has_graph_checkpoint", |tx| {
+                Box::pin(async move {
+                    Ok(tx
+                        .fetch_optional(
+                            "SELECT 1 AS present FROM graph_nodes WHERE job_id = {} LIMIT 1",
+                            &[SqlArg::I64(job_id.0 as i64)],
+                        )
+                        .await?
+                        .is_some())
+                })
+            })
+            .await
+        })
+        .map_err(LoadError::Read)
+    }
+
     // The job's checkpoint, or `None` when it has no rows. Read in one
     // transaction, so it is one checkpoint even beside a writer.
     pub(crate) fn load_graph_checkpoint(
         &self,
         job_id: JobId,
-    ) -> Result<Option<GraphCheckpoint>, StateError> {
+    ) -> Result<Option<GraphCheckpoint>, LoadError> {
         let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "load_graph_checkpoint", |tx| {
-                Box::pin(async move { read_checkpoint(tx, job_id).await })
+        let fetched = self
+            .run_sql_blocking(async move {
+                SqlRuntime::run_in_transaction(&datastore, "load_graph_checkpoint", |tx| {
+                    Box::pin(async move { fetch_checkpoint(tx, job_id).await })
+                })
+                .await
             })
-            .await
-        })
+            .map_err(LoadError::Read)?;
+        fetched.map(interpret).transpose().map_err(LoadError::Rows)
     }
 
     // The root's row of the job's checkpoint with its facts parts, or
@@ -533,29 +663,13 @@ impl Database {
 }
 
 // Whether the job `job_id` names is live: while its queue row or its torrent
-// row is. A checkpoint is kept for exactly the live jobs.
-fn live_job(job_id: &str) -> String {
+// row is. A checkpoint is kept for exactly the live jobs, and the start-up
+// prune of orphaned active rows reads the same predicate.
+pub(crate) fn live_job(job_id: &str) -> String {
     format!(
         "(EXISTS (SELECT 1 FROM active_jobs WHERE active_jobs.job_id = {job_id})
           OR EXISTS (SELECT 1 FROM torrents WHERE torrents.job_id = {job_id}))"
     )
-}
-
-// Delete every checkpoint row whose job is not live. Returns how many went.
-pub(crate) async fn delete_orphans(tx: &mut SqlTx<'_>) -> Result<usize, StateError> {
-    let mut removed = 0;
-    for table in TABLES {
-        removed += tx
-            .execute(
-                &format!(
-                    "DELETE FROM {table} WHERE NOT {}",
-                    live_job(&format!("{table}.job_id"))
-                ),
-                &[],
-            )
-            .await? as usize;
-    }
-    Ok(removed)
 }
 
 pub(crate) async fn write_delta(
@@ -591,6 +705,14 @@ pub(crate) async fn write_delta(
     write(tx, id, &delta.crypt).await?;
     write(tx, id, &delta.parts).await?;
     write(tx, id, &delta.holds).await?;
+    write(tx, id, &delta.held_parts).await?;
+    if let Some(verdict) = &delta.feed_verdict {
+        tx.execute(
+            "UPDATE active_jobs SET feed_verdict = {} WHERE job_id = {}",
+            &[SqlArg::Text(verdict.encode()?), SqlArg::I64(id)],
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -704,10 +826,26 @@ async fn read_root(
     }))
 }
 
-async fn read_checkpoint(
+// A checkpoint's rows as the database returned them, before any value in
+// them is read.
+struct Fetched {
+    nodes: Vec<SqlRow>,
+    members: Vec<SqlRow>,
+    coverage: Vec<SqlRow>,
+    envelopes: Vec<SqlRow>,
+    crypt: Vec<SqlRow>,
+    parts: Vec<SqlRow>,
+    holds: Vec<SqlRow>,
+    held_parts: Vec<SqlRow>,
+    feed_verdict: Option<SqlRow>,
+}
+
+// Every row of the job's checkpoint, or `None` when it has no nodes. Only
+// the database fails here.
+async fn fetch_checkpoint(
     tx: &mut SqlTx<'_>,
     job_id: JobId,
-) -> Result<Option<GraphCheckpoint>, StateError> {
+) -> Result<Option<Fetched>, StateError> {
     let args = [SqlArg::I64(job_id.0 as i64)];
     let nodes = tx
         .fetch_all(
@@ -718,22 +856,97 @@ async fn read_checkpoint(
     if nodes.is_empty() {
         return Ok(None);
     }
-    let nodes = nodes
-        .iter()
-        .map(node_row)
-        .collect::<Result<_, StateError>>()?;
+    Ok(Some(Fetched {
+        nodes,
+        members: tx
+            .fetch_all(
+                "SELECT node_id, member_id, name, output_name, crc32, length, closed, \
+                 bound_node_id, owner_node_id, owner_volume, given_up_node_id, given_up_volume, \
+                 buried, undecided, has_file, on_disk, refused, copy_of, refuted_kind \
+                 FROM graph_members WHERE job_id = {} ORDER BY node_id, member_id",
+                &args,
+            )
+            .await?,
+        coverage: tx
+            .fetch_all(
+                "SELECT node_id, member_id, range_start, range_end, provenance, verified \
+                 FROM graph_coverage WHERE job_id = {} ORDER BY node_id, member_id, range_start",
+                &args,
+            )
+            .await?,
+        envelopes: tx
+            .fetch_all(
+                "SELECT node_id, volume, range_start, range_end, provenance, closed, settled, file \
+                 FROM graph_envelopes WHERE job_id = {} ORDER BY node_id, volume, range_start",
+                &args,
+            )
+            .await?,
+        crypt: tx
+            .fetch_all(
+                "SELECT node_id, member_id, run_start, seed \
+                 FROM graph_crypt WHERE job_id = {} ORDER BY node_id, member_id, run_start",
+                &args,
+            )
+            .await?,
+        parts: tx
+            .fetch_all(
+                "SELECT node_id, part, bytes \
+                 FROM graph_facts_parts WHERE job_id = {} ORDER BY node_id, part",
+                &args,
+            )
+            .await?,
+        holds: tx
+            .fetch_all(
+                "SELECT node_id, volume, range_start, range_end, scratch_offset \
+                 FROM graph_holds WHERE job_id = {} ORDER BY node_id, volume, range_start",
+                &args,
+            )
+            .await?,
+        held_parts: tx
+            .fetch_all(
+                "SELECT file_index, ordinal, decoded_len, spool_path, raw_size, crc_valid, \
+                 truncation_suspected, part_crc_verified, part_crc, expected_file_crc, file_size, \
+                 yenc_part, yenc_total, yenc_begin, yenc_end, yenc_name, crc_segments \
+                 FROM graph_held_parts WHERE job_id = {} ORDER BY file_index, ordinal",
+                &args,
+            )
+            .await?,
+        feed_verdict: tx
+            .fetch_optional(
+                "SELECT feed_verdict FROM active_jobs WHERE job_id = {}",
+                &args,
+            )
+            .await?,
+    }))
+}
+
+// The values in the fetched rows. Fails only on a value this build cannot
+// take: a column of another type, or one that does not decode.
+fn interpret(fetched: Fetched) -> Result<GraphCheckpoint, StateError> {
     let pair = |row: &SqlRow, first: &str, second: &str| -> Result<_, StateError> {
         Ok(row.opt_i64(first)?.zip(row.opt_i64(second)?))
     };
-    let members = tx
-        .fetch_all(
-            "SELECT node_id, member_id, name, output_name, length, closed, bound_node_id, \
-             owner_node_id, owner_volume, given_up_node_id, given_up_volume, buried, \
-             undecided, has_file, refused, copy_of \
-             FROM graph_members WHERE job_id = {} ORDER BY node_id, member_id",
-            &args,
-        )
-        .await?
+    let nodes = fetched
+        .nodes
+        .iter()
+        .map(|row| {
+            Ok(NodeRow {
+                node: row.i64("node_id")?,
+                parent: row.opt_i64("parent_node_id")?,
+                parent_member: row.opt_i64("parent_member_id")?,
+                volumes: row.opt_bytes("volumes")?,
+                window: pair(row, "window_start", "window_end")?,
+                kind: row.text("kind")?,
+                state: row.text("state")?,
+                reason: row.opt_text("reason")?,
+                facts_version: row.i64("facts_version")?,
+                facts: row.bytes("facts")?,
+                winning_password: row.opt_i64("winning_password")?,
+            })
+        })
+        .collect::<Result<_, StateError>>()?;
+    let members = fetched
+        .members
         .iter()
         .map(|row| {
             Ok(MemberRow {
@@ -741,6 +954,7 @@ async fn read_checkpoint(
                 member: row.i64("member_id")?,
                 name: row.text("name")?,
                 output_name: row.text("output_name")?,
+                crc32: row.opt_i64("crc32")?,
                 length: row.opt_i64("length")?,
                 closed: row.bool("closed")?,
                 bound: row.opt_i64("bound_node_id")?,
@@ -749,18 +963,15 @@ async fn read_checkpoint(
                 buried: row.bool("buried")?,
                 undecided: row.bool("undecided")?,
                 has_file: row.bool("has_file")?,
+                on_disk: row.opt_text("on_disk")?,
                 refused: row.opt_text("refused")?,
                 copy_of: row.opt_i64("copy_of")?,
+                refuted_kind: row.opt_text("refuted_kind")?,
             })
         })
         .collect::<Result<_, StateError>>()?;
-    let coverage = tx
-        .fetch_all(
-            "SELECT node_id, member_id, range_start, range_end, provenance, verified \
-             FROM graph_coverage WHERE job_id = {} ORDER BY node_id, member_id, range_start",
-            &args,
-        )
-        .await?
+    let coverage = fetched
+        .coverage
         .iter()
         .map(|row| {
             Ok(CoverageRow {
@@ -773,13 +984,8 @@ async fn read_checkpoint(
             })
         })
         .collect::<Result<_, StateError>>()?;
-    let envelopes = tx
-        .fetch_all(
-            "SELECT node_id, volume, range_start, range_end, provenance, closed, settled \
-             FROM graph_envelopes WHERE job_id = {} ORDER BY node_id, volume, range_start",
-            &args,
-        )
-        .await?
+    let envelopes = fetched
+        .envelopes
         .iter()
         .map(|row| {
             Ok(EnvelopeRow {
@@ -790,16 +996,12 @@ async fn read_checkpoint(
                 provenance: row.text("provenance")?,
                 closed: row.opt_i64("closed")?,
                 settled: row.bool("settled")?,
+                file: row.opt_text("file")?,
             })
         })
         .collect::<Result<_, StateError>>()?;
-    let crypt = tx
-        .fetch_all(
-            "SELECT node_id, member_id, run_start, seed \
-             FROM graph_crypt WHERE job_id = {} ORDER BY node_id, member_id, run_start",
-            &args,
-        )
-        .await?
+    let crypt = fetched
+        .crypt
         .iter()
         .map(|row| {
             Ok(CryptRow {
@@ -810,25 +1012,13 @@ async fn read_checkpoint(
             })
         })
         .collect::<Result<_, StateError>>()?;
-    let parts = tx
-        .fetch_all(
-            &format!(
-                "SELECT {PART_COLUMNS} FROM graph_facts_parts WHERE job_id = {{}} \
-                 ORDER BY node_id, part"
-            ),
-            &args,
-        )
-        .await?
+    let parts = fetched
+        .parts
         .iter()
         .map(part_row)
         .collect::<Result<_, StateError>>()?;
-    let holds = tx
-        .fetch_all(
-            "SELECT node_id, volume, range_start, range_end, scratch_offset \
-             FROM graph_holds WHERE job_id = {} ORDER BY node_id, volume, range_start",
-            &args,
-        )
-        .await?
+    let holds = fetched
+        .holds
         .iter()
         .map(|row| {
             Ok(HoldRow {
@@ -840,7 +1030,46 @@ async fn read_checkpoint(
             })
         })
         .collect::<Result<_, StateError>>()?;
-    Ok(Some(GraphCheckpoint {
+    let held_parts = fetched
+        .held_parts
+        .iter()
+        .map(|row| {
+            let article = match row.opt_i64("raw_size")? {
+                None => None,
+                Some(raw_size) => Some(HeldArticleRow {
+                    raw_size,
+                    crc_valid: row.bool("crc_valid")?,
+                    truncation_suspected: row.bool("truncation_suspected")?,
+                    part_crc_verified: row.bool("part_crc_verified")?,
+                    part_crc: row.i64("part_crc")?,
+                    expected_file_crc: row.opt_i64("expected_file_crc")?,
+                    file_size: row.i64("file_size")?,
+                    part: row.opt_i64("yenc_part")?,
+                    total: row.opt_i64("yenc_total")?,
+                    begin: row.opt_i64("yenc_begin")?,
+                    end: row.opt_i64("yenc_end")?,
+                    name: row.text("yenc_name")?,
+                    crc_segments: row.bytes("crc_segments")?,
+                }),
+            };
+            Ok(HeldPartRow {
+                file: row.i64("file_index")?,
+                ordinal: row.i64("ordinal")?,
+                decoded_len: row.i64("decoded_len")?,
+                spool_path: row.text("spool_path")?,
+                article,
+            })
+        })
+        .collect::<Result<_, StateError>>()?;
+    let feed_verdict = fetched
+        .feed_verdict
+        .map(|row| row.opt_text("feed_verdict"))
+        .transpose()?
+        .flatten()
+        .map(|value| super::feed_verdict::FeedVerdict::decode(&value))
+        .transpose()?;
+    Ok(GraphCheckpoint {
+        feed_verdict,
         nodes,
         members,
         coverage,
@@ -848,5 +1077,6 @@ async fn read_checkpoint(
         crypt,
         parts,
         holds,
-    }))
+        held_parts,
+    })
 }

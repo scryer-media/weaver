@@ -60,7 +60,24 @@ func nntpPassword() string {
 	return defaultNNTPPassword
 }
 
+// authenticateNNTPConnection opens the harness's own channel: MODE CONTROL
+// first, so the server leaves it out of the sessions it counts, then the
+// credentials. A server that predates control channels answers MODE as a
+// reader-mode request, which changes nothing.
 func authenticateNNTPConnection(conn net.Conn, reader *bufio.Reader, addr string) error {
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write([]byte("MODE CONTROL\r\n")); err != nil {
+		return fmt.Errorf("write control mode to %s: %w", addr, err)
+	}
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	modeResp, err := reader.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read control mode response from %s: %w", addr, err)
+	}
+	if modeResp = strings.TrimSpace(modeResp); !strings.HasPrefix(modeResp, "200") {
+		return fmt.Errorf("unexpected control mode response from %s: %s", addr, modeResp)
+	}
+
 	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if _, err := conn.Write([]byte("AUTHINFO USER " + nntpUsername() + "\r\n")); err != nil {
 		return fmt.Errorf("write auth user to %s: %w", addr, err)

@@ -75,6 +75,15 @@ pub struct MemberRecord {
     // and it is listed nowhere.
     #[serde(default)]
     pub copy_of: Option<MemberId>,
+    // The CRC32 its object's headers state for it.
+    #[serde(default)]
+    pub crc32: Option<u32>,
+    // Its front came once, whether or not a restart can read it back.
+    pub fronted: bool,
+    // The kind whose reading of it was refuted, so its bytes say who owns
+    // it after a restart too.
+    #[serde(default)]
+    pub refuted: Option<Kind>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

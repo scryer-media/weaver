@@ -10,11 +10,13 @@ use std::sync::Arc;
 
 use sevenz_turbo::encoder_options::{AesEncoderOptions, Lzma2Options};
 use sevenz_turbo::{ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, Password};
-use weaver_graph::{ByteRange, Emit, Object, Provenance, Pull, RecoveryKind, VolumeIndex, Why};
+use weaver_graph::{
+    ByteRange, Emit, Located, MemberId, Object, Provenance, Pull, RecoveryKind, VolumeIndex, Why,
+};
 
 use super::SevenZipStore;
 use crate::keys::Keys;
-use crate::testing::{Quiet, payload};
+use crate::testing::payload;
 use owner::Owner;
 
 const PASSWORD: &str = "a-test-passphrase";
@@ -158,111 +160,30 @@ fn bytes_ahead_of_the_tail_are_held_until_it_arrives() {
     streamed(&owner);
 }
 
-fn split(bytes: &[u8], parts: usize) -> Vec<(String, Vec<u8>)> {
-    let part = bytes.len().div_ceil(parts);
-    bytes
-        .chunks(part)
-        .enumerate()
-        .map(|(index, chunk)| (format!("alpha.7z.{:03}", index + 1), chunk.to_vec()))
-        .collect()
-}
-
+// A 7z posted again is the file when its signature header measures the same
+// container; a name, a piece with no signature, or another container's
+// front is nothing of it.
 #[test]
-fn a_split_set_streams_with_its_volumes_out_of_order() {
+fn a_copy_of_the_file_with_its_signature_is_claimed_as_the_file() {
     let bytes = archive(copy(), false);
-    let volumes = split(&bytes, 3);
-    assert_eq!(volumes.len(), 3);
-    let mut owner = Owner::new(store(), volumes);
-    for volume in [2, 0, 1] {
-        owner.frames(volume, 4096);
-    }
-    for volume in [2, 0, 1] {
-        owner.close(volume);
-    }
-    no_trouble(&owner);
-    streamed(&owner);
-    let rebuilt: Vec<u8> = (0..3)
-        .flat_map(|volume| owner.posted(volume).unwrap())
-        .collect();
-    assert_eq!(rebuilt, bytes);
-}
-
-// Four pieces under names that number none of them, as the store holds
-// the first and the last: every piece but the last is as long as the
-// first, so either middle piece fits either middle place.
-fn unnamed_middles() -> (SevenZipStore, Vec<(&'static str, Vec<u8>)>) {
-    let bytes = archive(copy(), false);
-    let names = [
-        "e93a07c1d25b4f68a0c3e1f7b9d24c85",
-        "1b7f3d9e05a24c6f8e1d0b3a7c9f2e64",
-        "c40e8b2f6a1d4973b5e0f2c8d16a9b37",
-        "7a2c5e9f0b3d4e81a6f9c2b07d4e1f58",
-    ];
-    let pieces: Vec<_> = names
-        .into_iter()
-        .zip(split(&bytes, 4))
-        .map(|(name, (_, piece))| (name, piece))
-        .collect();
-    assert_eq!(pieces.len(), 4);
-    assert!(pieces[3].1.len() < pieces[0].1.len());
+    let other = archive(aes(), false);
     let mut object = store();
-    for volume in [0, 3] {
-        let (name, piece) = &pieces[volume];
-        let (front, length) = (&piece[..32], Some(piece.len() as u64));
-        if volume > 0 {
-            assert_eq!(
-                object.claim(name, front, length),
-                Some(VolumeIndex(volume as u32))
-            );
-        }
-        object.bound(VolumeIndex(volume as u32), name, front, length);
-    }
-    (object, pieces)
-}
-
-// No name or header says which middle piece comes first: the store claims
-// neither while the set stands, refuses the set for them once the job is
-// quiet, and the refused set takes them past every place it has, so they
-// go where the set went.
-#[test]
-fn two_middle_pieces_nothing_orders_refuse_the_set_at_quiet() {
-    let (mut object, pieces) = unnamed_middles();
-    let middles: Vec<_> = pieces[1..3]
-        .iter()
-        .map(|(name, piece)| (*name, &piece[..32], piece.len() as u64))
-        .collect();
-    for (name, front, length) in &middles {
-        assert_eq!(object.claim(name, front, Some(*length)), None);
-    }
-    let mut out = Vec::new();
-    object.quiet(&Quiet(middles.clone()), &mut out);
-    assert_eq!(out, vec![Emit::Refuse(Why::OrderUnknown)]);
-    let (name, front, length) = middles[0];
+    let length = Some(bytes.len() as u64);
+    object.bound(VolumeIndex(0), "alpha.7z", &bytes[..32], length);
     assert_eq!(
-        object.claim(name, front, Some(length)),
-        Some(VolumeIndex(4))
+        object.claim("alpha.7z", &bytes[..32], length),
+        vec![VolumeIndex(0)]
     );
-}
-
-// A recovery set that gives the pieces their real names orders them: once
-// the first piece carries its own, each middle piece takes the place its
-// number gives, and nothing is left beside the set to refuse it for.
-#[test]
-fn a_piece_a_recovery_set_names_takes_the_place_its_number_gives() {
-    let (mut object, pieces) = unnamed_middles();
-    object.renamed(VolumeIndex(0), "alpha.7z.001");
-    for (volume, name) in [(2, "alpha.7z.003"), (1, "alpha.7z.002")] {
-        let piece = &pieces[volume].1;
-        let (front, length) = (&piece[..32], Some(piece.len() as u64));
-        assert_eq!(
-            object.claim(name, front, length),
-            Some(VolumeIndex(volume as u32))
-        );
-        object.bound(VolumeIndex(volume as u32), name, front, length);
-    }
-    let mut out = Vec::new();
-    object.quiet(&Quiet(Vec::new()), &mut out);
-    assert!(!out.contains(&Emit::Refuse(Why::OrderUnknown)), "{out:?}");
+    assert_eq!(
+        object.claim("e93a07c1d25b4f68a0c3e1f7b9d24c85", &bytes[..32], length),
+        vec![VolumeIndex(0)]
+    );
+    assert!(
+        object
+            .claim("alpha.7z.002", &bytes[100..132], None)
+            .is_empty()
+    );
+    assert!(object.claim("alpha.7z", &other[..32], None).is_empty());
 }
 
 #[test]
@@ -359,6 +280,34 @@ fn an_encrypted_folder_streams_out_of_order_once_its_password_proves() {
     assert_eq!(owner.posted(0).as_deref(), Some(bytes.as_slice()));
 }
 
+// The arrival that completes the proof opens the folder in the same call:
+// the proof's bytes reach the member once, through the cipher once, so the
+// member comes out whole and enciphers back to the bytes as posted.
+#[test]
+fn the_arrival_that_proves_the_password_goes_through_the_cipher_once() {
+    let lone = payload(4, 40_000);
+    let bytes = write(aes(), false, &[(None, Entry::File("alpha.bin", &lone))]);
+    let mut owner = Owner::single(store(), bytes.clone());
+    // Bytes come in the order sent, never pulled ahead.
+    owner.pull = Pull::Moved(0);
+    owner.offer(PASSWORD);
+    // The end header first, so the proof is chosen before the folder comes;
+    // its last piece lies mid-folder, off the cipher's blocks.
+    let tail = end_header(&bytes).start;
+    let last = ByteRange::new(tail / 2 + 5, tail / 2 + 1005);
+    owner.deliver(0, ByteRange::new(0, 32));
+    owner.deliver(0, ByteRange::new(tail, bytes.len() as u64));
+    owner.deliver(0, ByteRange::new(32, last.start));
+    owner.deliver(0, ByteRange::new(last.end, tail));
+    owner.deliver(0, last);
+    owner.close(0);
+    no_trouble(&owner);
+    let got = owner.member("alpha.bin");
+    assert!(got.closed);
+    assert_eq!(got.bytes, lone);
+    assert_eq!(owner.posted(0).as_deref(), Some(bytes.as_slice()));
+}
+
 #[test]
 fn a_wrong_password_opens_nothing_and_the_right_one_after_it_does() {
     let bytes = archive(aes(), false);
@@ -435,6 +384,33 @@ fn an_encrypted_header_no_candidate_opens_is_refused_at_quiet() {
     assert!(owner.members.is_empty());
 }
 
+// An encrypted header read on bytes that came whole but are not the posted
+// ones, its end header untouched, does not open under the right password.
+// That rules the password wrong for those bytes only: another store sharing
+// the key cache reads the same container as posted and opens it under the
+// same password.
+#[test]
+fn an_encrypted_header_read_on_other_bytes_condemns_the_password_for_those_bytes_only() {
+    let keys = Arc::new(Keys::new(16));
+    let bytes = archive(aes(), true);
+    let end = end_header(&bytes);
+    let mut other = bytes.clone();
+    for byte in &mut other[end.start as usize - 16..end.start as usize] {
+        *byte ^= 0x5a;
+    }
+    let mut first = Owner::single(SevenZipStore::with_keys(keys.clone()), other);
+    first.frames(0, 4096);
+    first.offer(PASSWORD);
+    first.close(0);
+    assert!(first.members.is_empty());
+    let mut second = Owner::single(SevenZipStore::with_keys(keys), bytes);
+    second.frames(0, 4096);
+    second.offer(PASSWORD);
+    second.close(0);
+    no_trouble(&second);
+    streamed(&second);
+}
+
 // The end header: the last bytes of a container with nothing after it.
 fn end_header(bytes: &[u8]) -> ByteRange {
     let offset = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
@@ -464,16 +440,40 @@ fn an_end_header_declared_past_any_byte_holds_nothing_until_bytes_arrive() {
         weaver_graph::Delivery {
             volume: VolumeIndex(0),
             offset: 0,
-            bytes: &bytes,
+            bytes: &weaver_graph::Evidenced::from(bytes.to_vec()),
             provenance: Provenance::Fresh,
         },
         &mut |_, _| false,
         &mut out,
     );
     assert_eq!(lone.kept.from(32), &[] as &[u8]);
+    // The end header never comes, so the store names no member and says
+    // nothing of the format: what it named is unmapped on quiet.
     let mut owner = Owner::single(store(), bytes);
     owner.whole(4096);
-    assert!(has(&owner, &Emit::NeedsEngine(Why::Unsupported)));
+    owner.quiet();
+    assert!(owner.members.is_empty(), "{:?}", owner.members);
+    assert!(
+        !owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::NeedsEngine(_) | Emit::Damaged { .. })),
+        "{:?}",
+        owner.said
+    );
+}
+
+// A 7z of a major version this store cannot read is refused for that, not
+// handed to an engine as bytes no format names: it stays the container it
+// is.
+#[test]
+fn a_major_version_the_store_cannot_read_is_refused_unsupported() {
+    let mut bytes = archive(copy(), false);
+    bytes[6] = 1;
+    let mut owner = Owner::single(store(), bytes);
+    owner.whole(4096);
+    assert!(has(&owner, &Emit::Refuse(Why::Unsupported)));
+    assert!(!has(&owner, &Emit::NeedsEngine(Why::Unsupported)));
 }
 
 #[test]
@@ -760,4 +760,252 @@ fn every_unproven_candidate_wrong_needs_a_password() {
     assert!(has(&owner, &Emit::NeedsPassword));
     owner.quiet();
     assert!(has(&owner, &Emit::Refuse(Why::EncryptedHeader)));
+}
+
+fn member_id(owner: &Owner, name: &str) -> MemberId {
+    owner
+        .members
+        .iter()
+        .find(|(_, got)| got.name == name)
+        .map(|(id, _)| MemberId(*id))
+        .unwrap()
+}
+
+// An article of `alpha.bin` starting inside a cipher block, `seam`, and
+// ending inside another comes again, as a restart's lost article does: the
+// store forgets what it said of it, the articles either side stay where they
+// are and do not come again, and the article comes again whole. The member
+// comes out whole again, and enciphers back to the bytes as posted.
+fn unsaid_from_inside_a_block(methods: Vec<EncoderConfiguration>, password: Option<&str>) {
+    let bytes = archive(methods, false);
+    let length = bytes.len() as u64;
+    let mut owner = Owner::single(store(), bytes.clone());
+    if let Some(password) = password {
+        owner.offer(password);
+    }
+    // 32 for the signature header, then 5005 bytes into `alpha.bin`, 13
+    // into its cipher block.
+    let seam = 32 + 5005;
+    let lost = ByteRange::new(seam, seam + 1000);
+    for range in [
+        ByteRange::new(0, seam),
+        lost,
+        ByteRange::new(lost.end, length),
+    ] {
+        owner.deliver(0, range);
+    }
+    owner.close(0);
+    no_trouble(&owner);
+    streamed(&owner);
+    owner.uncover(0, lost);
+    assert!(!owner.member("alpha.bin").closed);
+    owner.deliver(0, lost);
+    no_trouble(&owner);
+    streamed(&owner);
+    assert_eq!(owner.posted(0).as_deref(), Some(bytes.as_slice()));
+}
+
+#[test]
+fn a_stored_member_unsaid_from_inside_it_comes_out_again_whole() {
+    unsaid_from_inside_a_block(copy(), None);
+}
+
+#[test]
+fn an_enciphered_member_unsaid_from_inside_a_cipher_block_comes_out_again_whole() {
+    unsaid_from_inside_a_block(aes(), Some(PASSWORD));
+}
+
+// A stored member's bytes are raw runs of the container, so a seek before the
+// end header is read is not located yet, the same seek after it lies where
+// the map puts it, and only a range the map rules out is never located.
+#[test]
+fn a_seek_before_the_end_header_is_read_is_located_once_it_is() {
+    let bytes = archive(copy(), false);
+    let mut owner = Owner::single(store(), bytes.clone());
+    let mut extents = Vec::new();
+    assert_eq!(
+        owner
+            .object
+            .extent(MemberId(0), ByteRange::new(100, 200), &mut extents),
+        Located::NotYet
+    );
+    assert!(extents.is_empty());
+    owner.whole(4096);
+    no_trouble(&owner);
+    let alpha = member_id(&owner, "alpha.bin");
+    assert_eq!(
+        owner
+            .object
+            .extent(alpha, ByteRange::new(100, 200), &mut extents),
+        Located::Whole
+    );
+    let read: Vec<u8> = extents
+        .iter()
+        .flat_map(|extent| bytes[extent.range.start as usize..extent.range.end as usize].to_vec())
+        .collect();
+    assert_eq!(read, payload(1, 10_000)[100..200]);
+    extents.clear();
+    assert_eq!(
+        owner
+            .object
+            .extent(alpha, ByteRange::new(10_000, 10_100), &mut extents),
+        Located::Never
+    );
+    assert!(extents.is_empty());
+}
+
+// A compressed folder sends the whole container to an engine, whose members
+// are decoded and never lie in the volumes.
+#[test]
+fn a_seek_under_a_compressed_folder_is_unseekable() {
+    let mut owner = Owner::single(store(), archive(lzma2(), false));
+    owner.whole(4096);
+    assert!(has(&owner, &Emit::NeedsEngine(Why::Compressed)));
+    let engine = crate::sevenz_engine::SevenZipEngine::new();
+    let mut extents = Vec::new();
+    assert_eq!(
+        engine.extent(MemberId(0), ByteRange::new(0, 100), &mut extents),
+        Located::Never
+    );
+    assert!(extents.is_empty());
+}
+
+// A 7z decode holds to the memory it was granted, and to the decoder's own
+// limits only when it was granted none.
+#[test]
+fn a_decode_holds_to_the_memory_it_was_granted() {
+    let granted = super::limits(&weaver_graph::Budget {
+        memory_bytes: Some(64 << 20),
+        threads: 1,
+        ..Default::default()
+    });
+    assert_eq!(granted.memory_limit_bytes, 64 << 20);
+    let own = sevenz_turbo::ArchiveLimits::default();
+    let none = super::limits(&weaver_graph::Budget::default());
+    assert_eq!(none.memory_limit_bytes, own.memory_limit_bytes);
+    assert_eq!(
+        granted.max_header_unpacked_bytes,
+        own.max_header_unpacked_bytes
+    );
+}
+
+type Files = Vec<(&'static str, Vec<u8>)>;
+
+// The same payload under two directories: the second moves the boundary
+// between the first two files.
+fn moved_boundary() -> (Vec<u8>, Vec<u8>, Files) {
+    let bytes = payload(1, 15_303);
+    let layout = |cut: usize| {
+        vec![
+            ("alpha.bin", bytes[..cut].to_vec()),
+            ("beta.bin", bytes[cut..10_000].to_vec()),
+            ("gamma.bin", bytes[10_000..].to_vec()),
+        ]
+    };
+    let write_layout = |files: &[(&'static str, Vec<u8>)]| {
+        let entries: Vec<_> = files
+            .iter()
+            .map(|(name, bytes)| (None, Entry::File(name, bytes)))
+            .collect();
+        write(copy(), false, &entries)
+    };
+    let (before, after) = (layout(5_000), layout(4_000));
+    (write_layout(&before), write_layout(&after), after)
+}
+
+// A header repaired into another directory over bytes the store already
+// routed: the store moves them to the members the new map gives, from the
+// bytes it routed, and asks for nothing twice.
+#[test]
+fn a_repaired_7z_header_remaps_routed_payload_without_an_engine() {
+    let (before, after, files) = moved_boundary();
+    assert_eq!(before.len(), after.len());
+    assert_eq!(end_header(&before), end_header(&after));
+    // The header stream the writer packs, and the end header naming it,
+    // follow the payload.
+    let payload: u64 = files.iter().map(|(_, bytes)| bytes.len() as u64).sum();
+    let header = ByteRange::new(32 + payload, before.len() as u64);
+    assert!(
+        (0..before.len())
+            .filter(|at| before[*at] != after[*at])
+            .all(|at| at < 32 || header.contains(at as u64)),
+        "only the headers differ"
+    );
+    let cut = before.len() / 2;
+    assert!(header.start >= cut as u64, "the headers lie past the cut");
+    let mut owner = Owner::single(store(), before.clone());
+    // The file up to the cut, then the old header: alpha whole, beta in part.
+    for at in (0..cut).step_by(4096) {
+        owner.deliver(0, ByteRange::new(at as u64, (at + 4096).min(cut) as u64));
+    }
+    owner.deliver(0, header);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.replays == 0);
+    // The repair writes the new signature header, then the new headers.
+    owner.deliver_as(
+        0,
+        ByteRange::new(0, 32),
+        Provenance::Repaired,
+        Some(&after[..32]),
+    );
+    owner.deliver_as(
+        0,
+        header,
+        Provenance::Repaired,
+        Some(&after[header.start as usize..header.end as usize]),
+    );
+    assert!(owner.replays > 0, "routed bytes come again");
+    assert!(has(&owner, &Emit::Retract(MemberId(0))));
+    assert!(has(&owner, &Emit::Retract(MemberId(1))));
+    assert!(!has(&owner, &Emit::Retract(MemberId(2))), "gamma stays");
+    // The rest of the payload, then the file closes.
+    owner.deliver_as(
+        0,
+        ByteRange::new(cut as u64, header.start),
+        Provenance::Fresh,
+        Some(&after[cut..header.start as usize]),
+    );
+    owner.close(0);
+    owner.quiet();
+    assert!(
+        !owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::NeedsEngine(_) | Emit::Refuse(_))),
+        "{:?}",
+        owner.said
+    );
+    assert_eq!(owner.members.len(), files.len());
+    for (name, bytes) in &files {
+        let got = owner.member(name);
+        assert_eq!(got.length, Some(bytes.len() as u64), "{name}");
+        assert!(got.closed, "{name} closed");
+        assert!(got.coverage.verified(ByteRange::new(0, bytes.len() as u64)));
+        assert_eq!(&got.bytes, bytes, "{name}");
+    }
+    assert_eq!(owner.held(), 0);
+    assert!(owner.refetched.is_empty(), "{:?}", owner.refetched);
+    assert_eq!(owner.posted(0).unwrap(), after);
+}
+
+#[test]
+fn a_file_longer_than_its_container_does_not_restart_the_store() {
+    let bytes = archive(copy(), false);
+    let mut owner = Owner::single(store(), bytes.clone());
+    owner.whole(4096);
+    let mut out = Vec::new();
+    owner
+        .object
+        .sized(VolumeIndex(0), bytes.len() as u64, &mut out);
+    assert!(out.is_empty());
+    // More bytes after the container do not move any member.
+    owner
+        .object
+        .sized(VolumeIndex(0), bytes.len() as u64 + 17, &mut out);
+    assert!(
+        !out.iter()
+            .any(|emit| matches!(emit, Emit::NeedsEngine(_) | Emit::Refuse(_)))
+    );
+    assert_eq!(owner.object.length, Some(bytes.len() as u64 + 17));
+    streamed(&owner);
 }

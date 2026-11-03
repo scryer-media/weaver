@@ -26,7 +26,7 @@ use par3_rs::{
     RecoveryBlock,
 };
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
-use weaver_graph::{ByteRange, MemberId};
+use weaver_graph::{Budget, ByteRange, MemberId};
 
 // How much of a member one verification read takes.
 const READ: u64 = 1 << 20;
@@ -184,7 +184,7 @@ pub(super) fn repair_set(
     set: &Par3Set,
     bound: &BTreeMap<String, MemberId>,
     coming: bool,
-    memory_limit: u64,
+    budget: Budget,
     access: &mut dyn MemberAccess,
 ) -> SetRepair {
     // The ranges the bytes proved bad, which a repair that cannot rebuild
@@ -207,11 +207,15 @@ pub(super) fn repair_set(
             lost,
         }
     };
-    let options = ExecutionOptions::default();
+    let mut options = ExecutionOptions::default();
+    options.workers = budget.threads();
     let Ok(layout) = BlockLayout::new(set, &options).map(Arc::new) else {
         return failed(0, 0, &proven, access);
     };
-    let mut lost = BTreeSet::new();
+    // The extents the members proved, by fingerprint and length, and those
+    // they did not, with the member each would go back into.
+    let mut held = BTreeMap::new();
+    let mut unproven = Vec::new();
     let mut rewrite = BTreeSet::new();
     for (index, file) in set.files().iter().enumerate() {
         let Some(shape) = layout.files().get(index) else {
@@ -219,16 +223,34 @@ pub(super) fn repair_set(
         };
         let member = bound.get(file.path()).copied();
         let evidence = member.and_then(|member| evidence(&layout, index, member, &options, access));
+        if let (Some(member), Some(evidence)) = (member, &evidence) {
+            for extent in verdicted(shape, evidence, ExtentVerdict::Intact) {
+                if let Some(key) = sum(&extent) {
+                    held.entry(key).or_insert((member, extent.range));
+                }
+            }
+        }
         match (member, evidence) {
             (_, Some(evidence)) if evidence.protected_complete() => continue,
             (Some(member), Some(evidence)) => {
                 proven.extend(damaged(shape, &evidence).map(|range| (member, range)));
-                lost.extend(unresolved(shape, &evidence));
+                unproven.extend(unresolved(shape, &evidence).map(|extent| (Some(member), extent)));
             }
-            _ => lost.extend(shape.extents.iter().filter_map(|extent| block(&extent))),
+            (member, _) => unproven.extend(shape.extents.iter().map(|extent| (member, extent))),
         }
         rewrite.insert(index);
     }
+    let copied = copy_held(&held, &unproven, access);
+    proven.retain(|(member, range)| !copied.contains(&(*member, range.start, range.end)));
+    let lost: BTreeSet<u64> = unproven
+        .iter()
+        .filter(|(member, extent)| {
+            member.is_none_or(|member| {
+                !copied.contains(&(member, extent.range.start, extent.range.end))
+            })
+        })
+        .filter_map(|(_, extent)| block(extent))
+        .collect();
     let count = lost.len() as u64;
     if rewrite.is_empty() {
         return SetRepair {
@@ -236,6 +258,7 @@ pub(super) fn repair_set(
             lost: 0,
         };
     }
+    let rebuilt = count + copied.len() as u64;
     let carried = carried(set, &layout);
     let lost: Vec<u64> = lost
         .into_iter()
@@ -268,7 +291,7 @@ pub(super) fn repair_set(
         carried: &carried,
         lost: &lost,
         rows,
-        limits: CodecLimits::new(memory_limit),
+        limits: CodecLimits::new(budget.memory_or(super::REPAIR_MEMORY_LIMIT)),
     };
     solve.write_carried(access);
     let solved = match &matrix {
@@ -289,15 +312,54 @@ pub(super) fn repair_set(
     }
     write_tails(&layout, set, bound, &rewrite, access);
     SetRepair {
-        outcome: RepairOutcome::Repaired { slices: count },
+        outcome: RepairOutcome::Repaired { slices: rebuilt },
         lost: count,
     }
 }
 
+// An extent's fingerprint and length, which name its bytes.
+fn sum(extent: &FileExtent) -> Option<(par3_rs::Fingerprint, u64)> {
+    match extent.kind {
+        ExtentKind::Block {
+            fingerprint: Some(fingerprint),
+            ..
+        } => Some((fingerprint, extent.range.end - extent.range.start)),
+        _ => None,
+    }
+}
+
+// An extent is its bytes: one a member did not prove whose fingerprint an
+// extent another member proved carries is those bytes, copied from it, and
+// costs no recovery block. Each copied, as its member and range.
+fn copy_held(
+    held: &BTreeMap<(par3_rs::Fingerprint, u64), (MemberId, Range<u64>)>,
+    unproven: &[(Option<MemberId>, FileExtent)],
+    access: &mut dyn MemberAccess,
+) -> BTreeSet<(MemberId, u64, u64)> {
+    let mut copied = BTreeSet::new();
+    let mut bytes = Vec::new();
+    for (member, extent) in unproven {
+        let (Some(into), Some((holder, from))) =
+            (member, sum(extent).and_then(|key| held.get(&key)))
+        else {
+            continue;
+        };
+        let from = ByteRange::new(from.start, from.end);
+        bytes.clear();
+        if access.read(*holder, from, &mut bytes) && bytes.len() as u64 == from.len() {
+            access.write_repaired(*into, extent.range.start, &bytes);
+            copied.insert((*into, extent.range.start, extent.range.end));
+        }
+    }
+    copied
+}
+
 // What the member's bytes prove against its description, read a piece at a
-// time. A set's blocks are judged over the described range alone, so bytes
-// a member carries past it are not read; a piece that does not read back
-// leaves the extents it holds unknown, and the reading carries on past it.
+// time, each piece by the runs of it that arrived. A set's blocks are judged
+// over the described range alone, so bytes a member carries past it are not
+// read; a hole leaves unknown only the extents it touches, and a run that
+// does not read back leaves those it holds unknown, and the reading carries
+// on past it.
 fn evidence(
     layout: &Arc<BlockLayout>,
     file: usize,
@@ -312,31 +374,47 @@ fn evidence(
     let mut verifier =
         StreamingVerifier::new(Arc::clone(layout), file, source, snapshot, options.clone()).ok()?;
     let mut bytes = Vec::new();
+    let mut runs = Vec::new();
     let mut offset = 0;
     while offset < len {
         let end = len.min(offset.saturating_add(READ));
-        bytes.clear();
-        if access.read(member, ByteRange::new(offset, end), &mut bytes)
-            && bytes.len() as u64 == end - offset
-        {
-            verifier.feed(offset, &bytes).ok()?;
+        runs.clear();
+        access.arrived(member, ByteRange::new(offset, end), &mut runs);
+        for run in &runs {
+            bytes.clear();
+            if access.read(member, *run, &mut bytes) && bytes.len() as u64 == run.len() {
+                verifier.feed(run.start, &bytes).ok()?;
+            }
         }
         offset = end;
     }
     Some(verifier.finish())
 }
 
-// The input blocks of the file the evidence does not prove intact.
+// The extents of the file the evidence does not prove intact.
 fn unresolved<'a>(
     shape: &'a FileLayout,
     evidence: &'a FileEvidence,
-) -> impl Iterator<Item = u64> + 'a {
+) -> impl Iterator<Item = FileExtent> + 'a {
+    verdicted(shape, evidence, ExtentVerdict::Unknown).chain(verdicted(
+        shape,
+        evidence,
+        ExtentVerdict::Damaged,
+    ))
+}
+
+// The extents of the file the evidence gives `verdict`.
+fn verdicted<'a>(
+    shape: &'a FileLayout,
+    evidence: &'a FileEvidence,
+    verdict: ExtentVerdict,
+) -> impl Iterator<Item = FileExtent> + 'a {
     shape
         .extents
         .iter()
         .zip(evidence.verdicts().iter())
-        .filter(|(_, verdict)| matches!(verdict, ExtentVerdict::Unknown | ExtentVerdict::Damaged))
-        .filter_map(|(extent, _)| block(&extent))
+        .filter(move |(_, given)| *given == verdict)
+        .map(|(extent, _)| extent)
 }
 
 // The member ranges of the file whose bytes disagreed with the set.

@@ -25,8 +25,28 @@ pub enum ArticleEligibility {
     Eligible(ProviderGroup),
     Excluded,
     Unavailable,
+    // Up and taking this pool's credentials, but short of the article's
+    // estimate in its remaining quota.
+    OutOfQuota,
     HigherPriority(ProviderGroup),
     BackfillProtected,
+}
+
+// Whether the backfill tier is open for one article: every fill server is
+// excluded for it, because it answered that it does not have the article or
+// it is past the job's retention. This is the only rule that opens backfill.
+// A fill server that is down, unroutable, out of quota or refusing this
+// pool's credentials does not count: backfill fills articles the fill
+// servers do not have, it never stands in for a fill server that is not
+// answering. Priority levels are the fallback for that.
+pub(crate) fn backfill_unlocked(
+    backfill: impl IntoIterator<Item = bool>,
+    excluded: impl Fn(usize) -> bool,
+) -> bool {
+    backfill
+        .into_iter()
+        .enumerate()
+        .all(|(idx, backfill)| backfill || excluded(idx))
 }
 
 #[derive(Debug, Clone)]
@@ -42,10 +62,10 @@ impl ProviderPolicy {
         bytes: u64,
     ) -> Option<ProviderGroup> {
         let excluded = |idx: usize| failures.contains(&idx) || retention.contains(&idx);
-        let backfill_unlocked =
-            self.servers.iter().enumerate().all(|(idx, state)| {
-                state.group.backfill || excluded(idx) || state.refuses_credentials
-            });
+        let backfill_unlocked = backfill_unlocked(
+            self.servers.iter().map(|state| state.group.backfill),
+            excluded,
+        );
         self.servers
             .iter()
             .enumerate()
@@ -73,8 +93,11 @@ impl ProviderPolicy {
         let Some(state) = self.servers.get(server) else {
             return ArticleEligibility::Unavailable;
         };
-        if !state.available || state.refuses_credentials || state.quota_remaining < bytes.max(1) {
+        if !state.available || state.refuses_credentials {
             return ArticleEligibility::Unavailable;
+        }
+        if state.quota_remaining < bytes.max(1) {
+            return ArticleEligibility::OutOfQuota;
         }
         match self.eligible_group(failures, retention, bytes) {
             Some(group) if group == state.group => ArticleEligibility::Eligible(group),
@@ -159,10 +182,68 @@ mod tests {
         for state in &mut policy.servers[..16] {
             state.refuses_credentials = true;
         }
-        assert!(matches!(
+        assert_eq!(
             policy.eligibility(16, &[], &[], 512),
-            ArticleEligibility::Eligible(_)
+            ArticleEligibility::BackfillProtected
+        );
+    }
+
+    fn fill_plus_backfill() -> ProviderPolicy {
+        ProviderPolicy {
+            servers: [false, true]
+                .into_iter()
+                .map(|backfill| ProviderState {
+                    group: ProviderGroup {
+                        backfill,
+                        priority: 0,
+                    },
+                    available: true,
+                    refuses_credentials: false,
+                    quota_remaining: u64::MAX,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_fill_server_refusing_credentials_never_opens_backfill() {
+        let mut policy = fill_plus_backfill();
+        policy.servers[0].refuses_credentials = true;
+        assert_eq!(
+            policy.eligibility(1, &[], &[], 512),
+            ArticleEligibility::BackfillProtected
+        );
+        assert_eq!(policy.eligible_group(&[], &[], 512), None);
+    }
+
+    #[test]
+    fn a_fill_server_without_the_article_opens_backfill() {
+        let policy = fill_plus_backfill();
+        assert!(matches!(
+            policy.eligibility(1, &[0], &[], 512),
+            ArticleEligibility::Eligible(ProviderGroup { backfill: true, .. })
         ));
+        assert!(matches!(
+            policy.eligibility(1, &[], &[0], 512),
+            ArticleEligibility::Eligible(ProviderGroup { backfill: true, .. })
+        ));
+    }
+
+    #[test]
+    fn a_level_refusing_credentials_falls_through_to_the_next_level() {
+        let mut policy = fill_plus_backfill();
+        policy.servers[1].group = ProviderGroup {
+            backfill: false,
+            priority: 1,
+        };
+        policy.servers[0].refuses_credentials = true;
+        assert_eq!(
+            policy.eligibility(1, &[], &[], 512),
+            ArticleEligibility::Eligible(ProviderGroup {
+                backfill: false,
+                priority: 1,
+            })
+        );
     }
 
     #[test]
@@ -171,6 +252,20 @@ mod tests {
         for state in &mut policy.servers[..8] {
             state.quota_remaining = 511;
         }
+        assert_eq!(
+            policy.eligibility(0, &[], &[], 512),
+            ArticleEligibility::OutOfQuota
+        );
+        policy.servers[1].available = false;
+        assert_eq!(
+            policy.eligibility(1, &[], &[], 512),
+            ArticleEligibility::Unavailable
+        );
+        policy.servers[2].refuses_credentials = true;
+        assert_eq!(
+            policy.eligibility(2, &[], &[], 512),
+            ArticleEligibility::Unavailable
+        );
         assert!(matches!(
             policy.eligibility(8, &[], &[], 512),
             ArticleEligibility::Eligible(_)

@@ -46,6 +46,8 @@ enum ProvenanceMirror {
     Fresh,
     Damaged,
     Repaired,
+    Refuted,
+    Lost,
 }
 through!(Provenance, ProvenanceMirror);
 
@@ -64,7 +66,7 @@ enum WhyMirror {
     Unsupported,
     Unmapped,
     TooDeep,
-    OrderUnknown,
+    InvalidArchive,
 }
 through!(Why, WhyMirror);
 

@@ -2,8 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // The pipeline's hooks into a graph job. The download and decode paths call
-// these when the job has a graph runtime and know nothing more about it; a
-// classic job has no runtime, so every hook is a lookup that finds nothing.
+// these and know nothing more about the job; a job that has gone has no
+// runtime, so every hook is a lookup that finds nothing for it.
 //
 // The root works in volumes and ordinals; the queues work in segment ids.
 // This file is where the two meet, and the only place the root's classes
@@ -12,19 +12,18 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use bytes::{Bytes, BytesMut};
 use tracing::warn;
 use weaver_graph::{ByteRange, Segment, VolumeIndex};
 
 use super::intake::Decoded;
 use super::source::{Class, Move};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
-use crate::jobs::model::JobState;
+use crate::jobs::model::{JobState, JobStatus};
 use crate::pipeline::download::queue::DownloadWork;
-use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile, Storage};
 use crate::pipeline::graph::limits;
+use crate::pipeline::post_health::GivenUp;
 use crate::pipeline::{DecodedChunk, Pipeline};
 
 // The priority a window volume is raised to: ahead of every article at the
@@ -32,30 +31,16 @@ use crate::pipeline::{DecodedChunk, Pipeline};
 const WINDOW_PRIORITY: u32 = 3;
 
 impl Pipeline {
-    // The engine the job was stamped with: a graph job is one with a graph
-    // runtime, which admission and restore give it from the stamp.
-    pub(in crate::pipeline) fn job_engine(&self, job_id: JobId) -> Engine {
-        if self.graph_jobs.contains_key(&job_id) {
-            Engine::Graph
-        } else {
-            Engine::Classic
-        }
-    }
-
-    // Give a job admitted or restored under `engine` its graph runtime. The
-    // job's state must already be in place: what its queues hold says which
-    // articles this run still has to fetch.
-    pub(crate) fn admit_graph_job(&mut self, job_id: JobId, engine: Engine) {
+    // Give a job admitted, or restored with no checkpoint, its graph
+    // runtime. The job's state must already be in place: what its queues
+    // hold says which articles this run still has to fetch.
+    pub(crate) fn admit_graph_job(&mut self, job_id: JobId) {
         // Read before the job is borrowed, in the order they are tried.
-        let passwords: Vec<String> = if engine == Engine::Graph {
-            self.archive_password_candidates_for_job(job_id)
-                .candidates
-                .iter()
-                .map(|candidate| candidate.value().to_owned())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let passwords: Vec<String> = self
+            .archive_password_candidates_for_job(job_id)
+            .iter()
+            .map(|candidate| candidate.value().to_owned())
+            .collect();
         let slots = self.graph_slot_limit();
         let Some(state) = self.jobs.get(&job_id) else {
             return;
@@ -90,30 +75,69 @@ impl Pipeline {
             caps,
             nesting: limits::NESTING,
             unpack: true,
+            hardware: self.graph_hardware.clone(),
+            metrics: Some(Arc::clone(&self.metrics)),
         };
-        let Some(mut graph) = GraphJob::for_engine(engine, job_id.0, &files, storage) else {
-            return;
-        };
+        let mut graph = GraphJob::admit(job_id.0, &files, storage);
         let mut queued = std::collections::HashSet::new();
-        state.download_queue.extend_segment_ids(&mut queued);
-        state.recovery_queue.extend_segment_ids(&mut queued);
+        if let Some(active) = state.articles.active() {
+            active.download_queue.extend_segment_ids(&mut queued);
+            active.recovery_queue.extend_segment_ids(&mut queued);
+        }
         graph.arrived_before(|volume, ordinal| queued.contains(&segment(job_id, volume, ordinal)));
-        self.install_graph_job(job_id, graph);
+        self.install_graph_job(job_id, graph, Vec::new());
     }
 
     // Give a job the graph runtime a restore rebuilt, or one just admitted,
-    // and take its first checkpoint: from here on, a graph job with no rows
-    // is one from before checkpoints.
-    pub(crate) fn install_graph_job(&mut self, job_id: JobId, mut graph: GraphJob) {
+    // take back the held parts its checkpoint names, start the runs and
+    // repairs the job's slots allow, and take its first checkpoint: from
+    // here on, a graph job with no rows is one from before checkpoints. The
+    // held parts are in place before that checkpoint, so it names them
+    // again. Runs start only here and in later steps, on the pipeline thread
+    // with the job in place, so everything a run says is heard.
+    pub(crate) fn install_graph_job(
+        &mut self,
+        job_id: JobId,
+        mut graph: GraphJob,
+        held_parts: Vec<crate::pipeline::held::HeldPart>,
+    ) {
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return;
         };
         let moves = graph.sample();
         apply_moves(state, &moves);
+        // The articles a run before a restart lost are given up as this
+        // run's are, each weighed as the post declares it.
+        let given_up = self
+            .given_up
+            .entry(job_id)
+            .or_insert_with(|| GivenUp::new(&state.spec));
+        for (volume, ordinal, bytes) in graph.lost_articles() {
+            let counts = state
+                .spec
+                .files
+                .get(volume.0 as usize)
+                .is_some_and(|file| file.role.counts_toward_health());
+            given_up.give_up(
+                segment(job_id, volume, ordinal),
+                None,
+                if counts { bytes } else { 0 },
+            );
+        }
         self.graph_jobs.insert(job_id, graph);
-        self.lend_graph_repairs(job_id);
-        self.after_graph_step(job_id);
-        self.checkpoint_graph_job(job_id);
+        self.adopt_held_parts(held_parts);
+        let result = self.start_graph_runs(job_id);
+        self.after_graph_result(job_id, result);
+    }
+
+    // Start the job's runs and lend its repairs under the slots it may hold
+    // now: none while it holds no NZB slot or is paused.
+    fn start_graph_runs(&mut self, job_id: JobId) -> Result<(), GraphError> {
+        let limit = self.graph_job_slot_limit(job_id);
+        match self.graph_jobs.get_mut(&job_id) {
+            Some(graph) if limit > 0 => graph.resume_runs(&mut self.graph_status.repairs, limit),
+            _ => Ok(()),
+        }
     }
 
     // A decoded article of a graph job, as the decoder placed it. True when
@@ -124,44 +148,92 @@ impl Pipeline {
         &mut self,
         segment_id: SegmentId,
         offset: u64,
-        data: &DecodedChunk,
+        data: DecodedChunk,
         intact: bool,
         positioned: bool,
         length: u64,
-        segments: &[weaver_yenc::Segment],
+        declared_end: Option<u64>,
+        segments: Vec<weaver_yenc::Segment>,
     ) -> bool {
         let job_id = segment_id.file_id.job_id;
         let limit = self.graph_job_slot_limit(job_id);
         let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
             return false;
         };
-        let decoded = Decoded {
-            volume: VolumeIndex(segment_id.file_id.file_index),
-            ordinal: segment_id.segment_number,
+        let decoded = decoded(
+            segment_id,
             offset,
-            bytes: copy(data),
+            data,
             intact,
             positioned,
-            length: (positioned && length > 0).then_some(length),
-            segments: segments
-                .iter()
-                .map(|segment| Segment {
-                    range: ByteRange::at(segment.file_offset, segment.len),
-                    crc32: segment.crc32,
-                    verified: intact,
-                })
-                .collect(),
-        };
+            length,
+            declared_end,
+            segments,
+        );
+        let committed = decoded.bytes.len() as u64;
         let result = graph.intake(decoded, &mut self.graph_status.repairs, limit);
-        self.after_graph_result(job_id, result);
+        // A copy the root dropped committed nothing.
+        if let Ok(true) = result {
+            self.metrics
+                .bytes_committed
+                .fetch_add(committed, std::sync::atomic::Ordering::Relaxed);
+            self.metrics
+                .segments_committed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.after_graph_result(job_id, result.map(drop));
         true
+    }
+
+    // Whether the root of a graph job already has the article in hand or
+    // has ruled it lost. An article the root does not hold, or a job that
+    // has gone, has settled nothing.
+    pub(in crate::pipeline) fn graph_article_settled(&self, segment_id: SegmentId) -> bool {
+        self.graph_jobs
+            .get(&segment_id.file_id.job_id)
+            .is_some_and(|graph| {
+                graph.article_settled(
+                    VolumeIndex(segment_id.file_id.file_index),
+                    segment_id.segment_number,
+                )
+            })
+    }
+
+    // An article of a graph job the decoder withdrew, its placement refuted
+    // by its neighbours, is sent back to the root for another copy.
+    pub(in crate::pipeline) fn graph_article_sent_back(&mut self, segment_id: SegmentId) {
+        if let Some(graph) = self.graph_jobs.get_mut(&segment_id.file_id.job_id) {
+            graph.send_back(
+                VolumeIndex(segment_id.file_id.file_index),
+                segment_id.segment_number,
+            );
+        }
+    }
+
+    // Whether an article of a graph job will never arrive: every server
+    // failed it, in this run or one before a restart.
+    pub(in crate::pipeline) fn graph_article_given_up(&self, segment_id: SegmentId) -> bool {
+        self.given_up
+            .get(&segment_id.file_id.job_id)
+            .is_some_and(|given_up| given_up.holds(segment_id))
+    }
+
+    // Where the root of a graph job stands in laying a file in order, as
+    // `ordered_front` says. `None` once the job has gone. Takes the graph
+    // jobs alone, so a caller may hold another field of the pipeline.
+    pub(in crate::pipeline) fn graph_ordered_front(
+        graph_jobs: &std::collections::HashMap<JobId, GraphJob>,
+        file_id: NzbFileId,
+    ) -> Option<(u32, u64, bool)> {
+        let graph = graph_jobs.get(&file_id.job_id)?;
+        Some(graph.ordered_front(VolumeIndex(file_id.file_index)))
     }
 
     // Whether the root is waiting on an article of a graph job, which is
     // the whole of whether the queue fetches it as completion work: every
     // path that rebuilds or requeues the article asks this, so a retry on
-    // another server keeps the class the root gave it. `None` for a classic
-    // job.
+    // another server keeps the class the root gave it. `None` once the job
+    // has gone.
     pub(in crate::pipeline) fn graph_article_waited_on(
         &self,
         segment_id: SegmentId,
@@ -199,7 +271,8 @@ impl Pipeline {
     }
 
     // Whether the root holds an article of a graph job parked: an object
-    // deferred it and nothing has wanted it since. `None` for a classic job.
+    // deferred it and nothing has wanted it since. `None` once the job has
+    // gone.
     pub(in crate::pipeline) fn graph_article_parked(&self, segment_id: SegmentId) -> Option<bool> {
         let graph = self.graph_jobs.get(&segment_id.file_id.job_id)?;
         Some(
@@ -211,8 +284,8 @@ impl Pipeline {
     }
 
     // Every server failed an article of a graph job. True when the job is a
-    // graph job: its objects rule on the loss, so the caller's health
-    // arithmetic is not asked.
+    // graph job. The range is refused to the root, whose objects rule on
+    // the refusal, and the feed is told the post lost an article.
     pub(in crate::pipeline) fn graph_article_lost(&mut self, segment_id: SegmentId) -> bool {
         let job_id = segment_id.file_id.job_id;
         let limit = self.graph_job_slot_limit(job_id);
@@ -226,29 +299,108 @@ impl Pipeline {
             limit,
         );
         self.after_graph_result(job_id, result);
+        self.post_lost(job_id);
         true
     }
 
     // What an engine's run said, or what a repair came back with. A run
     // that ended or a repair that ruled may have been the last thing the job
     // waited on, so the completion gate looks again.
+    //
+    // A stopped graph of a job that dropped its articles only hears its
+    // mail out, starting nothing, and goes once the last of it is heard: the
+    // job's next graph may be built from then on.
     pub(in crate::pipeline) fn graph_run_said(&mut self, said: Said) {
         let job_id = JobId(said.scope);
+        if let Heard::CheckpointBlocked {
+            control,
+            revision,
+            error,
+        } = &said.heard
+        {
+            self.pause_graph_checkpoint(job_id, control, *revision, error);
+            return;
+        }
+        if let Some(graph) = self.retiring_graph_jobs.get_mut(&job_id) {
+            if self.pending_graph_terminals.contains_key(&job_id)
+                || matches!(
+                    &said.heard,
+                    Heard::Repaired(_) | Heard::Replayed(_) | Heard::Verified(_)
+                )
+            {
+                if let Err(error) = graph.drain_failed_run(said) {
+                    warn!(job_id = job_id.0, %error, "failed to discard a stopped graph worker's output");
+                }
+            } else {
+                let _ = graph.run_said(said, &mut self.graph_status.repairs, 0);
+            }
+            if !graph.awaits_mail() {
+                let mut graph = self.retiring_graph_jobs.remove(&job_id);
+                if let Some(ticket) = graph.as_mut().and_then(GraphJob::forget_slot) {
+                    self.graph_status.repairs.release(ticket);
+                }
+                match self.pending_graph_terminals.remove(&job_id) {
+                    Some(crate::pipeline::health::PendingGraphTerminal::Failed(failure)) => {
+                        let cancelling = self.shared_state.queue.read(|inner| {
+                            inner
+                                .jobs
+                                .iter()
+                                .any(|row| row.id == job_id && row.intents.cancelled.is_some())
+                        });
+                        // Retirement blocks readmission; never apply an old
+                        // failure to a job that no longer has its failed state.
+                        if self.jobs.get(&job_id).is_some_and(|state| {
+                            matches!(&state.status, JobStatus::Failed { error } if error == &failure.error)
+                        }) {
+                            if let Some(graph) = graph {
+                                self.graph_jobs.insert(job_id, graph);
+                            }
+                            if cancelling {
+                                // The archive reply decides whether cancellation
+                                // wins. Worker completion must not race it into
+                                // failure cleanup or a second history write.
+                                self.pending_graph_terminals.insert(
+                                    job_id,
+                                    crate::pipeline::health::PendingGraphTerminal::Failed(failure),
+                                );
+                            } else {
+                                self.continue_job_failure(job_id, failure);
+                            }
+                        }
+                    }
+                    Some(crate::pipeline::health::PendingGraphTerminal::Cancelled {
+                        cleanup,
+                        keep_files,
+                    }) => {
+                        drop(graph);
+                        self.finish_cancelled_job(cleanup, keep_files);
+                    }
+                    None => {}
+                }
+                self.download_dispatch_wake = true;
+            }
+            self.wake_repair_waiters();
+            return;
+        }
         let limit = self.graph_job_slot_limit(job_id);
         let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
             self.graph_outside.deliver(said, limit);
             return;
         };
-        let ended = matches!(said.heard, Heard::Ended | Heard::Repaired(_));
+        let ended = matches!(
+            said.heard,
+            Heard::Ended | Heard::Repaired(_) | Heard::Replayed(_) | Heard::Verified(_)
+        );
+        let moving = graph.moves_waiting();
         let result = graph.run_said(said, &mut self.graph_status.repairs, limit);
-        if !self.jobs.contains_key(&job_id) {
-            if !graph.awaits_mail() {
-                self.graph_jobs.remove(&job_id);
-            }
-            return;
-        }
         self.after_graph_result(job_id, result);
-        if ended {
+        // The last file to move is where the delivery takes it from now.
+        let moved = moving
+            && !self
+                .graph_jobs
+                .get(&job_id)
+                .is_some_and(GraphJob::moves_waiting);
+        if ended || moved {
             self.schedule_job_completion_check(job_id);
         }
     }
@@ -266,12 +418,22 @@ impl Pipeline {
     }
 
     // How many runs a graph job may hold now: the extraction concurrency the
-    // tuner allows at this moment, the limit the repair slots follow too.
+    // tuner allows at this moment, the limit the repair slots follow too, and
+    // none while post-processing is paused. The pause is read as applied to
+    // the executor, the state whose release walks every graph job again, so
+    // a hold always has its release.
     pub(in crate::pipeline) fn graph_slot_limit(&self) -> usize {
-        limits::budgets(&self.direct_store.settings(), &self.tuner).1
+        if self.terminal_post_processing_executor.is_paused() {
+            0
+        } else {
+            limits::slots(&self.tuner)
+        }
     }
 
-    fn graph_job_slot_limit(&self, job_id: JobId) -> usize {
+    // How many runs and repairs the job may hold now: the pipeline's limit,
+    // and none while the job is not admitted or is paused, so each of those
+    // holds its extraction and repair and nothing else.
+    pub(in crate::pipeline) fn graph_job_slot_limit(&self, job_id: JobId) -> usize {
         if self.nzb_admitted.contains(&job_id)
             && self
                 .jobs
@@ -285,19 +447,26 @@ impl Pipeline {
     }
 
     pub(in crate::pipeline) fn resume_graph_work(&mut self, job_id: JobId) {
-        let limit = self.graph_job_slot_limit(job_id);
-        if limit == 0 {
+        if self.graph_job_slot_limit(job_id) == 0 || !self.graph_jobs.contains_key(&job_id) {
             return;
         }
-        let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
-            return;
-        };
-        let result = graph.resume_runs(&mut self.graph_status.repairs, limit);
+        let result = self.start_graph_runs(job_id);
         self.after_graph_result(job_id, result);
         self.schedule_job_completion_check(job_id);
     }
 
-    fn after_graph_result(&mut self, job_id: JobId, result: Result<(), GraphError>) {
+    pub(in crate::pipeline::graph) fn after_graph_result(
+        &mut self,
+        job_id: JobId,
+        result: Result<(), GraphError>,
+    ) {
+        if self.job_failure_started(job_id) {
+            return;
+        }
+        // What the step landed is said whatever the step came to: a file
+        // whose download ended is said once, as it ended, before the job
+        // fails on what the step did after.
+        self.publish_graph_notes(job_id);
         // A step the job's extraction budget refused ends the job here, so
         // nothing more is fetched or decoded for it.
         if self.fail_graph_job_on_breach(job_id) {
@@ -319,15 +488,10 @@ impl Pipeline {
     // Lend the job's due repairs under the repair slots every graph job
     // shares.
     pub(in crate::pipeline::graph) fn lend_graph_repairs(&mut self, job_id: JobId) {
-        if !self.nzb_admitted.contains(&job_id)
-            || self
-                .jobs
-                .get(&job_id)
-                .is_none_or(|state| state.run_state == crate::jobs::model::RunState::Paused)
-        {
+        let limit = self.graph_job_slot_limit(job_id);
+        if limit == 0 {
             return;
         }
-        let limit = self.graph_slot_limit();
         if let Some(graph) = self.graph_jobs.get_mut(&job_id)
             && let Err(error) = graph.lend(&mut self.graph_status.repairs, limit)
         {
@@ -347,23 +511,36 @@ impl Pipeline {
     // After anything reached the tree: answer the objects' seeks, move the
     // articles they moved, and report the phase if it changed.
     fn after_graph_step(&mut self, job_id: JobId) {
+        let limit = self.graph_job_slot_limit(job_id);
         let (Some(graph), Some(state)) =
             (self.graph_jobs.get_mut(&job_id), self.jobs.get_mut(&job_id))
         else {
             return;
         };
+        let Some(active) = state.articles.active() else {
+            return;
+        };
         let round = {
-            let (download, recovery) = (&state.download_queue, &state.recovery_queue);
-            graph.seek_round(|volume| {
-                let file_id = file(job_id, volume);
-                download.queued_count_for_file(file_id) + recovery.queued_count_for_file(file_id)
-                    > 0
-            })
+            let (download, recovery) = (&active.download_queue, &active.recovery_queue);
+            graph.seek_round(
+                |volume| {
+                    let file_id = file(job_id, volume);
+                    download.queued_count_for_file(file_id)
+                        + recovery.queued_count_for_file(file_id)
+                        > 0
+                },
+                &mut self.graph_status.repairs,
+                limit,
+            )
         };
         match round {
             Ok(moves) => apply_moves(state, &moves),
             Err(error) => warn!(job_id = job_id.0, error = %error, "graph seek round failed"),
         }
+        self.wake_repair_waiters();
+        // What the step landed is said before the stage it moved the job to,
+        // so a file landed by the step that ends the job is said first.
+        self.publish_graph_notes(job_id);
         self.report_graph_phase(job_id);
     }
 }
@@ -382,6 +559,10 @@ pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
         return;
     }
     let job_id = state.job_id;
+    // Only a job holding its articles has a root to move them.
+    let Some(state) = state.articles.active_mut() else {
+        return;
+    };
     // The latest class of each moved article, by its place in the post.
     let classes: BTreeMap<(u32, u32), Class> = moves
         .iter()
@@ -463,8 +644,36 @@ fn segment(job_id: JobId, volume: VolumeIndex, ordinal: u32) -> SegmentId {
     }
 }
 
-fn copy(data: &DecodedChunk) -> Bytes {
-    let mut bytes = BytesMut::with_capacity(data.len_bytes());
-    data.for_each_slice(|slice| bytes.extend_from_slice(slice));
-    bytes.freeze()
+// A decoded article as the root takes it, by value: the decoder's buffer
+// becomes the delivery's bytes, and its checksums are refiled in the list
+// they came in, so neither is copied.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn decoded(
+    segment_id: SegmentId,
+    offset: u64,
+    data: DecodedChunk,
+    intact: bool,
+    positioned: bool,
+    length: u64,
+    declared_end: Option<u64>,
+    segments: Vec<weaver_yenc::Segment>,
+) -> Decoded {
+    Decoded {
+        volume: VolumeIndex(segment_id.file_id.file_index),
+        ordinal: segment_id.segment_number,
+        offset,
+        bytes: data.into_bytes(),
+        intact,
+        positioned,
+        length: (positioned && length > 0).then_some(length),
+        declared_end: declared_end.filter(|_| positioned),
+        segments: segments
+            .into_iter()
+            .map(|segment| Segment {
+                range: ByteRange::at(segment.file_offset, segment.len),
+                crc32: segment.crc32,
+                verified: intact,
+            })
+            .collect(),
+    }
 }

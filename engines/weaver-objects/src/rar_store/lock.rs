@@ -195,9 +195,7 @@ impl RarStore {
     fn open_on(&mut self, index: usize) {
         self.headers_open = Some(index);
         self.recovery_said.clear();
-        for volume in self.volumes.values_mut() {
-            volume.walk.touch();
-        }
+        self.dirty.extend(self.volumes.keys().copied());
         self.stale = true;
     }
 

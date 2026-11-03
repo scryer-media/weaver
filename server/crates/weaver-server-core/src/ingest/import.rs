@@ -13,7 +13,7 @@ use crate::jobs::{
 };
 use crate::settings::archive_passwords;
 use weaver_model::files::{FileRole, unique_download_filenames};
-use weaver_nzb::{Nzb, parse_nzb};
+use weaver_nzb::{Nzb, NzbFile, parse_nzb};
 
 // Global counter for generating unique job IDs.
 static NEXT_JOB_ID: AtomicU64 = AtomicU64::new(1);
@@ -81,13 +81,19 @@ pub fn nzb_to_spec(
 // The files of a job built from `nzb`, their total size, and `metadata` with
 // the record of every file written under a name other than its full one.
 // Every job built from an NZB, first or again, names its files here, so a
-// rebuilt job finds them under the names the first run gave them.
+// rebuilt job finds them under the names the first run gave them. A file the
+// NZB lists with no article is not a file of the job: nothing could ever be
+// fetched for it, so no file of the job has fewer than one article.
 pub(super) fn nzb_file_specs(
     nzb: &Nzb,
     metadata: Vec<(String, String)>,
 ) -> (Vec<FileSpec>, u64, Vec<(String, String)>) {
-    let full_names = nzb
+    let posted: Vec<&NzbFile> = nzb
         .files
+        .iter()
+        .filter(|nzb_file| !nzb_file.segments.is_empty())
+        .collect();
+    let full_names = posted
         .iter()
         .map(|nzb_file| {
             // Prefer the enhanced extraction (handles PRiVATE format, higher confidence).
@@ -109,9 +115,9 @@ pub(super) fn nzb_file_specs(
             .zip(filenames.iter().map(String::as_str)),
     );
 
-    let mut files = Vec::with_capacity(nzb.files.len());
+    let mut files = Vec::with_capacity(posted.len());
     let mut total_bytes: u64 = 0;
-    for (nzb_file, filename) in nzb.files.iter().zip(filenames) {
+    for (nzb_file, filename) in posted.into_iter().zip(filenames) {
         let role = FileRole::from_filename(&filename);
 
         let segments: Vec<SegmentSpec> = nzb_file
@@ -331,6 +337,33 @@ mod tests {
         assert_eq!(segments[0].message_ids.in_use(), "first@example.invalid");
         assert_eq!(segments[0].article_number, 1);
         assert_eq!(spec.total_bytes, 20);
+    }
+
+    // A file listed with no article is no file of the job: the one after
+    // it is the job's first.
+    #[test]
+    fn a_file_with_no_article_is_not_a_file_of_the_job() {
+        let xml = r#"<?xml version="1.0"?>
+<nzb>
+  <file poster="p" date="0" subject="&quot;empty.bin&quot; yEnc (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments></segments>
+  </file>
+  <file poster="p" date="0" subject="&quot;slot.bin&quot; yEnc (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="10" number="1">only@example.invalid</segment></segments>
+  </file>
+</nzb>"#;
+        let spec = import_nzb(xml.as_bytes(), Path::new("slot.nzb")).unwrap().1;
+        assert_eq!(
+            spec.files
+                .iter()
+                .map(|file| file.filename.as_str())
+                .collect::<Vec<_>>(),
+            ["slot.bin"]
+        );
+        assert_eq!(spec.files[0].segments.len(), 1);
+        assert_eq!(spec.total_bytes, 10);
     }
 
     #[test]

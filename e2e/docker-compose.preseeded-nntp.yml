@@ -5,5 +5,7 @@ services:
   nntp:
     volumes: !override
       - nntp-certs:/certs
+      - ./.bin/nntp-health:/nntp-health:ro
   nntp2:
-    volumes: !override []
+    volumes: !override
+      - ./.bin/nntp-health:/nntp-health:ro

@@ -8,7 +8,6 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use bytes::Bytes;
-use weaver_graph::Provenance;
 
 use crate::kept::Kept;
 
@@ -25,7 +24,7 @@ impl SparseImage {
             runs: kept
                 .runs()
                 .into_iter()
-                .filter(|(_, _, provenance)| closed || *provenance != Provenance::Damaged)
+                .filter(|(_, _, provenance)| closed || !provenance.is_damaged())
                 .map(|(range, bytes, _)| (range.start, Bytes::copy_from_slice(bytes)))
                 .collect(),
             position: 0,

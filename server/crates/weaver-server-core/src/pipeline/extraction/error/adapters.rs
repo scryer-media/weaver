@@ -41,12 +41,6 @@ fn zstd_0_13_checksum_mismatch(text: &str) -> bool {
     text.contains("Restored data doesn't match checksum")
 }
 
-// zstd 0.13 (libzstd 1.5.7): a frame whose window is larger than the decoder
-// was allowed. Same channel as the checksum above.
-pub(super) fn zstd_0_13_frame_exceeds_window(text: &str) -> bool {
-    text.contains("too much memory")
-}
-
 // flate2 1.1.10: a gzip member whose CRC-32 or length trailer does not match
 // is an `InvalidInput` `io::Error` with this text and no typed cause.
 fn flate2_1_1_gzip_checksum_mismatch(text: &str) -> bool {

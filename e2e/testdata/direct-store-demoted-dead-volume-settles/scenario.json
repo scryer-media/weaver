@@ -24,15 +24,6 @@
     "directStore": {
       "expectedDemotionReason": "par2_damaged",
       "requireRoutedByteMaterialization": true
-    },
-    "log": {
-      "lines": [
-        {
-          "message": "RAR completion checkpoint",
-          "level": "INFO",
-          "forbidConsecutiveRepeats": true
-        }
-      ]
     }
   }
 }

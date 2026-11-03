@@ -9,12 +9,18 @@
 // repair came to returns through the run mail, numbered by the loan, and is
 // applied by the namespace as the set's ruling.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use tokio::sync::mpsc;
 use weaver_graph::NodeId;
 use weaver_graph::slots::{AskerId, Ticket};
 
 use super::super::engine::{Heard, Said};
-use super::super::namespace::{Lender, Loan, SetState};
+use super::super::hardware::Hardware;
+use super::super::namespace::{Lender, Loan, Replay, SetState};
 use super::super::status::RepairSlots;
 
 pub(crate) struct Loans {
@@ -24,6 +30,8 @@ pub(crate) struct Loans {
     serial: u64,
     out: Option<Out>,
     ticket: Option<Ticket>,
+    // What a repair is granted as it goes out.
+    hardware: Hardware,
 }
 
 // The repair that is out: its set, its number, and what the set said of
@@ -32,21 +40,45 @@ struct Out {
     set: NodeId,
     serial: u64,
     state: Option<SetState>,
+    stop: Option<Arc<AtomicBool>>,
+    kind: Work,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Work {
+    Repair,
+    Replay,
+    Verification,
 }
 
 impl Loans {
-    pub(crate) fn new(scope: u64, mail: mpsc::Sender<Said>) -> Self {
+    pub(crate) fn new(scope: u64, mail: mpsc::Sender<Said>, hardware: Hardware) -> Self {
         Self {
             scope,
             mail,
             serial: 0,
             out: None,
             ticket: None,
+            hardware,
         }
     }
 
     pub(crate) fn out(&self) -> bool {
         self.out.is_some()
+    }
+
+    pub(crate) fn repairing(&self) -> bool {
+        self.is_out(Work::Repair)
+    }
+
+    fn is_out(&self, kind: Work) -> bool {
+        self.out.as_ref().is_some_and(|out| out.kind == kind)
+    }
+
+    pub(crate) fn request_stop(&self) {
+        if let Some(stop) = self.out.as_ref().and_then(|out| out.stop.as_ref()) {
+            stop.store(true, Ordering::Relaxed);
+        }
     }
 
     // What the set whose repair is out said of itself as it left.
@@ -55,6 +87,13 @@ impl Loans {
             .as_ref()
             .filter(|out| out.set == set)
             .and_then(|out| out.state)
+    }
+
+    #[cfg(test)]
+    pub(super) fn current_repair(&self, set: NodeId, serial: u64) -> bool {
+        self.out
+            .as_ref()
+            .is_some_and(|out| out.kind == Work::Repair && out.set == set && out.serial == serial)
     }
 
     // The repair numbered `serial` came back to the set: it is no longer
@@ -78,12 +117,6 @@ impl Loans {
         self.ticket.take()
     }
 
-    // The slot, whatever holds it: the job is going away.
-    pub(crate) fn forget(&mut self) -> Option<Ticket> {
-        self.out = None;
-        self.ticket.take()
-    }
-
     // A lender over these loans that asks `slots` for a slot when it holds
     // none, or, without slots, lends only under the one it holds.
     pub(crate) fn lending<'a>(
@@ -100,9 +133,16 @@ pub(crate) struct Lending<'a> {
 }
 
 impl Lender for Lending<'_> {
+    // No repair goes out once the pipeline is shutting down: its set rules
+    // again after the restart.
     fn admit(&mut self) -> bool {
         let loans = &mut *self.loans;
-        if loans.out.is_some() {
+        if loans.out.is_some() || loans.hardware.shutdown().started() {
+            return false;
+        }
+        // A retained ticket still belongs to the retiring or paused job,
+        // but a zero-slot grant may not start another repair under it.
+        if self.slots.as_ref().is_some_and(|(_, limit)| *limit == 0) {
             return false;
         }
         if loans.ticket.is_some() {
@@ -123,10 +163,31 @@ impl Lender for Lending<'_> {
             set,
             serial,
             state: loan.state,
+            stop: None,
+            kind: Work::Repair,
         });
         let mail = loans.mail.clone();
+        // The repair runs inside the pool, on the budget in force as it goes
+        // out: a later profile reaches the next repair, not this one.
+        let grant = loans.hardware.grant();
+        let shutdown = loans.hardware.shutdown().clone();
         tokio::task::spawn_blocking(move || {
-            let returned = loan.run();
+            tracing::info!(
+                job_id = scope,
+                node = set.0,
+                generation = serial,
+                "graph repair worker started"
+            );
+            crate::e2e_failpoint::maybe_delay(crate::e2e_failpoint::REPAIR_TASK_START);
+            crate::e2e_failpoint::maybe_trip(crate::e2e_failpoint::REPAIR_TASK_START);
+            let returned = grant.install(|| loan.run(grant.repair.clone(), &shutdown));
+            tracing::info!(
+                job_id = scope,
+                node = set.0,
+                generation = serial,
+                cancelled = returned.stopped(),
+                "graph repair worker ended"
+            );
             // A closed channel means the pipeline is gone, and no one is
             // left to tell.
             let _ = mail.blocking_send(Said {
@@ -135,6 +196,61 @@ impl Lender for Lending<'_> {
                 generation: serial,
                 heard: Heard::Repaired(Box::new(returned)),
             });
+        });
+    }
+}
+
+impl Lending<'_> {
+    pub(crate) fn verify(&mut self, check: super::super::namespace::Verification) {
+        let loans = &mut *self.loans;
+        loans.serial += 1;
+        let (scope, node, serial) = (loans.scope, check.node, loans.serial);
+        loans.out = Some(Out {
+            set: node,
+            serial,
+            state: None,
+            stop: Some(Arc::clone(&check.stop)),
+            kind: Work::Verification,
+        });
+        let mail = loans.mail.clone();
+        let shutdown = loans.hardware.shutdown().clone();
+        tokio::task::spawn_blocking(move || {
+            let checked = check.run(&shutdown);
+            let _ = mail.blocking_send(Said {
+                scope,
+                node,
+                generation: serial,
+                heard: Heard::Verified(Box::new(checked)),
+            });
+        });
+    }
+
+    // Reconstruction shares admission and the completion acknowledgment
+    // with repair work; it never borrows a live object's delivery queue.
+    pub(crate) fn replay(&mut self, replay: Replay) {
+        let loans = &mut *self.loans;
+        loans.serial += 1;
+        let (scope, node, serial) = (loans.scope, replay.node, loans.serial);
+        loans.out = Some(Out {
+            set: node,
+            serial,
+            state: None,
+            stop: Some(Arc::clone(&replay.stop)),
+            kind: Work::Replay,
+        });
+        let mail = loans.mail.clone();
+        let shutdown = loans.hardware.shutdown().clone();
+        tokio::task::spawn_blocking(move || {
+            let replayed = replay.run(&shutdown);
+            if let Err(error) = mail.blocking_send(Said {
+                scope,
+                node,
+                generation: serial,
+                heard: Heard::Replayed(Box::new(replayed)),
+            }) && let Heard::Replayed(replayed) = error.0.heard
+            {
+                let _ = replayed.remove();
+            }
         });
     }
 }

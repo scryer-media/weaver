@@ -410,3 +410,176 @@ async fn cancel_jobs_reports_each_id_in_one_batch() {
     assert_eq!(row(missing)["cancelled"], false);
     assert_eq!(row(missing)["errorCode"], "NOT_FOUND");
 }
+
+#[tokio::test]
+async fn batch_by_ids_applies_found_jobs_and_refuses_missing_ones() {
+    let h = TestHarness::new().await;
+    let id1 = h.submit_test_nzb("batch-ids-1").await;
+    let id2 = h.submit_test_nzb("batch-ids-2").await;
+    let missing = id1.max(id2) + 1_000;
+
+    let resp = h
+        .execute(&format!(
+            r#"mutation {{ pauseQueueItems(target: {{ ids: [{id1}, {id2}, {id1}, {missing}] }}) {{
+                matched applied refused {{ id code }}
+            }} }}"#
+        ))
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    let result = &data["pauseQueueItems"];
+    assert_eq!(result["matched"], 3, "{result:?}");
+    assert_eq!(result["applied"], 2, "{result:?}");
+    assert_eq!(result["refused"][0]["id"], missing);
+    assert_eq!(result["refused"][0]["code"], "NOT_FOUND");
+
+    h.wait_for_job_status(id1, weaver_server_core::JobStatus::Paused)
+        .await;
+    h.wait_for_job_status(id2, weaver_server_core::JobStatus::Paused)
+        .await;
+}
+
+#[tokio::test]
+async fn batch_by_selection_reaches_every_matching_job_only() {
+    let h = TestHarness::new().await;
+    let tv1 = h.submit_test_nzb("batch-sel-tv-1").await;
+    let tv2 = h.submit_test_nzb("batch-sel-tv-2").await;
+    let other = h.submit_test_nzb("batch-sel-other").await;
+
+    let resp = h
+        .execute(&format!(
+            r#"mutation {{ setQueueItemsCategory(target: {{ ids: [{tv1}, {tv2}] }}, category: "tv") {{
+                matched applied
+            }} }}"#
+        ))
+        .await;
+    assert_no_errors(&resp);
+    assert_eq!(response_data(&resp)["setQueueItemsCategory"]["applied"], 2);
+
+    let resp = h
+        .execute(
+            r#"mutation { setQueueItemsPriority(
+                target: { selection: { categories: ["tv"] }, expectedMatched: 2 }, priority: HIGH
+            ) { matched applied } }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert_eq!(data["setQueueItemsPriority"]["matched"], 2, "{data:?}");
+    assert_eq!(data["setQueueItemsPriority"]["applied"], 2, "{data:?}");
+
+    for (id, expected) in [(tv1, Some("HIGH")), (tv2, Some("HIGH")), (other, None)] {
+        let resp = h
+            .execute(&format!(
+                r#"{{ queueItem(id: {id}) {{ attributes {{ key value }} }} }}"#
+            ))
+            .await;
+        assert_no_errors(&resp);
+        let data = response_data(&resp);
+        let priority = data["queueItem"]["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|attribute| attribute["key"] == "priority")
+            .and_then(|attribute| attribute["value"].as_str().map(str::to_owned));
+        assert_eq!(priority.as_deref(), expected, "job {id}");
+    }
+}
+
+#[tokio::test]
+async fn batch_refuses_too_many_ids_and_an_ambiguous_target() {
+    let h = TestHarness::new().await;
+    let ids = (1..=1_001u64)
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let resp = h
+        .execute(&format!(
+            r#"mutation {{ cancelQueueItems(target: {{ ids: [{ids}] }}) {{ matched }} }}"#
+        ))
+        .await;
+    assert_has_errors(&resp);
+    assert_eq!(
+        resp.errors[0]
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get("code"))
+            .cloned(),
+        Some(Value::from("BATCH_TOO_LARGE"))
+    );
+
+    let resp = h
+        .execute(r#"mutation { resumeQueueItems(target: {}) { matched } }"#)
+        .await;
+    assert_has_errors(&resp);
+
+    // Repeats are dropped before the cap: 1,001 ids naming 600 jobs fit.
+    let repeated = (1..=1_001u64)
+        .map(|id| (id % 600 + 1).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let resp = h
+        .execute(&format!(
+            r#"mutation {{ cancelQueueItems(target: {{ ids: [{repeated}] }}) {{ matched }} }}"#
+        ))
+        .await;
+    assert_no_errors(&resp);
+    assert_eq!(response_data(&resp)["cancelQueueItems"]["matched"], 600);
+}
+
+fn error_extension(resp: &async_graphql::Response, key: &str) -> Option<Value> {
+    resp.errors[0]
+        .extensions
+        .as_ref()
+        .and_then(|extensions| extensions.get(key))
+        .cloned()
+}
+
+#[tokio::test]
+async fn a_selection_acts_only_on_the_count_the_caller_confirmed() {
+    let h = TestHarness::new().await;
+    let first = h.submit_test_nzb("confirm-sel-1").await;
+    let second = h.submit_test_nzb("confirm-sel-2").await;
+
+    // No filter at all names the whole queue only when it says so.
+    let resp = h
+        .execute(r#"mutation { pauseQueueItems(target: { selection: {}, expectedMatched: 2 }) { matched } }"#)
+        .await;
+    assert_has_errors(&resp);
+    assert_eq!(
+        error_extension(&resp, "code"),
+        Some(Value::from("INVALID_INPUT"))
+    );
+
+    // The operator confirmed one job; a second has joined since, so nothing
+    // is paused and the answer carries the count to confirm again.
+    let resp = h
+        .execute(r#"mutation { pauseQueueItems(target: { selection: { all: true }, expectedMatched: 1 }) { matched } }"#)
+        .await;
+    assert_has_errors(&resp);
+    assert_eq!(
+        error_extension(&resp, "code"),
+        Some(Value::from("CONFLICT"))
+    );
+    assert_eq!(error_extension(&resp, "matched"), Some(Value::from(2)));
+    for id in [first, second] {
+        let resp = h
+            .execute(&format!("{{ queueItem(id: {id}) {{ state }} }}"))
+            .await;
+        assert_no_errors(&resp);
+        assert_ne!(
+            response_data(&resp)["queueItem"]["state"],
+            "PAUSED",
+            "job {id}"
+        );
+    }
+
+    // Confirmed again at the current count, the batch goes through.
+    let resp = h
+        .execute(r#"mutation { pauseQueueItems(target: { selection: { all: true }, expectedMatched: 2 }) { matched applied } }"#)
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert_eq!(data["pauseQueueItems"]["matched"], 2, "{data:?}");
+    assert_eq!(data["pauseQueueItems"]["applied"], 2, "{data:?}");
+}

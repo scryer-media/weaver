@@ -7,9 +7,10 @@
 // volume and covers that one member, with one slice over the bytes it
 // protects. It is never delivered.
 //
-// It rules once the volume is closed and bound. A volume every byte of
-// which passed whole is clean without a read; otherwise unrar-rs checks the
-// volume against the record, read by range through the namespace: clean
+// It rules once the volume is closed and bound. unrar-rs checks the volume
+// against the record, read by range through the namespace, whatever the
+// articles' own checks said: they prove the bytes are as posted, and only
+// the record's checksums prove they are what the record protects. Clean
 // when no unit is damaged, repaired once the damaged units it rebuilt are
 // written back into the member, impossible when the record cannot rebuild
 // them all or cannot vouch for every protected byte. A clean or repaired
@@ -36,8 +37,8 @@ use serde::{Deserialize, Serialize};
 use unrar_rs::{ArchiveFormat, RarError, RecoveryRecordAssessment, RecoveryRecordLayout};
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Handed, Kind, MemberId, Namespace,
-    Object, Placement, Provenance, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex,
+    ByteRange, Claim, Delivery, Durable, Emit, Extent, Facts, Handed, Kind, Located, MemberId,
+    Namespace, Object, Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex,
 };
 use zeroize::Zeroizing;
 
@@ -56,14 +57,15 @@ pub struct RarRecord {
     // How many bytes at the front of the volume the record protects, as
     // the last ruling that read it found.
     protected: Option<u64>,
+    // How the record cuts what it protects, as the last ruling that read it
+    // found: the unit size and the parity units it holds.
+    units: Option<(u64, u64)>,
+    // Ranges of the volume the parent refused: they will never come.
+    refused: Vec<ByteRange>,
     // The candidate the store opened the volume's headers on, as it
     // handed it.
     #[serde(skip)]
     password: Option<Zeroizing<String>>,
-    // The volume's bytes that passed whole, as the namespace fed them. A
-    // restart feeds them again.
-    #[serde(skip)]
-    proven: Coverage,
 }
 
 // What a ruling found of the volume.
@@ -86,16 +88,13 @@ enum Said {
 impl Durable for RarRecord {
     // 3: no front, where a sealed volume's was kept: the store hands the
     // candidate its headers opened on.
-    const VERSION: u16 = 3;
+    // 4: the record's units, and the ranges the parent refused.
+    const VERSION: u16 = 4;
 }
 
 impl RarRecord {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    fn proven_whole(&self, length: u64) -> bool {
-        self.proven.verified(ByteRange::new(0, length))
     }
 
     fn rule(&mut self, access: &mut dyn MemberAccess) -> Said {
@@ -112,21 +111,42 @@ impl RarRecord {
         let Some(length) = access.length(member) else {
             return Said::Unread;
         };
-        if self.proven_whole(length) {
-            return Said::Intact;
-        }
         let mut volume = Volume::new(access, member, length);
         let password = self.password.as_ref().map(|secret| secret.as_str());
-        let (said, protected) = examine(&mut volume, password);
-        self.protected = protected;
+        let (said, layout) = examine(&mut volume, password);
+        self.protected = layout.as_ref().map(|layout| layout.protected_size);
+        self.units = layout.map(|layout| (layout.unit_size, layout.parity_units));
         said
+    }
+
+    // The record's ruling on what was refused, once a ruling read how it
+    // cuts the volume: each protected unit a refused range touches will
+    // never come, and the record is impossible once they outnumber its
+    // parity units. Before the record is read it says nothing.
+    fn refused_short(&self) -> Option<RepairOutcome> {
+        let (unit, parity) = self.units.filter(|(unit, _)| *unit > 0)?;
+        let protected = ByteRange::new(0, self.protected?);
+        let damaged = self
+            .refused
+            .iter()
+            .filter_map(|range| range.intersect(protected))
+            .flat_map(|range| range.start / unit..=(range.end - 1) / unit)
+            .collect::<std::collections::BTreeSet<u64>>()
+            .len() as u64;
+        (damaged > parity).then_some(RepairOutcome::Impossible {
+            damaged,
+            reachable: parity,
+        })
     }
 }
 
 // The volume checked against its record, read under `password`, and how
-// many bytes the record protects when one was read. The rebuilt units are
+// the record cuts the volume when one was read. The rebuilt units are
 // written back only when the record vouches for every protected byte.
-fn examine(volume: &mut Volume<'_>, password: Option<&str>) -> (Said, Option<u64>) {
+fn examine(
+    volume: &mut Volume<'_>,
+    password: Option<&str>,
+) -> (Said, Option<RecoveryRecordLayout>) {
     let assessment = match unrar_rs::repair_from_recovery_record(&mut *volume, password) {
         Ok(Some(repair)) => {
             let said = said(&repair.assessment, repair.patches.len() as u64);
@@ -136,7 +156,7 @@ fn examine(volume: &mut Volume<'_>, password: Option<&str>) -> (Said, Option<u64
                     volume.write_repaired(patch.offset, &patch.bytes);
                 }
             }
-            return (said, Some(repair.assessment.layout.protected_size));
+            return (said, Some(repair.assessment.layout.clone()));
         }
         Err(RarError::RecoveryRecordInsufficient { .. }) => {
             unrar_rs::assess_recovery_record(&mut *volume, password)
@@ -146,7 +166,7 @@ fn examine(volume: &mut Volume<'_>, password: Option<&str>) -> (Said, Option<u64
     match assessment {
         Ok(Some(assessment)) => {
             found_damaged(volume, &assessment);
-            (said(&assessment, 0), Some(assessment.layout.protected_size))
+            (said(&assessment, 0), Some(assessment.layout.clone()))
         }
         Ok(None) | Err(_) => (Said::Unread, None),
     }
@@ -257,19 +277,16 @@ impl Object for RarRecord {
         });
     }
 
-    fn extent(&self, _member: MemberId, _range: ByteRange, _out: &mut Vec<Extent>) {}
+    fn extent(&self, _member: MemberId, _range: ByteRange, _out: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
 
     fn envelope(&self, _envelope: u32, _range: ByteRange) -> Option<Bytes> {
         None
     }
 
-    fn claim(
-        &mut self,
-        _name: &str,
-        _first_bytes: &[u8],
-        _length: Option<u64>,
-    ) -> Option<VolumeIndex> {
-        None
+    fn claim(&mut self, _name: &str, _first_bytes: &[u8], _length: Option<u64>) -> Claim {
+        Claim::default()
     }
 
     fn bound(&mut self, _volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
@@ -306,7 +323,7 @@ impl Recovery for RarRecord {
             self.member = found;
             self.said = None;
             self.protected = None;
-            self.proven = Coverage::new();
+            self.units = None;
         }
     }
 
@@ -315,19 +332,9 @@ impl Recovery for RarRecord {
         self.member == Some(member) && self.said != Some(Said::Unread)
     }
 
-    fn feed(&mut self, member: MemberId, segments: &[Segment]) {
-        if self.member != Some(member) {
-            return;
-        }
-        for segment in segments {
-            let provenance = if segment.verified {
-                Provenance::Fresh
-            } else {
-                Provenance::Damaged
-            };
-            self.proven.write(segment.range, provenance);
-        }
-    }
+    // The articles' checksums are of the bytes as posted, and the record's
+    // are of a unit, not foldable from them: the ruling reads the volume.
+    fn feed(&mut self, _member: MemberId, _segments: &[Segment]) {}
 
     // One slice, over the bytes the record protects.
     fn verdicts(&self, member: MemberId, out: &mut Vec<SliceVerdict>) {
@@ -343,13 +350,19 @@ impl Recovery for RarRecord {
 
     fn wants(&self, _out: &mut Vec<Seek>) {}
 
+    fn refused(&mut self, member: MemberId, range: ByteRange) {
+        if self.member == Some(member) && !self.refused.contains(&range) {
+            self.refused.push(range);
+        }
+    }
+
     // The bytes before the record's header. Until a ruling read the
-    // record, the volume passed whole and there is nothing to prove apart.
+    // record, it has proved nothing apart.
     fn proves(&self, _member: MemberId, length: u64) -> ByteRange {
         ByteRange::new(0, self.protected.unwrap_or(length).min(length))
     }
 
-    fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
+    fn repair(&mut self, access: &mut dyn MemberAccess, _: weaver_graph::Budget) -> RepairOutcome {
         let said = self.rule(access);
         self.said = Some(said);
         self.outcome().unwrap_or(RepairOutcome::Waiting)
@@ -359,6 +372,9 @@ impl Recovery for RarRecord {
     // is due again once it has. One that could not read the record checked
     // nothing, so it rules unread.
     fn outcome(&self) -> Option<RepairOutcome> {
+        if let Some(short) = self.refused_short() {
+            return Some(short);
+        }
         Some(match self.said? {
             Said::Waiting => return (!self.closed).then_some(RepairOutcome::Waiting),
             Said::Intact => RepairOutcome::Clean,

@@ -147,17 +147,39 @@ impl SqliteServices {
             connect_opts = connect_opts.journal_mode(SqliteJournalMode::Wal);
         }
 
-        let pool = pool_opts
-            .connect_with(connect_opts)
-            .await
-            .map_err(|error| {
-                StateError::Database(format!("cannot open SQLite database {db_url}: {error}"))
-            })?;
+        // The run goes over one connection. A connection keeps the schema it
+        // last read, and SQLite checks a dropped column against that copy, so
+        // a migration that drops a column an earlier step added on another
+        // connection would read it as missing.
+        let label = db_url.as_str();
+        let open = move |options: SqliteConnectOptions, pool_opts: SqlitePoolOptions| async move {
+            pool_opts.connect_with(options).await.map_err(|error| {
+                StateError::Database(format!("cannot open SQLite database {label}: {error}"))
+            })
+        };
+        let migration_pool = if is_memory {
+            None
+        } else {
+            Some(
+                open(
+                    connect_opts.clone(),
+                    SqlitePoolOptions::new().max_connections(1),
+                )
+                .await?,
+            )
+        };
+        let pool = open(connect_opts, pool_opts).await?;
+        let runner = migration_pool.as_ref().unwrap_or(&pool);
 
         // Read before the run, because the run is what changes the answer.
         let pre_migration_schema_version =
-            crate::schema_migrations::max_recorded_migration_version(&pool).await?;
-        crate::schema_migrations::run_embedded_migrations(&pool, migration_mode).await?;
+            crate::schema_migrations::max_recorded_migration_version(runner).await?;
+        let migrated =
+            crate::schema_migrations::run_embedded_migrations(runner, migration_mode).await;
+        if let Some(migration_pool) = migration_pool {
+            migration_pool.close().await;
+        }
+        migrated?;
 
         Ok(Self {
             pool,

@@ -12,7 +12,7 @@
 // its own:
 //
 //   ask up      `Seek`: "I want this range of this volume ahead of the normal
-//               order", answered `Moved`, `Lost` or `Unseekable`.
+//               order", answered `Moved`, `Lost`, `Unseekable` or `Unlocated`.
 //   receive     `Delivery`: bytes of a volume at an offset, with a provenance,
 //               answered with what they turned out to be (`Emit`).
 //
@@ -24,12 +24,15 @@
 // the sniffer. It must never learn a format's layout. Nothing here names a
 // header field, an article or a piece. The one exception is the sniffer,
 // which knows magic bytes and file types, and only those, so that it can
-// say which object a member belongs to.
+// say which object a member belongs to, and its sibling the table of file
+// types people open, so that a delivery can say whether a whole file is one.
 
 pub mod deliver;
 pub mod engine;
+pub mod evidence;
 pub mod facts;
 pub mod holds;
+pub mod known;
 pub mod marks;
 pub mod member;
 pub mod names;
@@ -44,22 +47,28 @@ pub mod volume;
 mod wire;
 
 pub use deliver::{Delivery, Emit, Handed, Posted, Provenance, RecoveryKind, Why};
-pub use engine::{Engine, Extraction, Lost, Sink, Volumes};
+pub use engine::{Budget, Engine, Extraction, Lost, Pool, Sink, Volumes};
+pub use evidence::{Algorithm, Digest, Evidence, Evidenced};
 pub use facts::{
     Change, Durable, Facts, Give, Part, Restore, RestoreError, Sealed, Shelf, Take, Taken,
     decode_parts, encode_parts, encode_since,
 };
+pub use known::known_type;
 pub use marks::{Marked, Marks};
 pub use member::{Coverage, Member, MemberId, Namespace, Run};
 pub use names::NameLedger;
 pub use object::{
-    Beside, Carried, Extent, Kind, Object, ObjectId, Placement, Placements, Posting, Standing,
+    Beside, Carried, Claim, Extent, Kind, Located, Object, ObjectId, Placement, Placements,
+    Posting, Standing,
 };
 pub use records::{
     CoverageRecord, CryptRecord, EnvelopeRecord, MemberRecord, NodeRecord, NodeState, TreeRecord,
 };
 pub use recovery::{Recovery, Segment, SliceVerdict};
 pub use seek::{Pull, Purpose, Seek, SeekUp, Weight, When};
-pub use sniff::{Sniff, VERDICT_BYTES, names_recovery, par2_index, signed, sniff};
-pub use tree::{Builder, Effect, NodeId, Tree};
+pub use sniff::{
+    HEAD_VERDICT_BYTES, Sniff, VERDICT_BYTES, names_recovery, par2_index, signed, signs_a_head,
+    sniff,
+};
+pub use tree::{Builder, Disclaim, Effect, NodeId, Tree};
 pub use volume::{ByteRange, VolumeIndex};

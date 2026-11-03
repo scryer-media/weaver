@@ -1,0 +1,13 @@
+{
+  "slug": "xz-corrupted",
+  "title": "E2E.Test.xz.corrupted.2026-TESTGRP",
+  "description": "A damaged lone xz stream must fail and retain its posted compressed bytes.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "expectedRetainedOutputBLAKE3": {
+    "灯火.bin.xz": "8ed047de2748bfa544878b0770dcc8173bf82f94e26154bfab2427a4e98b1c60"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks"
+  ]
+}

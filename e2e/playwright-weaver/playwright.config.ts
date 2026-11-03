@@ -12,7 +12,7 @@ const runArtifactsDir = artifactStage
   : artifactsDir;
 
 // The release gate kills a flow at its deadline, and a killed run keeps no
-// trace, video or report. The gate passes the time Playwright may use; the run
+// trace or report. The gate passes the time Playwright may use; the run
 // stops at that deadline through the global timeout, and the helpers fixture
 // ends each test before it so a stuck test fails with its evidence. Workers
 // load this file too and inherit the deadline the runner fixed.
@@ -56,7 +56,6 @@ export default defineConfig({
     baseURL: process.env.PLAYWRIGHT_BASE_URL || "http://weaver:9090",
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
-    video: "retain-on-failure",
     viewport: { width: 1440, height: 1200 },
     launchOptions: { args: ["--disable-dev-shm-usage"] },
   },

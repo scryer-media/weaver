@@ -4,15 +4,16 @@
 // Tier two of the archive matrix: articles that arrive wrong, recovery sets
 // as posters author them, uuencode, and the wider shapes of real posts.
 //
-// Every family crosses its axes into cells, runs each cell under every
-// extraction profile, and samples the matrix's schedules by a fixed stride.
-// Every run must publish the expected files byte for byte, or end in a named
-// failure that publishes none of them. No resolved defect bypasses its verdict.
+// Every family crosses its axes into cells, runs each cell as a graph job,
+// and samples the matrix's schedules by a fixed stride. Every run must
+// publish the expected files byte for byte, deliver the members it can
+// whole and end partial, or end in a named failure that publishes none of
+// them. No resolved defect bypasses its verdict.
 //
-// Campaigns run only from the manually dispatched extended workflow;
-// small family smokes run in the default suite.
+// Campaigns and family smokes alike run only from the manually dispatched
+// extended workflow: the default suite excludes the whole archive matrix.
+use super::super::graph::Answers;
 use super::*;
-use crate::pipeline::direct_unpack::wiring::{AbortLatch, DemotionReason as ChaseDemotion};
 use std::ops::Range;
 
 mod breadth;
@@ -29,12 +30,6 @@ use post::Post;
 use recovery::Geometry;
 use run::Verdict;
 
-pub(super) const PROFILES: [ExtractionProfile; 3] = [
-    ExtractionProfile::DirectStore,
-    ExtractionProfile::Chase,
-    ExtractionProfile::Conventional,
-];
-
 // The password every encrypted tier-two fixture is written under.
 pub(super) const PASSWORD: &str = "lantern-quay";
 
@@ -48,39 +43,30 @@ pub(super) enum Pool {
 }
 
 impl Pool {
-    // The pool's cases the profile includes, built once per process.
-    fn all(self, profile: ExtractionProfile) -> &'static [(usize, Schedule)] {
-        type ProfileCases = std::sync::OnceLock<Vec<(usize, Schedule)>>;
-        static POOLS: [[ProfileCases; 3]; 2] =
-            [const { [const { std::sync::OnceLock::new() }; 3] }; 2];
-        let at = PROFILES.iter().position(|&p| p == profile).unwrap();
-        POOLS[self as usize][at].get_or_init(|| {
+    // The pool's cases, built once per process.
+    fn all(self) -> &'static [(usize, Schedule)] {
+        static POOLS: [std::sync::OnceLock<Vec<(usize, Schedule)>>; 2] =
+            [const { std::sync::OnceLock::new() }; 2];
+        POOLS[self as usize].get_or_init(|| {
             let cases: Vec<(usize, Schedule)> = match self {
                 Self::Smoke => schedules().into_iter().enumerate().collect(),
                 Self::Combined => combined_schedule_cases(),
             };
-            // A withheld volume is a cell of the damage family, not a
+            // A withheld volume is a cell of the breadth family, not a
             // schedule every family samples: the runner posts what the
             // cell's post holds.
             cases
                 .into_iter()
-                .filter(|(_, (_, interruption))| {
-                    profile.includes(*interruption) && interruption.withheld().is_none()
-                })
+                .filter(|(_, (_, interruption))| interruption.withheld().is_none())
                 .collect()
         })
     }
 
-    // `per` of the pool's cases the profile includes, by a fixed stride
-    // from an offset that turns with `rotation`, so neighbouring cells see
-    // different schedules and every schedule is reached across the cells.
-    pub(super) fn sampled(
-        self,
-        profile: ExtractionProfile,
-        per: usize,
-        rotation: usize,
-    ) -> Vec<(usize, Schedule)> {
-        let all = self.all(profile);
+    // `per` of the pool's cases, by a fixed stride from an offset that
+    // turns with `rotation`, so neighbouring cells see different schedules
+    // and every schedule is reached across the cells.
+    pub(super) fn sampled(self, per: usize, rotation: usize) -> Vec<(usize, Schedule)> {
+        let all = self.all();
         let n = all.len();
         if n <= per {
             return all.to_vec();
@@ -91,9 +77,9 @@ impl Pool {
             .collect()
     }
 
-    // How many cases [`Self::sampled`] yields for the profile.
-    pub(super) fn count(self, profile: ExtractionProfile, per: usize) -> usize {
-        self.all(profile).len().min(per)
+    // How many cases [`Self::sampled`] yields.
+    pub(super) fn count(self, per: usize) -> usize {
+        self.all().len().min(per)
     }
 }
 
@@ -119,17 +105,11 @@ pub(super) struct Built {
     pub ruling: Option<Verdict>,
 }
 
-// Run one cell under one profile, enforcing every case's verdict directly.
-pub(super) async fn run_cell<C: Cell>(
-    cell: C,
-    profile: ExtractionProfile,
-    cases: Vec<(usize, Schedule)>,
-) {
+// Run one cell, enforcing every case's verdict directly, once for each time
+// its repairs' answers may be heard.
+pub(super) async fn run_cell<C: Cell>(cell: C, cases: Vec<(usize, Schedule)>) {
     let mut built: BTreeMap<(u8, bool), Built> = BTreeMap::new();
     for (case, (order, interruption)) in cases {
-        if !profile.includes(interruption) {
-            continue;
-        }
         let key = (
             interruption.loss().map_or(0, |(mask, _)| mask),
             interruption.fails(),
@@ -139,84 +119,87 @@ pub(super) async fn run_cell<C: Cell>(
         let verdict = fixture.ruling.unwrap_or_else(|| {
             recovery::verdict(&fixture.post, fixture.geometry, &lost, interruption.fails())
         });
-        let context = format!(
-            "{cell:?} profile={profile:?} case={case} order={order:?} interruption={interruption:?} verdict={verdict:?} par2={}",
-            cell.par2()
-        );
-        eprintln!("{context}");
-        let ran = run::run(&fixture.post, profile, &order, interruption).await;
-        ran.assert(&fixture.post, profile, verdict, &context);
+        let recovery = !fixture.post.index_of(post::Role::Index).is_empty()
+            || !fixture.post.index_of(post::Role::Recovery).is_empty();
+        for &answers in Answers::under(recovery) {
+            let context = format!(
+                "{cell:?} case={case} order={order:?} interruption={interruption:?} answers={answers:?} verdict={verdict:?} par2={}",
+                cell.par2()
+            );
+            eprintln!("{context}");
+            let ran = run::run(&fixture.post, &order, (interruption, answers)).await;
+            ran.assert(
+                &fixture.post,
+                verdict,
+                fixture.geometry.is_some() && interruption.fails(),
+                &context,
+            );
+        }
     }
 }
 
-// A cell's smoke: every data group in order and then reversed, under every
-// profile, with nothing lost.
+// A cell's smoke: every data group in order and then reversed, with
+// nothing lost.
 pub(super) async fn smoke<C: Cell>(cell: C) {
     let forward = slot_arrivals(4);
     let mut backward = forward.clone();
     backward.reverse();
-    for profile in PROFILES {
-        run_cell(
-            cell,
-            profile,
-            vec![
-                (0, (forward.clone(), Interruption::None)),
-                (1, (backward.clone(), Interruption::None)),
-            ],
-        )
-        .await;
-    }
+    run_cell(
+        cell,
+        vec![
+            (0, (forward, Interruption::None)),
+            (1, (backward, Interruption::None)),
+        ],
+    )
+    .await;
 }
 
 // A cell's smoke under a loss: the first and last groups each lose their
-// middle article, in order and reversed, under every profile.
+// middle article, in order and reversed.
 pub(super) async fn loss_smoke<C: Cell>(cell: C) {
     let forward = slot_arrivals(4);
     let mut backward = forward.clone();
     backward.reverse();
-    for profile in PROFILES {
-        run_cell(
-            cell,
-            profile,
-            vec![
+    run_cell(
+        cell,
+        vec![
+            (
+                0,
                 (
-                    0,
-                    (
-                        forward.clone(),
-                        Interruption::Loss {
-                            mask: 0b1001,
-                            index_first: true,
-                        },
-                    ),
+                    forward,
+                    Interruption::Loss {
+                        mask: 0b1001,
+                        index_first: true,
+                    },
                 ),
+            ),
+            (
+                1,
                 (
-                    1,
-                    (
-                        backward.clone(),
-                        Interruption::Loss {
-                            mask: 0b1001,
-                            index_first: false,
-                        },
-                    ),
+                    backward,
+                    Interruption::Loss {
+                        mask: 0b1001,
+                        index_first: false,
+                    },
                 ),
-            ],
-        )
-        .await;
-    }
+            ),
+        ],
+    )
+    .await;
 }
 
-// One family's work: its (cell, profile) units with the cases each runs,
+// One family's work: its cell units with the cases each runs,
 // laid end to end and cut into contiguous shards so a shard rebuilds as few
 // fixtures as it can.
 pub(super) struct Family<C> {
-    pub units: Vec<(C, ExtractionProfile, Pool, usize, usize)>,
+    pub units: Vec<(C, Pool, usize, usize)>,
 }
 
 impl<C: Cell> Family<C> {
     pub(super) fn total(&self) -> usize {
         self.units
             .iter()
-            .map(|&(_, profile, pool, per, _)| pool.count(profile, per))
+            .map(|&(_, pool, per, _)| pool.count(per))
             .sum()
     }
 
@@ -229,7 +212,7 @@ impl<C: Cell> Family<C> {
         let total: usize = self
             .units
             .iter()
-            .map(|&(cell, profile, pool, per, _)| pool.count(profile, per) * cell.case_weight())
+            .map(|&(cell, pool, per, _)| pool.count(per) * cell.case_weight())
             .sum();
         let range = shard * total / shards..(shard + 1) * total / shards;
         let replay = std::env::var("WEAVER_TIER2_CASE").ok().map(|selection| {
@@ -245,8 +228,8 @@ impl<C: Cell> Family<C> {
         });
         let mut at = 0;
         let mut weighted_at = 0;
-        for &(cell, profile, pool, per, rotation) in &self.units {
-            let count = pool.count(profile, per);
+        for &(cell, pool, per, rotation) in &self.units {
+            let count = pool.count(per);
             let unit = at..at + count;
             at += count;
             let weight = cell.case_weight();
@@ -257,7 +240,7 @@ impl<C: Cell> Family<C> {
                 continue;
             }
             let cases: Vec<_> = pool
-                .sampled(profile, per, rotation)
+                .sampled(per, rotation)
                 .into_iter()
                 .enumerate()
                 .filter_map(|(k, (_, schedule))| {
@@ -270,7 +253,7 @@ impl<C: Cell> Family<C> {
                 })
                 .collect();
             if !cases.is_empty() {
-                run_cell(cell, profile, cases).await;
+                run_cell(cell, cases).await;
             }
         }
     }

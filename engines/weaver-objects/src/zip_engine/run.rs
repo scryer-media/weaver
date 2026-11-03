@@ -10,13 +10,14 @@ use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use ::zip::ZipArchive;
+use ::zip::read::ZipReadOptions;
 use bytes::Bytes;
 use weaver_graph::{Emit, Extraction, MemberId, Provenance, Sink, Volumes};
 
 use super::image::{Image, Unopened};
 use crate::engine::Joined;
 use crate::verdict;
+use crate::zip::records::{self, Shape};
 
 pub(super) struct Run {
     password: Option<String>,
@@ -29,10 +30,15 @@ impl Run {
 }
 
 impl Extraction for Run {
-    fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, sink: &mut Sink<'_>) {
+    fn run(
+        self: Box<Self>,
+        volumes: Arc<dyn Volumes>,
+        sink: &mut Sink<'_>,
+        budget: weaver_graph::Budget,
+    ) {
         let joined = Joined::new(volumes);
         let failed = joined.failure();
-        let image = match Image::open(joined) {
+        let image = match Image::open(joined, &budget) {
             Ok(image) => image,
             Err(Unopened::Refused(why)) if !failed.load(Ordering::Acquire) => {
                 sink(Emit::Refuse(why));
@@ -74,31 +80,48 @@ struct Walk<'s, 'a> {
 
 impl Walk<'_, '_> {
     fn all(&mut self, image: Image, password: Option<&str>) -> Result<(), Option<Emit>> {
-        let mut archive = ZipArchive::new(image).map_err(|error| Some(verdict::zip(&error)))?;
+        let mut archive = image
+            .archive()
+            .map_err(|error| Some(verdict::zip(&error)))?;
         for index in 0..archive.len() {
-            let file = match password {
-                Some(password) => archive.by_index_decrypt(index, password.as_bytes()),
-                None => archive.by_index(index),
+            // An entry whose local header says another name, size or method
+            // than the directory is two files at once: the one the directory
+            // lists and the one a header walk finds. Neither is the member.
+            let options = ZipReadOptions::new()
+                .password(password.map(str::as_bytes))
+                .enforce_header_consistency(true);
+            let mut file = archive
+                .by_index_with_options(index, options)
+                .map_err(|error| Some(verdict::zip(&error)))?;
+            let name = file
+                .name()
+                .map_err(|error| Some(verdict::zip(&error)))?
+                .into_owned();
+            // A directory is a member with nothing in it, named as the store
+            // names it. Links and devices are not file bodies, so none is a
+            // member and the files around them stand.
+            let shape = records::shape(&name, file.unix_mode());
+            let length = match shape {
+                Shape::File => file.size(),
+                Shape::Directory => 0,
+                Shape::Other => continue,
             };
-            let mut file = file.map_err(|error| Some(verdict::zip(&error)))?;
-            // The namespace has no directories, and no links or devices: a
-            // directory is implied by the paths of the members inside it, and
-            // the others are not file bodies.
-            if !is_file_body(file.is_dir(), file.unix_mode()) {
-                continue;
-            }
+            let name = records::member_name(name, shape);
             let member = MemberId(self.next);
             self.next += 1;
             self.say(Emit::Member {
                 member,
-                name: file
-                    .name()
-                    .map_err(|error| Some(verdict::zip(&error)))?
-                    .into_owned(),
-                length: Some(file.size()),
+                name,
+                length: Some(length),
             })?;
             self.open = Some(member);
             let encrypted = file.encrypted();
+            if shape == Shape::File && !encrypted {
+                self.say(Emit::Checksum {
+                    member,
+                    crc32: file.crc32(),
+                })?;
+            }
             let mut out = Out {
                 sink: &mut *self.sink,
                 member,
@@ -121,12 +144,6 @@ impl Walk<'_, '_> {
     }
 }
 
-fn is_file_body(directory: bool, mode: Option<u32>) -> bool {
-    const KIND: u32 = 0o170_000;
-    const FILE: u32 = 0o100_000;
-    !directory && mode.is_none_or(|mode| matches!(mode & KIND, 0 | FILE))
-}
-
 // The decoder's output, handed to the sink as it is written.
 struct Out<'s, 'a> {
     sink: &'s mut Sink<'a>,
@@ -143,7 +160,7 @@ impl Write for Out<'_, '_> {
         let heard = (self.sink)(Emit::Bytes {
             member: self.member,
             offset: self.offset,
-            bytes: Bytes::copy_from_slice(bytes),
+            bytes: Bytes::copy_from_slice(bytes).into(),
             provenance: Provenance::Fresh,
         });
         if !heard {

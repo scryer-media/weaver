@@ -24,6 +24,7 @@ use crate::pipeline::graph::root::intake::Decoded;
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::status::Delivery;
 use crate::pipeline::graph::status::RepairSlots;
+use crate::pipeline::graph::status::Unarrived;
 
 const CANDIDATES: [&str; 4] = ["lantern-one", "lantern-two", OPENS, "lantern-four"];
 const WRONG: [&str; 4] = ["lantern-one", "lantern-two", "lantern-four", "lantern-five"];
@@ -115,6 +116,7 @@ impl Refusing {
                     intact: true,
                     positioned: true,
                     length: Some(bytes.len() as u64),
+                    declared_end: None,
                     segments: Vec::new(),
                 },
                 &mut RepairSlots::default(),
@@ -154,6 +156,13 @@ impl Refusing {
         }
     }
 
+    // The checkpoint `stamp`, taken of the job as it stands, has committed:
+    // a file waiting for it moves to its name.
+    fn checkpoint(&mut self, stamp: u64) {
+        self.job.recorded(stamp);
+        self.job.committed(stamp).unwrap();
+    }
+
     fn refused(&self, member: u32) -> Option<Why> {
         self.job.writer().refused(NodeId::ROOT, MemberId(member))
     }
@@ -164,6 +173,20 @@ impl Refusing {
 
     fn exists(&self, name: &str) -> bool {
         self.dir.path().join(name).exists()
+    }
+
+    // The files under the directory finalize never delivers.
+    fn internal(&self) -> Vec<String> {
+        let Ok(entries) =
+            std::fs::read_dir(self.dir.path().join(weaver_graph::names::INTERNAL_DIR))
+        else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     // A root member is a leaf: nothing is bound over it.
@@ -231,6 +254,8 @@ fn what_a_refused_store_closed_whole_is_delivered_whole() {
         |_| false,
         |_, _| false,
         |_, _| None,
+        |_, _| false,
+        |_| Unarrived::Short,
     );
     assert_eq!(
         delivery,
@@ -255,12 +280,44 @@ fn what_a_refused_store_closed_whole_is_delivered_whole() {
     }
 }
 
+// The store took the last bytes of each body and placed them in its member's
+// map, but never wrote them to the member, as a cipher keeps a block short of
+// its end. Refused, it gives them back itself: the volumes come back whole
+// and no byte of them is said to be damaged.
+#[test]
+fn a_refused_store_gives_back_bytes_it_took_and_never_placed() {
+    let mut refusing = refusing(Mode::Staging, 2, &[]);
+    refusing.deliver_all();
+    for member in 0..2 {
+        assert!(refusing.is_leaf(member));
+        assert_eq!(refusing.refused(member), Some(Why::Unsupported));
+        assert_eq!(
+            refusing.file(&format!("lantern.part{}.rar", member + 1)),
+            refusing.volumes[member as usize]
+        );
+    }
+    let damaged: Vec<_> = refusing
+        .job
+        .tree()
+        .namespace(NodeId::ROOT)
+        .unwrap()
+        .damaged_ranges()
+        .collect();
+    assert_eq!(damaged, Vec::new());
+    assert_eq!(refusing.job.phase(), RootPhase::Done);
+}
+
 #[tokio::test]
 async fn a_store_that_needs_an_engine_hands_its_volumes_to_one() {
     let mut refusing = refusing(Mode::NeedsEngine, 2, &[]);
     refusing.deliver_all();
+    // The store's files go once the checkpoint that says so commits.
     for member in 0..2 {
         assert_eq!(refusing.refused(member), Some(Why::Compressed));
+        assert!(refusing.exists(&format!("inner-{member}.bin")));
+    }
+    refusing.checkpoint(1);
+    for member in 0..2 {
         assert!(!refusing.exists(&format!("inner-{member}.bin")));
     }
     assert_eq!(
@@ -269,10 +326,17 @@ async fn a_store_that_needs_an_engine_hands_its_volumes_to_one() {
         "one engine over both"
     );
     refusing.until_ended().await;
+    // Publication waits for the checkpoints that record the final names.
+    let mut stamp = 1;
+    while refusing.job.moves_waiting() {
+        refusing.job.recorded(stamp);
+        refusing.job.committed(stamp).unwrap();
+        stamp += 1;
+    }
     // The engine read the volumes back from what the store had placed, its
     // header envelopes and its members' files, and wrote what it found.
     for member in 0..2 {
-        assert_eq!(refusing.file(&format!("echo-{member}.bin")), body(member));
+        assert_eq!(refusing.file(&format!("echo-{member}.mkv")), body(member));
     }
     assert_eq!(refusing.job.phase(), RootPhase::Done);
 }
@@ -316,8 +380,33 @@ fn a_store_no_candidate_opens_refuses_after_the_last() {
     assert_eq!(refusing.offers(), WRONG.to_vec());
     assert!(refusing.is_leaf(0));
     assert_eq!(refusing.refused(0), Some(Why::EncryptedHeader));
+    refusing.checkpoint(1);
     assert_eq!(refusing.file("lantern.part1.rar"), refusing.volumes[0]);
     assert_eq!(refusing.job.phase(), RootPhase::Done);
+}
+
+// A store that kept every byte as envelope and then refused gave them all
+// back to its leaf in the envelope's own file: the posted bytes are on disk
+// once, and the file moves to the leaf's name once the checkpoint that
+// records it as the leaf's has committed, leaving nothing behind.
+#[test]
+fn a_store_that_refuses_after_keeping_everything_as_envelope_leaves_none_behind() {
+    let mut refusing = refusing(Mode::Locked, 1, &WRONG);
+    refusing.deliver(0);
+    assert_eq!(refusing.refused(0), Some(Why::EncryptedHeader));
+    assert!(
+        !refusing.exists("lantern.part1.rar"),
+        "no checkpoint has recorded the leaf"
+    );
+    assert_eq!(
+        refusing.internal().len(),
+        1,
+        "one file holds the posted bytes"
+    );
+    assert!(refusing.job.moves_waiting());
+    refusing.checkpoint(1);
+    assert_eq!(refusing.file("lantern.part1.rar"), refusing.volumes[0]);
+    assert_eq!(refusing.internal(), Vec::<String>::new());
 }
 
 #[tokio::test]
@@ -339,6 +428,7 @@ async fn an_engine_that_refuses_leaves_a_leaf_nothing_is_bound_over() {
     assert_eq!(refusing.refused(0), Some(Why::Unsupported));
     assert!(refusing.is_leaf(0));
     assert!(refusing.job.tree().engines().is_empty());
+    refusing.checkpoint(1);
     assert_eq!(refusing.file("lantern.part1.rar"), refusing.volumes[0]);
     assert_eq!(refusing.starts.load(Ordering::SeqCst), 1);
     assert_eq!(refusing.job.phase(), RootPhase::Done);

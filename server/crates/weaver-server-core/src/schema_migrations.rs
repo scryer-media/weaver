@@ -18,12 +18,12 @@ use crate::migration_hook_ids;
 use crate::persistence::sql_runtime::SqlConn;
 
 pub(crate) mod egress_quotas_v53;
-pub(crate) mod networking_bandwidth_v75;
+pub(crate) mod networking_bandwidth_v81;
 pub(crate) mod proxy_resolver_v64;
 mod schedule_tracks_v55;
 pub(crate) mod script_concurrency_v58;
 pub(crate) mod script_instances_v55;
-pub(crate) mod tracker_hosts_v86;
+pub(crate) mod tracker_hosts_v92;
 pub(crate) mod unwanted_extensions_v56;
 
 const EMBEDDED_MIGRATION_CATALOG: &[u8] =
@@ -35,7 +35,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 96;
+const CURRENT_SCHEMA_VERSION: i64 = 102;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -825,11 +825,11 @@ async fn run_rust_hook(
         proxy_resolver_v64::HOOK_ID => {
             proxy_resolver_v64::name_proxy_resolvers(&mut SqlConn::Sqlite(tx)).await
         }
-        networking_bandwidth_v75::HOOK_ID => {
-            networking_bandwidth_v75::move_bandwidth_to_networking(&mut SqlConn::Sqlite(tx)).await
+        networking_bandwidth_v81::HOOK_ID => {
+            networking_bandwidth_v81::move_bandwidth_to_networking(&mut SqlConn::Sqlite(tx)).await
         }
-        tracker_hosts_v86::HOOK_ID => {
-            tracker_hosts_v86::fill_tracker_hosts(&mut SqlConn::Sqlite(tx)).await
+        tracker_hosts_v92::HOOK_ID => {
+            tracker_hosts_v92::fill_tracker_hosts(&mut SqlConn::Sqlite(tx)).await
         }
         other => Err(StateError::Database(format!(
             "unknown migration hook id '{other}'"
@@ -1513,27 +1513,26 @@ mod tests {
         assert_eq!(depth, Some(8));
     }
 
-    // Every job that existed before the engine stamp ran on the classic
-    // engine, so migration 66 must read it back as classic, active or
-    // finished, with no root phase.
+    // A job that was active or finished before migration 74 keeps its row
+    // when the engine column goes, active or finished.
     #[tokio::test]
-    async fn sqlite_migration_66_stamps_existing_jobs_classic() {
+    async fn sqlite_migration_74_drops_the_engine_column_and_keeps_jobs() {
         let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("pre-engine-stamp.db");
+        let db_path = temp.path().join("pre-graph-engine.db");
         let pool = open_test_pool(&db_path).await;
         let catalog = embedded_catalog().unwrap();
         let payload = embedded_payload_bytes().unwrap();
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(65), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(73), true)
             .await
             .unwrap();
         assert_eq!(
-            pragma_column_count(&pool, "active_jobs", &["engine", "root_phase"]).await,
-            0
+            pragma_column_count(&pool, "active_jobs", &["engine"]).await,
+            1
         );
         sqlx::query(
             "INSERT INTO active_jobs
-                (job_id, nzb_hash, nzb_path, output_dir, status, error, created_at, category, metadata)
-             VALUES (101, ?, 'active.nzb', 'active-output', 'queued', NULL, 1, NULL, NULL)",
+                (job_id, nzb_hash, nzb_path, output_dir, status, error, created_at, category, metadata, engine)
+             VALUES (101, ?, 'active.nzb', 'active-output', 'queued', NULL, 1, NULL, NULL, 'classic')",
         )
         .bind(vec![1_u8; 32])
         .execute(&pool)
@@ -1543,8 +1542,8 @@ mod tests {
             "INSERT INTO job_history
                 (job_id, name, status, total_bytes, downloaded_bytes,
                  optional_recovery_bytes, optional_recovery_downloaded_bytes,
-                 failed_bytes, health, created_at, completed_at)
-             VALUES (102, 'history', 'complete', 0, 0, 0, 0, 0, 1000, 1, 2)",
+                 failed_bytes, health, created_at, completed_at, engine)
+             VALUES (102, 'history', 'complete', 0, 0, 0, 0, 0, 1000, 1, 2, 'classic')",
         )
         .execute(&pool)
         .await
@@ -1554,28 +1553,29 @@ mod tests {
         run_embedded_migrations_on_path_blocking(&db_path).unwrap();
 
         let pool = open_test_pool(&db_path).await;
-        let root_phase: Option<String> =
-            sqlx::query_scalar("SELECT root_phase FROM active_jobs WHERE job_id = 101")
+        assert_eq!(
+            pragma_column_count(&pool, "active_jobs", &["engine"]).await,
+            0
+        );
+        assert_eq!(
+            pragma_column_count(&pool, "job_history", &["engine"]).await,
+            0
+        );
+        let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_jobs WHERE job_id = 101")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(active, 1);
+        let finished: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM job_history WHERE job_id = 102")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(root_phase, None);
+        assert_eq!(finished, 1);
         pool.close().await;
-
-        let db = crate::Database::open(&db_path).unwrap();
-        assert_eq!(
-            db.load_active_job_engine(crate::jobs::ids::JobId(101))
-                .unwrap(),
-            Some(crate::pipeline::graph::Engine::Classic)
-        );
-        assert_eq!(
-            db.load_job_history_engine(crate::jobs::ids::JobId(102))
-                .unwrap(),
-            Some(crate::pipeline::graph::Engine::Classic)
-        );
     }
 
-    // Migration 85 gives each torrent its saved peers and bans: an existing
+    // Migration 91 gives each torrent its saved peers and bans: an existing
     // torrent starts with none. They sit on its ledger row once the lean
     // resume migration moves them there.
     #[tokio::test]
@@ -1598,7 +1598,7 @@ mod tests {
 
         let db_path = temp.path().join("pre-torrent-peers.db");
         let pool = open_test_pool(&db_path).await;
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(82), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(88), true)
             .await
             .unwrap();
         assert_eq!(pragma_column_count(&pool, "torrents", &columns).await, 0);
@@ -1658,7 +1658,7 @@ mod tests {
 
         let db_path = temp.path().join("pre-lean-resume.db");
         let pool = open_test_pool(&db_path).await;
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(88), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(94), true)
             .await
             .unwrap();
         assert_eq!(
@@ -1718,7 +1718,7 @@ mod tests {
         pool.close().await;
     }
 
-    // Migration 86 keeps the hosts the torrents already announce to, each once
+    // Migration 92 keeps the hosts the torrents already announce to, each once
     // and as a rule matches it.
     #[tokio::test]
     async fn sqlite_migration_86_fills_tracker_hosts_from_the_torrents() {
@@ -1727,7 +1727,7 @@ mod tests {
         let pool = open_test_pool(&db_path).await;
         let catalog = embedded_catalog().unwrap();
         let payload = embedded_payload_bytes().unwrap();
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(85), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(91), true)
             .await
             .unwrap();
         for (job_id, hash) in [(7_i64, 7_u8), (8, 8)] {
@@ -1764,7 +1764,7 @@ mod tests {
         pool.close().await;
     }
 
-    // Migration 87 gives each torrent its own upload and download limits: a
+    // Migration 93 gives each torrent its own upload and download limits: a
     // fresh database has them, and an existing torrent is unlimited both
     // ways.
     #[tokio::test]
@@ -1783,7 +1783,7 @@ mod tests {
 
         let db_path = temp.path().join("pre-rate-limits.db");
         let pool = open_test_pool(&db_path).await;
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(86), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(92), true)
             .await
             .unwrap();
         assert_eq!(pragma_column_count(&pool, "torrents", &columns).await, 0);
@@ -1842,7 +1842,7 @@ mod tests {
 
         let db_path = temp.path().join("pre-file-priority.db");
         let pool = open_test_pool(&db_path).await;
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(87), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(93), true)
             .await
             .unwrap();
         assert_eq!(pragma_column_count(&pool, "torrents", &columns).await, 0);
@@ -1878,7 +1878,7 @@ mod tests {
         pool.close().await;
     }
 
-    // Migration 78 keeps each tracker's place in the announce list and drops
+    // Migration 84 keeps each tracker's place in the announce list and drops
     // the announce columns, which the session answers instead.
     #[tokio::test]
     async fn sqlite_migration_78_keeps_only_the_tracker_listing() {
@@ -1887,7 +1887,7 @@ mod tests {
         let pool = open_test_pool(&db_path).await;
         let catalog = embedded_catalog().unwrap();
         let payload = embedded_payload_bytes().unwrap();
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(77), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(83), true)
             .await
             .unwrap();
         sqlx::query(
@@ -1954,7 +1954,7 @@ mod tests {
         pool.close().await;
     }
 
-    // Migration 92 records who named each tracker; every row before it is
+    // Migration 98 records who named each tracker; every row before it is
     // the torrent's, as nothing recorded which were added by hand.
     #[tokio::test]
     async fn sqlite_migration_92_marks_every_existing_tracker_the_torrents() {
@@ -1963,7 +1963,7 @@ mod tests {
         let pool = open_test_pool(&db_path).await;
         let catalog = embedded_catalog().unwrap();
         let payload = embedded_payload_bytes().unwrap();
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(91), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(97), true)
             .await
             .unwrap();
         sqlx::query(
@@ -2008,7 +2008,7 @@ mod tests {
         pool.close().await;
     }
 
-    // Migration 93 forgets the mapped ports a test kept for routes; the
+    // Migration 99 forgets the mapped ports a test kept for routes; the
     // settings beside them stay.
     #[tokio::test]
     async fn sqlite_migration_93_forgets_saved_mapped_ports() {
@@ -2017,7 +2017,7 @@ mod tests {
         let pool = open_test_pool(&db_path).await;
         let catalog = embedded_catalog().unwrap();
         let payload = embedded_payload_bytes().unwrap();
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(92), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(98), true)
             .await
             .unwrap();
         sqlx::query(
@@ -2149,16 +2149,8 @@ mod tests {
         for table in [
             "active_file_progress",
             "active_files",
-            "active_par2",
-            "active_par2_files",
             "active_extracted",
-            "active_failed_extractions",
-            "active_extraction_chunks",
-            "active_archive_headers",
-            "active_rar_volume_facts",
             "active_detected_archives",
-            "active_volume_status",
-            "active_rar_verified_suspect",
             "active_file_identities",
         ] {
             let sql = format!("SELECT COUNT(*) FROM {table}");
@@ -2223,12 +2215,6 @@ mod tests {
                 Some("idle".to_string()),
             )
         );
-
-        let mut tx = pool.begin().await.unwrap();
-        restart_active_jobs_drop_active_segments_v28(&mut tx)
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
     }
 
     #[tokio::test]
@@ -2369,15 +2355,8 @@ mod tests {
             pragma_column_count(&pool, "servers", &["priority", "tls_ca_cert"]).await,
             2
         );
-        assert_eq!(
-            pragma_column_count(
-                &pool,
-                "active_extraction_chunks",
-                &["appended", "start_offset", "end_offset"]
-            )
-            .await,
-            3
-        );
+        // A later version drops the table these columns were added to.
+        assert!(!sqlite_table_exists(&pool, "active_extraction_chunks").await);
     }
 
     #[tokio::test]

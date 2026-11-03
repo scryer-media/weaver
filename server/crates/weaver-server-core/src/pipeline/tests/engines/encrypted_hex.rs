@@ -21,11 +21,11 @@ const CELL: Cell = Cell {
     binding: Binding::Par2Posted,
 };
 
-// Replay index 268: every volume lost whole, the PAR2 set in last.
-const ALL_LOST: usize = 268;
-// Replay index 357: every article in order, the first volume withheld until
+// Replay index 196: every volume lost whole, the PAR2 set in last.
+const ALL_LOST: usize = 196;
+// Replay index 285: every article in order, the first volume withheld until
 // late, after the recovery volumes.
-const FIRST_WITHHELD: usize = 357;
+const FIRST_WITHHELD: usize = 285;
 
 // All four volumes come back from one repair together, each founding a
 // store. A volume given back carries its walk only as far as its main
@@ -33,7 +33,7 @@ const FIRST_WITHHELD: usize = 357;
 // owner wants them: the store that holds the first volume takes it on the
 // number that main header states, and the set comes together in one store.
 #[tokio::test]
-async fn an_encrypted_header_hex_set_par2_recreates_whole_delivers_under_graph() {
+async fn an_encrypted_header_hex_set_par2_recreates_whole_delivers() {
     cell_case(CELL, ALL_LOST, RecoveryFormat::Par2).await;
 }
 
@@ -43,7 +43,6 @@ async fn an_encrypted_header_hex_set_par2_recreates_whole_delivers_under_graph()
 // header when the second volume is offered to it: that says nothing
 // against the second volume's stated number, so the store takes it.
 #[tokio::test]
-async fn an_encrypted_header_hex_set_whose_withheld_first_volume_par2_recreates_delivers_under_graph()
- {
+async fn an_encrypted_header_hex_set_whose_withheld_first_volume_par2_recreates_delivers() {
     cell_case(CELL, FIRST_WITHHELD, RecoveryFormat::Par2Ladder).await;
 }

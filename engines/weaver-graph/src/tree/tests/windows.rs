@@ -69,7 +69,9 @@ impl Object for Tape {
             range,
         });
     }
-    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
     }
@@ -88,7 +90,7 @@ impl Recovery for Tape {
     fn feed(&mut self, _: MemberId, _: &[Segment]) {}
     fn verdicts(&self, _: MemberId, _: &mut Vec<SliceVerdict>) {}
     fn wants(&self, _: &mut Vec<Seek>) {}
-    fn repair(&mut self, _: &mut dyn MemberAccess) -> RepairOutcome {
+    fn repair(&mut self, _: &mut dyn MemberAccess, _: crate::Budget) -> RepairOutcome {
         RepairOutcome::Clean
     }
     fn outcome(&self) -> Option<RepairOutcome> {
@@ -152,7 +154,7 @@ fn a_window_takes_what_passed_and_what_passes_at_its_own_offsets() {
         first,
         Posted {
             offset: 12,
-            bytes: Bytes::from(vec![7u8; 25]),
+            bytes: Bytes::from(vec![7u8; 25]).into(),
             provenance: Provenance::Damaged,
         },
         &mut Taping(Arc::clone(&log)),
@@ -249,14 +251,14 @@ fn damage_on_the_member_is_lost_to_the_window_where_they_overlap() {
     heard(&log);
     let mut effects = Vec::new();
     let mut taping = Taping(Arc::clone(&log));
-    tree.damaged_under_windows(
+    tree.damage_reached(
         NodeId::ROOT,
         first,
         ByteRange::new(25, 40),
         &mut taping,
         &mut effects,
     );
-    tree.damaged_under_windows(
+    tree.damage_reached(
         NodeId::ROOT,
         first,
         ByteRange::new(0, 10),

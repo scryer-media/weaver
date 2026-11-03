@@ -21,7 +21,7 @@ const BUFFER: usize = 4096;
 impl Decoder for Brotli {
     const KIND: Kind = Kind::Brotli;
 
-    fn window(first: &[u8]) -> u64 {
+    fn window(first: &[u8], _budget: &weaver_graph::Budget) -> u64 {
         1 << first.first().map_or(LARGEST_BITS, |&byte| bits(byte))
     }
 

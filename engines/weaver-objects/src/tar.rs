@@ -8,7 +8,8 @@
 // straight through to its member; headers, padding, the two zero blocks that
 // end the archive and whatever follows them are envelope, kept by the object
 // so it can hand them back. Tar carries no checksum over data, so nothing is
-// verified; a header's own checksum is the only damage it can see.
+// verified; a header's own checksum is the only failure it can see, and it
+// speaks of the walk, never of the volume's bytes.
 //
 // The object is pure: no I/O, no threads, no files. Bytes past the header
 // the walk waits on are held by its owner, who hands them back once the walk
@@ -19,17 +20,16 @@ mod header;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashSet;
-
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Durable, Emit, Extent, Facts, Kind, MemberId, Object, Placement,
-    Provenance, Pull, Seek, Standing, VolumeIndex, Why,
+    ByteRange, Coverage, Delivery, Durable, Emit, Evidenced, Extent, Facts, Kind, Located,
+    MemberId, Object, Placement, Provenance, Pull, Seek, Standing, VolumeIndex, Why,
 };
 
 use crate::grid::crc32;
 use crate::kept::Kept;
+use crate::lost::Lost;
 use header::{Body, Read};
 
 // The one envelope, in the volume's own coordinates.
@@ -100,13 +100,12 @@ pub struct Tar {
     end: Option<End>,
     length: Option<u64>,
     reached: u64,
-    lost: Vec<ByteRange>,
-    damage_said: HashSet<(u64, u64, u32)>,
+    lost: Lost,
     gone: bool,
 }
 
 impl Durable for Tar {
-    const VERSION: u16 = 1;
+    const VERSION: u16 = 2;
 
     // Entries follow one another from the front, each inside its own span,
     // up to the cursor, and name only members said.
@@ -131,9 +130,9 @@ impl Tar {
         Self::default()
     }
 
-    fn give_up(&mut self, emit: Emit, out: &mut Vec<Emit>) {
+    fn give_up(&mut self, why: Why, out: &mut Vec<Emit>) {
         self.gone = true;
-        out.push(emit);
+        out.push(Emit::Refuse(why));
     }
 
     fn crc_of(&self, range: ByteRange) -> u32 {
@@ -146,8 +145,7 @@ impl Tar {
             match header::read(&self.kept, self.cursor) {
                 Read::Wait(range) => return self.wait(range, out),
                 Read::Damaged(block) => {
-                    self.wait(ByteRange::new(self.cursor, block.end), out);
-                    return self.say_damaged(block, out);
+                    return self.wait(ByteRange::new(self.cursor, block.end), out);
                 }
                 Read::End(range) => {
                     self.ahead = None;
@@ -158,31 +156,17 @@ impl Tar {
                     return self.want_tail();
                 }
                 Read::Entry(entry) => self.record(entry, out),
-                Read::Unsupported => return self.give_up(Emit::Refuse(Why::Unsupported), out),
+                Read::Unsupported => return self.give_up(Why::Unsupported, out),
             }
         }
     }
 
     fn wait(&mut self, range: ByteRange, out: &mut Vec<Emit>) {
-        if self.lost.iter().any(|lost| lost.intersect(range).is_some()) {
-            return self.give_up(Emit::Refuse(Why::Unrepairable), out);
+        if self.lost.meets(range) {
+            return self.give_up(Why::Unrepairable, out);
         }
         self.ahead = Some(range);
         self.kept.want(range);
-    }
-
-    // Said once for each version of the header's bytes; the walk then waits
-    // for a repair to deliver it again.
-    fn say_damaged(&mut self, range: ByteRange, out: &mut Vec<Emit>) {
-        if self
-            .damage_said
-            .insert((range.start, range.end, self.crc_of(range)))
-        {
-            out.push(Emit::Damaged {
-                volume: VOLUME,
-                range,
-            });
-        }
     }
 
     fn record(&mut self, entry: header::Entry, out: &mut Vec<Emit>) {
@@ -191,11 +175,11 @@ impl Tar {
             Some((ByteRange::new(entry.data, data_end), end))
         });
         let Some((data, end)) = bounds else {
-            return self.give_up(Emit::Refuse(Why::Unsupported), out);
+            return self.give_up(Why::Unsupported, out);
         };
         let carries = entry.body == Body::File;
         if !carries && data.len() > ENVELOPE_LIMIT {
-            return self.give_up(Emit::Refuse(Why::Unsupported), out);
+            return self.give_up(Why::Unsupported, out);
         }
         if !carries {
             self.kept.want(data);
@@ -296,7 +280,7 @@ impl Tar {
     fn route(
         &mut self,
         range: ByteRange,
-        bytes: &[u8],
+        bytes: &Evidenced,
         provenance: Provenance,
         out: &mut Vec<Emit>,
     ) {
@@ -318,7 +302,7 @@ impl Tar {
             out.push(Emit::Bytes {
                 member,
                 offset,
-                bytes: Bytes::copy_from_slice(&bytes[at..at + part.len() as usize]),
+                bytes: bytes.slice(at..at + part.len() as usize),
                 provenance,
             });
             let said = &mut self.members[member.0 as usize];
@@ -340,6 +324,19 @@ impl Tar {
             (Some(end), None) => end.range.end,
             (None, _) => self.ahead.map_or(self.cursor, |ahead| ahead.end),
         }
+    }
+
+    // A walk that cannot reach the end once nothing more arrives: it waits on
+    // a header whose own checksum fails, or the volume ends inside what the
+    // walk needs. Both speak of what the tar reads out, never of the
+    // volume's bytes, so the walk marks nothing in the volume.
+    fn short(&self) -> Option<Why> {
+        if self.end.is_some() {
+            return None;
+        }
+        let header = matches!(header::read(&self.kept, self.cursor), Read::Damaged(_));
+        let length = self.length.unwrap_or(self.reached);
+        (header || self.missing_tail(length).is_some()).then_some(Why::Unrepairable)
     }
 
     // What the walk still needs when nothing more can arrive: the tail of an
@@ -394,42 +391,30 @@ impl Object for Tar {
         self.route(range, delivery.bytes, delivery.provenance, out);
     }
 
-    fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
-        if volume != VOLUME || self.end.is_some() {
-            return;
-        }
-        let length = self.length.unwrap_or(self.reached);
-        if let Some(range) = self.missing_tail(length)
-            && self.damage_said.insert((range.start, range.end, 0))
-        {
-            out.push(Emit::Damaged {
-                volume: VOLUME,
-                range,
-            });
-        }
-    }
+    fn volume_closed(&mut self, _volume: VolumeIndex, _out: &mut Vec<Emit>) {}
 
     fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Emit>) {
         if volume != VOLUME {
             return;
         }
-        self.lost.push(range);
+        self.lost.hold(range);
         if self.end.is_none()
             && self
                 .ahead
                 .is_some_and(|ahead| ahead.intersect(range).is_some())
         {
-            self.give_up(Emit::Refuse(Why::Unrepairable), out);
+            self.give_up(Why::Unrepairable, out);
         }
     }
 
-    // Nothing more will arrive. A member still damaged, or one named and
-    // never placed, leaves the archive unread.
+    // Nothing more will arrive. A member still damaged, a walk left short,
+    // or a member named and never placed, leaves the archive unread.
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
-        if let Some(why) =
-            crate::quiet::damaged(standing).or_else(|| crate::quiet::unplaced(standing))
+        if let Some(why) = crate::quiet::damaged(standing)
+            .or_else(|| self.short())
+            .or_else(|| crate::quiet::unplaced(standing))
         {
-            self.give_up(Emit::Refuse(why), out);
+            self.give_up(why, out);
         }
     }
 
@@ -495,24 +480,30 @@ impl Object for Tar {
         }
     }
 
-    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) {
+    // Every member is an entry's raw data, so every range of one lies
+    // somewhere: not located yet until the walk reads the entry's header,
+    // and never for a range past the data that header says it has.
+    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {
         let Some(said) = self.members.get(member.0 as usize) else {
-            return;
+            return Located::NotYet;
         };
         let wanted = ByteRange::new(
             said.data.start.saturating_add(range.start),
             said.data.start.saturating_add(range.end),
         );
-        if let Some(range) = said.data.intersect(wanted) {
-            out.push(Extent {
-                volume: VOLUME,
-                range,
-            });
-        }
+        let Some(range) = said.data.intersect(wanted) else {
+            return Located::Never;
+        };
+        out.push(Extent {
+            volume: VOLUME,
+            range,
+        });
+        Located::Whole
     }
 
     fn sized(&mut self, volume: VolumeIndex, length: u64, _out: &mut Vec<Emit>) {
-        if volume != VOLUME || self.length.is_some() {
+        // A length said anew is the producer's word now.
+        if volume != VOLUME || self.length == Some(length) {
             return;
         }
         self.length = Some(length);

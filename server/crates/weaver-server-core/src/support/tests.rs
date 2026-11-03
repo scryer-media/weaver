@@ -49,7 +49,6 @@ fn sentinel_nzb() -> Vec<u8> {
 
 fn active_job(id: u64) -> ActiveJob {
     ActiveJob {
-        engine: crate::pipeline::graph::Engine::Classic,
         job_id: JobId(id),
         nzb_hash: [0x11; 32],
         nzb_path: PathBuf::from(format!("/srv/{SENTINEL}/{id}.nzb")),
@@ -198,6 +197,7 @@ fn live_info(id: u64) -> JobInfo {
         total_files: 2,
         completed_files: 2,
         remaining_par_files: 0,
+        file_remaining_bytes: Vec::new(),
         password: Some(SENTINEL.to_string()),
         category: None,
         metadata: vec![(SENTINEL.to_string(), SENTINEL.to_string())],

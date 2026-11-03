@@ -173,14 +173,13 @@ pub(super) fn cells() -> Vec<Par2Cell> {
     cells
 }
 
-// Schedules each (cell, profile) unit samples from the archive matrix's
-// combined cases.
+// Schedules each cell samples from the archive matrix's combined cases.
 pub(super) const PER_UNIT: usize = 46;
 
-// Preserve every cell and profile, but sample fewer schedules for the cubic
+// Preserve every cell, but sample fewer schedules for the cubic
 // thousands-block algebra. Weight those cases separately when sharding.
 const THOUSANDS_PER_UNIT: usize = 2;
-pub(super) const TOTAL: usize = 4_000 * 3 * (PER_UNIT + THOUSANDS_PER_UNIT);
+pub(super) const TOTAL: usize = 4_000 * (PER_UNIT + THOUSANDS_PER_UNIT);
 
 pub(super) fn family() -> Family<Par2Cell> {
     let cells = cells();
@@ -199,14 +198,12 @@ pub(super) fn family() -> Family<Par2Cell> {
     Family {
         units: indexed
             .into_iter()
-            .flat_map(|(index, cell)| {
+            .map(|(index, cell)| {
                 let per = match cell.band {
                     Band::Hundreds => PER_UNIT,
                     Band::Thousands => THOUSANDS_PER_UNIT,
                 };
-                PROFILES
-                    .into_iter()
-                    .map(move |profile| (cell, profile, Pool::Combined, per, index))
+                (cell, Pool::Combined, per, index)
             })
             .collect(),
     }
@@ -481,7 +478,6 @@ async fn repaired_encrypted_restart_finishes_member_edges() {
             container: Container::Rar5EncryptedHeaders,
             creator: 2,
         },
-        ExtractionProfile::DirectStore,
         vec![(
             941437,
             (
@@ -512,7 +508,6 @@ async fn index_absent_restart_fetches_remaining_recovery() {
             container: Container::SevenZip,
             creator: 2,
         },
-        ExtractionProfile::DirectStore,
         vec![(
             941713,
             (
@@ -569,7 +564,7 @@ par2_smokes! {
 }
 
 // The campaign: 2,200 cost-balanced shards. Thousands-block cells retain
-// every profile with fewer schedules and a higher partition weight.
+// fewer schedules and a higher partition weight.
 mod combined_par2_realism {
     use super::*;
 

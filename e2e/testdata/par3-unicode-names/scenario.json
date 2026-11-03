@@ -1,0 +1,14 @@
+{
+  "slug": "par3-unicode-names",
+  "title": "E2E.Test.par3.unicode.names.2026-TESTGRP",
+  "description": "PAR3 repairs a non-ASCII payload using a non-ASCII recovery set name; exact bytes and the safe described name must survive.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "灯火-café-данные.bin": "40bf7a08c74f2a3a06cb85cf04a84df44d4eecd3b36f2d667b7bac19991d352d"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks"
+  ],
+  "exactOutputFiles": true
+}

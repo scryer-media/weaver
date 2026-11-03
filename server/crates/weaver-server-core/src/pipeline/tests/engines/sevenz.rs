@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// 7z containers under both engines: stored whole, split and posted header
+// 7z containers: stored whole, split and posted header
 // first, compressed, enciphered with and without the job's password, and
 // damaged under a PAR2 set.
 
@@ -15,23 +15,27 @@ use weaver_graph::recovery::RepairOutcome;
 
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
-use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::direct_store::multi_member_store_set;
+use crate::pipeline::tests::direct_store::scenarios::sevenz_store::{Entry, build_7z_shaped};
 
 use super::harness::{
-    ARTICLE, Claim, JOB, Outcome, Post, Scenario, admit, assert_same, collect, kinds, par2_set,
-    par2_volumes_sliced, payload, run, run_both, run_unprompted,
+    ARTICLE, Claim, JOB, Outcome, Post, Scenario, admit, assert_fetched_once, collect, kinds,
+    par2_set, par2_volumes_sliced, payload, run, run_unprompted,
 };
-use super::refused_then_repaired::{drive_to_finish, serve_posts};
-use crate::pipeline::tests::{job_status_for_assert, retire_pipeline_database};
+use super::refused_then_repaired::{drive_to_finish, serve_posts, serve_queued};
+use crate::jobs::ids::{NzbFileId, SegmentId};
+use crate::pipeline::Pipeline;
+use crate::pipeline::tests::{
+    job_status_for_assert, pump_pipeline_runtime_queues, retire_pipeline_database,
+};
 
 pub(super) const SECRET: &str = "quill-ember-secret";
 
 // The members every fixture holds, by name.
 pub(super) fn members() -> Vec<(&'static str, Vec<u8>)> {
     vec![
-        ("ember.bin", payload(5 * ARTICLE + 11, 41)),
-        ("quill.bin", payload(3 * ARTICLE - 3, 42)),
+        ("ember.mkv", payload(5 * ARTICLE + 11, 41)),
+        ("quill.mkv", payload(3 * ARTICLE - 3, 42)),
     ]
 }
 
@@ -75,29 +79,9 @@ pub(super) fn delivered(name: &str) -> String {
     format!("lantern beacon/{name}")
 }
 
-// Both engines end the job the same way and deliver the same files, though
-// classic fetched some articles twice on the way and graph none.
-fn assert_same_delivered_classic_refetching(classic: &Outcome, graph: &Outcome) {
-    assert!(
-        graph.refetched().is_empty(),
-        "graph asked for an article twice: {:?}",
-        graph.refetched()
-    );
-    assert!(!classic.refetched().is_empty(), "classic refetched nothing");
-    assert_eq!(classic.status, graph.status, "status");
-    assert_eq!(classic.failure_kind, graph.failure_kind, "failure kind");
-    assert_eq!(classic.files, graph.files, "delivered files");
-    assert_eq!(classic.claims, graph.claims, "claims");
-}
-
 // The members, every byte as written, and nothing else.
 fn assert_members(outcome: &Outcome) {
-    assert!(
-        outcome.completed(),
-        "{}: {:?}",
-        outcome.engine,
-        outcome.failure
-    );
+    assert!(outcome.completed(), "{:?}", outcome.failure);
     let expected = members();
     assert_eq!(
         outcome.files.keys().cloned().collect::<Vec<_>>(),
@@ -105,47 +89,63 @@ fn assert_members(outcome: &Outcome) {
             .iter()
             .map(|(name, _)| delivered(name))
             .collect::<Vec<_>>(),
-        "{}: delivered names",
-        outcome.engine
+        "delivered names",
     );
     for (name, bytes) in expected {
-        assert!(
-            outcome.files[&delivered(name)] == bytes,
-            "{}: {name} bytes",
-            outcome.engine
-        );
+        assert!(outcome.files[&delivered(name)] == bytes, "{name} bytes",);
     }
 }
 
 #[tokio::test]
-async fn a_stored_7z_delivers_its_members_under_both_engines() {
+async fn a_stored_7z_delivers_its_members() {
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", stored(None))]);
-    let (classic, graph) = run_both(&scenario).await;
+    let graph = run(&scenario).await;
     assert_members(&graph);
-    assert_members(&classic);
-    assert_same(&classic, &graph);
+    assert_fetched_once(&graph);
 }
 
 #[tokio::test]
-async fn a_stored_7z_split_into_three_volumes_delivers_its_members_under_both_engines() {
+async fn a_stored_7z_split_into_three_volumes_delivers_its_members() {
     let scenario = Scenario::new(split(&stored(None), 3));
-    let (classic, graph) = run_both(&scenario).await;
+    let graph = run(&scenario).await;
     assert_members(&graph);
-    assert_members(&classic);
-    assert_same(&classic, &graph);
+    assert_fetched_once(&graph);
 }
 
-// A split set renamed to numbers of its own, counted from ten: the first
-// volume's signature names the set, and the others are numbered from it.
+// `lantern.7z.001` and `.002`: the numbered names found the joiner, which
+// writes both pieces into one file, and the 7z store founds beneath that
+// file and reads it as the one file it is. The members come out of it whole.
 #[tokio::test]
-async fn a_split_7z_under_obfuscated_numbered_names_delivers_its_members() {
-    let volumes = split(&stored(None), 3)
-        .into_iter()
-        .zip(10..)
-        .map(|(post, number)| Post::plain(&format!("a1b2c3d4.{number}"), post.bytes))
-        .collect();
-    let graph = run(&Scenario::new(volumes), Engine::Graph).await;
+async fn two_numbered_pieces_join_into_the_one_file_the_7z_store_reads() {
+    let graph = run(&Scenario::new(split(&stored(None), 2))).await;
     assert_members(&graph);
+    assert_eq!(kinds(&graph), vec!["sevenz_store", "split"]);
+}
+
+// A PAR2 set over the pieces and one article of the second piece damaged:
+// the set repairs that piece, the pieces join into the file, and the 7z
+// store beneath delivers every member whole.
+#[tokio::test]
+async fn a_piece_repaired_by_par2_joins_and_delivers_every_member() {
+    let parts = split(&stored(None), 3);
+    let files: Vec<(&str, &[u8])> = parts
+        .iter()
+        .map(|post| (post.name.as_str(), post.bytes.as_slice()))
+        .collect();
+    let recovery = par2_set("lantern", &files, 4);
+    let mut posts = parts;
+    posts.extend(recovery);
+    let graph = run(&Scenario::new(posts).damaged(1, 0)).await;
+    assert_members(&graph);
+    assert!(
+        matches!(
+            graph.graph().outcomes.as_slice(),
+            [Some(RepairOutcome::Repaired { .. })]
+        ),
+        "{:?}",
+        graph.graph().outcomes
+    );
+    assert_eq!(kinds(&graph), vec!["par2", "sevenz_store", "split"]);
 }
 
 // A split set's pieces under hash names that number nothing, the second
@@ -153,8 +153,6 @@ async fn a_split_7z_under_obfuscated_numbered_names_delivers_its_members() {
 // piece's signature says what it is; the others have no signature, so they
 // wait unowned until the PAR2 set names them, and the store founded on the
 // first claims each by the name it is given. Nothing is fetched twice.
-// Classic renames by the PAR2 set before it reads the set, and delivers the
-// same.
 fn hashed(volumes: &[Post]) -> Vec<Post> {
     let mut posts: Vec<Post> = volumes
         .iter()
@@ -187,12 +185,75 @@ fn assert_named_by_par2(graph: &Outcome) {
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
 }
 
+// A stored split set, a hundred articles from its first volume's head on
+// spoiled before posting, and the PAR2 set over the volumes as they were.
+// Every article arrives clean. No volume's front signs anything, so the
+// set's numbered names found a joiner that writes the pieces into one
+// member, its run open for a volume the set may yet rebuild, and the
+// archive is read from that member as far as the spoiled bytes. The set
+// rewrites the volumes under the joiner's run, so the joined member starts
+// over: it has no file of its own until it is decided again, is written
+// anew from its rewritten volumes, and the archive is read again whole.
 #[tokio::test]
-async fn a_split_7z_under_hash_names_named_by_par2_last_delivers_its_members_under_both_engines() {
-    let (classic, graph) = run_both(&Scenario::new(hashed_with_par2_last())).await;
-    assert_members(&classic);
+async fn a_split_7z_whose_volumes_the_set_rewrote_under_its_joiner_delivers() {
+    const FRAME: usize = 768;
+    const VOLUMES: usize = 4;
+    const PER_VOLUME: usize = 32;
+    const SPOILED: usize = 100;
+    let member = payload(VOLUMES * PER_VOLUME * FRAME - 7 * FRAME, 71);
+    let archive = build_7z_shaped(
+        &[Entry::file("lantern.mkv", member.clone())],
+        sevenz_turbo::EncoderMethod::COPY,
+        None,
+        false,
+    );
+    let volumes: Vec<Post> = split(&archive, VOLUMES);
+    let files: Vec<(&str, &[u8])> = volumes
+        .iter()
+        .map(|post| (post.name.as_str(), post.bytes.as_slice()))
+        .collect();
+    let mut posts: Vec<Post> = volumes
+        .iter()
+        .map(|post| Post::plain(&post.name, post.bytes.clone()))
+        .collect();
+    let mut left = SPOILED;
+    for post in &mut posts {
+        let end = (left * FRAME).min(post.bytes.len());
+        post.bytes[..end].fill(0);
+        left -= end.div_ceil(FRAME);
+    }
+    assert_eq!(left, 0);
+    posts.extend(par2_volumes_sliced(
+        "lantern",
+        &files,
+        FRAME as u64,
+        SPOILED as u32 + 4,
+        1,
+    ));
+    let graph = run(&Scenario::new(posts).framed(FRAME)).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        vec![delivered("lantern.mkv")]
+    );
+    assert!(
+        graph.files[&delivered("lantern.mkv")] == member,
+        "member bytes"
+    );
+    assert_fetched_once(&graph);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired {
+            slices: SPOILED as u64
+        })]
+    );
+}
+
+#[tokio::test]
+async fn a_split_7z_under_hash_names_named_by_par2_last_delivers_its_members() {
+    let graph = run(&Scenario::new(hashed_with_par2_last())).await;
     assert_members(&graph);
-    assert_same(&classic, &graph);
+    assert_fetched_once(&graph);
     assert_named_by_par2(&graph);
 }
 
@@ -200,10 +261,8 @@ async fn a_split_7z_under_hash_names_named_by_par2_last_delivers_its_members_und
 // of one stored RAR, and the names the PAR2 set gives are claimed in that
 // namespace as they are at the top. The PAR2 files are members of the
 // archive like any other, so they are delivered beside the 7z's members.
-// Divergence: classic extracts the RAR and never renames what came out of
-// it, so it cannot read the 7z and fails the job.
 #[tokio::test]
-async fn a_split_7z_under_hash_names_inside_a_stored_rar_named_by_par2_last_delivers_under_graph() {
+async fn a_split_7z_under_hash_names_inside_a_stored_rar_named_by_par2_last_delivers() {
     let inner = hashed_with_par2_last();
     let named: Vec<(&str, Vec<u8>)> = inner
         .iter()
@@ -211,13 +270,7 @@ async fn a_split_7z_under_hash_names_inside_a_stored_rar_named_by_par2_last_deli
         .collect();
     let outer = multi_member_store_set(&named, 1).remove(0).1;
     let scenario = Scenario::new(vec![Post::plain("lantern.rar", outer)]);
-    let classic = run(&scenario, Engine::Classic).await;
-    assert!(
-        matches!(classic.status, Some(JobStatus::Failed { .. })),
-        "{:?}",
-        classic.status
-    );
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert!(graph.completed(), "{:?}", graph.failure);
     let mut expected: Vec<String> = members().iter().map(|(name, _)| delivered(name)).collect();
     expected.extend(
@@ -253,81 +306,104 @@ async fn a_coded_split_7z_missing_its_middle_volume_is_rebuilt_by_par2_and_decod
             .filter(|post| post.name != volumes[1].name)
             .map(|post| Post::plain(&post.name, post.bytes.clone())),
     );
-    let graph = run(&Scenario::new(posts), Engine::Graph).await;
+    let graph = run(&Scenario::new(posts)).await;
     assert_members(&graph);
 }
 
 // The header volume is file 0, so it is answered before any of the body:
 // the body arrives after its map and still reaches the members.
 #[tokio::test]
-async fn a_split_7z_posted_header_volume_first_delivers_its_members_under_both_engines() {
+async fn a_split_7z_posted_header_volume_first_delivers_its_members() {
     let mut volumes = split(&stored(None), 3);
     volumes.rotate_right(1);
     assert_eq!(volumes[0].name, "lantern.7z.003");
     let scenario = Scenario::new(volumes);
-    let (classic, graph) = run_both(&scenario).await;
+    let graph = run(&scenario).await;
     // `.003` has no signature and is a leaf until `.001` binds the store,
     // which is then offered it as it would have been had it come second.
     assert_members(&graph);
-    assert_members(&classic);
-    assert_same(&classic, &graph);
+    assert_fetched_once(&graph);
 }
 
 #[tokio::test]
-async fn an_lzma2_7z_is_extracted_under_both_engines_and_only_classic_refetches() {
+async fn an_lzma2_7z_is_extracted() {
     let archive = container(Lzma2Options::from_level(1).into(), None);
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", archive)]);
-    let (classic, graph) = run_both(&scenario).await;
+    let graph = run(&scenario).await;
     assert_members(&graph);
-    assert_members(&classic);
-    // Classic's direct store cannot place coded bytes and demotes, which
-    // fetches the archive again; graph binds the 7z engine in the stream.
-    assert_same_delivered_classic_refetching(&classic, &graph);
+    assert_fetched_once(&graph);
 }
 
 #[tokio::test]
-async fn an_aes_stored_7z_with_the_job_password_delivers_its_members_under_both_engines() {
+async fn an_aes_stored_7z_with_the_job_password_delivers_its_members() {
     let scenario =
         Scenario::new(vec![Post::plain("lantern.7z", stored(Some(SECRET)))]).password(SECRET);
-    let (classic, graph) = run_both(&scenario).await;
+    let graph = run(&scenario).await;
     assert_members(&graph);
-    assert_members(&classic);
-    assert_same(&classic, &graph);
+    assert_fetched_once(&graph);
 }
 
-// No password for an AES-stored 7z: classic fails the job for the password
-// after fetching the set again. The graph's store gives the container back
+// The candidates are tried in their order: the job's own, then the
+// settings'. The one the archive opened with is what the history keeps,
+// sealed, and never as a public attribute or in the clear.
+#[tokio::test]
+async fn archive_password_sources_are_ordered_and_validated_password_is_private() {
+    let scenario = Scenario::new(vec![Post::plain("lantern.7z", stored(Some(SECRET)))])
+        .password("filename-key")
+        .global_password("global-key")
+        .global_password(SECRET);
+    let graph = run(&scenario).await;
+    assert_members(&graph);
+    assert_eq!(graph.validated_password.as_deref(), Some(SECRET));
+    let stored = graph
+        .history_metadata
+        .as_deref()
+        .expect("the history row keeps the job's metadata");
+    assert!(!stored.contains(SECRET), "{stored}");
+    let metadata = crate::history::attributes::parse_history_metadata(Some(stored));
+    assert!(metadata.iter().any(
+        |(key, _)| key == crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY
+    ));
+    assert!(
+        !crate::public_history_attributes(&metadata)
+            .iter()
+            .any(|(key, _)| key.contains("validated_archive_password"))
+    );
+}
+
+// An archive that needs no password leaves none in the history.
+#[tokio::test]
+async fn an_archive_with_no_password_keeps_none_in_the_history() {
+    let scenario =
+        Scenario::new(vec![Post::plain("lantern.7z", stored(None))]).password("filename-key");
+    let graph = run(&scenario).await;
+    assert_members(&graph);
+    assert_eq!(graph.validated_password, None);
+}
+
+// No password for an AES-stored 7z: the store gives the container back
 // withheld, since nothing opened it, so nothing is whole and the job fails
 // naming the password it needs, with no refetch.
 #[tokio::test]
-async fn an_aes_stored_7z_without_a_password_fails_for_it_under_both_engines() {
+async fn an_aes_stored_7z_without_a_password_fails_for_it() {
     let archive = stored(Some(SECRET));
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", archive)]);
-    let (classic, graph) = run_both(&scenario).await;
+    let graph = run(&scenario).await;
 
-    for outcome in [&classic, &graph] {
-        assert!(
-            matches!(outcome.status, Some(JobStatus::Failed { .. })),
-            "{}: {:?}",
-            outcome.engine,
-            outcome.status
-        );
-        assert_eq!(
-            outcome.failure_kind,
-            Some(HistoryFailureKind::Password),
-            "{}: failure kind",
-            outcome.engine
-        );
-        assert!(
-            outcome.files.is_empty(),
-            "{}: {:?}",
-            outcome.engine,
-            outcome.files.keys()
-        );
-    }
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert_eq!(
+        graph.failure_kind,
+        Some(HistoryFailureKind::Password),
+        "failure kind",
+    );
+    assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
     assert_eq!(
         graph.failure.as_deref(),
-        Some("lantern.7z needs a password and none was given")
+        Some("WEAVER_PASSWORD_REQUIRED: lantern.7z needs a password and none was given")
     );
     assert!(
         graph.refetched().is_empty(),
@@ -337,59 +413,50 @@ async fn an_aes_stored_7z_without_a_password_fails_for_it_under_both_engines() {
 }
 
 #[tokio::test]
-async fn a_damaged_stored_7z_under_par2_is_repaired_and_delivered_under_both_engines_and_only_classic_refetches()
- {
+async fn a_damaged_stored_7z_under_par2_is_repaired_and_delivered() {
     let archive = stored(None);
     let mut posts = vec![Post::plain("lantern.7z", archive.clone())];
     posts.extend(par2_set("lantern", &[("lantern.7z", &archive)], 2));
     // The second article is member bytes: the signature header is the first
     // article's, and the map is at the tail.
     let scenario = Scenario::new(posts).damaged(0, 1);
-    let (classic, graph) = run_both(&scenario).await;
+    let graph = run(&scenario).await;
     assert_members(&graph);
-    assert_members(&classic);
-    // Classic demotes the damaged set and fetches the article again; graph
-    // repairs the volume in the stream.
-    assert_same_delivered_classic_refetching(&classic, &graph);
+    assert_fetched_once(&graph);
 }
 
 // The same under AES: the damaged article is cipher bytes, and the repair
 // reads the volume back through the store's keys and chain.
 #[tokio::test]
-async fn a_damaged_aes_stored_7z_under_par2_is_repaired_and_delivered_under_both_engines_and_only_classic_refetches()
- {
+async fn a_damaged_aes_stored_7z_under_par2_is_repaired_and_delivered() {
     let archive = stored(Some(SECRET));
     let mut posts = vec![Post::plain("lantern.7z", archive.clone())];
     posts.extend(par2_set("lantern", &[("lantern.7z", &archive)], 2));
     let scenario = Scenario::new(posts).damaged(0, 1).password(SECRET);
-    let (classic, graph) = run_both(&scenario).await;
+    let graph = run(&scenario).await;
     assert_members(&graph);
-    assert_members(&classic);
-    assert_same_delivered_classic_refetching(&classic, &graph);
+    assert_fetched_once(&graph);
 }
 
 // The coded stream damaged beside a PAR2 set: the engine waits at the
 // damaged article for its repair, then decodes the members once, and the
-// job ends with nothing parked. Divergence: classic demotes and fetches the
-// container's first article again; graph repairs in the stream.
+// job ends with nothing parked.
 #[tokio::test]
-async fn a_damaged_lzma2_7z_under_par2_is_repaired_in_the_stream_and_decoded_under_both_engines() {
+async fn a_damaged_lzma2_7z_under_par2_is_repaired_in_the_stream_and_decoded() {
     let archive = container(Lzma2Options::from_level(1).into(), None);
     let mut posts = vec![Post::plain("lantern.7z", archive.clone())];
     posts.extend(par2_set("lantern", &[("lantern.7z", &archive)], 2));
     // The second article is coded bytes: the signature header is the first
     // article's, and the end header is at the tail.
     let scenario = Scenario::new(posts).damaged(0, 1);
-    let (classic, graph) = run_both(&scenario).await;
+    let graph = run(&scenario).await;
     assert_members(&graph);
-    assert_members(&classic);
+    assert_fetched_once(&graph);
     assert!(
         kinds(&graph).contains(&"sevenz_engine"),
         "{:?}",
         kinds(&graph)
     );
-    assert_eq!(classic.refetched(), [(0, 0)]);
-    assert_same_delivered_classic_refetching(&classic, &graph);
     // An 11-slice archive (661 bytes): the count follows its size.
     assert_eq!(graph.reads, 20, "the slices the repair read back");
 }
@@ -404,27 +471,24 @@ fn aes_stored() -> Scenario {
 }
 
 // The password reaches the job only as a candidate. The store proves it by
-// the smallest member's checksum and asks once; classic tries the candidate
-// itself, and both deliver alike.
+// the smallest member's checksum and asks once.
 #[tokio::test]
-async fn an_aes_stored_7z_opened_by_a_password_candidate_delivers_under_both_engines() {
-    let (classic, graph) = run_both(&aes_stored().global_password(SECRET)).await;
-    assert_members(&classic);
+async fn an_aes_stored_7z_opened_by_a_password_candidate_delivers() {
+    let graph = run(&aes_stored().global_password(SECRET)).await;
     assert_members(&graph);
     assert_eq!(kinds(&graph), ["sevenz_store"]);
     assert_eq!(offered(&graph), [1], "one try for the one candidate");
-    assert_same(&classic, &graph);
+    assert_fetched_once(&graph);
 }
 
 // A wrong candidate and then the right one: the proof refutes the first, the
 // store asks again, and each candidate is offered once.
 #[tokio::test]
-async fn an_aes_stored_7z_tries_a_wrong_candidate_once_then_the_right_one_under_both_engines() {
+async fn an_aes_stored_7z_tries_a_wrong_candidate_once_then_the_right_one() {
     let scenario = aes_stored()
         .global_password("cinder-wrong-guess")
         .global_password(SECRET);
-    let (classic, graph) = run_both(&scenario).await;
-    assert_members(&classic);
+    let graph = run(&scenario).await;
     assert_members(&graph);
     assert_eq!(kinds(&graph), ["sevenz_store"]);
     assert_eq!(
@@ -432,7 +496,32 @@ async fn an_aes_stored_7z_tries_a_wrong_candidate_once_then_the_right_one_under_
         [2],
         "one try for each of the two candidates"
     );
-    assert_same(&classic, &graph);
+    assert_fetched_once(&graph);
+}
+
+// Every candidate wrong for a coded AES 7z: each run under a wrong one
+// writes until the checksum refutes it, and none of what a refused run
+// wrote stays. The job fails for the password, and its working directory
+// never holds more than the posted archive.
+#[tokio::test]
+async fn a_coded_aes_7z_no_candidate_opens_keeps_no_more_than_was_posted() {
+    let archive = container(Lzma2Options::from_level(1).into(), Some(SECRET));
+    let posted = archive.len() as u64;
+    let scenario = Scenario::new(vec![Post::plain("lantern.7z", archive)])
+        .global_password("cinder-wrong-guess")
+        .global_password("cinder-wrong-again");
+    let graph = run(&scenario).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Password));
+    assert!(
+        graph.graph().scratch <= posted,
+        "the working directory held {} bytes, {posted} were posted",
+        graph.graph().scratch
+    );
 }
 
 // AES over the members, coded by `method`, and over the end header alike,
@@ -464,25 +553,22 @@ fn sealed() -> Scenario {
 // The job's own password is its first candidate: the store, which cannot
 // parse the header without one, asks and is offered it once.
 #[tokio::test]
-async fn an_aes_7z_with_encrypted_headers_and_the_job_password_delivers_under_both_engines() {
-    let (classic, graph) = run_both(&sealed().password(SECRET)).await;
-    assert_members(&classic);
+async fn an_aes_7z_with_encrypted_headers_and_the_job_password_delivers() {
+    let graph = run(&sealed().password(SECRET)).await;
     assert_members(&graph);
     assert_eq!(kinds(&graph), ["sevenz_store"]);
     assert_eq!(offered(&graph), [1], "the job's password, once");
-    assert_same(&classic, &graph);
+    assert_fetched_once(&graph);
 }
 
 // The header refutes the wrong candidate by failing to parse, and opens on
 // the right one.
 #[tokio::test]
-async fn an_aes_7z_with_encrypted_headers_opened_by_the_second_candidate_delivers_under_both_engines()
- {
+async fn an_aes_7z_with_encrypted_headers_opened_by_the_second_candidate_delivers() {
     let scenario = sealed()
         .global_password("cinder-wrong-guess")
         .global_password(SECRET);
-    let (classic, graph) = run_both(&scenario).await;
-    assert_members(&classic);
+    let graph = run(&scenario).await;
     assert_members(&graph);
     assert_eq!(kinds(&graph), ["sevenz_store"]);
     assert_eq!(
@@ -490,7 +576,7 @@ async fn an_aes_7z_with_encrypted_headers_opened_by_the_second_candidate_deliver
         [2],
         "one try for each of the two candidates"
     );
-    assert_same(&classic, &graph);
+    assert_fetched_once(&graph);
 }
 
 // The last volume and the first are whole before the second has come:
@@ -499,18 +585,18 @@ async fn an_aes_7z_with_encrypted_headers_opened_by_the_second_candidate_deliver
 // bytes it is handed, and the job's password answers before the container
 // is ruled shut, though the volume that holds the header is already in.
 #[tokio::test]
-async fn a_split_7z_with_encrypted_headers_whose_last_volume_came_first_opens_on_the_job_password_under_graph()
- {
+async fn a_split_7z_with_encrypted_headers_whose_last_volume_came_first_opens_on_the_job_password()
+{
     let scenario = Scenario::new(split(
         &sealed_header(EncoderConfiguration::new(EncoderMethod::COPY)),
         3,
     ))
     .password(SECRET);
-    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario, Engine::Graph).await;
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
     while pipeline
         .jobs
         .get_mut(&JOB)
-        .and_then(|state| state.download_queue.pop())
+        .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
         .is_some()
     {}
     serve_posts(&mut pipeline, &scenario, 2..3).await;
@@ -545,26 +631,19 @@ fn lzma2() -> Scenario {
 
 // The LZMA2 container cut into articles of every size from the whole file
 // down to a byte (4 KiB is the whole 401-byte file again): one outcome and
-// one set of files under both engines. Divergence: from 64-byte articles
-// down, classic's direct store demotes and fetches the container again;
-// graph never refetches.
+// one set of files, and nothing fetched twice.
 #[tokio::test]
-async fn an_lzma2_7z_delivers_alike_in_every_frame_size_under_both_engines() {
+async fn an_lzma2_7z_delivers_alike_in_every_frame_size() {
     let mut seen = None;
     for size in [usize::MAX, 4096, 64, 1] {
-        let (classic, graph) = run_both(&lzma2().framed(size)).await;
-        assert_members(&classic);
+        let graph = run(&lzma2().framed(size)).await;
         assert_members(&graph);
         assert!(
             kinds(&graph).contains(&"sevenz_engine"),
             "{:?}",
             kinds(&graph)
         );
-        if size >= 4096 {
-            assert_same(&classic, &graph);
-        } else {
-            assert_same_delivered_classic_refetching(&classic, &graph);
-        }
+        assert_fetched_once(&graph);
         let files = seen.get_or_insert_with(|| graph.files.clone());
         assert_eq!(*files, graph.files, "frames of {size} bytes");
     }
@@ -572,12 +651,11 @@ async fn an_lzma2_7z_delivers_alike_in_every_frame_size_under_both_engines() {
 
 // The three parts served last article first, as a crowd of workers may:
 // the end header that maps the members is in hand first, the signature
-// header that finds it last. Graph only: the batch the harness serves
-// backwards is in no queue classic can see.
+// header that finds it last.
 #[tokio::test]
-async fn a_stored_7z_served_last_article_first_delivers_its_members_under_graph() {
+async fn a_stored_7z_served_last_article_first_delivers_its_members() {
     let scenario = Scenario::new(split(&stored(None), 3)).backwards();
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert_members(&graph);
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
 }
@@ -585,23 +663,17 @@ async fn a_stored_7z_served_last_article_first_delivers_its_members_under_graph(
 // The same frames served last article first: the folder's packed stream is
 // in hand before the headers that say the container needs the engine.
 #[tokio::test]
-async fn an_lzma2_7z_served_last_article_first_delivers_alike_in_every_frame_size_under_both_engines()
- {
+async fn an_lzma2_7z_served_last_article_first_delivers_alike_in_every_frame_size() {
     let mut seen = None;
     for size in [usize::MAX, 4096, 64, 1] {
-        let (classic, graph) = run_both(&lzma2().framed(size).backwards()).await;
-        assert_members(&classic);
+        let graph = run(&lzma2().framed(size).backwards()).await;
         assert_members(&graph);
         assert!(
             kinds(&graph).contains(&"sevenz_engine"),
             "{:?}",
             kinds(&graph)
         );
-        if size >= 4096 {
-            assert_same(&classic, &graph);
-        } else {
-            assert_same_delivered_classic_refetching(&classic, &graph);
-        }
+        assert_fetched_once(&graph);
         let files = seen.get_or_insert_with(|| graph.files.clone());
         assert_eq!(*files, graph.files, "frames of {size} bytes");
     }
@@ -614,41 +686,23 @@ pub(super) fn packed_end(archive: &[u8]) -> usize {
 }
 
 // In 16-byte articles, the last article wholly inside the packed streams:
-// quill.bin's, the second folder, touching no header.
+// quill.mkv's, the second folder, touching no header.
 fn last_packed_article(archive: &[u8]) -> u32 {
     (packed_end(archive) / 16 - 1) as u32
 }
 
-// quill.bin's stream damaged with no PAR2. The engine closes ember.bin whole,
-// then fails quill.bin's CRC: graph delivers ember.bin as written, leaves
-// quill.bin out, puts the container as posted in its place, and ends the job
-// Partial. Divergence: classic fails the job (Unpack), delivers nothing and
-// fetches every article before the damaged one again.
+// quill.mkv's stream damaged with no PAR2. The engine closes ember.mkv whole,
+// then fails quill.mkv's CRC: graph delivers ember.mkv as written, leaves
+// quill.mkv out, puts the container as posted in its place, and ends the job
+// Partial.
 #[tokio::test]
-async fn an_lzma2_7z_with_a_damaged_member_and_no_par2_delivers_the_members_it_closed_under_graph()
-{
+async fn an_lzma2_7z_with_a_damaged_member_and_no_par2_delivers_the_members_it_closed() {
     let archive = container(Lzma2Options::from_level(1).into(), None);
     let damaged = last_packed_article(&archive);
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", archive.clone())])
         .framed(16)
         .damaged(0, damaged);
-    let (classic, graph) = run_both(&scenario).await;
-
-    assert!(
-        matches!(classic.status, Some(JobStatus::Failed { .. })),
-        "classic: {:?}",
-        classic.status
-    );
-    assert_eq!(classic.failure_kind, Some(HistoryFailureKind::Unpack));
-    assert!(
-        classic.files.is_empty(),
-        "classic: {:?}",
-        classic.files.keys()
-    );
-    assert_eq!(
-        classic.refetched(),
-        (0..damaged).map(|at| (0, at)).collect::<Vec<_>>()
-    );
+    let graph = run(&scenario).await;
 
     assert_eq!(
         graph.status,
@@ -668,11 +722,11 @@ async fn an_lzma2_7z_with_a_damaged_member_and_no_par2_delivers_the_members_it_c
     );
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
-        [delivered("ember.bin"), delivered("lantern.7z")]
+        [delivered("ember.mkv"), delivered("lantern.7z")]
     );
     assert!(
-        graph.files[&delivered("ember.bin")] == members()[0].1,
-        "ember.bin closed before the failure, delivered whole"
+        graph.files[&delivered("ember.mkv")] == members()[0].1,
+        "ember.mkv closed before the failure, delivered whole"
     );
     assert_eq!(
         graph.files[&delivered("lantern.7z")].len(),
@@ -682,6 +736,36 @@ async fn an_lzma2_7z_with_a_damaged_member_and_no_par2_delivers_the_members_it_c
     assert_eq!(
         graph.graph().claims.get("lantern.7z"),
         Some(&Claim::Damaged)
+    );
+}
+
+// A single 7z whose head arrived wrong under a good article checksum, with
+// no recovery: no store founds on it, so it reaches the end whole as
+// posted. A whole archive is not a file the user opens, and nothing else
+// came out of it, so the job fails and publishes nothing.
+#[tokio::test]
+async fn a_single_7z_with_a_damaged_head_and_no_recovery_fails() {
+    let (name, ember) = members().swap_remove(0);
+    let mut archive = build_7z_shaped(
+        &[Entry::file(name, ember.clone())],
+        EncoderMethod::COPY,
+        None,
+        false,
+    );
+    for byte in &mut archive[..ARTICLE] {
+        *byte ^= 0x5a;
+    }
+    let graph = run(&Scenario::new(vec![Post::plain("lantern.7z", archive)])).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "graph: {:?} {:?} {:?}",
+        graph.status,
+        graph.failure,
+        graph.files.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        graph.files.get(&delivered(name)) != Some(&ember),
+        "ember.mkv never comes out of a container no store founds on"
     );
 }
 
@@ -700,18 +784,13 @@ fn beside_par2(archive: &[u8], blocks: u32) -> Scenario {
 // store never maps. Graph refuses it (`Why::Unmapped`) and gives the
 // container back withheld, as it stands, in place of its members; the
 // object failed and nothing is whole, so the job fails for unpacking, worded
-// by the refusal, never Complete with its members missing. Classic fails the job: it cannot read the archive.
+// by the refusal, never Complete with its members missing.
 #[tokio::test]
-async fn a_7z_whose_end_header_is_cut_short_is_refused_and_fails_under_graph() {
+async fn a_7z_whose_end_header_is_cut_short_is_refused_and_fails() {
     let mut archive = stored(None);
     archive.truncate(archive.len() - 8);
     let scenario = Scenario::new(vec![Post::plain("lantern.7z", archive)]);
-    let (classic, graph) = run_both(&scenario).await;
-    assert!(
-        matches!(classic.status, Some(JobStatus::Failed { .. })),
-        "classic: {:?}",
-        classic.status
-    );
+    let graph = run(&scenario).await;
     assert_eq!(
         graph.failure.as_deref(),
         Some("lantern.7z never placed every member it named")
@@ -727,14 +806,12 @@ async fn a_7z_whose_end_header_is_cut_short_is_refused_and_fails_under_graph() {
 
 // The end header damaged beside PAR2: the repair reads the container back
 // from what the namespace holds for it, rewrites the header, the store maps
-// from the repaired bytes and the members are decoded. Classic repairs and
-// extracts it too.
+// from the repaired bytes and the members are decoded.
 #[tokio::test]
-async fn an_lzma2_7z_with_a_damaged_end_header_beside_par2_is_repaired_and_decoded_under_graph() {
+async fn an_lzma2_7z_with_a_damaged_end_header_beside_par2_is_repaired_and_decoded() {
     let archive = container(Lzma2Options::from_level(1).into(), None);
     let scenario = beside_par2(&archive, 2).damaged(0, last_article(&archive));
-    let (classic, graph) = run_both(&scenario).await;
-    assert_members(&classic);
+    let graph = run(&scenario).await;
     assert_members(&graph);
     assert!(
         graph.refetched().is_empty(),
@@ -745,21 +822,15 @@ async fn an_lzma2_7z_with_a_damaged_end_header_beside_par2_is_repaired_and_decod
 
 // More of the end header damaged than PAR2 can rebuild: the store never
 // maps and the repair is impossible, so graph fails the job for the repair
-// rather than ending Complete with nothing. Classic fails it for the repair
-// too.
+// rather than ending Complete with nothing.
 #[tokio::test]
-async fn an_lzma2_7z_with_its_end_header_damaged_past_par2_is_refused_under_graph() {
+async fn an_lzma2_7z_with_its_end_header_damaged_past_par2_is_refused() {
     let archive = container(Lzma2Options::from_level(1).into(), None);
     let last = last_article(&archive);
     let scenario = beside_par2(&archive, 1)
         .damaged(0, last)
         .damaged(0, last - 1);
-    let (classic, graph) = run_both(&scenario).await;
-    assert!(
-        matches!(classic.status, Some(JobStatus::Failed { .. })),
-        "classic: {:?}",
-        classic.status
-    );
+    let graph = run(&scenario).await;
     assert!(
         matches!(graph.status, Some(JobStatus::Failed { .. })),
         "graph: {:?}",
@@ -777,14 +848,12 @@ async fn an_lzma2_7z_with_its_end_header_damaged_past_par2_is_refused_under_grap
 // the container is a leaf until the repair rewrites its front; then it is
 // identified again by the one offer every unowned member gets, the store
 // binds, hands the coded folders to the engine, and the members are
-// decoded. Classic repairs and extracts it too.
+// decoded.
 #[tokio::test]
-async fn an_lzma2_7z_with_a_damaged_first_article_beside_par2_binds_its_store_after_the_repair_under_graph()
- {
+async fn an_lzma2_7z_with_a_damaged_first_article_beside_par2_binds_its_store_after_the_repair() {
     let archive = container(Lzma2Options::from_level(1).into(), None);
     let scenario = beside_par2(&archive, 2).damaged(0, 0);
-    let (classic, graph) = run_both(&scenario).await;
-    assert_members(&classic);
+    let graph = run(&scenario).await;
     assert_members(&graph);
     assert!(
         kinds(&graph).contains(&"sevenz_engine"),
@@ -803,11 +872,11 @@ async fn an_lzma2_7z_with_a_damaged_first_article_beside_par2_binds_its_store_af
 // No volume of a container is a delivery of its own, so nothing is whole
 // and the job fails for unpacking.
 #[tokio::test]
-async fn a_split_7z_whose_last_volume_is_cut_short_delivers_no_volume_whole_under_graph() {
+async fn a_split_7z_whose_last_volume_is_cut_short_delivers_no_volume_whole() {
     let mut volumes = split(&stored(None), 3);
     let last = volumes.last_mut().unwrap();
     last.bytes.truncate(last.bytes.len() - 8);
-    let graph = run(&Scenario::new(volumes), Engine::Graph).await;
+    let graph = run(&Scenario::new(volumes)).await;
     let view = graph.graph();
     assert!(view.delivery.whole.is_empty(), "{:?}", view.delivery);
     assert!(
@@ -861,7 +930,7 @@ async fn a_damaged_six_volume_lzma2_7z_under_five_par2_volumes_rules_and_deliver
 // folder's bytes come again and open under the right one, and the file is
 // delivered whole with nothing fetched twice.
 #[tokio::test]
-async fn a_large_aes_stored_7z_offered_a_wrong_password_first_delivers_under_graph() {
+async fn a_large_aes_stored_7z_offered_a_wrong_password_first_delivers() {
     let file = payload(4 * 1024 * 1024 + 1, 61);
     let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
     writer.set_content_methods(vec![
@@ -880,7 +949,7 @@ async fn a_large_aes_stored_7z_offered_a_wrong_password_first_delivers_under_gra
         .framed(256 << 10)
         .global_password("not-the-secret")
         .global_password(SECRET);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert!(graph.completed(), "{:?}", graph.failure);
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
@@ -888,4 +957,374 @@ async fn a_large_aes_stored_7z_offered_a_wrong_password_first_delivers_under_gra
     );
     assert!(graph.files[&delivered("lantern.bin")] == file, "bytes");
     assert!(graph.refetched().is_empty(), "{:?}", graph.refetched());
+}
+
+// A 7z coded by `method` holding an empty directory beside a member.
+fn with_empty_directory(method: EncoderConfiguration) -> Vec<u8> {
+    let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+    writer.set_content_methods(vec![method]);
+    writer
+        .push_archive_entry::<Cursor<Vec<u8>>>(ArchiveEntry::new_directory("hollow"), None)
+        .unwrap();
+    let (name, bytes) = members().remove(0);
+    let mut entry = ArchiveEntry::new_file(name);
+    entry.size = bytes.len() as u64;
+    writer
+        .push_archive_entry(entry, Some(Cursor::new(bytes)))
+        .unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
+// The empty directory is delivered as a directory, stored through the store
+// and LZMA2 through the engine.
+#[tokio::test]
+async fn a_7z_holding_an_empty_directory_delivers_it() {
+    let methods: [EncoderConfiguration; 2] = [
+        EncoderConfiguration::new(EncoderMethod::COPY),
+        Lzma2Options::from_level(1).into(),
+    ];
+    for method in methods {
+        let scenario = Scenario::new(vec![Post::plain(
+            "lantern.7z",
+            with_empty_directory(method),
+        )]);
+        let graph = run(&scenario).await;
+        assert!(graph.completed(), "{:?}", graph.failure);
+        assert_eq!(
+            graph.empty.iter().collect::<Vec<_>>(),
+            [&delivered("hollow/")],
+            "empty directories"
+        );
+        assert_fetched_once(&graph);
+    }
+}
+
+// A full member checksum rejects all its bytes even though only one input
+// slice is corrupt. Repairing that slice must replay the rejected member's
+// dependency, while its live store still owns the input.
+#[tokio::test]
+async fn live_stores_replay_checksum_rejected_members_after_repair() {
+    use super::harness::par3_set;
+    use super::refused_then_repaired::serve_queued;
+    use crate::pipeline::tests::pump_pipeline_runtime_queues;
+    use weaver_graph::{MemberId, NodeId};
+
+    for rar in [false, true] {
+        for par3 in [false, true] {
+            let entries = members();
+            let (name, original) = if rar {
+                let (_, bytes) = multi_member_store_set(&entries, 1).remove(0);
+                ("lantern.rar", bytes)
+            } else {
+                ("lantern.7z", stored(None))
+            };
+            let payload = &entries[0].1;
+            let at = original
+                .windows(payload.len())
+                .position(|window| window == payload)
+                .expect("stored member bytes");
+            let mut posted = original.clone();
+            posted[at + ARTICLE + 3] ^= 0x5a;
+            let mut posts = vec![Post::plain(name, posted)];
+            posts.extend(if par3 {
+                par3_set("lantern", &[(name, &original)], 4)
+            } else {
+                par2_set("lantern", &[(name, &original)], 4)
+            });
+            let scenario = Scenario::new(posts);
+            let (_temp, mut pipeline, complete_dir) = admit(&scenario).await;
+            let count = original.len().div_ceil(ARTICLE) as u32;
+            // The prefix and tail precede the middle: a fragmented fold
+            // must still reject the full member before recovery arrives.
+            for ordinal in std::iter::once(0).chain(2..count).chain(std::iter::once(1)) {
+                serve_queued(&mut pipeline, &scenario, (0, ordinal)).await;
+                pump_pipeline_runtime_queues(&mut pipeline).await;
+            }
+            let tree = pipeline.graph_jobs.get(&JOB).expect("active graph").tree();
+            let (store, _) = tree
+                .child_of(NodeId::ROOT, MemberId(0))
+                .expect("live store");
+            assert!(tree.engine(store).is_none(), "the store must remain live");
+            assert!(
+                tree.namespace(store).unwrap().members().any(|member| {
+                    member.crc32.is_some()
+                        && member
+                            .coverage
+                            .runs()
+                            .any(|run| run.provenance == weaver_graph::Provenance::Refuted)
+                }),
+                "the output checksum must fail before repair"
+            );
+            serve_posts(&mut pipeline, &scenario, 1..scenario.posts.len() as u32).await;
+            drive_to_finish(&mut pipeline, &scenario).await;
+            let status = job_status_for_assert(&pipeline, JOB);
+            let mut files = BTreeMap::new();
+            collect(&complete_dir, &complete_dir, &mut files);
+            retire_pipeline_database(pipeline).await;
+            assert_eq!(status, Some(JobStatus::Complete), "rar={rar}, par3={par3}");
+            for (name, expected) in entries {
+                assert_eq!(files.get(&delivered(name)), Some(&expected), "{name}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_first_piece_posted_short_is_restored_by_recovery_and_the_join_completes() {
+    use weaver_graph::{Kind, MemberId, NodeId};
+
+    let archive = stored(None);
+    let mut posts = split(&archive, 3);
+    let protected: Vec<_> = posts
+        .iter()
+        .map(|post| (post.name.as_str(), post.bytes.as_slice()))
+        .collect();
+    let recovery = par2_set("lantern", &protected, 4);
+    // A short posting cuts the first piece's tail. Recovery must restore it
+    // before the pieces join into the file the 7z store reads.
+    let short = posts[0].bytes.len() - 17;
+    posts[0].bytes.truncate(short);
+    posts.extend(recovery);
+    let scenario = Scenario::new(posts);
+    let (_temp, mut pipeline, complete_dir) = admit(&scenario).await;
+    serve_posts(&mut pipeline, &scenario, 0..1).await;
+    let tree = pipeline.graph_jobs.get(&JOB).expect("active graph").tree();
+    let (store, _) = tree
+        .child_of(NodeId::ROOT, MemberId(0))
+        .expect("first piece owned");
+    // The numbered name founds the split store; the 7z store founds beneath
+    // the file it joins.
+    assert_eq!(tree.kind(store), Some(Kind::Split));
+    serve_posts(&mut pipeline, &scenario, 3..scenario.posts.len() as u32).await;
+    serve_posts(&mut pipeline, &scenario, 1..3).await;
+    drive_to_finish(&mut pipeline, &scenario).await;
+    let status = job_status_for_assert(&pipeline, JOB);
+    let mut files = BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    retire_pipeline_database(pipeline).await;
+    assert_eq!(status, Some(JobStatus::Complete));
+    for (name, expected) in members() {
+        assert_eq!(files.get(&delivered(name)), Some(&expected), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn checksum_rejection_survives_restart_before_parent_repair() {
+    use super::restart::{Down, run_restarting_at};
+    let original = stored(None);
+    let (name, expected) = members().remove(0);
+    let at = original
+        .windows(expected.len())
+        .position(|window| window == expected)
+        .unwrap();
+    let mut posted = original.clone();
+    posted[at + ARTICLE + 3] ^= 0x5a;
+    let count = posted.len().div_ceil(ARTICLE);
+    let mut posts = vec![Post::plain("lantern.7z", posted)];
+    posts.extend(par2_set("lantern", &[("lantern.7z", &original)], 4));
+    let mut scenario = Scenario::new(posts);
+    scenario.first = std::iter::once(0)
+        .chain(2..count as u32)
+        .chain(std::iter::once(1))
+        .map(|ordinal| (0, ordinal))
+        .collect();
+    let outcome = run_restarting_at(&scenario, &mut |_| {}, Down::Crash, &|arrived| {
+        arrived == count
+    })
+    .await;
+    assert_eq!(outcome.restarts, 1);
+    assert_eq!(outcome.status, Some(JobStatus::Complete));
+    assert!(
+        outcome.from_disk.is_empty(),
+        "recorded input must not be fetched again"
+    );
+    assert_eq!(outcome.files.get(&delivered(name)), Some(&expected));
+}
+
+#[tokio::test]
+async fn parent_repair_does_not_override_a_still_failing_member_checksum() {
+    let (name, expected) = members().remove(0);
+    let mut original = build_7z_shaped(
+        &[Entry::file(name, expected.clone())],
+        EncoderMethod::COPY,
+        None,
+        false,
+    );
+    let at = original
+        .windows(expected.len())
+        .position(|window| window == expected)
+        .unwrap();
+    // The recovery set itself describes bytes that fail the inner CRC.
+    original[at + 7] ^= 0x41;
+    let mut posted = original.clone();
+    posted[at + ARTICLE + 3] ^= 0x5a;
+    let mut posts = vec![Post::plain("lantern.7z", posted)];
+    posts.extend(par2_set("lantern", &[("lantern.7z", &original)], 4));
+    let scenario = Scenario::new(posts);
+    let (_temp, mut pipeline, _) = admit(&scenario).await;
+    serve_posts(&mut pipeline, &scenario, 0..1).await;
+    let tree = pipeline.graph_jobs.get(&JOB).unwrap().tree();
+    let (store, _) = tree
+        .child_of(weaver_graph::NodeId::ROOT, weaver_graph::MemberId(0))
+        .unwrap();
+    assert!(
+        tree.namespace(store)
+            .unwrap()
+            .members()
+            .any(|member| member.crc32.is_some()),
+        "fixture must state a member checksum"
+    );
+    assert!(
+        tree.namespace(store).unwrap().members().any(|member| member
+            .coverage
+            .runs()
+            .any(|run| run.provenance == weaver_graph::Provenance::Refuted)),
+        "fixture must be checksum-rejected"
+    );
+    serve_posts(&mut pipeline, &scenario, 1..scenario.posts.len() as u32).await;
+    drive_to_finish(&mut pipeline, &scenario).await;
+    let status = job_status_for_assert(&pipeline, JOB);
+    retire_pipeline_database(pipeline).await;
+    assert!(
+        matches!(status, Some(JobStatus::Failed { .. })),
+        "{status:?}"
+    );
+}
+
+// Articles of 60 bytes: past the 32-byte signature header the third,
+// `SENT_BACK`, starts 8 bytes into a cipher block of the folder and ends
+// inside another, and every byte of it is `ember.mkv`'s.
+const FRAME: usize = 60;
+const SENT_BACK: u32 = 2;
+
+// The stored container `posted`, enciphered under `password` when there is
+// one, and with `spoiled` the copy of `SENT_BACK` a server holds that is not
+// the posted bytes, though it passes its own check. One container stands
+// behind every copy: each enciphering draws its own salt and vector.
+fn sent_back_scenario(posted: &[u8], password: Option<&str>, spoiled: bool) -> Scenario {
+    let mut bytes = posted.to_vec();
+    let at = SENT_BACK as usize * FRAME;
+    if spoiled {
+        bytes[at..at + FRAME]
+            .iter_mut()
+            .for_each(|byte| *byte ^= 0x5a);
+    }
+    let scenario = Scenario::new(vec![Post::plain("lantern.7z", bytes)]).framed(FRAME);
+    match password {
+        Some(password) => scenario.password(password),
+        None => scenario,
+    }
+}
+
+// Whether `ember.mkv` of the job's store is closed, its checksum stated.
+fn ember_closed(pipeline: &Pipeline) -> bool {
+    let tree = pipeline.graph_jobs[&JOB].tree();
+    let (store, _) = tree
+        .child_of(weaver_graph::NodeId::ROOT, weaver_graph::MemberId(0))
+        .expect("the store is bound");
+    tree.namespace(store)
+        .unwrap()
+        .members()
+        .any(|member| member.name == "ember.mkv" && member.closed && member.crc32.is_some())
+}
+
+// The articles come in order, `first`'s copy of each: every one with
+// `closed`, so `ember.mkv` closes, or else all but the one that holds its
+// last bytes. Then `SENT_BACK` is sent back for another copy, as the decoder
+// sends back an article its neighbours refute, and `again`'s copy comes;
+// then the rest. The store says the member's bytes from there again, so its
+// own checksum fold no longer covers them all. What the job delivers once
+// it ends, and how it ends.
+async fn sent_back_once(
+    password: Option<&str>,
+    first_spoiled: bool,
+    closed: bool,
+) -> (Option<JobStatus>, BTreeMap<String, Vec<u8>>) {
+    let posted = stored(password);
+    let first = sent_back_scenario(&posted, password, first_spoiled);
+    let again = sent_back_scenario(&posted, password, !first_spoiled);
+    let articles = first.posts[0].bytes.len().div_ceil(FRAME) as u32;
+    // `ember.mkv` ends 32 + its length into the container.
+    let last = (32 + members()[0].1.len() - 1) as u32 / FRAME as u32;
+    let held = if closed { articles } else { last };
+    let (_temp, mut pipeline, complete_dir) = admit(&first).await;
+    for ordinal in 0..held {
+        serve_queued(&mut pipeline, &first, (0, ordinal)).await;
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+    }
+    assert_eq!(ember_closed(&pipeline), closed);
+    pipeline.graph_article_sent_back(SegmentId {
+        file_id: NzbFileId {
+            job_id: JOB,
+            file_index: 0,
+        },
+        segment_number: SENT_BACK,
+    });
+    serve_queued(&mut pipeline, &again, (0, SENT_BACK)).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
+    for ordinal in held..articles {
+        serve_queued(&mut pipeline, &again, (0, ordinal)).await;
+        pump_pipeline_runtime_queues(&mut pipeline).await;
+    }
+    drive_to_finish(&mut pipeline, &again).await;
+    let status = job_status_for_assert(&pipeline, JOB);
+    let mut files = BTreeMap::new();
+    collect(&complete_dir, &complete_dir, &mut files);
+    retire_pipeline_database(pipeline).await;
+    (status, files)
+}
+
+// The copy that came first was not the article's bytes and is sent back
+// before `ember.mkv` closes, and the one sent for comes right: the member is
+// checked over the bytes it holds once it closes, and both members come out
+// whole.
+async fn a_wrong_copy_sent_back_is_replaced_and_proved(password: Option<&str>) {
+    let (status, files) = sent_back_once(password, true, false).await;
+    assert_eq!(status, Some(JobStatus::Complete), "{:?}", files.keys());
+    for (name, bytes) in members() {
+        assert!(files.get(&delivered(name)) == Some(&bytes), "{name} bytes");
+    }
+}
+
+// The copy that came first was right and `ember.mkv` closed on it, and the
+// one that comes after the send back is not: what the member's checksum
+// proved of the first copy does not stand for the second, so `ember.mkv`
+// fails its checksum and is not delivered as whole; `quill.mkv`, untouched,
+// is.
+async fn a_wrong_copy_after_a_send_back_fails_the_member(password: Option<&str>) {
+    let (status, files) = sent_back_once(password, false, true).await;
+    assert!(
+        !matches!(status, Some(JobStatus::Complete)),
+        "{status:?} {:?}",
+        files.keys()
+    );
+    let (ember, quill) = (members().remove(0), members().remove(1));
+    assert!(
+        files.get(&delivered(ember.0)) != Some(&ember.1),
+        "ember.mkv whole"
+    );
+    assert!(
+        files.get(&delivered(quill.0)) == Some(&quill.1),
+        "quill.mkv bytes"
+    );
+}
+
+#[tokio::test]
+async fn a_stored_member_whose_wrong_article_was_sent_back_is_proved_on_its_right_copy() {
+    a_wrong_copy_sent_back_is_replaced_and_proved(None).await;
+}
+
+#[tokio::test]
+async fn an_enciphered_member_whose_wrong_article_was_sent_back_is_proved_on_its_right_copy() {
+    a_wrong_copy_sent_back_is_replaced_and_proved(Some(SECRET)).await;
+}
+
+#[tokio::test]
+async fn a_stored_member_whose_article_came_again_wrong_fails_its_checksum() {
+    a_wrong_copy_after_a_send_back_fails_the_member(None).await;
+}
+
+#[tokio::test]
+async fn an_enciphered_member_whose_article_came_again_wrong_fails_its_checksum() {
+    a_wrong_copy_after_a_send_back_fails_the_member(Some(SECRET)).await;
 }

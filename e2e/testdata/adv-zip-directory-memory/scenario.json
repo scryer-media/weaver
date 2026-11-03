@@ -1,0 +1,16 @@
+{
+  "slug": "adv-zip-directory-memory",
+  "title": "E2E.Adversarial.Zip.Directory.Memory.2026-TESTGRP",
+  "description": "A valid zip with more than eight MiB of central-directory comments. A deflated first member sends it to the bounded engine, which refuses to allocate the directory and leaves the original archive untouched.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "directory.zip": "7ada62eadfd3e8d60b4f562e1d2f20b97400d8eafab5bac7a17963966ac6ff49"
+  },
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "requiredOutputs": ["directory.zip"],
+    "forbiddenOutputs": ["f000", "f001", "f143"]
+  }
+}

@@ -131,7 +131,6 @@ impl TestHarness {
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
             direct_store: None,
-            direct_unpack: None,
             delivery_naming: None,
             hardware_profile: None,
             metrics: Default::default(),
@@ -194,6 +193,7 @@ impl TestHarness {
             );
         let schema = build_schema(SchemaContext {
             handle: handle.clone(),
+            pipeline_state: shared_state.clone(),
             scheduled_resume: scheduled_resume.clone(),
             config: shared_config.clone(),
             db: db.clone(),

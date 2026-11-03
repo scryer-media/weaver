@@ -1859,7 +1859,7 @@ async fn a_refused_torrent_reads_and_is_removed_as_failed_before_its_job_is_back
     }
     retired.wait_for(|retired| *retired >= 1).await.unwrap();
     rig.service.stop().await;
-    rig.db.prune_orphan_active_state().unwrap();
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
     again.open().await.unwrap();
@@ -2864,7 +2864,7 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
         (total, 30, Some(EPOCH_MS + 30_000))
     );
     // What the server's recovery clears before anything starts.
-    rig.db.prune_orphan_active_state().unwrap();
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
     let handle = queue();
@@ -3763,7 +3763,7 @@ async fn a_restart_after_a_recheck_does_not_have_the_piece_it_lost() {
     handle.wait_until_initialized().await.unwrap();
     assert_eq!(job_have(&rig.service, job_id).await, 3);
     rig.service.stop().await;
-    rig.db.prune_orphan_active_state().unwrap();
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
     reopen(&again).await;
@@ -3840,7 +3840,7 @@ async fn a_stop_before_a_recheck_found_every_piece_checks_every_piece_on_the_nex
     assert!(intake.checking().unwrap());
     assert_eq!(job_have(&rig.service, job_id).await, 0);
     rig.service.stop().await;
-    rig.db.prune_orphan_active_state().unwrap();
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
     reopen(&again).await;
@@ -6705,7 +6705,7 @@ async fn resumes_with_its_pieces(fetched: PartlyFetched) {
         ..
     } = fetched;
     // What the server's recovery clears before anything starts.
-    rig.db.prune_orphan_active_state().unwrap();
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
     again.open().await.unwrap();
@@ -6763,7 +6763,7 @@ async fn a_restart_restores_a_torrents_job_at_the_tick_not_at_start() {
         ..
     } = partly_fetched().await;
     rig.service.stop().await;
-    rig.db.prune_orphan_active_state().unwrap();
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
     let ledger = rig.db.get_torrent_counters(job_id).unwrap().unwrap();
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
@@ -6820,7 +6820,7 @@ async fn a_restart_during_a_check_shows_what_its_job_will_hold() {
     assert!(intake.checking().unwrap());
     assert!(intake.found(4).unwrap());
     rig.service.save_checkpoints([job_id].into()).await;
-    rig.db.prune_orphan_active_state().unwrap();
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
     let written = again.written();
@@ -6861,7 +6861,7 @@ async fn a_restored_torrent_attaches_as_soon_as_its_job_is_back() {
         ..
     } = partly_fetched().await;
     rig.service.stop().await;
-    rig.db.prune_orphan_active_state().unwrap();
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
     again.open().await.unwrap();
@@ -6910,7 +6910,7 @@ async fn a_paused_torrent_restarts_showing_what_it_has() {
     } = partly_fetched().await;
     rig.service.pause(job_id).await.unwrap();
     rig.service.stop().await;
-    rig.db.prune_orphan_active_state().unwrap();
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
     let written = again.written();
@@ -6964,7 +6964,7 @@ async fn restarts_showing(fetched: PartlyFetched, shown: (u64, u64, u64)) {
         ..
     } = fetched;
     // What the server's recovery clears before anything starts.
-    rig.db.prune_orphan_active_state().unwrap();
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
     reopen(&again).await;
     handle_of(&again, job_id)

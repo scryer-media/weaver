@@ -134,11 +134,24 @@ func TestSaltedEntryMayNotCarryASizeOrDigest(t *testing.T) {
 	}
 }
 
-// The committed ledger is the real subject: exactly the fixtures whose writer
-// draws a salt are salted — the 7-Zip AES chains, and the encrypted RAR repair
-// sets under PAR2 and PAR3, whose recovery data covers the salted ciphertext —
-// and every one belongs to a recipe that admits it cannot pin its bytes.
+// The committed ledger admits only writers with variable bytes: encryption
+// salts, recovery sets over ciphertext, and RAR recovery records. Every entry
+// belongs to a recipe that admits it cannot pin its bytes.
 func saltedWriterPath(path string) bool {
+	switch path {
+	case "testdata/par2-unrelated-set/record.rar",
+		"testdata/rar4-record-repair/record.rar",
+		"testdata/rar4-record-and-volume-repair/record.part1.rar",
+		"testdata/rar4-record-and-volume-repair/record.part1.rev",
+		"testdata/rar4-record-and-volume-repair/record.part3.rar",
+		"testdata/rar5-record-repair/record.rar",
+		"testdata/rar5-record-and-volume-repair/record.part1.rar",
+		"testdata/rar5-record-and-volume-repair/record.part1.rev",
+		"testdata/rar5-record-and-volume-repair/record.part3.rar":
+		// Recovery records carry a clock (RAR4) or variable recovery data
+		// (RAR5); .rev files protect those bytes too.
+		return true
+	}
 	return strings.Contains(path, "aes256") ||
 		strings.Contains(path, "direct-store-encrypted-par2-repair") ||
 		strings.Contains(path, "direct-store-encrypted-par3-repair") ||

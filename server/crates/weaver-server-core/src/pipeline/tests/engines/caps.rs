@@ -1,22 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The extraction caps under graph: one budget per job, held where the
-// namespace writes. A breach fails the job as classic's budget fails one,
-// with the refusal's rendering and reason word, at the extraction stage; a
-// name the operator's policy refuses fails it with the policy's sentence.
-// The depth limit is no breach: the tree never builds an object past it,
-// the member is delivered as the container it is, and the job goes on. Classic enforces these in its extraction workers, which
-// this harness does not run, so every row here is graph-only. The deadline
-// has no row: it is a wall clock, and no row here races one.
+// The extraction caps: one budget per job, held where the namespace
+// writes. A breach fails the job with the refusal's rendering and reason
+// word, at the extraction stage; a name the operator's policy refuses fails
+// it with the policy's sentence. The depth limit is no breach: the tree
+// never builds an object past it, the member is delivered as the container
+// it is, and the job goes on. The deadline has no row: it is a wall clock,
+// and no row here races one.
 
-use super::harness::{ARTICLE, Post, Scenario, payload, run};
+use super::harness::{ARTICLE, Post, Scenario, assert_fetched_once, payload, run};
 use super::restart::run_restarting;
 use super::streams::{gzip, tar, xz};
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::extraction::ExtractionLimits;
-use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::direct_store::{multi_member_store_set, single_member_store_set};
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -68,7 +66,7 @@ pub(super) fn zeros_zstd(blocks: usize) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn a_member_inflating_past_the_ratio_fails_the_job_naming_ratio_under_graph() {
+async fn a_member_inflating_past_the_ratio_fails_the_job_naming_ratio() {
     // Half a MiB from a few dozen bytes, against a ratio of four: the job's
     // limit is the floor a ratio never goes under.
     let scenario =
@@ -76,7 +74,7 @@ async fn a_member_inflating_past_the_ratio_fails_the_job_naming_ratio_under_grap
             limits.max_ratio = 4;
             limits.ratio_floor_bytes = FLOOR;
         }));
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert_refused(&graph, "ratio");
     assert!(
         graph
@@ -89,32 +87,34 @@ async fn a_member_inflating_past_the_ratio_fails_the_job_naming_ratio_under_grap
 }
 
 #[tokio::test]
-async fn a_job_writing_past_its_byte_cap_fails_naming_job_bytes_under_graph() {
+async fn a_job_writing_past_its_byte_cap_fails_naming_job_bytes() {
     let scenario = Scenario::new(vec![Post::plain(
         "ember.bin.xz",
         xz(&payload(40 * ARTICLE, 71)),
     )])
     .limits(limits(|limits| limits.max_job_bytes = 1000));
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert_refused(&graph, "job_bytes");
 }
 
 #[tokio::test]
-async fn a_member_past_its_byte_cap_fails_naming_member_bytes_under_graph() {
+async fn a_member_past_its_byte_cap_fails_naming_member_bytes() {
     let scenario = Scenario::new(vec![Post::plain(
         "ember.bin.xz",
         xz(&payload(40 * ARTICLE, 72)),
     )])
     .limits(limits(|limits| limits.max_member_bytes = 1000));
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert_refused(&graph, "member_bytes");
+    // Counted once, under its reason.
+    assert_eq!(graph.rejections, [0, 0, 1, 0, 0, 0, 0, 0, 0]);
 }
 
 // A stored member whose header declares more than the cap, of which only
 // the first article arrives: its file takes the declared length when it
 // opens, so the cap is breached there, whatever the bytes reach.
 #[tokio::test]
-async fn a_member_declaring_past_its_byte_cap_fails_naming_member_bytes_under_graph() {
+async fn a_member_declaring_past_its_byte_cap_fails_naming_member_bytes() {
     let body = payload(3 * ARTICLE + 5, 79);
     let (name, bytes) = single_member_store_set("beacon.bin", &body, 1).remove(0);
     let articles = bytes.len().div_ceil(ARTICLE) as u32;
@@ -124,7 +124,7 @@ async fn a_member_declaring_past_its_byte_cap_fails_naming_member_bytes_under_gr
     for ordinal in 1..articles {
         scenario = scenario.lost(0, ordinal);
     }
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert_refused(&graph, "member_bytes");
     let declared = format!("member output would reach {} bytes", body.len());
     assert!(
@@ -138,7 +138,7 @@ async fn a_member_declaring_past_its_byte_cap_fails_naming_member_bytes_under_gr
 }
 
 #[tokio::test]
-async fn an_archive_past_the_entry_cap_fails_naming_entries_under_graph() {
+async fn an_archive_past_the_entry_cap_fails_naming_entries() {
     let members: Vec<(String, Vec<u8>)> = (0..5)
         .map(|index| (format!("ember{index}.bin"), payload(ARTICLE + index, 73)))
         .collect();
@@ -148,7 +148,7 @@ async fn an_archive_past_the_entry_cap_fails_naming_entries_under_graph() {
         .collect();
     let scenario = Scenario::new(vec![Post::plain("lantern.tar", tar(&borrowed))])
         .limits(limits(|limits| limits.max_entries = 3));
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert_refused(&graph, "entries");
 }
 
@@ -170,12 +170,12 @@ fn chain(levels: usize) -> (Post, Vec<u8>, Vec<u8>) {
 }
 
 #[tokio::test]
-async fn a_chain_past_the_depth_limit_is_refused_at_the_limit_under_graph() {
+async fn a_chain_past_the_depth_limit_is_refused_at_the_limit() {
     // Every RAR above the innermost opens; that one would open a namespace
     // past the limit, so it is never opened. No budget is breached: it is
     // handed over as the file it is, and the job completes.
     let (post, _, innermost) = chain(DEPTH_LIMIT + 1);
-    let graph = run(&Scenario::new(vec![post]), Engine::Graph).await;
+    let graph = run(&Scenario::new(vec![post])).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     assert!(
         graph.graph().delivery.withheld.is_empty(),
@@ -198,9 +198,9 @@ async fn a_chain_past_the_depth_limit_is_refused_at_the_limit_under_graph() {
 }
 
 #[tokio::test]
-async fn a_chain_at_the_depth_limit_delivers_under_graph() {
+async fn a_chain_at_the_depth_limit_delivers() {
     let (post, body, _) = chain(DEPTH_LIMIT);
-    let graph = run(&Scenario::new(vec![post]), Engine::Graph).await;
+    let graph = run(&Scenario::new(vec![post])).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     let delivered: Vec<_> = graph
         .files
@@ -215,13 +215,13 @@ async fn a_chain_at_the_depth_limit_delivers_under_graph() {
 async fn caps_at_their_defaults_touch_nothing() {
     let members = super::streams::members();
     let scenario = Scenario::new(vec![Post::plain("lantern.tar.gz", gzip(&tar(&members)))]);
-    let (classic, graph) = super::harness::run_both(&scenario).await;
+    let graph = run(&scenario).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
-    super::harness::assert_same(&classic, &graph);
+    assert_fetched_once(&graph);
 }
 
 #[tokio::test]
-async fn a_member_the_extension_policy_rejects_fails_the_job_at_any_depth_under_graph() {
+async fn a_member_the_extension_policy_rejects_fails_the_job_at_any_depth() {
     let rejected = |posts: Vec<Post>| Scenario::new(posts).unacceptable(&["exe"]);
     let member = || vec![("beacon.exe", payload(2 * ARTICLE + 3, 75))];
     let cases = [
@@ -242,7 +242,7 @@ async fn a_member_the_extension_policy_rejects_fails_the_job_at_any_depth_under_
         ),
     ];
     for (posts, name) in cases {
-        let graph = run(&rejected(posts), Engine::Graph).await;
+        let graph = run(&rejected(posts)).await;
         assert_eq!(
             graph.failure.as_deref(),
             Some(format!("unwanted extension '.exe' in '{name}'").as_str()),
@@ -255,14 +255,14 @@ async fn a_member_the_extension_policy_rejects_fails_the_job_at_any_depth_under_
 }
 
 #[tokio::test]
-async fn a_member_the_policy_allows_is_untouched_under_graph() {
+async fn a_member_the_policy_allows_is_untouched() {
     let members = vec![
         ("exe.bin", payload(2 * ARTICLE + 3, 76)),
         ("beacon.exe.bin", payload(ARTICLE + 1, 77)),
     ];
     let scenario = Scenario::new(vec![Post::plain("lantern.tar.gz", gzip(&tar(&members)))])
         .unacceptable(&["exe"]);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     for (name, bytes) in &members {
         let delivered = graph
@@ -284,7 +284,7 @@ async fn a_job_restarted_mid_extraction_keeps_counting_its_bytes() {
         Scenario::new(vec![Post::plain("ember.bin.xz", xz(&body))]).limits(limits(|limits| {
             limits.max_job_bytes = body.len() as u64 - 1
         }));
-    let whole = run(&scenario, Engine::Graph).await;
+    let whole = run(&scenario).await;
     assert_refused(&whole, "job_bytes");
     let restarted = run_restarting(&scenario, &mut |_| {}).await;
     assert!(restarted.restarts > 0, "the run restarted");
@@ -372,14 +372,14 @@ fn assert_leaves(files: &std::collections::BTreeMap<String, Vec<u8>>, breadth: &
 }
 
 #[tokio::test]
-async fn a_breadth_post_past_the_memory_limit_fails_naming_memory_under_graph() {
+async fn a_breadth_post_past_the_memory_limit_fails_naming_memory() {
     // Ten RARs a level, four deep: far fewer entries than the limit, and
     // what their namespaces keep resident passes a MiB long before the
     // last is announced.
     let breadth = breadth(10, 4);
     assert!(breadth.entries < 100_000, "{}", breadth.entries);
     let scenario = breadth_scenario(&breadth.post, |limits| limits.max_memory_bytes = MIB);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert_refused(&graph, "memory");
     let failure = graph.failure.as_deref().unwrap_or_default();
     assert!(
@@ -390,11 +390,11 @@ async fn a_breadth_post_past_the_memory_limit_fails_naming_memory_under_graph() 
 }
 
 #[tokio::test]
-async fn a_breadth_post_one_entry_past_the_entry_limit_fails_naming_entries_under_graph() {
+async fn a_breadth_post_one_entry_past_the_entry_limit_fails_naming_entries() {
     let breadth = breadth(5, 4);
     let limit = breadth.entries - 1;
     let scenario = breadth_scenario(&breadth.post, |limits| limits.max_entries = limit);
-    let graph = run(&scenario, Engine::Graph).await;
+    let graph = run(&scenario).await;
     assert_refused(&graph, "entries");
     assert!(
         graph
@@ -410,9 +410,9 @@ async fn a_breadth_post_one_entry_past_the_entry_limit_fails_naming_entries_unde
 }
 
 #[tokio::test]
-async fn a_breadth_post_under_its_limits_delivers_every_leaf_under_graph() {
+async fn a_breadth_post_under_its_limits_delivers_every_leaf() {
     let breadth = breadth(5, 4);
-    let graph = run(&breadth_scenario(&breadth.post, |_| {}), Engine::Graph).await;
+    let graph = run(&breadth_scenario(&breadth.post, |_| {})).await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     assert_leaves(&graph.files, &breadth);
 }
@@ -427,12 +427,12 @@ async fn a_breadth_post_restarted_counts_its_entries_and_resident_bytes_as_befor
         })
         .framed(RESTARTED_FRAME)
     };
-    let whole = run(&at(breadth.entries, 4 * GIB), Engine::Graph).await;
+    let whole = run(&at(breadth.entries, 4 * GIB)).await;
     assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
     // What the namespaces kept, summed from the tree: the job is held to it
     // exactly, uninterrupted and restarted.
     let resident = whole.graph().resident;
-    let exact = run(&at(breadth.entries, resident), Engine::Graph).await;
+    let exact = run(&at(breadth.entries, resident)).await;
     assert!(exact.completed(), "{:?} {:?}", exact.status, exact.failure);
     let restarted = run_restarting(&at(breadth.entries, resident), &mut |_| {}).await;
     assert!(restarted.restarts > 0, "the run restarted");

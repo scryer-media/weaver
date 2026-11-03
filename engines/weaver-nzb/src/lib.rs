@@ -20,6 +20,7 @@ pub use deobfuscate::{
 };
 pub use error::NzbError;
 pub use parser::{
-    FileParseDiagnostics, ParseDiagnostics, parse_nzb, parse_nzb_reader, parse_nzb_with_diagnostics,
+    FileParseDiagnostics, NzbNames, ParseDiagnostics, parse_nzb, parse_nzb_names_reader,
+    parse_nzb_reader, parse_nzb_with_diagnostics,
 };
 pub use types::{Nzb, NzbFile, NzbMeta, NzbSegment};

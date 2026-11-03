@@ -582,6 +582,8 @@ fn install_e2e_network_time_scale() {
         leg_cooldown_initial = ?timing.leg_cooldown_initial,
         rung_cooldown = ?timing.rung_cooldown,
         replan_interval = ?timing.replan_interval,
+        pool_idle_retire = ?timing.pool_idle_retire,
+        pool_idle_sweep = ?timing.pool_idle_sweep,
         "e2e network time scale installed"
     );
 }

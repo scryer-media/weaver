@@ -431,7 +431,7 @@ func PAR3Recipes() []Recipe {
 	const obfuscatedName = "51273aad56a8b904e96928935278a627.201"
 	add(Recipe{
 		Slug: "par3-obfuscated-names", ByteReproducible: true,
-		Notes: "The payload posted under an obfuscated hex name with one block damaged. The name the set records is the only trustworthy one, so the delivered file must carry it.",
+		Notes: "The payload posted as a lone numbered piece under an obfuscated hex name with one block damaged. The piece founds a split, and the file is delivered whole under the name the set records.",
 		Build: sequence(
 			par3WritePayloads(obfuscated),
 			par3Create(PAR3Spec{Index: "indigo.vale.s01e08.par3", Sources: []string{obfuscated.name},

@@ -104,4 +104,68 @@ impl<K: Ord + Copy, V> Marked<K, V> {
     pub fn marks(&self) -> &Marks<K> {
         &self.marks
     }
+
+    // The entries, the marks given up with the map.
+    pub fn into_map(self) -> BTreeMap<K, V> {
+        self.map
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use crate::deliver::{Posted, Provenance};
+    use crate::member::MemberId;
+    use crate::tree::record_tests::{Objects, three_levels};
+    use crate::tree::{Mark, NodeId, Tree};
+
+    fn deliver(tree: &mut Tree, member: MemberId, offset: u64, bytes: &[u8]) {
+        let arrival = Posted {
+            offset,
+            bytes: Bytes::copy_from_slice(bytes).into(),
+            provenance: Provenance::Fresh,
+        };
+        tree.deliver(NodeId::ROOT, member, arrival, &mut Objects, &mut Vec::new());
+    }
+
+    // An article's bytes for one root member mark that member, and none of
+    // its siblings; the root's own row is not marked.
+    #[test]
+    fn writing_one_members_coverage_marks_that_member_alone() {
+        let mut tree = Tree::new();
+        let mut effects = Vec::new();
+        let members: Vec<MemberId> = ["a.bin", "b.bin", "c.bin"]
+            .into_iter()
+            .map(|name| tree.announce_root(name, Some(4), &mut effects))
+            .collect();
+        for member in &members {
+            deliver(&mut tree, *member, 0, b"le");
+        }
+        let at = tree.generation();
+        let namespace_at = tree.namespace(NodeId::ROOT).unwrap().generation();
+
+        deliver(&mut tree, members[2], 2, b"af");
+
+        let marked: Vec<Mark> = tree.marked_since(at).collect();
+        assert_eq!(marked, vec![Mark::Members(NodeId::ROOT)]);
+        let namespace = tree.namespace(NodeId::ROOT).unwrap();
+        let changed: Vec<MemberId> = namespace.changed_since(namespace_at).collect();
+        assert_eq!(changed, vec![members[2]]);
+    }
+
+    // Bytes an object takes reach it through its node, so its node's own
+    // row, which carries its facts, is marked; the root's is not.
+    #[test]
+    fn writing_object_facts_marks_the_node() {
+        let (mut tree, archive) = three_levels();
+        let object = tree.child_of(NodeId::ROOT, archive).unwrap().0;
+        let at = tree.generation();
+
+        deliver(&mut tree, archive, 18, b"more");
+
+        let marked: Vec<Mark> = tree.marked_since(at).collect();
+        assert!(marked.contains(&Mark::Node(object)), "{marked:?}");
+        assert!(!marked.contains(&Mark::Node(NodeId::ROOT)), "{marked:?}");
+    }
 }

@@ -73,10 +73,11 @@ const (
 	twoSetsDamageLength       = 2 * twoSetsPrimarySliceSize
 )
 
-// ignorableSidecarNotesText is the sidecar payload of the ignorable-deficit
-// set. WriteText pads it to a fixed length, so what matters is that it is a
-// deterministic run of bytes; the title is invented.
-const ignorableSidecarNotesText = "Golden Meridian - season two, episode three. Release notes beside the payload; every name here is invented.\n"
+// Distinct blocks prevent PAR2 from repairing a deficit by copying an
+// identical surviving block instead of consuming recovery data.
+func writeIgnorableSidecar(path string) error {
+	return WritePRNG(path, "ignorable-deficit/sidecar", ignorableSidecarBytes)
+}
 
 // The payload paths recipes name as provenance: ledger paths that carry
 // exactly the bytes the artifact cache feeds to the oracles.
@@ -133,7 +134,15 @@ var ScenarioOnly = map[string]string{
 	"rar5-multivolume-missing-tail":            "stages the first two volumes of rar5-multivolume and omits the third",
 	"single-mkv-sparse-nzb":                    "stages single-mkv's payload under a sparse NZB numbering",
 	"extensionless-payload-named-by-content":   "stages single-mkv's payload under a name with no extension",
+	"par3-obfuscated-plain-name":               "stages par3-obfuscated-names under a bare hex name, so the payload is a plain file until its PAR3 set moves it",
 	"stat-health-probe":                        "stages two direct MKVs; the same articles are deleted from each by the harness",
+	"adv-rar-named-mkv":                        "stages rar5-single's archive under a .mkv name",
+	"adv-7z-named-rar":                         "stages single-7z's archive under a .rar name",
+	"adv-exe-carrying-rar":                     "stages rar5-single's archive under a .exe name",
+	"adv-zip-named-par2":                       "stages zip-unencrypted's archive under a .par2 name",
+	"adv-password-rar5":                        "stages rar5-encrypted's archive; the lane submits it with no password and with a wrong one",
+	"adv-password-7z":                          "stages 7z-encrypted's archive; the lane submits it with no password and with a wrong one",
+	"adv-password-zip":                         "stages zip-encrypted's archive; the lane submits it with no password and with a wrong one",
 }
 
 // Recipes is the corpus, one entry per scenario directory that owns bytes.
@@ -1190,13 +1199,13 @@ func Recipes() []Recipe {
 
 	add(Recipe{
 		Slug: "par2-ignorable-deficit", Family: "PAR2",
-		Notes: "A 5 MiB payload and a 32 KiB text sidecar under one recovery set of 4 KiB blocks, with five of the sidecar's eight blocks zeroed against three recovery blocks. " +
+		Notes: "A 5 MiB payload and a 32 KiB sidecar of distinct deterministic blocks under one recovery set of 4 KiB blocks, with five of the sidecar's eight blocks zeroed against three recovery blocks. " +
 			"Every payload block verifies, so the only damage in the set is a short metadata file the recovery data cannot rebuild: the whole question the fixture asks is what a verdict does with that alone.",
 		Inputs: []string{previewPayloadPath},
 		Build: sequence(
 			publish("clip-preview", "test-media.mkv"),
 			func(ctx context.Context, env *Env) error {
-				return WriteText(env.OutputPath("info.nfo"), ignorableSidecarNotesText, ignorableSidecarBytes)
+				return writeIgnorableSidecar(env.OutputPath("info.nfo"))
 			},
 			par2(PAR2Spec{Base: "release.par2", SliceSize: ignorableSliceSize, RecoveryBlocks: 3, RecoveryFiles: 1,
 				Sources: []string{"test-media.mkv", "info.nfo"}}),
@@ -1342,7 +1351,7 @@ func Recipes() []Recipe {
 	add(Recipe{
 		Slug: "par2-multi-set-archives-insufficient", Family: "PAR2",
 		Notes: "The 64 KiB/96 KiB mixed-grid counterpart: the primary archive has enough recovery data for its two damaged slices, " +
-			"while the secondary archive has only one recovery block and must make the aggregate job fail.",
+			"while the secondary archive has only one recovery block, so the job ends Partial with the primary's member delivered whole.",
 		Inputs: []string{samplePayloadPath, previewPayloadPath},
 		Build:  multiPARSetArchives(1),
 	})
@@ -1581,6 +1590,9 @@ func Recipes() []Recipe {
 	recipes = append(recipes, DirectStoreRecipes()...)
 	recipes = append(recipes, PAR3Recipes()...)
 	recipes = append(recipes, SpeedTestRecipes()...)
+	recipes = append(recipes, AdversarialRecipes()...)
+	recipes = append(recipes, GraphGapRecipes()...)
+	recipes = append(recipes, GraphBoundaryRecipes()...)
 	return recipes
 }
 
