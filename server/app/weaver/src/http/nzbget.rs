@@ -1877,7 +1877,7 @@ fn nzbget_group(
         "FileCount": item.file_count,
         "RemainingFileCount": item.remaining_file_count,
         "RemainingParCount": item.remaining_par_count,
-        "Health": item.health,
+        "Health": nzbget_health_of(item.total_bytes, item.optional_recovery_bytes, item.failed_bytes),
         "CriticalHealth": critical_health,
         "DupeKey": attribute_value(&item.attributes, "nzbget.dupe_key").unwrap_or_default(),
         "DupeScore": attribute_value(&item.attributes, "nzbget.dupe_score")
@@ -1979,17 +1979,40 @@ fn post_progress_info(item: &QueueItem, post_started_at: Option<i64>) -> PostPro
 }
 
 // NZBGet's CriticalHealth: the health floor below which the download cannot
-// be repaired. Approximated from the recovery volume share of the job.
+// be repaired, as NZBGet reports it: the recovery must cover the loss and
+// still leave itself enough blocks, so the floor is (size - 2 x recovery) /
+// (size - recovery). A job with no recovery reports 1000; one with any
+// recovery never does.
 fn critical_health(item: &QueueItem) -> u64 {
     critical_health_of(item.total_bytes, item.optional_recovery_bytes)
+}
+
+// NZBGet's Health: the share of the non-recovery bytes that arrived, as
+// NZBGet's CalcHealth weighs it. A job that lost anything never reads 1000.
+// `failed_bytes` is already the non-recovery loss.
+fn nzbget_health_of(total_bytes: u64, optional_recovery_bytes: u64, failed_bytes: u64) -> u32 {
+    if failed_bytes == 0 || total_bytes <= optional_recovery_bytes {
+        return 1000;
+    }
+    let size = total_bytes - optional_recovery_bytes;
+    let health = size.saturating_sub(failed_bytes) * 1000 / size;
+    health.min(999) as u32
 }
 
 fn critical_health_of(total_bytes: u64, optional_recovery_bytes: u64) -> u64 {
     if total_bytes == 0 {
         return 1000;
     }
-    let payload = total_bytes.saturating_sub(optional_recovery_bytes);
-    (payload * 1000) / total_bytes
+    if optional_recovery_bytes.saturating_mul(2) > total_bytes {
+        return 0;
+    }
+    let critical = (total_bytes - optional_recovery_bytes * 2) * 1000
+        / (total_bytes - optional_recovery_bytes);
+    if optional_recovery_bytes > 0 {
+        critical.min(999)
+    } else {
+        critical
+    }
 }
 
 // The category string an NZBGet client submitted, kept beside the canonical
@@ -2524,7 +2547,11 @@ fn nzbget_history_item(
             },
         ),
         timings,
-        item.health,
+        nzbget_health_of(
+            item.total_bytes,
+            item.optional_recovery_bytes,
+            item.failed_bytes,
+        ),
         critical_health_of(item.total_bytes, item.optional_recovery_bytes),
         &item.error.clone().unwrap_or_default(),
         item.client_request_id.as_deref(),
@@ -2555,7 +2582,11 @@ fn nzbget_history_queue_item(
             failure_kind_for(failed, kept, item.error.as_deref(), item.health),
         ),
         timings,
-        item.health,
+        nzbget_health_of(
+            item.total_bytes,
+            item.optional_recovery_bytes,
+            item.failed_bytes,
+        ),
         critical_health_of(item.total_bytes, item.optional_recovery_bytes),
         &item.error.clone().unwrap_or_default(),
         item.client_request_id.as_deref(),
@@ -4454,5 +4485,18 @@ mod active_download_state_tests {
         assert!(!nzbget_has_active_download(
             QueueItemState::FinalizingDownload
         ));
+    }
+}
+
+#[cfg(test)]
+mod health_and_stage_tests {
+    use super::*;
+
+    #[test]
+    fn health_is_weighed_over_the_bytes_that_are_not_recovery() {
+        assert_eq!(nzbget_health_of(1000, 100, 0), 1000);
+        assert_eq!(nzbget_health_of(1000, 100, 90), 900);
+        assert_eq!(nzbget_health_of(1_000_000, 0, 1), 999);
+        assert_eq!(nzbget_health_of(100, 100, 5), 1000);
     }
 }
