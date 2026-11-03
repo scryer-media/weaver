@@ -26,7 +26,7 @@ use crate::clone_to_owned::CloneToOwned;
 use crate::core::{
     hash_id::InfoHashes,
     magnet::Magnet,
-    net::{HttpClients, NamedBy, NoNames, Resolver},
+    net::{ClientShape, HttpClients, NamedBy, NoClients, NoNames, Resolver},
     spawn_utils::spawn_with_cancel,
     torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info, WebSeed, WebSeedKind},
     v2_tree::torrent_name,
@@ -284,9 +284,9 @@ pub struct Session {
     pub(crate) external_ips: Arc<ExternalIps>,
     dht: Option<Dht>,
     pub(crate) connector: Arc<StreamConnector>,
-    pub(crate) reqwest_client: reqwest::Client,
-    // Builds the clients web seeds are asked through, each held to the
-    // address its request was checked at.
+    // The clients every request is asked through: metainfo and the allow
+    // list by their URL, trackers and web seeds each held to the address
+    // its request was checked at.
     pub(crate) http_clients: Arc<dyn HttpClients>,
     // Resolves web seeds' host names, so their addresses are known before
     // they are asked: the session's resolver.
@@ -353,10 +353,12 @@ fn is_bare_info_hash(s: &str) -> bool {
 }
 
 async fn torrent_from_url(
-    reqwest_client: &reqwest::Client,
+    clients: &dyn HttpClients,
     url: &str,
 ) -> anyhow::Result<ParsedTorrentFile> {
-    let response = reqwest_client
+    let response = clients
+        .client(None, &ClientShape::FETCH)
+        .context("error building HTTP(S) client")?
         .get(url)
         .send()
         .await
@@ -1049,12 +1051,13 @@ pub struct SessionOptions {
     /// ([`NoNames`]).
     pub resolver: Option<Arc<dyn Resolver>>,
 
-    /// Build the HTTP clients with this instead of the session's own builder.
-    /// Its client for no target downloads torrents and the block and allow
-    /// lists; a tracker or a web seed is asked through a client for the
-    /// addresses the session checked its host at. When set,
-    /// `bind_device_name` and the identity's User-Agent do not apply to HTTP
-    /// requests; configure them on the clients.
+    /// The HTTP clients the session asks through: it builds none itself.
+    /// Their client for no target downloads torrents and the allow list; a
+    /// tracker or a web seed is asked through a client for the addresses
+    /// the session checked its host at; a port mapper asks the gateway
+    /// through their gateway client and socket. `bind_device_name` and the
+    /// identity's User-Agent do not apply to them; configure them on the
+    /// clients. A session given none makes no HTTP request ([`NoClients`]).
     ///
     /// The client for no target does its own DNS lookups:
     /// [`SessionOptions::resolver`] does not apply to it. If those lookups must be routed too, build it
@@ -1557,25 +1560,10 @@ impl Session {
                 .await
                 .context("error initializing session persistence store")?;
 
-            let http_clients: Arc<dyn HttpClients> = match opts.http_client.take() {
-                Some(clients) => clients,
-                None => {
-                    let user_agent = identity.user_agent.clone();
-                    let bind_device = opts.bind_device_name.clone();
-                    Arc::new(move || {
-                        #[allow(unused_mut)]
-                        let mut builder = reqwest::Client::builder().user_agent(&user_agent);
-                        #[cfg(not(windows))]
-                        if let Some(bd) = bind_device.as_ref() {
-                            builder = builder.interface(bd);
-                        }
-                        builder
-                    })
-                }
-            };
-            let reqwest_client = http_clients
-                .client(None)
-                .context("error building HTTP(S) client")?;
+            let http_clients: Arc<dyn HttpClients> = opts
+                .http_client
+                .take()
+                .unwrap_or_else(|| Arc::new(NoClients));
 
             let stream_connector = Arc::new(
                 StreamConnector::new(StreamConnectorArgs {
@@ -1592,7 +1580,7 @@ impl Session {
 
             let allowlist = if let Some(allowlist_url) = opts.allowlist_url {
                 info!(url = allowlist_url, "loading p2p allowlist");
-                let al = IpRanges::load_from_url(&reqwest_client, &allowlist_url)
+                let al = IpRanges::load_from_url(&*http_clients, &allowlist_url)
                     .await
                     .with_context(|| format!("error reading allowlist from {allowlist_url}"))?;
                 info!(len = al.len(), "loaded allowlist");
@@ -1675,7 +1663,6 @@ impl Session {
                     .as_ref()
                     .is_some_and(|l| l.utp_socket.is_some()),
                 default_storage_factory: opts.default_storage_factory,
-                reqwest_client,
                 http_clients,
                 resolver,
                 connector: stream_connector,
@@ -2096,7 +2083,8 @@ impl Session {
         forward: Option<PortMapEvents>,
     ) {
         let interface =
-            crate::route_interface::route_interface(bind_device_name).map_err(|e| format!("{e:#}"));
+            crate::route_interface::route_interface(bind_device_name, self.http_clients.as_ref())
+                .map_err(|e| format!("{e:#}"));
         info!(
             ?requests,
             ?interface,
@@ -2107,7 +2095,12 @@ impl Session {
             description: self.identity.user_agent.clone(),
             ..Default::default()
         };
-        match UpnpPortForwarder::new(requests.clone(), Some(upnp_opts), interface.clone()) {
+        match UpnpPortForwarder::new(
+            requests.clone(),
+            Some(upnp_opts),
+            interface.clone(),
+            self.http_clients.as_ref(),
+        ) {
             Ok(upnp) => self.spawn_port_mapper(
                 "upnp_forward",
                 upnp.run(self.cancellation_token.clone(), events_tx.clone()),
@@ -2117,7 +2110,7 @@ impl Session {
         let route = interface.and_then(|i| GatewayRoute::of(&i).map_err(|e| format!("{e:#}")));
         self.spawn_port_mapper(
             "natpmp_forward",
-            NatPmpMapper::new(route, requests, None)
+            NatPmpMapper::new(route, requests, None, self.http_clients.clone())
                 .run(self.cancellation_token.clone(), events_tx),
         );
         self.follow_port_mappings(events, forward);
@@ -2575,7 +2568,7 @@ impl Session {
                         AddTorrent::Url(url)
                             if url.starts_with("http://") || url.starts_with("https://") =>
                         {
-                            torrent_from_url(&self.reqwest_client, &url).await?
+                            torrent_from_url(self.http_clients.as_ref(), &url).await?
                         }
                         AddTorrent::Url(url) => {
                             bail!(
@@ -3948,10 +3941,10 @@ mod tests {
         // A node run by hand on 127.0.0.1 answers ping, find_node and
         // get_peers, giving a token, and reports each announce_peer port.
         use crate::bencode::{BencodeValue, ByteBufOwned, dyn_from_bytes};
+        use crate::core::net::DatagramSocket;
         use crate::dht::{DhtConfig, DhtState, Id20};
         use futures::StreamExt;
         use std::net::Ipv4Addr;
-        use tokio::net::UdpSocket;
 
         const NODE_ID: [u8; 20] = [0x42; 20];
 
@@ -3970,7 +3963,7 @@ mod tests {
 
         // The port of the next announce_peer the node hears, answering
         // every query before it.
-        async fn next_announced(node: &UdpSocket) -> i64 {
+        async fn next_announced(node: &Arc<dyn DatagramSocket>) -> i64 {
             let mut buf = [0u8; 2048];
             loop {
                 let (len, from) = node.recv_from(&mut buf).await.unwrap();
@@ -3995,8 +3988,8 @@ mod tests {
             }
         }
 
-        let node = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let node_addr = node.local_addr().unwrap();
+        let node = crate::test_support::loopback_udp().await;
+        let node_addr = node.bind_addr();
         let dht = DhtState::with_config(DhtConfig {
             listen_addr: Some((Ipv4Addr::LOCALHOST, 0).into()),
             bootstrap_addrs: Some(vec![node_addr.to_string()]),
@@ -4777,10 +4770,16 @@ mod tests {
         session: &Session,
         info_hash: super::Id20,
         offer_v2: bool,
-    ) -> (tokio::net::TcpStream, Vec<u8>) {
+    ) -> (
+        (
+            crate::type_aliases::BoxAsyncReadVectored,
+            crate::type_aliases::BoxAsyncWrite,
+        ),
+        Vec<u8>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let mut stream = tokio::net::TcpStream::connect(session.listen_addr().unwrap())
+        let (mut read, mut write) = crate::test_support::tcp(session.listen_addr().unwrap())
             .await
             .unwrap();
         let mut handshake = [0u8; 68];
@@ -4789,10 +4788,10 @@ mod tests {
             .serialize_unchecked_len(&mut handshake);
         // A refused connection may be closed before or while this is written,
         // and reset after: either way nothing comes back.
-        let _ = stream.write_all(&handshake[..len]).await;
+        let _ = write.write_all(&handshake[..len]).await;
         let mut answer = Vec::new();
-        let _ = (&mut stream).take(68).read_to_end(&mut answer).await;
-        (stream, answer)
+        let _ = (&mut read).take(68).read_to_end(&mut answer).await;
+        ((read, write), answer)
     }
 
     // Whether a 68-byte handshake answer offers v2.
@@ -5453,7 +5452,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let torrent = v2_torrent(true);
         let (_dir, session, handle) = seeding_v2(&torrent).await;
-        let (mut stream, answer) =
+        let ((mut read, mut write), answer) =
             greet_with(&session, handle.info_hashes().v1.unwrap(), false).await;
         assert_eq!(answered_hash(&answer), handle.info_hashes().v1);
 
@@ -5469,11 +5468,11 @@ mod tests {
             });
         let mut frame = [0u8; 53];
         let len = request.serialize(&mut frame, &Default::default).unwrap();
-        stream.write_all(&frame[..len]).await.unwrap();
+        write.write_all(&frame[..len]).await.unwrap();
 
         // The session closes the connection: the read ends.
         let mut rest = Vec::new();
-        let _ = stream.read_to_end(&mut rest).await;
+        let _ = read.read_to_end(&mut rest).await;
 
         session.stop().await;
     }

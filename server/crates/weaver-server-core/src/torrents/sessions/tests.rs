@@ -178,7 +178,11 @@ impl Routes for FakeRoutes {
             shape: plan.kind.shape(None),
             factory: Some(factory),
             names: Arc::new(weaver_torrent::network::NoNames),
-            http: tracker_client(&LegKind::System, None)?,
+            http: tracker_client(
+                &LegKind::System,
+                crate::torrents::net::system_dialer(),
+                None,
+            )?,
             leg,
         })
     }
@@ -1483,7 +1487,12 @@ fn leg(kind: LegKind) -> OpenLeg {
         kind,
         factory: None,
         names: Arc::new(weaver_torrent::network::NoNames),
-        http: tracker_client(&LegKind::System, None).unwrap(),
+        http: tracker_client(
+            &LegKind::System,
+            crate::torrents::net::system_dialer(),
+            None,
+        )
+        .unwrap(),
         leg: None,
     }
 }

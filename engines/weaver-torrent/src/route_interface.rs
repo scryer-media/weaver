@@ -11,6 +11,8 @@ use std::{
 
 use anyhow::{Context, bail};
 
+use crate::core::net::{Egress, HttpClients};
+
 /// One IPv4 address of one interface.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteInterface {
@@ -23,22 +25,25 @@ pub struct RouteInterface {
 }
 
 /// A documentation address no host answers at. The routing table sends it
-/// the way it sends any public address, and connecting a UDP socket to it
-/// sends nothing: the socket's source address names the interface.
+/// the way it sends any public address: where traffic toward it leaves
+/// from names the interface.
 const PUBLIC_PROBE: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 9);
 
 /// The interface the route's traffic takes: `device` when the session is
-/// bound to one, otherwise the one the host's routing table sends public
-/// traffic through.
-pub fn route_interface(device: Option<&str>) -> anyhow::Result<RouteInterface> {
+/// bound to one, otherwise the one `clients` say public traffic leaves
+/// through.
+pub fn route_interface(
+    device: Option<&str>,
+    clients: &dyn HttpClients,
+) -> anyhow::Result<RouteInterface> {
     let interfaces = ipv4_interfaces().context("error listing network interfaces")?;
-    pick(interfaces, device, PUBLIC_PROBE)
+    pick(interfaces, device, || source_toward(clients, PUBLIC_PROBE))
 }
 
 fn pick(
     interfaces: Vec<RouteInterface>,
     device: Option<&str>,
-    probe: SocketAddr,
+    source: impl FnOnce() -> anyhow::Result<Ipv4Addr>,
 ) -> anyhow::Result<RouteInterface> {
     let ip = match device {
         Some(device) => {
@@ -47,7 +52,7 @@ fn pick(
                 .find(|i| i.name == device)
                 .with_context(|| format!("{device} has no IPv4 address"));
         }
-        None => source_toward(probe)?,
+        None => source()?,
     };
     interfaces
         .into_iter()
@@ -55,16 +60,13 @@ fn pick(
         .with_context(|| format!("no interface holds {ip}, the address traffic leaves from"))
 }
 
-/// The address a datagram to `to` would leave from.
-fn source_toward(to: SocketAddr) -> anyhow::Result<Ipv4Addr> {
-    let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-        .context("error binding the route probe")?;
-    socket
-        .connect(to)
-        .with_context(|| format!("no route toward {to}"))?;
-    match socket.local_addr()?.ip() {
-        IpAddr::V4(ip) => Ok(ip),
-        ip => bail!("the route toward {to} leaves from {ip}"),
+/// The address a request to `to` leaves from, as `clients` route it.
+fn source_toward(clients: &dyn HttpClients, to: SocketAddr) -> anyhow::Result<Ipv4Addr> {
+    match clients.egress(to) {
+        Egress::From(IpAddr::V4(ip)) => Ok(ip),
+        Egress::From(ip) => bail!("the route toward {to} leaves from {ip}"),
+        Egress::NoRoute => bail!("no route toward {to}"),
+        Egress::Proxied => bail!("the route toward {to} leaves through a proxy"),
     }
 }
 
@@ -125,9 +127,28 @@ fn ipv4_interfaces() -> io::Result<Vec<RouteInterface>> {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::net::Ipv4Addr;
 
-    use super::{RouteInterface, ipv4_interfaces, pick};
+    use std::net::{IpAddr, SocketAddr};
+
+    use super::{RouteInterface, ipv4_interfaces, pick, source_toward};
+    use crate::{ClientShape, Egress, HttpClients, HttpTarget};
+
+    // A route on which every request leaves from `0`.
+    struct LeavesFrom(IpAddr);
+
+    impl HttpClients for LeavesFrom {
+        fn client(
+            &self,
+            _: Option<HttpTarget<'_>>,
+            _: &ClientShape,
+        ) -> anyhow::Result<reqwest::Client> {
+            anyhow::bail!("the route makes no requests")
+        }
+        fn egress(&self, _: SocketAddr) -> Egress {
+            Egress::From(self.0)
+        }
+    }
 
     fn interface(name: &str, ip: [u8; 4], point_to_point: bool) -> RouteInterface {
         RouteInterface {
@@ -139,8 +160,9 @@ mod tests {
 
     #[test]
     fn the_route_interface_holds_the_address_traffic_toward_the_probe_leaves_from() {
-        let loopback: SocketAddr = (Ipv4Addr::LOCALHOST, 9).into();
-        let found = pick(ipv4_interfaces().unwrap(), None, loopback).unwrap();
+        let route = LeavesFrom(Ipv4Addr::LOCALHOST.into());
+        let source = || source_toward(&route, super::PUBLIC_PROBE);
+        let found = pick(ipv4_interfaces().unwrap(), None, source).unwrap();
         assert_eq!(found.ip, Ipv4Addr::LOCALHOST);
         assert!(!found.point_to_point, "{found:?}");
     }
@@ -151,7 +173,8 @@ mod tests {
             interface("en0", [192, 168, 1, 20], false),
             interface("utun8", [10, 44, 0, 2], true),
         ];
-        let unused: SocketAddr = (Ipv4Addr::LOCALHOST, 9).into();
+        let unused =
+            || -> anyhow::Result<Ipv4Addr> { unreachable!("a bound device is not probed") };
         assert_eq!(
             pick(interfaces.clone(), Some("utun8"), unused).unwrap(),
             interface("utun8", [10, 44, 0, 2], true)

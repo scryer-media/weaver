@@ -35,7 +35,7 @@ use crate::{
         hash_id::Id20,
         lengths::{Lengths, ValidPieceIndex},
         magnet::Escaped,
-        net::{HttpClients, HttpTarget, NamedBy, Resolved, Resolver, is_public},
+        net::{ClientShape, HttpClients, HttpTarget, NamedBy, Resolved, Resolver, is_public},
         torrent_metainfo::{WebSeed, WebSeedKind, escape_path},
     },
     peer_connection::{PeerConnectionHandler, WriterRequest},
@@ -921,11 +921,14 @@ impl<'a> WebSeedConnection<'a> {
         }
         let client = self
             .clients
-            .client(Some(HttpTarget {
-                host: &key.0,
-                port,
-                addrs: addr.as_slice(),
-            }))
+            .client(
+                Some(HttpTarget {
+                    host: &key.0,
+                    port,
+                    addrs: addr.as_slice(),
+                }),
+                &ClientShape::FETCH,
+            )
             .with_context(|| format!("{url}: building its client"))?;
         self.pinned.lock().insert(key, client.clone());
         Ok(Reached { addr, client })
@@ -1309,7 +1312,7 @@ mod tests {
     impl Drop for Server {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::SeqCst);
-            let _ = TcpStream::connect(self.addr);
+            crate::test_support::knock(self.addr);
         }
     }
 
@@ -1510,7 +1513,7 @@ mod tests {
 
     // The session's own clients.
     fn direct() -> Arc<dyn HttpClients> {
-        Arc::new(builder)
+        Arc::new(crate::test_support::Loopback::with(builder))
     }
 
     // The clients of a network where every address is the server at `at`:
@@ -1535,16 +1538,17 @@ mod tests {
     }
 
     impl HttpClients for Wired {
-        fn builder(
+        fn client(
             &self,
             target: Option<HttpTarget<'_>>,
-        ) -> anyhow::Result<reqwest::ClientBuilder> {
+            shape: &ClientShape,
+        ) -> anyhow::Result<reqwest::Client> {
             let at = [self.at.ip()];
             let target = target.map(|t| {
                 self.built.lock().extend(t.addrs);
                 HttpTarget { addrs: &at, ..t }
             });
-            Ok(crate::core::net::for_target(builder(), target))
+            crate::test_support::client(builder(), target, shape)
         }
     }
 
@@ -2007,7 +2011,7 @@ mod tests {
             ]
         );
         // The same factory's client for no target reaches no such host.
-        let unpinned = direct().client(None).unwrap();
+        let unpinned = direct().client(None, &ClientShape::FETCH).unwrap();
         assert!(unpinned.get(url).send().await.is_err());
     }
 
@@ -2538,8 +2542,14 @@ mod tests {
             named_by: NamedBy::Operator,
         };
         let out = tempfile::TempDir::with_prefix("test_web_seed_out")?;
-        let session =
-            Session::new_with_opts(out.path().into(), isolated_session_opts(false)).await?;
+        let session = Session::new_with_opts(
+            out.path().into(),
+            crate::SessionOptions {
+                http_client: Some(crate::test_support::loopback()),
+                ..isolated_session_opts(false)
+            },
+        )
+        .await?;
         let storage = MemoryStorageFactory::default();
         let handle = session
             .add_torrent(

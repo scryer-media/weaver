@@ -120,11 +120,15 @@ pub use url::Url;
 pub use crate::buffers::*;
 pub use crate::clone_to_owned::CloneToOwned;
 pub use crate::core::magnet::*;
-pub use crate::core::net::{Egress, HttpClients, HttpTarget, NamedBy, for_target, route_to};
+pub use crate::core::net::{
+    ClientShape, ClientTls, ClientUse, Egress, HttpClients, HttpTarget, NamedBy, NoClients,
+};
 pub use crate::core::peer_id::*;
 pub use crate::core::torrent_metainfo::*;
 pub use crate::identity::{Identity, TrackerIds};
 
+#[cfg(test)]
+pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
 

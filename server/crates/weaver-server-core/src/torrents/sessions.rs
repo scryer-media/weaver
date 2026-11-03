@@ -265,8 +265,8 @@ impl OpenLeg {
         Ok(Self {
             shape: kind.shape(Some(&dialer)),
             factory,
+            http: tracker_client(&kind, Arc::clone(&dialer), bridge)?,
             names: Arc::new(LegNames(dialer)),
-            http: tracker_client(&kind, bridge)?,
             kind,
             leg,
         })

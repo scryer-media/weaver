@@ -8,7 +8,9 @@
 use crate::EncryptionPolicy;
 use crate::bencode::BencodeValue;
 use crate::buffers::ByteBuf;
-use crate::core::net::{HttpClients, HttpTarget, NamedBy, Resolved, Resolver, is_public};
+use crate::core::net::{
+    ClientShape, ClientUse, HttpClients, HttpTarget, NamedBy, Resolved, Resolver, is_public,
+};
 use crate::tracker::ScrapeOk;
 use crate::tracker::tracker_comms::{Reachable, only_reachable};
 use anyhow::Context;
@@ -554,7 +556,12 @@ async fn reach(
         port: url.port_or_known_default().unwrap_or(0),
         addrs: &addrs,
     };
-    let client = clients.tracker_client(target, shape == Shape::Libtorrent)?;
+    let client = clients.client(
+        Some(target),
+        &ClientShape::of(ClientUse::Tracker {
+            title_case: shape == Shape::Libtorrent,
+        }),
+    )?;
     Ok((client, addrs))
 }
 
@@ -771,17 +778,18 @@ mod tests {
     struct Targets(std::sync::Mutex<Vec<(String, u16, Vec<IpAddr>)>>);
 
     impl HttpClients for Targets {
-        fn builder(
+        fn client(
             &self,
             target: Option<HttpTarget<'_>>,
-        ) -> anyhow::Result<reqwest::ClientBuilder> {
+            shape: &ClientShape,
+        ) -> anyhow::Result<reqwest::Client> {
             let target = target.expect("a tracker is asked through a target");
             self.0.lock().unwrap().push((
                 target.host.to_owned(),
                 target.port,
                 target.addrs.to_vec(),
             ));
-            Ok(reqwest::Client::builder().no_proxy())
+            crate::test_support::client(reqwest::Client::builder().no_proxy(), None, shape)
         }
     }
 

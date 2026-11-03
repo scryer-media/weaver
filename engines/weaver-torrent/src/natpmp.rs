@@ -7,16 +7,18 @@
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
     time::Duration,
 };
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use futures::FutureExt;
-use tokio::{net::UdpSocket, time::Instant};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
 use crate::{
+    core::net::{DatagramSocket, Egress, HttpClients},
     route_interface::RouteInterface,
     upnp::{PortMapEvents, PortMapReports, PortMapRequest, PortmapProtocol, PortmapTransport},
 };
@@ -220,7 +222,7 @@ impl State {
         p
     }
 
-    async fn send_map_request(&mut self, i: usize, socket: &UdpSocket) {
+    async fn send_map_request(&mut self, i: usize, socket: &GatewaySocket) {
         let packet = self.map_request(&self.mappings[i]);
         let m = &mut self.mappings[i];
         trace!(
@@ -246,7 +248,7 @@ impl State {
 
     /// libtorrent `resend_request`. A mapping the gateway never answered is
     /// reported failed, as one it refused is.
-    async fn resend_request(&mut self, i: usize, socket: &UdpSocket, reports: &PortMapReports) {
+    async fn resend_request(&mut self, i: usize, socket: &GatewaySocket, reports: &PortMapReports) {
         let Some(flight) = self.in_flight.filter(|f| f.index == i) else {
             return;
         };
@@ -263,7 +265,7 @@ impl State {
         self.send_map_request(i, socket).await;
     }
 
-    async fn send_public_address_request(&self, socket: &UdpSocket) {
+    async fn send_public_address_request(&self, socket: &GatewaySocket) {
         if let Err(e) = socket.send(&[VERSION_NATPMP, OPCODE_PUBLIC_ADDRESS]).await {
             debug!("error sending a public address request: {e:#}");
         }
@@ -271,7 +273,7 @@ impl State {
 
     /// Send the next mapping that has something to do, if the socket is
     /// free (libtorrent `update_mapping` / `try_next_mapping`).
-    async fn start_next(&mut self, socket: &UdpSocket) {
+    async fn start_next(&mut self, socket: &GatewaySocket) {
         if self.in_flight.is_some() {
             return;
         }
@@ -299,7 +301,7 @@ impl State {
     }
 
     /// libtorrent `on_resend_request` and `mapping_expired`.
-    async fn on_timer(&mut self, socket: &UdpSocket, reports: &PortMapReports) {
+    async fn on_timer(&mut self, socket: &GatewaySocket, reports: &PortMapReports) {
         let now = Instant::now();
         if let Some(flight) = self.in_flight {
             if flight.resend_at <= now {
@@ -319,7 +321,7 @@ impl State {
     /// MAP each, sent once without waiting for an answer, and report each
     /// gone (libtorrent `natpmp::close_impl`; `send_map_request` under
     /// `m_abort`). One last reported failed stays as reported.
-    async fn close(&mut self, socket: &UdpSocket, reports: &PortMapReports) {
+    async fn close(&mut self, socket: &GatewaySocket, reports: &PortMapReports) {
         self.in_flight = None;
         for i in 0..self.mappings.len() {
             let m = &mut self.mappings[i];
@@ -353,7 +355,7 @@ impl State {
     }
 
     /// libtorrent `on_reply`.
-    async fn on_reply(&mut self, p: &[u8], socket: &UdpSocket, reports: &PortMapReports) {
+    async fn on_reply(&mut self, p: &[u8], socket: &GatewaySocket, reports: &PortMapReports) {
         if p.len() < 4 {
             return;
         }
@@ -501,6 +503,29 @@ fn gateway_route(routes: &[Route], interface: &RouteInterface) -> anyhow::Result
     })
 }
 
+/// The socket a mapper asks the gateway over: what it sends goes to the
+/// gateway, and only the gateway's answers come back.
+struct GatewaySocket {
+    socket: Arc<dyn DatagramSocket>,
+    gateway: SocketAddr,
+}
+
+impl GatewaySocket {
+    async fn send(&self, packet: &[u8]) -> io::Result<usize> {
+        self.socket.send_to(packet, self.gateway).await
+    }
+
+    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let (n, from) = self.socket.recv_from(buf).await?;
+            if from == self.gateway {
+                return Ok(n);
+            }
+            trace!(%from, "ignoring a datagram not from the gateway");
+        }
+    }
+}
+
 /// Keeps ports mapped on the gateway over PCP, or NAT-PMP when the gateway
 /// only speaks that (libtorrent `natpmp`).
 pub struct NatPmpMapper {
@@ -508,36 +533,53 @@ pub struct NatPmpMapper {
     route: Result<GatewayRoute, String>,
     mappings: Vec<PortMapRequest>,
     opts: NatPmpOptions,
+    /// The session's clients, whose route reaches the gateway and gives the
+    /// socket to ask it over.
+    clients: Arc<dyn HttpClients>,
 }
 
 impl NatPmpMapper {
-    /// A mapper asking over `route`, or failing every mapping for why there
-    /// is no route to ask over.
+    /// A mapper asking over `route` through `clients`' socket, or failing
+    /// every mapping for why there is no route to ask over.
     pub fn new(
         route: Result<GatewayRoute, String>,
         mappings: Vec<PortMapRequest>,
         opts: Option<NatPmpOptions>,
+        clients: Arc<dyn HttpClients>,
     ) -> Self {
         Self {
             route,
             mappings,
             opts: opts.unwrap_or_default(),
+            clients,
         }
     }
 
-    /// The socket the mapper asks the gateway over, connected so only the
+    /// The socket the mapper asks the gateway over, from which only the
     /// gateway's answers come through, and the address it asks from.
-    async fn connect(route: Result<GatewayRoute, String>) -> anyhow::Result<(UdpSocket, IpAddr)> {
+    async fn connect(
+        route: Result<GatewayRoute, String>,
+        clients: &dyn HttpClients,
+    ) -> anyhow::Result<(GatewaySocket, IpAddr)> {
         let route = route.map_err(anyhow::Error::msg)?;
-        let socket = UdpSocket::bind((route.local_ip, 0))
+        let socket = clients
+            .gateway_socket(SocketAddr::new(route.local_ip, 0))
             .await
             .with_context(|| format!("error binding the NAT-PMP socket to {}", route.local_ip))?;
-        socket
-            .connect(route.gateway)
-            .await
-            .with_context(|| format!("error connecting to the gateway at {}", route.gateway))?;
-        let local_ip = socket.local_addr()?.ip();
-        Ok((socket, local_ip))
+        if clients.egress(route.gateway) == Egress::NoRoute {
+            bail!(
+                "error connecting to the gateway at {}: no route",
+                route.gateway
+            );
+        }
+        let local_ip = socket.bind_addr().ip();
+        Ok((
+            GatewaySocket {
+                socket,
+                gateway: route.gateway,
+            },
+            local_ip,
+        ))
     }
 
     /// Keep every port mapped until cancelled, then remove the mappings. A
@@ -545,7 +587,7 @@ impl NatPmpMapper {
     /// never answers does.
     pub async fn run(self, cancel: CancellationToken, events: PortMapEvents) -> anyhow::Result<()> {
         let reports = PortMapReports::new(PortmapTransport::NatPmp, events);
-        let (socket, local_ip) = match Self::connect(self.route).await {
+        let (socket, local_ip) = match Self::connect(self.route, self.clients.as_ref()).await {
             Ok(connected) => connected,
             Err(e) => {
                 debug!("NAT-PMP / PCP mapper has no gateway to ask: {e:#}");
@@ -555,7 +597,7 @@ impl NatPmpMapper {
                 return Ok(());
             }
         };
-        debug!(gateway = ?socket.peer_addr(), %local_ip, "NAT-PMP / PCP mapper started");
+        debug!(gateway = %socket.gateway, %local_ip, "NAT-PMP / PCP mapper started");
 
         let mut state = State {
             // libtorrent `natpmp::start`: assume PCP, fall back to NAT-PMP.
@@ -853,10 +895,9 @@ mod tests {
         time::Duration,
     };
 
-    use tokio::{
-        net::UdpSocket,
-        sync::mpsc::{UnboundedReceiver, unbounded_channel},
-    };
+    use std::sync::Arc;
+
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
     use tokio_util::sync::CancellationToken;
 
     use super::{
@@ -864,20 +905,22 @@ mod tests {
         parse_proc_net_route,
     };
     use crate::{
+        core::net::DatagramSocket,
         route_interface::RouteInterface,
+        test_support::{loopback, loopback_udp},
         upnp::{PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport, tests::hold_clock},
     };
 
     /// A gateway the test answers by hand.
     struct Gateway {
-        socket: UdpSocket,
+        socket: Arc<dyn DatagramSocket>,
         mapper: Option<SocketAddr>,
     }
 
     impl Gateway {
         async fn new() -> Self {
             Self {
-                socket: UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+                socket: loopback_udp().await,
                 mapper: None,
             }
         }
@@ -907,7 +950,7 @@ mod tests {
         run_mapper_over(
             Ok(GatewayRoute {
                 local_ip: Ipv4Addr::LOCALHOST.into(),
-                gateway: gateway.socket.local_addr().unwrap(),
+                gateway: gateway.socket.bind_addr(),
             }),
             protocols,
         )
@@ -925,7 +968,7 @@ mod tests {
                 external_port: 6881,
             })
             .collect();
-        let mapper = NatPmpMapper::new(route, mappings, None);
+        let mapper = NatPmpMapper::new(route, mappings, None, loopback());
         let cancel = CancellationToken::new();
         let (events_tx, events) = unbounded_channel();
         let task = tokio::spawn(mapper.run(cancel.clone(), events_tx));
