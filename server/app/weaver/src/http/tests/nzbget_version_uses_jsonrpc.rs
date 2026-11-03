@@ -5146,6 +5146,8 @@ fn sort_test_job(job_id: u64, name: &str, total: u64, priority: &str, created_ms
     let mut job = reorder_test_job(job_id);
     job.name = name.to_string();
     job.total_bytes = total;
+    job.wanted_bytes = total;
+    job.remaining_bytes = total;
     job.metadata = vec![("priority".to_string(), priority.to_string())];
     job.created_at_epoch_ms = created_ms;
     job
@@ -5556,4 +5558,41 @@ async fn nzbget_priority_reports_the_value_the_client_set() {
         .unwrap();
     let groups = rpc_result(app, "listgroups", serde_json::json!([])).await;
     assert_eq!(group_priority(&groups, id), (50, 50));
+}
+
+#[tokio::test]
+async fn nzbget_reports_nothing_remaining_once_a_clean_post_has_arrived() {
+    // Every wanted article has arrived; only the recovery held back until a
+    // loss asks for it is left. NZBGet lists that as paused, so a client that
+    // reads remaining less paused sees nothing still to come.
+    let mut job = nzbget_test_job(
+        98,
+        JobStatus::Downloading,
+        weaver_server_core::DownloadState::Downloading,
+        1_000,
+        870,
+        vec![],
+    );
+    job.wanted_bytes = 900;
+    job.remaining_bytes = 0;
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        scheduler_handle_with_jobs(vec![job]).await,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let groups = rpc_result(app.clone(), "listgroups", serde_json::json!([])).await;
+    let group = &groups[0];
+    assert_eq!(group["FileSizeLo"], 1_000);
+    assert_eq!(group["RemainingSizeLo"], 100);
+    assert_eq!(group["PausedSizeLo"], 100);
+    assert_eq!(group["DownloadedSizeLo"], 900);
+    assert_eq!(
+        group["RemainingSizeMB"].as_u64().unwrap() - group["PausedSizeMB"].as_u64().unwrap(),
+        0
+    );
+
+    let status = rpc_result(app, "status", serde_json::json!([])).await;
+    assert_eq!(status["RemainingSizeLo"], 0);
 }
