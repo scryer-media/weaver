@@ -275,6 +275,10 @@ impl Segments {
         }
     }
 
+    pub fn first_is_mtu_probe(&self) -> bool {
+        self.segments.front().is_some_and(|s| s.is_mtu_probe())
+    }
+
     pub fn total_len_packets(&self) -> usize {
         self.segments.len()
     }

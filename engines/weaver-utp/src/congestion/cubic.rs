@@ -5,7 +5,7 @@ use std::{f64, time::Duration};
 
 use tokio::time::Instant;
 
-use crate::rtte::RttEstimator;
+use crate::{rtte::RttEstimator, seq_nr::SeqNr};
 
 use super::CongestionController;
 
@@ -76,13 +76,13 @@ impl CongestionController for Cubic {
         (self.ssthresh * self.mss as f64) as usize
     }
 
-    fn on_retransmission_timeout(&mut self, _now: Instant) {
+    fn on_retransmission_timeout(&mut self, _now: Instant, _sent_up_to: SeqNr) {
         self.ssthresh = (self.cwnd * BETA_CUBIC).max(2.);
         self.w_max = self.cwnd;
         self.cwnd = 1.
     }
 
-    fn on_enter_recovery(&mut self, now: Instant) {
+    fn on_enter_recovery(&mut self, now: Instant, _lost: SeqNr, _sent_up_to: SeqNr) {
         self.w_max = self.cwnd;
         self.cwnd *= BETA_CUBIC;
         self.ssthresh = self.cwnd.max(2.);
@@ -224,7 +224,7 @@ mod tests {
         trace!(?cubic, "cubic after 50 MSS packets");
 
         now += rtt * 3;
-        cubic.on_enter_recovery(now);
+        cubic.on_enter_recovery(now, 0.into(), 0.into());
         trace!(?cubic, "cubic after triple duplicate acks");
         // Pretend there was a fast retransmit here.
 
@@ -236,7 +236,7 @@ mod tests {
         trace!(?cubic, "cubic after 250 acked packets");
 
         now += Duration::from_secs(1);
-        cubic.on_retransmission_timeout(now);
+        cubic.on_retransmission_timeout(now, 0.into());
 
         trace!(?cubic, "cubic after RTO");
 

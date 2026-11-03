@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::{CongestionController, DelaySample};
-use crate::rtte::RttEstimator;
+use crate::{rtte::RttEstimator, seq_nr::SeqNr};
 
 const FRAC: u32 = 16;
 // The window a stream starts with: one Ethernet frame.
@@ -51,6 +51,11 @@ pub struct Ledbat {
     slow_start: bool,
     mss: usize,
     rwnd: usize,
+    // A loss cuts the window only for a packet sent after this one, the
+    // last sent when the window was last cut or timed out.
+    loss_gate: Option<SeqNr>,
+    // Nor before this.
+    next_cut: Option<Instant>,
 }
 
 impl core::fmt::Debug for Ledbat {
@@ -75,6 +80,8 @@ impl Ledbat {
             slow_start: true,
             mss,
             rwnd: usize::MAX,
+            loss_gate: None,
+            next_cut: None,
         };
         ledbat.floor();
         ledbat
@@ -170,9 +177,11 @@ impl CongestionController for Ledbat {
         self.floor();
     }
 
-    fn on_retransmission_timeout(&mut self, _now: Instant) {
+    fn on_retransmission_timeout(&mut self, _now: Instant, sent_up_to: SeqNr) {
         self.cwnd = (self.mss as i64) << FRAC;
         self.slow_start = true;
+        // What was in flight is counted lost already.
+        self.loss_gate = Some(sent_up_to);
     }
 
     // An idle direction keeps two thirds of its window, then slow-starts.
@@ -182,7 +191,17 @@ impl CongestionController for Ledbat {
         self.slow_start = true;
     }
 
-    fn on_enter_recovery(&mut self, _now: Instant) {
+    // Losses come in bursts: one cut per window of packets, and no more
+    // than one per cut timer.
+    fn on_enter_recovery(&mut self, now: Instant, lost: SeqNr, sent_up_to: SeqNr) {
+        if self.loss_gate.is_some_and(|gate| lost <= gate) {
+            return;
+        }
+        if self.next_cut.is_some_and(|next| now <= next) {
+            return;
+        }
+        self.next_cut = Some(now + self.params.cwnd_reduce_timer);
+        self.loss_gate = Some(sent_up_to);
         self.cut();
     }
 
@@ -288,7 +307,7 @@ mod tests {
             l.on_delay_sample(sample(10, MSS, w));
         }
         let before = l.window();
-        l.on_enter_recovery(Instant::now());
+        l.on_enter_recovery(Instant::now(), 10.into(), 20.into());
         assert_eq!(l.window(), before / 2);
         assert!(!l.is_slow_start());
         assert_eq!(l.ssthresh, before / 2);
@@ -301,8 +320,8 @@ mod tests {
             let w = l.window();
             l.on_delay_sample(sample(10, MSS, w));
         }
-        l.on_enter_recovery(Instant::now());
-        l.on_retransmission_timeout(Instant::now());
+        l.on_enter_recovery(Instant::now(), 10.into(), 20.into());
+        l.on_retransmission_timeout(Instant::now(), 20.into());
         assert!(l.is_slow_start());
         assert_eq!(l.window(), MSS);
         let threshold = l.ssthresh;
@@ -320,7 +339,7 @@ mod tests {
             let w = l.window();
             l.on_delay_sample(sample(10, MSS, w));
         }
-        l.on_enter_recovery(Instant::now());
+        l.on_enter_recovery(Instant::now(), 10.into(), 20.into());
         let before = l.window();
         l.on_idle_timeout();
         assert!(l.window().abs_diff(before * 2 / 3) <= 1, "{l:?}");
@@ -329,5 +348,54 @@ mod tests {
             l.on_idle_timeout();
         }
         assert_eq!(l.window(), MSS);
+    }
+
+    fn grown() -> Ledbat {
+        let mut l = ledbat();
+        for _ in 0..8 {
+            let w = l.window();
+            l.on_delay_sample(sample(10, MSS, w));
+        }
+        l
+    }
+
+    #[test]
+    fn losses_from_one_window_cut_it_once() {
+        let mut l = grown();
+        let now = Instant::now();
+        let before = l.window();
+        l.on_enter_recovery(now, 10.into(), 20.into());
+        // Sent before the first loss was seen, lost after the cut timer.
+        l.on_enter_recovery(now + Duration::from_secs(1), 15.into(), 25.into());
+        assert_eq!(l.window(), before / 2);
+        // Sent after it.
+        l.on_enter_recovery(now + Duration::from_secs(2), 21.into(), 30.into());
+        assert_eq!(l.window(), before / 4);
+    }
+
+    #[test]
+    fn no_two_cuts_within_the_cut_timer() {
+        let mut l = grown();
+        let now = Instant::now();
+        let before = l.window();
+        l.on_enter_recovery(now, 10.into(), 20.into());
+        l.on_enter_recovery(now + Duration::from_millis(100), 21.into(), 30.into());
+        assert_eq!(l.window(), before / 2);
+        l.on_enter_recovery(now + Duration::from_millis(101), 22.into(), 30.into());
+        assert_eq!(l.window(), before / 4);
+    }
+
+    #[test]
+    fn a_loss_from_before_a_timeout_does_not_cut() {
+        let mut l = grown();
+        let now = Instant::now();
+        l.on_retransmission_timeout(now, 20.into());
+        for _ in 0..8 {
+            let w = l.window();
+            l.on_delay_sample(sample(10, MSS, w));
+        }
+        let before = l.window();
+        l.on_enter_recovery(now + Duration::from_secs(1), 18.into(), 30.into());
+        assert_eq!(l.window(), before);
     }
 }

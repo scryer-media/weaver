@@ -384,7 +384,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     // congestion, but due to them being too large.
                     if !seg.is_mtu_probe() {
                         self.congestion_controller
-                            .on_retransmission_timeout(self.this_poll.now);
+                            .on_retransmission_timeout(self.this_poll.now, self.last_sent_seq_nr);
                         self.rtte.on_rto_timeout();
                         self.recovery
                             .on_rto_timeout(self.last_sent_seq_nr, &self.socket.stats);

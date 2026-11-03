@@ -237,7 +237,10 @@ impl Recovery {
                     return;
                 }
 
-                congestion_controller.on_enter_recovery(now);
+                // A lost probe was too large, which says nothing of congestion.
+                if !tx_segs.first_is_mtu_probe() {
+                    congestion_controller.on_enter_recovery(now, high_ack + 1, last_sent_seq_nr);
+                }
 
                 let high_rxt = high_ack;
                 let pipe_estimate = tx_segs.calc_pipe(high_rxt, last_sent_seq_nr, rtt, now);
@@ -297,5 +300,70 @@ impl Recovery {
 impl Default for Recovery {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+
+    use super::Recovery;
+    use crate::{
+        congestion::{
+            CongestionController,
+            ledbat::{Ledbat, LedbatParams},
+        },
+        raw::{Type, UtpHeader},
+        stats::UtpStats,
+        stream_tx_segments::{OnAckResult, Segments},
+    };
+
+    // Four ACKs of the packet before `first`: three duplicates, which
+    // count the first packet in flight lost.
+    fn lose_the_first(first_is_probe: bool) -> (usize, usize, bool) {
+        let mut segs = Segments::new(10.into());
+        assert!(segs.enqueue(1000, first_is_probe));
+        for _ in 0..4 {
+            assert!(segs.enqueue(500, false));
+        }
+        let mut cc = Ledbat::new(500, LedbatParams::default());
+        cc.set_remote_window(usize::MAX);
+        let before = cc.window();
+        let mut recovery = Recovery::new();
+        let stats = UtpStats::default();
+        for _ in 0..4 {
+            recovery.on_ack(
+                &UtpHeader {
+                    htype: Type::ST_STATE,
+                    ack_nr: 9.into(),
+                    wnd_size: 1 << 20,
+                    ..Default::default()
+                },
+                &OnAckResult::default(),
+                &mut segs,
+                14.into(),
+                &mut cc,
+                Instant::now(),
+                Duration::from_millis(50),
+                &stats,
+            );
+        }
+        (before, cc.window(), recovery.is_recovering())
+    }
+
+    #[test]
+    fn a_lost_packet_cuts_the_window() {
+        let (before, after, recovering) = lose_the_first(false);
+        assert!(recovering);
+        assert_eq!(after, before / 2);
+    }
+
+    #[test]
+    fn a_lost_mtu_probe_does_not_cut_the_window() {
+        let (before, after, recovering) = lose_the_first(true);
+        assert!(recovering);
+        assert_eq!(after, before);
     }
 }

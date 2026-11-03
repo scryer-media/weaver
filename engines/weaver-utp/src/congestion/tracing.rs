@@ -3,7 +3,7 @@
 
 use tokio::time::Instant;
 
-use crate::{constants::CONGESTION_TRACING_LOG_LEVEL, rtte::RttEstimator};
+use crate::{constants::CONGESTION_TRACING_LOG_LEVEL, rtte::RttEstimator, seq_nr::SeqNr};
 
 use super::CongestionController;
 
@@ -42,23 +42,23 @@ where
         );
     }
 
-    fn on_retransmission_timeout(&mut self, now: Instant) {
+    fn on_retransmission_timeout(&mut self, now: Instant, sent_up_to: SeqNr) {
         log_if_changed!(
             CONGESTION_TRACING_LOG_LEVEL,
             "on_rto",
             self,
             |s| s.inner,
-            |s| s.inner.on_retransmission_timeout(now)
+            |s| s.inner.on_retransmission_timeout(now, sent_up_to)
         );
     }
 
-    fn on_enter_recovery(&mut self, now: Instant) {
+    fn on_enter_recovery(&mut self, now: Instant, lost: SeqNr, sent_up_to: SeqNr) {
         log_if_changed!(
             CONGESTION_TRACING_LOG_LEVEL,
             "on_enter_recovery",
             self,
             |s| s.inner,
-            |s| s.inner.on_enter_recovery(now)
+            |s| s.inner.on_enter_recovery(now, lost, sent_up_to)
         );
     }
 

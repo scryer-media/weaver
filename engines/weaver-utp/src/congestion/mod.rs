@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use crate::rtte::RttEstimator;
+use crate::{rtte::RttEstimator, seq_nr::SeqNr};
 
 /// A one-way delay sample that came with acknowledged data.
 #[derive(Debug, Clone, Copy)]
@@ -39,11 +39,11 @@ pub trait CongestionController: Send + Sync + core::fmt::Debug {
     /// Increase the window on ACK
     fn on_ack(&mut self, now: Instant, len: usize, rtt: &RttEstimator);
 
-    // NOT fast retransmit
-    // flight_size: bytes sent and not yet acknowledged
-    fn on_retransmission_timeout(&mut self, now: Instant);
+    // NOT fast retransmit. `sent_up_to` is the last sequence number sent.
+    fn on_retransmission_timeout(&mut self, now: Instant, sent_up_to: SeqNr);
 
-    fn on_enter_recovery(&mut self, now: Instant);
+    /// `lost` was lost, with everything up to `sent_up_to` sent.
+    fn on_enter_recovery(&mut self, now: Instant, lost: SeqNr, sent_up_to: SeqNr);
 
     fn set_remote_window(&mut self, win: usize);
 
