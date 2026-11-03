@@ -354,7 +354,8 @@ async fn an_aes_7z_inside_a_header_encrypted_rar5_delivers() {
 
 // A stored 7z one deep holding a directory with a member, an empty file and
 // an empty directory: every one is delivered at depth two, the empty file
-// empty and the directories as directories.
+// empty and the directories as directories, which are no files of the
+// delivery.
 #[tokio::test]
 async fn a_7z_one_deep_delivers_its_directory_empty_file_and_empty_directory() {
     let pine = payload(4 * ARTICLE + 13, 78);
@@ -380,12 +381,7 @@ async fn a_7z_one_deep_delivers_its_directory_empty_file_and_empty_directory() {
     whole.sort();
     assert_eq!(
         whole,
-        [
-            "pack/",
-            "pack/empty.marker",
-            "pack/hollow/",
-            "pack/pine.bin"
-        ],
+        ["pack/empty.marker", "pack/pine.bin"],
         "{delivery:?}"
     );
     assert!(

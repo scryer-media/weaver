@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use weaver_graph::{Member, MemberId, NodeId, Sniff, Tree, Why, known_type};
 
 use crate::jobs::model::JobStatus;
+use crate::pipeline::graph::leaf::Leaf;
 use crate::post_processing::model::PipelineFailureStage;
 
 use super::Failure;
@@ -363,7 +364,12 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
     // that withholds it, it is withheld; a volume of an object that refused
     // it is delivered as it stands, unless the object disclaimed it
     // (`Why::disclaims`); and otherwise it is whole when its bytes are.
+    // A directory is no file of the delivery: it holds files, and is
+    // neither whole nor short of its own.
     fn leaf(&mut self, node: NodeId, member: &Member, short: bool) {
+        if Leaf::is_directory(&member.output_name) {
+            return;
+        }
         let claim = Claim::of(member);
         let name = member.output_name.clone();
         if claim != Claim::Complete && (short || (self.unrepaired)(node, member.id)) {

@@ -550,3 +550,73 @@ async fn a_single_zip_whose_every_entry_fails_its_crc_fails() {
         graph.files.keys().collect::<Vec<_>>()
     );
 }
+
+// A stored zip whose `ember.mkv` arrives wrong under a good article
+// checksum, beside a whole `lantern.par2` whose packets are not PAR2 (so
+// nothing reads it as recovery), all under `gallery/` when `directory`
+// says so. Neither the directory nor the recovery file is a usable file.
+fn nothing_usable(directory: bool) -> Vec<u8> {
+    let prefix = if directory { "gallery/" } else { "" };
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    if directory {
+        writer.add_directory("gallery/", stored()).unwrap();
+    }
+    writer
+        .start_file(format!("{prefix}lantern.par2"), stored())
+        .unwrap();
+    writer.write_all(&payload(2 * ARTICLE, 53)).unwrap();
+    let ember = &members()[0].1;
+    writer
+        .start_file(format!("{prefix}ember.mkv"), stored())
+        .unwrap();
+    writer.write_all(ember).unwrap();
+    let mut bytes = writer.finish().unwrap().into_inner();
+    let at = bytes
+        .windows(32)
+        .position(|window| window == &ember[..32])
+        .expect("the entry's data");
+    for byte in &mut bytes[at + ember.len() / 2..][..16] {
+        *byte ^= 0x5a;
+    }
+    bytes
+}
+
+// An explicit directory is no usable file: with its only real file short,
+// the job delivered nothing whole and fails, never counting the directory.
+#[tokio::test]
+async fn a_zip_whose_only_whole_member_is_a_directory_fails_with_nothing_whole() {
+    let scenario = Scenario::new(vec![Post::plain("lantern.zip", nothing_usable(true))]);
+    let graph = run(&scenario).await;
+    assert!(
+        graph.graph().delivery.whole.is_empty(),
+        "{:?}",
+        graph.graph().delivery
+    );
+    assert!(
+        matches!(
+            &graph.status,
+            Some(JobStatus::Failed { error }) if error.starts_with("no file was delivered whole")
+        ),
+        "{:?}",
+        graph.status
+    );
+}
+
+// A recovery file an archive unpacked whole, whose packets nothing reads
+// as recovery, is no usable file either: beside a short payload the job
+// fails.
+#[tokio::test]
+async fn a_zip_whose_only_whole_member_is_an_unread_par2_fails() {
+    let scenario = Scenario::new(vec![Post::plain("lantern.zip", nothing_usable(false))]);
+    let graph = run(&scenario).await;
+    assert!(
+        graph.graph().delivery.whole.is_empty(),
+        "{:?}",
+        graph.graph().delivery
+    );
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+}
