@@ -281,7 +281,7 @@ fn sample_release_dry_run_expectations<'a>() -> ReleaseDryRunExpectations<'a> {
 #[test]
 fn release_args_signature_uses_bump_mode_when_version_not_explicit() {
     assert_eq!(
-        release_args_signature(None, VersionBump::Minor),
+        release_args_signature(None, VersionBump::Minor, false),
         "bump:minor"
     );
 }
@@ -290,9 +290,30 @@ fn release_args_signature_uses_bump_mode_when_version_not_explicit() {
 fn release_args_signature_uses_explicit_version_when_present() {
     let version = Version::parse("1.2.3").unwrap();
     assert_eq!(
-        release_args_signature(Some(&version), VersionBump::Patch),
+        release_args_signature(Some(&version), VersionBump::Patch, false),
         "version:1.2.3"
     );
+}
+
+#[test]
+fn dangerous_graphql_override_changes_release_cache_identity() {
+    let mut cache = sample_release_dry_run_cache();
+    cache.release_args = release_args_signature(None, VersionBump::Patch, true);
+    assert_eq!(
+        release_dry_run_cache_rejection_reason(&cache, &sample_release_dry_run_expectations())
+            .as_deref(),
+        Some("release arguments changed since dry run")
+    );
+}
+
+#[test]
+fn release_cli_accepts_explicit_dangerous_graphql_override() {
+    let cli =
+        Cli::try_parse_from(["xtask", "release", "--patch", "--allow-graphql-dangerous"]).unwrap();
+    let Commands::Release(args) = cli.command else {
+        panic!("expected release command");
+    };
+    assert!(args.allow_graphql_dangerous);
 }
 
 #[test]
