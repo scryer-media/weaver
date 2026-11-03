@@ -181,6 +181,12 @@ impl SocketEgress {
 
     // Bind a datagram socket for a tunnel peer of the supplied address family.
     pub fn bind_udp(&self, peer: SocketAddr) -> io::Result<UdpSocket> {
+        let socket = self.udp_socket(peer)?;
+        socket.set_nonblocking(true)?;
+        Ok(socket.into())
+    }
+
+    fn udp_socket(&self, peer: SocketAddr) -> io::Result<Socket> {
         let socket = self.socket(peer, Type::DGRAM, Protocol::UDP)?;
         if !matches!(self, Self::SourceAddress(_)) {
             let unspecified = if peer.is_ipv4() {
@@ -190,6 +196,31 @@ impl SocketEgress {
             };
             socket.bind(&SocketAddr::new(unspecified, 0).into())?;
         }
+        Ok(socket)
+    }
+
+    // The address a datagram to `to` leaves this egress from: a socket bound
+    // as the egress binds, connected to `to`, which sends nothing and fails
+    // when no route reaches it.
+    pub(crate) fn source_toward(&self, to: SocketAddr) -> io::Result<IpAddr> {
+        let socket = UdpSocket::from(self.udp_socket(to)?);
+        socket.connect(to)?;
+        Ok(socket.local_addr()?.ip())
+    }
+
+    // Bind a datagram socket a direct leg's consumer sends from itself, on
+    // `local`'s port: at the source address this egress pins, else at
+    // `local`'s address, on the egress's device when it names one.
+    pub(crate) fn bind_udp_at(&self, local: SocketAddr) -> io::Result<UdpSocket> {
+        let local = match self {
+            Self::SourceAddress(source) => SocketAddr::new(*source, local.port()),
+            _ => local,
+        };
+        let socket = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
+        if let Self::Interface(name) = self {
+            bind_interface(&socket, name, local.is_ipv6())?;
+        }
+        socket.bind(&local.into())?;
         socket.set_nonblocking(true)?;
         Ok(socket.into())
     }
@@ -200,6 +231,34 @@ mod connect_tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    // Loopback is reached from loopback, by the host's own route or from a
+    // pinned source address; a socket held to an IPv4 address has no route
+    // to an IPv6 one.
+    #[test]
+    fn a_route_leaves_from_the_address_its_egress_pins() {
+        let loopback = IpAddr::from(Ipv4Addr::LOCALHOST);
+        let to = SocketAddr::new(loopback, 9);
+        assert_eq!(SocketEgress::System.source_toward(to).unwrap(), loopback);
+        let pinned = SocketEgress::SourceAddress(loopback);
+        assert_eq!(pinned.source_toward(to).unwrap(), loopback);
+        assert!(pinned.source_toward("[::1]:9".parse().unwrap()).is_err());
+    }
+
+    // A local socket binds where it is asked, or at the pinned source
+    // address on the port asked for.
+    #[test]
+    fn a_local_socket_binds_at_the_pinned_source() {
+        let loopback = IpAddr::from(Ipv4Addr::LOCALHOST);
+        let socket = SocketEgress::System
+            .bind_udp_at(SocketAddr::new(loopback, 0))
+            .unwrap();
+        assert_eq!(socket.local_addr().unwrap().ip(), loopback);
+        let socket = SocketEgress::SourceAddress(loopback)
+            .bind_udp_at(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0))
+            .unwrap();
+        assert_eq!(socket.local_addr().unwrap().ip(), loopback);
+    }
 
     #[test]
     fn connected_hangup_preserves_the_peers_last_reply() {
