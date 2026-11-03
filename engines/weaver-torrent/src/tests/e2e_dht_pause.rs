@@ -4,14 +4,11 @@
 use std::{
     io,
     net::{Ipv4Addr, SocketAddr},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
 };
 
 use anyhow::Context;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     AddTorrent, AddTorrentOptions, DhtSessionConfig, ListenerOptions, Session, SessionOptions,
@@ -62,9 +59,10 @@ impl SocketFactory for Loopback {
 
 // The blocking receive keeps the paused clock still until the test advances
 // it. Every query is answered; searches and announces are reported by hash.
+// Dropping the node drops `_stop`, which ends its receive.
 struct Node {
     addr: SocketAddr,
-    stop: Arc<AtomicBool>,
+    _stop: oneshot::Sender<()>,
     heard: mpsc::UnboundedReceiver<(Id20, bool)>,
 }
 
@@ -75,16 +73,21 @@ impl Node {
         let socket = crate::test_support::loopback_udp_now();
         let addr = socket.bind_addr();
         let runtime = tokio::runtime::Handle::current();
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = stop.clone();
+        let (stop, mut stopped) = oneshot::channel::<()>();
         let (tx, heard) = mpsc::unbounded_channel();
         tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 4096];
             loop {
-                let (len, from) = runtime.block_on(socket.recv_from(&mut buf)).unwrap();
-                if stopped.load(Ordering::SeqCst) {
+                let received = runtime.block_on(async {
+                    tokio::select! {
+                        biased;
+                        _ = &mut stopped => None,
+                        received = socket.recv_from(&mut buf) => received.ok(),
+                    }
+                });
+                let Some((len, from)) = received else {
                     break;
-                }
+                };
                 let msg = bprotocol::deserialize_message::<ByteBufOwned>(&buf[..len]).unwrap();
                 match &msg.kind {
                     MessageKind::GetPeersRequest(q) => {
@@ -112,7 +115,11 @@ impl Node {
                 runtime.block_on(socket.send_to(&reply, from)).unwrap();
             }
         });
-        Ok(Self { addr, stop, heard })
+        Ok(Self {
+            addr,
+            _stop: stop,
+            heard,
+        })
     }
 
     async fn announced(&mut self, hash: Id20, forbidden: Option<Id20>) -> anyhow::Result<()> {
@@ -123,15 +130,6 @@ impl Node {
                 return Ok(());
             }
         }
-    }
-}
-
-impl Drop for Node {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        use futures::FutureExt;
-        let socket = crate::test_support::loopback_udp_now();
-        let _ = socket.send_to(&[], self.addr).now_or_never();
     }
 }
 
