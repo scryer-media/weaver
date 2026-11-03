@@ -30,7 +30,7 @@ use crate::pipeline::held::{HeldPart, held_parts_from_rows};
 use crate::pipeline::{
     Pipeline, assemble_archive_password_candidates, read_job_password_candidates,
 };
-use weaver_graph::names::INTERNAL_DIR;
+use weaver_graph::names::{INTERNAL_DIR, key};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GraphRestoreError {
@@ -285,34 +285,42 @@ pub(super) fn sweep_unnamed(
         .iter()
         .map(|hold| super::namespace::scratch_name(hold.node));
     let spooled = held_parts.iter().map(|part| part.spool_path.clone());
-    let named: HashSet<PathBuf> = members
+    // Each name as the path it takes on disk, the key the name ledger and
+    // the writer compare names by: a directory "Folder/" and a file
+    // "folder/b.bin" lie in one directory where the disk folds case.
+    let named: HashSet<String> = members
         .chain(envelopes)
         .chain(holds)
         .chain(spooled)
-        .map(|name| PathBuf::from(name.replace('\\', "/").trim_end_matches('/')))
+        .map(|name| key(&name.replace('\\', "/")))
         .collect();
     // The directories a named file lies in, the chunk directory always
     // among them.
-    let mut within: HashSet<PathBuf> = HashSet::from([PathBuf::from(INTERNAL_DIR)]);
+    let mut within: HashSet<String> = HashSet::from([key(INTERNAL_DIR)]);
     for name in &named {
-        within.extend(name.ancestors().skip(1).map(Path::to_path_buf));
+        within.extend(name.match_indices('/').map(|(at, _)| name[..at].to_owned()));
     }
     sweep_within(working_dir, Path::new(""), &named, &within);
 }
 
-fn sweep_within(dir: &Path, at: &Path, named: &HashSet<PathBuf>, within: &HashSet<PathBuf>) {
+fn sweep_within(dir: &Path, at: &Path, named: &HashSet<String>, within: &HashSet<String>) {
     let Ok(entries) = std::fs::read_dir(dir.join(at)) else {
         return;
     };
     for entry in entries.flatten() {
         let name = at.join(entry.file_name());
+        let path_key = key(&name.to_string_lossy().replace('\\', "/"));
         let kind = entry.file_type();
         let directory = kind.as_ref().is_ok_and(std::fs::FileType::is_dir);
-        if named.contains(&name) || (at.as_os_str().is_empty() && the_directorys(&name)) {
+        if at.as_os_str().is_empty() && the_directorys(&name) {
             continue;
         }
-        if directory && within.contains(&name) {
+        // A named directory stays, but only what is named in it does.
+        if directory && (within.contains(&path_key) || named.contains(&path_key)) {
             sweep_within(dir, &name, named, within);
+            continue;
+        }
+        if named.contains(&path_key) {
             continue;
         }
         let path = entry.path();
