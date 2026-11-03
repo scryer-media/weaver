@@ -4778,6 +4778,186 @@ async fn the_download_queue_keeps_its_order_and_moves_as_qbittorrent_does() {
     assert_eq!(places().await, [Some(2), Some(3), Some(1), Some(4), None]);
 }
 
+// An add reads no other torrent, so adding one costs the same however many
+// there are: it takes its turn and rank from the end of the queue as the
+// last pass left it, and puts its own job in the queue. A change to an
+// earlier torrent waits for the next pass, and the exporter's reading for
+// the next publish of every torrent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_add_reads_no_other_torrent() {
+    let rig = rig(set_clock());
+    // No session is built while the route is down.
+    rig.routes.set_down(Some("down"));
+    let queue = queue();
+    let state = queue.state().clone();
+    rig.service.publish_to(queue);
+    // Not opened: no job mail is heard and nothing settles, so only what
+    // the test does publishes.
+    let mut settings = rig.service.settings();
+    settings.torrent.max_active_downloads = 1;
+    rig.service.set_settings(settings).await;
+    let add = |seed: u8| {
+        let service = rig.service.clone();
+        async move {
+            service
+                .add(request(AddSource::Metainfo(plain(
+                    &format!("set{seed}"),
+                    seed,
+                ))))
+                .await
+                .unwrap()
+        }
+    };
+    let a = add(1).await;
+    let b = add(2).await;
+    // `a` finishes after the last pass: it seeds, and gives up its slot
+    // and its rank at the next.
+    rig.service
+        .inner
+        .live
+        .lock()
+        .await
+        .get_mut(&a)
+        .unwrap()
+        .record
+        .completed_at_ms = Some(EPOCH_MS);
+    let mut exported = rig.service.inner.published.subscribe();
+    exported.mark_unchanged();
+
+    let c = add(3).await;
+    let turns = || async {
+        let live = rig.service.inner.live.lock().await;
+        [a, b, c].map(|id| (live[&id].queued, live[&id].queue_rank))
+    };
+    assert_eq!(
+        turns().await,
+        [(false, Some(1)), (true, Some(2)), (true, Some(3))]
+    );
+    assert!(!exported.has_changed().unwrap());
+    let jobs: Vec<JobId> = state.list_jobs().iter().map(|job| job.job_id).collect();
+    assert_eq!(jobs, [a, b, c]);
+
+    // The next pass, as the tick runs it, settles what changed.
+    rig.service.apply_queue().await;
+    assert_eq!(
+        turns().await,
+        [(false, None), (false, Some(1)), (true, Some(2))]
+    );
+}
+
+// A rig whose service has one download slot and no session (the route is
+// down), not opened: nothing settles but what the test runs. With a way
+// to add the torrent of `seed`, and each torrent's turn: waiting for a
+// slot, and its rank.
+struct OneSlot {
+    rig: Rig,
+}
+
+impl OneSlot {
+    async fn new() -> Self {
+        let rig = rig(set_clock());
+        rig.routes.set_down(Some("down"));
+        rig.service.publish_to(queue());
+        let mut settings = rig.service.settings();
+        settings.torrent.max_active_downloads = 1;
+        rig.service.set_settings(settings).await;
+        Self { rig }
+    }
+
+    async fn add(&self, seed: u8) -> JobId {
+        self.rig
+            .service
+            .add(request(AddSource::Metainfo(plain(
+                &format!("set{seed}"),
+                seed,
+            ))))
+            .await
+            .unwrap()
+    }
+
+    async fn turns(&self, jobs: &[JobId]) -> Vec<(bool, Option<u32>)> {
+        let live = self.rig.service.inner.live.lock().await;
+        jobs.iter()
+            .map(|id| (live[id].queued, live[id].queue_rank))
+            .collect()
+    }
+}
+
+// A slot and a rank freed where no pass runs (a torrent removed, failed or
+// finished) go to the torrents after it at the next settle, not the next
+// tick (libtorrent `remove_torrent` and `torrent::finished` trigger the
+// recalculation).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slot_freed_without_a_pass_goes_out_at_the_next_settle() {
+    let one = OneSlot::new().await;
+    let service = &one.rig.service;
+    let [a, b, c, d] = [
+        one.add(1).await,
+        one.add(2).await,
+        one.add(3).await,
+        one.add(4).await,
+    ];
+    assert_eq!(
+        one.turns(&[a, b, c, d]).await,
+        [
+            (false, Some(1)),
+            (true, Some(2)),
+            (true, Some(3)),
+            (true, Some(4))
+        ]
+    );
+
+    service.remove(a, false, true).await.unwrap();
+    service.settle().await;
+    assert_eq!(
+        one.turns(&[b, c, d]).await,
+        [(false, Some(1)), (true, Some(2)), (true, Some(3))]
+    );
+
+    service.fail(b, "gone".into()).await;
+    service.settle().await;
+    assert_eq!(
+        one.turns(&[c, d]).await,
+        [(false, Some(1)), (true, Some(2))]
+    );
+
+    service.completed(c).await;
+    service.settle().await;
+    assert_eq!(one.turns(&[c, d]).await, [(false, None), (false, Some(1))]);
+}
+
+// Two adds at once take their places in one order and can join the live
+// torrents in the other. The one that arrives after a torrent placed
+// behind it asks for a pass, and the next settle gives the slot and the
+// first rank back to the one placed first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_add_arriving_out_of_place_has_its_turn_settled_by_a_pass() {
+    let one = OneSlot::new().await;
+    let service = &one.rig.service;
+    // The second add's place is taken before the first's, as when its
+    // placing waits longer.
+    service
+        .inner
+        .next_queue_position
+        .store(5, Ordering::Relaxed);
+    let behind = one.add(1).await;
+    service
+        .inner
+        .next_queue_position
+        .store(2, Ordering::Relaxed);
+    let before = one.add(2).await;
+    assert_eq!(
+        one.turns(&[before, behind]).await,
+        [(true, Some(2)), (false, Some(1))]
+    );
+
+    service.settle().await;
+    assert_eq!(
+        one.turns(&[before, behind]).await,
+        [(false, Some(1)), (true, Some(2))]
+    );
+}
+
 #[test]
 fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_default() {
     let mut record = TorrentRecord {

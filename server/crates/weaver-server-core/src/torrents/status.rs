@@ -4,8 +4,6 @@
 //! A torrent's state as consumers see it, read off what the session reports
 //! and what holds it back, and its seeding goal.
 
-use std::collections::BTreeSet;
-
 use weaver_torrent::{
     AnnounceErrorKind, FetchPhase, TorrentStats, TorrentStatsState, TrackerAnnounce,
 };
@@ -349,25 +347,72 @@ impl Queued {
     }
 }
 
-/// The torrents the queue lets run: of those no hold stops, every forced
-/// or seeding one, and the first `max_active` of the rest that are not
-/// paused. Only a torrent still downloading takes one of the `max_active`
-/// slots.
-pub fn active(torrents: &[Queued], max_active: u32, holds: &HoldSet) -> BTreeSet<JobId> {
-    let mut slots = max_active as usize;
-    let mut active = BTreeSet::new();
-    for torrent in torrents {
-        if holds.reason_for(torrent.target()).is_some() {
-            continue;
-        }
-        if torrent.forced || torrent.seeding {
-            active.insert(torrent.job_id);
-        } else if !torrent.paused && slots > 0 {
-            slots -= 1;
-            active.insert(torrent.job_id);
+/// Each torrent's turn, in queue order: of those no hold stops, every
+/// forced or seeding one runs, and the first `max_active` of the rest that
+/// are not paused. Only a torrent still downloading takes one of the
+/// `max_active` slots, or a rank. With them, the queue's end as the walk
+/// left it.
+pub fn turns(torrents: &[Queued], max_active: u32, holds: &HoldSet) -> (Vec<Turn>, Slots) {
+    let mut slots = Slots::new(max_active);
+    let turns = torrents
+        .iter()
+        .map(|torrent| slots.take(torrent, holds))
+        .collect();
+    (turns, slots)
+}
+
+/// A torrent's turn in the queue: whether it runs, and its place among
+/// the torrents still downloading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Turn {
+    pub active: bool,
+    pub rank: Option<u32>,
+}
+
+/// A walk down the queue: the download slots still free and the ranks
+/// given. A torrent's turn depends only on those before it, so the walk's
+/// end is all a torrent added after them needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Slots {
+    left: u32,
+    ranked: u32,
+}
+
+impl Slots {
+    pub fn new(max_active: u32) -> Self {
+        Self {
+            left: max_active,
+            ranked: 0,
         }
     }
-    active
+
+    /// The turn of `torrent`, next in the queue.
+    pub fn take(&mut self, torrent: &Queued, holds: &HoldSet) -> Turn {
+        let rank = (!torrent.seeding).then(|| {
+            self.ranked += 1;
+            self.ranked
+        });
+        Turn {
+            active: self.admit(torrent, holds),
+            rank,
+        }
+    }
+
+    // Whether `torrent` runs: taking a slot if it is still downloading and
+    // not forced.
+    fn admit(&mut self, torrent: &Queued, holds: &HoldSet) -> bool {
+        if holds.reason_for(torrent.target()).is_some() {
+            return false;
+        }
+        if torrent.forced || torrent.seeding {
+            return true;
+        }
+        if torrent.paused || self.left == 0 {
+            return false;
+        }
+        self.left -= 1;
+        true
+    }
 }
 
 /// A tracker as the views show it, from how announcing to it last went.
@@ -533,12 +578,24 @@ pub fn resolved_by(url: &str, names: Option<ResolvedBy>) -> Option<ResolvedBy> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::time::{Duration, UNIX_EPOCH};
 
     use weaver_torrent::{AnnounceError, AnnounceOk, LastAnnounce};
 
     use super::*;
     use crate::settings::{SeedTimeCounting, SeedingAction};
+
+    // The torrents the queue lets run.
+    fn active(torrents: &[Queued], max_active: u32, holds: &HoldSet) -> BTreeSet<JobId> {
+        let (turns, _) = turns(torrents, max_active, holds);
+        torrents
+            .iter()
+            .zip(turns)
+            .filter(|(_, turn)| turn.active)
+            .map(|(torrent, _)| torrent.job_id)
+            .collect()
+    }
 
     fn seen(engine: Engine) -> Observed {
         Observed {

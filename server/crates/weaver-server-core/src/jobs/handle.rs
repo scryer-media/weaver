@@ -401,6 +401,34 @@ impl SharedPipelineState {
         })
     }
 
+    // One job of the other owner's, the rest left as published: a job new to
+    // the queue takes its place in the owner's order, by when it was added.
+    fn publish_torrent_job(&self, job: JobInfo) -> Vec<PipelineEvent> {
+        self.queue.write(|inner| {
+            let job_id = job.job_id;
+            // Only a job already published is looked for among the others.
+            let at = inner
+                .torrent_ids
+                .contains(&job_id)
+                .then(|| inner.torrents.iter().position(|was| was.job_id == job_id))
+                .flatten();
+            let before = at.map_or(&[][..], |at| std::slice::from_ref(&inner.torrents[at]));
+            let events = owned_job_events(before, std::slice::from_ref(&job));
+            match at {
+                Some(at) => inner.torrents[at] = job,
+                None => {
+                    let key = (job.created_at_epoch_ms, job_id);
+                    let at = inner
+                        .torrents
+                        .partition_point(|was| (was.created_at_epoch_ms, was.job_id) <= key);
+                    inner.torrent_ids.insert(job_id);
+                    inner.torrents.insert(at, job);
+                }
+            }
+            Change::changed(events)
+        })
+    }
+
     // Seat the owner of the jobs published beside the pipeline's.
     pub fn seat_owner(&self, owner: Arc<dyn QueueOwner>) {
         *self.owner.write().unwrap() = Some(owner);
@@ -1516,6 +1544,14 @@ impl SchedulerHandle {
     // A job that leaves is retired, which says how it ended.
     pub fn publish_owned_jobs(&self, jobs: Vec<JobInfo>) {
         for event in self.state.publish_torrent_jobs(jobs) {
+            let _ = self.event_tx.send(event);
+        }
+    }
+
+    // Publish one job another owner keeps, the others as they stand, with
+    // what that changed on the job events.
+    pub fn publish_owned_job(&self, job: JobInfo) {
+        for event in self.state.publish_torrent_job(job) {
             let _ = self.event_tx.send(event);
         }
     }

@@ -1316,6 +1316,18 @@ fn queued(settings: &TorrentSettings, rules: &[TrackerRule], torrent: &Live, now
     }
 }
 
+// `torrent`'s turn in the queue as a pass gives it: its rank, the hold
+// that pauses it, and whether it waits for a slot.
+fn take_turn(torrent: &mut Live, queued: &Queued, turn: status::Turn, holds: &HoldSet, now: i64) {
+    torrent.queue_rank = turn.rank;
+    torrent.settle(now);
+    torrent.paused_by = torrent
+        .resumed()
+        .then(|| holds.reason_for(queued.target()))
+        .flatten();
+    torrent.queued = !turn.active && torrent.resumed() && torrent.paused_by.is_none();
+}
+
 // A torrent's files under `layout`: the metainfo's names and lengths, at
 // `levels`.
 fn files_of(layout: Option<&PieceLayout>, levels: &[FilePriority]) -> Vec<TorrentFile> {
@@ -1869,6 +1881,8 @@ pub(super) struct Signal {
     dirty: Mutex<BTreeSet<JobId>>,
     unsaved: Mutex<BTreeMap<JobId, u32>>,
     refused: Mutex<BTreeMap<JobId, String>>,
+    // A slot or a rank moved where no pass runs: the next settle runs one.
+    pass_wanted: AtomicBool,
     wake: Notify,
 }
 
@@ -1899,6 +1913,19 @@ impl Signal {
 
     fn take(&self) -> BTreeSet<JobId> {
         std::mem::take(&mut *locked(&self.dirty))
+    }
+
+    // Ask for one pass over the queue at the next settle. Any number of
+    // asks before it runs are one pass (libtorrent `trigger_auto_manage`,
+    // posted once however many ask).
+    fn want_pass(&self) {
+        if !self.pass_wanted.swap(true, Ordering::AcqRel) {
+            self.wake.notify_one();
+        }
+    }
+
+    fn take_pass(&self) -> bool {
+        self.pass_wanted.swap(false, Ordering::AcqRel)
     }
 
     fn take_refused(&self, job_id: JobId) -> Option<String> {
@@ -1988,6 +2015,21 @@ struct Inner {
     // The place in the download queue the next torrent added takes: past
     // every one kept (libtorrent puts a new torrent last in the queue).
     next_queue_position: AtomicI64,
+    // What the last pass over the queue left at its end, written under
+    // `live`'s lock: a torrent added goes there.
+    queue_end: Mutex<QueueEnd>,
+}
+
+// A snapshot of the download queue's end from the last pass, extended by
+// each torrent added since: the slots still free, the ranks given, and the
+// place of the last torrent in it. A torrent added after them changes no
+// earlier torrent's turn or rank, so it takes its own from here. What moved
+// since the pass (a torrent gone or finished, one placed before the end) is
+// corrected by the next, which those ask for.
+#[derive(Debug, Clone, Copy)]
+struct QueueEnd {
+    slots: status::Slots,
+    last: Option<(i64, JobId)>,
 }
 
 #[derive(Clone)]
@@ -2004,6 +2046,7 @@ impl TorrentService {
         clock: Arc<dyn Clock>,
     ) -> Self {
         sessions.set_config(settings.torrent.clone());
+        let max_active = settings.torrent.max_active_downloads;
         Self {
             inner: Arc::new(Inner {
                 db,
@@ -2027,6 +2070,11 @@ impl TorrentService {
                 sessions_read: Mutex::default(),
                 counters: Counters::default(),
                 next_queue_position: AtomicI64::new(0),
+                // An empty queue: every slot free.
+                queue_end: Mutex::new(QueueEnd {
+                    slots: status::Slots::new(max_active),
+                    last: None,
+                }),
             }),
         }
     }
@@ -2464,6 +2512,9 @@ impl TorrentService {
             }
         }
         self.save_checkpoints(self.inner.signal.take_due()).await;
+        if self.inner.signal.take_pass() {
+            self.apply_queue().await;
+        }
         self.apply_picking().await;
         self.publish().await;
     }
@@ -2659,6 +2710,8 @@ impl TorrentService {
             }
             torrent.settle(now);
             torrent.record.completed_at_ms = Some(now);
+            // It seeds now: its slot and rank go to the torrents after it.
+            self.inner.signal.want_pass();
             self.inner.counters.event(TorrentEvent::Completed);
             if let Err(error) = self.inner.db.set_torrent_completed(job_id, now) {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's completion");
@@ -3148,11 +3201,10 @@ impl TorrentService {
                     }
                 };
                 self.give_metainfo(&mut torrent, &parsed);
-                self.inner.live.lock().await.insert(job_id, torrent);
-                self.apply_queue().await;
+                self.enqueue(torrent).await;
                 self.attach(job_id, None).await;
                 self.inner.counters.event(TorrentEvent::Added);
-                self.publish().await;
+                self.publish_job(job_id).await;
                 Ok(job_id)
             }
             AddSource::Magnet(uri) => {
@@ -3209,13 +3261,60 @@ impl TorrentService {
                 let identity = identity_of(torrent.rule(&rules), &torrent.identity);
                 let terms = PeerTerms::of(&self.settings(), torrent.rule(&rules));
                 torrent.route = Some(plan.key.clone());
-                self.inner.live.lock().await.insert(job_id, torrent);
+                self.enqueue(torrent).await;
                 self.spawn_resolve(job_id, plan, uri, None, identity, terms)
                     .await;
                 self.inner.counters.event(TorrentEvent::Added);
-                self.publish().await;
+                self.publish_job(job_id).await;
                 Ok(job_id)
             }
+        }
+    }
+
+    // A torrent just added joins the live ones last in the queue. No
+    // earlier torrent's turn or rank moves for it, so its own follow from
+    // the queue's end as the last pass left it, which it then extends: an
+    // add reads no other torrent. Whatever changed since that pass is
+    // settled at the next. One that took its place before another added
+    // since, and arrives after it, asks for that pass now: the turns given
+    // since are out of order.
+    async fn enqueue(&self, mut torrent: Live) {
+        let mut live = self.inner.live.lock().await;
+        let settings = self.settings();
+        let rules = self.rules();
+        let holds = self.holds();
+        let now = self.inner.clock.now_ms();
+        let queued = queued(&settings, &rules, &torrent, now);
+        let place = (torrent.record.queue_position, torrent.record.job_id);
+        {
+            let mut end = self
+                .inner
+                .queue_end
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let turn = end.slots.take(&queued, &holds);
+            if end.last.is_some_and(|last| place < last) {
+                self.inner.signal.want_pass();
+            } else {
+                end.last = Some(place);
+            }
+            take_turn(&mut torrent, &queued, turn, &holds, now);
+        }
+        live.insert(torrent.record.job_id, torrent);
+    }
+
+    // The job of `job_id`, just added, into the published queue beside the
+    // others as they stand: an add reads one torrent, not every one
+    // (libtorrent posts one `add_torrent_alert`). The exporter's reading
+    // takes it at the next publish of every torrent.
+    async fn publish_job(&self, job_id: JobId) {
+        let Some(queue) = self.queue() else {
+            return;
+        };
+        let now = self.inner.clock.now_ms();
+        if let Some(view) = self.torrent(job_id).await {
+            let status = job_status(&view);
+            queue.publish_owned_job(report(view, status, now).job_info());
         }
     }
 
@@ -4001,6 +4100,8 @@ impl TorrentService {
     async fn fail(&self, job_id: JobId, error: String) {
         let torrent = self.inner.live.lock().await.remove(&job_id);
         let Some(mut torrent) = torrent else { return };
+        // Its slot and rank go to the torrents after it.
+        self.inner.signal.want_pass();
         self.inner.counters.event(TorrentEvent::Failed);
         self.detach(&mut torrent).await;
         self.retire(torrent, "failed", Some(error)).await;
@@ -4101,6 +4202,8 @@ impl TorrentService {
         }
         let mut torrent = live.remove(&job_id).ok_or(ActionError::NotFound(job_id))?;
         drop(live);
+        // Its slot and rank go to the torrents after it.
+        self.inner.signal.want_pass();
         if let Some(Resolving::Fetching(fetch)) = torrent.resolving.take() {
             fetch.abort();
             self.inner.counters.fetch(FetchOutcome::Cancelled);
@@ -4972,28 +5075,24 @@ impl TorrentService {
             .iter()
             .map(|torrent| queued(&settings, &rules, torrent, now))
             .collect();
-        let active = status::active(&queue, settings.torrent.max_active_downloads, &holds);
-        let ranks: BTreeMap<JobId, u32> = queue
+        let last = order
+            .last()
+            .map(|torrent| (torrent.record.queue_position, torrent.record.job_id));
+        let (turns, slots) = status::turns(&queue, settings.torrent.max_active_downloads, &holds);
+        let turns: BTreeMap<JobId, (&Queued, status::Turn)> = queue
             .iter()
-            .filter(|torrent| !torrent.seeding)
-            .zip(1..)
-            .map(|(torrent, rank)| (torrent.job_id, rank))
+            .zip(turns)
+            .map(|(queued, turn)| (queued.job_id, (queued, turn)))
             .collect();
-        let targets: BTreeMap<JobId, _> = queue
-            .iter()
-            .map(|torrent| (torrent.job_id, torrent.target()))
-            .collect();
+        *self
+            .inner
+            .queue_end
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = QueueEnd { slots, last };
         for torrent in live.values_mut() {
-            let job_id = torrent.record.job_id;
-            let active = active.contains(&job_id);
-            torrent.queue_rank = ranks.get(&job_id).copied();
-            torrent.settle(now);
-            torrent.paused_by = torrent
-                .resumed()
-                .then(|| holds.reason_for(targets[&job_id]))
-                .flatten();
-            torrent.queued = !active && torrent.resumed() && torrent.paused_by.is_none();
-            let run = active && torrent.resumed();
+            let (queued, turn) = turns[&torrent.record.job_id];
+            take_turn(torrent, queued, turn, &holds, now);
+            let run = turn.active && torrent.resumed();
             let Some(attached) = &torrent.attached else {
                 continue;
             };
