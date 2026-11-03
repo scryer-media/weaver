@@ -11,6 +11,9 @@
 // continuation, a contiguous file and any type tar does not name are not
 // extracted: their stored data is envelope. A sparse entry's map may run on
 // into extension blocks after its header, and its data starts past them.
+// A pax sparse entry, a regular one whose pax records carry GNU's sparse
+// keys, is a sparse entry too: its stored data is packed extents, behind
+// its map in the 1.0 format, and its size counts the map.
 
 use weaver_graph::ByteRange;
 
@@ -72,6 +75,8 @@ struct Extended {
     path: Option<String>,
     long_name: Option<String>,
     size: Option<u64>,
+    // A GNU sparse key: the entry's data is packed extents, not its file.
+    sparse: bool,
 }
 
 pub(super) fn read(kept: &Kept, start: u64) -> Read {
@@ -173,6 +178,7 @@ fn entry(header: &[u8], data: u64, extended: Extended, size: u64) -> Entry {
         .unwrap_or_else(|| ustar_name(header));
     let typeflag = header[TYPEFLAG];
     let body = match typeflag {
+        _ if extended.sparse => Body::Skipped,
         b'5' => Body::Directory,
         // A pre-POSIX header marks a directory by its trailing slash alone.
         b'0' | 0 if name.ends_with('/') => Body::Directory,
@@ -224,6 +230,7 @@ fn pax(mut records: &[u8], extended: &mut Extended) {
                         .ok()
                         .and_then(|size| size.parse().ok());
                 }
+                key if key.starts_with(b"GNU.sparse.") => extended.sparse = true,
                 _ => {}
             }
         }
