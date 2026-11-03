@@ -4778,6 +4778,73 @@ async fn the_download_queue_keeps_its_order_and_moves_as_qbittorrent_does() {
     assert_eq!(places().await, [Some(2), Some(3), Some(1), Some(4), None]);
 }
 
+// An add reads no other torrent, so adding one costs the same however many
+// there are: it takes its turn and rank from the end of the queue as the
+// last pass left it, and puts its own job in the queue. A change to an
+// earlier torrent waits for the next pass, and the exporter's reading for
+// the next publish of every torrent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_add_reads_no_other_torrent() {
+    let rig = rig(set_clock());
+    // No session is built while the route is down.
+    rig.routes.set_down(Some("down"));
+    let queue = queue();
+    let state = queue.state().clone();
+    rig.service.publish_to(queue);
+    // Not opened: no job mail is heard and nothing settles, so only what
+    // the test does publishes.
+    let mut settings = rig.service.settings();
+    settings.torrent.max_active_downloads = 1;
+    rig.service.set_settings(settings).await;
+    let add = |seed: u8| {
+        let service = rig.service.clone();
+        async move {
+            service
+                .add(request(AddSource::Metainfo(plain(
+                    &format!("set{seed}"),
+                    seed,
+                ))))
+                .await
+                .unwrap()
+        }
+    };
+    let a = add(1).await;
+    let b = add(2).await;
+    // `a` finishes after the last pass: it seeds, and gives up its slot
+    // and its rank at the next.
+    rig.service
+        .inner
+        .live
+        .lock()
+        .await
+        .get_mut(&a)
+        .unwrap()
+        .record
+        .completed_at_ms = Some(EPOCH_MS);
+    let mut exported = rig.service.inner.published.subscribe();
+    exported.mark_unchanged();
+
+    let c = add(3).await;
+    let turns = || async {
+        let live = rig.service.inner.live.lock().await;
+        [a, b, c].map(|id| (live[&id].queued, live[&id].queue_rank))
+    };
+    assert_eq!(
+        turns().await,
+        [(false, Some(1)), (true, Some(2)), (true, Some(3))]
+    );
+    assert!(!exported.has_changed().unwrap());
+    let jobs: Vec<JobId> = state.list_jobs().iter().map(|job| job.job_id).collect();
+    assert_eq!(jobs, [a, b, c]);
+
+    // The next pass, as the tick runs it, settles what changed.
+    rig.service.apply_queue().await;
+    assert_eq!(
+        turns().await,
+        [(false, None), (false, Some(1)), (true, Some(2))]
+    );
+}
+
 #[test]
 fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_default() {
     let mut record = TorrentRecord {
