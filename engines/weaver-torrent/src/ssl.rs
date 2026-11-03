@@ -134,7 +134,8 @@ fn provider() -> CryptoProvider {
 struct Tls {
     client: Arc<ClientConfig>,
     server: Arc<ServerConfig>,
-    identity: SslIdentity,
+    // What the torrent's HTTPS announces present and trust.
+    announces: crate::ClientTls,
 }
 
 /// What makes a torrent an SSL torrent: its CA, the names it answers to in
@@ -242,7 +243,10 @@ impl SslTorrent {
         Ok(Tls {
             client: Arc::new(client),
             server: Arc::new(server),
-            identity,
+            announces: crate::ClientTls {
+                identity: identity.to_pem().into(),
+                ca: self.ca.to_vec().into(),
+            },
         })
     }
 
@@ -271,10 +275,7 @@ impl SslTorrent {
     pub fn client_tls(&self) -> anyhow::Result<crate::ClientTls> {
         let tls = self.tls.load();
         let tls = tls.as_ref().context("the SSL torrent has no identity")?;
-        Ok(crate::ClientTls {
-            identity: tls.identity.to_pem().into(),
-            ca: self.ca.to_vec().into(),
-        })
+        Ok(tls.announces.clone())
     }
 }
 
