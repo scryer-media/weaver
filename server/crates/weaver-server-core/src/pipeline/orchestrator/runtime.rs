@@ -594,6 +594,22 @@ impl Pipeline {
         ) as u32
     }
 
+    // The recovery volumes' size and what of them came: the graph's articles
+    // in hand for a graph job, the assembly's otherwise. The one figure the
+    // live report and the history row both read.
+    pub(crate) fn optional_recovery_bytes(&self, state: &JobState) -> (u64, u64) {
+        let (total, assembled) = state.optional_recovery_bytes();
+        let Some(graph) = self.graph_jobs.get(&state.job_id) else {
+            return (total, assembled);
+        };
+        let arrived: u64 = (0u32..)
+            .zip(&state.spec.files)
+            .filter(|(_, file)| file.role.is_recovery())
+            .map(|(index, _)| graph.arrived_bytes(index))
+            .sum();
+        (total, arrived.min(total))
+    }
+
     pub(crate) fn effective_downloaded_bytes(state: &JobState) -> u64 {
         state
             .downloaded_bytes

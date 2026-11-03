@@ -22,6 +22,7 @@ import {
 } from "@/graphql/queries";
 import { authHeaders } from "@/graphql/client";
 import { copyText } from "@/lib/clipboard";
+import { criticalHealthMilli, HEALTH_TONE_CLASS, healthTone } from "@/lib/health-tone";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { openUrlAsDownload, readDownloadErrorMessage, saveResponseAsDownload } from "@/lib/download";
 import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
@@ -62,7 +63,7 @@ import { buildTimelineView, downloadingMs, type JobTimelineData } from "../data/
 import { useNextData } from "../data/next-data";
 import { useSharedStructure } from "../data/share";
 import { countLabel } from "../i18n/labels";
-import { NextShell, RailBlock } from "../shell/NextShell";
+import { NextShell } from "../shell/NextShell";
 import { SupportReportActions } from "../features/SupportReportActions";
 
 /**
@@ -533,22 +534,6 @@ function JobDetailContent() {
           </div>
         </header>
       }
-      railFooter={
-        <RailBlock eyebrow={t("next.job.savedBandwidth")}>
-          <div className="text-[20px] font-semibold tracking-[-0.02em] text-wv-accent">
-            {job.optionalRecoveryBytes > 0 ? formatSize(savedBytes) : EM_DASH}
-          </div>
-          <div className="font-wv-mono text-[10.5px] leading-[1.5] text-wv-faint">
-            {job.optionalRecoveryBytes === 0
-              ? t("next.job.saved.noSet")
-              : job.optionalRecoveryDownloadedBytes === 0
-                ? t("next.job.saved.untouched")
-                : savedBytes === 0
-                  ? t("next.job.saved.wholeSet")
-                  : t("next.job.saved.partSet")}
-          </div>
-        </RailBlock>
-      }
       statusNote={
         report ?? (
           <span className="flex min-w-0 items-center gap-[7px]">
@@ -597,9 +582,9 @@ function JobDetailContent() {
             valueClassName={
               !verified && !done && !failed
                 ? "text-wv-muted"
-                : job.health >= 1000
-                  ? "text-wv-accent"
-                  : "text-wv-error"
+                : HEALTH_TONE_CLASS[
+                    healthTone(job.health, criticalHealthMilli(job.totalBytes, job.optionalRecoveryBytes))
+                  ]
             }
             note={
               verified || done || failed

@@ -2698,7 +2698,7 @@ async fn nzbget_rate_persists_limit_and_pausescan_toggles_watch_folder() {
 async fn nzbget_history_reports_compound_status_history_time_and_stage_timings() {
     let db = Database::open_in_memory().unwrap();
     // A fifth of the job was optional recovery data, so it stays repairable
-    // down to 80% health.
+    // down to (1000 - 400) / (1000 - 200) = 75% health.
     let mut complete = nzbget_history_row(400, "complete", 1_700_000_400, None);
     complete.total_bytes = 1_000;
     complete.optional_recovery_bytes = 200;
@@ -2744,7 +2744,7 @@ async fn nzbget_history_reports_compound_status_history_time_and_stage_timings()
     assert_eq!(by_id(400)["DownloadTimeSec"], 300);
     assert_eq!(by_id(400)["RepairTimeSec"], 40);
     assert_eq!(by_id(400)["PostTotalTimeSec"], 40);
-    assert_eq!(by_id(400)["CriticalHealth"], 800);
+    assert_eq!(by_id(400)["CriticalHealth"], 750);
     assert_eq!(by_id(401)["CriticalHealth"], 1000);
     assert_eq!(by_id(401)["Status"], "DELETED/HEALTH");
     assert_eq!(by_id(401)["DownloadTimeSec"], 0);

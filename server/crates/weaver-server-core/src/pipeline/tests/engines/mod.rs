@@ -66,6 +66,7 @@
 //
 // Files are indexed as the posts are listed; ordinals count from zero.
 
+mod accounting;
 mod binding_order;
 mod caps;
 mod checkpoint_cost;

@@ -14,9 +14,10 @@ use super::{
     shown_status,
 };
 use crate::events::model::PipelineEvent;
+use crate::jobs::JobPhase;
 use crate::jobs::ids::{JobId, NzbFileId};
 use crate::jobs::model::JobStatus;
-use crate::operations::instrumentation::StageOutcomeKind;
+use crate::operations::instrumentation::{JobStageKind, StageOutcomeKind};
 use crate::pipeline::completion::finalize::check::par2_damage_ignorable;
 use crate::pipeline::extraction::ExtractionError;
 use crate::pipeline::graph::job::{GraphJob, Note};
@@ -681,6 +682,7 @@ impl Pipeline {
         for event in stage {
             self.emit_job_event(event);
         }
+        self.time_graph_stage(job_id, phase);
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return;
         };
@@ -710,6 +712,36 @@ impl Pipeline {
         if let Some(hook) = hook {
             crate::e2e_failpoint::maybe_delay(hook);
             crate::e2e_failpoint::maybe_trip(hook);
+        }
+    }
+
+    // The stage clocks and phase rows of the root's phases. A phase opens
+    // its own as the root enters it; reaching a later phase closes every
+    // earlier one. A root back to downloading for recovery, then repairing
+    // again, keeps the repair it opened first.
+    pub(in crate::pipeline::graph) fn time_graph_stage(&mut self, job_id: JobId, phase: RootPhase) {
+        let order = |phase: RootPhase| match phase {
+            RootPhase::Downloading => 0,
+            RootPhase::Verifying => 1,
+            RootPhase::Repairing => 2,
+            RootPhase::Extracting => 3,
+            RootPhase::Done => 4,
+        };
+        let reached = order(phase);
+        if reached > order(RootPhase::Verifying) {
+            self.note_stage_finished(job_id, JobStageKind::Verify);
+        }
+        if reached > order(RootPhase::Repairing) {
+            self.phase_end(job_id, JobPhase::Repairing);
+        }
+        if reached > order(RootPhase::Extracting) {
+            self.phase_end(job_id, JobPhase::Extracting);
+        }
+        match phase {
+            RootPhase::Verifying => self.note_stage_started(job_id, JobStageKind::Verify),
+            RootPhase::Repairing => self.phase_begin_unsampled(job_id, JobPhase::Repairing),
+            RootPhase::Extracting => self.phase_begin_unsampled(job_id, JobPhase::Extracting),
+            RootPhase::Downloading | RootPhase::Done => {}
         }
     }
 

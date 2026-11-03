@@ -796,6 +796,8 @@ pub(in crate::pipeline::tests) struct GraphView {
     // What the job's report showed at each look, its status and whether it
     // was fetching repair data, each change once.
     pub(in crate::pipeline::tests) shown: Vec<(JobStatus, bool)>,
+    // The job's report at the last look.
+    pub(in crate::pipeline::tests) report: Option<crate::jobs::handle::JobInfo>,
     // At each look, for every root member a set covers: its name, whether
     // its sets proved it (every one covering it ruled clean or repaired and
     // none is out), and whether the root still keeps its checksums.
@@ -831,6 +833,10 @@ pub(in crate::pipeline::tests) struct Outcome {
     pub(in crate::pipeline::tests) validated_password: Option<String>,
     // The metadata the job's history row keeps, as stored.
     pub(in crate::pipeline::tests) history_metadata: Option<String>,
+    // The job's history row, as stored.
+    pub(in crate::pipeline::tests) history: Option<crate::JobHistoryRow>,
+    // How many times each job stage's duration was observed, by stage name.
+    pub(in crate::pipeline::tests) stages_timed: Vec<(&'static str, u64)>,
 }
 
 // The kind of every object a graph run's tree held, by its name, sorted.
@@ -1044,11 +1050,16 @@ pub(in crate::pipeline::tests) async fn try_run(scenario: &Scenario) -> Result<O
     let rejections = pipeline.metrics.extraction_rejections();
     let metrics = pipeline.metrics.raw_snapshot();
     let validated_password = pipeline.db.validated_archive_password(JOB.0).unwrap();
-    let history_metadata = pipeline
-        .db
-        .get_job_history(JOB.0)
-        .unwrap()
-        .and_then(|row| row.metadata);
+    let history = pipeline.db.get_job_history(JOB.0).unwrap();
+    let history_metadata = history.as_ref().and_then(|row| row.metadata.clone());
+    let stages_timed = pipeline
+        .metrics
+        .job_lifecycle
+        .snapshot()
+        .stage_duration
+        .into_iter()
+        .map(|(stage, histogram)| (stage, histogram.count))
+        .collect();
     retire_pipeline_database(pipeline).await;
     Ok(Outcome {
         status,
@@ -1067,6 +1078,8 @@ pub(in crate::pipeline::tests) async fn try_run(scenario: &Scenario) -> Result<O
         metrics,
         validated_password,
         history_metadata,
+        history,
+        stages_timed,
     })
 }
 
@@ -1459,10 +1472,11 @@ pub(in crate::pipeline::tests) fn observe(
     };
     let looked = std::time::Instant::now();
     if let Some(report) = pipeline.job_report(JOB) {
-        let shown = (report.status, report.fetching_repair_data);
+        let shown = (report.status.clone(), report.fetching_repair_data);
         if view.shown.last() != Some(&shown) {
             view.shown.push(shown);
         }
+        view.report = Some(report);
     }
     let tree = job.tree();
     if let Some(namespace) = tree.namespace(weaver_graph::NodeId::ROOT) {

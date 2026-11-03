@@ -484,7 +484,7 @@ impl Pipeline {
         let created_at = now - elapsed_secs;
         let total = state.spec.total_bytes;
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
-            state.optional_recovery_bytes();
+            self.optional_recovery_bytes(state);
         let health = health_milli(total, state.failed_bytes);
         let row = crate::JobHistoryRow {
             job_id: job_id.0,
