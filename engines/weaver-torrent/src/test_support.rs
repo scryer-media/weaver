@@ -26,6 +26,11 @@ pub(crate) fn sockets() -> KernelSockets {
     KernelSockets::new(None).expect("kernel sockets on no device")
 }
 
+/// The kernel factory, shared.
+pub(crate) fn socket_factory() -> std::sync::Arc<dyn crate::network::SocketFactory> {
+    std::sync::Arc::new(sockets())
+}
+
 /// A datagram socket bound at `addr`.
 pub(crate) async fn udp(addr: impl Into<SocketAddr>) -> Arc<dyn DatagramSocket> {
     let addr = addr.into();
@@ -63,9 +68,11 @@ pub(crate) async fn tcp(
     sockets().connect_tcp(addr.into()).await
 }
 
-/// The client `builder` makes.
+/// The client `builder` makes, from the routing layer's direct egress.
 pub(crate) fn build(builder: reqwest::ClientBuilder) -> anyhow::Result<reqwest::Client> {
-    Ok(builder.build()?)
+    Ok(weaver_tunnel::test_support::http_client::direct_client(
+        builder,
+    )?)
 }
 
 /// `builder` held to `target`: it follows no redirect, and dials the

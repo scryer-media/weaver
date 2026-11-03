@@ -6547,6 +6547,7 @@ dependencies = [
  "uuid",
  "walkdir",
  "weaver-model",
+ "weaver-tunnel",
  "windows",
  "x509-parser",
 ]
@@ -6566,6 +6567,7 @@ dependencies = [
  "proxy-tunnels",
  "quinn",
  "rcgen",
+ "reqwest",
  "socket2",
  "thiserror 2.0.21",
  "tokio",

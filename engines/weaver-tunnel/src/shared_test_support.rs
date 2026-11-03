@@ -8,6 +8,9 @@ pub mod dns;
 #[cfg(feature = "test-support")]
 #[path = "test_support/http3.rs"]
 pub mod http3;
+#[cfg(feature = "test-support")]
+#[path = "test_support/http_client.rs"]
+pub mod http_client;
 #[path = "test_support/natpmp.rs"]
 pub mod natpmp;
 #[path = "test_support/proxy.rs"]

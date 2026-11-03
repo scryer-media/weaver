@@ -85,3 +85,5 @@ tempfile = { workspace = true }
 # tests advance it past a deadline instead of waiting for one.
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
+# The routing layer's HTTP clients, for tests that make requests.
+weaver-tunnel = { path = "../weaver-tunnel", features = ["test-support"] }

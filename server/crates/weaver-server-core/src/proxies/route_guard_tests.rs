@@ -91,11 +91,12 @@ const CLIENT_CRATES: &[(&str, &[&str])] = &[
             "weaver",
             "weaver-server-api",
             "weaver-server-core",
-            // The torrent session takes its tracker client from
-            // `torrents::net`, built on the route; its own fallback client is
-            // never built. UPnP keeps its own client and runs only on System
-            // egress.
+            // The torrent session builds no client: it takes every one,
+            // the port mappers' too, from `torrents::net`, built on the route.
             "weaver-torrent",
+            // Only under `test-support`: a finished client on the host's
+            // egress for consumers' tests, never in a product build.
+            "weaver-tunnel",
         ],
     ),
     ("hyper", &["axum", "hyper-rustls", "hyper-util", "reqwest"]),
