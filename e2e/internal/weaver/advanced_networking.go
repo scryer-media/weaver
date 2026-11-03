@@ -5,10 +5,16 @@ package weaver
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"log"
-	"net"
+	"math/big"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -157,49 +163,100 @@ func speedTestReleaseFlow() weaverReleaseFlowSpec {
 	spec.PlaywrightScript = "speed-test"
 	// The reference posting a Usenet run is pointed at.
 	spec.SeedFixtures = []string{"speed-test-100mb"}
-	// The public endpoint a bandwidth run is pointed at.
-	spec.PublicTargets = []weaverPublicTarget{{Host: cloudflareSpeedHost, Port: 443}}
+	// The bandwidth run's Cloudflare endpoint, answered and served by the
+	// proxy fixture so the run never meets the public service's rate limit.
+	spec.ServedHosts = []string{cloudflareSpeedHost}
 	return spec
-}
-
-// A public host the proxy fixture forwards to and answers for.
-type weaverPublicTarget struct {
-	Host string
-	Port int
 }
 
 // The Cloudflare bandwidth test endpoint the speed test's bandwidth run uses.
 const cloudflareSpeedHost = "speed.cloudflare.com"
 
-// lookupPublicHostIPv4 resolves a public target on the host; the fixture
-// answers Weaver with these addresses and forwards to the first.
-var lookupPublicHostIPv4 = netLookupIPv4
+// Where the served hosts' certificates sit inside the containers: the
+// fixture mounts the whole directory, Weaver only the CA.
+const (
+	servedTLSDir    = "/served-tls"
+	servedTLSCA     = servedTLSDir + "/ca.pem"
+	servedTLSCert   = servedTLSDir + "/cert.pem"
+	servedTLSKey    = servedTLSDir + "/key.pem"
+	extraRootsEnv   = "WEAVER_SPEED_TEST_EXTRA_ROOTS"
+	servedHostsEnv  = "PROXY_FIXTURE_SERVED_HOSTS"
+	servedCertEnv   = "PROXY_FIXTURE_TLS_CERT"
+	servedKeyEnv    = "PROXY_FIXTURE_TLS_KEY"
+	servedTLSSubdir = "served-tls"
+)
 
-func netLookupIPv4(ctx context.Context, host string) ([]string, error) {
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", host)
+// writeServedTLS makes a CA for the run and one leaf certificate naming
+// every served host, signed by it, and writes ca.pem, cert.pem and key.pem
+// into dir.
+func writeServedTLS(dir string, hosts []string) error {
+	now := time.Now()
+	serial := func() (*big.Int, error) { return rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 127)) }
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	addresses := make([]string, 0, len(ips))
-	for _, ip := range ips {
-		addresses = append(addresses, ip.String())
+	caSerial, err := serial()
+	if err != nil {
+		return err
 	}
-	return addresses, nil
-}
-
-func resolvePublicTargets(ctx context.Context, targets []weaverPublicTarget) ([]map[string]any, error) {
-	resolved := make([]map[string]any, 0, len(targets))
-	for _, target := range targets {
-		addresses, err := lookupPublicHostIPv4(ctx, target.Host)
-		if err != nil {
-			return nil, fmt.Errorf("resolve public target %s: %w", target.Host, err)
+	caTemplate := &x509.Certificate{
+		SerialNumber:          caSerial,
+		Subject:               pkix.Name{CommonName: "Weaver e2e served-host CA"},
+		NotBefore:             now.Add(-time.Hour),
+		NotAfter:              now.Add(30 * 24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
+	if err != nil {
+		return err
+	}
+	ca, err := x509.ParseCertificate(caDER)
+	if err != nil {
+		return err
+	}
+	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return err
+	}
+	leafSerial, err := serial()
+	if err != nil {
+		return err
+	}
+	leafDER, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: leafSerial,
+		Subject:      pkix.Name{CommonName: hosts[0]},
+		DNSNames:     hosts,
+		NotBefore:    now.Add(-time.Hour),
+		NotAfter:     now.Add(30 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}, ca, &leafKey.PublicKey, caKey)
+	if err != nil {
+		return err
+	}
+	leafKeyDER, err := x509.MarshalPKCS8PrivateKey(leafKey)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	files := map[string]*pem.Block{
+		"ca.pem":   {Type: "CERTIFICATE", Bytes: caDER},
+		"cert.pem": {Type: "CERTIFICATE", Bytes: leafDER},
+		// Readable by the fixture whatever user it runs as; the key signs
+		// nothing but this run's test host.
+		"key.pem": {Type: "PRIVATE KEY", Bytes: leafKeyDER},
+	}
+	for name, block := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), pem.EncodeToMemory(block), 0o644); err != nil {
+			return err
 		}
-		if len(addresses) == 0 {
-			return nil, fmt.Errorf("resolve public target %s: no IPv4 address", target.Host)
-		}
-		resolved = append(resolved, map[string]any{"host": target.Host, "port": target.Port, "addresses": addresses})
 	}
-	return resolved, nil
+	return nil
 }
 
 // The Bind refusal needs a Weaver without CAP_NET_RAW, which is a container
@@ -367,7 +424,7 @@ func networkDefinition(subnet string) (map[string]any, error) {
 
 // advancedNetworkOverride builds the phase's whole generated Compose override.
 // JSON is valid YAML, and marshalling keeps paths and the host table quoted.
-func advancedNetworkOverride(ctx context.Context, phase *weaverReleasePhase) (map[string]any, error) {
+func advancedNetworkOverride(phase *weaverReleasePhase) (map[string]any, error) {
 	layout := phase.Spec.NetworkLayout
 	if len(phase.EgressSubnets) != layout.egressNetworks() {
 		return nil, fmt.Errorf("%s needs %d egress subnets, has %d", phase.Flow, layout.egressNetworks(), len(phase.EgressSubnets))
@@ -454,15 +511,17 @@ func advancedNetworkOverride(ctx context.Context, phase *weaverReleasePhase) (ma
 		"PROXY_FIXTURE_ADDRESSES": strings.Join(fixtureAddresses, ","),
 		"PROXY_FIXTURE_HOSTS":     string(fixtureHostsJSON),
 	}
-	if len(phase.Spec.PublicTargets) > 0 {
-		targets, err := resolvePublicTargets(ctx, phase.Spec.PublicTargets)
-		if err != nil {
-			return nil, err
-		}
-		targetsJSON, _ := json.Marshal(targets)
-		fixtureEnv["PROXY_FIXTURE_PUBLIC_TARGETS"] = string(targetsJSON)
-	}
 	service("proxy-fixture")["environment"] = fixtureEnv
+	servedDir := filepath.Join(phase.RootDir, servedTLSSubdir)
+	if len(phase.Spec.ServedHosts) > 0 {
+		if err := writeServedTLS(servedDir, phase.Spec.ServedHosts); err != nil {
+			return nil, fmt.Errorf("served host certificates: %w", err)
+		}
+		fixtureEnv[servedHostsEnv] = strings.Join(phase.Spec.ServedHosts, ",")
+		fixtureEnv[servedCertEnv] = servedTLSCert
+		fixtureEnv[servedKeyEnv] = servedTLSKey
+		service("proxy-fixture")["volumes"] = []any{servedDir + ":" + servedTLSDir + ":ro"}
+	}
 
 	resolverPath := filepath.Join(phase.RootDir, "proxy-resolv.conf")
 	if err := os.WriteFile(resolverPath, []byte("nameserver "+resolverIP+"\noptions timeout:1 attempts:1\n"), 0o644); err != nil {
@@ -482,6 +541,11 @@ func advancedNetworkOverride(ctx context.Context, phase *weaverReleasePhase) (ma
 		weaver["environment"] = map[string]any{"WEAVER_RETAIN_NET_RAW": "true"}
 	}
 
+	if len(phase.Spec.ServedHosts) > 0 {
+		weaver["volumes"] = append(weaver["volumes"].([]any), filepath.Join(servedDir, "ca.pem")+":"+servedTLSCA+":ro")
+		weaver["environment"].(map[string]any)[extraRootsEnv] = servedTLSCA
+	}
+
 	playwrightEnv := map[string]any{
 		"E2E_NETWORK_HOSTS":  string(networkHostsJSON),
 		"E2E_WEAVER_NET_RAW": netRaw,
@@ -496,8 +560,8 @@ func advancedNetworkOverride(ctx context.Context, phase *weaverReleasePhase) (ma
 	return map[string]any{"networks": networks, "services": services}, nil
 }
 
-func writeAdvancedNetworkOverride(ctx context.Context, phase *weaverReleasePhase) error {
-	override, err := advancedNetworkOverride(ctx, phase)
+func writeAdvancedNetworkOverride(phase *weaverReleasePhase) error {
+	override, err := advancedNetworkOverride(phase)
 	if err != nil {
 		return err
 	}

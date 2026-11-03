@@ -63,9 +63,10 @@ type weaverReleaseFlowSpec struct {
 	NetworkLayout weaverReleaseNetworkLayout
 	// DropNetRaw starts Weaver without CAP_NET_RAW.
 	DropNetRaw bool
-	// PublicTargets are the public hosts the proxy fixture resolves and
-	// forwards to, for a flow that reaches a real service.
-	PublicTargets []weaverPublicTarget
+	// ServedHosts are public HTTPS names the proxy fixture answers for and
+	// serves itself, under a certificate from a CA made for the run that
+	// Weaver is told to trust, so the flow never reaches the real service.
+	ServedHosts []string
 	// Stages run the Playwright script once per stage, restarting Weaver
 	// between stages.
 	Stages []string
@@ -542,7 +543,7 @@ func assignWeaverReleaseNetworkSubnets(
 			return err
 		}
 		if phase.Spec.NetworkLayout != weaverNetworkLayoutDefault {
-			if err := writeAdvancedNetworkOverride(ctx, phase); err != nil {
+			if err := writeAdvancedNetworkOverride(phase); err != nil {
 				return err
 			}
 			continue
