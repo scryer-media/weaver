@@ -349,6 +349,17 @@ impl GraphJob {
         &self.writer
     }
 
+    // The job paused or resumed: its extraction deadline does not run
+    // while it is paused.
+    pub(crate) fn hold_clock(&mut self, paused: bool) {
+        self.writer.hold_clock(paused);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clock_held(&self) -> bool {
+        self.writer.clock_held()
+    }
+
     pub(crate) fn pending(&self) -> &Pending {
         &self.pending
     }

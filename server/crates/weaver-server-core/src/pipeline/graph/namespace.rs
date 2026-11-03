@@ -274,6 +274,17 @@ impl NamespaceWriter {
         self.caps.refusal()
     }
 
+    // The job paused or resumed: its extraction deadline does not run
+    // while it is paused.
+    pub(crate) fn hold_clock(&mut self, paused: bool) {
+        self.caps.hold_clock(paused);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clock_held(&self) -> bool {
+        self.caps.clock_held()
+    }
+
     // How many member reads every repair so far needed: the evidence fed as
     // bytes passed settles the rest without one.
     pub(crate) fn read_backs(&self) -> u64 {
@@ -413,7 +424,7 @@ impl NamespaceWriter {
         self.caps.admit_member(tree, node, member)?;
         if Leaf::is_directory(&output_name) {
             self.settle(tree, builder, segments, node, member, out)?;
-            Leaf::at(&self.working_dir, &output_name).create_directory()?;
+            self.leaf(node, member, &output_name)?.create_directory()?;
         } else if length == Some(0) {
             return self.shut(tree, builder, segments, node, member, out);
         }

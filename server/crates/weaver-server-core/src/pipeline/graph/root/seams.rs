@@ -123,6 +123,7 @@ impl Pipeline {
             );
         }
         self.graph_jobs.insert(job_id, graph);
+        self.hold_extraction_clock(job_id);
         self.adopt_held_parts(held_parts);
         let result = self.start_graph_runs(job_id);
         self.after_graph_result(job_id, result);
