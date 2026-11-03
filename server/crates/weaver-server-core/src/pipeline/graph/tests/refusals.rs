@@ -339,6 +339,9 @@ async fn a_store_that_needs_an_engine_hands_its_volumes_to_one() {
         assert_eq!(refusing.file(&format!("echo-{member}.mkv")), body(member));
     }
     assert_eq!(refusing.job.phase(), RootPhase::Done);
+    // The engine extracted the archive, so it was never given up on.
+    let given = given_back(&mut refusing);
+    assert!(given.is_empty(), "{given:#?}");
 }
 
 #[test]
@@ -479,4 +482,35 @@ impl tracing::Subscriber for Captured {
     }
     fn enter(&self, _: &tracing::span::Id) {}
     fn exit(&self, _: &tracing::span::Id) {}
+}
+
+// ADVERSARY (uncommitted): one archive given up on is one demotion. The
+// job's event history should say so once, not once per volume; and an
+// archive handed to an engine that then reads it was not given up on.
+fn given_back(refusing: &mut Refusing) -> Vec<String> {
+    refusing
+        .job
+        .take_notes()
+        .into_iter()
+        .filter_map(|note| match note {
+            crate::pipeline::graph::job::Note::GivenBack(given) => Some(format!("{given:?}")),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn adversary_a_refused_five_volume_store_is_one_demotion_event() {
+    let mut refusing = refusing(Mode::Refuse, 5, &[]);
+    refusing.deliver_all();
+    let given = given_back(&mut refusing);
+    assert_eq!(given.len(), 1, "{given:#?}");
+}
+
+#[tokio::test]
+async fn adversary_a_store_handed_to_an_engine_is_not_given_up() {
+    let mut refusing = refusing(Mode::NeedsEngine, 2, &[]);
+    refusing.deliver_all();
+    let given = given_back(&mut refusing);
+    assert!(given.is_empty(), "{given:#?}");
 }

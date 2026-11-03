@@ -162,9 +162,8 @@ struct Acknowledging {
     closed: BTreeSet<(NodeId, MemberId)>,
 }
 
-// A member an object gave back, or that nothing took: the archive it
-// belonged to was given up on as an archive, and the member is delivered or
-// withheld as its bytes stand.
+// An archive given up on as an archive: its members are delivered or
+// withheld as their bytes stand. Named by the first member given back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GivenBack {
     pub(crate) member: String,
@@ -221,8 +220,12 @@ pub(crate) struct NamespaceWriter {
     // first piece of a file once the whole return is down: a later slice of
     // the same return may still rewrite the front of a piece beside it.
     refused_in_batch: BTreeSet<(NodeId, MemberId)>,
-    // Members given back since the job last asked, for its events.
+    // Archives given up on since the job last asked, for its events.
     given_back: Vec<GivenBack>,
+    // The archives already given up on: the object that gave its members
+    // back, or the member itself when nothing held it. One archive is one
+    // event however many volumes it had.
+    given_up: BTreeSet<(NodeId, Option<MemberId>)>,
     #[cfg(test)]
     diagnostics: Vec<weaver_graph::recovery::RepairDiagnostic>,
     placements: Vec<Placement>,
@@ -260,6 +263,7 @@ impl NamespaceWriter {
             acknowledging: None,
             refused_in_batch: BTreeSet::new(),
             given_back: Vec::new(),
+            given_up: BTreeSet::new(),
             #[cfg(test)]
             diagnostics: Vec::new(),
             placements: Vec::new(),
@@ -1028,7 +1032,10 @@ impl NamespaceWriter {
             // Handed over as the member's, by `apply_each`.
             Effect::Folded { .. } => {}
             Effect::Refused { node, member, why } | Effect::NeedsEngine { node, member, why } => {
-                self.refuse(tree, *node, *member, *why);
+                // A member handed to an engine is read by it: the archive was
+                // not given up on.
+                let given_up = matches!(effect, Effect::Refused { .. });
+                self.refuse(tree, *node, *member, *why, given_up);
                 // The engine the refusal handed the member to took it over.
                 if matches!(effect, Effect::NeedsEngine { .. })
                     && let Some((engine, _)) = tree.child_of(*node, *member)
@@ -1327,7 +1334,7 @@ impl NamespaceWriter {
                 self.capture(tree, builder, owner, &arrival, &mut effects)?;
                 return self.apply_each(tree, builder, segments, effects, write, out);
             }
-            self.refuse(tree, node, member, Why::HoldsBreached);
+            self.refuse(tree, node, member, Why::HoldsBreached, true);
             self.write_file(tree, node, member, arrival.offset, &arrival.bytes)?;
             out.push(Effect::Refused {
                 node,
@@ -1815,17 +1822,19 @@ impl NamespaceWriter {
     }
 
     // The member is a leaf because something gave it back or never took
-    // it. Said once, when the reason is new.
-    fn refuse(&mut self, tree: &Tree, node: NodeId, member: MemberId, why: Why) {
+    // it. Said once, when the reason is new. When `given_up`, the archive it
+    // belonged to is noted for the job's events, once per archive.
+    fn refuse(&mut self, tree: &Tree, node: NodeId, member: MemberId, why: Why, given_up: bool) {
         if self.files_mut(node).refuse(member, why) == Some(why) {
             return;
         }
         // The object that gave the member back, if one had it.
-        let kind = tree
-            .refused_by(node, member)
+        let object = tree.refused_by(node, member);
+        let kind = object
             .and_then(|object| tree.kind(object))
             .map(|kind| kind.to_string())
             .unwrap_or_default();
+        let member_id = member;
         let member = member_name(tree, node, member);
         tracing::info!(
             job_id = self.scope,
@@ -1835,11 +1844,17 @@ impl NamespaceWriter {
             why = %why_name(why),
             "object refused"
         );
-        self.given_back.push(GivenBack {
-            member,
-            container: kind,
-            why,
-        });
+        let archive = match object {
+            Some(object) => (object, None),
+            None => (node, Some(member_id)),
+        };
+        if given_up && self.given_up.insert(archive) {
+            self.given_back.push(GivenBack {
+                member,
+                container: kind,
+                why,
+            });
+        }
     }
 
     fn files_mut(&mut self, node: NodeId) -> &mut Files {
