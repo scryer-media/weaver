@@ -170,8 +170,6 @@ struct Volume {
     // whose placement this run never saw counts its encoded bytes, the most
     // it can have decoded to. Kept beside `settled_bytes`.
     arrived_decoded: u64,
-    // The most decoded bytes one article of the volume brought this run.
-    largest: u64,
     // Decoded offsets known exactly, by boundary index: boundary `k` is
     // where article `k` starts, and boundary `articles.len()` is the end.
     known: BTreeMap<usize, u64>,
@@ -228,7 +226,6 @@ impl Volume {
             encoded_len: encoded,
             settled_bytes: 0,
             arrived_decoded: 0,
-            largest: 0,
             known: BTreeMap::from([(0, 0)]),
             disorder: 0,
             parkable: (0..sizes.len()).collect(),
@@ -654,7 +651,6 @@ impl ArticleMap {
             return;
         };
         found.articles[index].intact = intact;
-        found.largest = found.largest.max(range.len());
         found.set_state(&mut self.open, index, State::Arrived(Some(range)));
         found.know(index, range.start);
         if let Some(end) = declared_end {
@@ -666,23 +662,28 @@ impl ArticleMap {
         found.cut_after(&mut self.open, index);
     }
 
-    // The most decoded bytes the volume's articles can deliver, which no
-    // length an article declares may pass: the post's encoded bytes for the
-    // file, at or above its decoded bytes as encoding only adds, or, for a
-    // post that lists no sizes, its articles times the largest one seen,
-    // `article` being the one in hand. A length past it books a file the
-    // post cannot fill (nzbfast `crates/nzbfast-engine/src/get/workers.rs:777-867`,
-    // `crates/nzbfast-unpack/src/repair/sidefetch.rs:376-382`); SABnzbd
-    // only refuses one past 500 GiB (sabctools `src/yenc.cc:339-342`) and
-    // NZBGet none (`daemon/nntp/ArticleWriter.cpp:72-115`).
-    pub(crate) fn posted_cap(&self, volume: VolumeIndex, article: u64) -> u64 {
+    // The file lengths the volume's articles can reach, `part` being the
+    // decoded bytes of the article in hand: above where its last article
+    // begins and no further than where it ends, each article as long as
+    // this one, and never past the post's encoded bytes for the file, at or
+    // above its decoded bytes as encoding only adds. A length outside books
+    // a file the post cannot fill, or one its parts run past: either way it
+    // is a lie, every part is written where its own header puts it, and the
+    // file reaches as far as its bytes land (nzbfast
+    // `crates/nzbfast-engine/src/get/workers.rs:777-867`,
+    // `crates/nzbfast-unpack/src/repair/sidefetch.rs:376-382`; sabctools
+    // `src/yenc.cc:339-377`; NZBGet `daemon/nntp/ArticleWriter.cpp:557-558`).
+    pub(crate) fn reachable(&self, volume: VolumeIndex, part: u64, length: u64) -> bool {
         let Some(found) = self.volumes.get(volume.0 as usize) else {
-            return 0;
+            return false;
         };
-        match found.encoded_len {
-            0 => (found.articles.len() as u64).saturating_mul(found.largest.max(article)),
+        let articles = found.articles.len() as u64;
+        let posted = match found.encoded_len {
+            0 => u64::MAX,
             posted => posted,
-        }
+        };
+        articles.saturating_sub(1).saturating_mul(part) < length
+            && length <= articles.saturating_mul(part).min(posted)
     }
 
     // The file's decoded length, which the first decoded article declares.

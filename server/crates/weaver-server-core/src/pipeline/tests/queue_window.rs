@@ -275,3 +275,75 @@ async fn a_parked_job_enters_with_the_edit_it_was_given() {
     assert_eq!(*read_id, id);
     assert_eq!(request.spec.category.as_deref(), Some("fresh"));
 }
+
+// A job past the window that took the slot but whose stored NZB cannot be
+// read back is never installed. Its cancel still archives it, removes its
+// row and frees the slot for the next job.
+#[tokio::test]
+async fn an_unreadable_parked_job_is_cancelled_and_frees_its_slot() {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, handle) = long_queue(&temp, 1).await;
+    let unreadable = JobId(QUEUE_WINDOW as u64 + 1);
+    let next = JobId(QUEUE_WINDOW as u64 + 2);
+    pipeline.db.flush_write_queue().await.unwrap();
+    let datastore = pipeline.db.datastore();
+    pipeline
+        .db
+        .run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE active_jobs SET nzb_zstd = {} WHERE job_id = {}",
+                &[
+                    SqlArg::Bytes(b"not an nzb".to_vec()),
+                    SqlArg::I64(unreadable.0 as i64),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+        .unwrap();
+    // The window's other jobs paused, the slot job 1 frees goes to the job
+    // past the window, whose read back fails.
+    let window: Vec<JobId> = (2..=QUEUE_WINDOW as u64).map(JobId).collect();
+    for outcome in handle.set_jobs_paused(window, true).await.into_values() {
+        outcome.unwrap();
+    }
+    settle(&mut pipeline).await;
+    handle.cancel_job(JobId(1)).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    finish_cancel_jobs(&mut pipeline).await;
+    settle(&mut pipeline).await;
+    assert!(pipeline.nzb_admitted.contains(&unreadable));
+    assert!(pipeline.window_unreadable.contains(&unreadable));
+    assert!(!pipeline.jobs.contains_key(&unreadable));
+
+    handle.cancel_job(unreadable).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    // The cancel is taken without the job's NZB: its archive is under way.
+    assert!(
+        pipeline
+            .shared_state
+            .queue
+            .read(|inner| { inner.job(unreadable).is_some_and(|row| row.report.retiring) })
+    );
+    finish_cancel_jobs(&mut pipeline).await;
+    settle(&mut pipeline).await;
+    assert!(
+        handle
+            .list_jobs()
+            .iter()
+            .all(|job| job.job_id != unreadable)
+    );
+    assert!(!pipeline.nzb_admitted.contains(&unreadable));
+    assert!(!pipeline.window_unreadable.contains(&unreadable));
+    assert!(pipeline.nzb_admitted.contains(&next));
+    assert!(pipeline.jobs.contains_key(&next));
+    assert!(
+        pipeline
+            .db
+            .get_job_history(unreadable.0)
+            .unwrap()
+            .is_some_and(|row| row.status == "cancelled")
+    );
+}
