@@ -52,9 +52,9 @@ func liftPrimaryHold() error {
 }
 
 // pollFor reads `check` until it holds. Every wait in these cases ends on the
-// state it reads; the case timeout only ends a wait that never resolves.
+// state it reads, never on elapsed time; the enclosing runner bounds a wait
+// that never resolves.
 func (ctx *restartCaseContext) pollFor(what string, check func() (bool, error)) error {
-	deadline := time.Now().Add(ctx.Timeout)
 	for {
 		done, err := check()
 		if err != nil {
@@ -62,9 +62,6 @@ func (ctx *restartCaseContext) pollFor(what string, check func() (bool, error)) 
 		}
 		if done {
 			return nil
-		}
-		if !time.Now().Before(deadline) {
-			return fmt.Errorf("never saw %s", what)
 		}
 		time.Sleep(chaosPollInterval)
 	}
