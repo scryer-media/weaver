@@ -2021,13 +2021,15 @@ struct Inner {
 }
 
 // A snapshot of the download queue's end from the last pass, extended by
-// each torrent added since: the slots still free and the ranks given. A
-// torrent added after them changes no earlier torrent's turn or rank, so
-// it takes its own from here. What moved since the pass (a torrent gone or
-// finished) is corrected by the next, which those ask for.
+// each torrent added since: the slots still free, the ranks given, and the
+// place of the last torrent in it. A torrent added after them changes no
+// earlier torrent's turn or rank, so it takes its own from here. What moved
+// since the pass (a torrent gone or finished, one placed before the end) is
+// corrected by the next, which those ask for.
 #[derive(Debug, Clone, Copy)]
 struct QueueEnd {
     slots: status::Slots,
+    last: Option<(i64, JobId)>,
 }
 
 #[derive(Clone)]
@@ -2071,6 +2073,7 @@ impl TorrentService {
                 // An empty queue: every slot free.
                 queue_end: Mutex::new(QueueEnd {
                     slots: status::Slots::new(max_active),
+                    last: None,
                 }),
             }),
         }
@@ -3272,7 +3275,9 @@ impl TorrentService {
     // earlier torrent's turn or rank moves for it, so its own follow from
     // the queue's end as the last pass left it, which it then extends: an
     // add reads no other torrent. Whatever changed since that pass is
-    // settled at the next.
+    // settled at the next. One that took its place before another added
+    // since, and arrives after it, asks for that pass now: the turns given
+    // since are out of order.
     async fn enqueue(&self, mut torrent: Live) {
         let mut live = self.inner.live.lock().await;
         let settings = self.settings();
@@ -3280,6 +3285,7 @@ impl TorrentService {
         let holds = self.holds();
         let now = self.inner.clock.now_ms();
         let queued = queued(&settings, &rules, &torrent, now);
+        let place = (torrent.record.queue_position, torrent.record.job_id);
         {
             let mut end = self
                 .inner
@@ -3287,6 +3293,11 @@ impl TorrentService {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             let turn = end.slots.take(&queued, &holds);
+            if end.last.is_some_and(|last| place < last) {
+                self.inner.signal.want_pass();
+            } else {
+                end.last = Some(place);
+            }
             take_turn(&mut torrent, &queued, turn, &holds, now);
         }
         live.insert(torrent.record.job_id, torrent);
@@ -5064,6 +5075,9 @@ impl TorrentService {
             .iter()
             .map(|torrent| queued(&settings, &rules, torrent, now))
             .collect();
+        let last = order
+            .last()
+            .map(|torrent| (torrent.record.queue_position, torrent.record.job_id));
         let (turns, slots) = status::turns(&queue, settings.torrent.max_active_downloads, &holds);
         let turns: BTreeMap<JobId, (&Queued, status::Turn)> = queue
             .iter()
@@ -5074,7 +5088,7 @@ impl TorrentService {
             .inner
             .queue_end
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = QueueEnd { slots };
+            .unwrap_or_else(PoisonError::into_inner) = QueueEnd { slots, last };
         for torrent in live.values_mut() {
             let (queued, turn) = turns[&torrent.record.job_id];
             take_turn(torrent, queued, turn, &holds, now);

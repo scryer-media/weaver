@@ -4926,6 +4926,38 @@ async fn a_slot_freed_without_a_pass_goes_out_at_the_next_settle() {
     assert_eq!(one.turns(&[c, d]).await, [(false, None), (false, Some(1))]);
 }
 
+// Two adds at once take their places in one order and can join the live
+// torrents in the other. The one that arrives after a torrent placed
+// behind it asks for a pass, and the next settle gives the slot and the
+// first rank back to the one placed first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_add_arriving_out_of_place_has_its_turn_settled_by_a_pass() {
+    let one = OneSlot::new().await;
+    let service = &one.rig.service;
+    // The second add's place is taken before the first's, as when its
+    // placing waits longer.
+    service
+        .inner
+        .next_queue_position
+        .store(5, Ordering::Relaxed);
+    let behind = one.add(1).await;
+    service
+        .inner
+        .next_queue_position
+        .store(2, Ordering::Relaxed);
+    let before = one.add(2).await;
+    assert_eq!(
+        one.turns(&[before, behind]).await,
+        [(true, Some(2)), (false, Some(1))]
+    );
+
+    service.settle().await;
+    assert_eq!(
+        one.turns(&[before, behind]).await,
+        [(false, Some(1)), (true, Some(2))]
+    );
+}
+
 #[test]
 fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_default() {
     let mut record = TorrentRecord {
