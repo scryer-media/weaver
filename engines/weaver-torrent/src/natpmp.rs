@@ -19,7 +19,7 @@ use tracing::{debug, trace};
 
 use crate::{
     core::net::{DatagramSocket, Egress, HttpClients},
-    route_interface::RouteInterface,
+    route_interface::{self, RouteInterface},
     upnp::{PortMapEvents, PortMapReports, PortMapRequest, PortmapProtocol, PortmapTransport},
 };
 
@@ -480,26 +480,40 @@ impl State {
 
 /// Where a mapper asks: from an address on the route's interface to the
 /// NAT-PMP / PCP server of the gateway on it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GatewayRoute {
     pub local_ip: IpAddr,
     pub gateway: SocketAddr,
+    /// Every address of the route's interface, `local_ip` among them: the
+    /// route toward the gateway may leave from any of them.
+    pub interface_addresses: Vec<IpAddr>,
 }
 
 impl GatewayRoute {
     /// The default gateway on `interface`, the route's interface.
     pub fn of(interface: &RouteInterface) -> anyhow::Result<Self> {
         let routes = routes().context("error reading the routing table")?;
-        gateway_route(&routes, interface)
+        let addresses = route_interface::addresses_of(&interface.name)
+            .with_context(|| format!("error listing the addresses of {}", interface.name))?;
+        gateway_route(&routes, interface, addresses)
     }
 }
 
-fn gateway_route(routes: &[Route], interface: &RouteInterface) -> anyhow::Result<GatewayRoute> {
+fn gateway_route(
+    routes: &[Route],
+    interface: &RouteInterface,
+    mut interface_addresses: Vec<IpAddr>,
+) -> anyhow::Result<GatewayRoute> {
     let gateway = default_gateway_of(routes, &interface.name)
         .with_context(|| format!("no gateway on the route's interface {}", interface.name))?;
+    let local_ip = IpAddr::V4(interface.ip);
+    if !interface_addresses.contains(&local_ip) {
+        interface_addresses.push(local_ip);
+    }
     Ok(GatewayRoute {
-        local_ip: interface.ip.into(),
+        local_ip,
         gateway: (gateway, NATPMP_PORT).into(),
+        interface_addresses,
     })
 }
 
@@ -567,17 +581,25 @@ impl NatPmpMapper {
             .await
             .with_context(|| format!("error binding the NAT-PMP socket to {}", route.local_ip))?;
         // The gateway is asked from the socket's own address: the route
-        // toward it must leave from there.
+        // toward it must leave through the interface that holds it, from
+        // whichever of the interface's addresses the kernel picks.
         let local_ip = socket.bind_addr().ip();
         match clients.egress(route.gateway) {
             Egress::NoRoute => bail!(
                 "error connecting to the gateway at {}: no route",
                 route.gateway
             ),
-            Egress::From(from) if !local_ip.is_unspecified() && from != local_ip => bail!(
-                "error connecting to the gateway at {}: the route leaves from {from}, not {local_ip}",
-                route.gateway
-            ),
+            Egress::From(from)
+                if !local_ip.is_unspecified()
+                    && from != local_ip
+                    && !route.interface_addresses.contains(&from) =>
+            {
+                bail!(
+                    "error connecting to the gateway at {}: the route leaves from {from}, an \
+                     address not on the interface of {local_ip}",
+                    route.gateway
+                )
+            }
             Egress::From(_) | Egress::Proxied => {}
         }
         Ok((
@@ -898,7 +920,7 @@ fn routes() -> io::Result<Vec<Route>> {
 #[cfg(test)]
 mod tests {
     use std::{
-        net::{Ipv4Addr, SocketAddr},
+        net::{IpAddr, Ipv4Addr, SocketAddr},
         time::Duration,
     };
 
@@ -912,7 +934,7 @@ mod tests {
         parse_proc_net_route,
     };
     use crate::{
-        core::net::DatagramSocket,
+        core::net::{DatagramSocket, Egress, HttpClients},
         route_interface::RouteInterface,
         test_support::{loopback, loopback_udp},
         upnp::{PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport, tests::hold_clock},
@@ -958,6 +980,7 @@ mod tests {
             Ok(GatewayRoute {
                 local_ip: Ipv4Addr::LOCALHOST.into(),
                 gateway: gateway.socket.bind_addr(),
+                interface_addresses: vec![Ipv4Addr::LOCALHOST.into()],
             }),
             protocols,
         )
@@ -967,6 +990,14 @@ mod tests {
         route: Result<GatewayRoute, String>,
         protocols: &[PortmapProtocol],
     ) -> Running {
+        run_mapper_through(route, protocols, loopback())
+    }
+
+    fn run_mapper_through(
+        route: Result<GatewayRoute, String>,
+        protocols: &[PortmapProtocol],
+        clients: Arc<dyn HttpClients>,
+    ) -> Running {
         let mappings = protocols
             .iter()
             .map(|&protocol| PortMapRequest {
@@ -975,7 +1006,7 @@ mod tests {
                 external_port: 6881,
             })
             .collect();
-        let mapper = NatPmpMapper::new(route, mappings, None, loopback());
+        let mapper = NatPmpMapper::new(route, mappings, None, clients);
         let cancel = CancellationToken::new();
         let (events_tx, events) = unbounded_channel();
         let task = tokio::spawn(mapper.run(cancel.clone(), events_tx));
@@ -1259,7 +1290,7 @@ mod tests {
             ip: Ipv4Addr::new(10, 44, 0, 2),
             point_to_point: true,
         };
-        let route = gateway_route(&routes, &tunnel).map_err(|e| format!("{e:#}"));
+        let route = gateway_route(&routes, &tunnel, Vec::new()).map_err(|e| format!("{e:#}"));
         let mut running = run_mapper_over(route, &[PortmapProtocol::Tcp, PortmapProtocol::Udp]);
         for protocol in [PortmapProtocol::Tcp, PortmapProtocol::Udp] {
             assert_eq!(
@@ -1279,6 +1310,7 @@ mod tests {
         let route = GatewayRoute {
             local_ip: Ipv4Addr::LOCALHOST.into(),
             gateway: (Ipv4Addr::new(127, 0, 0, 2), NATPMP_PORT).into(),
+            interface_addresses: vec![Ipv4Addr::LOCALHOST.into()],
         };
         let mut running = run_mapper_over(Ok(route), &[PortmapProtocol::Tcp, PortmapProtocol::Udp]);
         for protocol in [PortmapProtocol::Tcp, PortmapProtocol::Udp] {
@@ -1287,11 +1319,60 @@ mod tests {
                 failed(
                     protocol,
                     "error connecting to the gateway at 127.0.0.2:5351: the route leaves from \
-                     127.0.0.2, not 127.0.0.1"
+                     127.0.0.2, an address not on the interface of 127.0.0.1"
                 )
             );
         }
         assert_eq!(running.events.recv().await, None);
+        running.task.await.unwrap().unwrap();
+    }
+
+    // Clients on a loopback route whose requests toward any address leave
+    // from `0`.
+    struct LeavingFrom(IpAddr, Arc<dyn HttpClients>);
+
+    impl HttpClients for LeavingFrom {
+        fn client(
+            &self,
+            target: Option<crate::HttpTarget<'_>>,
+            shape: &crate::ClientShape,
+        ) -> anyhow::Result<reqwest::Client> {
+            self.1.client(target, shape)
+        }
+        fn egress(&self, _: SocketAddr) -> Egress {
+            Egress::From(self.0)
+        }
+        fn gateway_socket<'a>(
+            &'a self,
+            local: SocketAddr,
+        ) -> crate::network::BoxFuture<'a, std::io::Result<Arc<dyn DatagramSocket>>> {
+            self.1.gateway_socket(local)
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_route_from_another_address_of_the_interface_asks_the_gateway() {
+        let _hold = hold_clock();
+        let mut gateway = Gateway::new().await;
+        // The interface holds a second address, and the kernel picks it as
+        // the source toward the gateway.
+        let alias: IpAddr = Ipv4Addr::new(127, 0, 0, 2).into();
+        let route = GatewayRoute {
+            local_ip: Ipv4Addr::LOCALHOST.into(),
+            gateway: gateway.socket.bind_addr(),
+            interface_addresses: vec![Ipv4Addr::LOCALHOST.into(), alias],
+        };
+        let mut running = run_mapper_through(
+            Ok(route),
+            &[PortmapProtocol::Tcp],
+            Arc::new(LeavingFrom(alias, loopback())),
+        );
+        let tcp = gateway.recv().await;
+        assert_pcp_map(&tcp, 6, 3600, Ipv4Addr::UNSPECIFIED);
+        gateway.send(&pcp_answer(&tcp, 0, 7200, 1000, 6881)).await;
+        assert_eq!(running.events.recv().await.unwrap().error, None);
+
+        running.cancel.cancel();
         running.task.await.unwrap().unwrap();
     }
 
@@ -1301,6 +1382,7 @@ mod tests {
         let route = GatewayRoute {
             local_ip: Ipv4Addr::new(192, 0, 2, 1).into(),
             gateway: (Ipv4Addr::LOCALHOST, NATPMP_PORT).into(),
+            interface_addresses: vec![Ipv4Addr::new(192, 0, 2, 1).into()],
         };
         let mut running = run_mapper_over(Ok(route), &[PortmapProtocol::Tcp, PortmapProtocol::Udp]);
         for protocol in [PortmapProtocol::Tcp, PortmapProtocol::Udp] {
@@ -1427,11 +1509,15 @@ mod tests {
             ip: Ipv4Addr::new(172, 16, 5, 85),
             point_to_point: false,
         };
+        // The route holds every address of the interface, its own among
+        // them.
+        let v6: IpAddr = "fe80::1".parse().unwrap();
         assert_eq!(
-            gateway_route(&routes, &en0).unwrap(),
+            gateway_route(&routes, &en0, vec![v6]).unwrap(),
             GatewayRoute {
                 local_ip: Ipv4Addr::new(172, 16, 5, 85).into(),
                 gateway: (Ipv4Addr::new(172, 16, 4, 1), NATPMP_PORT).into(),
+                interface_addresses: vec![v6, Ipv4Addr::new(172, 16, 5, 85).into()],
             }
         );
         let utun8 = RouteInterface {
@@ -1440,7 +1526,10 @@ mod tests {
             point_to_point: true,
         };
         assert_eq!(
-            format!("{:#}", gateway_route(&routes, &utun8).unwrap_err()),
+            format!(
+                "{:#}",
+                gateway_route(&routes, &utun8, Vec::new()).unwrap_err()
+            ),
             "no gateway on the route's interface utun8"
         );
     }

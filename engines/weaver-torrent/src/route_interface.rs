@@ -70,56 +70,96 @@ fn source_toward(clients: &dyn HttpClients, to: SocketAddr) -> anyhow::Result<Ip
     }
 }
 
-#[cfg(unix)]
+/// Every address `name` holds, IPv4 and IPv6: any of them is the
+/// interface's own, whichever the kernel picks to send from.
+pub fn addresses_of(name: &str) -> io::Result<Vec<IpAddr>> {
+    Ok(interface_addresses()?
+        .into_iter()
+        .filter(|a| a.name == name)
+        .map(|a| a.ip)
+        .collect())
+}
+
 fn ipv4_interfaces() -> io::Result<Vec<RouteInterface>> {
+    Ok(interface_addresses()?
+        .into_iter()
+        .filter_map(|a| match a.ip {
+            IpAddr::V4(ip) => Some(RouteInterface {
+                name: a.name,
+                ip,
+                point_to_point: a.point_to_point,
+            }),
+            IpAddr::V6(_) => None,
+        })
+        .collect())
+}
+
+/// One address of one interface, of either family.
+struct InterfaceAddress {
+    name: String,
+    ip: IpAddr,
+    point_to_point: bool,
+}
+
+#[cfg(unix)]
+fn interface_addresses() -> io::Result<Vec<InterfaceAddress>> {
     use nix::libc;
     let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
     // SAFETY: getifaddrs writes a list head we free below.
     if unsafe { libc::getifaddrs(&mut head) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    let mut interfaces = Vec::new();
+    let mut addresses = Vec::new();
     let mut at = head;
     while !at.is_null() {
         // SAFETY: a node of the list getifaddrs returned, not yet freed.
         let ifa = unsafe { &*at };
         at = ifa.ifa_next;
-        if ifa.ifa_addr.is_null()
-            // SAFETY: a non-null address getifaddrs filled in.
-            || i32::from(unsafe { (*ifa.ifa_addr).sa_family }) != libc::AF_INET
-        {
+        if ifa.ifa_addr.is_null() {
             continue;
         }
-        // SAFETY: an AF_INET address is a sockaddr_in.
-        let sin = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in>() };
+        // SAFETY: a non-null address getifaddrs filled in.
+        let ip = match i32::from(unsafe { (*ifa.ifa_addr).sa_family }) {
+            libc::AF_INET => {
+                // SAFETY: an AF_INET address is a sockaddr_in.
+                let sin = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in>() };
+                IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)))
+            }
+            libc::AF_INET6 => {
+                // SAFETY: an AF_INET6 address is a sockaddr_in6.
+                let sin6 = unsafe { &*ifa.ifa_addr.cast::<libc::sockaddr_in6>() };
+                IpAddr::V6(std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr))
+            }
+            _ => continue,
+        };
         // SAFETY: every node names its interface, NUL-terminated.
         let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) };
-        interfaces.push(RouteInterface {
+        addresses.push(InterfaceAddress {
             name: name.to_string_lossy().into_owned(),
-            ip: Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)),
+            ip,
             point_to_point: ifa.ifa_flags & libc::IFF_POINTOPOINT as u32 != 0,
         });
     }
     // SAFETY: the head getifaddrs returned, freed once.
     unsafe { libc::freeifaddrs(head) };
-    Ok(interfaces)
+    Ok(addresses)
 }
 
 /// The adapter list does not say which links are point-to-point.
 #[cfg(not(unix))]
-fn ipv4_interfaces() -> io::Result<Vec<RouteInterface>> {
+fn interface_addresses() -> io::Result<Vec<InterfaceAddress>> {
     use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
     let interfaces = NetworkInterface::show().map_err(io::Error::other)?;
     Ok(interfaces
         .into_iter()
         .flat_map(|i| {
-            i.addr.into_iter().filter_map(move |a| match a {
-                Addr::V4(a) => Some(RouteInterface {
-                    name: i.name.clone(),
-                    ip: a.ip,
-                    point_to_point: false,
-                }),
-                Addr::V6(_) => None,
+            i.addr.into_iter().map(move |a| InterfaceAddress {
+                name: i.name.clone(),
+                ip: match a {
+                    Addr::V4(a) => a.ip.into(),
+                    Addr::V6(a) => a.ip.into(),
+                },
+                point_to_point: false,
             })
         })
         .collect())
