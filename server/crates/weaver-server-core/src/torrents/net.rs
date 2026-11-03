@@ -1650,7 +1650,8 @@ mod tests {
     }
 
     // A queue's web seeds, one client per torrent past the most a leg
-    // keeps, drop their own oldest clients and leave the tracker's alone.
+    // keeps, drop the client asked for longest ago, keep every other, and
+    // leave the tracker's alone.
     #[test]
     fn web_seed_clients_never_push_out_the_trackers() {
         let clients = LegClients::new(
@@ -1674,20 +1675,28 @@ mod tests {
             ClientShape::FETCH.for_torrent(weaver_torrent::core::Id20::new(hash))
         };
         clients.client(target("tracker.test"), &announce).unwrap();
-        for n in 1..=CLIENTS_KEPT + 1 {
+        for n in 1..=CLIENTS_KEPT {
             clients.client(target("seed.test"), &seed(n)).unwrap();
         }
-        let built = clients.built();
-        assert_eq!(built, CLIENTS_KEPT + 2);
-
-        // The tracker's client is still kept, and so is the latest web seed's.
-        clients.client(target("tracker.test"), &announce).unwrap();
+        // The first web seed is asked for again, so the second is now the
+        // one asked for longest ago.
+        clients.client(target("seed.test"), &seed(1)).unwrap();
+        assert_eq!(clients.built(), CLIENTS_KEPT + 1);
         clients
             .client(target("seed.test"), &seed(CLIENTS_KEPT + 1))
             .unwrap();
-        assert_eq!(clients.built(), built);
-        // The web seed asked for longest ago was dropped.
-        clients.client(target("seed.test"), &seed(1)).unwrap();
+        let built = clients.built();
+        assert_eq!(built, CLIENTS_KEPT + 2);
+
+        // The tracker's client is still kept, and so is every web seed's but
+        // the second's, the first's included.
+        clients.client(target("tracker.test"), &announce).unwrap();
+        for n in std::iter::once(1).chain(3..=CLIENTS_KEPT + 1) {
+            clients.client(target("seed.test"), &seed(n)).unwrap();
+            assert_eq!(clients.built(), built, "web seed {n}");
+        }
+        // The second was dropped, and is built again.
+        clients.client(target("seed.test"), &seed(2)).unwrap();
         assert_eq!(clients.built(), built + 1);
     }
 
