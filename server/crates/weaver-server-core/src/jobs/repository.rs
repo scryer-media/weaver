@@ -6,7 +6,7 @@ use crate::history;
 use crate::history::persistence::replace_job_history_attributes_tx;
 use crate::jobs::ids::JobId;
 use crate::jobs::persistence::lock_active_job_for_delete_tx;
-use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, SqlTx, StoreDatastore};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, StoreDatastore};
 use crate::persistence::{Database, DatabaseWriterExecutor};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -14,18 +14,10 @@ pub struct OrphanActiveStateCounts {
     pub active_file_progress: usize,
     pub active_files: usize,
     pub active_file_identities: usize,
-    pub active_par2: usize,
-    pub active_par2_files: usize,
     pub active_extracted: usize,
-    pub active_failed_extractions: usize,
-    pub active_extraction_chunks: usize,
-    pub active_archive_headers: usize,
-    pub active_rar_volume_facts: usize,
     pub active_detected_archives: usize,
-    pub active_volume_status: usize,
-    pub active_rar_verified_suspect: usize,
-    pub active_direct_coverage: usize,
-    pub active_repair_outputs: usize,
+    // Every graph checkpoint table together.
+    pub graph_checkpoint: usize,
 }
 
 impl OrphanActiveStateCounts {
@@ -33,73 +25,54 @@ impl OrphanActiveStateCounts {
         self.active_file_progress
             + self.active_files
             + self.active_file_identities
-            + self.active_par2
-            + self.active_par2_files
             + self.active_extracted
-            + self.active_failed_extractions
-            + self.active_extraction_chunks
-            + self.active_archive_headers
-            + self.active_rar_volume_facts
             + self.active_detected_archives
-            + self.active_volume_status
-            + self.active_rar_verified_suspect
-            + self.active_direct_coverage
-            + self.active_repair_outputs
+            + self.graph_checkpoint
     }
 }
 
-const INLINE_INCREMENTAL_VACUUM_PAGES: u64 = 256;
-
-const ACTIVE_JOB_CHILD_TABLES: [&str; 15] = [
+const ACTIVE_JOB_CHILD_TABLES: [&str; 14] = [
     "active_file_progress",
     "active_files",
     "active_file_identities",
-    "active_par2",
-    "active_par2_files",
     "active_extracted",
-    "active_failed_extractions",
-    "active_extraction_chunks",
-    "active_archive_headers",
-    "active_rar_volume_facts",
     "active_detected_archives",
-    "active_volume_status",
-    "active_rar_verified_suspect",
-    "active_direct_coverage",
-    "active_repair_outputs",
+    "graph_nodes",
+    "graph_members",
+    "graph_coverage",
+    "graph_envelopes",
+    "graph_crypt",
+    "graph_recovery",
+    "graph_holds",
+    "graph_facts_parts",
+    "graph_held_parts",
 ];
 
-async fn run_inline_incremental_vacuum(datastore: &StoreDatastore) -> Result<(), StateError> {
-    if datastore.engine() != SqlEngine::Sqlite {
-        return Ok(());
-    }
-    SqlRuntime::execute(
-        datastore.read_exec(),
-        &format!("PRAGMA incremental_vacuum({INLINE_INCREMENTAL_VACUUM_PAGES})"),
-        &[],
-    )
-    .await?;
-    Ok(())
-}
-
-async fn delete_orphan_rows(tx: &mut SqlTx<'_>, table: &'static str) -> Result<usize, StateError> {
+async fn delete_orphan_rows(
+    tx: &mut SqlTx<'_>,
+    table: &'static str,
+    job_id: i64,
+) -> Result<usize, StateError> {
     let deleted = tx
         .execute(
             &format!(
                 "DELETE FROM {table}
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM active_jobs WHERE active_jobs.job_id = {table}.job_id
+                 WHERE job_id = {{}} AND NOT EXISTS (
+                     SELECT 1 FROM active_jobs WHERE active_jobs.job_id = {{}}
                  )"
             ),
-            &[],
+            &[SqlArg::I64(job_id), SqlArg::I64(job_id)],
         )
         .await?;
     Ok(deleted as usize)
 }
 
-async fn delete_active_job_rows(tx: &mut SqlTx<'_>, id: i64) -> Result<(), StateError> {
+// Deletes one job's rows from each table, in order. PostgreSQL takes them in
+// one statement.
+async fn delete_job_rows(tx: &mut SqlTx<'_>, tables: &[&str], id: i64) -> Result<(), StateError> {
     if matches!(&*tx, SqlTx::Postgres(_)) {
         let mut sql = String::from("WITH ");
-        for (idx, table) in ACTIVE_JOB_CHILD_TABLES.iter().enumerate() {
+        for (idx, table) in tables.iter().enumerate() {
             if idx > 0 {
                 sql.push_str(", ");
             }
@@ -107,25 +80,35 @@ async fn delete_active_job_rows(tx: &mut SqlTx<'_>, id: i64) -> Result<(), State
                 "d{idx} AS (DELETE FROM {table} WHERE job_id = {{}})"
             ));
         }
-        sql.push_str(", d_job AS (DELETE FROM active_jobs WHERE job_id = {}) SELECT 1");
-        let args = vec![SqlArg::I64(id); ACTIVE_JOB_CHILD_TABLES.len() + 1];
+        sql.push_str(" SELECT 1");
+        let args = vec![SqlArg::I64(id); tables.len()];
         tx.execute(&sql, &args).await?;
         return Ok(());
     }
 
-    for table in ACTIVE_JOB_CHILD_TABLES {
+    for table in tables {
         tx.execute(
             &format!("DELETE FROM {table} WHERE job_id = {{}}"),
             &[SqlArg::I64(id)],
         )
         .await?;
     }
-    tx.execute(
-        "DELETE FROM active_jobs WHERE job_id = {}",
-        &[SqlArg::I64(id)],
-    )
-    .await?;
     Ok(())
+}
+
+async fn delete_active_job_rows(tx: &mut SqlTx<'_>, id: i64) -> Result<(), StateError> {
+    let mut tables = ACTIVE_JOB_CHILD_TABLES.to_vec();
+    tables.push("active_jobs");
+    delete_job_rows(tx, &tables, id).await
+}
+
+// Clears what an earlier run of this job id left in the child tables, so a
+// job written again under the same id starts with none of it.
+pub(crate) async fn delete_active_job_child_rows_tx(
+    tx: &mut SqlTx<'_>,
+    job_id: JobId,
+) -> Result<(), StateError> {
+    delete_job_rows(tx, &ACTIVE_JOB_CHILD_TABLES, job_id.0 as i64).await
 }
 
 fn history_args(history: &history::JobHistoryRow, job_id: JobId) -> Vec<SqlArg> {
@@ -283,7 +266,6 @@ async fn archive_job_sql(
         })
     })
     .await?;
-    run_inline_incremental_vacuum(&datastore).await?;
     Ok(archived)
 }
 
@@ -321,7 +303,6 @@ impl Database {
             })
             .await?;
             db.notify_script_events_changed();
-            run_inline_incremental_vacuum(&datastore).await?;
             Ok(())
         });
         if result.is_ok() {
@@ -330,73 +311,71 @@ impl Database {
         result
     }
 
-    pub fn prune_orphan_active_state(&self) -> Result<OrphanActiveStateCounts, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            let counts =
+    // Removes the rows a job left in the active tables after its own row
+    // went, for jobs numbered below `below`: the jobs that existed when the
+    // caller took that number, so a job created since is never looked at.
+    // The orphans are found by reads, and each job's rows then go in a
+    // transaction of their own, so the writer is never held across a table.
+    pub fn prune_orphan_active_state(
+        &self,
+        below: JobId,
+    ) -> Result<OrphanActiveStateCounts, StateError> {
+        const ACTIVE_TABLES: [&str; 5] = [
+            "active_file_progress",
+            "active_files",
+            "active_file_identities",
+            "active_extracted",
+            "active_detected_archives",
+        ];
+        let below = i64::try_from(below.0).unwrap_or(i64::MAX);
+        let mut orphans = std::collections::BTreeSet::new();
+        for table in ACTIVE_TABLES
+            .into_iter()
+            .chain(crate::jobs::graph_checkpoint::TABLES)
+        {
+            let datastore = self.datastore();
+            let sql = format!(
+                "SELECT DISTINCT job_id FROM {table}
+                 WHERE job_id < {{}} AND NOT EXISTS (
+                     SELECT 1 FROM active_jobs WHERE active_jobs.job_id = {table}.job_id
+                 )"
+            );
+            let ids = self.run_sql_blocking_read(async move {
+                SqlRuntime::fetch_all(datastore.read_exec(), &sql, &[SqlArg::I64(below)])
+                    .await?
+                    .into_iter()
+                    .map(|row| row.i64("job_id"))
+                    .collect::<Result<Vec<_>, _>>()
+            })?;
+            orphans.extend(ids);
+        }
+
+        let mut counts = OrphanActiveStateCounts::default();
+        for job_id in orphans {
+            let datastore = self.datastore();
+            let removed = self.run_sql_blocking(async move {
                 SqlRuntime::run_in_transaction(&datastore, "prune_orphan_active_state", |tx| {
                     Box::pin(async move {
-                        Ok(OrphanActiveStateCounts {
-                            active_file_progress: delete_orphan_rows(tx, "active_file_progress")
-                                .await?,
-                            active_files: delete_orphan_rows(tx, "active_files").await?,
-                            active_file_identities: delete_orphan_rows(
-                                tx,
-                                "active_file_identities",
-                            )
-                            .await?,
-                            active_par2: delete_orphan_rows(tx, "active_par2").await?,
-                            active_par2_files: delete_orphan_rows(tx, "active_par2_files").await?,
-                            active_extracted: delete_orphan_rows(tx, "active_extracted").await?,
-                            active_failed_extractions: delete_orphan_rows(
-                                tx,
-                                "active_failed_extractions",
-                            )
-                            .await?,
-                            active_extraction_chunks: delete_orphan_rows(
-                                tx,
-                                "active_extraction_chunks",
-                            )
-                            .await?,
-                            active_archive_headers: delete_orphan_rows(
-                                tx,
-                                "active_archive_headers",
-                            )
-                            .await?,
-                            active_rar_volume_facts: delete_orphan_rows(
-                                tx,
-                                "active_rar_volume_facts",
-                            )
-                            .await?,
-                            active_detected_archives: delete_orphan_rows(
-                                tx,
-                                "active_detected_archives",
-                            )
-                            .await?,
-                            active_volume_status: delete_orphan_rows(tx, "active_volume_status")
-                                .await?,
-                            active_rar_verified_suspect: delete_orphan_rows(
-                                tx,
-                                "active_rar_verified_suspect",
-                            )
-                            .await?,
-                            active_repair_outputs: delete_orphan_rows(tx, "active_repair_outputs")
-                                .await?,
-                            active_direct_coverage: delete_orphan_rows(
-                                tx,
-                                "active_direct_coverage",
-                            )
-                            .await?,
-                        })
+                        let mut removed = Vec::new();
+                        for table in ACTIVE_TABLES
+                            .into_iter()
+                            .chain(crate::jobs::graph_checkpoint::TABLES)
+                        {
+                            removed.push(delete_orphan_rows(tx, table, job_id).await?);
+                        }
+                        Ok(removed)
                     })
                 })
-                .await?;
-
-            if counts.total_removed() > 0 {
-                run_inline_incremental_vacuum(&datastore).await?;
-            }
-            Ok(counts)
-        })
+                .await
+            })?;
+            counts.active_file_progress += removed[0];
+            counts.active_files += removed[1];
+            counts.active_file_identities += removed[2];
+            counts.active_extracted += removed[3];
+            counts.active_detected_archives += removed[4];
+            counts.graph_checkpoint += removed[5..].iter().sum::<usize>();
+        }
+        Ok(counts)
     }
 }
 

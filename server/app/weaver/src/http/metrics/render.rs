@@ -19,7 +19,7 @@ use weaver_server_core::operations::instrumentation::{
     JobLifecycleMetricsSnapshot, PipelineHistogramsSnapshot, ProcessMetricsSnapshot,
     ServerMetricsSnapshot,
 };
-use weaver_server_core::operations::metrics_store::JOB_STATUS_KEYS;
+use weaver_server_core::operations::metrics_store::{JOB_STATUS_KEYS, JobStatusCounts};
 use weaver_server_core::post_processing::executor::PostProcessingMetricsSnapshot;
 use weaver_server_core::post_processing::run_metrics::{
     RunStatus, ScriptMetrics, ScriptRunMetricsSnapshot,
@@ -62,7 +62,10 @@ pub(crate) const OBSERVED_LIMITERS: [&str; 8] = [
 #[derive(Clone, Copy)]
 pub(crate) struct PrometheusRenderInput<'a> {
     pub(crate) snapshot: &'a MetricsSnapshot,
+    // The jobs exported a series of their own.
     pub(crate) jobs: &'a [JobInfo],
+    // Every job the runtime holds, counted by status.
+    pub(crate) job_counts: &'a JobStatusCounts,
     pub(crate) pipeline_paused: bool,
     pub(crate) download_block: &'a DownloadBlockState,
     pub(crate) server_health: &'a [ServerHealthInfo],
@@ -106,6 +109,7 @@ impl<'a> PrometheusRenderInput<'a> {
         Self {
             snapshot,
             jobs: &[],
+            job_counts: &JobStatusCounts::EMPTY,
             pipeline_paused: false,
             download_block,
             server_health: &[],
@@ -155,8 +159,10 @@ pub(crate) fn render_prometheus_metrics(
     server_health: &[ServerHealthInfo],
     runtime_generation: u64,
 ) -> String {
+    let job_counts = JobStatusCounts::from_statuses(jobs.iter().map(|job| &job.status));
     let mut input = PrometheusRenderInput::new(snapshot, download_block);
     input.jobs = jobs;
+    input.job_counts = &job_counts;
     input.pipeline_paused = pipeline_paused;
     input.server_health = server_health;
     input.runtime_generation = runtime_generation;
@@ -168,6 +174,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     let PrometheusRenderInput {
         snapshot,
         jobs,
+        job_counts,
         pipeline_paused,
         download_block,
         server_health,
@@ -230,11 +237,11 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     }
 
     for status in JOB_STATUS_KEYS {
-        let count = jobs
-            .iter()
-            .filter(|job| job_status_label(&job.status) == status)
-            .count();
-        out.sample(&f::PIPELINE_JOBS, &[("status", status)], count);
+        out.sample(
+            &f::PIPELINE_JOBS,
+            &[("status", status)],
+            job_counts.count(status),
+        );
     }
 
     let observed_limiter =
@@ -952,18 +959,6 @@ fn render_stalls_and_workers(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         &[],
         snapshot.direct_write_evictions,
     );
-
-    for (event, value) in [
-        ("admitted", snapshot.direct_sets_admitted),
-        ("demoted", snapshot.direct_sets_demoted),
-        ("finalized_direct", snapshot.direct_sets_finalized_direct),
-        (
-            "repaired_while_direct",
-            snapshot.direct_sets_repaired_while_direct,
-        ),
-    ] {
-        out.sample(&f::DIRECT_STORE_SETS, &[("event", event)], value);
-    }
 
     out.sample(
         &f::DEOBFUSCATED_MEMBERS,
@@ -1700,6 +1695,7 @@ pub(crate) fn job_status_label(status: &JobStatus) -> &'static str {
         JobStatus::QueuedPostProcessing => "queued_post_processing",
         JobStatus::PostProcessing => "post_processing",
         JobStatus::Complete => "complete",
+        JobStatus::Partial => "partial",
         JobStatus::Failed { .. } => "failed",
         JobStatus::Paused => "paused",
     }

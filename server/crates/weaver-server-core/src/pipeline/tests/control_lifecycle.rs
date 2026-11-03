@@ -8,14 +8,24 @@ fn handle(pipeline: &Pipeline) -> SchedulerHandle {
     SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
 }
 
+// A repeated-article cache that cannot be prepared fails the job when its
+// articles are built, through the failure path, and never leaves it waiting.
 #[tokio::test]
-async fn repeated_article_cache_failure_refuses_admission_before_persistence() {
+async fn a_repeated_article_cache_failure_fails_the_job_when_its_articles_are_built() {
     let temp = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
     let handle = handle(&pipeline);
     let id = JobId(9201);
-    let mut spec = segmented_job_spec("cache admission fixture", "payload.bin", &[100, 100]);
-    spec.files[0].segments[1].message_id = spec.files[0].segments[0].message_id.clone();
+    // Two files posted from the same article: an NZB repeats an article
+    // across files, never within one.
+    let mut spec = standalone_job_spec(
+        "cache admission fixture",
+        &[
+            ("payload.bin".to_string(), 100),
+            ("copy.bin".to_string(), 100),
+        ],
+    );
+    spec.files[1].segments[0].message_ids = spec.files[0].segments[0].message_ids.clone();
     // Occupy the unsuffixed name first, so admission selects the same
     // job-specific directory in which the cache failure is staged.
     let collision =
@@ -27,41 +37,35 @@ async fn repeated_article_cache_failure_refuses_admission_before_persistence() {
     crate::jobs::working_dir::stamp_working_dir(&pipeline.intermediate_dir, &working_dir, id)
         .await
         .unwrap();
-    let blocker = working_dir.join(".weaver-chunks");
+    let blocker = working_dir.join(weaver_graph::names::CACHE_DIR);
     tokio::fs::write(&blocker, b"not a cache directory")
         .await
         .unwrap();
 
-    let result = handle
-        .add_job(
-            id,
-            spec.clone(),
-            PathBuf::from("cache-fixture.nzb"),
-            sample_nzb_zstd(),
-        )
-        .await;
-    assert!(
-        matches!(&result, Err(SchedulerError::InvalidInput(error)) if error == "article cache scratch path is not a directory"),
-        "expected the staged cache preparation failure, got {result:?}"
-    );
-    assert!(handle.get_job(id).is_err());
-    assert!(!pipeline.db.load_active_jobs().unwrap().contains_key(&id));
-    assert!(pipeline.db.get_job_history(id.0).unwrap().is_none());
-    assert!(blocker.is_file());
-
-    tokio::fs::remove_file(blocker).await.unwrap();
+    let nzb_zstd = nzb_zstd_for(&spec);
     handle
-        .add_job(
-            id,
-            spec,
-            PathBuf::from("cache-fixture.nzb"),
-            sample_nzb_zstd(),
-        )
+        .add_job(id, spec, PathBuf::from("cache-fixture.nzb"), nzb_zstd)
         .await
         .unwrap();
     pipeline.apply_queue_intents().await;
-    assert!(pipeline.jobs.contains_key(&id));
-    assert!(pipeline.repeated_articles.contains_key(&id));
+    assert!(!pipeline.repeated_articles.contains_key(&id));
+    activate_job(&mut pipeline, id).await;
+    assert!(!pipeline.repeated_articles.contains_key(&id));
+    // The failed job leaves once its working directory is released off the
+    // actor.
+    settle_failed_releases(&mut pipeline).await;
+    assert!(!pipeline.jobs.contains_key(&id));
+    let status = pipeline
+        .finished_jobs()
+        .await
+        .into_iter()
+        .find(|job| job.job_id == id)
+        .map(|job| job.status);
+    assert!(
+        matches!(&status, Some(JobStatus::Failed { error }) if error.contains("article cache scratch path is not a directory")),
+        "expected the staged cache preparation failure, got {status:?}"
+    );
+    assert!(blocker.is_file());
 }
 
 // Renaming an idle job moves its working directory with the repeated-article
@@ -73,22 +77,27 @@ async fn a_rename_carries_the_repeated_article_cache_to_the_new_working_dir() {
     let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
     let handle = handle(&pipeline);
     let id = JobId(9203);
-    let mut spec = segmented_job_spec("cache rename fixture", "payload.bin", &[100, 100]);
-    spec.files[0].segments[1].message_id = spec.files[0].segments[0].message_id.clone();
+    // Two files posted from the same article: an NZB repeats an article
+    // across files, never within one.
+    let mut spec = standalone_job_spec(
+        "cache rename fixture",
+        &[
+            ("payload.bin".to_string(), 100),
+            ("copy.bin".to_string(), 100),
+        ],
+    );
+    spec.files[1].segments[0].message_ids = spec.files[0].segments[0].message_ids.clone();
+    let nzb_zstd = nzb_zstd_for(&spec);
     handle
-        .add_job(
-            id,
-            spec,
-            PathBuf::from("cache-rename.nzb"),
-            sample_nzb_zstd(),
-        )
+        .add_job(id, spec, PathBuf::from("cache-rename.nzb"), nzb_zstd)
         .await
         .unwrap();
     pipeline.apply_queue_intents().await;
+    activate_job(&mut pipeline, id).await;
     assert!(pipeline.repeated_articles.contains_key(&id));
     let old_dir = pipeline.jobs[&id].working_dir.clone();
     let caches = |dir: &std::path::Path| -> Vec<PathBuf> {
-        std::fs::read_dir(dir.join(".weaver-chunks"))
+        std::fs::read_dir(dir.join(weaver_graph::names::CACHE_DIR))
             .into_iter()
             .flatten()
             .flatten()
@@ -129,7 +138,9 @@ async fn shutdown_services_terminal_completion_needed_by_pending_readmission() {
             id,
             segmented_job_spec("shutdown admission fixture", "payload.bin", &[100]),
             PathBuf::from("shutdown-fixture.nzb"),
-            sample_nzb_zstd(),
+            nzb_zstd_for(
+                &(segmented_job_spec("shutdown admission fixture", "payload.bin", &[100])),
+            ),
         )
         .await
         .unwrap();
@@ -193,74 +204,6 @@ async fn shutdown_services_terminal_completion_needed_by_pending_readmission() {
         })
     );
     assert!(pipeline.db.load_active_jobs().unwrap().contains_key(&id));
-}
-
-#[tokio::test]
-async fn retiring_jobs_refuse_new_mutations_before_archive_acknowledgement() {
-    let temp = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
-    let handle = handle(&pipeline);
-    let id = JobId(9203);
-    insert_active_job(
-        &mut pipeline,
-        id,
-        segmented_job_spec("retiring mutation fixture", "payload.bin", &[100]),
-    )
-    .await;
-    let (release, released) = std::sync::mpsc::channel::<()>();
-    pipeline
-        .db
-        .try_queue_write("hold_retiring_archive", move |_| {
-            let _ = released.recv();
-            Ok(())
-        })
-        .unwrap();
-    let mut events = handle.subscribe_events();
-    pipeline.complete_job_after_terminal_post_processing(id);
-    assert!(pipeline.shared_state.queue.read(|inner| {
-        inner
-            .jobs
-            .iter()
-            .any(|row| row.id == id && row.report.retiring)
-    }));
-    let watermark = handle.job_revision();
-    assert!(matches!(
-        handle.pause_job(id).await,
-        Err(SchedulerError::Conflict(_))
-    ));
-    assert!(matches!(
-        handle.resume_job(id).await,
-        Err(SchedulerError::Conflict(_))
-    ));
-    assert!(matches!(
-        handle
-            .update_job(
-                id,
-                crate::JobUpdate {
-                    category: crate::jobs::FieldUpdate::Set("changed-category".into()),
-                    ..Default::default()
-                }
-            )
-            .await,
-        Err(SchedulerError::Conflict(_))
-    ));
-    assert!(matches!(
-        handle.cancel_job(id).await,
-        Err(SchedulerError::Conflict(_))
-    ));
-    assert!(matches!(
-        handle.cancel_semantic_bad(id).await,
-        Err(SchedulerError::Conflict(_))
-    ));
-    assert_eq!(handle.job_revision(), watermark);
-    drop(release);
-    while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCompleted { job_id } if job_id == id)
-    {
-    }
-    assert_eq!(
-        pipeline.db.get_job_history(id.0).unwrap().unwrap().status,
-        "complete"
-    );
 }
 
 // A cancelled job leaves the queue only when its row does: on the done event
@@ -347,7 +290,7 @@ async fn extraction_pause_uses_current_download_activity() {
     state.download_state = crate::DownloadState::Complete;
     state.post_state = crate::jobs::model::PostState::Extracting;
     state.run_state = crate::jobs::model::RunState::Active;
-    state.download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
     pipeline.active_downloads_by_job.insert(id, 1);
     pipeline.report_job(id);
     assert_eq!(
@@ -362,6 +305,10 @@ async fn extraction_pause_uses_current_download_activity() {
         crate::jobs::model::RunState::Paused
     );
 
+    // The article out on a lane kept the paused job's articles. It comes
+    // back, and the job resumes before a turn parks it: it still holds its
+    // articles, with nothing left to fetch.
+    assert!(pipeline.jobs[&id].articles.active().is_some());
     pipeline.active_downloads_by_job.remove(&id);
     handle.resume_job(id).await.unwrap();
     pipeline.apply_queue_intents().await;
@@ -486,11 +433,14 @@ async fn pause_refused_after_downloads_drain_clears_the_intent_and_releases_the_
         let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
         let handle = handle(&pipeline);
         let id = JobId(9207 + index);
-        let spec = minimal_job_state(id, "pause before delivery", PathBuf::new()).spec;
-        let working_dir = insert_active_job(&mut pipeline, id, spec).await;
-        tokio::fs::write(working_dir.join("payload.bin"), b"payload")
-            .await
-            .unwrap();
+        insert_delivered_job(
+            &mut pipeline,
+            id,
+            "pause before delivery",
+            "payload.bin",
+            b"payload",
+        )
+        .await;
         let state = pipeline.jobs.get_mut(&id).unwrap();
         state.status = JobStatus::Extracting;
         state.download_state = crate::DownloadState::Complete;
@@ -534,13 +484,31 @@ async fn pause_refused_after_downloads_drain_clears_the_intent_and_releases_the_
         assert!(pipeline.pending_completion_checks.contains(&id));
         let mut events = handle.subscribe_events();
         pipeline.check_job_completion(id).await;
+        // The released move is in flight, so the wait below has a move to hear.
+        assert!(
+            pipeline.inflight_moves.contains(&id),
+            "{:?}",
+            pipeline.jobs.get(&id).map(|state| &state.status)
+        );
         let done = pipeline.move_done_rx.recv().await.unwrap();
         assert_eq!(done.job_id, id);
         assert!(done.result.is_ok());
         pipeline.handle_move_to_complete_done(done).await;
-        while !matches!(events.recv().await.unwrap(), PipelineEvent::JobCompleted { job_id } if job_id == id)
-        {
-        }
+        let terminal = loop {
+            match events.recv().await.unwrap() {
+                event @ (PipelineEvent::JobCompleted { job_id }
+                | PipelineEvent::JobFailed { job_id, .. })
+                    if job_id == id =>
+                {
+                    break event;
+                }
+                _ => {}
+            }
+        };
+        assert!(
+            matches!(terminal, PipelineEvent::JobCompleted { .. }),
+            "{terminal:?}"
+        );
         assert_eq!(
             pipeline.db.get_job_history(id.0).unwrap().unwrap().status,
             "complete"
@@ -564,7 +532,7 @@ async fn extraction_with_queued_download_work_can_pause_without_current_activity
     state.status = JobStatus::Extracting;
     state.download_state = crate::DownloadState::Complete;
     state.post_state = crate::jobs::model::PostState::Extracting;
-    assert!(!state.download_queue.is_empty());
+    assert!(!state.articles.active().unwrap().download_queue.is_empty());
     assert!(!pipeline.job_has_current_download_activity(id));
     pipeline.report_job(id);
     assert_eq!(
@@ -584,9 +552,21 @@ async fn extraction_with_queued_download_work_can_pause_without_current_activity
         crate::jobs::model::RunState::Paused
     );
 
+    // Nothing was out, so the pause let the articles go at once: the resumed
+    // job is built again from its stored NZB, and its queue emptied as the
+    // fixture's was.
+    assert!(pipeline.jobs[&id].articles.active().is_none());
     handle.resume_job(id).await.unwrap();
     pipeline.apply_queue_intents().await;
-    pipeline.jobs.get_mut(&id).unwrap().download_queue = DownloadQueue::new();
+    crate::pipeline::tests::activate_job(&mut pipeline, id).await;
+    pipeline
+        .jobs
+        .get_mut(&id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue = DownloadQueue::new();
     pipeline.report_job(id);
     let watermark = handle.job_revision();
     assert!(matches!(

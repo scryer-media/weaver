@@ -567,13 +567,14 @@ impl UuDecoder {
             return;
         }
 
-        // Further below the minimum the line cannot carry the bytes it claims.
-        // Both reference decoders treat this as a bad line; one drops it
-        // silently and the other drops it with a flag. This keeps the flag and
-        // additionally salvages the whole groups that are present, so a
-        // truncated line contributes its readable prefix instead of nothing —
-        // the repair layer is better served by partial data than by a hole.
-        self.damaged = true;
+        // Further below the minimum. A line that claims more bytes than it has
+        // characters cannot carry them, and is damage. One with at least a
+        // character for every byte it claims is a length character that
+        // overstates its line: the groups it holds are the line, and it is
+        // not damage. Either way the groups that are present are salvaged, so
+        // a truncated line contributes its readable prefix instead of nothing
+        // — the repair layer is better served by partial data than by a hole.
+        self.damaged |= declared > payload.len();
         self.decode_salvage(declared, payload);
     }
 
@@ -613,7 +614,8 @@ impl UuDecoder {
     // Scalar group-at-a-time decode, used for truncated and over-long lines.
     //
     // Consumes two characters for a one-byte tail and three for a two-byte
-    // tail. A group with fewer characters than that minimum is truncated.
+    // tail. A group with fewer characters than that minimum is truncated. The
+    // caller rules whether a line it runs out on is damage.
     fn decode_salvage(&mut self, declared: usize, payload: &[u8]) {
         let mut remaining = declared;
         let mut chars = payload;
@@ -643,12 +645,6 @@ impl UuDecoder {
             self.decoded_len += remaining.min(3) as u64;
             remaining = remaining.saturating_sub(3);
             chars = &chars[needed..];
-        }
-
-        if remaining > 0 {
-            // Ran out of characters mid-line: the shortfall is real damage even
-            // when the groups that were present decoded cleanly.
-            self.damaged = true;
         }
     }
 }
@@ -1097,11 +1093,12 @@ mod tests {
     }
 
     #[test]
-    fn tail_short_by_a_whole_group_still_damages() {
+    fn tail_short_by_a_whole_group_decodes_the_groups_it_holds() {
         // The boundary the stripped-whitespace tolerance sits on. Short by less
         // than a group is reconstructed as eaten spaces; short by a whole group
-        // would be inventing three bytes out of no observed characters, so it
-        // stays damage-and-salvage.
+        // would be inventing three bytes out of no observed characters, so only
+        // the groups present are decoded. While the line still has a character
+        // for every byte it claims, that is not damage; below that, it is.
         let payload: Vec<u8> = (0..45u8).collect();
         let full = uu_line(&payload, b' ');
         assert_eq!(full.len(), 61);
@@ -1112,25 +1109,44 @@ mod tests {
         assert!(!decoder.damaged(), "three short is the tolerated shape");
         assert_eq!(decoder.decoded_len(), 45);
 
-        // 56: a whole group short.
-        let starved = full[..1 + 56].to_vec();
+        // 56: a whole group short, still a character for each of 45 bytes.
+        let overstated = full[..1 + 56].to_vec();
+        let decoder = decode_all(&[b"begin 644 silver-horizon.bin".to_vec(), overstated]);
+        assert!(
+            !decoder.damaged(),
+            "a character for every claimed byte is not damage"
+        );
+        assert_eq!(decoder.output(), &payload[..42]);
+
+        // 44: fewer characters than the 45 bytes the length char claims.
+        let starved = full[..1 + 44].to_vec();
         let decoder = decode_all(&[b"begin 644 silver-horizon.bin".to_vec(), starved]);
-        assert!(decoder.damaged(), "a whole group short is damage");
+        assert!(decoder.damaged(), "fewer characters than bytes is damage");
         assert_eq!(
-            decoder.decoded_len(),
-            42,
+            decoder.output(),
+            &payload[..33],
             "the groups that were whole are still salvaged"
         );
     }
 
     #[test]
     fn overstated_tail_length_does_not_invent_an_unobserved_group() {
+        // A final line whose length character claims one byte more than its
+        // one group carries. The group is the line: three bytes, clean.
         let payload = [17, 29, 43];
         let mut line = uu_line(&payload, b'`');
         line[0] = b' ' + 4;
         let decoder = decode_all(&[b"begin 644 payload.bin".to_vec(), line]);
         assert_eq!(decoder.output(), &payload);
         assert_eq!(decoder.decoded_len(), 3);
+        assert!(!decoder.damaged());
+
+        // Claiming more bytes than the line has characters is damage, and the
+        // group present is still salvaged.
+        let mut line = uu_line(&payload, b'`');
+        line[0] = b' ' + 5;
+        let decoder = decode_all(&[b"begin 644 payload.bin".to_vec(), line]);
+        assert_eq!(decoder.output(), &payload);
         assert!(decoder.damaged());
     }
 

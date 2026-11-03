@@ -90,6 +90,14 @@ func cmdDoctor(w io.Writer) error {
 // cmdCompose runs `compose <args>` in the e2e directory through the resolved
 // engine. Arguments pass through unchanged; only the engine overlay is added.
 func cmdCompose(args []string) error {
+	for _, arg := range args {
+		if arg == "up" || arg == "run" || arg == "create" {
+			if err := ensureNNTPHealthBinary(); err != nil {
+				return err
+			}
+			break
+		}
+	}
 	cmd := containerengine.Command(append([]string{"compose"}, args...)...)
 	cmd.Dir = e2eDir()
 	cmd.Stdin = os.Stdin

@@ -4,50 +4,147 @@
 use super::*;
 use crate::pipeline::queue::Change;
 
+// How many restores one turn installs.
+pub(crate) const RESTORE_BATCH: usize = 32;
+
 impl Pipeline {
     pub(crate) async fn apply_queue_intents(&mut self) {
         self.answer_diagnostics_request();
         self.apply_queue_globals().await;
+        // The walks below visit every row. They run when an intent was
+        // written, a row came or went, a global gate moved, a propagation
+        // hold ran out, or the last walk left something to look at again;
+        // otherwise nothing they would find has changed.
+        let mark = self
+            .shared_state
+            .queue
+            .read(crate::pipeline::nzb_admission::QueueWalkMark::of);
+        let now = Instant::now();
+        let walk = std::mem::take(&mut self.queue_walk_due)
+            || self.queue_walk_mark != Some(mark)
+            || self
+                .propagation_ready_at
+                .values()
+                .any(|(ready_at, _)| *ready_at <= now);
+        self.queue_walk_mark = Some(mark);
+        if !self.reconcile_nzb_admission(walk).await {
+            self.settle_reprocess_pending().await;
+            return;
+        }
+        crate::pipeline::queue::count_walk();
+        // Installing a job is its add, whether it comes from intake or from a
+        // restart, under any pause and with every slot taken; only a shutdown
+        // installs nothing. Admission decides only whether its articles go
+        // out. A restore whose row carries a pause installs parked.
+        // A restart's restores install a bounded batch a turn: the jobs
+        // holding a slot first, wherever they stand, then the rest in queue
+        // order, so the jobs that download start while the rest install.
         let restores = self.shared_state.queue.write(|inner| {
+            if inner.globals.shutting_down {
+                return Change::unchanged(Vec::new());
+            }
+            let mut holders: Vec<usize> = self
+                .nzb_admitted
+                .iter()
+                .filter_map(|id| inner.job_position(*id))
+                .filter(|position| inner.jobs[*position].intents.restore.is_some())
+                .collect();
+            holders.sort_unstable();
+            let order: Vec<usize> = holders
+                .into_iter()
+                .chain(
+                    (0..inner.jobs.len())
+                        .filter(|position| inner.jobs[*position].intents.restore.is_some())
+                        .filter(|position| !self.nzb_admitted.contains(&inner.jobs[*position].id)),
+                )
+                .take(RESTORE_BATCH)
+                .collect();
             Change::unchanged(
-                inner
-                    .jobs
-                    .iter_mut()
-                    .filter_map(|row| row.intents.restore.take())
+                order
+                    .into_iter()
+                    .filter_map(|position| {
+                        let row = &mut inner.jobs[position];
+                        let paused = row.intents.paused == Some(true);
+                        row.intents.restore.take().map(|mut request| {
+                            if paused && request.status != JobStatus::Paused {
+                                request.paused_resume_status = Some(request.status.clone());
+                                request.paused_resume_download_state = request.download_state;
+                                request.paused_resume_post_state = request.post_state;
+                                request.status = JobStatus::Paused;
+                                request.run_state = Some(crate::RunState::Paused);
+                            }
+                            request
+                        })
+                    })
                     .collect::<Vec<_>>(),
             )
         });
+        // A full batch may have left more behind; the next turn looks.
+        self.restores_waiting = restores.len() == RESTORE_BATCH;
+        self.queue_walk_due |= self.restores_waiting;
+        if !restores.is_empty() {
+            self.download_dispatch_wake = true;
+            self.restore_pass
+                .get_or_insert_with(|| (Instant::now(), 0))
+                .1 += restores.len();
+        }
         for request in restores {
             let id = request.job_id;
             if let Err(error) = self.install_restored_job(request).await {
                 error!(job_id = id.0, %error, "failed to install restore ticket");
             }
+            // An installed job is a new candidate for a slot.
+            self.queue_walk_due = true;
             self.report_job(id);
             self.shared_state.queue.write(|inner| {
-                if let Some(row) = inner.jobs.iter_mut().find(|row| row.id == id) {
+                if let Some(row) = inner.job_mut(id) {
                     row.report.restoring = false;
                 }
                 Change::changed(())
             });
         }
+        if !self.restores_waiting
+            && let Some((started, installed)) = self.restore_pass.take()
+        {
+            info!(
+                installed,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "installed every job a restart restored"
+            );
+        }
+        let mut deferred = false;
         let admissions = self.shared_state.queue.write(|inner| {
+            if inner.globals.shutting_down {
+                return Change::unchanged(Vec::new());
+            }
             Change::unchanged(
                 inner
                     .jobs
                     .iter_mut()
+                    .filter(|row| {
+                        // A history retry can reuse the ID while the previous
+                        // graph run is still draining its terminal workers.
+                        // The next turn looks again.
+                        let waits = row.admission.is_some() && self.awaits_job_articles(row.id);
+                        deferred |= waits;
+                        !waits
+                    })
                     .filter_map(|row| row.admission.take().map(|job| (row.id, job)))
                     .collect::<Vec<_>>(),
             )
         });
+        self.queue_walk_due |= deferred || !admissions.is_empty();
         for (id, job) in admissions {
             let reprocess = job
                 .restart
                 .as_ref()
                 .is_some_and(|restart| restart.reprocess);
             self.install_prepared_add(id, job);
-            if reprocess {
-                self.reload_metadata_from_disk(id).await;
+            self.nzb_reprocess_pending.remove(&id);
+            if reprocess && self.nzb_admitted.contains(&id) {
                 self.check_job_completion(id).await;
+            } else if reprocess {
+                self.nzb_reprocess_pending.insert(id);
             }
         }
         let (order, pending) = self.shared_state.queue.read(|inner| {
@@ -68,25 +165,13 @@ impl Pipeline {
             )
         });
         let installed_order: Vec<_> = order
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|id| self.jobs.contains_key(id))
             .collect();
         if installed_order != self.job_order {
             self.job_order = installed_order;
-            let positions: Vec<_> = self
-                .job_order
-                .iter()
-                .enumerate()
-                .map(|(index, id)| (*id, index as i64))
-                .collect();
-            if let Err(error) = self
-                .db
-                .try_queue_write("update_active_job_queue_positions", move |db| {
-                    db.update_active_job_queue_positions(&positions)
-                })
-            {
-                error!(%error, "failed to persist queue order");
-            }
+            self.persist_queue_order(&order).await;
         }
         use crate::jobs::handle::CancellationOrigin;
         for origin in [
@@ -124,9 +209,19 @@ impl Pipeline {
             // intent the pipeline did not act on.
             let mut refused = false;
             if let Some(paused) = intents.paused.filter(|_| apply_pause) {
-                if paused {
-                    self.demand_direct_store_barriers_for_pause(Some(job_id))
-                        .await;
+                // A resume waits for its slot; the admission pass states the
+                // wait, and the walk after the slot is taken applies it.
+                if !paused && !self.nzb_admitted.contains(&job_id) {
+                    continue;
+                }
+                if paused
+                    && let Err(error) = self
+                        .db_blocking(move |db| db.set_nzb_pause_release(job_id, true))
+                        .await
+                {
+                    error!(job_id = job_id.0, %error, "failed to persist NZB pause release");
+                    self.queue_walk_due = true;
+                    continue;
                 }
                 let result = if paused {
                     self.pause_job_runtime(job_id)
@@ -137,7 +232,29 @@ impl Pipeline {
                     Ok(()) => {
                         self.report_job(job_id);
                         if paused {
+                            self.nzb_pause_releases.insert(job_id);
                             self.emit_download_finished_if_active(job_id);
+                        } else {
+                            // Keep the interrupted-pause marker until the resumed
+                            // lifecycle has committed. A crash in between restores
+                            // a paused job instead of leaking an occupied slot.
+                            let result = match self.db.flush_write_queue().await {
+                                Ok(()) => {
+                                    self.db_blocking(move |db| {
+                                        db.set_nzb_pause_release(job_id, false)
+                                    })
+                                    .await
+                                }
+                                Err(error) => Err(error),
+                            };
+                            match result {
+                                Ok(()) => {
+                                    self.nzb_pause_releases.remove(&job_id);
+                                }
+                                Err(error) => {
+                                    error!(job_id = job_id.0, %error, "failed to settle NZB resume")
+                                }
+                            }
                         }
                         self.emit_job_event(if paused {
                             PipelineEvent::JobPaused { job_id }
@@ -147,6 +264,30 @@ impl Pipeline {
                     }
                     Err(error) => {
                         warn!(job_id = job_id.0, paused, %error, "pipeline refused the job's pause intent");
+                        if paused
+                            && let Err(error) = self
+                                .db_blocking(move |db| db.set_nzb_pause_release(job_id, false))
+                                .await
+                        {
+                            error!(job_id = job_id.0, %error, "failed to withdraw NZB pause release");
+                        }
+                        if !paused
+                            && self.jobs.get(&job_id).is_some_and(|state| {
+                                state.run_state == crate::jobs::model::RunState::Paused
+                            })
+                        {
+                            // A refused resume must return its newly acquired
+                            // slot once any recovery work has quiesced.
+                            if let Err(error) = self
+                                .db_blocking(move |db| db.set_nzb_pause_release(job_id, true))
+                                .await
+                            {
+                                error!(job_id = job_id.0, %error, "failed to persist refused NZB resume");
+                                self.queue_walk_due = true;
+                                continue;
+                            }
+                            self.nzb_pause_releases.insert(job_id);
+                        }
                         refused = true;
                     }
                 }
@@ -156,15 +297,14 @@ impl Pipeline {
                     .jobs
                     .get(&job_id)
                     .is_some_and(|state| state.run_state != crate::jobs::model::RunState::Paused)
-                    && (self.deferred_moves.contains(&job_id)
-                        || self.deferred_post_processing.contains(&job_id))
+                    && self.deferred_moves.contains(&job_id)
                 {
                     self.schedule_job_completion_check(job_id);
                 }
             }
             self.apply_pending_job_update(job_id);
             self.shared_state.queue.write(|inner| {
-                if let Some(row) = inner.jobs.iter_mut().find(|row| row.id == job_id) {
+                if let Some(row) = inner.job_mut(job_id) {
                     row.report.seen_intent_seq = intents.seq;
                     if refused && row.intents.pause_seq == intents.pause_seq {
                         row.intents.paused = None;
@@ -178,6 +318,7 @@ impl Pipeline {
             });
             self.report_job(job_id);
         }
+        self.settle_reprocess_pending().await;
         let renames = self.shared_state.queue.read(|inner| {
             inner
                 .jobs
@@ -189,7 +330,7 @@ impl Pipeline {
         for (id, name) in renames {
             if self.rename_working_dir_when_quiet(id, &name).await {
                 self.shared_state.queue.write(|inner| {
-                    if let Some(row) = inner.jobs.iter_mut().find(|row| row.id == id)
+                    if let Some(row) = inner.job_mut(id)
                         && row.intents.rename_to.as_ref() == Some(&name)
                     {
                         row.intents.rename_to = None;
@@ -197,8 +338,81 @@ impl Pipeline {
                     Change::changed(())
                 });
                 self.report_job(id);
+            } else {
+                // Renamed once the job is quiet; the next turn looks again.
+                self.queue_walk_due = true;
             }
         }
+    }
+
+    // Stores the queue's order by writing a new position only for the rows
+    // whose stored one no longer sorts where the row stands. The write goes
+    // through the ordered writer queue, which the shutdown drain flushes
+    // within its bound and warns about if it cannot.
+    async fn persist_queue_order(&mut self, order: &[JobId]) {
+        if self
+            .queue_positions_lost
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.queue_positions = None;
+        }
+        let persisted = match self.queue_positions.take() {
+            Some(persisted) => persisted,
+            None => match self
+                .db_blocking(|db| db.load_active_job_queue_positions())
+                .await
+            {
+                Ok(persisted) => persisted,
+                Err(error) => {
+                    error!(%error, "failed to read stored queue order");
+                    HashMap::new()
+                }
+            },
+        };
+        let writes = queue_position_writes(order, &persisted);
+        let mut positions: HashMap<JobId, i64> = order
+            .iter()
+            .filter_map(|id| persisted.get(id).map(|position| (*id, *position)))
+            .collect();
+        positions.extend(writes.iter().copied());
+        if writes.is_empty() {
+            self.queue_positions = Some(positions);
+            return;
+        }
+        // A write that does not commit leaves the database holding other
+        // positions than these, so the next order change reads them back.
+        let lost = Arc::clone(&self.queue_positions_lost);
+        match self
+            .db
+            .try_queue_write("update_active_job_queue_positions", move |db| {
+                db.update_active_job_queue_positions(&writes)
+                    .inspect_err(|_| lost.store(true, std::sync::atomic::Ordering::Release))
+            }) {
+            Ok(()) => self.queue_positions = Some(positions),
+            // Read back from the database before the next order is written.
+            Err(error) => error!(%error, "failed to persist queue order"),
+        }
+    }
+
+    // A reprocessed job is judged once it holds a slot and runs.
+    async fn settle_reprocess_pending(&mut self) {
+        let reprocess: Vec<_> = self
+            .nzb_reprocess_pending
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.nzb_admitted.contains(id)
+                    && self.jobs.get(id).is_some_and(|state| {
+                        state.run_state == crate::jobs::model::RunState::Active
+                    })
+            })
+            .collect();
+        for id in reprocess {
+            self.nzb_reprocess_pending.remove(&id);
+            self.check_job_completion(id).await;
+        }
+        self.nzb_reprocess_pending
+            .retain(|id| self.jobs.contains_key(id));
     }
 
     pub(crate) fn apply_pending_job_update(&mut self, job_id: JobId) {
@@ -206,7 +420,7 @@ impl Pipeline {
             return;
         };
         let update = self.shared_state.queue.write(|inner| {
-            let Some(row) = inner.jobs.iter_mut().find(|row| row.id == job_id) else {
+            let Some(row) = inner.job_mut(job_id) else {
                 return Change::unchanged(None);
             };
             let Some(update) = row.intents.update.take() else {
@@ -244,18 +458,21 @@ impl Pipeline {
             .read(|inner| inner.globals.random_read_iops);
         if let Some(iops) = iops.filter(|iops| self.applied_random_read_iops != Some(*iops)) {
             self.applied_random_read_iops = Some(iops);
-            let previous = self.tuner.max_concurrent_extractions();
             self.tuner.set_random_read_iops(iops);
-            if self.tuner.max_concurrent_extractions() > previous {
-                self.promote_queued_extractions();
-            }
+        }
+        let write_mbps = self
+            .shared_state
+            .queue
+            .read(|inner| inner.globals.sequential_write_mbps);
+        if let Some(write_mbps) =
+            write_mbps.filter(|mbps| self.applied_sequential_write_mbps != Some(*mbps))
+        {
+            self.applied_sequential_write_mbps = Some(write_mbps);
+            self.tuner.set_sequential_write_mbps(write_mbps);
         }
         let globals = self.shared_state.queue.read(|inner| inner.globals.clone());
         if globals.paused != self.global_paused || globals.scheduled_pause != self.scheduled_pause {
             self.download_dispatch_stall = None;
-            if globals.paused {
-                self.demand_direct_store_barriers_for_pause(None).await;
-            }
             self.global_paused = globals.paused;
             self.scheduled_pause = globals.scheduled_pause;
             if globals.paused {
@@ -276,9 +493,6 @@ impl Pipeline {
             });
         }
         if globals.speed_test_paused != self.applied_speed_test_pause {
-            if globals.speed_test_paused {
-                self.demand_direct_store_barriers_for_pause(None).await;
-            }
             self.applied_speed_test_pause = globals.speed_test_paused;
             self.download_restart_durable_lead_retry_after.clear();
         }
@@ -334,18 +548,9 @@ impl Pipeline {
         }
         if paused {
             self.terminal_post_processing_executor.pause();
-            if let Some(runtime) = self.par3_runtime.as_mut() {
-                runtime.admission_paused = true;
-            }
             return;
         }
         self.terminal_post_processing_executor.resume();
-        if let Some(runtime) = self.par3_runtime.as_mut() {
-            runtime.admission_paused = false;
-            if let Err(error) = runtime.dispatch() {
-                error!(%error, "PAR3 dispatch failed on post-processing resume");
-            }
-        }
         let deferred_moves: Vec<_> = self.deferred_moves.drain().collect();
         for job_id in deferred_moves {
             if self.shared_state.queue.read(|inner| {
@@ -360,36 +565,181 @@ impl Pipeline {
             if self.jobs.get(&job_id).is_some_and(|state| {
                 !matches!(
                     state.status,
-                    JobStatus::Paused | JobStatus::Complete | JobStatus::Failed { .. }
+                    JobStatus::Paused
+                        | JobStatus::Complete
+                        | JobStatus::Partial
+                        | JobStatus::Failed { .. }
                 )
             }) && let Err(error) = self.start_move_to_complete(job_id).await
             {
                 self.fail_job(job_id, error);
             }
         }
-        self.promote_queued_repairs();
-        self.promote_queued_extractions();
-        let jobs: Vec<_> = self.deferred_post_processing.drain().collect();
+        // The pause held every graph job's repair and extraction slots. Each
+        // live job asks for them again, and its completion gate looks again.
+        let jobs: Vec<_> = self.graph_jobs.keys().copied().collect();
         for job_id in jobs {
             if self.shared_state.queue.read(|inner| {
-                inner.jobs.iter().any(|row| {
-                    row.id == job_id
-                        && (row.intents.paused == Some(true) || row.intents.cancelled.is_some())
+                inner.job(job_id).is_some_and(|row| {
+                    row.intents.paused == Some(true) || row.intents.cancelled.is_some()
                 })
             }) {
-                self.deferred_post_processing.insert(job_id);
                 continue;
             }
             self.apply_pending_job_update(job_id);
-            let Some(state) = self.jobs.get(&job_id) else {
+            if !self.jobs.contains_key(&job_id) {
                 continue;
-            };
-            let files: Vec<_> = state.assembly.files().map(|file| file.file_id()).collect();
-            for file_id in files {
-                self.try_arm_direct_unpack_for_file(job_id, file_id);
             }
-            self.try_rar_extraction(job_id).await;
-            self.schedule_job_completion_check(job_id);
+            self.resume_graph_work(job_id);
         }
+    }
+}
+
+// Spacing between positions given out fresh, so later moves usually find
+// room between two neighbours without renumbering.
+const QUEUE_POSITION_STRIDE: i64 = 1024;
+
+// The position writes that make stored positions ascend along `order`. The
+// longest run of rows whose stored positions already ascend keeps them; each
+// other row gets a position between its kept neighbours. Only when two kept
+// neighbours leave no room does every row get a fresh, spaced position.
+pub(crate) fn queue_position_writes(
+    order: &[JobId],
+    persisted: &HashMap<JobId, i64>,
+) -> Vec<(JobId, i64)> {
+    let keys: Vec<Option<i64>> = order.iter().map(|id| persisted.get(id).copied()).collect();
+    // Longest strictly ascending run of stored positions, by patience
+    // sorting: `tails[k]` is the index ending the best run of length k + 1.
+    let mut tails: Vec<usize> = Vec::new();
+    let mut previous: Vec<Option<usize>> = vec![None; order.len()];
+    for (index, key) in keys.iter().enumerate() {
+        let Some(key) = *key else { continue };
+        let at = tails.partition_point(|&tail| keys[tail].expect("kept rows have positions") < key);
+        previous[index] = at.checked_sub(1).map(|before| tails[before]);
+        if at == tails.len() {
+            tails.push(index);
+        } else {
+            tails[at] = index;
+        }
+    }
+    let mut kept = vec![false; order.len()];
+    let mut cursor = tails.last().copied();
+    while let Some(index) = cursor {
+        kept[index] = true;
+        cursor = previous[index];
+    }
+    let mut writes = Vec::new();
+    let mut index = 0;
+    let mut low: Option<i64> = None;
+    while index < order.len() {
+        if kept[index] {
+            low = keys[index];
+            index += 1;
+            continue;
+        }
+        let end = (index..order.len())
+            .find(|&at| kept[at])
+            .unwrap_or(order.len());
+        let high = keys.get(end).copied().flatten();
+        let count = (end - index) as i64;
+        let fresh: Vec<i64> = match (low, high) {
+            (None, None) => (0..count)
+                .map(|step| step * QUEUE_POSITION_STRIDE)
+                .collect(),
+            (Some(low), None) => (1..=count)
+                .map(|step| low + step * QUEUE_POSITION_STRIDE)
+                .collect(),
+            (None, Some(high)) => (0..count)
+                .map(|step| high - (count - step) * QUEUE_POSITION_STRIDE)
+                .collect(),
+            (Some(low), Some(high)) if high - low > count => {
+                let gap = (high - low) / (count + 1);
+                (1..=count).map(|step| low + step * gap).collect()
+            }
+            (Some(_), Some(_)) => {
+                return order
+                    .iter()
+                    .enumerate()
+                    .map(|(at, id)| (*id, at as i64 * QUEUE_POSITION_STRIDE))
+                    .filter(|(id, position)| persisted.get(id) != Some(position))
+                    .collect();
+            }
+        };
+        writes.extend(order[index..end].iter().copied().zip(fresh));
+        index = end;
+    }
+    writes
+}
+
+#[cfg(test)]
+mod position_tests {
+    use super::*;
+
+    fn ids(range: std::ops::Range<u64>) -> Vec<JobId> {
+        range.map(JobId).collect()
+    }
+
+    // Applies `writes` and checks the stored positions ascend along `order`.
+    fn assert_sorted(
+        order: &[JobId],
+        persisted: &mut HashMap<JobId, i64>,
+        writes: &[(JobId, i64)],
+    ) {
+        persisted.extend(writes.iter().copied());
+        let stored: Vec<i64> = order.iter().map(|id| persisted[id]).collect();
+        assert!(
+            stored.windows(2).all(|pair| pair[0] < pair[1]),
+            "{stored:?}"
+        );
+    }
+
+    #[test]
+    fn a_queue_written_once_is_not_written_again() {
+        let order = ids(0..10_000);
+        let mut persisted = HashMap::new();
+        let writes = queue_position_writes(&order, &persisted);
+        assert_eq!(writes.len(), order.len());
+        assert_sorted(&order, &mut persisted, &writes);
+        assert!(queue_position_writes(&order, &persisted).is_empty());
+    }
+
+    #[test]
+    fn moving_one_job_writes_one_row_once_the_positions_are_spaced() {
+        let mut order = ids(0..10_000);
+        let mut persisted = HashMap::new();
+        let writes = queue_position_writes(&order, &persisted);
+        assert_sorted(&order, &mut persisted, &writes);
+
+        // To the top, to the bottom, and into the middle.
+        for (from, to) in [(9_999, 0), (0, 9_999), (5_000, 1_234)] {
+            let id = order.remove(from);
+            order.insert(to, id);
+            let writes = queue_position_writes(&order, &persisted);
+            assert_eq!(writes, vec![(id, writes[0].1)]);
+            assert_sorted(&order, &mut persisted, &writes);
+        }
+
+        // Removing rows and appending one writes only the new row.
+        order.retain(|id| id.0 % 3 != 0);
+        order.push(JobId(20_000));
+        let writes = queue_position_writes(&order, &persisted);
+        assert_eq!(writes.len(), 1);
+        assert_sorted(&order, &mut persisted, &writes);
+    }
+
+    #[test]
+    fn dense_positions_with_no_room_are_respaced_once() {
+        let mut order = ids(0..100);
+        let mut persisted: HashMap<JobId, i64> =
+            order.iter().map(|id| (*id, id.0 as i64)).collect();
+        let id = order.remove(50);
+        order.insert(10, id);
+        let writes = queue_position_writes(&order, &persisted);
+        assert_sorted(&order, &mut persisted, &writes);
+        let id = order.remove(70);
+        order.insert(20, id);
+        let writes = queue_position_writes(&order, &persisted);
+        assert_eq!(writes.len(), 1);
+        assert_sorted(&order, &mut persisted, &writes);
     }
 }

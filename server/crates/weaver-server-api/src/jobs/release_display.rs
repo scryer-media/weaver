@@ -15,12 +15,25 @@ use weaver_server_core::ingest::{derive_release_name, original_release_title};
 use super::types::{ParsedEpisode, ParsedRelease};
 
 const MIN_PARSE_CONFIDENCE_FOR_DISPLAY_NAME: f32 = 0.4;
-const RELEASE_DISPLAY_CACHE_MAX_ENTRIES: usize = 512;
+// The most jobs each listing's cache holds: above the largest queue a
+// snapshot walks, so a pass over a 10,000-job queue parses each name once.
+const RELEASE_DISPLAY_CACHE_MAX_ENTRIES: usize = 16_384;
+
+/// Which listing a job is named for, and so which cache keeps its display:
+/// the queue's and history's are separate, so reading history never pushes
+/// a queued job's display out. A caller with no job keeps nothing.
+#[derive(Clone, Copy)]
+pub(crate) enum ReleaseDisplayCache {
+    Queue(u64),
+    History(u64),
+    None,
+}
 
 pub(crate) struct ReleaseDisplayInput<'a> {
     pub job_name: &'a str,
     pub metadata: &'a [(String, String)],
     pub category: Option<&'a str>,
+    pub cache: ReleaseDisplayCache,
 }
 
 #[derive(Clone)]
@@ -30,45 +43,172 @@ pub(crate) struct ReleaseDisplayInfo {
     pub parsed_release: ParsedRelease,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ReleaseDisplayCacheKey {
-    job_name: String,
-    metadata: Vec<(String, String)>,
-    category: Option<String>,
+// A job's entry: its id, and a hash of the name, metadata and category the
+// display was derived from, so an edit to any of them misses. Built from the
+// borrowed input; a hit copies nothing of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ReleaseDisplayKey {
+    job_id: u64,
+    fingerprint: u64,
 }
 
-impl ReleaseDisplayCacheKey {
-    fn from_input(input: &ReleaseDisplayInput<'_>) -> Self {
+impl ReleaseDisplayKey {
+    fn of(job_id: u64, input: &ReleaseDisplayInput<'_>) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        input.job_name.hash(&mut hasher);
+        input.metadata.hash(&mut hasher);
+        input.category.hash(&mut hasher);
         Self {
-            job_name: input.job_name.to_owned(),
-            metadata: input.metadata.to_vec(),
-            category: input.category.map(str::to_owned),
+            job_id,
+            fingerprint: hasher.finish(),
+        }
+    }
+}
+
+const NIL: usize = usize::MAX;
+
+struct LruNode<V> {
+    key: ReleaseDisplayKey,
+    value: V,
+    prev: usize,
+    next: usize,
+}
+
+/// A least-recently-used map with a fixed bound: a hit moves the entry to
+/// the front, and an insert past the bound reuses the slot of the entry used
+/// longest ago. Every step is constant time.
+struct Lru<V> {
+    slots: HashMap<ReleaseDisplayKey, usize>,
+    nodes: Vec<LruNode<V>>,
+    head: usize,
+    tail: usize,
+    bound: usize,
+}
+
+impl<V> Lru<V> {
+    fn new(bound: usize) -> Self {
+        Self {
+            slots: HashMap::new(),
+            nodes: Vec::new(),
+            head: NIL,
+            tail: NIL,
+            bound: bound.max(1),
+        }
+    }
+
+    fn unlink(&mut self, slot: usize) {
+        let (prev, next) = (self.nodes[slot].prev, self.nodes[slot].next);
+        match prev {
+            NIL => self.head = next,
+            prev => self.nodes[prev].next = next,
+        }
+        match next {
+            NIL => self.tail = prev,
+            next => self.nodes[next].prev = prev,
+        }
+    }
+
+    fn push_front(&mut self, slot: usize) {
+        self.nodes[slot].prev = NIL;
+        self.nodes[slot].next = self.head;
+        match self.head {
+            NIL => self.tail = slot,
+            head => self.nodes[head].prev = slot,
+        }
+        self.head = slot;
+    }
+
+    fn get(&mut self, key: &ReleaseDisplayKey) -> Option<&V> {
+        let slot = *self.slots.get(key)?;
+        if self.head != slot {
+            self.unlink(slot);
+            self.push_front(slot);
+        }
+        Some(&self.nodes[slot].value)
+    }
+
+    fn insert(&mut self, key: ReleaseDisplayKey, value: V) {
+        if let Some(&slot) = self.slots.get(&key) {
+            self.nodes[slot].value = value;
+            if self.head != slot {
+                self.unlink(slot);
+                self.push_front(slot);
+            }
+            return;
+        }
+        let slot = if self.nodes.len() < self.bound {
+            self.nodes.push(LruNode {
+                key,
+                value,
+                prev: NIL,
+                next: NIL,
+            });
+            self.nodes.len() - 1
+        } else {
+            let slot = self.tail;
+            self.unlink(slot);
+            self.slots.remove(&self.nodes[slot].key);
+            self.nodes[slot].key = key;
+            self.nodes[slot].value = value;
+            slot
+        };
+        self.push_front(slot);
+        self.slots.insert(key, slot);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+}
+
+struct ReleaseDisplayCaches {
+    queue: Lru<ReleaseDisplayInfo>,
+    history: Lru<ReleaseDisplayInfo>,
+}
+
+impl ReleaseDisplayCaches {
+    fn of(&mut self, cache: ReleaseDisplayCache) -> Option<(&mut Lru<ReleaseDisplayInfo>, u64)> {
+        match cache {
+            ReleaseDisplayCache::Queue(id) => Some((&mut self.queue, id)),
+            ReleaseDisplayCache::History(id) => Some((&mut self.history, id)),
+            ReleaseDisplayCache::None => None,
         }
     }
 }
 
 pub(crate) fn release_display_info(input: ReleaseDisplayInput<'_>) -> ReleaseDisplayInfo {
-    let cache_key = ReleaseDisplayCacheKey::from_input(&input);
-    if let Ok(cache) = release_display_cache().lock()
-        && let Some(cached) = cache.get(&cache_key)
+    let job_id = match input.cache {
+        ReleaseDisplayCache::Queue(id) | ReleaseDisplayCache::History(id) => id,
+        ReleaseDisplayCache::None => return compute_release_display_info(input),
+    };
+    let key = ReleaseDisplayKey::of(job_id, &input);
+    let cache = input.cache;
+    if let Ok(mut caches) = release_display_caches().lock()
+        && let Some((lru, _)) = caches.of(cache)
+        && let Some(cached) = lru.get(&key)
     {
         return cached.clone();
     }
 
     let display = compute_release_display_info(input);
-    if let Ok(mut cache) = release_display_cache().lock() {
-        if cache.len() >= RELEASE_DISPLAY_CACHE_MAX_ENTRIES {
-            cache.clear();
-        }
-        cache.insert(cache_key, display.clone());
+    if let Ok(mut caches) = release_display_caches().lock()
+        && let Some((lru, _)) = caches.of(cache)
+    {
+        lru.insert(key, display.clone());
     }
     display
 }
 
-fn release_display_cache() -> &'static Mutex<HashMap<ReleaseDisplayCacheKey, ReleaseDisplayInfo>> {
-    static CACHE: OnceLock<Mutex<HashMap<ReleaseDisplayCacheKey, ReleaseDisplayInfo>>> =
-        OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+fn release_display_caches() -> &'static Mutex<ReleaseDisplayCaches> {
+    static CACHES: OnceLock<Mutex<ReleaseDisplayCaches>> = OnceLock::new();
+    CACHES.get_or_init(|| {
+        Mutex::new(ReleaseDisplayCaches {
+            queue: Lru::new(RELEASE_DISPLAY_CACHE_MAX_ENTRIES),
+            history: Lru::new(RELEASE_DISPLAY_CACHE_MAX_ENTRIES),
+        })
+    })
 }
 
 fn compute_release_display_info(input: ReleaseDisplayInput<'_>) -> ReleaseDisplayInfo {
@@ -645,6 +785,28 @@ fn imdb_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"tt\d{5,}").expect("valid regex"))
 }
 
+// The titles a job's release display derives from its name, metadata and
+// category: the original, the display and the normalized title. The admin
+// diagnostics package reads these for its stand-in table, so the display is
+// derived the one way the API derives it.
+pub fn release_display_names(
+    job_name: &str,
+    metadata: &[(String, String)],
+    category: Option<&str>,
+) -> Vec<String> {
+    let info = release_display_info(ReleaseDisplayInput {
+        job_name,
+        metadata,
+        category,
+        cache: ReleaseDisplayCache::None,
+    });
+    vec![
+        info.original_title,
+        info.display_title,
+        info.parsed_release.normalized_title,
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -654,6 +816,7 @@ mod tests {
             job_name,
             metadata: &[],
             category,
+            cache: ReleaseDisplayCache::None,
         })
     }
 
@@ -668,6 +831,7 @@ mod tests {
             job_name: "Display Name",
             metadata: &metadata,
             category: Some("TV > HD"),
+            cache: ReleaseDisplayCache::Queue(1),
         });
 
         assert_eq!(info.original_title, metadata[0].1);
@@ -738,5 +902,79 @@ mod tests {
 
         assert_eq!(info.display_title, "ubuntu-24 04 2-live-server-amd64");
         assert_eq!(info.parsed_release, ParsedRelease::default());
+    }
+
+    fn key(job_id: u64) -> ReleaseDisplayKey {
+        ReleaseDisplayKey {
+            job_id,
+            fingerprint: 0,
+        }
+    }
+
+    #[test]
+    fn the_cache_drops_the_entry_used_longest_ago_and_keeps_its_bound() {
+        let mut lru = Lru::new(3);
+        for id in 1..=3 {
+            lru.insert(key(id), id);
+        }
+        // Touching 1 makes 2 the oldest; a fourth job pushes 2 out, not 1.
+        assert_eq!(lru.get(&key(1)), Some(&1));
+        lru.insert(key(4), 4);
+        assert_eq!(lru.len(), 3);
+        assert_eq!(lru.get(&key(2)), None);
+        assert_eq!(lru.get(&key(1)), Some(&1));
+        assert_eq!(lru.get(&key(3)), Some(&3));
+        assert_eq!(lru.get(&key(4)), Some(&4));
+        // A pass over more jobs than the bound keeps the latest ones.
+        for id in 10..20 {
+            lru.insert(key(id), id);
+        }
+        assert_eq!(lru.len(), 3);
+        assert_eq!(
+            [17, 18, 19].map(|id| lru.get(&key(id)).copied()),
+            [Some(17), Some(18), Some(19)]
+        );
+    }
+
+    #[test]
+    fn reading_history_never_pushes_a_queued_job_out() {
+        let name = "History.Reader.Never.Evicts.S01E01.1080p";
+        let queued = |id| ReleaseDisplayInput {
+            job_name: name,
+            metadata: &[],
+            category: None,
+            cache: ReleaseDisplayCache::Queue(id),
+        };
+        let queue_id = u64::MAX - 7;
+        release_display_info(queued(queue_id));
+        for id in 0..(RELEASE_DISPLAY_CACHE_MAX_ENTRIES as u64 + 10) {
+            release_display_info(ReleaseDisplayInput {
+                job_name: name,
+                metadata: &[],
+                category: None,
+                cache: ReleaseDisplayCache::History(id),
+            });
+        }
+        let key = ReleaseDisplayKey::of(queue_id, &queued(queue_id));
+        let mut caches = release_display_caches().lock().unwrap();
+        assert!(caches.queue.get(&key).is_some());
+        assert_eq!(caches.history.len(), RELEASE_DISPLAY_CACHE_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn an_edited_name_misses_the_cached_display() {
+        let first = release_display_info(ReleaseDisplayInput {
+            job_name: "Edited.Name.Before.S01E01.1080p",
+            metadata: &[],
+            category: None,
+            cache: ReleaseDisplayCache::Queue(u64::MAX - 9),
+        });
+        let second = release_display_info(ReleaseDisplayInput {
+            job_name: "Edited.Name.After.S01E01.1080p",
+            metadata: &[],
+            category: None,
+            cache: ReleaseDisplayCache::Queue(u64::MAX - 9),
+        });
+        assert_ne!(first.display_title, second.display_title);
     }
 }

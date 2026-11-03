@@ -432,27 +432,27 @@ func demoteUnrunnableGenerators(root string, ledger *corpus.Ledger) {
 
 // goWriterIDs credits the Go writers a scenario's file extensions imply.
 func goWriterIDs(lock Lock, files []string) []string {
-	ids := []string{"go-fixture-bytes"}
+	ids := []string{"go-fixture-bytes@go1.27.3"}
 	for _, name := range files {
 		switch {
 		case strings.HasSuffix(name, ".zip"):
-			ids = append(ids, "go-archive-zip")
+			ids = append(ids, "go-archive-zip@go1.27.3")
 		case strings.HasSuffix(name, ".tar"):
-			ids = append(ids, "go-archive-tar")
+			ids = append(ids, "go-archive-tar@go1.27.3")
 		case strings.HasSuffix(name, ".tar.gz"), strings.HasSuffix(name, ".tgz"), strings.HasSuffix(name, ".tar.gzip"):
-			ids = append(ids, "go-archive-tar", "go-compress-gzip")
+			ids = append(ids, "go-archive-tar@go1.27.3", "go-compress-gzip@go1.27.3")
 		case strings.HasSuffix(name, ".tar.bz2"), strings.HasSuffix(name, ".tbz2"), strings.HasSuffix(name, ".tar.bzip2"):
-			ids = append(ids, "go-archive-tar", "go-dsnet-bzip2@v0.0.1")
+			ids = append(ids, "go-archive-tar@go1.27.3", "go-dsnet-bzip2@v0.0.1@go1.27.3")
 		case strings.HasSuffix(name, ".gz"):
-			ids = append(ids, "go-compress-gzip")
+			ids = append(ids, "go-compress-gzip@go1.27.3")
 		case strings.HasSuffix(name, ".deflate"):
-			ids = append(ids, "go-compress-flate")
+			ids = append(ids, "go-compress-flate@go1.27.3")
 		case strings.HasSuffix(name, ".bz2"):
-			ids = append(ids, "go-dsnet-bzip2@v0.0.1")
+			ids = append(ids, "go-dsnet-bzip2@v0.0.1@go1.27.3")
 		case strings.HasSuffix(name, ".zst"):
-			ids = append(ids, "go-klauspost-zstd@v1.19.2")
+			ids = append(ids, "go-klauspost-zstd@v1.20.3")
 		case strings.HasSuffix(name, ".br"):
-			ids = append(ids, "go-andybalholm-brotli@v1.2.3")
+			ids = append(ids, "go-andybalholm-brotli@v1.2.7")
 		}
 	}
 	known := map[string]struct{}{}

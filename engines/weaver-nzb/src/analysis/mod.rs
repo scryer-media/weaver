@@ -30,10 +30,10 @@ use weaver_model::files::{FileRole, archive_base_name};
 use crate::parser::ParseDiagnostics;
 use crate::types::{Nzb, NzbFile};
 
-pub use self::classify::{DomainSpread, PosterTool};
+pub use self::classify::{DomainSpread, FileExt, PosterTool, file_ext};
 use self::classify::{
-    FileExt, NameShape, NameSource, StemClass, SubjectNumbers, classify_name, file_ext,
-    name_mentions_password, par_base_name, parse_subject_numbers, poster_tool, stem_class,
+    NameShape, NameSource, StemClass, SubjectNumbers, classify_name, name_mentions_password,
+    par_base_name, parse_subject_numbers, poster_tool, stem_class,
 };
 
 // Bumped whenever a field changes meaning or disappears.
@@ -483,7 +483,7 @@ pub fn analyze(nzb: &Nzb, diagnostics: &ParseDiagnostics, now_epoch_secs: u64) -
                 nzb.files
                     .iter()
                     .flat_map(|file| &file.segments)
-                    .map(|segment| segment.message_id.as_str()),
+                    .map(|segment| segment.message_id()),
             ),
             weaver_version: None,
         },
@@ -541,7 +541,7 @@ fn analyze_files<'a>(nzb: &'a Nzb, diagnostics: &ParseDiagnostics) -> Vec<Analyz
             let mut ids: Vec<&str> = file
                 .segments
                 .iter()
-                .map(|segment| segment.message_id.as_str())
+                .map(|segment| segment.message_id())
                 .collect();
             ids.sort_unstable();
             let repeats = match seen_segment_sets.get(&ids) {
@@ -647,7 +647,7 @@ fn shape(
     for (index, file) in nzb.files.iter().enumerate() {
         for segment in &file.segments {
             owners
-                .entry(segment.message_id.as_str())
+                .entry(segment.message_id())
                 .and_modify(|owner| {
                     if *owner != index {
                         *owner = usize::MAX;

@@ -1,0 +1,15 @@
+{
+  "slug": "feed-verdict-restart",
+  "title": "E2E.Test.feed.verdict.restart.2026-TESTGRP",
+  "description": "The restart harness withholds every broken-file article, proves the abandoned-file feed verdict committed, and requires Partial with whole survivor.mkv after restart. It derives the lost broken.mkv placeholder's size and zero-byte digest from the submitted NZB, then checks the exact final file set and both hashes.",
+  "category": "2000",
+  "expected_outcome": "partial_delivery",
+  "expectedOutputBLAKE3": {
+    "survivor.mkv": "d299cafa4921b8037d348db7833863e31a4511d285be0cd97e462412fd7cdc72"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks"
+  ],
+  "segment_size": 16384,
+  "exactOutputFiles": true
+}

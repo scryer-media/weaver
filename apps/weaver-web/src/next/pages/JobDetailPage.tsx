@@ -21,6 +21,7 @@ import {
   RESUME_JOB_MUTATION,
 } from "@/graphql/queries";
 import { authHeaders } from "@/graphql/client";
+import { copyText } from "@/lib/clipboard";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { openUrlAsDownload, readDownloadErrorMessage, saveResponseAsDownload } from "@/lib/download";
 import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
@@ -406,8 +407,9 @@ function JobDetailContent() {
           `${formatClockSeconds(event.timestamp)}  ${event.kind.padEnd(32)}  ${event.message}`,
       )
       .join("\n");
-    void navigator.clipboard?.writeText(text);
-    setReport(countLabel(t, "next.job.copiedEvents", events.length));
+    void copyText(text).then((taken) =>
+      setReport(taken ? countLabel(t, "next.job.copiedEvents", events.length) : t("next.system.copyFailed")),
+    );
   };
 
   return (
@@ -713,8 +715,11 @@ function JobDetailContent() {
                   type="button"
                   title={t("next.job.copyPathTitle")}
                   onClick={() => {
-                    void navigator.clipboard?.writeText(file.path);
-                    setReport(t("next.job.copiedPath", { name: file.name }));
+                    void copyText(file.path).then((taken) =>
+                      setReport(
+                        taken ? t("next.job.copiedPath", { name: file.name }) : t("next.system.copyFailed"),
+                      ),
+                    );
                   }}
                   className="cursor-pointer text-right text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-fg"
                 >

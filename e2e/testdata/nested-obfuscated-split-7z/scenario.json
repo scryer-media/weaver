@@ -1,7 +1,8 @@
 {
   "slug": "nested-obfuscated-split-7z",
   "title": "E2E.Test.Nested.Obfuscated.Split.7z.2024.1080p.BluRay.x264-TESTGRP",
-  "description": "A top-level 7z archive containing an obfuscated split 7z set named .10/.11/.12. Exercises nested archive probing after the outer archive extracts.",
+  "description": "A 7z whose members are split 7z pieces numbered .10/.11/.12 opens, but the pieces inside are never joined, because the lowest number is above one, so the job fails with no usable file.",
   "category": "2000",
-  "expected_outcome": "success"
+  "expected_outcome": "extraction_failure",
+  "expectedErrorContains": "never placed every member it named"
 }

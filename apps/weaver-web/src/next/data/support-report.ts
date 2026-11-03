@@ -4,6 +4,7 @@
 import { useCallback, useState } from "react";
 import { useClient, type Client } from "urql";
 import { JOB_SUPPORT_REPORT_QUERY } from "@/graphql/queries";
+import { copyText } from "@/lib/clipboard";
 import { saveBlobAsDownload } from "@/lib/download";
 
 /**
@@ -33,16 +34,8 @@ export function fencedReport(report: SupportReport): string {
 }
 
 /** Copy the text form; resolves false when the browser refuses the clipboard. */
-export async function copySupportReport(report: SupportReport): Promise<boolean> {
-  if (!navigator.clipboard) {
-    return false;
-  }
-  try {
-    await navigator.clipboard.writeText(fencedReport(report));
-    return true;
-  } catch {
-    return false;
-  }
+export function copySupportReport(report: SupportReport): Promise<boolean> {
+  return copyText(fencedReport(report));
 }
 
 function reportFingerprint(report: SupportReport): string | null {

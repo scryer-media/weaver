@@ -15,6 +15,7 @@ use std::os::fd::AsRawFd;
 #[cfg(not(windows))]
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(not(windows))]
@@ -216,6 +217,7 @@ pub struct BlockingNntpConnection {
     poisoned: bool,
     transfer_control: Option<Arc<ServerTransferControl>>,
     body_accounting: VecDeque<BodyTransferAccounting>,
+    body_activity: Option<Arc<AtomicU64>>,
     // The egress's accounting for each outstanding BODY, in step with
     // `body_accounting`. Empty when the connection has no egress control.
     egress_accounting: VecDeque<BodyTransferAccounting>,
@@ -229,9 +231,18 @@ pub struct BlockingNntpConnection {
     // offered, because the server has never been shown to need one. See
     // [`crate::server_caps`].
     group_probe_armed: bool,
+    // The recovery ticket of the lane this connection serves, told when a
+    // BODY is answered. See [`crate::recovery::ConnectionHealth::answered`].
+    health: Option<Arc<crate::recovery::ConnectionHealth>>,
 }
 
 impl BlockingBodyLane {
+    // The caller owns attribution and generation. Replace before each
+    // response so a reused connection never credits the previous lease.
+    pub fn set_body_activity(&mut self, activity: Arc<AtomicU64>) {
+        self.conn.body_activity = Some(activity);
+    }
+
     // Apply the batch's immutable geometry before every decoded response, so
     // a lane reused by another job cannot carry previous checkpoint state.
     pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
@@ -260,6 +271,7 @@ impl BlockingBodyLane {
         let mut conn =
             BlockingNntpConnection::connect_for_group(config, groups.first().map(String::as_str))?;
         conn.set_transfer_control(transfer_control);
+        conn.health = Some(Arc::clone(&permit.health_lease.0));
         permit.socket_slot.set_path(conn.route_path.as_ref());
         permit
             .socket_slot
@@ -438,7 +450,7 @@ impl BlockingBodyLane {
             .lock()
             .expect("lane idle clock poisoned")
             .map_or(Duration::ZERO, |since| since.elapsed());
-        if idle >= Duration::from_mins(5) {
+        if idle >= self._permit.max_idle_age {
             return true;
         }
         if self.conn.transport.tcp().is_none() {
@@ -1234,10 +1246,12 @@ impl BlockingNntpConnection {
             poisoned: false,
             transfer_control: None,
             body_accounting: VecDeque::new(),
+            body_activity: None,
             egress_accounting: VecDeque::new(),
             checkpoint_plan: CheckpointPlan::None,
             last_response_line_wait: Duration::ZERO,
             group_probe_armed: false,
+            health: None,
         };
 
         // The route's setup evidence is whether the server answered over this
@@ -1260,8 +1274,12 @@ impl BlockingNntpConnection {
         debug!(code = greeting.code.raw(), msg = %greeting.message, "received blocking NNTP greeting");
         match greeting.code.raw() {
             200 | 201 => {}
-            400 => return Err(NntpError::ServiceUnavailable),
-            502 => return Err(NntpError::from_status(greeting.code, &greeting.message)),
+            400 | 502 => {
+                return Err(NntpError::from_login_status(
+                    greeting.code,
+                    &greeting.message,
+                ));
+            }
             _ => return Err(NntpError::unexpected(greeting.code, &greeting.message)),
         }
 
@@ -1419,15 +1437,21 @@ impl BlockingNntpConnection {
         match user_resp.code.raw() {
             281 => return Ok(()),
             381 => {}
-            _ => return Err(NntpError::from_status(user_resp.code, &user_resp.message)),
+            _ => {
+                return Err(NntpError::from_login_status(
+                    user_resp.code,
+                    &user_resp.message,
+                ));
+            }
         }
 
         let pass_resp = self.send_command(&Command::AuthInfoPass(password.to_string()))?;
         match pass_resp.code.raw() {
             281 => Ok(()),
-            481 => Err(NntpError::AuthenticationFailed),
-            482 => Err(NntpError::AuthenticationRejected),
-            _ => Err(NntpError::from_status(pass_resp.code, &pass_resp.message)),
+            _ => Err(NntpError::from_login_status(
+                pass_resp.code,
+                &pass_resp.message,
+            )),
         }
     }
 
@@ -1444,7 +1468,12 @@ impl BlockingNntpConnection {
         match user_resp.code.raw() {
             281 => return Ok(()),
             381 => {}
-            _ => return Err(NntpError::from_status(user_resp.code, &user_resp.message)),
+            _ => {
+                return Err(NntpError::from_login_status(
+                    user_resp.code,
+                    &user_resp.message,
+                ));
+            }
         }
 
         let pass_resp = self.send_command_with_active_budget(
@@ -1453,9 +1482,10 @@ impl BlockingNntpConnection {
         )?;
         match pass_resp.code.raw() {
             281 => Ok(()),
-            481 => Err(NntpError::AuthenticationFailed),
-            482 => Err(NntpError::AuthenticationRejected),
-            _ => Err(NntpError::from_status(pass_resp.code, &pass_resp.message)),
+            _ => Err(NntpError::from_login_status(
+                pass_resp.code,
+                &pass_resp.message,
+            )),
         }
     }
 
@@ -1590,6 +1620,9 @@ impl BlockingNntpConnection {
     }
 
     fn charge_active_body(&mut self, bytes: usize) -> Duration {
+        if let Some(activity) = &self.body_activity {
+            activity.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
         // Both levels are charged before either is waited on, so the read
         // waits for the later deadline: the lower of the two rates.
         let egress_charge = match (self.egress_accounting.front_mut(), &self.egress_control) {
@@ -1627,33 +1660,6 @@ impl BlockingNntpConnection {
             permit.add_throttle_wait(server_wait);
         }
         egress_wait.saturating_add(server_wait)
-    }
-
-    fn charge_active_body_without_wait(&mut self, bytes: usize) {
-        if let Some(outcome) = &self.route_outcome {
-            outcome.read(bytes);
-        }
-        match (self.egress_accounting.front_mut(), &self.egress_control) {
-            (Some(BodyTransferAccounting::Tracked(permit)), _) => {
-                permit.record_without_wait(bytes);
-            }
-            (Some(BodyTransferAccounting::Unlimited), Some(control)) => {
-                control.record_unlimited_body_bytes(bytes);
-            }
-            (None, Some(control)) => control.pace_read_without_wait(bytes),
-            (_, None) => {}
-        }
-        match self.body_accounting.front_mut() {
-            Some(BodyTransferAccounting::Unlimited) => {
-                if let Some(control) = &self.transfer_control {
-                    control.record_unlimited_body_bytes(bytes);
-                }
-            }
-            Some(BodyTransferAccounting::Tracked(permit)) => {
-                permit.record_without_wait(bytes);
-            }
-            None => {}
-        }
     }
 
     fn finish_active_body(&mut self) {
@@ -2162,7 +2168,7 @@ impl BlockingNntpConnection {
             // dropped and the next dial authenticates from the start, which is
             // also where a credential that has genuinely gone bad is booked.
             // Reporting this as an auth failure instead disabled the whole
-            // server for the auth backoff and unlocked backfill behind it.
+            // server for the auth backoff.
             self.fail_body_pipeline();
             return Err(NntpError::SessionExpired.into());
         }
@@ -2197,6 +2203,9 @@ impl BlockingNntpConnection {
                 return Err(error);
             }
         };
+        if let Some(health) = &self.health {
+            health.answered();
+        }
         let profile_cpu = profile_cpu_timings_enabled();
         decoder.set_profile_cpu(profile_cpu);
         decoder.set_checkpoint_plan(self.checkpoint_plan.clone());
@@ -2213,25 +2222,13 @@ impl BlockingNntpConnection {
             let payload_delta = decoder
                 .body_payload_bytes_consumed()
                 .saturating_sub(payload_before);
-            if let Some(budget) = budget.as_deref()
-                && budget.remaining().is_zero()
-            {
-                self.charge_active_body_without_wait(payload_delta as usize);
-                let error = active_transfer_timeout(budget);
-                self.fail_body_pipeline();
-                return Err(error.into());
-            }
+            // Every turn follows bytes arriving (the status line or a read),
+            // and a deliberate local rate-limit wait is not the server's
+            // silence, so the inactivity budget restarts after both.
             let waited = self.charge_active_body(payload_delta as usize);
             throttle_wait = throttle_wait.saturating_add(waited);
             if let Some(budget) = budget.as_deref_mut() {
-                budget.exclude_wait(waited);
-            }
-            if let Some(budget) = budget.as_deref()
-                && budget.remaining().is_zero()
-            {
-                let error = active_transfer_timeout(budget);
-                self.fail_body_pipeline();
-                return Err(error.into());
+                budget.progress_at(Instant::now());
             }
             match decoded {
                 Err(error) => {
@@ -3163,6 +3160,7 @@ fn clone_nntp_error(error: &NntpError) -> NntpError {
         NntpError::PoolShutdown => NntpError::PoolShutdown,
         NntpError::SoftTimeout(seconds) => NntpError::SoftTimeout(*seconds),
         NntpError::AcquireTimeout(seconds) => NntpError::AcquireTimeout(*seconds),
+        NntpError::WorkObsolete => NntpError::WorkObsolete,
         NntpError::QuotaBlocked(rejection) => NntpError::QuotaBlocked(rejection.clone()),
         NntpError::BodyNotRequestedDueToQuota {
             preceding_rejection,

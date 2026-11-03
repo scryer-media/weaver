@@ -15,7 +15,6 @@ pub(crate) struct AdmissionResources {
     pub db: crate::Database,
     pub intermediate_dir: PathBuf,
     pub complete_dir: PathBuf,
-    pub memory: Arc<crate::pipeline::ProcessMemoryBudget>,
 }
 
 pub(crate) struct PreparedAdd {
@@ -24,8 +23,6 @@ pub(crate) struct PreparedAdd {
     pub working_dir: PathBuf,
     pub nzb_hash: [u8; 32],
     pub nzb_password_candidates: Option<Vec<crate::jobs::ArchivePasswordCandidate>>,
-    pub scheduling_memory: crate::pipeline::ProcessMemoryPermit,
-    pub repeated_articles: Option<Arc<crate::pipeline::download::repeated::RepeatedArticles>>,
     pub restart: Option<RestartAdmission>,
 }
 
@@ -60,7 +57,7 @@ impl Queue {
                 return Change::unchanged(Err(SchedulerError::ChannelClosed));
             }
             let id = request.job_id;
-            if inner.jobs.iter().any(|row| row.id == id) || inner.admissions.contains(&id) {
+            if inner.contains_job(id) || inner.admissions.contains(&id) {
                 return Change::unchanged(Err(SchedulerError::JobExists(id)));
             }
             let mut info = initial_info(
@@ -74,7 +71,7 @@ impl Queue {
             let mut row = JobRow::new(info);
             row.report.restoring = true;
             row.intents.restore = Some(request);
-            inner.jobs.push(row);
+            inner.push_job(row);
             Change::changed(Ok(()))
         })
     }
@@ -106,7 +103,7 @@ impl Queue {
                     "a history operation is still running".into(),
                 )));
             }
-            if inner.jobs.iter().any(|row| row.id == id) || !inner.admissions.insert(id) {
+            if inner.contains_job(id) || !inner.admissions.insert(id) {
                 return Change::unchanged(Err(SchedulerError::JobExists(id)));
             }
             Change::unchanged(Ok(()))
@@ -135,7 +132,7 @@ impl Queue {
             self.write_intent(|inner| {
                 let mut row = JobRow::new(job);
                 row.admission = Some(prepared);
-                inner.jobs.push(row);
+                inner.push_job(row);
                 let _ = events.send(event);
                 Change::changed(())
             });
@@ -204,6 +201,7 @@ pub(super) fn initial_info(
         total_files: spec.files.len() as u32,
         completed_files: 0,
         remaining_par_files: 0,
+        file_remaining_bytes: Vec::new(),
         password: spec.password.clone(),
         category: spec.category.clone(),
         metadata: spec.metadata.clone(),

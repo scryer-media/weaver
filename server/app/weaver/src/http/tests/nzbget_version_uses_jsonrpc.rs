@@ -1208,7 +1208,7 @@ async fn nzbget_status_and_listgroups_support_sonarr_progress_queries() {
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
     shared_state.record_wire_bytes(1_048_576);
     shared_state.refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
-    let handle = SchedulerHandle::new(event_tx, shared_state);
+    let handle = TestQueue::new(event_tx, shared_state);
     let config = test_config();
     config
         .write()
@@ -1355,7 +1355,7 @@ async fn nzbget_status_clamps_download_rate_to_arr_int() {
     shared_state.record_wire_bytes(1 << 60);
     shared_state.refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
     assert!(shared_state.metrics_snapshot().current_download_speed > i32::MAX as u64);
-    let handle = SchedulerHandle::new(event_tx, shared_state);
+    let handle = TestQueue::new(event_tx, shared_state);
     let config = test_config();
     {
         let mut config_write = config.write().await;
@@ -2391,6 +2391,100 @@ async fn nzbget_editqueue_unsupported_commands_return_false_without_fault() {
 }
 
 #[tokio::test]
+async fn nzbget_editqueue_applies_every_found_id_past_a_missing_one() {
+    let job = |id| {
+        nzbget_test_job(
+            id,
+            JobStatus::Queued,
+            weaver_server_core::DownloadState::Queued,
+            100,
+            0,
+            vec![],
+        )
+    };
+    let handle = scheduler_handle_with_jobs(vec![job(1), job(2)]).await;
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let (status, payload) = post_nzbget(
+        app.clone(),
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupPause", 0, "", [1, 99, 2]],
+            "id": "pause"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(payload["result"], true);
+    wait_for_job_status(&handle, JobId(1), JobStatus::Paused).await;
+    wait_for_job_status(&handle, JobId(2), JobStatus::Paused).await;
+
+    // NZBGet answers false only when it finds none of the ids.
+    let (_, payload) = post_nzbget(
+        app,
+        serde_json::json!({
+            "method": "editqueue",
+            "params": ["GroupResume", 0, "", [98, 99]],
+            "id": "resume"
+        }),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(payload["result"], false);
+}
+
+#[tokio::test]
+async fn nzbget_listgroups_lists_many_groups_in_queue_order_with_one_database_read() {
+    // More groups than one chunk, half of them post-processing, so the
+    // answer spans chunks and asks when post-processing began.
+    let jobs = (1..=600)
+        .map(|id| {
+            let status = if id % 2 == 0 {
+                JobStatus::Extracting
+            } else {
+                JobStatus::Queued
+            };
+            let (download_state, post_state, run_state) =
+                weaver_server_core::runtime_lanes_from_status_snapshot(&status);
+            JobInfo {
+                download_state,
+                post_state,
+                run_state,
+                ..nzbget_test_job(id, status, download_state, 100, 0, vec![])
+            }
+        })
+        .collect::<Vec<_>>();
+    let handle = scheduler_handle_with_jobs(jobs).await;
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let before =
+        super::super::nzbget::LISTGROUPS_DB_READS.load(std::sync::atomic::Ordering::Relaxed);
+    let groups = rpc_result(app, "listgroups", serde_json::json!([])).await;
+    let after =
+        super::super::nzbget::LISTGROUPS_DB_READS.load(std::sync::atomic::Ordering::Relaxed);
+
+    let ids = groups
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|group| group["NZBID"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, (1..=600).collect::<Vec<_>>());
+    assert_eq!(after - before, 1);
+}
+
+#[tokio::test]
 async fn nzbget_editqueue_rejects_more_than_max_ids() {
     let app = nzbget_test_router(
         Database::open_in_memory().unwrap(),
@@ -2661,7 +2755,7 @@ async fn nzbget_history_reports_compound_status_history_time_and_stage_timings()
 #[tokio::test]
 async fn nzbget_listfiles_reports_nzb_files_with_progress() {
     let db = Database::open_in_memory().unwrap();
-    let job = nzbget_test_job(
+    let mut job = nzbget_test_job(
         55,
         JobStatus::Downloading,
         weaver_server_core::DownloadState::Downloading,
@@ -2669,6 +2763,9 @@ async fn nzbget_listfiles_reports_nzb_files_with_progress() {
         150_000,
         vec![],
     );
+    // The job's snapshot as its download publishes it: 150_000 bytes of
+    // alpha.rar in, nothing of beta.par2.
+    job.file_remaining_bytes = vec![450_000, 100_000];
     db.create_active_job(&weaver_server_core::ActiveJob {
         job_id: JobId(55),
         nzb_hash: [7u8; 32],
@@ -2688,19 +2785,6 @@ async fn nzbget_listfiles_reports_nzb_files_with_progress() {
         password_override: None,
         supplied_password_candidates: Vec::new(),
     })
-    .unwrap();
-    db.upsert_file_progress_batch(&[weaver_server_core::ActiveFileProgress {
-        job_id: JobId(55),
-        file_index: 0,
-        coverage: weaver_server_core::jobs::assembly::FileCoverage::from_ordered_runs([
-            weaver_server_core::jobs::assembly::CoverageRun {
-                first_ordinal: 0,
-                ordinals: 1,
-                start: 0,
-                end: 150_000,
-            },
-        ]),
-    }])
     .unwrap();
     let handle = scheduler_handle_with_jobs(vec![job]).await;
     let app = nzbget_test_router(db, handle, test_config(), ApiKeyCache::default());
@@ -4215,7 +4299,7 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
         },
     )
     .unwrap();
-    let app = job_nzb_test_router(db, handle);
+    let app = job_nzb_test_router(db, handle.handle.clone());
 
     let response = app
         .oneshot(
@@ -4288,7 +4372,7 @@ async fn job_output_file_download_handler_streams_history_file() {
         server_attribution: None,
     })
     .unwrap();
-    let app = job_nzb_test_router(db, handle);
+    let app = job_nzb_test_router(db, handle.handle.clone());
 
     let response = app
         .oneshot(
@@ -4630,6 +4714,45 @@ async fn nzbget_history_reports_each_failure_cause_in_its_own_status_field() {
             assert_eq!(entry[other], expected, "{kind:?} {other}");
         }
         assert_eq!(entry["Deleted"], field == "DeleteStatus", "{kind:?}");
+    }
+}
+
+// A partial delivery is a failed unpack to NZBGet clients, whether the job
+// is still in memory or its history row has landed.
+#[tokio::test]
+async fn nzbget_history_reports_a_partial_job_as_an_unpack_failure() {
+    use weaver_server_core::history::HistoryFailureKind;
+
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&nzbget_history_row(802, "partial", 1_700_000_802, None))
+        .unwrap();
+    assert!(
+        db.set_history_failure_kind(802, Some(HistoryFailureKind::Unpack))
+            .unwrap()
+    );
+    let mut live = sample_job(801, "partial-live", JobStatus::Partial);
+    (live.download_state, live.post_state, live.run_state) =
+        weaver_server_core::runtime_lanes_from_status_snapshot(&live.status);
+    let handle = scheduler_handle_with_jobs_and_db(vec![live], db.clone()).await;
+    let app = nzbget_test_router(
+        db,
+        handle,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let entries = rpc_result(app, "history", serde_json::json!([])).await;
+    for id in [801, 802] {
+        let entry = entries
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["NZBID"] == id)
+            .unwrap();
+        assert_eq!(entry["Status"], "FAILURE/UNPACK", "{id}");
+        assert_eq!(entry["UnpackStatus"], "FAILURE", "{id}");
+        assert_eq!(entry["ParStatus"], "NONE", "{id}");
+        assert_eq!(entry["DeleteStatus"], "NONE", "{id}");
     }
 }
 

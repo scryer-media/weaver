@@ -71,6 +71,7 @@ pub async fn idle_pipeline(
         state.clone(),
         db,
         config,
+        crate::runtime::StartupDiskGate::opened(),
     )
     .await
     .expect("isolated pipeline initialization");
@@ -140,6 +141,5 @@ pub(crate) fn admission_resources(
         db,
         intermediate_dir: root.join("intermediate"),
         complete_dir: root.join("complete"),
-        memory: Arc::new(ProcessMemoryBudget::new(1024 * 1024 * 1024)),
     }
 }

@@ -1,0 +1,16 @@
+{
+  "slug": "split-xz-missing",
+  "title": "E2E.Test.split.xz.missing.2026-TESTGRP",
+  "description": "Entire middle XZ piece absent, with no recovery and no known missing length. Failed must retain exactly the two posted pieces with their original bytes; no joined or decoded output is usable.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "expectedRetainedOutputBLAKE3": {
+    "灯火.bin.xz.001": "44a2664b053a8bccf69641d995bf4dfd6a582a1a8344bbb7348d1a3524550c62",
+    "灯火.bin.xz.003": "c0517ab8c41b9ad71c7b39a99752fc24bde5d72a490e8bda3229784fe815012e"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks",
+    "灯火.bin.xz",
+    "灯火.bin"
+  ]
+}

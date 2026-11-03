@@ -48,14 +48,6 @@ var requiredJobEventStabilityWindow = 500 * time.Millisecond
 var terminalFixtureStateTimeout = 5 * time.Second
 var terminalFixtureStatePollInterval = 100 * time.Millisecond
 
-const (
-	fileIdentityRewriteObserverTable         = "e2e_file_identity_rewrite_observations"
-	fileIdentityRewriteObserverInsertTrigger = "e2e_file_identity_rewrite_observations_insert"
-	fileIdentityRewriteObserverUpdateTrigger = "e2e_file_identity_rewrite_observations_update"
-	fileIdentityRewriteObserverFunction      = "e2e_file_identity_rewrite_observations_capture"
-	fileIdentityRewriteObservedAtEpochMS     = "CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)"
-)
-
 type fileIdentityRewriteObservation struct {
 	Observed                     bool
 	RequiredClassificationSource string
@@ -65,52 +57,29 @@ type fileIdentityRewriteObservation struct {
 	ObservedCurrentFilenames     []string
 }
 
+// fileIdentityRewriteObserver reads how weaver named a job's files from the
+// graph's log lines, holding the weaver log as it stood when opened.
 type fileIdentityRewriteObserver struct {
-	db        *sql.DB
-	datastore weaverDatastore
+	graphLog *string
 }
 
 func localWeaverDBPath() string {
 	return filepath.Join(localWeaverDir(), "weaver.db")
 }
 
-func installFileIdentityRewriteObserver(dbPath string) error {
-	db, datastore, err := openWeaverStateDB(dbPath)
+func openFileIdentityRewriteObserver() (*fileIdentityRewriteObserver, error) {
+	raw, err := os.ReadFile(localWeaverLogPath())
 	if err != nil {
-		return fmt.Errorf("open weaver state db: %w", err)
+		return nil, fmt.Errorf("read weaver log: %w", err)
 	}
-	defer closeWeaverStateDB(db, datastore)
-
-	statements := sqliteFileIdentityRewriteObserverStatements()
-	if datastore == weaverDatastorePostgres {
-		statements = postgresFileIdentityRewriteObserverStatements()
-	}
-	for _, statement := range statements {
-		if _, err := db.Exec(statement); err != nil {
-			return fmt.Errorf("install file identity rewrite observer: %w", err)
-		}
-	}
-	return nil
-}
-
-func openFileIdentityRewriteObserver(dbPath string) (*fileIdentityRewriteObserver, error) {
-	db, datastore, err := openWeaverStateDB(dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("open weaver state db: %w", err)
-	}
-	return &fileIdentityRewriteObserver{
-		db:        db,
-		datastore: datastore,
-	}, nil
+	graphLog := string(raw)
+	return &fileIdentityRewriteObserver{graphLog: &graphLog}, nil
 }
 
 func (o *fileIdentityRewriteObserver) Close() error {
-	if o == nil || o.db == nil {
-		return nil
+	if o != nil {
+		o.graphLog = nil
 	}
-	db := o.db
-	o.db = nil
-	closeWeaverStateDB(db, o.datastore)
 	return nil
 }
 
@@ -118,177 +87,13 @@ func (o *fileIdentityRewriteObserver) Observe(
 	jobID int,
 	assertion *ScenarioFileIdentityRewriteAssertion,
 ) (fileIdentityRewriteObservation, error) {
-	if o == nil || o.db == nil {
+	if o == nil || o.graphLog == nil {
 		return newFileIdentityRewriteObservation(assertion), fmt.Errorf("file identity rewrite observer is closed")
 	}
-	return evaluateActiveFileIdentityRewrite(o.db, o.datastore, jobID, assertion)
-}
-
-func sqliteFileIdentityRewriteObserverStatements() []string {
-	return []string{
-		"DROP TRIGGER IF EXISTS " + fileIdentityRewriteObserverInsertTrigger,
-		"DROP TRIGGER IF EXISTS " + fileIdentityRewriteObserverUpdateTrigger,
-		"DROP TABLE IF EXISTS " + fileIdentityRewriteObserverTable,
-		`CREATE TABLE ` + fileIdentityRewriteObserverTable + ` (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			observed_at_epoch_ms INTEGER NOT NULL,
-			operation TEXT NOT NULL,
-			job_id INTEGER NOT NULL,
-			file_index INTEGER NOT NULL,
-			source_filename TEXT NOT NULL,
-			current_filename TEXT NOT NULL,
-			canonical_filename TEXT,
-			classification_kind TEXT,
-			classification_set_name TEXT,
-			classification_volume_index INTEGER,
-			classification_source TEXT NOT NULL
-		)`,
-		`CREATE INDEX e2e_file_identity_rewrite_observations_job_id_idx
-			ON ` + fileIdentityRewriteObserverTable + ` (job_id, current_filename, classification_source)`,
-		`CREATE TRIGGER ` + fileIdentityRewriteObserverInsertTrigger + `
-			AFTER INSERT ON active_file_identities
-			BEGIN
-				INSERT INTO ` + fileIdentityRewriteObserverTable + ` (
-					observed_at_epoch_ms,
-					operation,
-					job_id,
-					file_index,
-					source_filename,
-					current_filename,
-					canonical_filename,
-					classification_kind,
-					classification_set_name,
-					classification_volume_index,
-					classification_source
-				) VALUES (
-					` + fileIdentityRewriteObservedAtEpochMS + `,
-					'insert',
-					NEW.job_id,
-					NEW.file_index,
-					NEW.source_filename,
-					NEW.current_filename,
-					NEW.canonical_filename,
-					NEW.classification_kind,
-					NEW.classification_set_name,
-					NEW.classification_volume_index,
-					NEW.classification_source
-				);
-			END`,
-		`CREATE TRIGGER ` + fileIdentityRewriteObserverUpdateTrigger + `
-			AFTER UPDATE ON active_file_identities
-			BEGIN
-				INSERT INTO ` + fileIdentityRewriteObserverTable + ` (
-					observed_at_epoch_ms,
-					operation,
-					job_id,
-					file_index,
-					source_filename,
-					current_filename,
-					canonical_filename,
-					classification_kind,
-					classification_set_name,
-					classification_volume_index,
-					classification_source
-				) VALUES (
-					` + fileIdentityRewriteObservedAtEpochMS + `,
-					'update',
-					NEW.job_id,
-					NEW.file_index,
-					NEW.source_filename,
-					NEW.current_filename,
-					NEW.canonical_filename,
-					NEW.classification_kind,
-					NEW.classification_set_name,
-					NEW.classification_volume_index,
-					NEW.classification_source
-				);
-			END`,
+	if jobID <= 0 {
+		return newFileIdentityRewriteObservation(assertion), nil
 	}
-}
-
-func postgresFileIdentityRewriteObserverStatements() []string {
-	return []string{
-		"DROP TRIGGER IF EXISTS " + fileIdentityRewriteObserverInsertTrigger + " ON active_file_identities",
-		"DROP TRIGGER IF EXISTS " + fileIdentityRewriteObserverUpdateTrigger + " ON active_file_identities",
-		"DROP FUNCTION IF EXISTS " + fileIdentityRewriteObserverFunction + "()",
-		"DROP TABLE IF EXISTS " + fileIdentityRewriteObserverTable,
-		`CREATE TABLE ` + fileIdentityRewriteObserverTable + ` (
-			id BIGSERIAL PRIMARY KEY,
-			observed_at_epoch_ms BIGINT NOT NULL,
-			operation TEXT NOT NULL,
-			job_id BIGINT NOT NULL,
-			file_index INTEGER NOT NULL,
-			source_filename TEXT NOT NULL,
-			current_filename TEXT NOT NULL,
-			canonical_filename TEXT,
-			classification_kind TEXT,
-			classification_set_name TEXT,
-			classification_volume_index INTEGER,
-			classification_source TEXT NOT NULL
-		)`,
-		`CREATE INDEX e2e_file_identity_rewrite_observations_job_id_idx
-			ON ` + fileIdentityRewriteObserverTable + ` (job_id, current_filename, classification_source)`,
-		`CREATE FUNCTION ` + fileIdentityRewriteObserverFunction + `()
-			RETURNS trigger
-			LANGUAGE plpgsql
-			AS $$
-			BEGIN
-				INSERT INTO ` + fileIdentityRewriteObserverTable + ` (
-					observed_at_epoch_ms,
-					operation,
-					job_id,
-					file_index,
-					source_filename,
-					current_filename,
-					canonical_filename,
-					classification_kind,
-					classification_set_name,
-					classification_volume_index,
-					classification_source
-				) VALUES (
-					(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT,
-					lower(TG_OP),
-					NEW.job_id,
-					NEW.file_index,
-					NEW.source_filename,
-					NEW.current_filename,
-					NEW.canonical_filename,
-					NEW.classification_kind,
-					NEW.classification_set_name,
-					NEW.classification_volume_index,
-					NEW.classification_source
-				);
-				RETURN NEW;
-			END;
-			$$`,
-		`CREATE TRIGGER ` + fileIdentityRewriteObserverInsertTrigger + `
-			AFTER INSERT ON active_file_identities
-			FOR EACH ROW
-			EXECUTE FUNCTION ` + fileIdentityRewriteObserverFunction + `()`,
-		`CREATE TRIGGER ` + fileIdentityRewriteObserverUpdateTrigger + `
-			AFTER UPDATE ON active_file_identities
-			FOR EACH ROW
-			EXECUTE FUNCTION ` + fileIdentityRewriteObserverFunction + `()`,
-	}
-}
-
-func observeActiveFileIdentityRewrite(
-	dbPath string,
-	jobID int,
-	assertion *ScenarioFileIdentityRewriteAssertion,
-) (fileIdentityRewriteObservation, error) {
-	observation := newFileIdentityRewriteObservation(assertion)
-	if jobID <= 0 || assertion == nil || !assertion.enabled() {
-		return observation, nil
-	}
-
-	db, datastore, err := openWeaverStateDB(dbPath)
-	if err != nil {
-		return observation, fmt.Errorf("open weaver state db: %w", err)
-	}
-	defer closeWeaverStateDB(db, datastore)
-
-	return evaluateActiveFileIdentityRewrite(db, datastore, jobID, assertion)
+	return graphFileIdentityRewrite(*o.graphLog, jobID, assertion), nil
 }
 
 func applyRuntimeFileIdentityRewriteTerminalCheck(
@@ -349,7 +154,7 @@ func assertTerminalFixtureStateSweeping(dbPath string, jobID int, expectedStatus
 	}
 
 	if sweepOrphans {
-		if err := assertNoOrphanActiveState(db); err != nil {
+		if err := assertNoOrphanActiveState(db, datastore); err != nil {
 			return err
 		}
 	}
@@ -360,14 +165,18 @@ func assertTerminalFixtureStateSweeping(dbPath string, jobID int, expectedStatus
 // lingeringJobActiveState counts the job's rows in every active-state table in
 // one statement, and names each table that still holds any.
 func lingeringJobActiveState(db *sql.DB, datastore weaverDatastore, jobID int) ([]string, error) {
-	counts := make([]string, 0, len(weaverActiveStateTables))
-	args := make([]any, 0, len(weaverActiveStateTables))
-	for _, table := range weaverActiveStateTables {
+	tables, err := presentActiveStateTables(db, datastore)
+	if err != nil {
+		return nil, err
+	}
+	counts := make([]string, 0, len(tables))
+	args := make([]any, 0, len(tables))
+	for _, table := range tables {
 		counts = append(counts, fmt.Sprintf(`(SELECT COUNT(*) FROM %s WHERE job_id = ?)`, table.Name))
 		args = append(args, jobID)
 	}
 	query := rebindWeaverSQL(datastore, `SELECT `+strings.Join(counts, ", "))
-	values := make([]int, len(weaverActiveStateTables))
+	values := make([]int, len(tables))
 	dest := make([]any, len(values))
 	for i := range values {
 		dest[i] = &values[i]
@@ -376,7 +185,7 @@ func lingeringJobActiveState(db *sql.DB, datastore weaverDatastore, jobID int) (
 		return nil, fmt.Errorf("count active state rows for job %d: %w", jobID, err)
 	}
 	var lingering []string
-	for i, table := range weaverActiveStateTables {
+	for i, table := range tables {
 		if values[i] > 0 {
 			lingering = append(lingering, fmt.Sprintf("%s=%d", table.Name, values[i]))
 		}
@@ -391,8 +200,12 @@ func assertNoLingeringWeaverActiveState(dbPath string) error {
 	}
 	defer closeWeaverStateDB(db, datastore)
 
+	tables, err := presentActiveStateTables(db, datastore)
+	if err != nil {
+		return err
+	}
 	var lingering []string
-	for _, table := range weaverActiveStateTables {
+	for _, table := range tables {
 		count, err := countTableRows(db, table.Name)
 		if err != nil {
 			return err
@@ -415,7 +228,7 @@ func assertNoOrphanActiveStatePath(dbPath string) error {
 	}
 	defer closeWeaverStateDB(db, datastore)
 
-	return assertNoOrphanActiveState(db)
+	return assertNoOrphanActiveState(db, datastore)
 }
 
 func loadJobHistoryStatus(db *sql.DB, datastore weaverDatastore, jobID int) (string, bool, error) {
@@ -484,9 +297,32 @@ func orphanActiveStateJobIDs(db *sql.DB, table string) (string, error) {
 	return strings.Join(jobIDs, ","), nil
 }
 
-func assertNoOrphanActiveState(db *sql.DB) error {
+// presentActiveStateTables is the active-state tables this database has. A
+// database a migration has dropped tables from sweeps the ones it still holds.
+func presentActiveStateTables(db *sql.DB, datastore weaverDatastore) ([]weaverActiveStateTable, error) {
+	present := make([]weaverActiveStateTable, 0, len(weaverActiveStateTables))
+	for _, table := range weaverActiveStateTables {
+		exists, err := weaverStateTableExists(db, datastore, table.Name)
+		if err != nil {
+			return nil, err
+		}
+		if exists {
+			present = append(present, table)
+		}
+	}
+	return present, nil
+}
+
+func assertNoOrphanActiveState(db *sql.DB, datastore weaverDatastore) error {
+	tables, err := presentActiveStateTables(db, datastore)
+	if err != nil {
+		return err
+	}
 	var orphaned []string
-	for _, table := range weaverActiveStateTables[1:] {
+	for _, table := range tables {
+		if table.Name == "active_jobs" {
+			continue
+		}
 		var count int
 		query := fmt.Sprintf(
 			`SELECT COUNT(*) FROM %s WHERE NOT EXISTS (
@@ -514,137 +350,6 @@ func assertNoOrphanActiveState(db *sql.DB) error {
 	return nil
 }
 
-func evaluateActiveFileIdentityRewrite(
-	db *sql.DB,
-	datastore weaverDatastore,
-	jobID int,
-	assertion *ScenarioFileIdentityRewriteAssertion,
-) (fileIdentityRewriteObservation, error) {
-	observation := newFileIdentityRewriteObservation(assertion)
-	if jobID <= 0 || assertion == nil || !assertion.enabled() {
-		return observation, nil
-	}
-
-	presentSources := make(map[string]map[string]struct{})
-	activeRows, err := collectFileIdentityRewriteRows(
-		db,
-		presentSources,
-		rebindWeaverSQL(
-			datastore,
-			`SELECT current_filename, classification_source FROM active_file_identities WHERE job_id = ?`,
-		),
-		jobID,
-	)
-	if err != nil {
-		return observation, fmt.Errorf("query active_file_identities for job %d: %w", jobID, err)
-	}
-
-	if activeRows == 0 {
-		observerExists, err := weaverStateTableExists(db, datastore, fileIdentityRewriteObserverTable)
-		if err != nil {
-			return observation, err
-		}
-		if observerExists {
-			if _, err := collectFileIdentityRewriteRows(
-				db,
-				presentSources,
-				rebindWeaverSQL(
-					datastore,
-					`SELECT current_filename, classification_source
-					 FROM `+fileIdentityRewriteObserverTable+`
-					 WHERE id IN (
-						SELECT MAX(id)
-						FROM `+fileIdentityRewriteObserverTable+`
-						WHERE job_id = ?
-						GROUP BY file_index
-					 )`,
-				),
-				jobID,
-			); err != nil {
-				return observation, fmt.Errorf("query latest %s rows for job %d: %w", fileIdentityRewriteObserverTable, jobID, err)
-			}
-		}
-	}
-
-	requiredCurrentFilenames := normalizeManifestFilenames(assertion.RequiredCurrentFilenames)
-	forbiddenCurrentFilenames := normalizeManifestFilenames(assertion.ForbiddenCurrentFilenames)
-	requiredSource := observation.RequiredClassificationSource
-
-	for _, currentFilename := range requiredCurrentFilenames {
-		sources, ok := presentSources[currentFilename]
-		if !ok {
-			observation.MissingCurrentFilenames = append(observation.MissingCurrentFilenames, currentFilename)
-			continue
-		}
-		if requiredSource != "" {
-			if _, ok := sources[requiredSource]; !ok {
-				observation.WrongClassificationSources = append(
-					observation.WrongClassificationSources,
-					fmt.Sprintf("%s (found: %s)", currentFilename, joinSortedSet(sources)),
-				)
-			}
-		}
-	}
-
-	for _, currentFilename := range forbiddenCurrentFilenames {
-		if _, ok := presentSources[currentFilename]; ok {
-			observation.ForbiddenCurrentFilenames = append(observation.ForbiddenCurrentFilenames, currentFilename)
-		}
-	}
-
-	if len(presentSources) > 0 {
-		observedCurrentFilenames := make([]string, 0, len(presentSources))
-		for currentFilename, sources := range presentSources {
-			observedCurrentFilenames = append(
-				observedCurrentFilenames,
-				fmt.Sprintf("%s (%s)", currentFilename, joinSortedSet(sources)),
-			)
-		}
-		sort.Strings(observedCurrentFilenames)
-		observation.ObservedCurrentFilenames = observedCurrentFilenames
-	}
-
-	observation.Observed =
-		len(observation.MissingCurrentFilenames) == 0 &&
-			len(observation.ForbiddenCurrentFilenames) == 0 &&
-			len(observation.WrongClassificationSources) == 0
-
-	return observation, nil
-}
-
-func collectFileIdentityRewriteRows(
-	db *sql.DB,
-	presentSources map[string]map[string]struct{},
-	query string,
-	args ...interface{},
-) (int, error) {
-	rows, err := db.Query(query, args...)
-	if err != nil {
-		return 0, err
-	}
-	defer rows.Close()
-
-	count := 0
-	for rows.Next() {
-		var (
-			currentFilename      string
-			classificationSource string
-		)
-		if err := rows.Scan(&currentFilename, &classificationSource); err != nil {
-			return count, err
-		}
-		if _, ok := presentSources[currentFilename]; !ok {
-			presentSources[currentFilename] = make(map[string]struct{})
-		}
-		presentSources[currentFilename][normalizeFileIdentityClassificationSource(classificationSource)] = struct{}{}
-		count++
-	}
-	if err := rows.Err(); err != nil {
-		return count, err
-	}
-	return count, nil
-}
-
 func applyTerminalStateCheck(dbPath string, jobID int, slug string, status string) (string, string) {
 	return applyTerminalStateCheckSweeping(dbPath, jobID, slug, status, true)
 }
@@ -656,12 +361,35 @@ func applyTerminalStateCheckSweeping(dbPath string, jobID int, slug string, stat
 	if jobID <= 0 || !facadeTerminalStatus(status) {
 		return status, ""
 	}
-	if err := assertTerminalFixtureStateEventuallySweeping(dbPath, jobID, status, sweepOrphans); err != nil {
+	scenario, err := loadScenario(filepath.Join(testdataDir(), slug))
+	if err := assertTerminalFixtureStateEventuallySweeping(dbPath, jobID, scenario.expectedHistoryStatus(status), sweepOrphans); err != nil {
 		log.Printf("  %s: state mismatch after %s: %v", slug, status, err)
 		return "DB_STATE_ERROR", err.Error()
 	}
-	if normalizeFacadeState(status) == "COMPLETE" {
-		scenario, err := loadScenario(filepath.Join(testdataDir(), slug))
+	if err == nil && scenario.ExpectedFailureKind != "" {
+		kindErr := withStateDB(dbPath, func(db *stateConn) error {
+			var kind string
+			if err := db.QueryRow(`SELECT COALESCE(failure_kind, '') FROM job_history WHERE job_id = ?`, jobID).Scan(&kind); err != nil {
+				return err
+			}
+			if !strings.EqualFold(kind, scenario.ExpectedFailureKind) {
+				return fmt.Errorf("job %d failure kind %q, expected %q", jobID, kind, scenario.ExpectedFailureKind)
+			}
+			return nil
+		})
+		if kindErr != nil {
+			return "FAILURE_KIND_ERROR", kindErr.Error()
+		}
+	}
+	if err == nil && scenario.ExpectedRetainedOutputBLAKE3 != nil {
+		if !strings.EqualFold(scenario.expectedHistoryStatus(status), "FAILED") {
+			return "RETAINED_OUTPUT_ERROR", "retained-output contract requires a Failed job, not a usable delivery"
+		}
+		if retainedErr := assertRetainedOutputBLAKE3(dbPath, jobID, scenario.ExpectedRetainedOutputBLAKE3); retainedErr != nil {
+			return "RETAINED_OUTPUT_ERROR", retainedErr.Error()
+		}
+	}
+	if scenario.deliveredOn(status) {
 		if err == nil && len(scenario.RequiredJobEvents) > 0 {
 			if err := assertRequiredJobEvents(dbPath, jobID, scenario.RequiredJobEvents); err != nil {
 				log.Printf("  %s: required job event mismatch after %s: %v", slug, status, err)
@@ -686,6 +414,11 @@ func applyTerminalStateCheckSweeping(dbPath string, jobID int, slug string, stat
 				return "OUTPUT_DIGEST_ERROR", err.Error()
 			}
 		}
+		if err == nil && scenario.ExactOutputFiles {
+			if exactErr := assertExactOutputBLAKE3(dbPath, jobID, scenario.ExpectedOutputBLAKE3, false); exactErr != nil {
+				return "OUTPUT_LEFTOVER_ERROR", exactErr.Error()
+			}
+		}
 		if err == nil && len(scenario.ForbiddenOutputPaths) > 0 {
 			if err := assertForbiddenOutputPaths(dbPath, jobID, scenario.ForbiddenOutputPaths); err != nil {
 				log.Printf("  %s: forbidden output present after %s: %v", slug, status, err)
@@ -698,22 +431,16 @@ func applyTerminalStateCheckSweeping(dbPath string, jobID int, slug string, stat
 				return "PAR2_SETTLEMENT_ERROR", err.Error()
 			}
 		}
-		if err == nil && directStoreEnabledForPhase() && scenario.directStoreAssertion() != nil {
-			if err := assertDirectStoreScenario(jobID, scenario.directStoreAssertion()); err != nil {
+		if err == nil && scenario.directStoreAssertion() != nil {
+			if err := assertDirectStoreScenario(jobID, scenario); err != nil {
 				log.Printf("  %s: direct-store runtime assertion failed after %s: %v", slug, status, err)
 				return "DIRECT_STORE_ASSERTION_ERROR", err.Error()
 			}
 		}
 		if err == nil && scenario.directUnpackAssertion() != nil {
-			if err := assertDirectUnpackScenario(jobID, scenario.directUnpackAssertion()); err != nil {
+			if err := assertDirectUnpackScenario(dbPath, jobID, scenario.directUnpackAssertion()); err != nil {
 				log.Printf("  %s: direct-unpack runtime assertion failed after %s: %v", slug, status, err)
 				return "DIRECT_UNPACK_ASSERTION_ERROR", err.Error()
-			}
-		}
-		if err == nil && scenario.healthProbeAssertion() != nil {
-			if err := assertHealthProbeScenario(jobID, scenario.healthProbeAssertion()); err != nil {
-				log.Printf("  %s: health-probe runtime assertion failed after %s: %v", slug, status, err)
-				return "HEALTH_PROBE_ASSERTION_ERROR", err.Error()
 			}
 		}
 		if err == nil && scenario.logAssertion() != nil {
@@ -724,71 +451,6 @@ func applyTerminalStateCheckSweeping(dbPath string, jobID int, slug string, stat
 		}
 	}
 	return status, ""
-}
-
-// The lines the health probe emits for a job. Activation is logged once per
-// round; the completion line carries `inconclusive=true` when not one
-// confirmation batch got an answer — every batch hit its transport deadline —
-// so the round had nothing to read a verdict from. A round that lost some
-// batches but answered for others is conclusive over the part it answered
-// and reports the shortfall as `unverified=`.
-const (
-	healthProbeActivatedMessage = "health probe activated"
-	healthProbeCompleteMessage  = "health probe complete"
-)
-
-// assertHealthProbeScenario reads the probe's own log lines for the job. A job
-// whose probe timed out still completes with the right bytes, so this is the
-// only place a probe that sat on its soft timeout — every article it could
-// sample already sampled, the lanes it was waiting on long idle — shows up.
-func assertHealthProbeScenario(jobID int, assertion *ScenarioHealthProbeAssertion) error {
-	if assertion == nil {
-		return nil
-	}
-	raw, err := os.ReadFile(localWeaverLogPath())
-	if err != nil {
-		return fmt.Errorf("read weaver log: %w", err)
-	}
-
-	wantJobID := strconv.Itoa(jobID)
-	activated := 0
-	completed := 0
-	inconclusive := 0
-	for _, rawLine := range strings.Split(string(raw), "\n") {
-		line := ansiEscape.ReplaceAllString(rawLine, "")
-		if isWeaverDebugRingReplay(line) || directLogJobID(line) != wantJobID {
-			continue
-		}
-		switch {
-		case strings.Contains(line, healthProbeActivatedMessage):
-			activated++
-		case strings.Contains(line, healthProbeCompleteMessage):
-			completed++
-			if weaverLogField(line, "inconclusive") == "true" {
-				inconclusive++
-			}
-		}
-	}
-
-	if assertion.RequireActivated && activated == 0 {
-		return errors.New("the health probe never activated for this job; the fixture's damage did not cross the activation threshold")
-	}
-	if assertion.ForbidActivated && activated > 0 {
-		return fmt.Errorf(
-			"the health probe activated %d time(s) for this job; the fixture's damage is a hole the "+
-				"recovery set covers, and sampling it is work the probe policy rules out",
-			activated,
-		)
-	}
-	if assertion.ForbidInconclusive && inconclusive > 0 {
-		return fmt.Errorf(
-			"%d of %d health probe round(s) ended inconclusive: no confirmation batch got an "+
-				"answer before its transport deadline, which on the harness's own server means "+
-				"the probe sat waiting on lanes it should have been handed",
-			inconclusive, completed,
-		)
-	}
-	return nil
 }
 
 // assertLogScenario reads weaver's log for the job and holds each named
@@ -859,7 +521,10 @@ func splitWeaverLogLine(clean string) (level string, payload string) {
 	return level, payload
 }
 
-func assertDirectStoreScenario(jobID int, assertion *ScenarioDirectStoreAssertion) error {
+// assertDirectStoreScenario judges a scenario's direct-store assertion by the
+// graph's lines for the job: stored members are always read in place.
+func assertDirectStoreScenario(jobID int, scenario *Scenario) error {
+	assertion := scenario.directStoreAssertion()
 	if assertion == nil {
 		return nil
 	}
@@ -867,51 +532,20 @@ func assertDirectStoreScenario(jobID int, assertion *ScenarioDirectStoreAssertio
 	if err != nil {
 		return fmt.Errorf("read weaver log: %w", err)
 	}
-
-	wantJobID := strconv.Itoa(jobID)
-	seenDemotion := false
-	seenMaterialization := false
-	for _, rawLine := range strings.Split(string(raw), "\n") {
-		line := ansiEscape.ReplaceAllString(rawLine, "")
-		if isWeaverDebugRingReplay(line) || directLogJobID(line) != wantJobID {
-			continue
-		}
-		if strings.Contains(line, "direct-store set demoted") && directDemotionReason(line) == assertion.ExpectedDemotionReason {
-			seenDemotion = true
-		}
-		if strings.Contains(line, "direct-store set materialized from its own routed bytes") {
-			seenMaterialization = true
-		}
-		if assertion.ForbidVolumeRefetch && strings.Contains(line, "direct-store reconstruction is not possible; refetching the set's volumes") {
-			return errors.New("direct-store refetched volumes after demotion")
-		}
+	localFiles, err := dataFiles(filepath.Join(testdataDir(), scenario.Slug))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("list scenario files: %w", err)
 	}
-	if assertion.ExpectedDemotionReason != "" && !seenDemotion {
-		return fmt.Errorf("direct-store did not demote with %q", assertion.ExpectedDemotionReason)
+	volumes, err := scenarioArchiveVolumes(scenario, localFiles)
+	if err != nil {
+		return err
 	}
-	if assertion.RequireRoutedByteMaterialization && !seenMaterialization {
-		return errors.New("direct-store did not materialize the demoted set from routed bytes")
-	}
-	return nil
+	return graphDirectStoreVerdict(string(raw), jobID, assertion, volumes)
 }
 
-// The lines the direct-unpack controller emits. Asserting on these rather than
-// on output bytes is the only external evidence there is: an installed chase
-// and a conventional extraction produce byte-identical members, which is the
-// whole point of the feature.
-const (
-	directUnpackArmedMessage    = "direct unpack armed"
-	directUnpackConsumedMessage = "installed direct-unpack members instead of re-extracting"
-	directUnpackDemotedMessage  = "direct unpack demoted"
-	directUnpackAbortedMessage  = "direct unpack aborted"
-	// directUnpackMemoryYielded is the demotion of a chase that gave its
-	// decoder up to an extraction waiting for memory. Whether that happens
-	// depends on what the other jobs in the run are decoding at the time, not
-	// on the set under test.
-	directUnpackMemoryYielded = "memory_yielded"
-)
-
-func assertDirectUnpackScenario(jobID int, assertion *ScenarioDirectUnpackAssertion) error {
+// assertDirectUnpackScenario judges a direct-unpack assertion by the graph's
+// archive objects and deliveries together with the job's output directory.
+func assertDirectUnpackScenario(dbPath string, jobID int, assertion *ScenarioDirectUnpackAssertion) error {
 	if assertion == nil {
 		return nil
 	}
@@ -919,76 +553,18 @@ func assertDirectUnpackScenario(jobID int, assertion *ScenarioDirectUnpackAssert
 	if err != nil {
 		return fmt.Errorf("read weaver log: %w", err)
 	}
-	return directUnpackVerdict(string(raw), jobID, assertion, directUnpackEnabledForPhase())
+	outputDir, err := loadJobOutputDir(dbPath, jobID)
+	if err != nil {
+		return err
+	}
+	delivered, err := listOutputFiles(outputDir)
+	if err != nil {
+		return fmt.Errorf("read output directory for job %d: %w", jobID, err)
+	}
+	// No flow that judges runtime assertions relaunches weaver into the
+	// phase's log, so there is no restart point to hand the verdict.
+	return graphDirectUnpackVerdict(string(raw), jobID, assertion, delivered, graphNoRelaunch)
 }
-
-// directUnpackVerdict judges one job's direct-unpack log lines against its
-// assertion, in a phase that ran with the feature enabled or not.
-func directUnpackVerdict(log string, jobID int, assertion *ScenarioDirectUnpackAssertion, enabled bool) error {
-	wantJobID := strconv.Itoa(jobID)
-	armed := 0
-	consumed := false
-	yielded := false
-	seenDemotion := false
-	anyActivity := false
-	for _, rawLine := range strings.Split(log, "\n") {
-		line := ansiEscape.ReplaceAllString(rawLine, "")
-		if isWeaverDebugRingReplay(line) || directLogJobID(line) != wantJobID {
-			continue
-		}
-		switch {
-		case strings.Contains(line, directUnpackArmedMessage):
-			armed++
-			yielded = false
-			anyActivity = true
-		case strings.Contains(line, directUnpackConsumedMessage):
-			consumed = true
-			anyActivity = true
-		case strings.Contains(line, directUnpackDemotedMessage):
-			anyActivity = true
-			reason := directDemotionReason(line)
-			yielded = reason == directUnpackMemoryYielded
-			if assertion.ExpectedDemotionReason != "" && reason == assertion.ExpectedDemotionReason {
-				seenDemotion = true
-			}
-		case strings.Contains(line, directUnpackAbortedMessage):
-			anyActivity = true
-		}
-	}
-
-	// Darkness is only meaningful in a phase that ran without the gate; with it
-	// on, activity is the expected result rather than a failure.
-	if assertion.ForbidAnyActivity && !enabled {
-		if anyActivity {
-			return errors.New("direct unpack left traces in the log with the gate off")
-		}
-		return nil
-	}
-	if !enabled {
-		return nil
-	}
-
-	if assertion.RequireArmed && armed == 0 {
-		return errors.New("direct unpack never armed this set")
-	}
-	// A chase that yielded its decoder was extracted conventionally by
-	// design, so its members were never there to install. Only the job's
-	// last chase counts: a yield does not excuse one that armed or failed
-	// after it.
-	if assertion.RequireConsumed && !consumed && !yielded {
-		return errors.New("direct unpack did not install its members; the set was extracted conventionally")
-	}
-	if assertion.RequireRearmAfterRestart && armed < 2 {
-		return fmt.Errorf("direct unpack armed %d time(s); a restart mid-chase must re-arm", armed)
-	}
-	if assertion.ExpectedDemotionReason != "" && !seenDemotion {
-		return fmt.Errorf("direct unpack did not demote with %q", assertion.ExpectedDemotionReason)
-	}
-	return nil
-}
-
-const cleanPar2SettlementMessage = "PAR2 set settled clean from in-stream grid evidence"
-const cleanPar2VerificationSourceMessage = "PAR2 clean set verification source"
 
 var cleanPar2VerificationModes = []string{"grid", "file_crc", "quick_digest", "strong_decode", "authoritative"}
 
@@ -1018,94 +594,7 @@ func assertPar2CleanSettlement(jobID int, assertion *ScenarioPar2CleanSettlement
 	if err != nil {
 		return fmt.Errorf("read weaver log: %w", err)
 	}
-	wantJobID := strconv.Itoa(jobID)
-	observedModes := make(map[string]string, len(assertion.ExpectedSetVerificationModes))
-	for _, rawLine := range strings.Split(string(raw), "\n") {
-		line := ansiEscape.ReplaceAllString(rawLine, "")
-		if !strings.Contains(line, cleanPar2VerificationSourceMessage) || isWeaverDebugRingReplay(line) || directLogJobID(line) != wantJobID {
-			continue
-		}
-		setID := weaverLogField(line, "recovery_set_id")
-		wantModes, wanted := assertion.ExpectedSetVerificationModes[setID]
-		if !wanted {
-			return fmt.Errorf("clean PAR2 verification source observed unexpected set %s", setID)
-		}
-		mode := weaverLogField(line, "verification_mode")
-		if !slices.Contains(wantModes, mode) {
-			return fmt.Errorf("clean PAR2 verification source for set %s has mode %q, want one of %v", setID, mode, wantModes)
-		}
-		sliceSize, err := parseWeaverLogUint(line, "slice_size")
-		if err != nil {
-			return fmt.Errorf("clean PAR2 verification source for set %s: %w", setID, err)
-		}
-		if wantSliceSize := assertion.ExpectedSetSliceSizes[setID]; sliceSize != wantSliceSize {
-			return fmt.Errorf("clean PAR2 verification source for set %s has slice size %d, want %d", setID, sliceSize, wantSliceSize)
-		}
-		if _, duplicate := observedModes[setID]; duplicate {
-			return fmt.Errorf("clean PAR2 verification source observed set %s more than once", setID)
-		}
-		observedModes[setID] = mode
-	}
-	if len(observedModes) != len(assertion.ExpectedSetVerificationModes) {
-		missing := make([]string, 0, len(assertion.ExpectedSetVerificationModes)-len(observedModes))
-		for setID := range assertion.ExpectedSetVerificationModes {
-			if _, ok := observedModes[setID]; !ok {
-				missing = append(missing, setID)
-			}
-		}
-		sort.Strings(missing)
-		return fmt.Errorf("clean PAR2 verification source did not observe set(s): %s", strings.Join(missing, ", "))
-	}
-
-	observedGridSets := make(map[string]uint64)
-	for _, rawLine := range strings.Split(string(raw), "\n") {
-		line := ansiEscape.ReplaceAllString(rawLine, "")
-		if !strings.Contains(line, cleanPar2SettlementMessage) || isWeaverDebugRingReplay(line) || directLogJobID(line) != wantJobID {
-			continue
-		}
-		setID := weaverLogField(line, "recovery_set_id")
-		mode, wanted := observedModes[setID]
-		if !wanted {
-			return fmt.Errorf("clean PAR2 settlement observed unexpected set %s", setID)
-		}
-		if mode != "grid" {
-			return fmt.Errorf("clean PAR2 settlement observed set %s with non-grid mode %q", setID, mode)
-		}
-		sliceSize, err := parseWeaverLogUint(line, "slice_size")
-		if err != nil {
-			return fmt.Errorf("clean PAR2 settlement for set %s: %w", setID, err)
-		}
-		if wantSliceSize := assertion.ExpectedSetSliceSizes[setID]; sliceSize != wantSliceSize {
-			return fmt.Errorf("clean PAR2 settlement for set %s has slice size %d, want %d", setID, sliceSize, wantSliceSize)
-		}
-		if verdict := weaverLogField(line, "verdict"); verdict != "clean" {
-			return fmt.Errorf("clean PAR2 settlement for set %s has verdict %q, want clean", setID, verdict)
-		}
-		readBytes, err := parseWeaverLogUint(line, "verification_read_bytes")
-		if err != nil {
-			return fmt.Errorf("clean PAR2 settlement for set %s: %w", setID, err)
-		}
-		if readBytes != assertion.VerificationReadBytes {
-			return fmt.Errorf("clean PAR2 settlement for set %s read %d verification bytes, want %d", setID, readBytes, assertion.VerificationReadBytes)
-		}
-		if _, duplicate := observedGridSets[setID]; duplicate {
-			return fmt.Errorf("clean PAR2 settlement observed set %s more than once", setID)
-		}
-		observedGridSets[setID] = sliceSize
-	}
-	missingGridSets := make([]string, 0)
-	for setID, mode := range observedModes {
-		if mode == "grid" {
-			if _, ok := observedGridSets[setID]; !ok {
-				missingGridSets = append(missingGridSets, setID)
-			}
-		}
-	}
-	if len(missingGridSets) > 0 {
-		sort.Strings(missingGridSets)
-		return fmt.Errorf("clean PAR2 settlement did not observe grid set(s): %s", strings.Join(missingGridSets, ", "))
-	}
-	return nil
+	return graphPar2CleanSettlementVerdict(string(raw), jobID, assertion)
 }
 
 func parseWeaverLogUint(line, field string) (uint64, error) {
@@ -1139,18 +628,24 @@ func assertTerminalFixtureStateEventually(dbPath string, jobID int, expectedStat
 }
 
 func assertTerminalFixtureStateEventuallySweeping(dbPath string, jobID int, expectedStatus string, sweepOrphans bool) error {
-	deadline := time.Now().Add(terminalFixtureStateTimeout)
+	return waitForTerminalFixtureState(func() error {
+		return assertTerminalFixtureStateSweeping(dbPath, jobID, expectedStatus, sweepOrphans)
+	}, time.Now, time.Sleep)
+}
+
+func waitForTerminalFixtureState(check func() error, now func() time.Time, wait func(time.Duration)) error {
+	deadline := now().Add(terminalFixtureStateTimeout)
 	var lastErr error
 	for {
-		err := assertTerminalFixtureStateSweeping(dbPath, jobID, expectedStatus, sweepOrphans)
+		err := check()
 		if err == nil {
 			return nil
 		}
 		lastErr = err
-		if time.Now().After(deadline) {
+		if now().After(deadline) {
 			return lastErr
 		}
-		time.Sleep(terminalFixtureStatePollInterval)
+		wait(terminalFixtureStatePollInterval)
 	}
 }
 
@@ -1265,19 +760,9 @@ func assertMaxJobEventCounts(dbPath string, jobID int, maximums map[string]int) 
 }
 
 func assertOutputBLAKE3(dbPath string, jobID int, expectedByRelativePath map[string]string) error {
-	db, datastore, err := openWeaverStateDB(dbPath)
+	outputDir, err := loadJobOutputDir(dbPath, jobID)
 	if err != nil {
-		return fmt.Errorf("open weaver state db: %w", err)
-	}
-	defer closeWeaverStateDB(db, datastore)
-
-	var outputDir string
-	query := rebindWeaverSQL(datastore, `SELECT output_dir FROM job_history WHERE job_id = ?`)
-	if err := db.QueryRow(query, jobID).Scan(&outputDir); err != nil {
-		return fmt.Errorf("load output directory for job %d: %w", jobID, err)
-	}
-	if outputDir == "" {
-		return fmt.Errorf("job %d has no output directory", jobID)
+		return err
 	}
 
 	relativePaths := make([]string, 0, len(expectedByRelativePath))
@@ -1322,29 +807,31 @@ func assertOutputBLAKE3(dbPath string, jobID int, expectedByRelativePath map[str
 	return nil
 }
 
-// assertForbiddenOutputPaths fails when the job's completed output still holds
-// a file the scenario says is not part of the release. It is the counterpart of
-// assertOutputBLAKE3: that one says the release is right, this one says nothing
-// the pipeline used along the way was handed over with it — split parts a join
-// consumed, backups a repair wrote, an archive an extraction opened.
-func assertForbiddenOutputPaths(dbPath string, jobID int, patterns []string) error {
+// loadJobOutputDir is the directory a finished job delivered into, from its
+// history row.
+func loadJobOutputDir(dbPath string, jobID int) (string, error) {
 	db, datastore, err := openWeaverStateDB(dbPath)
 	if err != nil {
-		return fmt.Errorf("open weaver state db: %w", err)
+		return "", fmt.Errorf("open weaver state db: %w", err)
 	}
 	defer closeWeaverStateDB(db, datastore)
 
 	var outputDir string
 	query := rebindWeaverSQL(datastore, `SELECT output_dir FROM job_history WHERE job_id = ?`)
 	if err := db.QueryRow(query, jobID).Scan(&outputDir); err != nil {
-		return fmt.Errorf("load output directory for job %d: %w", jobID, err)
+		return "", fmt.Errorf("load output directory for job %d: %w", jobID, err)
 	}
 	if outputDir == "" {
-		return fmt.Errorf("job %d has no output directory", jobID)
+		return "", fmt.Errorf("job %d has no output directory", jobID)
 	}
+	return outputDir, nil
+}
 
+// listOutputFiles is every file under an output directory, as slash-relative
+// paths.
+func listOutputFiles(outputDir string) ([]string, error) {
 	var delivered []string
-	walkErr := filepath.WalkDir(outputDir, func(path string, entry os.DirEntry, err error) error {
+	err := filepath.WalkDir(outputDir, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -1358,8 +845,22 @@ func assertForbiddenOutputPaths(dbPath string, jobID int, patterns []string) err
 		delivered = append(delivered, filepath.ToSlash(relative))
 		return nil
 	})
-	if walkErr != nil {
-		return fmt.Errorf("read output directory for job %d: %w", jobID, walkErr)
+	return delivered, err
+}
+
+// assertForbiddenOutputPaths fails when the job's completed output still holds
+// a file the scenario says is not part of the release. It is the counterpart of
+// assertOutputBLAKE3: that one says the release is right, this one says nothing
+// the pipeline used along the way was handed over with it — split parts a join
+// consumed, backups a repair wrote, an archive an extraction opened.
+func assertForbiddenOutputPaths(dbPath string, jobID int, patterns []string) error {
+	outputDir, err := loadJobOutputDir(dbPath, jobID)
+	if err != nil {
+		return err
+	}
+	delivered, err := listOutputFiles(outputDir)
+	if err != nil {
+		return fmt.Errorf("read output directory for job %d: %w", jobID, err)
 	}
 
 	found, err := matchForbiddenOutputPaths(patterns, delivered)
@@ -1497,10 +998,10 @@ func (o fileIdentityRewriteObservation) terminalFailureMessage(status string, la
 		}
 	}
 	if len(parts) == 1 {
-		parts = append(parts, "no matching active_file_identities rows were observed")
+		parts = append(parts, "no matching graph log lines (recovery bound, member delivered, object bound) were observed")
 	}
 	if len(o.ObservedCurrentFilenames) > 0 {
-		parts = append(parts, "effective file identity rows: "+strings.Join(o.ObservedCurrentFilenames, ", "))
+		parts = append(parts, "file identities in the graph log: "+strings.Join(o.ObservedCurrentFilenames, ", "))
 	}
 	if strings.TrimSpace(lastQueryError) != "" {
 		parts = append(parts, "last oracle query error: "+strings.TrimSpace(lastQueryError))

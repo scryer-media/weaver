@@ -59,69 +59,6 @@ pub(super) fn end_header(more_volumes: bool) -> Vec<u8> {
     header(5, 0, &encode_vint(u64::from(more_volumes)), &[])
 }
 
-pub(super) fn file_header(
-    filename: &str,
-    common_flags_extra: u64,
-    data_size: u64,
-    unpacked_size: u64,
-    data_crc: Option<u32>,
-) -> Vec<u8> {
-    file_header_with_extra(
-        filename,
-        common_flags_extra,
-        data_size,
-        unpacked_size,
-        data_crc,
-        &[],
-    )
-}
-
-pub(super) fn file_header_with_extra(
-    filename: &str,
-    common_flags_extra: u64,
-    data_size: u64,
-    unpacked_size: u64,
-    data_crc: Option<u32>,
-    extra: &[u8],
-) -> Vec<u8> {
-    let mut type_body = encode_vint(u64::from(data_crc.is_some()) * 0x0004);
-    type_body.extend_from_slice(&encode_vint(unpacked_size));
-    type_body.extend_from_slice(&encode_vint(0o644));
-    if let Some(data_crc) = data_crc {
-        type_body.extend_from_slice(&data_crc.to_le_bytes());
-    }
-    type_body.extend_from_slice(&encode_vint(0));
-    type_body.extend_from_slice(&encode_vint(1));
-    type_body.extend_from_slice(&encode_vint(filename.len() as u64));
-    type_body.extend_from_slice(filename.as_bytes());
-
-    let mut file_body = encode_vint(data_size);
-    file_body.extend_from_slice(&type_body);
-    header(2, 0x0002 | common_flags_extra, &file_body, extra)
-}
-
-pub(super) fn extra_record(record_type: u64, body: &[u8]) -> Vec<u8> {
-    let type_bytes = encode_vint(record_type);
-    let mut data = encode_vint((type_bytes.len() + body.len()) as u64);
-    data.extend_from_slice(&type_bytes);
-    data.extend_from_slice(body);
-    data
-}
-
-pub(super) fn file_version_extra(version: u64) -> Vec<u8> {
-    let mut body = encode_vint(0);
-    body.extend_from_slice(&encode_vint(version));
-    extra_record(0x04, &body)
-}
-
-pub(super) fn redirection_extra(redirection_type: u64, target: &str) -> Vec<u8> {
-    let mut body = encode_vint(redirection_type);
-    body.extend_from_slice(&encode_vint(0));
-    body.extend_from_slice(&encode_vint(target.len() as u64));
-    body.extend_from_slice(target.as_bytes());
-    extra_record(0x05, &body)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

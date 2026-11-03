@@ -20,13 +20,44 @@ const ZSTD_LEVEL: i32 = 10;
 // One collected file, or the reason there is no file.
 pub(super) struct Component {
     pub(super) name: String,
+    pub(super) form: Form,
     pub(super) outcome: Result<Vec<u8>, String>,
+}
+
+// How a component's bytes are read, which is how the sanitizer reaches the
+// names inside them without rewriting anything else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Form {
+    // Plain text: logs and metrics.
+    Text,
+    // A JSON document, sanitized value by value.
+    Json,
+    // A TOML document, sanitized value by value.
+    Toml,
+    // A gzip stream of text, as collected: a rotated log.
+    Gzip,
+    // The text a `Gzip` stream held, opened for sanitizing and compressed
+    // again once sanitized.
+    GzipText,
 }
 
 impl Component {
     pub(super) fn bytes(name: impl Into<String>, data: Vec<u8>) -> Self {
+        Self::of_form(name, Form::Text, data)
+    }
+
+    pub(super) fn gzip(name: impl Into<String>, data: Vec<u8>) -> Self {
+        Self::of_form(name, Form::Gzip, data)
+    }
+
+    pub(super) fn toml(name: impl Into<String>, document: impl Into<String>) -> Self {
+        Self::of_form(name, Form::Toml, document.into().into_bytes())
+    }
+
+    fn of_form(name: impl Into<String>, form: Form, data: Vec<u8>) -> Self {
         Self {
             name: name.into(),
+            form,
             outcome: Ok(data),
         }
     }
@@ -38,6 +69,7 @@ impl Component {
     pub(super) fn failed(name: impl Into<String>, error: impl std::fmt::Display) -> Self {
         Self {
             name: name.into(),
+            form: Form::Text,
             outcome: Err(error.to_string()),
         }
     }
@@ -47,7 +79,7 @@ impl Component {
     pub(super) fn json<T: Serialize>(name: impl Into<String>, value: &T) -> Self {
         let name = name.into();
         match serde_json::to_vec_pretty(value) {
-            Ok(data) => Self::bytes(name, data),
+            Ok(data) => Self::of_form(name, Form::Json, data),
             Err(error) => Self::failed(name, error),
         }
     }
@@ -58,8 +90,20 @@ impl Component {
 pub(super) struct Manifest {
     pub(super) weaver_version: String,
     pub(super) generated_at_utc: String,
+    pub(super) sanitized: ManifestSanitized,
     pub(super) files: Vec<ManifestFile>,
     pub(super) errors: Vec<ManifestError>,
+}
+
+// The package's names are stand-ins: how many there are, and what was
+// replaced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct ManifestSanitized {
+    pub(super) stand_ins: u64,
+    // Every finished job the history holds; names are read for the 2,000
+    // most recent. `None` when the history could not be read.
+    pub(super) history_jobs_total: Option<u64>,
+    pub(super) note: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +135,7 @@ pub(super) fn build_archive(
     components: Vec<Component>,
     weaver_version: &str,
     generated_at_utc: &str,
+    sanitized: ManifestSanitized,
 ) -> std::io::Result<Vec<u8>> {
     let mut files = Vec::new();
     let mut errors = Vec::new();
@@ -115,6 +160,7 @@ pub(super) fn build_archive(
     let mut manifest = Manifest {
         weaver_version: weaver_version.to_string(),
         generated_at_utc: generated_at_utc.to_string(),
+        sanitized,
         files,
         errors,
     };
@@ -198,6 +244,11 @@ mod tests {
             ],
             "0.0.0-test",
             "2000-01-01T00:00:00Z",
+            ManifestSanitized {
+                stand_ins: 7,
+                history_jobs_total: Some(2001),
+                note: "test".to_string(),
+            },
         )
         .expect("archive builds");
 
@@ -218,6 +269,8 @@ mod tests {
 
         assert_eq!(manifest.weaver_version, "0.0.0-test");
         assert_eq!(manifest.generated_at_utc, "2000-01-01T00:00:00Z");
+        assert_eq!(manifest.sanitized.stand_ins, 7);
+        assert_eq!(manifest.sanitized.history_jobs_total, Some(2001));
         assert_eq!(manifest.errors.len(), 1);
         assert_eq!(manifest.errors[0].name, "pipeline-internals.json");
         assert!(manifest.errors[0].error.contains("channel closed"));

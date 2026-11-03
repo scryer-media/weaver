@@ -12,7 +12,9 @@ use weaver_server_core::{
     split_history_metadata,
 };
 
-use crate::jobs::release_display::{ReleaseDisplayInput, release_display_info};
+use crate::jobs::release_display::{
+    ReleaseDisplayCache, ReleaseDisplayInput, release_display_info,
+};
 use crate::jobs::types::{
     Attribute, DuplicateSummaryInfo, JobStatusGql, ParsedRelease, PreparedQueueFilter,
     QueueAttention, QueueFilterInput, QueueItemState, matches_attribute_filter_prepared,
@@ -500,6 +502,7 @@ pub fn history_item_from_row(
         job_name: &row.name,
         metadata: &metadata_pairs,
         category: row.category.as_deref(),
+        cache: ReleaseDisplayCache::History(row.job_id),
     });
     history_item_from_display(
         row,
@@ -710,8 +713,7 @@ fn attention_for_history_row(row: &JobHistoryRow, state: QueueItemState) -> Opti
 fn history_state_from_row(row: &JobHistoryRow) -> QueueItemState {
     match row.status.to_ascii_lowercase().as_str() {
         "complete" => QueueItemState::Completed,
-        "cancelled" => QueueItemState::Failed,
-        "failed" => QueueItemState::Failed,
+        "cancelled" | "failed" | "partial" => QueueItemState::Failed,
         "paused" => QueueItemState::Paused,
         _ => QueueItemState::Failed,
     }

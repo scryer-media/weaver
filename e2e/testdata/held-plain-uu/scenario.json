@@ -1,0 +1,14 @@
+{
+  "slug": "held-plain-uu",
+  "title": "E2E.Test.held.plain.uu.2026-TESTGRP",
+  "description": "A small UUDeview multipart plain input for durable unanchored held-part pause/restart/resume; the restart harness holds first article IDs.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "held-plain.bin": "3165496ee72a3a3c30f7236cbbeea8eecd13756439aa07b52e1fbebf3a4351bd"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks"
+  ],
+  "exactOutputFiles": true
+}

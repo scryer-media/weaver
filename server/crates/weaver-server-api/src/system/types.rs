@@ -130,6 +130,7 @@ impl From<&DownloadBlockState> for DownloadBlock {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, SimpleObject)]
+#[graphql(complex)]
 pub struct Metrics {
     pub bytes_downloaded: u64,
     pub bytes_decoded: u64,
@@ -144,20 +145,6 @@ pub struct Metrics {
     pub write_buffered_bytes: u64,
     pub write_buffered_segments: u32,
     pub direct_write_evictions: u64,
-    /// Lifetime count of archive sets direct-store admitted. Together with
-    /// the two below this is the external answer to "did direct routing carry
-    /// this work, or quietly fall back?" — output bytes are identical either
-    /// way.
-    pub direct_sets_admitted: u64,
-    /// Lifetime count of sets that left direct routing (demoted); per-reason
-    /// detail is in the server logs.
-    pub direct_sets_demoted: u64,
-    /// Lifetime count of sets that completed without ever writing a source
-    /// volume to disk — direct-store's success case.
-    pub direct_sets_finalized_direct: u64,
-    /// Lifetime count of sets repaired in place without leaving direct
-    /// routing.
-    pub direct_sets_repaired_while_direct: u64,
     pub decode_pressure_soft_limit_bytes: u64,
     pub decode_pressure_hard_limit_bytes: u64,
     pub write_pressure_soft_limit_bytes: u64,
@@ -214,6 +201,42 @@ pub struct Metrics {
     pub decode_rate_mbps: f64,
 }
 
+// The direct-store set counters, kept in the schema at 0 for the clients that
+// still read them: the graph engine routes no set directly.
+// TODO(0.17.0): remove
+#[ComplexObject]
+impl Metrics {
+    /// Lifetime count of archive sets direct-store admitted. Together with
+    /// the two below this is the external answer to "did direct routing carry
+    /// this work, or quietly fall back?" — output bytes are identical either
+    /// way.
+    #[graphql(deprecation = "always 0 since the graph engine; removed in 0.17.0")]
+    async fn direct_sets_admitted(&self) -> u64 {
+        0
+    }
+
+    /// Lifetime count of sets that left direct routing (demoted); per-reason
+    /// detail is in the server logs.
+    #[graphql(deprecation = "always 0 since the graph engine; removed in 0.17.0")]
+    async fn direct_sets_demoted(&self) -> u64 {
+        0
+    }
+
+    /// Lifetime count of sets that completed without ever writing a source
+    /// volume to disk — direct-store's success case.
+    #[graphql(deprecation = "always 0 since the graph engine; removed in 0.17.0")]
+    async fn direct_sets_finalized_direct(&self) -> u64 {
+        0
+    }
+
+    /// Lifetime count of sets repaired in place without leaving direct
+    /// routing.
+    #[graphql(deprecation = "always 0 since the graph engine; removed in 0.17.0")]
+    async fn direct_sets_repaired_while_direct(&self) -> u64 {
+        0
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Enum)]
 pub enum DownloadPressureStateGql {
     #[default]
@@ -268,10 +291,6 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             write_buffered_bytes: m.write_buffered_bytes,
             write_buffered_segments: m.write_buffered_segments as u32,
             direct_write_evictions: m.direct_write_evictions,
-            direct_sets_admitted: m.direct_sets_admitted,
-            direct_sets_demoted: m.direct_sets_demoted,
-            direct_sets_finalized_direct: m.direct_sets_finalized_direct,
-            direct_sets_repaired_while_direct: m.direct_sets_repaired_while_direct,
             decode_pressure_soft_limit_bytes: m.decode_pressure_soft_limit_bytes,
             decode_pressure_hard_limit_bytes: m.decode_pressure_hard_limit_bytes,
             write_pressure_soft_limit_bytes: m.write_pressure_soft_limit_bytes,

@@ -1,0 +1,17 @@
+{
+  "slug": "sniff-trailing-names",
+  "title": "E2E.Test.Sniff.Trailing.Names.2026-TESTGRP",
+  "description": "ZIP metadata names signatureless raw Deflate and Brotli streams with trailing quote, underscore, or dots. Each decodes a signed TAR holding one safe final filename. Classification must trim the suffix decoration; signatures alone cannot recognize the compressed inputs.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "dots.bin": "3896de77851400c20fb1bd08f7f9dbb5e8ff3a91f2b4467b2de5ec3b244359c7",
+    "quote.bin": "3d6163e45d16df10a8bcceec8fb1b1fefd34d4dace93b561f8d9b518c9e59e34",
+    "underscore.bin": "2eb0cea602b50b982d3f8633eff4131fbf1419aabfac3ef1f818685cd9ec112a"
+  },
+  "exactOutputFiles": true,
+  "forbiddenOutputPaths": [
+    ".weaver-chunks",
+    "streams.zip"
+  ]
+}

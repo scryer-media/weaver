@@ -17,7 +17,7 @@ use weaver_server_core::jobs::{
 use weaver_server_core::operations::metrics::MetricsSnapshot;
 use weaver_server_core::{is_public_history_attribute_key, split_history_metadata};
 
-use super::release_display::{ReleaseDisplayInput, release_display_info};
+use super::release_display::{ReleaseDisplayCache, ReleaseDisplayInput, release_display_info};
 use crate::system::types::{DownloadBlock, Metrics};
 
 pub use weaver_server_core::CLIENT_REQUEST_ID_ATTRIBUTE_KEY;
@@ -92,7 +92,9 @@ impl From<&weaver_server_core::JobStatus> for QueueItemState {
             weaver_server_core::JobStatus::Moving => Self::Finalizing,
             weaver_server_core::JobStatus::PostProcessing => Self::PostProcessing,
             weaver_server_core::JobStatus::Complete => Self::Completed,
-            weaver_server_core::JobStatus::Failed { .. } => Self::Failed,
+            // Clients see a partial delivery as failed until they model it.
+            weaver_server_core::JobStatus::Partial
+            | weaver_server_core::JobStatus::Failed { .. } => Self::Failed,
             weaver_server_core::JobStatus::Paused => Self::Paused,
         }
     }
@@ -367,10 +369,80 @@ pub struct QueuePageInput {
     pub search: Option<String>,
     pub states: Option<Vec<QueueItemState>>,
     pub priorities: Option<Vec<QueuePriority>>,
+    /// The empty string names jobs with no category.
     pub categories: Option<Vec<String>>,
     /// Omit both fields to retain the scheduler's hot-download order.
     pub sort_field: Option<QueueSortField>,
     pub sort_direction: Option<QueueSortDirection>,
+}
+
+/// Which queued jobs a batch acts on: every job matching all the given
+/// fields. A selection with no filter names the whole queue only when it says
+/// so with `all: true`; otherwise it is refused.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, InputObject)]
+pub struct QueueSelectionInput {
+    pub search: Option<String>,
+    pub states: Option<Vec<QueueItemState>>,
+    pub priorities: Option<Vec<QueuePriority>>,
+    /// The empty string names jobs with no category.
+    pub categories: Option<Vec<String>>,
+    /// The whole queue, stated outright. Required when no filter is given.
+    pub all: Option<bool>,
+}
+
+/// The jobs a batch acts on: `ids` (at most 1,000 distinct) or a `selection`
+/// that names every queued job it matches. Give exactly one. A selection
+/// carries `expectedMatched`, the count the caller saw; when the queue now
+/// matches a different count the whole batch is refused with `CONFLICT`,
+/// whose `matched` extension carries the current count to confirm again.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, InputObject)]
+pub struct QueueBatchTarget {
+    pub ids: Option<Vec<u64>>,
+    pub selection: Option<QueueSelectionInput>,
+    pub expected_matched: Option<u32>,
+}
+
+/// One job a batch did not change, and why: `NOT_FOUND` for an id the queue
+/// does not hold, `CONFLICT` for a job that refuses the change now,
+/// `INTERNAL` otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct QueueBatchRefusal {
+    pub id: u64,
+    pub code: String,
+    pub message: String,
+}
+
+/// What a batch did: how many jobs it named, how many took the change, and
+/// each one that did not.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct QueueBatchResult {
+    pub matched: u32,
+    pub applied: u32,
+    pub refused: Vec<QueueBatchRefusal>,
+}
+
+/// Jobs matching the search and priorities, counted by category before the
+/// category and state filters apply. The empty string is no category.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct QueueCategoryCount {
+    pub category: String,
+    pub count: u32,
+}
+
+/// Jobs matching the search, priorities and categories, counted by state
+/// before the state filter applies.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct QueueStateCount {
+    pub state: QueueItemState,
+    pub count: u32,
+}
+
+/// Bytes still to fetch for one page row and every waiting or downloading
+/// job ahead of it in queue order, whatever the page's sort.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
+pub struct QueueEtaBytes {
+    pub id: u64,
+    pub bytes_through: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
@@ -379,6 +451,15 @@ pub struct QueuePage {
     pub total_count: u32,
     pub summary: QueueSummary,
     pub categories: Vec<String>,
+    pub category_counts: Vec<QueueCategoryCount>,
+    pub state_counts: Vec<QueueStateCount>,
+    /// Bytes still to fetch across queued and downloading jobs.
+    pub remaining_bytes: u64,
+    /// Size and fetched bytes of the jobs a time-left estimate counts.
+    pub eta_total_bytes: u64,
+    pub eta_downloaded_bytes: u64,
+    /// One entry per page row a time-left estimate counts.
+    pub eta_through: Vec<QueueEtaBytes>,
     pub latest_cursor: String,
 }
 
@@ -390,6 +471,9 @@ pub enum QueueEventKind {
     ItemAttention,
     ItemCompleted,
     ItemRemoved,
+    /// The global state changed, or many items changed at once: their
+    /// per-item progress and state changes are not sent one by one, so
+    /// re-read the queue. Arrivals, completions and failures are still sent.
     GlobalStateChanged,
 }
 
@@ -1006,6 +1090,7 @@ impl From<&weaver_server_core::JobInfo> for Job {
             job_name: &info.name,
             metadata: &info.metadata,
             category: info.category.as_deref(),
+            cache: ReleaseDisplayCache::Queue(info.job_id.0),
         });
 
         Self {
@@ -1078,7 +1163,8 @@ impl From<&weaver_server_core::JobStatus> for JobStatusGql {
             weaver_server_core::JobStatus::QueuedPostProcessing => Self::QueuedPostProcessing,
             weaver_server_core::JobStatus::PostProcessing => Self::PostProcessing,
             weaver_server_core::JobStatus::Complete => Self::Complete,
-            weaver_server_core::JobStatus::Failed { .. } => Self::Failed,
+            weaver_server_core::JobStatus::Partial
+            | weaver_server_core::JobStatus::Failed { .. } => Self::Failed,
             weaver_server_core::JobStatus::Paused => Self::Paused,
         }
     }
@@ -1180,6 +1266,7 @@ pub fn queue_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
         job_name: &info.name,
         metadata: &info.metadata,
         category: info.category.as_deref(),
+        cache: ReleaseDisplayCache::Queue(info.job_id.0),
     });
     queue_item_from_display(
         info,
@@ -1194,7 +1281,7 @@ pub fn queue_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
 
 // Projects just the display data needed by queue tables. Full release parsing
 // stays on detail/snapshot paths, where callers actually render it.
-pub(crate) fn queue_table_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
+pub fn queue_table_item_from_job(info: &weaver_server_core::JobInfo) -> QueueItem {
     let (client_request_id, attributes) = split_attributes(&info.metadata);
     let state = queue_item_state_from_job_info(info);
     let (original_title, display_title) = queue_display_titles_from_job(info);
@@ -1280,6 +1367,7 @@ pub fn queue_item_from_submission(
         job_name: &submitted.summary.name,
         metadata: &submitted.summary.metadata,
         category: submitted.summary.category.as_deref(),
+        cache: ReleaseDisplayCache::Queue(submitted.job_id.0),
     });
     QueueItem {
         id: submitted.job_id.0,
@@ -1410,39 +1498,57 @@ pub fn queue_summary(items: &[QueueItem], metrics: &MetricsSnapshot) -> QueueSum
     };
 
     for item in items {
-        match item.state {
-            QueueItemState::AwaitingQueueScripts => summary.active_items += 1,
-            QueueItemState::Queued => summary.queued_items += 1,
-            QueueItemState::Paused => summary.paused_items += 1,
-            QueueItemState::Failed => summary.failed_items += 1,
-            QueueItemState::Verifying => {
-                summary.active_items += 1;
-                summary.verifying_items += 1;
+        summary.count_state(item.state);
+    }
+
+    summary
+}
+
+impl QueueSummary {
+    /// An empty summary carrying the live download speed.
+    pub fn empty(metrics: &MetricsSnapshot) -> Self {
+        Self {
+            total_items: 0,
+            queued_items: 0,
+            active_items: 0,
+            paused_items: 0,
+            failed_items: 0,
+            total_bytes: 0,
+            downloaded_bytes: 0,
+            current_download_speed: metrics.current_download_speed,
+            verifying_items: 0,
+            repairing_items: 0,
+            extracting_items: 0,
+        }
+    }
+
+    /// Counts one job in `state`.
+    pub(crate) fn count_state(&mut self, state: QueueItemState) {
+        match state {
+            QueueItemState::AwaitingQueueScripts => self.active_items += 1,
+            QueueItemState::Queued => self.queued_items += 1,
+            QueueItemState::Paused => self.paused_items += 1,
+            QueueItemState::Failed => self.failed_items += 1,
+            QueueItemState::Verifying | QueueItemState::Checking => {
+                self.active_items += 1;
+                self.verifying_items += 1;
             }
             QueueItemState::Repairing => {
-                summary.active_items += 1;
-                summary.repairing_items += 1;
+                self.active_items += 1;
+                self.repairing_items += 1;
             }
             QueueItemState::Extracting => {
-                summary.active_items += 1;
-                summary.extracting_items += 1;
+                self.active_items += 1;
+                self.extracting_items += 1;
             }
             QueueItemState::Downloading
             | QueueItemState::FetchingRepairData
             | QueueItemState::FinalizingDownload
             | QueueItemState::Finalizing
-            | QueueItemState::PostProcessing => {
-                summary.active_items += 1;
-            }
-            QueueItemState::Checking => {
-                summary.active_items += 1;
-                summary.verifying_items += 1;
-            }
+            | QueueItemState::PostProcessing => self.active_items += 1,
             QueueItemState::Completed => {}
         }
     }
-
-    summary
 }
 
 pub fn queue_event_from_record(id: i64, record: PersistedQueueEvent) -> QueueEvent {
@@ -1559,14 +1665,58 @@ fn wait_reason_for_post_state(
     }
 }
 
+// The fields the queue state is read from, borrowed from a job or a queue
+// row's view, so classifying a row copies nothing.
+#[derive(Clone, Copy)]
+pub struct QueueStateFacts<'a> {
+    pub status: &'a weaver_server_core::JobStatus,
+    pub run_state: weaver_server_core::RunState,
+    pub download_state: weaver_server_core::DownloadState,
+    pub post_state: weaver_server_core::PostState,
+    pub download_wait_reason: Option<&'a str>,
+    pub fetching_repair_data: bool,
+    pub finalizing_download: bool,
+}
+
+impl<'a> QueueStateFacts<'a> {
+    pub fn of_job(info: &'a weaver_server_core::JobInfo) -> Self {
+        Self {
+            status: &info.status,
+            run_state: info.run_state,
+            download_state: info.download_state,
+            post_state: info.post_state,
+            download_wait_reason: info.download_wait_reason.as_deref(),
+            fetching_repair_data: info.fetching_repair_data,
+            finalizing_download: info.finalizing_download,
+        }
+    }
+
+    pub fn of_view(view: &'a weaver_server_core::pipeline::queue::paging::JobView<'_>) -> Self {
+        let job = view.job();
+        Self {
+            status: view.status(),
+            run_state: view.run_state(),
+            download_state: view.download_state(),
+            post_state: job.post_state,
+            download_wait_reason: view.download_wait_reason(),
+            fetching_repair_data: job.fetching_repair_data,
+            finalizing_download: job.finalizing_download,
+        }
+    }
+}
+
 // Resolve the user-facing queue state from the authoritative runtime lanes.
 // Active download work is always primary; post-processing and completion-tail
 // overlays become primary only after that lane finishes.
 pub fn queue_item_state_from_job_info(info: &weaver_server_core::JobInfo) -> QueueItemState {
-    resolve_queue_item_state(info, true)
+    queue_item_state(QueueStateFacts::of_job(info))
 }
 
-fn terminal_queue_item_state(info: &weaver_server_core::JobInfo) -> Option<QueueItemState> {
+pub fn queue_item_state(facts: QueueStateFacts<'_>) -> QueueItemState {
+    resolve_queue_item_state(facts, true)
+}
+
+fn terminal_queue_item_state(info: QueueStateFacts<'_>) -> Option<QueueItemState> {
     if matches!(info.run_state, weaver_server_core::RunState::Paused) {
         return Some(QueueItemState::Paused);
     }
@@ -1584,18 +1734,29 @@ fn terminal_queue_item_state(info: &weaver_server_core::JobInfo) -> Option<Queue
         weaver_server_core::DownloadState::Complete
     ) && matches!(info.post_state, weaver_server_core::PostState::Completed)
     {
-        return Some(QueueItemState::Completed);
+        // The lanes say the job delivered; its status says whether whole,
+        // and clients read a partial delivery as failed.
+        return Some(match QueueItemState::from(info.status) {
+            QueueItemState::Failed => QueueItemState::Failed,
+            _ => QueueItemState::Completed,
+        });
     }
 
     None
 }
 
 fn resolve_queue_item_state(
-    info: &weaver_server_core::JobInfo,
+    info: QueueStateFacts<'_>,
     include_finalization_states: bool,
 ) -> QueueItemState {
     if let Some(state) = terminal_queue_item_state(info) {
         return state;
+    }
+
+    if info.download_wait_reason == Some("nzb_slot")
+        && info.run_state != weaver_server_core::RunState::Paused
+    {
+        return QueueItemState::Queued;
     }
 
     // The delivery tail runs strictly after the download lane settles: the
@@ -1668,7 +1829,7 @@ fn resolve_queue_item_state(
         | weaver_server_core::PostState::QueuedExtract
         | weaver_server_core::PostState::QueuedPostProcessing => QueueItemState::Queued,
         weaver_server_core::PostState::Idle | weaver_server_core::PostState::WaitingForVolumes => {
-            QueueItemState::from(&info.status)
+            QueueItemState::from(info.status)
         }
     }
 }
@@ -1678,16 +1839,25 @@ fn resolve_queue_item_state(
 pub fn queue_item_state_from_job_info_for_download_accounting(
     info: &weaver_server_core::JobInfo,
 ) -> QueueItemState {
+    queue_item_state_for_download_accounting(QueueStateFacts::of_job(info))
+}
+
+pub fn queue_item_state_for_download_accounting(info: QueueStateFacts<'_>) -> QueueItemState {
     // The control and terminal lanes rule here as everywhere: a started
     // download the global pause holds is Paused, not active.
     if let Some(state) = terminal_queue_item_state(info) {
         return state;
     }
+    if info.download_wait_reason == Some("nzb_slot")
+        && info.run_state != weaver_server_core::RunState::Paused
+    {
+        return QueueItemState::Queued;
+    }
     // A started download that holds no lane right now has still started for
     // the counters, unless propagation holds it.
-    if info.status == weaver_server_core::JobStatus::Downloading
+    if *info.status == weaver_server_core::JobStatus::Downloading
         && info.download_state == weaver_server_core::DownloadState::Queued
-        && info.download_wait_reason.as_deref()
+        && info.download_wait_reason
             != Some(weaver_server_core::jobs::handle::PROPAGATION_WAIT_REASON)
     {
         return QueueItemState::Downloading;

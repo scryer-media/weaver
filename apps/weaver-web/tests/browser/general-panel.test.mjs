@@ -44,6 +44,26 @@ async function assertNeverDirty(page) {
   assert.equal(actions, null);
 }
 
+test("the NZB limit defaults to ten and saves only its positive integer field", async () => {
+  const { page, errors } = await open();
+  try {
+    const limit = page.getByRole("spinbutton", { name: "Maximum concurrent NZBs", exact: true });
+    await limit.waitFor();
+    assert.equal(await limit.inputValue(), "10");
+    assert.equal(await limit.getAttribute("min"), "1");
+    assert.equal(await limit.getAttribute("step"), "1");
+    await limit.fill("3");
+    await limit.press("Enter");
+    await sentCount(page, "UpdateSettings", 1);
+    assert.deepEqual(await sent(page, "UpdateSettings"), [{ input: { maxConcurrentNzbs: 3 } }]);
+    await page.locator("#status").filter({ hasText: /^clean$/ }).waitFor();
+    await assertNeverDirty(page);
+    assert.deepEqual(errors, []);
+  } finally {
+    await page.close();
+  }
+});
+
 test("a toggle, a select and a committed number each save on their own, and the top bar never turns dirty", async () => {
   const { page, errors } = await open();
   try {

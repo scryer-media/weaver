@@ -697,8 +697,11 @@ fn history_query_plan(
         for state in states {
             match state {
                 QueueItemState::Completed => statuses.push("complete".to_string()),
+                // Clients see a partial delivery as failed, so asking for
+                // failed rows asks for partial ones too.
                 QueueItemState::Failed => {
                     statuses.push("failed".to_string());
+                    statuses.push("partial".to_string());
                     statuses.push("cancelled".to_string());
                 }
                 QueueItemState::Paused => statuses.push("paused".to_string()),
@@ -998,6 +1001,7 @@ fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
         total_files: 0,
         completed_files: 0,
         remaining_par_files: 0,
+        file_remaining_bytes: Vec::new(),
         password: None,
         category: row.category.clone(),
         metadata,

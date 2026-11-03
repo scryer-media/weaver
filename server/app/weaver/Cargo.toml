@@ -48,6 +48,10 @@ async-graphql = { workspace = true }
 async-graphql-axum = { workspace = true, default-features = false }
 reqwest = { workspace = true }
 quick-xml = { workspace = true, default-features = false }
+# The diagnostics filter: one automaton over its stand-in table, and the
+# SHA-256 fingerprint a provider's pinned TLS certificate is written as.
+aho-corasick = { workspace = true }
+sha2 = { workspace = true }
 libc = { workspace = true }
 rayon = { workspace = true, default-features = false }
 rust-embed = { workspace = true, default-features = false }
@@ -63,7 +67,7 @@ bzip2 = { workspace = true }
 tempfile = { workspace = true }
 
 [build-dependencies]
-embed-resource = "3.0.11"
+embed-resource = "3.0.12"
 
 [dev-dependencies]
 weaver-server-core = { path = "../../crates/weaver-server-core", default-features = false, features = ["test-support"] }
@@ -73,15 +77,15 @@ tower = { workspace = true, default-features = false }
 tokio = { workspace = true, features = ["test-util"] }
 # A real client for the GraphQL socket tests: an upgrade only happens on a live
 # connection, never through a one-shot router call.
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"] }
 
 # Every target but Windows allocates through jemalloc; see
 # `allocator_jemalloc`. jemalloc fixes its page size at compile time, so the
 # release build sets `JEMALLOC_SYS_WITH_LG_PAGE` for each target it
 # cross-compiles.
 [target.'cfg(not(target_os = "windows"))'.dependencies]
-tikv-jemallocator = { version = "0.6", default-features = false }
-tikv-jemalloc-sys = { version = "0.6", default-features = false }
+tikv-jemallocator = { version = "0.7", default-features = false }
+tikv-jemalloc-sys = { version = "0.7", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 # Windows has no jemalloc, and its system heap serializes threaded allocation

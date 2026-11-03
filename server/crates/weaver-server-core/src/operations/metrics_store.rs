@@ -1034,11 +1034,13 @@ pub struct JobStatusCounts([f64; NUM_JOB_STATUS_METRICS]);
 
 impl Default for JobStatusCounts {
     fn default() -> Self {
-        Self([0.0; NUM_JOB_STATUS_METRICS])
+        Self::EMPTY
     }
 }
 
 impl JobStatusCounts {
+    pub const EMPTY: Self = Self([0.0; NUM_JOB_STATUS_METRICS]);
+
     pub fn from_statuses<'a>(statuses: impl IntoIterator<Item = &'a JobStatus>) -> Self {
         Self::default().with_statuses(statuses)
     }
@@ -1212,7 +1214,9 @@ fn job_status_index(status: &JobStatus) -> Option<usize> {
         JobStatus::Moving => "moving",
         JobStatus::QueuedPostProcessing => "queued_post_processing",
         JobStatus::PostProcessing => "post_processing",
-        JobStatus::Failed { .. } => "failed",
+        // The history chunks persist a fixed-width status array, so a new
+        // key would orphan every stored chunk; clients read Partial as failed.
+        JobStatus::Failed { .. } | JobStatus::Partial => "failed",
         JobStatus::Complete => "complete",
     };
     JOB_STATUS_KEYS

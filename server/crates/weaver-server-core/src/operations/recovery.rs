@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use rayon::prelude::*;
 use tracing::{error, info, warn};
 
 use crate::Database;
@@ -21,6 +22,52 @@ pub struct RecoveredServerState {
     pub initial_history: Vec<JobInfo>,
     pub to_restore: Vec<RestoreCandidate>,
     pub initial_global_paused: bool,
+    // What recovery leaves until the server answers; `spawn` runs it once.
+    pub after_boot: AfterBoot,
+}
+
+// The start-up housekeeping that nothing serving a request waits on: the
+// rows jobs left in the active tables after their own row went. It looks
+// only at jobs numbered below the first number this start hands out, so a
+// job created while it runs is never one it removes rows of.
+pub struct AfterBoot {
+    db: Database,
+    below: crate::jobs::ids::JobId,
+}
+
+impl AfterBoot {
+    pub fn spawn(self) -> tokio::task::JoinHandle<()> {
+        tokio::task::spawn_blocking(move || {
+            self.run();
+        })
+    }
+
+    pub(crate) fn run(self) -> Option<crate::jobs::repository::OrphanActiveStateCounts> {
+        let started = std::time::Instant::now();
+        match self.db.prune_orphan_active_state(self.below) {
+            Ok(counts) => {
+                info!(
+                    active_file_progress = counts.active_file_progress,
+                    active_files = counts.active_files,
+                    active_file_identities = counts.active_file_identities,
+                    active_extracted = counts.active_extracted,
+                    active_detected_archives = counts.active_detected_archives,
+                    graph_checkpoint = counts.graph_checkpoint,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "removed orphaned active-state rows after start-up"
+                );
+                Some(counts)
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "failed to remove orphaned active-state rows after start-up; the next start tries again"
+                );
+                None
+            }
+        }
+    }
 }
 
 pub struct RestoreCandidate {
@@ -54,32 +101,8 @@ pub async fn recover_server_state(
         .unwrap_or_else(|_| (max_id + 1).max(10_000));
     crate::ingest::init_job_counter(next_job_id);
 
-    match db.prune_orphan_active_state() {
-        Ok(counts) if counts.total_removed() > 0 => {
-            info!(
-                active_file_progress = counts.active_file_progress,
-                active_files = counts.active_files,
-                active_par2 = counts.active_par2,
-                active_par2_files = counts.active_par2_files,
-                active_extracted = counts.active_extracted,
-                active_failed_extractions = counts.active_failed_extractions,
-                active_extraction_chunks = counts.active_extraction_chunks,
-                active_archive_headers = counts.active_archive_headers,
-                active_rar_volume_facts = counts.active_rar_volume_facts,
-                active_detected_archives = counts.active_detected_archives,
-                active_volume_status = counts.active_volume_status,
-                active_rar_verified_suspect = counts.active_rar_verified_suspect,
-                active_direct_coverage = counts.active_direct_coverage,
-                "removed orphaned active-state rows before recovery"
-            );
-        }
-        Ok(_) => {}
-        Err(error) => {
-            warn!(error = %error, "failed to cleanup orphaned active-state rows before recovery");
-        }
-    }
-
-    let active_jobs = db.load_active_jobs().unwrap_or_default();
+    // Each job's rows alone: its file rows are read as it installs.
+    let active_jobs = db.load_active_job_rows()?;
     let mut referenced_intermediate_dirs: HashSet<PathBuf> = active_jobs
         .values()
         .filter(|recovered| recovered.output_dir.starts_with(intermediate_dir))
@@ -90,153 +113,170 @@ pub async fn recover_server_state(
     let mut initial_history = Vec::new();
     let mut to_restore = Vec::new();
 
-    for (job_id, recovered) in active_jobs {
-        let is_finished = matches!(
-            recovered.status.as_str(),
-            "complete" | "failed" | "cancelled"
-        );
+    let (finished, in_progress): (Vec<_>, Vec<_>) =
+        active_jobs.into_iter().partition(|(_, recovered)| {
+            matches!(
+                recovered.status.as_str(),
+                "complete" | "partial" | "failed" | "cancelled"
+            )
+        });
 
-        if is_finished {
-            let name = recovered
-                .nzb_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Unknown")
-                .to_string();
-            let status =
-                job_status_from_persisted_str(&recovered.status, recovered.error.as_deref());
-            let (download_state, post_state, run_state) =
-                runtime_lanes_from_status_snapshot(&status);
-            archive_unfinished_terminal_job(db, job_id, &recovered, &name, &status);
-            initial_history.push(JobInfo {
-                job_id,
-                job_hash: Some(recovered.nzb_hash),
-                name,
-                error: if let JobStatus::Failed { error } = &status {
-                    Some(error.clone())
-                } else {
-                    None
-                },
-                download_wait_reason: None,
-                download_retry_at_epoch_ms: None,
-                status,
-                download_state,
-                finalizing_download: false,
-                fetching_repair_data: false,
-                post_state,
-                run_state,
-                progress: 1.0,
-                total_bytes: 0,
-                downloaded_bytes: 0,
-                optional_recovery_bytes: 0,
-                optional_recovery_downloaded_bytes: 0,
-                phase_progress: Vec::new(),
-                failed_bytes: 0,
-                health: 1000,
-                terminal_discards: Vec::new(),
-                total_files: 0,
-                completed_files: 0,
-                remaining_par_files: 0,
-                password: None,
-                category: recovered.category,
-                metadata: recovered.metadata,
-                output_dir: Some(recovered.output_dir.display().to_string()),
-                // Recovered from the active-job snapshot, which carries no
-                // attribution: the ledger lives with the finished job's
-                // history row.
-                server_attribution: Vec::new(),
-                created_at_epoch_ms: recovered.created_at as f64 * 1000.0,
-            });
-        } else {
-            // In-progress job - need to re-parse NZB and restore.
-            let parse_result = recovered
-                .nzb_zstd
-                .as_deref()
+    for (job_id, recovered) in finished {
+        let name = recovered
+            .nzb_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Unknown")
+            .to_string();
+        let status = job_status_from_persisted_str(&recovered.status, recovered.error.as_deref());
+        let (download_state, post_state, run_state) = runtime_lanes_from_status_snapshot(&status);
+        archive_unfinished_terminal_job(db, job_id, &recovered, &name, &status);
+        initial_history.push(JobInfo {
+            job_id,
+            job_hash: Some(recovered.nzb_hash),
+            name,
+            error: if let JobStatus::Failed { error } = &status {
+                Some(error.clone())
+            } else {
+                None
+            },
+            download_wait_reason: None,
+            download_retry_at_epoch_ms: None,
+            status,
+            download_state,
+            finalizing_download: false,
+            fetching_repair_data: false,
+            post_state,
+            run_state,
+            progress: 1.0,
+            total_bytes: 0,
+            downloaded_bytes: 0,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            phase_progress: Vec::new(),
+            failed_bytes: 0,
+            health: 1000,
+            terminal_discards: Vec::new(),
+            total_files: 0,
+            completed_files: 0,
+            remaining_par_files: 0,
+            file_remaining_bytes: Vec::new(),
+            password: None,
+            category: recovered.category,
+            metadata: recovered.metadata,
+            output_dir: Some(recovered.output_dir.display().to_string()),
+            // Recovered from the active-job snapshot, which carries no
+            // attribution: the ledger lives with the finished job's
+            // history row.
+            server_attribution: Vec::new(),
+            created_at_epoch_ms: recovered.created_at as f64 * 1000.0,
+        });
+    }
+
+    // In-progress jobs: each NZB is read and parsed on its own, so a worker
+    // holds one job's article lists at a time, and only the job's files are
+    // kept. The jobs are spread over the cores, as the parse is most of a
+    // start. The install reads the lists back from the same stored NZB, and
+    // a job waiting its turn lets them go again. A read that fails stops the
+    // start, as the read of every row did; only a missing or unreadable NZB
+    // archives the job.
+    let parsed = in_progress
+        .par_iter()
+        .map(|(job_id, recovered)| {
+            let missing = || {
+                ingest::PersistedNzbError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("persisted NZB missing from database for job {}", job_id.0),
+                ))
+            };
+            Ok(db
+                .load_active_job_persisted_nzb(*job_id)?
+                .and_then(|(_, nzb_zstd)| nzb_zstd)
                 .filter(|nzb_zstd| !nzb_zstd.is_empty())
-                .ok_or_else(|| {
-                    ingest::PersistedNzbError::Io(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("persisted NZB missing from database for job {}", job_id.0),
-                    ))
-                })
-                .and_then(ingest::parse_persisted_nzb_bytes);
-
-            match parse_result {
-                Ok(nzb) => {
+                .ok_or_else(missing)
+                .and_then(|nzb_zstd| ingest::parse_persisted_nzb_bytes(&nzb_zstd))
+                .map(|nzb| {
                     let mut spec = ingest::nzb_to_spec(
                         &nzb,
                         &recovered.nzb_path,
-                        recovered.category,
-                        recovered.metadata,
+                        recovered.category.clone(),
+                        recovered.metadata.clone(),
                     );
-                    // Apply a persisted password override on top of the
-                    // NZB-derived password ('' = explicitly none).
-                    match recovered.password_override.as_deref() {
-                        None => {}
-                        Some("") => spec.password = None,
-                        Some(password) => spec.password = Some(password.to_string()),
-                    }
-                    let status = job_status_from_persisted_str(
-                        &recovered.status,
-                        recovered.error.as_deref(),
-                    );
-                    let download_state = recovered
-                        .download_state
-                        .as_deref()
-                        .and_then(DownloadState::parse);
-                    let post_state = recovered.post_state.as_deref().and_then(PostState::parse);
-                    let run_state = recovered.run_state.as_deref().and_then(RunState::parse);
-                    let paused_resume_status = recovered
-                        .paused_resume_status
-                        .as_deref()
-                        .map(|status| job_status_from_persisted_str(status, None));
-                    let paused_resume_download_state = recovered
-                        .paused_resume_download_state
-                        .as_deref()
-                        .and_then(DownloadState::parse);
-                    let paused_resume_post_state = recovered
-                        .paused_resume_post_state
-                        .as_deref()
-                        .and_then(PostState::parse);
-                    to_restore.push(RestoreCandidate {
+                    drop(nzb);
+                    let summaries = spec.drop_article_lists();
+                    (spec, summaries)
+                }))
+        })
+        .collect::<Vec<Result<_, crate::StateError>>>();
+
+    for ((job_id, recovered), parsed) in in_progress.into_iter().zip(parsed) {
+        match parsed? {
+            Ok((mut spec, summaries)) => {
+                let runtime = crate::pipeline::StoredRuntimeValues::of(&recovered);
+                // Apply a persisted password override on top of the
+                // NZB-derived password ('' = explicitly none).
+                match recovered.password_override.as_deref() {
+                    None => {}
+                    Some("") => spec.password = None,
+                    Some(password) => spec.password = Some(password.to_string()),
+                }
+                let status =
+                    job_status_from_persisted_str(&recovered.status, recovered.error.as_deref());
+                let download_state = recovered
+                    .download_state
+                    .as_deref()
+                    .and_then(DownloadState::parse);
+                let post_state = recovered.post_state.as_deref().and_then(PostState::parse);
+                let run_state = recovered.run_state.as_deref().and_then(RunState::parse);
+                let paused_resume_status = recovered
+                    .paused_resume_status
+                    .as_deref()
+                    .map(|status| job_status_from_persisted_str(status, None));
+                let paused_resume_download_state = recovered
+                    .paused_resume_download_state
+                    .as_deref()
+                    .and_then(DownloadState::parse);
+                let paused_resume_post_state = recovered
+                    .paused_resume_post_state
+                    .as_deref()
+                    .and_then(PostState::parse);
+                to_restore.push(RestoreCandidate {
+                    job_id,
+                    queue_position: recovered.queue_position,
+                    request: RestoreJobRequest {
                         job_id,
-                        queue_position: recovered.queue_position,
-                        request: RestoreJobRequest {
-                            job_id,
-                            job_hash: recovered.nzb_hash,
-                            spec,
-                            complete_files: recovered.complete_files,
-                            file_progress: recovered.file_progress,
-                            detected_archives: recovered.detected_archives,
-                            file_identities: recovered.file_identities,
-                            extracted_members: recovered.extracted_members,
-                            status,
-                            download_state,
-                            post_state,
-                            run_state,
-                            queued_repair_at_epoch_ms: recovered.queued_repair_at_epoch_ms,
-                            queued_extract_at_epoch_ms: recovered.queued_extract_at_epoch_ms,
-                            paused_resume_status,
-                            paused_resume_download_state,
-                            paused_resume_post_state,
-                            working_dir: recovered.output_dir,
-                        },
-                    });
-                }
-                Err(ingest::PersistedNzbError::Parse(e)) => {
-                    warn!(
-                        job_id = job_id.0,
-                        error = %e,
-                        "failed to parse NZB for recovered job"
-                    );
-                }
-                Err(ingest::PersistedNzbError::Io(e)) => {
-                    warn!(
-                        job_id = job_id.0,
-                        error = %e,
-                        "failed to read NZB for recovered job"
-                    );
-                }
+                        job_hash: recovered.nzb_hash,
+                        spec,
+                        detected_archives: recovered.detected_archives,
+                        file_identities: recovered.file_identities,
+                        status,
+                        download_state,
+                        post_state,
+                        run_state,
+                        queued_repair_at_epoch_ms: recovered.queued_repair_at_epoch_ms,
+                        queued_extract_at_epoch_ms: recovered.queued_extract_at_epoch_ms,
+                        paused_resume_status,
+                        paused_resume_download_state,
+                        paused_resume_post_state,
+                        working_dir: recovered.output_dir,
+                        restart: Some(crate::RestartRead { runtime, summaries }),
+                    },
+                });
+            }
+            Err(error) => {
+                // A skipped owner would never enter the runtime queue and
+                // could therefore never release its admission, so archive
+                // it before dispatch starts. An archive that fails leaves
+                // the row active, and the next start tries it again.
+                let name = recovered
+                    .nzb_path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("Unknown");
+                let status = JobStatus::Failed {
+                    error: format!("Cannot recover persisted NZB: {error}"),
+                };
+                archive_unfinished_terminal_job(db, job_id, &recovered, name, &status);
             }
         }
     }
@@ -299,6 +339,7 @@ pub async fn recover_server_state(
                     total_files: 0,
                     completed_files: 0,
                     remaining_par_files: 0,
+                    file_remaining_bytes: Vec::new(),
                     password: None,
                     category: row.category,
                     metadata: row
@@ -365,6 +406,10 @@ pub async fn recover_server_state(
         initial_history,
         to_restore,
         initial_global_paused,
+        after_boot: AfterBoot {
+            db: db.clone(),
+            below: crate::jobs::ids::JobId(next_job_id),
+        },
     })
 }
 
@@ -381,6 +426,9 @@ pub async fn recover_server_state(
 // The active row is all that survives, and it carries no byte counters, so the
 // synthesized row states what is known and leaves the rest at the same zeros
 // the recovered runtime entry already reports rather than inventing figures.
+//
+// One row that cannot be written never stops start-up: the failure is logged,
+// the row stays active, and the next start tries it again.
 fn archive_unfinished_terminal_job(
     db: &Database,
     job_id: crate::jobs::ids::JobId,
@@ -388,27 +436,35 @@ fn archive_unfinished_terminal_job(
     name: &str,
     status: &JobStatus,
 ) {
+    if let Err(error) = try_archive_unfinished_terminal_job(db, job_id, recovered, name, status) {
+        warn!(
+            job_id = job_id.0,
+            error = %error,
+            "failed to archive a job during startup recovery; its row stays active until the next start"
+        );
+    }
+}
+
+fn try_archive_unfinished_terminal_job(
+    db: &Database,
+    job_id: crate::jobs::ids::JobId,
+    recovered: &crate::jobs::record::RecoveredJob,
+    name: &str,
+    status: &JobStatus,
+) -> Result<(), crate::StateError> {
     // An archive is an upsert, so never run one over a row that already exists:
     // a real history row holds the figures this one cannot reconstruct.
-    match db.get_job_history(job_id.0) {
-        Ok(Some(_)) => return,
-        Ok(None) => {}
-        Err(error) => {
-            warn!(
-                job_id = job_id.0,
-                error = %error,
-                "failed to check history before archiving a terminal active job"
-            );
-            return;
-        }
+    if db.get_job_history(job_id.0)?.is_some() {
+        return db.delete_active_job(job_id);
     }
 
     let (status_str, error_message) = match status {
         JobStatus::Complete => ("complete", None),
+        JobStatus::Partial => ("partial", None),
         JobStatus::Failed { error } => ("failed", Some(error.clone())),
         // Anything else reaching this branch is a status the active row calls
         // finished but the runtime does not model as terminal; leave it alone.
-        _ => return,
+        _ => return Ok(()),
     };
     let completed_at = (crate::jobs::epoch_ms_now() / 1_000.0) as i64;
     let row = crate::JobHistoryRow {
@@ -432,18 +488,13 @@ fn archive_unfinished_terminal_job(
         metadata: crate::jobs::persistence::metadata_json(&recovered.metadata).unwrap_or(None),
         server_attribution: None,
     };
-    match db.archive_job(job_id, &row) {
-        Ok(()) => info!(
-            job_id = job_id.0,
-            status = status_str,
-            "archived a job that stopped between its terminal status and its history row"
-        ),
-        Err(error) => warn!(
-            job_id = job_id.0,
-            error = %error,
-            "failed to archive a job that stopped before its history row"
-        ),
-    }
+    db.archive_job(job_id, &row)?;
+    info!(
+        job_id = job_id.0,
+        status = status_str,
+        "archived a job during startup recovery"
+    );
+    Ok(())
 }
 
 fn cleanup_unreferenced_intermediate_dirs(
@@ -484,7 +535,7 @@ mod tests {
     use crate::StateError;
     use crate::jobs::working_dir::working_dir_marker_path;
     use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
-    use crate::{ActiveJob, Database, JobHistoryRow, JobId, NzbFileId};
+    use crate::{ActiveJob, Database, JobHistoryRow, JobId};
 
     fn sample_active_job(id: u64, nzb_path: PathBuf, output_dir: PathBuf) -> ActiveJob {
         ActiveJob {
@@ -548,6 +599,79 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_archives_unreadable_nzb_owners_before_dispatch() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        for (id, bytes) in [(1, Vec::new()), (2, vec![1, 2, 3])] {
+            let mut job = sample_active_job(
+                id,
+                temp.path().join(format!("job-{id}.nzb")),
+                temp.path().join(format!("job-{id}")),
+            );
+            job.nzb_zstd = bytes;
+            db.create_active_job(&job).unwrap();
+            db.set_nzb_admitted(JobId(id), true).unwrap();
+        }
+        let recovered = recover_server_state(&db, temp.path(), &temp.path().join("intermediate"))
+            .await
+            .unwrap();
+        assert!(recovered.to_restore.is_empty());
+        assert_eq!(recovered.initial_history.len(), 2);
+        for id in [JobId(1), JobId(2)] {
+            assert!(recovered.initial_history.iter().any(|job| {
+                job.job_id == id && matches!(job.status, crate::JobStatus::Failed { .. })
+            }));
+        }
+        assert!(db.load_nzb_admissions().unwrap().is_empty());
+        assert!(db.load_active_jobs().unwrap().is_empty());
+        for id in [1, 2] {
+            let history = db.get_job_history(id).unwrap().unwrap();
+            assert_eq!(history.status, "failed");
+            assert!(
+                history
+                    .error_message
+                    .unwrap()
+                    .contains("Cannot recover persisted NZB")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_archive_failure_keeps_starting_and_retries_next_start() {
+        for terminal in [false, true] {
+            let temp = TempDir::new().unwrap();
+            let db = Database::open_in_memory().unwrap();
+            let mut job =
+                sample_active_job(1, temp.path().join("job.nzb"), temp.path().join("job"));
+            if terminal {
+                job.status = "complete";
+            } else {
+                job.nzb_zstd.clear();
+            }
+            db.create_active_job(&job).unwrap();
+            db.set_nzb_admitted(JobId(1), true).unwrap();
+            execute_sql(
+                &db,
+                "CREATE TRIGGER reject_recovery_history BEFORE INSERT ON job_history
+                 BEGIN SELECT RAISE(ABORT, 'injected archive failure'); END",
+                vec![],
+            );
+            recover_server_state(&db, temp.path(), &temp.path().join("intermediate"))
+                .await
+                .unwrap();
+            assert!(db.load_nzb_admissions().unwrap().contains(&JobId(1)));
+            assert!(db.load_active_jobs().unwrap().contains_key(&JobId(1)));
+            assert!(db.get_job_history(1).unwrap().is_none());
+            execute_sql(&db, "DROP TRIGGER reject_recovery_history", vec![]);
+            recover_server_state(&db, temp.path(), &temp.path().join("intermediate"))
+                .await
+                .unwrap();
+            assert!(db.load_nzb_admissions().unwrap().is_empty());
+            assert!(db.get_job_history(1).unwrap().is_some());
+        }
     }
 
     #[tokio::test]
@@ -618,20 +742,142 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(count_rows(&db, "active_file_progress", 100), 0);
         assert!(active_output_dir.exists());
         assert!(history_output_dir.exists());
         assert!(!orphan_output_dir.exists());
         assert!(unrelated_output_dir.exists());
         assert_eq!(recovered.to_restore.len(), 1);
+
+        // The orphaned rows are left for after the server answers, and that
+        // pass, which runs once, removes them.
+        assert_eq!(count_rows(&db, "active_file_progress", 100), 1);
+        let counts = recovered.after_boot.run().expect("prune runs");
+        assert_eq!(counts.active_file_progress, 1);
+        assert_eq!(counts.total_removed(), 1);
+        assert_eq!(count_rows(&db, "active_file_progress", 100), 0);
+        assert_eq!(count_rows(&db, "active_files", 1), 1);
+    }
+
+    // A history retry reuses the job's id, which sits below the after-boot
+    // prune's floor, so it can land before the prune reaches that id. The
+    // retry clears what the earlier run left in the active tables itself.
+    #[tokio::test]
+    async fn a_retry_before_the_prune_starts_without_the_earlier_runs_rows() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        db.insert_job_history(&JobHistoryRow {
+            job_id: 2,
+            job_hash: None,
+            name: "job-2".into(),
+            status: "failed".into(),
+            error_message: None,
+            total_bytes: 10,
+            downloaded_bytes: 0,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 10,
+            health: 0,
+            category: None,
+            output_dir: None,
+            nzb_path: None,
+            created_at: 1,
+            completed_at: 2,
+            metadata: None,
+            server_attribution: None,
+        })
+        .unwrap();
+        execute_sql(
+            &db,
+            "INSERT INTO active_files (job_id, file_index, filename, md5)
+             VALUES ({}, 0, 'stale', x'00112233445566778899aabbccddeeff')",
+            vec![SqlArg::I64(2)],
+        );
+        execute_sql(
+            &db,
+            "INSERT INTO active_file_progress (job_id, file_index, coverage)
+             VALUES ({}, 0, x'00')",
+            vec![SqlArg::I64(2)],
+        );
+        let recovered = recover_server_state(&db, temp.path(), &temp.path().join("intermediate"))
+            .await
+            .unwrap();
+        // The retry lands first: same id, new active row.
+        let retry = sample_active_job(2, temp.path().join("job-2.nzb"), temp.path().join("job-2"));
         assert!(
-            recovered.to_restore[0]
-                .request
-                .complete_files
-                .contains(&NzbFileId {
-                    job_id: JobId(1),
+            db.materialize_admission(&retry, &[], None, None, true)
+                .unwrap()
+        );
+        assert_eq!(count_rows(&db, "active_files", 2), 0);
+        assert_eq!(count_rows(&db, "active_file_progress", 2), 0);
+        recovered.after_boot.run().expect("prune runs");
+        assert_eq!(count_rows(&db, "active_jobs", 2), 1);
+    }
+
+    // Recovery reads a job's row and NZB, never its file rows: those are
+    // read as the job installs. The queue's rows come back whole and in
+    // order, with the names and sizes their NZBs give.
+    #[tokio::test]
+    async fn recovery_reads_no_file_rows() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        for id in 1..=3 {
+            let mut job = sample_active_job(
+                id,
+                temp.path().join(format!("job-{id}.nzb")),
+                temp.path().join(format!("job-{id}")),
+            );
+            if id == 2 {
+                job.status = "downloading";
+                job.download_state = "downloading";
+            }
+            db.create_active_job(&job).unwrap();
+            db.save_file_identities(
+                JobId(id),
+                &[crate::jobs::ActiveFileIdentity {
                     file_index: 0,
-                })
+                    source_filename: "sample".to_string(),
+                    current_filename: "sample.renamed".to_string(),
+                    canonical_filename: None,
+                    classification: None,
+                    classification_source: crate::jobs::FileIdentitySource::Declared,
+                }],
+            )
+            .unwrap();
+            db.complete_file(JobId(id), 0, "sample", &[0xBB; 16])
+                .unwrap();
+        }
+        let recovered = recover_server_state(&db, temp.path(), &temp.path().join("intermediate"))
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered
+                .to_restore
+                .iter()
+                .map(|candidate| candidate.job_id)
+                .collect::<Vec<_>>(),
+            vec![JobId(1), JobId(2), JobId(3)]
+        );
+        for candidate in &recovered.to_restore {
+            let request = &candidate.request;
+            assert!(
+                request.file_identities.is_empty(),
+                "job {}",
+                candidate.job_id.0
+            );
+            assert!(
+                request.detected_archives.is_empty(),
+                "job {}",
+                candidate.job_id.0
+            );
+            assert_eq!(request.spec.name, format!("job-{}", candidate.job_id.0));
+            assert_eq!(request.spec.files.len(), 1);
+            assert_eq!(request.spec.total_bytes, 10);
+        }
+        // The rows are still there for the install to read.
+        let stored = db.load_active_job(JobId(2)).unwrap().unwrap();
+        assert_eq!(
+            stored.file_identities[&0].current_filename,
+            "sample.renamed"
         );
     }
 
@@ -749,6 +995,7 @@ mod tests {
             .unwrap();
         db.set_active_job_status(JobId(12), "failed", Some("boom"))
             .unwrap();
+        db.set_nzb_admitted(JobId(12), true).unwrap();
         db.insert_job_history(&JobHistoryRow {
             job_id: 12,
             job_hash: None,
@@ -776,6 +1023,8 @@ mod tests {
             .unwrap();
 
         let kept = db.get_job_history(12).unwrap().expect("history row");
+        assert!(db.load_nzb_admissions().unwrap().is_empty());
+        assert!(db.load_active_jobs().unwrap().is_empty());
         assert_eq!(kept.name, "already-archived");
         assert_eq!(kept.total_bytes, 4096);
         assert_eq!(kept.downloaded_bytes, 2048);

@@ -27,6 +27,25 @@ pub enum StateError {
     Refused(Refusal),
 }
 
+// Why stored state did not load. `Read`: the database did not return it, or
+// what it returned did not decrypt, and a later try may read it. `Rows`: it
+// returned it, and a value in it is not one this build takes.
+#[derive(Debug, thiserror::Error)]
+pub enum LoadError {
+    #[error("{0}")]
+    Read(StateError),
+    #[error("{0}")]
+    Rows(StateError),
+}
+
+impl From<LoadError> for StateError {
+    fn from(error: LoadError) -> Self {
+        match error {
+            LoadError::Read(error) | LoadError::Rows(error) => error,
+        }
+    }
+}
+
 impl StateError {
     pub fn refusal(&self) -> Option<&Refusal> {
         match self {

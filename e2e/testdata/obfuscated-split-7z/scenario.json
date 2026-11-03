@@ -1,7 +1,8 @@
 {
   "slug": "obfuscated-split-7z",
   "title": "E2E.Test.Obfuscated.Split.7z.2024.1080p.BluRay.x264-TESTGRP",
-  "description": "Obfuscated split 7z volumes renamed to .10/.11/.12 without the .7z marker. Exercises RAR probe failure followed by 7z detection fallback.",
+  "description": "A split 7z posted as pieces numbered .10/.11/.12 is never joined, because the lowest number is above one, so the job fails with no usable file.",
   "category": "2000",
-  "expected_outcome": "success"
+  "expected_outcome": "extraction_failure",
+  "expectedErrorContains": "never placed every member it named"
 }

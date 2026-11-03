@@ -1,0 +1,16 @@
+{
+  "slug": "par2-namespace-restart",
+  "title": "E2E.Test.PAR2.Namespace.Restart.2026-TESTGRP",
+  "description": "Content-matched a.bin posted as b.bin beside an independent 00-keep.bin. The restart harness first commits the independent file, then tests the recorded leaf move and reconstruction with both recorded locations absent.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "expectedOutputBLAKE3": {
+    "00-keep.bin": "5f4c8b6c3f705367c42ceb3627b8685639b79019f9ce938eebb4094a0d9290bf",
+    "a.bin": "b321ea74f3bf6de2920ed1b2743edab6139d88f7ef76f08a2cae6976a06c6211",
+    "b.bin": "d827c9a16ba6348ba6bb9aaed4c25fbd6764e57936800f64a3e4b996be0b31cb"
+  },
+  "exactOutputFiles": true,
+  "forbiddenOutputPaths": [
+    ".weaver-chunks"
+  ]
+}

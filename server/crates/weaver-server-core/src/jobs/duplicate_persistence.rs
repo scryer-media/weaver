@@ -364,7 +364,9 @@ impl Database {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT c.job_id, c.group_id, g.normalized_key, c.score, c.candidate_state,
-                        c.source_nzb_zstd, c.terminal_cause, c.promotion_state
+                        CASE WHEN length(c.source_nzb_zstd) > 0 THEN 1 ELSE 0 END
+                            AS source_stored,
+                        c.terminal_cause, c.promotion_state
                  FROM semantic_duplicate_candidates AS c
                  INNER JOIN semantic_duplicate_groups AS g ON g.group_id = c.group_id
                  WHERE c.job_id = {}",
@@ -385,10 +387,7 @@ impl Database {
                     normalized_key: row.text("normalized_key")?,
                     score: row.i64("score")?,
                     state,
-                    source_stored: row
-                        .bytes("source_nzb_zstd")
-                        .map(|bytes| !bytes.is_empty())
-                        .unwrap_or(false),
+                    source_stored: row.i64("source_stored")? != 0,
                     terminal_cause: row
                         .opt_text("terminal_cause")?
                         .as_deref()
@@ -406,8 +405,12 @@ impl Database {
         })
     }
 
-    // Loads at most 256 requested duplicate summaries with one bounded query
-    // on both SQLite and PostgreSQL. Missing identities are omitted.
+    // Loads at most 256 requested duplicate summaries on both SQLite and
+    // PostgreSQL with two bounded queries: one row per job for the snapshot
+    // and its semantic candidate, then the jobs' fingerprints. The candidate's
+    // stored source is read only by length, so the compressed NZB that sits in
+    // the same row is never read, and the candidate row is read once per job
+    // rather than once per fingerprint. Missing identities are omitted.
     pub fn duplicate_summaries(
         &self,
         job_ids: &[JobId],
@@ -429,26 +432,31 @@ impl Database {
             .iter()
             .map(|job_id| SqlArg::I64(job_id.0 as i64))
             .collect::<Vec<_>>();
-        let query = format!(
+        let summary_query = format!(
             "SELECT s.job_id, s.lifecycle, s.normalized_name, s.admission_action,
                     s.admission_reason, s.created_at,
                     s.updated_at, s.reservation_expires_at,
-                    f.fingerprint_kind, f.fingerprint_version, f.fingerprint_digest,
                     c.group_id AS semantic_group_id, g.normalized_key AS semantic_normalized_key,
                     c.score AS semantic_score, c.candidate_state AS semantic_candidate_state,
-                    c.source_nzb_zstd AS semantic_source_nzb_zstd,
+                    CASE WHEN length(c.source_nzb_zstd) > 0 THEN 1 ELSE 0 END
+                        AS semantic_source_stored,
                     c.terminal_cause AS semantic_terminal_cause,
                     c.promotion_state AS semantic_promotion_state
              FROM duplicate_job_snapshots AS s
-             LEFT JOIN job_fingerprints AS f ON f.job_id = s.job_id
              LEFT JOIN semantic_duplicate_candidates AS c ON c.job_id = s.job_id
              LEFT JOIN semantic_duplicate_groups AS g ON g.group_id = c.group_id
              WHERE s.job_id IN ({placeholders})
-             ORDER BY s.job_id ASC, f.fingerprint_kind ASC, f.fingerprint_version ASC"
+             ORDER BY s.job_id ASC"
+        );
+        let fingerprint_query = format!(
+            "SELECT job_id, fingerprint_kind, fingerprint_version, fingerprint_digest
+             FROM job_fingerprints
+             WHERE job_id IN ({placeholders})
+             ORDER BY job_id ASC, fingerprint_kind ASC, fingerprint_version ASC"
         );
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &query, &args).await?;
+            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &summary_query, &args).await?;
             let mut summaries = BTreeMap::new();
             for row in rows {
                 let job_id = JobId(row.i64("job_id")? as u64);
@@ -468,32 +476,41 @@ impl Database {
                     }
                     None => None,
                 };
-                let entry = summaries
-                    .entry(job_id)
-                    .or_insert_with(|| DuplicateJobSummary {
+                let semantic = match row.opt_text("semantic_candidate_state")? {
+                    Some(_) => Some(semantic_snapshot_from_summary_row(&row)?),
+                    None => None,
+                };
+                summaries.insert(
+                    job_id,
+                    DuplicateJobSummary {
                         snapshot,
                         admission_action,
                         admission_reason,
                         fingerprints: Vec::new(),
-                        semantic: None,
-                    });
-                if let Some(kind) = row.opt_text("fingerprint_kind")? {
-                    let kind = FingerprintKind::from_persisted(&kind).ok_or_else(|| {
-                        StateError::Database("invalid duplicate fingerprint kind".to_string())
-                    })?;
-                    let digest = row.bytes("fingerprint_digest")?;
-                    let digest = digest.try_into().map_err(|_| {
-                        StateError::Database("invalid duplicate fingerprint digest".to_string())
-                    })?;
-                    entry.fingerprints.push(JobFingerprint {
-                        kind,
-                        version: row.i64("fingerprint_version")? as u16,
-                        digest,
-                    });
-                }
-                if entry.semantic.is_none() && row.opt_text("semantic_candidate_state")?.is_some() {
-                    entry.semantic = Some(semantic_snapshot_from_summary_row(&row)?);
-                }
+                        semantic,
+                    },
+                );
+            }
+            let rows =
+                SqlRuntime::fetch_all(datastore.read_exec(), &fingerprint_query, &args).await?;
+            for row in rows {
+                let job_id = JobId(row.i64("job_id")? as u64);
+                let Some(entry) = summaries.get_mut(&job_id) else {
+                    continue;
+                };
+                let kind = row.text("fingerprint_kind")?;
+                let kind = FingerprintKind::from_persisted(&kind).ok_or_else(|| {
+                    StateError::Database("invalid duplicate fingerprint kind".to_string())
+                })?;
+                let digest = row.bytes("fingerprint_digest")?;
+                let digest = digest.try_into().map_err(|_| {
+                    StateError::Database("invalid duplicate fingerprint digest".to_string())
+                })?;
+                entry.fingerprints.push(JobFingerprint {
+                    kind,
+                    version: row.i64("fingerprint_version")? as u16,
+                    digest,
+                });
             }
             for summary in summaries.values_mut() {
                 summary.fingerprints.sort();
@@ -1337,7 +1354,8 @@ pub(crate) async fn transition_duplicate_snapshot_for_history_tx(
 ) -> Result<(), StateError> {
     let lifecycle = match history_status {
         "complete" | "succeeded" => DuplicateJobLifecycle::Succeeded,
-        "failed" => DuplicateJobLifecycle::Failed,
+        // A partial delivery reads as failed outside the engine.
+        "failed" | "partial" => DuplicateJobLifecycle::Failed,
         "cancelled" => DuplicateJobLifecycle::Cancelled,
         _ => return Ok(()),
     };
@@ -2181,10 +2199,7 @@ fn semantic_snapshot_from_summary_row(
         normalized_key: row.text("semantic_normalized_key")?,
         score: row.i64("semantic_score")?,
         state,
-        source_stored: row
-            .bytes("semantic_source_nzb_zstd")
-            .map(|bytes| !bytes.is_empty())
-            .unwrap_or(false),
+        source_stored: row.i64("semantic_source_stored")? != 0,
         terminal_cause: row
             .opt_text("semantic_terminal_cause")?
             .as_deref()

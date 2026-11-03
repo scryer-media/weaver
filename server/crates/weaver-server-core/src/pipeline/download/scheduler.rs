@@ -98,6 +98,7 @@
 use super::worker::DownloadPressure;
 use super::worker::{BlockedBy, ServableWork, ServableWorkFilter};
 use super::*;
+use crate::jobs::model::JobArticles;
 use crate::operations::metrics::SchedulerBlockClause;
 
 // What a server gets when it asks for work.
@@ -258,41 +259,42 @@ impl Pipeline {
 
     // Every job that could be downloaded from, in the order the hot job and
     // then each spill candidate are drawn from: dispatch priority first,
-    // submission order within a priority.
+    // queue order within a priority. Only a job holding a slot can download,
+    // so the walk is over the slots, each found in the queue by its index.
     pub(in crate::pipeline) fn download_scheduler_eligible_jobs(&self) -> Vec<JobId> {
-        let held = self.shared_state.queue.read(|inner| {
-            inner
-                .jobs
+        let candidates: Vec<(JobId, usize)> = self.shared_state.queue.read(|inner| {
+            self.nzb_admitted
                 .iter()
-                .filter(|row| row.intents.cancelled.is_some() || row.intents.paused == Some(true))
-                .map(|row| row.id)
-                .collect::<HashSet<_>>()
+                .filter_map(|job_id| {
+                    let position = match inner.job_position(*job_id) {
+                        Some(position) => {
+                            let row = &inner.jobs[position];
+                            if row.intents.cancelled.is_some() || row.intents.paused == Some(true) {
+                                return None;
+                            }
+                            position
+                        }
+                        // A job installed without a queue row ranks after
+                        // every row, in install order.
+                        None => {
+                            inner.jobs.len() + self.job_order.iter().position(|id| id == job_id)?
+                        }
+                    };
+                    Some((*job_id, position))
+                })
+                .collect()
         });
-        let mut eligible = self
-            .job_order
-            .iter()
-            .enumerate()
-            .filter_map(|(index, job_id)| {
-                let state = self.jobs.get(job_id)?;
-                if held.contains(job_id)
-                    || state.download_queue.is_empty()
+        let mut eligible = candidates
+            .into_iter()
+            .filter_map(|(job_id, position)| {
+                let state = self.jobs.get(&job_id)?;
+                if !state.articles.has_queued_download_work()
                     || !Self::status_allows_download_dispatch(&state.status)
-                    || self.held_for_added_scripts(*job_id)
+                    || self.held_for_added_scripts(job_id)
                 {
                     return None;
                 }
-                // A job whose own health probe asked every lane for a pickup
-                // and got none stands down for one handout. The probe rides
-                // the download lanes, so a job holding all of them starves the
-                // batch that is trying to decide whether its release exists at
-                // all — and the busier it is, the longer it holds them. No
-                // lane is reserved: the job is simply not offered work while
-                // the batch is waiting, so the next lane to come free takes
-                // the batch.
-                if self.owned_download_lane_pool.probe_is_starved_by(job_id.0) {
-                    return None;
-                }
-                Some((Self::job_dispatch_priority(state), index, *job_id))
+                Some((Self::job_dispatch_priority(state), position, job_id))
             })
             .collect::<Vec<_>>();
         eligible.sort_unstable();
@@ -313,7 +315,7 @@ impl Pipeline {
         let queued = self
             .jobs
             .get(&job_id)
-            .map_or(0, |state| state.download_queue.len());
+            .map_or(0, |state| state.articles.queued_download_len());
         let out_on_lanes = self
             .active_downloads_by_job
             .get(&job_id)
@@ -336,6 +338,9 @@ impl Pipeline {
         lane: Option<LaneShare>,
         pressure: DownloadPressure,
     ) -> ShareTaken {
+        if let Err(blocked) = self.job_articles_built(job_id) {
+            return ShareTaken::Blocked(blocked);
+        }
         let Some(lane) = lane else {
             return match self.take_servable_works(job_id, server_idx, want, pressure) {
                 Ok(works) => ShareTaken::Works(works),
@@ -382,6 +387,28 @@ impl Pipeline {
         }
     }
 
+    // A job is handed work only once its articles are built. The first time
+    // the walk reaches a job waiting its turn, its articles are sent for, and
+    // until they arrive the job is blocked on every server, so its turn
+    // passes down the walk as any blocked job's does.
+    fn job_articles_built(&mut self, job_id: JobId) -> Result<(), BlockedBy> {
+        match self.jobs.get(&job_id).map(|state| &state.articles) {
+            None | Some(JobArticles::Active(_)) => Ok(()),
+            Some(JobArticles::Activating(..)) => {
+                Err(BlockedBy::only(SchedulerBlockClause::Activation))
+            }
+            Some(JobArticles::Queued(_)) => {
+                // A job too young to fetch from is not sent for until it is
+                // old enough to be handed work.
+                if self.propagation_hold_until(job_id).is_some() {
+                    return Err(BlockedBy::only(SchedulerBlockClause::Propagation));
+                }
+                self.request_job_activation(job_id);
+                Err(BlockedBy::only(SchedulerBlockClause::Activation))
+            }
+        }
+    }
+
     // Take up to `want` articles of one job that `server_idx` may fetch.
     //
     // `Ok` is never empty; `Err` means this job is blocked on this server
@@ -400,10 +427,7 @@ impl Pipeline {
         if self.propagation_hold_until(job_id).is_some() {
             return Err(BlockedBy::only(SchedulerBlockClause::Propagation));
         }
-        // An archive whose unlock order changed re-ranks its queue before
-        // anything is taken from it.
-        self.apply_rar_unlock_priorities_if_dirty(job_id);
-        let bootstrap_files = self.par2_metadata_bootstrap_files(job_id);
+        let bootstrap_files = self.recovery_metadata_bootstrap_files(job_id);
         let uu_cursor_ordinals = self.selection_uu_cursor_ordinals(pressure);
 
         // Sampled once for the whole handout. Each article taken is charged
@@ -416,7 +440,15 @@ impl Pipeline {
             uu_cursor_ordinals.as_ref(),
         ) {
             ServableWork::Scan(filter) => filter,
-            ServableWork::NoQueuedFilePasses(blocked) => return Err(blocked),
+            ServableWork::NoQueuedFilePasses(blocked) => {
+                if blocked
+                    .clauses()
+                    .any(|clause| clause == SchedulerBlockClause::Checkpoint)
+                {
+                    self.note_checkpoint_dispatch_block(job_id);
+                }
+                return Err(blocked);
+            }
             ServableWork::RetentionExcluded => {
                 // Retention rules this server out for the job. When it rules
                 // every server out, no lane will ever take the queue: retire
@@ -437,8 +469,9 @@ impl Pipeline {
                 break;
             };
             let popped = state
-                .download_queue
-                .pop_first_matching(|work| filter.allows(work));
+                .articles
+                .download_queue_mut()
+                .and_then(|queue| queue.pop_first_matching(|work| filter.allows(work)));
             let Some(work) = popped else {
                 self.metrics
                     .download_scheduler_scan_no_match_total
@@ -446,9 +479,6 @@ impl Pipeline {
                 break;
             };
             filter.note_taken(&work);
-            if bootstrap_files.is_some() {
-                self.par2_metadata_bootstrap_claims_work(job_id, &work);
-            }
             taken.push(work);
         }
 
@@ -463,6 +493,14 @@ impl Pipeline {
     }
 
     fn note_scan_skips(&self, filter: &ServableWorkFilter<'_>) {
+        if let Some((server_idx, estimate)) = filter.quota_short()
+            && let Some(quota) = self
+                .nntp
+                .pool()
+                .server_transfer_control(weaver_nntp::pool::ServerId(server_idx))
+        {
+            quota.quota_rejection_for_dispatch(estimate);
+        }
         let skipped = filter.skipped();
         if skipped != 0 {
             self.metrics
@@ -481,20 +519,21 @@ impl Pipeline {
     }
 
     fn record_handout(&mut self, kind: HandoutKind, mut works: Vec<DownloadWork>) -> Handout {
-        self.shared_state.queue.read(|inner| {
-            for work in &mut works {
-                work.counters = inner
-                    .jobs
-                    .iter()
-                    .find(|row| row.id == work.segment_id.file_id.job_id)
-                    .map(|row| {
-                        row.counters
-                            .totals
-                            .get_or_init(|| self.shared_state.queue.counters.clone());
-                        Arc::clone(&row.counters)
-                    });
-            }
+        // A handout never spans jobs, so its job's queue row is found once.
+        let Some(job_id) = works.first().map(|work| work.segment_id.file_id.job_id) else {
+            return Handout::Idle;
+        };
+        let counters = self.shared_state.queue.read(|inner| {
+            inner.job(job_id).map(|row| {
+                row.counters
+                    .totals
+                    .get_or_init(|| self.shared_state.queue.counters.clone());
+                Arc::clone(&row.counters)
+            })
         });
+        for work in &mut works {
+            work.counters = counters.clone();
+        }
         let counter = match kind {
             HandoutKind::Hot => &self.metrics.download_scheduler_handouts_total_hot,
             HandoutKind::Spill => &self.metrics.download_scheduler_handouts_total_spill,
@@ -576,7 +615,7 @@ impl Pipeline {
         if self.propagation_hold_until(job_id).is_some() {
             return Err(BlockedBy::only(SchedulerBlockClause::Propagation));
         }
-        let bootstrap_files = self.par2_metadata_bootstrap_files(job_id);
+        let bootstrap_files = self.recovery_metadata_bootstrap_files(job_id);
         let uu_cursor_ordinals = self.selection_uu_cursor_ordinals(pressure);
         let filter = match self.servable_work_filter(
             job_id,
@@ -593,8 +632,10 @@ impl Pipeline {
         let Some(state) = self.jobs.get(&job_id) else {
             return Err(BlockedBy::default());
         };
-        let found = state
-            .download_queue
+        let Some(queue) = state.articles.download_queue() else {
+            return Err(BlockedBy::only(SchedulerBlockClause::Activation));
+        };
+        let found = queue
             .peek_first_matching(|work| filter.allows(work))
             .is_some();
         self.note_scan_skips(&filter);

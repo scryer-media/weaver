@@ -312,7 +312,7 @@ fn write_working_marker(dir: &Dir, value: &str) -> std::io::Result<()> {
 
 // Where the v2 form of a marker is written before it replaces the v1 one.
 // Never read as a marker.
-const WORKING_DIR_MARKER_UPGRADE: &str = ".weaver-job-dir.upgrade";
+pub(crate) const WORKING_DIR_MARKER_UPGRADE: &str = ".weaver-job-dir.upgrade";
 
 // Replaces a verified v1 marker with its v2 form, so the directory stops
 // depending on a device number that may change.
@@ -471,6 +471,42 @@ pub fn remove_job_working_dir(
         }
         HistoryWorkingDir::LeftInPlace => Ok(HistoryWorkingDir::LeftInPlace),
     }
+}
+
+// A failed job's working directory keeps only what the job delivered. The
+// graph's internals and the run's caches go: their checkpoint leaves with
+// the job, so nothing could read them again. A directory left holding nothing but its ownership
+// marker goes whole. A directory this job does not own is left as it is.
+pub(crate) fn release_failed_working_dir(
+    root: &Path,
+    path: &Path,
+    job_id: JobId,
+) -> std::io::Result<()> {
+    let dir = match open_working_directory(root, path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        result => result?,
+    };
+    let stored = read_working_marker(&dir)?;
+    if judge_history_marker(&dir, path, &stored, job_id)? != HistoryWorkingDir::Owned {
+        return Ok(());
+    }
+    for scratch in [
+        weaver_graph::names::INTERNAL_DIR,
+        weaver_graph::names::CACHE_DIR,
+    ] {
+        match dir.remove_dir_all(scratch) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+            _ => {}
+        }
+    }
+    let mut delivered = false;
+    for entry in dir.entries()? {
+        delivered |= entry?.file_name() != WORKING_DIR_MARKER;
+    }
+    if !delivered {
+        dir.remove_open_dir_all()?;
+    }
+    Ok(())
 }
 
 pub async fn stamp_working_dir(root: &Path, path: &Path, job_id: JobId) -> std::io::Result<()> {

@@ -21,6 +21,8 @@ impl Database {
         })
     }
 
+    // The password an archive opened with, sealed under the database key
+    // for the job's metadata.
     pub(crate) fn seal_validated_archive_password(
         &self,
         password: &str,

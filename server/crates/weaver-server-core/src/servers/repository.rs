@@ -53,26 +53,41 @@ impl Database {
         &self,
         usage: &ServerDownloadUsage,
     ) -> Result<(), StateError> {
+        self.store_download_usage(std::slice::from_ref(usage), &[])
+    }
+
+    // Store a flush's server and egress usage rows in one transaction, so a
+    // flush commits once whatever the number of servers and egresses, and
+    // waits for the database writer like every other write instead of
+    // retrying against its lock one row at a time.
+    pub fn store_download_usage(
+        &self,
+        server: &[ServerDownloadUsage],
+        egress: &[ServerDownloadUsage],
+    ) -> Result<(), StateError> {
+        let mut statements = Vec::with_capacity(server.len() + egress.len());
+        for usage in server {
+            statements.push((SERVER_USAGE_UPSERT, server_download_usage_args(usage)?));
+        }
+        for usage in egress {
+            statements.push((EGRESS_USAGE_UPSERT, egress_download_usage_args(usage)?));
+        }
+        if statements.is_empty() {
+            return Ok(());
+        }
+        let statements = std::sync::Arc::new(statements);
         let datastore = self.datastore();
-        let args = server_download_usage_args(usage)?;
         self.run_sql_blocking(async move {
-            SqlRuntime::execute(
-                datastore.read_exec(),
-                "INSERT INTO server_download_usage
-                    (server_id, lifetime_bytes, quota_baseline_bytes,
-                     window_start_epoch_seconds, window_end_epoch_seconds,
-                     updated_at_epoch_seconds)
-                 VALUES ({}, {}, {}, {}, {}, {})
-                 ON CONFLICT(server_id) DO UPDATE SET
-                    lifetime_bytes = excluded.lifetime_bytes,
-                    quota_baseline_bytes = excluded.quota_baseline_bytes,
-                    window_start_epoch_seconds = excluded.window_start_epoch_seconds,
-                    window_end_epoch_seconds = excluded.window_end_epoch_seconds,
-                    updated_at_epoch_seconds = excluded.updated_at_epoch_seconds",
-                &args,
-            )
-            .await?;
-            Ok(())
+            SqlRuntime::run_in_transaction(&datastore, "store_download_usage", |tx| {
+                let statements = statements.clone();
+                Box::pin(async move {
+                    for (statement, args) in statements.iter() {
+                        tx.execute(statement, args).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
         })
     }
 
@@ -136,38 +151,36 @@ impl Database {
         &self,
         usage: &ServerDownloadUsage,
     ) -> Result<(), StateError> {
-        let datastore = self.datastore();
-        let args = server_download_usage_args(usage)?;
-        self.run_sql_blocking(async move {
-            SqlRuntime::execute(
-                datastore.read_exec(),
-                "INSERT INTO egress_download_usage
-                    (egress_id, lifetime_bytes, quota_baseline_bytes,
-                     window_start_epoch_seconds, window_end_epoch_seconds,
-                     updated_at_epoch_seconds)
-                 SELECT id, {}, {}, {}, {}, {}
-                   FROM egress_interfaces
-                  WHERE id = {}
-                 ON CONFLICT(egress_id) DO UPDATE SET
-                    lifetime_bytes = excluded.lifetime_bytes,
-                    quota_baseline_bytes = excluded.quota_baseline_bytes,
-                    window_start_epoch_seconds = excluded.window_start_epoch_seconds,
-                    window_end_epoch_seconds = excluded.window_end_epoch_seconds,
-                    updated_at_epoch_seconds = excluded.updated_at_epoch_seconds",
-                &[
-                    args[1].clone(),
-                    args[2].clone(),
-                    args[3].clone(),
-                    args[4].clone(),
-                    args[5].clone(),
-                    args[0].clone(),
-                ],
-            )
-            .await?;
-            Ok(())
-        })
+        self.store_download_usage(&[], std::slice::from_ref(usage))
     }
 }
+
+const SERVER_USAGE_UPSERT: &str = "INSERT INTO server_download_usage
+        (server_id, lifetime_bytes, quota_baseline_bytes,
+         window_start_epoch_seconds, window_end_epoch_seconds,
+         updated_at_epoch_seconds)
+     VALUES ({}, {}, {}, {}, {}, {})
+     ON CONFLICT(server_id) DO UPDATE SET
+        lifetime_bytes = excluded.lifetime_bytes,
+        quota_baseline_bytes = excluded.quota_baseline_bytes,
+        window_start_epoch_seconds = excluded.window_start_epoch_seconds,
+        window_end_epoch_seconds = excluded.window_end_epoch_seconds,
+        updated_at_epoch_seconds = excluded.updated_at_epoch_seconds";
+
+// Usage for an egress that no longer exists selects no row and is dropped.
+const EGRESS_USAGE_UPSERT: &str = "INSERT INTO egress_download_usage
+        (egress_id, lifetime_bytes, quota_baseline_bytes,
+         window_start_epoch_seconds, window_end_epoch_seconds,
+         updated_at_epoch_seconds)
+     SELECT id, {}, {}, {}, {}, {}
+       FROM egress_interfaces
+      WHERE id = {}
+     ON CONFLICT(egress_id) DO UPDATE SET
+        lifetime_bytes = excluded.lifetime_bytes,
+        quota_baseline_bytes = excluded.quota_baseline_bytes,
+        window_start_epoch_seconds = excluded.window_start_epoch_seconds,
+        window_end_epoch_seconds = excluded.window_end_epoch_seconds,
+        updated_at_epoch_seconds = excluded.updated_at_epoch_seconds";
 
 fn server_download_usage_from_row(row: SqlRow) -> Result<ServerDownloadUsage, StateError> {
     Ok(ServerDownloadUsage {
@@ -198,6 +211,13 @@ fn server_download_usage_args(usage: &ServerDownloadUsage) -> Result<Vec<SqlArg>
         SqlArg::OptI64(usage.window_end.map(|value| value.timestamp())),
         SqlArg::I64(usage.updated_at.timestamp()),
     ])
+}
+
+// The egress upsert takes the usage values first and the egress id last.
+fn egress_download_usage_args(usage: &ServerDownloadUsage) -> Result<Vec<SqlArg>, StateError> {
+    let mut args = server_download_usage_args(usage)?;
+    args.rotate_left(1);
+    Ok(args)
 }
 
 fn i64_from_u64(value: u64, field: &str) -> Result<i64, StateError> {

@@ -2,7 +2,7 @@
 # time and verified against the SHA-256 test-corpus/toolchains.json pins before
 # it is installed. Distribution `p7zip` forks are deliberately not used: they
 # are a different codebase with a different container writer.
-FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 
 ARG SEVENZIP_URL
 ARG SEVENZIP_SHA256

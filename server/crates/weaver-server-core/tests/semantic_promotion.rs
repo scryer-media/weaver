@@ -56,11 +56,11 @@ impl Harness {
             retry: None,
             max_download_speed: None,
             propagation_delay_secs: None,
+            max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
             watch_folder: WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: None,
-            direct_unpack: None,
             delivery_naming: None,
             metrics: Default::default(),
             config_path: None,
@@ -114,6 +114,7 @@ impl Harness {
             state,
             db.clone(),
             config,
+            weaver_server_core::runtime::StartupDiskGate::opened(),
         )
         .await
         .unwrap();
@@ -185,7 +186,7 @@ fn score_spec(name: &str, message_id: &str) -> JobSpec {
                 ordinal: 0,
                 article_number: 1,
                 bytes: 10,
-                message_id: message_id.to_string(),
+                message_ids: weaver_server_core::MessageIds::new(vec![message_id.to_string()]),
             }],
         }],
     }

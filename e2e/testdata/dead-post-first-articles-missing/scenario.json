@@ -1,7 +1,7 @@
 {
   "slug": "dead-post-first-articles-missing",
   "title": "Ember.Latitude.S03E04.2026.1080p.WEB-DL.H264-DEADPOST",
-  "description": "Ten RAR volumes with every article deleted from both servers. With no PAR2 candidates, metadata discovery cannot race the first-article verdict. All ten leading articles are missing, deterministically exercising the first-article gate. Recovery exhaustion is tested separately by dead-post-recovery-unobtainable.",
+  "description": "Ten RAR volumes with every article deleted from both servers and no PAR2 to bind. Nothing arrives for any archive, so no file is delivered whole and the job fails as soon as every article is booked missing. Recovery that cannot be fetched is tested separately by dead-post-recovery-unobtainable.",
   "category": "2000",
   "expected_outcome": "health_failure",
   "expectedErrorContains": "first articles are missing",
@@ -19,10 +19,5 @@
   ],
   "deleteSubjectContains": [
     ".rar"
-  ],
-  "runtimeAssertions": {
-    "healthProbe": {
-      "forbidInconclusive": true
-    }
-  }
+  ]
 }

@@ -519,6 +519,7 @@ const KNOWN_STATUSES: &[&str] = &[
     "queued_post_processing",
     "post_processing",
     "complete",
+    "partial",
     "failed",
     "paused",
     "cancelled",

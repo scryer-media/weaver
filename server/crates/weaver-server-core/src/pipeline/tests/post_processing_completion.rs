@@ -115,11 +115,7 @@ exit {exit_code}
 
     let job_id = JobId(10071);
     let job_name = "Late Completion With Live Script";
-    let spec = minimal_job_state(job_id, job_name, PathBuf::new()).spec;
-    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
-    tokio::fs::write(working_dir.join("payload.mkv"), b"payload")
-        .await
-        .unwrap();
+    insert_delivered_job(&mut pipeline, job_id, job_name, "payload.mkv", b"payload").await;
     let destination = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(job_name));
     pipeline.start_move_to_complete(job_id).await.unwrap();
     settle_inflight_moves(&mut pipeline).await;
@@ -320,6 +316,156 @@ async fn post_processing_resume_applies_pending_category_before_a_deferred_move(
     pipeline.db.flush_write_queue().await.unwrap();
 }
 
+// A job with queue scripts but no post-processing instance still passes
+// through the terminal pass, which waits for the job's own queue events
+// before it leaves the queue. Without a queue script it completes at once.
+#[tokio::test]
+async fn queue_scripts_hold_a_job_without_post_processing_instances() {
+    for with_queue_script in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+        let scripts = temp.path().join("scripts");
+        tokio::fs::create_dir_all(&scripts).await.unwrap();
+        let script = scripts.join("queue.sh");
+        tokio::fs::write(&script, "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nexit 0\n")
+            .await
+            .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        pipeline
+            .db
+            .replace_post_processing_script_directory(&scripts)
+            .unwrap();
+        pipeline
+            .db
+            .save_post_processing_settings(&PostProcessingSettings {
+                execution_enabled: true,
+                ..Default::default()
+            })
+            .unwrap();
+        if with_queue_script {
+            pipeline
+                .db
+                .create_script_instance(ScriptInstanceDraft::new(
+                    ScriptName::new("queue.sh").unwrap(),
+                    InstanceTrigger::Queue(
+                        crate::post_processing::model::QueueEvent::FileDownloaded,
+                    ),
+                ))
+                .unwrap();
+        }
+        pipeline.terminal_post_processing_executor =
+            PostProcessingExecutor::new(pipeline.db.clone(), scripts.clone());
+
+        let job_id = JobId(10081);
+        insert_delivered_job(
+            &mut pipeline,
+            job_id,
+            "Queue Scripts Only",
+            "payload.mkv",
+            b"payload",
+        )
+        .await;
+        // The delivered file raised the job's own queue event; hear it out
+        // first, so whether the terminal pass waits turns on the scripts alone.
+        crate::post_processing::events::wait_for_job_events(&pipeline.db, job_id.0)
+            .await
+            .unwrap();
+        pipeline.start_move_to_complete(job_id).await.unwrap();
+        settle_inflight_moves(&mut pipeline).await;
+
+        if !with_queue_script {
+            assert!(
+                !pipeline.jobs.contains_key(&job_id),
+                "{:?}",
+                pipeline.jobs.get(&job_id).map(|state| &state.status)
+            );
+            let finished = pipeline
+                .finished_jobs()
+                .await
+                .into_iter()
+                .find(|job| job.job_id == job_id)
+                .unwrap();
+            assert_eq!(finished.status, JobStatus::Complete);
+            continue;
+        }
+        assert_eq!(
+            pipeline.jobs[&job_id].status,
+            JobStatus::QueuedPostProcessing
+        );
+        let done = loop {
+            match pipeline
+                .terminal_post_processing_done_rx
+                .recv()
+                .await
+                .unwrap()
+            {
+                TerminalPostProcessingEvent::Done(done) => break done,
+                TerminalPostProcessingEvent::Started(started) => {
+                    pipeline.handle_terminal_post_processing_started(started);
+                }
+                _ => panic!("unexpected terminal post-processing event"),
+            }
+        };
+        assert_eq!(done.job_id, job_id);
+        assert_eq!(
+            done.result.as_ref().unwrap().summary,
+            PostProcessingSummary::NotRun
+        );
+        pipeline.handle_terminal_post_processing_done(done);
+        let finished = pipeline
+            .finished_jobs()
+            .await
+            .into_iter()
+            .find(|job| job.job_id == job_id)
+            .unwrap();
+        assert_eq!(finished.status, JobStatus::Complete);
+    }
+}
+
+// A job submitted by URL hands its scripts that URL: the terminal pass's
+// context carries what the submission recorded.
+#[tokio::test]
+async fn terminal_post_processing_context_carries_the_submission_url() {
+    use crate::post_processing::model::{PipelineOutcome, PostProcessingFacts};
+
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let job_id = JobId(10074);
+    let payload = b"url payload".to_vec();
+    let mut spec = standalone_job_spec(
+        "Cobalt Ridge By Url",
+        &[("payload.bin".into(), payload.len() as u32)],
+    );
+    let url = "http://fixture.invalid/by-url.nzb";
+    spec.metadata.push((
+        crate::post_processing::scan::SOURCE_URL_KEY.into(),
+        url.into(),
+    ));
+    let nzb = format!(
+        r#"<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><file poster="fixture" date="0" subject="&quot;payload.bin&quot;"><groups><group>alt.binaries.test</group></groups><segments><segment bytes="{}" number="1">segment-0@example.com</segment></segments></file></nzb>"#,
+        payload.len()
+    );
+    insert_active_job_with_persisted_nzb(
+        &mut pipeline,
+        job_id,
+        spec,
+        crate::ingest::compress_nzb_bytes(nzb.as_bytes()).unwrap(),
+    )
+    .await;
+
+    let context = pipeline
+        .terminal_post_processing_context(
+            job_id,
+            &PostProcessingFacts {
+                outcome: PipelineOutcome::Succeeded,
+                par_status: 0,
+                unpack_status: 0,
+            },
+        )
+        .unwrap();
+    assert_eq!(context.source_url.as_deref(), Some(url));
+}
+
 // Point `pipeline` at a script directory holding one script that records the
 // directory it was handed and succeeds, run through the real supervisor.
 async fn install_recording_script(pipeline: &mut Pipeline, temp: &tempfile::TempDir) -> PathBuf {
@@ -413,22 +559,22 @@ async fn restart_between_final_move_and_first_script_resumes_scripts_on_delivere
     let job_id = JobId(10072);
     let job_name = "Amber Orchard Restart Window";
     let payload = b"delivered payload".to_vec();
-    let spec = standalone_job_spec(job_name, &[("payload.bin".into(), payload.len() as u32)]);
-    let nzb = format!(
-        r#"<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><file poster="fixture" date="0" subject="&quot;payload.bin&quot;"><groups><group>alt.binaries.test</group></groups><segments><segment bytes="{}" number="1">segment-0@example.com</segment></segments></file></nzb>"#,
-        payload.len()
-    );
-    let working_dir = insert_active_job_with_persisted_nzb(
-        &mut pipeline,
-        job_id,
-        spec,
-        crate::ingest::compress_nzb_bytes(nzb.as_bytes()).unwrap(),
-    )
-    .await;
-    write_and_complete_file(&mut pipeline, job_id, 0, "payload.bin", &payload).await;
-    persist_completed_file_hash(&pipeline, job_id, 0, "payload.bin", &payload).await;
-
-    pipeline.start_move_to_complete(job_id).await.unwrap();
+    // The job's one article arrives and the job moves its output.
+    let working_dir =
+        insert_delivered_job(&mut pipeline, job_id, job_name, "payload.bin", &payload).await;
+    pipeline.check_job_completion(job_id).await;
+    // The download's queue-script barrier runs no script and lets it on.
+    let TerminalPostProcessingEvent::QueueDone(id, result) = pipeline
+        .terminal_post_processing_done_rx
+        .recv()
+        .await
+        .unwrap()
+    else {
+        panic!("no queue script is admitted");
+    };
+    assert_eq!(id, job_id);
+    pipeline.handle_queue_scripts_done(id, result).await;
+    pump_pipeline_runtime_queues(&mut pipeline).await;
     settle_inflight_moves(&mut pipeline).await;
 
     let destination = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(job_name));
@@ -530,100 +676,6 @@ async fn restart_between_final_move_and_first_script_resumes_scripts_on_delivere
     );
 }
 
-// A job with queue scripts but no post-processing instance still passes
-// through the terminal pass, which waits for the job's own queue events
-// before it leaves the queue. Without a queue script it completes at once.
-#[tokio::test]
-async fn queue_scripts_hold_a_job_without_post_processing_instances() {
-    for with_queue_script in [true, false] {
-        let temp = tempfile::tempdir().unwrap();
-        let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
-        let scripts = temp.path().join("scripts");
-        tokio::fs::create_dir_all(&scripts).await.unwrap();
-        let script = scripts.join("queue.sh");
-        tokio::fs::write(&script, "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nexit 0\n")
-            .await
-            .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        pipeline
-            .db
-            .replace_post_processing_script_directory(&scripts)
-            .unwrap();
-        pipeline
-            .db
-            .save_post_processing_settings(&PostProcessingSettings {
-                execution_enabled: true,
-                ..Default::default()
-            })
-            .unwrap();
-        if with_queue_script {
-            pipeline
-                .db
-                .create_script_instance(ScriptInstanceDraft::new(
-                    ScriptName::new("queue.sh").unwrap(),
-                    InstanceTrigger::Queue(
-                        crate::post_processing::model::QueueEvent::FileDownloaded,
-                    ),
-                ))
-                .unwrap();
-        }
-        pipeline.terminal_post_processing_executor =
-            PostProcessingExecutor::new(pipeline.db.clone(), scripts.clone());
-
-        let job_id = JobId(10081);
-        let spec = minimal_job_state(job_id, "Queue Scripts Only", PathBuf::new()).spec;
-        let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
-        tokio::fs::write(working_dir.join("payload.mkv"), b"payload")
-            .await
-            .unwrap();
-        pipeline.start_move_to_complete(job_id).await.unwrap();
-        settle_inflight_moves(&mut pipeline).await;
-
-        if !with_queue_script {
-            assert!(!pipeline.jobs.contains_key(&job_id));
-            let finished = pipeline
-                .finished_jobs()
-                .await
-                .into_iter()
-                .find(|job| job.job_id == job_id)
-                .unwrap();
-            assert_eq!(finished.status, JobStatus::Complete);
-            continue;
-        }
-        assert_eq!(
-            pipeline.jobs[&job_id].status,
-            JobStatus::QueuedPostProcessing
-        );
-        let done = loop {
-            match pipeline
-                .terminal_post_processing_done_rx
-                .recv()
-                .await
-                .unwrap()
-            {
-                TerminalPostProcessingEvent::Done(done) => break done,
-                TerminalPostProcessingEvent::Started(started) => {
-                    pipeline.handle_terminal_post_processing_started(started);
-                }
-                _ => panic!("unexpected terminal post-processing event"),
-            }
-        };
-        assert_eq!(done.job_id, job_id);
-        assert_eq!(
-            done.result.as_ref().unwrap().summary,
-            PostProcessingSummary::NotRun
-        );
-        pipeline.handle_terminal_post_processing_done(done);
-        let finished = pipeline
-            .finished_jobs()
-            .await
-            .into_iter()
-            .find(|job| job.job_id == job_id)
-            .unwrap();
-        assert_eq!(finished.status, JobStatus::Complete);
-    }
-}
-
 const NEVER_RERUN_SCRIPT: &str = r#"#!/bin/sh
 ### NZBGET POST-PROCESSING SCRIPT ###
 set -eu
@@ -645,8 +697,8 @@ exit 93
 
 // A restart part way through a failed job's scripts resumes the ones that
 // had not started, and they are told the failure the scripts before the
-// restart were told, though the restart lost the extraction that the unpack
-// status came from. The script that was running is not run again.
+// restart were told, read back from what the pass kept. The script that was
+// running is not run again.
 #[tokio::test]
 async fn restart_part_way_through_a_failed_jobs_scripts_resumes_them_with_its_failure() {
     use crate::post_processing::model::{
@@ -682,12 +734,10 @@ async fn restart_part_way_through_a_failed_jobs_scripts_resumes_them_with_its_fa
         crate::ingest::compress_nzb_bytes(nzb.as_bytes()).unwrap(),
     )
     .await;
-    // The archive was extracted, then the output could not be moved.
-    pipeline
-        .extracted_archives
-        .insert(job_id, ["payload".to_string()].into_iter().collect());
+    // The output could not be moved.
     pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Moving;
     pipeline.fail_job(job_id, "could not move the output".to_string());
+    settle_failed_releases(&mut pipeline).await;
     assert_eq!(
         pipeline.jobs[&job_id].status,
         JobStatus::QueuedPostProcessing
@@ -710,7 +760,7 @@ async fn restart_part_way_through_a_failed_jobs_scripts_resumes_them_with_its_fa
                 message: failure.clone(),
             },
             par_status: 0,
-            unpack_status: 2,
+            unpack_status: 0,
         }
     );
     let before = status_env(
@@ -719,7 +769,7 @@ async fn restart_part_way_through_a_failed_jobs_scripts_resumes_them_with_its_fa
             .unwrap(),
     );
     assert_eq!(before["NZBPP_TOTALSTATUS"], "FAILURE");
-    assert_eq!(before["NZBPP_UNPACKSTATUS"], "2");
+    assert_eq!(before["NZBPP_UNPACKSTATUS"], "0");
 
     // The first script was running when weaver stopped.
     let first = pipeline
@@ -769,7 +819,6 @@ async fn restart_part_way_through_a_failed_jobs_scripts_resumes_them_with_its_fa
 
     install_scripts(&mut restored, &temp, &list).await;
     restored.restore_job(request).await.unwrap();
-    assert!(!restored.extracted_archives.contains_key(&job_id));
     let kept = restored
         .db
         .job_post_processing_facts(job_id.0)
@@ -846,48 +895,4 @@ async fn restart_part_way_through_a_failed_jobs_scripts_resumes_them_with_its_fa
         "{:?}",
         finished.status
     );
-}
-
-// A job submitted by URL hands its scripts that URL: the terminal pass's
-// context carries what the submission recorded.
-#[tokio::test]
-async fn terminal_post_processing_context_carries_the_submission_url() {
-    use crate::post_processing::model::{PipelineOutcome, PostProcessingFacts};
-
-    let temp = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
-    let job_id = JobId(10074);
-    let payload = b"url payload".to_vec();
-    let mut spec = standalone_job_spec(
-        "Cobalt Ridge By Url",
-        &[("payload.bin".into(), payload.len() as u32)],
-    );
-    let url = "http://fixture.invalid/by-url.nzb";
-    spec.metadata.push((
-        crate::post_processing::scan::SOURCE_URL_KEY.into(),
-        url.into(),
-    ));
-    let nzb = format!(
-        r#"<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"><file poster="fixture" date="0" subject="&quot;payload.bin&quot;"><groups><group>alt.binaries.test</group></groups><segments><segment bytes="{}" number="1">segment-0@example.com</segment></segments></file></nzb>"#,
-        payload.len()
-    );
-    insert_active_job_with_persisted_nzb(
-        &mut pipeline,
-        job_id,
-        spec,
-        crate::ingest::compress_nzb_bytes(nzb.as_bytes()).unwrap(),
-    )
-    .await;
-
-    let context = pipeline
-        .terminal_post_processing_context(
-            job_id,
-            &PostProcessingFacts {
-                outcome: PipelineOutcome::Succeeded,
-                par_status: 0,
-                unpack_status: 0,
-            },
-        )
-        .unwrap();
-    assert_eq!(context.source_url.as_deref(), Some(url));
 }

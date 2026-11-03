@@ -11,6 +11,12 @@ use crate::jobs::JobId;
 use crate::jobs::phase_progress::{JobPhase, JobPhaseProgress, PhaseCounters};
 use crate::operations::metrics::{PipelineMetrics, RateSeries};
 
+// Counts the ticker's samples, so a test can pin that a parked ticker takes
+// none.
+#[cfg(test)]
+pub(crate) static COUNTER_SAMPLES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) struct PhaseSample {
     counters: Arc<PhaseCounters>,
     started: f64,
@@ -27,7 +33,7 @@ impl Queue {
         started: f64,
     ) {
         self.write(|inner| {
-            if let Some(row) = inner.jobs.iter_mut().find(|row| row.id == id)
+            if let Some(row) = inner.job_mut(id)
                 && let std::collections::hash_map::Entry::Vacant(entry) = row.phases.entry(phase)
             {
                 entry.insert(PhaseSample {
@@ -36,6 +42,7 @@ impl Queue {
                     first: None,
                     rate: RateSeries::new(),
                 });
+                inner.phased_jobs.insert(id);
                 return Change::changed(());
             }
             Change::unchanged(())
@@ -44,13 +51,19 @@ impl Queue {
 
     pub(crate) fn end_phase(&self, id: JobId, phase: JobPhase) {
         self.write(|inner| {
-            if let Some(row) = inner.jobs.iter_mut().find(|row| row.id == id) {
+            if let Some(row) = inner.job_mut(id) {
                 row.phases.remove(&phase);
                 row.sampled_phases.retain(|sample| sample.phase != phase);
                 row.report
                     .job
                     .phase_progress
                     .retain(|sample| sample.phase != phase);
+                if row.phases.is_empty() {
+                    // A row out of every phase is no longer sampled; a later
+                    // phase starts its download series afresh from the gauge.
+                    row.download_rate = None;
+                    inner.phased_jobs.remove(&id);
+                }
                 return Change::changed(());
             }
             Change::unchanged(())
@@ -70,11 +83,50 @@ impl Queue {
             return;
         }
         let queue = Arc::downgrade(self);
+        let mut drive = self.subscribe_drive();
         runtime.spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(250));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Whether the ticker has driven since it last parked.
+            let mut drove = false;
             loop {
-                interval.tick().await;
+                if !*drive.borrow_and_update() {
+                    // Nothing moves, so a sample would find what the last
+                    // one found. Parking after driving takes one sample, so
+                    // bytes counted since the last tick, such as a speed
+                    // test's last articles, are published. Write out the
+                    // bandwidth the samples recorded, then wait for a turn
+                    // that finds work.
+                    let Some(queue) = queue.upgrade() else { break };
+                    if std::mem::take(&mut drove) && !queue.closed.load(Ordering::Acquire) {
+                        queue.sample_counters(
+                            &metrics,
+                            &events,
+                            tokio::time::Instant::now().into_std(),
+                        );
+                    }
+                    if let Err(error) = queue.sample_bandwidth(true) {
+                        tracing::warn!(%error, "failed to flush bandwidth usage");
+                    }
+                    drop(queue);
+                    if drive.changed().await.is_err() {
+                        break;
+                    }
+                    interval.reset_immediately();
+                    continue;
+                }
+                drove = true;
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    // A turn that finds nothing to drive parks the ticker now,
+                    // not after one more tick.
+                    changed = drive.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                }
                 let Some(queue) = queue.upgrade() else { break };
                 if queue.closed.load(Ordering::Acquire) {
                     break;
@@ -89,6 +141,8 @@ impl Queue {
         events: &tokio::sync::broadcast::Sender<PipelineEvent>,
         now: Instant,
     ) {
+        #[cfg(test)]
+        COUNTER_SAMPLES.fetch_add(1, Ordering::Relaxed);
         if let Err(error) = self.sample_bandwidth(false) {
             tracing::warn!(%error, "failed to sample bandwidth usage");
         }
@@ -107,11 +161,17 @@ impl Queue {
             });
             inner.metrics = Some(snapshot);
             let epoch = crate::jobs::epoch_ms_now();
-            for row in &mut inner.jobs {
-                // Every row's download series advances on every tick, whatever
-                // its phase, and starts from the gauge's own sample instants:
-                // the gauge integrates the transfer total each row's counter is
-                // credited beside, so the rows' rates sum to the gauge.
+            let phased: Vec<JobId> = inner.phased_jobs().collect();
+            for id in phased {
+                let Some(row) = inner.job_mut(id) else {
+                    continue;
+                };
+                // A row's download series advances on every tick while the
+                // row is in a phase, and starts from the gauge's own sample
+                // instants: the gauge integrates the transfer total each
+                // row's counter is credited beside, so the rows' rates sum
+                // to the gauge. A row in no phase moves no bytes and shows
+                // no rate, so the tick leaves it alone.
                 let downloaded = row.counters.downloaded.load(Ordering::Relaxed);
                 let download_rate = row
                     .download_rate

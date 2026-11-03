@@ -51,6 +51,7 @@ type Scenario struct {
 	// terminal error and the run has to fail for that reason. Matched
 	// case-insensitively against the job's terminal error message.
 	ExpectedErrorContains              string            `json:"expectedErrorContains,omitempty"`
+	ExpectedFailureKind                string            `json:"expectedFailureKind,omitempty"`
 	Password                           string            `json:"password,omitempty"`
 	SegmentSize                        int               `json:"segment_size,omitempty"`
 	NZBSegmentNumbers                  []int             `json:"nzb_segment_numbers,omitempty"`
@@ -75,13 +76,17 @@ type Scenario struct {
 	// the whole job, so a fixture whose outcome depends on the primary copy
 	// alone cannot be satisfied by the backup taking the first fetch when the
 	// primary is out of seats. The gate lifts once the job is terminal.
-	BackupUnavailableUntilJobTerminal bool                       `json:"backupUnavailableUntilJobTerminal,omitempty"`
-	RequiredJobEvents                 []string                   `json:"requiredJobEvents,omitempty"`
-	ForbiddenJobEvents                []string                   `json:"forbiddenJobEvents,omitempty"`
-	MaxJobEventCounts                 map[string]int             `json:"maxJobEventCounts,omitempty"`
-	ExpectedOutputBLAKE3              map[string]string          `json:"expectedOutputBLAKE3,omitempty"`
-	ForbiddenOutputPaths              []string                   `json:"forbiddenOutputPaths,omitempty"`
-	RuntimeAssertions                 *ScenarioRuntimeAssertions `json:"runtimeAssertions,omitempty"`
+	BackupUnavailableUntilJobTerminal bool              `json:"backupUnavailableUntilJobTerminal,omitempty"`
+	RequiredJobEvents                 []string          `json:"requiredJobEvents,omitempty"`
+	ForbiddenJobEvents                []string          `json:"forbiddenJobEvents,omitempty"`
+	MaxJobEventCounts                 map[string]int    `json:"maxJobEventCounts,omitempty"`
+	ExpectedOutputBLAKE3              map[string]string `json:"expectedOutputBLAKE3,omitempty"`
+	ExactOutputFiles                  bool              `json:"exactOutputFiles,omitempty"`
+	// Failed jobs may retain damaged inputs without delivering usable files.
+	// When present, this is the exact retained file set apart from the ownership marker.
+	ExpectedRetainedOutputBLAKE3 map[string]string          `json:"expectedRetainedOutputBLAKE3,omitempty"`
+	ForbiddenOutputPaths         []string                   `json:"forbiddenOutputPaths,omitempty"`
+	RuntimeAssertions            *ScenarioRuntimeAssertions `json:"runtimeAssertions,omitempty"`
 	// Disabled keeps a fixture in the corpus, seeded and verified, while the
 	// canonical runs leave it out. The value says why: the behavior it pins is
 	// one weaver does not deliver yet.
@@ -94,7 +99,6 @@ type ScenarioRuntimeAssertions struct {
 	DirectStore         *ScenarioDirectStoreAssertion         `json:"directStore,omitempty"`
 	DirectUnpack        *ScenarioDirectUnpackAssertion        `json:"directUnpack,omitempty"`
 	QueueLiveness       *ScenarioQueueLivenessAssertion       `json:"queueLiveness,omitempty"`
-	HealthProbe         *ScenarioHealthProbeAssertion         `json:"healthProbe,omitempty"`
 	Log                 *ScenarioLogAssertion                 `json:"log,omitempty"`
 }
 
@@ -128,26 +132,6 @@ type ScenarioLogLineAssertion struct {
 	ForbidConsecutiveRepeats bool `json:"forbidConsecutiveRepeats,omitempty"`
 }
 
-// ScenarioHealthProbeAssertion pins how the health probe behaved on a job that
-// still completed. A job can finish with the right bytes after the probe sat
-// on its soft timeout for every article it could not sample, so the outcome
-// alone never sees that stall; the probe's own log lines do.
-type ScenarioHealthProbeAssertion struct {
-	// RequireActivated demands the probe actually ran for this job — the
-	// fixture's damage must be enough to cross the activation threshold, or
-	// the rest of the assertion is vacuous.
-	RequireActivated bool `json:"requireActivated,omitempty"`
-	// ForbidActivated demands the probe stayed off for this job — the damage
-	// is a hole the recovery set already covers, or a single file failing
-	// while the rest of the posting lands, and sampling would add nothing.
-	ForbidActivated bool `json:"forbidActivated,omitempty"`
-	// ForbidInconclusive fails the job if any probe round ended inconclusive:
-	// a confirmation batch that hit its transport deadline instead of getting
-	// an answer, which on a healthy server is the probe waiting on a lane it
-	// should have been handed.
-	ForbidInconclusive bool `json:"forbidInconclusive,omitempty"`
-}
-
 type ScenarioFileIdentityRewriteAssertion struct {
 	RequiredCurrentFilenames     []string `json:"requiredCurrentFilenames,omitempty"`
 	ForbiddenCurrentFilenames    []string `json:"forbiddenCurrentFilenames,omitempty"`
@@ -160,24 +144,18 @@ type ScenarioPar2CleanSettlementAssertion struct {
 	VerificationReadBytes        uint64              `json:"verificationReadBytes"`
 }
 
-// ScenarioDirectStoreAssertion pins the exceptional direct-store path in a
-// fixture which otherwise has byte-identical conventional output. It is only
-// evaluated in a direct-store phase.
+// ScenarioDirectStoreAssertion pins how a stored archive was read in place, in
+// a fixture whose output is byte-identical either way. graphDirectStoreVerdict
+// says what each field means.
 type ScenarioDirectStoreAssertion struct {
 	ExpectedDemotionReason           string `json:"expectedDemotionReason"`
 	RequireRoutedByteMaterialization bool   `json:"requireRoutedByteMaterialization"`
 	ForbidVolumeRefetch              bool   `json:"forbidVolumeRefetch"`
 }
 
-// ScenarioDirectUnpackAssertion pins what the 7z direct-unpack chase did, read
-// from weaver's own log lines — the harness has no metrics surface, and the
-// chase is otherwise invisible by design: a consumed chase and a conventional
-// extraction deliver byte-identical output.
-//
-// The positive fields are only evaluated in a phase that ran with the gate on;
-// ForbidAnyActivity is only evaluated in a phase that ran with it off, so one
-// scenario proves engagement where the feature is enabled and darkness where it
-// is not.
+// ScenarioDirectUnpackAssertion pins how an archive was opened in the stream,
+// read from weaver's own log lines: the output is byte-identical however it was
+// read. graphDirectUnpackVerdict says what each field means.
 type ScenarioDirectUnpackAssertion struct {
 	// RequireArmed demands the set was admitted to a chase.
 	RequireArmed bool `json:"requireArmed,omitempty"`
@@ -199,6 +177,47 @@ type ScenarioDirectUnpackAssertion struct {
 // still running.
 type ScenarioQueueLivenessAssertion struct {
 	ProbeSlug string `json:"probeSlug"`
+}
+
+// expectedOutcome is the outcome the scenario expects.
+func (s *Scenario) expectedOutcome() string {
+	return s.ExpectedOutcome
+}
+
+// outcomePartialDelivery is the expected outcome of a job that delivers some
+// outputs whole and others damaged: history records it PARTIAL, the facade
+// reports it FAILED, and the outputs the scenario lists are still checked as
+// delivered.
+const outcomePartialDelivery = "partial_delivery"
+
+// expectedHistoryStatus is the job_history status the scenario expects of a job
+// the facade reports terminal with `status`. A partial delivery is FAILED to the
+// facade and PARTIAL in history; every other outcome records what the facade
+// reports. A nil scenario expects the facade status.
+func (s *Scenario) expectedHistoryStatus(status string) string {
+	if s != nil && s.expectedOutcome() == outcomePartialDelivery && normalizeFacadeState(status) == "FAILED" {
+		return "PARTIAL"
+	}
+	return status
+}
+
+// deliveredOn reports whether a job the facade reports terminal with `status`
+// delivered outputs the scenario's post-terminal checks (events, digests,
+// runtime assertions) apply to: a completed job, or a partial delivery the
+// scenario expects.
+func (s *Scenario) deliveredOn(status string) bool {
+	switch normalizeFacadeState(status) {
+	case "COMPLETE":
+		return true
+	case "FAILED":
+		return s != nil && s.expectedOutcome() == outcomePartialDelivery
+	}
+	return false
+}
+
+// expectedErrorContains is the terminal error substring the scenario expects.
+func (s *Scenario) expectedErrorContains() string {
+	return s.ExpectedErrorContains
 }
 
 func (s *Scenario) fileIdentityRewriteAssertion() *ScenarioFileIdentityRewriteAssertion {
@@ -234,13 +253,6 @@ func (s *Scenario) queueLivenessAssertion() *ScenarioQueueLivenessAssertion {
 		return nil
 	}
 	return s.RuntimeAssertions.QueueLiveness
-}
-
-func (s *Scenario) healthProbeAssertion() *ScenarioHealthProbeAssertion {
-	if s == nil || s.RuntimeAssertions == nil {
-		return nil
-	}
-	return s.RuntimeAssertions.HealthProbe
 }
 
 func (s *Scenario) logAssertion() *ScenarioLogAssertion {
@@ -379,6 +391,8 @@ func Run(args []string, programName string) {
 		cmdRestartAll()
 	case "restart-test":
 		cmdRestartTest(args[1:])
+	case "adversarial":
+		cmdAdversarial(args[1:])
 	case "chaos":
 		if len(args) < 2 {
 			log.Fatalf("usage: %s chaos <config>  (e.g. 'drop_conn=10,slow_body=50' or 'off')", cliProgramName)
@@ -422,6 +436,7 @@ Commands:
   container-restart    Restart the Docker Weaver service and verify its persisted encryption key
   restart-all           Run the restart/crash litmus suite
   restart-test [case...] Run specific restart case(s)
+  adversarial [slug...] Run the adversarial-archives scenarios on SQLite
   chaos <config>        Configure NNTP chaos on the primary server
   chaos-test            Run the NNTP chaos suite
   tcp-chaos             Run the TCP chaos suite
@@ -436,7 +451,7 @@ Environment:
   E2E_RUNTIME_PORTS_FILE  Path to the runtime port state file
   E2E_RUN_DIR          Path to local temp state for managed weaver runs
   E2E_WEAVER_DATASTORE Weaver datastore for managed local runs: sqlite|postgres (default: sqlite)
-  E2E_WEAVER_RELEASE_GATE_JOBS Parallel product-flow workers (default: 8, or 4 inside a full run; max: 16)
+  E2E_WEAVER_RELEASE_GATE_JOBS Parallel product-flow workers (default: 8, or 6 inside a full run; max: 16)
   E2E_FULL_PHASE_JOBS  Phases a full run executes at once (default: 4)
   E2E_WEAVER_RELEASE_GATE_ROOT Stable root for release-gate runs and latest pointer
   E2E_WEAVER_PLAYWRIGHT_IMAGE Weaver-only Playwright image override
@@ -470,6 +485,7 @@ Environment:
   E2E_RESTART_ONLY_CASE       Limit restart-all to a specific restart case name
   E2E_RESTART_TIMEOUT_SEC     Per-case timeout for restart suite (default: 900)
   E2E_RESTART_KEEP_ARTIFACTS  Keep restart artifacts under E2E_RUN_DIR (default: true)
+  E2E_ADVERSARIAL_TIMEOUT_SEC Bound on the whole adversarial lane (default: 3600)
   CHAOS_ONLY_ROUND     Limit chaos-test to a specific round number
   TCP_CHAOS_ONLY_ROUND Limit tcp-chaos to a specific round number`, cliProgramName)
 }
@@ -1240,6 +1256,33 @@ func testdataDir() string {
 }
 
 var canonicalFixtureSlugs = []string{
+	"sniff-trailing-names",
+	"split-gzip",
+	"split-bzip2",
+	"split-zstd",
+	"split-xz-damaged",
+	"split-gzip-damaged",
+	"split-xz-missing",
+	"split-xz-missing-article",
+	"split-xz-missing-par2",
+	"split-xz-damaged-par2",
+	"xz-corrupted",
+	"bzip2-corrupted",
+	"zstd-corrupted",
+	"tarxz-corrupted-empty",
+	"tarxz-corrupted-partial",
+	"rar4-record-repair",
+	"rar5-record-repair",
+	"rar4-record-and-volume-repair",
+	"rar5-record-and-volume-repair",
+	"par2-unicode-names",
+	"par3-unicode-names",
+	"par2-unrelated-set",
+	"par2-describes-unposted",
+	"rar-par2-case-collision",
+	"held-plain-uu",
+	"held-rar-uu",
+	"held-stream-uu",
 	// The 7z direct-unpack codec matrix: every coder chain the pinned 7-Zip
 	// writes and weaver decodes, in both shapes. The split variants are the
 	// ones a chase can overlap; the single .7z ones have no topology until
@@ -1277,13 +1320,12 @@ var canonicalFixtureSlugs = []string{
 	"brotli-single",
 	"bzip2-single",
 	"deflate-single",
-	// Direct-store routing writes a RAR set's members straight to their
-	// destinations and never materialises the source volumes. Its output is
-	// byte-identical to the conventional path, so these fixtures prove nothing
-	// by their bytes alone — what they prove is that the sets weaver *should*
-	// route direct still do, asserted from weaver's own counters after the run
-	// (see assertDirectStoreEngagement). Each is store-method and non-solid;
-	// archives direct-store is right to refuse are the rest of this corpus.
+	// A stored RAR set's members are written straight to their destinations
+	// and the source volumes are never materialised. The output is the same
+	// either way, so these fixtures prove nothing by their bytes alone; what
+	// they prove is that the sets weaver should read in place still are,
+	// asserted from the graph's lines after the run (see
+	// assertDirectStoreEngagement). Each is store-method and non-solid.
 	"direct-store-encrypted",
 	"direct-store-encrypted-par2-repair",
 	"direct-store-hp",
@@ -1348,6 +1390,7 @@ var canonicalFixtureSlugs = []string{
 	"par2-multi-set-archives-clean",
 	"par2-multi-set-archives-insufficient",
 	"par2-direct-repair",
+	"par2-exact-name-content-match",
 	"par2-ignorable-deficit",
 	"par2-partial-volume",
 	"par2-two-sets",
@@ -1463,6 +1506,9 @@ var canonicalFixtureSlugs = []string{
 	"zip-corrupted",
 	"zip-encrypted",
 	"zip-unencrypted",
+	"zip-deflate-lost-article",
+	"zip-cp437-empty-dirs",
+	"zip-unicode-collisions",
 	"xz-text",
 	"xz-video",
 	"zstd-single",
@@ -1520,8 +1566,10 @@ func fixtureSlugsForSeedProfile(profile string) []string {
 		return append([]string(nil), tcpChaosFixtureSlugs...)
 	case "restart":
 		return restartFixtureSlugs()
+	case "adversarial":
+		return adversarialFixtureSlugs()
 	default:
-		log.Fatalf("invalid E2E_SEED_PROFILE=%q (expected functional|chaos|tcp-chaos|restart)", profile)
+		log.Fatalf("invalid E2E_SEED_PROFILE=%q (expected functional|chaos|tcp-chaos|restart|adversarial)", profile)
 		return nil
 	}
 }
@@ -1977,7 +2025,7 @@ func cmdScenarios() {
 	fmt.Printf("%-25s %-5s %-22s %s\n", "SLUG", "CAT", "OUTCOME", "DESCRIPTION")
 	fmt.Println(strings.Repeat("-", 100))
 	for _, s := range loadScenariosForSlugs(canonicalFixtureSlugs) {
-		outcome := s.ExpectedOutcome
+		outcome := s.expectedOutcome()
 		if s.Disabled != "" {
 			outcome = "disabled"
 		}

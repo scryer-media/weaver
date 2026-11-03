@@ -1,0 +1,15 @@
+{
+  "slug": "adv-zip-duplicate-names",
+  "title": "E2E.Adversarial.Zip.Duplicate.Names.2026-TESTGRP",
+  "description": "Duplicate ZIP names are rejected by security validation; retained archive bytes are not usable delivery.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "expectedErrorContains": "invalid archive",
+  "adversarial": {
+    "group": "default",
+    "outcome": "failed",
+    "errorContains": "invalid archive",
+    "extractsNothing": true,
+    "forbiddenOutputs": ["dup.txt", "dup (1).txt"]
+  }
+}

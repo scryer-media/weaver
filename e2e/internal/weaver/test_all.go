@@ -4,11 +4,10 @@
 package weaver
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -113,11 +112,11 @@ func printSlowestTestJobs(jobs []testJob, limit int) {
 	}
 }
 
-func observeRuntimeFileIdentityRewrite(job *testJob, dbPath string, queryContext string) {
+func observeRuntimeFileIdentityRewrite(job *testJob, queryContext string) {
 	if !testJobNeedsRuntimeFileIdentityRewrite(job) {
 		return
 	}
-	observer, err := openFileIdentityRewriteObserver(dbPath)
+	observer, err := openFileIdentityRewriteObserver()
 	if err != nil {
 		job.fileIdentityRewriteLastQueryError = err.Error()
 		log.Printf("  %s: runtime file-identity rewrite query error%s: %v", job.slug, queryContext, err)
@@ -264,7 +263,7 @@ func functionalStatusPollIndexes(jobs []testJob, fastRewritePolling bool, cursor
 func finalizeTestJobFromSnapshot(job *testJob, dbPath string, snapshot facadeItemSnapshot, queryContext string) {
 	job.resolvedAt = time.Now()
 	assertion := job.scenario.fileIdentityRewriteAssertion()
-	observeRuntimeFileIdentityRewrite(job, dbPath, queryContext)
+	observeRuntimeFileIdentityRewrite(job, queryContext)
 
 	if overrideStatus, overrideErrMsg, overridden := applyRuntimeFileIdentityRewriteTerminalCheck(
 		snapshot.Status,
@@ -285,16 +284,23 @@ func finalizeTestJobFromSnapshot(job *testJob, dbPath string, snapshot facadeIte
 	}
 }
 
-// functionalNeedsFileIdentityRewriteObserver reports whether any fixture reads
-// the rewrite observer. Its trigger adds a write to every file-identity upsert
-// weaver makes, so a run with no reader leaves it out.
-func functionalNeedsFileIdentityRewriteObserver(jobs []testJob) bool {
-	for i := range jobs {
-		if jobs[i].scenario.fileIdentityRewriteAssertion().enabled() {
-			return true
-		}
-	}
-	return false
+// fileCompleteQuery asks whether a job has every byte of a posted file. Each
+// posted file is checkpointed as a root member (node 0) with the byte runs it
+// holds of it, so the file is complete once its length is known and its runs
+// cover all of it.
+const fileCompleteQuery = `SELECT COUNT(*) FROM graph_members m
+	WHERE m.job_id = ? AND m.node_id = 0 AND m.name = ? AND m.length IS NOT NULL
+	AND m.length <= (
+		SELECT COALESCE(SUM(c.range_end - c.range_start), 0) FROM graph_coverage c
+		WHERE c.job_id = m.job_id AND c.node_id = m.node_id AND c.member_id = m.member_id
+	)`
+
+// fileComplete reports whether weaver holds every byte of the job's posted
+// file.
+func fileComplete(db *sql.DB, datastore weaverDatastore, jobID int, filename string) (bool, error) {
+	var count int
+	err := db.QueryRow(rebindWeaverSQL(datastore, fileCompleteQuery), jobID, filename).Scan(&count)
+	return count > 0, err
 }
 
 func waitForActiveFileComplete(dbPath string, jobID int, filename string, timeout time.Duration) error {
@@ -304,15 +310,10 @@ func waitForActiveFileComplete(dbPath string, jobID int, filename string, timeou
 	}
 	defer closeWeaverStateDB(db, datastore)
 
-	query := rebindWeaverSQL(
-		datastore,
-		`SELECT COUNT(*) FROM active_files WHERE job_id = ? AND filename = ?`,
-	)
 	deadline := time.Now().Add(timeout)
 	for {
-		var count int
-		err := db.QueryRow(query, jobID, filename).Scan(&count)
-		if err == nil && count > 0 {
+		complete, err := fileComplete(db, datastore, jobID, filename)
+		if err == nil && complete {
 			return nil
 		}
 		if err != nil && !isTransientSQLiteBusy(err) {
@@ -653,11 +654,6 @@ func runTests(slugs []string) {
 	}
 
 	dbPath := localWeaverDBPath()
-	if functionalNeedsFileIdentityRewriteObserver(jobs) {
-		if err := installFileIdentityRewriteObserver(dbPath); err != nil {
-			log.Fatalf("install file identity rewrite observer: %v", err)
-		}
-	}
 	// The queue-liveness fixture must consume the one-shot delay before normal
 	// functional batches can run. It is otherwise indistinguishable from a
 	// normal direct-store repair fixture, so keep it in the functional corpus
@@ -762,7 +758,7 @@ func runTests(slugs []string) {
 
 		fastRewritePolling := functionalHasPendingFileIdentityRewrite(jobs)
 		if fastRewritePolling {
-			observer, err := openFileIdentityRewriteObserver(dbPath)
+			observer, err := openFileIdentityRewriteObserver()
 			if err != nil {
 				for i := range jobs {
 					if testJobNeedsRuntimeFileIdentityRewrite(&jobs[i]) {
@@ -947,10 +943,10 @@ func runTests(slugs []string) {
 	passCount, failCount := 0, 0
 	for _, j := range jobs {
 		passed := false
-		switch j.scenario.ExpectedOutcome {
+		switch j.scenario.expectedOutcome() {
 		case "success", "repair_then_success":
 			passed = j.status == "COMPLETE"
-		case "health_failure", "encryption_unsupported", "repair_failure", "extraction_failure":
+		case "health_failure", "encryption_unsupported", "repair_failure", "extraction_failure", outcomePartialDelivery:
 			passed = j.status == "FAILED"
 		case "nested_depth_exceeded":
 			// Completes but output is still an archive (not the final media)
@@ -962,7 +958,7 @@ func runTests(slugs []string) {
 		// A scenario that names the failure it is testing has to get that
 		// failure: "FAILED" on its own is also what a broken fixture looks like.
 		mismatch := ""
-		if expected := j.scenario.ExpectedErrorContains; passed && expected != "" {
+		if expected := j.scenario.expectedErrorContains(); passed && expected != "" {
 			if !strings.Contains(strings.ToLower(j.errMsg), strings.ToLower(expected)) {
 				passed = false
 				mismatch = fmt.Sprintf(
@@ -982,7 +978,7 @@ func runTests(slugs []string) {
 		} else {
 			passCount++
 		}
-		fmt.Printf("%-25s %-22s %-12s %-8s %s\n", j.slug, j.scenario.ExpectedOutcome, j.status, testJobDurationLabel(j), label)
+		fmt.Printf("%-25s %-22s %-12s %-8s %s\n", j.slug, j.scenario.expectedOutcome(), j.status, testJobDurationLabel(j), label)
 	}
 	fmt.Println(strings.Repeat("-", 78))
 	fmt.Printf("Total: %d passed, %d failed out of %d\n", passCount, failCount, len(jobs))
@@ -1005,7 +1001,7 @@ func runTests(slugs []string) {
 		}
 	}
 
-	if err := assertDirectStoreEngagement(weaverURL, jobs); err != nil {
+	if err := assertDirectStoreEngagement(jobs); err != nil {
 		fmt.Printf("DIRECT-STORE ASSERTION FAILED: %v\n", err)
 		emitProgressEvent(progressEvent{Kind: "phase_done", Current: len(jobs), Total: len(jobs), Status: "fail"})
 		os.Exit(1)
@@ -1020,249 +1016,23 @@ func runTests(slugs []string) {
 	stopManagedWeaverAfterProfileCollection()
 }
 
-// directStoreCounters is weaver's lifetime view of direct-store routing.
-type directStoreCounters struct {
-	Admitted            int64 `json:"directSetsAdmitted"`
-	Demoted             int64 `json:"directSetsDemoted"`
-	FinalizedDirect     int64 `json:"directSetsFinalizedDirect"`
-	RepairedWhileDirect int64 `json:"directSetsRepairedWhileDirect"`
-}
-
-func fetchDirectStoreCounters(weaverURL string) (directStoreCounters, error) {
-	var counters directStoreCounters
-	payload, _ := json.Marshal(map[string]interface{}{
-		"query": `query {
-			metrics {
-				directSetsAdmitted
-				directSetsDemoted
-				directSetsFinalizedDirect
-				directSetsRepairedWhileDirect
-			}
-		}`,
-	})
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := postGraphQLWithClient(client, weaverURL, payload)
+// assertDirectStoreEngagement checks that the phase's store archives were read
+// in place. Stored members produce the same bytes either way, so a run that
+// never bound a store object passes every `expectedOutputBLAKE3` and every
+// event assertion in the corpus; the graph's lines are the only witness (see
+// graphDirectStoreEngagementVerdict).
+func assertDirectStoreEngagement(jobs []testJob) error {
+	raw, err := os.ReadFile(localWeaverLogPath())
 	if err != nil {
-		return counters, err
+		return fmt.Errorf("could not read the weaver log to check store engagement: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		body, _ := io.ReadAll(resp.Body)
-		return counters, fmt.Errorf("metrics query returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	var gqlResp struct {
-		Data struct {
-			Metrics directStoreCounters `json:"metrics"`
-		} `json:"data"`
-		Errors []struct {
-			Message string `json:"message"`
-		} `json:"errors"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&gqlResp); err != nil {
-		return counters, fmt.Errorf("decode metrics response: %w", err)
-	}
-	if len(gqlResp.Errors) > 0 {
-		return counters, fmt.Errorf("metrics query error: %s", gqlResp.Errors[0].Message)
-	}
-	return gqlResp.Data.Metrics, nil
-}
-
-// assertDirectStoreEngagement checks that direct-store routing actually carried
-// the corpus when the phase asked for it.
-//
-// This is the assertion the scenario files cannot express. Direct-store emits
-// the same `SegmentCommitted`/`FileComplete` events as the conventional path
-// and produces byte-identical output, so a run that silently demoted every set
-// — or never engaged the gate at all — passes every `expectedOutputBLAKE3` and
-// every event assertion in the corpus. Until these counters existed, a green
-// `functional-direct` phase meant "no wrong bytes", not "direct-store worked".
-//
-// Deliberately not asserted: `Demoted == 0`. The functional corpus contains
-// archives direct-store is *right* to refuse — compressed and solid members,
-// for two — so a zero demotion count would be a bug, not a success. What must
-// hold is that the gate engaged and that at least one set rode it all the way
-// to completion without ever writing a source volume, which is the only
-// externally observable proof the feature did its job.
-//
-// A no-op when the phase did not enable direct-store: the conventional phases
-// legitimately report zeroes, and asserting there would fail them all.
-func assertDirectStoreEngagement(weaverURL string, jobs []testJob) error {
-	if !directStoreEnabledForPhase() {
-		return nil
-	}
-
-	counters, err := fetchDirectStoreCounters(weaverURL)
-	if err != nil {
-		return fmt.Errorf("could not read direct-store counters: %w", err)
-	}
-
-	fmt.Printf(
-		"direct-store: admitted=%d finalized_direct=%d demoted=%d repaired_while_direct=%d\n",
-		counters.Admitted, counters.FinalizedDirect, counters.Demoted, counters.RepairedWhileDirect,
-	)
-
-	if counters.Admitted == 0 {
-		return fmt.Errorf(
-			"WEAVER_RAR_DIRECT_STORE is on but weaver admitted 0 archive sets — "+
-				"the gate never engaged, so this phase proved nothing about direct routing "+
-				"(demoted=%d finalized_direct=%d)",
-			counters.Demoted, counters.FinalizedDirect,
-		)
-	}
-	if counters.FinalizedDirect == 0 {
-		return fmt.Errorf(
-			"weaver admitted %d direct set(s) but finalized 0 of them directly — every set "+
-				"fell back to writing source volumes, which is the silent-demotion failure this "+
-				"phase exists to catch (demoted=%d)",
-			counters.Admitted, counters.Demoted,
-		)
-	}
-	if counters.FinalizedDirect < directStoreArchiveSetCount {
-		return fmt.Errorf(
-			"only %d set(s) finalized direct, but the corpus carries %d archive sets built to route "+
-				"direct end to end — at least one of them demoted; check the weaver log for "+
-				"`direct-store set demoted` and its reason",
-			counters.FinalizedDirect, directStoreArchiveSetCount,
-		)
-	}
-	// The corpus carries `direct-store-par2-repair`, a damaged set whose whole
-	// point is to be repaired in place without leaving direct routing. The
-	// finalized-direct floor above cannot see the difference between "repaired
-	// while direct" and "was never damaged at all" — a fixture regression that
-	// stops producing damage would pass every other check while the repair path
-	// silently went unexercised. The counter is the only witness that the
-	// repair actually ran, which is why a zero here fails the phase.
-	if counters.RepairedWhileDirect < 1 {
-		return fmt.Errorf(
-			"repaired_while_direct=0, but the corpus carries a damaged direct fixture that must "+
-				"be repaired in place — either its set demoted for damage the recovery could have "+
-				"covered, or the fixture no longer produces damage; check the weaver log for "+
-				"`staying direct while the targeted recovery arrives` (admitted=%d finalized_direct=%d demoted=%d)",
-			counters.Admitted, counters.FinalizedDirect, counters.Demoted,
-		)
-	}
-	return assertNoUnexpectedDirectDemotions(jobs)
-}
-
-// Demotion reasons that are direct-store *working*: the set carried something
-// it is designed to refuse, and refusing is the correct outcome. The functional
-// corpus is full of these — compressed, solid and encrypted RAR sets that exist
-// to test the conventional path — so their presence says nothing about whether
-// direct routing is healthy.
-// Archive sets in the canonical corpus built to route direct end to end. Kept
-// as a count rather than a list because the counters report finalized sets in
-// aggregate; par2-multi-set-archives contributes two independent sets.
-// direct-store-par2-withheld-volume counts: a volume nobody posted is created
-// by the repair and the set finalizes direct around it. Three PAR3 twins of the
-// repair sets count the same way; direct-store-par3-withheld-volume is disabled
-// and does not run.
-const directStoreArchiveSetCount = 16
-
-// Demotion reasons that mean direct-store REFUSED an archive it is designed not
-// to carry. Refusal is the correct outcome and says nothing about health.
-//
-// Taken from the product's own `DemotionReason::metric()` strings. Every other
-// reason in that enum is a failure — a set weaver admitted and then could not
-// carry — and fails the phase below.
-var byDesignDirectRefusals = map[string]bool{
-	"member_compressed":        true,
-	"member_encrypted":         true,
-	"member_solid":             true,
-	"member_directory":         true,
-	"member_redirection":       true,
-	"member_no_checksum":       true,
-	"member_malformed_chain":   true,
-	"member_blake2_only":       true,
-	"tolerance_budget":         true,
-	"unsupported_format":       true,
-	"encrypted_facts_disagree": true,
-	// Refused *destinations* over a truthful image, not a carry failure. The
-	// router classifies both as `VolumeDemand::Virtual`: the archive parsed,
-	// the routed bytes are the posted bytes, and what direct-store refused is
-	// where a member would land — a path the RAR validator rejects, or two
-	// members that sanitize to the same path. The conventional extractor
-	// applies the same two rules and fails the archive the same way, so
-	// demoting is what makes direct routing reproduce the conventional
-	// outcome exactly instead of silently overwriting one member with
-	// another.
-	//
-	// These reach the check at *header* time rather than at admission. Member
-	// names do not exist until a volume's headers are parsed, so a collision
-	// or an unsafe path among members that live under directories can only be
-	// discovered then — and since directory members became admissible, the
-	// `member_directory` refusal no longer fires first and hides them.
-	"colliding_destinations": true,
-	"unsafe_destination":     true,
-	// The 7z container refusals that describe the archive's shape rather than
-	// its bytes: a coder other than `Copy`, AES content or an AES end header,
-	// an anti-item, a redirection, a container of only directories and empty
-	// files, an entry name the path check refuses, or a volume zero with no
-	// usable length hint. Each hands the set to the conventional path, which
-	// extracts it the ordinary way.
-	"7z_coder":                true,
-	"7z_encrypted_content":    true,
-	"7z_encrypted_header":     true,
-	"7z_anti_item":            true,
-	"7z_redirection":          true,
-	"7z_nothing_to_route":     true,
-	"7z_unsafe_destination":   true,
-	"7z_volume_hint_unusable": true,
-}
-
-// Declared outcomes that say a fixture is damaged on purpose: its bytes or its
-// articles are broken, and the scenario expects weaver to repair or refuse it.
-// With direct-store on for every functional run those sets are admitted first,
-// detect their own damage and demote — correctly — so a damage demotion from
-// one of them is the product working rather than failing.
-var damagedFixtureOutcomes = map[string]bool{
-	"repair_then_success": true,
-	"repair_failure":      true,
-	"extraction_failure":  true,
-	"health_failure":      true,
-}
-
-// isDamageDemotion reports whether a reason means "the bytes were wrong", which
-// a deliberately corrupt fixture is entitled to produce.
-func isDamageDemotion(reason string) bool {
-	switch reason {
-	case "member_checksum_mismatch", "part_checksum_mismatch", "volume_crc_mismatch",
-		"par2_damaged", "par2_unbindable", "7z_volume_size":
-		return true
-	}
-	return false
-}
-
-// scenarioAllowsDamageDemotion reports whether a scenario is entitled to a
-// damage demotion with this reason, from what its scenario.json declares.
-//
-// A scenario that carries a `directStore` assertion owns its demotions: only
-// the reason it names is allowed, because the fixture exists to pin what
-// direct-store does with it. Every other scenario is allowed a damage demotion
-// when its declared outcome says the fixture is damaged on purpose.
-func scenarioAllowsDamageDemotion(scenario *Scenario, reason string) bool {
-	if scenario == nil || !isDamageDemotion(reason) {
-		return false
-	}
-	if assertion := scenario.directStoreAssertion(); assertion != nil {
-		return assertion.ExpectedDemotionReason == reason
-	}
-	return damagedFixtureOutcomes[scenario.ExpectedOutcome]
-}
-
-// submittedScenariosByJobID maps job id -> the scenario submitted as that job,
-// the same pairing the phase log prints as "<slug> — submitted job=<id>". It is
-// what lets a demotion be attributed to the fixture that caused it: the check
-// otherwise sees only aggregate reasons and cannot tell a corrupt-on-purpose
-// fixture from a healthy set that failed.
-func submittedScenariosByJobID(jobs []testJob) map[string]*Scenario {
-	scenarios := make(map[string]*Scenario, len(jobs))
+	var jobIDs []int
 	for _, job := range jobs {
-		if job.jobID == 0 || job.scenario == nil {
-			continue
+		if job.jobID > 0 {
+			jobIDs = append(jobIDs, job.jobID)
 		}
-		scenarios[strconv.Itoa(job.jobID)] = job.scenario
 	}
-	return scenarios
+	return graphDirectStoreEngagementVerdict(string(raw), jobIDs)
 }
 
 // weaverDebugRingTarget is the log target weaver writes a job's debug ring
@@ -1292,120 +1062,9 @@ func directLogJobID(line string) string {
 	return rest[:end]
 }
 
-// assertNoUnexpectedDirectDemotions fails the phase on any demotion that is
-// neither a by-design refusal nor a deliberately damaged fixture.
-//
-// The counters alone cannot express this: `directSetsDemoted` sums correct
-// refusals and genuine failures together, and this corpus produces dozens of the
-// former every run. The reason lives only in weaver's log, so that is where this
-// reads it.
-func assertNoUnexpectedDirectDemotions(jobs []testJob) error {
-	raw, err := os.ReadFile(localWeaverLogPath())
-	if err != nil {
-		return fmt.Errorf("could not read the weaver log to check demotion reasons: %w", err)
-	}
-	reasons := unexpectedDirectDemotions(string(raw), submittedScenariosByJobID(jobs))
-	if len(reasons) == 0 {
-		return nil
-	}
-	return fmt.Errorf(
-		"direct-store demoted set(s) for reason(s) that are neither by-design refusals nor "+
-			"deliberate fixture damage: %s — a set was admitted and then could not be carried",
-		strings.Join(reasons, ", "),
-	)
-}
-
-// unexpectedDirectDemotions tallies the demotions in a weaver log that are
-// neither by-design refusals nor damage the demoting job's scenario declares,
-// as sorted "<reason> (job <slug>) x<count>" entries. A demotion from a job no
-// scenario was submitted as is attributed to its raw job id.
-func unexpectedDirectDemotions(log string, scenarios map[string]*Scenario) []string {
-	unexpected := map[string]int{}
-	for _, line := range strings.Split(log, "\n") {
-		if !strings.Contains(line, "direct-store set demoted") || isWeaverDebugRingReplay(line) {
-			continue
-		}
-		reason := directDemotionReason(line)
-		if reason == "" || byDesignDirectRefusals[reason] ||
-			// Header-encrypted refusals carry a per-format suffix
-			// (`header_encrypted_rar4`, `..._unkeyable`), so match the family.
-			strings.HasPrefix(reason, "header_encrypted") {
-			continue
-		}
-		jobID := directLogJobID(line)
-		scenario := scenarios[jobID]
-		if scenarioAllowsDamageDemotion(scenario, reason) {
-			continue
-		}
-		job := "id " + jobID
-		if scenario != nil {
-			job = scenario.Slug
-		}
-		unexpected[fmt.Sprintf("%s (job %s)", reason, job)]++
-	}
-	reasons := make([]string, 0, len(unexpected))
-	for reason, count := range unexpected {
-		reasons = append(reasons, fmt.Sprintf("%s x%d", reason, count))
-	}
-	sort.Strings(reasons)
-	return reasons
-}
-
 // ansiEscape matches the SGR sequences weaver's tracing writer emits around
 // every field name and separator.
 var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
-
-// directDemotionReason pulls the reason out of a `direct-store set demoted ...
-// reason="member_compressed"` log line.
-//
-// Stripping ANSI first is the whole subtlety of reading that log. Weaver writes
-// it with colour, so the raw bytes are
-// `reason<ESC>[0m<ESC>[2m=<ESC>[0m"member_compressed"` and a search for the
-// literal `reason="` matches nothing at all. Parsing without stripping made
-// this check silently pass a run that had demoted three sets for failure
-// reasons — it reported success at precisely the moment it had something to
-// report, which is the worst way for an assertion to be wrong.
-func directDemotionReason(line string) string {
-	line = ansiEscape.ReplaceAllString(line, "")
-	const key = "reason="
-	start := strings.Index(line, key)
-	if start < 0 {
-		return ""
-	}
-	rest := strings.TrimPrefix(line[start+len(key):], `"`)
-	end := strings.IndexAny(rest, "\" \t")
-	if end < 0 {
-		return strings.TrimSpace(rest)
-	}
-	return rest[:end]
-}
-
-// directStoreEnabledForPhase reports whether this harness process was launched
-// with direct-store on. The phase definition passes `WEAVER_RAR_DIRECT_STORE`
-// through `extraEnv`, which reaches both weaver and this process, so the
-// harness can read the same switch the product read.
-func directStoreEnabledForPhase() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("WEAVER_RAR_DIRECT_STORE"))) {
-	case "1", "true", "on", "yes":
-		return true
-	default:
-		return false
-	}
-}
-
-// directUnpackEnabledForPhase reports whether weaver ran this phase with the 7z
-// direct-unpack gate on. The phase's extraEnv reaches weaver and this process
-// alike, so the harness reads the same switch the product read — but unlike
-// direct-store the product default is ON, so an unset or unrecognised value
-// means the gate was up. Only an explicit off reading turns it off.
-func directUnpackEnabledForPhase() bool {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("WEAVER_DIRECT_UNPACK"))) {
-	case "0", "false", "off", "no":
-		return false
-	default:
-		return true
-	}
-}
 
 func functionalPollInterval(jobs []testJob) time.Duration {
 	if functionalHasPendingFileIdentityRewrite(jobs) {

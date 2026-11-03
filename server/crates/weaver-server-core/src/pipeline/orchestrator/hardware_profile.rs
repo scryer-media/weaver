@@ -66,7 +66,7 @@ impl Pipeline {
     //
     // Nothing running is stopped or resized. Each limit is taken where an
     // activity starts: a download reads the tuner when it is dispatched, a
-    // decode when it is spawned, an extraction or repair clones the pool,
+    // decode when it is spawned, a graph run or repair takes the grant,
     // the extraction limits and its memory-budget view when it is admitted.
     // Replacing them here therefore leaves running work with what it started
     // on and gives the next activity the new values. A replaced pool is
@@ -79,17 +79,9 @@ impl Pipeline {
             return;
         }
 
-        let prior_extract_threads = self.tuner.params().extract_thread_count;
         self.tuner.set_profile_tuning(tuning);
         self.shared_state
             .set_sevenz_decode_memory_bytes(tuning.sevenz_decode_memory_bytes);
-        self.shared_state.set_chase_widening(tuning.chase_widening);
-        // The PAR3 budgets are sized on first use, so the share only matters
-        // until then; the worker cap is read at every dispatch.
-        crate::pipeline::repair::par3::budget::set_memory_share(tuning.par3_memory);
-        if let Some(par3) = self.par3_runtime.as_mut() {
-            par3.set_cpu_cap(tuning.par3_cpu_cap);
-        }
 
         let limits = self
             .extraction_limits
@@ -102,17 +94,8 @@ impl Pipeline {
             self.extraction_limits = Arc::new(limits);
         }
 
-        // Both pools are sized from the same count. A chase already running
-        // on the old chase pool still counts as occupied when a new one asks
-        // for a worker, so admission against the new pool's size stays
-        // conservative until the old chases end.
         let extract_threads = self.tuner.params().extract_thread_count;
-        if extract_threads != prior_extract_threads {
-            self.pp_pool =
-                crate::runtime::postprocess_pool::build_postprocess_pool(extract_threads);
-            self.chase_pool =
-                crate::runtime::postprocess_pool::build_postprocess_pool(extract_threads);
-        }
+        self.graph_hardware.follow(&self.tuner);
 
         info!(
             hardware_profile = in_force.active.as_str(),

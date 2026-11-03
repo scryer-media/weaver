@@ -41,7 +41,7 @@ func scriptedCappedProvider(t *testing.T, refusals int32) (host, port string, se
 				}
 				reader := bufio.NewReader(conn)
 				_, _ = conn.Write([]byte("200 scripted ready\r\n"))
-				for _, reply := range []string{"381 password\r\n", "281 authenticated\r\n"} {
+				for _, reply := range []string{"200 control\r\n", "381 password\r\n", "281 authenticated\r\n"} {
 					if _, err := reader.ReadString('\n'); err != nil {
 						return
 					}
@@ -53,6 +53,18 @@ func scriptedCappedProvider(t *testing.T, refusals int32) (host, port string, se
 				}
 				served.Add(1)
 				_, _ = conn.Write([]byte(`290 {"attempted":9,"accepted":4,"rejected":5,"active":0,"peak_active":4,"configured_limit":4}` + "\r\n"))
+				// Complete the same QUIT/EOF handshake as the real fixture.
+				// Closing with the client's QUIT unread can reset the socket
+				// and make a successfully answered metrics read look failed.
+				command, err = reader.ReadString('\n')
+				if err != nil {
+					return
+				}
+				if strings.TrimSpace(command) != "QUIT" {
+					t.Errorf("expected QUIT after metrics, got %q", command)
+					return
+				}
+				_, _ = conn.Write([]byte("205 closing connection\r\n"))
 			}()
 		}
 	}()

@@ -14,7 +14,10 @@ mod admission;
 mod counters;
 mod history;
 mod intents;
+pub mod paging;
 pub(crate) use admission::{AdmissionResources, PreparedAdd, RestartAdmission};
+#[cfg(test)]
+pub(crate) use counters::COUNTER_SAMPLES;
 pub(crate) use history::clear_restart_artifacts;
 
 /// The control plane's shared facts. A guard never leaves a synchronous
@@ -24,6 +27,9 @@ pub struct Queue {
     history: std::sync::RwLock<Arc<[JobInfo]>>,
     revision: watch::Sender<u64>,
     intent_wake: tokio::sync::Notify,
+    // The actor's word on whether anything is there for a periodic driver
+    // to move. The counters ticker waits on it while it says no.
+    drive: watch::Sender<bool>,
     pub(crate) resources: std::sync::OnceLock<AdmissionResources>,
     pub(crate) closed: std::sync::atomic::AtomicBool,
     ticker_started: std::sync::atomic::AtomicBool,
@@ -66,7 +72,13 @@ impl<T> Change<T> {
 #[derive(Default)]
 pub struct QueueInner {
     pub globals: Globals,
+    // Rows are added, removed and reordered only through `push_job`,
+    // `retain_jobs` and `reindex_jobs`, which keep `job_positions` in step.
     pub jobs: Vec<JobRow>,
+    // Each row's position in `jobs`, so a lookup by id is one probe.
+    job_positions: HashMap<JobId, usize>,
+    // The rows in a phase, the only ones the metrics tick samples.
+    phased_jobs: std::collections::HashSet<JobId>,
     pub history_summary: crate::operations::metrics_store::JobStatusCounts,
     pub(crate) admissions: std::collections::HashSet<JobId>,
     pub(crate) history_operations: std::collections::HashSet<JobId>,
@@ -77,6 +89,20 @@ pub struct QueueInner {
     pub(crate) diagnostics_requested: u64,
     pub(crate) diagnostics: Option<(u64, crate::pipeline::diagnostics::PipelineDiagnostics)>,
     pub(crate) metrics: Option<crate::operations::metrics::MetricsSnapshot>,
+    // Bumped by every intent write, so the actor can tell a turn with no new
+    // intent from one that needs a walk over the rows.
+    intent_epoch: u64,
+}
+
+// Counts the actor's walks over every queue row, so a test can pin how many
+// a pass makes.
+#[cfg(test)]
+pub(crate) static ROW_WALKS: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+pub(crate) fn count_walk() {
+    #[cfg(test)]
+    ROW_WALKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[derive(Clone, Default)]
@@ -91,13 +117,27 @@ pub struct Globals {
     pub speed_limit: u64,
     pub scheduled_speed_limit: Option<u64>,
     pub propagation_delay: std::time::Duration,
+    pub max_concurrent_nzbs: Option<std::num::NonZeroU32>,
     pub hardware_profile: Option<crate::runtime::HardwareProfile>,
     pub hardware_profile_in_force: Option<crate::jobs::handle::HardwareProfileInForce>,
     pub scheduled_hardware_profile: Option<crate::runtime::HardwareProfile>,
     pub random_read_iops: Option<f64>,
+    pub sequential_write_mbps: Option<f64>,
     pub runtime_paths: Option<RuntimePaths>,
     pub nntp_generation: u64,
     pub nntp_active: Option<crate::jobs::handle::NntpRuntimeActivation>,
+}
+
+impl Globals {
+    // Whether a hold over the whole queue stops every download: a pause, a
+    // scheduled or speed-test pause, a schedule replay, or shutdown.
+    pub(crate) fn holds_downloads(&self) -> bool {
+        self.paused
+            || self.scheduled_pause
+            || self.speed_test_paused
+            || self.schedule_replay_paused
+            || self.shutting_down
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -135,6 +175,8 @@ pub struct Intents {
 
 pub struct Report {
     pub job: JobInfo,
+    // Published only from the actor's durable admission ledger.
+    pub nzb_admitted: bool,
     pub seen_intent_seq: u64,
     pub retiring: bool,
     pub restoring: bool,
@@ -181,6 +223,7 @@ impl JobRow {
             id: job.job_id,
             intents: Intents::default(),
             report: Report {
+                nzb_admitted: false,
                 download_active: job.download_state == crate::DownloadState::Downloading,
                 download_work_pending: false,
                 job,
@@ -282,18 +325,96 @@ impl QueueInner {
     pub fn visible_jobs(&self) -> impl Iterator<Item = JobInfo> + '_ {
         self.jobs.iter().map(|row| row.info(&self.globals))
     }
+
+    pub(crate) fn intent_epoch(&self) -> u64 {
+        self.intent_epoch
+    }
+
+    // The row for `id`, found through the position index.
+    pub(crate) fn job(&self, id: JobId) -> Option<&JobRow> {
+        self.jobs.get(self.job_position(id)?)
+    }
+
+    // The row for `id` to change, found through the position index.
+    pub(crate) fn job_mut(&mut self, id: JobId) -> Option<&mut JobRow> {
+        let position = self.job_position(id)?;
+        self.jobs.get_mut(position)
+    }
+
+    pub(crate) fn contains_job(&self, id: JobId) -> bool {
+        self.job_position(id).is_some()
+    }
+
+    // Where `id` stands in `jobs`, found through the position index.
+    pub(crate) fn job_position(&self, id: JobId) -> Option<usize> {
+        let position = *self.job_positions.get(&id)?;
+        let row = self.jobs.get(position)?;
+        debug_assert_eq!(row.id, id, "the queue's position index is out of step");
+        (row.id == id).then_some(position)
+    }
+
+    // The rows in a phase.
+    pub(crate) fn phased_jobs(&self) -> impl Iterator<Item = JobId> + '_ {
+        self.phased_jobs.iter().copied()
+    }
+
+    pub(crate) fn push_job(&mut self, row: JobRow) {
+        if !row.phases.is_empty() {
+            self.phased_jobs.insert(row.id);
+        }
+        self.job_positions.insert(row.id, self.jobs.len());
+        self.jobs.push(row);
+    }
+
+    // Removes one row, moving up only the rows after it in the index.
+    pub(crate) fn remove_job(&mut self, id: JobId) -> Option<JobRow> {
+        let position = self.job_position(id)?;
+        self.job_positions.remove(&id);
+        self.phased_jobs.remove(&id);
+        let row = self.jobs.remove(position);
+        for (offset, later) in self.jobs[position..].iter().enumerate() {
+            self.job_positions.insert(later.id, position + offset);
+        }
+        Some(row)
+    }
+
+    pub(crate) fn retain_jobs(&mut self, keep: impl FnMut(&JobRow) -> bool) {
+        self.jobs.retain(keep);
+        self.reindex_jobs();
+    }
+
+    // Rebuilds the position index after `jobs` was replaced or reordered.
+    pub(crate) fn reindex_jobs(&mut self) {
+        self.job_positions = self
+            .jobs
+            .iter()
+            .enumerate()
+            .map(|(position, row)| (row.id, position))
+            .collect();
+        self.phased_jobs = self
+            .jobs
+            .iter()
+            .filter(|row| !row.phases.is_empty())
+            .map(|row| row.id)
+            .collect();
+    }
 }
 
 impl Queue {
     pub fn new(jobs: Vec<JobInfo>) -> Self {
         Self {
             history: std::sync::RwLock::default(),
-            inner: Mutex::new(QueueInner {
-                jobs: jobs.into_iter().map(JobRow::new).collect(),
-                ..QueueInner::default()
+            inner: Mutex::new({
+                let mut inner = QueueInner {
+                    jobs: jobs.into_iter().map(JobRow::new).collect(),
+                    ..QueueInner::default()
+                };
+                inner.reindex_jobs();
+                inner
             }),
             revision: watch::channel(0).0,
             intent_wake: tokio::sync::Notify::new(),
+            drive: watch::channel(false).0,
             resources: std::sync::OnceLock::new(),
             closed: std::sync::atomic::AtomicBool::new(false),
             ticker_started: std::sync::atomic::AtomicBool::new(false),
@@ -311,13 +432,7 @@ impl Queue {
     }
 
     pub(crate) fn job_counters(&self, id: JobId) -> Option<Arc<JobCounters>> {
-        self.read(|inner| {
-            inner
-                .jobs
-                .iter()
-                .find(|row| row.id == id)
-                .map(|row| row.counters.clone())
-        })
+        self.read(|inner| inner.job(id).map(|row| row.counters.clone()))
     }
 
     // Called while changing queue membership, so retirement, summary and
@@ -358,7 +473,10 @@ impl Queue {
     }
 
     pub fn write_intent<T>(&self, write: impl FnOnce(&mut QueueInner) -> Change<T>) -> T {
-        let result = self.write(write);
+        let result = self.write(|inner| {
+            inner.intent_epoch = inner.intent_epoch.wrapping_add(1);
+            write(inner)
+        });
         self.intent_wake.notify_one();
         result
     }
@@ -367,15 +485,23 @@ impl Queue {
         self.intent_wake.notified().await;
     }
 
-    // Resolves once shutdown has been signalled. It watches the revision,
-    // which every write moves, so it takes no wake from the actor's loop.
-    pub(crate) async fn shutdown_requested(&self) {
-        let mut revision = self.subscribe();
-        while !self.read(|inner| inner.globals.shutting_down) {
-            if revision.changed().await.is_err() {
-                std::future::pending::<()>().await;
-            }
-        }
+    // Set by the actor at the end of each turn; a repeat of the same answer
+    // wakes no one.
+    pub(crate) fn set_driving(&self, driving: bool) {
+        self.drive.send_if_modified(|current| {
+            let changed = *current != driving;
+            *current = driving;
+            changed
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn driving(&self) -> bool {
+        *self.drive.borrow()
+    }
+
+    pub(crate) fn subscribe_drive(&self) -> watch::Receiver<bool> {
+        self.drive.subscribe()
     }
 
     pub fn subscribe(&self) -> watch::Receiver<u64> {
@@ -395,7 +521,7 @@ impl Queue {
             }
             for id in ids {
                 if let Some(job) = reports.remove(&id) {
-                    inner.jobs.push(JobRow::new(job));
+                    inner.push_job(JobRow::new(job));
                 }
             }
             Change::changed(())
@@ -431,6 +557,7 @@ mod label_tests {
             total_files: 1,
             completed_files: 0,
             remaining_par_files: 0,
+            file_remaining_bytes: Vec::new(),
             password: None,
             category: None,
             metadata: Vec::new(),

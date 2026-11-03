@@ -78,24 +78,34 @@ impl Pipeline {
     // underneath them), the earliest in dispatch order is the one named.
     pub(in crate::pipeline) fn spill_job_in_flight_on(&self, server_idx: usize) -> Option<JobId> {
         let hot = self.current_hot_job();
-        let mut chosen: Option<(usize, JobId)> = None;
-        for owner in self.download_lane_owners.values() {
-            if owner.server_idx != Some(server_idx)
-                || owner.outstanding.is_empty()
-                || Some(owner.job_id) == hot
-            {
-                continue;
-            }
-            if chosen.is_some_and(|(_, job_id)| job_id == owner.job_id) {
-                continue;
-            }
-            let Some(index) = self.job_order.iter().position(|id| *id == owner.job_id) else {
-                continue;
-            };
-            if chosen.is_none_or(|(best, _)| index < best) {
-                chosen = Some((index, owner.job_id));
-            }
-        }
+        let mut owners: Vec<JobId> = self
+            .download_lane_owners
+            .values()
+            .filter(|owner| {
+                owner.server_idx == Some(server_idx)
+                    && !owner.outstanding.is_empty()
+                    && Some(owner.job_id) != hot
+            })
+            .map(|owner| owner.job_id)
+            .collect();
+        owners.sort_unstable();
+        owners.dedup();
+        // The owner standing first in the queue, each found by its index.
+        let chosen: Option<(usize, JobId)> = self.shared_state.queue.read(|inner| {
+            owners
+                .into_iter()
+                .filter(|job_id| self.jobs.contains_key(job_id))
+                .filter_map(|job_id| {
+                    let index = inner.job_position(job_id).or_else(|| {
+                        self.job_order
+                            .iter()
+                            .position(|id| *id == job_id)
+                            .map(|index| inner.jobs.len() + index)
+                    })?;
+                    Some((index, job_id))
+                })
+                .min()
+        });
         chosen.map(|(_, job_id)| job_id)
     }
 
@@ -204,6 +214,15 @@ impl Pipeline {
                 lease: None,
                 park_reason: LaneParkReason::Error,
             });
+            return;
+        }
+        // A health probe batch waits for a seat on this server and has none
+        // free anywhere it may go. The lane is given no more articles: it
+        // finishes the ones it holds and parks keeping its connection, and
+        // the next dispatch pass seats the batch there. The batch never
+        // shares the lane with articles in flight.
+        if self.probe_waits_for_seat_on(server_idx) {
+            self.park_download_lane_refill(request, LaneParkReason::ProbeYield, held_since, now);
             return;
         }
 
@@ -350,11 +369,9 @@ impl Pipeline {
             }
         }
         let mut returned = 0;
-        if let Some(state) = self.jobs.get_mut(&job_id) {
-            for work in works {
-                state.download_queue.push(work);
-                returned += 1;
-            }
+        for work in works {
+            self.enqueue_download_work(work);
+            returned += 1;
         }
         if returned > 0 {
             self.update_queue_metrics();
@@ -362,11 +379,20 @@ impl Pipeline {
         if reserved.is_empty() {
             return None;
         }
+        // The handout was cut for `server_idx` alone, so the lease is pinned
+        // there and no article in it may have failed on that server.
+        debug_assert!(
+            reserved
+                .iter()
+                .all(|work| !work.exclude_servers.contains(&server_idx)),
+            "a lease holds an article already excluded from the server it is pinned to"
+        );
         let completion_critical = reserved.iter().any(|work| work.completion_critical);
         let dial_exclude_servers = (0..self.nntp.pool().server_count())
             .filter(|idx| *idx != server_idx)
             .collect();
         Some(DownloadBatchLease {
+            body_activity: Arc::default(),
             lane_id,
             job_id,
             runtime_generation: self.pool_generation,
@@ -375,7 +401,12 @@ impl Pipeline {
             completion_critical,
             effective_exclude_servers: self.effective_exclude_servers(job_id, &[]),
             dial_exclude_servers,
-            checkpoint_plan: self.par2_checkpoint_plan(job_id),
+            checkpoint_plan: self
+                .graph_jobs
+                .get(&job_id)
+                .map_or(weaver_yenc::CheckpointPlan::None, |graph| {
+                    weaver_yenc::CheckpointPlan::from_slice_sizes(graph.block_sizes()).plan
+                }),
             pressure_clear: pressure.state == DownloadPressureState::Clear,
             works: reserved,
         })
@@ -452,7 +483,7 @@ impl Pipeline {
             queued = self
                 .jobs
                 .values()
-                .map(|state| state.download_queue.len())
+                .map(|state| state.articles.queued_download_len())
                 .sum::<usize>(),
             "download lane refill denied; lane parking"
         );
