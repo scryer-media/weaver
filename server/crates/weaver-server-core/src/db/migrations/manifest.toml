@@ -1369,3 +1369,20 @@ kind = "sql"
 file = "migrations/0102_torrent_seed_verified/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 103
+description = "data used per day, per server and per category"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0103_usage_daily/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0103_usage_daily/postgres.sql"
+engine = "postgres"
+scope = "all"

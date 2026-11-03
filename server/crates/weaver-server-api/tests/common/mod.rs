@@ -242,6 +242,7 @@ impl TestHarness {
             spawn_history_delete_worker,
             post_processing_executor: None,
             torrents: None,
+            usage_recorder: None,
         });
 
         Self {

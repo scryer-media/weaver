@@ -35,6 +35,7 @@ import {
 import { WV, WV_FILL } from "../data/palette";
 import { aroundSlot, countLabel } from "../i18n/labels";
 import { NextShell } from "../shell/NextShell";
+import { DashboardNav } from "./monitoring/dashboards";
 import { AttentionBlock, UptimeBlock, providerLoadPercent } from "../shell/rail-blocks";
 import {
   cappedDirections,
@@ -166,7 +167,12 @@ const MonitoringScreen = memo(function MonitoringScreen({
       }
       railMiddle={<AttentionBlock />}
       railFooter={<UptimeBlock />}
-      beforeContent={<MonitoringStrip compute={compute} />}
+      beforeContent={
+        <>
+          <DashboardNav active="engine" />
+          <MonitoringStrip compute={compute} />
+        </>
+      }
       statusRight={
         series.error
           ? series.error

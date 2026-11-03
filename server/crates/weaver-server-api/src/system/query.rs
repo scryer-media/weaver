@@ -202,6 +202,28 @@ impl SystemQuery {
         .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
         .map_err(|error| graphql_error("INTERNAL", error))
     }
+    /// Data used per day by each server or category: today, this week (from
+    /// Monday), this month, this year, all time and the asked range, each
+    /// date in the range, and the jobs finished today and in the range. All
+    /// dates are this host's local dates.
+    #[graphql(guard = "ReadGuard")]
+    async fn usage_history(
+        &self,
+        ctx: &Context<'_>,
+        range: crate::system::usage_history::UsageRange,
+        kind: Option<crate::system::usage_history::UsageConsumerKindGql>,
+    ) -> Result<crate::system::usage_history::UsageHistory> {
+        use crate::system::usage_history::{load_usage_history, local_today, usage_period};
+        let period = usage_period(&range)
+            .map_err(|error| graphql_error("INVALID_INPUT", error.to_string()))?;
+        let db = ctx.data::<Database>()?.clone();
+        tokio::task::spawn_blocking(move || {
+            load_usage_history(&db, local_today(), period, kind.map(Into::into))
+        })
+        .await
+        .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+        .map_err(|error| graphql_error("INTERNAL", error.to_string()))
+    }
     #[graphql(guard = "AdminGuard")]
     async fn browse_directories(
         &self,
@@ -649,6 +671,7 @@ async fn collect_server_health(
         penalty_until: Option<u64>,
         open: u32,
         busy: u32,
+        server_id: Option<u32>,
     }
 
     let configs = pool.server_configs();
@@ -674,6 +697,9 @@ async fn collect_server_health(
                 penalty_until,
                 open,
                 busy,
+                server_id: pool
+                    .stable_server_id(weaver_nntp::ServerId(idx))
+                    .map(|id| id.0),
             }
         })
         .collect();
@@ -684,6 +710,7 @@ async fn collect_server_health(
     let pool_busy = pre.iter().any(|snapshot| snapshot.busy > 0);
 
     let health = pool.health().lock().await;
+    let now = std::time::Instant::now();
     pre.into_iter()
         .enumerate()
         .map(|(idx, snapshot)| {
@@ -750,6 +777,8 @@ async fn collect_server_health(
                 failure_count: srv.failure_count,
                 consecutive_failures: srv.consecutive_failures,
                 premature_deaths: health.recent_premature_deaths(idx) as u32,
+                down: srv.state().is_down(now),
+                server_id: snapshot.server_id,
                 pool_index: idx,
             }
         })

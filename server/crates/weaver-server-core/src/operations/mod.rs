@@ -11,6 +11,7 @@ pub mod maintenance;
 pub mod metrics;
 pub mod metrics_store;
 pub mod recovery;
+pub mod usage_history;
 
 pub use async_ops::{
     AsyncOperationState, AsyncOperationTargetState, HistoryDeleteOperationInsertError,
@@ -52,3 +53,9 @@ pub use metrics_store::{
     RawMetricsHistoryPoint, RollupMetricsHistoryPoint,
 };
 pub use recovery::{RecoveredServerState, RestoreCandidate, recover_server_state};
+pub use usage_history::{
+    FinishedJobCounts, ServerStateReading, ServerUsageReading, USAGE_FLUSH_INTERVAL_SECS,
+    USAGE_RETENTION_DAYS, UsageConsumerKind, UsageConsumerSummary, UsageConsumerTotal, UsageCounts,
+    UsageDayRow, UsageFlush, UsagePeriod, UsageReading, UsageRecorder, UsageSummary, period_bounds,
+    summarize_usage, summary_read_from, week_start,
+};

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, broadcast};
 use tracing::{error, info, warn};
 
-use crate::{heartbeat, http, restart, shutdown, wiring};
+use crate::{heartbeat, http, restart, shutdown, usage, wiring};
 use weaver_server_core::events::model::PipelineEvent;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::{Config, SharedConfig};
@@ -437,6 +437,15 @@ pub(crate) async fn run(
         weaver_server_core::application_upgrade::spawn_sigstore_trust_root_priming(proxies.clone());
     }
 
+    // Data used per day starts from the totals as they stand now, before any
+    // download moves them.
+    let usage_recorder = Arc::new(weaver_server_core::operations::UsageRecorder::new());
+    let usage_sources = usage::UsageSources {
+        handle: handle.clone(),
+        transfer_policy: Arc::clone(&server_transfer_policy),
+    };
+    usage::prime(&usage_recorder, &usage_sources).await;
+
     // Build the GraphQL schema now that the live NNTP pool exists (for server-health metrics).
     let schema = weaver_server_api::context::build_schema_with_backup(
         weaver_server_api::SchemaContext {
@@ -463,6 +472,7 @@ pub(crate) async fn run(
             spawn_history_delete_worker: true,
             post_processing_executor: Some(post_processing_executor),
             torrents: torrents.clone(),
+            usage_recorder: Some(Arc::clone(&usage_recorder)),
         },
         backup.clone(),
     );
@@ -495,6 +505,11 @@ pub(crate) async fn run(
     let update_check_task = update_check.start_background_loop();
     watch_folder.reconcile_from_config().await?;
     let metrics_history_task = shutdown::spawn_metrics_history_task(handle.clone(), db.clone());
+    let usage_history_task = usage::spawn_usage_history_task(
+        Arc::clone(&usage_recorder),
+        usage_sources.clone(),
+        db.clone(),
+    );
     let heartbeat_task = heartbeat::spawn_heartbeat_task();
     let maintenance_task = weaver_server_core::operations::spawn_maintenance_worker(
         db.clone(),
@@ -636,6 +651,7 @@ pub(crate) async fn run(
             rss_task.abort();
             watch_folder.stop().await;
             metrics_history_task.abort();
+            usage_history_task.abort();
             heartbeat_task.abort();
             maintenance_task.abort();
             update_check_task.abort();
@@ -646,6 +662,7 @@ pub(crate) async fn run(
                 "serve pipeline exit",
             )
             .await;
+            usage::record_and_flush(&usage_recorder, &usage_sources, &db).await;
             return Err(error.into());
         }
         result = &mut server_task => {
@@ -666,6 +683,7 @@ pub(crate) async fn run(
             rss_task.abort();
             watch_folder.stop().await;
             metrics_history_task.abort();
+            usage_history_task.abort();
             heartbeat_task.abort();
             maintenance_task.abort();
             update_check_task.abort();
@@ -676,6 +694,7 @@ pub(crate) async fn run(
                 "serve HTTP exit",
             )
             .await;
+            usage::record_and_flush(&usage_recorder, &usage_sources, &db).await;
             return match result {
                 Ok(Ok(())) => Err("HTTP server exited unexpectedly".into()),
                 Ok(Err(error)) => Err(error),
@@ -714,12 +733,14 @@ pub(crate) async fn run(
     rss_task.abort();
     watch_folder.stop().await;
     metrics_history_task.abort();
+    usage_history_task.abort();
     heartbeat_task.abort();
     maintenance_task.abort();
     semantic_promotion_task.abort();
     server_transfer_maintenance.abort();
     wiring::flush_server_transfer_usage(Arc::clone(&server_transfer_policy), stop.flush_context())
         .await;
+    usage::record_and_flush(&usage_recorder, &usage_sources, &db).await;
     // The last thing an orderly run says about itself: how much memory it ever
     // held. A run that ended on purpose and one that was killed for its size
     // are only distinguishable if the orderly one leaves this behind.
