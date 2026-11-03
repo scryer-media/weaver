@@ -328,7 +328,9 @@ pub trait HttpClients: Send + Sync + 'static {
 }
 
 /// The clients of a session given none: it makes no HTTP request, so it
-/// fetches nothing by URL and announces to no HTTP tracker.
+/// fetches nothing by URL and announces to no HTTP tracker. Its traffic
+/// leaves on the host's own route, and its port mapper asks the gateway
+/// from the host's own socket.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct NoClients;
 
@@ -339,6 +341,26 @@ impl HttpClients for NoClients {
         _shape: &ClientShape,
     ) -> anyhow::Result<reqwest::Client> {
         anyhow::bail!("the session was given no HTTP clients")
+    }
+
+    fn egress(&self, to: SocketAddr) -> Egress {
+        match crate::network::host_source_toward(to) {
+            Ok(ip) => Egress::From(ip),
+            Err(error) => {
+                tracing::debug!(%to, %error, "the host has no route toward the address");
+                Egress::NoRoute
+            }
+        }
+    }
+
+    fn gateway_socket<'a>(
+        &'a self,
+        local: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        Box::pin(async move {
+            let sockets = crate::network::KernelSockets::new(None).map_err(io::Error::other)?;
+            crate::network::SocketFactory::bind_udp(&sockets, local).await
+        })
     }
 }
 

@@ -167,6 +167,22 @@ mod tests {
         assert!(!found.point_to_point, "{found:?}");
     }
 
+    // A session given no clients leaves on the host's own route, and asks
+    // the gateway from the host's own socket.
+    #[tokio::test]
+    async fn a_session_given_no_clients_takes_the_hosts_route() {
+        let to = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
+        assert_eq!(
+            crate::NoClients.egress(to),
+            Egress::From(Ipv4Addr::LOCALHOST.into())
+        );
+        let socket = crate::NoClients
+            .gateway_socket(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .await
+            .unwrap();
+        assert_eq!(socket.bind_addr().ip(), IpAddr::from(Ipv4Addr::LOCALHOST));
+    }
+
     #[test]
     fn a_bound_device_is_the_route_interface() {
         let interfaces = vec![

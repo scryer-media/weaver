@@ -214,6 +214,21 @@ impl KernelSockets {
     }
 }
 
+/// The address the host's own route toward `to` leaves from. Connecting a
+/// datagram socket picks the route and sends nothing.
+pub(crate) fn host_source_toward(to: SocketAddr) -> io::Result<std::net::IpAddr> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let any = match to {
+        SocketAddr::V4(_) => SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)),
+        SocketAddr::V6(_) => SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
+    };
+    let socket = Socket::new(Domain::for_address(any), Type::DGRAM, Some(Protocol::UDP))?;
+    socket.bind(&any.into())?;
+    let socket = std::net::UdpSocket::from(socket);
+    socket.connect(to)?;
+    Ok(socket.local_addr()?.ip())
+}
+
 impl SocketFactory for KernelSockets {
     fn connect_tcp<'a>(
         &'a self,
