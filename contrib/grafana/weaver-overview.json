@@ -185,8 +185,158 @@
       "type": "timeseries"
     },
     {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Whether every download is paused by hand.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [
+            {
+              "options": { "0": { "index": 0, "text": "Running" }, "1": { "index": 1, "text": "Paused" } },
+              "type": "value"
+            }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "text", "value": null }] },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "id": 90,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "max(weaver_pipeline_paused{job=\"$job\",instance=~\"$instance\"})",
+          "legendFormat": "paused",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "title": "Downloads",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 6 }
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "When the quota that holds downloads resets. Not held while no quota holds them.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [{ "options": { "0": { "index": 0, "text": "Not held" } }, "type": "value" }],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "text", "value": null }] },
+          "unit": "dateTimeAsIso"
+        },
+        "overrides": []
+      },
+      "id": 91,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "max(weaver_download_quota_block_window_end_seconds{job=\"$job\",instance=~\"$instance\"}) * 1000",
+          "legendFormat": "lifts",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "title": "Quota hold lifts",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 5, "x": 4, "y": 6 }
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Jobs that left the queue in the last 24 hours, by result.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "text", "value": null }] },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "id": 92,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "sum by (result) (increase(weaver_jobs_finished_total{job=\"$job\",instance=~\"$instance\"}[24h]))",
+          "legendFormat": "{{result}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "title": "Jobs finished / 24h",
+      "type": "stat",
+      "gridPos": { "h": 5, "w": 7, "x": 9, "y": 6 }
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Space left on the filesystem behind each configured folder.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "text", "value": null }] },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "id": 93,
+      "options": {
+        "displayMode": "basic",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "showUnfilled": true,
+        "minVizHeight": 10,
+        "minVizWidth": 0,
+        "valueMode": "color"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "max by (role) (weaver_disk_available_bytes{job=\"$job\",instance=~\"$instance\"})",
+          "legendFormat": "{{role}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "title": "Disk free",
+      "type": "bargauge",
+      "gridPos": { "h": 5, "w": 8, "x": 16, "y": 6 }
+    },
+    {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 11 },
       "id": 10,
       "panels": [],
       "title": "Pipeline",
@@ -215,7 +365,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 7 },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 12 },
       "id": 11,
       "options": {
         "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -256,7 +406,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 7 },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 12 },
       "id": 12,
       "options": {
         "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -310,7 +460,7 @@
           }
         ]
       },
-      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 13 },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 18 },
       "id": 13,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -373,7 +523,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 13 },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 18 },
       "id": 14,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -394,7 +544,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 19 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
       "id": 20,
       "panels": [],
       "title": "Servers",
@@ -422,7 +572,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 20 },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 25 },
       "id": 21,
       "options": {
         "legend": { "calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -468,7 +618,7 @@
           }
         ]
       },
-      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 20 },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 25 },
       "id": 22,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -514,7 +664,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 26 },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 31 },
       "id": 23,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -553,7 +703,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 26 },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 31 },
       "id": 24,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -602,7 +752,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 26 },
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 31 },
       "id": 25,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -612,7 +762,7 @@
         {
           "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
           "editorMode": "code",
-          "expr": "weaver_server_download_quota_used_bytes{job=\"$job\",instance=~\"$instance\"} / clamp_min(weaver_server_download_quota_limit_bytes{job=\"$job\",instance=~\"$instance\"}, 1)",
+          "expr": "weaver_server_download_quota_used_bytes{job=\"$job\",instance=~\"$instance\"} / (weaver_server_download_quota_limit_bytes{job=\"$job\",instance=~\"$instance\"} > 0)",
           "legendFormat": "{{server}}",
           "range": true,
           "refId": "A"
@@ -649,7 +799,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 32 },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 37 },
       "id": 26,
       "options": {
         "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -687,7 +837,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 32 },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 37 },
       "id": 27,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -707,8 +857,121 @@
       "type": "timeseries"
     },
     {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Article bytes each server delivered in the last 24 hours.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "text", "value": null }] },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "id": 94,
+      "options": {
+        "displayMode": "basic",
+        "orientation": "horizontal",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "showUnfilled": true,
+        "minVizHeight": 10,
+        "minVizWidth": 0,
+        "valueMode": "color"
+      },
+      "pluginVersion": "11.0.0",
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "sum by (server) (increase(weaver_server_download_bytes_total{job=\"$job\",instance=~\"$instance\"}[24h]))",
+          "legendFormat": "{{server}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "title": "Data per server / 24h",
+      "type": "bargauge",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 43 }
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Share of article requests each server answered with the article. Requests a quota refused never reached the server and are left out.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "mappings": [],
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "id": 95,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "sum by (server) (rate(weaver_server_article_attempts_total{job=\"$job\",instance=~\"$instance\",outcome=\"success\"}[5m])) / clamp_min(sum by (server) (rate(weaver_server_article_attempts_total{job=\"$job\",instance=~\"$instance\",outcome!=\"quota_blocked\"}[5m])), 0.001)",
+          "legendFormat": "{{server}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "title": "Articles found per server",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 43 }
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Share of each network route's download quota spent in its current window. A route with no quota is left out.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "line",
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "mappings": [],
+          "unit": "percentunit"
+        },
+        "overrides": []
+      },
+      "id": 96,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "weaver_egress_download_quota_used_bytes{job=\"$job\",instance=~\"$instance\"} / (weaver_egress_download_quota_limit_bytes{job=\"$job\",instance=~\"$instance\"} > 0)",
+          "legendFormat": "{{egress_id}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "title": "Egress quota used",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 43 }
+    },
+    {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 38 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 49 },
       "id": 40,
       "panels": [],
       "title": "Jobs",
@@ -734,7 +997,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 39 },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 50 },
       "id": 41,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -772,7 +1035,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 39 },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 50 },
       "id": 42,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -792,8 +1055,108 @@
       "type": "timeseries"
     },
     {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Recovery checks, repairs and archive extractions that finished, by result.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "bars",
+            "fillOpacity": 40,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "id": 97,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "sum by (result) (increase(weaver_verifications_total{job=\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "verify {{result}}",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "sum by (result) (increase(weaver_repairs_total{job=\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "repair {{result}}",
+          "refId": "B",
+          "range": true
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "sum by (result) (increase(weaver_extractions_total{job=\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "extract {{result}}",
+          "refId": "C",
+          "range": true
+        }
+      ],
+      "title": "Verify, repair and extract",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 56 }
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "description": "Files that could not be completed and articles no server had.",
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisPlacement": "auto",
+            "drawStyle": "bars",
+            "fillOpacity": 40,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "mappings": [],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "id": 98,
+      "options": {
+        "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "sum(increase(weaver_files_missing_total{job=\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "files",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "editorMode": "code",
+          "expr": "sum(increase(weaver_missing_segments_total{job=\"$job\",instance=~\"$instance\"}[$__rate_interval]))",
+          "legendFormat": "articles",
+          "refId": "B",
+          "range": true
+        }
+      ],
+      "title": "Missing files and articles",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 56 }
+    },
+    {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 45 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 62 },
       "id": 30,
       "panels": [],
       "title": "Storage & post-processing",
@@ -818,7 +1181,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 46 },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 63 },
       "id": 31,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -865,7 +1228,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 46 },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 63 },
       "id": 32,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -904,7 +1267,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 46 },
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 63 },
       "id": 33,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -950,7 +1313,7 @@
           }
         ]
       },
-      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 52 },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 69 },
       "id": 34,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -995,7 +1358,7 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 58 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 75 },
       "id": 50,
       "panels": [],
       "title": "Process",
@@ -1020,7 +1383,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 59 },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 76 },
       "id": 51,
       "options": {
         "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -1078,7 +1441,7 @@
           }
         ]
       },
-      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 59 },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 76 },
       "id": 52,
       "options": {
         "legend": { "calcs": ["lastNotNull"], "displayMode": "list", "placement": "bottom", "showLegend": true },
@@ -1119,7 +1482,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 65
+        "y": 82
       },
       "id": 60,
       "panels": [],
@@ -1182,7 +1545,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 66
+        "y": 83
       },
       "id": 61,
       "options": {
@@ -1317,7 +1680,7 @@
         "h": 6,
         "w": 12,
         "x": 0,
-        "y": 74
+        "y": 91
       },
       "id": 62,
       "options": {
@@ -1393,7 +1756,7 @@
         "h": 6,
         "w": 12,
         "x": 12,
-        "y": 74
+        "y": 91
       },
       "id": 63,
       "options": {
@@ -1454,7 +1817,7 @@
         "h": 6,
         "w": 8,
         "x": 0,
-        "y": 80
+        "y": 97
       },
       "id": 64,
       "options": {
@@ -1526,7 +1889,7 @@
         "h": 6,
         "w": 8,
         "x": 8,
-        "y": 80
+        "y": 97
       },
       "id": 65,
       "options": {
@@ -1598,7 +1961,7 @@
         "h": 6,
         "w": 8,
         "x": 16,
-        "y": 80
+        "y": 97
       },
       "id": 66,
       "options": {
@@ -1663,7 +2026,7 @@
         "h": 6,
         "w": 12,
         "x": 0,
-        "y": 86
+        "y": 103
       },
       "id": 67,
       "options": {
@@ -1724,7 +2087,7 @@
         "h": 6,
         "w": 12,
         "x": 12,
-        "y": 86
+        "y": 103
       },
       "id": 68,
       "options": {
@@ -1763,7 +2126,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 92
+        "y": 109
       },
       "id": 69,
       "panels": [],
@@ -1802,7 +2165,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 93
+        "y": 110
       },
       "id": 70,
       "options": {
@@ -1923,7 +2286,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 93
+        "y": 110
       },
       "id": 71,
       "options": {
@@ -1984,7 +2347,7 @@
         "h": 6,
         "w": 12,
         "x": 0,
-        "y": 101
+        "y": 118
       },
       "id": 72,
       "options": {
@@ -2045,7 +2408,7 @@
         "h": 6,
         "w": 12,
         "x": 12,
-        "y": 101
+        "y": 118
       },
       "id": 73,
       "options": {
@@ -2095,7 +2458,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 107
+        "y": 124
       },
       "id": 74,
       "panels": [],
@@ -2146,7 +2509,7 @@
         "h": 8,
         "w": 14,
         "x": 0,
-        "y": 108
+        "y": 125
       },
       "id": 75,
       "options": {
@@ -2309,7 +2672,7 @@
         "h": 8,
         "w": 10,
         "x": 14,
-        "y": 108
+        "y": 125
       },
       "id": 76,
       "options": {
@@ -2443,7 +2806,7 @@
         "h": 6,
         "w": 8,
         "x": 0,
-        "y": 116
+        "y": 133
       },
       "id": 77,
       "options": {
@@ -2515,7 +2878,7 @@
         "h": 6,
         "w": 8,
         "x": 8,
-        "y": 116
+        "y": 133
       },
       "id": 78,
       "options": {
@@ -2587,7 +2950,7 @@
         "h": 6,
         "w": 8,
         "x": 16,
-        "y": 116
+        "y": 133
       },
       "id": 79,
       "options": {
@@ -2650,7 +3013,7 @@
         "h": 6,
         "w": 8,
         "x": 0,
-        "y": 122
+        "y": 139
       },
       "id": 80,
       "options": {
@@ -2711,7 +3074,7 @@
         "h": 6,
         "w": 8,
         "x": 8,
-        "y": 122
+        "y": 139
       },
       "id": 81,
       "options": {
@@ -2794,7 +3157,7 @@
         "h": 6,
         "w": 8,
         "x": 16,
-        "y": 122
+        "y": 139
       },
       "id": 82,
       "options": {
