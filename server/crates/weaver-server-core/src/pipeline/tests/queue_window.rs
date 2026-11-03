@@ -227,3 +227,51 @@ async fn a_reorder_among_parked_jobs_is_stored() {
         stored[&past]
     );
 }
+
+// An edit given to a parked job is in its row when the job enters the
+// window, even while the write that carries it still waits in the job's
+// queue: the read waits for it.
+#[tokio::test]
+async fn a_parked_job_enters_with_the_edit_it_was_given() {
+    use crate::persistence::connection::JOB_WRITE_WAITS;
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _handle) = long_queue(&temp, 2).await;
+    let id = JobId(900);
+    assert!(pipeline.window_parked(id));
+    // The edit's write waits in the job's queue until the gate opens.
+    let (open, gate) = std::sync::mpsc::channel::<()>();
+    pipeline
+        .db
+        .try_queue_job_write(id, "test_gated_edit", move |db| {
+            gate.recv().unwrap();
+            db.update_active_job(
+                id,
+                &crate::jobs::JobUpdate {
+                    category: crate::jobs::model::FieldUpdate::Set("fresh".into()),
+                    ..Default::default()
+                },
+            )
+        })
+        .unwrap();
+    let waits = JOB_WRITE_WAITS.load(Ordering::Relaxed);
+    let loaded = std::cell::Cell::new(false);
+    let load = async {
+        let read = pipeline.load_parked_jobs(vec![id]).await;
+        loaded.set(true);
+        read
+    };
+    // The gate opens once the read waits on the job's writes, or once it
+    // read without waiting.
+    let opener = async {
+        while JOB_WRITE_WAITS.load(Ordering::Relaxed) == waits && !loaded.get() {
+            tokio::task::yield_now().await;
+        }
+        open.send(()).unwrap();
+    };
+    let (read, ()) = tokio::join!(load, opener);
+    let [(read_id, Ok(Some(request)))] = read.as_slice() else {
+        panic!("the parked job reads back");
+    };
+    assert_eq!(*read_id, id);
+    assert_eq!(request.spec.category.as_deref(), Some("fresh"));
+}

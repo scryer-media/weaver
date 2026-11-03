@@ -1654,6 +1654,24 @@ impl Database {
         self.try_send_with_retry(command, label)
     }
 
+    // Waits until every write queued for the job before this call has run.
+    // A marker joins the end of the job's lane and answers once it is
+    // reached; writes on one lane run in order, each to its commit.
+    pub(crate) async fn job_writes_committed(
+        &self,
+        job_id: crate::jobs::ids::JobId,
+    ) -> Result<(), StateError> {
+        let (reached, rx) = oneshot::channel();
+        self.try_queue_job_write(job_id, "job_writes_committed", move |_| {
+            let _ = reached.send(());
+            Ok(())
+        })?;
+        #[cfg(test)]
+        JOB_WRITE_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        rx.await
+            .map_err(|_| StateError::Database("database writer queue closed".to_string()))
+    }
+
     pub(crate) fn try_queue_graph_checkpoint(
         &self,
         job_id: crate::jobs::ids::JobId,
@@ -2157,6 +2175,11 @@ fn close_line(overflow: &Mutex<Option<VecDeque<QueuedWrite>>>, context: &'static
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
+
+// Each wait for a job's queued writes, counted for the tests.
+#[cfg(test)]
+pub(crate) static JOB_WRITE_WAITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests;
