@@ -7,7 +7,7 @@
 
 use weaver_graph::recovery::RepairOutcome;
 
-use super::harness::{ARTICLE, Outcome, Post, Scenario, par2_set, payload, run};
+use super::harness::{ARTICLE, Outcome, Post, Scenario, par2_set, par3_set, payload, run};
 use super::rar::with_par2;
 use crate::JobHistoryRow;
 use crate::pipeline::health_milli;
@@ -103,6 +103,34 @@ async fn a_clean_post_counts_only_the_recovery_heads_it_read() {
     assert_eq!(row.optional_recovery_downloaded_bytes, ARTICLE as u64);
 }
 
+// Two articles lost against a volume of two blocks: the whole volume is
+// fetched, so the live report has no recovery volume left to fetch (the
+// NZBGet facade's RemainingParCount), and the whole set is counted.
+#[tokio::test]
+async fn a_volume_fetched_whole_leaves_no_par_volume_remaining() {
+    let scenario = Scenario::new(covered(73)).lost(0, 1).lost(0, 2);
+    let set = recovery_set(&scenario.posts);
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 2 })]
+    );
+    let report = graph.graph().report.as_ref().expect("the job was reported");
+    assert_eq!(report.remaining_par_files, 0);
+    assert_eq!(history(&graph).optional_recovery_downloaded_bytes, set);
+}
+
+// A clean post leaves its volume unfetched but for its head: one volume
+// remains.
+#[tokio::test]
+async fn a_clean_post_leaves_its_par_volume_remaining() {
+    let graph = run(&Scenario::new(covered(74))).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    let report = graph.graph().report.as_ref().expect("the job was reported");
+    assert_eq!(report.remaining_par_files, 1);
+}
+
 // The bytes of the articles the run asked for and was served, and of the
 // ones every server lacked, each article once.
 fn served_and_lost(scenario: &Scenario, outcome: &Outcome) -> (u64, u64) {
@@ -176,4 +204,30 @@ async fn an_extracted_rar_set_accounts_every_byte() {
     assert_eq!(graph.files["lantern beacon/beacon.bin"], body);
     assert_accounted(&scenario, &graph, 0);
     assert!(history(&graph).optional_recovery_downloaded_bytes > 0);
+}
+
+// A clean post under PAR3 leaves both its PAR3 volumes to fetch, as NZBGet
+// counts every par file still queued.
+#[tokio::test]
+async fn a_clean_par3_post_leaves_its_volumes_remaining() {
+    let data = payload(4 * ARTICLE, 81);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par3_set("lantern", &[("lantern.bin", &data)], 2));
+    let graph = run(&Scenario::new(posts)).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    let report = graph.graph().report.as_ref().expect("the job was reported");
+    assert_eq!(report.remaining_par_files, 2);
+}
+
+// A volume fetched to its end, one of its articles lost on every server,
+// has nothing left to fetch, and is not remaining.
+#[tokio::test]
+async fn a_volume_with_a_lost_article_fetched_to_its_end_is_not_remaining() {
+    let data = payload(4 * ARTICLE, 82);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 3));
+    let graph = run(&Scenario::new(posts).lost(0, 1).lost(0, 2).lost(2, 2)).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    let report = graph.graph().report.as_ref().expect("the job was reported");
+    assert_eq!(report.remaining_par_files, 0, "{:?}", graph.requests);
 }

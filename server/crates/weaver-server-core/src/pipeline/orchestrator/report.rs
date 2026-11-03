@@ -147,26 +147,38 @@ impl Pipeline {
         };
         let (download_state, post_state, run_state) =
             crate::jobs::model::runtime_lanes_from_status_snapshot(&status);
-        let is_par_volume = |role: &weaver_model::files::FileRole| {
+        // The recovery files, index included, as NZBGet counts its par files.
+        let is_par_file = |role: &weaver_model::files::FileRole| {
             matches!(
                 role,
-                weaver_model::files::FileRole::Par2 {
-                    is_index: false,
-                    ..
-                }
+                weaver_model::files::FileRole::Par2 { .. }
+                    | weaver_model::files::FileRole::Par3 { .. }
             )
         };
-        let remaining_par_files = match state.articles.assembly() {
-            Some(assembly) => assembly
-                .files()
-                .filter(|file| is_par_volume(file.role()) && !file.is_complete())
-                .count() as u32,
-            None => state
+        // The recovery files with articles still to fetch: the graph's
+        // article map says for a graph job, whose assembly no article
+        // marks. An article every server lacked is not still to fetch.
+        let remaining_par_files = if let Some(graph) = self.graph_jobs.get(&state.job_id) {
+            state
                 .spec
                 .files
                 .iter()
-                .filter(|file| is_par_volume(&file.role))
-                .count() as u32,
+                .zip(graph.remaining_bytes())
+                .filter(|(file, remaining)| is_par_file(&file.role) && *remaining > 0)
+                .count() as u32
+        } else {
+            match state.articles.assembly() {
+                Some(assembly) => assembly
+                    .files()
+                    .filter(|file| is_par_file(file.role()) && !file.is_complete())
+                    .count() as u32,
+                None => state
+                    .spec
+                    .files
+                    .iter()
+                    .filter(|file| is_par_file(&file.role))
+                    .count() as u32,
+            }
         };
         let download_wait = self.download_wait_by_job.get(&state.job_id);
         Some(JobInfo {
