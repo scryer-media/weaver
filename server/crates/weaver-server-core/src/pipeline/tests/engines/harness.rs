@@ -41,6 +41,10 @@ pub(in crate::pipeline) struct Post {
     pub(in crate::pipeline) name: String,
     pub(in crate::pipeline) role: FileRole,
     pub(in crate::pipeline) bytes: Vec<u8>,
+    // The smallest article this file is posted in. A poster cuts a file
+    // whose leading structure must arrive whole in articles that hold it,
+    // whatever the rest of the post uses.
+    pub(in crate::pipeline) least_article: usize,
 }
 
 impl Post {
@@ -49,11 +53,17 @@ impl Post {
             name: name.to_string(),
             role: FileRole::from_filename(name),
             bytes,
+            least_article: 0,
         }
     }
 
+    // The article size this file is posted in where the post uses `size`.
+    pub(in crate::pipeline) fn article(&self, size: usize) -> usize {
+        size.max(self.least_article)
+    }
+
     pub(in crate::pipeline) fn articles(&self, size: usize) -> impl Iterator<Item = &[u8]> {
-        self.bytes.chunks(size)
+        self.bytes.chunks(self.article(size))
     }
 }
 
@@ -1329,7 +1339,7 @@ async fn serve_from(
     }
     let intact = !scenario.spoils(server, (file, ordinal));
     let post = &scenario.posts[file as usize];
-    let offset = ordinal as usize * scenario.article;
+    let offset = ordinal as usize * post.article(scenario.article);
     let posted = post
         .articles(scenario.article)
         .nth(ordinal as usize)
