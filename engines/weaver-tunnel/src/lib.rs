@@ -36,7 +36,8 @@ pub mod transport;
 #[path = "shared_wireguard.rs"]
 pub mod wireguard;
 
-// Fixtures dial their own loopback listeners.
+// Fixtures dial their own loopback listeners, and hand out clients whose
+// connections the system egress dials.
 #[allow(clippy::disallowed_methods)]
 #[cfg(any(test, feature = "test-support"))]
 #[path = "shared_test_support.rs"]

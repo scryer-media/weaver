@@ -206,6 +206,47 @@ fn only_pinned_crates_carry_a_network_client() {
     }
 }
 
+// The lockfile cannot tell a product edge from a test one, so weaver-tunnel's
+// pin above holds only while its manifest keeps reqwest optional, turned on
+// by its test-support feature alone.
+#[test]
+fn the_tunnels_client_is_for_tests_alone() {
+    let path = workspace().join("engines/weaver-tunnel/Cargo.toml");
+    let manifest: toml::Table = std::fs::read_to_string(path).unwrap().parse().unwrap();
+    let reqwest = &manifest["dependencies"]["reqwest"];
+    assert_eq!(
+        reqwest.get("optional").and_then(toml::Value::as_bool),
+        Some(true),
+        "weaver-tunnel's reqwest must stay optional"
+    );
+    let elsewhere: Vec<String> = ["build-dependencies", "target"]
+        .into_iter()
+        .filter(|table| {
+            manifest
+                .get(*table)
+                .is_some_and(|value| value.to_string().contains("reqwest"))
+        })
+        .map(str::to_owned)
+        .collect();
+    let turned_on_by: Vec<&str> = manifest["features"]
+        .as_table()
+        .unwrap()
+        .iter()
+        .filter(|(_, enables)| {
+            enables.as_array().unwrap().iter().any(|feature| {
+                let feature = feature.as_str().unwrap();
+                feature.trim_start_matches("dep:").split(['/', '?']).next() == Some("reqwest")
+            })
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(turned_on_by, ["test-support"]);
+    assert!(
+        elsewhere.is_empty(),
+        "weaver-tunnel names reqwest in {elsewhere:?}"
+    );
+}
+
 // Each package in a lockfile, with the names of the packages it depends on.
 fn lock_packages(lock: &str) -> Vec<(String, Vec<String>)> {
     lock.split("[[package]]")
