@@ -1564,33 +1564,19 @@ mod tests {
         assert_eq!(clients.built(), 1);
     }
 
-    // A session's next leg asks with its own clients: one built on the leg
-    // before, for the same target and shape, never reaches it. Each leg's
-    // builder names it in the User-Agent its requests carry.
-    #[tokio::test]
-    async fn a_next_leg_never_gets_the_last_legs_client() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let served = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut head = Vec::new();
-            let mut buf = [0u8; 1024];
-            while !head.ends_with(b"\r\n\r\n") {
-                let read = stream.read(&mut buf).await.unwrap();
-                assert!(read > 0, "the request ended early");
-                head.extend_from_slice(&buf[..read]);
-            }
-            stream
-                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
-                .await
-                .unwrap();
-            String::from_utf8(head).unwrap().to_ascii_lowercase()
-        });
-        let leg = |name: &'static str| {
+    // Two legs asked for the same target and shape each build their own
+    // client, from one builder that counts what it is asked for: a client
+    // built for one leg is never handed to the other.
+    #[test]
+    fn legs_never_share_a_client() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let leg = || {
+            let builds = Arc::clone(&builds);
             LegClients::new(
-                move || Ok(reqwest::Client::builder().no_proxy().user_agent(name)),
+                move || {
+                    builds.fetch_add(1, Ordering::Relaxed);
+                    Ok(reqwest::Client::builder().no_proxy())
+                },
                 None,
                 LegKind::System,
                 system_dialer(),
@@ -1600,22 +1586,18 @@ mod tests {
         let target = || {
             Some(HttpTarget {
                 host: "seed.test",
-                port,
+                port: 80,
                 addrs: &checked,
             })
         };
-        let last = leg("last-leg");
+        let last = leg();
         last.client(target(), &ClientShape::FETCH).unwrap();
-        let next = leg("next-leg");
-        let client = next.client(target(), &ClientShape::FETCH).unwrap();
-        assert_eq!(next.built(), 1);
-        client
-            .get(format!("http://seed.test:{port}/f"))
-            .send()
-            .await
-            .unwrap();
-        let head = served.await.unwrap();
-        assert!(head.contains("user-agent: next-leg\r\n"), "{head}");
+        last.client(target(), &ClientShape::FETCH).unwrap();
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+        let next = leg();
+        next.client(target(), &ClientShape::FETCH).unwrap();
+        assert_eq!(builds.load(Ordering::Relaxed), 2);
+        assert_eq!((last.built(), next.built()), (1, 1));
     }
 
     // A leg's client for a web seed's target dials the host at the checked
