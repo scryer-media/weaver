@@ -285,10 +285,13 @@ pub async fn recover_server_state(
     }
 
     // Also load archived job history from SQLite so the UI can show completed/failed jobs.
-    match db.list_job_history(&HistoryFilter {
-        limit: Some(FINISHED_JOBS_RUNTIME_CAP as u32),
-        ..HistoryFilter::default()
-    }) {
+    match db.list_job_history(
+        &HistoryFilter {
+            limit: Some(FINISHED_JOBS_RUNTIME_CAP as u32),
+            ..HistoryFilter::default()
+        },
+        crate::HistoryRows::All,
+    ) {
         Ok(history_rows) => {
             for row in history_rows {
                 if let Some(output_dir) = row.output_dir.as_ref() {

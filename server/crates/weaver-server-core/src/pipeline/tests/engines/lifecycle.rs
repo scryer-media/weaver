@@ -382,7 +382,7 @@ async fn history_is_archived_before_the_job_is_announced_complete() {
     );
     let listed = pipeline
         .db
-        .list_job_history(&crate::HistoryFilter::default())
+        .list_job_history(&crate::HistoryFilter::default(), crate::HistoryRows::All)
         .unwrap();
     assert!(listed.iter().any(|row| row.job_id == JOB.0));
 }
