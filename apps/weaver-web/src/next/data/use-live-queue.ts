@@ -2,7 +2,13 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useClient, useSubscription, type AnyVariables, type DocumentInput } from "urql";
+import {
+  stringifyVariables,
+  useClient,
+  useSubscription,
+  type AnyVariables,
+  type DocumentInput,
+} from "urql";
 import {
   QUEUE_PAGE_QUERY,
   QUEUE_PAGE_UPDATES_SUBSCRIPTION,
@@ -65,10 +71,11 @@ export interface LiveQueue {
  * A query kept live: the subscription's pushes, the query's answer when one is
  * asked for since, and the poll's while the socket is down.
  *
- * Each push is tagged with the variables it answers. When the variables
- * change, the last answer stays on screen until the new one comes, and is
- * reported `stale` meanwhile, so nothing is judged against rows the new
- * variables did not ask for.
+ * Each push is tagged with the variables it answers, by value: a new object
+ * holding the same variables asks the same question, and urql keeps the same
+ * subscription for it. When the variables change, the last answer stays on
+ * screen until the new one comes, and is reported `stale` meanwhile, so
+ * nothing is judged against rows the new variables did not ask for.
  */
 function useLiveRead<Data, Variables extends AnyVariables>(
   query: DocumentInput<Data, Variables>,
@@ -78,40 +85,41 @@ function useLiveRead<Data, Variables extends AnyVariables>(
   const client = useClient();
   const connection = useGraphqlConnectionState();
   const disconnected = connection.status === "disconnected";
-  const tag = useCallback((_previous: unknown, data: Data) => ({ data, variables }), [variables]);
+  const key = useMemo(() => stringifyVariables(variables), [variables]);
+  const tag = useCallback((_previous: unknown, data: Data) => ({ data, key }), [key]);
   const [{ data: tagged, error: pushError }] = useSubscription<
     Data,
-    { data: Data; variables: Variables },
+    { data: Data; key: string },
     Variables
   >({ query: subscription, variables, pause: disconnected }, tag);
-  const pushed = tagged?.variables === variables ? tagged.data : undefined;
-  const [polled, setPolled] = useState<{ data: Data; variables: Variables }>();
+  const pushed = tagged?.key === key ? tagged.data : undefined;
+  const [polled, setPolled] = useState<{ data: Data; key: string }>();
   useReconnectPolling<Data, Variables>({
     enabled: disconnected,
     query,
     variables,
-    onData: (data) => setPolled({ data, variables }),
+    onData: (data) => setPolled({ data, key }),
   });
   // An answer read on request stands until the next push replaces it.
-  const [asked, setAsked] = useState<{ data: Data; after: Data | undefined; variables: Variables }>();
+  const [asked, setAsked] = useState<{ data: Data; after: Data | undefined; key: string }>();
   const refresh = useCallback(() => {
     void client
       .query<Data, Variables>(query, variables, { requestPolicy: "network-only" })
       .toPromise()
       .then((result) => {
         if (result.data) {
-          setAsked({ data: result.data, after: pushed, variables });
+          setAsked({ data: result.data, after: pushed, key });
         }
       });
-  }, [client, pushed, query, variables]);
+  }, [client, key, pushed, query, variables]);
 
   useEffect(() => {
     if (!disconnected) setPolled(undefined);
   }, [disconnected]);
 
   let data = pushed;
-  if (asked && asked.after === pushed && asked.variables === variables) data = asked.data;
-  if (disconnected && polled && polled.variables === variables) data = polled.data;
+  if (asked && asked.after === pushed && asked.key === key) data = asked.data;
+  if (disconnected && polled && polled.key === key) data = polled.data;
   const stale = data === undefined && tagged !== undefined;
   if (stale) data = tagged.data;
   return { data, stale, error: pushError?.message ?? null, refresh };
