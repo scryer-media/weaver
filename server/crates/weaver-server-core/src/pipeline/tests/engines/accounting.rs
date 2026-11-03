@@ -1,0 +1,179 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+// The job's figures as the graph earned them: what came, what was lost,
+// what recovery was fetched, read off the live report and the history row
+// the job leaves.
+
+use weaver_graph::recovery::RepairOutcome;
+
+use super::harness::{ARTICLE, Outcome, Post, Scenario, par2_set, payload, run};
+use super::rar::with_par2;
+use crate::JobHistoryRow;
+use crate::pipeline::health_milli;
+use crate::pipeline::tests::direct_store::single_member_store_set;
+
+// A plain file and a PAR2 set of two blocks over it: the file is post 0,
+// the index post 1, the volume post 2.
+fn covered(seed: u8) -> Vec<Post> {
+    let data = payload(4 * ARTICLE, seed);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
+    posts
+}
+
+fn history(outcome: &Outcome) -> &JobHistoryRow {
+    outcome
+        .history
+        .as_ref()
+        .expect("the job left a history row")
+}
+
+// The recovery volume's posted size.
+fn recovery_set(posts: &[Post]) -> u64 {
+    posts
+        .iter()
+        .filter(|post| post.role.is_recovery())
+        .map(|post| post.bytes.len() as u64)
+        .sum()
+}
+
+// The recovery bytes the run asked for, each article once.
+fn recovery_fetched(posts: &[Post], outcome: &Outcome) -> u64 {
+    outcome
+        .requests
+        .keys()
+        .filter(|(file, _)| posts[*file as usize].role.is_recovery())
+        .map(|(file, ordinal)| {
+            posts[*file as usize]
+                .articles(ARTICLE)
+                .nth(*ordinal as usize)
+                .map_or(0, |article| article.len() as u64)
+        })
+        .sum()
+}
+
+// One article lost under PAR2: the job fetches recovery, repairs the slice
+// and completes, and both the live report and the history row count the
+// recovery it fetched, never more than the set.
+#[tokio::test]
+async fn a_repaired_loss_counts_the_recovery_it_fetched() {
+    let scenario = Scenario::new(covered(71)).lost(0, 1);
+    let posts = &scenario.posts;
+    let set = recovery_set(posts);
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+    let row = history(&graph);
+    assert_eq!(row.optional_recovery_bytes, set);
+    assert!(
+        row.optional_recovery_downloaded_bytes > 0 && row.optional_recovery_downloaded_bytes <= set,
+        "{} of {set}",
+        row.optional_recovery_downloaded_bytes
+    );
+    assert_eq!(
+        row.optional_recovery_downloaded_bytes,
+        recovery_fetched(posts, &graph)
+    );
+    let report = graph.graph().report.as_ref().expect("the job was reported");
+    assert!(report.optional_recovery_downloaded_bytes > 0);
+}
+
+// Nothing lost: no recovery block is fetched. The volume's opening
+// article still comes, as every posted file's does, to say what it is,
+// and that is all that is counted.
+#[tokio::test]
+async fn a_clean_post_counts_only_the_recovery_heads_it_read() {
+    let scenario = Scenario::new(covered(72));
+    let posts = &scenario.posts;
+    let set = recovery_set(posts);
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    let row = history(&graph);
+    assert_eq!(row.optional_recovery_bytes, set);
+    let heads: Vec<_> = graph
+        .requests
+        .keys()
+        .filter(|(file, _)| posts[*file as usize].role.is_recovery())
+        .collect();
+    assert_eq!(heads, [&(2, 0)]);
+    assert_eq!(row.optional_recovery_downloaded_bytes, ARTICLE as u64);
+}
+
+// The bytes of the articles the run asked for and was served, and of the
+// ones every server lacked, each article once.
+fn served_and_lost(scenario: &Scenario, outcome: &Outcome) -> (u64, u64) {
+    let size = |(file, ordinal): (u32, u32)| {
+        scenario.posts[file as usize]
+            .articles(scenario.article)
+            .nth(ordinal as usize)
+            .map_or(0, |article| article.len() as u64)
+    };
+    outcome
+        .requests
+        .keys()
+        .fold((0, 0), |(served, lost), article| {
+            if scenario.lost.contains(article) {
+                (served, lost + size(*article))
+            } else {
+                (served + size(*article), lost)
+            }
+        })
+}
+
+// The history row's byte figures add up to what the run fetched. Its
+// failed bytes are what the delivery still lacks: a loss repaired into a
+// whole file fails nothing.
+fn assert_accounted(scenario: &Scenario, outcome: &Outcome, failed: u64) {
+    let row = history(outcome);
+    let total: u64 = scenario
+        .posts
+        .iter()
+        .map(|post| post.bytes.len() as u64)
+        .sum();
+    let (served, _) = served_and_lost(scenario, outcome);
+    assert_eq!(row.total_bytes, total);
+    assert_eq!(row.downloaded_bytes, served);
+    assert_eq!(row.failed_bytes, failed);
+    assert_eq!(row.health, health_milli(total, failed));
+    assert_eq!(
+        row.optional_recovery_downloaded_bytes,
+        recovery_fetched(&scenario.posts, outcome)
+    );
+}
+
+#[tokio::test]
+async fn a_clean_post_accounts_every_byte() {
+    let scenario = Scenario::new(covered(75));
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_accounted(&scenario, &graph, 0);
+    assert_eq!(history(&graph).health, 1000);
+}
+
+#[tokio::test]
+async fn a_repaired_post_accounts_every_byte() {
+    let scenario = Scenario::new(covered(76)).lost(0, 2);
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    let (_, lost) = served_and_lost(&scenario, &graph);
+    assert_eq!(lost, ARTICLE as u64);
+    assert_accounted(&scenario, &graph, 0);
+}
+
+// A stored RAR set beside PAR2, one volume article lost: repaired in the
+// stream and extracted, every figure still adds up.
+#[tokio::test]
+async fn an_extracted_rar_set_accounts_every_byte() {
+    let body = payload(7 * ARTICLE + 13, 77);
+    let scenario =
+        Scenario::new(with_par2(single_member_store_set("beacon.bin", &body, 2))).lost(0, 2);
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(graph.files["lantern beacon/beacon.bin"], body);
+    assert_accounted(&scenario, &graph, 0);
+    assert!(history(&graph).optional_recovery_downloaded_bytes > 0);
+}

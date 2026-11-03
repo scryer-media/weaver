@@ -156,6 +156,10 @@ struct Volume {
     // The post's encoded bytes of the articles no longer waited on: in hand,
     // or lost for good. Kept by the one path that changes a state.
     settled_bytes: u64,
+    // The decoded bytes of the articles in hand. One that arrived in a run
+    // whose placement this run never saw counts its encoded bytes, the most
+    // it can have decoded to. Kept beside `settled_bytes`.
+    arrived_decoded: u64,
     // Decoded offsets known exactly, by boundary index: boundary `k` is
     // where article `k` starts, and boundary `articles.len()` is the end.
     known: BTreeMap<usize, u64>,
@@ -209,6 +213,7 @@ impl Volume {
             articles,
             encoded_len: encoded,
             settled_bytes: 0,
+            arrived_decoded: 0,
             known: BTreeMap::from([(0, 0)]),
             disorder: 0,
             parkable: (0..sizes.len()).collect(),
@@ -235,13 +240,19 @@ impl Volume {
         }
         // Another copy, or none: what its tail lacked is asked again.
         self.cut.remove(&index);
+        let size = self.encoded_at(index + 1) - self.encoded_at(index);
         if (was == State::Waiting) != (state == State::Waiting) {
-            let size = self.encoded_at(index + 1) - self.encoded_at(index);
             self.settled_bytes = match state {
                 State::Waiting => self.settled_bytes - size,
                 _ => self.settled_bytes + size,
             };
         }
+        let decoded = |state: State| match state {
+            State::Arrived(Some(range)) => range.end - range.start,
+            State::Arrived(None) => size,
+            State::Waiting | State::Lost { .. } => 0,
+        };
+        self.arrived_decoded = self.arrived_decoded - decoded(was) + decoded(state);
         self.articles[index].state = state;
         open.file(self.at, index, state);
         self.file_parkable(index);
@@ -732,6 +743,14 @@ impl ArticleMap {
             .iter()
             .map(|found| found.encoded_len - found.settled_bytes)
             .collect()
+    }
+
+    // The volume's decoded bytes in hand. An article an earlier run brought
+    // counts, as it came over the wire then.
+    pub(crate) fn arrived_bytes(&self, volume: VolumeIndex) -> u64 {
+        self.volumes
+            .get(volume.0 as usize)
+            .map_or(0, |found| found.arrived_decoded)
     }
 
     // How many volumes have every article in hand.

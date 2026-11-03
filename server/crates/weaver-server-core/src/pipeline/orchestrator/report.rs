@@ -135,7 +135,7 @@ impl Pipeline {
         }
         let total = state.spec.total_bytes;
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
-            state.optional_recovery_bytes();
+            self.optional_recovery_bytes(state);
         let health = health_milli(total, state.failed_bytes);
         let status = if self.awaiting_queue_script_barrier(state.job_id)
             && state.status == JobStatus::Downloading
