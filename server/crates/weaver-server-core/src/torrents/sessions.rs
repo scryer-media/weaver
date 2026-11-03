@@ -1284,8 +1284,11 @@ struct Configured {
     // The addresses last blocked, and the blocklist and banned entries they
     // were made of: settings that change neither keep the one list, so the
     // sessions are not filtered again.
-    blocked: Option<(Option<Arc<IpRanges>>, Vec<String>, Arc<IpRanges>)>,
+    blocked: Option<Blocked>,
 }
+
+// The blocklist and banned entries a blocked list was made of, and the list.
+type Blocked = (Option<Arc<IpRanges>>, Vec<String>, Arc<IpRanges>);
 
 impl Configured {
     // `session` opened, under settings that may have changed while it did.

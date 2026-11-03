@@ -512,8 +512,8 @@ mod tests {
             let used = both(moved[0], moved[1]);
             self.rates = split_rates(Some(self.cap), self.split, given, used);
             let rates = [self.rates.usenet.unwrap(), self.rates.torrent.unwrap()];
-            for side in 0..2 {
-                self.tokens[side] = self.tokens[side].min(Self::holds(side, rates[side]));
+            for (side, rate) in rates.into_iter().enumerate() {
+                self.tokens[side] = self.tokens[side].min(Self::holds(side, rate));
             }
             (used, self.rates)
         }

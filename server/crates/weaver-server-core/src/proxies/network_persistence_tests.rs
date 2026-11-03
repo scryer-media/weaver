@@ -134,16 +134,14 @@ fn a_download_limit_turned_off_is_kept() {
         .run_sql_blocking_read({
             let store = db.datastore();
             async move {
-                Ok::<_, StateError>(
-                    SqlRuntime::fetch_all(
-                        store.read_exec(),
-                        "SELECT quota_download_bytes FROM egress_interfaces WHERE id = {}",
-                        &[SqlArg::I64(i64::from(wan.id))],
-                    )
-                    .await?
-                    .remove(0)
-                    .i64("quota_download_bytes")?,
+                SqlRuntime::fetch_all(
+                    store.read_exec(),
+                    "SELECT quota_download_bytes FROM egress_interfaces WHERE id = {}",
+                    &[SqlArg::I64(i64::from(wan.id))],
                 )
+                .await?
+                .remove(0)
+                .i64("quota_download_bytes")
             }
         })
         .unwrap();

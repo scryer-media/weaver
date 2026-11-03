@@ -504,7 +504,7 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
     let info = job_info(view.clone(), EPOCH_MS + 1000);
     assert_eq!(info.status, JobStatus::Downloading);
     assert_eq!(
-        crate::jobs::handle::job_download_rates(&[info.clone()]),
+        crate::jobs::handle::job_download_rates(std::slice::from_ref(&info)),
         [(JobId(7), 500)]
     );
     assert_eq!(info.phase_progress[0].estimated_remaining_ms, Some(6000));
@@ -2807,10 +2807,8 @@ async fn the_global_pause_reaches_the_torrents() {
             (view.state, view.detail)
         }
     };
-    let held = |job_id| {
-        let state = state.clone();
-        async move { matches!(state(job_id).await, (TorrentState::Queued, Some(_))) }
-    };
+    let held =
+        |job_id| async move { matches!(state(job_id).await, (TorrentState::Queued, Some(_))) };
     let scheduled = |scope, owner| Hold {
         origin: HoldOrigin::Scheduled,
         scope,
@@ -5093,7 +5091,7 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         move_to: None,
         queue_position: 0,
     };
-    let mut rules = vec![TrackerRule {
+    let mut rules = [TrackerRule {
         archive_passwords: Default::default(),
         bound: None,
         id: 1,

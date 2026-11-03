@@ -2527,10 +2527,12 @@ impl TorrentService {
             if let Some(error) = tee.refusal() {
                 // A checkpoint the tee let go for it ends, on the torrent's
                 // lane, before this: its failure goes with it.
-                let _ = self.queue_save(job_id, "torrent_checkpoint_let_go", move |db| {
-                    db.forget_checkpoint_failure(job_id);
-                    Ok(())
-                });
+                drop(
+                    self.queue_save(job_id, "torrent_checkpoint_let_go", move |db| {
+                        db.forget_checkpoint_failure(job_id);
+                        Ok(())
+                    }),
+                );
                 self.refused(job_id, error).await;
                 continue;
             }

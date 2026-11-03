@@ -291,7 +291,7 @@ impl Database {
                 &[],
             )
             .await?;
-            rows.iter().map(|row| Ok(row.text("host")?)).collect()
+            rows.iter().map(|row| row.text("host")).collect()
         })
     }
 
