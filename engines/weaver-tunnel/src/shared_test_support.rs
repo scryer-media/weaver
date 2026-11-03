@@ -13,6 +13,16 @@ pub mod http3;
 pub mod http_client;
 #[path = "test_support/natpmp.rs"]
 pub mod natpmp;
+
+/// The host's own egress, alone, as a route with nothing saved leaves, and
+/// with no connect deadline: a test waits on what it checks.
+pub fn system_dialer() -> std::sync::Arc<dyn crate::pipe::Dialer> {
+    std::sync::Arc::new(crate::pipe::Egress::new(
+        0,
+        crate::egress::SocketEgress::System,
+        std::time::Duration::MAX,
+    ))
+}
 #[path = "test_support/proxy.rs"]
 pub mod proxy;
 #[cfg(feature = "test-support")]

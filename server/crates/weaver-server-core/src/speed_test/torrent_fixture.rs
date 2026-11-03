@@ -86,7 +86,7 @@ impl TorrentFixture {
             info_hash: Mutex::new([0; 20]),
             answer: Mutex::new(Answer::default()),
             announces: watch::channel(Vec::new()).0,
-            direct: direct_route(),
+            direct: weaver_tunnel::test_support::system_dialer(),
         });
         let serving = shared.clone();
         tokio::spawn(async move {
@@ -289,20 +289,6 @@ async fn announce(query: &str, shared: &Shared) -> Vec<u8> {
     body.extend_from_slice(&peers);
     body.push(b'e');
     body
-}
-
-// The host's own egress, alone, as a runtime with nothing saved routes it.
-fn direct_route() -> Arc<dyn Dialer> {
-    crate::proxies::NetworkRuntime::new(
-        crate::Database::open_in_memory().unwrap(),
-        tokio::runtime::Handle::current(),
-    )
-    .unwrap()
-    .egress_dialer(
-        crate::proxies::SYSTEM_EGRESS_ID,
-        std::time::Duration::from_secs(30),
-    )
-    .unwrap()
 }
 
 // Connect to the peer on `port` through `direct` and trade handshakes with
