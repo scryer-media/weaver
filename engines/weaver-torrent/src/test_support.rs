@@ -80,35 +80,28 @@ pub(crate) fn build(builder: reqwest::ClientBuilder) -> anyhow::Result<reqwest::
     )?)
 }
 
-/// `builder` held to `target`: it follows no redirect, and dials the
-/// target's host at the target's addresses only.
-pub(crate) fn for_target(
-    builder: reqwest::ClientBuilder,
-    target: Option<HttpTarget<'_>>,
-) -> reqwest::ClientBuilder {
-    let Some(target) = target else {
-        return builder;
-    };
-    let builder = builder.redirect(reqwest::redirect::Policy::none());
-    // An address in the URL is dialed as it is.
-    if target.host.parse::<IpAddr>().is_ok() {
-        return builder;
-    }
-    let addrs: Vec<SocketAddr> = target
-        .addrs
-        .iter()
-        .map(|ip| SocketAddr::new(*ip, target.port))
-        .collect();
-    builder.resolve_to_addrs(target.host, &addrs)
-}
-
-/// The client of `shape` for `target`, from `builder`.
+/// The client of `shape` for `target`, from `builder`: one held to a
+/// target follows no redirect, and dials the target's host at the target's
+/// addresses only.
 pub(crate) fn client(
     builder: reqwest::ClientBuilder,
     target: Option<HttpTarget<'_>>,
     shape: &ClientShape,
 ) -> anyhow::Result<reqwest::Client> {
-    build(shape.apply(for_target(builder, target))?)
+    let Some(target) = target else {
+        return build(shape.apply(builder)?);
+    };
+    let builder = shape.apply(builder.redirect(reqwest::redirect::Policy::none()))?;
+    // An address in the URL is dialed as it is.
+    if target.host.parse::<IpAddr>().is_ok() || target.addrs.is_empty() {
+        return build(builder);
+    }
+    Ok(weaver_tunnel::test_support::http_client::pinned_client(
+        builder,
+        target.host,
+        target.port,
+        target.addrs,
+    )?)
 }
 
 /// Where a request to `to` leaves on a loopback route: a loopback address
