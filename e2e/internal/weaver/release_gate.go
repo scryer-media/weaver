@@ -430,10 +430,25 @@ func runWeaverReleaseGate(parent context.Context, mode string) error {
 	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 
-	jobs := weaverReleaseGateJobs(len(phases))
+	durationsPath := weaverReleaseGateDurationsPath()
+	durations := readWeaverReleaseGateDurations(durationsPath)
+	pools := weaverReleaseGatePools(phases, durations)
+	jobs := weaverReleasePoolWorkers(pools)
+	known := 0
+	for _, phase := range phases {
+		if _, ok := durations[weaverReleaseFlowKey(phase)]; ok {
+			known++
+		}
+	}
+	poolsNote := weaverReleasePoolsNote(pools, known)
+	log.Printf("release gate pools: %s", poolsNote)
+	emitProgressEvent(progressEvent{Kind: "phase_note", Detail: poolsNote})
 	fanoutStarted := time.Now()
-	results := runWeaverReleasePhases(ctx, phases, jobs)
+	results := runWeaverReleasePhases(ctx, pools)
 	fanoutWall := time.Since(fanoutStarted)
+	if err := recordWeaverReleaseGateDurations(durationsPath, durations, results); err != nil {
+		log.Printf("warning: record release flow durations: %v", err)
+	}
 	manifest.FinishedAt = time.Now().UTC()
 	manifest.Status = "passed"
 	var failures []error
@@ -458,6 +473,7 @@ func runWeaverReleaseGate(parent context.Context, mode string) error {
 		failures = append(failures, err)
 	}
 	printWeaverReleaseSummary(results, runDir, jobs, fanoutWall)
+	fmt.Printf("Pools: %s\n", poolsNote)
 	return errors.Join(failures...)
 }
 
@@ -700,11 +716,11 @@ func weaverReleaseGateJobs(flowCount int) int {
 	return requested
 }
 
-func runWeaverReleasePhases(ctx context.Context, phases []*weaverReleasePhase, jobs int) []weaverReleasePhaseResult {
-	if jobs < 1 {
-		jobs = 1
+func runWeaverReleasePhases(ctx context.Context, pools []weaverReleasePool) []weaverReleasePhaseResult {
+	var phases []*weaverReleasePhase
+	for _, pool := range pools {
+		phases = append(phases, pool.Phases...)
 	}
-	queue := make(chan *weaverReleasePhase)
 	results := make(chan weaverReleasePhaseResult, len(phases))
 	// Announce the flow set up front so the parent dashboard can draw one bar
 	// per flow before any of them start, instead of discovering them as they
@@ -730,49 +746,52 @@ func runWeaverReleasePhases(ctx context.Context, phases []*weaverReleasePhase, j
 		})
 	}
 	var workers sync.WaitGroup
-	for range jobs {
-		workers.Add(1)
+	for _, pool := range pools {
+		queue := make(chan *weaverReleasePhase)
 		go func() {
-			defer workers.Done()
-			for phase := range queue {
-				key := weaverReleaseFlowKey(phase)
-				running.Add(1)
-				emitProgressEvent(progressEvent{Kind: "flow_start", Name: key})
-				noteQueue()
-				result := runWeaverReleasePhase(ctx, phase, queuedAt)
-				status := "pass"
-				if result.Err != nil {
-					status = "fail"
+			defer close(queue)
+			for _, phase := range pool.Phases {
+				select {
+				case queue <- phase:
+				case <-ctx.Done():
+					return
 				}
-				running.Add(-1)
-				emitProgressEvent(progressEvent{
-					Kind:   "flow_done",
-					Status: status,
-					Name:   key,
-					Detail: fmt.Sprintf("%s (queued %s)",
-						result.Duration.Round(time.Second), result.Timing.QueueWait.Round(time.Second)),
-				})
-				emitProgressEvent(progressEvent{
-					Kind:    "phase_progress",
-					Current: int(completed.Add(1)),
-					Total:   len(phases),
-					Detail:  key,
-				})
-				noteQueue()
-				results <- result
 			}
 		}()
-	}
-	go func() {
-		defer close(queue)
-		for _, phase := range phases {
-			select {
-			case queue <- phase:
-			case <-ctx.Done():
-				return
-			}
+		for range max(pool.Jobs, 1) {
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				for phase := range queue {
+					key := weaverReleaseFlowKey(phase)
+					running.Add(1)
+					emitProgressEvent(progressEvent{Kind: "flow_start", Name: key})
+					noteQueue()
+					result := runWeaverReleasePhase(ctx, phase, queuedAt)
+					status := "pass"
+					if result.Err != nil {
+						status = "fail"
+					}
+					running.Add(-1)
+					emitProgressEvent(progressEvent{
+						Kind:   "flow_done",
+						Status: status,
+						Name:   key,
+						Detail: fmt.Sprintf("%s (queued %s)",
+							result.Duration.Round(time.Second), result.Timing.QueueWait.Round(time.Second)),
+					})
+					emitProgressEvent(progressEvent{
+						Kind:    "phase_progress",
+						Current: int(completed.Add(1)),
+						Total:   len(phases),
+						Detail:  key,
+					})
+					noteQueue()
+					results <- result
+				}
+			}()
 		}
-	}()
+	}
 	workers.Wait()
 	close(results)
 	out := make([]weaverReleasePhaseResult, 0, len(phases))
