@@ -67,6 +67,27 @@ func (ctx *restartCaseContext) pollFor(what string, check func() (bool, error)) 
 	}
 }
 
+// pollJob is pollFor for a wait on one job's state short of its end: it
+// also ends, failing with the state the job ended in, when the job ends
+// first, as the state it waits for can no longer come.
+func (ctx *restartCaseContext) pollJob(what, dbPath string, jobID int, check func() (bool, error)) error {
+	return ctx.pollFor(what, func() (bool, error) {
+		done, err := check()
+		if err == nil && !done {
+			err = endedFirst(dbPath, jobID)
+		}
+		return done, err
+	})
+}
+
+func endedFirst(dbPath string, jobID int) error {
+	status, ok := restartJobStatusFromDB(dbPath, jobID)
+	if status = normalizeDBStatus(status); ok && (dbStatusTerminal(status) || status == "cancelled") {
+		return fmt.Errorf("job %d ended %s first", jobID, status)
+	}
+	return nil
+}
+
 // graphQLMutate posts one operation and fails on a transport error or any
 // GraphQL error.
 func graphQLMutate(weaverURL, query string, variables map[string]any, out any) error {
