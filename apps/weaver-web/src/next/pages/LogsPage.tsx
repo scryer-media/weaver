@@ -42,13 +42,13 @@ const ROW_ESTIMATE_PX = 31;
 
 const FILTERS: LogLevelFilter[] = ["all", ...LOG_LEVELS];
 
-type LogFilterPreset = "default" | "download" | "directStore" | "everything" | "custom";
+type LogFilterPreset = "default" | "download" | "graphEngine" | "everything" | "custom";
 
 /** Directives per preset. Blank asks the server for its startup filter. */
 const PRESET_DIRECTIVES: Record<Exclude<LogFilterPreset, "custom">, string> = {
   default: "",
   download: "info,weaver_server_core::pipeline::download=debug,weaver_nntp=debug",
-  directStore: "info,weaver_server_core::pipeline::direct_store=debug",
+  graphEngine: "info,weaver_server_core::pipeline::graph=debug,weaver_graph=debug",
   everything: "debug",
 };
 
@@ -107,7 +107,7 @@ function LogFilterBar() {
   const options: { value: LogFilterPreset; label: string }[] = [
     { value: "default", label: t("next.logs.filter.preset.default") },
     { value: "download", label: t("next.logs.filter.preset.download") },
-    { value: "directStore", label: t("next.logs.filter.preset.directStore") },
+    { value: "graphEngine", label: t("next.logs.filter.preset.graphEngine") },
     { value: "everything", label: t("next.logs.filter.preset.everything") },
     { value: "custom", label: t("next.logs.filter.preset.custom") },
   ];

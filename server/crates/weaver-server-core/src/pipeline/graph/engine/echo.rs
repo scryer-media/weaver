@@ -3,7 +3,7 @@
 
 // A pretend engine for tests: every volume is an eight-byte header and a
 // body, and a run echoes each body, read through its volumes in order, as a
-// member of its own named `echo-<volume>.bin`. Its first volume carries a
+// member of its own named `echo-<volume>.mkv`. Its first volume carries a
 // store's signature so the sniffer names it a store, which the echoes build
 // as this engine; the volumes after it are claimed by their `.partN`
 // names. It bids for the volumes after the one its run reached, nearest
@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use weaver_graph::{
-    Builder, ByteRange, Delivery, Emit, Engine, Extent, Extraction, Kind, MemberId, Object,
-    ObjectId, Placement, Provenance, Pull, Seek, Sink, VolumeIndex, Volumes, Weight, Why,
+    Builder, ByteRange, Claim, Delivery, Emit, Engine, Extent, Extraction, Kind, Located, MemberId,
+    Object, ObjectId, Placement, Provenance, Pull, Seek, Sink, VolumeIndex, Volumes, Weight, Why,
 };
 
 pub(crate) const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x01\x00";
@@ -28,6 +28,40 @@ pub(crate) struct Echoes {
     pub(crate) bids: Arc<Mutex<Vec<Seek>>>,
     // The window each engine declares it holds resident while it runs.
     pub(crate) window: u64,
+    pub(crate) gate: Option<Arc<RunGate>>,
+    // Whether each run also reads every volume's closed length once it has
+    // echoed its body, as a layout that sizes itself from a volume does.
+    pub(crate) lengths: bool,
+}
+
+// Hold a real worker across actor-side cancellation without relying on its
+// scheduling speed. The gate opens only when the test has checked ownership.
+#[derive(Default)]
+pub(crate) struct RunGate {
+    started: tokio::sync::Notify,
+    released: Mutex<bool>,
+    wake: std::sync::Condvar,
+}
+
+impl RunGate {
+    pub(crate) async fn started(&self) {
+        self.started.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.wake.notify_all();
+    }
+
+    fn enter(&self) {
+        self.started.notify_one();
+        let released = self.released.lock().unwrap();
+        drop(
+            self.wake
+                .wait_while(released, |released| !*released)
+                .unwrap(),
+        );
+    }
 }
 
 impl Builder for Echoes {
@@ -35,12 +69,14 @@ impl Builder for Echoes {
     // the echo volumes still recovers them.
     fn build(&mut self, kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
         if !matches!(kind, Kind::RarStore | Kind::RarEngine) {
-            return weaver_objects::Objects.build(kind, id);
+            return weaver_objects::Objects::default().build(kind, id);
         }
         Some(Box::new(Echo {
             volumes: self.volumes,
             bids: Arc::clone(&self.bids),
             window: self.window,
+            gate: self.gate.clone(),
+            lengths: self.lengths,
         }))
     }
 
@@ -60,6 +96,8 @@ struct Echo {
     volumes: u32,
     bids: Arc<Mutex<Vec<Seek>>>,
     window: u64,
+    gate: Option<Arc<RunGate>>,
+    lengths: bool,
 }
 
 impl Object for Echo {
@@ -86,14 +124,19 @@ impl Object for Echo {
             range,
         });
     }
-    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
     }
-    fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Option<VolumeIndex> {
-        let (_, part) = name.rsplit_once(".part")?;
-        let part: u32 = part.strip_suffix(".rar")?.parse().ok()?;
-        (part >= 2).then(|| VolumeIndex(part - 1))
+    fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Claim {
+        name.rsplit_once(".part")
+            .and_then(|(_, part)| part.strip_suffix(".rar")?.parse::<u32>().ok())
+            .filter(|part| *part >= 2)
+            .map(|part| VolumeIndex(part - 1))
+            .into_iter()
+            .collect()
     }
     fn reads_in_order(&self) -> bool {
         true
@@ -110,6 +153,8 @@ impl Engine for Echo {
     fn start(&mut self) -> Box<dyn Extraction> {
         Box::new(EchoRun {
             volumes: self.volumes,
+            gate: self.gate.clone(),
+            lengths: self.lengths,
         })
     }
     fn bid(&self, reached: VolumeIndex, out: &mut Vec<Seek>) {
@@ -130,15 +175,25 @@ impl Engine for Echo {
 
 struct EchoRun {
     volumes: u32,
+    gate: Option<Arc<RunGate>>,
+    lengths: bool,
 }
 
 impl Extraction for EchoRun {
-    fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, sink: &mut Sink<'_>) {
+    fn run(
+        self: Box<Self>,
+        volumes: Arc<dyn Volumes>,
+        sink: &mut Sink<'_>,
+        _: weaver_graph::Budget,
+    ) {
+        if let Some(gate) = &self.gate {
+            gate.enter();
+        }
         for index in 0..self.volumes {
             let (volume, member) = (VolumeIndex(index), MemberId(index));
             let announced = Emit::Member {
                 member,
-                name: format!("echo-{index}.bin"),
+                name: format!("echo-{index}.mkv"),
                 length: None,
             };
             if !sink(announced) {
@@ -157,7 +212,7 @@ impl Extraction for EchoRun {
                 let bytes = Emit::Bytes {
                     member,
                     offset: offset - HEADER as u64,
-                    bytes: Bytes::copy_from_slice(&chunk[..read]),
+                    bytes: Bytes::copy_from_slice(&chunk[..read]).into(),
                     provenance: Provenance::Fresh,
                 };
                 if read > 0 && !sink(bytes) {
@@ -167,6 +222,9 @@ impl Extraction for EchoRun {
                 if read < CHUNK {
                     break;
                 }
+            }
+            if self.lengths {
+                volumes.len(volume);
             }
             if !sink(Emit::MemberClosed(member)) {
                 return;

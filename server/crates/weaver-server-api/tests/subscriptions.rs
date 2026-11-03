@@ -35,6 +35,18 @@ async fn wait_for_queue_cursor_change(harness: &TestHarness, previous: &str) -> 
     }
 }
 
+// Publish a download speed above zero on the paused clock. Nothing downloads
+// in the harness, so the counters ticker stays parked; the rate window's two
+// samples are taken here instead: a baseline, then one 250 ms later after
+// wire bytes are booked.
+async fn publish_live_speed(harness: &TestHarness) {
+    let now = || tokio::time::Instant::now().into_std();
+    harness.shared_state.refresh_metrics_snapshot(now());
+    harness.shared_state.record_wire_bytes(256 * 1024);
+    tokio::time::advance(Duration::from_millis(250)).await;
+    assert!(harness.shared_state.refresh_metrics_snapshot(now()));
+}
+
 #[tokio::test]
 async fn queue_snapshots_subscription_emits_snapshot() {
     let h = TestHarness::new().await;
@@ -107,6 +119,88 @@ async fn idle_queue_snapshots_client_gets_nothing_until_a_job_is_added() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn queue_page_updates_push_only_the_asked_page_once_per_burst() {
+    let h = TestHarness::new().await;
+    let mut ids = Vec::new();
+    for index in 0..6 {
+        ids.push(h.submit_test_nzb(&format!("page-update-{index}")).await);
+    }
+
+    let request = Request::new(
+        "subscription { queuePageUpdates(input: { pageIndex: 0, pageSize: 2 }) { items { id } totalCount stateCounts { state count } } }",
+    )
+    .data(CallerScope::Read);
+    let mut stream = h.schema.execute_stream(request);
+
+    let first = stream.next().await.expect("stream should stay open");
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    let first = first.data.into_json().unwrap();
+    assert_eq!(first["queuePageUpdates"]["totalCount"], 6);
+    assert_eq!(
+        first["queuePageUpdates"]["items"].as_array().unwrap().len(),
+        2,
+        "the page carries only the rows it asked for"
+    );
+
+    // Three changes land before the subscriber is polled again: the next
+    // page reads all of them at once.
+    for id in &ids[..3] {
+        let pause = h
+            .execute(&format!("mutation {{ pauseJob(id: {id}) }}"))
+            .await;
+        assert!(pause.errors.is_empty());
+        h.wait_for_job_status(*id, weaver_server_core::JobStatus::Paused)
+            .await;
+    }
+
+    let second = stream.next().await.expect("stream should stay open");
+    assert!(second.errors.is_empty(), "{:?}", second.errors);
+    let second = second.data.into_json().unwrap();
+    assert_eq!(second["queuePageUpdates"]["totalCount"], 6);
+    assert_eq!(
+        second["queuePageUpdates"]["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let paused = second["queuePageUpdates"]["stateCounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["state"] == "PAUSED")
+        .map(|entry| entry["count"].as_u64().unwrap());
+    assert_eq!(paused, Some(3), "one page carries the whole burst");
+
+    // The burst was answered once: with the hold long past and nothing
+    // changed since, the stream has nothing more to send.
+    tokio::time::advance(Duration::from_millis(1_500)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        stream.next().now_or_never().is_none(),
+        "no second page follows a burst that one page already answered"
+    );
+
+    // The next change is answered by the next page.
+    let pause = h
+        .execute(&format!("mutation {{ pauseJob(id: {}) }}", ids[3]))
+        .await;
+    assert!(pause.errors.is_empty());
+    h.wait_for_job_status(ids[3], weaver_server_core::JobStatus::Paused)
+        .await;
+    let third = stream.next().await.expect("stream should stay open");
+    assert!(third.errors.is_empty(), "{:?}", third.errors);
+    let third = third.data.into_json().unwrap();
+    let paused = third["queuePageUpdates"]["stateCounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["state"] == "PAUSED")
+        .map(|entry| entry["count"].as_u64().unwrap());
+    assert_eq!(paused, Some(4));
+}
+
 #[tokio::test]
 async fn queue_snapshots_reflect_pause_state() {
     let h = TestHarness::new().await;
@@ -160,19 +254,8 @@ async fn queue_snapshots_use_published_speed_on_unrelated_events() {
     let h = TestHarness::new().await;
     let job_id = h.submit_test_nzb("speed-cache-snapshot").await;
 
-    // Establish the independent ticker's baseline with the controlled clock.
-    tokio::time::advance(Duration::from_millis(250)).await;
-    tokio::task::yield_now().await;
-    h.shared_state.record_wire_bytes(256 * 1024);
-    let mut revisions = h.handle.subscribe_job_changes();
-    tokio::time::advance(Duration::from_millis(250)).await;
-    loop {
-        revisions.mark_unchanged();
-        if h.handle.get_metrics().current_download_speed > 0 {
-            break;
-        }
-        revisions.changed().await.unwrap();
-    }
+    publish_live_speed(&h).await;
+    assert!(h.handle.get_metrics().current_download_speed > 0);
 
     let request = Request::new(
         "subscription { queueSnapshots { items { id state } summary { currentDownloadSpeed } } }",
@@ -351,10 +434,7 @@ async fn system_metrics_updates_emit_metrics_and_global_state() {
         "no pool means no servers to count"
     );
 
-    h.shared_state.record_wire_bytes(256 * 1024);
-    tokio::time::advance(Duration::from_millis(250)).await;
-    h.shared_state
-        .refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
+    publish_live_speed(&h).await;
 
     let second = stream.next().await.expect("stream should stay open");
     assert!(second.errors.is_empty());
@@ -406,10 +486,7 @@ async fn system_metrics_updates_share_metrics_snapshot_speed() {
         .expect("second stream should stay open");
     assert!(first_b.errors.is_empty());
 
-    h.shared_state.record_wire_bytes(256 * 1024);
-    tokio::time::advance(Duration::from_millis(250)).await;
-    h.shared_state
-        .refresh_metrics_snapshot(tokio::time::Instant::now().into_std());
+    publish_live_speed(&h).await;
 
     async fn next_nonzero_speed<S>(stream: &mut S, label: &str) -> u64
     where

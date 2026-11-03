@@ -1,0 +1,16 @@
+{
+  "slug": "tarxz-corrupted-partial",
+  "title": "E2E.Test.tarxz.corrupted.partial.2026-TESTGRP",
+  "description": "Valid XZ wraps a TAR with its second header damaged. Only the first whole member, of a known type, is usable, so the outcome must be Partial.",
+  "category": "2000",
+  "expected_outcome": "partial_delivery",
+  "expectedOutputBLAKE3": {
+    "bundle.tar": "6354078140d547639ff55eab0ac6dca5137d373337a6365aa4961c160c7f3db1",
+    "first.mkv": "7e7fad682f4723e2b40f7ffe07d55ab5f69fab42c9fedc757eb9ca2b2fbe0df6"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks",
+    "second.mkv"
+  ],
+  "exactOutputFiles": true
+}

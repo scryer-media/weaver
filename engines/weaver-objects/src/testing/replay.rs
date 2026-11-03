@@ -70,7 +70,7 @@ impl Owner {
                 Delivery {
                     volume: VolumeIndex(volume),
                     offset,
-                    bytes,
+                    bytes: &weaver_graph::Evidenced::from(bytes.to_vec()),
                     provenance: Provenance::Fresh,
                 },
                 &mut |placement, into| read(&self.written, placement, into),
@@ -119,7 +119,7 @@ impl Owner {
             Delivery {
                 volume,
                 offset,
-                bytes,
+                bytes: &weaver_graph::Evidenced::from(bytes.to_vec()),
                 provenance: Provenance::Fresh,
             },
             &mut |placement, into| read(&self.written, placement, into),
@@ -215,7 +215,8 @@ pub(crate) fn restores_alike(
         (facts.kind, facts.version > Facts::UNSUPPORTED),
         (live.kind(), true)
     );
-    let mut restored = crate::restore(&facts).expect("the facts restore");
+    let mut restored =
+        crate::restore(&facts, weaver_graph::Budget::default()).expect("the facts restore");
     assert_eq!(restored.kind(), live.kind());
     let mut theirs = owner.clone();
     for step in again {

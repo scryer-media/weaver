@@ -100,6 +100,20 @@ impl RunVolumes {
         self.lost.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    // Whether every volume the run reads is in: no volume can join, and
+    // each bound one has closed.
+    pub(crate) fn all_in(&self) -> bool {
+        let state = self.shelf.lock();
+        state.complete
+            && !state.deciding
+            && state.volumes.iter().all(|volume| {
+                state
+                    .kept
+                    .get(volume)
+                    .is_some_and(|kept| kept.closed.is_some())
+            })
+    }
+
     // Whether the run may still speak: nothing has stopped it.
     pub(crate) fn current(&self) -> bool {
         !self.stopped() && self.shelf.generation() == self.generation
@@ -182,7 +196,23 @@ impl Volumes for RunVolumes {
     }
 
     fn len(&self, volume: VolumeIndex) -> Option<u64> {
-        self.shelf.lock().kept.get(&volume.0)?.closed
+        let mut state = self.shelf.lock();
+        if state.generation != self.generation || self.stopped() {
+            return None;
+        }
+        let kept = state.kept.get_mut(&volume.0)?;
+        let length = kept.closed?;
+        kept.length_read = Some(length);
+        Some(length)
+    }
+
+    fn settled(&self, volume: VolumeIndex) -> bool {
+        let state = self.shelf.lock();
+        state.kept.get(&volume.0).is_some_and(|kept| {
+            kept.closed.is_some_and(|length| {
+                kept.settled || kept.coverage.verified(ByteRange::new(0, length))
+            })
+        })
     }
 
     fn read_at(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
@@ -204,11 +234,6 @@ impl Volumes for RunVolumes {
         };
         read_exact_at(file, offset, &mut into[..len])?;
         Ok(len)
-    }
-
-    fn bridged(&self, lost: Lost) {
-        self.spans()
-            .remove(&(lost.volume.0, lost.range.start, lost.range.end));
     }
 }
 

@@ -6,11 +6,12 @@ mod facts;
 use std::collections::BTreeMap;
 
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Emit, Object, Placement, Provenance, VolumeIndex, Why,
+    ByteRange, Coverage, Delivery, Emit, Extent, Located, MemberId, Object, Placement, Provenance,
+    VolumeIndex, Why,
 };
 
 use super::Tar;
-use crate::testing::payload;
+use crate::testing::{Quiet, payload};
 
 const BLOCK: usize = 512;
 
@@ -240,7 +241,7 @@ impl Owner {
             Delivery {
                 volume: VolumeIndex(0),
                 offset: range.start,
-                bytes: &bytes,
+                bytes: &weaver_graph::Evidenced::from(bytes.to_vec()),
                 provenance,
             },
             &mut |_, _| false,
@@ -460,6 +461,75 @@ fn sparse_and_continued_entries_are_not_extracted() {
     assert_eq!(owner.posted().as_deref(), Some(archive.as_slice()));
 }
 
+// A pax sparse entry is a regular header behind pax records carrying GNU's
+// sparse keys: its data is packed extents, in the 1.0 format behind a map
+// its size counts. Neither shape is a file: both stay envelope and the walk
+// finds the regular entry behind them.
+#[test]
+fn pax_sparse_entries_are_not_extracted() {
+    let mut writer = Writer::default();
+    // 0.1: the map in the records, the data the packed extents alone.
+    let mut records = pax_record("GNU.sparse.size", "4096");
+    records.extend(pax_record("GNU.sparse.numblocks", "2"));
+    records.extend(pax_record("GNU.sparse.map", "0,512,2048,512"));
+    records.extend(pax_record("path", "holes-0.1.bin"));
+    writer.raw(
+        header(
+            "PaxHeaders/holes",
+            "",
+            records.len() as u64,
+            b'x',
+            Dialect::Ustar,
+        ),
+        &records,
+    );
+    writer.raw(
+        header("holes-0.1.bin", "", 1_024, b'0', Dialect::Ustar),
+        &payload(7, 1_024),
+    );
+    // 1.0: the map at the front of the data, padded to a block.
+    let mut records = pax_record("GNU.sparse.major", "1");
+    records.extend(pax_record("GNU.sparse.minor", "0"));
+    records.extend(pax_record("GNU.sparse.name", "holes-1.0.bin"));
+    records.extend(pax_record("GNU.sparse.realsize", "4096"));
+    writer.raw(
+        header(
+            "PaxHeaders/holes",
+            "",
+            records.len() as u64,
+            b'x',
+            Dialect::Ustar,
+        ),
+        &records,
+    );
+    let mut data = b"2\n0\n512\n2048\n512\n".to_vec();
+    data.resize(BLOCK, 0);
+    data.extend_from_slice(&payload(8, 1_024));
+    writer.raw(
+        header(
+            "GNUSparseFile.0/holes-1.0.bin",
+            "",
+            data.len() as u64,
+            b'0',
+            Dialect::Ustar,
+        ),
+        &data,
+    );
+    writer.file("after.bin", &payload(9, 800));
+    let archive = writer.finish().bytes;
+    for frame in [archive.len(), 4096, 1] {
+        let mut owner = Owner::new(archive.clone());
+        owner.whole(frame);
+        clean(&owner);
+        assert_eq!(
+            owner.files(),
+            vec![("after.bin".to_owned(), payload(9, 800))],
+            "frames of {frame}"
+        );
+        assert_eq!(owner.posted().as_deref(), Some(archive.as_slice()));
+    }
+}
+
 #[test]
 fn bytes_that_arrive_before_their_headers_are_held_until_the_walk_reaches_them() {
     let archive = mixed().bytes;
@@ -480,8 +550,11 @@ fn bytes_that_arrive_before_their_headers_are_held_until_the_walk_reaches_them()
     assert_eq!(owner.posted().as_deref(), Some(archive.as_slice()));
 }
 
+// The header's own checksum speaks of the walk, not of the volume: the walk
+// holds there, marks nothing, and reads on when a repair delivers the
+// header again.
 #[test]
-fn a_header_whose_checksum_fails_is_damaged_until_it_is_repaired() {
+fn a_header_whose_checksum_fails_holds_the_walk_until_it_is_repaired() {
     let writer = mixed();
     let at = writer.headers[2];
     let mut bad = writer.bytes.clone();
@@ -493,15 +566,8 @@ fn a_header_whose_checksum_fails_is_damaged_until_it_is_repaired() {
         owner.deliver_as(piece, Provenance::Damaged, Some(&bytes));
     }
     owner.close();
-    assert_eq!(
-        owner.said,
-        [Emit::Damaged {
-            volume: VolumeIndex(0),
-            range: header
-        }]
-    );
+    assert!(owner.said.is_empty(), "{:?}", owner.said);
     assert_eq!(owner.members.len(), 2, "only the entries before it");
-    owner.said.clear();
     let repaired = writer.bytes[at..at + BLOCK].to_vec();
     owner.deliver_as(header, Provenance::Repaired, Some(&repaired));
     clean(&owner);
@@ -544,24 +610,24 @@ fn a_repair_of_a_header_already_read_retracts_from_that_entry_on() {
     assert_eq!(owner.files(), mixed_files());
 }
 
+// The missing tail of a volume that ends inside an entry speaks of the walk,
+// not of the volume: it marks nothing, and the archive is refused once
+// nothing more will arrive.
 #[test]
-fn a_volume_that_closes_inside_an_entry_is_damaged_for_the_missing_tail() {
+fn a_volume_that_closes_inside_an_entry_refuses_the_archive_once_quiet() {
     let writer = mixed();
     let data = writer.data[2];
     let cut = data + 1_234;
     let mut owner = Owner::new(writer.bytes[..cut].to_vec());
     owner.whole(4096);
-    assert_eq!(
-        owner.said,
-        [Emit::Damaged {
-            volume: VolumeIndex(0),
-            range: ByteRange::new(cut as u64, (data + 5_000) as u64)
-        }]
-    );
+    assert!(owner.said.is_empty(), "{:?}", owner.said);
     let beta = &owner.members[&2];
     assert_eq!(beta.name, "deep/beta.bin");
     assert!(!beta.closed);
     assert!(owner.members[&0].closed);
+    let mut out = Vec::new();
+    owner.tar.quiet(&Quiet(Vec::new()), &mut out);
+    assert_eq!(out, [Emit::Refuse(Why::Unrepairable)]);
 }
 
 #[test]
@@ -588,6 +654,31 @@ fn a_header_that_will_never_arrive_refuses_the_archive() {
     assert_eq!(out, [Emit::Refuse(Why::Unrepairable)]);
 }
 
+// A loss told again, as a quiet job tells every loss each time it settles,
+// is the one the archive holds: it is held once.
+#[test]
+fn a_loss_told_again_is_held_once() {
+    let writer = mixed();
+    let at = writer.data[2] as u64;
+    let mut owner = Owner::new(writer.bytes.clone());
+    owner.deliver(ByteRange::new(0, at));
+    let mut out = Vec::new();
+    owner
+        .tar
+        .volume_lost(VolumeIndex(0), ByteRange::at(at, 100), &mut out);
+    owner
+        .tar
+        .volume_lost(VolumeIndex(0), ByteRange::at(at, 100), &mut out);
+    owner
+        .tar
+        .volume_lost(VolumeIndex(0), ByteRange::at(at + 20, 50), &mut out);
+    assert_eq!(
+        Vec::from(owner.tar.lost.clone()),
+        vec![ByteRange::at(at, 100)]
+    );
+    assert!(out.is_empty());
+}
+
 #[test]
 fn a_members_bytes_lie_where_its_entry_put_them() {
     let writer = mixed();
@@ -608,4 +699,61 @@ fn a_members_bytes_lie_where_its_entry_put_them() {
         }]
     );
     assert!(owner.tar.reads_in_order());
+}
+
+// A member's bytes are raw runs of the archive, so a seek into a member the
+// walk has not reached is not located yet, the same seek once its header is
+// read lies where the entry put it, and only a range past the entry's data
+// is never located.
+#[test]
+fn a_seek_into_a_member_the_walk_has_not_reached_is_located_once_it_has() {
+    let writer = mixed();
+    let mut owner = Owner::new(writer.bytes.clone());
+    owner.deliver(ByteRange::new(0, writer.headers[2] as u64));
+    let beta = MemberId(2);
+    let mut extents = Vec::new();
+    assert_eq!(
+        owner
+            .tar
+            .extent(beta, ByteRange::new(100, 200), &mut extents),
+        Located::NotYet
+    );
+    assert!(extents.is_empty());
+    owner.whole(4096);
+    clean(&owner);
+    let data = writer.data[2] as u64;
+    assert_eq!(
+        owner
+            .tar
+            .extent(beta, ByteRange::new(100, 200), &mut extents),
+        Located::Whole
+    );
+    assert_eq!(
+        extents,
+        [Extent {
+            volume: VolumeIndex(0),
+            range: ByteRange::new(data + 100, data + 200)
+        }]
+    );
+    extents.clear();
+    assert_eq!(
+        owner
+            .tar
+            .extent(beta, ByteRange::new(5_000, 5_100), &mut extents),
+        Located::Never
+    );
+    assert!(extents.is_empty());
+}
+
+// An archive under a compressed stream is the stream's decoded member, and a
+// decoded member never lies in the volumes.
+#[test]
+fn a_seek_under_a_compressed_stream_is_unseekable() {
+    let stream = crate::stream::GzipStream::new();
+    let mut extents = Vec::new();
+    assert_eq!(
+        stream.extent(MemberId(0), ByteRange::new(0, 100), &mut extents),
+        Located::Never
+    );
+    assert!(extents.is_empty());
 }

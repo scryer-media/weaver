@@ -10,7 +10,6 @@
 // hardware can keep.
 
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 use crate::runtime::system_profile::SystemProfile;
 
@@ -29,10 +28,9 @@ pub struct ProfileTuning {
     pub extraction_memory_bytes: u64,
     // Articles decoded at once.
     pub decode_threads: usize,
-    // Threads in the post-processing and chase pools: 7z and xz decode
-    // threads, PAR2 verify and repair, and concurrent chases all come from
-    // these. A profile change builds new pools for the work that starts after
-    // it; work already running finishes on the pool it started on.
+    // Threads in the post-processing pool. A profile change builds a new pool
+    // for the work that starts after it; work already running finishes on the
+    // pool it started on.
     pub extract_threads: usize,
     // A cap on concurrent downloads, chosen by the profile rather
     // than derived from pressure. Per-job live memory scales with the number
@@ -55,46 +53,6 @@ pub struct ProfileTuning {
     // machine's memory. It never touches a configured limit. `None` leaves
     // the derived value alone.
     pub direct_store_resident_default_cap_bytes: Option<u64>,
-    // How a direct-unpack chase widens its 7z decoder onto the threads the
-    // profile gives it once complete runs pile up behind the frontier.
-    pub chase_widening: ChaseWidening,
-}
-
-// How a direct-unpack chase spends the decoder threads it is allowed.
-//
-// Every chase decodes on one thread at the download frontier, so output
-// starts before the block has finished downloading; the parallel decoder
-// buffers a whole run before decoding any of it, so starting wider would
-// hold the first output back until the first run had downloaded. The
-// profiles differ in what they do once a backlog of complete runs appears.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChaseWidening {
-    // Widen straight to the ceiling on any backlog, rather than one thread
-    // per waiting run. The wide profile clears a backlog as fast as its
-    // memory allows; the small ones take a thread at a time, so a passing
-    // backlog never takes memory the rest of the machine is using.
-    pub all_at_once: bool,
-    // How often the backlog is looked at. A run is at least a dictionary's
-    // worth of decoded bytes, so at download speed runs arrive tenths of a
-    // second apart at the fastest; the small profiles look less often and
-    // widen later, the wide one looks more often and widens sooner.
-    pub poll: Duration,
-}
-
-impl ChaseWidening {
-    // The balanced profile's widening, and what a chase uses before any
-    // profile is in force: a thread per waiting run, looked at ten times a
-    // second.
-    pub const BALANCED: Self = Self {
-        all_at_once: false,
-        poll: Duration::from_millis(100),
-    };
-}
-
-impl Default for ChaseWidening {
-    fn default() -> Self {
-        Self::BALANCED
-    }
 }
 
 // A share of the machine's memory: a fraction of it, up to a ceiling.
@@ -320,17 +278,6 @@ impl HardwareProfile {
                 Self::Performance => None,
             },
             direct_store_resident_default_cap_bytes: row.direct_store_resident_default_cap_bytes,
-            chase_widening: match self {
-                Self::Efficient => ChaseWidening {
-                    all_at_once: false,
-                    poll: Duration::from_millis(200),
-                },
-                Self::Balanced => ChaseWidening::BALANCED,
-                Self::Performance => ChaseWidening {
-                    all_at_once: true,
-                    poll: Duration::from_millis(50),
-                },
-            },
         }
     }
 

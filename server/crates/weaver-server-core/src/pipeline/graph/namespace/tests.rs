@@ -7,14 +7,25 @@ use weaver_graph::holds::{HoldBudgets, ScratchHold};
 
 use crate::pipeline::graph::checkpoint::HoldRecord;
 use weaver_graph::recovery::{MemberAccess, Recovery, RepairOutcome, SliceVerdict};
-use weaver_graph::{Delivery, Emit, Extent, Kind, Object, ObjectId, Pull, RecoveryKind, Seek};
+use weaver_graph::{
+    Delivery, Emit, Extent, Kind, Located, Object, ObjectId, Pull, RecoveryKind, Seek,
+};
 
 use super::*;
 use crate::pipeline::graph::lines::Lines;
 
 mod recovery;
+mod recovery_contracts;
+mod replay;
+mod store_proof;
 mod streams;
+mod verification;
 mod windows;
+
+thread_local! {
+    // How many members a pass over the holds asked what is held of them.
+    pub(super) static RELEASE_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";
 const HEADER: u64 = SIGNATURE.len() as u64;
@@ -25,6 +36,7 @@ const HEADER: u64 = SIGNATURE.len() as u64;
 struct Store {
     announced: bool,
     length: u64,
+    checksum_on_repair: Option<u32>,
 }
 
 impl Object for Store {
@@ -53,6 +65,14 @@ impl Object for Store {
                 length: Some(self.length),
             });
         }
+        if delivery.provenance == Provenance::Repaired
+            && let Some(crc32) = self.checksum_on_repair.take()
+        {
+            out.push(Emit::Checksum {
+                member: MemberId(0),
+                crc32,
+            });
+        }
         let skip = HEADER
             .saturating_sub(delivery.offset)
             .min(delivery.bytes.len() as u64);
@@ -60,7 +80,7 @@ impl Object for Store {
             out.push(Emit::Bytes {
                 member: MemberId(0),
                 offset: delivery.offset + skip - HEADER,
-                bytes: Bytes::copy_from_slice(&delivery.bytes[skip as usize..]),
+                bytes: Bytes::copy_from_slice(&delivery.bytes[skip as usize..]).into(),
                 provenance: delivery.provenance,
             });
         }
@@ -86,7 +106,18 @@ impl Object for Store {
         }
     }
 
-    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {
+        if member != MemberId(0) {
+            return Located::Never;
+        }
+        if let Some(range) = range.intersect(ByteRange::new(0, self.length)) {
+            out.push(Extent {
+                volume: VolumeIndex(0),
+                range: range.shift(HEADER as i64),
+            });
+        }
+        Located::Whole
+    }
 
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
@@ -148,7 +179,8 @@ impl Object for Late {
             out.push(Emit::Bytes {
                 member: MemberId(0),
                 offset: part.start - body().start,
-                bytes: Bytes::copy_from_slice(&delivery.bytes[start..start + part.len() as usize]),
+                bytes: Bytes::copy_from_slice(&delivery.bytes[start..start + part.len() as usize])
+                    .into(),
                 provenance: delivery.provenance,
             });
         }
@@ -184,7 +216,9 @@ impl Object for Late {
         }
     }
 
-    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
 
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
@@ -197,6 +231,7 @@ struct Build {
     par: Arc<Mutex<Seen>>,
     fix: Option<Fix>,
     inner: u64,
+    checksum_on_repair: Option<u32>,
     heard: Arc<Mutex<Vec<u64>>>,
 }
 
@@ -206,6 +241,7 @@ impl Builder for Build {
             Kind::RarStore => Some(Box::new(Store {
                 announced: false,
                 length: self.inner,
+                checksum_on_repair: self.checksum_on_repair,
             })),
             Kind::SevenZipStore => Some(Box::new(Late { mapped: false })),
             Kind::Xz => Some(Box::new(streams::Decoded::new(Arc::clone(&self.heard)))),
@@ -215,6 +251,7 @@ impl Builder for Build {
                 fixing: None,
                 fix: self.fix,
                 seen: Arc::clone(&self.par),
+                last: None,
             })),
             _ => None,
         }
@@ -253,12 +290,14 @@ impl Segments for Source {
 }
 
 // What the pretend recovery set saw: its evidence, and what it read when
-// asked to repair.
+// asked to repair, and what happens between its two reads.
 #[derive(Default)]
 struct Seen {
+    report_error: bool,
     fed: Vec<Segment>,
     read: Option<Vec<u8>>,
     volume: Option<Vec<u8>>,
+    between: Option<Box<dyn FnMut() + Send>>,
 }
 
 // The repair the pretend set makes: read the named member, write a fix.
@@ -294,6 +333,8 @@ struct Par {
     fixing: Option<MemberId>,
     fix: Option<Fix>,
     seen: Arc<Mutex<Seen>>,
+    // What its last repair came to, until a bind changes what it covers.
+    last: Option<RepairOutcome>,
 }
 
 impl Object for Par {
@@ -320,7 +361,9 @@ impl Object for Par {
         out.push(Placement::Envelope { envelope: 0, range });
     }
 
-    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
 
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
@@ -337,6 +380,7 @@ impl Object for Par {
 
 impl Recovery for Par {
     fn bind(&mut self, namespace: &mut weaver_graph::Namespace, renamed: &mut Vec<MemberId>) {
+        let covered = (self.volume, self.others.clone());
         self.volume = namespace.find_by_name("set.par2").map(|own| own.id);
         self.fixing = self
             .fix
@@ -359,6 +403,9 @@ impl Recovery for Par {
             namespace.rename(member, "show.mkv");
             renamed.push(member);
         }
+        if covered != (self.volume, self.others.clone()) {
+            self.last = None;
+        }
     }
 
     fn covers(&self, member: MemberId) -> bool {
@@ -372,11 +419,42 @@ impl Recovery for Par {
     fn verdicts(&self, _: MemberId, _: &mut Vec<SliceVerdict>) {}
     fn wants(&self, _: &mut Vec<Seek>) {}
 
-    fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
+    fn repair(&mut self, access: &mut dyn MemberAccess, _: weaver_graph::Budget) -> RepairOutcome {
+        let outcome = self.ruled(access);
+        self.last = Some(outcome);
+        outcome
+    }
+
+    fn outcome(&self) -> Option<RepairOutcome> {
+        self.last
+    }
+}
+
+impl Par {
+    fn ruled(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
+        if self.seen.lock().unwrap().report_error {
+            #[derive(Debug)]
+            struct Injected(std::io::Error);
+            impl std::fmt::Display for Injected {
+                fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("injected reconstruction failure")
+                }
+            }
+            impl std::error::Error for Injected {
+                fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                    Some(&self.0)
+                }
+            }
+            let error = Injected(std::io::Error::other("injected storage cause"));
+            access.repair_error("execute recovery", "set-a", &error);
+        }
         let mut volume = Vec::new();
         let span = ByteRange::new(0, PAR2_SIGNATURE.len() as u64);
         if access.read_volume(VolumeIndex(0), span, &mut volume) {
             self.seen.lock().unwrap().volume = Some(volume);
+        }
+        if let Some(between) = self.seen.lock().unwrap().between.as_mut() {
+            between();
         }
         let (Some(fix), Some(member)) = (self.fix, self.fixing) else {
             return RepairOutcome::Clean;
@@ -387,10 +465,6 @@ impl Recovery for Par {
         }
         access.write_repaired(member, fix.fix.0, fix.fix.1);
         RepairOutcome::Repaired { slices: 1 }
-    }
-
-    fn outcome(&self) -> Option<RepairOutcome> {
-        None
     }
 }
 
@@ -410,6 +484,7 @@ struct Job {
     fix: Option<Fix>,
     // The length of the member the pretend store holds.
     inner: u64,
+    checksum_on_repair: Option<u32>,
     // What every pretend stream had been delivered each time it heard its
     // volume closed.
     heard: Arc<Mutex<Vec<u64>>>,
@@ -434,6 +509,7 @@ impl Job {
             par: Arc::new(Mutex::new(Seen::default())),
             fix: None,
             inner: 5,
+            checksum_on_repair: None,
             heard: Arc::default(),
             out: Vec::new(),
         }
@@ -479,7 +555,7 @@ impl Job {
             node,
             member,
             offset,
-            bytes: Bytes::copy_from_slice(bytes),
+            bytes: Bytes::copy_from_slice(bytes).into(),
             provenance,
         };
         let mut build = self.build();
@@ -507,12 +583,26 @@ impl Job {
             par: Arc::clone(&self.par),
             fix: self.fix,
             inner: self.inner,
+            checksum_on_repair: self.checksum_on_repair,
             heard: Arc::clone(&self.heard),
         }
     }
 
     fn file(&self, name: &str) -> Vec<u8> {
         std::fs::read(self.dir.path().join(name)).expect("leaf file")
+    }
+
+    // Commit checkpoints as the write lane would, until no move waits: each
+    // records what is wanted, and its commit runs the moves it covers and
+    // frees the names they left.
+    fn commit(&mut self) {
+        while self.writer.moves_waiting() {
+            let stamp = self.writer.committed + 1;
+            self.writer.recorded(stamp);
+            self.writer
+                .commit_moves(&mut self.tree, stamp)
+                .expect("moves");
+        }
     }
 
     fn root(&self) -> &weaver_graph::Namespace {
@@ -528,14 +618,14 @@ impl Job {
     fn run_lent(&mut self, build: &mut dyn Builder, lent: Inline) -> Vec<(NodeId, RepairOutcome)> {
         let mut ruled = Vec::new();
         for loan in lent.0 {
-            let returned = loan.run();
+            let returned = loan.run(weaver_graph::Budget::default(), &Default::default());
             ruled.extend(returned.outcome.map(|outcome| (returned.set, outcome)));
             self.writer
                 .returned(
                     &mut self.tree,
                     build,
                     &Source,
-                    &weaver_objects::Objects,
+                    &weaver_objects::Objects::default(),
                     returned,
                     &mut self.out,
                 )
@@ -552,7 +642,9 @@ impl Job {
         due: &[NodeId],
     ) -> Vec<(NodeId, RepairOutcome)> {
         let mut lent = Inline::default();
-        self.writer.repair(&mut self.tree, node, due, &mut lent);
+        self.writer
+            .repair(&mut self.tree, node, due, &mut lent)
+            .expect("lent");
         self.run_lent(build, lent)
     }
 }
@@ -595,6 +687,31 @@ fn bytes_before_the_member_is_decided_are_on_disk_in_its_file() {
 
     job.send(member, 2, b"ws, ", Provenance::Fresh);
     assert!(!job.tree.is_undecided(NodeId::ROOT, member));
+    assert_eq!(job.file("notes.bin"), b"Raws, world");
+}
+
+// Every article routes through the writer, so the effects of each one land
+// in the room the writer keeps: empty between deliveries, its buffer reused
+// by the next, and the bytes still reach the file in order.
+#[test]
+fn routed_deliveries_reuse_the_writer_s_effect_room() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("notes.bin", Some(11));
+    job.send(member, 0, b"Raws", Provenance::Fresh);
+    assert!(!job.tree.is_undecided(NodeId::ROOT, member));
+    job.send(member, 4, b", wor", Provenance::Fresh);
+    assert!(job.writer.effects.is_empty());
+    let room = (job.writer.effects.as_ptr(), job.writer.effects.capacity());
+    assert!(room.1 > 0, "a routed delivery left its buffer in the room");
+
+    job.send(member, 9, b"ld", Provenance::Fresh);
+    assert!(job.writer.effects.is_empty());
+    assert_eq!(
+        (job.writer.effects.as_ptr(), job.writer.effects.capacity()),
+        room,
+        "the next delivery reuses the room rather than a list of its own"
+    );
+    job.close(member);
     assert_eq!(job.file("notes.bin"), b"Raws, world");
 }
 
@@ -798,6 +915,37 @@ fn a_member_closes_exactly_when_covered_at_its_length() {
     assert_eq!(job.file("video.mkv"), b"abcmidend");
 }
 
+// A member whose object states a CRC32 for its bytes is checked when it
+// closes: bytes that each arrived good but together fail the stated
+// checksum are damage on the whole member, and bytes that match it stay
+// clean.
+#[test]
+fn a_member_failing_its_stated_checksum_is_damaged_when_it_closes() {
+    for (sent, damaged) in [(&b"abcmidend"[..], false), (&b"abcmixend"[..], true)] {
+        let mut job = Job::new(PLENTY);
+        let member = job.member("video.mkv", Some(9));
+        job.tree
+            .namespace_mut(NodeId::ROOT)
+            .and_then(|namespace| namespace.get_mut(member))
+            .expect("the announced member")
+            .crc32 = Some(crc32(b"abcmidend"));
+        job.send(member, 0, sent, Provenance::Fresh);
+        job.close(member);
+        assert!(!job.is_open(NodeId::ROOT, member));
+        let expected = if damaged {
+            vec![(member, ByteRange::new(0, 9))]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            job.root().damaged_ranges().collect::<Vec<_>>(),
+            expected,
+            "sent {:?}",
+            String::from_utf8_lossy(sent)
+        );
+    }
+}
+
 // The tree's coverage and the leaf on disk agree: a run the coverage records
 // that the file no longer gives back ends the replay with the file's error.
 #[test]
@@ -815,6 +963,7 @@ fn replaying_a_leaf_whose_file_is_gone_ends_in_the_leaf_error() {
         &Source,
         NodeId::ROOT,
         member,
+        None,
         &mut job.out,
     );
     assert!(
@@ -855,6 +1004,7 @@ fn replaying_a_leaf_whose_lost_tail_was_never_written_replays_what_it_holds() {
         &Source,
         NodeId::ROOT,
         member,
+        None,
         &mut job.out,
     );
     assert!(replayed.is_ok(), "{replayed:?}");
@@ -919,6 +1069,37 @@ fn bytes_held_before_a_store_knows_its_map_reach_the_member_once_it_does() {
     assert_eq!(posted, whole);
 }
 
+// A pass over the holds asks only the volumes that hold bytes: of six
+// hundred members and two stores waiting on their maps, a delivery to a
+// plain member asks the two stores, and each map then releases its own.
+#[test]
+fn a_pass_over_the_holds_asks_only_the_volumes_that_hold_bytes() {
+    let mut job = Job::new(PLENTY);
+    let plain: Vec<MemberId> = (0..600)
+        .map(|index| job.member(&format!("f{index}.bin"), Some(4)))
+        .collect();
+    let stores = [
+        job.member("a.7z", Some(map_at().end)),
+        job.member("b.7z", Some(map_at().end)),
+    ];
+    let mut front = seven_z().to_vec();
+    front.extend_from_slice(b"hello");
+    for store in stores {
+        job.send(store, 0, &front, Provenance::Fresh);
+    }
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), 2 * body().len());
+    RELEASE_ASKED.set(0);
+
+    job.send(plain[0], 0, b"data", Provenance::Fresh);
+
+    assert_eq!(RELEASE_ASKED.get(), stores.len());
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), 2 * body().len());
+    job.send(stores[0], map_at().start, MAP, Provenance::Fresh);
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len());
+    job.send(stores[1], map_at().start, MAP, Provenance::Fresh);
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
+}
+
 // The ledger confines every name to the working dir: a name that would
 // climb out is written under the part of it that stays inside.
 #[test]
@@ -948,10 +1129,274 @@ fn a_rename_moves_the_file_and_the_name_allocation() {
         )
         .expect("rename");
     assert_eq!(renamed, "show.part01.rar");
+    // The file stays where it sat until a checkpoint records the name.
+    assert_eq!(job.file("3f9a.bin"), b"data");
+    job.commit();
     assert_eq!(job.file("show.part01.rar"), b"data");
     assert!(!job.dir.path().join("3f9a.bin").exists());
     let next = job.member("3f9a.bin", None);
     assert_eq!(job.root().get(next).unwrap().output_name, "3f9a.bin");
+}
+
+// A member renamed and then discarded before its file moved leaves its old
+// name once the checkpoint that says the file is gone has committed: the
+// member kept off the name meanwhile takes it. The file itself stays where
+// the database names it until then, so a restore from the checkpoint before
+// finds it.
+#[test]
+fn a_name_a_discarded_file_sat_at_is_free_once_its_checkpoint_commits() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("3f9a.bin", Some(4));
+    job.send(member, 0, b"data", Provenance::Fresh);
+    let mut build = job.build();
+    job.writer
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, member, "show.mkv")
+        .expect("rename");
+    let leaf = job
+        .writer
+        .files_mut(NodeId::ROOT)
+        .leaves
+        .remove(&member)
+        .expect("leaf");
+    job.writer.discard(leaf).expect("discard");
+    assert_eq!(job.file("3f9a.bin"), b"data");
+    let next = job.member("3f9a.bin", None);
+    assert_eq!(job.root().get(next).unwrap().output_name, "3f9a (1).bin");
+    job.commit();
+    assert!(!job.dir.path().join("3f9a.bin").exists());
+    assert_eq!(job.root().get(next).unwrap().output_name, "3f9a.bin");
+    assert!(!job.writer.moves_waiting());
+}
+
+// A file none of whose bytes were written was never made, so discarding it
+// leaves nothing to go: a file made at its path before the checkpoint
+// commits, such as the envelope of the volume's next holder, is a newer one
+// and stays once it does.
+#[test]
+fn a_discarded_leaf_with_no_file_takes_no_newer_file_at_its_path() {
+    let mut job = Job::new(PLENTY);
+    let name = crate::pipeline::graph::envelope::envelope_name(NodeId(2), 1);
+    let leaf = Leaf::at(job.dir.path(), &name);
+    job.writer.discard(leaf).expect("discard");
+    let path = job.dir.path().join(&name);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"next").unwrap();
+    job.commit();
+    assert_eq!(std::fs::read(&path).unwrap(), b"next");
+}
+
+// The other order: the newer file is at the path before the leaf that never
+// made one is discarded. The path holding a file says nothing of the leaf.
+#[test]
+fn a_discarded_leaf_with_no_file_leaves_a_newer_file_already_at_its_path() {
+    let mut job = Job::new(PLENTY);
+    let name = crate::pipeline::graph::envelope::envelope_name(NodeId(2), 1);
+    let leaf = Leaf::at(job.dir.path(), &name);
+    let path = job.dir.path().join(&name);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"next").unwrap();
+    job.writer.discard(leaf).expect("discard");
+    job.commit();
+    assert_eq!(std::fs::read(&path).unwrap(), b"next");
+}
+
+#[test]
+fn a_new_repair_leaf_cannot_outlive_its_uncommitted_name_during_a_move() {
+    let mut job = Job::new(PLENTY);
+    let donor = job.member("b.bin", Some(5));
+    job.send(donor, 0, b"alpha", Provenance::Fresh);
+    let mut build = job.build();
+    job.writer
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, donor, "a.bin")
+        .unwrap();
+    let repair = job.member("b.bin", Some(5));
+    assert_eq!(job.root().get(repair).unwrap().output_name, "b (1).bin");
+    let recorded_repair = job.root().get(repair).unwrap().clone();
+    let donor_file = job.writer.file_state(NodeId::ROOT, donor);
+    let repair_file = job.writer.file_state(NodeId::ROOT, repair);
+    assert!(donor_file.has_file);
+    assert_eq!(donor_file.on_disk.as_deref(), Some("b.bin"));
+    assert!(!repair_file.has_file);
+    job.writer.recorded(1);
+
+    // Repair returns after this checkpoint was captured. Its first file
+    // must stay unpublished until a checkpoint also records its ownership.
+    job.send(repair, 0, b"bravo", Provenance::Repaired);
+    assert!(job.writer.commit_moves(&mut job.tree, 1).unwrap());
+    assert_eq!(job.file("a.bin"), b"alpha");
+    assert!(
+        !job.dir.path().join("b (1).bin").exists(),
+        "a crash must not strand a repair at an uncommitted temporary name"
+    );
+
+    // Restore exactly the captured member and file facts. The newer repair
+    // bytes are not adopted; the recorded donor is found after its move.
+    *job.tree
+        .namespace_mut(NodeId::ROOT)
+        .unwrap()
+        .get_mut(repair)
+        .unwrap() = recorded_repair;
+    job.tree.rebuild_names();
+    job.writer = NamespaceWriter::new(
+        1,
+        job.dir.path().to_path_buf(),
+        Arc::clone(&job.accountant),
+        CapacityReader::unknown(),
+    );
+    job.writer
+        .restore_file(&job.tree, NodeId::ROOT, donor, &donor_file)
+        .unwrap();
+    job.writer
+        .restore_file(&job.tree, NodeId::ROOT, repair, &repair_file)
+        .unwrap();
+    for (node, member, name) in job.writer.waiting() {
+        job.tree.leaving(node, member, &name);
+    }
+    let mut settled = Vec::new();
+    job.tree.settle_names(&mut settled);
+    job.writer.moved(&mut job.tree, &settled).unwrap();
+    let mut uncommitted = Vec::new();
+    assert!(
+        !job.writer
+            .read_posted(&job.tree, repair, ByteRange::new(0, 5), &mut uncommitted)
+    );
+    job.send(repair, 0, b"bravo", Provenance::Repaired);
+    job.commit();
+    assert_eq!(job.file("a.bin"), b"alpha");
+    assert_eq!(job.file("b.bin"), b"bravo");
+    assert!(!job.dir.path().join("b (1).bin").exists());
+}
+
+#[test]
+fn a_new_repair_leaf_waits_while_only_a_vacated_name_is_uncommitted() {
+    let mut job = Job::new(PLENTY);
+    let donor = job.member("b.bin", Some(5));
+    job.send(donor, 0, b"alpha", Provenance::Fresh);
+    let mut build = job.build();
+    job.writer
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, donor, "a.bin")
+        .unwrap();
+    job.writer.recorded(1);
+    assert!(job.writer.commit_moves(&mut job.tree, 1).unwrap());
+    assert!(job.writer.moves.is_empty());
+    assert!(!job.writer.left.is_empty());
+
+    let repair = job.member("b.bin", Some(5));
+    assert_eq!(job.root().get(repair).unwrap().output_name, "b (1).bin");
+    job.send(repair, 0, b"bravo", Provenance::Repaired);
+    assert!(!job.dir.path().join("b (1).bin").exists());
+    let pending = job.writer.file_state(NodeId::ROOT, repair);
+    assert!(pending.has_file);
+    let pending_name = format!(
+        "{}/graph-waiting-0-{}",
+        weaver_graph::names::INTERNAL_DIR,
+        repair.0
+    );
+    assert_eq!(pending.on_disk.as_deref(), Some(pending_name.as_str()));
+    job.commit();
+    assert_eq!(job.file("a.bin"), b"alpha");
+    assert_eq!(job.file("b.bin"), b"bravo");
+    assert!(!job.dir.path().join("b (1).bin").exists());
+}
+
+#[test]
+fn a_committed_leaf_move_rejects_an_unowned_destination() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("source.bin", Some(5));
+    job.send(member, 0, b"owned", Provenance::Fresh);
+    let mut build = job.build();
+    job.writer
+        .rename(
+            &mut job.tree,
+            &mut build,
+            NodeId::ROOT,
+            member,
+            "target.bin",
+        )
+        .expect("rename intent");
+    job.writer.recorded(2);
+    std::fs::write(job.dir.path().join("target.bin"), b"unrelated").unwrap();
+    assert!(!job.writer.commit_moves(&mut job.tree, 1).unwrap());
+    let error = job.writer.commit_moves(&mut job.tree, 2).unwrap_err();
+    assert!(
+        matches!(error, WriteError::Leaf(LeafError::Io { source, .. }) if source.kind() == std::io::ErrorKind::AlreadyExists)
+    );
+    assert_eq!(job.file("source.bin"), b"owned");
+    assert_eq!(job.file("target.bin"), b"unrelated");
+    assert_eq!(
+        job.writer.waiting(),
+        vec![(NodeId::ROOT, member, "source.bin".into())]
+    );
+    assert_eq!(job.root().get(member).unwrap().output_name, "target.bin");
+    // Removing the obstruction is an explicit storage repair. The failed
+    // move kept the same recorded source and intent for a later retry.
+    std::fs::remove_file(job.dir.path().join("target.bin")).unwrap();
+    assert!(job.writer.commit_moves(&mut job.tree, 2).unwrap());
+    assert_eq!(job.file("target.bin"), b"owned");
+}
+
+#[test]
+fn an_exclusive_leaf_move_preserves_case_only_renaming() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("BEACON.BIN"), b"owned").unwrap();
+    let mut leaf = Leaf::at(directory.path(), "BEACON.BIN");
+    // The name ledger intentionally keeps an already-equivalent spelling.
+    // Exercise the filesystem operation with an actual leaf move intent.
+    leaf.intend("beacon.bin");
+    assert_eq!(
+        leaf.move_on(directory.path()).unwrap(),
+        Some("BEACON.BIN".into())
+    );
+    assert_eq!(
+        std::fs::read(directory.path().join("beacon.bin")).unwrap(),
+        b"owned"
+    );
+    let names: Vec<_> = std::fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(names.iter().any(|name| name == "beacon.bin"));
+    assert!(!names.iter().any(|name| name == "BEACON.BIN"));
+}
+
+// One file wants the name another still sits at, and the checkpoint that
+// says the other leaves it comes later: the earlier commit moves nothing
+// onto the name, the later one moves the other file off it, and the first
+// moves on only once the checkpoint that records that move has committed.
+// No file lands on bytes still written under the name, whatever the file
+// system folds.
+#[test]
+fn a_file_waits_off_a_name_another_file_still_sits_at() {
+    let mut job = Job::new(PLENTY);
+    let (first, second) = (MemberId(1), MemberId(2));
+    for (member, name, bytes) in [(first, "x.bin", b"alpha"), (second, "y.bin", b"bravo")] {
+        std::fs::write(job.dir.path().join(name), bytes).expect("file");
+        let leaf = Leaf::at(job.dir.path(), name);
+        job.writer
+            .files_mut(NodeId::ROOT)
+            .leaves
+            .insert(member, leaf);
+    }
+    job.writer.intend(NodeId::ROOT, first, "y.bin");
+    job.writer.recorded(1);
+    job.writer.intend(NodeId::ROOT, second, "z.bin");
+    job.writer.recorded(2);
+
+    let moved = job.writer.commit_moves(&mut job.tree, 1).expect("commit");
+    assert!(!moved);
+    assert_eq!(job.file("x.bin"), b"alpha");
+    assert_eq!(job.file("y.bin"), b"bravo");
+
+    let moved = job.writer.commit_moves(&mut job.tree, 2).expect("commit");
+    assert!(moved);
+    assert_eq!(job.file("z.bin"), b"bravo");
+    assert_eq!(job.file("x.bin"), b"alpha");
+    assert!(!job.dir.path().join("y.bin").exists());
+
+    job.commit();
+    assert_eq!(job.file("y.bin"), b"alpha");
+    assert_eq!(job.file("z.bin"), b"bravo");
+    assert!(!job.dir.path().join("x.bin").exists());
 }
 
 #[test]
@@ -1070,7 +1515,305 @@ fn a_bound_member_reads_back_through_its_envelope_and_its_child() {
 }
 
 #[test]
-fn a_retraction_truncates_the_leaf_and_keeps_its_name_for_what_comes_back() {
+fn an_envelope_on_disk_reads_through_the_root_only_after_its_ownership_is_restored() {
+    let mut job = Job::new(PLENTY);
+    let (member, child) = bound_store(&mut job);
+    let kept = job.writer.envelopes.records(child);
+    assert_eq!(kept.len(), 1);
+    let file = job.writer.file_state(child, MemberId(0));
+    job.writer = NamespaceWriter::new(
+        1,
+        job.dir.path().to_path_buf(),
+        Arc::clone(&job.accountant),
+        CapacityReader::unknown(),
+    );
+    job.writer
+        .restore_file(&job.tree, child, MemberId(0), &file)
+        .unwrap();
+
+    let mut posted = Vec::new();
+    assert!(
+        !job.writer
+            .read_posted(&job.tree, member, ByteRange::new(0, 7), &mut posted),
+        "an existing envelope without committed ownership is not adopted"
+    );
+    job.writer.restore_kept(&kept[0]).unwrap();
+    assert!(
+        job.writer
+            .read_posted(&job.tree, member, ByteRange::new(0, 12), &mut posted)
+    );
+    assert_eq!(posted, [SIGNATURE, b"hello"].concat());
+}
+
+#[test]
+fn a_deleted_output_does_not_hide_the_surviving_committed_envelope() {
+    let mut job = Job::new(PLENTY);
+    let (member, child) = bound_store(&mut job);
+    let kept = job.writer.envelopes.records(child);
+    let file = job.writer.file_state(child, MemberId(0));
+    job.writer = NamespaceWriter::new(
+        1,
+        job.dir.path().to_path_buf(),
+        Arc::clone(&job.accountant),
+        CapacityReader::unknown(),
+    );
+    std::fs::remove_file(job.dir.path().join("inner.bin")).unwrap();
+    job.writer.restore_kept(&kept[0]).unwrap();
+    job.writer
+        .restore_file(&job.tree, child, MemberId(0), &file)
+        .unwrap();
+
+    let mut posted = Vec::new();
+    assert!(
+        job.writer
+            .read_posted(&job.tree, member, ByteRange::new(0, 7), &mut posted)
+    );
+    assert_eq!(posted, SIGNATURE);
+    let mut missing = Vec::new();
+    assert!(
+        !job.writer
+            .read_posted(&job.tree, member, ByteRange::new(7, 12), &mut missing)
+    );
+}
+
+// A return can happen while the complete source still awaits handover.
+// Its recorded coverage, not its allocated length, describes retained bytes.
+#[test]
+fn give_back_retains_the_unreplayed_leaf_without_adopting_sparse_holes() {
+    for (sparse, restored) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut job = Job::new(PLENTY);
+        let member = job.member("pack.bin", Some(12));
+        job.send(member, 0, SIGNATURE, Provenance::Fresh);
+        let owner = job.tree.child_of(NodeId::ROOT, member).unwrap();
+        let source = [SIGNATURE, b"hello"].concat();
+        let (offset, bytes) = if sparse {
+            (10, &source[10..])
+        } else {
+            (0, &source[..])
+        };
+        job.writer
+            .write_file(
+                &job.tree,
+                NodeId::ROOT,
+                member,
+                offset,
+                &bytes.to_vec().into(),
+            )
+            .unwrap();
+        let original = job.writer.files[&NodeId::ROOT].leaves[&member]
+            .path()
+            .to_path_buf();
+        let record = job
+            .tree
+            .namespace_mut(NodeId::ROOT)
+            .unwrap()
+            .get_mut(member)
+            .unwrap();
+        record
+            .coverage
+            .write(ByteRange::new(offset, 12), Provenance::Fresh);
+        record.closed = !sparse;
+        if restored {
+            let state = job.writer.file_state(NodeId::ROOT, member);
+            job.writer
+                .restore_file(&job.tree, NodeId::ROOT, member, &state)
+                .unwrap();
+            assert_eq!(
+                job.writer.files[&NodeId::ROOT].leaves[&member]
+                    .folded(12, weaver_graph::Algorithm::Crc32),
+                None
+            );
+        }
+
+        job.writer
+            .given_back(&mut job.tree, (NodeId::ROOT, member), owner)
+            .unwrap();
+
+        let record = job
+            .tree
+            .namespace(NodeId::ROOT)
+            .unwrap()
+            .get(member)
+            .unwrap();
+        assert!(record.coverage.covered(ByteRange::new(0, HEADER)));
+        assert!(record.coverage.covered(ByteRange::new(10, 12)));
+        assert_eq!(record.coverage.covered(ByteRange::new(HEADER, 10)), !sparse);
+        assert_eq!(record.closed, !sparse);
+        let leaf = &job.writer.files[&NodeId::ROOT].leaves[&member];
+        assert_eq!(leaf.path(), original, "handover keeps the recorded source");
+        let mut actual = Vec::new();
+        leaf.read(0, 12, &mut actual).unwrap();
+        assert_eq!(&actual[..HEADER as usize], SIGNATURE);
+        assert_eq!(&actual[10..], &source[10..]);
+        if !sparse {
+            assert_eq!(actual, source);
+        }
+    }
+}
+
+#[test]
+fn give_back_does_not_retain_a_truncated_leaf_tail() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("pack.bin", Some(12));
+    job.send(member, 0, SIGNATURE, Provenance::Fresh);
+    let owner = job.tree.child_of(NodeId::ROOT, member).unwrap();
+    job.writer
+        .write_file(
+            &job.tree,
+            NodeId::ROOT,
+            member,
+            0,
+            &[SIGNATURE, b"hello"].concat().into(),
+        )
+        .unwrap();
+    let leaf = job
+        .writer
+        .files_mut(NodeId::ROOT)
+        .leaves
+        .get_mut(&member)
+        .unwrap();
+    leaf.close(12).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(leaf.path())
+        .unwrap()
+        .set_len(9)
+        .unwrap();
+    let record = job
+        .tree
+        .namespace_mut(NodeId::ROOT)
+        .unwrap()
+        .get_mut(member)
+        .unwrap();
+    record
+        .coverage
+        .write(ByteRange::new(0, 12), Provenance::Fresh);
+    record.closed = true;
+
+    job.writer
+        .given_back(&mut job.tree, (NodeId::ROOT, member), owner)
+        .unwrap();
+
+    let record = job
+        .tree
+        .namespace(NodeId::ROOT)
+        .unwrap()
+        .get(member)
+        .unwrap();
+    assert!(record.coverage.covered(ByteRange::new(0, 9)));
+    assert!(!record.coverage.covered(ByteRange::new(9, 12)));
+    assert!(!record.closed);
+}
+
+#[test]
+fn give_back_reports_a_missing_recorded_leaf_without_discarding_the_source_record() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("pack.bin", Some(12));
+    job.send(member, 0, SIGNATURE, Provenance::Fresh);
+    let owner = job.tree.child_of(NodeId::ROOT, member).unwrap();
+    job.writer
+        .write_file(
+            &job.tree,
+            NodeId::ROOT,
+            member,
+            0,
+            &[SIGNATURE, b"hello"].concat().into(),
+        )
+        .unwrap();
+    let leaf = job
+        .writer
+        .files_mut(NodeId::ROOT)
+        .leaves
+        .get_mut(&member)
+        .unwrap();
+    leaf.close(12).unwrap();
+    std::fs::remove_file(leaf.path()).unwrap();
+
+    assert!(
+        job.writer
+            .given_back(&mut job.tree, (NodeId::ROOT, member), owner)
+            .is_err()
+    );
+    assert!(job.writer.files[&NodeId::ROOT].leaves.contains_key(&member));
+}
+
+// A restore brings an envelope back as far as its file reaches, and the
+// member's coverage as far as what arrived. Given back after that, the
+// envelope is the member's file, and what it lacks is not in hand: the
+// coverage gives it up to come again, so replaying the file reads only
+// what the file holds.
+#[test]
+fn a_member_given_back_after_a_restore_holds_only_what_its_envelope_kept() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("pack.bin", None);
+    job.send(member, 0, SIGNATURE, Provenance::Fresh);
+    let (child, volume) = job
+        .tree
+        .child_of(NodeId::ROOT, member)
+        .expect("bound to the store");
+    let kept = job.writer.envelopes.records(child);
+    assert_eq!(kept.len(), 1);
+    job.writer = NamespaceWriter::new(
+        1,
+        job.dir.path().to_path_buf(),
+        Arc::clone(&job.accountant),
+        CapacityReader::unknown(),
+    );
+    let envelope = job
+        .dir
+        .path()
+        .join(crate::pipeline::graph::envelope::envelope_name(
+            child,
+            kept[0].envelope,
+        ));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&envelope)
+        .and_then(|file| file.set_len(3))
+        .expect("the crash left three bytes");
+    job.writer.restore_kept(&kept[0]).unwrap();
+
+    let mut build = job.build();
+    job.writer
+        .said(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            child,
+            Emit::GiveBack(volume),
+            &mut job.out,
+        )
+        .expect("give back");
+    let replayed = job.writer.replay_file(
+        &mut job.tree,
+        &mut build,
+        &Source,
+        NodeId::ROOT,
+        member,
+        None,
+        &mut job.out,
+    );
+    assert!(replayed.is_ok(), "{replayed:?}");
+    let coverage = &job
+        .tree
+        .namespace(NodeId::ROOT)
+        .and_then(|namespace| namespace.get(member))
+        .expect("the member")
+        .coverage;
+    assert!(coverage.covered(ByteRange::new(0, 3)));
+    assert!(!coverage.covered(ByteRange::new(3, 4)), "{coverage:?}");
+    let access = job.writer.access(&job.tree);
+    let mut posted = Vec::new();
+    assert!(access.read_at(NodeId::ROOT, member, ByteRange::new(0, 3), &mut posted));
+    assert_eq!(posted, &SIGNATURE[..3]);
+    assert!(!access.read_at(NodeId::ROOT, member, ByteRange::new(3, 4), &mut posted));
+}
+
+// A retracted member has no file: what comes back is written anew, under
+// the name it keeps. The file it had stays where the last checkpoint names
+// it until the one that says it is gone commits.
+#[test]
+fn a_retraction_discards_the_leaf_and_keeps_its_name_for_what_comes_back() {
     let mut job = Job::new(PLENTY);
     let (member, child) = bound_store(&mut job);
     job.send(member, 12, b"RETRACT", Provenance::Fresh);
@@ -1078,7 +1821,9 @@ fn a_retraction_truncates_the_leaf_and_keeps_its_name_for_what_comes_back() {
         node: child,
         member: MemberId(0),
     }));
-    assert_eq!(job.file("inner.bin"), b"");
+    assert!(job.dir.path().join("inner.bin").exists());
+    job.commit();
+    assert!(!job.dir.path().join("inner.bin").exists());
     let inner = job.tree.namespace(child).unwrap().get(MemberId(0)).unwrap();
     assert_eq!(inner.output_name, "inner.bin");
     assert_eq!(inner.coverage.bytes_covered(), 0);
@@ -1103,7 +1848,7 @@ fn a_refusal_keeps_the_member_it_closed_and_replaces_the_open_one_with_the_volum
         Emit::Bytes {
             member: MemberId(1),
             offset: 0,
-            bytes: Bytes::from_static(b"ab"),
+            bytes: Bytes::from_static(b"ab").into(),
             provenance: Provenance::Fresh,
         },
     ] {
@@ -1131,6 +1876,9 @@ fn a_refusal_keeps_the_member_it_closed_and_replaces_the_open_one_with_the_volum
         .expect("refuse");
     assert_eq!(job.file("pack.bin"), [SIGNATURE, b"hello"].concat());
     assert_eq!(job.file("inner.bin"), b"hello");
+    // The open member's file goes once the checkpoint that says so commits.
+    assert!(job.dir.path().join("open.bin").exists());
+    job.commit();
     assert!(!job.dir.path().join("open.bin").exists());
     assert!(job.tree.buried(child));
     let kept = job.tree.namespace(child).expect("what it closed stays");
@@ -1147,6 +1895,52 @@ fn a_refusal_keeps_the_member_it_closed_and_replaces_the_open_one_with_the_volum
         [MemberId(0)]
     );
     assert!(job.root().get(member).unwrap().is_leaf());
+}
+
+// A store that gave up is gone, and its envelopes with it, but their files
+// stay until the checkpoint that records it gone has committed. Until then
+// the checkpoint the database holds names them, and a crash comes back to
+// it with the bytes they hold still on disk.
+#[test]
+fn a_gone_stores_envelope_file_stays_until_the_checkpoint_saying_so_commits() {
+    let mut job = Job::new(PLENTY);
+    let (_, child) = bound_store(&mut job);
+    let kept = job.writer.envelopes.records(child);
+    assert_eq!(kept.len(), 1);
+    let envelope = job.dir.path().join(kept[0].file.clone().unwrap_or_else(|| {
+        crate::pipeline::graph::envelope::envelope_name(child, kept[0].envelope)
+    }));
+    assert!(envelope.exists());
+    // The checkpoint that names the envelope has committed.
+    job.writer.recorded(1);
+    job.writer.commit_moves(&mut job.tree, 1).expect("commit");
+    let mut build = job.build();
+    job.writer
+        .said(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            child,
+            Emit::Refuse(Why::Compressed),
+            &mut job.out,
+        )
+        .expect("refuse");
+    assert!(job.tree.buried(child));
+    assert!(job.writer.envelopes.records(child).is_empty());
+    assert!(
+        envelope.exists(),
+        "no checkpoint has said the store is gone"
+    );
+    assert!(job.writer.awaits_commit());
+    job.writer.recorded(2);
+    job.writer.commit_moves(&mut job.tree, 1).expect("commit");
+    assert!(
+        envelope.exists(),
+        "the committed checkpoint still names the envelope"
+    );
+    job.writer.commit_moves(&mut job.tree, 2).expect("commit");
+    assert!(!envelope.exists());
+    assert!(!job.writer.awaits_commit());
 }
 
 // A root member recognised as the name a store's member was written under
@@ -1167,6 +1961,7 @@ fn a_shallower_member_that_claims_a_written_name_moves_the_deeper_file_aside() {
     assert_eq!(renamed, "INNER.bin");
     let inner = job.tree.namespace(child).unwrap().get(MemberId(0)).unwrap();
     assert_eq!(inner.output_name, "inner (1).bin");
+    job.commit();
     assert_eq!(job.file("INNER.bin"), b"data");
     assert_eq!(job.file("inner (1).bin"), b"hello");
     assert!(!job.dir.path().join("3f9a.bin").exists());
@@ -1199,8 +1994,9 @@ fn a_recovery_object_in_the_tree_is_fed_and_its_renames_move_the_file() {
     // The member's front changed, so the object matched again and
     // recognised the member by what has arrived of it.
     assert_eq!(job.root().get(member).unwrap().output_name, "show.mkv");
-    assert!(!job.dir.path().join("3f9a.bin").exists());
     job.send(member, 4, b"more", Provenance::Fresh);
+    job.commit();
+    assert!(!job.dir.path().join("3f9a.bin").exists());
     assert_eq!(job.file("show.mkv"), b"datamore");
 }
 
@@ -1299,7 +2095,7 @@ fn bytes_the_source_has_no_checksums_for_are_checked_as_they_are_in_hand() {
             node: NodeId::ROOT,
             member,
             offset,
-            bytes: Bytes::copy_from_slice(bytes),
+            bytes: Bytes::copy_from_slice(bytes).into(),
             provenance,
         };
         let mut build = job.build();
@@ -1453,7 +2249,7 @@ async fn the_deadline_runs_from_the_first_produced_member_not_from_admission() {
         node: NodeId::ROOT,
         member: store,
         offset: front.len() as u64,
-        bytes: Bytes::from_static(b"world"),
+        bytes: Bytes::from_static(b"world").into(),
         provenance: Provenance::Fresh,
     };
     let mut build = job.build();
@@ -1465,4 +2261,418 @@ async fn the_deadline_runs_from_the_first_produced_member_not_from_admission() {
         job.writer.refusal().map(ExtractionFailure::reason),
         Some(ExtractionRejectionReason::Deadline)
     );
+}
+
+// The stated checksum is checked whatever shape the writes left the fold
+// in: a write over bytes already written forgets the run it overlapped, so
+// the fold no longer spans the member, and the file is read back instead.
+// Bytes rewritten wrong are damage; bytes rewritten the same stay clean.
+#[test]
+fn a_member_failing_its_stated_checksum_is_damaged_when_a_rewrite_broke_the_fold() {
+    for (again, damaged) in [(&b"midend"[..], false), (&b"mixend"[..], true)] {
+        let mut job = Job::new(PLENTY);
+        let member = job.member("video.mkv", Some(9));
+        job.tree
+            .namespace_mut(NodeId::ROOT)
+            .and_then(|namespace| namespace.get_mut(member))
+            .expect("the announced member")
+            .crc32 = Some(crc32(b"abcmidend"));
+        job.send(member, 0, b"abcmi", Provenance::Fresh);
+        job.send(member, 3, again, Provenance::Fresh);
+        job.close(member);
+        assert!(!job.is_open(NodeId::ROOT, member));
+        let expected = if damaged {
+            vec![(member, ByteRange::new(0, 9))]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            job.root().damaged_ranges().collect::<Vec<_>>(),
+            expected,
+            "rewrote {:?}",
+            String::from_utf8_lossy(again)
+        );
+    }
+}
+#[test]
+fn same_path_rewrite_invalidates_repair_loan() {
+    let mut job = Job::new(PLENTY).with_set(Some(Fix {
+        name: "payload.bin",
+        read: ByteRange::new(0, 32768),
+        fix: (20000, b"OK"),
+    }));
+    let member = job.member("payload.bin", Some(32768));
+    job.send(member, 0, &vec![0x6d; 32768], Provenance::Fresh);
+    let mut lent = Inline::default();
+    let due = job.tree.recovery_nodes(NodeId::ROOT);
+    job.writer
+        .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+        .unwrap();
+    assert_eq!(lent.0.len(), 1);
+    let returned = lent
+        .0
+        .pop()
+        .unwrap()
+        .run(weaver_graph::Budget::default(), &Default::default());
+    assert!(
+        !job.writer.moved_since(&job.tree, &returned),
+        "unchanged input retains the loan"
+    );
+    let before = job.writer.files[&NodeId::ROOT].leaves[&member].revision();
+    job.send(member, 20000, b"new", Provenance::Fresh);
+    assert_ne!(
+        job.writer.files[&NodeId::ROOT].leaves[&member].revision(),
+        before
+    );
+    assert_eq!(&job.file("payload.bin")[20000..20003], b"new");
+    assert!(job.writer.moved_since(&job.tree, &returned));
+    let mut build = job.build();
+    let error = job
+        .writer
+        .returned(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            &weaver_objects::Objects::default(),
+            returned,
+            &mut job.out,
+        )
+        .unwrap_err();
+    assert!(matches!(error, WriteError::StaleRecovery { .. }));
+    assert_eq!(
+        &job.file("payload.bin")[20000..20003],
+        b"new",
+        "stale writes cannot publish without reconstruction"
+    );
+}
+
+#[test]
+fn rejected_damage_does_not_change_recovery_evidence() {
+    let mut job = Job::new(PLENTY).with_set(None);
+    let member = job.member("payload.bin", Some(8));
+    job.send(member, 0, b"repaired", Provenance::Repaired);
+    let fed = job.par.lock().unwrap().fed.len();
+    job.send(member, 2, b"BAD", Provenance::Damaged);
+    assert_eq!(job.file("payload.bin"), b"repaired");
+    assert_eq!(job.par.lock().unwrap().fed.len(), fed);
+}
+
+#[test]
+fn clipping_source_evidence_does_not_upgrade_verification() {
+    struct Unverified;
+    impl Segments for Unverified {
+        fn segments_for(&self, _: NodeId, _: VolumeIndex, _: ByteRange, out: &mut Vec<Segment>) {
+            out.push(Segment {
+                range: ByteRange::new(0, 8),
+                crc32: 0,
+                verified: false,
+            });
+        }
+    }
+    let mut job = Job::new(PLENTY).with_set(None);
+    let member = job.member("payload.bin", Some(8));
+    let mut build = job.build();
+    let arrival = Arrival {
+        node: NodeId::ROOT,
+        member,
+        offset: 2,
+        bytes: Bytes::from_static(b"data").into(),
+        provenance: Provenance::Fresh,
+    };
+    job.writer
+        .deliver(
+            &mut job.tree,
+            &mut build,
+            &Unverified,
+            arrival,
+            &mut job.out,
+        )
+        .unwrap();
+    let seen = job.par.lock().unwrap();
+    assert_eq!(
+        seen.fed.last(),
+        Some(&Segment {
+            range: ByteRange::new(2, 6),
+            crc32: crc32(b"data"),
+            verified: false,
+        })
+    );
+}
+
+#[test]
+fn unrelated_candidate_and_shared_scratch_activity_do_not_invalidate_repair_loan() {
+    for resident_limit in [u64::MAX, 0] {
+        let mut job = Job::new(HoldBudgets {
+            resident_limit,
+            ..PLENTY
+        })
+        .with_set(Some(Fix {
+            name: "payload.bin",
+            read: ByteRange::new(0, 32768),
+            fix: (20000, b"OK"),
+        }));
+        let member = job.member("payload.bin", Some(32768));
+        let other = job.member("other.pending", Some(32768));
+        job.send(member, 0, &vec![0x6d; 32768], Provenance::Fresh);
+        job.send(other, 20000, b"old", Provenance::Fresh);
+        let before = job.writer.files[&NodeId::ROOT].leaves[&member].revision();
+        let mut lent = Inline::default();
+        let due = job.tree.recovery_nodes(NodeId::ROOT);
+        job.writer
+            .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+            .unwrap();
+        let returned = lent
+            .0
+            .pop()
+            .unwrap()
+            .run(weaver_graph::Budget::default(), &Default::default());
+        assert!(
+            !job.writer
+                .keep_held(NodeId::ROOT, other, 25000, Bytes::from_static(b"held"))
+                .unwrap()
+        );
+        job.send(other, 20000, b"new", Provenance::Fresh);
+        assert_eq!(
+            job.writer.files[&NodeId::ROOT].leaves[&member].revision(),
+            before
+        );
+        assert!(
+            !job.writer.moved_since(&job.tree, &returned),
+            "unconsumed candidate activity cannot stale the repair"
+        );
+    }
+}
+
+#[test]
+fn replacement_of_a_borrowed_hold_invalidates_repair_loan() {
+    for resident_limit in [u64::MAX, 0] {
+        let mut job = Job::new(HoldBudgets {
+            resident_limit,
+            ..PLENTY
+        })
+        .with_set(Some(Fix {
+            name: "payload.bin",
+            read: ByteRange::new(0, 8),
+            fix: (2, b"OK"),
+        }));
+        let member = job.member("payload.bin", Some(8));
+        assert!(
+            !job.writer
+                .keep_held(NodeId::ROOT, member, 0, Bytes::from_static(b"original"))
+                .unwrap()
+        );
+        job.tree
+            .namespace_mut(NodeId::ROOT)
+            .unwrap()
+            .get_mut(member)
+            .unwrap()
+            .coverage
+            .write(ByteRange::new(0, 8), Provenance::Fresh);
+        let mut lent = Inline::default();
+        let due = job.tree.recovery_nodes(NodeId::ROOT);
+        job.writer
+            .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+            .unwrap();
+        let returned = lent
+            .0
+            .pop()
+            .unwrap()
+            .run(weaver_graph::Budget::default(), &Default::default());
+        assert_eq!(
+            job.par.lock().unwrap().read.as_deref(),
+            Some(b"original".as_slice())
+        );
+        assert!(!job.writer.moved_since(&job.tree, &returned));
+        assert!(
+            !job.writer
+                .keep_held(NodeId::ROOT, member, 2, Bytes::from_static(b"new"))
+                .unwrap()
+        );
+        assert!(
+            job.writer.moved_since(&job.tree, &returned),
+            "borrowed RAM and scratch sources keep their own identities"
+        );
+    }
+}
+
+#[test]
+fn a_returned_ruling_stands_on_the_ranges_it_read_and_only_those() {
+    for resident_limit in [u64::MAX, 0] {
+        let mut job = Job::new(HoldBudgets {
+            resident_limit,
+            ..PLENTY
+        })
+        .with_set(Some(Fix {
+            name: "payload.bin",
+            read: ByteRange::new(0, 8),
+            fix: (2, b"OK"),
+        }));
+        let member = job.member("payload.bin", Some(16));
+        let arrive = |job: &mut Job, offset: u64, bytes: &'static [u8]| {
+            assert!(
+                !job.writer
+                    .keep_held(NodeId::ROOT, member, offset, Bytes::from_static(bytes))
+                    .unwrap()
+            );
+            job.tree
+                .namespace_mut(NodeId::ROOT)
+                .unwrap()
+                .get_mut(member)
+                .unwrap()
+                .coverage
+                .write(
+                    ByteRange::new(offset, offset + bytes.len() as u64),
+                    Provenance::Fresh,
+                );
+        };
+        arrive(&mut job, 0, b"original");
+        let mut lent = Inline::default();
+        let due = job.tree.recovery_nodes(NodeId::ROOT);
+        job.writer
+            .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+            .unwrap();
+        let returned = lent
+            .0
+            .pop()
+            .unwrap()
+            .run(weaver_graph::Budget::default(), &Default::default());
+        assert_eq!(
+            job.par.lock().unwrap().read.as_deref(),
+            Some(b"original".as_slice())
+        );
+        arrive(&mut job, 8, b"and more");
+        assert!(
+            !job.writer.moved_since(&job.tree, &returned),
+            "bytes past what the repair read leave its ruling standing"
+        );
+        arrive(&mut job, 2, b"new");
+        assert!(
+            job.writer.moved_since(&job.tree, &returned),
+            "a hold replaced inside what the repair read takes its ruling back"
+        );
+    }
+}
+
+// The file a repair read is written again past what it read while the
+// repair is out: its ruling stands. A byte it read written again, or said
+// again with another provenance, takes the ruling back.
+#[test]
+fn a_returned_ruling_stands_while_its_file_changes_past_what_it_read() {
+    for rewritten in [true, false] {
+        let mut job = Job::new(PLENTY).with_set(Some(Fix {
+            name: "payload.bin",
+            read: ByteRange::new(0, 8),
+            fix: (2, b"OK"),
+        }));
+        let member = job.member("payload.bin", Some(16));
+        job.send(member, 0, b"original and mor", Provenance::Fresh);
+        let mut lent = Inline::default();
+        let due = job.tree.recovery_nodes(NodeId::ROOT);
+        job.writer
+            .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+            .unwrap();
+        let returned = lent
+            .0
+            .pop()
+            .unwrap()
+            .run(weaver_graph::Budget::default(), &Default::default());
+        let write = |job: &mut Job, offset: u64, bytes: &[u8]| {
+            job.writer
+                .files_mut(NodeId::ROOT)
+                .leaves
+                .get_mut(&member)
+                .unwrap()
+                .write(offset, bytes, None)
+                .unwrap();
+        };
+        write(&mut job, 8, b"AND MORE");
+        assert_eq!(job.file("payload.bin"), b"originalAND MORE");
+        assert!(
+            !job.writer.moved_since(&job.tree, &returned),
+            "bytes past what the repair read leave its ruling standing"
+        );
+        if rewritten {
+            write(&mut job, 4, b"new");
+        } else {
+            job.tree
+                .namespace_mut(NodeId::ROOT)
+                .unwrap()
+                .get_mut(member)
+                .unwrap()
+                .coverage
+                .write(ByteRange::new(4, 7), Provenance::Repaired);
+        }
+        assert!(
+            job.writer.moved_since(&job.tree, &returned),
+            "rewritten={rewritten}: a byte the repair read changed takes its ruling back"
+        );
+    }
+}
+
+#[test]
+fn worker_diagnostics_are_published_only_for_current_acknowledgment() {
+    use crate::pipeline::graph::hardware::Shutdown;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for mode in 0..3 {
+        let mut job = Job::new(PLENTY).with_set(Some(Fix {
+            name: "payload.bin",
+            read: ByteRange::new(0, 32768),
+            fix: (20000, b"OK"),
+        }));
+        let member = job.member("payload.bin", Some(32768));
+        job.send(member, 0, &vec![0x6d; 32768], Provenance::Fresh);
+        job.par.lock().unwrap().report_error = true;
+        let stop = Arc::new(AtomicBool::new(false));
+        if mode == 2 {
+            let stop = Arc::clone(&stop);
+            job.par.lock().unwrap().between =
+                Some(Box::new(move || stop.store(true, Ordering::Release)));
+        }
+        let mut lent = Inline::default();
+        let due = job.tree.recovery_nodes(NodeId::ROOT);
+        job.writer
+            .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+            .unwrap();
+        let returned = lent
+            .0
+            .pop()
+            .unwrap()
+            .run(weaver_graph::Budget::default(), &Shutdown::of(stop));
+        assert_eq!(
+            returned.diagnostics.len(),
+            1,
+            "the worker captured the injected error"
+        );
+        if mode == 1 {
+            job.send(member, 20000, b"new", Provenance::Fresh);
+        }
+        let mut build = job.build();
+        let result = job.writer.returned(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            &weaver_objects::Objects::default(),
+            returned,
+            &mut job.out,
+        );
+        if mode == 1 {
+            assert!(matches!(result, Err(WriteError::StaleRecovery { .. })));
+        } else {
+            result.unwrap();
+        }
+        if mode == 0 {
+            let [diagnostic] = job.writer.diagnostics.as_slice() else {
+                panic!("one accepted diagnostic");
+            };
+            assert_eq!(diagnostic.operation, "execute recovery");
+            assert_eq!(diagnostic.context, "set-a");
+            assert_eq!(diagnostic.error, "injected reconstruction failure");
+            assert_eq!(diagnostic.causes, ["injected storage cause"]);
+        } else {
+            assert!(
+                job.writer.diagnostics.is_empty(),
+                "stale or stopped work cannot log a current failure"
+            );
+        }
+    }
 }

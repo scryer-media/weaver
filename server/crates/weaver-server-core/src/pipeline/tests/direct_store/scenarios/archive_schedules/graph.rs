@@ -10,9 +10,8 @@ use weaver_graph::recovery::RepairOutcome;
 
 use super::*;
 use crate::history::HistoryFailureKind;
-use crate::pipeline::graph::Engine;
+use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::tests::engines::harness::{JOB, finished};
-use crate::pipeline::tests::engines::restart::stamp_graph;
 
 pub(in crate::pipeline::tests) mod grouping;
 mod two_sets;
@@ -31,6 +30,8 @@ pub(in super::super) struct GraphOutcome {
     // The names the post carries its files under, and the names its
     // recovery set describes the volumes by.
     pub(in super::super) own: BTreeSet<String>,
+    // A joined posting whose output was compared with every source byte.
+    pub(in super::super) joined: Option<String>,
     // Articles the job asked for while it held them on disk by its own
     // account.
     pub(in super::super) rerequested: BTreeSet<(u32, u32)>,
@@ -62,10 +63,11 @@ pub(in super::super) struct Leaves {
 }
 
 // Pieces a job holds as plain files: how many the post carries to it, and
-// how many of those come whole.
+// the names of those that come whole.
 pub(in super::super) struct Files {
     pub(in super::super) posted: usize,
-    pub(in super::super) whole: usize,
+    pub(in super::super) whole: Vec<String>,
+    pub(in super::super) joined: Option<String>,
 }
 
 // What a post is under one schedule: the members its archive holds, and
@@ -180,26 +182,9 @@ fn rar_recovers(
     recovered
 }
 
-// Whether a schedule has a meaning under the graph. A demotion hands a
-// direct set to conventional extraction, and the graph has no such hand-off
-// to take; every other boundary action is a pipeline going down.
-pub(in super::super) fn runs_under_graph(interruption: Interruption) -> bool {
-    !matches!(
-        interruption,
-        Interruption::Demote(_)
-            | Interruption::Combined {
-                action: BoundaryAction::Demote,
-                ..
-            }
-            | Interruption::Twice {
-                first: BoundaryAction::Demote,
-                ..
-            }
-            | Interruption::Twice {
-                second: BoundaryAction::Demote,
-                ..
-            }
-    )
+// Some whole file is one a job can end partial by.
+fn usable<'n>(whole: impl IntoIterator<Item = &'n String>) -> bool {
+    whole.into_iter().any(|name| weaver_graph::known_type(name))
 }
 
 // What a schedule loses: an article of a volume, or a volume the post never
@@ -209,15 +194,18 @@ fn loses(interruption: Interruption) -> bool {
 }
 
 // The one rule set, as the ways a run disagrees with it. The members
-// delivered whole are exactly the deliverable ones. The job is complete
+// delivered whole include the reference reader's deliverable ones, and
+// every published member is checked against its fixture bytes. The job is complete
 // when every member is whole and the post mended all the schedule
-// damaged, failed when nothing is whole, and partial otherwise. A post the
-// job has no reason to read as an archive is files as posted, held to the
-// same rule: complete when every piece came whole, failed when none did,
-// partial otherwise. A job that
+// damaged, partial when a whole member is of a type people open, and failed
+// otherwise. A post the job has no reason to read as an archive is files as
+// posted, held to the same rule: complete when every piece came whole,
+// partial when a whole piece is of a known type, failed otherwise. A job that
 // delivered nothing leaves nothing in its output directory; one that
 // delivered anything moved all of itself there. Only the members and the
-// post's own files are published. Nothing on disk is asked for again. A
+// post's own files are published, and on a partial job the container joined
+// from the post's numbered pieces as well: an unpack that ended short leaves
+// it beside the members it delivered. Nothing on disk is asked for again. A
 // starved recovery set that leaves nothing deliverable fails the job as a
 // repair.
 pub(in super::super) fn graph_disagreements(
@@ -239,19 +227,25 @@ pub(in super::super) fn graph_disagreements(
         .map(|(name, _)| name.clone())
         .collect();
     let status = if let Some(files) = files {
-        if files.whole == 0 {
-            matches!(outcome.status, Some(JobStatus::Failed { .. }))
-        } else if files.whole == files.posted {
-            outcome.status == Some(JobStatus::Complete)
-        } else {
-            outcome.status == Some(JobStatus::Partial)
+        if files.joined.is_some() && files.joined != outcome.joined {
+            said.push(format!(
+                "joined posting {:?} was not delivered byte-exact",
+                files.joined
+            ));
         }
-    } else if whole.is_empty() {
-        matches!(outcome.status, Some(JobStatus::Failed { .. }))
-    } else if whole.len() == post.members.len() && *mended {
+        if !files.whole.is_empty() && files.whole.len() == files.posted {
+            outcome.status == Some(JobStatus::Complete)
+        } else if usable(&files.whole) {
+            outcome.status == Some(JobStatus::Partial)
+        } else {
+            matches!(outcome.status, Some(JobStatus::Failed { .. }))
+        }
+    } else if !whole.is_empty() && whole.len() == post.members.len() && *mended {
         outcome.status == Some(JobStatus::Complete)
-    } else {
+    } else if usable(&whole) {
         outcome.status == Some(JobStatus::Partial)
+    } else {
+        matches!(outcome.status, Some(JobStatus::Failed { .. }))
     };
     if !status {
         said.push(format!(
@@ -261,38 +255,49 @@ pub(in super::super) fn graph_disagreements(
             post.members.len(),
             files.as_ref().map_or("none".to_string(), |files| format!(
                 "{} of {} whole",
-                files.whole, files.posted
+                files.whole.len(),
+                files.posted
             ))
         ));
     }
-    if whole != *deliverable {
-        said.push(format!(
-            "delivered whole {whole:?}, deliverable {deliverable:?}"
-        ));
-    }
-    if deliverable.is_empty() {
-        let present: Vec<_> = outcome
-            .files
-            .iter()
-            .filter(|(_, bytes)| bytes.is_some())
-            .map(|(name, _)| name)
-            .collect();
-        if !present.is_empty() {
-            said.push(format!(
-                "nothing is deliverable, yet {present:?} is published"
-            ));
-        }
-    }
+    let present = outcome
+        .files
+        .iter()
+        .filter(|(_, bytes)| bytes.is_some())
+        .map(|(name, _)| name.clone())
+        .collect();
+    said.extend(
+        crate::pipeline::tests::archive_output_contract::disagreements(
+            deliverable,
+            &whole,
+            &present,
+        ),
+    );
     if !whole.is_empty() && !outcome.leftovers.is_empty() {
         said.push(format!(
             "left outside the output directory: {:?}",
             outcome.leftovers
         ));
     }
+    let joined: BTreeSet<&str> = if outcome.status == Some(JobStatus::Partial) {
+        outcome
+            .own
+            .iter()
+            .filter_map(|name| {
+                crate::pipeline::tests::archive_output_contract::joined_container(name)
+            })
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
     let foreign: Vec<_> = outcome
         .published
         .iter()
-        .filter(|path| !post.members.contains_key(*path) && !outcome.own.contains(*path))
+        .filter(|path| {
+            !post.members.contains_key(*path)
+                && !outcome.own.contains(*path)
+                && !joined.contains(path.as_str())
+        })
         .collect();
     if !foreign.is_empty() {
         said.push(format!(
@@ -307,13 +312,25 @@ pub(in super::super) fn graph_disagreements(
     }
     if interruption.fails()
         && options.recovery != RecoveryFormat::Absent
-        && deliverable.is_empty()
+        && whole.is_empty()
         && outcome.failure_kind != Some(HistoryFailureKind::Repair)
     {
         said.push(format!(
             "the starved set fails the job as {:?}, not as a repair; recovery seen {:?}",
             outcome.failure_kind, outcome.recovery
         ));
+    }
+    if !said.is_empty() {
+        for (name, expected) in post.members {
+            if let Some(Some(actual)) = outcome.files.get(name)
+                && let Some(difference) =
+                    crate::pipeline::tests::archive_output_contract::output_difference(
+                        name, expected, actual,
+                    )
+            {
+                said.push(difference);
+            }
+        }
     }
     said
 }
@@ -337,7 +354,7 @@ pub(in super::super) async fn run_graph_schedule(
     described: Option<&[String]>,
     order: &[(u32, u32)],
     wanted: &[&str],
-    interruption: Interruption,
+    (interruption, answers): (Interruption, Answers),
 ) -> GraphOutcome {
     Box::pin(drive_graph_schedule(
         options,
@@ -346,7 +363,7 @@ pub(in super::super) async fn run_graph_schedule(
         described,
         order,
         wanted,
-        interruption,
+        (interruption, answers),
     ))
     .await
 }
@@ -439,11 +456,110 @@ impl Run<'_> {
     }
 }
 
-// What an orchestrator turn does after an article: the runs' mail is heard,
-// every completion check a step scheduled runs, and the runtime queues
+// When a repair's answer is heard, a wire of the schedule like its
+// interruption: before the next article arrives, or held while the rest of
+// the schedule's articles arrive, until a restart or a crash stops the
+// pipeline or the schedule is spent. A post with no recovery set lends no
+// repair, so it runs only heard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in super::super) enum Answers {
+    Heard,
+    Held,
+}
+
+impl Answers {
+    pub(in super::super) fn under(recovery: bool) -> &'static [Self] {
+        if recovery {
+            &[Self::Heard, Self::Held]
+        } else {
+            &[Self::Heard]
+        }
+    }
+}
+
+// The orchestrator turns of one schedule, the repair answer a held
+// schedule keeps back, and the database's word that checkpoints committed
+// when a crash at a move is still to come.
+pub(in super::super) struct Turns {
+    answers: Answers,
+    held: Vec<Said>,
+    holds_written: bool,
+    written: Vec<Said>,
+}
+
+impl Turns {
+    pub(in super::super) fn new(answers: Answers) -> Self {
+        Self {
+            answers,
+            held: Vec::new(),
+            holds_written: false,
+            written: Vec::new(),
+        }
+    }
+
+    // A crash at a move comes back to the database as it stood before the
+    // article that made a file wait, so the job must not have acted on a
+    // checkpoint the step committed after it: a file the step's first
+    // checkpoint stops naming would be gone while that database still names
+    // it. The word that a checkpoint committed is kept back from the turn
+    // that heard it and given to the next one, after the crash checks
+    // between them, so a crash at a move always finds the commits of its
+    // own article unheard, as they are when the process dies before the
+    // database's word reaches the job. A word for a checkpoint before the
+    // article is heard before the job acts on the article's own.
+    pub(in super::super) fn holding_written(mut self, holds: bool) -> Self {
+        self.holds_written = holds;
+        self
+    }
+
+    // What an orchestrator turn does after an article: the commits a crash
+    // check was kept from are heard first, then the runs' mail, every
+    // completion check a step scheduled runs, and the runtime queues
+    // settle. Whatever is lent out is then waited for, so its answer is
+    // heard before the next article, or kept back when the schedule holds
+    // repairs' answers.
+    pub(in super::super) async fn turn(&mut self, pipeline: &mut Pipeline) {
+        for said in std::mem::take(&mut self.written) {
+            pipeline.graph_run_said(said);
+        }
+        let mut mail = pipeline.graph_runs.waiting();
+        loop {
+            for said in mail {
+                if self.answers == Answers::Held && matches!(said.heard, Heard::Repaired(_)) {
+                    self.held.push(said);
+                } else if self.holds_written && matches!(said.heard, Heard::Written { .. }) {
+                    self.written.push(said);
+                } else {
+                    pipeline.graph_run_said(said);
+                }
+            }
+            settle(pipeline).await;
+            if !self.held.is_empty() || !pipeline.graph_jobs.get(&JOB).is_some_and(|job| job.lent())
+            {
+                break;
+            }
+            mail = vec![pipeline.graph_runs.recv().await.expect("a loan answers")];
+        }
+    }
+
+    // Hears what is held back, before the schedule stops the pipeline or
+    // once it has no articles left to hold it behind.
+    pub(in super::super) async fn release(&mut self, pipeline: &mut Pipeline) -> bool {
+        if self.held.is_empty() && self.written.is_empty() {
+            return false;
+        }
+        let written = std::mem::take(&mut self.written);
+        for said in written.into_iter().chain(std::mem::take(&mut self.held)) {
+            pipeline.graph_run_said(said);
+        }
+        settle(pipeline).await;
+        true
+    }
+}
+
+// Every completion check a step scheduled runs, and the runtime queues
 // settle.
-async fn turn(pipeline: &mut Pipeline) {
-    pipeline.hear_graph_runs();
+async fn settle(pipeline: &mut Pipeline) {
     while let Some(queued) = pipeline.pending_completion_checks.pop_front() {
         pipeline.check_job_completion(queued).await;
     }
@@ -451,11 +567,11 @@ async fn turn(pipeline: &mut Pipeline) {
 }
 
 // What a gate round can change: when none of it moved, nothing will.
-fn fingerprint(pipeline: &Pipeline) -> String {
+pub(super) fn fingerprint(pipeline: &Pipeline) -> String {
     let queued = pipeline.jobs.get(&JOB).map(|state| {
         (
-            state.download_queue.len(),
-            state.recovery_queue.len(),
+            state.articles.active().unwrap().download_queue.len(),
+            state.articles.active().unwrap().recovery_queue.len(),
             state.status.clone(),
         )
     });
@@ -469,7 +585,7 @@ fn fingerprint(pipeline: &Pipeline) -> String {
 // A new pipeline over `root` with the job restored from the rows the last
 // one left, exactly as startup recovery restores it, and whether it was: a
 // job the last one had finished is not.
-async fn restore(
+pub(super) async fn restore(
     root: &tempfile::TempDir,
     spec: &JobSpec,
     trace: &mut Vec<String>,
@@ -499,11 +615,8 @@ async fn restore(
             job_id: JOB,
             job_hash: recovered.nzb_hash,
             spec: spec.clone(),
-            complete_files: recovered.complete_files,
-            file_progress: recovered.file_progress,
             detected_archives: recovered.detected_archives,
             file_identities: recovered.file_identities,
-            extracted_members: recovered.extracted_members,
             status: crate::jobs::model::job_status_from_persisted_str(
                 &recovered.status,
                 recovered.error.as_deref(),
@@ -520,14 +633,169 @@ async fn restore(
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             working_dir: recovered.output_dir,
+            restart: None,
         })
         .await
         .unwrap();
     assert!(
-        !pipeline.blocked_restores.contains_key(&JOB) && pipeline.is_graph_job(JOB),
+        !pipeline.blocked_restores.contains_key(&JOB) && pipeline.graph_jobs.contains_key(&JOB),
         "a graph job restores from its checkpoint: {trace:?}"
     );
     (pipeline, true)
+}
+
+// Whether a member's file of the job waits to move to the name it wants.
+fn file_waits(pipeline: &Pipeline) -> bool {
+    pipeline
+        .graph_jobs
+        .get(&JOB)
+        .is_some_and(|job| !job.writer().waiting().is_empty())
+}
+
+// The database files under `from` replace those under `to`: the main file
+// and its write-ahead log. The shared-memory index goes, and the next open
+// builds it again from the log.
+fn copy_database(from: &std::path::Path, to: &std::path::Path) {
+    for name in ["weaver.db", "weaver.db-wal"] {
+        let (source, target) = (from.join(name), to.join(name));
+        if source.exists() {
+            std::fs::copy(&source, &target).unwrap();
+        } else if target.exists() {
+            std::fs::remove_file(&target).unwrap();
+        }
+    }
+    let index = to.join("weaver.db-shm");
+    if index.exists() {
+        std::fs::remove_file(index).unwrap();
+    }
+}
+
+// A crash at a move. While no member's file waits to move, each step keeps
+// the database as the queued writes leave it, and the articles it does not
+// account for: those the job held only in memory then, and every one served
+// since. A crash before the next move's checkpoint commits comes back to
+// that database, and those articles are not on disk by its account.
+struct MoveCrash {
+    state: Option<MoveState>,
+    quiet: tempfile::TempDir,
+    since: Vec<(u32, u32)>,
+}
+
+impl MoveCrash {
+    fn new(interruption: Interruption) -> Self {
+        Self {
+            state: interruption.moving(),
+            quiet: tempfile::tempdir().unwrap(),
+            since: Vec::new(),
+        }
+    }
+
+    async fn settle(&mut self, pipeline: &Pipeline, root: &std::path::Path) {
+        if self.state.is_none() || file_waits(pipeline) {
+            return;
+        }
+        pipeline.db.flush_write_queue().await.unwrap();
+        copy_database(root, self.quiet.path());
+        self.since = pipeline
+            .graph_jobs
+            .get(&JOB)
+            .map(|job| job.in_memory())
+            .unwrap_or_default();
+    }
+
+    fn served(&mut self, article: (u32, u32)) {
+        if self.state.is_some() {
+            self.since.push(article);
+        }
+    }
+
+    // The process dies the first time a member's file waits to move, with
+    // the move in the schedule's state: the checkpoint naming where the file
+    // goes rolled back, committed with its word unheard, or heard so the file
+    // moved and the checkpoint saying so rolled back. Returns the pipeline
+    // that goes on, and the status the job went down with when it did not
+    // restore. The commits' word the turns kept back dies with the process,
+    // or is heard first when the commit's word is.
+    async fn crash(
+        &mut self,
+        mut pipeline: Pipeline,
+        root: &tempfile::TempDir,
+        spec: &JobSpec,
+        (run, turns): (&mut Run<'_>, &mut Turns),
+    ) -> (Pipeline, Option<Option<JobStatus>>) {
+        let Some(state) = self.state.filter(|_| file_waits(&pipeline)) else {
+            return (pipeline, None);
+        };
+        self.state = None;
+        let written = std::mem::take(&mut turns.written);
+        // No crash is still to come, so nothing is kept back from here on:
+        // a job that fails on the restore waits for its commits' word
+        // before it goes, and a word kept back would never reach it.
+        turns.holds_written = false;
+        pipeline.db.flush_write_queue().await.unwrap();
+        let waiting = pipeline
+            .graph_jobs
+            .get(&JOB)
+            .map(|job| job.writer().waiting())
+            .unwrap_or_default();
+        let kept = tempfile::tempdir().unwrap();
+        let back_to = match state {
+            MoveState::Uncommitted => {
+                for article in self.since.drain(..) {
+                    run.delivered.remove(&article);
+                }
+                Some(self.quiet.path())
+            }
+            MoveState::Unheard => None,
+            MoveState::Unrecorded => {
+                copy_database(root.path(), kept.path());
+                // The job comes back to the database kept here: what it held
+                // only in memory now is not on disk by that database's
+                // account, wherever the steps the commit's word lets run
+                // then write it.
+                if let Some(job) = pipeline.graph_jobs.get(&JOB) {
+                    for article in job.in_memory() {
+                        run.delivered.remove(&article);
+                    }
+                }
+                for said in written {
+                    pipeline.graph_run_said(said);
+                }
+                pipeline.hear_graph_runs();
+                let still = pipeline
+                    .graph_jobs
+                    .get(&JOB)
+                    .map(|job| job.writer().waiting())
+                    .unwrap_or_default();
+                assert!(
+                    waiting.iter().any(|file| !still.contains(file)),
+                    "the commit's word moves a waiting file: {waiting:?} still {still:?}: {:?}",
+                    run.trace
+                );
+                Some(kept.path())
+            }
+        };
+        let status = job_status_for_assert(&pipeline, JOB);
+        if let Some(job) = pipeline.graph_jobs.get(&JOB) {
+            for article in job.in_memory() {
+                run.delivered.remove(&article);
+            }
+        }
+        run.trace.push(format!(
+            "Crash at a move {state:?}: waiting={waiting:?} status={status:?}"
+        ));
+        retire_pipeline_database(pipeline).await;
+        if let Some(from) = back_to {
+            copy_database(from, root.path());
+        }
+        let (mut pipeline, restored) = restore(root, spec, &mut run.trace).await;
+        if !restored {
+            return (pipeline, Some(status));
+        }
+        run.note_asks(&mut pipeline);
+        run.look(&pipeline);
+        (pipeline, None)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -538,10 +806,10 @@ async fn drive_graph_schedule(
     described: Option<&[String]>,
     order: &[(u32, u32)],
     wanted: &[&str],
-    interruption: Interruption,
+    (interruption, answers): (Interruption, Answers),
 ) -> GraphOutcome {
-    assert!(runs_under_graph(interruption), "{interruption:?}");
     enable_schedule_trace();
+    let mut turns = Turns::new(answers).holding_written(interruption.moving().is_some());
     // Every volume the set is written as: what a recovery set or a listing
     // describes. The run serves the ones the post carries.
     let written = volumes;
@@ -569,23 +837,21 @@ async fn drive_graph_schedule(
     let (mut pipeline, _, complete) = new_direct_pipeline(&root).await;
     let output = complete.join(crate::jobs::working_dir::sanitize_dirname(&spec.name));
     insert_active_job(&mut pipeline, JOB, spec.clone()).await;
-    stamp_graph(&pipeline.db);
-    pipeline.admit_graph_job(JOB, Engine::Graph);
-    assert!(pipeline.is_graph_job(JOB));
     let index = run.recovery.first().map(|carrier| (carrier.index, 0));
     if let Some(index) = index
         && index_first
     {
         run.serve(&mut pipeline, index).await;
-        turn(&mut pipeline).await;
+        turns.turn(&mut pipeline).await;
         run.look(&pipeline);
     }
     let mut retired = None;
+    let mut moving = MoveCrash::new(interruption);
     for (step, action, arrives) in interruption.boundaries(order.len()) {
         match action {
             BoundaryAction::None => {}
-            BoundaryAction::Demote => unreachable!("no schedule the graph runs demotes"),
             action @ (BoundaryAction::Restart | BoundaryAction::Crash) => {
+                turns.release(&mut pipeline).await;
                 if action == BoundaryAction::Restart {
                     pipeline.drain().await;
                 }
@@ -600,9 +866,6 @@ async fn drive_graph_schedule(
                 run.trace
                     .push(format!("{action:?} at {step}: status={status:?}"));
                 retire_pipeline_database(pipeline).await;
-                // The write handles are process-wide; a dead process takes its
-                // handles with it, so the next incarnation must open its own.
-                settle_direct_output_removals(root.path()).await;
                 let restored;
                 (pipeline, restored) = restore(&root, &spec, &mut run.trace).await;
                 if !restored {
@@ -610,6 +873,9 @@ async fn drive_graph_schedule(
                     break;
                 }
                 run.note_asks(&mut pipeline);
+                // What the restored job lends out speaks before the next
+                // article, or is held behind it.
+                turns.turn(&mut pipeline).await;
                 run.look(&pipeline);
             }
         }
@@ -619,17 +885,35 @@ async fn drive_graph_schedule(
         let Some(&article) = order.get(step) else {
             break;
         };
+        moving.settle(&pipeline, root.path()).await;
         run.serve(&mut pipeline, article).await;
-        turn(&mut pipeline).await;
+        moving.served(article);
+        let gone;
+        (pipeline, gone) = moving
+            .crash(pipeline, &root, &spec, (&mut run, &mut turns))
+            .await;
+        if let Some(status) = gone {
+            retired = Some(status);
+            break;
+        }
+        turns.turn(&mut pipeline).await;
         run.look(&pipeline);
         run.note_asks(&mut pipeline);
+        let gone;
+        (pipeline, gone) = moving
+            .crash(pipeline, &root, &spec, (&mut run, &mut turns))
+            .await;
+        if let Some(status) = gone {
+            retired = Some(status);
+            break;
+        }
     }
     if let Some(index) = index
         && !index_first
         && retired.is_none()
     {
         run.serve(&mut pipeline, index).await;
-        turn(&mut pipeline).await;
+        turns.turn(&mut pipeline).await;
         run.look(&pipeline);
     }
     let mut stalled = None;
@@ -637,7 +921,7 @@ async fn drive_graph_schedule(
         while let Some(work) = pipeline
             .jobs
             .get_mut(&JOB)
-            .and_then(|state| state.download_queue.pop())
+            .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
         {
             let article = (
                 work.segment_id.file_id.file_index,
@@ -646,19 +930,39 @@ async fn drive_graph_schedule(
             if run.delivered.contains(&article) {
                 run.rerequested.insert(article);
             }
+            moving.settle(&pipeline, root.path()).await;
             run.serve(&mut pipeline, article).await;
-            turn(&mut pipeline).await;
+            moving.served(article);
+            let gone;
+            (pipeline, gone) = moving
+                .crash(pipeline, &root, &spec, (&mut run, &mut turns))
+                .await;
+            if gone.is_some() {
+                retired = gone;
+                break;
+            }
+            turns.turn(&mut pipeline).await;
             run.look(&pipeline);
+            let gone;
+            (pipeline, gone) = moving
+                .crash(pipeline, &root, &spec, (&mut run, &mut turns))
+                .await;
+            if gone.is_some() {
+                retired = gone;
+                break;
+            }
+        }
+        if retired.is_some() {
+            break;
+        }
+        if turns.release(&mut pipeline).await {
+            run.look(&pipeline);
+            continue;
         }
         if finished(&pipeline) {
             break;
         }
         let before = fingerprint(&pipeline);
-        // The idle tick: bytes held out of order behind an article that
-        // will never commit are written out.
-        if pipeline.write_buffered_bytes > 0 {
-            pipeline.flush_quiescent_write_backlog().await;
-        }
         if pipeline.jobs.contains_key(&JOB) {
             pipeline.check_job_completion(JOB).await;
         }
@@ -695,28 +999,38 @@ async fn drive_graph_schedule(
         }
         let after = fingerprint(&pipeline);
         if before == after && stalled.replace(after.clone()) == Some(after.clone()) {
-            panic!(
-                "graph schedule stalled at {after}: {} trace={:?}",
-                debug_job_state(&pipeline, JOB),
-                run.trace
-            );
+            panic!("graph schedule stalled at {after}: trace={:?}", run.trace);
         }
+    }
+    if let Some(state) = moving.state {
+        run.trace.push(format!(
+            "no member's file waited to move: {state:?} never came"
+        ));
     }
     let status = retired.unwrap_or_else(|| job_status_for_assert(&pipeline, JOB));
     run.trace.push(format!(
-        "terminal {status:?}: {}; bound={:?}; recovery={:?}; rerequested={:?}",
-        debug_job_state(&pipeline, JOB),
-        run.bound,
-        run.outcomes,
-        run.rerequested
+        "terminal {status:?}; bound={:?}; recovery={:?}; rerequested={:?}",
+        run.bound, run.outcomes, run.rerequested
     ));
     let files = wanted
         .iter()
         .map(|name| ((*name).to_string(), std::fs::read(output.join(name)).ok()))
         .collect();
-    settle_direct_output_removals(root.path()).await;
     let mut published = files_under(&output);
     published.remove(crate::jobs::working_dir::OUTPUT_DIR_MARKER);
+    // A numbered posting may be delivered under its joined name. The
+    // alias belongs to this post only if every output byte is the posted
+    // sequence; a name alone never makes an unexpected file acceptable.
+    let mut joined = None;
+    if let Some((name, bytes)) = crate::pipeline::tests::archive_output_contract::joined_posting(
+        posted
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
+    ) && std::fs::read(output.join(&name)).ok().as_deref() == Some(bytes.as_slice())
+    {
+        own.insert(name.clone());
+        joined = Some(name);
+    }
     let mut leftovers: BTreeSet<String> = files_under(&pipeline.intermediate_dir)
         .into_iter()
         .map(|path| format!("intermediate/{path}"))
@@ -741,6 +1055,7 @@ async fn drive_graph_schedule(
         published,
         leftovers,
         own,
+        joined,
         rerequested: run.rerequested,
         durable: run.delivered,
         trace: run.trace,
@@ -762,9 +1077,7 @@ pub(in super::super) fn graph_schedules(
     };
     cases
         .into_iter()
-        .filter(|(_, (_, interruption))| {
-            runs_under_graph(*interruption) && interruption.fits(volumes)
-        })
+        .filter(|(_, (_, interruption))| interruption.fits(volumes))
         .collect()
 }
 
@@ -823,42 +1136,50 @@ pub(in super::super) fn graph_compressed_fixture(format: CompressedFormat) -> Gr
     }
 }
 
-// One cell: the schedule driven under `spec`'s password and judged. A cell
-// the rule set disagrees with comes back as its report.
+// One cell: the schedule driven under `spec`'s password and judged, once
+// for each time its repairs' answers may be heard. A cell the rule set
+// disagrees with comes back as its report.
 async fn graph_cell(
     fixture: &GraphFixture,
     spec: JobSpec,
     opens: bool,
     cell: String,
     (order, interruption): Schedule,
-) -> Option<String> {
-    eprintln!("{cell} order={order:?} interruption={interruption:?}");
-    let wanted: Vec<&str> = fixture.members.keys().map(String::as_str).collect();
-    let outcome = run_graph_schedule(
-        fixture.options,
-        spec,
-        &fixture.volumes,
-        fixture.described.as_deref(),
-        &order,
-        &wanted,
-        interruption,
-    )
-    .await;
-    let post = Post {
-        members: &fixture.members,
-        leaves: (fixture.deliverable)(opens, interruption),
-    };
-    let said = graph_disagreements(&outcome, &post, interruption, fixture.options);
-    (!said.is_empty()).then(|| {
-        format!(
-            "{cell} order={order:?} interruption={interruption:?}: {}; the graph: status={:?} bound={:?} recovery={:?} trace={:?}",
-            said.join("; "),
-            outcome.status,
-            outcome.bound,
-            outcome.recovery,
-            outcome.trace
+) -> Vec<String> {
+    let mut reports = Vec::new();
+    let recovery = fixture.options.recovery != RecoveryFormat::Absent;
+    for &answers in Answers::under(recovery) {
+        let wire =
+            format!("{cell} order={order:?} interruption={interruption:?} answers={answers:?}");
+        eprintln!("{wire}");
+        let wanted: Vec<&str> = fixture.members.keys().map(String::as_str).collect();
+        let outcome = run_graph_schedule(
+            fixture.options,
+            spec.clone(),
+            &fixture.volumes,
+            fixture.described.as_deref(),
+            &order,
+            &wanted,
+            (interruption, answers),
         )
-    })
+        .await;
+        let post = Post {
+            members: &fixture.members,
+            leaves: (fixture.deliverable)(opens, interruption),
+        };
+        let said = graph_disagreements(&outcome, &post, interruption, fixture.options);
+        if !said.is_empty() {
+            reports.push(format!(
+                "{wire}: {}; the graph: status={:?} bound={:?} recovery={:?} trace={:?}",
+                said.join("; "),
+                outcome.status,
+                outcome.bound,
+                outcome.recovery,
+                outcome.trace
+            ));
+        }
+    }
+    reports
 }
 
 // The fixture's cases under its own password, by replay index; the reports
@@ -880,9 +1201,6 @@ pub(in super::super) async fn graph_fixture_cases(
 async fn graph_wrong_password(fixture: &GraphFixture, selection: Selection) -> Vec<String> {
     let mut reports = Vec::new();
     for (case, schedule) in wrong_password_schedules(selection).into_iter().enumerate() {
-        if !runs_under_graph(schedule.1) {
-            continue;
-        }
         let mut wrong = fixture.spec.clone();
         wrong.password = Some("incorrect-key".to_string());
         let cell = format!("{} wrong password case={case}", fixture.label);

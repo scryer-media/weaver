@@ -18,7 +18,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use par2_rs::packet::{CreatorPacket, FileDescriptionPacket, IfscPacket, MainPacket};
+use par2_rs::packet::{
+    CreatorPacket, FileDescriptionPacket, IfscPacket, MainPacket, UnicodeFilenamePacket,
+};
 use par2_rs::{FileId, Packet, RecoverySetId, SliceChecksum};
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
@@ -42,6 +44,7 @@ pub(super) struct Par2Facts {
     lengths: BTreeMap<MemberId, u64>,
     meter: Meter,
     refused: bool,
+    refusals: BTreeMap<MemberId, Vec<ByteRange>>,
     output_limit: u64,
     memory_limit: usize,
 }
@@ -70,7 +73,8 @@ pub(super) struct SetFacts {
 }
 
 // The metadata packets the walk keeps, field for field, so the set's index
-// is rebuilt by par2-rs from the same packets.
+// is rebuilt by par2-rs from the same packets. A new field goes last with a
+// default, so facts written before it still decode.
 #[derive(Serialize, Deserialize)]
 enum PacketFacts {
     Main {
@@ -86,12 +90,23 @@ enum PacketFacts {
         length: u64,
         name: String,
         par2_name: String,
+        // The name as the packet carried it, which its file ID hashes.
+        // Facts written before it was kept hold only the decoded name, whose
+        // UTF-8 bytes stand in for it.
+        #[serde(default)]
+        par2_name_bytes: Option<Vec<u8>>,
     },
     Checksums {
         file: [u8; 16],
         slices: Vec<(u32, [u8; 16])>,
     },
     Creator(String),
+    // A file's name as its Unicode Filename packet spells it, which the set
+    // takes in place of the File Description's.
+    Name {
+        file: [u8; 16],
+        name: String,
+    },
 }
 
 // A set's metadata packets, as the set keeps them. They encode as their
@@ -137,6 +152,7 @@ impl PacketFacts {
                 length: file.file_length,
                 name: file.filename.clone(),
                 par2_name: file.par2_name.clone(),
+                par2_name_bytes: Some(file.par2_name_bytes.clone()),
             },
             Packet::InputFileSliceChecksum(ifsc) => Self::Checksums {
                 file: *ifsc.file_id.as_bytes(),
@@ -147,6 +163,10 @@ impl PacketFacts {
                     .collect(),
             },
             Packet::Creator(creator) => Self::Creator(creator.creator_id.clone()),
+            Packet::UnicodeFilename(name) => Self::Name {
+                file: *name.file_id.as_bytes(),
+                name: name.name.clone(),
+            },
             Packet::RecoverySlice(_) | Packet::Unknown { .. } => return None,
         })
     }
@@ -171,12 +191,14 @@ impl PacketFacts {
                 length,
                 name,
                 par2_name,
+                par2_name_bytes,
             } => Packet::FileDescription(FileDescriptionPacket {
                 file_id: FileId::from_bytes(file),
                 hash_full,
                 hash_16k,
                 file_length: length,
                 filename: name,
+                par2_name_bytes: par2_name_bytes.unwrap_or_else(|| par2_name.as_bytes().to_vec()),
                 par2_name,
             }),
             Self::Checksums { file, slices } => Packet::InputFileSliceChecksum(IfscPacket {
@@ -187,6 +209,10 @@ impl PacketFacts {
                     .collect(),
             }),
             Self::Creator(creator_id) => Packet::Creator(CreatorPacket { creator_id }),
+            Self::Name { file, name } => Packet::UnicodeFilename(UnicodeFilenamePacket {
+                file_id: FileId::from_bytes(file),
+                name,
+            }),
         }
     }
 }
@@ -197,7 +223,8 @@ impl Durable for Par2Facts {
     // shelved by chunk of blocks.
     // 4: no outcome of the object's own, it is its sets' last repairs; a
     // sealed value encodes as nothing, numbered by its owner's walk.
-    const VERSION: u16 = 4;
+    // 5: the ranges of members the parent refused.
+    const VERSION: u16 = 5;
 
     fn parts(&self, take: &mut Take) -> Result<(), String> {
         for set in &self.sets {
@@ -239,9 +266,9 @@ pub(super) fn of(par2: &Par2) -> Facts {
         .iter()
         .map(|volume| VolumeFacts {
             front: volume.walker.front(),
-            walk_lost: volume.walker.lost().to_vec(),
+            walk_lost: volume.walker.lost(),
             arrived: volume.arrived.clone(),
-            lost: volume.lost.clone(),
+            lost: volume.lost.clone().into(),
             closed: volume.closed,
             named_blocks: volume.named_blocks,
             walked_blocks: volume.walked_blocks,
@@ -250,11 +277,11 @@ pub(super) fn of(par2: &Par2) -> Facts {
         .collect();
     let sets = par2
         .ordered()
-        .into_iter()
+        .iter()
         .map(|key| {
-            let state = &par2.sets[&key];
+            let state = &par2.sets[key];
             SetFacts {
-                key,
+                key: *key,
                 first_seen: state.first_seen,
                 packets: state.packets().clone(),
                 hashes: state.hashes().clone(),
@@ -276,6 +303,7 @@ pub(super) fn of(par2: &Par2) -> Facts {
         lengths: par2.lengths.clone(),
         meter: par2.meter.clone(),
         refused: par2.refused,
+        refusals: par2.shown.refusals.clone(),
         output_limit: par2.output_limit,
         memory_limit: par2.memory_limit,
     };
@@ -291,11 +319,12 @@ pub(super) fn par2(facts: &Facts) -> Result<Par2, RestoreError> {
         .map(|volume| Volume {
             walker: Walker::resumed(volume.front, volume.walk_lost),
             arrived: volume.arrived,
-            lost: volume.lost,
+            lost: volume.lost.into(),
             closed: volume.closed,
             named_blocks: volume.named_blocks,
             walked_blocks: volume.walked_blocks,
             sets: volume.sets,
+            name: None,
         })
         .collect();
     for set in kept.sets {
@@ -310,16 +339,17 @@ pub(super) fn par2(facts: &Facts) -> Result<Par2, RestoreError> {
             &[],
         );
         state.last = set.last;
-        par2.sets.insert(set.key, state);
+        par2.file_set(set.key, state);
     }
     par2.grid = kept.grid;
     par2.lengths = kept.lengths;
     par2.meter = kept.meter;
     par2.refused = kept.refused;
+    par2.shown.refusals = kept.refusals;
     par2.output_limit = kept.output_limit;
     par2.memory_limit = kept.memory_limit;
-    for key in par2.ordered() {
-        par2.fold_set(key);
+    for at in 0..par2.order.len() {
+        par2.fold_set(par2.order[at]);
     }
     Ok(par2)
 }

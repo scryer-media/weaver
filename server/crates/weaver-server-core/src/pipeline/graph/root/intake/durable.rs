@@ -67,6 +67,20 @@ impl Checksums {
         }
     }
 
+    // Whether the decoder kept checksums wholly inside `range` and every one
+    // passed: the bytes last delivered there were whole.
+    pub(crate) fn verified(&self, volume: VolumeIndex, range: ByteRange) -> bool {
+        let Some(kept) = self.volumes.get(&volume) else {
+            return false;
+        };
+        let mut inside = kept
+            .range(range.start..range.end)
+            .map(|(_, segment)| segment)
+            .filter(|segment| segment.range.end <= range.end)
+            .peekable();
+        inside.peek().is_some() && inside.all(|segment| segment.verified)
+    }
+
     // Whether bytes read back for `range` match every checksum the decoder
     // took wholly inside it. A range with none is taken as read.
     pub(crate) fn matches(&self, volume: VolumeIndex, range: ByteRange, bytes: &[u8]) -> bool {

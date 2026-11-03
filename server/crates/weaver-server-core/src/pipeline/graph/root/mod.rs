@@ -86,8 +86,9 @@ pub(crate) trait Root: Segments {
     // The class changes since the last call, soonest first.
     fn take_moves(&mut self) -> Vec<Self::Move>;
     // A fetched unit: the delivery for the namespace, and the volume's
-    // length when the unit declared it.
-    fn receive(&mut self, intake: Self::Intake) -> (Arrival, Option<u64>);
+    // length when the unit declared it. None for a copy of a unit the root
+    // holds already, which brings nothing.
+    fn receive(&mut self, intake: Self::Intake) -> Option<(Arrival, Option<u64>)>;
     // Every server failed the unit; nothing will fetch it again.
     fn lost(&mut self, volume: VolumeIndex, unit: u32);
     // Whether the volume still has units to come.
@@ -96,6 +97,31 @@ pub(crate) trait Root: Segments {
     // A unit fetched only when something asks for it holds nothing back.
     fn volume_to_come(&self, volume: VolumeIndex) -> bool {
         self.volume_waiting(volume)
+    }
+    // The volumes with a unit the queue fetches unasked still to come, in
+    // volume order.
+    fn coming(&self) -> impl Iterator<Item = VolumeIndex> + '_ {
+        (0..self.volume_count() as u32)
+            .map(VolumeIndex)
+            .filter(|volume| self.volume_to_come(*volume))
+    }
+    // Where a volume with nothing left to fetch is known to end, when its
+    // last unit says so.
+    fn reached(&self, _volume: VolumeIndex) -> Option<u64> {
+        None
+    }
+    // Whether every unit of the volume is in hand: none waits and none was
+    // lost.
+    fn volume_whole(&self, _volume: VolumeIndex) -> bool {
+        false
+    }
+    // How many class changes wait for the queue, and whether one after the
+    // first `from` of them parked a unit.
+    fn moves_pending(&self) -> usize {
+        0
+    }
+    fn parked_since(&self, _from: usize) -> bool {
+        false
     }
     // What the root asks for itself before a round of seeks, from what the
     // tree knows now.
@@ -167,10 +193,22 @@ impl ArticleRoot {
     }
 
     // A decoded article: record where it landed and what it was, and hand
-    // back the delivery for the namespace.
-    pub(crate) fn receive(&mut self, decoded: Decoded) -> Arrival {
+    // back the delivery for the namespace. The first intact copy of an
+    // article stands: a further copy, however it decoded, brings nothing
+    // until a seek sends the article back for another.
+    pub(crate) fn receive(&mut self, decoded: Decoded) -> Option<Arrival> {
+        if self.map.holds_intact(decoded.volume, decoded.ordinal) {
+            return None;
+        }
+        let decoded = decoded.declared();
         let range = decoded.range();
-        self.map.arrived(decoded.volume, decoded.ordinal, range);
+        self.map.arrived(
+            decoded.volume,
+            decoded.ordinal,
+            range,
+            decoded.declared_end,
+            decoded.intact,
+        );
         if let Some(length) = decoded.length {
             self.map.set_length(decoded.volume, length);
         }
@@ -181,7 +219,7 @@ impl ArticleRoot {
             // could be credited to the wrong bytes.
             self.map.set_ordered_only(decoded.volume);
         }
-        decoded.into_arrival()
+        Some(decoded.into_arrival())
     }
 
     // Answer one round of seeks: each moves its articles to the class the
@@ -264,9 +302,9 @@ impl Root for ArticleRoot {
         self.map.take_moves()
     }
 
-    fn receive(&mut self, intake: Decoded) -> (Arrival, Option<u64>) {
+    fn receive(&mut self, intake: Decoded) -> Option<(Arrival, Option<u64>)> {
         let length = intake.length;
-        (ArticleRoot::receive(self, intake), length)
+        Some((ArticleRoot::receive(self, intake)?, length))
     }
 
     fn lost(&mut self, volume: VolumeIndex, unit: u32) {
@@ -281,10 +319,29 @@ impl Root for ArticleRoot {
         self.map.volume_to_come(volume)
     }
 
+    fn coming(&self) -> impl Iterator<Item = VolumeIndex> + '_ {
+        self.map.coming()
+    }
+
+    fn reached(&self, volume: VolumeIndex) -> Option<u64> {
+        self.map.reached(volume)
+    }
+
+    fn volume_whole(&self, volume: VolumeIndex) -> bool {
+        self.map.volume_whole(volume)
+    }
+
+    fn moves_pending(&self) -> usize {
+        self.map.moves_pending()
+    }
+
+    fn parked_since(&self, from: usize) -> bool {
+        self.map.parked_since(from)
+    }
+
     fn bootstrap(&mut self, tree: &Tree) {
         sample::indexes(&self.indexes, &self.map, &mut self.window);
-        let map = &self.map;
-        sample::bootstrap(tree, |volume| map.volume_waiting(volume), &mut self.window);
+        sample::bootstrap(tree, self.map.waiting_volumes(), &mut self.window);
         sample::fronts(tree, &mut self.map);
     }
 

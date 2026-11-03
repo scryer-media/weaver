@@ -10,6 +10,19 @@
 // passes and only its exponent kept; the payload stays in the volume's file
 // and is read back when a repair spends it. Bytes that arrive ahead of the
 // front are held until the front reaches them, within a bound.
+//
+// What the walk has read past it has read as it was then. A range whose
+// bytes come again is walked again: from its start, when the front stands
+// in it, or by a walk of its own bounded by it, when the front is past it,
+// so the walk past the range goes on as it was.
+//
+// A header is trusted for what it claims only until the bytes say
+// otherwise. A streamed packet whose hash fails, or whose claimed end lies
+// past the volume's end, was no packet: the walk steps one byte past its
+// magic and resyncs from there, as the next packet may begin anywhere in
+// what was read as its body. Those bytes have left the hold, so the walk
+// asks for them again, and reads them as they come back: from the first
+// magic they held, as no byte before it can begin a packet.
 
 use std::collections::BTreeMap;
 
@@ -19,12 +32,15 @@ use par2_rs::packet::{HEADER_SIZE, MAGIC, PacketHeader, PacketType};
 use par2_rs::{FileHashState, Packet, ScannedPacket, parse_packet};
 use weaver_graph::ByteRange;
 
+use crate::lost::minus;
+
 // The longest body par2-rs buffers for each metadata type. A longer one, and
 // a packet of a type it does not know, is hashed and dropped.
 const MAIN_BODY_CAP: u64 = 12 + 32_768 * 16;
 const FILE_DESC_BODY_CAP: u64 = 56 + 100_000;
 const IFSC_BODY_CAP: u64 = 16 + 32_768 * 20;
 const CREATOR_BODY_CAP: u64 = 100_000;
+const UNICODE_FILENAME_BODY_CAP: u64 = 16 + 2 * 100_000;
 // Bytes ahead of the front a volume may hold. Past it, deliveries are not
 // walked; the payloads are still on disk and a repair reads them back.
 const HOLD_CAP: usize = 8 * 1024 * 1024;
@@ -45,6 +61,9 @@ pub(super) enum Found {
     },
     // A packet that passed its hash and is of no use.
     Unused,
+    // Bytes the walk read past as a packet that was none, which it reads
+    // again from the volume.
+    Again(ByteRange),
 }
 
 // A packet hashed as it passes.
@@ -53,6 +72,43 @@ struct Streamed {
     header: PacketHeader,
     hasher: FileHashState,
     exponent: u32,
+    magic: Magic,
+}
+
+// The first magic in a streamed packet's bytes past its own, as far as they
+// have passed: where the walk starts again if the packet was none.
+#[derive(Default)]
+struct Magic {
+    first: Option<u64>,
+    // The last bytes passed, short of a whole magic, which one may begin in.
+    tail: Vec<u8>,
+}
+
+impl Magic {
+    // The bytes from `at` on pass.
+    fn pass(&mut self, at: u64, bytes: &[u8]) {
+        if self.first.is_some() {
+            return;
+        }
+        let mut joint = std::mem::take(&mut self.tail);
+        let from = at - joint.len() as u64;
+        joint.extend_from_slice(&bytes[..bytes.len().min(MAGIC.len() - 1)]);
+        self.first = find_magic(&joint)
+            .map(|found| from + found)
+            .or_else(|| find_magic(bytes).map(|found| at + found));
+        let keep = if bytes.len() >= MAGIC.len() - 1 {
+            &bytes[bytes.len() + 1 - MAGIC.len()..]
+        } else {
+            &joint[joint.len().saturating_sub(MAGIC.len() - 1)..]
+        };
+        self.tail = keep.to_vec();
+    }
+
+    // Where a walk that read up to `next` starts again: at the first magic,
+    // or where one could still begin.
+    fn again(&self, next: u64) -> u64 {
+        self.first.unwrap_or(next - self.tail.len() as u64)
+    }
 }
 
 #[derive(Default)]
@@ -61,18 +117,25 @@ pub(super) struct Walker {
     // packet being streamed.
     next: u64,
     streamed: Option<Streamed>,
+    // The volume's length, once known: no packet runs past it.
+    length: Option<u64>,
     // Coalesced islands of bytes at or past `next`, keyed by their offset.
     held: BTreeMap<u64, Vec<u8>>,
     held_bytes: usize,
     // Ranges no server has; the front steps over them and resyncs, or every
     // packet past a lost article would stay unfound.
     lost: Vec<ByteRange>,
+    // Ranges behind the front whose bytes come again, in offset order and
+    // apart, each walked again by a walk of its own that ends where the
+    // range does.
+    again: Vec<(ByteRange, Walker)>,
 }
 
 impl Walker {
-    // A walk resumed at a packet boundary: a packet streamed when the
-    // checkpoint was taken is hashed again from its header, and what was
-    // held past the front is delivered again by the replay.
+    // A walk resumed where a checkpoint left it, a packet boundary or the
+    // start of a range walked again: a packet streamed when the checkpoint
+    // was taken is hashed again from its header, and what was held past the
+    // front is delivered again by the replay.
     pub(super) fn resumed(front: u64, lost: Vec<ByteRange>) -> Self {
         Self {
             next: front,
@@ -81,9 +144,40 @@ impl Walker {
         }
     }
 
-    // The packet boundary the walk has reached.
+    // A walk of a range that comes again: it ends at the range's end, as at
+    // a loss, and a packet the end cuts is dropped.
+    fn bounded(range: ByteRange, length: Option<u64>) -> Self {
+        Self {
+            length,
+            ..Self::resumed(range.start, vec![ByteRange::new(range.end, u64::MAX)])
+        }
+    }
+
+    // The packet boundary the walk has reached, or the earliest a range
+    // walked again has: what a resumed walk starts from.
     pub(super) fn front(&self) -> u64 {
-        self.streamed.as_ref().map_or(self.next, |open| open.at)
+        self.resume().0
+    }
+
+    // The front a resumed walk starts from and the ranges it steps over:
+    // the losses, and what lies between a range walked again and the next
+    // place a walk stands, which the walk already read.
+    fn resume(&self) -> (u64, Vec<ByteRange>) {
+        let mut ahead = self.streamed.as_ref().map_or(self.next, |open| open.at);
+        let mut lost = self.lost.clone();
+        for (range, walk) in self.again.iter().rev() {
+            let (front, inside) = walk.resume();
+            lost.extend(
+                inside
+                    .iter()
+                    .filter_map(|piece| piece.intersect(ByteRange::new(0, range.end))),
+            );
+            if range.end < ahead {
+                lost.push(ByteRange::new(range.end, ahead));
+            }
+            ahead = front;
+        }
+        (ahead, lost)
     }
 
     // Whether the packet at the front is a recovery packet: the one being
@@ -102,11 +196,42 @@ impl Walker {
         matches!(header, Some(PacketType::RecoverySlice))
     }
 
-    pub(super) fn lost(&self) -> &[ByteRange] {
-        &self.lost
+    // What a resumed walk steps over.
+    pub(super) fn lost(&self) -> Vec<ByteRange> {
+        self.resume().1
+    }
+
+    // The volume's length is known. A packet being streamed past it was
+    // none, and is read again from the byte past its magic.
+    pub(super) fn sized(&mut self, length: u64, found: &mut Vec<Found>) {
+        self.length = Some(length);
+        for (_, walk) in &mut self.again {
+            walk.sized(length, found);
+        }
+        if let Some(from) = self
+            .streamed
+            .as_ref()
+            .filter(|open| open.at + open.header.length > length)
+            .map(|open| open.magic.again(self.next))
+        {
+            self.read_again(from, found);
+        }
+        self.walk(found);
     }
 
     pub(super) fn deliver(&mut self, offset: u64, bytes: &[u8], found: &mut Vec<Found>) {
+        let arrived = ByteRange::at(offset, bytes.len() as u64);
+        for (range, walk) in &mut self.again {
+            if let Some(piece) = arrived.intersect(*range) {
+                let from = (piece.start - offset) as usize;
+                walk.deliver(
+                    piece.start,
+                    &bytes[from..from + piece.len() as usize],
+                    found,
+                );
+            }
+        }
+        self.again.retain(|(range, walk)| walk.next < range.end);
         if offset + bytes.len() as u64 <= self.next {
             return;
         }
@@ -123,9 +248,113 @@ impl Walker {
     }
 
     pub(super) fn lose(&mut self, range: ByteRange, found: &mut Vec<Found>) {
+        for (bound, walk) in &mut self.again {
+            if let Some(piece) = range.intersect(*bound) {
+                walk.lose(piece, found);
+            }
+        }
+        self.again.retain(|(range, walk)| walk.next < range.end);
         if range.end > self.next {
             self.lost.push(range);
             self.walk(found);
+        }
+    }
+
+    // The bytes of the range come again, and what was read of them is not
+    // behind the walk: no longer lost, not held, and walked again as they
+    // come. When the front stands in the range it starts again from the
+    // range's start; a packet the range cuts into is dropped, as its hash
+    // read the bytes that were there. When the front is past the range, the
+    // range is walked on its own and the walk past it goes on.
+    pub(super) fn unposted(&mut self, range: ByteRange, found: &mut Vec<Found>) {
+        if range.is_empty() {
+            return;
+        }
+        self.lost = self
+            .lost
+            .iter()
+            .flat_map(|lost| minus(*lost, range))
+            .collect();
+        self.unhold(range);
+        for (bound, walk) in &mut self.again {
+            if let Some(piece) = range.intersect(*bound) {
+                walk.unposted(piece, found);
+            }
+        }
+        if range.start >= self.next {
+            return;
+        }
+        if range.end >= self.next {
+            self.streamed = None;
+            self.next = range.start;
+            // What the walks of their own were to read from the range's
+            // start on is read again by this one: they end there.
+            for (bound, walk) in &mut self.again {
+                if bound.end > range.start {
+                    bound.end = range.start.max(bound.start);
+                    walk.end_at(bound.end, found);
+                }
+            }
+            self.again.retain(|(bound, walk)| walk.next < bound.end);
+            return;
+        }
+        if self
+            .streamed
+            .as_ref()
+            .is_some_and(|open| open.at < range.end)
+        {
+            self.streamed = None;
+        }
+        let mut parts = vec![range];
+        for (bound, _) in &self.again {
+            parts = parts.iter().flat_map(|part| minus(*part, *bound)).collect();
+        }
+        let length = self.length;
+        self.again.extend(
+            parts
+                .into_iter()
+                .map(|part| (part, Self::bounded(part, length))),
+        );
+        self.again.sort_by_key(|(bound, _)| bound.start);
+    }
+
+    // The packet being streamed was none. The walk starts again from `from`,
+    // the first magic past its own, and what it read of the packet from
+    // there, which has left the hold, comes again from the volume.
+    fn read_again(&mut self, from: u64, found: &mut Vec<Found>) {
+        let range = ByteRange::new(from, self.next);
+        self.streamed = None;
+        self.unposted(range, found);
+        found.push(Found::Again(range));
+    }
+
+    // A walk of a range walked again ends sooner.
+    fn end_at(&mut self, end: u64, found: &mut Vec<Found>) {
+        self.lost.retain(|lost| lost.end != u64::MAX);
+        self.lost.push(ByteRange::new(end, u64::MAX));
+        self.walk(found);
+    }
+
+    // Drop the held bytes inside the range.
+    fn unhold(&mut self, range: ByteRange) {
+        let touching: Vec<u64> = self
+            .held
+            .range(..range.end)
+            .filter(|(at, island)| **at + island.len() as u64 > range.start)
+            .map(|(at, _)| *at)
+            .collect();
+        for at in touching {
+            let Some(island) = self.held.remove(&at) else {
+                continue;
+            };
+            self.held_bytes -= island.len();
+            let whole = ByteRange::at(at, island.len() as u64);
+            for keep in minus(whole, range) {
+                let from = (keep.start - at) as usize;
+                let kept = island[from..from + keep.len() as usize].to_vec();
+                self.held_bytes += kept.len();
+                self.held.insert(keep.start, kept);
+            }
         }
     }
 
@@ -200,7 +429,10 @@ impl Walker {
         let header = (&front[..8] == MAGIC)
             .then(|| PacketHeader::parse(front, at).ok())
             .flatten();
-        let Some(header) = header else {
+        let length = self.length;
+        let past_end =
+            |header: &PacketHeader| length.is_some_and(|length| at + header.length > length);
+        let Some(header) = header.filter(|header| !past_end(header)) else {
             let step = resync(front);
             self.advance(at + step);
             return true;
@@ -211,11 +443,14 @@ impl Walker {
             };
             let mut hasher = FileHashState::new();
             hasher.update(&front[32..HEADER_SIZE]);
+            let mut magic = Magic::default();
+            magic.pass(at + 1, &front[1..HEADER_SIZE]);
             self.streamed = Some(Streamed {
                 at,
                 exponent: u32::from_le_bytes([exponent[0], exponent[1], exponent[2], exponent[3]]),
                 header,
                 hasher,
+                magic,
             });
             self.advance(at + HEADER_SIZE as u64);
             return true;
@@ -239,8 +474,8 @@ impl Walker {
     }
 
     // Hash what is held of the streamed packet; at its end, hand it on if
-    // its hash passes. One that fails was read past and is dropped: its
-    // bytes are gone from the hold, so the walk resumes at its end.
+    // its hash passes. One that fails was none: the walk starts again from
+    // the byte past its magic, reading what it took for the packet again.
     fn stream(&mut self, found: &mut Vec<Found>) -> bool {
         let (Some(open), Some(front)) = (self.streamed.as_mut(), self.held.get(&self.next)) else {
             return false;
@@ -248,6 +483,7 @@ impl Walker {
         let end = open.at + open.header.length;
         let take = (end - self.next).min(front.len() as u64) as usize;
         open.hasher.update(&front[..take]);
+        open.magic.pass(self.next, &front[..take]);
         let to = self.next + take as u64;
         self.advance(to);
         if to < end {
@@ -257,6 +493,7 @@ impl Walker {
             return true;
         };
         if open.hasher.finalize() != open.header.packet_hash {
+            self.read_again(open.magic.again(self.next), found);
             return true;
         }
         found.push(match open.header.packet_type {
@@ -295,6 +532,7 @@ fn body_cap(packet_type: PacketType) -> Option<u64> {
         PacketType::FileDescription => Some(FILE_DESC_BODY_CAP),
         PacketType::InputFileSliceChecksum => Some(IFSC_BODY_CAP),
         PacketType::Creator => Some(CREATOR_BODY_CAP),
+        PacketType::UnicodeFilename => Some(UNICODE_FILENAME_BODY_CAP),
         PacketType::RecoverySlice | PacketType::Unknown(_) => None,
     }
 }
@@ -302,11 +540,15 @@ fn body_cap(packet_type: PacketType) -> Option<u64> {
 // How far to step from a front that is not a trusted header: to the next
 // magic in hand, or to where the next magic could still begin.
 fn resync(front: &[u8]) -> u64 {
-    let found = front[1..]
+    let found = find_magic(&front[1..]).map(|at| at + 1);
+    found.unwrap_or((front.len() + 1 - MAGIC.len()) as u64)
+}
+
+fn find_magic(bytes: &[u8]) -> Option<u64> {
+    bytes
         .windows(MAGIC.len())
         .position(|window| window == MAGIC)
-        .map(|at| at + 1);
-    found.unwrap_or(front.len() + 1 - MAGIC.len()) as u64
+        .map(|at| at as u64)
 }
 
 // What one job's packets may cost across every volume, by par2-rs's three
@@ -330,15 +572,18 @@ impl Meter {
     pub(super) fn charge(&mut self, found: &Found) -> bool {
         self.examined += 1;
         let variable = match found {
-            Found::Unused => None,
+            Found::Unused | Found::Again(_) => None,
             Found::Recovery { .. } => Some(0),
             Found::Metadata { packet, .. } => Some(match packet {
                 Packet::Main(main) => (main.recovery_file_ids.len()
                     + main.non_recovery_file_ids.len())
                 .saturating_mul(16),
-                Packet::FileDescription(file) => {
-                    file.filename.len().saturating_add(file.par2_name.len())
-                }
+                Packet::FileDescription(file) => file
+                    .filename
+                    .len()
+                    .saturating_add(file.par2_name.len())
+                    .saturating_add(file.par2_name_bytes.len()),
+                Packet::UnicodeFilename(name) => name.name.len().saturating_mul(5),
                 Packet::InputFileSliceChecksum(ifsc) => ifsc
                     .checksums
                     .len()

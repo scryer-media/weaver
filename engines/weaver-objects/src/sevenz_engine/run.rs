@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// One run of the 7z engine. sevenz-turbo reads the set as one positional
-// source, the volumes joined end to end, and walks its entries in archive
+// One run of the 7z engine. sevenz-turbo reads the file as one positional
+// source and walks its entries in archive
 // order, each decoded straight into the sink with its CRC checked as it
 // goes. A 7z names its members only in the end header at its tail, so the
 // run's first reads wait for the tail to land; reads wait for bytes still
@@ -14,10 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
-use sevenz_turbo::{
-    ArchiveEntry, ArchiveLimits, ArchiveReader, EntryRead, Error, Password, ReadAt,
-};
-use weaver_graph::{Emit, Extraction, MemberId, Provenance, Sink, Volumes};
+use sevenz_turbo::{ArchiveEntry, ArchiveReader, EntryRead, Error, Password, ReadAt};
+use weaver_graph::{Budget, Emit, Extraction, MemberId, Provenance, Sink, Volumes};
 
 use crate::engine::Joined;
 use crate::verdict;
@@ -33,7 +31,7 @@ impl Run {
 }
 
 impl Extraction for Run {
-    fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, sink: &mut Sink<'_>) {
+    fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, sink: &mut Sink<'_>, budget: Budget) {
         let input = Joined::new(volumes);
         let failed = input.failure();
         let password = self
@@ -46,11 +44,15 @@ impl Extraction for Run {
             open: None,
             stopped: false,
         };
-        let walked = ArchiveReader::from_read_at(input, password, ArchiveLimits::default())
-            .and_then(|mut reader| {
-                reader.set_verify_checksums(true);
-                reader.for_each_entries_direct(|entry, read| walk.entry(entry, read))
-            });
+        // The decoder holds no more than the run was granted, and decodes on
+        // as many threads.
+        let limits = crate::sevenz_store::limits(&budget);
+        let threads = u32::try_from(budget.threads()).unwrap_or(u32::MAX);
+        let walked = ArchiveReader::from_read_at(input, password, limits).and_then(|mut reader| {
+            reader.set_verify_checksums(true);
+            reader.set_threads(threads);
+            reader.for_each_entries_direct(|entry, read| walk.entry(entry, read))
+        });
         let Err(error) = walked else {
             return;
         };
@@ -80,20 +82,34 @@ struct Walk<'s, 'a> {
 
 impl Walk<'_, '_> {
     fn entry(&mut self, entry: &ArchiveEntry, read: &mut dyn EntryRead) -> Result<bool, Error> {
-        // The namespace has no directories, and no links or devices: a
-        // directory is implied by the paths of the members inside it, and
-        // the others are not file bodies, so none is a member and the files
-        // around them stand. sevenz-turbo drains what is left unread.
-        if !is_file_body(entry) {
+        // A directory is a member with nothing in it, named with a trailing
+        // slash as the store names it. Links and devices are not file
+        // bodies, so none is a member and the files around them stand.
+        // sevenz-turbo drains what is left unread.
+        let mut name = entry.name().to_owned();
+        let length = if is_directory(entry) {
+            if !name.ends_with(['/', '\\']) {
+                name.push('/');
+            }
+            0
+        } else if is_file_body(entry) {
+            entry.size()
+        } else {
             return Ok(true);
-        }
+        };
         let member = MemberId(self.next);
         self.next += 1;
         self.say(Emit::Member {
             member,
-            name: entry.name().to_owned(),
-            length: Some(entry.size()),
+            name,
+            length: Some(length),
         })?;
+        if length > 0 && entry.has_crc {
+            self.say(Emit::Checksum {
+                member,
+                crc32: entry.crc as u32,
+            })?;
+        }
         self.open = Some(member);
         let mut out = Out {
             sink: &mut *self.sink,
@@ -126,6 +142,10 @@ fn stopped() -> Error {
     Error::Other(Cow::Borrowed("the owner stopped the run"))
 }
 
+fn is_directory(entry: &ArchiveEntry) -> bool {
+    entry.is_directory() && !entry.is_anti_item() && !entry.is_symlink()
+}
+
 fn is_file_body(entry: &ArchiveEntry) -> bool {
     const KIND: u32 = 0o170_000;
     const FILE: u32 = 0o100_000;
@@ -137,14 +157,14 @@ fn is_file_body(entry: &ArchiveEntry) -> bool {
             .is_none_or(|mode| matches!(mode & KIND, 0 | FILE))
 }
 
-// The joined volumes, as sevenz-turbo reads them.
+// The file, as sevenz-turbo reads it.
 impl ReadAt for Joined {
     fn read_at(&self, into: &mut [u8], offset: u64) -> io::Result<usize> {
         self.read(offset, into)
     }
 
     // The signature header says where the end header lies and how long it
-    // is, and a 7z ends with it: the set's length while it is still
+    // is, and a 7z ends with it: the file's length while it is still
     // growing, and the reason the run waits for the tail before anything
     // else. Bytes after the end header, a trailing recovery set, are not the
     // archive's.
@@ -179,7 +199,7 @@ impl Write for Out<'_, '_> {
         let heard = (self.sink)(Emit::Bytes {
             member: self.member,
             offset: self.offset,
-            bytes: Bytes::copy_from_slice(bytes),
+            bytes: Bytes::copy_from_slice(bytes).into(),
             provenance: Provenance::Fresh,
         });
         if !heard {

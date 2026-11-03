@@ -16,7 +16,7 @@ use super::echo::{Echoes, HEADER, SIGNATURE};
 use super::volumes::RunVolumes;
 use super::{Heard, RUN_OVERHEAD, Reservation, RunMail, Runs};
 use crate::operations::disk::CapacityReader;
-use crate::pipeline::graph::envelope::{Envelopes, Shelf};
+use crate::pipeline::graph::envelope::{Envelopes, Shelf, envelope_name};
 use crate::pipeline::graph::job::{GraphJob, RootFile};
 use crate::pipeline::graph::namespace::NamespaceWriter;
 use crate::pipeline::graph::root::intake::Decoded;
@@ -97,8 +97,7 @@ fn a_read_over_damaged_bytes_waits_for_their_repair() {
 }
 
 // Damaged bytes nothing will repair are lost to a read, as missing ones are:
-// the read ends short where they begin, and the next fails on exactly them,
-// until the run says it read on past them.
+// the read ends short where they begin, and the next fails on exactly them.
 #[test]
 fn a_read_over_damaged_bytes_nothing_will_repair_fails_as_lost() {
     let dir = tempfile::tempdir().unwrap();
@@ -126,8 +125,6 @@ fn a_read_over_damaged_bytes_nothing_will_repair_fails_as_lost() {
         }
     );
     assert!(volumes.lost());
-    volumes.bridged(lost);
-    assert!(!volumes.lost(), "a span the run read on past still ends it");
 }
 
 #[test]
@@ -195,6 +192,26 @@ fn a_read_of_bytes_nothing_will_bring_fails_as_lost() {
     assert!(volumes.lost());
 }
 
+// Every volume a run reads is in once no volume can join and each bound one
+// has closed: until then a member it finds may still wait on bytes.
+#[test]
+fn a_run_has_all_its_volumes_once_none_can_join_and_each_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_envelopes, shelf) = shelved(dir.path());
+    let volumes = reader(&shelf);
+    close(&shelf, 0, 10, false);
+    assert!(!volumes.all_in(), "another volume can still join");
+    shelf.update(|state| {
+        state.volumes.insert(1);
+        state.complete = true;
+    });
+    assert!(!volumes.all_in(), "the second volume is still open");
+    close(&shelf, 1, 4, false);
+    assert!(volumes.all_in());
+    shelf.update(|state| state.deciding = true);
+    assert!(!volumes.all_in(), "a member beside them is still deciding");
+}
+
 #[test]
 fn a_volume_that_never_joined_is_lost_once_no_more_can_join() {
     let dir = tempfile::tempdir().unwrap();
@@ -207,6 +224,54 @@ fn a_volume_that_never_joined_is_lost_once_no_more_can_join() {
     let mut into = [0; 4];
     let error = volumes.read_at(VolumeIndex(3), 0, &mut into).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::NotFound);
+}
+
+#[test]
+fn copies_and_growth_leave_the_run_that_observed_the_bytes_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut envelopes, shelf) = shelved(dir.path());
+    envelopes
+        .keep(NODE, 0, 0, b"original", Provenance::Fresh)
+        .unwrap();
+    let volumes = reader(&shelf);
+    assert_eq!(read(&volumes, 0, 8).unwrap(), b"original");
+    envelopes
+        .keep(NODE, 0, 0, b"original", Provenance::Fresh)
+        .unwrap();
+    assert!(
+        volumes.current(),
+        "an identical copy changes no observed input"
+    );
+    envelopes
+        .keep(NODE, 0, 8, b"tail", Provenance::Fresh)
+        .unwrap();
+    assert!(volumes.current(), "unread input remains ordinary growth");
+    envelopes
+        .keep(NODE, 0, 7, b"lTAIL", Provenance::Fresh)
+        .unwrap();
+    assert!(
+        volumes.current(),
+        "a partial overlap preserves every consumed byte"
+    );
+}
+
+#[test]
+fn a_first_write_below_an_observed_footer_is_not_a_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut envelopes, shelf) = shelved(dir.path());
+    envelopes
+        .keep(NODE, 0, 8, b"tail", Provenance::Fresh)
+        .unwrap();
+    let volumes = reader(&shelf);
+    assert_eq!(read(&volumes, 8, 4).unwrap(), b"tail");
+    envelopes
+        .keep(NODE, 0, 0, b"original", Provenance::Fresh)
+        .unwrap();
+    assert!(
+        volumes.current(),
+        "the high-water mark does not make a sparse hole observed input"
+    );
+    assert_eq!(read(&volumes, 0, 12).unwrap(), b"originaltail");
 }
 
 #[test]
@@ -238,16 +303,19 @@ fn forgetting_the_node_stops_a_waiting_read() {
     envelopes.keep(NODE, 0, 0, b"0", Provenance::Fresh).unwrap();
     let volumes = reader(&shelf);
     let read = std::thread::spawn(move || read(&volumes, 0, 4));
-    envelopes.forget(NODE).unwrap();
+    let files = envelopes.forget(NODE);
     let error = read.join().unwrap().unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    // The file stays for its owner to remove once no checkpoint names it.
+    assert_eq!(files.len(), 1);
+    assert!(files[0].path().exists());
 }
 
 // A run that says nothing and returns.
 struct Quiet;
 
 impl Extraction for Quiet {
-    fn run(self: Box<Self>, _: Arc<dyn Volumes>, _: &mut Sink<'_>) {}
+    fn run(self: Box<Self>, _: Arc<dyn Volumes>, _: &mut Sink<'_>, _: weaver_graph::Budget) {}
 }
 
 fn unbounded() -> Arc<HoldsAccountant> {
@@ -289,6 +357,64 @@ async fn a_run_takes_a_slot_and_the_next_queues_behind_the_limit() {
     assert_eq!(said.node, second);
     assert!(runs.ended(second, said.generation, 1).is_empty());
     assert!(!runs.live());
+}
+
+// A run that panics as it reads.
+struct Panics;
+
+impl Extraction for Panics {
+    fn run(self: Box<Self>, _: Arc<dyn Volumes>, _: &mut Sink<'_>, _: weaver_graph::Budget) {
+        panic!("the run panics as it reads");
+    }
+}
+
+// A run that panics still ends: its end is said as its thread unwinds, and
+// gives its slot to the run waiting behind it.
+#[tokio::test]
+async fn a_run_that_panics_still_says_it_ended() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut envelopes = Envelopes::new(dir.path().to_path_buf());
+    let mut mail = RunMail::default();
+    let mut runs = Runs::new(1, 1, mail.sender(), unbounded());
+    let (first, second) = (NodeId(1), NodeId(2));
+    assert_eq!(runs.ask(first, 1), vec![first]);
+    assert!(runs.ask(second, 1).is_empty());
+    runs.start(first, Box::new(Panics), envelopes.shelf(first));
+
+    let said = mail.recv().await.unwrap();
+    assert_eq!(said.node, first);
+    assert!(matches!(said.heard, Heard::Ended));
+    assert_eq!(runs.ended(first, said.generation, 1), vec![second]);
+}
+
+// A run stopped as the job goes down keeps the generation it ran under, so
+// no run starts on its node under that generation again: what its thread
+// says once stopped, its end included, is not heard as any run's. It gives
+// back its slot, and the job is not quiet, since it never finished reading.
+#[tokio::test]
+async fn a_stopped_run_keeps_its_generation_and_what_it_says_after_is_not_heard() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut envelopes = Envelopes::new(dir.path().to_path_buf());
+    let mut mail = RunMail::default();
+    let mut runs = Runs::new(1, 1, mail.sender(), unbounded());
+    let (first, second) = (NodeId(1), NodeId(2));
+    assert_eq!(runs.ask(first, 1), vec![first]);
+    let shelf = envelopes.shelf(first);
+    runs.start(first, Box::new(Quiet), Arc::clone(&shelf));
+    let generation = runs.generation(first).expect("the run started");
+
+    runs.stop(1);
+    assert!(runs.has(first), "the stopped run stays");
+    assert_eq!(runs.generation(first), Some(generation));
+    assert_eq!(shelf.generation(), generation, "no step retracts it");
+    assert!(!runs.in_flight(), "nothing of it is awaited");
+    assert!(runs.live(), "it never finished reading");
+    assert_eq!(runs.ask(second, 1), vec![second], "its slot is free");
+
+    let said = mail.recv().await.unwrap();
+    assert_eq!((said.node, said.generation), (first, generation));
+    assert!(matches!(said.heard, Heard::Ended));
+    assert!(!runs.current(first, said.generation));
 }
 
 // Three runs hold the three slots and a fourth waits. The limit falls to
@@ -423,6 +549,18 @@ fn echoing(count: u32) -> Echoing {
 
 // Echo volumes whose engine declares `window`, reserved against `accountant`.
 fn echoing_within(count: u32, window: u64, accountant: Arc<HoldsAccountant>) -> Echoing {
+    echoing_as(
+        Echoes {
+            volumes: count,
+            window,
+            ..Echoes::default()
+        },
+        accountant,
+    )
+}
+
+fn echoing_as(echoes: Echoes, accountant: Arc<HoldsAccountant>) -> Echoing {
+    let count = echoes.volumes;
     let volumes: Vec<Vec<u8>> = (0..count)
         .map(|index| {
             let mut volume = if index == 0 {
@@ -442,11 +580,6 @@ fn echoing_within(count: u32, window: u64, accountant: Arc<HoldsAccountant>) -> 
             articles: vec![(0, volume.len() as u32)],
         })
         .collect();
-    let echoes = Echoes {
-        volumes: count,
-        bids: Arc::default(),
-        window,
-    };
     let bids = Arc::clone(&echoes.bids);
     let dir = tempfile::tempdir().unwrap();
     let writer = NamespaceWriter::new(
@@ -481,6 +614,7 @@ impl Echoing {
                     intact: true,
                     positioned: true,
                     length: Some(bytes.len() as u64),
+                    declared_end: None,
                     segments: Vec::new(),
                 },
                 &mut RepairSlots::default(),
@@ -523,12 +657,14 @@ impl Echoing {
 
     fn bid(&mut self) -> Vec<Seek> {
         self.bids.lock().unwrap().clear();
-        self.job.seek_round(|_| true).unwrap();
+        self.job
+            .seek_round(|_| true, &mut RepairSlots::default(), 1)
+            .unwrap();
         std::mem::take(&mut *self.bids.lock().unwrap())
     }
 
     fn echoed(&self, member: u32) -> Vec<u8> {
-        std::fs::read(self.dir.path().join(format!("echo-{member}.bin"))).unwrap()
+        std::fs::read(self.dir.path().join(format!("echo-{member}.mkv"))).unwrap()
     }
 }
 
@@ -559,6 +695,99 @@ async fn the_job_reports_extracting_while_a_run_is_live_and_done_after() {
     }
     assert_eq!(echoing.job.phase(), RootPhase::Done);
     assert_eq!(echoing.echoed(0), body(0));
+}
+
+// A second clean copy of a volume, with other bytes, after the run that read
+// the first ended or while it still reads: the first copy stands, so nothing
+// is retracted and no run starts again.
+#[tokio::test]
+async fn a_different_verified_copy_leaves_a_finished_runs_output() {
+    first_copy_stands(true).await;
+}
+
+#[tokio::test]
+async fn a_different_verified_copy_leaves_a_live_runs_output() {
+    first_copy_stands(false).await;
+}
+
+async fn first_copy_stands(ended: bool) {
+    let mut echoing = echoing(1);
+    echoing.deliver(0);
+    if ended {
+        while !echoing.hear().await {}
+        assert_eq!(echoing.job.phase(), RootPhase::Done);
+    } else {
+        echoing.until_closed(0).await;
+    }
+    let engine = echoing.engine();
+    let generation = echoing.job.runs().generation(engine).unwrap();
+    for byte in &mut echoing.volumes[0][HEADER..] {
+        *byte ^= 0x5a;
+    }
+    echoing.deliver(0);
+    assert!(echoing.closed(0), "the first copy's output stands");
+    assert_eq!(echoing.job.runs().generation(engine), Some(generation));
+    if !ended {
+        while !echoing.hear().await {}
+    }
+    assert!(!echoing.job.runs().live(), "no run reads the second copy");
+    assert_eq!(echoing.echoed(0), body(0));
+    assert_eq!(echoing.job.phase(), RootPhase::Done);
+}
+
+// Two clean copies of one volume that differ, in either order, in two jobs:
+// each job's output is the copy it took first, byte for byte.
+#[tokio::test]
+async fn differing_duplicate_copies_give_one_output_in_either_order() {
+    for flipped in [false, true] {
+        let mut echoing = echoing(1);
+        let mut other = echoing.volumes[0].clone();
+        for byte in &mut other[HEADER..] {
+            *byte ^= 0x5a;
+        }
+        if flipped {
+            other = std::mem::replace(&mut echoing.volumes[0], other);
+        }
+        let first = echoing.volumes[0].clone();
+        echoing.deliver(0);
+        echoing.volumes[0] = other;
+        echoing.deliver(0);
+        while !echoing.hear().await {}
+        assert_eq!(echoing.echoed(0), first[HEADER..], "flipped: {flipped}");
+        assert_eq!(echoing.job.phase(), RootPhase::Done);
+    }
+}
+
+// A volume that came before the one that built its engine was a file of its
+// own. The engine keeps the volume whole, so its envelope is that file under
+// a second name, not a copy, and the first name goes once the checkpoint
+// that stops naming it commits.
+#[tokio::test]
+async fn a_volume_its_engine_takes_from_its_file_is_on_disk_once() {
+    let mut echoing = echoing(2);
+    echoing.deliver(1);
+    let posted = echoing.dir.path().join("lantern.part2.rar");
+    assert_eq!(std::fs::read(&posted).unwrap(), echoing.volumes[1]);
+    echoing.deliver(0);
+    let envelope = echoing.dir.path().join(envelope_name(echoing.engine(), 1));
+    assert_eq!(std::fs::read(&envelope).unwrap(), echoing.volumes[1]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            std::fs::metadata(&posted).unwrap().ino(),
+            std::fs::metadata(&envelope).unwrap().ino(),
+            "the envelope is the volume's file"
+        );
+    }
+    echoing.job.recorded(1);
+    echoing.job.committed(1).unwrap();
+    assert!(!posted.exists());
+    assert_eq!(std::fs::read(&envelope).unwrap(), echoing.volumes[1]);
+    while !echoing.hear().await {}
+    for member in 0..2 {
+        assert_eq!(echoing.echoed(member), body(member));
+    }
 }
 
 #[tokio::test]
@@ -651,4 +880,183 @@ async fn an_engine_turned_away_for_memory_starts_once_resident_bytes_are_release
         assert_eq!(echoing.echoed(member), body(member));
     }
     assert_eq!(accountant.usage().resident, 0);
+}
+
+// A posted volume the run already read closes again at another length, as
+// a recovery set's description corrects it: every offset after it moved, so
+// the run built on the old ones starts over.
+#[tokio::test]
+async fn a_volume_the_run_read_closing_at_another_length_restarts_the_run() {
+    let mut echoing = echoing(3);
+    echoing.deliver(0);
+    echoing.until_closed(0).await;
+    assert_eq!(echoing.echoed(0), body(0));
+    let engine = echoing.engine();
+    let before = echoing.job.runs().generation(engine);
+    assert!(before.is_some(), "the run is live");
+    let namespace = echoing.job.namespace_mut(NodeId::ROOT).unwrap();
+    let name = namespace.get(MemberId(0)).unwrap().name.clone();
+    let length = namespace.get(MemberId(0)).unwrap().length.unwrap();
+    namespace.recognise(MemberId(0), &name, length - 1);
+    echoing.deliver(1);
+    assert_ne!(echoing.job.runs().generation(engine), before);
+    assert!(!echoing.closed(0), "accepted old output must be retracted");
+    // The retracted output stays where the last checkpoint names it until
+    // the one that says it is gone commits.
+    assert!(echoing.dir.path().join("echo-0.mkv").exists());
+    echoing.job.recorded(1);
+    echoing.job.committed(1).unwrap();
+    assert!(!echoing.dir.path().join("echo-0.mkv").exists());
+}
+
+// A recovery set reopens a volume whose closed length the run read, to
+// rebuild it, and closes it again at the same length: nothing the run read
+// moved, so what it built stays.
+#[tokio::test]
+async fn a_repair_that_reopens_a_length_read_volume_keeps_the_run() {
+    length_read_volume_reopened(false).await;
+}
+
+// The same volume closes again at another length: the run sized itself from
+// the old one, so it starts over.
+#[tokio::test]
+async fn a_repair_that_changes_a_read_length_retracts_the_run() {
+    length_read_volume_reopened(true).await;
+}
+
+async fn length_read_volume_reopened(changed: bool) {
+    let mut echoing = echoing_as(
+        Echoes {
+            volumes: 3,
+            lengths: true,
+            ..Echoes::default()
+        },
+        unbounded(),
+    );
+    for volume in 0..3 {
+        echoing.deliver(volume);
+    }
+    while !echoing.hear().await {}
+    let engine = echoing.engine();
+    let before = echoing.job.runs().generation(engine);
+    let set = |echoing: &mut Echoing, closed: bool| {
+        let namespace = echoing.job.namespace_mut(NodeId::ROOT).unwrap();
+        if closed && changed {
+            let name = namespace.get(MemberId(2)).unwrap().name.clone();
+            let length = namespace.get(MemberId(2)).unwrap().length.unwrap();
+            namespace.recognise(MemberId(2), &name, length - 1);
+        }
+        namespace.get_mut(MemberId(2)).unwrap().closed = closed;
+        echoing
+            .job
+            .resume_runs(&mut RepairSlots::default(), 1)
+            .unwrap();
+    };
+    set(&mut echoing, false);
+    assert_eq!(
+        echoing.job.runs().generation(engine),
+        before,
+        "a reopen moves nothing the run read"
+    );
+    assert!((0..3).all(|member| echoing.closed(member)));
+    set(&mut echoing, true);
+    if !changed {
+        assert_eq!(echoing.job.runs().generation(engine), before);
+        for member in 0..3 {
+            assert!(echoing.closed(member), "nothing was retracted");
+            assert_eq!(echoing.echoed(member), body(member));
+        }
+        return;
+    }
+    assert!(!echoing.closed(0), "every member of the run is retracted");
+    assert!(echoing.dir.path().join("echo-0.mkv").exists());
+    echoing.job.recorded(1);
+    echoing.job.committed(1).unwrap();
+    assert!(!echoing.dir.path().join("echo-0.mkv").exists());
+    while !echoing.hear().await {}
+    assert_ne!(echoing.job.runs().generation(engine), before);
+    // The rerun's output takes a backing of its own, as any replacement does.
+    let record = echoing
+        .job
+        .tree()
+        .namespace(engine)
+        .unwrap()
+        .get(MemberId(2))
+        .unwrap();
+    assert!(record.closed);
+    let file = echoing.job.writer().file_state(engine, MemberId(2));
+    let name = file.on_disk.as_deref().unwrap_or(&record.output_name);
+    let short = body(2);
+    assert_eq!(
+        std::fs::read(echoing.dir.path().join(name)).unwrap(),
+        short[..short.len() - 1]
+    );
+}
+
+#[test]
+fn giving_back_length_observed_input_stops_its_worker_before_payload_is_read() {
+    for observed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut envelopes, shelf) = shelved(dir.path());
+        close(&shelf, 0, 6, false);
+        let worker = reader(&shelf);
+        if observed {
+            assert_eq!(worker.len(FIRST), Some(6));
+        }
+        assert_eq!(shelf.reached(), None);
+        envelopes.take(NODE, 0).unwrap();
+        assert_eq!(worker.current(), !observed);
+    }
+}
+
+#[test]
+fn a_stale_length_read_cannot_register_a_new_runs_dependency() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut envelopes, shelf) = shelved(dir.path());
+    close(&shelf, 0, 6, false);
+    let old = reader(&shelf);
+    assert_eq!(old.len(FIRST), Some(6));
+    shelf.restart();
+    let current = reader(&shelf);
+    assert_eq!(
+        old.len(FIRST),
+        None,
+        "stale metadata cannot decide a layout"
+    );
+    envelopes.take(NODE, 0).unwrap();
+    assert!(current.current(), "the new run observed no old length");
+}
+
+#[test]
+fn giving_back_read_input_stops_its_worker_but_unread_later_input_does_not() {
+    for (read, give_back, stopped) in [(0, 2, false), (2, 2, true), (2, 1, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let node = NodeId(1);
+        let mut envelopes = Envelopes::new(dir.path().to_path_buf());
+        for volume in 0..3 {
+            envelopes
+                .keep(node, volume, 0, b"source", Provenance::Fresh)
+                .unwrap();
+        }
+        let shelf = envelopes.shelf(node);
+        shelf.update(|state| state.volumes.extend(0..3));
+        let generation = shelf.begin();
+        let worker = RunVolumes::new(Arc::clone(&shelf), generation);
+        assert_eq!(
+            worker.read_at(VolumeIndex(read), 0, &mut [0; 6]).unwrap(),
+            6
+        );
+        envelopes.take(node, give_back).unwrap();
+        assert_eq!(worker.current(), !stopped);
+        assert_eq!(shelf.generation(), generation + u64::from(stopped));
+        if stopped {
+            assert_eq!(
+                worker
+                    .read_at(VolumeIndex(0), 0, &mut [0; 6])
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::BrokenPipe
+            );
+        }
+    }
 }

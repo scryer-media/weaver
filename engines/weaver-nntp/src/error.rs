@@ -117,13 +117,14 @@ pub enum NntpError {
     #[error("command not recognized (500)")]
     CommandNotRecognized,
 
-    // Too many connections to this server (502).
+    // The provider declines one more connection: a connection limit, or one
+    // account in use from too many addresses (400, 481, 482, 502).
     // Transient — back off and retry, do NOT disable the server.
     #[error("too many connections (502)")]
     TooManyConnections,
 
-    // Access denied — server refuses this client (502).
-    // Permanent — credentials or IP are rejected.
+    // Access denied — server refuses this account with a 502 at login that
+    // is not a connection limit.
     #[error("access denied (502)")]
     AccessDenied,
 
@@ -167,6 +168,13 @@ pub enum NntpError {
     // queueing behind it would only have burned the caller's whole budget.
     #[error("{}", acquire_timeout_message(*.0))]
     AcquireTimeout(u64),
+
+    // The caller's work guard turned the work away before anything was sent:
+    // its job paused or changed, or the provider policy no longer lets this
+    // server serve it. It is neither a wait nor a verdict on the server, so
+    // it never reaches server health or a fetch attempt trace.
+    #[error("work is no longer current; nothing was sent")]
+    WorkObsolete,
 
     // A per-server BODY quota rejected admission before the command was sent.
     // This is scheduler policy, never a server health failure.
@@ -220,8 +228,8 @@ impl NntpError {
         )
     }
 
-    // Whether this is the server refusing the account's credentials (480,
-    // 481, 482, or a 502 that is not a connection limit).
+    // Whether this is the server refusing the account: its credentials (480,
+    // 481, 482, 452), or a 502 at login that is not a connection limit.
     pub fn is_credentials_refusal(&self) -> bool {
         matches!(
             self,
@@ -240,67 +248,109 @@ impl NntpError {
         }
     }
 
-    // Map common NNTP status codes to specific error variants.
+    // Classify a reply read on an established session: any command after
+    // the greeting and AUTHINFO have been answered.
     pub fn from_status(code: StatusCode, message: &str) -> Self {
-        match code.raw() {
+        Self::classify(code, message, ReplyPhase::Session)
+    }
+
+    // Classify a reply read while the connection is still being admitted:
+    // the greeting, and the answers to AUTHINFO USER and PASS.
+    pub fn from_login_status(code: StatusCode, message: &str) -> Self {
+        Self::classify(code, message, ReplyPhase::Login)
+    }
+
+    // The one map from an NNTP reply to an error class.
+    //
+    // Providers put the same refusal behind different codes, so the text
+    // decides as much as the code does. The checks run in a fixed order: a
+    // connection limit first (400, 481, 482, 502), then an account in use
+    // from too many addresses (481, 482, 502), both of which are the
+    // provider declining one more socket; then the codes on their own.
+    //
+    // Any other 502 while the connection is being admitted turns the account
+    // away, whether it names the login, the account's paid allowance, or
+    // nothing. Once the session is up, the account was already accepted, so
+    // any other 502 costs this connection and a fresh one is dialled; if the
+    // account has really gone bad, that dial's login reply says so.
+    //
+    // A 500 that names the login is only read as a refusal while logging in:
+    // later, "500 invalid command" is the server not knowing the command.
+    //
+    // Real replies:
+    // - "502 Too Many Connections - Teknews", "502 maximum connections",
+    //   "400 too many connections": connection limit.
+    // - "481 max simultaneous IP addresses reached": addresses.
+    // - "452 Authentication rejected", "500 username required" (login):
+    //   credentials.
+    // - "502 byte limit exceeded", "502 download limit exceeded": allowance,
+    //   a refusal at login and a reconnect mid-session.
+    // - "451 article not found": the article is missing.
+    fn classify(code: StatusCode, message: &str, phase: ReplyPhase) -> Self {
+        let text = message.to_lowercase();
+        let raw = code.raw();
+        if matches!(raw, 400 | 481 | 482 | 502) && names_connection_limit(&text) {
+            return NntpError::TooManyConnections;
+        }
+        if matches!(raw, 481 | 482 | 502) && names_address_sharing(&text) {
+            return NntpError::TooManyConnections;
+        }
+        match raw {
             400 => NntpError::ServiceUnavailable,
             411 => NntpError::NoSuchGroup,
             412 => NntpError::NoGroupSelected,
             423 => NntpError::NoArticleWithNumber,
-            430 => NntpError::ArticleNotFound,
+            430 | 451 => NntpError::ArticleNotFound,
+            452 => NntpError::AuthenticationFailed,
             480 => NntpError::AuthenticationRequired,
-            481 => Self::classify_auth_error(message, NntpError::AuthenticationFailed),
-            482 => Self::classify_auth_error(message, NntpError::AuthenticationRejected),
+            481 => NntpError::AuthenticationFailed,
+            482 => NntpError::AuthenticationRejected,
             483 => NntpError::TlsRequired,
+            500 if phase == ReplyPhase::Login && names_login(&text) => {
+                NntpError::AuthenticationFailed
+            }
             500 => NntpError::CommandNotRecognized,
-            502 => Self::classify_502(message),
+            502 => match phase {
+                ReplyPhase::Login => NntpError::AccessDenied,
+                ReplyPhase::Session => NntpError::ServiceUnavailable,
+            },
             _ => NntpError::unexpected(code, message),
         }
     }
+}
 
-    // Check if a 481/482 response is actually a "too many connections" error.
-    //
-    // Some servers (Eweka, etc.) return 481 or 482 with messages like
-    // "too many connections for your user" instead of the standard 502.
-    fn classify_auth_error(message: &str, default: NntpError) -> Self {
-        if Self::is_too_many_connections_message(message) {
-            NntpError::TooManyConnections
-        } else {
-            default
-        }
-    }
+// Where in a connection's life a reply was read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplyPhase {
+    // The greeting and the AUTHINFO exchange.
+    Login,
+    // Every command after the connection was admitted.
+    Session,
+}
 
-    // Distinguish "too many connections" (transient) from "access denied"
-    // (permanent) based on the 502 response message text.
-    //
-    // Real-world 502 messages from news providers:
-    // - "502 too many connections" (Newshosting, Eweka, etc.)
-    // - "502 Too Many Connections - Teknews"
-    // - "502 max connection limit reached"
-    // - "502 connection limit exceeded"
-    // - "502 Access Denied"
-    // - "502 You have no permission to talk"
-    fn classify_502(message: &str) -> Self {
-        if Self::is_too_many_connections_message(message) {
-            NntpError::TooManyConnections
-        } else {
-            NntpError::AccessDenied
-        }
-    }
+// Whether lower-cased reply text names a connection limit. A limit on bytes
+// or downloads is the account's allowance, not a limit on sockets.
+fn names_connection_limit(text: &str) -> bool {
+    !text.contains("download")
+        && !text.contains("byte")
+        && ["exceed", "connections", "too many", "threads", "limit"]
+            .iter()
+            .any(|clue| text.contains(clue))
+}
 
-    // Check if a response message indicates a connection-limit error.
-    //
-    // Used by both `classify_502` and `classify_auth_error` since servers
-    // return these messages on 481, 482, and 502 interchangeably.
-    fn is_too_many_connections_message(message: &str) -> bool {
-        let lower = message.to_ascii_lowercase();
-        lower.contains("too many")
-            || lower.contains("connection limit")
-            || lower.contains("max connect")
-            || lower.contains("limit reached")
-            || lower.contains("limit exceeded")
-            || lower.contains("connections exceeded")
-    }
+// Whether lower-cased reply text names one account used from too many
+// addresses at once.
+fn names_address_sharing(text: &str) -> bool {
+    ["simultaneous ip", "multiple ip"]
+        .iter()
+        .any(|clue| text.contains(clue))
+}
+
+// Whether lower-cased reply text names the login.
+fn names_login(text: &str) -> bool {
+    ["username", "password", "invalid", "authen", "access denied"]
+        .iter()
+        .any(|clue| text.contains(clue))
 }
 
 impl fmt::Display for StatusCode {
@@ -390,20 +440,141 @@ mod tests {
     fn classify_502_access_denied() {
         let sc = |raw| StatusCode::new(raw);
 
-        // Permanent access denial.
+        // Any 502 that is not a connection limit refuses the account while
+        // logging in.
         assert!(matches!(
-            NntpError::from_status(sc(502), "Access Denied"),
+            NntpError::from_login_status(sc(502), "Access Denied"),
+            NntpError::AccessDenied
+        ));
+        // A 502 that says nothing more refuses the account while logging in.
+        assert!(matches!(
+            NntpError::from_login_status(sc(502), "You have no permission to talk"),
             NntpError::AccessDenied
         ));
         assert!(matches!(
-            NntpError::from_status(sc(502), "You have no permission to talk"),
+            NntpError::from_login_status(sc(502), ""),
             NntpError::AccessDenied
         ));
-        // Unknown 502 message defaults to AccessDenied (safe default).
+    }
+
+    #[test]
+    fn mid_session_bare_502_reconnects() {
+        let sc = |raw| StatusCode::new(raw);
+
+        // Once the session is up, a 502 without connection-limit wording
+        // costs the connection, not the account, whatever else it says.
+        for message in [
+            "",
+            "You have no permission to talk",
+            "service closed",
+            "Access Denied",
+            "byte limit exceeded",
+            "download limit exceeded",
+            "Account expired",
+        ] {
+            let error = NntpError::from_status(sc(502), message);
+            assert!(
+                matches!(error, NntpError::ServiceUnavailable),
+                "{message:?} gave {error:?}"
+            );
+            assert!(!error.is_credentials_refusal());
+        }
+    }
+
+    #[test]
+    fn provider_replies_take_their_class() {
+        let sc = |raw| StatusCode::new(raw);
+        let login = |raw, message| NntpError::from_login_status(sc(raw), message);
+        let session = |raw, message| NntpError::from_status(sc(raw), message);
+
+        // An account in use from too many addresses: the provider declines
+        // a socket, it does not reject the credentials.
+        let error = login(481, "max simultaneous IP addresses reached");
+        assert!(matches!(error, NntpError::TooManyConnections), "{error:?}");
+        assert!(!error.is_credentials_refusal());
+        let error = login(502, "Too many connections from multiple IP addresses");
+        assert!(matches!(error, NntpError::TooManyConnections), "{error:?}");
+
+        // The paid allowance is spent: at login the account is refused (a
+        // spent allowance part-way through a session reconnects, and the
+        // next login lands here).
+        for message in ["byte limit exceeded", "download limit exceeded"] {
+            let error = login(502, message);
+            assert!(
+                matches!(error, NntpError::AccessDenied),
+                "{message:?} gave {error:?}"
+            );
+            assert!(error.is_credentials_refusal());
+        }
+        let error = login(502, "Account expired");
+        assert!(matches!(error, NntpError::AccessDenied), "{error:?}");
+        let error = login(481, "download limit exceeded");
+        assert!(
+            matches!(error, NntpError::AuthenticationFailed),
+            "{error:?}"
+        );
+
+        // The connection-limit wording is wider than the literal phrase.
+        for (code, message) in [
+            (502, "maximum connections"),
+            (502, "max connection limit reached"),
+            (502, "connections exceeded for account"),
+            (502, "too many threads"),
+            (481, "Connection limit exceeded"),
+            (482, "Too many connections"),
+        ] {
+            let error = login(code, message);
+            assert!(
+                matches!(error, NntpError::TooManyConnections),
+                "{code} {message:?} gave {error:?}"
+            );
+        }
+
+        // A 400 that names the limit, at the greeting or after login.
+        for error in [
+            login(400, "too many connections"),
+            session(400, "too many connections"),
+        ] {
+            assert!(matches!(error, NntpError::TooManyConnections), "{error:?}");
+        }
+        // A 400 that says nothing more is the server's passing trouble.
         assert!(matches!(
-            NntpError::from_status(sc(502), ""),
-            NntpError::AccessDenied
+            login(400, "idle timeout"),
+            NntpError::ServiceUnavailable
         ));
+
+        // Credentials.
+        let error = login(452, "Authentication rejected");
+        assert!(
+            matches!(error, NntpError::AuthenticationFailed),
+            "{error:?}"
+        );
+        assert!(error.is_credentials_refusal());
+        let error = login(500, "username required");
+        assert!(
+            matches!(error, NntpError::AuthenticationFailed),
+            "{error:?}"
+        );
+        assert!(error.is_credentials_refusal());
+        let error = login(502, "Invalid username or password");
+        assert!(matches!(error, NntpError::AccessDenied), "{error:?}");
+
+        // A 500 that happens to name the login, once the session is up, is
+        // still the server not knowing the command.
+        let error = session(500, "invalid command");
+        assert!(
+            matches!(error, NntpError::CommandNotRecognized),
+            "{error:?}"
+        );
+        assert!(matches!(
+            login(500, "command not recognized"),
+            NntpError::CommandNotRecognized
+        ));
+
+        // 451 is the article missing, beside 423 and 430.
+        let error = session(451, "article not found");
+        assert!(matches!(error, NntpError::ArticleNotFound), "{error:?}");
+        assert!(error.is_article_not_found());
     }
 
     #[test]

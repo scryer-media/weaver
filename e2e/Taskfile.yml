@@ -145,6 +145,13 @@ tasks:
     cmds:
       - "{{.E2E_BIN}} restart-test {{.CLI_ARGS}}"
 
+  adversarial:
+    desc: Run the adversarial-archives scenarios on SQLite
+    dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
+    cmds:
+      - "{{.E2E_BIN}} adversarial {{.CLI_ARGS}}"
+
   restart-all:
     desc: Run the full Weaver restart suite
     dir: "{{.TASKFILE_DIR}}"

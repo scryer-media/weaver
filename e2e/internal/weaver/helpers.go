@@ -143,7 +143,7 @@ func normalizeFacadeState(state string) string {
 
 func facadeTerminalStatus(state string) bool {
 	switch normalizeFacadeState(state) {
-	case "COMPLETE", "FAILED":
+	case "COMPLETE", "FAILED", "PARTIAL":
 		return true
 	default:
 		return false

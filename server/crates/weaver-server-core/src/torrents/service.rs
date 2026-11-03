@@ -2617,7 +2617,7 @@ impl TorrentService {
         let job_id = torrent.record.job_id;
         let pending = torrent.job.as_ref()?.with(|job| {
             let pending = job.pending().clone();
-            pending.put(job).then_some(pending)
+            pending.put(job, Vec::new()).then_some(pending)
         });
         torrent.settle(now);
         let resume = torrent.take_resume(now, false);
@@ -2634,7 +2634,7 @@ impl TorrentService {
         });
         let writer = pending.clone();
         let landed = self.queue_save(job_id, "torrent_checkpoint", move |db| {
-            let delta = writer.as_ref().and_then(checkpoint::Pending::take);
+            let delta = writer.as_ref().and_then(|writer| writer.take().0);
             let written = db.save_torrent_checkpoint(
                 job_id,
                 delta.map(Arc::new),
@@ -2783,6 +2783,8 @@ impl TorrentService {
             caps: Caps::new(Arc::clone(&env.limits), policy, declared),
             nesting: limits::NESTING,
             unpack,
+            hardware: Default::default(),
+            metrics: None,
         }
     }
 
@@ -4211,7 +4213,7 @@ impl TorrentService {
         let written = torrent
             .job
             .as_ref()
-            .map(|job| job.with(|job| job.written()))
+            .map(|job| job.with(|job| job.written_paths()))
             .unwrap_or_default();
         self.detach(&mut torrent).await;
         if delete_files && let Some(dir) = torrent.record.storage_dir.clone() {

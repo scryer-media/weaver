@@ -23,7 +23,7 @@ license-file = "LICENSE"
 repository = "https://github.com/scryer-media/weaver"
 
 [workspace.dependencies]
-tokio = { version = "1.53", default-features = false, features = ["fs", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.54", default-features = false, features = ["fs", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 serde = { version = "1.0", default-features = false, features = ["derive", "rc", "std"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 thiserror = { version = "2.0", default-features = false, features = ["std"] }
@@ -43,8 +43,7 @@ pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 sha1 = { version = "0.11", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.11", default-features = false }
 hmac = { version = "0.13", default-features = false }
-aws-lc-rs = { version = "1.18", default-features = false, features = ["non-fips"] }
-aws-lc-sys = { version = "0.45", default-features = false, features = ["all-bindings"] }
+aws-lc-rs = { version = "1.19", default-features = false, features = ["non-fips"] }
 argon2 = { version = "0.6", default-features = false, features = ["alloc", "password-hash"] }
 getrandom = { version = "0.4", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["std"] }
@@ -111,24 +110,25 @@ sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio
 tempfile = { version = "3", default-features = false, features = ["getrandom"] }
 filetime = { version = "0.2.29", default-features = false }
 memmap2 = { version = "0.9", default-features = false }
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
-sevenz-turbo = { version = "0.29.2", default-features = false, features = ["aes256", "aws-lc-crypto", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }
+sevenz-turbo = { version = "0.29.3", default-features = false, features = ["aes256", "aws-lc-crypto", "brotli", "bzip2", "deflate", "lz4", "ppmd", "util", "zstd"] }
 lzma-turbo = { version = "0.10.2", default-features = false, features = ["std", "asm", "crc", "crypto", "xz"] }
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json", "gzip", "brotli", "deflate", "zstd", "socks"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "gzip", "brotli", "deflate", "zstd", "socks"] }
 semver = { version = "1.0", default-features = false, features = ["serde", "std"] }
 httpdate = { version = "1.0", default-features = false }
 rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "sys_rng", "thread_rng"] }
 regex = { version = "1.13", default-features = false, features = ["std", "perf", "unicode"] }
 ipnet = { version = "2.12", default-features = false, features = ["std"] }
-unicode-normalization = { version = "0.1.25", default-features = false }
+unicode-normalization = { version = "0.1.26", default-features = false }
+aho-corasick = { version = "1.1.5", default-features = false, features = ["std", "perf-literal"] }
 tar = { version = "0.4", default-features = false }
 cap-std = { version = "4", default-features = false }
 cap-fs-ext = { version = "4", default-features = false, features = ["std"] }
 cap-primitives = { version = "4", default-features = false }
 zip = { version = "9", default-features = false, features = ["aes-crypto", "deflate64", "deflate-flate2-zlib-rs", "bzip2", "time"] }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-brotli = { version = "8", default-features = false, features = ["std"] }
+brotli = { version = "9", default-features = false, features = ["std"] }
 bzip2 = "0.6"
 base64 = { version = "0.23", default-features = false, features = ["std"] }
 security-framework = { version = "3", default-features = false }
@@ -152,7 +152,7 @@ windows-sys = { version = "0.61", default-features = false }
 # Re-enabling means shipping a GPU repair lane again: decide it deliberately,
 # and re-verify with `cargo tree -e features --workspace | grep metal`.
 # Authenticated recovery scanning and source-change handling.
-par2-rs = { version = "=0.10.13", default-features = false, features = ["crypto-aws-lc"] }
+par2-rs = { version = "=0.11.0", default-features = false, features = ["crypto-aws-lc"] }
 # Native PAR3 verification and repair; shares CPU arithmetic with PAR2.
 # 0.4.1 is a floor, not just a preference: before it, a session alone on the
 # budget that could not fit its own admitted packets was reported as peer
@@ -197,7 +197,11 @@ par3-rs = { version = "=0.8.1", default-features = false }
 # router clones a member's key where it hands one on.
 # 0.14.1, with par2-rs 0.10.13, hashes through crc-turbo and drops crc-fast and
 # the `RARPAR_CRC32_VPCLMUL` override; `CRC_TURBO_TIER` pins the tier instead.
-unrar-rs = { version = "0.14.1", default-features = false, features = ["crypto-aws-lc"] }
+# 0.14.3 states a split member's checksum only once its final part's header
+# has been read, and an extraction merges the continuation headers it read.
+# 0.15.0 states a RAR5 member's hash-MAC flag, opens `rar rc`-rebuilt RAR4 -hp
+# volumes, and chains continuation volumes by split header, not by name.
+unrar-rs = { version = "0.15.1", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]
@@ -308,7 +312,9 @@ opt-level = 3
 inherits = "test"
 opt-level = 3
 debug-assertions = false
-overflow-checks = true
+overflow-checks = false
+codegen-units = 2
+lto = "thin"
 
 # Rarpar crates normally use crates.io; the PAR2 revision above is a temporary
 # pin to the authenticated-scanner and source-change fixes.

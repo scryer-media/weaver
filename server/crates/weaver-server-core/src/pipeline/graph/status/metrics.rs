@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The graph engine's metric family, beside the classic `direct_store.*`
-// names and aliasing none of them: `graph.<what>.<reason>[.<object kind>]`.
+// The graph engine's metric family: `graph.<what>.<reason>[.<object kind>]`.
 
 use weaver_graph::recovery::RepairOutcome;
 

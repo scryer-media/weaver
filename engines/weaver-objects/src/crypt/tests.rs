@@ -105,6 +105,7 @@ fn bytes_in_any_order_decipher_once_their_seed_is_in() {
     let (plain, cipher) = posted(1000);
     let mut stream = cbc(&plain, &cipher);
     let mut out = Out::default();
+    let mut kept = BTreeSet::from([cipher.len() as u64]);
     for range in scrambled(cipher.len(), 37) {
         out.deliver(
             &mut stream,
@@ -112,11 +113,71 @@ fn bytes_in_any_order_decipher_once_their_seed_is_in() {
             &cipher[range.start as usize..range.end as usize],
             Provenance::Fresh,
         );
+        if range.start % BLOCK != 0 {
+            kept.insert(block_ceil(range.start));
+        }
     }
     assert_eq!(out.bytes, plain);
     assert!(out.coverage.verified(ByteRange::new(0, plain.len() as u64)));
-    // What is left: the final block, which seals the padding.
-    assert_eq!(stream.kept(), 1);
+    // What is left: the final block, which seals the padding, and each block
+    // an arrival started inside.
+    assert_eq!(stream.kept(), kept.len());
+}
+
+// A span un-said from inside a block, as its owner un-says it: from the
+// start of that block. The bytes before the span do not come again, and the
+// block comes out again whole from what the chain kept when the span's
+// arrival first started inside it.
+#[test]
+fn a_span_unsaid_from_inside_a_block_comes_out_again_whole() {
+    let (plain, cipher) = posted(100);
+    let mut stream = cbc(&plain, &cipher);
+    let mut out = Out::default();
+    let seam = 41;
+    out.deliver(&mut stream, 0, &cipher[..seam], Provenance::Fresh);
+    out.deliver(&mut stream, seam as u64, &cipher[seam..], Provenance::Fresh);
+    assert_eq!(out.bytes, plain);
+    let from = block_floor(seam as u64);
+    let (plain_len, cipher_len) = (plain.len() as u64, cipher.len() as u64);
+    out.coverage.erase(ByteRange::new(from, plain_len));
+    out.padding
+        .forget(plain_len, ByteRange::new(from, cipher_len));
+    let said = out.deliver(&mut stream, seam as u64, &cipher[seam..], Provenance::Fresh);
+    let said: Vec<ByteRange> = said
+        .iter()
+        .map(|plain| ByteRange::at(plain.offset, plain.bytes.len() as u64))
+        .collect();
+    assert_eq!(said, vec![ByteRange::new(from, plain_len)]);
+    assert_eq!(out.bytes, plain);
+    assert!(out.coverage.verified(ByteRange::new(0, plain_len)));
+}
+
+// The stream came whole, then the same bytes came again from inside a block
+// that had come out, as a second copy whose seams differ does: that block is
+// kept as one an arrival started inside, so an un-say from that seam brings it
+// out again whole though the bytes before the seam do not come again.
+#[test]
+fn the_same_bytes_again_from_inside_a_block_keep_it_for_an_unsay_there() {
+    let (plain, cipher) = posted(100);
+    let mut stream = cbc(&plain, &cipher);
+    let mut out = Out::default();
+    let seam = 41;
+    out.deliver(&mut stream, 0, &cipher, Provenance::Fresh);
+    let again = out.deliver(&mut stream, seam as u64, &cipher[seam..], Provenance::Fresh);
+    assert!(again.is_empty(), "nothing new: {again:?}");
+    let from = block_floor(seam as u64);
+    let (plain_len, cipher_len) = (plain.len() as u64, cipher.len() as u64);
+    out.coverage.erase(ByteRange::new(from, plain_len));
+    out.padding
+        .forget(plain_len, ByteRange::new(from, cipher_len));
+    let said = out.deliver(&mut stream, seam as u64, &cipher[seam..], Provenance::Fresh);
+    let said: Vec<ByteRange> = said
+        .iter()
+        .map(|plain| ByteRange::at(plain.offset, plain.bytes.len() as u64))
+        .collect();
+    assert_eq!(said, vec![ByteRange::new(from, plain_len)]);
+    assert_eq!(out.bytes, plain);
+    assert!(out.coverage.verified(ByteRange::new(0, plain_len)));
 }
 
 #[test]

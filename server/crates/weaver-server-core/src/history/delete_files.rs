@@ -70,10 +70,6 @@ impl JobCleanupDirs {
     ) -> Result<Vec<PathBuf>, crate::SchedulerError> {
         let mut left_in_place = self.left_in_place;
         for dir in self.owned {
-            // Failed jobs never pass through the finalize close, so drop any
-            // cached write handles before their dirs (and paths) are freed
-            // for reuse.
-            crate::pipeline::close_cached_write_handles_under(&dir).await;
             let root = intermediate_dir.to_path_buf();
             let target = dir.clone();
             let removal = tokio::task::spawn_blocking(move || {

@@ -17,6 +17,57 @@ use crate::member::MemberId;
 use crate::seek::Seek;
 use crate::volume::{ByteRange, VolumeIndex};
 
+// An object's answer to a claim: the places the member could take, none
+// when there are none, or not yet, while the front in hand is too short for
+// the object to judge the member by, with the places that front gives it.
+// Once no more of the front can come, those places are the answer. It
+// reads as the places wherever only the places matter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Claim {
+    Places(Vec<VolumeIndex>),
+    NotYet(Vec<VolumeIndex>),
+}
+
+impl Default for Claim {
+    fn default() -> Self {
+        Self::Places(Vec::new())
+    }
+}
+
+impl From<Vec<VolumeIndex>> for Claim {
+    fn from(places: Vec<VolumeIndex>) -> Self {
+        Self::Places(places)
+    }
+}
+
+impl FromIterator<VolumeIndex> for Claim {
+    fn from_iter<I: IntoIterator<Item = VolumeIndex>>(places: I) -> Self {
+        Self::Places(places.into_iter().collect())
+    }
+}
+
+impl std::ops::Deref for Claim {
+    type Target = [VolumeIndex];
+
+    fn deref(&self) -> &[VolumeIndex] {
+        match self {
+            Self::Places(places) | Self::NotYet(places) => places,
+        }
+    }
+}
+
+impl AsRef<[VolumeIndex]> for Claim {
+    fn as_ref(&self) -> &[VolumeIndex] {
+        self
+    }
+}
+
+impl PartialEq<Vec<VolumeIndex>> for Claim {
+    fn eq(&self, other: &Vec<VolumeIndex>) -> bool {
+        matches!(self, Self::Places(places) if places == other)
+    }
+}
+
 // A format the sniffer can name and an object can own. The list is closed on
 // purpose: adding a format means adding an object, and nothing else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -218,6 +269,20 @@ pub struct Extent {
     pub range: ByteRange,
 }
 
+// What a store says of a member range it was asked where it lies, beside the
+// extents it gave.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Located {
+    // The extents given are all of the range.
+    Whole,
+    // The extents given are the part the store has placed; the rest lies in
+    // volumes whose headers it has not read yet, and is located once it has.
+    NotYet,
+    // The bytes can never be addressed: the member is no run of the
+    // volumes' raw bytes, so only the normal order reaches them.
+    Never,
+}
+
 // What an object parsed of one of its volumes, which travels with the member
 // when the object gives it back: the next owner adopts it in place of
 // reading the member's headers again. Only an object of the same kind can
@@ -280,9 +345,20 @@ pub trait Object: Send + Sync {
     );
 
     // My volume has no more bytes coming: everything that could arrive has.
+    // A close may be told again, as a loss may: a restore tells every close
+    // again. A close told again is the one already heard.
     fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>);
 
+    // How far my closing volume reached: the end of the last of its bytes
+    // that arrived or was lost, short of its length when its articles
+    // declared more than they hold. Told just before every close, after its
+    // length.
+    fn volume_reached(&mut self, _volume: VolumeIndex, _reached: u64, _out: &mut Vec<Emit>) {}
+
     // This range of my volume will never arrive and no recovery covers it.
+    // A range may be told again, alone or inside a wider run: a restore tells
+    // every loss again, and a quiet job tells its data objects every loss
+    // each time it settles. A loss told again is the one already held.
     fn volume_lost(&mut self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Emit>);
 
     // The job is quiet: nothing more will arrive and no repair will come,
@@ -306,8 +382,10 @@ pub trait Object: Send + Sync {
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>);
 
     // The forward map: where does this range of my member lie in my volumes?
-    // Empty when the member's layout is not known yet.
-    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>);
+    // The extents go into `out`; the answer says whether they are all of the
+    // range, the part placed so far, or whether the range can never be
+    // addressed.
+    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located;
 
     // The bytes posted for this range of my volume, rebuilt through the
     // inverse map: `read` hands back what one placement holds. An object
@@ -344,8 +422,10 @@ pub trait Object: Send + Sync {
     // My volume's length is known: its member declared one, or it closed at
     // the length it reached. Said ahead of every delivery while it is known
     // and once more at the close, so an object acts on it once and ignores
-    // the repeats. A store that splits its container into volumes by size
-    // learns its geometry here.
+    // the repeats. A length that differs is the producer's word now, as when
+    // a store beneath a split hears its member said anew, and it is final
+    // only at the close. A store that splits its container into volumes by
+    // size learns its geometry here.
     fn sized(&mut self, _volume: VolumeIndex, _length: u64, _out: &mut Vec<Emit>) {}
 
     // A password the job offers. The object checks it against its own
@@ -363,42 +443,63 @@ pub trait Object: Send + Sync {
     // reads.
     fn bound(&mut self, _volume: VolumeIndex, _name: &str, _front: &[u8], _length: Option<u64>) {}
 
-    // I am a window on recovery data another object found, and this is
-    // what it handed me to read the range by: at my building, and again
-    // each time it hands it anew.
-    fn handed(&mut self, _handed: &Handed) {}
-
-    // A new member appeared beside the one I am bound to. Is it one of my
-    // volumes? A RAR store claims `.part02.rar` after `.part01.rar`, a 7z
-    // store a piece with no signature of its own by its length. Only an
-    // object can say, because only it knows how its volumes chain. Answer
-    // with the volume index the member becomes, its position in the set and
-    // never the order it arrived in, or `None` to let the sniffer decide. A
-    // freshly built object is asked first about the member it was built
-    // for, and `None` makes that member its first volume. The answer only
-    // reads: the volume exists once `bound` says so.
-    fn claim(
-        &mut self,
-        _name: &str,
-        _first_bytes: &[u8],
-        _length: Option<u64>,
-    ) -> Option<VolumeIndex> {
+    // A read-only copy of placement metadata for this kind's engine. The
+    // retiring store retains every byte and inverse map until materialized.
+    fn engine_volume(&self, _volume: VolumeIndex) -> Option<Carried> {
         None
     }
 
-    // Bytes outrank names, headers outrank links: whether I hold `volume`
-    // only provisionally, by links alone, where the member whose claim
-    // named it, by its first bytes or what was parsed of it, states its
-    // place, so the member takes the place and the holder is given back.
-    // Only reads.
+    // I am a window on recovery data another object found, and this is
+    // what it handed me to read the range by: at my building, again each
+    // time it hands it anew, and again when I take my node back after a
+    // loan, whether I am the one lent or one rebuilt from its facts.
+    fn handed(&mut self, _handed: &Handed) {}
+
+    // A new member appeared beside the one I am bound to. Is it one of my
+    // volumes? A RAR store claims `.part02.rar` after `.part01.rar`, a split
+    // store `.002` after `.001`. Only an
+    // object can say, because only it knows how its volumes chain. Answer
+    // with every volume index the member could become, held or not, its
+    // position in the set and never the order it arrived in, or none to let
+    // the sniffer decide: whether the member is the one holding a place is
+    // the tree's to judge, by fronts, as which of several free places it
+    // takes is. A freshly built object is asked first about the member it
+    // was built for, and none makes that member its first volume. The
+    // answer only reads: the volume exists once `bound` says so. An object
+    // that cannot judge the member by the front it has so far answers not
+    // yet, with the places that front gives it, and is asked again as the
+    // front grows; once no more of it can come, those places are its answer.
+    fn claim(&mut self, _name: &str, _first_bytes: &[u8], _length: Option<u64>) -> Claim {
+        Claim::default()
+    }
+
+    // Bytes outrank names, and what states a place outranks links: whether
+    // I hold `volume` only provisionally, by links alone, where the member
+    // whose claim named it, by its name, its first bytes or what was parsed
+    // of it, states its place, so the member takes the place and the holder
+    // is given back. Only reads.
     fn provisional(
         &self,
         _volume: VolumeIndex,
+        _name: &str,
         _first_bytes: &[u8],
         _carried: Option<&Carried>,
     ) -> bool {
         false
     }
+
+    // The parse a volume can carry to another owner, without changing this
+    // object. Only a volume whose bytes contribute to no output may travel.
+    // A sibling judges this same parse before the tree changes any binding;
+    // `give_back` then transfers it. No bytes are read to answer.
+    fn carried(&self, _volume: VolumeIndex) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        None
+    }
+
+    // Every volume `carried` answers for, as I stand now. I keep them as my
+    // volumes come, go, and come to contribute to an output, so a sibling's
+    // take reads only these, never a volume that routes output.
+    fn carriable(&self, _out: &mut Vec<VolumeIndex>) {}
 
     // A volume I said I give back: what I parsed of it, to travel with the
     // member, or `None` when I keep nothing of it worth carrying or more
@@ -412,22 +513,40 @@ pub trait Object: Send + Sync {
     // from here.
     fn taken(&mut self, _volume: VolumeIndex) {}
 
-    // A member a sibling gave back, offered with what that sibling parsed
-    // of it: is it one of my volumes? Answered from what was parsed, never
-    // by reading the member again; `None` from an object that cannot read
-    // what was carried.
-    fn reclaim(&mut self, _name: &str, _carried: &Carried) -> Option<VolumeIndex> {
-        None
+    // A sibling's transferable volume, with its retained front and parse:
+    // is it one of mine? The parse outranks the front and name wherever it
+    // says more. It answers as `claim` does, not yet included. This only
+    // reads, and never fetches the member again.
+    fn reclaim(
+        &self,
+        _name: &str,
+        _front: &[u8],
+        _length: Option<u64>,
+        _carried: &(dyn std::any::Any + Send + Sync),
+    ) -> Claim {
+        Claim::default()
     }
 
-    // A member I reclaimed is now this volume of mine, and what was parsed
-    // of it is mine to keep: `bound`, for a member that brings its parse.
-    fn adopt(&mut self, volume: VolumeIndex, name: &str, _carried: Carried) {
-        self.bound(volume, name, &[], None);
+    // A member I reclaimed is now this volume of mine, with its name, front
+    // and length as the tree holds them, and what was parsed of it is mine
+    // to keep: `bound`, for a member that brings its parse. What the parse
+    // says outranks the tree's facts; I never know less of it than a fresh
+    // bind would tell me.
+    fn adopt(
+        &mut self,
+        volume: VolumeIndex,
+        name: &str,
+        front: &[u8],
+        length: Option<u64>,
+        _carried: Carried,
+    ) {
+        self.bound(volume, name, front, length);
     }
 
     // My volume's member has another name now: a recovery set named it.
-    fn renamed(&mut self, _volume: VolumeIndex, _name: &str) {}
+    // A stronger name can change its placement, through the same emits as
+    // a delivery. The tree applies them before making further claims.
+    fn renamed(&mut self, _volume: VolumeIndex, _name: &str, _out: &mut Vec<Emit>) {}
 
     // My set was refused, whoever said why: I read nothing more, and what I
     // claim after goes where the set went.

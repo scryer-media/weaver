@@ -152,19 +152,7 @@ impl SystemQuery {
     async fn system_status(&self, ctx: &Context<'_>) -> Result<SystemStatus> {
         let handle = ctx.data::<SchedulerHandle>()?;
         let config = ctx.data::<SharedConfig>()?;
-        let items: Vec<QueueItem> = handle
-            .list_jobs()
-            .into_iter()
-            .filter(|info| {
-                !matches!(
-                    info.status,
-                    weaver_server_core::JobStatus::Complete
-                        | weaver_server_core::JobStatus::Partial
-                        | weaver_server_core::JobStatus::Failed { .. }
-                )
-            })
-            .map(|info| queue_item_from_job(&info))
-            .collect();
+        let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
         let metrics = handle.get_metrics();
         let max_download_speed = with_timed_config_read(
             config,
@@ -180,7 +168,7 @@ impl SystemQuery {
         Ok(SystemStatus {
             version: env!("CARGO_PKG_VERSION").to_string(),
             global_state,
-            summary: queue_summary(&items, &metrics),
+            summary: crate::jobs::paging::summary(state, &metrics),
         })
     }
     /// System metrics facade for integrations.
@@ -351,14 +339,17 @@ impl SystemQuery {
         // Open sockets only mean "preparing" while a job is waiting to fetch
         // through them; the pool's keep-alive after a finished download, or a
         // paused queue, holds the same sockets open with nothing to prepare.
+        let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
         let work_waiting = !handle.is_globally_paused()
-            && handle.list_jobs().iter().any(|job| {
-                matches!(
-                    job.status,
-                    weaver_server_core::JobStatus::Queued
-                        | weaver_server_core::JobStatus::Downloading
-                        | weaver_server_core::JobStatus::Checking
-                )
+            && state.read_queue(|inner| {
+                inner.jobs.iter().any(|row| {
+                    matches!(
+                        row.view(&inner.globals).status(),
+                        weaver_server_core::JobStatus::Queued
+                            | weaver_server_core::JobStatus::Downloading
+                            | weaver_server_core::JobStatus::Checking
+                    )
+                })
             });
         match live_pool.or(fallback_pool) {
             Some(pool) => {

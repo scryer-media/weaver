@@ -64,7 +64,7 @@ func TestSubmitOneNZBOnlySendsForceWhenRequested(t *testing.T) {
 	}
 }
 
-func TestSubmitSlugNTimesForcesOnlyRepeatedSubmissions(t *testing.T) {
+func TestSubmitSlugNTimesForcesEverySubmission(t *testing.T) {
 	const slug = "restart-repeat"
 	writeSubmitTestFixture(t, slug)
 
@@ -94,11 +94,7 @@ func TestSubmitSlugNTimesForcesOnlyRepeatedSubmissions(t *testing.T) {
 		t.Fatalf("ids = %v, want three ids", ids)
 	}
 	for i, input := range inputs {
-		force, exists := input["force"]
-		if i == 0 && exists {
-			t.Errorf("first submission unexpectedly sent force=%v", force)
-		}
-		if i > 0 && force != true {
+		if force := input["force"]; force != true {
 			t.Errorf("submission %d force = %#v, want true", i+1, force)
 		}
 	}

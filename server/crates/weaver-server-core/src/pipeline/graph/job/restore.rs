@@ -93,7 +93,7 @@ impl<R: Root> GraphJob<R> {
         storage: Storage,
         limit: usize,
     ) -> Result<Restored<R>, RestoreFailure> {
-        let mut tree = Tree::rebuild(&snapshot.tree, &weaver_objects::Objects)?;
+        let mut tree = Tree::rebuild(&snapshot.tree, &storage.hardware)?;
         tree.nest_at_most(storage.nesting);
         same_volumes(&tree, root.volume_count())?;
         let runs = Runs::new(
@@ -101,7 +101,8 @@ impl<R: Root> GraphJob<R> {
             storage.slots,
             storage.mail,
             Arc::clone(&storage.accountant),
-        );
+        )
+        .on(storage.hardware);
         let mut writer = NamespaceWriter::new(
             scope,
             storage.working_dir,
@@ -109,8 +110,10 @@ impl<R: Root> GraphJob<R> {
             storage.free_disk,
         )
         .capped(storage.caps)
+        .metered(storage.metrics)
         .keeping_in(storage.kept_dir)
         .keeping(root.kept_files());
+        writer.restore_verifications(&snapshot.job.pending_verifications);
         writer.restore_members(&tree);
         for ((node, member), state) in &snapshot.files {
             if tree
@@ -120,8 +123,16 @@ impl<R: Root> GraphJob<R> {
             {
                 continue;
             }
-            writer.restore_file(&tree, *node, *member, *state)?;
+            writer.restore_file(&tree, *node, *member, state)?;
         }
+        // A file that still sits at a name it is moving off keeps that name
+        // from every other member until it has moved.
+        for (node, member, name) in writer.waiting() {
+            tree.leaving(node, member, &name);
+        }
+        let mut settled = Vec::new();
+        tree.settle_names(&mut settled);
+        writer.moved(&mut tree, &settled)?;
         writer.restore_read_backs(snapshot.job.read_backs);
         for kept in &snapshot.kept {
             writer.restore_kept(kept)?;
@@ -130,10 +141,13 @@ impl<R: Root> GraphJob<R> {
         let mut job = Self {
             tree,
             root,
-            builder: super::builder(storage.unpack),
+            builder: match storage.unpack {
+                true => Box::new(runs.hardware()),
+                false => super::builder(false),
+            },
             kept: R::Kept::default(),
             writer,
-            loans: Loans::new(runs.scope(), runs.mail()),
+            loans: Loans::new(runs.scope(), runs.mail(), runs.hardware()),
             runs,
             passwords: Passwords::new(storage.passwords),
             reported: snapshot.job.reported,
@@ -141,17 +155,33 @@ impl<R: Root> GraphJob<R> {
             moving: None,
             relocated: None,
             kept_existing: false,
+            mail_owed: None,
+            notes: Vec::new(),
+            fed: super::runs::Fed::default(),
+            sealed_at: None,
         };
         for (node, index) in &snapshot.passwords {
             job.offer_again(*node, *index)?;
         }
+        let rejected = job.tree.rejected_inputs(
+            NodeId::ROOT,
+            job.namespace().members().map(|member| member.id),
+        );
         let (refetched, read) = job.read_back()?;
+        job.writer.queue_rechecks(rejected);
         job.mark_damage()?;
+        let mut effects = Vec::new();
+        job.tree
+            .close_again(&mut job.writer.placing(&mut *job.builder), &mut effects);
+        job.settle(effects)?;
         for volume in 0..job.root.volume_count() {
             job.after_member(VolumeIndex(volume as u32))?;
         }
         job.repair()?;
         job.step_runs(Vec::new(), limit)?;
+        // What the restore closed again landed before the restart, and was
+        // said then.
+        job.notes.clear();
         Ok(Restored {
             settled: job.root.settled(),
             refetched,
@@ -343,7 +373,7 @@ impl<R: Root> GraphJob<R> {
                     node: NodeId::ROOT,
                     member: MemberId(read.volume.0),
                     offset: range.start,
-                    bytes,
+                    bytes: bytes.into(),
                     provenance,
                 },
                 &mut out,

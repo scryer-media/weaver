@@ -196,8 +196,8 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             tracing::debug!(job_id = 91_002_u64, "before the stall");
             tracing::debug!(job_id = 91_002_u64, "just before the stall");
-            job_debug_ring::dump(91_002, "test stall");
-            job_debug_ring::dump(91_002, "test stall");
+            job_debug_ring::dump(91_002, 0, "test stall");
+            job_debug_ring::dump(91_002, 0, "test stall");
         });
 
         let records = records.0.lock().unwrap();

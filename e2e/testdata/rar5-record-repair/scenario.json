@@ -1,0 +1,14 @@
+{
+  "slug": "rar5-record-repair",
+  "title": "E2E.Test.rar5.record.repair.2026-TESTGRP",
+  "description": "RAR5 embedded recovery repairs damaged bytes with no external recovery set.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "record.bin": "3a6157ad43a2bab09622e4785e1af8f81877c3e9f19ead61ad502e6092310e57"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks"
+  ],
+  "exactOutputFiles": true
+}

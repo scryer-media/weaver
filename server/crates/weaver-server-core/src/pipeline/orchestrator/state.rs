@@ -10,106 +10,6 @@ impl Pipeline {
             .join(job_id.0.to_string())
     }
 
-    // The job's staging root, registered on the job state so completion,
-    // cancel and failure treat it as the job's output.
-    //
-    // Only names the directory: nothing here touches the filesystem, since
-    // this runs on the pipeline task and the root sits under the complete
-    // directory. Whatever writes into it creates it — [`ExtractionRoot::open`]
-    // for extraction, the placement task for direct-store destinations — and
-    // every reader of an unwritten root treats it as empty.
-    pub(crate) fn extraction_staging_dir(&mut self, job_id: JobId) -> PathBuf {
-        if let Some(state) = self.jobs.get(&job_id)
-            && let Some(ref staging) = state.staging_dir
-        {
-            return staging.clone();
-        }
-        let staging = self.deterministic_extraction_staging_dir(job_id);
-        if let Some(state) = self.jobs.get_mut(&job_id) {
-            state.staging_dir = Some(staging.clone());
-        }
-        staging
-    }
-
-    pub(crate) fn extraction_budget(
-        &mut self,
-        job_id: JobId,
-        staging: &std::path::Path,
-    ) -> Result<Arc<JobExtractionBudget>, crate::pipeline::ExtractionError> {
-        if let Some(budget) = self.extraction_budgets.get(&job_id) {
-            return Ok(Arc::clone(budget));
-        }
-        let state = self.jobs.get(&job_id).ok_or_else(|| {
-            crate::pipeline::ExtractionError::terminal(format!("job {job_id:?} not found"))
-        })?;
-        let archive_sources = state
-            .assembly
-            .archive_topologies()
-            .values()
-            .flat_map(|topology| topology.volume_map.keys().cloned())
-            .collect::<HashSet<_>>();
-        // A direct set's source volumes never enter the archive topology —
-        // that is the point of the route — but they are archive input all the
-        // same, and their members land in the staging tree this budget is
-        // about to snapshot. Leaving them out collapses the ratio base to its
-        // floor and then counts the set's own finalized output as a
-        // violation of it.
-        let direct_source_files: HashSet<u32> = self
-            .direct_store
-            .sets_for(job_id)
-            .iter()
-            .flat_map(|set| set.plan().files.keys().copied())
-            .collect();
-        let declared_archive_bytes = state
-            .assembly
-            .files()
-            .filter(|file| {
-                archive_sources.contains(&self.current_filename_for_file(job_id, file))
-                    || direct_source_files.contains(&file.file_id().file_index)
-            })
-            .map(|file| file.total_bytes())
-            .sum::<u64>()
-            .max(1);
-        let (initial_entries, initial_bytes) = match ExtractionRoot::snapshot_usage(staging) {
-            Ok(usage) => usage,
-            Err(error) => {
-                let budget = JobExtractionBudget::with_capacity(
-                    Arc::clone(&self.extraction_limits),
-                    self.process_memory_budget.for_job(job_id.0),
-                    self.storage_capacity
-                        .reader(crate::operations::StorageRoot::Complete),
-                    staging.to_path_buf(),
-                    declared_archive_bytes,
-                    0,
-                    0,
-                    Arc::clone(&self.metrics),
-                )?;
-                let rejection = error.reject(&budget);
-                // Kept as the job's budget: the job fails on this refusal,
-                // and every later look at the budget must find it stopped
-                // on it rather than open a fresh one.
-                self.extraction_budgets.insert(job_id, budget);
-                return Err(rejection.into());
-            }
-        };
-        let budget = JobExtractionBudget::with_capacity(
-            Arc::clone(&self.extraction_limits),
-            self.process_memory_budget.for_job(job_id.0),
-            self.storage_capacity
-                .reader(crate::operations::StorageRoot::Complete),
-            staging.to_path_buf(),
-            declared_archive_bytes,
-            initial_entries,
-            initial_bytes,
-            Arc::clone(&self.metrics),
-        )?;
-        self.extraction_budgets.insert(job_id, Arc::clone(&budget));
-        let cancellation_budget = Arc::clone(&budget);
-        self.shared_state
-            .register_job_cancellation(job_id, Arc::new(move || cancellation_budget.cancel()));
-        Ok(budget)
-    }
-
     pub(crate) fn note_write_buffered(&mut self, bytes: usize, segments: usize) {
         self.write_buffered_bytes = self.write_buffered_bytes.saturating_add(bytes);
         self.write_buffered_segments = self.write_buffered_segments.saturating_add(segments);
@@ -188,45 +88,31 @@ impl Pipeline {
 
     pub(crate) fn publish_active_stage_metrics(&self) {
         self.metrics.set_active_downloads(self.active_downloads);
-        self.metrics.active_decodes.store(
-            self.active_decodes_by_job.values().sum::<usize>(),
-            Ordering::Relaxed,
-        );
+        self.metrics
+            .active_decodes
+            .store(self.active_decodes_by_job.total(), Ordering::Relaxed);
     }
 
     pub(crate) fn clear_job_write_backlog(&mut self, job_id: JobId) {
-        // Every map, not just the write buffers: a completed uuencode file
-        // keeps a tombstone entry in `uu_files` after its write buffer is gone
-        // (it is what suppresses the restart checkpoint), and teardown is where
-        // that entry is finally dropped. A file can also hold nothing but
-        // parked articles still waiting for the part before them.
+        // A uuencode file keeps its entry in `uu_files` until teardown drops
+        // it here. A file can also hold nothing but parked articles still
+        // waiting for the part before them.
         let file_ids: std::collections::HashSet<NzbFileId> = self
-            .write_buffers
+            .uu_files
             .keys()
-            .chain(self.uu_files.keys())
             .chain(self.unanchored_parked.keys())
             .copied()
             .filter(|file_id| file_id.job_id == job_id)
             .collect();
 
-        let mut released_bytes = 0usize;
-        let mut released_segments = 0usize;
-        let mut released_spooled_bytes = 0usize;
-        let mut released_spooled_segments = 0usize;
-        let mut released_uu_parked_segments = 0usize;
         for file_id in file_ids {
-            if let Some(buf) = self.write_buffers.remove(&file_id) {
-                released_bytes += buf.buffered_bytes();
-                released_segments += buf.buffered_len();
-            }
-            // Memory and disk parks use distinct ledgers. Removing the entry
-            // drops `TempPath` and unlinks every remaining per-job spool file.
+            // Memory and disk parks use distinct ledgers; each part is let
+            // go as any part is, its spool file with it.
             if let Some(uu) = self.uu_files.remove(&file_id) {
-                released_bytes += uu.parked_memory_bytes();
-                released_segments += uu.parked.len() - uu.parked_spooled_segments();
-                released_spooled_bytes += uu.parked_spooled_bytes();
-                released_spooled_segments += uu.parked_spooled_segments();
-                released_uu_parked_segments += uu.parked.len();
+                for part in uu.parked.into_values() {
+                    self.release_parked_bytes(part.bytes);
+                    self.release_uu_parked_segment();
+                }
             }
             self.uu_park_requeues
                 .retain(|segment_id, _| segment_id.file_id != file_id);
@@ -234,192 +120,14 @@ impl Pipeline {
                 .retain(|segment_id, _| segment_id.file_id != file_id);
             self.pending_unanchored_release
                 .retain(|segment_id| segment_id.file_id != file_id);
-            if let Some(parked) = self.unanchored_parked.remove(&file_id) {
-                released_bytes += parked
-                    .values()
-                    .map(|(result, _)| result.data.len_bytes())
-                    .sum::<usize>();
-                released_segments += parked.len();
+            for part in self
+                .unanchored_parked
+                .remove(&file_id)
+                .into_iter()
+                .flat_map(BTreeMap::into_values)
+            {
+                self.release_parked_bytes(part.bytes);
             }
-            self.file_prefix_16k.remove(&file_id);
-            self.file_proven_par2_fingerprint.remove(&file_id);
-            self.par3_inside_probes.remove(file_id);
-            self.file_declared_size.remove(&file_id);
         }
-
-        if released_bytes > 0 || released_segments > 0 {
-            self.release_write_buffered(released_bytes, released_segments);
-        }
-        if released_spooled_bytes > 0 || released_spooled_segments > 0 {
-            self.release_uu_spooled(released_spooled_bytes, released_spooled_segments);
-        }
-        for _ in 0..released_uu_parked_segments {
-            self.release_uu_parked_segment();
-        }
-        remove_empty_uu_park_dir(&self.uu_spool_root, job_id);
-    }
-
-    pub(crate) fn clear_job_extraction_runtime(&mut self, job_id: JobId) {
-        self.extracted_members.remove(&job_id);
-        self.extracted_archives.remove(&job_id);
-        self.missing_volume_archive_sets.remove(&job_id);
-        self.inflight_extractions.remove(&job_id);
-        self.failed_extractions.remove(&job_id);
-        // Released with the verdicts that would have lifted the hold: a
-        // reprocessed job re-learns its damage from the bytes it re-reads.
-        self.known_damaged_archive_sets.remove(&job_id);
-        self.pending_concat.remove(&job_id);
-        self.par2_bypassed.remove(&job_id);
-        self.par2_discovery_wait_logged.remove(&job_id);
-        self.par2_verified.remove(&job_id);
-        // The verdict that retired them is gone, so a reprocessed job rebuilds
-        // its split topologies and asks the recovery set again.
-        self.par2_joined_split_sets.remove(&job_id);
-        self.recovery_unposted_outputs.remove(&job_id);
-        // The verdict is gone, so the post-verdict re-entry budget goes with it.
-        if let Some(runtime) = self.par2_runtime.get_mut(&job_id)
-            && let Some(set_runtime) = runtime.served_mut()
-        {
-            set_runtime.post_verdict_reconcile_attempts = 0;
-        }
-        self.par2_pre_repair_dir_entries.remove(&job_id);
-        self.sfv_checked.remove(&job_id);
-    }
-
-    pub(crate) fn clear_job_rar_runtime(&mut self, job_id: JobId) {
-        self.eagerly_deleted.remove(&job_id);
-        self.rar_sets.retain(|(jid, _), _| *jid != job_id);
-        self.clear_rar_unlock_priorities(job_id);
-        self.pending_rar_capacity_retries
-            .retain(|(jid, _, _)| *jid != job_id);
-        self.rar_waiting_members
-            .retain(|(jid, _, _), _| *jid != job_id);
-        self.normalization_retried.remove(&job_id);
-    }
-
-    // Record that an archive set's source bytes are known wrong.
-    //
-    // Two seams record this today: a direct-store demotion whose reason is
-    // damage (`DemotionReason::is_source_damage`), and a direct-unpack part
-    // completing with in-stream damage reported against it. The fact is
-    // deliberately not tied to either: any path that establishes a volume
-    // is damaged before a recovery set has ruled — an in-place repair of a
-    // mismatched part included — records it here, and the completion gate
-    // keeps answering correctly without learning a new vocabulary.
-    pub(in crate::pipeline) fn note_known_archive_set_damage(
-        &mut self,
-        job_id: JobId,
-        set_name: &str,
-    ) {
-        if self
-            .known_damaged_archive_sets
-            .entry(job_id)
-            .or_default()
-            .insert(set_name.to_string())
-        {
-            tracing::info!(
-                job_id = job_id.0,
-                set_name = %set_name,
-                "archive set damage on record — recovery must settle before this job extracts"
-            );
-        }
-    }
-
-    // Whether extraction for this job must wait for the recovery set's
-    // verdict because damage is already on record.
-    //
-    // PAR3 publications must settle before known damaged sources are extracted.
-    // PAR2 keeps its existing four release conditions below.
-    // Four releases, and a job with none of them would never extract at all,
-    // which is why each is checked rather than assumed: no recovery set to
-    // ask, a set the job has bypassed, a verdict already in hand
-    // (`par2_verified` is set by both the clean pass and the tail of a
-    // repair), and a served set that has *settled* — asked and answered, even
-    // when the answer was one it could not act on. Without that last one an
-    // unrepairable set would hold its own undamaged members hostage waiting
-    // for a second verdict that is never coming.
-    //
-    // A clean job records nothing and is not touched by this — the
-    // extract-first path stays exactly as it is, with no hash pass added.
-    pub(in crate::pipeline) fn archive_extraction_held_for_known_damage(
-        &self,
-        job_id: JobId,
-    ) -> bool {
-        if !self
-            .known_damaged_archive_sets
-            .get(&job_id)
-            .is_some_and(|sets| !sets.is_empty())
-        {
-            return false;
-        }
-        if self.par3_verification_pending(job_id) {
-            return true;
-        }
-        if self.par2_set(job_id).is_none()
-            || self.par2_bypassed.contains(&job_id)
-            || self.par2_verified.contains(&job_id)
-        {
-            return false;
-        }
-        !self.par2_served_set_id(job_id).is_some_and(|set_id| {
-            self.par2_runtime(job_id)
-                .and_then(|runtime| runtime.set_runtime(set_id))
-                .is_some_and(|set_runtime| set_runtime.settled)
-        })
-    }
-
-    pub(crate) fn set_failed_extraction_member(&mut self, job_id: JobId, member_name: &str) {
-        self.failed_extractions
-            .entry(job_id)
-            .or_default()
-            .insert(member_name.to_string());
-    }
-
-    pub(crate) fn replace_failed_extraction_members(
-        &mut self,
-        job_id: JobId,
-        members: HashSet<String>,
-    ) {
-        if members.is_empty() {
-            self.failed_extractions.remove(&job_id);
-        } else {
-            self.failed_extractions.insert(job_id, members.clone());
-        }
-    }
-
-    pub(crate) fn set_normalization_retried_state(
-        &mut self,
-        job_id: JobId,
-        normalization_retried: bool,
-    ) {
-        if normalization_retried {
-            self.normalization_retried.insert(job_id);
-        } else {
-            self.normalization_retried.remove(&job_id);
-        }
-        if let Err(error) = self
-            .db
-            .set_active_job_normalization_retried(job_id, normalization_retried)
-        {
-            error!(
-                job_id = job_id.0,
-                normalization_retried,
-                error = %error,
-                "failed to persist normalization retry state"
-            );
-        }
-    }
-
-    pub(crate) fn write_target_for_file(
-        &self,
-        file_id: NzbFileId,
-    ) -> Option<(JobId, String, PathBuf, PathBuf)> {
-        let job_id = file_id.job_id;
-        let state = self.jobs.get(&job_id)?;
-        let file_asm = state.assembly.file(file_id)?;
-        let filename = self.current_filename_for_file(job_id, file_asm);
-        let working_dir = state.working_dir.clone();
-        let file_path = working_dir.join(&filename);
-        Some((job_id, filename, working_dir, file_path))
     }
 }

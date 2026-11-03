@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use par2_rs::checksum::md5;
 use par2_rs::{FileId, Packet, Par2FileSet};
 use serde::{Deserialize, Serialize};
 use weaver_graph::recovery::RepairOutcome;
@@ -17,6 +18,7 @@ use weaver_graph::{ByteRange, Coverage, MemberId, Sealed, Seek, VolumeIndex, Wei
 use super::facts::Packets;
 use super::repair::SetRepair;
 use super::walker::Walker;
+use crate::lost::Lost;
 use crate::recovery_volume;
 
 const MAX_PAR2_INPUT_SLICES: u64 = 32_768;
@@ -40,10 +42,19 @@ pub(super) struct SetState {
     // The set as far as its metadata has arrived; `None` until its main
     // packet has.
     pub(super) index: Option<Par2FileSet>,
+    described: bool,
+    pub(super) checksummed: bool,
     // Each described file's whole CRC32, folded from its slice checksums
     // when the index is built: the index is fixed until a new packet
     // rebuilds it, so the fold is too.
     whole: BTreeMap<FileId, u32>,
+    // The slices that share their checksums with another, by those
+    // checksums, folded with `whole`: equal checksums are equal bytes, so
+    // each holds the others' bytes.
+    alike: BTreeMap<SliceKey, Vec<(FileId, u64)>>,
+    // The described files by the hash of their front, folded with `whole`:
+    // what a member's front digest finds its file by.
+    fronts: BTreeMap<Front, Vec<FileId>>,
     // Recovery packets by exponent: the first copy found is the one kept.
     pub(super) recovery: BTreeMap<u32, Location>,
     // Which member each described file is bound to: by its front, its
@@ -64,7 +75,11 @@ impl SetState {
             packets: Sealed::default(),
             hashes: BTreeSet::new(),
             index: None,
+            described: false,
+            checksummed: false,
             whole: BTreeMap::new(),
+            alike: BTreeMap::new(),
+            fronts: BTreeMap::new(),
             recovery: BTreeMap::new(),
             members: BTreeMap::new(),
             unnamed: Vec::new(),
@@ -72,17 +87,38 @@ impl SetState {
         }
     }
 
-    // Take a metadata packet; the index is rebuilt when it is new. A set's
-    // metadata is a few packets per file, so rebuilding is cheaper than
-    // keeping two ways of growing it. A set whose geometry is past the
-    // limits has no index.
-    pub(super) fn take_metadata(&mut self, hash: [u8; 16], packet: Packet, output_limit: u64) {
+    // Collect distinct packets; the caller rebuilds once per ingestion batch.
+    pub(super) fn take_metadata(&mut self, hash: [u8; 16], packet: Packet) -> bool {
         if !self.hashes.insert(hash) {
-            return;
+            return false;
         }
         self.packets.change(|packets| packets.0.push(packet));
+        true
+    }
+
+    pub(super) fn rebuild(&mut self, output_limit: u64) {
         self.index = index_of(&self.packets.get().0, output_limit);
         self.whole = whole_of(self.index.as_ref());
+        self.alike = alike_of(self.index.as_ref());
+        self.fronts = fronts_of(self.index.as_ref());
+        self.index_changed();
+        self.last = None;
+    }
+
+    // Readiness is a property of metadata, never work for a dispatch query.
+    pub(super) fn index_changed(&mut self) {
+        self.described = self.index.as_ref().is_some_and(|index| {
+            index
+                .recovery_file_ids
+                .iter()
+                .all(|id| index.file_description(id).is_some())
+        });
+        self.checksummed = self.index.as_ref().is_some_and(|index| {
+            index
+                .recovery_file_ids
+                .iter()
+                .all(|id| index.file_checksums(id).is_some())
+        });
     }
 
     // A set as a checkpoint recorded it: the index is rebuilt from its
@@ -94,13 +130,17 @@ impl SetState {
         output_limit: u64,
     ) -> Self {
         let index = index_of(&packets.get().0, output_limit);
-        Self {
+        let mut state = Self {
             whole: whole_of(index.as_ref()),
+            alike: alike_of(index.as_ref()),
+            fronts: fronts_of(index.as_ref()),
             index,
             packets,
             hashes,
             ..Self::new(first_seen)
-        }
+        };
+        state.index_changed();
+        state
     }
 
     pub(super) fn packets(&self) -> &Sealed<Packets> {
@@ -111,24 +151,32 @@ impl SetState {
         &self.hashes
     }
 
-    // An index that can verify every file it protects: each has its
-    // description and, unless empty, its slice checksums.
+    // An index that describes every file it protects: each has its
+    // description, which names it, sizes it and hashes it whole. Its slice
+    // checksums, when the set carries them, say which slices are good; a
+    // file without them is checked whole and rebuilt whole.
     pub(super) fn usable(&self) -> Option<&Par2FileSet> {
-        let index = self.index.as_ref()?;
-        index
-            .recovery_file_ids
-            .iter()
-            .all(|id| {
-                index.file_description(id).is_some_and(|description| {
-                    description.length == 0 || index.file_checksums(id).is_some()
-                })
-            })
-            .then_some(index)
+        self.described.then_some(self.index.as_ref()).flatten()
     }
 
     // The CRC32 the described file's slices fold to.
     pub(super) fn whole(&self, file: FileId) -> Option<u32> {
         self.whole.get(&file).copied()
+    }
+
+    // Every slice whose bytes are those of `slice` of `file`, itself among
+    // them; none when no other slice shares its checksums.
+    pub(super) fn alike(&self, file: FileId, slice: u64) -> &[(FileId, u64)] {
+        self.index
+            .as_ref()
+            .and_then(|index| slice_key(index, file, slice))
+            .and_then(|key| self.alike.get(&key))
+            .map_or(&[], Vec::as_slice)
+    }
+
+    // The described files whose front is `front`, in file order.
+    pub(super) fn fronted(&self, front: &Front) -> &[FileId] {
+        self.fronts.get(front).map_or(&[], Vec::as_slice)
     }
 
     pub(super) fn members(&self) -> &BTreeMap<FileId, MemberId> {
@@ -192,16 +240,30 @@ impl SetState {
         self.members.insert(file, member);
     }
 
-    // An impossible verdict counted the blocks of the volumes bound then; a
-    // volume bound since may bring more, so the set is tried again. Without
+    // Damage shown since an unread verdict may be what the descriptions
+    // the set has not read cover, so the set is tried again. An impossible
+    // verdict stands: damage only grows, so what the set could not rebuild
+    // it still cannot.
+    pub(super) fn damage_shown(&mut self) {
+        if self
+            .last
+            .is_some_and(|last| last.outcome == RepairOutcome::Unread)
+        {
+            self.last = None;
+        }
+    }
+
+    // An impossible verdict counted the blocks of the volumes bound then,
+    // and an unread one the descriptions they could bring; a volume bound
+    // since may bring more of either, so the set is tried again. Without
     // this the verdict would depend on whether a volume's front decided
     // before or after the damage arrived.
     pub(super) fn reopen(&mut self) {
-        let impossible = matches!(
+        let stale = matches!(
             self.last.map(|last| last.outcome),
-            Some(RepairOutcome::Impossible { .. })
+            Some(RepairOutcome::Impossible { .. } | RepairOutcome::Unread)
         );
-        if impossible {
+        if stale {
             self.last = None;
         }
     }
@@ -233,24 +295,34 @@ impl SetState {
 pub(super) struct Volume {
     pub(super) walker: Walker,
     pub(super) arrived: Coverage,
-    pub(super) lost: Vec<ByteRange>,
+    pub(super) lost: Lost,
     pub(super) closed: bool,
     // The recovery blocks the volume's name says it carries.
     pub(super) named_blocks: Option<u64>,
     pub(super) walked_blocks: u64,
     // The sets whose packets the walk has found in it.
     pub(super) sets: BTreeSet<[u8; 16]>,
+    // The name it was bound under, which a later volume of the set continues.
+    pub(super) name: Option<String>,
 }
 
 impl Volume {
     pub(super) fn name(&mut self, name: &str) {
         self.named_blocks = recovery_volume::named_blocks(name, ".par2");
+        self.name = Some(name.to_owned());
     }
 
     // Whether the volume can bring the set blocks: it carries the set's
     // packets, or nothing of it has been walked to say whose it is.
     pub(super) fn serves(&self, set: &[u8; 16]) -> bool {
         self.sets.is_empty() || self.sets.contains(set)
+    }
+
+    // Whether every byte of the volume was walked: it is closed and nothing
+    // of it was lost. One closed over a loss was never read where the loss
+    // lies, and a volume lost whole was never read at all.
+    pub(super) fn read_through(&self) -> bool {
+        self.closed && self.lost.is_empty()
     }
 
     // Whether the walk has shown the volume carries recovery blocks: one
@@ -276,14 +348,22 @@ impl Volume {
         });
     }
 
-    // Recovery blocks still to come, by the volume's name, less what was
-    // walked and what a lost range could have held. `packet` is the smallest
-    // recovery packet any known set writes, so a loss is never undercounted.
-    pub(super) fn coming(&self, packet: Option<u64>) -> u64 {
+    // The most recovery blocks the volume may still bring: what its name
+    // says it carries, less what was walked. A loss inside it is not counted
+    // against it, so this never falls short of the blocks really there.
+    pub(super) fn left(&self) -> u64 {
         if self.closed {
             return 0;
         }
-        let named = self.named_blocks.unwrap_or(0);
+        self.named_blocks
+            .unwrap_or(0)
+            .saturating_sub(self.walked_blocks)
+    }
+
+    // The fewest recovery blocks the volume will still bring: what is left,
+    // less what a lost range could have held. `packet` is the smallest
+    // recovery packet any known set writes, so a loss is never undercounted.
+    pub(super) fn coming(&self, packet: Option<u64>) -> u64 {
         let lost: u64 = match packet {
             Some(packet) if packet > 0 => self
                 .lost
@@ -291,11 +371,9 @@ impl Volume {
                 .map(|range| range.len().div_ceil(packet) + 1)
                 .sum(),
             _ if self.lost.is_empty() => 0,
-            _ => named,
+            _ => self.left(),
         };
-        named
-            .saturating_sub(self.walked_blocks)
-            .saturating_sub(lost)
+        self.left().saturating_sub(lost)
     }
 }
 
@@ -314,6 +392,80 @@ fn whole_of(index: Option<&Par2FileSet>) -> BTreeMap<FileId, u32> {
         .keys()
         .filter_map(|file| Some((*file, index.expected_file_crc32(*file)?)))
         .collect()
+}
+
+// A slice's checksums, which name its bytes.
+type SliceKey = (u32, [u8; 16]);
+
+fn slice_key(index: &Par2FileSet, file: FileId, slice: u64) -> Option<SliceKey> {
+    let checksum = index
+        .file_checksums(&file)?
+        .get(usize::try_from(slice).ok()?)?;
+    Some((checksum.crc32, checksum.md5))
+}
+
+fn alike_of(index: Option<&Par2FileSet>) -> BTreeMap<SliceKey, Vec<(FileId, u64)>> {
+    let Some(index) = index else {
+        return BTreeMap::new();
+    };
+    let mut alike: BTreeMap<SliceKey, Vec<(FileId, u64)>> = BTreeMap::new();
+    for file in index.files.keys() {
+        for (slice, checksum) in index.file_checksums(file).into_iter().flatten().enumerate() {
+            alike
+                .entry((checksum.crc32, checksum.md5))
+                .or_default()
+                .push((*file, slice as u64));
+        }
+    }
+    alike.retain(|_, slices| slices.len() > 1);
+    alike
+}
+
+// PAR2 identifies a file by the MD5 of at most this much of its front.
+const HASH_WINDOW: u64 = 16 * 1024;
+
+// A front as PAR2 names a file by it: the MD5 of its first bytes, up to
+// HASH_WINDOW, with how many there were. A front shorter than the window
+// answers only for a file of its own length, since a longer front would
+// already contradict a shorter file, and a full one for every file at least
+// the window long: one front answers for every description it could be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct Front {
+    window: u64,
+    md5: [u8; 16],
+}
+
+impl Front {
+    // The front of a member's first bytes; none until one arrived.
+    pub(super) fn of(first_bytes: &[u8]) -> Option<Self> {
+        let window = HASH_WINDOW.min(first_bytes.len() as u64);
+        (window > 0).then(|| Self {
+            window,
+            md5: md5(&first_bytes[..window as usize]),
+        })
+    }
+
+    // The front a description states for its file.
+    fn described(length: u64, hash_16k: [u8; 16]) -> Self {
+        Self {
+            window: length.min(HASH_WINDOW),
+            md5: hash_16k,
+        }
+    }
+}
+
+fn fronts_of(index: Option<&Par2FileSet>) -> BTreeMap<Front, Vec<FileId>> {
+    let mut fronts: BTreeMap<Front, Vec<FileId>> = BTreeMap::new();
+    for description in index.into_iter().flat_map(|index| index.files.values()) {
+        fronts
+            .entry(Front::described(description.length, description.hash_16k))
+            .or_default()
+            .push(description.file_id);
+    }
+    for files in fronts.values_mut() {
+        files.sort();
+    }
+    fronts
 }
 
 // Admit declared geometry before anything is built on it.

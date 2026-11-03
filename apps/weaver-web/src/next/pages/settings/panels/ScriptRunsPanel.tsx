@@ -5,6 +5,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { Link } from "react-router";
 import { gql, useClient } from "urql";
 import { SCRIPT_RUNS_QUERY } from "@/graphql/queries";
+import { copyText } from "@/lib/clipboard";
 import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { FireAndForgetTag, ScriptRunName, ScriptStatusMark, TruncatedTag, scriptRunName } from "../../../components/JobScriptResults";
@@ -132,14 +133,11 @@ function RunDetail({
   const name = scriptRunName(run);
   const adapter = run.adapter === null ? null : run.adapter === "SABNZBD" ? "SABnzbd" : "NZBGet";
   const copy = () => {
-    if (shown === null || !navigator.clipboard) {
+    if (shown === null) {
       onCopied(false);
       return;
     }
-    navigator.clipboard.writeText(shown).then(
-      () => onCopied(true),
-      () => onCopied(false),
-    );
+    void copyText(shown).then(onCopied);
   };
   return (
     <div className="flex min-w-0 flex-col gap-2">

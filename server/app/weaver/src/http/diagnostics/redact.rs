@@ -43,8 +43,9 @@ const SENSITIVE_JSON_NEEDLES: [&str; 12] = [
 ];
 
 // Needles for on-disk configuration files, where a bare `key` is far more
-// likely to be a credential than a structural field name.
-const SENSITIVE_CONFIG_NEEDLES: [&str; 4] = ["password", "secret", "key", "token"];
+// likely to be a credential than a structural field name, and an account
+// name identifies the subscription it signs in to.
+const SENSITIVE_CONFIG_NEEDLES: [&str; 5] = ["password", "secret", "key", "token", "username"];
 
 // Whether a JSON object key names something that must not leave the host.
 pub(super) fn is_sensitive_json_key(key: &str) -> bool {

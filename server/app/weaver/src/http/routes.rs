@@ -108,6 +108,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
     let super::ServerRuntime {
         schema,
         handle,
+        pipeline_state,
         scheduled_resume,
         db,
         auth_cache,
@@ -181,6 +182,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
     let nzbget_context = super::nzbget::NzbgetFacadeContext::new(
         db.clone(),
         handle.clone(),
+        pipeline_state.clone(),
         config.clone(),
         auth_cache.clone(),
         api_key_cache.clone(),
@@ -242,6 +244,7 @@ pub(super) fn build_router(runtime: super::ServerRuntime) -> Router {
         .fallback(get(super::assets::static_handler))
         .layer(middleware::from_fn(super::auth::enforce_browser_csrf))
         .layer(Extension(handle))
+        .layer(Extension(pipeline_state))
         .layer(Extension(schema))
         .layer(Extension(backup))
         .layer(Extension(db))

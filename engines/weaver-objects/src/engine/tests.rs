@@ -4,7 +4,6 @@
 use weaver_graph::{Object, Seek, VolumeIndex};
 
 use crate::rar_engine::RarEngine;
-use crate::sevenz_engine::SevenZipEngine;
 use crate::testing::replay::{Step, contains, restores_alike};
 use crate::zip_engine::ZipEngine;
 
@@ -24,7 +23,7 @@ fn restored(engine: Box<dyn Object>, names: [&str; 3], last: u32) {
     assert!(!contains(&facts.bytes, PASSWORD.as_bytes()));
     let claim = |object: &mut Box<dyn Object>| object.claim(names[1], &[], None);
     assert_eq!(claim(&mut live), claim(&mut again));
-    assert_eq!(claim(&mut live), Some(VolumeIndex(1)));
+    assert_eq!(claim(&mut live), vec![VolumeIndex(1)]);
     let bids = |object: &mut Box<dyn Object>| {
         let mut out: Vec<Seek> = Vec::new();
         object.wants(&mut out);
@@ -41,15 +40,10 @@ fn restored(engine: Box<dyn Object>, names: [&str; 3], last: u32) {
 }
 
 #[test]
-fn every_engine_restored_from_its_facts_claims_and_bids_alike() {
+fn every_engine_of_volumes_restored_from_its_facts_claims_and_bids_alike() {
     restored(
         Box::new(RarEngine::new()),
         ["alpha.part1.rar", "alpha.part2.rar", "alpha.part3.rar"],
-        2,
-    );
-    restored(
-        Box::new(SevenZipEngine::new()),
-        ["alpha.7z.001", "alpha.7z.002", "alpha.7z.003"],
         2,
     );
     restored(

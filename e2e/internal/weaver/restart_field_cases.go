@@ -6,12 +6,15 @@ package weaver
 import (
 	"bufio"
 	"bytes"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -179,6 +182,102 @@ func nzbSegments(slug string) ([]nzbSegmentRef, error) {
 	return out, nil
 }
 
+// decodedRange is the bytes of its file an article decodes to, as [Start, End).
+type decodedRange struct {
+	Start uint64
+	End   uint64
+}
+
+var ybeginSize = regexp.MustCompile(`^=ybegin .*\bsize=(\d+)`)
+
+// articleDecodedRange reads the range an article decodes to from its yEnc
+// header lines: `=ypart begin= end=` (one-based, inclusive) for a part of a
+// multi-part file, or the whole of `=ybegin size=` for a file in one article.
+func articleDecodedRange(wire []byte) (decodedRange, error) {
+	var size uint64
+	sawSize := false
+	for _, line := range bytes.Split(wire, []byte("\n")) {
+		line = bytes.TrimRight(line, "\r")
+		if match := ypartLine.FindSubmatch(line); match != nil {
+			begin, err := strconv.ParseUint(string(match[1]), 10, 64)
+			if err != nil {
+				return decodedRange{}, err
+			}
+			end, err := strconv.ParseUint(string(match[2]), 10, 64)
+			if err != nil {
+				return decodedRange{}, err
+			}
+			if begin == 0 || end < begin {
+				return decodedRange{}, fmt.Errorf("=ypart begin=%d end=%d is not a range", begin, end)
+			}
+			return decodedRange{Start: begin - 1, End: end}, nil
+		}
+		if match := ybeginSize.FindSubmatch(line); match != nil && !sawSize {
+			value, err := strconv.ParseUint(string(match[1]), 10, 64)
+			if err != nil {
+				return decodedRange{}, err
+			}
+			size, sawSize = value, true
+		}
+	}
+	if !sawSize {
+		return decodedRange{}, fmt.Errorf("no yEnc header")
+	}
+	return decodedRange{Start: 0, End: size}, nil
+}
+
+// segmentDecodedRanges reads, by message id, the range each segment decodes
+// to, from the articles the news server holds. ARTICLE is not a BODY, so the
+// server's body counts do not see it.
+func segmentDecodedRanges(host, port string, segments []nzbSegmentRef) (map[string]decodedRange, error) {
+	session, err := openNntpCommandSession(host, port, true)
+	if err != nil {
+		return nil, err
+	}
+	defer session.close()
+	out := make(map[string]decodedRange, len(segments))
+	for _, segment := range segments {
+		wire, err := readStoredArticle(session, segment.MessageID)
+		if err != nil {
+			return nil, err
+		}
+		decoded, err := articleDecodedRange(wire)
+		if err != nil {
+			return nil, fmt.Errorf("<%s>: %w", segment.MessageID, err)
+		}
+		out[segment.MessageID] = decoded
+	}
+	return out, nil
+}
+
+// coveredArticles names the articles whose decoded bytes the checkpoint rows
+// hold whole: the articles a restart may never fetch again.
+func coveredArticles(segments []nzbSegmentRef, ranges map[string]decodedRange, rows []fileCoverageRow) map[string]bool {
+	covered := map[string]bool{}
+	for _, row := range rows {
+		for _, segment := range segments {
+			decoded, known := ranges[segment.MessageID]
+			if known && segment.FileIndex == row.FileIndex && row.Coverage.Covers(decoded.Start, decoded.End) {
+				covered[segment.MessageID] = true
+			}
+		}
+	}
+	return covered
+}
+
+// refetchedArticles lists, sorted, the covered articles the server served
+// again between the two readings of its body counts.
+func refetchedArticles(covered map[string]bool, before, after restartNntpMetrics) []string {
+	var out []string
+	for id, count := range after.BodyCounts {
+		if count > before.BodyCounts[id] && covered[id] {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func fileBLAKE3(path string) (string, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -207,9 +306,10 @@ func completedFilesBySize(size int64) []string {
 
 // R1. One article early in a single plain file is missing while the rest of
 // the file downloads, so the file's coverage has a hole near its start and
-// most of its bytes past it. A restart must keep every covered ordinal and
-// fetch only what the checkpoint did not cover, the hole among them.
-func runEarlyGapRestartRefetchesOnlyTheGap(ctx *restartCaseContext) (restartCaseResult, error) {
+// most of its bytes past it. A restart must keep the healthy durable bytes
+// and the definitive missing-article refusal. Restoring the provider's article
+// does not turn a process restart into a new download attempt.
+func runEarlyGapRestartPreservesBytesAndRefusal(ctx *restartCaseContext) (restartCaseResult, error) {
 	const slug = "single-mkv"
 	const checkpointBytes = 4 * 1024 * 1024
 	checkpointEnv := fmt.Sprintf("WEAVER_E2E_DOWNLOAD_RESTART_CHECKPOINT_BYTES=%d", checkpointBytes)
@@ -232,6 +332,13 @@ func runEarlyGapRestartRefetchesOnlyTheGap(ctx *restartCaseContext) (restartCase
 	if gap == nil {
 		return restartCaseResult{}, fmt.Errorf("%s has no segment %d", slug, gapNumber)
 	}
+	// The checkpoint holds decoded bytes, so each article is named by the
+	// range it decodes to, read before the gap's article is taken away.
+	ranges, err := segmentDecodedRanges(nntpHost(), nntpPort(), segments)
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	gapRange := ranges[gap.MessageID]
 	putBack, err := withholdArticles(nntpHost(), nntpPort(), []string{gap.MessageID})
 	if err != nil {
 		return restartCaseResult{}, err
@@ -269,7 +376,8 @@ func runEarlyGapRestartRefetchesOnlyTheGap(ctx *restartCaseContext) (restartCase
 		if err == nil {
 			lastCoverage = rows
 			for _, row := range rows {
-				if row.FileIndex == gap.FileIndex && row.Err == nil && !row.Coverage.Contains(gap.Ordinal) && row.Coverage.CoveredBytes() >= coveredFloor {
+				healthy := row.Coverage.Healthy()
+				if row.FileIndex == gap.FileIndex && !healthy.Covers(gapRange.Start, gapRange.End) && healthy.CoveredBytes() >= coveredFloor {
 					reached = true
 				}
 			}
@@ -281,8 +389,9 @@ func runEarlyGapRestartRefetchesOnlyTheGap(ctx *restartCaseContext) (restartCase
 	}
 	if !reached {
 		_, _, _, _ = ctx.captureEvidence("pre_timeout", "")
+		coverageJSON, _ := json.Marshal(lastCoverage)
 		return classifyRestartResult(ctx.Profile, false, "", false, "",
-			fmt.Sprintf("the restart point was never reached: no checkpoint covered %d bytes past the missing ordinal %d (last coverage %+v)", coveredFloor, gap.Ordinal, lastCoverage)), nil
+			fmt.Sprintf("the restart point was never reached: no checkpoint covered %d healthy bytes past the missing ordinal %d (last coverage %s)", coveredFloor, gap.Ordinal, coverageJSON)), nil
 	}
 
 	if err := ctx.interruptWeaverAndWaitForExit(); err != nil {
@@ -301,19 +410,18 @@ func runEarlyGapRestartRefetchesOnlyTheGap(ctx *restartCaseContext) (restartCase
 		return classifyRestartResult(ctx.Profile, false, "", false, "",
 			fmt.Sprintf("job was %q at shutdown, not an active download", status)), nil
 	}
-	covered := map[string]bool{}
+	proof, err := readCheckpointEvidence(dbPath, jobID)
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	writeRestartJSON(filepath.Join(ctx.CaseDir, "pre_restart_checkpoint.json"), proof)
+	covered := directDurableArticles(segments, ranges, proof)
+	if len(covered) == 0 {
+		return restartCaseResult{}, fmt.Errorf("early-gap checkpoint contains no proven durable articles")
+	}
 	var coveredBytes uint64
 	for _, row := range preCoverage {
-		if row.Err != nil {
-			return classifyRestartResult(ctx.Profile, false, "", false, "",
-				fmt.Sprintf("file %d checkpoint does not decode: %v", row.FileIndex, row.Err)), nil
-		}
-		coveredBytes += row.Coverage.CoveredBytes()
-		for _, segment := range segments {
-			if segment.FileIndex == row.FileIndex && row.Coverage.Contains(segment.Ordinal) {
-				covered[segment.MessageID] = true
-			}
-		}
+		coveredBytes += row.Coverage.Healthy().CoveredBytes()
 	}
 	if covered[gap.MessageID] {
 		return classifyRestartResult(ctx.Profile, false, "", false, "",
@@ -336,19 +444,9 @@ func runEarlyGapRestartRefetchesOnlyTheGap(ctx *restartCaseContext) (restartCase
 		return restartCaseResult{}, err
 	}
 
-	var refetchedCovered []string
+	refetchedCovered := refetchedArticles(covered, preNntp, postNntp)
 	gapFetched := postNntp.BodyCounts[gap.MessageID] > preNntp.BodyCounts[gap.MessageID]
-	fetchedAfter := 0
-	for id, count := range postNntp.BodyCounts {
-		if count <= preNntp.BodyCounts[id] {
-			continue
-		}
-		fetchedAfter++
-		if covered[id] {
-			refetchedCovered = append(refetchedCovered, id)
-		}
-	}
-	sort.Strings(refetchedCovered)
+	fetchedAfter, _ := bodyFetchesSinceRestartPoint(preNntp, postNntp)
 
 	source := filepath.Join(testdataDir(), slug, "test-media.mkv")
 	info, err := os.Stat(source)
@@ -370,15 +468,17 @@ func runEarlyGapRestartRefetchesOnlyTheGap(ctx *restartCaseContext) (restartCase
 
 	detail := fmt.Sprintf("covered_at_shutdown=%d bytes (%d of %d ordinals) gap_ordinal=%d fetched_after_restart=%d refetched_covered=%d gap_refetched=%t final=%s output_ok=%t",
 		coveredBytes, len(covered), len(segments), gap.Ordinal, fetchedAfter, len(refetchedCovered), gapFetched, statuses[jobID], outputOK)
-	pass := statuses[jobID] == "COMPLETE" && len(refetchedCovered) == 0 && gapFetched && outputOK
+	// There is no recovery or other usable end file in this post. The persisted
+	// refusal must therefore end Failed, even though the provider now has it.
+	pass := statuses[jobID] == "FAILED" && len(refetchedCovered) == 0 && !gapFetched && !outputOK
 	failure := "early-gap restart: " + detail
 	if len(refetchedCovered) > 0 {
 		failure += fmt.Sprintf(" refetched covered ids: %v", refetchedCovered)
 	}
-	if !outputOK {
+	if outputOK {
 		failure += fmt.Sprintf(" output candidates=%v last_blake3=%s want=%s", outputs, got, want)
 	}
-	return classifyRestartResult(ctx.Profile, pass, "restart after an early gap fetched only what the checkpoint did not cover: "+detail, false, "", failure), nil
+	return classifyRestartResult(ctx.Profile, pass, "restart preserved healthy durable bytes and the missing-article refusal: "+detail, false, "", failure), nil
 }
 
 // R2. The operator stops Weaver while a job is verifying. Every article was
@@ -442,6 +542,7 @@ func runInterruptDuringVerifyingRefetchesNothing(ctx *restartCaseContext) (resta
 // The log lines a PAR2 pass writes while it scans or repairs. None may follow
 // the drain's last line.
 var par2PassLogNeedles = []string{
+	"graph repair worker",
 	"par2 damaged-path analysis",
 	"par2 repair",
 	"par2 scan",
@@ -528,7 +629,15 @@ func runInterruptDuringPar2PassStopsThePass(ctx *restartCaseContext) (restartCas
 		return restartCaseResult{}, err
 	}
 	secondRun := stripANSIEscapeSequences(string(full[len(firstRun):]))
-	rescanned := strings.Contains(secondRun, "par2 damaged-path analysis started")
+	startedAgain := len(graphLogEvents(secondRun, jobID, "graph repair worker started")) > 0
+	cancelled := false
+	for _, started := range graphLogEvents(string(firstRun), jobID, "graph repair worker started") {
+		for _, ended := range graphLogEvents(string(firstRun), jobID, "graph repair worker ended") {
+			if started["node"] == ended["node"] && started["generation"] == ended["generation"] && ended["cancelled"] == "true" {
+				cancelled = true
+			}
+		}
+	}
 	repaired := false
 	if kinds, err := jobEventKinds(caseDBPath(ctx), jobID); err == nil && len(kinds) >= len(preKinds) {
 		for _, kind := range kinds[len(preKinds):] {
@@ -538,9 +647,17 @@ func runInterruptDuringPar2PassStopsThePass(ctx *restartCaseContext) (restartCas
 		}
 	}
 
-	detail := fmt.Sprintf("status_at_shutdown=%s drain_finished=%t pass_lines_after_signal=%d pass_lines_after_drain=%d rescanned_after_restart=%t repaired_after_restart=%t final=%s",
-		preStatus, stoppedAt >= 0, len(afterSignal), len(afterDrain), rescanned, repaired, statuses[jobID])
-	pass := stoppedAt >= 0 && len(afterDrain) == 0 && rescanned && repaired && statuses[jobID] == "COMPLETE"
+	if err := waitForJobArchived(caseDBPath(ctx), jobID); err != nil {
+		return restartCaseResult{}, err
+	}
+	size, digest, err := singleMKVSource()
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	outputOK := deliveredCopy(completeDirOf(caseDBPath(ctx), jobID), size, digest)
+	detail := fmt.Sprintf("status_at_shutdown=%s drain_finished=%t pass_lines_after_signal=%d pass_lines_after_drain=%d generation_cancelled=%t repair_started_after_restart=%t repaired_after_restart=%t output_verified=%t final=%s",
+		preStatus, stoppedAt >= 0, len(afterSignal), len(afterDrain), cancelled, startedAgain, repaired, outputOK, statuses[jobID])
+	pass := stoppedAt >= 0 && len(afterDrain) == 0 && cancelled && startedAgain && repaired && outputOK && statuses[jobID] == "COMPLETE"
 	failure := "Ctrl-C during a PAR2 pass: " + detail
 	if len(afterSignal) > 0 {
 		failure += fmt.Sprintf(" first pass lines after the signal: %q", afterSignal[:min(len(afterSignal), 3)])

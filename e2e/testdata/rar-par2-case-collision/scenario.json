@@ -1,0 +1,15 @@
+{
+  "slug": "rar-par2-case-collision",
+  "title": "E2E.Test.rar.par2.case.collision.2026-TESTGRP",
+  "description": "Distinct RAR and PAR2-described loose payload names collide under case folding; both survive under the existing namespace suffix policy.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "expectedOutputBLAKE3": {
+    "BEACON (1).BIN": "cbbfe1ee00034ee73835343e198b5d4b000d102b7a288f1d7b7ff3410160ed1b",
+    "beacon.bin": "10e354094930ee5149532d09bf541e7032157ae41991ed724c7f54ebe2087cfe"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks"
+  ],
+  "exactOutputFiles": true
+}

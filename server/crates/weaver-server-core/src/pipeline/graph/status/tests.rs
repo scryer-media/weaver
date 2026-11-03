@@ -6,7 +6,7 @@ use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::slots::AskerId;
 use weaver_graph::{ByteRange, Kind, Member, MemberId, Namespace, NodeId, Provenance, Why};
 
-use super::claims::{Claim, ClaimedMember, refused};
+use super::claims::{Claim, ClaimedMember, Delivered, Unarrived, refused};
 use super::{
     Delivery, RecoverySummary, RepairSlots, RootJob, SetSummary, Step, drive, failure, shown_status,
 };
@@ -17,13 +17,11 @@ use crate::jobs::model::{
 };
 use crate::pipeline::Pipeline;
 use crate::pipeline::PipelineEvent;
-use crate::pipeline::completion::NestedExtractionDecision;
 use crate::pipeline::download::queue::DownloadQueue;
-use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::root::phase::{self, RootPhase};
 use crate::pipeline::tests::{
-    hear_graph_mail, insert_active_job, insert_active_job_on, job_status_for_assert,
-    new_direct_pipeline, rar5_fixture_bytes, standalone_job_spec, submit_decoded_segment,
+    hear_graph_mail, insert_active_job, job_status_for_assert, new_direct_pipeline,
+    standalone_job_spec, submit_decoded_segment,
 };
 
 // A graph job's reads, prepared by the test: a namespace, a summary, and the
@@ -92,7 +90,11 @@ impl RootJob for Prepared {
         None
     }
 
-    fn repair_out(&self) -> bool {
+    fn work_pending(&self) -> bool {
+        false
+    }
+
+    fn moves_waiting(&self) -> bool {
         false
     }
 }
@@ -100,6 +102,7 @@ impl RootJob for Prepared {
 // A member: its name, its length, and the runs it holds with how each came.
 type MemberRuns<'a> = (&'a str, u64, &'a [(u64, u64, Provenance)]);
 
+// A settled namespace: every member closed.
 fn namespace(members: &[MemberRuns]) -> Namespace {
     let mut namespace = Namespace::new();
     for (name, length, runs) in members {
@@ -110,6 +113,7 @@ fn namespace(members: &[MemberRuns]) -> Namespace {
                 .coverage
                 .write(ByteRange::new(*start, *end), *provenance);
         }
+        member.closed = true;
     }
     namespace
 }
@@ -140,8 +144,8 @@ fn member(namespace: &Namespace, id: u32) -> &Member {
 // The job as the completion gate sees it once the download pass is over.
 fn settle_download_state(pipeline: &mut Pipeline, job_id: JobId) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    state.download_queue = DownloadQueue::new();
-    state.recovery_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     state.status = JobStatus::Downloading;
     state.refresh_runtime_lanes_from_status();
 }
@@ -150,9 +154,8 @@ fn sfv_line_with_crc(name: &str, crc32: u32) -> String {
     format!("{name} {crc32:08x}\n")
 }
 
-// A payload and a listing that agrees with it or not. The classic SFV pass
-// records each read it makes, so whether it ran is plain from the record.
-async fn job_with_a_listing(pipeline: &mut Pipeline, job_id: JobId, engine: Engine, agrees: bool) {
+// A payload and a listing that agrees with it or not.
+async fn job_with_a_listing(pipeline: &mut Pipeline, job_id: JobId, agrees: bool) {
     let payload: Vec<u8> = (0..96u32).map(|value| (value % 251) as u8).collect();
     let crc = par2_rs::checksum::crc32(&payload);
     let listed = if agrees { crc } else { crc ^ 0xffff_ffff };
@@ -164,8 +167,7 @@ async fn job_with_a_listing(pipeline: &mut Pipeline, job_id: JobId, engine: Engi
             ("ember.field.sfv".to_string(), listing.len() as u32),
         ],
     );
-    insert_active_job_on(pipeline, job_id, spec, engine).await;
-    pipeline.admit_graph_job(job_id, engine);
+    insert_active_job(pipeline, job_id, spec).await;
     let file = |file_index| NzbFileId { job_id, file_index };
     submit_decoded_segment(
         pipeline,
@@ -328,6 +330,10 @@ fn claims_read_complete_damaged_and_missing_off_the_namespace() {
     assert_eq!(Claim::of(member(&names, 1)), Claim::Complete);
     assert_eq!(Claim::of(member(&names, 2)), Claim::Damaged { bytes: 40 });
     assert_eq!(Claim::of(member(&names, 3)), Claim::Missing { bytes: 70 });
+    // Every byte in and clean, but never closed: nothing checked it whole.
+    let mut open = namespace(&[("ember.open", 100, &[(0, 100, Provenance::Fresh)])]);
+    open.get_mut(MemberId(0)).unwrap().closed = false;
+    assert_eq!(Claim::of(member(&open, 0)), Claim::Damaged { bytes: 0 });
 
     let mut unknown = Namespace::new();
     unknown.announce("ember.unknown", None);
@@ -494,8 +500,7 @@ fn a_delivery_ends_complete_partial_or_failed_by_its_short_files() {
         whole: names(whole),
         damaged: names(damaged),
         unrepaired: names(unrepaired),
-        withheld: Vec::new(),
-        files: Vec::new(),
+        ..Delivery::default()
     };
     let error = "PAR2 recovery failed for 1 set(s)";
     assert_eq!(
@@ -503,11 +508,11 @@ fn a_delivery_ends_complete_partial_or_failed_by_its_short_files() {
         JobStatus::Complete
     );
     assert_eq!(
-        delivery(&["ember.bin"], &[], &["ember.dat"]).status(Some(error)),
+        delivery(&["ember.mkv"], &[], &["ember.dat"]).status(Some(&failed(error))),
         JobStatus::Partial
     );
     assert_eq!(
-        delivery(&["ember.bin"], &["ember.dat"], &[]).status(None),
+        delivery(&["ember.mkv"], &["ember.dat"], &[]).status(None),
         JobStatus::Partial
     );
     // Nothing is whole: the job failed, whatever ships as it stands.
@@ -524,15 +529,198 @@ fn a_delivery_ends_complete_partial_or_failed_by_its_short_files() {
         }
     );
     assert_eq!(
-        delivery(&[], &[], &["ember.dat"]).status(Some(error)),
+        delivery(&[], &[], &["ember.dat"]).status(Some(&failed(error))),
         JobStatus::Failed {
             error: error.to_string()
         }
     );
     assert_eq!(
-        delivery(&[], &["ember.dat"], &[]).status(Some(error)),
+        delivery(&[], &["ember.dat"], &[]).status(Some(&failed(error))),
         JobStatus::Failed {
             error: error.to_string()
+        }
+    );
+}
+
+// A short delivery is partial only when a whole file is of a type people
+// open, posted plainly or unpacked; a whole file of no known type alone
+// leaves the job failed, and stays in its working directory.
+#[test]
+fn a_short_delivery_is_partial_only_by_a_whole_file_of_a_known_type() {
+    let error = "PAR2 recovery failed for 1 set(s)";
+    let posted = |whole: &str| Delivery {
+        whole: vec![whole.to_string()],
+        unrepaired: vec!["ember.mkv".to_string()],
+        ..Delivery::default()
+    };
+    assert_eq!(
+        posted("d1c70000.bin").status(Some(&failed(error))),
+        JobStatus::Failed {
+            error: error.to_string()
+        }
+    );
+    assert_eq!(
+        posted("d1c70000.bin").status(None),
+        JobStatus::Failed {
+            error: "no file of a known type was delivered whole; 1 short: ember.mkv".to_string()
+        }
+    );
+    assert_eq!(
+        posted("ember.nfo").status(Some(&failed(error))),
+        JobStatus::Partial
+    );
+    // One member of a 7z unpacked whole, the other lost with the volume
+    // that held it.
+    let unpacked = |whole: &str| Delivery {
+        whole: vec![whole.to_string()],
+        damaged: vec!["ember.idx".to_string()],
+        files: [(whole, true), ("ember.idx", false)]
+            .into_iter()
+            .map(|(name, whole)| Delivered {
+                name: name.to_string(),
+                from: name.to_string(),
+                depth: 1,
+                whole,
+                crc32: None,
+            })
+            .collect(),
+        ..Delivery::default()
+    };
+    assert_eq!(
+        unpacked("ember.bin").status(None),
+        JobStatus::Failed {
+            error: "no file of a known type was delivered whole; 1 short: ember.idx".to_string()
+        }
+    );
+    assert_eq!(unpacked("ember.mkv").status(None), JobStatus::Partial);
+    // Nothing short completes whatever the names.
+    let mut whole = unpacked("ember.bin");
+    whole.damaged.clear();
+    whole.files.truncate(1);
+    assert_eq!(whole.status(None), JobStatus::Complete);
+}
+
+#[test]
+fn an_empty_delivery_cannot_complete() {
+    assert_eq!(
+        Delivery::default().status(None),
+        JobStatus::Failed {
+            error: "no file was delivered whole".to_string(),
+        }
+    );
+}
+
+#[test]
+fn an_empty_delivery_preserves_the_feed_failure() {
+    let mut failure = failed("the source ended without usable output");
+    failure.from_feed = true;
+    assert_eq!(
+        Delivery::default().status(Some(&failure)),
+        JobStatus::Failed {
+            error: failure.message,
+        }
+    );
+}
+
+// A posted file none of whose bytes arrived is what its name says it was.
+// Another posting of a volume a file that arrived is named into is no file
+// at all. One whose name says nothing may have been anything: beside a
+// whole file the job completes, and alone it is short and the job fails.
+// One whose name says what it is stays short.
+#[test]
+fn a_posted_file_that_never_arrived_is_what_its_name_says() {
+    let mut tree = weaver_graph::Tree::new();
+    let mut objects = weaver_objects::Objects::default();
+    let mut effects = Vec::new();
+    let names = ["ember.mkv", "lantern.part01.rar", "d1c70000", "notes.txt"];
+    let members: Vec<MemberId> = names
+        .iter()
+        .map(|name| tree.announce_root(name, Some(64), &mut effects))
+        .collect();
+    let arrival = weaver_graph::Posted {
+        offset: 0,
+        bytes: bytes::Bytes::from(vec![b'e'; 64]).into(),
+        provenance: Provenance::Fresh,
+    };
+    tree.deliver(
+        NodeId::ROOT,
+        members[0],
+        arrival,
+        &mut objects,
+        &mut effects,
+    );
+    tree.close(NodeId::ROOT, members[0], &mut objects, &mut effects);
+    let unarrived = |member: MemberId| match member.0 {
+        1 => Unarrived::Again,
+        2 => Unarrived::Unnamed,
+        _ => Unarrived::Short,
+    };
+    let delivery = Delivery::read(
+        &tree,
+        |_| true,
+        |_| false,
+        |_, _| false,
+        |_, _| None,
+        |_, _| false,
+        unarrived,
+    );
+    assert_eq!(delivery.whole, vec!["ember.mkv".to_string()]);
+    assert_eq!(delivery.unnamed, vec!["d1c70000".to_string()]);
+    assert_eq!(delivery.damaged, vec!["notes.txt".to_string()]);
+    assert!(
+        delivery
+            .files
+            .iter()
+            .all(|file| file.name != "lantern.part01.rar"),
+        "{:?}",
+        delivery.files
+    );
+    assert_eq!(delivery.status(None), JobStatus::Partial);
+    // A whole file at `depth`: a set extracted it below the post, or at
+    // zero it is one of the post's own files.
+    let unnamed = |whole: &[(&str, u32)]| Delivery {
+        whole: whole.iter().map(|(name, _)| name.to_string()).collect(),
+        unnamed: vec!["d1c70000".to_string()],
+        files: whole
+            .iter()
+            .map(|(name, depth)| Delivered {
+                name: name.to_string(),
+                from: name.to_string(),
+                depth: *depth,
+                whole: true,
+                crc32: None,
+            })
+            .collect(),
+        ..Delivery::default()
+    };
+    assert_eq!(
+        unnamed(&[("ember.bin", 1)]).status(None),
+        JobStatus::Complete
+    );
+    // Beside the post's own files alone, the file that never came may have
+    // been any file of the post, which lacks it.
+    assert_eq!(
+        unnamed(&[("ember.mkv", 0)]).status(None),
+        JobStatus::Partial
+    );
+    // The feed gave the post up over the file that never came: its words
+    // rule nothing, and the delivery is still complete.
+    let feed = super::Failure::post_given_up("health 75.0% below critical 85.0%".to_string());
+    assert_eq!(
+        unnamed(&[("ember.bin", 1)]).status(Some(&feed)),
+        JobStatus::Complete
+    );
+    assert_eq!(delivery.status(Some(&feed)), JobStatus::Partial);
+    assert_eq!(
+        unnamed(&[]).status(None),
+        JobStatus::Failed {
+            error: "no file was delivered whole; 1 short: d1c70000".to_string()
+        }
+    );
+    assert_eq!(
+        unnamed(&[]).status(Some(&feed)),
+        JobStatus::Failed {
+            error: "health 75.0% below critical 85.0%".to_string()
         }
     );
 }
@@ -550,7 +738,7 @@ fn a_delivery_with_a_withheld_member_fails_worded_by_the_refusal() {
             .collect(),
         ..Delivery::default()
     };
-    let password = "lantern.rar needs a password and none was given";
+    let password = "WEAVER_PASSWORD_REQUIRED: lantern.rar needs a password and none was given";
     for why in [Why::Encrypted, Why::EncryptedHeader] {
         assert_eq!(
             withheld(&[], &[("lantern.rar", why)]).status(None),
@@ -571,30 +759,130 @@ fn a_delivery_with_a_withheld_member_fails_worded_by_the_refusal() {
         .withheld_error()
         .as_deref(),
         Some(
-            "lantern.part1.rar, lantern.part2.rar needs a password and none was given; \
+            "WEAVER_PASSWORD_REQUIRED: lantern.part1.rar, lantern.part2.rar needs a password and none was given; \
              ember.7z never placed every member it named"
         )
     );
     assert_eq!(
-        withheld(&["ember.bin"], &[("lantern.rar", Why::Encrypted)]).status(None),
+        withheld(&["ember.mkv"], &[("lantern.rar", Why::Encrypted)]).status(None),
         JobStatus::Partial
     );
     // A recovery object's failure is the one that left the job short.
     let error = "PAR2 recovery failed for 1 set(s)";
     assert_eq!(
-        withheld(&[], &[("lantern.rar", Why::Encrypted)]).status(Some(error)),
+        withheld(&[], &[("lantern.rar", Why::Encrypted)]).status(Some(&failed(error))),
         JobStatus::Failed {
             error: error.to_string()
         }
     );
 }
 
+// A whole file whose name and front say an object reads it, which no
+// object opened, is a container and no end file, whatever its format: alone
+// it fails the job, and beside a whole file of its own it leaves the job
+// partial. The tree is given the member as a leaf straight, the state an
+// object that never bound to a whole joined file leaves.
+#[test]
+fn a_whole_container_nothing_opened_is_no_usable_file() {
+    let mut container = b"Rar!\x1a\x07\x01\x00".to_vec();
+    container.resize(600, b'q');
+    assert!(matches!(
+        weaver_graph::signed(&container, Some(600)),
+        weaver_graph::Sniff::Object(_)
+    ));
+    let read = |names: &[&str]| {
+        let mut tree = weaver_graph::Tree::new();
+        let mut effects = Vec::new();
+        for name in names {
+            let member = tree.announce_root(name, Some(600), &mut effects);
+            let bytes = if name.ends_with(".mkv") {
+                vec![b'm'; 600]
+            } else {
+                container.clone()
+            };
+            let namespace = tree.namespace_mut(NodeId::ROOT).unwrap();
+            namespace.arrive(member, ByteRange::new(0, 600), Provenance::Fresh);
+            namespace.keep_first_bytes(member, 0, &bytes, Provenance::Fresh);
+            namespace.get_mut(member).unwrap().closed = true;
+        }
+        Delivery::read(
+            &tree,
+            |_| true,
+            |_| false,
+            |_, _| false,
+            |_, _| None,
+            |_, _| false,
+            |_| Unarrived::Short,
+        )
+    };
+    let alone = read(&["d1c70000"]);
+    assert!(alone.whole.is_empty(), "{alone:?}");
+    assert_eq!(alone.damaged, vec!["d1c70000".to_string()]);
+    assert!(matches!(alone.status(None), JobStatus::Failed { .. }));
+    let beside = read(&["d1c70000", "lantern.mkv"]);
+    assert_eq!(beside.whole, vec!["lantern.mkv".to_string()]);
+    assert_eq!(beside.status(None), JobStatus::Partial);
+}
+
+// A 7z whose start header fails its CRC is still the store's by its name,
+// and the store refuses it for a reason that does not disclaim it: alone it
+// fails the job, and beside a whole file of its own it leaves the job
+// partial. The same bytes under a name that claims no kind are a file.
+#[test]
+fn a_broken_7z_is_refused_and_no_usable_file() {
+    let read = |names: &[&str]| {
+        let mut objects = weaver_objects::Objects::default();
+        let mut tree = weaver_graph::Tree::new();
+        let mut effects = Vec::new();
+        let mut bytes = vec![0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0, 4];
+        bytes.resize(600, b'q');
+        let bytes = bytes::Bytes::from(bytes);
+        for name in names {
+            let member = tree.announce_root(name, Some(600), &mut effects);
+            let arrival = weaver_graph::Posted {
+                offset: 0,
+                bytes: bytes.clone().into(),
+                provenance: Provenance::Fresh,
+            };
+            tree.deliver(NodeId::ROOT, member, arrival, &mut objects, &mut effects);
+            tree.close(NodeId::ROOT, member, &mut objects, &mut effects);
+        }
+        let bound: Vec<NodeId> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                weaver_graph::Effect::Bound { child, .. } => Some(*child),
+                _ => None,
+            })
+            .collect();
+        for node in bound {
+            tree.quiet(node, &mut objects, &mut effects);
+        }
+        Delivery::read(
+            &tree,
+            |_| true,
+            |_| false,
+            |_, _| false,
+            |_, _| None,
+            |_, _| false,
+            |_| Unarrived::Short,
+        )
+    };
+    let alone = read(&["lantern.7z"]);
+    assert_eq!(alone.damaged, vec!["lantern.7z".to_string()]);
+    assert!(matches!(alone.status(None), JobStatus::Failed { .. }));
+    let beside = read(&["lantern.7z", "lantern.mkv"]);
+    assert_eq!(beside.whole, vec!["lantern.mkv".to_string()]);
+    assert_eq!(beside.status(None), JobStatus::Partial);
+    let unnamed = read(&["lantern.bin"]);
+    assert_eq!(unnamed.whole, vec!["lantern.bin".to_string()]);
+}
+
 #[tokio::test]
-async fn a_graph_job_skips_the_old_passes_and_moves_to_complete() {
+async fn a_job_with_a_listing_moves_to_complete() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(91_202);
-    job_with_a_listing(&mut pipeline, job_id, Engine::Graph, true).await;
+    job_with_a_listing(&mut pipeline, job_id, true).await;
     // The last article may already have advanced the job to its move.
     if !pipeline.inflight_moves.contains(&job_id) {
         settle_download_state(&mut pipeline, job_id);
@@ -604,32 +892,9 @@ async fn a_graph_job_skips_the_old_passes_and_moves_to_complete() {
     if let Some(JobStatus::Failed { error }) = job_status_for_assert(&pipeline, job_id) {
         panic!("the graph job failed: {error}");
     }
-    assert!(
-        pipeline.sfv_verify_read_splits.is_empty(),
-        "the listing pass must not run for a graph job"
-    );
     assert!(pipeline.inflight_moves.contains(&job_id));
     let record = &pipeline.terminal_reconciliations[&job_id];
     assert_eq!((record.failed_bytes, record.health), (0, 1000));
-}
-
-#[tokio::test]
-async fn a_classic_job_still_runs_the_old_passes() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(91_203);
-    job_with_a_listing(&mut pipeline, job_id, Engine::Classic, true).await;
-    assert!(!pipeline.is_graph_job(job_id));
-    if !pipeline.inflight_moves.contains(&job_id) {
-        settle_download_state(&mut pipeline, job_id);
-        pipeline.check_job_completion(job_id).await;
-    }
-
-    if let Some(JobStatus::Failed { error }) = job_status_for_assert(&pipeline, job_id) {
-        panic!("the classic job failed: {error}");
-    }
-    assert_eq!(pipeline.sfv_verify_read_splits.len(), 1);
-    assert!(pipeline.inflight_moves.contains(&job_id));
 }
 
 // The listing's own object rules for a graph job, and its failure reads as a
@@ -640,7 +905,7 @@ async fn a_disagreeing_listing_fails_a_graph_job_through_its_object() {
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
     let mut events = pipeline.event_tx.subscribe();
     let job_id = JobId(91_208);
-    job_with_a_listing(&mut pipeline, job_id, Engine::Graph, false).await;
+    job_with_a_listing(&mut pipeline, job_id, false).await;
     if pipeline.jobs.contains_key(&job_id) {
         settle_download_state(&mut pipeline, job_id);
         pipeline.check_job_completion(job_id).await;
@@ -655,7 +920,7 @@ async fn a_disagreeing_listing_fails_a_graph_job_through_its_object() {
                 .to_string()
         })
     );
-    assert!(pipeline.sfv_verify_read_splits.is_empty());
+    crate::pipeline::tests::settle_failed_releases(&mut pipeline).await;
     while !matches!(
         events.recv().await.expect("pipeline event channel closed"),
         PipelineEvent::JobFailed { job_id: failed, .. } if failed == job_id
@@ -668,52 +933,15 @@ async fn a_disagreeing_listing_fails_a_graph_job_through_its_object() {
 }
 
 #[tokio::test]
-async fn a_graph_job_never_rescans_its_output_for_nested_archives() {
-    for (job_id, engine, expected) in [
-        (
-            JobId(91_204),
-            Engine::Graph,
-            NestedExtractionDecision::NoNestedArchives,
-        ),
-        (
-            JobId(91_205),
-            Engine::Classic,
-            NestedExtractionDecision::Started,
-        ),
-    ] {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-        let spec = standalone_job_spec("Ember Nested", &[("outer.bin".to_string(), 8)]);
-        insert_active_job_on(&mut pipeline, job_id, spec, engine).await;
-        pipeline.admit_graph_job(job_id, engine);
-        let staging = temp_dir.path().join("ember-nested");
-        tokio::fs::create_dir_all(&staging).await.unwrap();
-        tokio::fs::write(
-            staging.join("inner.rar"),
-            rar5_fixture_bytes("rar5_nested_2deep.rar"),
-        )
-        .await
-        .unwrap();
-        pipeline.jobs.get_mut(&job_id).unwrap().staging_dir = Some(staging);
-        let decision = pipeline
-            .maybe_start_nested_extraction(job_id)
-            .await
-            .unwrap();
-        assert_eq!(decision, expected, "{engine:?}");
-    }
-}
-
-#[tokio::test]
 async fn a_graph_census_keeps_a_damaged_member_and_refuses_an_empty_delivery() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
 
-    // Nothing of the payload ever arrived: refused with the classic words.
+    // Nothing of the payload ever arrived: refused as never delivered.
     let job_id = JobId(91_206);
     let spec = standalone_job_spec("Ember Empty", &[("ember.bin".to_string(), 64)]);
-    insert_active_job_on(&mut pipeline, job_id, spec, Engine::Graph).await;
-    pipeline.admit_graph_job(job_id, Engine::Graph);
-    let Some(Err(error)) = pipeline.reconcile_graph_delivery(job_id) else {
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let Err(error) = pipeline.reconcile_terminal_delivery(job_id) else {
         panic!("an empty graph delivery is refused");
     };
     assert_eq!(
@@ -721,10 +949,42 @@ async fn a_graph_census_keeps_a_damaged_member_and_refuses_an_empty_delivery() {
         "1 payload file(s) were never delivered and no verification, repair or discard \
          accounts for them (64 declared bytes): ember.bin"
     );
+}
 
-    // A classic job keeps its own census.
-    let classic = JobId(91_207);
-    let spec = standalone_job_spec("Ember Classic", &[("ember.bin".to_string(), 64)]);
-    insert_active_job(&mut pipeline, classic, spec).await;
-    assert!(pipeline.reconcile_graph_delivery(classic).is_none());
+// A recovery failure as the rulings word it, naming no object.
+fn failed(message: &str) -> super::Failure {
+    super::Failure {
+        objects: Vec::new(),
+        message: message.to_owned(),
+        rejection: None,
+        from_feed: false,
+    }
+}
+
+// A delivery left short by a recovery object that ruled the loss beyond it
+// names the repair as the stage, whether or not the object bound a member
+// it could name unrepaired: a set that bound nothing still ruled.
+#[test]
+fn a_short_delivery_names_the_repair_when_a_recovery_object_ruled_though_it_bound_nothing() {
+    use crate::post_processing::model::PipelineFailureStage;
+    let delivery = Delivery {
+        whole: Vec::new(),
+        damaged: vec!["ember.bin".to_string()],
+        ..Delivery::default()
+    };
+    let message = "PAR2 recovery failed for 1 set(s)";
+    assert_eq!(
+        delivery.shortfall_stage(None),
+        PipelineFailureStage::Extract
+    );
+    assert_eq!(
+        delivery.shortfall_stage(Some(&failed(message))),
+        PipelineFailureStage::Extract
+    );
+    let mut ruled = failed(message);
+    ruled.objects = vec![NodeId(1)];
+    assert_eq!(
+        delivery.shortfall_stage(Some(&ruled)),
+        PipelineFailureStage::Repair
+    );
 }

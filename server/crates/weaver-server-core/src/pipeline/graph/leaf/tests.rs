@@ -11,7 +11,7 @@ fn pool() -> &'static ReaderPool {
 
 // A covered leaf of `bytes` read through `readers`, its write handle let go.
 fn closed(readers: &'static ReaderPool, dir: &Path, name: &str, bytes: &[u8]) -> Leaf {
-    let mut leaf = Leaf::at(dir, name).unwrap().with_readers(readers);
+    let mut leaf = Leaf::at(dir, name).with_readers(readers);
     leaf.write(0, bytes, Some(bytes.len() as u64)).unwrap();
     leaf.close(bytes.len() as u64).unwrap();
     leaf
@@ -42,7 +42,8 @@ fn a_closed_leaf_is_read_through_one_handle_that_follows_none_of_its_moves() {
     assert!(!other.reader_is_open());
 
     // Renamed, the handle is let go and the file read where it now is.
-    leaf.rename(dir.path(), "b.bin").unwrap();
+    leaf.intend("b.bin");
+    leaf.move_on(dir.path()).unwrap();
     assert!(!leaf.reader_is_open());
     assert_eq!(read(&leaf, 0, 2), b"01");
     assert!(leaf.reader_is_open());

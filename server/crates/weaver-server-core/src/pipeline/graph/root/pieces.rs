@@ -160,7 +160,7 @@ impl PieceRoot {
             node: NodeId::ROOT,
             member: MemberId(verified.volume.0),
             offset: verified.offset,
-            bytes: verified.bytes,
+            bytes: weaver_graph::Evidenced::new(verified.bytes),
             provenance: Provenance::Fresh,
         }
     }
@@ -372,9 +372,9 @@ impl Root for PieceRoot {
         moves
     }
 
-    fn receive(&mut self, intake: Verified) -> (Arrival, Option<u64>) {
+    fn receive(&mut self, intake: Verified) -> Option<(Arrival, Option<u64>)> {
         // Every file's length is in the metainfo, announced with the file.
-        (PieceRoot::receive(self, intake), None)
+        Some((PieceRoot::receive(self, intake), None))
     }
 
     fn lost(&mut self, volume: VolumeIndex, unit: u32) {
@@ -391,7 +391,10 @@ impl Root for PieceRoot {
 
     fn bootstrap(&mut self, tree: &Tree) {
         let units = &self.units;
-        sample::bootstrap(tree, |volume| waiting_in(units, volume), &mut self.window);
+        let waiting = (0..units.len() as u32)
+            .map(VolumeIndex)
+            .filter(|volume| waiting_in(units, *volume));
+        sample::bootstrap(tree, waiting, &mut self.window);
     }
 
     fn answer(&mut self, asks: &[Ask], queued: impl FnMut(VolumeIndex) -> bool) -> Vec<Pull> {

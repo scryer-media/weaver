@@ -11,14 +11,17 @@ use crate::deliver::{Delivery, Emit, Posted, Provenance, Why};
 use crate::engine::{Engine, Extraction, Sink, Volumes};
 use crate::facts::{Durable, Facts, Restore, RestoreError};
 use crate::member::MemberId;
-use crate::object::{Extent, Kind, Object, ObjectId, Placement, Standing};
+use crate::object::{Extent, Kind, Located, Object, ObjectId, Placement, Standing};
 use crate::records::{NodeState, TreeRecord};
 use crate::seek::{Pull, Seek, Weight};
 use crate::tree::NodeId;
 use crate::volume::{ByteRange, VolumeIndex};
 
 const XZ: &[u8] = b"\xfd7zXZ\x00";
-const GZIP: &[u8] = b"\x1f\x8b";
+const GZIP: &[u8] = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03";
+const PAYLOAD: &[u8] = b"payload";
+// Where the archive's front ends: its damage lands here, its replay after.
+const FRONT_END: u64 = (XZ.len() + GZIP.len() + PAYLOAD.len()) as u64;
 
 // A pretend wrapper: its own magic, then one member that is everything
 // after it, under a fixed name. As an engine it bids for the volume after
@@ -69,7 +72,7 @@ impl Object for Wrap {
             out.push(Emit::Bytes {
                 member: MemberId(0),
                 offset: delivery.offset + skip as u64 - self.header(),
-                bytes: Bytes::copy_from_slice(&delivery.bytes[skip..]),
+                bytes: Bytes::copy_from_slice(&delivery.bytes[skip..]).into(),
                 provenance: delivery.provenance,
             });
         }
@@ -90,11 +93,12 @@ impl Object for Wrap {
             range: ByteRange::new(start, range.end.max(start)).shift(-(self.header() as i64)),
         });
     }
-    fn extent(&self, _: MemberId, range: ByteRange, out: &mut Vec<Extent>) {
+    fn extent(&self, _: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {
         out.push(Extent {
             volume: VolumeIndex(0),
             range: range.shift(self.header() as i64),
         });
+        Located::Whole
     }
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
@@ -123,10 +127,10 @@ impl Engine for Wrap {
 struct Idle;
 
 impl Extraction for Idle {
-    fn run(self: Box<Self>, _: Arc<dyn Volumes>, _: &mut Sink<'_>) {}
+    fn run(self: Box<Self>, _: Arc<dyn Volumes>, _: &mut Sink<'_>, _: crate::Budget) {}
 }
 
-struct Objects;
+pub(crate) struct Objects;
 
 impl Builder for Objects {
     fn build(&mut self, kind: Kind, _: ObjectId) -> Option<Box<dyn Object>> {
@@ -156,7 +160,7 @@ impl Restore for Objects {
 // Root, an xz wrapper below it, a gzip wrapper below that: three levels,
 // with a root leaf that takes the name the deepest member wants, so the
 // ledger's suffix has to come back too, and damage in the coverage.
-fn three_levels() -> (Tree, MemberId) {
+pub(crate) fn three_levels() -> (Tree, MemberId) {
     let mut tree = Tree::new();
     let mut effects = Vec::new();
     let leaf = tree.announce_root("leaf.bin", Some(4), &mut effects);
@@ -167,7 +171,7 @@ fn three_levels() -> (Tree, MemberId) {
             member,
             Posted {
                 offset,
-                bytes: Bytes::copy_from_slice(bytes),
+                bytes: Bytes::copy_from_slice(bytes).into(),
                 provenance,
             },
             &mut Objects,
@@ -175,9 +179,9 @@ fn three_levels() -> (Tree, MemberId) {
         );
     };
     deliver(&mut tree, leaf, 0, b"leaf", Provenance::Fresh);
-    let front = [XZ, GZIP, b"payload"].concat();
+    let front = [XZ, GZIP, PAYLOAD].concat();
     deliver(&mut tree, archive, 0, &front, Provenance::Fresh);
-    deliver(&mut tree, archive, 15, b"bad", Provenance::Damaged);
+    deliver(&mut tree, archive, FRONT_END, b"bad", Provenance::Damaged);
     (tree, archive)
 }
 
@@ -225,8 +229,8 @@ fn a_rebuilt_tree_takes_the_replay_as_the_live_one_does() {
             NodeId::ROOT,
             archive,
             Posted {
-                offset: 18,
-                bytes: Bytes::from_static(b" more"),
+                offset: FRONT_END + 3,
+                bytes: Bytes::from_static(b" more").into(),
                 provenance: Provenance::Fresh,
             },
             &mut Objects,
@@ -322,7 +326,7 @@ fn a_member_a_buried_refusal_left_open_comes_back_buried() {
         &mut Objects,
         &mut effects,
     );
-    tree.bury(NodeId::ROOT, archive);
+    tree.bury(NodeId::ROOT, archive, &mut Vec::new());
     assert!(tree.left_open(NodeId::ROOT, archive));
     let open: Vec<(NodeId, MemberId)> = [NodeId(1), NodeId(2)]
         .into_iter()

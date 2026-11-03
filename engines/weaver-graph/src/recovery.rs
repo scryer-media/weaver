@@ -6,6 +6,7 @@
 // beside it; it verifies them from evidence the namespace hands it as bytes
 // pass, and repairs them by asking up for its recovery data.
 
+use crate::engine::Budget;
 use crate::member::{MemberId, Namespace};
 use crate::seek::Seek;
 use crate::volume::{ByteRange, VolumeIndex};
@@ -62,10 +63,39 @@ pub struct SetRuling {
     pub read: bool,
 }
 
-// The namespace's face toward a recovery object: read a member's bytes and
-// write repaired ones. Positional, in member coordinates. The namespace
-// resolves where the bytes actually live through the owner's inverse map.
+// A worker's ephemeral operation failure, separate from its durable ruling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepairDiagnostic {
+    pub operation: String,
+    pub context: String,
+    pub error: String,
+    pub causes: Vec<String>,
+}
+
+impl RepairDiagnostic {
+    pub fn capture(operation: &str, context: &str, error: &dyn std::error::Error) -> Self {
+        let mut causes = Vec::new();
+        let mut source = error.source();
+        while let Some(error) = source {
+            causes.push(error.to_string());
+            source = error.source();
+        }
+        Self {
+            operation: operation.to_owned(),
+            context: context.to_owned(),
+            error: error.to_string(),
+            causes,
+        }
+    }
+}
+
+// The namespace's face toward a recovery object: positional member reads
+// and staged repair writes, resolved through the owner's inverse map.
 pub trait MemberAccess {
+    // Ephemeral worker diagnostics. The owner publishes them only when it
+    // accepts the current attempt; they never change the serialized ruling.
+    fn repair_error(&mut self, _operation: &str, _context: &str, _error: &dyn std::error::Error) {}
+
     fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool;
     fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]);
     // A range the object proved bad and could not rebuild. The namespace
@@ -104,7 +134,10 @@ pub trait MemberAccess {
 pub trait Recovery {
     // Match the namespace's members to what this object describes, by id,
     // name or content. A member recognised by content alone is renamed
-    // through the namespace and listed in `renamed`. Called whenever the
+    // through the namespace, and one the object settles at another length
+    // takes it there (`Namespace::take_described`): each is listed in
+    // `renamed`, and its file and the object it is a volume of follow it.
+    // Called whenever the
     // namespace's members, their lengths or their first bytes change, and
     // after the object learned more of what it describes. An object handed
     // its members when it was made has nothing to match.
@@ -119,6 +152,14 @@ pub trait Recovery {
     // Whether this object describes the member, by id, name or content.
     fn covers(&self, member: MemberId) -> bool;
 
+    // Whether the object has yet to learn what some set of it describes:
+    // its own volumes may still say, once something asks for them. The
+    // owner asks it to rule once the namespace holds every other member,
+    // and the ruling says whether it waits on a volume or checked nothing.
+    fn undescribed(&self) -> bool {
+        false
+    }
+
     // Whether this object's own volumes are part of the release. Recovery
     // data is spent by the job and left out; a listing is kept beside what
     // it lists.
@@ -127,8 +168,16 @@ pub trait Recovery {
     }
 
     // Evidence as bytes pass: the namespace calls this for every covered
-    // member on every delivery and every repair.
+    // member on every delivery and every repair. It is where a ruling is
+    // taken back for its input: bytes said again keep it when they are what
+    // it read. Forgetting input says nothing to a set.
     fn feed(&mut self, member: MemberId, segments: &[Segment]);
+
+    // Evidence published while acknowledging this object's own repair.
+    // It establishes the ruling's new input rather than invalidating it.
+    fn feed_proven(&mut self, member: MemberId, segments: &[Segment]) {
+        self.feed(member, segments);
+    }
 
     // The block sizes at whose boundaries `feed`'s checksums have to be cut
     // for this object to vouch for a block without reading it back. A
@@ -137,6 +186,12 @@ pub trait Recovery {
     // checksums of any alignment, or takes none, names none.
     fn block_sizes(&self, _out: &mut Vec<u64>) {}
 
+    // The parent's other answer to a seek: this range of a covered member
+    // will never come. The object learns that and nothing else, no bytes
+    // and no verdict on them, and counts it against what it can still
+    // reach, so it rules short the moment the refusals outrun its blocks.
+    fn refused(&mut self, _member: MemberId, _range: ByteRange) {}
+
     // The verdict per slice of a covered member, as far as the evidence goes.
     fn verdicts(&self, member: MemberId, out: &mut Vec<SliceVerdict>);
 
@@ -144,8 +199,9 @@ pub trait Recovery {
     // damage it knows about.
     fn wants(&self, out: &mut Vec<Seek>);
 
-    // Repair what is damaged among the members this object covers.
-    fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome;
+    // Repair what is damaged among the members this object covers, within
+    // what `budget` grants the repair.
+    fn repair(&mut self, access: &mut dyn MemberAccess, budget: Budget) -> RepairOutcome;
 
     // What the last repair came to, or `None` before one ran, and again
     // after a bind changed which members this object covers: the verdict

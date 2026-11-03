@@ -191,13 +191,6 @@ fn instrumentation_registries_are_reachable_from_the_shared_metrics_handle() {
         m.pipeline_histograms.snapshot().disk_write_duration.count,
         0
     );
-
-    m.pipeline_histograms
-        .observe_disk_write(std::time::Duration::from_millis(3));
-    assert_eq!(
-        m.pipeline_histograms.snapshot().disk_write_duration.count,
-        1
-    );
 }
 
 // `ALL` is what the Prometheus exporter iterates to build its label sets, so

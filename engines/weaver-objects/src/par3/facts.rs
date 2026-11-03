@@ -18,7 +18,9 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use weaver_graph::{Coverage, Durable, Facts, Kind, MemberId, Object, ObjectId, RestoreError};
+use weaver_graph::{
+    ByteRange, Coverage, Durable, Facts, Kind, MemberId, Object, ObjectId, RestoreError,
+};
 
 use super::{MAX_CARRIERS, Par3, Ruling, Settled, Unnamed, Volume};
 
@@ -33,17 +35,23 @@ pub(super) struct Par3Facts {
     needed: u64,
     last: Option<Ruling>,
     settled: BTreeMap<String, Settled>,
+    refusals: BTreeMap<MemberId, Vec<ByteRange>>,
 }
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct VolumeFacts {
     arrived: Coverage,
     closed: bool,
+    // The name it was bound under: replay does not bind it again when the
+    // carrier's leading packet is damaged.
+    name: Option<String>,
 }
 
 impl Durable for Par3Facts {
     // 2: a repair that came up short kept with the volumes closed then.
-    const VERSION: u16 = 2;
+    // 3: the ranges of members the parent refused.
+    // 4: the name each volume was bound under.
+    const VERSION: u16 = 4;
 
     fn impossible(&self) -> Option<&'static str> {
         if self.volumes.len() > MAX_CARRIERS {
@@ -72,6 +80,7 @@ pub(super) fn of(par3: &Par3) -> Facts {
             .map(|volume| VolumeFacts {
                 arrived: volume.arrived.clone(),
                 closed: volume.closed,
+                name: volume.name.clone(),
             })
             .collect(),
         bound: par3.bound.clone(),
@@ -81,6 +90,7 @@ pub(super) fn of(par3: &Par3) -> Facts {
         needed: par3.needed,
         last: par3.last,
         settled: par3.settled.clone(),
+        refusals: par3.shown.refusals.clone(),
     };
     Facts::of(Kind::Par3, &facts)
 }
@@ -95,7 +105,11 @@ pub(super) fn par3(facts: &Facts) -> Result<Par3, RestoreError> {
             front: Vec::new(),
             arrived: volume.arrived,
             closed: volume.closed,
-            named_blocks: None,
+            named_blocks: volume
+                .name
+                .as_deref()
+                .and_then(|name| crate::recovery_volume::named_blocks(name, ".par3")),
+            name: volume.name,
         })
         .collect();
     par3.bound = kept.bound;
@@ -105,6 +119,9 @@ pub(super) fn par3(facts: &Facts) -> Result<Par3, RestoreError> {
     par3.needed = kept.needed;
     par3.last = kept.last;
     par3.settled = kept.settled;
+    // The blocks they touch are counted again at the next bind, once the
+    // replayed fronts describe the sets.
+    par3.shown.refusals = kept.refusals;
     Ok(par3)
 }
 

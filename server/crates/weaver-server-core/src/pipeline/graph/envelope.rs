@@ -68,14 +68,46 @@ pub(crate) struct Kept {
     // The length, once its member closed, and whether nothing more will
     // come at all, not even a repair: what is missing then is lost.
     pub(crate) closed: Option<u64>,
+    // The length the volume last closed at, kept across a reopen: a run
+    // that read past the volume built on it until it closes at another.
+    pub(crate) closed_at: Option<u64>,
     pub(crate) settled: bool,
     // How far the run has read, which a repair behind it invalidates.
     pub(crate) reached: u64,
+    // The closed length the run read, a dependency even before any payload
+    // byte of this volume was read. Only another closed length breaks it.
+    pub(crate) length_read: Option<u64>,
+}
+
+// The file an envelope is kept in: its name, how many bytes it holds, and
+// whether it is on disk.
+#[derive(Debug)]
+pub(crate) struct KeptFile {
+    pub(crate) name: String,
+    pub(crate) covered: u64,
+    pub(crate) on_disk: bool,
 }
 
 impl Kept {
+    // An envelope with nothing kept yet, in `leaf`'s file.
+    fn in_file(leaf: Leaf) -> Self {
+        Self {
+            leaf,
+            coverage: Coverage::new(),
+            closed: None,
+            closed_at: None,
+            settled: false,
+            reached: 0,
+            length_read: None,
+        }
+    }
+
     pub(crate) fn path(&self) -> &Path {
         self.leaf.path()
+    }
+
+    pub(crate) fn into_leaf(self) -> Leaf {
+        self.leaf
     }
 }
 
@@ -134,9 +166,10 @@ impl Envelopes {
     }
 
     // Keep `bytes` at `offset` of an envelope, replacing what they overlap:
-    // a repaired header replaces the damaged one. Repaired bytes, or clean
-    // bytes over damaged ones whoever brings them, behind what a run
-    // already read stop that run, since what it built on was wrong.
+    // a repaired header replaces the damaged one. A repair, or a clean copy
+    // mending damage, behind what a run already read stops that run, since
+    // its output used superseded input. A further clean copy of clean bytes
+    // never reaches here: the first copy stands.
     pub(crate) fn keep(
         &mut self,
         node: NodeId,
@@ -178,19 +211,72 @@ impl Envelopes {
         }
     }
 
+    // Every node with a shelf, in node order.
+    pub(crate) fn nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.shelves.keys().copied()
+    }
+
     // The node's shelf, if anything was ever kept on it.
     pub(crate) fn shelf_of(&self, node: NodeId) -> Option<Arc<Shelf>> {
         self.shelves.get(&node).map(Arc::clone)
     }
 
+    // The file an envelope sits in, relative to the working directory, and
+    // how many bytes it keeps there.
+    pub(crate) fn kept_file(&self, node: NodeId, envelope: u32) -> Option<KeptFile> {
+        let shelf = self.shelves.get(&node)?;
+        let state = shelf.lock();
+        state.kept.get(&envelope).map(|kept| KeptFile {
+            name: kept.leaf.name().to_owned(),
+            covered: kept.coverage.bytes_covered(),
+            on_disk: kept.leaf.on_disk(),
+        })
+    }
+
+    // The envelope starts in `name`, a file that already holds its bytes at
+    // their own offsets, or none when `on_disk` says it was never made:
+    // nothing is cleared, and what is kept in it is written over the same
+    // bytes. False when the envelope started already.
+    pub(crate) fn start_in(
+        &mut self,
+        node: NodeId,
+        envelope: u32,
+        name: &str,
+        on_disk: bool,
+    ) -> bool {
+        let shelf = self.shelf(node);
+        let started = shelf.update(|state| match state.kept.entry(envelope) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(free) => {
+                free.insert(Kept::in_file(Leaf::over(&state.dir, name, on_disk)));
+                true
+            }
+        });
+        if started {
+            self.marks.mark(node);
+        }
+        started
+    }
+
     // An envelope the object at `node` gave back with its volume leaves the
     // shelf, file and all: the file, at the volume's own offsets, is what
     // the object kept of the volume. Nothing is read or copied.
-    pub(crate) fn take(&mut self, node: NodeId, envelope: u32) -> Option<Leaf> {
+    pub(crate) fn take(&mut self, node: NodeId, envelope: u32) -> Option<Kept> {
         let shelf = self.shelves.get(&node)?;
-        let kept = shelf.update(|state| state.kept.remove(&envelope))?;
+        let kept = shelf.update(|state| {
+            // Removing a volume changes the order already-read input used.
+            // The run barrier also retracts its acknowledged derived output.
+            let read_after = state.kept.range(envelope..).any(|(index, kept)| {
+                kept.reached > 0 || (*index == envelope && kept.length_read.is_some())
+            });
+            let kept = state.kept.remove(&envelope)?;
+            if read_after {
+                state.generation += 1;
+            }
+            Some(kept)
+        })?;
         self.marks.mark(node);
-        Some(kept.leaf)
+        Some(kept)
     }
 
     // Change the node's shelf as `change` says it did, which marks the node
@@ -214,20 +300,18 @@ impl Envelopes {
     }
 
     // The node is gone, and its envelopes with it. A run still reading them
-    // is stopped first.
-    pub(crate) fn forget(&mut self, node: NodeId) -> Result<(), LeafError> {
+    // is stopped first. Their files are returned, not removed: the last
+    // checkpoint the database holds may still name them.
+    pub(crate) fn forget(&mut self, node: NodeId) -> Vec<Leaf> {
         let Some(shelf) = self.shelves.remove(&node) else {
-            return Ok(());
+            return Vec::new();
         };
         self.marks.mark(node);
         let kept = shelf.update(|state| {
             state.generation += 1;
             std::mem::take(&mut state.kept)
         });
-        for (_, kept) in kept {
-            kept.leaf.remove()?;
-        }
-        Ok(())
+        kept.into_values().map(|kept| kept.leaf).collect()
     }
 
     // Let go of every envelope file's handle ahead of the directory moving.
@@ -263,8 +347,17 @@ impl Drop for Envelopes {
     }
 }
 
+// The shelves this thread locked, by node, for a test to read back.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LOCKED: std::cell::RefCell<Vec<NodeId>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl Shelf {
     pub(crate) fn lock(&self) -> MutexGuard<'_, Shelved> {
+        #[cfg(test)]
+        LOCKED.with_borrow_mut(|locked| locked.push(self.node));
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -305,20 +398,10 @@ impl Shelf {
         match state.kept.entry(envelope) {
             Entry::Occupied(kept) => Ok(kept.into_mut()),
             Entry::Vacant(free) => {
-                let name = format!(
-                    "{}/graph-envelope-{}-{envelope}",
-                    weaver_graph::names::INTERNAL_DIR,
-                    self.node.0
-                );
-                let mut leaf = Leaf::at(&state.dir, &name)?;
+                let name = free_envelope_name(&state.dir, self.node, envelope);
+                let mut leaf = Leaf::at(&state.dir, &name);
                 leaf.truncate()?;
-                Ok(free.insert(Kept {
-                    leaf,
-                    coverage: Coverage::new(),
-                    closed: None,
-                    settled: false,
-                    reached: 0,
-                }))
+                Ok(free.insert(Kept::in_file(leaf)))
             }
         }
     }
@@ -369,8 +452,38 @@ impl Shelf {
         self.update(|state| {
             for kept in state.kept.values_mut() {
                 kept.reached = 0;
+                kept.length_read = None;
             }
             state.generation
         })
     }
+}
+
+// The file an envelope of `node` numbered `envelope` sits in, unless a
+// checkpoint says another.
+pub(crate) fn envelope_name(node: NodeId, envelope: u32) -> String {
+    format!(
+        "{}/graph-envelope-{}-{envelope}",
+        weaver_graph::names::INTERNAL_DIR,
+        node.0
+    )
+}
+
+// The file a new envelope starts in: the one its node and number name, or,
+// while a file still sits there, the first free one after it.
+fn free_envelope_name(dir: &Path, node: NodeId, envelope: u32) -> String {
+    free_name(dir, &envelope_name(node, envelope))
+}
+
+// `name`, or, while a file still sits there, the first free one after it:
+// one a member given back sits at waiting to move, or one that goes once a
+// checkpoint commits. Nothing is written over a file that sits anywhere.
+pub(crate) fn free_name(dir: &Path, name: &str) -> String {
+    if !dir.join(name).exists() {
+        return name.to_owned();
+    }
+    (1u32..)
+        .map(|again| format!("{name}-{again}"))
+        .find(|again| !dir.join(again).exists())
+        .expect("an unbounded counter finds a free name")
 }

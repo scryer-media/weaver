@@ -17,24 +17,35 @@ use bytes::Bytes;
 use crate::deliver::Posted;
 use crate::deliver::{Emit, Handed, Provenance, Why};
 use crate::engine::{Engine, Extraction};
-use crate::member::{Member, MemberId, Namespace};
+use crate::evidence::Evidenced;
+use crate::member::{Coverage, FIRST_BYTES, Member, MemberId, Namespace};
 use crate::names::{Moved, NameLedger, Position};
-use crate::object::{Carried, Extent, Kind, Object, ObjectId, Placement, Posting};
+use crate::object::{Carried, Claim, Extent, Kind, Located, Object, ObjectId, Placement, Posting};
 use crate::recovery::Recovery;
-use crate::seek::{Pull, Seek, SeekUp};
-use crate::sniff::{Sniff, signed, sniff};
+use crate::seek::{Pull, Seek, SeekUp, When};
+use crate::sniff::{Sniff, VERDICT_BYTES, signed};
 use crate::volume::{ByteRange, VolumeIndex};
 
 mod lent;
 mod nodes;
+mod pieces;
 mod quiet;
 mod records;
 
 use lent::{Arrived, Told, Waiting};
+pub use nodes::Mark;
 use nodes::Nodes;
+#[cfg(test)]
+pub(crate) use records::tests as record_tests;
 
 // What objects parsed of the members they gave back, by namespace and member.
 type Given = BTreeMap<(NodeId, MemberId), Carried>;
+
+// How many members a changed front looked at, for the tests that count it.
+#[cfg(test)]
+thread_local! {
+    static FRONT_CANDIDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u32);
@@ -62,6 +73,9 @@ struct Binding {
     // what their members received before: their close waits for the
     // hand-over, so the object hears it once, after every byte.
     awaiting: BTreeSet<VolumeIndex>,
+    // What the window's owner handed its object, last. An object that takes
+    // the node again is handed it before it hears anything.
+    handed: Handed,
 }
 
 struct Node {
@@ -108,6 +122,67 @@ impl Node {
             lent: None,
         }
     }
+
+    fn members_mut(&mut self) -> MembersMut<'_> {
+        MembersMut {
+            namespace: &mut self.namespace,
+            children: &mut self.children,
+            undecided: &mut self.undecided,
+        }
+    }
+
+    fn own(&mut self, member: MemberId, owner: (NodeId, VolumeIndex)) {
+        self.members_mut().own(member, owner);
+    }
+
+    fn disown(&mut self, member: MemberId) {
+        self.members_mut().disown(member);
+    }
+
+    fn undecide(&mut self, member: MemberId) {
+        self.members_mut().undecide(member);
+    }
+
+    fn decide(&mut self, member: MemberId) {
+        self.members_mut().decide(member);
+    }
+}
+
+// A node's members, to change, and nothing of the node's own row: its
+// namespace, and what the node keeps of each member beside it.
+struct MembersMut<'a> {
+    namespace: &'a mut Namespace,
+    children: &'a mut BTreeMap<MemberId, (NodeId, VolumeIndex)>,
+    undecided: &'a mut BTreeSet<MemberId>,
+}
+
+impl MembersMut<'_> {
+    // What the node keeps of a member beside its record, its owner and
+    // whether its first bytes have yet decided one, is in the member's row:
+    // each change marks the member, and these are the only ways to make one.
+    fn own(&mut self, member: MemberId, owner: (NodeId, VolumeIndex)) {
+        if self.children.insert(member, owner) != Some(owner) {
+            self.namespace.mark(member);
+        }
+    }
+
+    fn disown(&mut self, member: MemberId) {
+        if self.children.remove(&member).is_some() {
+            self.namespace.mark(member);
+        }
+    }
+
+    fn undecide(&mut self, member: MemberId) {
+        if self.undecided.insert(member) {
+            self.namespace.mark(member);
+        }
+    }
+
+    fn decide(&mut self, member: MemberId) {
+        if self.undecided.remove(&member) {
+            self.namespace.mark(member);
+        }
+    }
 }
 
 // What the tree tells its owner to do with bytes it cannot place itself:
@@ -120,7 +195,7 @@ pub enum Effect {
         node: NodeId,
         member: MemberId,
         offset: u64,
-        bytes: Bytes,
+        bytes: Evidenced,
         provenance: Provenance,
     },
     // These bytes of a member of `node`'s namespace reached `child`, the
@@ -135,7 +210,7 @@ pub enum Effect {
         child: NodeId,
         volume: VolumeIndex,
         offset: u64,
-        bytes: Bytes,
+        bytes: Evidenced,
         provenance: Provenance,
     },
     // A new member of `node`'s namespace was announced.
@@ -157,11 +232,13 @@ pub enum Effect {
     },
     // A member of `node`'s namespace is another posting of `into`, a volume
     // an object holds already: its bytes are `into`'s from now on. What the
-    // owner held or wrote of it goes down as `into`'s, and it has no file.
+    // owner held or wrote of it goes down as `into`'s, each run as `held`
+    // says it arrived, and it has no file.
     Folded {
         node: NodeId,
         copy: MemberId,
         into: MemberId,
+        held: Coverage,
     },
     // A member was refused streaming for this reason and is a leaf now. The
     // object that owned it is retired, not gone: the owner materialises the
@@ -178,6 +255,17 @@ pub enum Effect {
         node: NodeId,
         member: MemberId,
         why: Why,
+    },
+    // A member's object holds it no more, and nothing failed: a volume's
+    // own bytes refuted the claim its name made, or a name a recovery set
+    // gave it moved it. The owner materialises the member's bytes into its
+    // own file through the retired object's inverse map, as a refused
+    // member's, has the tree claim it again for that reason
+    // (`Tree::claim_again`), then buries it.
+    Disclaimed {
+        node: NodeId,
+        member: MemberId,
+        why: Disclaim,
     },
     // The object at `from` gave this member back, which was its `volume`:
     // its own headers say the member is not its there. The member is a leaf
@@ -272,6 +360,30 @@ pub trait Builder {
     ) -> bool;
 }
 
+// Why an object gives its volumes up, which says what holds them next.
+#[derive(Clone, Copy)]
+enum Unbinding {
+    // Nothing here reads them: they are leaves, refused for this reason.
+    Refused(Why),
+    // Only an engine reads them, bound in the object's place.
+    Engine(Why),
+    // The object's hold ended and nothing failed: each is claimed again
+    // (`Tree::claim_again`), as the reason says.
+    Disclaimed(Disclaim),
+}
+
+// Why an object's hold on its members ended with nothing failed, which says
+// how each is claimed again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Disclaim {
+    // A verdict about a volume's own bytes said the object's kind is wrong:
+    // that kind is no answer to who owns its members (`Member::refuted`).
+    Refuted,
+    // A name moved a member: the place was wrong, never the kind, so each
+    // member's name and front say who owns it, as founding asks.
+    Moved,
+}
+
 pub struct Tree {
     nodes: Nodes,
     // What an object parsed of a member it gave back, parked beside the
@@ -347,7 +459,11 @@ impl Tree {
 
     // Run `act` on the recovery object at `node` together with the namespace
     // it is bound in, where the members it covers are. `None` when the node
-    // is the root or its object recovers nothing.
+    // is the root, its object recovers nothing or is lent. What the object
+    // is told may change what it knows, and only it can say whether it did,
+    // so its own row is marked; the home is marked only for the members
+    // `act` changed. A question that changes nothing asks
+    // `consult_recovery`.
     pub fn with_recovery<R>(
         &mut self,
         node: NodeId,
@@ -356,15 +472,30 @@ impl Tree {
         let home = self.home(node)?;
         // The object steps out of its node for the call, so the namespace
         // can be borrowed beside it; it steps back in after.
-        let mut object = self.nodes.get_mut(&node)?.object.take()?;
-        let result = match (object.recovery_mut(), self.nodes.get_mut(&home)) {
-            (Some(recovery), Some(found)) => Some(act(recovery, &mut found.namespace)),
-            _ => None,
-        };
-        if let Some(found) = self.nodes.get_mut(&node) {
-            found.object = Some(object);
+        let mut object = self.nodes.object_out(node)?;
+        let result = object.recovery_mut().and_then(|recovery| {
+            self.nodes
+                .with_namespace(home, |namespace| act(recovery, namespace))
+        });
+        if result.is_some() {
+            self.nodes.mark_own(node);
         }
+        self.nodes.object_in(node, object);
         result
+    }
+
+    // Ask the recovery object at `node`, beside the namespace it is bound
+    // in, what it knows: a question changes nothing, so nothing is marked.
+    // `None` when the node is the root, or its object recovers nothing or
+    // is lent.
+    pub fn consult_recovery<R>(
+        &self,
+        node: NodeId,
+        ask: impl FnOnce(&dyn Recovery, &Namespace) -> R,
+    ) -> Option<R> {
+        let recovery = self.recovery(node)?;
+        let namespace = self.namespace(self.home(node)?)?;
+        Some(ask(recovery, namespace))
     }
 
     // The namespace the object at `node` is bound in: the one its volumes
@@ -491,6 +622,19 @@ impl Tree {
         found
     }
 
+    // The first namespace after `after` in node order that a set is homed
+    // in, or the first of them when `after` is none: the namespaces that
+    // have sets, asked without visiting the nodes beside them.
+    pub fn next_recovery_home(&self, after: Option<NodeId>) -> Option<NodeId> {
+        let from = after.map_or(Bound::Unbounded, |after| {
+            Bound::Excluded((after, NodeId(u32::MAX)))
+        });
+        self.sets
+            .range((from, Bound::Unbounded))
+            .next()
+            .map(|(home, _)| *home)
+    }
+
     // Every namespace bound in `node`'s whose object is not a recovery
     // object: where a member a recovery object here names may be founded.
     pub fn namespaces_below(&self, node: NodeId) -> Vec<NodeId> {
@@ -538,7 +682,7 @@ impl Tree {
 
     // Nothing more will arrive for a posting of a member of `node`'s
     // namespace. The member closes once every posting of it has: it takes
-    // the length it reached when it declared none, the object it is bound
+    // the length it reached when it declared none or less, the object it is bound
     // to hears that its volume is closed (at its hand-over, when the owner
     // still owes it the member's earlier bytes), and the owner closes its
     // file.
@@ -549,18 +693,21 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
-        let Some(found) = self.nodes.get_mut(&node) else {
+        let Some(namespace) = self.nodes.namespace_mut(node) else {
             return;
         };
-        let member = found.namespace.resolve(posting);
-        if !found.namespace.end(posting) {
+        let member = namespace.resolve(posting);
+        if !namespace.end(posting) {
             return;
         }
-        let Some(record) = found.namespace.get_mut(member) else {
+        let Some(record) = namespace.get_mut(member) else {
             return;
         };
+        // A member closes at least as long as what arrived of it: bytes past
+        // a length its articles declared are on disk, and its length is
+        // theirs until a recovery set proves another.
         let reached = record.coverage.runs().last().map_or(0, |run| run.range.end);
-        record.length.get_or_insert(reached);
+        record.length = Some(record.length.map_or(reached, |length| length.max(reached)));
         if self.awaiting(node, member).is_none() {
             self.volume_closed(node, member, builder, effects);
         }
@@ -638,8 +785,23 @@ impl Tree {
         });
     }
 
+    // How far a posting's own articles reached, which their producer knows
+    // and the member's coverage does not (`Member::reached`). Told before the
+    // posting closes; the member keeps the furthest its postings reached.
+    pub fn reached(&mut self, node: NodeId, posting: MemberId, end: u64) {
+        let Some(namespace) = self.nodes.namespace_mut(node) else {
+            return;
+        };
+        let member = namespace.resolve(posting);
+        if let Some(record) = namespace.get_mut(member) {
+            record.reached = Some(record.reached.map_or(end, |was| was.max(end)));
+        }
+    }
+
     // The object a closed member is a volume of hears it closed, at its
-    // length.
+    // length, and how far its bytes reached: as far as its producer said,
+    // or else the end of its coverage, what arrived of it and what was lost
+    // of it alike.
     fn volume_closed(
         &mut self,
         node: NodeId,
@@ -650,18 +812,71 @@ impl Tree {
         let Some(found) = self.nodes.get(&node) else {
             return;
         };
-        let Some(length) = found
+        let Some((length, reached)) = found
             .namespace
             .get(member)
             .filter(|record| record.closed)
-            .and_then(|record| record.length)
+            .and_then(|record| {
+                let covered = record.coverage.runs().last().map_or(0, |run| run.range.end);
+                Some((record.length?, record.reached.unwrap_or(covered)))
+            })
         else {
             return;
         };
         let Some((child, volume)) = found.children.get(&member).copied() else {
             return;
         };
-        self.reach(child, Told::Closed { volume, length }, builder, effects);
+        let told = Told::Closed {
+            volume,
+            length,
+            reached,
+        };
+        self.reach(child, told, builder, effects);
+    }
+
+    // The object a closed member of `node`'s namespace is a volume of hears
+    // its close again, at the member's length now: after a restore, or once
+    // a recovery set settled that length anew.
+    pub fn closed_at(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        if self.awaiting(node, member).is_none() {
+            self.volume_closed(node, member, builder, effects);
+        }
+    }
+
+    // A restore tells every object the close of each of its volumes
+    // again, as it tells every loss again: an object lent out when the
+    // checkpoint was taken comes back as it was when it left, and a close
+    // that reached it meanwhile went down with the run. A closed member no
+    // object owns whose front has not said what it is hears its close
+    // again too, as `close` first told it: it ended before its front could
+    // say, as one a checkpoint names undecided because an object gave it
+    // back did, whose front the restore cannot bring again.
+    pub fn close_again(&mut self, builder: &mut dyn Builder, effects: &mut Vec<Effect>) {
+        for node in self.live() {
+            let closed: Vec<MemberId> = self.nodes.get(&node).map_or_else(Vec::new, |found| {
+                found
+                    .namespace
+                    .records()
+                    .filter(|record| record.closed)
+                    .map(|record| record.id)
+                    .collect()
+            });
+            for member in closed {
+                self.closed_at(node, member, builder, effects);
+                for window in self.windows_on(node, member) {
+                    self.close_window(window, builder, effects);
+                }
+                if self.is_undecided(node, member) {
+                    effects.push(Effect::Closed { node, member });
+                }
+            }
+        }
     }
 
     fn windows_on(&self, node: NodeId, member: MemberId) -> Vec<NodeId> {
@@ -683,8 +898,12 @@ impl Tree {
         let Some(length) = self.window(window).map(|range| range.len()) else {
             return;
         };
-        let volume = VolumeIndex(0);
-        self.reach(window, Told::Closed { volume, length }, builder, effects);
+        let told = Told::Closed {
+            volume: VolumeIndex(0),
+            length,
+            reached: length,
+        };
+        self.reach(window, told, builder, effects);
     }
 
     // Lend the object at `node` out of the tree, so the owner can run it
@@ -856,42 +1075,106 @@ impl Tree {
     // delivered, and the rest of it goes: the posted volumes stand in for
     // that. When an engine took the volumes it reads them again and makes
     // every member over, so nothing of the node stays. A refused node stays
-    // whatever it keeps, to claim the rest of its set.
-    pub fn bury(&mut self, node: NodeId, member: MemberId) {
-        let Some((retired, _)) = self
-            .nodes
-            .retired_mut(&(node, member))
-            .and_then(Option::take)
-        else {
+    // whatever it keeps, to claim the rest of its set. A volume a refused
+    // set held, now in its member's own file, is given back as every volume
+    // of the set is: offered to the objects beside the set, with nothing
+    // carried, and the set's still only when none takes it.
+    pub fn bury(&mut self, node: NodeId, member: MemberId, effects: &mut Vec<Effect>) {
+        let Some((retired, last)) = self.unbury(node, member) else {
             return;
         };
-        if self
-            .nodes
-            .retired()
-            .values()
-            .flatten()
-            .any(|(other, _)| *other == retired)
-        {
-            return;
-        }
         let read_again = self.child_of(node, member).is_some();
         let refused = self
             .nodes
             .get(&retired)
             .is_some_and(|found| found.refused.is_some());
-        if read_again || !(self.keep_closed(retired) || refused) {
-            self.drop_subtree(retired);
-            self.remove_node(retired);
+        if refused && self.give_read_back(node, (retired, member), effects) {
+            return;
+        }
+        if !last {
+            return;
+        }
+        if read_again || !(self.keep_closed(retired, effects) || refused) {
+            self.drop_subtree(retired, effects);
+            self.remove_node(retired, effects);
         }
     }
 
+    // The retired node a member was read back through, once the owner has:
+    // the member's record keeps that it was given up, and no longer where
+    // to read it, and whether no other member reads back through the node.
+    fn unbury(&mut self, node: NodeId, member: MemberId) -> Option<(NodeId, bool)> {
+        let (retired, _) = self
+            .nodes
+            .retired_mut(&(node, member))
+            .and_then(Option::take)?;
+        let last = !self
+            .nodes
+            .retired()
+            .values()
+            .flatten()
+            .any(|(other, _)| *other == retired);
+        Some((retired, last))
+    }
+
+    // A member a live object holds was rewritten: its bytes went on to
+    // members below, and a refusal of one of those was a verdict on bytes
+    // it no longer holds. Every member, at any depth, that the rewritten
+    // bytes reached through live objects and that an object refused.
+    pub fn refused_through(&self, node: NodeId, member: MemberId) -> Vec<(NodeId, MemberId)> {
+        let mut found = Vec::new();
+        let mut pending = vec![(node, member)];
+        while let Some((node, member)) = pending.pop() {
+            let Some((child, volume)) = self.child_of(node, member) else {
+                continue;
+            };
+            let Some(length) = self
+                .namespace(node)
+                .and_then(|namespace| namespace.get(member))
+                .and_then(|record| record.length)
+            else {
+                continue;
+            };
+            let Some(object) = self
+                .nodes
+                .get(&child)
+                .filter(|owner| !owner.retired)
+                .and_then(|owner| owner.object.as_ref())
+            else {
+                continue;
+            };
+            let mut placements = Vec::new();
+            object.locate(volume, ByteRange::new(0, length), &mut placements);
+            let mut landed = BTreeSet::new();
+            for placement in placements {
+                if let Placement::Member { member, .. } = placement {
+                    landed.insert(member);
+                }
+            }
+            let refusers = self.refused_below(child);
+            for below in landed {
+                let refused = refusers.iter().any(|refuser| {
+                    self.volumes(*refuser)
+                        .is_some_and(|(_, volumes)| volumes.values().any(|held| *held == below))
+                });
+                if refused {
+                    found.push((child, below));
+                } else {
+                    pending.push((child, below));
+                }
+            }
+        }
+        found
+    }
+
     // A recovery object repaired the member, a leaf of `node`'s namespace:
-    // a refusal of it was a verdict on bytes it no longer holds. Every
-    // object that refused it goes whole, as a buried node does when its
-    // volumes are read again: the reader offered them makes every member
-    // over. Each of its volumes is a member no object owns, asked again who
-    // owns it as a member whose front has just spoken. Returns those
-    // volumes; none when nothing refused the member.
+    // a refusal of it was a verdict on bytes it no longer holds, and so was
+    // its own front's word that no object owns it. Every object that
+    // refused it goes whole, as a buried node does when its volumes are
+    // read again: the reader offered them makes every member over. Each of
+    // its volumes is a member no object owns, asked again who owns it as a
+    // member whose front has just spoken, and so is the member itself.
+    // Returns those members; none when an object owns the member.
     pub fn reopen(
         &mut self,
         node: NodeId,
@@ -902,21 +1185,53 @@ impl Tree {
         if self.child_of(node, member).is_some() {
             return Vec::new();
         }
+        // The objects whose refusal the rewrite answers: those holding the
+        // member, and those that take the member as a volume of theirs by
+        // their own answer to its rewritten front, as `offer` asks it: a set
+        // that gave up for want of a volume it never had, which the member
+        // is.
+        let Some((name, length, front)) = self
+            .namespace(node)
+            .and_then(|namespace| Some((namespace.get(member)?, namespace.first_bytes(member))))
+            .map(|(record, front)| (record.name.clone(), record.length, front.to_vec()))
+        else {
+            return Vec::new();
+        };
         let refusers: Vec<NodeId> = self
             .refused_below(node)
             .into_iter()
             .filter(|object| {
-                self.volumes(*object)
-                    .is_some_and(|(_, volumes)| volumes.values().any(|bound| *bound == member))
+                let holds = self
+                    .volumes(*object)
+                    .is_some_and(|(_, volumes)| volumes.values().any(|bound| *bound == member));
+                holds
+                    || self
+                        .nodes
+                        .get_mut(object)
+                        .filter(|refuser| {
+                            refuser
+                                .binding
+                                .as_ref()
+                                .is_some_and(|binding| binding.window.is_none())
+                        })
+                        .and_then(|refuser| refuser.object.as_mut())
+                        .is_some_and(|refuser| !refuser.claim(&name, &front, length).is_empty())
             })
             .collect();
-        let mut reopened = Vec::new();
+        if refusers.is_empty() && !self.unowned(node, member) {
+            return Vec::new();
+        }
+        let mut reopened = vec![member];
         for refuser in refusers {
             if let Some((_, volumes)) = self.volumes(refuser) {
-                reopened.extend(volumes.values().copied());
+                for volume in volumes.values().copied() {
+                    if !reopened.contains(&volume) {
+                        reopened.push(volume);
+                    }
+                }
             }
-            self.drop_subtree(refuser);
-            self.remove_node(refuser);
+            self.drop_subtree(refuser, effects);
+            self.remove_node(refuser, effects);
         }
         for volume in &reopened {
             self.nodes.unretire(&(node, *volume));
@@ -937,7 +1252,7 @@ impl Tree {
     // object left one open. It keeps no name and no file. The rest goes with
     // its name, and so does every window, which owns nothing of its member.
     // `false` when nothing stays, and removing the node is the caller's.
-    fn keep_closed(&mut self, node: NodeId) -> bool {
+    fn keep_closed(&mut self, node: NodeId, effects: &mut Vec<Effect>) -> bool {
         let Some(found) = self.nodes.get_mut(&node) else {
             return false;
         };
@@ -951,35 +1266,35 @@ impl Tree {
             .map(|record| (record.id, record.is_whole(), record.closed))
             .collect();
         for window in windows {
-            self.drop_subtree(window);
-            self.remove_node(window);
+            self.drop_subtree(window, effects);
+            self.remove_node(window, effects);
         }
         for (member, whole, closed) in members {
             let owner = self.child_of(node, member).map(|(child, _)| child);
-            if owner.is_some_and(|child| self.keep_closed(child)) {
+            if owner.is_some_and(|child| self.keep_closed(child, effects)) {
                 continue;
             }
             // A recovery volume lives in its member's own file, as a leaf does.
             let own_file = owner.is_none_or(|child| self.recovers(child));
             let open = !closed && !owner.is_some_and(|child| self.recovers(child));
             if let Some(child) = owner {
-                self.drop_subtree(child);
-                self.remove_node(child);
+                self.drop_subtree(child, effects);
+                self.remove_node(child, effects);
             }
             let Some(found) = self.nodes.get_mut(&node) else {
                 return false;
             };
-            found.children.remove(&member);
+            found.disown(member);
             found.namespace.unbind(member);
             if open {
-                found.undecided.remove(&member);
+                found.decide(member);
                 self.nodes.retire((node, member), None);
-                self.names.release((node, member));
+                self.release_name((node, member), effects);
             } else if !(whole && own_file) {
                 found.namespace.remove(member);
-                found.undecided.remove(&member);
+                found.decide(member);
                 self.nodes.unretire(&(node, member));
-                self.names.release((node, member));
+                self.release_name((node, member), effects);
             }
         }
         self.nodes
@@ -1032,6 +1347,7 @@ impl Tree {
     // Whether the object that read `member` of `node`'s namespace, buried
     // since, had announced a member it never closed: its buried node still
     // holds that member.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn left_open(&self, node: NodeId, member: MemberId) -> bool {
         self.kept(node, member).any(|kept| self.leaves_open(kept))
     }
@@ -1053,6 +1369,14 @@ impl Tree {
     // still hold what they closed whole: the member is a leaf again, and
     // those files are delivered beside it.
     pub fn kept(&self, node: NodeId, member: MemberId) -> impl Iterator<Item = NodeId> + '_ {
+        self.readers(node, member).filter(|id| self.buried(*id))
+    }
+
+    // Every node that reads `member` of `node`'s namespace as one of its
+    // volumes, live or retired: the object that owns it, an engine bound in
+    // a refused object's place, and the refused object itself while it
+    // stands.
+    pub fn readers(&self, node: NodeId, member: MemberId) -> impl Iterator<Item = NodeId> + '_ {
         self.nodes
             .iter()
             .filter(move |(_, found)| {
@@ -1063,11 +1387,25 @@ impl Tree {
                 })
             })
             .map(|(id, _)| *id)
-            .filter(|id| self.buried(*id))
     }
 
+    // The node's namespace, to change: it marks each member it changes, and
+    // the node's own row is left unmarked.
     pub fn namespace_mut(&mut self, node: NodeId) -> Option<&mut Namespace> {
-        self.nodes.get_mut(&node).map(|found| &mut found.namespace)
+        self.nodes.namespace_mut(node)
+    }
+
+    // What a member given back carries, until an owner adopts it. Whether
+    // the member waits on an owner reads it, so a change marks the member.
+    fn give(&mut self, at: (NodeId, MemberId), carried: Carried) {
+        self.nodes.mark_member(at.0, at.1);
+        self.given.insert(at, carried);
+    }
+
+    fn take_given(&mut self, at: &(NodeId, MemberId)) -> Option<Carried> {
+        let taken = self.given.remove(at)?;
+        self.nodes.mark_member(at.0, at.1);
+        Some(taken)
     }
 
     // The object a member is a volume of, and which volume; a posting of a
@@ -1094,14 +1432,25 @@ impl Tree {
         !self.windows_on(node, member).is_empty()
     }
 
-    // Whether damage at `range` of the member stops its front for good: it
-    // starts where the bytes in hand from the member's start run out, so the
-    // front can grow no further unless a repair brings those bytes back.
-    pub fn front_lost(&self, node: NodeId, member: MemberId, range: ByteRange) -> bool {
-        self.namespace(node).is_some_and(|namespace| {
-            usize::try_from(range.start)
-                .is_ok_and(|start| start <= namespace.first_bytes(member).len())
-        })
+    // Whether more of the member's front can still come: it has not ended,
+    // the front it has is short of all a member keeps, and no damage stops
+    // it, as damage that starts where the bytes in hand from its start run
+    // out does. A repair there brings the front back, which asks again who
+    // owns it.
+    pub fn front_to_come(&self, node: NodeId, member: MemberId) -> bool {
+        let Some(namespace) = self.namespace(node) else {
+            return false;
+        };
+        let Some(record) = namespace.get(member) else {
+            return false;
+        };
+        let front = namespace.first_bytes(member).len();
+        !record.closed
+            && front < FIRST_BYTES
+            && !record
+                .coverage
+                .damaged_ranges()
+                .any(|range| usize::try_from(range.start).is_ok_and(|start| start <= front))
     }
 
     // Whether a member of `node`'s namespace has a front that has not yet
@@ -1128,18 +1477,41 @@ impl Tree {
     // for good, before the front could say what it is. The objects beside
     // it are offered it with what it has, as a volume of theirs, as a
     // member that has said what it is would be; unclaimed, it is a leaf.
+    // One whose front has said, waiting on a holder's front that comes
+    // again, waits on: that front decides it, whatever its own did. One
+    // beside a lent sibling waits for the loan, as when it was first asked.
     pub fn settle_leaf(&mut self, node: NodeId, member: MemberId, effects: &mut Vec<Effect>) {
-        let Some(found) = self.nodes.get_mut(&node) else {
+        let Some(found) = self.nodes.get(&node) else {
             return;
         };
-        if !found.undecided.remove(&member) {
+        if !found.undecided.contains(&member) {
             return;
         }
         let front = found.namespace.first_bytes(member).to_vec();
         let mut siblings = self.bound_below(node);
         siblings.extend(self.refused_below(node));
-        siblings.retain(|sibling| !self.lent(*sibling));
-        self.offer(node, member, &front, &siblings, effects);
+        if self.behind_a_loan(node, member, &siblings) {
+            return;
+        }
+        if !self.offer(node, member, &front, &siblings, effects)
+            && let Some(mut members) = self.nodes.members_mut(node)
+        {
+            members.decide(member);
+        }
+    }
+
+    // A sibling that is lent out cannot be asked whether the member is its
+    // volume: the member queues behind the loan, undecided, and is asked
+    // again when the sibling is back. Whether it queued.
+    fn behind_a_loan(&mut self, node: NodeId, member: MemberId, siblings: &[NodeId]) -> bool {
+        let Some(lent) = siblings.iter().copied().find(|sibling| self.lent(*sibling)) else {
+            return false;
+        };
+        self.queue_behind(lent, node, member);
+        if let Some(mut members) = self.nodes.members_mut(node) {
+            members.undecide(member);
+        }
+        true
     }
 
     // The inverse map of the object at `node`: where this range of its volume
@@ -1238,8 +1610,16 @@ impl Tree {
     ) -> MemberId {
         let found = self.nodes.get_mut(&node).expect("announce on a live node");
         let member = found.namespace.announce(name, length);
-        found.undecided.insert(member);
+        found.undecide(member);
         self.place(node, member, effects);
+        // An object of the namespace may place the member by its name alone,
+        // before any of its bytes: it is offered now with no prefix, by the
+        // one offer, and asked again when its bytes come if none takes it. A
+        // lent object cannot be asked, so the bytes ask it later.
+        let siblings = self.bound_below(node);
+        if !siblings.is_empty() && !siblings.iter().any(|sibling| self.lent(*sibling)) {
+            self.offer(node, member, &[], &siblings, effects);
+        }
         member
     }
 
@@ -1268,7 +1648,8 @@ impl Tree {
     // it; a member no object owns is asked again who owns it, as a new
     // member is. An owner its bytes founded then takes what the name now
     // places from a sibling founded by names alone, as it does when it is
-    // founded. No other owner loses a member here.
+    // founded. A sibling with parsed state transfers only what it can
+    // carry and this owner accepts.
     fn renamed(
         &mut self,
         node: NodeId,
@@ -1286,17 +1667,18 @@ impl Tree {
         let Some((child, volume)) = self.child_of(node, member) else {
             return self.identify_again(node, member, builder, effects);
         };
-        let told = Told::Renamed {
-            volume,
-            name: name.clone(),
-        };
-        if self.wait(child, Waiting::Told(told)).is_some()
-            && let Some(object) = self
-                .nodes
-                .get_mut(&child)
-                .and_then(|found| found.object.as_mut())
-        {
-            object.renamed(volume, &name);
+        self.reach(child, Told::Renamed { volume, name }, builder, effects);
+        // The object's answer may already have returned and reassigned it.
+        if self.child_of(node, member) != Some((child, volume)) {
+            return;
+        }
+        // A name that no longer places the member there ends the hold,
+        // however the object was founded: the member is read back and
+        // claimed again as founding claims it. A name says where, never
+        // that a kind was wrong, so nothing is refuted.
+        if !self.still_holds(node, child, member, volume) {
+            let moved = Unbinding::Disclaimed(Disclaim::Moved);
+            return self.unbind(child, moved, builder, effects);
         }
         let unowned: Vec<(MemberId, Vec<u8>)> = self
             .namespace(node)
@@ -1315,8 +1697,106 @@ impl Tree {
             }
         }
         if !self.founded_by_name(child) {
-            self.take_named(node, child, effects);
+            self.take_claimed(node, child, effects);
         }
+    }
+
+    // Whether the object at `child` still holds `member` as `volume` by the
+    // name the member carries now. It asks what founding asks, whichever
+    // came first, the name or the bytes: a kind the name and the front say
+    // the member is, other than the object's, ends the hold, so a numbered
+    // name moves a piece to the split store from an owner its bytes
+    // founded, as it would have founded the split store had it come before
+    // them. A member whose front signs is held by its bytes. One whose
+    // front signs nothing is held by its name alone, and the object's own
+    // claim on that name answers: a name that places it elsewhere in the
+    // object, or nowhere in it, ends the hold.
+    fn still_holds(
+        &mut self,
+        node: NodeId,
+        child: NodeId,
+        member: MemberId,
+        volume: VolumeIndex,
+    ) -> bool {
+        let Some((name, length, front, said)) = self.namespace(node).and_then(|namespace| {
+            let front = namespace.first_bytes(member);
+            namespace.get(member).map(|record| {
+                (
+                    record.name.clone(),
+                    record.length,
+                    front.to_vec(),
+                    record.said(front),
+                )
+            })
+        }) else {
+            return true;
+        };
+        // An engine reads the kind of store it stands in for.
+        let owner = self.kind(child);
+        let kind_agrees = match said {
+            Sniff::Object(kind) => owner == Some(kind) || owner == kind.engine_for(),
+            Sniff::Leaf | Sniff::Pending => true,
+        };
+        let signs = matches!(signed(&front, length), Sniff::Object(_));
+        kind_agrees
+            && (signs
+                || self
+                    .nodes
+                    .get_mut(&child)
+                    .and_then(|found| found.object.as_mut())
+                    .is_none_or(|object| object.claim(&name, &front, length).contains(&volume)))
+    }
+
+    // A name was all that held `member` as `volume` of the object at
+    // `child`, and its new name places it there no more: the volume leaves
+    // the object as one a founded sibling takes does, the member's file its
+    // own and nothing copied, and the member is asked again who owns it. An
+    // object left with no volume goes.
+    fn release_named(
+        &mut self,
+        node: NodeId,
+        child: NodeId,
+        (volume, member): (VolumeIndex, MemberId),
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let empty = self.release(node, child, (volume, member), effects);
+        self.forget_empty(child, empty, effects);
+        self.identify_again(node, member, builder, effects);
+    }
+
+    // `member` leaves the object at `child`, where only its name held it as
+    // `volume`: the object holds nothing of it from here, and the member's
+    // file is its own, nothing copied. Whether the object holds no volume.
+    fn release(
+        &mut self,
+        node: NodeId,
+        child: NodeId,
+        (volume, member): (VolumeIndex, MemberId),
+        effects: &mut Vec<Effect>,
+    ) -> bool {
+        let mut empty = false;
+        if let Some(found) = self.nodes.get_mut(&child) {
+            if let Some(binding) = found.binding.as_mut() {
+                binding.volumes.remove(&volume);
+                binding.awaiting.remove(&volume);
+                empty = binding.volumes.is_empty();
+            }
+            if let Some(object) = found.object.as_mut() {
+                object.taken(volume);
+            }
+        }
+        if let Some(found) = self.nodes.get_mut(&node) {
+            found.disown(member);
+            found.namespace.unbind(member);
+        }
+        effects.push(Effect::GivenBack {
+            node,
+            member,
+            from: child,
+            volume,
+        });
+        empty
     }
 
     // The object at `node` gives volumes back, every one it named in one
@@ -1369,7 +1849,7 @@ impl Tree {
                 offered.push(member);
             }
         }
-        self.forget_empty(node, empty);
+        self.forget_empty(node, empty, effects);
         for member in offered {
             self.identify_again(parent, member, builder, effects);
         }
@@ -1389,10 +1869,10 @@ impl Tree {
         self.given_back(node, member).then_some(Why::Unmapped)
     }
 
-    fn forget_empty(&mut self, node: NodeId, empty: bool) {
+    fn forget_empty(&mut self, node: NodeId, empty: bool, effects: &mut Vec<Effect>) {
         if empty {
-            self.drop_subtree(node);
-            self.remove_node(node);
+            self.drop_subtree(node, effects);
+            self.remove_node(node, effects);
         }
     }
 
@@ -1432,6 +1912,37 @@ impl Tree {
         }
     }
 
+    // A member's file has moved off `name`, so the ledger may give it
+    // again, and the member that wanted it while it was left moves to it.
+    pub fn vacated(&mut self, name: &str, effects: &mut Vec<Effect>) {
+        let mut moved = Vec::new();
+        self.names.vacated(name, &mut moved);
+        self.report_moves(moved, effects);
+    }
+
+    // Restored, every member the ledger kept off the name it wants while a
+    // file left it takes the name, now free.
+    pub fn settle_names(&mut self, effects: &mut Vec<Effect>) {
+        let mut moved = Vec::new();
+        self.names.settle(&mut moved);
+        self.report_moves(moved, effects);
+    }
+
+    // A member leaves the ledger. Each name it was moving off is handed to
+    // the member that wanted it while it was left, as that member's move;
+    // the member's file goes there once nothing sits at the name on disk.
+    fn release_name(&mut self, holder: (NodeId, MemberId), effects: &mut Vec<Effect>) {
+        let mut moved = Vec::new();
+        self.names.release(holder, &mut moved);
+        self.report_moves(moved, effects);
+    }
+
+    // A restored member's file still sits at `name`, which it is moving off:
+    // the ledger gives it to no other member until it has.
+    pub fn leaving(&mut self, node: NodeId, member: MemberId, name: &str) {
+        self.names.leaving((node, member), name);
+    }
+
     // Give the member the output name the ledger allocates for the name it
     // wants, and move whichever members that displaced.
     fn place(&mut self, node: NodeId, member: MemberId, effects: &mut Vec<Effect>) {
@@ -1453,6 +1964,12 @@ impl Tree {
         {
             record.output_name = given;
         }
+        self.report_moves(moved, effects);
+    }
+
+    // Members the ledger moved take their new names, and each move is
+    // reported.
+    fn report_moves(&mut self, moved: Vec<Moved>, effects: &mut Vec<Effect>) {
         for Moved { holder, old, new } in moved {
             let (node, member) = holder;
             if let Some(record) = self
@@ -1488,11 +2005,11 @@ impl Tree {
 
     // A node leaves the tree, and its members' names with it. A set that
     // moved into its namespace is homed where it was posted again.
-    fn remove_node(&mut self, node: NodeId) -> Option<Node> {
+    fn remove_node(&mut self, node: NodeId, effects: &mut Vec<Effect>) -> Option<Node> {
         let removed = self.nodes.remove(&node)?;
         self.given.retain(|(at, _), _| *at != node);
         for record in removed.namespace.members() {
-            self.names.release((node, record.id));
+            self.release_name((node, record.id), effects);
         }
         self.rehome(node);
         for set in self.recovery_nodes(node) {
@@ -1521,52 +2038,62 @@ impl Tree {
             provenance,
         } = arrival;
         let range = ByteRange::at(offset, bytes.len() as u64);
-        let Some(found) = self.nodes.get_mut(&node) else {
+        let Some(namespace) = self.nodes.namespace_mut(node) else {
             return;
         };
-        // Clean bytes over damage, or where a member nothing more arrives
-        // for has none, replace what was there, whichever posting or repair
-        // brings them.
-        let mends = provenance.is_verified()
-            && found
-                .namespace
-                .get(found.namespace.resolve(posting))
-                .is_some_and(|record| {
-                    record.coverage.damaged(range)
-                        || record.closed && !record.coverage.covered(range)
-                });
-        let (member, taken) = found.namespace.arrive(posting, range, provenance);
-        for part in taken {
+        let (member, taken) = namespace.arrive(posting, range, provenance);
+        for (part, landed) in taken {
             let from = (part.start - offset) as usize;
             let piece = bytes.slice(from..from + part.len() as usize);
-            let arrived = (part.start, piece, provenance);
-            self.take(node, member, arrived, mends, builder, effects);
+            let arrived = (part.start, piece, landed);
+            self.take(node, member, arrived, builder, effects);
         }
     }
 
     // What a member took of a delivery: kept at its front, handed to its
-    // owner or written as a leaf. A member that took clean bytes over
-    // damage is asked again who owns it when they reach its front.
+    // owner or written as a leaf. A member with no owner is asked again who
+    // owns it when bytes reach its front.
     fn take(
         &mut self,
         node: NodeId,
         member: MemberId,
-        (offset, bytes, provenance): (u64, Bytes, Provenance),
-        mends: bool,
+        (offset, bytes, provenance): (u64, Evidenced, Provenance),
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
-        let Some(found) = self.nodes.get_mut(&node) else {
+        // An owner of the kind the member's own name says it is, which may
+        // hold it by that name alone: it founded the owner, or the owner
+        // took it by name before any of its bytes came.
+        let named = self.child_of(node, member).filter(|(child, _)| {
+            self.namespace(node)
+                .and_then(|namespace| namespace.get(member))
+                .and_then(|record| crate::sniff::recovery_by_name(&record.name))
+                .is_some_and(|kind| self.kind(*child) == Some(kind))
+        });
+        let Some(namespace) = self.nodes.namespace_mut(node) else {
             return;
         };
-        found
-            .namespace
-            .keep_first_bytes(member, offset, &bytes, provenance);
+        let frontless = namespace.first_bytes(member).is_empty();
+        namespace.keep_first_bytes(member, offset, &bytes, provenance);
+        let came = frontless && !namespace.first_bytes(member).is_empty();
         // Bytes that landed in the member's contiguous front, whoever sent
         // them: an undecided member is asked who owns it each time, since
         // a front that stopped at a hole grows again when the hole fills.
         let front =
-            usize::try_from(offset).is_ok_and(|at| at < found.namespace.first_bytes(member).len());
+            usize::try_from(offset).is_ok_and(|at| at < namespace.first_bytes(member).len());
+        // Bytes outrank names: a front that signs another kind than that
+        // owner leaves it, and the member is asked again who owns it, from
+        // its bytes.
+        if front && let Some((child, volume)) = named {
+            let length = namespace.get(member).and_then(|record| record.length);
+            let signs = signed(namespace.first_bytes(member), length);
+            if matches!(signs, Sniff::Object(kind) if self.kind(child) != Some(kind)) {
+                self.release_named(node, child, (volume, member), builder, effects);
+            }
+        }
+        let Some(found) = self.nodes.get(&node) else {
+            return;
+        };
         let undecided = found.undecided.contains(&member);
         if front && undecided {
             self.identify_again(node, member, builder, effects);
@@ -1631,19 +2158,76 @@ impl Tree {
                     bytes,
                     provenance,
                 });
-                // Damage at the front may have hidden what the member is;
-                // clean bytes there let it say, once they are in its file.
-                if front && !undecided && mends {
+                // A front that grew may say what the member is: one that
+                // came late, as one a restart fetches again, or clean bytes
+                // over damage that hid it. It says, once they are in its
+                // file.
+                if front && !undecided {
                     self.identify_again(node, member, builder, effects);
                 }
             }
+        }
+        if came {
+            self.front_changed(node, member, false, builder, effects);
+        }
+    }
+
+    // The member's front changed: it came, or was lost. A member not yet
+    // decided whose own front is in hand may have waited on it, as on a
+    // holder whose front a restart did not keep: it is asked again who owns
+    // it, and folds into the holder, or takes the place of one whose front
+    // was lost. A lost front opens that place to a member no object owns as
+    // well, which could not wait, so it is asked again too. The undecided
+    // set names who may wait; nothing keeps the members no object owns, so
+    // only a lost front walks the namespace for them.
+    fn front_changed(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        lost: bool,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let waiting: BTreeSet<MemberId> = self
+            .nodes
+            .get(&node)
+            .map(|found| {
+                let unowned: Vec<MemberId> = if lost {
+                    found
+                        .namespace
+                        .members()
+                        .map(|record| record.id)
+                        .filter(|other| self.unowned(node, *other))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                found
+                    .undecided
+                    .iter()
+                    .copied()
+                    .chain(unowned)
+                    .filter(|other| {
+                        #[cfg(test)]
+                        FRONT_CANDIDATES.with(|seen| seen.set(seen.get() + 1));
+                        *other != member && !found.namespace.first_bytes(*other).is_empty()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for other in waiting {
+            self.identify_again(node, other, builder, effects);
         }
     }
 
     // The front of a member with no owner changed: it is asked again who
     // owns it, from the front it has now. Its bytes are written as a leaf
     // meanwhile, which is right either way: a bound member's bytes are
-    // re-delivered to its object by the owner on `Bound`.
+    // re-delivered to its object by the owner on `Bound`. A front short of
+    // what the sniff reads before its verdict, the whole member's or every
+    // signature's, that can grow no more, says no more of what the member
+    // is than it did when it stopped: the member settles, and founds
+    // nothing from a part of a front.
     fn identify_again(
         &mut self,
         node: NodeId,
@@ -1654,13 +2238,108 @@ impl Tree {
         if !(self.is_undecided(node, member) || self.unowned(node, member)) {
             return;
         }
-        let Some(front) = self
-            .namespace(node)
-            .map(|namespace| namespace.first_bytes(member).to_vec())
+        let Some((front, length)) = self.namespace(node).map(|namespace| {
+            let length = namespace.get(member).and_then(|record| record.length);
+            (namespace.first_bytes(member).to_vec(), length)
+        }) else {
+            return;
+        };
+        let most = VERDICT_BYTES as u64;
+        let verdict = length.map_or(most, |length| length.min(most));
+        if (front.len() as u64) < verdict && !self.front_to_come(node, member) {
+            return self.settle_leaf(node, member, effects);
+        }
+        self.identify(node, member, &front, builder, effects);
+    }
+
+    // A member its object holds no more, once the owner has read its bytes
+    // back into its own file: a volume's own bytes refuted the claim its
+    // set's names made (`Emit::Refuted`), or the name a recovery set gave
+    // it no longer places it there (`renamed`). Nothing gave it up: it is a
+    // member no object has claimed, and the object goes once the last of
+    // its volumes is read back, with everything under it, since nothing of
+    // an ended reading stays.
+    //
+    // It is claimed as founding claims it, by its name and its front.
+    // Where the bytes refuted the object's kind, that kind is no answer:
+    // then its own bytes say what it is. The member keeps that kind
+    // (`Member::said`), so a front read back or fetched again later, or
+    // after a restart, is asked the same and founds no object of it from
+    // the name. A name that moved it refutes nothing: its new name says
+    // where it goes. Only the objects of the kind it is beside it are
+    // offered it, so the set it is takes it where that set places it, and
+    // nothing of another kind holding members by their names can take it
+    // instead. A member whose bytes have not said yet stays the leaf it was
+    // read back as: its file has its bytes, a front fetched again joins them
+    // there, and it is asked again once they are in it, as any leaf whose
+    // front comes is.
+    pub fn claim_again(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        why: Disclaim,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let buried = self.unbury(node, member);
+        let refuted_kind = buried
+            .filter(|_| why == Disclaim::Refuted)
+            .and_then(|(refuted, _)| self.kind(refuted));
+        self.nodes.unretire(&(node, member));
+        if let Some((refuted, true)) = buried {
+            self.drop_subtree(refuted, effects);
+            self.remove_node(refuted, effects);
+        }
+        if let Some(kind) = refuted_kind
+            && let Some(record) = self
+                .nodes
+                .namespace_mut(node)
+                .and_then(|namespace| namespace.get_mut(member))
+        {
+            record.refuted = Some(kind);
+        }
+        self.claim_as_said(node, member, builder, effects);
+    }
+
+    // A member no object owns, claimed by what it says (`Member::said`):
+    // offered first to the objects of that kind beside it, else founding
+    // one; a member that says no kind stays the leaf it is.
+    fn claim_as_said(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some(namespace) = self.namespace(node) else {
+            return;
+        };
+        let front = namespace.first_bytes(member).to_vec();
+        let Some((name, length, said)) = namespace
+            .get(member)
+            .map(|record| (record.name.clone(), record.length, record.said(&front)))
         else {
             return;
         };
-        self.identify(node, member, &front, builder, effects);
+        let Sniff::Object(kind) = said else {
+            return;
+        };
+        let kin: Vec<NodeId> = self
+            .bound_below(node)
+            .into_iter()
+            .filter(|sibling| self.kind(*sibling) == Some(kind))
+            .collect();
+        if self.offer(node, member, &front, &kin, effects) {
+            return;
+        }
+        self.found(
+            node,
+            member,
+            kind,
+            (&name, &front, length),
+            builder,
+            effects,
+        );
     }
 
     // Who owns a member, from its front. First the objects already in its
@@ -1679,80 +2358,172 @@ impl Tree {
     ) {
         let mut siblings = self.bound_below(node);
         siblings.extend(self.refused_below(node));
-        // A sibling that is lent out cannot be asked whether the member is
-        // its volume: the member queues behind the loan, undecided, and is
-        // asked again when the sibling is back.
-        if let Some(lent) = siblings.iter().copied().find(|sibling| self.lent(*sibling)) {
-            self.queue_behind(lent, node, member);
-            if let Some(found) = self.nodes.get_mut(&node) {
-                found.undecided.insert(member);
-            }
+        if self.behind_a_loan(node, member, &siblings) {
             return;
         }
         if self.offer(node, member, prefix, &siblings, effects) {
             return;
         }
-        let Some(found) = self.nodes.get_mut(&node) else {
+        let Some(mut members) = self.nodes.members_mut(node) else {
             return;
         };
-        let Some((name, length)) = found
+        let Some((name, length, said)) = members
             .namespace
             .get(member)
-            .map(|record| (record.name.clone(), record.length))
+            .map(|record| (record.name.clone(), record.length, record.said(prefix)))
         else {
             return;
         };
-        match sniff(&name, prefix, length) {
+        match said {
             Sniff::Pending => {}
             Sniff::Leaf => {
-                found.undecided.remove(&member);
+                members.decide(member);
             }
             Sniff::Object(kind) => {
-                found.undecided.remove(&member);
-                // The member is the volume its new object places it at, the
-                // position its set gives it, whichever volume came first. A
-                // member given back is placed by what was parsed of it, and
-                // founds nothing where that places it nowhere: it waits for
-                // the set it continues.
-                let volumes = |object: &mut dyn Object, given: &Given| {
-                    let volume = match given.get(&(node, member)) {
-                        Some(carried) => object.reclaim(&name, carried)?,
-                        None => object
-                            .claim(&name, prefix, length)
-                            .unwrap_or(VolumeIndex(0)),
-                    };
-                    Some(BTreeMap::from([(volume, member)]))
-                };
-                match self.attach(node, kind, volumes, builder) {
-                    Ok(Some(child)) => {
-                        self.bound(node, member, kind, child, effects);
-                        self.offer_unowned(node, child, effects);
-                        if matches!(signed(prefix, length), Sniff::Object(_)) {
-                            self.take_named(node, child, effects);
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(why) => effects.push(Effect::Refused { node, member, why }),
-                }
+                self.found(
+                    node,
+                    member,
+                    kind,
+                    (&name, prefix, length),
+                    builder,
+                    effects,
+                );
             }
         }
     }
 
-    // The members of the namespace bound to a PAR2 object whose fronts say
-    // they are the set's index, whatever they were posted as.
-    pub fn signed_indexes(&self, node: NodeId) -> Vec<MemberId> {
-        let Some(namespace) = self.namespace(node) else {
-            return Vec::new();
+    // Build the object `member` founds, of `kind`, and bind the member to it.
+    // The member is the volume its new object places it at, the position its
+    // set gives it, whichever volume came first. A member given back is
+    // placed by what was parsed of it, and founds nothing where that places
+    // it nowhere: it waits for the set it continues. The new object is
+    // offered every member with no owner, and then a recovery volume none
+    // took, its bytes not yet come, founds the set its name says it is.
+    // A member of a set already refuted founds none: it is refuted with
+    // it, and claimed by what its bytes say.
+    fn found(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        kind: Kind,
+        (name, prefix, length): (&str, &[u8], Option<u64>),
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        if let Some(mut members) = self.nodes.members_mut(node) {
+            members.decide(member);
+        }
+        if self.refuted_with_its_set(node, member, kind, (name, prefix, length), builder) {
+            self.claim_as_said(node, member, builder, effects);
+            return;
+        }
+        let volumes = |object: &mut dyn Object, given: &Given| {
+            let volume = match given.get(&(node, member)) {
+                Some(carried) => only(object.reclaim(name, prefix, length, carried.as_ref()))?,
+                None => only(object.claim(name, prefix, length)).unwrap_or(VolumeIndex(0)),
+            };
+            Some(BTreeMap::from([(volume, member)]))
         };
-        namespace
+        match self.attach(node, kind, volumes, builder) {
+            Ok(Some(child)) => {
+                self.bound(node, member, kind, child, effects);
+                self.offer_unowned(node, child, effects);
+                if matches!(signed(prefix, length), Sniff::Object(_)) {
+                    self.take_claimed(node, child, effects);
+                }
+                self.found_by_name(node, builder, effects);
+            }
+            Ok(None) => {}
+            Err(why) => effects.push(Effect::Refused { node, member, why }),
+        }
+    }
+
+    // Whether `member`, not yet refuted and whose own bytes do not sign
+    // `kind`, is a member of a set of `kind` already refuted, and is now
+    // marked refuted with it: an object of that kind bound to it alone, as
+    // founding would bind it, claims a member whose reading as `kind` was
+    // refuted. The object says which names are its set; the refutation is a
+    // fact of each member, so a member posted or read after it is refuted
+    // as the others were.
+    fn refuted_with_its_set(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        kind: Kind,
+        (name, prefix, length): (&str, &[u8], Option<u64>),
+        builder: &mut dyn Builder,
+    ) -> bool {
+        if signed(prefix, length) == Sniff::Object(kind) {
+            return false;
+        }
+        let Some(namespace) = self.namespace(node) else {
+            return false;
+        };
+        if namespace
+            .get(member)
+            .is_none_or(|record| record.refuted.is_some())
+        {
+            return false;
+        }
+        let refuted: Vec<(String, Vec<u8>, Option<u64>)> = namespace
             .members()
-            .filter(|member| {
-                self.child_of(node, member.id)
-                    .is_some_and(|(child, _)| self.kind(child) == Some(Kind::Par2))
-                    && crate::sniff::par2_index(namespace.first_bytes(member.id))
+            .filter(|record| record.id != member && record.refuted == Some(kind))
+            .map(|record| {
+                let front = namespace.first_bytes(record.id).to_vec();
+                (record.name.clone(), front, record.length)
             })
-            .map(|member| member.id)
-            .collect()
+            .collect();
+        if refuted.is_empty() {
+            return false;
+        }
+        let Some(mut object) = builder.build(kind, ObjectId(self.next_node)) else {
+            return false;
+        };
+        let volume = only(object.claim(name, prefix, length)).unwrap_or(VolumeIndex(0));
+        object.bound(volume, name, prefix, length);
+        if refuted
+            .iter()
+            .all(|(other, front, length)| object.claim(other, front, *length).is_empty())
+        {
+            return false;
+        }
+        let Some(record) = self
+            .nodes
+            .namespace_mut(node)
+            .and_then(|namespace| namespace.get_mut(member))
+        else {
+            return false;
+        };
+        record.refuted = Some(kind);
+        true
+    }
+
+    // A recovery volume of the post whose bytes have not come, that no
+    // object of its namespace took by its name, founds the set its name
+    // says it is: the set counts it as coming from the moment the post is
+    // known, as a set already there would. Its hold is its name's: when its
+    // own front comes and signs another kind, the member leaves the set and
+    // its bytes say what it is; otherwise an object another member's bytes
+    // found takes it where its own claim places it, as from any object
+    // founded on names.
+    fn found_by_name(
+        &mut self,
+        node: NodeId,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let named = self.namespace(node).and_then(|namespace| {
+            namespace
+                .members()
+                .filter(|record| self.undecided_recovery(node, record.id))
+                .find_map(|record| {
+                    let kind = crate::sniff::recovery_by_name(&record.name)?;
+                    Some((record.id, record.name.clone(), record.length, kind))
+                })
+        });
+        if let Some((member, name, length, kind)) = named {
+            self.found(node, member, kind, (&name, &[], length), builder, effects);
+        }
     }
 
     // A member no object owns: a leaf whose front has spoken, and which no
@@ -1767,8 +2538,19 @@ impl Tree {
         })
     }
 
+    // A member whose front never came: a name is all that holds it as any
+    // object's volume, and a member whose front came outranks it.
+    fn held_by_name(&self, node: NodeId, member: MemberId) -> bool {
+        self.child_of(node, member).is_some()
+            && self
+                .namespace(node)
+                .and_then(|namespace| namespace.get(member))
+                .is_some_and(|record| !record.fronted)
+    }
+
     // An object founded on nothing but names: none of its volumes' fronts
-    // signs anything, so its hold on each is its name's.
+    // signs anything, so its hold on each is its name's. A front that came
+    // and is no longer kept placed its volume by more than a name.
     fn founded_by_name(&self, node: NodeId) -> bool {
         let Some(found) = self.nodes.get(&node) else {
             return false;
@@ -1780,92 +2562,139 @@ impl Tree {
             return false;
         };
         binding.volumes.values().all(|member| {
-            let length = namespace.get(*member).and_then(|record| record.length);
-            !matches!(
-                signed(namespace.first_bytes(*member), length),
-                Sniff::Object(_)
-            )
+            let Some(record) = namespace.get(*member) else {
+                return true;
+            };
+            let front = namespace.first_bytes(*member);
+            !record.fronted
+                || (!front.is_empty() && !matches!(signed(front, record.length), Sniff::Object(_)))
         })
     }
 
-    // An object its bytes founded takes, from each sibling founded by name
-    // alone, every volume its own claim places: a name is all that held
-    // them there, and bytes outrank names. The volume goes as one given
-    // back does, its file the member's own and nothing copied, straight to
-    // its new owner, never offered to the sibling again. A sibling left
-    // with no volume goes.
-    fn take_named(&mut self, node: NodeId, child: NodeId, effects: &mut Vec<Effect>) {
-        let named: Vec<NodeId> = self
+    // A member's front, where it lies in its namespace.
+    fn front(&self, node: NodeId, member: MemberId) -> &[u8] {
+        self.namespace(node)
+            .map_or(&[][..], |namespace| namespace.first_bytes(member))
+    }
+
+    // The volumes `sibling` can give up to an object its bytes founded,
+    // with their members: every one, when names alone hold them; else the
+    // ones its object says it can carry, which it keeps as it goes.
+    fn transferable(&self, sibling: NodeId, named: bool) -> Vec<(VolumeIndex, MemberId)> {
+        let Some(found) = self.nodes.get(&sibling) else {
+            return Vec::new();
+        };
+        let Some(binding) = found.binding.as_ref() else {
+            return Vec::new();
+        };
+        if named {
+            return binding.volumes.iter().map(|(v, m)| (*v, *m)).collect();
+        }
+        let mut carriable = Vec::new();
+        if let Some(object) = found.object.as_ref() {
+            object.carriable(&mut carriable);
+        }
+        carriable
+            .into_iter()
+            .filter_map(|volume| Some((volume, *binding.volumes.get(&volume)?)))
+            .collect()
+    }
+
+    // An established object takes the volumes its siblings can transfer
+    // and its own claims accept. A sibling founded on names alone yields
+    // every volume to bytes; any other must consent, and offers only the
+    // volumes it says it can carry, so one whose volumes all route output
+    // offers none. The receiver judges that parse, the front read where it
+    // lies, before any edge changes, and a front is copied only for a
+    // volume it accepts. The existing give-back/adopt path keeps its bytes
+    // in place.
+    fn take_claimed(&mut self, node: NodeId, child: NodeId, effects: &mut Vec<Effect>) {
+        let siblings: Vec<NodeId> = self
             .bound_below(node)
             .into_iter()
-            .filter(|sibling| *sibling != child && self.founded_by_name(*sibling))
+            .filter(|sibling| *sibling != child && !self.lent(*sibling))
             .collect();
-        for sibling in named {
-            let held: Vec<(VolumeIndex, MemberId)> = self
-                .nodes
-                .get(&sibling)
-                .and_then(|found| found.binding.as_ref())
-                .map(|binding| binding.volumes.iter().map(|(v, m)| (*v, *m)).collect())
-                .unwrap_or_default();
+        for sibling in siblings {
+            let named = self.founded_by_name(sibling);
+            let held = self.transferable(sibling, named);
             for (volume, member) in held {
-                let Some((name, length, front)) = self.namespace(node).and_then(|namespace| {
-                    namespace.get(member).map(|record| {
-                        (
-                            record.name.clone(),
-                            record.length,
-                            namespace.first_bytes(member).to_vec(),
-                        )
-                    })
+                let Some((name, length)) = self.namespace(node).and_then(|namespace| {
+                    namespace
+                        .get(member)
+                        .map(|record| (record.name.clone(), record.length))
                 }) else {
                     continue;
                 };
-                let Some(place) = self
-                    .nodes
-                    .get_mut(&child)
-                    .and_then(|found| found.object.as_mut())
-                    .and_then(|object| object.claim(&name, &front, length))
-                else {
+                let place = if named {
+                    let front = self.front(node, member).to_vec();
+                    self.nodes
+                        .get_mut(&child)
+                        .and_then(|found| found.object.as_mut())
+                        .and_then(|object| only(object.claim(&name, &front, length)))
+                } else {
+                    self.nodes
+                        .get(&sibling)
+                        .and_then(|found| found.object.as_ref())
+                        .and_then(|object| object.carried(volume))
+                        .and_then(|carried| {
+                            self.nodes
+                                .get(&child)
+                                .and_then(|found| found.object.as_ref())
+                                .and_then(|object| {
+                                    only(object.reclaim(
+                                        &name,
+                                        self.front(node, member),
+                                        length,
+                                        carried,
+                                    ))
+                                })
+                        })
+                };
+                let Some(place) = place else {
                     continue;
                 };
                 // A place the object holds already: the member is another
                 // posting of the one there, or stays where its name put it.
+                // A member whose front never came, at a place the object
+                // holds by bytes, is a volume of neither: a name was all
+                // that held it, and it is a member no object owns.
                 let holder = self
                     .nodes
                     .get(&child)
                     .and_then(|found| found.binding.as_ref())
                     .and_then(|binding| binding.volumes.get(&place))
                     .copied();
-                if holder.is_some_and(|into| {
-                    !self
-                        .namespace(node)
+                let folds = holder.is_none_or(|into| {
+                    self.namespace(node)
                         .is_some_and(|namespace| namespace.folds(member, into))
-                }) {
+                });
+                let outranked = holder.is_some_and(|into| {
+                    self.front(node, member).is_empty() && !self.held_by_name(node, into)
+                });
+                if !folds && !outranked {
                     continue;
                 }
-                if let Some(found) = self.nodes.get_mut(&sibling) {
-                    if let Some(binding) = found.binding.as_mut() {
-                        binding.volumes.remove(&volume);
-                        binding.awaiting.remove(&volume);
-                    }
-                    if let Some(object) = found.object.as_mut() {
-                        object.taken(volume);
-                    }
+                if !named {
+                    let Some(carried) = self
+                        .nodes
+                        .get_mut(&sibling)
+                        .and_then(|found| found.object.as_mut())
+                        .and_then(|object| object.give_back(volume))
+                    else {
+                        continue;
+                    };
+                    self.give((node, member), carried);
                 }
-                if let Some(found) = self.nodes.get_mut(&node) {
-                    found.children.remove(&member);
-                    found.namespace.unbind(member);
-                }
-                effects.push(Effect::GivenBack {
-                    node,
-                    member,
-                    from: sibling,
-                    volume,
-                });
+                self.release(node, sibling, (volume, member), effects);
                 match holder {
-                    Some(into) => {
+                    Some(into) if folds => {
                         self.fold(node, member, into, effects);
                     }
-                    None => self.join(node, member, (child, place), (&name, &front), effects),
+                    Some(_) => {}
+                    None => {
+                        let front = self.front(node, member).to_vec();
+                        self.join(node, member, (child, place), (&name, &front), effects);
+                    }
                 }
             }
             let empty = self
@@ -1873,34 +2702,78 @@ impl Tree {
                 .get(&sibling)
                 .and_then(|found| found.binding.as_ref())
                 .is_some_and(|binding| binding.volumes.is_empty());
-            self.forget_empty(sibling, empty);
+            self.forget_empty(sibling, empty, effects);
         }
     }
 
     // Offer every member of `node`'s namespace that has no owner to the
-    // object bound at `child`, by the one offer a new member gets.
+    // object bound at `child`, by the one offer a new member gets. A member
+    // whose bytes have not said what it is yet, under a name an object may
+    // claim, is offered too, by that name, as it would have been had it
+    // been announced after the object: a set counts it as coming from the
+    // moment the post is known, and its bytes bind it for real when they
+    // come.
     fn offer_unowned(&mut self, node: NodeId, child: NodeId, effects: &mut Vec<Effect>) {
+        let offered = |tree: &Self, member: MemberId| {
+            tree.unowned(node, member)
+                || tree.undecided_named(node, member, crate::sniff::names_claimable)
+        };
         let unowned: Vec<(MemberId, Vec<u8>)> = self
             .namespace(node)
             .map(|namespace| {
                 namespace
                     .members()
-                    .filter(|record| self.unowned(node, record.id))
+                    .filter(|record| offered(self, record.id))
                     .map(|record| (record.id, namespace.first_bytes(record.id).to_vec()))
                     .collect()
             })
             .unwrap_or_default();
         for (member, front) in unowned {
             // A take can take others with it: offer only what is left.
-            if self.unowned(node, member) {
+            if offered(self, member) {
                 self.offer(node, member, &front, &[child], effects);
             }
         }
     }
 
+    // A member whose bytes have not yet said what it is, no object holds,
+    // and whose posted name says it is recovery data.
+    fn undecided_recovery(&self, node: NodeId, member: MemberId) -> bool {
+        self.undecided_named(node, member, crate::sniff::names_recovery)
+    }
+
+    // A member whose bytes have not yet said what it is, no object holds,
+    // and whose posted name `says` what it is.
+    fn undecided_named(&self, node: NodeId, member: MemberId, says: fn(&str) -> bool) -> bool {
+        self.nodes.get(&node).is_some_and(|found| {
+            found.namespace.copy_of(member).is_none()
+                && found.undecided.contains(&member)
+                && !found.children.contains_key(&member)
+                && !self.nodes.retired().contains_key(&(node, member))
+                && found
+                    .namespace
+                    .get(member)
+                    .is_some_and(|record| says(&record.name))
+        })
+    }
+
     // The one offer of a member with no owner to objects of its namespace,
-    // in the order given; the first to claim it takes it as that volume.
-    // Whether one did.
+    // in the order given. Each object answers the places the member could
+    // take, held or free, and the tree judges them once, whatever the
+    // format: a member that is another posting of a holder folds into it; a
+    // holder whose front is coming again keeps the member waiting on it; a
+    // place another member holds, their fronts differing, is no place for
+    // it, and one whose fronts are not both in hand is not judged, so no
+    // other place is chosen past it. A place whose holder's front was lost
+    // is open, as a free one is, and taking it displaces the holder. Of the
+    // places left, one takes it, and several leave it unclaimed, since
+    // nothing orders it. Where the object answers one place, the member's
+    // bytes also outrank a holder held by its name alone or
+    // provisionally. An object that cannot judge the member yet keeps it
+    // waiting while more of its front can come, and once none can, answers
+    // the places the front it has gives it. Whether one took it, or the
+    // member, not yet decided, waits undecided on a holder's front that
+    // comes again or on its own front, and is asked again when it comes.
     fn offer(
         &mut self,
         node: NodeId,
@@ -1909,6 +2782,14 @@ impl Tree {
         objects: &[NodeId],
         effects: &mut Vec<Effect>,
     ) -> bool {
+        // How the member takes a place left to it: free, or from the member
+        // holding it by its name alone, or holding it as one that yields.
+        #[derive(Clone, Copy)]
+        enum Taking {
+            Free,
+            Named(MemberId),
+            Yields(MemberId),
+        }
         let Some((name, length)) = self
             .namespace(node)
             .and_then(|namespace| namespace.get(member))
@@ -1916,6 +2797,7 @@ impl Tree {
         else {
             return false;
         };
+        let mut waits = false;
         for child in objects {
             let Some(found) = self.nodes.get_mut(child).filter(|found| {
                 // A window owns none of its member, so it takes none.
@@ -1930,37 +2812,111 @@ impl Tree {
             let refused = found.refused;
             // A member given back is claimed by what was parsed of it.
             let carried = self.given.get(&(node, member));
-            let Some(volume) = found.object.as_mut().and_then(|object| match carried {
-                Some(carried) => object.reclaim(&name, carried),
-                None => object.claim(&name, prefix, length),
-            }) else {
-                continue;
+            let answer = found
+                .object
+                .as_mut()
+                .map(|object| match carried {
+                    Some(carried) => object.reclaim(&name, prefix, length, carried.as_ref()),
+                    None => object.claim(&name, prefix, length),
+                })
+                .unwrap_or_default();
+            let places = match answer {
+                Claim::NotYet(_) if self.front_to_come(node, member) => {
+                    waits = true;
+                    continue;
+                }
+                Claim::Places(places) | Claim::NotYet(places) => places,
             };
-            // A volume the object holds already: the member is another
-            // posting of the one holding it, or none of the object's. The
-            // member it holds there already is asked of the others.
-            let holder = found
-                .binding
-                .as_ref()
-                .and_then(|binding| binding.volumes.get(&volume))
-                .copied();
-            if let Some(into) = holder {
+            let one = places.len() == 1;
+            let mut open = Vec::new();
+            let mut coming = false;
+            let mut judged = true;
+            for volume in places {
+                // A volume the object holds already: the member is another
+                // posting of the one holding it, or none of the object's.
+                let holder = self
+                    .nodes
+                    .get(child)
+                    .and_then(|found| found.binding.as_ref())
+                    .and_then(|binding| binding.volumes.get(&volume))
+                    .copied();
+                let Some(into) = holder else {
+                    open.push((volume, Taking::Free));
+                    continue;
+                };
                 if into != member && self.fold(node, member, into, effects) {
                     return true;
                 }
-                let yields = into != member
-                    && refused.is_none()
-                    && self
-                        .nodes
-                        .get(child)
-                        .and_then(|found| found.object.as_ref())
-                        .is_some_and(|object| {
-                            object.provisional(volume, prefix, self.given.get(&(node, member)))
-                        });
-                if !yields {
+                // The member it holds there already is asked of the others.
+                if into == member || refused.is_some() {
                     continue;
                 }
-                self.displace(node, (*child, volume), into, effects);
+                let fronted = !prefix.is_empty();
+                // A holder whose front came and is not in hand: the
+                // claimant's front can fold into it only once that front
+                // comes again. Lost instead, the claimant's bytes outrank
+                // it where they name its place alone; still coming, a
+                // claimant not yet decided waits on it.
+                let away = fronted
+                    .then(|| self.namespace(node)?.front_away(into))
+                    .flatten();
+                // A holder whose front never came holds its place by its
+                // name alone, which the claimant's bytes outrank: it leaves
+                // the object as a volume a founded sibling takes does, and
+                // is a member no object owns, as it would be had the
+                // claimant come first.
+                if one && fronted && self.held_by_name(node, into) {
+                    open.push((volume, Taking::Named(into)));
+                } else if away == Some(true)
+                    || one
+                        && self
+                            .nodes
+                            .get(child)
+                            .and_then(|found| found.object.as_ref())
+                            .is_some_and(|object| {
+                                object.provisional(
+                                    volume,
+                                    &name,
+                                    prefix,
+                                    self.given.get(&(node, member)),
+                                )
+                            })
+                {
+                    open.push((volume, Taking::Yields(into)));
+                } else {
+                    // Fronts that differ put the place out of its reach;
+                    // one not in hand, its own or the holder's, leaves the
+                    // place unjudged, and no other place is its while one is.
+                    coming |= away == Some(false);
+                    judged &= fronted
+                        && self
+                            .namespace(node)
+                            .is_some_and(|namespace| !namespace.first_bytes(into).is_empty());
+                }
+            }
+            if coming {
+                waits |= self.is_undecided(node, member);
+                continue;
+            }
+            let ([(volume, taking)], true) = (&open[..], judged) else {
+                continue;
+            };
+            let (volume, taking) = (*volume, *taking);
+            match taking {
+                Taking::Free => {}
+                Taking::Named(into) => {
+                    self.release(node, *child, (volume, into), effects);
+                    // It has no byte authority yet, so a front still to come
+                    // must receive a new ownership decision. One that will
+                    // never come says no more: it stays the leaf it is, as a
+                    // member whose front was lost is settled a leaf.
+                    if self.front_to_come(node, into)
+                        && let Some(mut members) = self.nodes.members_mut(node)
+                    {
+                        members.undecide(into);
+                    }
+                }
+                Taking::Yields(into) => self.displace(node, (*child, volume), into, effects),
             }
             match refused {
                 None => self.join(node, member, (*child, volume), (&name, prefix), effects),
@@ -1969,20 +2925,22 @@ impl Tree {
                 // It hears the volume as any object does, so what it claims
                 // next is claimed beside it.
                 Some(why) => {
-                    let carried = self.given.remove(&(node, member));
+                    let carried = self.take_given(&(node, member));
                     if let Some(found) = self.nodes.get_mut(child) {
                         if let Some(binding) = found.binding.as_mut() {
                             binding.volumes.insert(volume, member);
                         }
                         if let Some(object) = found.object.as_mut() {
                             match carried {
-                                Some(carried) => object.adopt(volume, &name, carried),
+                                Some(carried) => {
+                                    object.adopt(volume, &name, prefix, length, carried);
+                                }
                                 None => object.bound(volume, &name, prefix, length),
                             }
                         }
                     }
-                    if let Some(found) = self.nodes.get_mut(&node) {
-                        found.undecided.remove(&member);
+                    if let Some(mut members) = self.nodes.members_mut(node) {
+                        members.decide(member);
                     }
                     self.nodes.retire((node, member), None);
                     effects.push(Effect::Refused { node, member, why });
@@ -1990,11 +2948,11 @@ impl Tree {
             }
             return true;
         }
-        false
+        waits
     }
 
     // The holder of a place its object holds provisionally makes way for a
-    // claim that names the place, as take_named moves a volume: the holder
+    // claim that names the place, as take_claimed moves a volume: the holder
     // leaves the object with what was parsed of it, its holds in place, and
     // is parked as a member given back, so the claimant joins the place
     // first and the holder is offered again beside it.
@@ -2034,7 +2992,7 @@ impl Tree {
             .and_then(|found| found.object.as_mut())
             .and_then(|object| object.give_back(volume));
         if let Some(found) = self.nodes.get_mut(&parent) {
-            found.children.remove(&member);
+            found.disown(member);
             found.namespace.unbind(member);
         }
         effects.push(Effect::GivenBack {
@@ -2045,7 +3003,17 @@ impl Tree {
         });
         match carried {
             Some(carried) => {
-                self.given.insert((parent, member), carried);
+                // A completed earlier refusal is no longer this member's
+                // disposition: its current owner explicitly gave it back.
+                if self
+                    .nodes
+                    .retired()
+                    .get(&(parent, member))
+                    .is_some_and(Option::is_none)
+                {
+                    self.nodes.unretire(&(parent, member));
+                }
+                self.give((parent, member), carried);
                 true
             }
             None => {
@@ -2074,13 +3042,18 @@ impl Tree {
         let Some(found) = self.nodes.get_mut(&node) else {
             return false;
         };
-        if !found.namespace.fold(copy, into) {
+        let Some(held) = found.namespace.fold(copy, into) else {
             return false;
-        }
-        found.undecided.remove(&copy);
-        self.given.remove(&(node, copy));
-        self.names.release((node, copy));
-        effects.push(Effect::Folded { node, copy, into });
+        };
+        found.decide(copy);
+        self.take_given(&(node, copy));
+        self.release_name((node, copy), effects);
+        effects.push(Effect::Folded {
+            node,
+            copy,
+            into,
+            held,
+        });
         true
     }
 
@@ -2093,12 +3066,12 @@ impl Tree {
         (name, front): (&str, &[u8]),
         effects: &mut Vec<Effect>,
     ) {
-        let carried = self.given.remove(&(node, member));
+        let carried = self.take_given(&(node, member));
         let Some(parent) = self.nodes.get_mut(&node) else {
             return;
         };
-        parent.undecided.remove(&member);
-        parent.children.insert(member, (child, volume));
+        parent.decide(member);
+        parent.own(member, (child, volume));
         parent.namespace.bind(member, ObjectId(child.0));
         let length = parent
             .namespace
@@ -2114,7 +3087,7 @@ impl Tree {
         // owner adopts as it stands: it reads none of the member again.
         let kind = child_node.object.as_mut().map(|object| {
             match carried {
-                Some(carried) => object.adopt(volume, name, carried),
+                Some(carried) => object.adopt(volume, name, front, length, carried),
                 None => object.bound(volume, name, front, length),
             }
             object.kind()
@@ -2176,22 +3149,23 @@ impl Tree {
         let parent = self.nodes.get_mut(&node).ok_or(Why::Unsupported)?;
         for (volume, member) in &volumes {
             if let Some(record) = parent.namespace.get(*member) {
+                let front = parent.namespace.first_bytes(*member);
                 match self.given.remove(&(node, *member)) {
-                    Some(carried) => object.adopt(*volume, &record.name, carried),
-                    None => {
-                        let front = parent.namespace.first_bytes(*member);
-                        object.bound(*volume, &record.name, front, record.length)
+                    Some(carried) => {
+                        object.adopt(*volume, &record.name, front, record.length, carried);
                     }
+                    None => object.bound(*volume, &record.name, front, record.length),
                 }
             }
             parent.namespace.bind(*member, id);
-            parent.children.insert(*member, (child, *volume));
+            parent.own(*member, (child, *volume));
         }
         let binding = Binding {
             parent: node,
             volumes,
             window: None,
             awaiting: BTreeSet::new(),
+            handed: Handed::default(),
         };
         self.nodes
             .insert(child, Node::new(Some(object), Some(binding)));
@@ -2206,7 +3180,8 @@ impl Tree {
     // the owner, in the member's offsets; the window takes it now, and the
     // rest as it passes. `None`, and nothing bound, when no object of that
     // kind can be built or the range already has a window, which takes
-    // what was handed in place of what it held.
+    // what was handed in place of what it held, now or when its object is
+    // taken back.
     pub fn attach_window(
         &mut self,
         node: NodeId,
@@ -2225,28 +3200,23 @@ impl Tree {
                 .is_some_and(|binding| binding.window == Some(range))
         });
         if let Some(window) = taken {
-            if let Some(object) = self
-                .nodes
-                .get_mut(&window)
-                .and_then(|found| found.object.as_mut())
-            {
-                object.handed(handed);
-            }
+            self.hand(window, handed);
             return None;
         }
         let child = NodeId(self.next_node);
         let mut object = builder.build(kind, ObjectId(child.0))?;
         self.next_node += 1;
         object.bound(VolumeIndex(0), &name, &[], length);
-        object.handed(handed);
         let binding = Binding {
             parent: node,
             volumes: BTreeMap::from([(VolumeIndex(0), member)]),
             window: Some(range),
             awaiting: BTreeSet::new(),
+            handed: Handed::default(),
         };
         self.nodes
             .insert(child, Node::new(Some(object), Some(binding)));
+        self.hand(child, handed);
         self.nodes
             .get_mut(&node)?
             .windows
@@ -2255,6 +3225,7 @@ impl Tree {
             .push(child);
         self.rehome(child);
         for (offset, bytes, provenance) in passed {
+            let bytes = Evidenced::new(bytes);
             self.deliver_window(child, offset, &bytes, provenance, builder, effects);
         }
         if closed {
@@ -2263,13 +3234,28 @@ impl Tree {
         Some(child)
     }
 
+    // The window's owner hands its object what it reads the range by. The
+    // node keeps it, so an object lent out meanwhile, or rebuilt from its
+    // facts in its place, is handed it when it is taken back.
+    fn hand(&mut self, window: NodeId, handed: &Handed) {
+        let Some(found) = self.nodes.get_mut(&window) else {
+            return;
+        };
+        if let Some(binding) = found.binding.as_mut() {
+            binding.handed = handed.clone();
+        }
+        if let Some(object) = found.object.as_mut() {
+            object.handed(handed);
+        }
+    }
+
     // The part of a delivery to the window's member that falls in the
     // window, delivered to its object at the window's own offsets.
     fn deliver_window(
         &mut self,
         window: NodeId,
         offset: u64,
-        bytes: &Bytes,
+        bytes: &Evidenced,
         provenance: Provenance,
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
@@ -2375,12 +3361,21 @@ impl Tree {
                         }
                     }
                     // A member announced again after a retraction kept its
-                    // record and its name, but not its length.
+                    // record, but not its length; the name it is announced
+                    // under now is the one its producer read from the bytes
+                    // it starts over on, so a different one renames it. A
+                    // length said again is the producer's word on it now: a
+                    // store whose geometry moved says its member anew.
+                    let mut renamed = false;
                     if let Some(record) = self
                         .namespace_mut(node)
                         .and_then(|namespace| namespace.get_mut(member))
                     {
-                        record.length = record.length.or(length);
+                        record.length = length.or(record.length);
+                        renamed = record.name != name;
+                    }
+                    if renamed {
+                        self.rename(node, member, &name, builder, effects);
                     }
                     effects.push(Effect::Announced { node, member });
                 }
@@ -2401,6 +3396,14 @@ impl Tree {
                         builder,
                         effects,
                     );
+                }
+                Emit::Checksum { member, crc32 } => {
+                    if let Some(record) = self
+                        .namespace_mut(node)
+                        .and_then(|namespace| namespace.get_mut(member))
+                    {
+                        record.crc32 = Some(crc32);
+                    }
                 }
                 Emit::MemberClosed(member) => self.close(node, member, builder, effects),
                 Emit::Retract(member) => self.retract(node, member, effects),
@@ -2427,8 +3430,14 @@ impl Tree {
                 Emit::Again { volume, range } => again.push((volume, range)),
                 Emit::Damaged { volume, range } => self.damaged(node, volume, range, effects),
                 Emit::NeedsPassword => effects.push(Effect::NeedsPassword { node }),
-                Emit::NeedsEngine(why) => self.unbind(node, why, true, builder, effects),
-                Emit::Refuse(why) => self.unbind(node, why, false, builder, effects),
+                Emit::NeedsEngine(why) => {
+                    self.unbind(node, Unbinding::Engine(why), builder, effects);
+                }
+                Emit::Refuse(why) => self.unbind(node, Unbinding::Refused(why), builder, effects),
+                Emit::Refuted => {
+                    let refuted = Unbinding::Disclaimed(Disclaim::Refuted);
+                    self.unbind(node, refuted, builder, effects);
+                }
                 Emit::GiveBack(volume) => given.push(volume),
             }
             if self.nodes.get(&node).is_none_or(|found| found.retired) {
@@ -2457,13 +3466,13 @@ impl Tree {
             .get(&node)
             .and_then(|found| found.children.get(&member).copied())
         {
-            self.drop_subtree(child);
-            let volumes = self.detach(child);
+            self.drop_subtree(child, effects);
+            let volumes = self.detach(child, effects);
             if let Some(found) = self.nodes.get_mut(&node) {
                 for volume in &volumes {
-                    found.children.remove(volume);
+                    found.disown(*volume);
                     found.namespace.retract(*volume);
-                    found.undecided.insert(*volume);
+                    found.undecide(*volume);
                     self.given.remove(&(node, *volume));
                 }
                 for volume in volumes {
@@ -2474,14 +3483,14 @@ impl Tree {
         // A member that starts over was given up by nothing yet.
         if let Some(found) = self.nodes.get_mut(&node) {
             found.namespace.retract(member);
-            found.undecided.insert(member);
+            found.undecide(member);
             self.nodes.unretire(&(node, member));
-            self.given.remove(&(node, member));
+            self.take_given(&(node, member));
         }
         // A window was a range of the member's old bytes.
         for window in self.windows_on(node, member) {
-            self.drop_subtree(window);
-            self.remove_node(window);
+            self.drop_subtree(window, effects);
+            self.remove_node(window, effects);
         }
         if let Some(found) = self.nodes.get_mut(&node) {
             found.windows.remove(&member);
@@ -2492,14 +3501,15 @@ impl Tree {
     // The object at `node` gives its members up: every volume it owned
     // becomes a leaf of the parent namespace, or, when it asked for an
     // engine and its kind has one, the volumes of an engine bound in its
-    // place. Either way the object and its subtree retire: they answer where
-    // their bytes went until the owner, told once per volume, has read them
-    // back and buried them.
+    // place, or, when a volume's bytes refuted its claim, a member the owner
+    // has claimed by its own bytes once it has its bytes back. Every way the
+    // object and its subtree retire: they answer where their bytes went
+    // until the owner, told once per volume, has read them back and buried
+    // them.
     fn unbind(
         &mut self,
         node: NodeId,
-        why: Why,
-        engine: bool,
+        unbinding: Unbinding,
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
@@ -2514,8 +3524,8 @@ impl Tree {
         if binding.window.is_some() {
             // A window owns none of its member: nothing is given up, and
             // nothing reads back through it, so it simply goes.
-            self.drop_subtree(node);
-            self.remove_node(node);
+            self.drop_subtree(node, effects);
+            self.remove_node(node, effects);
             if let Some(found) = self.nodes.get_mut(&binding.parent) {
                 for windows in found.windows.values_mut() {
                     windows.retain(|window| *window != node);
@@ -2524,23 +3534,73 @@ impl Tree {
             return;
         }
         let parent = binding.parent;
+        // A refused set gives back first every volume it can carry, as any
+        // object gives a volume back: what is left is refused with it.
+        let given = match unbinding {
+            Unbinding::Refused(_) => self.give_carried(node, effects),
+            Unbinding::Engine(_) | Unbinding::Disclaimed(_) => Vec::new(),
+        };
+        let Some(binding) = self
+            .nodes
+            .get(&node)
+            .and_then(|found| found.binding.clone())
+        else {
+            return;
+        };
         if let Some(found) = self.nodes.get_mut(&parent) {
             for member in binding.volumes.values() {
-                found.children.remove(member);
+                found.disown(*member);
                 found.namespace.unbind(*member);
             }
         }
         for (volume, member) in &binding.volumes {
             self.nodes.retire((parent, *member), Some((node, *volume)));
         }
+        let (why, engine) = match unbinding {
+            Unbinding::Refused(why) => (why, false),
+            Unbinding::Engine(why) => (why, true),
+            // Nothing holds the set's volumes now: each is claimed again
+            // once the owner has them back, and nothing failed.
+            Unbinding::Disclaimed(why) => {
+                for member in binding.volumes.into_values() {
+                    effects.push(Effect::Disclaimed {
+                        node: parent,
+                        member,
+                        why,
+                    });
+                }
+                return;
+            }
+        };
         let engine = kind
             .and_then(Kind::engine_for)
             .filter(|_| engine)
             .and_then(|kind| {
+                let handed: Vec<_> = self
+                    .nodes
+                    .get(&node)
+                    .and_then(|found| found.object.as_ref())
+                    .into_iter()
+                    .flat_map(|object| {
+                        binding.volumes.iter().filter_map(|(volume, member)| {
+                            Some((*member, object.engine_volume(*volume)?))
+                        })
+                    })
+                    .collect();
+                for (member, metadata) in handed {
+                    self.give((parent, member), metadata);
+                }
                 let volumes = binding.volumes.clone();
-                self.attach(parent, kind, |_, _| Some(volumes), builder)
+                let attached = self
+                    .attach(parent, kind, |_, _| Some(volumes), builder)
                     .ok()
-                    .flatten()
+                    .flatten();
+                if attached.is_none() {
+                    for member in binding.volumes.values() {
+                        self.take_given(&(parent, *member));
+                    }
+                }
+                attached
             });
         for member in binding.volumes.into_values() {
             effects.push(match engine {
@@ -2570,7 +3630,107 @@ impl Tree {
                 node
             }
         };
+        // What the set gave back is offered to the objects beside it first,
+        // by the one offer, and only what none takes is the refused set's.
+        let beside = self.beside(parent, node);
+        for member in given {
+            if self.unowned(parent, member) {
+                let front = self.front(parent, member).to_vec();
+                self.offer(parent, member, &front, &beside, effects);
+            }
+        }
         self.offer_unowned(parent, holder, effects);
+        let empty = self
+            .nodes
+            .get(&node)
+            .and_then(|found| found.binding.as_ref())
+            .is_some_and(|binding| binding.volumes.is_empty());
+        self.forget_empty(node, empty, effects);
+    }
+
+    // The volumes the object at `node` can carry leave it, each parked
+    // beside its namespace as a member given back, as `give_back` parks
+    // them. The members parked, for the caller to offer.
+    fn give_carried(&mut self, node: NodeId, effects: &mut Vec<Effect>) -> Vec<MemberId> {
+        let Some(parent) = self
+            .nodes
+            .get(&node)
+            .and_then(|found| found.binding.as_ref())
+            .map(|binding| binding.parent)
+        else {
+            return Vec::new();
+        };
+        let mut parked = Vec::new();
+        for (volume, member) in self.transferable(node, false) {
+            if let Some(binding) = self
+                .nodes
+                .get_mut(&node)
+                .and_then(|found| found.binding.as_mut())
+            {
+                binding.volumes.remove(&volume);
+                binding.awaiting.remove(&volume);
+            }
+            if self.park(parent, (node, volume), member, effects) {
+                parked.push(member);
+            }
+        }
+        parked
+    }
+
+    // The objects of `parent`'s namespace beside `node` that an offer of a
+    // volume it gives back goes to.
+    fn beside(&self, parent: NodeId, node: NodeId) -> Vec<NodeId> {
+        self.bound_below(parent)
+            .into_iter()
+            .filter(|sibling| *sibling != node && !self.lent(*sibling))
+            .collect()
+    }
+
+    // A volume the refused set at `set` held by what its headers mapped, now
+    // read back into its member's own file: the set gives it back, and it is
+    // offered beside the set as a volume given back is, with nothing
+    // carried, so it is claimed fresh by its name and front and a further
+    // posting folds into the volume it is. None taking it, it stays the
+    // set's, refused with it. A set left with no volume goes, as one that
+    // gave back every volume it held goes. Whether it went.
+    fn give_read_back(
+        &mut self,
+        parent: NodeId,
+        (set, member): (NodeId, MemberId),
+        effects: &mut Vec<Effect>,
+    ) -> bool {
+        let Some(volume) = self.volumes(set).and_then(|(_, volumes)| {
+            volumes
+                .iter()
+                .find(|(_, held)| **held == member)
+                .map(|(volume, _)| *volume)
+        }) else {
+            return false;
+        };
+        self.nodes.unretire(&(parent, member));
+        let beside = self.beside(parent, set);
+        let front = self.front(parent, member).to_vec();
+        self.offer(parent, member, &front, &beside, effects);
+        let taken = self.child_of(parent, member).is_some()
+            || self
+                .namespace(parent)
+                .is_some_and(|namespace| namespace.copy_of(member).is_some());
+        if !taken {
+            self.nodes.retire((parent, member), None);
+            return false;
+        }
+        let Some(binding) = self
+            .nodes
+            .get_mut(&set)
+            .and_then(|found| found.binding.as_mut())
+        else {
+            return false;
+        };
+        binding.volumes.remove(&volume);
+        binding.awaiting.remove(&volume);
+        let empty = binding.volumes.is_empty();
+        self.forget_empty(set, empty, effects);
+        empty
     }
 
     fn retire(&mut self, node: NodeId) {
@@ -2590,8 +3750,8 @@ impl Tree {
     }
 
     // Remove a node and return the parent members that were its volumes.
-    fn detach(&mut self, node: NodeId) -> Vec<MemberId> {
-        self.remove_node(node)
+    fn detach(&mut self, node: NodeId, effects: &mut Vec<Effect>) -> Vec<MemberId> {
+        self.remove_node(node, effects)
             .and_then(|removed| removed.binding)
             .map(|binding| binding.volumes.into_values().collect())
             .unwrap_or_default()
@@ -2599,12 +3759,12 @@ impl Tree {
 
     // A node's subtree goes with it, the objects that refused their volumes
     // in its namespace among it.
-    fn drop_subtree(&mut self, node: NodeId) {
+    fn drop_subtree(&mut self, node: NodeId, effects: &mut Vec<Effect>) {
         let mut below = self.bound_below(node);
         below.extend(self.refused_below(node));
         for child in below {
-            self.drop_subtree(child);
-            self.remove_node(child);
+            self.drop_subtree(child, effects);
+            self.remove_node(child, effects);
         }
     }
 
@@ -2630,6 +3790,18 @@ impl Tree {
                 pulled = pulled.fold(ask.unseekable());
                 continue;
             };
+            // A window's set that covers the member it sits in rules on that
+            // member only once all of it is in, its own recovery bytes with
+            // it: deferring them would hold back the ruling that asks for
+            // them, so the deferral parks nothing.
+            if ask.when == When::Deferred
+                && self.window(at).is_some()
+                && self
+                    .recovery(at)
+                    .is_some_and(|recovery| recovery.covers(member))
+            {
+                continue;
+            }
             // A seek past the end of a window asks for nothing that is the
             // node's.
             let Some(range) = self
@@ -2651,12 +3823,15 @@ impl Tree {
             };
             let mut extents = std::mem::take(&mut self.extents);
             extents.clear();
-            object.extent(member, ask.range, &mut extents);
-            if extents.is_empty() {
-                // The parent does not know the member's layout yet, so it
-                // cannot say where the bytes lie; the ask waits for the
-                // normal order to reach them.
-                pulled = pulled.fold(ask.unseekable());
+            match object.extent(member, ask.range, &mut extents) {
+                Located::Whole => {}
+                // The parent has not read the header that places the rest
+                // of the bytes; the ask is lifted again next round, when it
+                // may have.
+                Located::NotYet => pulled = pulled.fold(ask.unlocated()),
+                // Nothing above can bring the bytes forward; the ask waits
+                // for the normal order to reach them.
+                Located::Never => pulled = pulled.fold(ask.unseekable()),
             }
             for extent in extents.iter().rev() {
                 asks.push((
@@ -2673,11 +3848,13 @@ impl Tree {
         pulled
     }
 
-    // Damage at a range of `node`'s volume. The tree asks the node's object
-    // where those bytes went and reports damage on each member they landed
-    // in; a damaged member bound to a child becomes damage on the child's
-    // volume, and so on down. The owner, told of each damaged member, finds
-    // the nearest recovery object that covers it.
+    // A range of `node`'s volume that will never arrive. The tree asks the
+    // node's object where those bytes would have gone and records the loss
+    // on each member they land in; a member bound to a child loses that
+    // range of the child's volume, and so on down. A loss is recorded as
+    // the loss it is at every depth, never as bytes that came damaged. The
+    // owner, told of each member that lost bytes, finds the nearest
+    // recovery object that covers it.
     pub fn damage(
         &mut self,
         node: NodeId,
@@ -2685,16 +3862,158 @@ impl Tree {
         range: ByteRange,
         effects: &mut Vec<Effect>,
     ) {
-        self.descend(vec![(node, volume, range)], effects);
+        self.descend(vec![(node, volume, range)], Provenance::Lost, effects);
+    }
+
+    // The member's bytes, every one of them in, fail the checksum its
+    // object's headers state for them. Which bytes are wrong is not known,
+    // so the whole member is damaged, and the damage descends as any other.
+    pub fn checksum_failed(&mut self, node: NodeId, member: MemberId, effects: &mut Vec<Effect>) {
+        let Some(found) = self.nodes.members_mut(node) else {
+            return;
+        };
+        let member = found.namespace.resolve(member);
+        let Some(record) = found.namespace.get_mut(member) else {
+            return;
+        };
+        let Some(length) = record.length else {
+            return;
+        };
+        let range = ByteRange::new(0, length);
+        // This checks the assembled member itself, not one posting's
+        // report of damage. A parent's repair proves its input bytes;
+        // it cannot overrule the derived member's own failed checksum.
+        record.coverage.write(range, Provenance::Refuted);
+        effects.push(Effect::Damaged {
+            node,
+            member,
+            range,
+        });
+        let pending = found
+            .children
+            .get(&member)
+            .map(|&(child, volume)| (child, volume, range))
+            .into_iter()
+            .collect();
+        self.descend(pending, Provenance::Refuted, effects);
+    }
+
+    // Capture the complete input dependencies of checksummed, damaged
+    // outputs before a repair's partial deliveries erase that evidence.
+    // This is a repair transition, not a payload-delivery query. Engine
+    // objects restart through their run generation; stores replay through
+    // the same inverse map used when they ask for bytes again.
+    pub fn rejected_inputs(
+        &self,
+        parent: NodeId,
+        rewritten: impl IntoIterator<Item = MemberId>,
+    ) -> Vec<(NodeId, Vec<(VolumeIndex, ByteRange)>)> {
+        let mut pending: Vec<_> = rewritten
+            .into_iter()
+            .filter_map(|member| self.child_of(parent, member).map(|(node, _)| node))
+            .collect();
+        let mut seen = BTreeSet::new();
+        let mut rejected = Vec::new();
+        while let Some(node) = pending.pop() {
+            if !seen.insert(node) {
+                continue;
+            }
+            let Some(found) = self.nodes.get(&node).filter(|found| !found.retired) else {
+                continue;
+            };
+            let Some(object) = found.object.as_ref() else {
+                continue;
+            };
+            if object.engine().is_some() {
+                continue;
+            }
+            pending.extend(self.bound_below(node));
+            let mut extents = Vec::new();
+            for member in found.namespace.members() {
+                let Some(length) = member.length.filter(|_| member.crc32.is_some()) else {
+                    continue;
+                };
+                if member
+                    .coverage
+                    .runs()
+                    .any(|run| run.provenance.is_damaged())
+                {
+                    object.extent(member.id, ByteRange::new(0, length), &mut extents);
+                }
+            }
+            extents.sort_by_key(|extent| (extent.volume, extent.range.start));
+            let mut ranges: Vec<(VolumeIndex, ByteRange)> = Vec::new();
+            for extent in extents {
+                if let Some((volume, range)) = ranges.last_mut()
+                    && *volume == extent.volume
+                    && extent.range.start <= range.end
+                {
+                    range.end = range.end.max(extent.range.end);
+                } else {
+                    ranges.push((extent.volume, extent.range));
+                }
+            }
+            if !ranges.is_empty() {
+                rejected.push((node, ranges));
+            }
+        }
+        rejected.sort_by_key(|(node, _)| *node);
+        rejected
+    }
+
+    // The damage marked in the namespaces below `node` on members an object
+    // further down reads, as ranges of the members of `node` their bytes
+    // came from: each object's forward map carries a damaged range of its
+    // member to where it lies in the volumes it is bound to, and on up. Such
+    // a mark is the reading object's verdict on bytes it was handed, and a
+    // set that proves those ranges here proves the bytes it was given on. A
+    // mark on a member nothing reads further is its producer's verdict on
+    // what it made, which proof of the bytes it was made from does not
+    // answer: it stands until its producer judges the member again.
+    pub fn damaged_below(&self, node: NodeId) -> Vec<(MemberId, ByteRange)> {
+        let mut damaged = Vec::new();
+        for child in self.bound_below(node) {
+            let Some(found) = self.nodes.get(&child).filter(|found| !found.retired) else {
+                continue;
+            };
+            let (Some(object), Some(binding)) = (found.object.as_ref(), found.binding.as_ref())
+            else {
+                continue;
+            };
+            let mut extents = Vec::new();
+            let read_below = |member: &MemberId| {
+                let member = found.namespace.resolve(*member);
+                found.children.contains_key(&member) || found.windows.contains_key(&member)
+            };
+            for (member, range) in found
+                .namespace
+                .damaged_ranges()
+                .filter(|(member, _)| read_below(member))
+                .chain(self.damaged_below(child))
+            {
+                object.extent(member, range, &mut extents);
+            }
+            for extent in extents {
+                if let (Some(member), Some(range)) = (
+                    binding.volumes.get(&extent.volume),
+                    self.in_member(child, extent.range),
+                ) {
+                    damaged.push((*member, range));
+                }
+            }
+        }
+        damaged
     }
 
     // An object found its own volume bad: a header checksum failed. The
-    // member that volume is in the parent's namespace is marked first, so
-    // the recovery beside it repairs those bytes, and the damage then
-    // descends as any other. A checksum names the whole range it covers,
-    // not the bytes that were bad: damage already marked in that range
-    // accounts for the failure, at the bytes it reached, and marking the
-    // rest would only mark bytes that arrived whole.
+    // member that volume is in the parent's namespace is marked refuted
+    // first, so the recovery beside it repairs those bytes and nothing but
+    // proof lifts the verdict, and it then descends as any other. A
+    // checksum names the whole range it covers, not the bytes that were
+    // bad: damage already marked in that range accounts for the failure,
+    // at the bytes it reached, and marking the rest would only mark bytes
+    // that arrived whole. A volume no member is has nothing in hand to
+    // judge: it is lost, as any range that never arrives.
     fn damaged(
         &mut self,
         node: NodeId,
@@ -2711,8 +4030,9 @@ impl Tree {
             Some((parent, member)) if self.damaged_in(parent, member, range) => {}
             Some((parent, member)) => {
                 let mut pending = Vec::new();
-                self.mark(parent, member, range, effects, &mut pending);
-                self.descend(pending, effects);
+                let verdict = (range, Provenance::Refuted);
+                self.mark(parent, member, verdict, effects, &mut pending);
+                self.descend(pending, Provenance::Refuted, effects);
             }
             None => self.damage(node, volume, range, effects),
         }
@@ -2755,17 +4075,20 @@ impl Tree {
                 record
                     .coverage
                     .overlapping(range)
-                    .any(|run| run.provenance == Provenance::Damaged)
+                    .any(|run| run.provenance.is_damaged())
             })
     }
 
+    // Damage descends with the provenance it was marked with: a loss as
+    // `Lost`, a checksum's verdict as `Refuted`.
     fn descend(
         &mut self,
         pending: Vec<(NodeId, VolumeIndex, ByteRange)>,
+        provenance: Provenance,
         effects: &mut Vec<Effect>,
     ) {
         self.walk_down(pending, |tree, node, member, range, pending| {
-            tree.mark(node, member, range, effects, pending);
+            tree.mark(node, member, (range, provenance), effects, pending);
         });
     }
 
@@ -2774,6 +4097,22 @@ impl Tree {
     // open, and each object bound below forgets what it said of it, so the
     // bytes are said again as they first were.
     pub fn uncover(&mut self, node: NodeId, volume: VolumeIndex, range: ByteRange) {
+        self.forget_input(node, volume, range, false);
+    }
+
+    // Input staged through the existing map is being checked again, not
+    // lost. A repair below that map still answers old upstream damage.
+    pub fn recheck(&mut self, node: NodeId, volume: VolumeIndex, range: ByteRange) {
+        self.forget_input(node, volume, range, true);
+    }
+
+    fn forget_input(
+        &mut self,
+        node: NodeId,
+        volume: VolumeIndex,
+        range: ByteRange,
+        keep_repairs: bool,
+    ) {
         if let Some(object) = self
             .nodes
             .get_mut(&node)
@@ -2784,7 +4123,22 @@ impl Tree {
         self.walk_down(
             vec![(node, volume, range)],
             |tree, node, member, range, pending| {
-                tree.unsay(node, member, range, pending);
+                if !keep_repairs {
+                    tree.unsay(node, member, range, pending);
+                    return;
+                }
+                let mut forgotten = crate::member::Coverage::new();
+                forgotten.write(range, Provenance::Fresh);
+                if let Some(record) = tree.namespace(node).and_then(|ns| ns.get(member)) {
+                    for run in record.coverage.overlapping(range) {
+                        if run.provenance == Provenance::Repaired {
+                            forgotten.erase(run.range);
+                        }
+                    }
+                }
+                for run in forgotten.runs() {
+                    tree.unsay(node, member, run.range, pending);
+                }
             },
         );
     }
@@ -2804,6 +4158,22 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
+        for (volume, posted) in self.again_read(node, ranges, builder) {
+            self.replay_piece(node, volume, posted, builder, effects);
+        }
+    }
+
+    // What `again` delivers, read back and uncovered, each run to go to the
+    // object by `replay_piece` as any delivery does: what it places nowhere
+    // yet, a file it cannot key, is the owner's to hold. The owner applies
+    // each run's effects before the next run goes, so a run the object
+    // could not place when it came never looks placed by a later one.
+    pub fn again_read(
+        &mut self,
+        node: NodeId,
+        ranges: &[(VolumeIndex, ByteRange)],
+        builder: &dyn Builder,
+    ) -> Vec<(VolumeIndex, Posted)> {
         let mut again = Vec::new();
         for &(volume, range) in ranges {
             let Some((parent, member)) = self
@@ -2826,6 +4196,7 @@ impl Tree {
                     record
                         .coverage
                         .overlapping(within)
+                        .filter(|run| run.provenance.arrived())
                         .filter_map(|run| {
                             let piece = run.range.intersect(within)?;
                             (!piece.is_empty()).then(|| (piece.shift(-shift), run.provenance))
@@ -2833,56 +4204,136 @@ impl Tree {
                         .collect()
                 })
                 .unwrap_or_default();
-            let length = record.and_then(|record| record.length);
             let Some(object) = self
                 .nodes
                 .get(&node)
                 .and_then(|found| found.object.as_ref())
             else {
-                return;
+                return Vec::new();
             };
-            let (tree, reader) = (&*self, &*builder);
+            let (tree, reader) = (&*self, builder);
             let mut read = |placement: &Placement, into: &mut Vec<u8>| {
                 reader.read(tree, node, volume, placement, into)
             };
-            for (piece, provenance) in runs {
+            // Bytes held as damage above may not all sit below: an object
+            // that placed them only after they came holds none of them.
+            // Only what sits below goes again, and a loss never does.
+            let pieces = runs.into_iter().flat_map(|(piece, provenance)| {
+                let sitting = if provenance.is_damaged() {
+                    tree.sitting(node, object.as_ref(), volume, piece)
+                } else {
+                    vec![piece]
+                };
+                sitting.into_iter().map(move |piece| (piece, provenance))
+            });
+            for (piece, provenance) in pieces {
                 let mut bytes = Vec::new();
                 if object.posted(volume, piece, &mut read, &mut bytes) {
                     again.push((
-                        parent,
-                        member,
-                        length,
                         volume,
-                        piece,
-                        Bytes::from(bytes),
-                        provenance,
+                        Posted {
+                            offset: piece.start,
+                            bytes: Evidenced::from(bytes),
+                            provenance,
+                        },
                     ));
                 }
             }
         }
-        for (_, _, _, volume, piece, _, _) in &again {
-            self.uncover(node, *volume, *piece);
+        for (volume, posted) in &again {
+            let piece = ByteRange::at(posted.offset, posted.bytes.len() as u64);
+            self.uncover(node, *volume, piece);
         }
-        // Each run reaches the object as any delivery does: what it places
-        // nowhere yet, a file it cannot key, is the owner's to hold.
-        for (parent, member, length, volume, piece, bytes, provenance) in again {
-            effects.push(Effect::Reached {
-                node: parent,
-                member,
-                child: node,
-                volume,
-                offset: piece.start,
-                bytes: bytes.clone(),
-                provenance,
-            });
-            let arrived = Arrived {
-                volume,
-                offset: piece.start,
-                bytes,
-                provenance,
+        again
+    }
+
+    // The parts of a range of the node's volume whose bytes sit below it,
+    // in order: as far as the record of the member the object placed them
+    // in says they arrived, a loss not, and the whole of what it placed
+    // anywhere else.
+    fn sitting(
+        &self,
+        node: NodeId,
+        object: &dyn Object,
+        volume: VolumeIndex,
+        range: ByteRange,
+    ) -> Vec<ByteRange> {
+        let mut placements = Vec::new();
+        object.locate(volume, range, &mut placements);
+        if placements.iter().map(Placement::len).sum::<u64>() != range.len() {
+            return vec![range];
+        }
+        let mut parts: Vec<ByteRange> = Vec::new();
+        let mut at = range.start;
+        for placement in &placements {
+            let piece = ByteRange::at(at, placement.len());
+            at = piece.end;
+            let sat: Vec<ByteRange> = match placement {
+                Placement::Member {
+                    member,
+                    range: within,
+                } => self
+                    .namespace(node)
+                    .and_then(|namespace| namespace.get(*member))
+                    .map(|record| {
+                        record
+                            .coverage
+                            .overlapping(*within)
+                            .filter(|run| run.provenance.arrived())
+                            .filter_map(|run| run.range.intersect(*within))
+                            .map(|part| part.shift(piece.start as i64 - within.start as i64))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                _ => vec![piece],
             };
-            self.deliver_to_object(node, &arrived, length, builder, effects);
+            for part in sat.into_iter().filter(|part| !part.is_empty()) {
+                match parts.last_mut() {
+                    Some(last) if last.end == part.start => last.end = part.end,
+                    _ => parts.push(part),
+                }
+            }
         }
+        parts
+    }
+
+    // One piece whose posted bytes the owner staged before uncovering the
+    // replay's ranges. The owner drains its effects before the next piece,
+    // so neither replay input nor derived output accumulates in memory.
+    pub fn replay_piece(
+        &mut self,
+        node: NodeId,
+        volume: VolumeIndex,
+        posted: Posted,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some((parent, member)) = self
+            .volumes(node)
+            .and_then(|(parent, volumes)| Some((parent, *volumes.get(&volume)?)))
+        else {
+            return;
+        };
+        let length = self
+            .namespace(parent)
+            .and_then(|namespace| namespace.get(member))
+            .and_then(|member| member.length);
+        effects.push(Effect::Reached {
+            node: parent,
+            member,
+            child: node,
+            volume,
+            offset: posted.offset,
+            bytes: posted.bytes.clone(),
+            provenance: posted.provenance,
+        });
+        let arrived = Arrived {
+            volume,
+            offset: posted.offset,
+            bytes: posted.bytes,
+            provenance: posted.provenance,
+        };
+        self.deliver_to_object(node, &arrived, length, builder, effects);
     }
 
     // Each member the ranges of the nodes' volumes landed in, by the node's
@@ -2929,38 +4380,42 @@ impl Tree {
         if range.is_empty() {
             return;
         }
-        let Some(found) = self.nodes.get_mut(&node) else {
+        let Some(found) = self.nodes.members_mut(node) else {
             return;
         };
-        let member = found.namespace.uncover(member, range);
+        // Only what the member lost goes unsaid below it: what it holds from
+        // another posting still stands there.
+        let (member, lost) = found.namespace.uncover(member, range);
         let Some((child, volume)) = found.children.get(&member).copied() else {
             return;
         };
-        if let Some(object) = self
-            .nodes
-            .get_mut(&child)
-            .and_then(|found| found.object.as_mut())
-        {
-            object.unposted(volume, range);
+        for range in lost {
+            if let Some(object) = self
+                .nodes
+                .get_mut(&child)
+                .and_then(|found| found.object.as_mut())
+            {
+                object.unposted(volume, range);
+            }
+            pending.push((child, volume, range));
         }
-        pending.push((child, volume, range));
     }
 
     fn mark(
         &mut self,
         node: NodeId,
         member: MemberId,
-        range: ByteRange,
+        (range, provenance): (ByteRange, Provenance),
         effects: &mut Vec<Effect>,
         pending: &mut Vec<(NodeId, VolumeIndex, ByteRange)>,
     ) {
-        let Some(found) = self.nodes.get_mut(&node) else {
+        let Some(found) = self.nodes.members_mut(node) else {
             return;
         };
         // A posting's loss is the member's only where no other posting
         // brought those bytes clean.
-        let (member, lost) = found.namespace.arrive(member, range, Provenance::Damaged);
-        for range in lost {
+        let (member, lost) = found.namespace.arrive(member, range, provenance);
+        for (range, _) in lost {
             effects.push(Effect::Damaged {
                 node,
                 member,
@@ -2975,7 +4430,8 @@ impl Tree {
     // Damage reached a member range, as `Effect::Damaged` said. A window on
     // it reads that range as its own volume, so what of it falls there is
     // lost to the window's object: nothing recovers the recovery data.
-    pub fn damaged_under_windows(
+    // Damage at its first byte lost its front, as `front_changed` hears.
+    pub fn damage_reached(
         &mut self,
         node: NodeId,
         member: MemberId,
@@ -2992,6 +4448,9 @@ impl Tree {
             };
             let own = piece.shift(-(whole.start as i64));
             self.volume_lost(window, VolumeIndex(0), own, builder, effects);
+        }
+        if range.start == 0 {
+            self.front_changed(node, member, true, builder, effects);
         }
     }
 
@@ -3026,25 +4485,55 @@ impl Tree {
     }
 }
 
+// The one place an object's answer names, where a step moves a member
+// without weighing it against the places held: several name none.
+fn only(places: impl AsRef<[VolumeIndex]>) -> Option<VolumeIndex> {
+    match places.as_ref()[..] {
+        [place] => Some(place),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::deliver::{Delivery, RecoveryKind};
 
     mod again;
+    mod candidates;
+    mod handed;
+    mod lift;
+    mod numbered;
+    mod pieces;
+    mod refuted;
+    mod reopen;
     mod reposted;
     mod sets;
+    mod takes;
     mod windows;
 
     const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";
     const HEADER: u64 = 7;
     const VOLUME_LEN: u64 = 100;
 
+    // The root's `copy` folded into `into`, whatever it brought before.
+    fn folded(effects: &[Effect], copy: MemberId, into: MemberId) -> bool {
+        effects.iter().any(|effect| {
+            matches!(effect, Effect::Folded { node, copy: was, into: is, .. }
+                if *node == NodeId::ROOT && *was == copy && *is == into)
+        })
+    }
+
     // A pretend store: a seven-byte header on volume 0, then one member
     // whose bytes run across volumes of a fixed length. It claims `.r00`
     // as its second volume.
+    #[derive(serde::Serialize, serde::Deserialize)]
     struct Split {
         announced: bool,
+    }
+
+    impl crate::Durable for Split {
+        const VERSION: u16 = 1;
     }
 
     impl Object for Split {
@@ -3053,6 +4542,9 @@ mod tests {
 
         fn kind(&self) -> Kind {
             Kind::RarStore
+        }
+        fn facts(&self) -> crate::Facts {
+            crate::Facts::of(Kind::RarStore, self)
         }
         fn deliver(
             &mut self,
@@ -3112,7 +4604,7 @@ mod tests {
                 range: member,
             });
         }
-        fn extent(&self, _: MemberId, range: ByteRange, out: &mut Vec<Extent>) {
+        fn extent(&self, _: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {
             let mut at = range.start + HEADER;
             let end = range.end + HEADER;
             while at < end {
@@ -3124,16 +4616,18 @@ mod tests {
                 });
                 at = stop;
             }
+            Located::Whole
         }
         fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
             None
         }
-        fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Option<VolumeIndex> {
+        fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Claim {
             match name.rsplit_once('.') {
-                Some((_, "r00" | "002")) => Some(VolumeIndex(1)),
-                Some((_, "r01" | "003")) => Some(VolumeIndex(2)),
-                _ => None,
+                Some((_, "r00" | "002")) => vec![VolumeIndex(1)],
+                Some((_, "r01" | "003")) => vec![VolumeIndex(2)],
+                _ => Vec::new(),
             }
+            .into()
         }
         fn offer_password(&mut self, secret: &str, out: &mut Vec<Emit>) {
             if secret == "open" {
@@ -3175,7 +4669,9 @@ mod tests {
                 range,
             });
         }
-        fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+        fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+            Located::Never
+        }
         fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
             None
         }
@@ -3212,17 +4708,22 @@ mod tests {
                 range,
             });
         }
-        fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+        fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+            Located::Never
+        }
         fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
             None
         }
         fn bound(&mut self, volume: VolumeIndex, _: &str, _: &[u8], _: Option<u64>) {
             self.0.push(volume);
         }
-        fn claim(&mut self, name: &str, _: &[u8], _: Option<u64>) -> Option<VolumeIndex> {
-            let (_, digits) = name.rsplit_once('.')?;
-            let number: u32 = digits.parse().ok()?;
-            Some(VolumeIndex(number.checked_sub(1)?))
+        fn claim(&mut self, name: &str, _: &[u8], _: Option<u64>) -> Claim {
+            name.rsplit_once('.')
+                .and_then(|(_, digits)| digits.parse::<u32>().ok())
+                .and_then(|number| number.checked_sub(1))
+                .map(VolumeIndex)
+                .into_iter()
+                .collect()
         }
         fn taken(&mut self, volume: VolumeIndex) {
             self.0.retain(|held| *held != volume);
@@ -3297,7 +4798,7 @@ mod tests {
             node: child,
             member: MemberId(0),
             offset: 0,
-            bytes: Bytes::from_static(b"hello"),
+            bytes: Bytes::from_static(b"hello").into(),
             provenance: Provenance::Fresh,
         }));
         assert_eq!(
@@ -3352,7 +4853,7 @@ mod tests {
             member,
             Posted {
                 offset: 0,
-                bytes: Bytes::from_static(b"hello"),
+                bytes: Bytes::from_static(b"hello").into(),
                 provenance: Provenance::Fresh,
             },
             &mut Build,
@@ -3364,7 +4865,7 @@ mod tests {
                 node: NodeId::ROOT,
                 member,
                 offset: 0,
-                bytes: Bytes::from_static(b"hello"),
+                bytes: Bytes::from_static(b"hello").into(),
                 provenance: Provenance::Fresh
             }]
         );
@@ -3374,6 +4875,18 @@ mod tests {
                 .get(member)
                 .unwrap()
                 .is_complete()
+        );
+    }
+
+    // A volume announced beside a bound object is offered to it at once, by
+    // its name, before any of its bytes arrive.
+    #[test]
+    fn an_announced_volume_is_offered_to_the_object_before_its_bytes() {
+        let (mut tree, _, child, _) = bound_tree();
+        let second = tree.announce_root("show.r00", None, &mut Vec::new());
+        assert_eq!(
+            tree.child_of(NodeId::ROOT, second),
+            Some((child, VolumeIndex(1)))
         );
     }
 
@@ -3387,7 +4900,7 @@ mod tests {
             second,
             Posted {
                 offset: 0,
-                bytes: Bytes::from_static(b"world"),
+                bytes: Bytes::from_static(b"world").into(),
                 provenance: Provenance::Fresh,
             },
             &mut Build,
@@ -3401,7 +4914,7 @@ mod tests {
             node: child,
             member: MemberId(0),
             offset: VOLUME_LEN - HEADER,
-            bytes: Bytes::from_static(b"world"),
+            bytes: Bytes::from_static(b"world").into(),
             provenance: Provenance::Fresh,
         }));
     }
@@ -3419,7 +4932,7 @@ mod tests {
             second,
             Posted {
                 offset: 0,
-                bytes: Bytes::from_static(b"world"),
+                bytes: Bytes::from_static(b"world").into(),
                 provenance: Provenance::Fresh,
             },
             &mut Build,
@@ -3467,7 +4980,7 @@ mod tests {
             piece,
             Posted {
                 offset: 0,
-                bytes: Bytes::from_static(b"world"),
+                bytes: Bytes::from_static(b"world").into(),
                 provenance: Provenance::Fresh,
             },
             &mut Build,
@@ -3532,7 +5045,7 @@ mod tests {
                 member,
                 Posted {
                     offset: range.start as u64,
-                    bytes: Bytes::copy_from_slice(&body[range]),
+                    bytes: Bytes::copy_from_slice(&body[range]).into(),
                     provenance,
                 },
                 &mut Build,
@@ -3569,7 +5082,7 @@ mod tests {
             second,
             Posted {
                 offset: 0,
-                bytes: Bytes::from_static(b"w"),
+                bytes: Bytes::from_static(b"w").into(),
                 provenance: Provenance::Fresh,
             },
             &mut Build,
@@ -3624,7 +5137,7 @@ mod tests {
             second,
             Posted {
                 offset: 0,
-                bytes: Bytes::from_static(b"w"),
+                bytes: Bytes::from_static(b"w").into(),
                 provenance: Provenance::Fresh,
             },
             &mut Build,
@@ -3671,6 +5184,155 @@ mod tests {
         assert_eq!(
             inner.coverage.damaged_ranges().collect::<Vec<_>>(),
             vec![ByteRange::new(3, 6)]
+        );
+    }
+
+    #[test]
+    fn rejected_inputs_follow_bindings_and_deduplicate_rewritten_volumes() {
+        let (mut tree, first, child, _) = bound_tree();
+        let unrelated = tree.announce_root("unrelated.bin", Some(6), &mut Vec::new());
+        let record = tree
+            .nodes
+            .get_mut(&child)
+            .unwrap()
+            .namespace
+            .get_mut(MemberId(0))
+            .unwrap();
+        record.length = Some(6);
+        record.crc32 = Some(0);
+        record
+            .coverage
+            .write(ByteRange::new(0, 6), Provenance::Damaged);
+        assert!(tree.rejected_inputs(NodeId::ROOT, [unrelated]).is_empty());
+        assert_eq!(
+            tree.rejected_inputs(NodeId::ROOT, [first, first]),
+            vec![(
+                child,
+                vec![(VolumeIndex(0), ByteRange::new(HEADER, HEADER + 6))]
+            )]
+        );
+        tree.nodes
+            .get_mut(&child)
+            .unwrap()
+            .namespace
+            .get_mut(MemberId(0))
+            .unwrap()
+            .coverage
+            .write(ByteRange::new(0, 6), Provenance::Repaired);
+        assert!(tree.rejected_inputs(NodeId::ROOT, [first]).is_empty());
+    }
+
+    #[test]
+    fn replay_keeps_repairs_but_missing_input_does_not() {
+        let (mut tree, _, child, _) = bound_tree();
+        let record = tree
+            .nodes
+            .get_mut(&child)
+            .unwrap()
+            .namespace
+            .get_mut(MemberId(0))
+            .unwrap();
+        record
+            .coverage
+            .write(ByteRange::new(0, 6), Provenance::Fresh);
+        let repaired = ByteRange::new(2, 4);
+        record.coverage.write(repaired, Provenance::Repaired);
+        let input = ByteRange::new(HEADER, HEADER + 6);
+        tree.recheck(child, VolumeIndex(0), input);
+        let coverage = &tree
+            .namespace(child)
+            .unwrap()
+            .get(MemberId(0))
+            .unwrap()
+            .coverage;
+        assert_eq!(coverage.bytes_covered(), repaired.len());
+        assert!(coverage.verified(repaired));
+        let mut effects = Vec::new();
+        tree.replay_piece(
+            child,
+            VolumeIndex(0),
+            Posted {
+                offset: HEADER,
+                bytes: Bytes::from_static(b"abcdef").into(),
+                provenance: Provenance::Damaged,
+            },
+            &mut Build,
+            &mut effects,
+        );
+        let coverage = &tree
+            .namespace(child)
+            .unwrap()
+            .get(MemberId(0))
+            .unwrap()
+            .coverage;
+        assert!(
+            coverage.verified(repaired),
+            "old damage cannot replace the repair"
+        );
+        assert!(coverage.damaged(ByteRange::new(0, 2)));
+        assert!(coverage.damaged(ByteRange::new(4, 6)));
+        tree.uncover(child, VolumeIndex(0), input);
+        assert_eq!(
+            tree.namespace(child)
+                .unwrap()
+                .get(MemberId(0))
+                .unwrap()
+                .coverage
+                .bytes_covered(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_members_own_checksum_can_reject_repaired_bytes() {
+        let (mut tree, first, child, _) = bound_tree();
+        let range = ByteRange::new(0, 6);
+        let record = tree
+            .nodes
+            .get_mut(&child)
+            .unwrap()
+            .namespace
+            .get_mut(MemberId(0))
+            .unwrap();
+        record.length = Some(range.end);
+        record.coverage.write(range, Provenance::Repaired);
+        let mut effects = Vec::new();
+        // An upstream damage report cannot take back a repair.
+        tree.damage(child, VolumeIndex(0), ByteRange::new(7, 13), &mut effects);
+        assert!(
+            tree.namespace(child)
+                .unwrap()
+                .get(MemberId(0))
+                .unwrap()
+                .coverage
+                .verified(range)
+        );
+        effects.clear();
+        tree.checksum_failed(child, MemberId(0), &mut effects);
+        assert_eq!(
+            effects,
+            vec![Effect::Damaged {
+                node: child,
+                member: MemberId(0),
+                range
+            }]
+        );
+        assert!(
+            tree.namespace(child)
+                .unwrap()
+                .get(MemberId(0))
+                .unwrap()
+                .coverage
+                .damaged(range)
+        );
+        assert!(
+            !tree
+                .namespace(NodeId::ROOT)
+                .unwrap()
+                .get(first)
+                .unwrap()
+                .coverage
+                .damaged(ByteRange::new(7, 13))
         );
     }
 
@@ -3789,7 +5451,7 @@ mod tests {
             second,
             Posted {
                 offset: 0,
-                bytes: Bytes::from_static(b"w"),
+                bytes: Bytes::from_static(b"w").into(),
                 provenance: Provenance::Fresh,
             },
             &mut Build,
@@ -3801,7 +5463,7 @@ mod tests {
             first,
             Posted {
                 offset: 20,
-                bytes: Bytes::from_static(b"REFUSE"),
+                bytes: Bytes::from_static(b"REFUSE").into(),
                 provenance: Provenance::Fresh,
             },
             &mut Build,
@@ -3818,7 +5480,7 @@ mod tests {
                     child,
                     volume: VolumeIndex(0),
                     offset: 20,
-                    bytes: Bytes::from_static(b"REFUSE"),
+                    bytes: Bytes::from_static(b"REFUSE").into(),
                     provenance: Provenance::Fresh,
                 },
                 Effect::Refused {
@@ -3845,9 +5507,9 @@ mod tests {
         );
         assert!(tree.namespace(child).is_some());
         assert!(tree.engines().is_empty());
-        tree.bury(NodeId::ROOT, first);
+        tree.bury(NodeId::ROOT, first, &mut Vec::new());
         assert!(tree.namespace(child).is_some(), "one volume still unread");
-        tree.bury(NodeId::ROOT, second);
+        tree.bury(NodeId::ROOT, second, &mut Vec::new());
         // Nothing of the store stays but a member it left open, buried.
         assert!(tree.namespace(child).is_none_or(|namespace| {
             namespace
@@ -3882,7 +5544,7 @@ mod tests {
             second,
             Posted {
                 offset: 0,
-                bytes: Bytes::from_static(b"w"),
+                bytes: Bytes::from_static(b"w").into(),
                 provenance: Provenance::Fresh,
             },
             &mut Build,
@@ -3893,14 +5555,14 @@ mod tests {
             first,
             Posted {
                 offset: 20,
-                bytes: Bytes::from_static(b"REFUSE"),
+                bytes: Bytes::from_static(b"REFUSE").into(),
                 provenance: Provenance::Fresh,
             },
             &mut Build,
             &mut Vec::new(),
         );
-        tree.bury(NodeId::ROOT, first);
-        tree.bury(NodeId::ROOT, second);
+        tree.bury(NodeId::ROOT, first, &mut Vec::new());
+        tree.bury(NodeId::ROOT, second, &mut Vec::new());
         assert!(
             tree.namespace(child).is_none_or(|namespace| {
                 namespace
@@ -3951,13 +5613,13 @@ mod tests {
             first,
             Posted {
                 offset: 20,
-                bytes: Bytes::from_static(b"REFUSE"),
+                bytes: Bytes::from_static(b"REFUSE").into(),
                 provenance: Provenance::Fresh,
             },
             &mut Build,
             &mut Vec::new(),
         );
-        tree.bury(NodeId::ROOT, first);
+        tree.bury(NodeId::ROOT, first, &mut Vec::new());
         let later = tree.announce_root("show.r01", None, &mut Vec::new());
         let mut bytes = SIGNATURE.to_vec();
         bytes.extend_from_slice(b"hello");
@@ -4016,7 +5678,7 @@ mod tests {
                 Emit::Bytes {
                     member: MemberId(1),
                     offset: 0,
-                    bytes: Bytes::from_static(b"ab"),
+                    bytes: Bytes::from_static(b"ab").into(),
                     provenance: Provenance::Fresh,
                 },
                 Emit::Refuse(Why::Compressed),
@@ -4031,7 +5693,7 @@ mod tests {
         }));
         assert!(!tree.buried(child), "its volume is still to be read back");
         assert_eq!(tree.kept(NodeId::ROOT, first).count(), 0);
-        tree.bury(NodeId::ROOT, first);
+        tree.bury(NodeId::ROOT, first, &mut Vec::new());
         assert!(tree.buried(child));
         assert_eq!(tree.kept(NodeId::ROOT, first).collect::<Vec<_>>(), [child]);
         assert!(tree.live().iter().all(|node| *node != child));
@@ -4061,41 +5723,70 @@ mod tests {
         )));
     }
 
+    // A member moved off a name leaves the ledger before its file has left
+    // the name: the member given another name while it was left takes it
+    // now, as its move, so it is written under the name it wanted once the
+    // file is gone, never under the suffixed one for good.
     #[test]
-    fn a_volume_claimed_before_the_one_ahead_of_it_leaves_a_gap_until_that_one_comes() {
+    fn a_name_a_released_member_was_leaving_goes_to_the_member_that_wanted_it() {
+        let (mut tree, first, child, _) = bound_tree();
+        tree.emitted(
+            child,
+            vec![
+                Emit::Retract(MemberId(0)),
+                Emit::Member {
+                    member: MemberId(0),
+                    name: "other.bin".into(),
+                    length: Some(5),
+                },
+            ],
+            &mut Build,
+            &mut Vec::new(),
+        );
+        let wanting = tree.announce_root("inner.bin", None, &mut Vec::new());
+        assert_eq!(output_name(&tree, NodeId::ROOT, wanting), "inner (1).bin");
+        tree.emitted(
+            child,
+            vec![Emit::Refuse(Why::Compressed)],
+            &mut Build,
+            &mut Vec::new(),
+        );
+        let mut effects = Vec::new();
+        tree.bury(NodeId::ROOT, first, &mut effects);
+        assert!(
+            effects.contains(&Effect::Renamed {
+                node: NodeId::ROOT,
+                member: wanting,
+                old: "inner (1).bin".into(),
+                new: "inner.bin".into(),
+            }),
+            "{effects:?}"
+        );
+        assert_eq!(output_name(&tree, NodeId::ROOT, wanting), "inner.bin");
+    }
+
+    // Volumes named out of order are each held at announce, by name, before
+    // any of their bytes: the one named ahead leaves no gap, and a seek into
+    // it goes up to the source for that member's bytes.
+    #[test]
+    fn a_volume_named_ahead_is_held_before_its_bytes_come() {
         let (mut tree, first, child, _) = bound_tree();
         let third = tree.announce_root("show.r01", None, &mut Vec::new());
         let second = tree.announce_root("show.r00", None, &mut Vec::new());
-        let deliver = |tree: &mut Tree, member| {
-            tree.deliver(
-                NodeId::ROOT,
-                member,
-                Posted {
-                    offset: 0,
-                    bytes: Bytes::from_static(b"w"),
-                    provenance: Provenance::Fresh,
-                },
-                &mut Build,
-                &mut Vec::new(),
-            )
-        };
-        deliver(&mut tree, third);
-        let volumes = |tree: &Tree| {
-            let (_, volumes) = tree.volumes(child).unwrap();
-            volumes.iter().map(|(v, m)| (v.0, *m)).collect::<Vec<_>>()
-        };
-        assert_eq!(volumes(&tree), vec![(0, first), (2, third)]);
+        let (_, volumes) = tree.volumes(child).unwrap();
+        let volumes: Vec<_> = volumes.iter().map(|(v, m)| (v.0, *m)).collect();
+        assert_eq!(volumes, vec![(0, first), (1, second), (2, third)]);
         let seek = Seek::data(
             VolumeIndex(1),
             ByteRange::new(0, 10),
             crate::seek::Weight(1),
         );
+        let mut root = Root(Vec::new());
+        assert_eq!(tree.lift(child, seek, &mut root), Pull::Moved(1));
         assert_eq!(
-            tree.lift(child, seek, &mut Root(Vec::new())),
-            Pull::Unseekable
+            root.0.iter().map(|seek| seek.volume).collect::<Vec<_>>(),
+            vec![VolumeIndex(second.0)]
         );
-        deliver(&mut tree, second);
-        assert_eq!(volumes(&tree), vec![(0, first), (1, second), (2, third)]);
     }
 
     #[test]
@@ -4137,6 +5828,44 @@ mod tests {
         assert_eq!(tree.namespace(child).unwrap().len(), 1);
     }
 
+    // A member its producer retracted and announces again under another
+    // name, read from the bytes it starts over on, takes that name.
+    #[test]
+    fn a_member_announced_again_under_another_name_is_renamed() {
+        let (mut tree, _, child, _) = bound_tree();
+        tree.emitted(
+            child,
+            vec![Emit::Retract(MemberId(0))],
+            &mut Build,
+            &mut Vec::new(),
+        );
+        let mut effects = Vec::new();
+        tree.emitted(
+            child,
+            vec![Emit::Member {
+                member: MemberId(0),
+                name: "other.bin".into(),
+                length: Some(5),
+            }],
+            &mut Build,
+            &mut effects,
+        );
+        let inner = tree.namespace(child).unwrap().get(MemberId(0)).unwrap();
+        assert_eq!(
+            (inner.name.as_str(), inner.output_name.as_str()),
+            ("other.bin", "other.bin")
+        );
+        assert!(
+            effects.contains(&Effect::Renamed {
+                node: child,
+                member: MemberId(0),
+                old: "inner.bin".into(),
+                new: "other.bin".into(),
+            }),
+            "{effects:?}"
+        );
+    }
+
     fn two_volumes() -> (Tree, MemberId, MemberId, NodeId) {
         let (mut tree, first, child, _) = bound_tree();
         let second = tree.announce_root("show.r00", None, &mut Vec::new());
@@ -4145,7 +5874,7 @@ mod tests {
             second,
             Posted {
                 offset: 0,
-                bytes: Bytes::from_static(b"w"),
+                bytes: Bytes::from_static(b"w").into(),
                 provenance: Provenance::Fresh,
             },
             &mut Build,
@@ -4163,7 +5892,7 @@ mod tests {
             first,
             Posted {
                 offset: 20,
-                bytes: Bytes::from_static(b"ENGINE"),
+                bytes: Bytes::from_static(b"ENGINE").into(),
                 provenance: Provenance::Fresh,
             },
             &mut Build,
@@ -4180,7 +5909,7 @@ mod tests {
                     child,
                     volume: VolumeIndex(0),
                     offset: 20,
-                    bytes: Bytes::from_static(b"ENGINE"),
+                    bytes: Bytes::from_static(b"ENGINE").into(),
                     provenance: Provenance::Fresh,
                 },
                 Effect::NeedsEngine {
@@ -4213,8 +5942,8 @@ mod tests {
         let mut wants = Vec::new();
         tree.collect_wants(&mut wants);
         assert!(wants.iter().all(|(node, _)| *node != child));
-        tree.bury(NodeId::ROOT, first);
-        tree.bury(NodeId::ROOT, second);
+        tree.bury(NodeId::ROOT, first, &mut Vec::new());
+        tree.bury(NodeId::ROOT, second, &mut Vec::new());
         assert!(tree.namespace(child).is_none());
         assert!(tree.namespace(engine).is_some());
     }
@@ -4227,15 +5956,15 @@ mod tests {
             first,
             Posted {
                 offset: 20,
-                bytes: Bytes::from_static(b"ENGINE"),
+                bytes: Bytes::from_static(b"ENGINE").into(),
                 provenance: Provenance::Fresh,
             },
             &mut Build,
             &mut Vec::new(),
         );
         let (engine, _) = tree.child_of(NodeId::ROOT, first).unwrap();
-        tree.bury(NodeId::ROOT, first);
-        tree.bury(NodeId::ROOT, second);
+        tree.bury(NodeId::ROOT, first, &mut Vec::new());
+        tree.bury(NodeId::ROOT, second, &mut Vec::new());
         let mut effects = Vec::new();
         tree.emitted(
             engine,
@@ -4396,9 +6125,16 @@ mod tests {
     // A pretend store whose first volume is `show.rar`, which holds
     // `linked.bin` where its links put it, provisionally: the first free
     // place after the first, and `stated.r00` at the place it states, 1.
-    #[derive(Default)]
+    // A full one takes nothing back from what it parsed of a volume it gave
+    // up, so the volume waits, given back, to be offered again.
+    #[derive(Default, serde::Serialize, serde::Deserialize)]
     struct Yielder {
         held: BTreeMap<VolumeIndex, String>,
+        full: bool,
+    }
+
+    impl crate::facts::Durable for Yielder {
+        const VERSION: u16 = 1;
     }
 
     impl Yielder {
@@ -4433,22 +6169,32 @@ mod tests {
                 range,
             });
         }
-        fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+        fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+            Located::Never
+        }
         fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
             None
         }
-        fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Option<VolumeIndex> {
+        fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Claim {
             match name {
                 "show.rar" => Some(VolumeIndex(0)),
                 "stated.r00" => Some(VolumeIndex(1)),
                 "linked.bin" => self.free(),
                 _ => None,
             }
+            .into_iter()
+            .collect()
         }
         fn bound(&mut self, volume: VolumeIndex, name: &str, _: &[u8], _length: Option<u64>) {
             self.held.insert(volume, name.to_owned());
         }
-        fn provisional(&self, volume: VolumeIndex, front: &[u8], _: Option<&Carried>) -> bool {
+        fn provisional(
+            &self,
+            volume: VolumeIndex,
+            _: &str,
+            front: &[u8],
+            _: Option<&Carried>,
+        ) -> bool {
             front == b"stat"
                 && self
                     .held
@@ -4460,10 +6206,24 @@ mod tests {
                 .remove(&volume)
                 .map(|name| Box::new(name) as Carried)
         }
-        fn reclaim(&mut self, _: &str, carried: &Carried) -> Option<VolumeIndex> {
-            (carried.downcast_ref::<String>()? == "linked.bin")
-                .then(|| self.free())
-                .flatten()
+        fn reclaim(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: Option<u64>,
+            carried: &(dyn std::any::Any + Send + Sync),
+        ) -> Claim {
+            (!self.full
+                && carried
+                    .downcast_ref::<String>()
+                    .is_some_and(|name| name == "linked.bin"))
+            .then(|| self.free())
+            .flatten()
+            .into_iter()
+            .collect()
+        }
+        fn facts(&self) -> crate::facts::Facts {
+            crate::facts::Facts::of(Kind::RarStore, self)
         }
     }
 
@@ -4498,7 +6258,7 @@ mod tests {
             first,
             Posted {
                 offset: 0,
-                bytes: Bytes::from_static(SIGNATURE),
+                bytes: Bytes::from_static(SIGNATURE).into(),
                 provenance: Provenance::Fresh,
             },
             &mut build,
@@ -4511,7 +6271,7 @@ mod tests {
             linked,
             Posted {
                 offset: 0,
-                bytes: Bytes::from_static(b"held"),
+                bytes: Bytes::from_static(b"held").into(),
                 provenance: Provenance::Fresh,
             },
             &mut build,
@@ -4528,7 +6288,7 @@ mod tests {
             stated,
             Posted {
                 offset: 0,
-                bytes: Bytes::from_static(b"stat"),
+                bytes: Bytes::from_static(b"stat").into(),
                 provenance: Provenance::Fresh,
             },
             &mut build,
@@ -4549,6 +6309,87 @@ mod tests {
             volume: VolumeIndex(1),
         }));
         assert!(!tree.given_back(NodeId::ROOT, linked));
+    }
+
+    // A store that takes back nothing it gave up, built as found or as its
+    // facts restore it.
+    struct FullBuild;
+    impl Builder for FullBuild {
+        fn build(&mut self, kind: Kind, _: ObjectId) -> Option<Box<dyn Object>> {
+            (kind == Kind::RarStore).then(|| {
+                Box::new(Yielder {
+                    full: true,
+                    ..Yielder::default()
+                }) as Box<dyn Object>
+            })
+        }
+        fn read(
+            &self,
+            _: &Tree,
+            _: NodeId,
+            _: VolumeIndex,
+            _: &Placement,
+            _: &mut Vec<u8>,
+        ) -> bool {
+            false
+        }
+    }
+
+    impl crate::facts::Restore for FullBuild {
+        fn restore(
+            &self,
+            facts: &crate::facts::Facts,
+        ) -> Result<Box<dyn Object>, crate::facts::RestoreError> {
+            Ok(Box::new(facts.read::<Yielder>(Kind::RarStore)?))
+        }
+    }
+
+    // A member given back with its parse waits to be offered again, and
+    // the parse is not in the records: a tree rebuilt from them holds it
+    // undecided, so its front, coming again, offers it again and it joins
+    // the store as it would have live.
+    #[test]
+    fn a_member_given_back_comes_back_undecided_and_is_offered_again() {
+        let mut build = FullBuild;
+        let mut tree = Tree::new();
+        let mut effects = Vec::new();
+        let deliver = |tree: &mut Tree, member, bytes: &'static [u8], build: &mut FullBuild| {
+            tree.deliver(
+                NodeId::ROOT,
+                member,
+                Posted {
+                    offset: 0,
+                    bytes: Bytes::from_static(bytes).into(),
+                    provenance: Provenance::Fresh,
+                },
+                build,
+                &mut Vec::new(),
+            );
+        };
+        let first = tree.announce_root("show.rar", None, &mut effects);
+        deliver(&mut tree, first, SIGNATURE, &mut build);
+        let store = tree.child_of(NodeId::ROOT, first).expect("bound").0;
+        let linked = tree.announce_root("linked.bin", None, &mut effects);
+        deliver(&mut tree, linked, b"held", &mut build);
+        let stated = tree.announce_root("stated.r00", None, &mut effects);
+        deliver(&mut tree, stated, b"stat", &mut build);
+        assert_eq!(tree.child_of(NodeId::ROOT, linked), None);
+        assert!(tree.given_back(NodeId::ROOT, linked));
+
+        let record = tree.records();
+        let parked = record.nodes[0]
+            .members
+            .iter()
+            .find(|member| member.member == linked)
+            .expect("recorded");
+        assert!(parked.undecided);
+
+        let mut rebuilt = Tree::rebuild(&record, &FullBuild).expect("rebuilds");
+        deliver(&mut rebuilt, linked, b"held", &mut build);
+        assert_eq!(
+            rebuilt.child_of(NodeId::ROOT, linked),
+            Some((store, VolumeIndex(2)))
+        );
     }
 
     // A pretend store that holds every byte as envelope and, on `GIVE`,
@@ -4587,12 +6428,17 @@ mod tests {
                 range,
             });
         }
-        fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+        fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+            Located::Never
+        }
         fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
             None
         }
-        fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Option<VolumeIndex> {
-            name.ends_with(".r00").then_some(VolumeIndex(1))
+        fn claim(&mut self, name: &str, _: &[u8], _length: Option<u64>) -> Claim {
+            name.ends_with(".r00")
+                .then_some(VolumeIndex(1))
+                .into_iter()
+                .collect()
         }
         fn bound(&mut self, volume: VolumeIndex, _: &str, _: &[u8], _length: Option<u64>) {
             self.held.push(volume);
@@ -4601,9 +6447,19 @@ mod tests {
             self.held.retain(|held| *held != volume);
             Some(Box::new(volume))
         }
-        fn reclaim(&mut self, _: &str, carried: &Carried) -> Option<VolumeIndex> {
+        fn reclaim(
+            &self,
+            _: &str,
+            _: &[u8],
+            _: Option<u64>,
+            carried: &(dyn std::any::Any + Send + Sync),
+        ) -> Claim {
             self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            carried.downcast_ref::<VolumeIndex>().copied()
+            carried
+                .downcast_ref::<VolumeIndex>()
+                .copied()
+                .into_iter()
+                .collect()
         }
     }
 
@@ -4645,7 +6501,7 @@ mod tests {
             first,
             Posted {
                 offset: 0,
-                bytes: Bytes::from_static(SIGNATURE),
+                bytes: Bytes::from_static(SIGNATURE).into(),
                 provenance: Provenance::Fresh,
             },
             &mut build,
@@ -4658,7 +6514,7 @@ mod tests {
             second,
             Posted {
                 offset: 0,
-                bytes: Bytes::from_static(b"held"),
+                bytes: Bytes::from_static(b"held").into(),
                 provenance: Provenance::Fresh,
             },
             &mut build,
@@ -4674,7 +6530,7 @@ mod tests {
             second,
             Posted {
                 offset: 4,
-                bytes: Bytes::from_static(b"GIVE"),
+                bytes: Bytes::from_static(b"GIVE").into(),
                 provenance: Provenance::Fresh,
             },
             &mut build,

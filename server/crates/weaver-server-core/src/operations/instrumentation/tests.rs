@@ -282,9 +282,7 @@ fn job_lifecycle_records_stage_and_post_processing_outcomes() {
     let metrics = JobLifecycleMetrics::new();
     metrics.note_stage_duration(JobStageKind::Download, Duration::from_secs(30));
     metrics.note_stage_duration(JobStageKind::Repair, Duration::from_secs(3));
-    metrics.note_verification(VerificationOutcomeKind::Damaged);
     metrics.note_repair(StageOutcomeKind::Complete, 12);
-    metrics.note_extraction(StageOutcomeKind::Failed);
     metrics.note_file_missing(4);
 
     let snapshot = metrics.snapshot();
@@ -294,25 +292,7 @@ fn job_lifecycle_records_stage_and_post_processing_outcomes() {
         .find(|(stage, _)| *stage == "download")
         .expect("download stage");
     assert_eq!(download.1.count, 1);
-    assert_eq!(
-        snapshot
-            .verifications
-            .iter()
-            .find(|(outcome, _)| *outcome == "damaged")
-            .expect("damaged")
-            .1,
-        1
-    );
     assert_eq!(snapshot.repair_slices_repaired_total, 12);
-    assert_eq!(
-        snapshot
-            .extractions
-            .iter()
-            .find(|(outcome, _)| *outcome == "failed")
-            .expect("failed")
-            .1,
-        1
-    );
     assert_eq!(snapshot.files_missing_total, 1);
     assert_eq!(snapshot.missing_segments_total, 4);
 }
@@ -346,15 +326,12 @@ fn pipeline_histograms_report_none_until_a_stage_is_actually_timed() {
     assert!(snapshot.decode_task_duration.is_none());
     assert!(snapshot.extract_member_duration.is_none());
 
-    histograms.observe_disk_write(Duration::from_millis(2));
-    histograms.observe_extract_member(Duration::from_secs(4));
+    histograms.observe_decode_task(Duration::from_millis(2));
     let snapshot = histograms.snapshot();
-    assert_eq!(snapshot.disk_write_duration.count, 1);
-    assert!(snapshot.decode_task_duration.is_none());
     assert_eq!(
         snapshot
-            .extract_member_duration
-            .expect("extract member timed")
+            .decode_task_duration
+            .expect("decode task timed")
             .count,
         1
     );

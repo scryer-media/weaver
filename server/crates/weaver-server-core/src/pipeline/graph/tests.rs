@@ -1,58 +1,36 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The engine switch, and the joined path under it: a graph job's articles go
-// from the decoder through the root, the tree and the namespace writer to
-// its files, and the classic assembly writes nothing.
+// The joined path: a job's articles go from the decoder through the root,
+// the tree and the namespace writer to its files, and the assembly writes
+// nothing.
 
 use std::path::{Path, PathBuf};
 
 use weaver_graph::recovery::RepairOutcome;
 use weaver_graph::{ByteRange, Kind, MemberId, Provenance};
-use weaver_model::files::FileRole;
 
 use super::*;
 use crate::history::HistoryFailureKind;
-use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
+use crate::jobs::ids::{JobId, NzbFileId};
 use crate::jobs::model::JobStatus;
-use crate::jobs::model::{FileSpec, JobSpec, SegmentSpec};
 use crate::pipeline::PipelineEvent;
 use crate::pipeline::download::queue::DownloadQueue;
 use crate::pipeline::graph::engine::echo::{Echoes, HEADER, SIGNATURE};
 use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::status::{Delivered, Delivery};
-use crate::pipeline::tests::{insert_active_job_on, new_direct_pipeline, retire_pipeline_database};
+use crate::pipeline::tests::engines::harness::{
+    ARTICLE, Post, par2_set, par2_volumes, payload, spec,
+};
+use crate::pipeline::tests::{
+    hear_graph_mail, insert_active_job, new_direct_pipeline, retire_pipeline_database, segment_id,
+};
 use crate::pipeline::{
     DecodeResult, DecodedChunk, Pipeline, SegmentEncoding, SegmentSource, SegmentTerminalState,
     YencLayoutAssertions,
 };
 
-// One article's decoded size, and the PAR2 slice size, so every article is
-// exactly one slice and its checksum is a slice's.
-const ARTICLE: usize = 64;
-
-struct Post {
-    name: String,
-    role: FileRole,
-    bytes: Vec<u8>,
-}
-
-impl Post {
-    fn plain(name: &str, bytes: Vec<u8>) -> Self {
-        Self {
-            name: name.to_string(),
-            role: FileRole::Standalone,
-            bytes,
-        }
-    }
-
-    fn articles(&self) -> impl Iterator<Item = &[u8]> {
-        self.bytes.chunks(ARTICLE)
-    }
-}
-
-// Bytes no format sniffs as its own.
 // A file delivered under the name it wanted.
 fn delivered(name: &str, depth: u32, whole: bool) -> Delivered {
     Delivered {
@@ -60,103 +38,7 @@ fn delivered(name: &str, depth: u32, whole: bool) -> Delivered {
         from: name.to_string(),
         depth,
         whole,
-    }
-}
-
-fn payload(len: usize, seed: u8) -> Vec<u8> {
-    (0..len)
-        .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed) | 0x80)
-        .collect()
-}
-
-// A PAR2 set over `data` posted as `name`: an index and one volume of two
-// recovery blocks, sliced at the article size.
-fn par2_set(name: &str, data: &[u8]) -> Vec<Post> {
-    let posts = par2_volumes(name, data, 2, 1);
-    assert_eq!(posts.len(), 2, "an index and one volume");
-    posts
-}
-
-// A PAR2 set over `data` posted as `name`: an index and `volumes` volumes
-// carrying `blocks` recovery blocks between them, sliced at the article
-// size. Each volume opens with a recovery packet.
-fn par2_volumes(name: &str, data: &[u8], blocks: u32, volumes: u32) -> Vec<Post> {
-    use par2_rs::create::{BlockSizing, Par2Creator, Par2CreatorOptions, RecoveryAmount};
-
-    let source = tempfile::tempdir().unwrap();
-    std::fs::write(source.path().join(name), data).unwrap();
-    let mut options = Par2CreatorOptions::with_output(
-        source.path().join("lantern.par2"),
-        Some(source.path().to_path_buf()),
-        vec![source.path().join(name)],
-    );
-    options.block_sizing = BlockSizing::Bytes(ARTICLE as u64);
-    options.recovery_amount = RecoveryAmount::Count(blocks);
-    options.volume_count = Some(volumes);
-    let creator = Par2Creator::new(options);
-    let created = creator.create(&creator.plan().unwrap()).unwrap();
-    let mut posts: Vec<Post> = created
-        .output_paths
-        .iter()
-        .map(|path| {
-            let name = path.file_name().unwrap().to_str().unwrap().to_string();
-            let is_index = !name.contains(".vol");
-            Post {
-                role: FileRole::Par2 {
-                    is_index,
-                    recovery_block_count: if is_index { 0 } else { blocks / volumes },
-                },
-                bytes: std::fs::read(path).unwrap(),
-                name,
-            }
-        })
-        .collect();
-    // The index first, then the volumes in name order.
-    posts.sort_by_key(|post| {
-        (
-            !matches!(post.role, FileRole::Par2 { is_index: true, .. }),
-            post.name.clone(),
-        )
-    });
-    posts
-}
-
-fn spec(name: &str, posts: &[Post]) -> JobSpec {
-    JobSpec {
-        name: name.to_string(),
-        password: None,
-        total_bytes: posts.iter().map(|post| post.bytes.len() as u64).sum(),
-        category: None,
-        metadata: vec![],
-        files: posts
-            .iter()
-            .enumerate()
-            .map(|(index, post)| FileSpec {
-                filename: post.name.clone(),
-                role: post.role.clone(),
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: post
-                    .articles()
-                    .enumerate()
-                    .map(|(ordinal, article)| SegmentSpec {
-                        ordinal: ordinal as u32,
-                        article_number: ordinal as u32,
-                        bytes: article.len() as u32,
-                        message_ids: crate::jobs::MessageIds::new(vec![format!(
-                            "lantern-{index}-{ordinal}@example.com"
-                        )]),
-                    })
-                    .collect(),
-            })
-            .collect(),
-    }
-}
-
-fn segment_id(job_id: JobId, file_index: u32, segment_number: u32) -> SegmentId {
-    SegmentId {
-        file_id: NzbFileId { job_id, file_index },
-        segment_number,
+        crc32: None,
     }
 }
 
@@ -167,14 +49,12 @@ async fn graph_job(
     posts: &[Post],
 ) -> (Pipeline, PathBuf) {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
-    insert_active_job_on(
+    insert_active_job(
         &mut pipeline,
         job_id,
-        spec("lantern joined", posts),
-        Engine::Graph,
+        spec("lantern joined", posts, ARTICLE),
     )
     .await;
-    pipeline.admit_graph_job(job_id, Engine::Graph);
     assert!(pipeline.graph_jobs.contains_key(&job_id));
     let working_dir = pipeline.jobs[&job_id].working_dir.clone();
     (pipeline, working_dir)
@@ -191,7 +71,7 @@ async fn decode(
     intact: bool,
 ) {
     let body = posts[index as usize]
-        .articles()
+        .articles(ARTICLE)
         .nth(ordinal as usize)
         .unwrap()
         .to_vec();
@@ -221,7 +101,7 @@ async fn decode_as(
                 yenc_layout: YencLayoutAssertions {
                     file_size: post.bytes.len() as u64,
                     part: Some(ordinal + 1),
-                    total: Some(post.articles().count() as u32),
+                    total: Some(post.articles(ARTICLE).count() as u32),
                     begin: Some(offset as u64 + 1),
                     end: Some(offset as u64 + len),
                 },
@@ -248,7 +128,7 @@ async fn decode_as(
 }
 
 async fn decode_all(pipeline: &mut Pipeline, job_id: JobId, posts: &[Post], index: u32) {
-    let count = posts[index as usize].articles().count() as u32;
+    let count = posts[index as usize].articles(ARTICLE).count() as u32;
     for ordinal in 0..count {
         decode(pipeline, job_id, posts, index, ordinal, true).await;
     }
@@ -273,9 +153,12 @@ fn member_file(pipeline: &Pipeline, job_id: JobId, member: u32) -> Option<PathBu
         .map(|(_, path)| path)
 }
 
-// The classic assembly never saw a byte of the file.
-fn classic_wrote_nothing(pipeline: &Pipeline, job_id: JobId, index: u32) {
+// The assembly never saw a byte of the file.
+fn assembly_wrote_nothing(pipeline: &Pipeline, job_id: JobId, index: u32) {
     let file = pipeline.jobs[&job_id]
+        .articles
+        .active()
+        .unwrap()
         .assembly
         .file(NzbFileId {
             job_id,
@@ -291,7 +174,7 @@ fn read(path: &Path) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn two_plain_files_are_written_at_their_names_and_classic_writes_nothing() {
+async fn two_plain_files_are_written_at_their_names_and_the_assembly_writes_nothing() {
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_001);
     let posts = [
@@ -313,7 +196,7 @@ async fn two_plain_files_are_written_at_their_names_and_classic_writes_nothing()
                 Provenance::Fresh
             )]
         );
-        classic_wrote_nothing(&pipeline, job_id, index as u32);
+        assembly_wrote_nothing(&pipeline, job_id, index as u32);
     }
     assert!(pipeline.graph_jobs[&job_id].namespace().is_clean());
     retire_pipeline_database(pipeline).await;
@@ -343,7 +226,7 @@ async fn a_damaged_article_is_written_as_damaged_and_its_range_reported() {
         vec![(MemberId(0), damaged)]
     );
     assert_eq!(read(&working_dir.join("lantern.bin")), posts[0].bytes);
-    classic_wrote_nothing(&pipeline, job_id, 0);
+    assembly_wrote_nothing(&pipeline, job_id, 0);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -353,10 +236,11 @@ async fn a_par2_set_beside_a_plain_file_adjudicates_it_clean_without_reading_bac
     let job_id = JobId(92_003);
     let data = payload(4 * ARTICLE, 4);
     let mut posts = vec![Post::plain("lantern.bin", data.clone())];
-    posts.extend(par2_set("lantern.bin", &data));
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
     let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
     // The data first: its segments arrive before anything covers it.
     decode_all(&mut pipeline, job_id, &posts, 0).await;
+    assert!(pipeline.graph_jobs[&job_id].checksums_held(MemberId(0)));
     decode_all(&mut pipeline, job_id, &posts, 1).await;
     // The volume's first article, which is what the sample fetches; the
     // rest stays parked.
@@ -370,6 +254,8 @@ async fn a_par2_set_beside_a_plain_file_adjudicates_it_clean_without_reading_bac
     assert_eq!(summaries[0].outcome, Some(RepairOutcome::Clean));
     assert_eq!(job.writer().read_backs(), 0, "the fed segments were enough");
     assert!(job.namespace().is_clean());
+    // The ruling proved the file whole, and its checksums were sealed.
+    assert!(!job.checksums_held(MemberId(0)));
     retire_pipeline_database(pipeline).await;
 }
 
@@ -379,7 +265,7 @@ async fn a_lost_article_under_a_par2_set_is_repaired_through_the_tree() {
     let job_id = JobId(92_004);
     let data = payload(4 * ARTICLE, 5);
     let mut posts = vec![Post::plain("lantern.bin", data.clone())];
-    posts.extend(par2_set("lantern.bin", &data));
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
     let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
     decode_all(&mut pipeline, job_id, &posts, 1).await;
     decode(&mut pipeline, job_id, &posts, 2, 0, true).await;
@@ -392,25 +278,31 @@ async fn a_lost_article_under_a_par2_set_is_repaired_through_the_tree() {
     // The repair waits for blocks, and its seek promoted the volume's
     // parked articles ahead of everything.
     let lost = ByteRange::new(ARTICLE as u64, 2 * ARTICLE as u64);
-    assert!(runs(&pipeline, job_id, 0).contains(&(lost, Provenance::Damaged)));
+    assert!(runs(&pipeline, job_id, 0).contains(&(lost, Provenance::Lost)));
     let job = pipeline.graph_jobs.get_mut(&job_id).unwrap();
     assert_eq!(
         job.recovery_summary()[0].outcome,
         Some(RepairOutcome::Waiting)
     );
-    let volume_articles = posts[2].articles().count() as u32;
+    let volume_articles = posts[2].articles(ARTICLE).count() as u32;
     assert!(volume_articles > 1);
     let state = &pipeline.jobs[&job_id];
     for ordinal in 1..volume_articles {
         let id = segment_id(job_id, 2, ordinal);
         assert_eq!(
             state
+                .articles
+                .active()
+                .unwrap()
                 .recovery_queue
                 .count_matching(|work| work.segment_id == id),
             0
         );
         assert_eq!(
             state
+                .articles
+                .active()
+                .unwrap()
                 .download_queue
                 .count_matching(|work| work.segment_id == id
                     && work.is_recovery
@@ -425,7 +317,7 @@ async fn a_lost_article_under_a_par2_set_is_repaired_through_the_tree() {
         decode(&mut pipeline, job_id, &posts, 2, ordinal, true).await;
     }
     assert!(pipeline.graph_jobs[&job_id].repair_out());
-    assert!(runs(&pipeline, job_id, 0).contains(&(lost, Provenance::Damaged)));
+    assert!(runs(&pipeline, job_id, 0).contains(&(lost, Provenance::Lost)));
     let job = pipeline.graph_jobs.get_mut(&job_id).unwrap();
     assert!(!matches!(
         job.recovery_summary()[0].outcome,
@@ -452,7 +344,7 @@ async fn a_lost_article_under_a_par2_set_is_repaired_through_the_tree() {
         ]
     );
     assert_eq!(read(&working_dir.join("lantern.bin")), data);
-    classic_wrote_nothing(&pipeline, job_id, 0);
+    assembly_wrote_nothing(&pipeline, job_id, 0);
     retire_pipeline_database(pipeline).await;
 }
 
@@ -462,12 +354,39 @@ async fn a_hex_named_member_bound_by_its_prefix_is_renamed_and_its_file_moves() 
     let job_id = JobId(92_005);
     let data = payload(3 * ARTICLE, 6);
     let mut posts = vec![Post::plain("8d1f0c2a9b7e4f6013a5c7e9", data.clone())];
-    posts.extend(par2_set("lantern.bin", &data));
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
     let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
     decode_all(&mut pipeline, job_id, &posts, 0).await;
     let hex = working_dir.join(&posts[0].name);
     assert_eq!(member_file(&pipeline, job_id, 0), Some(hex.clone()));
     decode_all(&mut pipeline, job_id, &posts, 1).await;
+    // The volume still to come is the set's own from the post, so with the
+    // payload in, the set rules as its index is founded, before it is read;
+    // the bind that names the member follows once that run is heard. The
+    // file moves once the checkpoint that records its name has committed.
+    // That commit runs beside the repair and may be heard with it, so what
+    // stands then is read against what the database holds.
+    hear_repair(&mut pipeline, job_id).await;
+    if pipeline.graph_jobs[&job_id].moves_waiting() {
+        assert!(hex.exists());
+    } else {
+        let stored = pipeline.db.load_graph_checkpoint(job_id).unwrap().unwrap();
+        let root = stored
+            .nodes
+            .iter()
+            .find(|node| node.parent.is_none())
+            .unwrap()
+            .node;
+        assert!(
+            stored
+                .members
+                .iter()
+                .any(|row| row.node == root && row.member == 0 && row.name == "lantern.bin")
+        );
+        assert!(!hex.exists());
+    }
+    hear_graph_mail(&mut pipeline, job_id).await;
+    assert!(!pipeline.graph_jobs[&job_id].moves_waiting());
 
     let member = pipeline.graph_jobs[&job_id]
         .namespace()
@@ -576,28 +495,103 @@ async fn a_turn_hears_all_the_run_mail_waiting() {
     retire_pipeline_database(pipeline).await;
 }
 
+// A paused graph job with nothing out lets its articles and its graph go at
+// once. Resumed while it holds its NZB slot, it is built again from its
+// checkpoint and installed. Its graph starts no run while the slot is taken
+// away, and once the slot is back the articles are written.
 #[tokio::test]
-async fn paused_graph_work_stays_queued_until_resume_has_nzb_admission() {
+async fn paused_graph_work_is_rebuilt_on_resume_and_runs_only_with_nzb_admission() {
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_100);
     let body = payload(2 * ARTICLE + 9, 8);
     let posts = vec![echo_volume(0, &body)];
     let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
-    echo_engines(&mut pipeline, job_id, 1);
     pipeline.pause_job_runtime(job_id).unwrap();
-    // An already-issued decode may finish after pause, but cannot start
-    // an extraction worker while the job drains its admission.
+    assert!(pipeline.jobs[&job_id].articles.active().is_none());
+    assert!(!pipeline.graph_jobs.contains_key(&job_id));
+
+    assert!(pipeline.nzb_admitted.contains(&job_id));
+    pipeline.resume_job_runtime(job_id).unwrap();
+    crate::pipeline::tests::activate_job(&mut pipeline, job_id).await;
+    assert!(pipeline.graph_jobs.contains_key(&job_id));
+    echo_engines(&mut pipeline, job_id, 1);
+    pipeline.nzb_admitted.remove(&job_id);
     decode_all(&mut pipeline, job_id, &posts, 0).await;
     assert!(!pipeline.graph_jobs[&job_id].awaits_mail());
-    assert!(!working_dir.join("echo-0.bin").exists());
-    pipeline.nzb_admitted.remove(&job_id);
-    pipeline.resume_graph_work(job_id);
-    assert!(!pipeline.graph_jobs[&job_id].awaits_mail());
+    assert!(!working_dir.join("echo-0.mkv").exists());
     pipeline.nzb_admitted.insert(job_id);
-    pipeline.resume_job_runtime(job_id).unwrap();
+    pipeline.resume_graph_work(job_id);
     assert!(pipeline.graph_jobs[&job_id].awaits_mail());
     drain_runs(&mut pipeline, job_id).await;
-    assert_eq!(read(&working_dir.join("echo-0.bin")), body);
+    assert_eq!(read(&working_dir.join("echo-0.mkv")), body);
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
+async fn a_checkpoint_error_queued_before_resume_cannot_pause_the_resumed_job() {
+    use super::engine::{Heard, Said};
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_103);
+    let posts = vec![echo_volume(0, &payload(4 * ARTICLE, 8))];
+    let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
+    let control = pipeline.graph_jobs[&job_id].pending().control();
+    let revision = control.revision();
+    let error = |revision| Said {
+        scope: job_id.0,
+        node: weaver_graph::NodeId::ROOT,
+        generation: 0,
+        heard: Heard::CheckpointBlocked {
+            control: control.clone(),
+            revision,
+            error: "fixture storage failure".into(),
+        },
+    };
+    pipeline.graph_run_said(error(revision));
+    assert_eq!(pipeline.jobs[&job_id].status, JobStatus::Paused);
+    pipeline.resume_job_runtime(job_id).unwrap();
+    let resumed = pipeline.jobs[&job_id].status.clone();
+    assert_ne!(resumed, JobStatus::Paused);
+    assert_ne!(control.revision(), revision);
+    pipeline.graph_run_said(error(revision));
+    assert_eq!(pipeline.jobs[&job_id].status, resumed);
+    pipeline.graph_run_said(error(control.revision()));
+    assert_eq!(pipeline.jobs[&job_id].status, JobStatus::Paused);
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
+async fn a_closed_checkpoint_writer_pauses_with_an_actionable_error() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_105);
+    let posts = vec![echo_volume(0, &payload(4 * ARTICLE, 8))];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    pipeline.db.flush_write_queue().await.unwrap();
+    hear_graph_mail(&mut pipeline, job_id).await;
+    // Generic writes receive the writer's detached handle: SQL is available,
+    // but its command queue is closed. Exercise that actual queue refusal.
+    let (sent, received) = tokio::sync::oneshot::channel();
+    pipeline
+        .db
+        .try_queue_write("capture_detached_writer", move |db| {
+            assert!(sent.send(db.clone()).is_ok());
+            Ok(())
+        })
+        .unwrap();
+    let db = std::mem::replace(&mut pipeline.db, received.await.unwrap());
+    pipeline.recover_cancelled_graph_checkpoint(job_id);
+    while pipeline.jobs[&job_id].status != JobStatus::Paused {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
+    assert!(
+        pipeline.jobs[&job_id]
+            .failure_error
+            .as_deref()
+            .unwrap()
+            .contains("Checkpoint could not be persisted")
+    );
+    assert!(working_dir.exists());
+    pipeline.db = db;
     retire_pipeline_database(pipeline).await;
 }
 
@@ -611,12 +605,374 @@ async fn terminal_graph_runtime_is_retained_until_its_worker_stops() {
     decode(&mut pipeline, job_id, &posts, 0, 0, true).await;
     assert!(pipeline.graph_jobs[&job_id].awaits_mail());
     pipeline.purge_terminal_job_runtime(job_id);
-    assert!(pipeline.graph_jobs[&job_id].awaits_mail());
+    assert!(!pipeline.graph_jobs.contains_key(&job_id));
+    assert!(pipeline.retiring_graph_jobs[&job_id].awaits_mail());
     assert!(pipeline.nzb_admitted.contains(&job_id));
-    while pipeline.graph_jobs.contains_key(&job_id) {
+    while pipeline.retiring_graph_jobs.contains_key(&job_id) {
         let said = pipeline.graph_runs.recv().await.unwrap();
         pipeline.graph_run_said(said);
     }
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
+async fn nonterminal_retirement_keeps_a_repair_only_worker_without_applying_its_output() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_109);
+    let data = payload(4 * ARTICLE, 5);
+    let mut posts = vec![Post::plain("lantern.bin", data)];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &posts[0].bytes)], 2));
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    decode_all(&mut pipeline, job_id, &posts, 1).await;
+    decode(&mut pipeline, job_id, &posts, 2, 0, true).await;
+    for ordinal in [0, 2, 3] {
+        decode(&mut pipeline, job_id, &posts, 0, ordinal, true).await;
+    }
+    pipeline.book_terminal_segment(segment_id(job_id, 0, 1), SegmentTerminalState::Missing);
+    hear_repair(&mut pipeline, job_id).await;
+    let volume_articles = posts[2].articles(ARTICLE).count() as u32;
+    for ordinal in 1..volume_articles {
+        decode(&mut pipeline, job_id, &posts, 2, ordinal, true).await;
+    }
+    assert!(pipeline.graph_jobs[&job_id].repair_out());
+    let before = read(&working_dir.join("lantern.bin"));
+    pipeline.retire_graph_job(job_id);
+    assert!(pipeline.retiring_graph_jobs[&job_id].repair_out());
+    assert!(!pipeline.pending_graph_terminals.contains_key(&job_id));
+    while pipeline.retiring_graph_jobs.contains_key(&job_id) {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
+    assert_eq!(read(&working_dir.join("lantern.bin")), before);
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
+async fn failure_keeps_a_repair_only_worker_and_its_slot_until_acknowledged() {
+    repair_only_retirement(false).await;
+}
+
+#[tokio::test]
+async fn cancellation_keeps_a_repair_only_worker_and_its_slot_until_acknowledged() {
+    repair_only_retirement(true).await;
+}
+
+async fn repair_only_retirement(cancel: bool) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_107);
+    let data = payload(3 * ARTICLE, 6);
+    let mut posts = vec![Post::plain("8d1f0c2a9b7e4f6013a5c7e9", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let waiter_job = JobId(job_id.0 + 1);
+    insert_active_job(
+        &mut pipeline,
+        waiter_job,
+        spec(
+            "waiting repair",
+            &[Post::plain("waiting.bin", payload(ARTICLE, 9))],
+            ARTICLE,
+        ),
+    )
+    .await;
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    decode_all(&mut pipeline, job_id, &posts, 1).await;
+    assert!(pipeline.graph_jobs[&job_id].repair_out());
+    assert!(!pipeline.graph_jobs[&job_id].runs().in_flight());
+    let waiter = weaver_graph::slots::AskerId(waiter_job.0);
+    assert!(pipeline.graph_status.repairs.admit(waiter, 1).is_none());
+    let mut events = pipeline.event_tx.subscribe();
+    if cancel {
+        pipeline.report_all_for_test();
+        let handle =
+            crate::SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+        handle.cancel_job_keeping_files(job_id).await.unwrap();
+        pipeline.apply_queue_intents().await;
+        match pipeline
+            .terminal_post_processing_done_rx
+            .recv()
+            .await
+            .unwrap()
+        {
+            crate::pipeline::TerminalPostProcessingEvent::CancelJobsDone(done) => {
+                pipeline.handle_cancel_jobs_done(done);
+            }
+            _ => panic!("expected cancellation archive reply"),
+        }
+    } else {
+        pipeline.fail_job(job_id, "namespace move collision".into());
+    }
+    assert!(
+        pipeline.retiring_graph_jobs.contains_key(&job_id),
+        "a repair reply remains owned even when no decoder run is active"
+    );
+    assert!(pipeline.retiring_graph_jobs[&job_id].repair_out());
+    assert!(pipeline.pending_graph_terminals.contains_key(&job_id));
+    assert!(!pipeline.graph_status.repairs.handed(waiter));
+    assert!(!pipeline.releasing_failed_jobs.contains(&job_id));
+    assert!(working_dir.exists());
+    pipeline.remove_pending_completion_check(waiter_job);
+    while pipeline.retiring_graph_jobs.contains_key(&job_id) {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
+    assert!(!pipeline.pending_graph_terminals.contains_key(&job_id));
+    assert!(pipeline.graph_status.repairs.handed(waiter));
+    assert!(pipeline.pending_completion_checks.contains(&waiter_job));
+    pipeline.graph_status.repairs.forget(waiter);
+    if cancel {
+        assert!(!pipeline.jobs.contains_key(&job_id));
+    } else {
+        crate::pipeline::tests::settle_failed_releases(&mut pipeline).await;
+    }
+    pipeline.db.flush_write_queue().await.unwrap();
+    let terminals = std::iter::from_fn(|| events.try_recv().ok())
+        .filter(|event| {
+            matches!(event,
+            PipelineEvent::JobCancelled { job_id: id }
+            | PipelineEvent::JobFailed { job_id: id, .. } if *id == job_id)
+        })
+        .count();
+    assert_eq!(terminals, 1);
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
+async fn repeated_failure_keeps_worker_ownership_and_releases_once() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_102);
+    let posts = vec![echo_volume(0, &payload(4 * ARTICLE, 8))];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    echo_engines(&mut pipeline, job_id, 1);
+    decode(&mut pipeline, job_id, &posts, 0, 0, true).await;
+    assert!(pipeline.graph_jobs[&job_id].awaits_mail());
+    pipeline.transition_postprocessing_status(job_id, JobStatus::Extracting, None);
+    assert_eq!(
+        pipeline
+            .metrics
+            .extract_active
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    pipeline.fail_job(job_id, "first failure".into());
+    pipeline.fail_job(job_id, "late failure".into());
+    assert_eq!(
+        pipeline
+            .metrics
+            .extract_active
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert!(pipeline.pending_graph_terminals.contains_key(&job_id));
+    assert!(!pipeline.releasing_failed_jobs.contains(&job_id));
+    assert!(working_dir.exists());
+    assert_eq!(
+        pipeline.jobs[&job_id].failure_error.as_deref(),
+        Some("first failure")
+    );
+    let retired = &pipeline.retiring_graph_jobs[&job_id];
+    let node = retired.tree().engines()[0];
+    let generation = retired.runs().generation(node).unwrap();
+    pipeline.graph_run_said(super::engine::Said {
+        scope: job_id.0,
+        node,
+        generation: generation.wrapping_add(1),
+        heard: super::engine::Heard::Ended,
+    });
+    assert!(pipeline.retiring_graph_jobs[&job_id].awaits_mail());
+    while pipeline.retiring_graph_jobs.contains_key(&job_id) {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
+    assert!(!pipeline.pending_graph_terminals.contains_key(&job_id));
+    assert!(pipeline.releasing_failed_jobs.contains(&job_id));
+    pipeline.fail_job(job_id, "cleanup raced".into());
+    crate::pipeline::tests::settle_failed_releases(&mut pipeline).await;
+    assert!(!pipeline.releasing_failed_jobs.contains(&job_id));
+    assert!(pipeline.failed_release_rx.try_recv().is_err());
+    assert_eq!(
+        pipeline
+            .metrics
+            .extract_active
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
+    assert!(
+        !working_dir.join("echo-0.mkv").exists(),
+        "late worker output must not be published"
+    );
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
+async fn cancellation_keeps_worker_files_and_blocks_same_id_retry_until_ack() {
+    cancel_held_failure(false).await;
+}
+
+#[tokio::test]
+async fn shutdown_hears_cancelled_graph_workers_before_finishing_cancellation() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_106);
+    let posts = vec![echo_volume(0, &payload(4 * ARTICLE, 8))];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let gate = std::sync::Arc::new(super::engine::echo::RunGate::default());
+    pipeline
+        .graph_jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .set_builder(Box::new(Echoes {
+            volumes: 1,
+            gate: Some(gate.clone()),
+            ..Default::default()
+        }));
+    decode(&mut pipeline, job_id, &posts, 0, 0, true).await;
+    gate.started().await;
+    pipeline.report_all_for_test();
+    let handle =
+        crate::SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let mut events = handle.subscribe_events();
+    handle.cancel_job_keeping_files(job_id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    match pipeline
+        .terminal_post_processing_done_rx
+        .recv()
+        .await
+        .unwrap()
+    {
+        crate::pipeline::TerminalPostProcessingEvent::CancelJobsDone(done) => {
+            pipeline.handle_cancel_jobs_done(done)
+        }
+        _ => panic!("expected cancellation archive reply"),
+    }
+    assert!(pipeline.retiring_graph_jobs[&job_id].awaits_mail());
+    assert!(pipeline.jobs.contains_key(&job_id));
+    assert!(working_dir.exists());
+    handle.shutdown().await.unwrap();
+    gate.release();
+    // The production shutdown branch must receive the final graph ACK, not
+    // wait exclusively for an archive reply that it has already processed.
+    pipeline.run().await;
+    assert!(!pipeline.jobs.contains_key(&job_id));
+    assert!(!pipeline.retiring_graph_jobs.contains_key(&job_id));
+    assert!(!pipeline.pending_graph_terminals.contains_key(&job_id));
+    assert_eq!(
+        pipeline
+            .db
+            .get_job_history(job_id.0)
+            .unwrap()
+            .unwrap()
+            .status,
+        "cancelled"
+    );
+    let mut cancelled = 0;
+    while let Ok(event) = events.try_recv() {
+        if matches!(event, PipelineEvent::JobCancelled { job_id: id } if id == job_id) {
+            cancelled += 1;
+        }
+    }
+    assert_eq!(cancelled, 1);
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
+async fn cancellation_wins_failure_when_worker_ack_precedes_archive_reply() {
+    cancel_held_failure(true).await;
+}
+
+async fn cancel_held_failure(ack_before_archive: bool) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_104);
+    let posts = vec![echo_volume(0, &payload(4 * ARTICLE, 8))];
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    let gate = std::sync::Arc::new(super::engine::echo::RunGate::default());
+    pipeline
+        .graph_jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .set_builder(Box::new(Echoes {
+            volumes: 1,
+            gate: Some(gate.clone()),
+            ..Default::default()
+        }));
+    decode(&mut pipeline, job_id, &posts, 0, 0, true).await;
+    gate.started().await;
+    pipeline.fail_job(job_id, "failure before operator cancellation".into());
+    pipeline.report_all_for_test();
+    let handle =
+        crate::SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let mut events = handle.subscribe_events();
+    handle.cancel_job(job_id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    if ack_before_archive {
+        gate.release();
+        while pipeline.retiring_graph_jobs.contains_key(&job_id) {
+            hear_graph_mail(&mut pipeline, job_id).await;
+        }
+        assert!(pipeline.pending_graph_terminals.contains_key(&job_id));
+        assert!(!pipeline.releasing_failed_jobs.contains(&job_id));
+    }
+    match pipeline
+        .terminal_post_processing_done_rx
+        .recv()
+        .await
+        .unwrap()
+    {
+        crate::pipeline::TerminalPostProcessingEvent::CancelJobsDone(done) => {
+            pipeline.handle_cancel_jobs_done(done);
+        }
+        _ => panic!("expected cancellation archive reply"),
+    }
+    if !ack_before_archive {
+        assert!(pipeline.retiring_graph_jobs[&job_id].awaits_mail());
+        assert!(pipeline.jobs.contains_key(&job_id));
+        assert!(working_dir.exists());
+        assert!(
+            !pipeline
+                .shared_state
+                .queue
+                .read(|inner| inner.pending_cleanup.contains(&job_id))
+        );
+        assert!(matches!(
+            handle.redownload_job(job_id).await,
+            Err(crate::SchedulerError::Conflict(_))
+        ));
+        pipeline.apply_queue_intents().await;
+        assert!(pipeline.jobs.contains_key(&job_id));
+        assert!(!pipeline.releasing_failed_jobs.contains(&job_id));
+        gate.release();
+        while pipeline.retiring_graph_jobs.contains_key(&job_id) {
+            hear_graph_mail(&mut pipeline, job_id).await;
+        }
+    }
+    assert!(!pipeline.jobs.contains_key(&job_id));
+    assert!(!pipeline.pending_graph_terminals.contains_key(&job_id));
+    assert!(!pipeline.releasing_failed_jobs.contains(&job_id));
+    let mut cancelled = 0;
+    while let Ok(event) = events.try_recv() {
+        if matches!(event, PipelineEvent::JobCancelled { job_id: id } if id == job_id) {
+            cancelled += 1;
+        }
+        assert!(!matches!(event, PipelineEvent::JobFailed { job_id: id, .. } if id == job_id));
+    }
+    assert_eq!(cancelled, 1);
+    assert_eq!(
+        pipeline
+            .db
+            .get_job_history(job_id.0)
+            .unwrap()
+            .unwrap()
+            .status,
+        "cancelled"
+    );
+    handle.redownload_job(job_id).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    crate::pipeline::tests::activate_job(&mut pipeline, job_id).await;
+    assert!(!matches!(
+        pipeline.jobs[&job_id].status,
+        JobStatus::Failed { .. }
+    ));
+    assert!(pipeline.jobs[&job_id].working_dir.exists());
+    assert!(pipeline.failed_release_rx.try_recv().is_err());
     retire_pipeline_database(pipeline).await;
 }
 
@@ -639,8 +995,8 @@ async fn an_archive_handed_to_its_engine_writes_what_the_engine_read() {
     let job = &pipeline.graph_jobs[&job_id];
     assert_eq!(job.tree().engines().len(), 1);
     for (index, body) in bodies.iter().enumerate() {
-        assert_eq!(&read(&working_dir.join(format!("echo-{index}.bin"))), body);
-        classic_wrote_nothing(&pipeline, job_id, index as u32);
+        assert_eq!(&read(&working_dir.join(format!("echo-{index}.mkv"))), body);
+        assembly_wrote_nothing(&pipeline, job_id, index as u32);
     }
     // The volumes are the engine's input, not files of the job.
     assert!(job.member_files().is_empty());
@@ -675,13 +1031,14 @@ async fn a_delivery_with_a_damaged_member_settles_to_partial() {
     assert_eq!(
         pipeline.graph_delivery(job_id),
         Some(Delivery {
-            whole: vec!["echo-0.bin".to_string(), "echo-1.bin".to_string()],
+            whole: vec!["echo-0.mkv".to_string(), "echo-1.mkv".to_string()],
             damaged: vec!["lantern.dat".to_string()],
+            unnamed: Vec::new(),
             unrepaired: Vec::new(),
             withheld: Vec::new(),
             files: vec![
-                delivered("echo-0.bin", 1, true),
-                delivered("echo-1.bin", 1, true),
+                delivered("echo-0.mkv", 1, true),
+                delivered("echo-1.mkv", 1, true),
                 delivered("lantern.dat", 0, false),
             ],
         })
@@ -694,8 +1051,8 @@ async fn a_delivery_with_a_damaged_member_settles_to_partial() {
     // The queues owe nothing more, so the completion gate hands the job to
     // its delivery.
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    state.download_queue = DownloadQueue::new();
-    state.recovery_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
     state.status = JobStatus::Downloading;
     state.refresh_runtime_lanes_from_status();
     pipeline.check_job_completion(job_id).await;
@@ -724,6 +1081,40 @@ async fn a_delivery_with_a_damaged_member_settles_to_partial() {
     retire_pipeline_database(pipeline).await;
 }
 
+// A plain file arrives damaged beside the recovery the post carried for
+// it, which never yielded a set: none of its packets came, so nothing
+// ruled on the damage. What is short is short because that recovery could
+// not be used, so the shortfall is the repair's, for PAR2 and PAR3 alike.
+#[tokio::test]
+async fn a_short_file_beside_recovery_that_never_ruled_is_the_repair_stage() {
+    for (job_id, recovery) in [
+        (JobId(92_031), "lantern.par2"),
+        (JobId(92_032), "lantern.par3"),
+    ] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let posts = vec![
+            Post::plain("lantern.dat", payload(2 * ARTICLE, 13)),
+            Post::plain(recovery, payload(ARTICLE, 14)),
+        ];
+        let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
+        decode(&mut pipeline, job_id, &posts, 0, 0, true).await;
+        decode(&mut pipeline, job_id, &posts, 0, 1, false).await;
+
+        let delivery = pipeline.graph_delivery(job_id).unwrap();
+        assert_eq!(
+            delivery.unrepaired,
+            vec!["lantern.dat".to_string()],
+            "{recovery}"
+        );
+        assert_eq!(
+            pipeline.graph_shortfall(job_id).map(|(stage, _)| stage),
+            Some(crate::post_processing::model::PipelineFailureStage::Repair),
+            "{recovery}"
+        );
+        retire_pipeline_database(pipeline).await;
+    }
+}
+
 // An echo volume beside a PAR2 set, its second article arriving as `wrong`
 // with `intact` the checksum's verdict on it. The index and the volume's
 // first article come first, so the set can reach its blocks; the rest of
@@ -736,13 +1127,13 @@ async fn echo_volume_with_a_wrong_article(
     let body = payload(4 * ARTICLE - HEADER, 10);
     let mut posts = vec![echo_volume(0, &body)];
     let volume = posts[0].bytes.clone();
-    posts.extend(par2_set("lantern.part1.rar", &volume));
+    posts.extend(par2_set("lantern", &[("lantern.part1.rar", &volume)], 2));
     let (mut pipeline, working_dir) = graph_job(temp_dir, job_id, &posts).await;
     echo_engines(&mut pipeline, job_id, 1);
     decode_all(&mut pipeline, job_id, &posts, 1).await;
     decode(&mut pipeline, job_id, &posts, 2, 0, true).await;
     for ordinal in 0..4 {
-        let mut article = posts[0].articles().nth(ordinal).unwrap().to_vec();
+        let mut article = posts[0].articles(ARTICLE).nth(ordinal).unwrap().to_vec();
         if ordinal == 1 {
             article.iter_mut().for_each(|byte| *byte ^= 0x5a);
         }
@@ -758,12 +1149,12 @@ async fn echo_volume_with_a_wrong_article(
         )
         .await;
     }
-    (pipeline, working_dir.join("echo-0.bin"), body, posts)
+    (pipeline, working_dir.join("echo-0.mkv"), body, posts)
 }
 
 // The recovery blocks arrive, and the set repairs the one wrong slice.
 async fn repair_the_wrong_article(pipeline: &mut Pipeline, job_id: JobId, posts: &[Post]) {
-    for ordinal in 1..posts[2].articles().count() as u32 {
+    for ordinal in 1..posts[2].articles(ARTICLE).count() as u32 {
         decode(pipeline, job_id, posts, 2, ordinal, true).await;
     }
     hear_repair(pipeline, job_id).await;
@@ -825,55 +1216,19 @@ async fn a_repair_of_an_article_that_passed_its_checksum_retracts_what_the_engin
     assert!(pipeline.graph_jobs[&job_id].runs().live());
     assert_ne!(run_generation(&pipeline, job_id), first, "read again");
     drain_runs(&mut pipeline, job_id).await;
-    assert_eq!(read(&echoed), body);
+    // The retracted member's file went with its bytes; the one read again
+    // waits under its name for the checkpoint that frees it.
+    let engine = pipeline.graph_jobs[&job_id].tree().engines()[0];
+    let written = pipeline.graph_jobs[&job_id]
+        .writer()
+        .files(engine)
+        .map(|(_, path)| path.to_path_buf())
+        .next()
+        .expect("the member read again has a file");
+    assert_ne!(written, echoed);
+    assert_eq!(read(&written), body);
     assert_eq!(pipeline.graph_jobs[&job_id].phase(), RootPhase::Done);
     retire_pipeline_database(pipeline).await;
-}
-
-#[test]
-fn parse_defaults_to_graph_when_unset_or_blank() {
-    assert_eq!(Engine::parse(None), Engine::Graph);
-    assert_eq!(Engine::parse(Some("")), Engine::Graph);
-    assert_eq!(Engine::parse(Some("  ")), Engine::Graph);
-    assert_eq!(Engine::default(), Engine::Graph);
-}
-
-#[test]
-fn parse_reads_both_engines() {
-    assert_eq!(Engine::parse(Some("classic")), Engine::Classic);
-    assert_eq!(Engine::parse(Some("graph")), Engine::Graph);
-}
-
-#[test]
-fn parse_ignores_case() {
-    assert_eq!(Engine::parse(Some("GRAPH")), Engine::Graph);
-    assert_eq!(Engine::parse(Some("Graph")), Engine::Graph);
-    assert_eq!(Engine::parse(Some("ClAsSiC")), Engine::Classic);
-    assert_eq!(Engine::parse(Some(" graph ")), Engine::Graph);
-}
-
-#[test]
-fn parse_falls_back_to_graph_on_an_unknown_value() {
-    assert_eq!(Engine::parse(Some("turbo")), Engine::Graph);
-    assert_eq!(Engine::parse(Some("graph2")), Engine::Graph);
-}
-
-#[test]
-fn spelling_round_trips() {
-    for engine in [Engine::Classic, Engine::Graph] {
-        assert_eq!(engine.as_str().parse::<Engine>(), Ok(engine));
-        assert_eq!(engine.to_string(), engine.as_str());
-    }
-    assert_eq!(
-        "turbo".parse::<Engine>(),
-        Err(UnknownEngine("turbo".to_string()))
-    );
-}
-
-#[test]
-fn classic_switches_apply_only_to_classic() {
-    assert!(Engine::Classic.classic_switches_apply());
-    assert!(!Engine::Graph.classic_switches_apply());
 }
 
 mod refusals;
@@ -948,12 +1303,18 @@ fn assert_parked(pipeline: &Pipeline, job_id: JobId, index: u32, ordinal: u32) {
     let state = &pipeline.jobs[&job_id];
     assert_eq!(
         state
+            .articles
+            .active()
+            .unwrap()
             .recovery_queue
             .count_matching(|work| work.segment_id == id),
         1
     );
     assert_eq!(
         state
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .count_matching(|work| work.segment_id == id),
         0
@@ -970,12 +1331,18 @@ fn assert_raised(pipeline: &Pipeline, job_id: JobId, index: u32, ordinal: u32) {
     let state = &pipeline.jobs[&job_id];
     assert_eq!(
         state
+            .articles
+            .active()
+            .unwrap()
             .recovery_queue
             .count_matching(|work| work.segment_id == id),
         0
     );
     assert_eq!(
         state
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .count_matching(|work| work.segment_id == id
                 && work.is_recovery
@@ -985,7 +1352,7 @@ fn assert_raised(pipeline: &Pipeline, job_id: JobId, index: u32, ordinal: u32) {
 }
 
 fn after_head(posts: &[Post], index: u32) -> std::ops::Range<u32> {
-    HEAD..posts[index as usize].articles().count() as u32
+    HEAD..posts[index as usize].articles(ARTICLE).count() as u32
 }
 
 async fn decode_head(pipeline: &mut Pipeline, job_id: JobId, posts: &[Post], index: u32) {
@@ -998,7 +1365,7 @@ async fn decode_head(pipeline: &mut Pipeline, job_id: JobId, posts: &[Post], ind
 fn three_volumes(seed: u8) -> Vec<Post> {
     let data = payload(8 * ARTICLE, seed);
     let mut posts = vec![Post::plain("lantern.bin", data.clone())];
-    posts.extend(par2_volumes("lantern.bin", &data, 6, 3));
+    posts.extend(par2_volumes("lantern", &[("lantern.bin", &data)], 6, 3));
     assert_eq!(posts.len(), 5, "the data, an index and three volumes");
     posts
 }
@@ -1013,7 +1380,10 @@ async fn a_recovery_volume_whose_head_arrived_before_damage_is_parked_not_fetche
     let posts = three_volumes(30);
     let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
     let state = &pipeline.jobs[&job_id];
-    assert!(state.recovery_queue.is_empty(), "nothing parked by name");
+    assert!(
+        state.articles.active().unwrap().recovery_queue.is_empty(),
+        "nothing parked by name"
+    );
     decode_all(&mut pipeline, job_id, &posts, 1).await;
     decode_head(&mut pipeline, job_id, &posts, 2).await;
     let rest = after_head(&posts, 2);
@@ -1078,7 +1448,6 @@ async fn a_restart_parks_the_volume_again_from_the_objects_wants() {
     let posts = three_volumes(32);
     let working_dir = {
         let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
-        root::tests::stamp_graph(&pipeline.db, job_id);
         decode_all(&mut pipeline, job_id, &posts, 1).await;
         decode_head(&mut pipeline, job_id, &posts, 2).await;
         for ordinal in after_head(&posts, 2) {
@@ -1094,12 +1463,9 @@ async fn a_restart_parks_the_volume_again_from_the_objects_wants() {
         .restore_job(crate::RestoreJobRequest {
             job_id,
             job_hash: [0; 32],
-            spec: spec("lantern joined", &posts),
-            complete_files: std::collections::HashSet::new(),
-            file_progress: Default::default(),
+            spec: spec("lantern joined", &posts, ARTICLE),
             detected_archives: Default::default(),
             file_identities: Default::default(),
-            extracted_members: std::collections::HashSet::new(),
             status: JobStatus::Downloading,
             download_state: None,
             post_state: None,
@@ -1110,6 +1476,7 @@ async fn a_restart_parks_the_volume_again_from_the_objects_wants() {
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             working_dir,
+            restart: None,
         })
         .await
         .unwrap();

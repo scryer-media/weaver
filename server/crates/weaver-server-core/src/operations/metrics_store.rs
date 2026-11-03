@@ -1034,11 +1034,13 @@ pub struct JobStatusCounts([f64; NUM_JOB_STATUS_METRICS]);
 
 impl Default for JobStatusCounts {
     fn default() -> Self {
-        Self([0.0; NUM_JOB_STATUS_METRICS])
+        Self::EMPTY
     }
 }
 
 impl JobStatusCounts {
+    pub const EMPTY: Self = Self([0.0; NUM_JOB_STATUS_METRICS]);
+
     pub fn from_statuses<'a>(statuses: impl IntoIterator<Item = &'a JobStatus>) -> Self {
         Self::default().with_statuses(statuses)
     }

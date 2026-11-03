@@ -11,7 +11,7 @@ use tokio::sync::broadcast;
 
 use crate::events::model::PipelineEvent;
 use crate::jobs::assembly::DetectedArchiveIdentity;
-use crate::jobs::ids::{JobId, NzbFileId};
+use crate::jobs::ids::JobId;
 use crate::jobs::record::ActiveFileIdentity;
 
 use crate::jobs::error::SchedulerError;
@@ -39,25 +39,6 @@ struct JobCancellationState {
 }
 
 impl JobCancellationRegistry {
-    fn register(&self, job_id: JobId, callback: JobCancellationCallback) {
-        let cancel_now = {
-            let mut state = self
-                .state
-                .lock()
-                .expect("job cancellation registry poisoned");
-            let cancel_now = state.requested.contains(&job_id);
-            state
-                .callbacks
-                .entry(job_id)
-                .or_default()
-                .push(Arc::clone(&callback));
-            cancel_now
-        };
-        if cancel_now {
-            callback();
-        }
-    }
-
     fn cancel(&self, job_id: JobId) -> bool {
         let callbacks = {
             let mut state = self
@@ -72,14 +53,6 @@ impl JobCancellationRegistry {
             callback();
         }
         cancelled
-    }
-
-    fn requested(&self, job_id: JobId) -> bool {
-        self.state
-            .lock()
-            .expect("job cancellation registry poisoned")
-            .requested
-            .contains(&job_id)
     }
 
     fn clear(&self, job_id: JobId) {
@@ -107,8 +80,17 @@ pub struct SharedPipelineState {
     metrics: Arc<PipelineMetrics>,
     download_block: Arc<RwLock<DownloadBlockState>>,
     server_quota_blocked: Arc<AtomicBool>,
+    // Set once shutdown is asked for, with the queue's own signal, for work
+    // off the actor that must not take the queue's lock to read it.
+    shutdown_started: Arc<AtomicBool>,
     // The egress whose download quota holds work back, while one does.
     egress_quota_block: Arc<RwLock<Option<EgressQuotaBlock>>>,
+    // Whether `egress_quota_block` holds one, written with it under its
+    // write lock: clearing a block that is not there, which the pipeline
+    // asks on every article, takes no lock.
+    egress_quota_blocked: Arc<AtomicBool>,
+    #[cfg(test)]
+    egress_quota_block_locks: Arc<AtomicU64>,
     proxy_runtime: Arc<RwLock<Option<Arc<crate::proxies::ProxyRuntime>>>>,
     server_transfer_policy:
         Arc<RwLock<Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>>>,
@@ -126,10 +108,6 @@ pub struct SharedPipelineState {
     // profile put in force now reaches the next extraction. `u64::MAX` means no profile cap, and
     // the extraction ceiling alone bounds the decoder.
     sevenz_decode_memory_bytes: Arc<AtomicU64>,
-    // How a direct-unpack chase widens its 7z decoder, as the hardware
-    // profile in force decides it. Read when a chase starts, so a profile put
-    // in force now reaches the next chase.
-    chase_widening: Arc<RwLock<crate::runtime::hardware_profile::ChaseWidening>>,
     job_cancellations: JobCancellationRegistry,
     // The per-article stream (`ArticleDownloaded`, `SegmentDecoded`, ...),
     // kept off the job-level broadcast: a download emits several of these
@@ -163,16 +141,17 @@ impl SharedPipelineState {
             metrics,
             download_block: Arc::new(RwLock::new(DownloadBlockState::default())),
             server_quota_blocked: Arc::new(AtomicBool::new(false)),
+            shutdown_started: Arc::new(AtomicBool::new(false)),
             egress_quota_block: Arc::new(RwLock::new(None)),
+            egress_quota_blocked: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            egress_quota_block_locks: Arc::new(AtomicU64::new(0)),
             proxy_runtime: Arc::new(RwLock::new(None)),
             server_transfer_policy: Arc::new(RwLock::new(None)),
             nntp_pool: Arc::new(RwLock::new(None)),
             download_transport: Arc::new(RwLock::new(Vec::new())),
             server_probe_latency: Arc::new(RwLock::new(HashMap::new())),
             sevenz_decode_memory_bytes: Arc::new(AtomicU64::new(u64::MAX)),
-            chase_widening: Arc::new(RwLock::new(
-                crate::runtime::hardware_profile::ChaseWidening::default(),
-            )),
             job_cancellations: JobCancellationRegistry::default(),
             segment_events,
             speed_test: Arc::new(std::sync::Mutex::new(std::sync::Weak::new())),
@@ -212,6 +191,13 @@ impl SharedPipelineState {
         })
     }
 
+    // The queue's own rows, whatever their status: a job retiring into
+    // history stays here until its archive commits, and history hides it
+    // until then.
+    pub fn queue_jobs(&self) -> Vec<JobInfo> {
+        self.queue.read(|inner| inner.visible_jobs().collect())
+    }
+
     // How many published jobs are in each status, counted under the read
     // lock without copying a job.
     pub fn job_status_counts(&self) -> crate::operations::metrics_store::JobStatusCounts {
@@ -223,6 +209,30 @@ impl SharedPipelineState {
                     .map(|row| &row.report.job.status)
                     .chain(inner.torrents.iter().map(|job| &job.status)),
             )
+        })
+    }
+
+    // The jobs that get their own `weaver_job_*` series under `mode`,
+    // copied under the read lock; nothing else in the queue is copied.
+    // `Active` is the jobs the pipeline is working on: those holding an NZB
+    // slot and those past their download, until they finish. A job waiting
+    // its turn moves no value a series would show, and at ten thousand
+    // queued jobs its series were most of the scrape.
+    pub fn metrics_jobs(&self, mode: crate::settings::PerJobSeries) -> Vec<JobInfo> {
+        use crate::settings::PerJobSeries;
+        self.queue.read(|inner| match mode {
+            PerJobSeries::Off => Vec::new(),
+            PerJobSeries::All => inner
+                .visible_jobs()
+                .chain(self.queue.history().iter().cloned())
+                .collect(),
+            PerJobSeries::Active => inner
+                .jobs
+                .iter()
+                .filter(|row| row.report.nzb_admitted || row.report.job.status.past_download())
+                .map(|row| row.info(&inner.globals))
+                .filter(|job| !job.status.finished())
+                .collect(),
         })
     }
 
@@ -267,9 +277,7 @@ impl SharedPipelineState {
     pub fn get_job(&self, job_id: JobId) -> Option<JobInfo> {
         self.queue.read(|inner| {
             inner
-                .jobs
-                .iter()
-                .find(|row| row.id == job_id)
+                .job(job_id)
                 .map(|row| row.info(&inner.globals))
                 .or_else(|| {
                     inner
@@ -335,20 +343,8 @@ impl SharedPipelineState {
         self.metrics.raw_snapshot()
     }
 
-    pub(crate) fn register_job_cancellation(
-        &self,
-        job_id: JobId,
-        callback: JobCancellationCallback,
-    ) {
-        self.job_cancellations.register(job_id, callback);
-    }
-
     pub(crate) fn cancel_active_job_work(&self, job_id: JobId) -> bool {
         self.job_cancellations.cancel(job_id)
-    }
-
-    pub(crate) fn is_job_cancellation_requested(&self, job_id: JobId) -> bool {
-        self.job_cancellations.requested(job_id)
     }
 
     pub(crate) fn clear_job_cancellations(&self, job_id: JobId) {
@@ -377,6 +373,7 @@ impl SharedPipelineState {
                 .into_iter()
                 .map(crate::pipeline::queue::JobRow::new)
                 .collect();
+            inner.reindex_jobs();
             self.queue.replace_history(inner, Arc::from(Vec::new()));
             crate::pipeline::queue::Change::changed(())
         });
@@ -578,15 +575,32 @@ impl SharedPipelineState {
     // Record which egress quota, if any, holds work back, and re-lay the
     // published block state over it.
     pub fn set_egress_quota_block(&self, block: Option<EgressQuotaBlock>) {
+        if block.is_none() && !self.egress_quota_blocked.load(Ordering::Acquire) {
+            return;
+        }
+        #[cfg(test)]
+        self.egress_quota_block_locks
+            .fetch_add(1, Ordering::Relaxed);
+        if *self.egress_quota_block.read().unwrap() == block {
+            return;
+        }
         let mut state = self.download_block.write().unwrap();
         {
             let mut current = self.egress_quota_block.write().unwrap();
             if *current == block {
                 return;
             }
+            self.egress_quota_blocked
+                .store(block.is_some(), Ordering::Release);
             *current = block;
         }
         self.apply_quota_blocks(&mut state);
+    }
+
+    // How many times setting the egress block took its lock.
+    #[cfg(test)]
+    pub(crate) fn egress_quota_block_lock_count(&self) -> u64 {
+        self.egress_quota_block_locks.load(Ordering::Relaxed)
     }
 
     // Memory one conventional 7z extraction may hold. `u64::MAX` when no
@@ -600,18 +614,6 @@ impl SharedPipelineState {
     pub fn set_sevenz_decode_memory_bytes(&self, bytes: u64) {
         self.sevenz_decode_memory_bytes
             .store(bytes.max(1), Ordering::Relaxed);
-    }
-
-    // How a direct-unpack chase widens its 7z decoder. The balanced
-    // profile's widening until a profile is put in force.
-    pub fn chase_widening(&self) -> crate::runtime::hardware_profile::ChaseWidening {
-        *self.chase_widening.read().unwrap()
-    }
-
-    // Apply the chosen profile's chase widening. Chases already running keep
-    // the widening they started with.
-    pub fn set_chase_widening(&self, widening: crate::runtime::hardware_profile::ChaseWidening) {
-        *self.chase_widening.write().unwrap() = widening;
     }
 
     // The hardware profile in force, or `None` before a pipeline has
@@ -632,11 +634,21 @@ impl SharedPipelineState {
         });
     }
 
+    // The shutdown signal as an atomic, for work off the actor.
+    pub(crate) fn shutdown_started(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown_started)
+    }
+
     pub fn server_quota_blocked(&self) -> bool {
         self.server_quota_blocked.load(Ordering::Relaxed)
     }
 
+    // The block is laid again only when the value changed: the pipeline
+    // derives it on every queue change.
     pub fn set_server_quota_blocked(&self, blocked: bool) {
+        if self.server_quota_blocked.load(Ordering::Relaxed) == blocked {
+            return;
+        }
         let mut state = self.download_block.write().unwrap();
         self.server_quota_blocked.store(blocked, Ordering::Relaxed);
         self.apply_quota_blocks(&mut state);
@@ -1092,11 +1104,8 @@ pub struct RestoreJobRequest {
     pub job_id: JobId,
     pub job_hash: [u8; 32],
     pub spec: JobSpec,
-    pub complete_files: HashSet<NzbFileId>,
-    pub file_progress: HashMap<u32, crate::jobs::assembly::FileCoverage>,
     pub detected_archives: HashMap<u32, DetectedArchiveIdentity>,
     pub file_identities: HashMap<u32, ActiveFileIdentity>,
-    pub extracted_members: HashSet<String>,
     pub status: JobStatus,
     pub download_state: Option<crate::jobs::model::DownloadState>,
     pub post_state: Option<crate::jobs::model::PostState>,
@@ -1107,6 +1116,18 @@ pub struct RestoreJobRequest {
     pub paused_resume_download_state: Option<crate::jobs::model::DownloadState>,
     pub paused_resume_post_state: Option<crate::jobs::model::PostState>,
     pub working_dir: PathBuf,
+    // What a restart read of the job's row, when the request comes from one.
+    pub restart: Option<RestartRead>,
+}
+
+// What a restart read of a job's active row besides its request: the runtime
+// columns as stored, so the install writes back only what it changes, and
+// the summaries of the article lists it let go, so a job waiting its turn
+// installs without reading them back.
+#[derive(Clone, Debug)]
+pub struct RestartRead {
+    pub(crate) runtime: crate::pipeline::StoredRuntimeValues,
+    pub(crate) summaries: crate::jobs::model::FileSummaries,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1304,6 +1325,10 @@ pub struct JobInfo {
     // Files fully downloaded and committed.
     #[serde(default)]
     pub completed_files: u32,
+    // Each NZB file's bytes not yet downloaded, in the NZB's file order, as
+    // the post declares their sizes. Empty when no download runs for the job.
+    #[serde(default)]
+    pub file_remaining_bytes: Vec<u64>,
     // PAR2 recovery volumes not yet fetched (fetched on demand).
     #[serde(default)]
     pub remaining_par_files: u32,
@@ -1416,6 +1441,43 @@ impl SchedulerHandle {
     // Resume a paused job.
     pub async fn resume_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
         self.act(job_id, QueueAction::Resume).await
+    }
+
+    // Pause or resume every job named as one queue change: one revision for
+    // the batch, each job answered on its own. Another owner's jobs go to it.
+    pub async fn set_jobs_paused(
+        &self,
+        job_ids: impl IntoIterator<Item = JobId>,
+        paused: bool,
+    ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
+        let (owned, job_ids): (Vec<_>, Vec<_>) = job_ids
+            .into_iter()
+            .partition(|job_id| self.state.owner_of(*job_id).is_some());
+        let mut outcome = self.state.queue.set_jobs_paused(job_ids, paused);
+        let action = || match paused {
+            true => QueueAction::Pause,
+            false => QueueAction::Resume,
+        };
+        for job_id in owned {
+            outcome.insert(job_id, self.act(job_id, action()).await);
+        }
+        outcome
+    }
+
+    // Apply every job update named as one queue change: one revision for the
+    // batch, each job answered on its own. Another owner's jobs go to it.
+    pub async fn update_jobs(
+        &self,
+        updates: impl IntoIterator<Item = (JobId, JobUpdate)>,
+    ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
+        let (owned, updates): (Vec<_>, Vec<_>) = updates
+            .into_iter()
+            .partition(|(job_id, _)| self.state.owner_of(*job_id).is_some());
+        let mut outcome = self.state.queue.update_jobs(updates);
+        for (job_id, update) in owned {
+            outcome.insert(job_id, self.act(job_id, QueueAction::Update(update)).await);
+        }
+        outcome
     }
 
     // Cancel a job.
@@ -1669,6 +1731,11 @@ impl SchedulerHandle {
         self.state.list_jobs()
     }
 
+    // The queue's jobs, a job retiring into history included.
+    pub fn queue_jobs(&self) -> Vec<JobInfo> {
+        self.state.queue_jobs()
+    }
+
     // History excludes every row still owned by the queue, even after it is hidden.
     pub fn queued_job_ids(&self) -> HashSet<JobId> {
         self.state.queued_job_ids()
@@ -1678,6 +1745,12 @@ impl SchedulerHandle {
     // job).
     pub fn job_status_counts(&self) -> crate::operations::metrics_store::JobStatusCounts {
         self.state.job_status_counts()
+    }
+
+    // The jobs that get their own `weaver_job_*` series under `mode`. See
+    // [`SharedPipelineState::metrics_jobs`].
+    pub fn metrics_jobs(&self, mode: crate::settings::PerJobSeries) -> Vec<JobInfo> {
+        self.state.metrics_jobs(mode)
     }
 
     // The revision of the published job list; it moves on every publish.
@@ -2222,6 +2295,22 @@ impl SchedulerHandle {
     }
 
     // Update disk tuning after the background startup measurement completes.
+    // A zero write throughput means it was not measured and is not applied.
+    pub async fn update_disk_measurement(
+        &self,
+        measurement: crate::runtime::DiskMeasurement,
+    ) -> Result<(), SchedulerError> {
+        self.state.queue.write_intent(|inner| {
+            inner.globals.random_read_iops = Some(measurement.random_read_iops);
+            if measurement.sequential_write_mbps > 0.0 {
+                inner.globals.sequential_write_mbps = Some(measurement.sequential_write_mbps);
+            }
+            Change::changed(())
+        });
+        Ok(())
+    }
+
+    // Update read IOPS alone.
     pub async fn update_random_read_iops(
         &self,
         random_read_iops: f64,
@@ -2271,6 +2360,7 @@ impl SchedulerHandle {
             inner.globals.shutting_down = true;
             Change::changed(())
         });
+        self.state.shutdown_started.store(true, Ordering::Release);
         // An e2e hook held until shutdown is released by the same signal
         // the pipeline reads.
         crate::e2e_failpoint::release_shutdown_holds();

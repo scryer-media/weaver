@@ -91,6 +91,7 @@ impl ByteRange {
         Self::new(start, end)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn as_range(&self) -> Range<u64> {
         self.start..self.end
     }

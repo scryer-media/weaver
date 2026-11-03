@@ -129,42 +129,62 @@ impl Database {
         include_hidden: bool,
     ) -> Result<Vec<JobHistoryRow>, StateError> {
         let datastore = self.datastore();
-        let filter = filter.clone();
+        let (base, ids) = split_history_ids(datastore.engine(), filter);
         self.run_sql_blocking_read(async move {
-            let mut sql = String::from(JOB_HISTORY_SELECT_ALIASED);
-            let mut args = Vec::new();
-
-            append_history_from_clause(&mut sql, &mut args, &filter);
-            append_history_row_filter_predicates(&mut sql, &mut args, &filter);
-            if !include_hidden {
-                sql.push_str(" AND h.nzbget_hidden = 0");
+            let (offset, limit) = (
+                base.offset.unwrap_or(0) as usize,
+                base.limit.map(|limit| limit as usize),
+            );
+            // A split list is read whole up to the page's end in each chunk,
+            // and the page is cut from the merged rows in the same order.
+            let through = |extra: usize| HistoryFilter {
+                limit: limit.map(|limit| (limit + offset + extra).min(u32::MAX as usize) as u32),
+                offset: None,
+                ..base.clone()
+            };
+            let mut rows = match &ids {
+                HistoryIdSplit::Whole => {
+                    return fetch_history_rows(&datastore, &base, include_hidden).await;
+                }
+                HistoryIdSplit::In(chunks) => {
+                    let mut rows = Vec::new();
+                    for chunk in chunks {
+                        let filter = HistoryFilter {
+                            item_ids: Some(chunk.clone()),
+                            ..through(0)
+                        };
+                        rows.extend(fetch_history_rows(&datastore, &filter, include_hidden).await?);
+                    }
+                    rows.sort_by(|a, b| {
+                        (b.completed_at, b.job_id).cmp(&(a.completed_at, a.job_id))
+                    });
+                    rows
+                }
+                HistoryIdSplit::NotIn(excluded, _) => {
+                    let mut rows =
+                        fetch_history_rows(&datastore, &through(excluded.len()), include_hidden)
+                            .await?;
+                    rows.retain(|row| excluded.binary_search(&row.job_id).is_err());
+                    rows
+                }
+            };
+            rows.drain(..offset.min(rows.len()));
+            if let Some(limit) = limit {
+                rows.truncate(limit);
             }
-            sql.push_str(" ORDER BY h.completed_at DESC, h.job_id DESC");
-
-            append_history_pagination(&mut sql, &mut args, &filter);
-
-            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
-            rows.into_iter().map(job_history_row_from_sql).collect()
+            Ok(rows)
         })
     }
 
     pub fn count_job_history(&self, filter: &HistoryFilter) -> Result<u32, StateError> {
         let datastore = self.datastore();
-        let filter = filter.clone();
+        let (base, ids) = split_history_ids(datastore.engine(), filter);
         self.run_sql_blocking_read(async move {
-            let mut sql = String::from("SELECT COUNT(*) AS count FROM ");
-            let mut args = Vec::new();
-
-            append_history_from_clause(&mut sql, &mut args, &filter);
-            append_history_row_filter_predicates(&mut sql, &mut args, &filter);
-
-            let count = SqlRuntime::fetch_optional(datastore.read_exec(), &sql, &args)
-                .await?
-                .map(|row| row.i64("count"))
-                .transpose()?
-                .unwrap_or(0)
-                .max(0) as u32;
-            Ok(count)
+            let mut count = 0i64;
+            for (filter, sign) in ids.statements(&base) {
+                count += sign * count_history_rows(&datastore, &filter).await?;
+            }
+            Ok(count.max(0) as u32)
         })
     }
 
@@ -180,22 +200,20 @@ impl Database {
         filter: &HistoryFilter,
     ) -> Result<Vec<(String, u32)>, StateError> {
         let datastore = self.datastore();
-        let filter = filter.clone();
+        let (base, ids) = split_history_ids(datastore.engine(), filter);
         self.run_sql_blocking_read(async move {
-            let mut sql = String::from(
-                "SELECT COALESCE(h.category, '') AS category, COUNT(*) AS count FROM ",
-            );
-            let mut args = Vec::new();
-
-            append_history_from_clause(&mut sql, &mut args, &filter);
-            append_history_row_filter_predicates(&mut sql, &mut args, &filter);
-
-            sql.push_str(" GROUP BY COALESCE(h.category, '')");
-
-            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
-            rows.into_iter()
-                .map(|row| Ok((row.text("category")?, row.i64("count")?.max(0) as u32)))
-                .collect()
+            let mut counts = std::collections::BTreeMap::<String, i64>::new();
+            for (filter, sign) in ids.statements(&base) {
+                for (category, count) in count_history_rows_by_category(&datastore, &filter).await?
+                {
+                    *counts.entry(category).or_default() += sign * count;
+                }
+            }
+            Ok(counts
+                .into_iter()
+                .filter(|(_, count)| *count > 0)
+                .map(|(category, count)| (category, count as u32))
+                .collect())
         })
     }
 
@@ -440,6 +458,130 @@ fn append_not_in_filter(
     );
     sql.push(')');
     args.extend(values);
+}
+
+// A job-id list longer than the engine binds in one statement, split into
+// chunks it does bind. Ids are deduplicated first, so the chunks are disjoint
+// and their counts add up.
+enum HistoryIdSplit {
+    // The filter's id lists fit one statement.
+    Whole,
+    // `item_ids`, in chunks.
+    In(Vec<Vec<u64>>),
+    // `item_ids_not_in`, sorted, and in chunks: the rows left out are counted
+    // through the chunks and subtracted.
+    NotIn(Vec<u64>, Vec<Vec<u64>>),
+}
+
+impl HistoryIdSplit {
+    // The statements whose signed counts sum to the filter's count.
+    fn statements(&self, base: &HistoryFilter) -> Vec<(HistoryFilter, i64)> {
+        let with_ids = |chunk: &Vec<u64>| HistoryFilter {
+            item_ids: Some(chunk.clone()),
+            ..base.clone()
+        };
+        match self {
+            Self::Whole => vec![(base.clone(), 1)],
+            Self::In(chunks) => chunks.iter().map(|chunk| (with_ids(chunk), 1)).collect(),
+            Self::NotIn(_, chunks) => std::iter::once((base.clone(), 1))
+                .chain(chunks.iter().map(|chunk| (with_ids(chunk), -1)))
+                .collect(),
+        }
+    }
+}
+
+// Each id list is bound one parameter per id, and an engine takes only so
+// many in one statement (SQLite stops at 32,766), so a list past the batch
+// budget is split. The base filter keeps everything but the split list.
+fn split_history_ids(
+    engine: crate::persistence::sql_runtime::SqlEngine,
+    filter: &HistoryFilter,
+) -> (HistoryFilter, HistoryIdSplit) {
+    let mut base = filter.clone();
+    let mut excluded = base.item_ids_not_in.take().unwrap_or_default();
+    excluded.sort_unstable();
+    excluded.dedup();
+    if let Some(ids) = &mut base.item_ids {
+        ids.sort_unstable();
+        ids.dedup();
+        // Leaving out of a list is taking from it: one list, no exclusion.
+        ids.retain(|id| excluded.binary_search(id).is_err());
+        excluded.clear();
+    }
+    // Room for the filter's other parameters beside the list.
+    let budget = max_rows_for_engine(engine, 1).saturating_sub(64).max(1);
+    if base.item_ids.as_ref().is_some_and(|ids| ids.len() > budget) {
+        let ids = base.item_ids.take().unwrap_or_default();
+        let chunks = ids.chunks(budget).map(<[u64]>::to_vec).collect();
+        return (base, HistoryIdSplit::In(chunks));
+    }
+    if excluded.len() > budget {
+        let chunks = excluded.chunks(budget).map(<[u64]>::to_vec).collect();
+        return (base, HistoryIdSplit::NotIn(excluded, chunks));
+    }
+    if !excluded.is_empty() {
+        base.item_ids_not_in = Some(excluded);
+    }
+    (base, HistoryIdSplit::Whole)
+}
+
+async fn fetch_history_rows(
+    datastore: &crate::persistence::sql_runtime::StoreDatastore,
+    filter: &HistoryFilter,
+    include_hidden: bool,
+) -> Result<Vec<JobHistoryRow>, StateError> {
+    let mut sql = String::from(JOB_HISTORY_SELECT_ALIASED);
+    let mut args = Vec::new();
+
+    append_history_from_clause(&mut sql, &mut args, filter);
+    append_history_row_filter_predicates(&mut sql, &mut args, filter);
+    if !include_hidden {
+        sql.push_str(" AND h.nzbget_hidden = 0");
+    }
+    sql.push_str(" ORDER BY h.completed_at DESC, h.job_id DESC");
+
+    append_history_pagination(&mut sql, &mut args, filter);
+
+    let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
+    rows.into_iter().map(job_history_row_from_sql).collect()
+}
+
+async fn count_history_rows(
+    datastore: &crate::persistence::sql_runtime::StoreDatastore,
+    filter: &HistoryFilter,
+) -> Result<i64, StateError> {
+    let mut sql = String::from("SELECT COUNT(*) AS count FROM ");
+    let mut args = Vec::new();
+
+    append_history_from_clause(&mut sql, &mut args, filter);
+    append_history_row_filter_predicates(&mut sql, &mut args, filter);
+
+    Ok(
+        SqlRuntime::fetch_optional(datastore.read_exec(), &sql, &args)
+            .await?
+            .map(|row| row.i64("count"))
+            .transpose()?
+            .unwrap_or(0),
+    )
+}
+
+async fn count_history_rows_by_category(
+    datastore: &crate::persistence::sql_runtime::StoreDatastore,
+    filter: &HistoryFilter,
+) -> Result<Vec<(String, i64)>, StateError> {
+    let mut sql =
+        String::from("SELECT COALESCE(h.category, '') AS category, COUNT(*) AS count FROM ");
+    let mut args = Vec::new();
+
+    append_history_from_clause(&mut sql, &mut args, filter);
+    append_history_row_filter_predicates(&mut sql, &mut args, filter);
+
+    sql.push_str(" GROUP BY COALESCE(h.category, '')");
+
+    let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
+    rows.into_iter()
+        .map(|row| Ok((row.text("category")?, row.i64("count")?)))
+        .collect()
 }
 
 fn append_history_pagination(sql: &mut String, args: &mut Vec<SqlArg>, filter: &HistoryFilter) {

@@ -10,8 +10,8 @@
 use std::collections::BTreeMap;
 
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Emit, Object, Placement, Provenance, Pull, Seek, Standing,
-    VolumeIndex,
+    ByteRange, Coverage, Delivery, Digest, Emit, Evidence, Evidenced, Object, Placement,
+    Provenance, Pull, Seek, Standing, VolumeIndex,
 };
 
 use super::super::RarStore;
@@ -51,6 +51,9 @@ pub(super) struct Owner {
     delivered: BTreeMap<u32, Coverage>,
     bound: Vec<bool>,
     next: u32,
+    // When set, every delivery comes with the CRC32 of each article of this
+    // size it holds, cut where the delivery is cut, as a decoder hands it.
+    pub articles: Option<u64>,
 }
 
 impl Owner {
@@ -75,12 +78,15 @@ impl Owner {
             delivered: BTreeMap::new(),
             bound: vec![false; count],
             next: 0,
+            articles: None,
         };
         let (name, bytes) = &owner.volumes[first];
         let front = &bytes[..bytes.len().min(FRONT)];
         let volume = owner
             .object
             .claim(name, front, None)
+            .first()
+            .copied()
             .unwrap_or(VolumeIndex(0));
         assert_eq!(volume, VolumeIndex(first as u32), "founds on {name}");
         let name = name.clone();
@@ -109,6 +115,12 @@ impl Owner {
 
     fn size(&mut self, volume: usize) {
         let length = self.volumes[volume].1.len() as u64;
+        self.sized_as(volume, length);
+    }
+
+    // The volume's length said as `length`, whatever its bytes run to, as
+    // a producer says one it learned anew.
+    pub fn sized_as(&mut self, volume: usize, length: u64) {
         let mut out = Vec::new();
         self.object
             .sized(VolumeIndex(volume as u32), length, &mut out);
@@ -125,7 +137,7 @@ impl Owner {
         let first = &bytes[..bytes.len().min(FRONT)];
         assert_eq!(
             self.object.claim(name, first, None),
-            Some(VolumeIndex(volume as u32)),
+            vec![VolumeIndex(volume as u32)],
             "claims {name}"
         );
         let name = name.clone();
@@ -134,6 +146,30 @@ impl Owner {
         self.bound[volume] = true;
         self.size(volume);
         self.settle();
+    }
+
+    // The bytes at `range` with what a decoder proved of them: the CRC32 of
+    // each article's piece, computed here as the decoder computed it.
+    fn evidenced(&self, range: ByteRange, bytes: &[u8]) -> Evidenced {
+        let Some(size) = self.articles else {
+            return Evidenced::from(bytes.to_vec());
+        };
+        let mut evidence = Vec::new();
+        let mut at = range.start;
+        while at < range.end {
+            let end = ((at / size + 1) * size).min(range.end);
+            let piece = ByteRange::new(at - range.start, end - range.start);
+            let value = crc_turbo::checksum(
+                crc_turbo::CrcAlgorithm::Crc32IsoHdlc,
+                &bytes[piece.start as usize..piece.end as usize],
+            );
+            evidence.push(Evidence {
+                range: piece,
+                digest: Digest::crc32(value as u32),
+            });
+            at = end;
+        }
+        Evidenced::with(bytes.to_vec().into(), evidence)
     }
 
     pub fn deliver(&mut self, volume: usize, range: ByteRange) {
@@ -177,7 +213,7 @@ impl Owner {
             Delivery {
                 volume,
                 offset: range.start,
-                bytes: &bytes,
+                bytes: &self.evidenced(range, &bytes),
                 provenance,
             },
             &mut read,

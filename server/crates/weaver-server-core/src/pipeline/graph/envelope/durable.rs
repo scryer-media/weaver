@@ -8,7 +8,7 @@
 
 use weaver_graph::{Coverage, NodeId, Run};
 
-use super::{Envelopes, Kept};
+use super::{Envelopes, Kept, envelope_name};
 use crate::pipeline::graph::leaf::{Leaf, LeafError};
 
 // One kept envelope: its node, its number, the runs of it that are on disk,
@@ -20,6 +20,8 @@ pub(crate) struct KeptRecord {
     pub(crate) runs: Vec<Run>,
     pub(crate) closed: Option<u64>,
     pub(crate) settled: bool,
+    // The file it sits in, when not the one its node and number name.
+    pub(crate) file: Option<String>,
 }
 
 impl Envelopes {
@@ -38,6 +40,9 @@ impl Envelopes {
                 runs: kept.coverage.runs().copied().collect(),
                 closed: kept.closed,
                 settled: kept.settled,
+                file: Some(kept.leaf.name())
+                    .filter(|name| *name != envelope_name(node, *envelope))
+                    .map(str::to_owned),
             })
             .collect()
     }
@@ -57,16 +62,25 @@ impl Envelopes {
     pub(crate) fn restore(&mut self, record: &KeptRecord) -> Result<(), LeafError> {
         let shelf = self.shelf(record.node);
         self.marks.mark(record.node);
-        let name = format!(
-            "{}/graph-envelope-{}-{}",
-            weaver_graph::names::INTERNAL_DIR,
-            record.node.0,
-            record.envelope
-        );
-        let leaf = Leaf::at(&self.working_dir, &name)?;
+        let name = record
+            .file
+            .clone()
+            .unwrap_or_else(|| envelope_name(record.node, record.envelope));
+        let leaf = Leaf::found(&self.working_dir, &name);
+        // The checkpoint owns this path, but its file may have been lost
+        // or shortened since. Missing bytes must wait for refetch before
+        // a run starts: stale coverage would let it fail on an absent
+        // file, then never restart when fresh bytes replace that coverage.
+        let length = match leaf.len() {
+            Ok(length) => length,
+            Err(LeafError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
         let mut coverage = Coverage::new();
         for run in &record.runs {
-            coverage.write(run.range, run.provenance);
+            if let Some(range) = run.range.intersect(weaver_graph::ByteRange::new(0, length)) {
+                coverage.write(range, run.provenance);
+            }
         }
         shelf.update(|state| {
             state.kept.insert(
@@ -75,11 +89,18 @@ impl Envelopes {
                     leaf,
                     coverage,
                     closed: record.closed,
+                    // No run has read past a restored volume yet, and the
+                    // first to read one starts from its recorded length.
+                    closed_at: record.closed,
                     settled: record.settled,
                     reached: 0,
+                    length_read: None,
                 },
             );
         });
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests;

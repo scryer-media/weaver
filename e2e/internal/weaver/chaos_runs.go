@@ -95,8 +95,11 @@ func cmdChaosTest() {
 		{"combined: STAT bad code 100% + drop mid-body 5%", "stat_bad_code=100,drop_mid_body=5", true, 0, false},
 		{"combined: reauth 30% + drop mid-body 5% + slow 5ms", "reauth_body=30,drop_mid_body=5,slow_body=5", false, 0, false},
 		{
+			// This round checks capacity refusals and reuse of capped lanes.
+			// Per-line BODY delay makes a single corpus job exceed the batch
+			// budget; slow transfers are exercised by the other rounds.
 			name:            "provider cap below configured lanes, new newsgroup per job",
-			config:          "max_conns=4,slow_body=5",
+			config:          "max_conns=4",
 			providerCap:     4,
 			newsgroupPerJob: true,
 		},
@@ -142,6 +145,11 @@ func cmdChaosTest() {
 		}
 		if err := ensureNntpChaosOff(); err != nil {
 			log.Fatalf("reset NNTP chaos before round %q: %v", round.name, err)
+		}
+		if round.providerCap > 0 {
+			if _, err := waitForFreeNntpConnectionMetrics(nntpHost(), nntpPort()); err != nil {
+				log.Fatalf("drain NNTP sessions before round %q: %v", round.name, err)
+			}
 		}
 		if err := resetNntpMetrics(); err != nil {
 			log.Fatalf("reset NNTP metrics before round %q: %v", round.name, err)

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::deliver::Posted;
+use crate::member::Run;
 
 // What the object heard, in order.
 type Log = Arc<Mutex<Vec<Heard>>>;
@@ -92,7 +93,9 @@ impl Object for Trial {
             range,
         });
     }
-    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
     }
@@ -143,7 +146,7 @@ fn deliver(
         member,
         Posted {
             offset,
-            bytes: Bytes::copy_from_slice(bytes),
+            bytes: Bytes::copy_from_slice(bytes).into(),
             provenance,
         },
         builder,
@@ -226,4 +229,74 @@ fn a_range_asked_for_again_is_delivered_again_as_it_was_posted() {
         })
         .count();
     assert_eq!(leaves, 2, "the member's front is written again");
+}
+
+// A range that never came is recorded as the loss it is at every depth,
+// apart from bytes beside it that came damaged: asked for again, the
+// damaged bytes come again as they were posted, and nothing of the loss.
+#[test]
+fn a_loss_beside_damaged_bytes_is_never_said_again_as_bytes() {
+    let log = Log::default();
+    let mut builder = Trials(Arc::clone(&log));
+    let mut tree = Tree::new();
+    let mut effects = Vec::new();
+    let show = tree.announce_root("show.rar", None, &mut effects);
+    let mut front = SIGNATURE.to_vec();
+    front.extend_from_slice(b"hello");
+    deliver(
+        &mut tree,
+        &mut builder,
+        show,
+        (0, &front, Provenance::Fresh),
+        &mut effects,
+    );
+    let child = tree.child_of(NodeId::ROOT, show).expect("bound").0;
+    tree.damage(
+        NodeId::ROOT,
+        VolumeIndex(show.0),
+        ByteRange::new(20, 24),
+        &mut effects,
+    );
+    deliver(
+        &mut tree,
+        &mut builder,
+        show,
+        (15, b"CHECK", Provenance::Damaged),
+        &mut effects,
+    );
+    let runs = |tree: &Tree, node: NodeId, member: MemberId| -> Vec<Run> {
+        tree.namespace(node)
+            .and_then(|namespace| namespace.get(member))
+            .map(|record| record.coverage.runs().copied().collect())
+            .unwrap_or_default()
+    };
+    for (node, member) in [(NodeId::ROOT, show), (child, MemberId(0))] {
+        let held = runs(&tree, node, member);
+        assert!(
+            held.contains(&Run {
+                range: ByteRange::new(15, 20),
+                provenance: Provenance::Damaged,
+            }),
+            "{held:?}"
+        );
+        assert!(
+            held.contains(&Run {
+                range: ByteRange::new(20, 24),
+                provenance: Provenance::Lost,
+            }),
+            "{held:?}"
+        );
+    }
+    let again = tree.again_read(child, &[(VolumeIndex(0), ByteRange::new(0, 24))], &builder);
+    let said: Vec<(u64, Vec<u8>, Provenance)> = again
+        .into_iter()
+        .map(|(_, posted)| (posted.offset, posted.bytes.to_vec(), posted.provenance))
+        .collect();
+    assert_eq!(
+        said,
+        vec![
+            (0, front, Provenance::Fresh),
+            (15, b"CHECK".to_vec(), Provenance::Damaged),
+        ]
+    );
 }

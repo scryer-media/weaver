@@ -39,18 +39,24 @@ pub(crate) struct RootRow {
 
 impl RootRow {
     // Version 2 was the article root's facts with the job's beside them; no
-    // released build wrote it.
-    pub(crate) const VERSION: u16 = 3;
+    // released build wrote it, nor 3, the root's facts in a blob of their
+    // own. 8: the job's facts name the members whose whole-file check is
+    // still to come, and the checkpoint names why a range was lost and a
+    // range that never came; numbered past every version a 0.16 build
+    // wrote of the facts this row replaces.
+    pub(crate) const VERSION: u16 = 8;
 }
 
 // What the job keeps of itself in the root row, whatever its root.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct JobFacts {
     // How many member reads the job's repairs made: the writer's count.
     pub(crate) read_backs: u64,
     // The phase the job last reported, so a restored job reports only a
     // change from it.
     pub(crate) reported: Option<RootPhase>,
+    // Namespace members whose whole-file verification has not been acknowledged.
+    pub(crate) pending_verifications: Vec<(u32, u32)>,
 }
 
 // A root's own facts, as the root that wrote them encoded them: the blob
@@ -75,6 +81,7 @@ pub(crate) enum Parts {
 impl RootBlob {
     // The root's facts whole, every part with them: an encoding into
     // nothing kept reads the root whole.
+    #[cfg(test)]
     pub(crate) fn of<R: Root>(root: &R) -> Self {
         let (mut blob, parts) = Self::encode(root, &mut R::Kept::default());
         blob.parts = match parts {
@@ -208,6 +215,9 @@ impl ArticleRoot {
         }
         root.map.restore(&facts.volumes)?;
         root.checksums.restore(&facts.volumes);
+        let checksums = &root.checksums;
+        root.map
+            .vouch(|volume, range| checksums.verified(volume, range));
         Ok(root)
     }
 

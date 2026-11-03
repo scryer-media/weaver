@@ -176,16 +176,27 @@ fn the_record_covers_the_volume_it_sits_in_and_nothing_beside_it() {
 fn a_ruling_while_the_volume_is_open_waits_until_it_closes() {
     let volume = rar5_volume(&payload(2, 5000), 4);
     let (mut job, _) = job(&volume);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
     assert_eq!(job.object.outcome(), Some(RepairOutcome::Waiting));
     assert_eq!(job.store.reads, 0);
     close(&mut job);
     assert_eq!(job.object.outcome(), None, "due again once closed");
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
 }
 
+// Every article's own check passing says the bytes are as posted, not
+// that they are what the record protects: the record still reads the
+// volume, and finds it intact.
 #[test]
-fn a_volume_that_passed_whole_is_clean_without_a_read() {
+fn a_volume_that_passed_whole_is_still_checked_against_its_record() {
     let volume = rar5_volume(&payload(3, 5000), 4);
     let (mut job, member) = job(&volume);
     job.object.feed(
@@ -197,8 +208,38 @@ fn a_volume_that_passed_whole_is_clean_without_a_read() {
         }],
     );
     close(&mut job);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
-    assert_eq!(job.store.reads, 0);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
+    assert!(job.store.reads > 0, "the record read nothing");
+    assert_eq!(job.store.writes, 0);
+    assert_eq!(verdicts(&job, member), vec![SliceVerdict::Intact]);
+}
+
+// A byte changed before the volume was posted: every article passes its
+// own check, and only the record's checksums find the byte. It is rebuilt.
+#[test]
+fn a_volume_changed_before_posting_that_passed_whole_is_rebuilt_from_its_record() {
+    let volume = rar5_volume(&payload(7, 5000), 4);
+    let (mut job, member) = job(&volume);
+    job.store.members.get_mut(&member).unwrap()[1000] ^= 0x5a;
+    let posted = job.store.members[&member].clone();
+    job.object.feed(
+        member,
+        &[Segment {
+            range: ByteRange::new(0, posted.len() as u64),
+            crc32: crc32(&posted),
+            verified: true,
+        }],
+    );
+    close(&mut job);
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
+    assert_eq!(outcome, RepairOutcome::Repaired { slices: 1 });
+    assert!(job.store.members[&member] == volume, "rebuilt bytes");
     assert_eq!(verdicts(&job, member), vec![SliceVerdict::Intact]);
 }
 
@@ -215,7 +256,11 @@ fn an_unproven_volume_the_record_finds_intact_is_clean_and_nothing_is_written() 
         }],
     );
     close(&mut job);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
     assert!(job.store.reads > 0);
     assert_eq!(job.store.writes, 0);
 }
@@ -229,7 +274,9 @@ fn a_rar5_volume_with_damaged_bytes_is_rebuilt_from_its_record_in_place() {
         *byte ^= 0x5a;
     }
     close(&mut job);
-    let outcome = job.object.repair(&mut job.store);
+    let outcome = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
     assert!(
         matches!(outcome, RepairOutcome::Repaired { slices } if slices >= 2),
         "{outcome:?}"
@@ -250,7 +297,9 @@ fn bytes_the_namespace_cannot_read_are_rebuilt_from_the_record() {
         lost: vec![lost],
         found: Vec::new(),
     };
-    let outcome = job.object.repair(&mut access);
+    let outcome = job
+        .object
+        .repair(&mut access, weaver_graph::Budget::default());
     assert!(
         matches!(outcome, RepairOutcome::Repaired { .. }),
         "{outcome:?}"
@@ -273,7 +322,8 @@ fn a_rar5_volume_damaged_past_its_parity_is_impossible_and_nothing_is_written() 
         found: Vec::new(),
     };
     assert_eq!(
-        job.object.repair(&mut access),
+        job.object
+            .repair(&mut access, weaver_graph::Budget::default()),
         RepairOutcome::Impossible {
             damaged: 4,
             reachable: 2
@@ -308,7 +358,8 @@ fn damaged_parity_is_named_and_what_the_record_proves_ends_at_its_header() {
         found: Vec::new(),
     };
     assert_eq!(
-        job.object.repair(&mut access),
+        job.object
+            .repair(&mut access, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 1 }
     );
     assert_eq!(access.found.len(), 1, "{:?}", access.found);
@@ -325,9 +376,17 @@ fn a_record_that_never_finds_its_volume_waits_and_once_closed_says_nothing() {
     let mut job = Job::new(RarRecord::new(), weaver_graph::ObjectId(9));
     job.object.bound(VolumeIndex(0), VOLUME, &[], None);
     bind(&mut job);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
     close(&mut job);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Unread);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Unread
+    );
     assert_eq!(job.object.outcome(), Some(RepairOutcome::Unread));
 }
 
@@ -336,11 +395,19 @@ fn bytes_to_come_again_reopen_the_volume_and_take_back_what_was_said() {
     let volume = rar5_volume(&payload(13, 5000), 2);
     let (mut job, _) = job(&volume);
     close(&mut job);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Clean);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Clean
+    );
     job.object
         .unposted(VolumeIndex(0), ByteRange::new(0, volume.len() as u64));
     assert_eq!(job.object.outcome(), None);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Waiting);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
 }
 
 #[test]
@@ -350,7 +417,8 @@ fn a_rar3_volume_rebuilds_one_sector_per_slot_and_no_more() {
     job.store.members.get_mut(&member).unwrap()[700] ^= 1;
     close(&mut job);
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 1 }
     );
     assert!(job.store.members[&member] == volume, "rebuilt bytes");
@@ -361,7 +429,8 @@ fn a_rar3_volume_rebuilds_one_sector_per_slot_and_no_more() {
     damaged[700 + 4 * 512] ^= 1;
     close(&mut job);
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Impossible {
             damaged: 2,
             reachable: 4
@@ -387,7 +456,8 @@ fn a_volume_with_enciphered_headers_is_rebuilt_under_the_candidate_its_store_han
     job.object.volume_closed(VolumeIndex(0), &mut asked);
     assert!(asked.is_empty(), "{asked:?}");
     assert_eq!(
-        job.object.repair(&mut job.store),
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 1 }
     );
     assert!(job.store.members[&member] == volume, "rebuilt bytes");
@@ -401,13 +471,14 @@ fn a_restored_record_reads_under_the_candidate_its_store_hands_again() {
     let (mut job, member) = job(&volume);
     hand(&mut job.object, PASSWORD);
     close(&mut job);
-    let mut restored = crate::restore(&job.object.facts()).expect("restores");
+    let mut restored =
+        crate::restore(&job.object.facts(), weaver_graph::Budget::default()).expect("restores");
     hand(restored.as_mut(), PASSWORD);
     job.store.members.get_mut(&member).unwrap()[700] ^= 1;
     let recovery = restored.recovery_mut().expect("a recovery object");
     recovery.bind(&mut job.namespace, &mut Vec::new());
     assert_eq!(
-        recovery.repair(&mut job.store),
+        recovery.repair(&mut job.store, weaver_graph::Budget::default()),
         RepairOutcome::Repaired { slices: 1 }
     );
     assert!(job.store.members[&member] == volume, "rebuilt bytes");
@@ -422,7 +493,11 @@ fn a_volume_with_enciphered_headers_and_no_candidate_that_opens_them_says_nothin
     hand(&mut job.object, "not-the-key");
     job.store.members.get_mut(&member).unwrap()[700] ^= 1;
     close(&mut job);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Unread);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Unread
+    );
     assert!(!job.object.covers(member));
     assert!(verdicts(&job, member).is_empty());
     assert!(job.store.members[&member] != volume, "nothing written");
@@ -438,7 +513,11 @@ fn a_volume_whose_record_cannot_be_read_says_nothing_of_it() {
     volume[record..end].fill(0);
     let (mut job, member) = job(&volume);
     close(&mut job);
-    assert_eq!(job.object.repair(&mut job.store), RepairOutcome::Unread);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Unread
+    );
     assert!(!job.object.covers(member));
     assert!(verdicts(&job, member).is_empty());
 }
@@ -454,7 +533,9 @@ fn an_unread_record_gives_no_verdict() {
     let (mut job, member) = job(&volume);
     job.store.members.get_mut(&member).unwrap()[900] ^= 1;
     close(&mut job);
-    let ruled = job.object.repair(&mut job.store);
+    let ruled = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
     assert_eq!(ruled, RepairOutcome::Unread);
     assert_eq!(job.object.outcome(), Some(RepairOutcome::Unread));
     assert!(!job.object.covers(member));
@@ -477,9 +558,12 @@ fn what_the_record_said_survives_a_restore() {
     let (mut job, member) = job(&volume);
     job.store.members.get_mut(&member).unwrap()[20_000] ^= 1;
     close(&mut job);
-    let ruled = job.object.repair(&mut job.store);
+    let ruled = job
+        .object
+        .repair(&mut job.store, weaver_graph::Budget::default());
     assert!(matches!(ruled, RepairOutcome::Repaired { .. }), "{ruled:?}");
-    let restored = crate::restore(&job.object.facts()).expect("restores");
+    let restored =
+        crate::restore(&job.object.facts(), weaver_graph::Budget::default()).expect("restores");
     let recovery = restored.recovery().expect("a recovery object");
     assert_eq!(recovery.outcome(), Some(ruled));
     assert!(recovery.covers(member));

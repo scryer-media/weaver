@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The grouping cross under the graph engine, judged by the graph matrix's
-// one rule set.
+// The grouping cross, judged by the matrix's one rule set.
 //
-// The cells are the classic cross's: a cell exists when [`rule`] says a
+// A cell exists when [`rule`] says a
 // single job can present it. What a job delivers follows from the post
 // alone. The [`Fixture`] says which volumes the archive is written as,
 // which of them go up under which names, and which members the archive
@@ -126,9 +125,46 @@ fn cell_post(cell: Cell, fixture: Fixture, options: ScheduleOptions) -> Delivera
         let password = fixture.spec.password.as_deref();
         // Every 7z piece but the last is as long as the first, so a set
         // with more than one middle piece has pieces only a name orders.
-        let (count, _) = cell.naming.layout();
+        let (count, posted) = cell.naming.layout();
         let unordered = cell.container.is_sevenz() && count > 3 && !cell.orders_middles();
-        let deliverable = if !opens || unordered {
+        let withheld = interruption.withheld().map(|(volume, _)| volume as usize);
+        // The numbers the names of the pieces the job holds give them, each
+        // with the front its piece arrives with or its recovery set
+        // rebuilds.
+        let numbered: Vec<(u32, &[u8])> = fixture
+            .volumes
+            .iter()
+            .enumerate()
+            .filter(|(copy, _)| recovers || Some(*copy) != withheld)
+            .filter_map(|(copy, (name, _))| {
+                let number = match weaver_model::files::FileRole::from_filename(name) {
+                    weaver_model::files::FileRole::SevenZipSplit { number }
+                    | weaver_model::files::FileRole::SplitFile { number } => number,
+                    _ => return None,
+                };
+                Some((number, left[posted[copy]].as_deref()?))
+            })
+            .collect();
+        // Names join the pieces of a 7z set when they number them from the
+        // first: a set whose lowest number is above one is not joined, names
+        // that number nothing join nothing, and a piece numbered after the
+        // lowest whose front signs refutes the numbered set, the signing
+        // piece left standing alone. Without them only a recovery set joins
+        // the pieces.
+        let lowest = numbered.iter().map(|(number, _)| *number).min();
+        let names_join = lowest == Some(0)
+            && !numbered.iter().any(|(number, front)| {
+                *number > 0
+                    && matches!(
+                        weaver_graph::signed(front, Some(front.len() as u64)),
+                        weaver_graph::Sniff::Object(_)
+                    )
+            });
+        let joins = !cell.container.is_sevenz()
+            || count == 1
+            || options.recovery != RecoveryFormat::Absent
+            || names_join;
+        let deliverable = if !opens || unordered || !joins {
             BTreeSet::new()
         } else if mended && left.iter().all(Option::is_some) {
             members.keys().cloned().collect()
@@ -148,23 +184,62 @@ fn cell_post(cell: Cell, fixture: Fixture, options: ScheduleOptions) -> Delivera
         // the posted names says nothing of what the pieces are, and what it
         // recreates is already in what the post leaves.
         let archive = !cell.container.is_sevenz()
-            || cell.naming.names_place()
+            || crate::pipeline::tests::archive_output_contract::names_show_archive(
+                fixture
+                    .volumes
+                    .iter()
+                    .enumerate()
+                    .filter(|(copy, _)| Some(*copy) != withheld)
+                    .map(|(_, (name, _))| name.as_str()),
+            )
             || cell.binding.names_real()
             || left.first().is_some_and(|piece| {
                 piece
                     .as_ref()
                     .is_some_and(|bytes| bytes.starts_with(SEVENZ))
             });
-        let files = (!archive).then(|| {
-            let posted: Vec<&Vec<u8>> = left.iter().flatten().collect();
-            Files {
-                posted: posted.len(),
-                whole: posted
-                    .iter()
-                    .filter(|piece| fixture.volumes.iter().any(|(_, bytes)| bytes == **piece))
-                    .count(),
-            }
-        });
+        let visible = fixture
+            .volumes
+            .iter()
+            .enumerate()
+            .filter(|(copy, _)| Some(*copy) != withheld)
+            .map(|(copy, (name, bytes))| {
+                (left[posted[copy]].as_ref() == Some(bytes))
+                    .then_some((name.as_str(), bytes.as_slice()))
+            })
+            .collect::<Option<Vec<_>>>();
+        let joined = (!cell.binding.names_real() && names_join)
+            .then_some(visible)
+            .flatten()
+            .and_then(crate::pipeline::tests::archive_output_contract::joined_posting)
+            .filter(|(name, bytes)| {
+                crate::pipeline::tests::archive_output_contract::signatureless_join(name, bytes)
+            });
+        let files = if let Some((name, _)) = joined {
+            Some(Files {
+                posted: 1,
+                whole: vec![name.clone()],
+                joined: Some(name),
+            })
+        } else {
+            (!archive).then(|| {
+                let posted: Vec<&Vec<u8>> = left.iter().flatten().collect();
+                Files {
+                    posted: posted.len(),
+                    joined: None,
+                    whole: posted
+                        .iter()
+                        .filter_map(|piece| {
+                            fixture
+                                .volumes
+                                .iter()
+                                .find(|(_, bytes)| bytes == *piece)
+                                .map(|(name, _)| name.clone())
+                        })
+                        .collect(),
+                }
+            })
+        };
         Leaves {
             deliverable,
             mended,
@@ -191,7 +266,7 @@ async fn run_cell_under(cell: Cell, cases: Vec<(usize, Schedule)>, only: Option<
     let (options, described) = cell.binding.drive(&fixture);
     let mut layouts: Vec<(ScheduleOptions, Vec<(usize, Schedule)>)> = Vec::new();
     for (case, schedule) in cases {
-        if !runs_under_graph(schedule.1) || !cell.presents(schedule.1) {
+        if !cell.presents(schedule.1) {
             continue;
         }
         for layout in recovery_layouts(options, schedule.1)

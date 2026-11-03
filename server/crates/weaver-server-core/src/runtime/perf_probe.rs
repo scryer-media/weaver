@@ -80,11 +80,12 @@ pub(crate) fn record_value_owned(label: String, value: u64) {
     profiler().record_value(label, value);
 }
 
+// A scope reads the clock only while profiling is on: with it off a scope is
+// its label and nothing else, so a per-article scope costs no clock read.
 pub(crate) fn scope(label: &'static str) -> Scope {
     Scope {
         label,
-        started: Instant::now(),
-        enabled: enabled(),
+        started: probe_started(),
     }
 }
 
@@ -95,9 +96,27 @@ pub(crate) fn scope(label: &'static str) -> Scope {
 pub(crate) fn owned_scope(label: String) -> OwnedScope {
     OwnedScope {
         label,
-        started: Instant::now(),
-        enabled: enabled(),
+        started: probe_started(),
     }
+}
+
+fn probe_started() -> Option<Instant> {
+    enabled().then(|| {
+        #[cfg(test)]
+        SCOPE_CLOCK_READS.with(|reads| reads.set(reads.get() + 1));
+        Instant::now()
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static SCOPE_CLOCK_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+// Clock reads this thread's scopes have taken on opening.
+#[cfg(test)]
+pub(crate) fn scope_clock_reads() -> u64 {
+    SCOPE_CLOCK_READS.with(std::cell::Cell::get)
 }
 
 pub(crate) fn cpu_scope(label: &'static str) -> CpuScope {
@@ -131,46 +150,26 @@ pub(crate) fn record_sql_statement(
 
 pub(crate) struct Scope {
     label: &'static str,
-    started: Instant,
-    enabled: bool,
-}
-
-impl Scope {
-    // Close the scope early and hand its wall duration back to the caller.
-    //
-    // Exactly **one** clock read: the returned `Duration` is the same value
-    // the probe records, so a caller that wants both a profile bucket and a
-    // metric observation never reads the clock twice. Clearing `enabled`
-    // makes the `Drop` below a no-op, which is what keeps the second read
-    // from happening.
-    pub(crate) fn finish(mut self) -> Duration {
-        let elapsed = self.started.elapsed();
-        if self.enabled {
-            profiler().record(self.label.to_string(), elapsed);
-            self.enabled = false;
-        }
-        elapsed
-    }
+    started: Option<Instant>,
 }
 
 impl Drop for Scope {
     fn drop(&mut self) {
-        if self.enabled {
-            profiler().record(self.label.to_string(), self.started.elapsed());
+        if let Some(started) = self.started {
+            profiler().record(self.label.to_string(), started.elapsed());
         }
     }
 }
 
 pub(crate) struct OwnedScope {
     label: String,
-    started: Instant,
-    enabled: bool,
+    started: Option<Instant>,
 }
 
 impl Drop for OwnedScope {
     fn drop(&mut self) {
-        if self.enabled {
-            profiler().record(std::mem::take(&mut self.label), self.started.elapsed());
+        if let Some(started) = self.started {
+            profiler().record(std::mem::take(&mut self.label), started.elapsed());
         }
     }
 }
@@ -574,17 +573,8 @@ fn classify_sql(template: &str) -> String {
     for table in [
         "active_file_progress",
         "active_file_identities",
-        "active_par2_files",
-        "active_failed_extractions",
         "active_extracted",
-        "active_extraction_chunks",
-        "active_rar_verified_suspect",
-        "active_rar_volume_facts",
         "active_detected_archives",
-        "active_archive_headers",
-        "active_direct_coverage",
-        "active_repair_outputs",
-        "active_volume_status",
         "active_files",
         "active_jobs",
         "job_events",
@@ -657,4 +647,25 @@ fn first_table_after(lower_sql: &str, marker: &str) -> Option<String> {
         .trim_start_matches("public.")
         .to_string();
     if table.is_empty() { None } else { Some(table) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A scope opened on a per-article path reads the clock only when there is
+    // a profile to record into.
+    #[test]
+    fn a_scope_reads_the_clock_only_while_profiling_is_on() {
+        let before = scope_clock_reads();
+        for _ in 0..3 {
+            let _scope = scope("test.scope");
+            let _owned = owned_scope("test.owned_scope".to_string());
+        }
+        assert_eq!(
+            scope_clock_reads() - before,
+            if enabled() { 6 } else { 0 },
+            "a scope opened with profiling off must not read the clock"
+        );
+    }
 }

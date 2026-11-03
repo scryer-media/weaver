@@ -82,6 +82,23 @@ type weaverReleaseFlowSpec struct {
 }
 
 var weaverReleaseFlowSpecs = []weaverReleaseFlowSpec{
+	// The flow queue is drained in table order, so the slowest flows lead: the
+	// advanced networking partitions each bring up their own proxy and tunnel
+	// stacks and run longest, and starting them first keeps the tail of a run
+	// short instead of leaving one of them running alone at the end.
+	// Each partition's npm script selects its tests; the minutes are what one
+	// takes on a loaded host.
+	advancedNetworkingPartition("pool-reselection", []string{"network-pools.spec.ts"}, false, 25*time.Minute),                   // P02, ~7-11 min
+	advancedNetworkingPartition("routes", []string{"network-ladders.spec.ts"}, false, 25*time.Minute),                           // F01-F08, ~6-8 min
+	advancedNetworkingPartition("egress-link", []string{"network-egress.spec.ts"}, false, 20*time.Minute),                       // E07, ~7-8 min
+	advancedNetworkingPartition("pools", []string{"network-pools.spec.ts"}, false, 25*time.Minute),                              // P01, P03, P05, P06, ~5-9 min
+	advancedNetworkingPartition("legs", []string{"network-legs.spec.ts"}, false, 20*time.Minute),                                // ~5-7 min
+	advancedNetworkingPartition("sessions", []string{"network-sessions.spec.ts", "network-rss.spec.ts"}, false, 15*time.Minute), // ~5-6 min
+	advancedNetworkingPartition("egress", []string{"network-egress.spec.ts", "network-reload.spec.ts"}, true, 20*time.Minute),   // all but E07, ~4-6 min
+	advancedNetworkingPartition("routes-hops", []string{"network-ladders.spec.ts"}, false, 15*time.Minute),                      // F09-F17, ~3-4 min
+	advancedNetworkingPartition("pool-members", []string{"network-pools.spec.ts"}, false, 15*time.Minute),                       // P08-P14, ~3-5 min
+	advancedNetworkingNoNetRawReleaseFlow(),
+	advancedNetworkingExtendedReleaseFlow(),
 	browserReleaseFlow("ui-settings-crud", 6*time.Minute),
 	browserReleaseFlow("ui-security", 6*time.Minute),
 	ingressReleaseFlow(),
@@ -159,13 +176,7 @@ var weaverReleaseFlowSpecs = []weaverReleaseFlowSpec{
 		Artifacts:  []string{"flow.log", "status.json", "fake-nntp-counters.json"},
 		Timeout:    12 * time.Minute,
 	},
-	advancedNetworkingPartition("egress", []string{"network-egress.spec.ts", "network-legs.spec.ts", "network-reload.spec.ts"}, true),
-	advancedNetworkingPartition("routes", []string{"network-ladders.spec.ts", "network-sessions.spec.ts", "network-rss.spec.ts"}, false),
-	advancedNetworkingPartition("pools", []string{"network-pools.spec.ts"}, false),
-	advancedNetworkingPartition("pool-reselection", []string{"network-pools.spec.ts"}, false),
 	speedTestReleaseFlow(),
-	advancedNetworkingNoNetRawReleaseFlow(),
-	advancedNetworkingExtendedReleaseFlow(),
 	eventScriptsReleaseFlow(),
 	postProcessingScriptsReleaseFlow(),
 	schedulingReleaseFlow(),
@@ -219,7 +230,6 @@ func defaultWeaverReleaseArtifacts() []string {
 		"fake-nntp-counters.json",
 		"html-report",
 		"trace.zip",
-		"failure-video",
 		"screenshots",
 	}
 }
@@ -284,15 +294,14 @@ type weaverReleasePhase struct {
 }
 
 type weaverReleasePhaseStatus struct {
-	Flow       string       `json:"flow"`
-	Datastore  string       `json:"datastore"`
-	Project    string       `json:"project"`
-	Engine     weaverEngine `json:"engine"`
-	Status     string       `json:"status"`
-	StartedAt  time.Time    `json:"started_at"`
-	FinishedAt time.Time    `json:"finished_at,omitempty"`
-	DurationMS int64        `json:"duration_ms,omitempty"`
-	Error      string       `json:"error,omitempty"`
+	Flow       string    `json:"flow"`
+	Datastore  string    `json:"datastore"`
+	Project    string    `json:"project"`
+	Status     string    `json:"status"`
+	StartedAt  time.Time `json:"started_at"`
+	FinishedAt time.Time `json:"finished_at,omitempty"`
+	DurationMS int64     `json:"duration_ms,omitempty"`
+	Error      string    `json:"error,omitempty"`
 }
 
 type weaverReleasePhaseConfiguration struct {
@@ -602,7 +611,7 @@ func resolveWeaverReleaseGateSpecs(mode string) ([]weaverReleaseFlowSpec, error)
 	switch mode {
 	case "advanced-networking":
 		var out []weaverReleaseFlowSpec
-		for _, name := range []string{"egress", "routes", "pools", "pool-reselection"} {
+		for _, name := range advancedNetworkingPartitionNames {
 			spec, ok := weaverReleaseFlowSpecFor("advanced-networking-" + name)
 			if !ok {
 				return nil, fmt.Errorf("missing advanced networking partition %q", name)
@@ -783,7 +792,6 @@ func runWeaverReleasePhase(parent context.Context, phase *weaverReleasePhase) we
 		Flow:      phase.Flow,
 		Datastore: phase.Datastore,
 		Project:   phase.Project,
-		Engine:    engineUnderTest(),
 		Status:    "running",
 		StartedAt: started.UTC(),
 	}
@@ -2408,7 +2416,7 @@ func runWeaverReleasePlaywright(ctx context.Context, script string) error {
 const weaverReleaseFlowDeadlineEnv = "E2E_WEAVER_RELEASE_FLOW_DEADLINE"
 
 // weaverReleaseFlowWindup is what a flow needs after Playwright stops:
-// Playwright writing traces, videos and its report, the container exiting,
+// Playwright writing traces and its report, the container exiting,
 // and the flow capturing diagnostics and tearing its stack down.
 const weaverReleaseFlowWindup = 90 * time.Second
 
@@ -2419,7 +2427,7 @@ const weaverPlaywrightBudgetEnv = "E2E_WEAVER_PLAYWRIGHT_BUDGET_MS"
 
 // weaverReleasePlaywrightBudget is how long Playwright may run so that the
 // flow still winds up before the gate's kill. A killed Playwright leaves no
-// trace, video or report, so a stuck test must end through Playwright's own
+// trace or report, so a stuck test must end through Playwright's own
 // timeouts instead. ok is false when no deadline was passed down.
 func weaverReleasePlaywrightBudget(now time.Time, getenv func(string) string) (budget time.Duration, ok bool, err error) {
 	value := strings.TrimSpace(getenv(weaverReleaseFlowDeadlineEnv))

@@ -39,6 +39,17 @@ impl Pipeline {
     // the anchor is the newest date the NZB does carry, because that is the
     // article most likely still in flight.
     pub(in crate::pipeline) fn propagation_hold_until(&mut self, job_id: JobId) -> Option<Instant> {
+        // A hold that ran out goes once seen, whatever the delay is now, so
+        // it never calls for another walk.
+        if self
+            .propagation_ready_at
+            .get(&job_id)
+            .is_some_and(|(ready_at, _)| *ready_at <= Instant::now())
+        {
+            self.propagation_ready_at.remove(&job_id);
+            self.emit_job_event(PipelineEvent::PhaseProgressUpdated { job_id });
+            return None;
+        }
         let delay = self.propagation_delay;
         #[cfg(test)]
         let delay = self.propagation_delay_forced.unwrap_or(delay);
@@ -46,12 +57,7 @@ impl Pipeline {
             return None;
         }
         if let Some((ready_at, _)) = self.propagation_ready_at.get(&job_id).copied() {
-            if ready_at > Instant::now() {
-                return Some(ready_at);
-            }
-            self.propagation_ready_at.remove(&job_id);
-            self.emit_job_event(PipelineEvent::PhaseProgressUpdated { job_id });
-            return None;
+            return Some(ready_at);
         }
 
         let posted_at = self
@@ -60,7 +66,7 @@ impl Pipeline {
             .and_then(|state| Self::job_posted_at_epoch(&state.spec))
             .or_else(|| {
                 self.shared_state.queue.read(|inner| {
-                    let row = inner.jobs.iter().find(|row| row.id == job_id)?;
+                    let row = inner.job(job_id)?;
                     row.admission
                         .as_ref()
                         .map(|job| &job.spec)
@@ -163,12 +169,18 @@ impl Pipeline {
         second: &[usize],
     ) -> Vec<usize> {
         let mut merged = first.to_vec();
-        for idx in second {
+        Self::extend_exclude_servers(&mut merged, second);
+        merged
+    }
+
+    // [`Self::union_exclude_servers`] into a list the caller already owns,
+    // so a result that owns its work's ledger reuses that ledger's buffer.
+    pub(in crate::pipeline) fn extend_exclude_servers(merged: &mut Vec<usize>, more: &[usize]) {
+        for idx in more {
             if !merged.contains(idx) {
                 merged.push(*idx);
             }
         }
-        merged
     }
 
     // Union of a work item's failure exclusions and the job's retention
@@ -225,6 +237,10 @@ impl Pipeline {
     // hold the post within its retention, and must not be refusing this
     // pool's credentials. A refusal is a verdict, like the other two; a
     // quarantine for transport or capacity is a wait and keeps the server.
+    // A backfill server may serve the article only once every fill server
+    // is excluded for it or out of its retention: backfill fills what the
+    // fill servers lack, and a fill server refusing the credentials does not
+    // lack the article, so it never opens backfill.
     pub(in crate::pipeline) fn server_may_serve(
         pool: &weaver_nntp::NntpPool,
         idx: usize,
@@ -234,6 +250,8 @@ impl Pipeline {
         !failure_excludes.contains(&idx)
             && !retention_excludes.contains(&idx)
             && !pool.refuses_credentials(idx)
+            && (!pool.is_backfill(idx)
+                || pool.backfill_open_for(failure_excludes, retention_excludes))
     }
 
     // Whether an article carrying `failure_excludes` has no server left
@@ -318,7 +336,14 @@ impl Pipeline {
             .articles_not_found
             .fetch_add(1, Ordering::Relaxed);
         self.send_segment_event(|| PipelineEvent::ArticleNotFound { segment_id });
-        if self.book_failed_segment(segment_id) {
+        // A server that refuses the credentials never said the article is
+        // gone, so the post's health does not count it.
+        let state = if refused_by.is_empty() {
+            SegmentTerminalState::Missing
+        } else {
+            SegmentTerminalState::Unservable
+        };
+        if self.book_terminal_segment(segment_id, state) {
             self.note_gap_servers_support_fact(job_id, exclude_servers);
         }
         refused_by
@@ -337,11 +362,15 @@ impl Pipeline {
             Self::unavailable_server_count_from_excludes(&pool, &work.exclude_servers, &retention)
                 >= server_count
         };
-        let Some(state) = self.jobs.get_mut(&job_id) else {
+        let Some(active) = self
+            .jobs
+            .get_mut(&job_id)
+            .and_then(|state| state.articles.active_mut())
+        else {
             return 0;
         };
-        let mut retired = state.download_queue.extract_matching(unservable);
-        retired.extend(state.recovery_queue.extract_matching(unservable));
+        let mut retired = active.download_queue.extract_matching(unservable);
+        retired.extend(active.recovery_queue.extract_matching(unservable));
         if retired.is_empty() {
             return 0;
         }

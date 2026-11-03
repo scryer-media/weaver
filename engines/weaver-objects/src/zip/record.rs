@@ -8,17 +8,18 @@
 // that arrived before its header placed it, in a range the object kept to
 // read the directory, is said from what was kept.
 
-use bytes::Bytes;
-use weaver_graph::{ByteRange, Emit, MemberId, Provenance, Segment, SliceVerdict};
+use weaver_graph::{
+    Algorithm, ByteRange, Emit, Evidenced, MemberId, Provenance, Segment, SliceVerdict,
+};
 
 use super::Zip;
-use crate::grid::{self, WHOLE, crc32};
+use crate::grid::{self, WHOLE};
 
 impl Zip {
     pub(super) fn route(
         &mut self,
         range: ByteRange,
-        bytes: &[u8],
+        bytes: &Evidenced,
         provenance: Provenance,
         out: &mut Vec<Emit>,
     ) {
@@ -36,7 +37,7 @@ impl Zip {
             .collect();
         for (member, part, start) in parts {
             let slice =
-                &bytes[(part.start - range.start) as usize..(part.end - range.start) as usize];
+                bytes.slice((part.start - range.start) as usize..(part.end - range.start) as usize);
             self.record(member, part.start - start, slice, provenance, out);
         }
     }
@@ -70,12 +71,16 @@ impl Zip {
                 } else {
                     Provenance::Damaged
                 };
-                runs.push((part, run[..len as usize].to_vec(), provenance));
+                runs.push((
+                    part,
+                    Evidenced::from(run[..len as usize].to_vec()),
+                    provenance,
+                ));
                 cursor = part.end;
             }
         }
         for (part, bytes, provenance) in runs {
-            self.record(member, part.start - span.start, &bytes, provenance, out);
+            self.record(member, part.start - span.start, bytes, provenance, out);
         }
     }
 
@@ -83,7 +88,7 @@ impl Zip {
         &mut self,
         member: MemberId,
         offset: u64,
-        bytes: &[u8],
+        bytes: Evidenced,
         provenance: Provenance,
         out: &mut Vec<Emit>,
     ) {
@@ -108,21 +113,22 @@ impl Zip {
         {
             return;
         }
+        // What no level above proved is hashed here once and handed down
+        // with the bytes.
+        let mut bytes = bytes;
+        bytes.fill(Algorithm::Crc32);
+        let segment = Segment {
+            range,
+            crc32: bytes.digest(Algorithm::Crc32).value as u32,
+            verified: provenance.is_verified(),
+        };
+        self.grid.offer(member, WHOLE, &segment);
         out.push(Emit::Bytes {
             member,
             offset,
-            bytes: Bytes::copy_from_slice(bytes),
+            bytes,
             provenance,
         });
-        self.grid.offer(
-            member,
-            WHOLE,
-            &Segment {
-                range,
-                crc32: crc32(bytes),
-                verified: provenance.is_verified(),
-            },
-        );
         let whole = ByteRange::new(0, length);
         let folded = self.grid.fold(member, WHOLE, 0, whole);
         let verdict = grid::verdict(folded, length, 0, expected);

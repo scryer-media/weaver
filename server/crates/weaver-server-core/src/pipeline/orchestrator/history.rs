@@ -7,38 +7,19 @@ impl Pipeline {
     pub(crate) fn purge_terminal_job_runtime(&mut self, job_id: JobId) {
         self.queue_scripts_completed.remove(&job_id);
         self.added_script_holds.remove(&job_id);
+        self.release_job_articles(job_id);
         self.jobs.remove(&job_id);
-        self.forget_graph_repair(job_id);
-        if let Some(graph) = self.graph_jobs.get(&job_id) {
-            graph.request_stop();
-            if !graph.awaits_mail() {
-                self.graph_jobs.remove(&job_id);
-            }
-        }
+        self.post_probes.forget(job_id);
         self.pipeline_failure_stages.remove(&job_id);
         crate::runtime::job_debug_ring::forget(job_id.0);
-        self.posted_name_disagreement_logged.remove(&job_id);
         self.retire_stalled_download_lanes(job_id);
-        self.job_scheduling_memory.remove(&job_id);
-        self.repeated_articles.remove(&job_id);
         self.job_order.retain(|id| *id != job_id);
         self.remove_pending_completion_check(job_id);
-        self.pending_retries_by_job.remove(&job_id);
-        self.pending_retries_by_segment
-            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
-        self.transport_failure_streaks
-            .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
-        self.cancel_infrastructure_retries_for_job(job_id);
         self.download_wait_by_job.remove(&job_id);
         self.clear_terminal_segment_failures(job_id);
         self.terminal_reconciliations.remove(&job_id);
-        self.clear_par2_runtime_state(job_id);
-        self.clear_job_extraction_runtime(job_id);
-        self.extraction_budgets.remove(&job_id);
-        self.unacceptable_extension_policies.remove(&job_id);
         self.inflight_moves.remove(&job_id);
         self.deferred_moves.remove(&job_id);
-        self.deferred_post_processing.remove(&job_id);
         self.reserved_complete_destinations.remove(&job_id);
         self.active_download_passes.remove(&job_id);
         self.jobs_finalizing_download.remove(&job_id);
@@ -46,14 +27,11 @@ impl Pipeline {
         self.active_completion_critical_connections_by_job
             .remove(&job_id);
         self.job_last_download_activity.remove(&job_id);
-        self.clear_job_rar_runtime(job_id);
         self.clear_job_write_backlog(job_id);
         self.clear_job_progress_floor_runtime(job_id);
         self.clear_job_phase_progress_runtime(job_id);
         self.discard_stage_timers(job_id);
         self.clear_job_retention_excludes(job_id);
-        self.decode_retries
-            .retain(|seg_id, _| seg_id.file_id.job_id != job_id);
         self.rate_limit_reservations
             .retain(|seg_id, _| seg_id.file_id.job_id != job_id);
         self.update_queue_metrics();
@@ -81,7 +59,7 @@ impl Pipeline {
         // A row already retiring is a cancel whose archive is in flight; its
         // done event decides the job.
         let cancelled = self.shared_state.queue.write(|inner| {
-            let Some(row) = inner.jobs.iter_mut().find(|row| row.id == job_id) else {
+            let Some(row) = inner.job_mut(job_id) else {
                 return crate::pipeline::queue::Change::unchanged(None);
             };
             if row.report.retiring {
@@ -166,7 +144,7 @@ impl Pipeline {
         let created_at = now - elapsed_secs;
         let total = state.spec.total_bytes;
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
-            state.assembly.optional_recovery_bytes();
+            state.optional_recovery_bytes();
         let (failed_bytes, health, terminal_discards) = settled.unwrap_or_else(|| {
             (
                 state.failed_bytes,
@@ -202,7 +180,7 @@ impl Pipeline {
         };
 
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
-            state.assembly.optional_recovery_bytes();
+            state.optional_recovery_bytes();
         let (download_state, post_state, run_state) =
             crate::jobs::model::runtime_lanes_from_status_snapshot(&state.status);
         let finished = JobInfo {
@@ -232,9 +210,10 @@ impl Pipeline {
             failed_bytes,
             health,
             terminal_discards,
-            total_files: state.assembly.total_file_count() as u32,
-            completed_files: state.assembly.complete_file_count() as u32,
+            total_files: state.total_file_count() as u32,
+            completed_files: self.completed_file_count(state),
             remaining_par_files: 0,
+            file_remaining_bytes: Vec::new(),
             password: state.spec.password.clone(),
             category: state.spec.category.clone(),
             metadata: state.spec.metadata.clone(),
@@ -272,7 +251,7 @@ impl Pipeline {
             Err(e) => {
                 tracing::error!(job_id = job_id.0, error = %e, "failed to queue job history archival");
                 self.shared_state.queue.write(|inner| {
-                    if let Some(row) = inner.jobs.iter_mut().find(|row| row.id == job_id) {
+                    if let Some(row) = inner.job_mut(job_id) {
                         row.report.retiring = false;
                     }
                     crate::pipeline::queue::Change::changed(())
@@ -289,12 +268,10 @@ impl Pipeline {
         // snapshot must already list the job as finished when a subscriber
         // reacts, or the history facade rejects the lookup as a still-live job.
         self.shared_state.queue.write(|inner| {
-            let row = if let Some(index) = inner.jobs.iter().position(|row| row.id == job_id) {
+            let row = if let Some(index) = inner.job_position(job_id) {
                 &mut inner.jobs[index]
             } else {
-                inner
-                    .jobs
-                    .push(crate::pipeline::queue::JobRow::new(finished.clone()));
+                inner.push_job(crate::pipeline::queue::JobRow::new(finished.clone()));
                 inner.jobs.last_mut().expect("retiring job")
             };
             row.report.job = finished.clone();
@@ -323,7 +300,7 @@ impl Pipeline {
                 return;
             }
             queue.write(|inner| {
-                inner.jobs.retain(|row| row.id != job_id);
+                inner.remove_job(job_id);
                 if let Some(job) = finished {
                     let mut history: Vec<_> = queue
                         .history()

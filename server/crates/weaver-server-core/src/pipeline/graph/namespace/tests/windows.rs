@@ -56,7 +56,8 @@ impl Object for Carrier {
             out.push(Emit::Bytes {
                 member: MemberId(0),
                 offset: part.start - BODY.start,
-                bytes: Bytes::copy_from_slice(&delivery.bytes[start..start + part.len() as usize]),
+                bytes: Bytes::copy_from_slice(&delivery.bytes[start..start + part.len() as usize])
+                    .into(),
                 provenance: delivery.provenance,
             });
         }
@@ -88,7 +89,9 @@ impl Object for Carrier {
         }
     }
 
-    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
 
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
@@ -151,7 +154,9 @@ impl Object for Trail {
         out.push(Placement::Envelope { envelope: 0, range });
     }
 
-    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) {}
+    fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+        Located::Never
+    }
 
     fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
         None
@@ -175,7 +180,7 @@ impl Recovery for Trail {
     fn verdicts(&self, _: MemberId, _: &mut Vec<SliceVerdict>) {}
     fn wants(&self, _: &mut Vec<Seek>) {}
 
-    fn repair(&mut self, access: &mut dyn MemberAccess) -> RepairOutcome {
+    fn repair(&mut self, access: &mut dyn MemberAccess, _: weaver_graph::Budget) -> RepairOutcome {
         let mut volume = Vec::new();
         if access.read_volume(VolumeIndex(0), ByteRange::new(0, self.length), &mut volume) {
             self.tape.lock().unwrap().volume = Some(volume);
@@ -266,7 +271,7 @@ impl Carried {
             node: NodeId::ROOT,
             member: self.member,
             offset: start as u64,
-            bytes: Bytes::copy_from_slice(&volume()[start..end]),
+            bytes: Bytes::copy_from_slice(&volume()[start..end]).into(),
             provenance: Provenance::Fresh,
         };
         let job = &mut self.job;

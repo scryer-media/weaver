@@ -385,6 +385,8 @@ pub(crate) fn storage(dir: &std::path::Path) -> Storage {
         caps: Caps::unbounded(),
         nesting: u32::MAX,
         unpack: true,
+        hardware: Default::default(),
+        metrics: None,
     }
 }
 
@@ -399,7 +401,7 @@ fn torrent_job(layout: &Arc<PieceLayout>, dir: &std::path::Path) -> GraphJob<sup
     let runs = Runs::new(1, 1, RunMail::default().sender(), accountant);
     GraphJob::torrent(
         Arc::clone(layout),
-        Box::new(weaver_objects::Objects),
+        Box::new(weaver_objects::Objects::default()),
         writer,
         runs,
         u32::MAX,
@@ -912,7 +914,7 @@ async fn a_move_waits_while_a_run_is_out() {
     let runs = Runs::new(1, 1, mail.sender(), accountant);
     let mut job = GraphJob::torrent(
         Arc::clone(&layout),
-        Box::new(weaver_objects::Objects),
+        Box::new(weaver_objects::Objects::default()),
         writer,
         runs,
         u32::MAX,

@@ -12,7 +12,10 @@ mod durable;
 use std::collections::BTreeMap;
 
 use bytes::Bytes;
-use weaver_graph::{ByteRange, Marks, MemberId, NodeId, Provenance, Segment, VolumeIndex};
+use weaver_graph::{
+    ByteRange, Digest, Evidence, Evidenced, Marks, MemberId, NodeId, Provenance, Segment,
+    VolumeIndex,
+};
 
 use crate::pipeline::graph::namespace::{Arrival, Segments};
 
@@ -30,12 +33,36 @@ pub(crate) struct Decoded {
     pub(crate) positioned: bool,
     // The file's decoded length, when the article declares it.
     pub(crate) length: Option<u64>,
+    // Where the article's part ends, as its header declares it: where the
+    // next article begins, whatever its own bytes decoded to.
+    pub(crate) declared_end: Option<u64>,
     // The checksums of the article's bytes, cut at the recovery set's block
     // boundaries when the decoder knew them.
     pub(crate) segments: Vec<Segment>,
 }
 
 impl Decoded {
+    // The article as its header declares it. Bytes that decoded past the
+    // declared end are not its own: they are cut off, with the checksums
+    // that reach them, and the article is damaged. An intact article ends
+    // where it declares, so this cuts nothing of one.
+    pub(crate) fn declared(mut self) -> Self {
+        let Some(end) = self.declared_end else {
+            return self;
+        };
+        let own = end.saturating_sub(self.offset);
+        if self.bytes.len() as u64 <= own {
+            return self;
+        }
+        self.bytes.truncate(own as usize);
+        self.intact = false;
+        self.segments.retain(|segment| segment.range.end <= end);
+        for segment in &mut self.segments {
+            segment.verified = false;
+        }
+        self
+    }
+
     pub(crate) fn range(&self) -> ByteRange {
         ByteRange::at(self.offset, self.bytes.len() as u64)
     }
@@ -48,13 +75,25 @@ impl Decoded {
         }
     }
 
+    // The article's bytes go down with the checksums the decoder computed
+    // of them, damaged or not: each is the CRC32 of the bytes as decoded, so
+    // every level below folds it rather than hash the bytes again.
     pub(crate) fn into_arrival(self) -> Arrival {
+        let range = self.range();
+        let evidence = self
+            .segments
+            .iter()
+            .filter(|segment| range.covers(segment.range))
+            .map(|segment| Evidence {
+                range: segment.range.shift(-(self.offset as i64)),
+                digest: Digest::crc32(segment.crc32),
+            });
         Arrival {
             node: NodeId::ROOT,
             member: MemberId(self.volume.0),
             offset: self.offset,
             provenance: self.provenance(),
-            bytes: self.bytes,
+            bytes: Evidenced::with(self.bytes, evidence),
         }
     }
 }
@@ -88,13 +127,11 @@ impl Checksums {
         let kept = self.volumes.entry(volume).or_default();
         let marks = self.marks.entry(volume).or_default();
         for segment in segments {
-            let stale: Vec<u64> = kept
-                .range(..segment.range.end)
-                .rev()
-                .take_while(|(_, kept)| kept.range.end > segment.range.start)
-                .map(|(start, _)| *start)
-                .collect();
-            for start in stale {
+            // Overlapped checksums go nearest first, straight out of the
+            // map, with no list of them gathered on the way.
+            while let Some((&start, overlapped)) = kept.range(..segment.range.end).next_back()
+                && overlapped.range.end > segment.range.start
+            {
                 kept.remove(&start);
                 marks.mark(start);
                 self.kept -= 1;
@@ -164,6 +201,58 @@ impl Segments for Checksums {
             kept.range(first..range.end)
                 .map(|(_, segment)| *segment)
                 .filter(|segment| segment.range.intersect(range).is_some()),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn segment(start: u64, end: u64, crc32: u32) -> Segment {
+        Segment {
+            range: ByteRange::new(start, end),
+            crc32,
+            verified: true,
+        }
+    }
+
+    // An article delivered again replaces the checksums its range overlaps,
+    // straight out of the kept map: the same checksums kept and the same
+    // starts marked, and nothing allocated to find them.
+    #[test]
+    fn a_redelivery_replaces_what_it_overlaps_without_allocating() {
+        let volume = VolumeIndex(3);
+        let mut checksums = Checksums::default();
+        checksums.record(
+            volume,
+            &[
+                segment(0, 10, 1),
+                segment(10, 20, 2),
+                segment(20, 30, 3),
+                segment(30, 40, 4),
+            ],
+        );
+        let marked = checksums.marks[&volume].at();
+        let redelivery = [segment(0, 25, 9)];
+
+        let before = crate::alloc_probe::allocations();
+        checksums.record(volume, &redelivery);
+        assert_eq!(
+            crate::alloc_probe::allocations(),
+            before,
+            "replacing overlapped checksums allocates nothing"
+        );
+
+        assert_eq!(checksums.kept, 2);
+        let mut held = Vec::new();
+        checksums.segments_for(NodeId::ROOT, volume, ByteRange::new(0, 40), &mut held);
+        assert_eq!(held, vec![segment(0, 25, 9), segment(30, 40, 4)]);
+        assert_eq!(
+            checksums.marks[&volume].since(marked).collect::<Vec<_>>(),
+            vec![20, 10, 0],
+            "each overlapped start is marked, nearest first; the new segment \
+             marks its start again last"
         );
     }
 }

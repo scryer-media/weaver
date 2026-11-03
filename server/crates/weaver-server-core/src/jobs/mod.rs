@@ -3,9 +3,11 @@
 
 mod archive_password;
 pub mod assembly;
+pub mod diagnostic_names;
 pub mod duplicate;
 pub mod duplicate_persistence;
 pub mod error;
+pub(crate) mod feed_verdict;
 pub(crate) mod graph_checkpoint;
 pub mod handle;
 pub mod ids;
@@ -14,7 +16,6 @@ pub mod persistence;
 pub mod phase_progress;
 pub mod queries;
 pub mod record;
-pub(crate) mod repair_outputs;
 pub mod report;
 pub mod repository;
 pub mod server_attribution;
@@ -43,8 +44,8 @@ pub use handle::{
     AddJobOptions, CancelJobsOutcome, DownloadBlockKind, DownloadBlockState, EgressQuotaBlock,
     FINISHED_JOBS_RUNTIME_CAP, HISTORY_DELETE_BATCH_SIZE, HardwareProfileInForce,
     HistoryDeleteBatchOutcome, HistoryDeleteOutcome, Hold, HoldOrigin, HoldOwner, HoldScope,
-    HoldSet, JobInfo, NntpRuntimeActivation, QueueMoveTarget, RestoreJobRequest, SchedulerHandle,
-    ServerTransportHealth, SharedPipelineState,
+    HoldSet, JobInfo, NntpRuntimeActivation, QueueMoveTarget, RestartRead, RestoreJobRequest,
+    SchedulerHandle, ServerTransportHealth, SharedPipelineState,
 };
 pub use ids::{ConnectionId, JobId, MessageId, NzbFileId, SegmentId, ServerId};
 pub use model::{
@@ -54,7 +55,4 @@ pub use model::{
     runtime_lanes_from_status_snapshot,
 };
 pub use phase_progress::{JobPhase, JobPhaseProgress, PhaseAttemptCounters, PhaseCounters};
-pub use record::{
-    ActiveFileIdentity, ActiveFileProgress, ActiveJob, ActivePar2File, ExtractionChunk,
-    FileIdentitySource, RecoveredJob,
-};
+pub use record::{ActiveFileIdentity, ActiveJob, FileIdentitySource, RecoveredJob};

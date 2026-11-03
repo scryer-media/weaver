@@ -88,17 +88,9 @@ impl RootPhase {
     }
 
     // Whether the phase may replace this status. The root speaks for the
-    // job only while it is running its tree; a pause, a failure or anything
-    // after the tree is done belongs to whoever set it.
+    // job only while the job is in progress.
     pub(crate) fn may_replace(status: &JobStatus) -> bool {
-        matches!(
-            status,
-            JobStatus::Queued
-                | JobStatus::Downloading
-                | JobStatus::Verifying
-                | JobStatus::Repairing
-                | JobStatus::Extracting
-        )
+        status.in_progress()
     }
 }
 

@@ -12,7 +12,9 @@ use weaver_server_core::{
     split_history_metadata,
 };
 
-use crate::jobs::release_display::{ReleaseDisplayInput, release_display_info};
+use crate::jobs::release_display::{
+    ReleaseDisplayCache, ReleaseDisplayInput, release_display_info,
+};
 use crate::jobs::types::{
     Attribute, DuplicateSummaryInfo, JobStatusGql, ParsedRelease, PreparedQueueFilter, ProtocolGql,
     QueueAttention, QueueFilterInput, QueueItemState, matches_attribute_filter_prepared,
@@ -502,6 +504,7 @@ pub fn history_item_from_row(
         job_name: &row.name,
         metadata: &metadata_pairs,
         category: row.category.as_deref(),
+        cache: ReleaseDisplayCache::History(row.job_id),
     });
     history_item_from_display(
         row,

@@ -18,22 +18,22 @@ use weaver_graph::{MemberId, NodeId, Why};
 
 use super::harness::{
     ARTICLE, JOB, Post, Scenario, admit, collect, finished, par2_volumes, par2_volumes_sliced,
-    par3_set, serve,
+    par3_set, run, serve,
 };
 use super::rar::delivered;
 use super::sevenz;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::Pipeline;
-use crate::pipeline::graph::Engine;
 use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::tests::{
-    debug_job_state, hear_graph_mail, job_status_for_assert, pump_pipeline_runtime_queues,
-    rar5_fixture_bytes, retire_pipeline_database,
+    hear_graph_mail, job_status_for_assert, pump_pipeline_runtime_queues, rar5_fixture_bytes,
+    retire_pipeline_database,
 };
 
 const MIXED: &str = "rar5_multifile_lz.rar";
 // A byte inside the archive's headers: the engine's read of it ends in an
-// error that names no volume as damaged, so it refuses the archive.
+// error a repair can mend, which it says as damage on the volume as far as
+// it read it, the volume still open.
 const FLIPPED: usize = 38;
 const FRAME: usize = 16;
 
@@ -56,25 +56,81 @@ fn articles(post: &Post) -> u32 {
     post.bytes.len().div_ceil(FRAME) as u32
 }
 
-// Hear the job's runs until the archive's `volumes` are refused for its
-// damage.
-async fn until_refused_unrepairable(pipeline: &mut Pipeline, volumes: u32) {
+// Serve the archive's `volumes`, all but the last article of the volume
+// whose bytes are `damaged`, and hear the job's runs until the engine has
+// ruled on every volume, refusing it or saying damage on it; then serve
+// that last article. Every article arrives clean, so damage on a volume is
+// the engine's word. Holding the volume open keeps the run's read ahead of
+// its close, however late the run's thread is.
+async fn refused_while_open(
+    pipeline: &mut Pipeline,
+    scenario: &Scenario,
+    volumes: u32,
+    damaged: u32,
+) {
+    let held = (damaged, articles_of(scenario, damaged as usize) - 1);
+    for file in 0..volumes {
+        for ordinal in 0..articles_of(scenario, file as usize) {
+            if (file, ordinal) != held {
+                serve_queued(pipeline, scenario, (file, ordinal)).await;
+                pump_pipeline_runtime_queues(pipeline).await;
+            }
+        }
+    }
     loop {
         let writer = job(pipeline).writer();
-        if (0..volumes)
-            .all(|volume| writer.refused(NodeId::ROOT, MemberId(volume)) == Some(Why::Unrepairable))
-        {
+        let root = job(pipeline).tree().namespace(NodeId::ROOT).expect("root");
+        let damaged: Vec<MemberId> = root.damaged_ranges().map(|(member, _)| member).collect();
+        if (0..volumes).map(MemberId).all(|volume| {
+            writer.refused(NodeId::ROOT, volume) == Some(Why::Unrepairable)
+                || damaged.contains(&volume)
+        }) {
             break;
         }
         assert!(
-            job(pipeline).runs().live(),
-            "no run is out and nothing was refused: {}",
-            debug_job_state(pipeline, JOB)
+            job(pipeline).awaits_mail(),
+            "no run is out and nothing was ruled: {:?}; refused {:?}; damaged {:?}; awaits mail {}; runs {:?}",
+            job_status_for_assert(pipeline, JOB),
+            (0..volumes)
+                .map(|volume| writer.refused(NodeId::ROOT, MemberId(volume)))
+                .collect::<Vec<_>>(),
+            damaged,
+            job(pipeline).awaits_mail(),
+            job(pipeline).runs()
         );
         let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
         pipeline.graph_run_said(said);
         pump_pipeline_runtime_queues(pipeline).await;
     }
+    serve_queued(pipeline, scenario, held).await;
+    pump_pipeline_runtime_queues(pipeline).await;
+}
+
+// Serve one article as a download lane would: taken off the job's queues as
+// it is fetched, so what is still queued is what the job still owes.
+pub(super) async fn serve_queued(
+    pipeline: &mut Pipeline,
+    scenario: &Scenario,
+    (file, ordinal): (u32, u32),
+) {
+    if let Some(state) = pipeline.jobs.get_mut(&JOB) {
+        let this = |work: &crate::pipeline::download::queue::DownloadWork| {
+            work.segment_id.file_id.file_index == file && work.segment_id.segment_number == ordinal
+        };
+        state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .extract_matching(this);
+        state
+            .articles
+            .active_mut()
+            .unwrap()
+            .recovery_queue
+            .extract_matching(this);
+    }
+    serve(pipeline, scenario, (file, ordinal)).await;
 }
 
 // Run the completion gate and hear every run until the job finishes.
@@ -85,7 +141,7 @@ pub(super) async fn drive_to_finish(pipeline: &mut Pipeline, scenario: &Scenario
         while let Some(work) = pipeline
             .jobs
             .get_mut(&JOB)
-            .and_then(|state| state.download_queue.pop())
+            .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
         {
             moved = true;
             let article = (
@@ -116,36 +172,23 @@ pub(super) async fn drive_to_finish(pipeline: &mut Pipeline, scenario: &Scenario
         idle = if moved { 0 } else { idle + 1 };
         assert!(
             idle < 2 || finished(pipeline),
-            "stalled at {:?}: {}",
-            job_status_for_assert(pipeline, JOB),
-            debug_job_state(pipeline, JOB)
+            "stalled at {:?}",
+            job_status_for_assert(pipeline, JOB)
         );
     }
 }
 
 #[tokio::test]
-async fn a_member_its_engine_refused_before_its_set_repaired_it_is_read_again_under_graph() {
+async fn a_member_its_engine_said_damaged_before_its_set_repaired_it_is_read_again() {
     let posts = posts();
-    let (archive, index, volume) = (
-        articles(&posts[0]),
-        articles(&posts[1]),
-        articles(&posts[2]),
-    );
+    let (index, volume) = (articles(&posts[1]), articles(&posts[2]));
     let scenario = Scenario::new(posts).framed(FRAME);
-    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario, Engine::Graph).await;
-    while pipeline
-        .jobs
-        .get_mut(&JOB)
-        .and_then(|state| state.download_queue.pop())
-        .is_some()
-    {}
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
 
-    // The archive alone: the engine refuses it before any set is in.
-    for ordinal in 0..archive {
-        serve(&mut pipeline, &scenario, (0, ordinal)).await;
-        pump_pipeline_runtime_queues(&mut pipeline).await;
-    }
-    until_refused_unrepairable(&mut pipeline, 1).await;
+    // The archive alone: the engine says the damage before any set is in. The
+    // set's articles stay queued, so the completion gate sees the job still
+    // owes them and does not end it on the archive alone.
+    refused_while_open(&mut pipeline, &scenario, 1, 0).await;
     assert!(
         pipeline.graph_jobs[&JOB].recovery_summary().is_empty(),
         "no set is in"
@@ -157,7 +200,7 @@ async fn a_member_its_engine_refused_before_its_set_repaired_it_is_read_again_un
         .map(|ordinal| (1, ordinal))
         .chain((0..volume).map(|ordinal| (2, ordinal)));
     for article in set {
-        serve(&mut pipeline, &scenario, article).await;
+        serve_queued(&mut pipeline, &scenario, article).await;
         pump_pipeline_runtime_queues(&mut pipeline).await;
     }
     hear_graph_mail(&mut pipeline, JOB).await;
@@ -191,7 +234,7 @@ pub(super) async fn serve_posts(
     for file in files {
         let post = &scenario.posts[file as usize];
         for ordinal in 0..post.bytes.len().div_ceil(scenario.article) as u32 {
-            serve(pipeline, scenario, (file, ordinal)).await;
+            serve_queued(pipeline, scenario, (file, ordinal)).await;
             pump_pipeline_runtime_queues(pipeline).await;
         }
     }
@@ -202,8 +245,8 @@ pub(super) async fn serve_posts(
 async fn runs_before_the_repair(pipeline: &mut Pipeline) -> Said {
     assert!(
         job(pipeline).repair_out(),
-        "{}",
-        debug_job_state(pipeline, JOB)
+        "{:?}",
+        job_status_for_assert(pipeline, JOB)
     );
     let mut repaired = None;
     while repaired.is_none() || job(pipeline).runs().live() {
@@ -231,13 +274,10 @@ async fn until_no_run(pipeline: &mut Pipeline) {
 }
 
 fn job(pipeline: &Pipeline) -> &crate::pipeline::graph::job::GraphJob {
-    pipeline.graph_jobs.get(&JOB).unwrap_or_else(|| {
-        panic!(
-            "{:?}: {}",
-            job_status_for_assert(pipeline, JOB),
-            debug_job_state(pipeline, JOB)
-        )
-    })
+    pipeline
+        .graph_jobs
+        .get(&JOB)
+        .unwrap_or_else(|| panic!("{:?}", job_status_for_assert(pipeline, JOB)))
 }
 
 // The set's outcomes as the job reports them.
@@ -256,8 +296,10 @@ const FOUR: [&str; 4] = [
     "rar5_lz_four.part04.rar",
 ];
 const SLICE: usize = 1024;
-// Bytes inside the second volume's file header.
-const ZEROED: std::ops::Range<usize> = 60..80;
+// The size, type and flags of the second volume's file header: with them
+// gone no reader finds the continuation there. A spoiled name or checksum
+// alone does not stop a read; the volume's data is still taken.
+const ZEROED: std::ops::Range<usize> = 30..34;
 
 fn profile(name: &str) -> Vec<u8> {
     std::fs::read(format!(
@@ -270,13 +312,19 @@ fn profile(name: &str) -> Vec<u8> {
 // A compressed four-volume RAR5 set with bytes of its second volume zeroed
 // before posting, an index and a volume made over it as it was.
 fn four_volumes_zeroed() -> Vec<Post> {
+    four_volumes_spoiled(1, ZEROED)
+}
+
+// The set with `range` of the volume at `volume` zeroed before posting, an
+// index and a volume of two blocks made over it as it was.
+fn four_volumes_spoiled(volume: usize, range: std::ops::Range<usize>) -> Vec<Post> {
     let originals: Vec<Vec<u8>> = FOUR.iter().map(|name| profile(name)).collect();
     let mut posts: Vec<Post> = FOUR
         .iter()
         .zip(&originals)
         .map(|(name, bytes)| Post::plain(name, bytes.clone()))
         .collect();
-    posts[1].bytes[ZEROED].fill(0);
+    posts[volume].bytes[range].fill(0);
     let files: Vec<(&str, &[u8])> = FOUR
         .iter()
         .copied()
@@ -297,18 +345,11 @@ fn four_volumes_zeroed() -> Vec<Post> {
 // is offered all four again: the volumes it was not yet handed go on from
 // their own files, as they arrived, and the member decodes whole.
 #[tokio::test]
-async fn a_four_volume_rar_refused_before_its_set_repaired_one_volume_is_read_again_under_graph() {
+async fn a_four_volume_rar_said_damaged_before_its_set_repaired_one_volume_is_read_again() {
     let scenario = Scenario::new(four_volumes_zeroed()).framed(SLICE);
-    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario, Engine::Graph).await;
-    while pipeline
-        .jobs
-        .get_mut(&JOB)
-        .and_then(|state| state.download_queue.pop())
-        .is_some()
-    {}
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
 
-    serve_posts(&mut pipeline, &scenario, 0..4).await;
-    until_refused_unrepairable(&mut pipeline, 4).await;
+    refused_while_open(&mut pipeline, &scenario, 4, 1).await;
 
     serve_posts(&mut pipeline, &scenario, 4..6).await;
     hear_graph_mail(&mut pipeline, JOB).await;
@@ -324,6 +365,11 @@ async fn a_four_volume_rar_refused_before_its_set_repaired_one_volume_is_read_ag
     retire_pipeline_database(pipeline).await;
 
     assert_eq!(status, Some(JobStatus::Complete), "{:?}", files.keys());
+    assert_compressible(&files);
+}
+
+// The four-volume set's one member, delivered alone and whole.
+fn assert_compressible(files: &BTreeMap<String, Vec<u8>>) {
     assert_eq!(
         files.keys().cloned().collect::<Vec<_>>(),
         [delivered("compressible.txt")]
@@ -337,6 +383,35 @@ async fn a_four_volume_rar_refused_before_its_set_repaired_one_volume_is_read_ag
     );
 }
 
+// The head of a volume zeroed before posting: its signature and the headers
+// after it. Every article arrives clean, so the store has no volume to
+// place there and gives up on the set for the volume it lacks, before any
+// set is in. The set then rewrites the head. A store that gave up for want
+// of a volume is opened again with every volume it had and the one
+// rewritten, and the member decodes whole: the first volume's head, and a
+// middle volume's.
+#[tokio::test]
+async fn a_store_that_gave_up_for_a_volume_head_is_opened_again_once_the_set_rewrote_it() {
+    for volume in [0, 1] {
+        let scenario = Scenario::new(four_volumes_spoiled(volume, 0..32)).framed(SLICE);
+        let outcome = run(&scenario).await;
+        assert_eq!(
+            outcome.status,
+            Some(JobStatus::Complete),
+            "volume {volume}: {:?} {:?}",
+            outcome.failure,
+            outcome.files.keys()
+        );
+        assert_eq!(
+            outcome.graph().outcomes,
+            [Some(RepairOutcome::Repaired { slices: 1 })],
+            "volume {volume}"
+        );
+        assert!(outcome.refetched().is_empty(), "{:?}", outcome.refetched());
+        assert_compressible(&outcome.files);
+    }
+}
+
 // A header-enciphered LZMA2 7z split in three, one slice of its second
 // volume zeroed before posting, and an index and a volume made over the
 // volumes as they were. The engine, opened by the job's password, reads the
@@ -344,8 +419,8 @@ async fn a_four_volume_rar_refused_before_its_set_repaired_one_volume_is_read_ag
 // for a wrong password. The set repairs the slice, the engine reads the
 // repaired bytes through on the same password, and nothing is left asking.
 #[tokio::test]
-async fn a_header_enciphered_split_7z_whose_engine_read_damage_before_its_set_repaired_it_delivers_under_graph()
- {
+async fn a_header_enciphered_split_7z_whose_engine_read_damage_before_its_set_repaired_it_delivers()
+{
     let archive = sevenz::sealed_header(Lzma2Options::from_level(1).into());
     let volumes = sevenz::split(&archive, 3);
     let files: Vec<(&str, &[u8])> = volumes
@@ -357,13 +432,7 @@ async fn a_header_enciphered_split_7z_whose_engine_read_damage_before_its_set_re
     posts[1].bytes[ARTICLE..2 * ARTICLE].fill(0);
     posts.extend(set);
     let scenario = Scenario::new(posts).password(sevenz::SECRET);
-    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario, Engine::Graph).await;
-    while pipeline
-        .jobs
-        .get_mut(&JOB)
-        .and_then(|state| state.download_queue.pop())
-        .is_some()
-    {}
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
 
     serve_posts(&mut pipeline, &scenario, 0..3).await;
     until_no_run(&mut pipeline).await;
@@ -403,8 +472,7 @@ async fn a_header_enciphered_split_7z_whose_engine_read_damage_before_its_set_re
 // files, repairs the slice, the archive is read again whole, and the job
 // completes.
 #[tokio::test]
-async fn an_lzma2_7z_whose_engine_read_damage_before_its_par3_set_repaired_it_delivers_under_graph()
-{
+async fn an_lzma2_7z_whose_engine_read_damage_before_its_par3_set_repaired_it_delivers() {
     let original = sevenz::container(Lzma2Options::from_level(1).into(), None);
     let mut posted = original.clone();
     let quill = sevenz::packed_end(&original) / ARTICLE - 1;
@@ -413,21 +481,15 @@ async fn an_lzma2_7z_whose_engine_read_damage_before_its_par3_set_repaired_it_de
     posts.extend(par3_set("lantern", &[("lantern.7z", &original)], 4));
     let count = posts.len() as u32;
     let scenario = Scenario::new(posts);
-    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario, Engine::Graph).await;
-    while pipeline
-        .jobs
-        .get_mut(&JOB)
-        .and_then(|state| state.download_queue.pop())
-        .is_some()
-    {}
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
 
     serve_posts(&mut pipeline, &scenario, 1..count).await;
     let last = articles_of(&scenario, 0);
     for ordinal in std::iter::once(0).chain(2..last) {
-        serve(&mut pipeline, &scenario, (0, ordinal)).await;
+        serve_queued(&mut pipeline, &scenario, (0, ordinal)).await;
         pump_pipeline_runtime_queues(&mut pipeline).await;
     }
-    serve(&mut pipeline, &scenario, (0, 1)).await;
+    serve_queued(&mut pipeline, &scenario, (0, 1)).await;
     pump_pipeline_runtime_queues(&mut pipeline).await;
     let repaired = runs_before_the_repair(&mut pipeline).await;
     assert_eq!(
@@ -486,23 +548,19 @@ fn extracted(pipeline: &Pipeline) -> Vec<std::path::PathBuf> {
 // node's members are: it is delivered once, under its own name, with the
 // bytes it had.
 #[tokio::test]
-async fn a_member_delivered_whole_before_its_archive_was_refused_is_made_over_once_under_graph() {
+async fn a_member_delivered_whole_before_its_archive_was_refused_is_made_over_once() {
     let original = rar5_fixture_bytes(MIXED);
     let mut posted = original.clone();
     posted[FLIPPED_SECOND] ^= 0xff;
     let mut posts = vec![Post::plain("mixed.rar", posted)];
     posts.extend(par2_volumes("mixed", &[("mixed.rar", &original)], 2, 1));
     let scenario = Scenario::new(posts).framed(FRAME);
-    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario, Engine::Graph).await;
-    while pipeline
-        .jobs
-        .get_mut(&JOB)
-        .and_then(|state| state.download_queue.pop())
-        .is_some()
-    {}
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
 
-    serve_posts(&mut pipeline, &scenario, 0..1).await;
-    until_refused_unrepairable(&mut pipeline, 1).await;
+    refused_while_open(&mut pipeline, &scenario, 1, 0).await;
+    // The member's file moves to its name once the checkpoint that records
+    // the name has committed.
+    hear_graph_mail(&mut pipeline, JOB).await;
     let first = extracted(&pipeline);
     assert!(
         first.len() == 1 && first[0].ends_with("hello.txt"),

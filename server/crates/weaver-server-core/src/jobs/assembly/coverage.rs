@@ -131,15 +131,7 @@ impl FileCoverage {
             .flat_map(|run| run.first_ordinal..run.end_ordinal())
     }
 
-    // The runs a restart can still trust: those naming ordinals the file
-    // declares, and whose bytes lie inside the file as it now exists. File
-    // length never implies coverage, but a file shorter than a run cannot hold
-    // it.
-    pub(crate) fn retain_restorable(&mut self, total_segments: u32, disk_len: u64) {
-        self.runs
-            .retain(|run| run.end_ordinal() <= total_segments && run.end <= disk_len);
-    }
-
+    #[cfg(test)]
     pub(crate) fn encode(&self) -> Vec<u8> {
         let body: Vec<(u32, u32, u64, u64)> = self
             .runs
@@ -280,16 +272,5 @@ mod tests {
             FileCoverage::decode(&blob),
             Err(CoverageError::Malformed(_))
         ));
-    }
-
-    #[test]
-    fn restorable_coverage_drops_runs_the_file_cannot_hold() {
-        let mut coverage = FileCoverage::from_ordered_runs([
-            run(0, 2, 0, 20),
-            run(3, 1, 30, 40),
-            run(9, 1, 90, 99),
-        ]);
-        coverage.retain_restorable(9, 35);
-        assert_eq!(coverage.runs(), &[run(0, 2, 0, 20)]);
     }
 }

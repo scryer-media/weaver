@@ -4,12 +4,14 @@
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering, fence};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
 use crate::operations::instrumentation::DiskSpaceSnapshot;
+use crate::runtime::StartupDiskGate;
 
 // Capacity for the filesystem backing a path.
 #[derive(Debug, Clone, Copy)]
@@ -605,21 +607,112 @@ type SharedProbeFn = Arc<ProbeFn>;
 #[derive(Debug)]
 struct RootState {
     path: PathBuf,
-    capacity: Capacity,
     refresh_requested: bool,
     stopped: bool,
     completed_probes: u64,
+}
+
+// One root's latest reading, readable without a lock.
+//
+// Every write happens under the slot's lock, so a retarget and a reading that
+// lands for the old directory stay ordered; a reader takes no lock. The
+// sequence count is odd while a write is under way, and a read that overlaps
+// one tries again. The reading lives only here.
+#[derive(Debug)]
+struct PublishedCapacity {
+    // `sampled_at` is kept as its distance from this instant.
+    base: Instant,
+    seq: AtomicU64,
+    available_bytes: AtomicU64,
+    total_bytes: AtomicU64,
+    sampled_after_base_ns: AtomicU64,
+    flags: AtomicU8,
+}
+
+const CAPACITY_KNOWN: u8 = 1;
+const CAPACITY_STALE: u8 = 2;
+
+impl PublishedCapacity {
+    fn unknown(base: Instant) -> Self {
+        Self {
+            base,
+            seq: AtomicU64::new(0),
+            available_bytes: AtomicU64::new(0),
+            total_bytes: AtomicU64::new(0),
+            sampled_after_base_ns: AtomicU64::new(0),
+            flags: AtomicU8::new(0),
+        }
+    }
+
+    // Called with the slot's lock held, so there is one writer at a time.
+    fn publish(&self, capacity: Capacity) {
+        let (available_bytes, total_bytes, sampled_after_base_ns, flags) = match capacity {
+            Capacity::Known(reading) => (
+                reading.available_bytes,
+                reading.total_bytes,
+                u64::try_from(
+                    reading
+                        .sampled_at
+                        .saturating_duration_since(self.base)
+                        .as_nanos(),
+                )
+                .unwrap_or(u64::MAX),
+                CAPACITY_KNOWN | if reading.stale { CAPACITY_STALE } else { 0 },
+            ),
+            Capacity::Unknown => (0, 0, 0, 0),
+        };
+        let seq = self.seq.load(Ordering::Relaxed);
+        self.seq.store(seq.wrapping_add(1), Ordering::Relaxed);
+        fence(Ordering::Release);
+        self.available_bytes
+            .store(available_bytes, Ordering::Relaxed);
+        self.total_bytes.store(total_bytes, Ordering::Relaxed);
+        self.sampled_after_base_ns
+            .store(sampled_after_base_ns, Ordering::Relaxed);
+        self.flags.store(flags, Ordering::Relaxed);
+        self.seq.store(seq.wrapping_add(2), Ordering::Release);
+    }
+
+    fn read(&self) -> Capacity {
+        loop {
+            let before = self.seq.load(Ordering::Acquire);
+            if before & 1 == 0 {
+                let available_bytes = self.available_bytes.load(Ordering::Relaxed);
+                let total_bytes = self.total_bytes.load(Ordering::Relaxed);
+                let sampled_after_base_ns = self.sampled_after_base_ns.load(Ordering::Relaxed);
+                let flags = self.flags.load(Ordering::Relaxed);
+                fence(Ordering::Acquire);
+                if self.seq.load(Ordering::Relaxed) == before {
+                    if flags & CAPACITY_KNOWN == 0 {
+                        return Capacity::Unknown;
+                    }
+                    return Capacity::Known(CapacityReading {
+                        available_bytes,
+                        total_bytes,
+                        sampled_at: self.base + Duration::from_nanos(sampled_after_base_ns),
+                        stale: flags & CAPACITY_STALE != 0,
+                    });
+                }
+            }
+            std::hint::spin_loop();
+        }
+    }
 }
 
 #[derive(Debug)]
 struct RootSlot {
     root: StorageRoot,
     state: Mutex<RootState>,
+    capacity: PublishedCapacity,
     wake: Condvar,
+    #[cfg(test)]
+    locks: AtomicU64,
 }
 
 impl RootSlot {
     fn lock(&self) -> std::sync::MutexGuard<'_, RootState> {
+        #[cfg(test)]
+        self.locks.fetch_add(1, Ordering::Relaxed);
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -645,44 +738,76 @@ impl fmt::Debug for StorageCapacity {
         let mut list = f.debug_list();
         for slot in &self.slots {
             let state = slot.lock();
-            list.entry(&(slot.root.label(), &state.path, state.capacity));
+            list.entry(&(slot.root.label(), &state.path, slot.capacity.read()));
         }
         list.finish()
     }
 }
 
 impl StorageCapacity {
-    // Start sampling the real filesystems behind the three roots.
-    pub fn start(data: PathBuf, intermediate: PathBuf, complete: PathBuf) -> Self {
-        Self::with_probe(
+    // Start sampling the real filesystems behind the three roots once
+    // `startup_disk_work` opens. Until then every reading is unknown, which
+    // readers already allow for before a root's first probe.
+    pub fn start(
+        data: PathBuf,
+        intermediate: PathBuf,
+        complete: PathBuf,
+        startup_disk_work: StartupDiskGate,
+    ) -> Self {
+        Self::with_probe_after(
             [data, intermediate, complete],
             STORAGE_CAPACITY_REFRESH_INTERVAL,
             Arc::new(probe_disk_space),
+            startup_disk_work,
         )
     }
 
-    // Like [`Self::start`] with a caller-supplied probe and interval. `roots`
-    // is in [`StorageRoot::ALL`] order.
+    // Like [`Self::start`] with a caller-supplied probe and interval, and
+    // nothing to wait for. `roots` is in [`StorageRoot::ALL`] order.
     pub fn with_probe(roots: [PathBuf; 3], interval: Duration, probe: SharedProbeFn) -> Self {
+        Self::with_probe_after(roots, interval, probe, StartupDiskGate::opened())
+    }
+
+    // Like [`Self::with_probe`], with each root's first probe held until
+    // `startup_disk_work` opens.
+    pub fn with_probe_after(
+        roots: [PathBuf; 3],
+        interval: Duration,
+        probe: SharedProbeFn,
+        startup_disk_work: StartupDiskGate,
+    ) -> Self {
+        let base = Instant::now();
         let slots = StorageRoot::ALL.map(|root| {
             Arc::new(RootSlot {
                 root,
                 state: Mutex::new(RootState {
                     path: roots[root.index()].clone(),
-                    capacity: Capacity::Unknown,
                     refresh_requested: false,
                     stopped: false,
                     completed_probes: 0,
                 }),
+                capacity: PublishedCapacity::unknown(base),
                 wake: Condvar::new(),
+                #[cfg(test)]
+                locks: AtomicU64::new(0),
             })
         });
         for slot in &slots {
+            // The sampler waits on its own slot's condition variable, so
+            // the gate opening has to wake it there.
+            let woken = Arc::clone(slot);
+            startup_disk_work.on_open(move || {
+                drop(woken.lock());
+                woken.wake.notify_all();
+            });
             let thread_slot = Arc::clone(slot);
             let thread_probe = Arc::clone(&probe);
+            let thread_gate = startup_disk_work.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("weaver-capacity-{}", slot.root.label()))
-                .spawn(move || run_root_sampler(&thread_slot, interval, thread_probe));
+                .spawn(move || {
+                    run_root_sampler(&thread_slot, interval, thread_probe, &thread_gate)
+                });
             if let Err(error) = spawned {
                 warn!(
                     root = slot.root.label(),
@@ -698,15 +823,17 @@ impl StorageCapacity {
         &self.slots[root.index()]
     }
 
-    // The latest reading for `root`, without touching the filesystem.
+    // The latest reading for `root`, without touching the filesystem or
+    // taking a lock.
     pub fn current(&self, root: StorageRoot) -> Capacity {
-        self.slot(root).lock().capacity
+        self.slot(root).capacity.read()
     }
 
-    // A cloneable reader of `root`'s latest reading.
+    // A cloneable reader of `root`'s latest reading. Reading it takes no
+    // lock, so a per-article admission check never waits on the sampler.
     pub fn reader(&self, root: StorageRoot) -> CapacityReader {
         let slot = Arc::clone(self.slot(root));
-        CapacityReader::from_fn(move || slot.lock().capacity)
+        CapacityReader::from_fn(move || slot.capacity.read())
     }
 
     // Point `root` at a new directory. The old directory's reading is
@@ -718,7 +845,7 @@ impl StorageCapacity {
             return;
         }
         state.path = path;
-        state.capacity = Capacity::Unknown;
+        slot.capacity.publish(Capacity::Unknown);
         state.refresh_requested = true;
         slot.wake.notify_all();
     }
@@ -739,12 +866,15 @@ impl StorageCapacity {
             .iter()
             .filter_map(|slot| {
                 let state = slot.lock();
-                state.capacity.reading().map(|reading| DiskSpaceSnapshot {
-                    role: slot.root.label(),
-                    path: state.path.display().to_string(),
-                    total_bytes: reading.total_bytes,
-                    available_bytes: reading.available_bytes,
-                })
+                slot.capacity
+                    .read()
+                    .reading()
+                    .map(|reading| DiskSpaceSnapshot {
+                        role: slot.root.label(),
+                        path: state.path.display().to_string(),
+                        total_bytes: reading.total_bytes,
+                        available_bytes: reading.available_bytes,
+                    })
             })
             .collect()
     }
@@ -771,7 +901,26 @@ impl Drop for StorageCapacity {
     }
 }
 
-fn run_root_sampler(slot: &RootSlot, interval: Duration, probe: SharedProbeFn) {
+fn run_root_sampler(
+    slot: &RootSlot,
+    interval: Duration,
+    probe: SharedProbeFn,
+    startup_disk_work: &StartupDiskGate,
+) {
+    // Hold the first probe until the startup disk work is done. Stopping the
+    // storage meanwhile ends the wait as well.
+    {
+        let state = slot.lock();
+        let state = slot
+            .wake
+            .wait_while(state, |state| {
+                !state.stopped && !startup_disk_work.is_open()
+            })
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.stopped {
+            return;
+        }
+    }
     let mut sampler: Option<CapacitySampler> = None;
     loop {
         let path = {
@@ -801,7 +950,7 @@ fn run_root_sampler(slot: &RootSlot, interval: Duration, probe: SharedProbeFn) {
         // A retarget while the probe ran makes this reading the old
         // directory's; the thread probes the new one straight away.
         if state.path == path {
-            state.capacity = capacity;
+            slot.capacity.publish(capacity);
         }
         state.completed_probes += 1;
         slot.wake.notify_all();
@@ -1118,6 +1267,40 @@ mod tests {
         ]
     }
 
+    // No root is probed before the startup disk work is done: every probe
+    // records whether the gate was open when it ran.
+    #[test]
+    fn samplers_hold_their_first_probe_until_startup_disk_work_is_done() {
+        let gate = StartupDiskGate::closed();
+        let opened_at_probe = Arc::new(Mutex::new(Vec::new()));
+        let probe: SharedProbeFn = {
+            let gate = gate.clone();
+            let opened_at_probe = Arc::clone(&opened_at_probe);
+            Arc::new(move |_: &Path| {
+                opened_at_probe.lock().unwrap().push(gate.is_open());
+                Ok(DiskSpace {
+                    total_bytes: 1000,
+                    available_bytes: 500,
+                })
+            })
+        };
+        let storage = StorageCapacity::with_probe_after(roots(), NEVER, probe, gate.clone());
+        for root in StorageRoot::ALL {
+            assert!(
+                matches!(storage.current(root), Capacity::Unknown),
+                "nothing is known before the gate opens"
+            );
+        }
+
+        gate.open();
+        for root in StorageRoot::ALL {
+            storage.wait_for_probes(root, 1);
+        }
+        let opened_at_probe = opened_at_probe.lock().unwrap();
+        assert_eq!(opened_at_probe.len(), 3, "one probe per root");
+        assert!(opened_at_probe.iter().all(|open| *open));
+    }
+
     #[test]
     fn storage_readers_and_snapshots_serve_the_cached_reading_without_probing() {
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -1146,6 +1329,64 @@ mod tests {
             3,
             "reading the cache never probes"
         );
+    }
+
+    // Admission reads a root's capacity once per article, so the reader must
+    // hand back the sampler's reading without taking the root's lock.
+    #[test]
+    fn a_capacity_reader_takes_no_lock_and_returns_the_sampler_s_reading() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let storage = StorageCapacity::with_probe(roots(), NEVER, counting_probe(calls.clone()));
+        for root in StorageRoot::ALL {
+            storage.wait_for_probes(root, 1);
+        }
+        let slot = storage.slot(StorageRoot::Data);
+        let reader = storage.reader(StorageRoot::Data);
+        let locks = slot.locks.load(Ordering::Relaxed);
+        let first = reader.current();
+        for _ in 0..5 {
+            assert_eq!(reader.current(), first);
+            assert_eq!(storage.current(StorageRoot::Data), first);
+        }
+        assert_eq!(
+            slot.locks.load(Ordering::Relaxed),
+            locks,
+            "reading a root's capacity takes no lock"
+        );
+        let Capacity::Known(reading) = first else {
+            panic!("the data root has a reading");
+        };
+        assert_eq!(
+            (reading.available_bytes, reading.total_bytes, reading.stale),
+            (5, 1000, false)
+        );
+        assert!(reading.sampled_at >= slot.capacity.base);
+        assert_eq!(
+            storage.current(StorageRoot::Complete),
+            Capacity::Unknown,
+            "a root whose probe failed with no earlier reading stays unknown"
+        );
+    }
+
+    // The published reading is the sampler's reading, timestamp included:
+    // debits are keyed on `sampled_at`, so it has to come back exactly.
+    #[test]
+    fn a_published_reading_round_trips_exactly() {
+        let base = Instant::now();
+        let published = PublishedCapacity::unknown(base);
+        assert_eq!(published.read(), Capacity::Unknown);
+        for (offset_ns, stale) in [(0, false), (1, true), (5_000_000_123, false)] {
+            let capacity = Capacity::Known(CapacityReading {
+                available_bytes: 7 + offset_ns,
+                total_bytes: u64::MAX,
+                sampled_at: base + Duration::from_nanos(offset_ns),
+                stale,
+            });
+            published.publish(capacity);
+            assert_eq!(published.read(), capacity);
+        }
+        published.publish(Capacity::Unknown);
+        assert_eq!(published.read(), Capacity::Unknown);
     }
 
     #[test]

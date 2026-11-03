@@ -11,9 +11,9 @@ use sha2::Digest;
 
 use super::harness::{ARTICLE, Outcome, Post, Scenario, payload, run};
 use super::rar::{delivered, posts, with_par2};
+use super::restart::{Down, run_restarting_at};
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
-use crate::pipeline::graph::Engine;
 use crate::pipeline::tests::direct_store::protected_sealed_rar4_store_set;
 use crate::pipeline::tests::direct_store::scenarios::{
     HeaderCheck, encrypted_rar4_store_set, encrypted_store_set, header_encrypted_store_set,
@@ -38,8 +38,7 @@ fn wrong_then_right(posts: Vec<Post>, right: &str) -> Scenario {
 fn assert_whole(outcome: &Outcome, name: &str, sha256: &str, len: usize) {
     assert!(
         outcome.completed(),
-        "{}: {:?} {:?} {:?}",
-        outcome.engine,
+        "{:?} {:?} {:?}",
         outcome.status,
         outcome.failure,
         outcome.graph
@@ -47,16 +46,14 @@ fn assert_whole(outcome: &Outcome, name: &str, sha256: &str, len: usize) {
     assert_eq!(
         outcome.files.keys().cloned().collect::<Vec<_>>(),
         vec![delivered(name)],
-        "{}: delivered names",
-        outcome.engine
+        "delivered names",
     );
     let bytes = &outcome.files[&delivered(name)];
-    assert_eq!(bytes.len(), len, "{}: delivered length", outcome.engine);
+    assert_eq!(bytes.len(), len, "delivered length");
     assert_eq!(
         hex::encode(sha2::Sha256::digest(bytes)),
         sha256,
-        "{}: delivered bytes {:?}",
-        outcome.engine,
+        "delivered bytes {:?}",
         outcome.graph
     );
 }
@@ -112,110 +109,42 @@ fn rar5_stored_hp() -> Vec<(String, Vec<u8>)> {
 // 1. RAR4 stored, `-p`: no password check, so the wrong key is only seen
 // as the member's checksum failing.
 #[tokio::test]
-async fn pw_rar4_stored_p_wrong_then_right_delivers_under_graph() {
-    let graph = run(
-        &wrong_then_right(posts(rar4_stored_p()), SECRET),
-        Engine::Graph,
-    )
-    .await;
+async fn pw_rar4_stored_p_wrong_then_right_delivers() {
+    let graph = run(&wrong_then_right(posts(rar4_stored_p()), SECRET)).await;
     assert_body(&graph, &body());
-}
-
-#[tokio::test]
-async fn pw_rar4_stored_p_wrong_then_right_delivers_under_classic() {
-    let classic = run(
-        &wrong_then_right(posts(rar4_stored_p()), SECRET),
-        Engine::Classic,
-    )
-    .await;
-    assert_body(&classic, &body());
 }
 
 // 2. RAR4 stored, `-hp`.
 #[tokio::test]
-async fn pw_rar4_stored_hp_wrong_then_right_delivers_under_graph() {
-    let graph = run(
-        &wrong_then_right(posts(rar4_stored_hp()), SECRET),
-        Engine::Graph,
-    )
-    .await;
+async fn pw_rar4_stored_hp_wrong_then_right_delivers() {
+    let graph = run(&wrong_then_right(posts(rar4_stored_hp()), SECRET)).await;
     assert_body(&graph, &body());
-}
-
-#[tokio::test]
-async fn pw_rar4_stored_hp_wrong_then_right_delivers_under_classic() {
-    let classic = run(
-        &wrong_then_right(posts(rar4_stored_hp()), SECRET),
-        Engine::Classic,
-    )
-    .await;
-    assert_body(&classic, &body());
 }
 
 // 3. RAR4 compressed, `-p`.
 #[tokio::test]
-async fn pw_rar4_compressed_p_wrong_then_right_delivers_under_graph() {
+async fn pw_rar4_compressed_p_wrong_then_right_delivers() {
     let scenario = wrong_then_right(posts(fixture("rar4_enc_lz.rar")), FIXTURE_SECRET);
-    assert_fixture_member(&run(&scenario, Engine::Graph).await, "rar4_enc_lz.rar");
-}
-
-#[tokio::test]
-async fn pw_rar4_compressed_p_wrong_then_right_delivers_under_classic() {
-    let scenario = wrong_then_right(posts(fixture("rar4_enc_lz.rar")), FIXTURE_SECRET);
-    assert_fixture_member(&run(&scenario, Engine::Classic).await, "rar4_enc_lz.rar");
+    assert_fixture_member(&run(&scenario).await, "rar4_enc_lz.rar");
 }
 
 // 4. RAR5 stored `-p`, stored `-hp`, compressed `-p`.
 #[tokio::test]
-async fn pw_rar5_stored_p_wrong_then_right_delivers_under_graph() {
-    let graph = run(
-        &wrong_then_right(posts(rar5_stored_p()), SECRET),
-        Engine::Graph,
-    )
-    .await;
+async fn pw_rar5_stored_p_wrong_then_right_delivers() {
+    let graph = run(&wrong_then_right(posts(rar5_stored_p()), SECRET)).await;
     assert_body(&graph, &body());
 }
 
 #[tokio::test]
-async fn pw_rar5_stored_p_wrong_then_right_delivers_under_classic() {
-    let classic = run(
-        &wrong_then_right(posts(rar5_stored_p()), SECRET),
-        Engine::Classic,
-    )
-    .await;
-    assert_body(&classic, &body());
-}
-
-#[tokio::test]
-async fn pw_rar5_stored_hp_wrong_then_right_delivers_under_graph() {
-    let graph = run(
-        &wrong_then_right(posts(rar5_stored_hp()), SECRET),
-        Engine::Graph,
-    )
-    .await;
+async fn pw_rar5_stored_hp_wrong_then_right_delivers() {
+    let graph = run(&wrong_then_right(posts(rar5_stored_hp()), SECRET)).await;
     assert_body(&graph, &body());
 }
 
 #[tokio::test]
-async fn pw_rar5_stored_hp_wrong_then_right_delivers_under_classic() {
-    let classic = run(
-        &wrong_then_right(posts(rar5_stored_hp()), SECRET),
-        Engine::Classic,
-    )
-    .await;
-    assert_body(&classic, &body());
-}
-
-#[tokio::test]
-async fn pw_rar5_compressed_p_wrong_then_right_delivers_under_graph() {
+async fn pw_rar5_compressed_p_wrong_then_right_delivers() {
     let scenario = wrong_then_right(posts(fixture("rar5_enc_lz.rar")), FIXTURE_SECRET);
-    assert_fixture_member(&run(&scenario, Engine::Graph).await, "rar5_enc_lz.rar");
-}
-
-#[tokio::test]
-async fn pw_rar5_compressed_p_wrong_then_right_delivers_under_classic() {
-    let scenario = wrong_then_right(posts(fixture("rar5_enc_lz.rar")), FIXTURE_SECRET);
-    assert_fixture_member(&run(&scenario, Engine::Classic).await, "rar5_enc_lz.rar");
+    assert_fixture_member(&run(&scenario).await, "rar5_enc_lz.rar");
 }
 
 // 5. Every candidate wrong, RAR4 stored `-p`: the job fails for the
@@ -223,19 +152,20 @@ async fn pw_rar5_compressed_p_wrong_then_right_delivers_under_classic() {
 fn assert_fails_for_the_password(outcome: &Outcome) {
     assert!(
         matches!(outcome.status, Some(JobStatus::Failed { .. })),
-        "{}: {:?} {:?}",
-        outcome.engine,
+        "{:?} {:?}",
         outcome.status,
         outcome.failure
     );
     assert_eq!(
         outcome.failure_kind,
         Some(HistoryFailureKind::Password),
-        "{}: {:?}",
-        outcome.engine,
+        "{:?}",
         outcome.failure
     );
     assert!(outcome.files.is_empty(), "{:?}", outcome.files.keys());
+    // A password withheld is the extraction's failure, never a deletion
+    // for health.
+    assert!(!outcome.graph().health);
 }
 
 fn every_candidate_wrong() -> Scenario {
@@ -245,13 +175,8 @@ fn every_candidate_wrong() -> Scenario {
 }
 
 #[tokio::test]
-async fn pw_rar4_stored_p_every_candidate_wrong_fails_for_the_password_under_graph() {
-    assert_fails_for_the_password(&run(&every_candidate_wrong(), Engine::Graph).await);
-}
-
-#[tokio::test]
-async fn pw_rar4_stored_p_every_candidate_wrong_fails_for_the_password_under_classic() {
-    assert_fails_for_the_password(&run(&every_candidate_wrong(), Engine::Classic).await);
+async fn pw_rar4_stored_p_every_candidate_wrong_fails_for_the_password() {
+    assert_fails_for_the_password(&run(&every_candidate_wrong()).await);
 }
 
 // 6. RAR4 stored `-p` beside PAR2, one article of the member's cipher
@@ -263,13 +188,28 @@ fn damaged_beside_par2() -> Scenario {
 }
 
 #[tokio::test]
-async fn pw_rar4_stored_p_damaged_beside_par2_repairs_then_the_right_candidate_delivers_under_graph()
- {
-    assert_body(&run(&damaged_beside_par2(), Engine::Graph).await, &body());
+async fn pw_rar4_stored_p_damaged_beside_par2_repairs_then_the_right_candidate_delivers() {
+    assert_body(&run(&damaged_beside_par2()).await, &body());
 }
 
+// 7. RAR4 stored `-p` in four volumes of one article each, the job
+// submitted with a wrong password and shut down after the second volume:
+// the bytes written before the restart are no longer in the restored leaf's
+// fold, and the member's stated checksum is checked from the file. The job
+// fails as the uninterrupted one does, publishing nothing.
 #[tokio::test]
-async fn pw_rar4_stored_p_damaged_beside_par2_repairs_then_the_right_candidate_delivers_under_classic()
- {
-    assert_body(&run(&damaged_beside_par2(), Engine::Classic).await, &body());
+async fn pw_rar4_stored_p_wrong_password_restarted_after_the_second_volume_fails() {
+    let volumes = encrypted_rar4_store_set(MEMBER, &body(), 4, SECRET, Some([7; 8]));
+    let scenario = Scenario::new(posts(volumes))
+        .framed(4 * ARTICLE)
+        .password(WRONG);
+    let restarted =
+        run_restarting_at(&scenario, &mut |_| {}, Down::Shutdown, &|nth| nth == 2).await;
+    assert!(restarted.restarts > 0, "the run restarted");
+    assert!(
+        matches!(restarted.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        restarted.status
+    );
+    assert!(restarted.files.is_empty(), "{:?}", restarted.files.keys());
 }

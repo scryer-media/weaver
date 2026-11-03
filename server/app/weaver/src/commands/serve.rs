@@ -180,6 +180,7 @@ pub(crate) async fn run(
     // SharedPipelineState starts empty; initial_history is published below after recovery.
     let shared_state = weaver_server_core::SharedPipelineState::new(metrics, vec![]);
     let handle = SchedulerHandle::new(event_tx.clone(), shared_state.clone());
+    let pipeline_state = shared_state.clone();
     handle.set_server_transfer_policy(Arc::clone(&server_transfer_policy));
     handle.set_proxy_runtime(proxies.clone());
     handle.set_nntp_pool(Arc::clone(nntp.pool()));
@@ -195,6 +196,7 @@ pub(crate) async fn run(
     let initial_history = recovered_state.initial_history;
     let to_restore = recovered_state.to_restore;
     let initial_holds = recovered_state.initial_holds;
+    let after_boot = recovered_state.after_boot;
 
     // Publish recovered history to shared state so the API has data immediately.
     shared_state.load_history(initial_history.clone());
@@ -255,7 +257,11 @@ pub(crate) async fn run(
 
     // Create and start the pipeline.
     let maintenance_complete_dir = complete_dir.clone();
-    let iops_probe_dir = data_dir.clone();
+    let disk_probe_dir = data_dir.clone();
+    // Opened by the disk probe task below once the probe has run or been
+    // skipped. Database maintenance and the free-space samplers wait on it,
+    // so their first disk work does not land on top of the probe's.
+    let startup_disk_work = weaver_server_core::runtime::StartupDiskGate::closed();
     let mut pipeline = Pipeline::new(
         event_tx,
         nntp,
@@ -271,6 +277,7 @@ pub(crate) async fn run(
         shared_state,
         db.clone(),
         pipeline_config,
+        startup_disk_work.clone(),
     )
     .await?;
 
@@ -434,6 +441,7 @@ pub(crate) async fn run(
     let schema = weaver_server_api::context::build_schema_with_backup(
         weaver_server_api::SchemaContext {
             handle: handle.clone(),
+            pipeline_state: pipeline_state.clone(),
             scheduled_resume: scheduled_resume.clone(),
             config: shared_config.clone(),
             db: db.clone(),
@@ -491,6 +499,7 @@ pub(crate) async fn run(
     let maintenance_task = weaver_server_core::operations::spawn_maintenance_worker(
         db.clone(),
         maintenance_complete_dir,
+        startup_disk_work.clone(),
     );
 
     // The UI's restart button reaches the serve loop through this handle; the
@@ -507,6 +516,7 @@ pub(crate) async fn run(
     let server_runtime = http::ServerRuntime {
         schema,
         handle: handle.clone(),
+        pipeline_state,
         scheduled_resume,
         db: db.clone(),
         auth_cache: login_auth_cache,
@@ -524,33 +534,46 @@ pub(crate) async fn run(
         torrents: torrents.clone(),
     };
     let mut server_task = tokio::spawn(http::run_server(server_runtime, listener));
+    // Start-up housekeeping nothing serving a request waits on runs once the
+    // server answers.
+    let _after_boot_task = after_boot.spawn();
 
-    // Disk IOPS affects extraction admission only, so measure it after HTTP
-    // startup and apply the result to the live tuner without interrupting
-    // downloads or post-processing already in flight.
-    let _iops_probe_task = {
+    // The disk measurement affects extraction admission only, so take it
+    // after HTTP startup and apply the result to the live tuner without
+    // interrupting downloads or post-processing already in flight. It is
+    // stored and reused for a week, so most starts read a file instead.
+    let _disk_probe_task = {
         let handle = handle.clone();
         let system_profile = Arc::clone(&system_profile);
-        let probe_dir = iops_probe_dir;
+        let probe_dir = disk_probe_dir;
+        // Opens the gate however this task ends, a failed probe included,
+        // so nothing waits on it forever.
+        let opener = weaver_server_core::runtime::StartupDiskGateOpener::new(startup_disk_work);
         tokio::spawn(async move {
-            let random_read_iops = match tokio::task::spawn_blocking(move || {
-                weaver_server_core::runtime::measure_random_read_iops(&probe_dir)
+            let measurement = match tokio::task::spawn_blocking(move || {
+                weaver_server_core::runtime::startup_disk_measurement(&probe_dir)
             })
             .await
             {
-                Ok(iops) => iops,
+                Ok(measurement) => measurement,
                 Err(error) => {
                     warn!(error = %error, "disk probe task failed; using fallback IOPS");
-                    10_000.0
+                    weaver_server_core::runtime::DiskMeasurement {
+                        sequential_write_mbps: 0.0,
+                        random_read_iops: 10_000.0,
+                    }
                 }
             };
-            match handle.update_random_read_iops(random_read_iops).await {
+            drop(opener);
+            match handle.update_disk_measurement(measurement).await {
                 Ok(()) => {
-                    system_profile
+                    let mut profile = system_profile
                         .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .disk
-                        .random_read_iops = random_read_iops;
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    profile.disk.random_read_iops = measurement.random_read_iops;
+                    if measurement.sequential_write_mbps > 0.0 {
+                        profile.disk.sequential_write_mbps = measurement.sequential_write_mbps;
+                    }
                 }
                 Err(error) => {
                     warn!(error = %error, "failed to apply startup disk measurement");
@@ -752,11 +775,8 @@ mod restore_ticket_tests {
                         files: vec![],
                         total_bytes: 0,
                     },
-                    complete_files: Default::default(),
-                    file_progress: Default::default(),
                     detected_archives: Default::default(),
                     file_identities: Default::default(),
-                    extracted_members: Default::default(),
                     status: JobStatus::Queued,
                     download_state: None,
                     post_state: None,
@@ -767,6 +787,7 @@ mod restore_ticket_tests {
                     paused_resume_download_state: None,
                     paused_resume_post_state: None,
                     working_dir: PathBuf::from(format!("restore-fixture/{}", job_id.0)),
+                    restart: None,
                 },
             });
 

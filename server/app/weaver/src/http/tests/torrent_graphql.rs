@@ -167,10 +167,11 @@ async fn endpoint(dir: &std::path::Path, db: Database, torrents: TorrentService)
         scope: "admin".to_owned(),
     });
     let schema = build_schema(SchemaContext {
-        handle: handle.clone(),
+        handle: handle.handle.clone(),
+        pipeline_state: handle.state.clone(),
         scheduled_resume: weaver_server_api::ScheduledResumeCoordinator::new(
             db.clone(),
-            handle.clone(),
+            handle.handle.clone(),
         ),
         config: config.clone(),
         db: db.clone(),
@@ -178,10 +179,10 @@ async fn endpoint(dir: &std::path::Path, db: Database, torrents: TorrentService)
         auth_cache: auth_cache.clone(),
         api_key_cache: api_key_cache.clone(),
         security: RuntimeSecurityConfig::default(),
-        rss: weaver_server_api::RssService::new(handle.clone(), config.clone(), db.clone()),
+        rss: weaver_server_api::RssService::new(handle.handle.clone(), config.clone(), db.clone()),
         watch_folder: weaver_server_core::watch_folder::WatchFolderService::new(
             db.clone(),
-            handle.clone(),
+            handle.handle.clone(),
             config.clone(),
         ),
         update_check,

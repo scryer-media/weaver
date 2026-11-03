@@ -37,7 +37,6 @@ pub struct PipelineDiagnostics {
     pub nntp_handoff_draining: bool,
     pub pool_generation: u64,
     pub jobs: Vec<JobPipelineDiagnostics>,
-    pub direct_store: Vec<DirectStoreJobDiagnostics>,
     pub pool: Vec<PoolServerDiagnostics>,
     pub lanes: LaneDiagnostics,
     pub memory: MemoryDiagnostics,
@@ -67,7 +66,6 @@ pub struct PressureDiagnostics {
     pub hard_stall_seconds: Option<f64>,
     pub write_buffered_bytes: usize,
     pub write_buffered_segments: usize,
-    pub write_buffers: usize,
     pub decode_pending: usize,
     pub decode_pending_bytes: u64,
     pub decode_active_bytes: u64,
@@ -96,7 +94,6 @@ pub struct JobPipelineDiagnostics {
     pub status: JobStatus,
     pub download_queue_len: usize,
     pub recovery_queue_len: usize,
-    pub held_segments: usize,
     pub active_downloads: usize,
     pub active_download_connections: usize,
     pub active_decodes: usize,
@@ -133,26 +130,6 @@ pub struct JobPipelineDiagnostics {
     pub worst_transport_failure_segment: Option<String>,
     #[serde(default)]
     pub worst_transport_failure_streak: Option<u32>,
-}
-
-// Direct-store admission state for one job.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DirectStoreJobDiagnostics {
-    pub job_id: u64,
-    #[serde(flatten)]
-    pub counts: DirectSetCounts,
-    // Reconstruction sweeps this job's demoted sets still have in flight.
-    pub demotion_sweeps_in_flight: usize,
-}
-
-// How the sets admitted for one job are currently split.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-pub struct DirectSetCounts {
-    pub total: usize,
-    // Sets still routing bytes directly into their members.
-    pub admitted: usize,
-    pub demoted: usize,
-    pub finalized: usize,
 }
 
 // Connection leases held against one configured server.
@@ -255,7 +232,7 @@ impl Pipeline {
             }
         }
 
-        let provider_policy = self.nntp.pool().try_provider_policy();
+        let provider_policy = Some(self.nntp.pool().provider_policy());
         let mut jobs: Vec<JobPipelineDiagnostics> = self
             .jobs
             .iter()
@@ -263,8 +240,9 @@ impl Pipeline {
                 let wait = self.download_wait_by_job.get(job_id);
                 let checkpoint = self.checkpoint_admission(*job_id);
                 let next = state
-                    .download_queue
-                    .peek_first_matching(|work| !work.is_recovery);
+                    .articles
+                    .download_queue()
+                    .and_then(|queue| queue.peek_first_matching(|work| !work.is_recovery));
                 let (timed, indefinite, deadline) =
                     retries.get(job_id).copied().unwrap_or_default();
                 let group = next.and_then(|work| {
@@ -297,9 +275,8 @@ impl Pipeline {
                         .to_string()
                     }),
                     status: state.status.clone(),
-                    download_queue_len: state.download_queue.len(),
-                    recovery_queue_len: state.recovery_queue.len(),
-                    held_segments: state.held_segments.len(),
+                    download_queue_len: state.articles.queued_download_len(),
+                    recovery_queue_len: state.articles.queued_recovery_len(),
                     active_downloads: self
                         .active_downloads_by_job
                         .get(job_id)
@@ -367,21 +344,6 @@ impl Pipeline {
             .collect();
         jobs.sort_by_key(|job| job.job_id);
 
-        let direct_store = self
-            .direct_store
-            .set_counts_by_job()
-            .into_iter()
-            .map(|(job_id, counts)| DirectStoreJobDiagnostics {
-                job_id: job_id.0,
-                counts,
-                demotion_sweeps_in_flight: self
-                    .direct_demotion_in_flight
-                    .get(&job_id)
-                    .map(|sweeps| sweeps.len())
-                    .unwrap_or(0),
-            })
-            .collect();
-
         let pool = self
             .shared_state
             .nntp_pool()
@@ -441,7 +403,6 @@ impl Pipeline {
                     .map(|started| now.saturating_duration_since(started).as_secs_f64()),
                 write_buffered_bytes: self.write_buffered_bytes,
                 write_buffered_segments: self.write_buffered_segments,
-                write_buffers: self.write_buffers.len(),
                 decode_pending: metrics.decode_pending,
                 decode_pending_bytes: metrics.decode_pending_bytes,
                 decode_active_bytes: metrics.decode_active_bytes,
@@ -464,7 +425,6 @@ impl Pipeline {
             nntp_handoff_draining: self.nntp_handoff_draining,
             pool_generation: self.pool_generation,
             jobs,
-            direct_store,
             pool,
             lanes: LaneDiagnostics {
                 active: metrics.download_lanes_active,

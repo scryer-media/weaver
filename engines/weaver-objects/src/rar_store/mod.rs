@@ -24,20 +24,23 @@ mod walk;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet, btree_map};
+use std::ops::Bound;
 use std::sync::Arc;
 
-use unrar_rs::{EncryptedStore, StoredLayoutBuilder};
+use unrar_rs::{ArchiveFormat, EncryptedStore, StoredLayoutBuilder};
 use weaver_graph::{
-    ByteRange, Coverage, Delivery, Emit, Extent, Kind, MemberId, Object, Placement, Posting,
-    Provenance, Pull, Seek, Standing, VolumeIndex, Weight, Why,
+    ByteRange, Claim, Coverage, Delivery, Emit, Extent, Kind, Located, MemberId, Object, Placement,
+    Posting, Pull, Seek, Standing, VolumeIndex, Weight, Why,
 };
 use zeroize::Zeroizing;
 
 use crate::crypt::{Cbc, Chain, Padding};
+use crate::engine::SetName;
 use crate::grid::crc32;
 use crate::kept::Kept;
 use crate::keys::Keys;
+use crate::rar_engine::naming;
 use crate::runs::CrcRuns;
 use walk::{Step, Walk};
 
@@ -45,11 +48,20 @@ use walk::{Step, Walk};
 // streams here, so only the non-solid window applies.
 const WINDOW: u32 = 8;
 
+// The most volumes a set may number. RAR 1.5 to 4.x number a volume in 16
+// bits, so no set they write runs past it, and a RAR5 set that long is far
+// past any post. A set whose last volume is numbered beyond it is refused
+// before its gaps are said one by one.
+pub(super) const MOST_VOLUMES: u32 = 1 << 16;
+
 // One volume as the store holds it: everything it read of it, the headers
 // walked and the bytes kept for that, which is what travels with the member
 // when the store gives the volume back.
 pub(crate) struct Volume {
     name: Option<String>,
+    // Where the name puts the volume in its set's numbering, read once as
+    // the name is given.
+    numbered: Option<naming::VolumeName>,
     length: Option<u64>,
     closed: bool,
     kept: Kept,
@@ -63,12 +75,76 @@ impl Volume {
     fn new() -> Self {
         Self {
             name: None,
+            numbered: None,
             length: None,
             closed: false,
             kept: Kept::default(),
             walk: Walk::default(),
             front: None,
         }
+    }
+
+    // What the volume's headers have stated so far: what its walk read once
+    // that says whether it is one of a set, before then what its front
+    // stated. A walk stopped short of the main header, as one at enciphered
+    // headers with no password is, has stated nothing yet.
+    fn stated(&self) -> Option<&unrar_rs::RarVolumeFacts> {
+        self.walk
+            .facts
+            .as_ref()
+            .filter(|_| self.walk.in_set().is_some())
+            .or(self.front.as_ref())
+    }
+
+    fn name_as(&mut self, name: &str) {
+        self.numbered = numbering(name);
+        self.name = Some(name.to_owned());
+    }
+}
+
+// A name's place in its set's numbering.
+fn numbering(name: &str) -> Option<naming::VolumeName> {
+    #[cfg(test)]
+    counts::bump(|counts| counts.names += 1);
+    naming::parse(name)
+}
+
+// Where the volumes read in a format are filed.
+fn shelf(format: ArchiveFormat) -> usize {
+    match format {
+        ArchiveFormat::Rar14 => 0,
+        ArchiveFormat::Rar4 => 1,
+        ArchiveFormat::Rar5 => 2,
+    }
+}
+
+// What a test counts of the store's work, on its own thread: the volumes
+// walked and how many walks, layouts begun from the first volume, and bound
+// names read for their numbering.
+#[cfg(test)]
+mod counts {
+    use std::cell::RefCell;
+    use std::collections::BTreeSet;
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub(crate) struct Counts {
+        pub(crate) walked: BTreeSet<u32>,
+        pub(crate) walks: usize,
+        pub(crate) layouts: usize,
+        pub(crate) names: usize,
+    }
+
+    thread_local! {
+        static COUNTS: RefCell<Counts> = RefCell::default();
+    }
+
+    pub(crate) fn bump(count: impl FnOnce(&mut Counts)) {
+        COUNTS.with(|cell| count(&mut cell.borrow_mut()));
+    }
+
+    // What was counted since the last take.
+    pub(crate) fn take() -> Counts {
+        COUNTS.with(RefCell::take)
     }
 }
 
@@ -129,6 +205,17 @@ struct Entry {
 }
 
 impl Entry {
+    // The part of the file whose packed stream holds all of `stream`: a
+    // range the entry has not taken a part for yet is no member's bytes.
+    fn piece_of(&self, stream: ByteRange) -> Option<usize> {
+        let piece = self
+            .pieces
+            .partition_point(|piece| piece.at <= stream.start)
+            .checked_sub(1)?;
+        let found = &self.pieces[piece];
+        (stream.end <= found.at + found.data.len()).then_some(piece)
+    }
+
     fn packed(&self) -> u64 {
         self.pieces.iter().map(|piece| piece.data.len()).sum()
     }
@@ -137,6 +224,13 @@ impl Entry {
     // unknown, what the parts add up to once the last is in.
     fn plain_len(&self) -> Option<u64> {
         self.length.or_else(|| self.complete.then(|| self.packed()))
+    }
+
+    // Whether the store is the one to judge the member's whole checksum: a
+    // keyed one is not the member's CRC32, so it is stated to nothing below,
+    // which checks the CRC32 it is stated.
+    fn judges_its_checksum(&self) -> bool {
+        self.uses_mac
     }
 }
 
@@ -164,6 +258,25 @@ pub struct RarStore {
     volumes: BTreeMap<VolumeIndex, Volume>,
     // Volumes said to be given back, until the tree takes them.
     giving: BTreeMap<VolumeIndex, Volume>,
+    // The volumes held, here or in `giving`, that no entry's piece lies in:
+    // the ones that can travel to another owner. Filed where a volume comes
+    // or goes and where pieces do, so no question about one scans pieces.
+    unmapped: BTreeSet<VolumeIndex>,
+    // Every entry's pieces by the volume they lie in, as (entry, piece),
+    // filed where `unmapped` is, so finding a volume's parts scans no other
+    // volume's pieces.
+    pieces_in: BTreeMap<VolumeIndex, Vec<(usize, usize)>>,
+    // The volumes to look at again: walk their headers, hold them to the
+    // layout, say their recovery records. Filed wherever something a walk
+    // or the layout reads of a volume changes, so a look visits only them.
+    dirty: BTreeSet<VolumeIndex>,
+    // What the walks of the volumes held say of the set: the volumes whose
+    // headers say no volume follows them, and the volumes whose headers
+    // were read in each format. Filed as a volume is walked, comes or goes.
+    lasts: BTreeSet<VolumeIndex>,
+    formats: [BTreeSet<VolumeIndex>; 3],
+    // The layout kept: extended past its tail as volumes are read, laid
+    // afresh only where a volume it holds changed what it said.
     layout: Option<StoredLayoutBuilder>,
     entries: Vec<Entry>,
     candidates: Vec<Candidate>,
@@ -179,6 +292,8 @@ pub struct RarStore {
     damage_said: HashSet<(VolumeIndex, u64, u64, u32)>,
     recovery_said: BTreeSet<(VolumeIndex, u64)>,
     gaps_said: BTreeSet<VolumeIndex>,
+    // The files may open now: a password, a cipher or a condemned key
+    // changed.
     stale: bool,
     // The object gave its set up; it says nothing more.
     gone: bool,
@@ -201,6 +316,11 @@ impl RarStore {
             keys,
             volumes: BTreeMap::new(),
             giving: BTreeMap::new(),
+            unmapped: BTreeSet::new(),
+            pieces_in: BTreeMap::new(),
+            dirty: BTreeSet::new(),
+            lasts: BTreeSet::new(),
+            formats: Default::default(),
             layout: None,
             entries: Vec::new(),
             candidates: Vec::new(),
@@ -211,13 +331,82 @@ impl RarStore {
             damage_said: HashSet::new(),
             recovery_said: BTreeSet::new(),
             gaps_said: BTreeSet::new(),
-            stale: true,
+            stale: false,
             gone: false,
         }
     }
 
+    // A volume newly held lies under no piece: a layout maps only volumes
+    // held, and one leaves only once nothing maps it. Its headers are walked
+    // at the next look.
     fn volume(&mut self, volume: VolumeIndex) -> &mut Volume {
-        self.volumes.entry(volume).or_insert_with(Volume::new)
+        match self.volumes.entry(volume) {
+            btree_map::Entry::Occupied(found) => found.into_mut(),
+            btree_map::Entry::Vacant(place) => {
+                if !self.giving.contains_key(&volume) {
+                    self.unmapped.insert(volume);
+                }
+                self.dirty.insert(volume);
+                place.insert(Volume::new())
+            }
+        }
+    }
+
+    // Something the walk or the layout reads of a volume changed, or the
+    // volume came or went: look at it again.
+    fn touch(&mut self, volume: VolumeIndex) {
+        self.dirty.insert(volume);
+    }
+
+    // File what a volume's walk says of the set, as it stands now: whether
+    // no volume follows it, and the format its headers were read in. A
+    // volume no longer held says nothing.
+    fn file(&mut self, volume: VolumeIndex) {
+        let walk = self.volumes.get(&volume).map(|found| &found.walk);
+        match walk.is_some_and(Walk::is_last) {
+            true => self.lasts.insert(volume),
+            false => self.lasts.remove(&volume),
+        };
+        let format = walk
+            .and_then(|walk| walk.facts.as_ref())
+            .map(|facts| shelf(facts.archive_format()));
+        for (at, held) in self.formats.iter_mut().enumerate() {
+            match format == Some(at) {
+                true => held.insert(volume),
+                false => held.remove(&volume),
+            };
+        }
+    }
+
+    // Whether a volume held was read in a format other than `format`.
+    fn holds_other_than(&self, format: ArchiveFormat) -> bool {
+        let ours = shelf(format);
+        self.formats
+            .iter()
+            .enumerate()
+            .any(|(at, held)| at != ours && !held.is_empty())
+    }
+
+    // The volumes no piece lies in, from every entry again: where pieces
+    // went, at a retraction or a restore.
+    fn remap(&mut self) {
+        self.pieces_in.clear();
+        for (id, entry) in self.entries.iter().enumerate() {
+            for (at, piece) in entry.pieces.iter().enumerate() {
+                self.pieces_in
+                    .entry(piece.volume)
+                    .or_default()
+                    .push((id, at));
+            }
+        }
+        let mapped: BTreeSet<VolumeIndex> = self.pieces_in.keys().copied().collect();
+        self.unmapped = self
+            .volumes
+            .keys()
+            .chain(self.giving.keys())
+            .filter(|volume| !mapped.contains(volume))
+            .copied()
+            .collect();
     }
 
     fn give_up(&mut self, emit: Emit, out: &mut Vec<Emit>) {
@@ -242,20 +431,25 @@ impl RarStore {
         }
     }
 
-    // Look again at everything, after anything changed. What the store kept
-    // in its envelope and its map places elsewhere now is no longer its own,
-    // and is said so ahead of any giving up, past `fresh`, a volume range
-    // being delivered, which is placed afresh. Only a volume whose headers
-    // moved can say so, of the bytes they newly reach.
+    // Look again at what changed: the volumes touched, and the files when a
+    // key changed. What the store kept in its envelope and its map places
+    // elsewhere now is no longer its own, and is said so ahead of any giving
+    // up, past `fresh`, a volume range being delivered, which is placed
+    // afresh. Only a volume whose headers moved can say so, of the bytes
+    // they newly reach.
     fn settle(&mut self, fresh: Option<(VolumeIndex, ByteRange)>, out: &mut Vec<Emit>) {
-        if self.gone || !self.stale {
+        if self.gone || (!self.stale && self.dirty.is_empty()) {
             return;
         }
         let mut reached = BTreeMap::new();
-        while !self.gone && std::mem::take(&mut self.stale) {
-            self.walk_all(&mut reached, out);
+        while !self.gone && (std::mem::take(&mut self.stale) | !self.dirty.is_empty()) {
+            let touched = std::mem::take(&mut self.dirty);
+            self.walk(&touched, &mut reached, out);
+            // The layout holds to every volume touched so far, those the
+            // walks gave back or touched again included.
+            let touched: BTreeSet<VolumeIndex> = touched.union(&self.dirty).copied().collect();
             if !self.gone {
-                self.sync(out);
+                self.sync(&touched, out);
             }
             if !self.gone {
                 self.open_files(out);
@@ -270,15 +464,25 @@ impl RarStore {
         out.extend(last);
     }
 
-    // Walk every volume's headers as far as its bytes go, noting for each
-    // volume whose headers moved how far they reached before.
-    fn walk_all(&mut self, reached: &mut BTreeMap<VolumeIndex, u64>, out: &mut Vec<Emit>) {
-        let indices: Vec<VolumeIndex> = self.volumes.keys().copied().collect();
-        for volume in indices {
+    // Walk the headers of the volumes touched as far as their bytes go,
+    // noting for each one whose headers moved how far they reached before.
+    // A volume nothing touched reads as it did.
+    fn walk(
+        &mut self,
+        touched: &BTreeSet<VolumeIndex>,
+        reached: &mut BTreeMap<VolumeIndex, u64>,
+        out: &mut Vec<Emit>,
+    ) {
+        for &volume in touched {
             let password = self.header_password();
             let Some(found) = self.volumes.get_mut(&volume) else {
                 continue;
             };
+            #[cfg(test)]
+            counts::bump(|counts| {
+                counts.walks += 1;
+                counts.walked.insert(volume.0);
+            });
             let before = found.walk.reach().unwrap_or(0);
             let step = found.walk.step(
                 &mut found.kept,
@@ -287,23 +491,24 @@ impl RarStore {
                 self.keys.kdf(),
                 found.closed,
             );
+            self.file(volume);
+            let kept = &self.volumes[&volume].kept;
             match step {
                 Step::Walked { moved, damaged } => {
                     if moved {
                         reached.entry(volume).or_insert(before);
                     }
-                    self.stale |= moved;
                     if let Some(range) = damaged {
-                        let crc = found.kept.read(range).map_or(0, crc32);
+                        let crc = kept.read(range).map_or(0, crc32);
                         self.say_damaged(volume, range, crc, out);
                     }
                 }
                 Step::Locked(encryption) => self.open_headers(volume, &encryption, out),
                 Step::Broken(range) => {
-                    if found.kept.verified(range) {
+                    if kept.verified(range) {
                         return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
                     }
-                    let crc = found.kept.read(range).map_or(0, crc32);
+                    let crc = kept.read(range).map_or(0, crc32);
                     self.say_damaged(volume, range, crc, out);
                 }
                 Step::Refuse(emit) => return self.give_up(emit, out),
@@ -313,6 +518,7 @@ impl RarStore {
             }
             self.give_back_misplaced(volume, out);
         }
+        self.give_back_past_last(out);
     }
 
     // A volume read to its close whose own headers say it is not where the
@@ -350,13 +556,37 @@ impl RarStore {
                 .collect(),
             false => vec![volume],
         };
+        self.give_back_held(going, out);
+    }
+
+    // A set ends at the volume whose headers say no volume follows it. A
+    // volume held past it was claimed on a number every set states alike:
+    // it goes back at its close, as a misplaced one does, for the store
+    // whose set it is to claim.
+    fn give_back_past_last(&mut self, out: &mut Vec<Emit>) {
+        let Some(last) = self.last() else {
+            return;
+        };
+        let going: Vec<VolumeIndex> = self
+            .volumes
+            .range((Bound::Excluded(last), Bound::Unbounded))
+            .filter(|(_, found)| found.closed)
+            .map(|(index, _)| *index)
+            .collect();
+        if !going.is_empty() {
+            self.give_back_held(going, out);
+        }
+    }
+
+    fn give_back_held(&mut self, going: Vec<VolumeIndex>, out: &mut Vec<Emit>) {
         for index in going {
             if let Some(found) = self.volumes.remove(&index) {
                 self.giving.insert(index, found);
                 out.push(Emit::GiveBack(index));
             }
+            self.file(index);
+            self.touch(index);
         }
-        self.stale = true;
     }
 
     // Everything bound has closed: nothing more will arrive.
@@ -369,10 +599,7 @@ impl RarStore {
 
     // The last volume, once some volume's headers say it is.
     fn last(&self) -> Option<VolumeIndex> {
-        self.volumes
-            .iter()
-            .find(|(_, volume)| volume.walk.is_last())
-            .map(|(index, _)| *index)
+        self.lasts.first().copied()
     }
 
     // Numbered volumes that never came, once everything else has: damaged
@@ -389,6 +616,9 @@ impl RarStore {
         else {
             return;
         };
+        if last.0 >= MOST_VOLUMES {
+            return self.give_up(Emit::Refuse(Why::InvalidArchive), out);
+        }
         for index in 0..last.0 {
             let volume = VolumeIndex(index);
             let missing = self
@@ -434,8 +664,7 @@ impl Object for RarStore {
                 .kept
                 .absorb(range, delivery.bytes, delivery.provenance)
             {
-                found.walk.touch();
-                self.stale = true;
+                self.touch(volume);
             }
             self.settle(Some((volume, range)), out);
             if self.gone {
@@ -458,7 +687,7 @@ impl Object for RarStore {
             // A damaged delivery over the walk's next bytes is kept whole, so
             // it is said once and its repair is seen.
             let found = self.volume(volume);
-            if delivery.provenance == Provenance::Damaged && !found.closed {
+            if delivery.provenance.is_damaged() && !found.closed {
                 let hole = found.walk.hole(&found.kept, false);
                 if range.contains(hole) {
                     found.kept.want(ByteRange::new(hole, range.end));
@@ -487,11 +716,9 @@ impl Object for RarStore {
     fn volume_closed(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
         // A volume adopted closed was walked to its close already.
         let found = self.volume(volume);
-        if !found.closed {
-            found.closed = true;
-            found.walk.touch();
+        if !std::mem::replace(&mut found.closed, true) {
+            self.touch(volume);
         }
-        self.stale = true;
         self.settle(None, out);
         if self.gone {
             return;
@@ -573,8 +800,8 @@ impl Object for RarStore {
         self.place(volume, range, out);
     }
 
-    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) {
-        self.member_extent(member, range, out);
+    fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {
+        self.member_extent(member, range, out)
     }
 
     fn posted(
@@ -597,13 +824,14 @@ impl Object for RarStore {
     }
 
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {
+        // A length said anew is the producer's word now: the volume is
+        // walked again against it.
         let found = self.volume(volume);
-        if found.length.is_some() {
+        if found.length == Some(length) {
             return;
         }
         found.length = Some(length);
-        found.walk.touch();
-        self.stale = true;
+        self.touch(volume);
         self.settle(None, out);
     }
 
@@ -612,9 +840,7 @@ impl Object for RarStore {
         // opens nothing leaves it free to ask for the next one.
         self.asked = false;
         self.candidate(secret);
-        for volume in self.volumes.values_mut() {
-            volume.walk.touch();
-        }
+        self.dirty.extend(self.volumes.keys().copied());
         self.stale = true;
         self.settle(None, out);
     }
@@ -630,39 +856,66 @@ impl Object for RarStore {
     fn bound(&mut self, volume: VolumeIndex, name: &str, front: &[u8], _length: Option<u64>) {
         let facts = self.front_facts(front);
         let bound = self.volume(volume);
-        bound.name = Some(name.to_owned());
+        bound.name_as(name);
         bound.front = facts;
-        self.stale = true;
+        self.touch(volume);
     }
 
-    // A store that gave its set up still claims the rest of it, so the rest
-    // goes where the set went.
-    fn claim(
-        &mut self,
-        name: &str,
-        first_bytes: &[u8],
-        _length: Option<u64>,
-    ) -> Option<VolumeIndex> {
-        self.claim_volume(name, first_bytes)?
-            .claimed(self.gone, self.past())
+    fn engine_volume(&self, volume: VolumeIndex) -> Option<weaver_graph::Carried> {
+        let held = self.volumes.get(&volume)?;
+        Some(Box::new(crate::engine::CarriedVolume {
+            front: held.stated().cloned(),
+            length: held.length,
+        }))
     }
 
-    // What was read of the volume goes with it, unless it is more than a
-    // volume's headers can need: then the member is refused, never read
-    // again.
+    // The place the volume's headers or name give it, held or not: whether
+    // it takes it is the tree's to judge.
+    fn claim(&mut self, name: &str, first_bytes: &[u8], _length: Option<u64>) -> Claim {
+        self.claim_volume(name, first_bytes)
+    }
+
+    // A volume contributes to no member yet and can travel with all the
+    // parse it owns. This is also the guard on a transfer the tree asks for.
+    fn carried(&self, volume: VolumeIndex) -> Option<&(dyn std::any::Any + Send + Sync)> {
+        if !self.unmapped.contains(&volume) {
+            return None;
+        }
+        let held = self
+            .giving
+            .get(&volume)
+            .or_else(|| self.volumes.get(&volume))?;
+        (held.kept.len() <= claim::CARRIED).then_some(held)
+    }
+
+    fn carriable(&self, out: &mut Vec<VolumeIndex>) {
+        out.extend(
+            self.unmapped
+                .iter()
+                .copied()
+                .filter(|volume| self.carried(*volume).is_some()),
+        );
+    }
+
     fn give_back(&mut self, volume: VolumeIndex) -> Option<weaver_graph::Carried> {
-        self.stale = true;
-        self.giving
+        self.carried(volume)?;
+        let given = self
+            .giving
             .remove(&volume)
-            .or_else(|| self.volumes.remove(&volume))
-            .filter(|given| given.kept.len() <= claim::CARRIED)
-            .map(|volume| Box::new(volume) as weaver_graph::Carried)
+            .or_else(|| self.volumes.remove(&volume));
+        if !self.volumes.contains_key(&volume) && !self.giving.contains_key(&volume) {
+            self.unmapped.remove(&volume);
+        }
+        self.file(volume);
+        self.touch(volume);
+        given.map(|volume| Box::new(volume) as weaver_graph::Carried)
     }
 
     // A volume links alone placed: no layout maps it, so it goes as it is.
     fn provisional(
         &self,
         volume: VolumeIndex,
+        name: &str,
         first_bytes: &[u8],
         carried: Option<&weaver_graph::Carried>,
     ) -> bool {
@@ -670,16 +923,24 @@ impl Object for RarStore {
             return false;
         };
         let given = carried.and_then(|carried| carried.downcast_ref::<Volume>());
-        let facts = match given {
-            Some(given) => given.walk.facts.clone().or_else(|| given.front.clone()),
-            None => self.front_facts(first_bytes),
-        };
-        claim::yields(volume, holder, facts.as_ref())
+        self.yields(volume, holder, name, first_bytes, given)
     }
 
-    fn reclaim(&mut self, name: &str, carried: &weaver_graph::Carried) -> Option<VolumeIndex> {
-        self.reclaim_volume(name, carried.downcast_ref::<Volume>()?)?
-            .claimed(self.gone, self.past())
+    fn reclaim(
+        &self,
+        name: &str,
+        front: &[u8],
+        _length: Option<u64>,
+        carried: &(dyn std::any::Any + Send + Sync),
+    ) -> Claim {
+        match carried.downcast_ref::<Volume>() {
+            Some(given) => self.reclaim_volume(name, front, given),
+            None => carried
+                .downcast_ref::<crate::engine::CarriedVolume<unrar_rs::RarVolumeFacts>>()
+                .map_or_else(Claim::default, |given| {
+                    self.reclaim_front(name, front, given.front.as_ref())
+                }),
+        }
     }
 
     // The volume as its giver read it: its headers walked, its bytes kept,
@@ -687,20 +948,46 @@ impl Object for RarStore {
     // travels with it: its headers are walked again under this store's own,
     // so headers no password of the store opens ask the job, and every
     // password the store holds is one the job offered it.
-    fn adopt(&mut self, volume: VolumeIndex, name: &str, carried: weaver_graph::Carried) {
+    fn adopt(
+        &mut self,
+        volume: VolumeIndex,
+        name: &str,
+        front: &[u8],
+        length: Option<u64>,
+        carried: weaver_graph::Carried,
+    ) {
         let Ok(mut held) = carried.downcast::<Volume>() else {
-            return self.bound(volume, name, &[], None);
+            return self.bound(volume, name, front, length);
         };
-        held.name = Some(name.to_owned());
-        held.walk.touch();
-        self.volumes.insert(volume, *held);
-        self.stale = true;
+        held.name_as(name);
+        *self.volume(volume) = *held;
+        self.file(volume);
+        self.touch(volume);
     }
 
-    fn renamed(&mut self, volume: VolumeIndex, name: &str) {
-        if let Some(found) = self.volumes.get_mut(&volume) {
-            found.name = Some(name.to_owned());
+    fn renamed(&mut self, volume: VolumeIndex, name: &str, out: &mut Vec<Emit>) {
+        let Some(found) = self.volumes.get_mut(&volume) else {
+            return;
+        };
+        found.name_as(name);
+        // Finishing a RAR4 walk need not reveal an ordinal. A corrected
+        // name then places it more precisely than the links that held it;
+        // only a position the headers actually state outranks that name.
+        let stated = found.stated().is_some_and(claim::states_position);
+        let misplaced = found
+            .numbered
+            .as_ref()
+            .is_some_and(|named| named.index() != volume.0)
+            && !stated;
+        // The name is what settles a volume its headers do not place, and
+        // what it settles is said now, as a length said anew is: a
+        // checkpoint before the next delivery records the name, and a
+        // restore reads it again as said already.
+        self.touch(volume);
+        if misplaced && self.carried(volume).is_some() {
+            self.give_back_held(vec![volume], out);
         }
+        self.settle(None, out);
     }
 
     fn refused(&mut self) {

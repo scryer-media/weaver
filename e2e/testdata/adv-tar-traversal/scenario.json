@@ -1,0 +1,30 @@
+{
+  "slug": "adv-tar-traversal",
+  "title": "E2E.Adversarial.Tar.Traversal.2026-TESTGRP",
+  "description": "The traversal names of adv-zip-traversal in a ustar archive, held to the same confinement.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "escapeNames": [
+      "../../adv-escape-parent.txt",
+      "/tmp/adv-escape-absolute.txt",
+      "..\\..\\adv-escape-backslash.txt",
+      "C:\\adv-escape-drive.txt",
+      "inside/../../adv-escape-middle.txt",
+      "plain.txt"
+    ],
+    "escapePaths": [
+      "/tmp/adv-escape-absolute.txt"
+    ]
+  },
+  "expectedOutputBLAKE3": {
+    "C:/adv-escape-drive.txt": "be47164130d9acbf6118ce61e750d6fb9bfc643a97043cb01501ede1e8e4eaf8",
+    "adv-escape-backslash.txt": "8f77441bb1c4a8aeebd5f823c5a824dab033d9a86a0a46f3a971734ab5934921",
+    "adv-escape-parent.txt": "761cbce6522ae1cc90f99c1d3f55ba1001adc7b846aefd4424f79152f6cb5dd8",
+    "inside/adv-escape-middle.txt": "de13c517061524e1e583077bc3bd93d1c66ca8c9d3b6f49a0b90c9ce285cac00",
+    "plain.txt": "75f4afcb26eb7295aa902f524e3695cda4b4a9e897a78cdde3d427126946382b",
+    "tmp/adv-escape-absolute.txt": "fbae6ffb86252936a0943477186caa5e6b1e69f944d8447dd35199d866d4d87b"
+  }
+}

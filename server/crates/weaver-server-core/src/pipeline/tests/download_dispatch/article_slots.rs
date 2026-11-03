@@ -25,7 +25,7 @@ fn slot_segment(job_id: JobId) -> SegmentId {
 async fn slot_pipeline(temp_dir: &tempfile::TempDir, job_id: JobId, ids: &[&str]) -> Pipeline {
     let (mut pipeline, _, _) = new_direct_pipeline(temp_dir).await;
     pipeline.nntp = std::sync::Arc::new(retention_client(&[0]));
-    let mut spec = segmented_job_spec("Article Slot", FILENAME, &[128, 128]);
+    let mut spec = segmented_job_spec("Article Slot", FILENAME, &[128; 10]);
     spec.files[0].segments[0].message_ids =
         crate::jobs::MessageIds::new(ids.iter().map(|id| id.to_string()).collect());
     insert_active_job(&mut pipeline, job_id, spec).await;
@@ -39,10 +39,16 @@ fn lease_slot(pipeline: &mut Pipeline, job_id: JobId) -> Vec<(String, Vec<usize>
         return Vec::new();
     };
     let mut leased = state
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .extract_matching(|work| work.segment_id == segment_id);
     leased.extend(
         state
+            .articles
+            .active_mut()
+            .unwrap()
             .recovery_queue
             .extract_matching(|work| work.segment_id == segment_id),
     );
@@ -93,39 +99,6 @@ fn articles_not_found(pipeline: &Pipeline) -> u64 {
         .metrics
         .articles_not_found
         .load(std::sync::atomic::Ordering::Relaxed)
-}
-
-fn in_use(pipeline: &Pipeline, job_id: JobId) -> String {
-    pipeline.jobs[&job_id].spec.files[0].segments[0]
-        .message_ids
-        .in_use()
-        .to_string()
-}
-
-#[tokio::test]
-async fn a_slot_whose_first_id_arrives_never_fetches_the_second() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let job_id = JobId(40301);
-    let mut pipeline = slot_pipeline(&temp_dir, job_id, &[FIRST, SECOND]).await;
-    assert_eq!(
-        lease_slot(&mut pipeline, job_id),
-        [(FIRST.to_string(), vec![])]
-    );
-
-    finish_download(&mut pipeline, job_id, Ok(DownloadPayload::Raw(slot_body()))).await;
-    drain_decode_results(&mut pipeline, 1).await;
-
-    assert!(lease_slot(&mut pipeline, job_id).is_empty());
-    assert_eq!(in_use(&pipeline, job_id), FIRST);
-    let state = &pipeline.jobs[&job_id];
-    assert!(
-        state
-            .assembly
-            .file(slot_segment(job_id).file_id)
-            .unwrap()
-            .has_segment(0)
-    );
-    assert_eq!(state.failed_bytes, 0);
 }
 
 #[tokio::test]

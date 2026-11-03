@@ -134,7 +134,6 @@ fn config(complete_dir: &std::path::Path) -> SharedConfig {
         watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: None,
-        direct_unpack: None,
         delivery_naming: None,
         metrics: Default::default(),
         config_path: None,

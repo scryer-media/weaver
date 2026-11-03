@@ -18,6 +18,15 @@ Reading Weaver to understand how something works is fine. Copying it means the t
 - The one exception is creating release notes under `release-notes/` as part of the release process.
 - Keep plans, reports, and handoffs in the conversation or outside the repository. They never belong in a commit.
 
+## Job status: Partial
+
+A job ends Partial only when at least one truly usable file was downloaded: a complete end file the user can open, on disk, after every unpack. Nothing usable means Failed, never Partial.
+
+- An archive volume that arrived whole is not a usable file. A split part, a recovery file (PAR2, PAR3, `.rev`), an SFV, or any other member that exists to make something else is not a usable file either.
+- Example: one `.mkv` inside a five-volume RAR, one volume lost, nothing rebuilds it. Four volumes arrived whole, no usable file came out: Failed. Had the archive held two files and one unpacked whole: Partial.
+- Example: a post with no recovery and three plain files, one of which lost an article. The two complete files are usable: Partial.
+- Derive the status from delivered usable outputs, never from "some members arrived", "some volumes are whole", or "some articles came".
+
 ## Local archive matrix execution
 
 - Do not run the large archive schedule matrix during normal local development, routine validation, hygiene passes, or pre-commit checks. Run it locally only when an operator explicitly requests the matrix; a general request to test, validate, fix, or finish work is not authorization.
