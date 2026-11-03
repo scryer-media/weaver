@@ -94,17 +94,28 @@ impl SpeedEstimator {
         };
 
         let downloaded_bytes_diff = progress_bytes - first.progress_bytes;
-        let elapsed = instant - first.instant;
-        let bps = downloaded_bytes_diff as f64 / elapsed.as_secs_f64();
+        let elapsed = (instant - first.instant).as_nanos();
+        // Bytes over the window per second; as many as a u64 holds when no
+        // time has passed.
+        let bps = match u128::from(downloaded_bytes_diff)
+            .saturating_mul(1_000_000_000)
+            .checked_div(elapsed)
+        {
+            Some(bps) => u64::try_from(bps).unwrap_or(u64::MAX),
+            None if downloaded_bytes_diff == 0 => 0,
+            None => u64::MAX,
+        };
 
+        // The remaining bytes at the window's rate.
         let time_remaining_millis_rounded: u64 = if downloaded_bytes_diff > 0 {
-            let time_remaining_secs = remaining_bytes.unwrap_or_default() as f64 / bps;
-            (time_remaining_secs * 1000f64) as u64
+            let millis = u128::from(remaining_bytes.unwrap_or_default()).saturating_mul(elapsed)
+                / (u128::from(downloaded_bytes_diff) * 1_000_000);
+            u64::try_from(millis).unwrap_or(u64::MAX)
         } else {
             0
         };
         self.time_remaining_millis
             .store(time_remaining_millis_rounded, Ordering::Relaxed);
-        self.bytes_per_second.store(bps as u64, Ordering::Relaxed);
+        self.bytes_per_second.store(bps, Ordering::Relaxed);
     }
 }

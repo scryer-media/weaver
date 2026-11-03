@@ -226,7 +226,8 @@ impl Registry {
         let turn = self.first.pop_front().or_else(|| self.rotation.pop_front());
         self.rotation.extend(turn);
         let announcing = (self.first.len() + self.rotation.len()).max(1);
-        let mut delay = (ANNOUNCE_INTERVAL / announcing as u32).max(Duration::from_millis(1));
+        let mut delay = (ANNOUNCE_INTERVAL / u32::try_from(announcing).unwrap_or(u32::MAX))
+            .max(Duration::from_millis(1));
         if !self.first.is_empty() {
             delay = delay.min(FIRST_ANNOUNCE_SPACING);
         }

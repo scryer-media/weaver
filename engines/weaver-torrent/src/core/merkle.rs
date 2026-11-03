@@ -146,12 +146,13 @@ impl PieceTree {
 
     /// The layers above the piece layer.
     pub fn height(&self) -> u32 {
-        (self.layers.len() - 1) as u32
+        u32::try_from(self.layers.len() - 1).expect("a merkle tree's height fits in u32")
     }
 
     fn node(&self, layer: usize, index: u64) -> Id32 {
-        self.layers[layer]
-            .get(index as usize)
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| self.layers[layer].get(index))
             .copied()
             .unwrap_or(self.pads[layer])
     }

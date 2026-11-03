@@ -192,7 +192,7 @@ impl PieceSet {
     }
 
     fn total_pieces(&self) -> u32 {
-        self.pieces.len() as u32
+        u32::try_from(self.pieces.len()).expect("piece indexes fit in u32")
     }
 
     fn missing(&self) -> impl Iterator<Item = u32> + '_ {

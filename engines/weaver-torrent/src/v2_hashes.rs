@@ -75,7 +75,8 @@ impl V2Hashes {
             .iter()
             .filter_map(|f| {
                 let layer = layers.next().flatten();
-                let pieces = f.length.div_ceil(piece_length) as u32;
+                let pieces = u32::try_from(f.length.div_ceil(piece_length))
+                    .expect("piece indexes fit in u32");
                 let tree = OnceLock::new();
                 if let Some(layer) = layer {
                     let _ = tree.set(PieceTree::from_piece_layer(
@@ -91,7 +92,8 @@ impl V2Hashes {
                 Some(V2File {
                     root: f.pieces_root?,
                     length: f.length,
-                    first_piece: (f.offset / piece_length) as u32,
+                    first_piece: u32::try_from(f.offset / piece_length)
+                        .expect("piece indexes fit in u32"),
                     pieces,
                     chunks: (0..chunks).map(|_| OnceLock::new()).collect(),
                     tree,
@@ -169,7 +171,12 @@ impl V2Hashes {
                     .iter()
                     .enumerate()
                     .filter(|(_, c)| c.get().is_none())
-                    .map(move |(chunk, _)| (file, chunk as u32))
+                    .map(move |(chunk, _)| {
+                        (
+                            file,
+                            u32::try_from(chunk).expect("a file's layer runs fit in u32"),
+                        )
+                    })
             })
     }
 
@@ -191,8 +198,8 @@ impl V2Hashes {
             root: f.root,
             base: merkle::num_layers(self.blocks_per_piece()),
             index,
-            count: merkle::num_leafs(u64::from(f.pieces - index)).min(u64::from(LAYER_CHUNK))
-                as u32,
+            count: u32::try_from(merkle::num_leafs(u64::from(f.pieces - index)))
+                .map_or(LAYER_CHUNK, |count| count.min(LAYER_CHUNK)),
             proof_layers: merkle::num_layers(pieces) - 1,
         }
     }

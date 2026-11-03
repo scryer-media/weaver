@@ -95,7 +95,10 @@ impl Ladder {
     // Buckets up to `bucket` exist; the new ones are empty, at the end.
     fn reach(&mut self, bucket: usize) {
         if self.ends.len() <= bucket {
-            self.ends.resize(bucket + 1, self.pieces.len() as u32);
+            self.ends.resize(
+                bucket + 1,
+                u32::try_from(self.pieces.len()).expect("piece indexes fit in u32"),
+            );
         }
     }
 
@@ -104,7 +107,7 @@ impl Ladder {
     /// which moves the free slot down to the end of `bucket`.
     fn add(&mut self, piece: ValidPieceIndex, bucket: usize, rng: &mut StdRng, at: &mut [u32]) {
         self.reach(bucket);
-        let mut free = self.pieces.len() as u32;
+        let mut free = u32::try_from(self.pieces.len()).expect("piece indexes fit in u32");
         self.pieces.push(piece);
         for b in (bucket + 1..self.ends.len()).rev() {
             let first = self.begin(b);
@@ -244,7 +247,12 @@ impl PickIndex {
         let mut buckets: [Vec<Vec<ValidPieceIndex>>; PiecePriority::WANTED_DESCENDING.len()] =
             Default::default();
         for (id, key) in keys.iter().enumerate() {
-            let (Some(key), Some(piece)) = (key, lengths.validate_piece_index(id as u32)) else {
+            let (Some(key), Some(piece)) = (
+                key,
+                u32::try_from(id)
+                    .ok()
+                    .and_then(|id| lengths.validate_piece_index(id)),
+            ) else {
                 continue;
             };
             let level = &mut buckets[key.level as usize];
@@ -260,10 +268,12 @@ impl PickIndex {
             for mut bucket in level {
                 bucket.shuffle(&mut self.rng);
                 ladder.pieces.extend(bucket);
-                ladder.ends.push(ladder.pieces.len() as u32);
+                ladder
+                    .ends
+                    .push(u32::try_from(ladder.pieces.len()).expect("piece indexes fit in u32"));
             }
             for (slot, piece) in ladder.pieces.iter().enumerate() {
-                self.at[piece.get_usize()] = slot as u32;
+                self.at[piece.get_usize()] = u32::try_from(slot).expect("piece indexes fit in u32");
             }
         }
         self.keys = keys;
@@ -497,7 +507,8 @@ impl ChunkTracker {
             queued: 0,
             started: BTreeSet::new(),
             index: PickIndex::new(total_pieces),
-            have_count: have_pieces.as_slice().count_ones() as u32,
+            have_count: u32::try_from(have_pieces.as_slice().count_ones())
+                .expect("piece indexes fit in u32"),
             selection: Box::new(PieceSelection {
                 file_bytes,
                 priorities: vec![PiecePriority::Normal; total_pieces as usize],
@@ -628,7 +639,7 @@ impl ChunkTracker {
         let level = level_rank(self.selection.priorities[id])?;
         let open = self.received_chunks(piece) == 0;
         Some(Key {
-            level: level as u8,
+            level: u8::try_from(level).ok()?,
             bucket: 2 * (peers - 1) + open as u32,
         })
     }
@@ -736,19 +747,21 @@ impl ChunkTracker {
     // The counts of the queue, after a change to all of it.
     fn recount_queue(&mut self) {
         self.index.dirty = true;
-        self.queued = self.queue_pieces.count_ones() as u32;
+        self.queued =
+            u32::try_from(self.queue_pieces.count_ones()).expect("piece indexes fit in u32");
         let lengths = self.lengths;
         let chunk_status = &self.chunk_status;
         self.started = self
             .queue_pieces
             .iter_ones()
             .filter(|id| {
-                lengths
-                    .validate_piece_index(*id as u32)
+                u32::try_from(*id)
+                    .ok()
+                    .and_then(|id| lengths.validate_piece_index(id))
                     .and_then(|piece| chunk_status.get(lengths.chunk_range(piece)))
                     .is_some_and(|chunks| chunks.any())
             })
-            .map(|id| id as u32)
+            .map(|id| u32::try_from(id).expect("piece indexes fit in u32"))
             .collect();
     }
 

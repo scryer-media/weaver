@@ -88,7 +88,9 @@ impl PieceDigest {
         let mut buf = &buf[..take];
         v2.share -= take as u64;
         while !buf.is_empty() {
-            let take = buf.len().min((BLOCK_SIZE - v2.in_block) as usize);
+            let take = buf
+                .len()
+                .min(usize::try_from(BLOCK_SIZE - v2.in_block).unwrap_or(usize::MAX));
             v2.block.update(&buf[..take]);
             v2.in_block += take as u64;
             buf = &buf[take..];

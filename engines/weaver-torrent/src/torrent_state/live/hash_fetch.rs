@@ -116,7 +116,7 @@ pub(crate) fn block_request(v2: &V2Hashes, piece_length: u64, piece: u32) -> Opt
         root: f.root,
         base: 0,
         index: u32::try_from(u64::from(piece - f.first_piece) * blocks_per_piece).ok()?,
-        count: width as u32,
+        count: u32::try_from(width).ok()?,
         proof_layers: merkle::num_layers(width).checked_sub(1)?,
     })
 }
@@ -150,7 +150,7 @@ pub(crate) fn failed_blocks(
             Some(FailedBlock {
                 block: chunk.chunk_index,
                 sender,
-                leaf: merkle::hash_block(&buf[..len as usize]),
+                leaf: merkle::hash_block(&buf[..usize::try_from(len).ok()?]),
             })
         })
         .collect()

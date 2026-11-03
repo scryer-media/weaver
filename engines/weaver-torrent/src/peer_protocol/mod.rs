@@ -213,7 +213,9 @@ pub enum MessageDeserializeError {
 }
 
 pub fn serialize_piece_preamble(chunk: &ChunkInfo, mut buf: &mut [u8]) -> usize {
-    let len_prefix = MSGID_LEN as u32 + INTEGER_LEN as u32 * 2 + chunk.size;
+    let len_prefix = u32::try_from(MSGID_LEN + INTEGER_LEN * 2)
+        .expect("a piece header is nine bytes")
+        + chunk.size;
     BE::write_u32(&mut buf[0..4], len_prefix);
     buf[4] = MSGID_PIECE;
 
@@ -250,7 +252,8 @@ impl PartialBlock {
         if header[INTEGER_LEN] != MSGID_PIECE {
             return None;
         }
-        let len = BE::read_u32(&header[0..4]).checked_sub((MSGID_LEN + INTEGER_LEN * 2) as u32)?;
+        let len = BE::read_u32(&header[0..4])
+            .checked_sub(u32::try_from(MSGID_LEN + INTEGER_LEN * 2).ok()?)?;
         let received = u32::try_from(unread - header.len()).ok()?;
         (received < len).then_some(PartialBlock {
             index: BE::read_u32(&header[5..9]),
@@ -516,9 +519,12 @@ impl Message<'_> {
             };
         }
 
+        // A length a u32 cannot hold has no frame.
         macro_rules! write_preamble {
             ($msg_len:expr, $msg_id:expr) => {
-                out[0..4].copy_from_slice(&(($msg_len + 1u32).to_be_bytes()));
+                let len_prefix = u32::try_from($msg_len + MSGID_LEN)
+                    .map_err(|_| SerializeError::NoSpaceInBuffer)?;
+                out[0..4].copy_from_slice(&len_prefix.to_be_bytes());
                 out[4] = $msg_id;
             };
         }
@@ -533,7 +539,7 @@ impl Message<'_> {
                     Message::Reject(..) => MSGID_REJECT,
                     _ => unsafe { unreachable_unchecked() },
                 };
-                write_preamble!((INTEGER_LEN * 3) as u32, msg_id);
+                write_preamble!(INTEGER_LEN * 3, msg_id);
                 request.serialize_unchecked_len(&mut out[PREAMBLE_LEN..]);
                 Ok(TOTAL_LEN)
             }
@@ -541,7 +547,7 @@ impl Message<'_> {
                 let block_len = b.as_ref().len();
                 let total_len: usize = PREAMBLE_LEN + block_len;
                 check_len!(total_len);
-                write_preamble!(block_len as u32, MSGID_BITFIELD);
+                write_preamble!(block_len, MSGID_BITFIELD);
                 out[PREAMBLE_LEN..PREAMBLE_LEN + block_len].copy_from_slice(b.as_ref());
                 Ok(total_len)
             }
@@ -569,7 +575,7 @@ impl Message<'_> {
                 let payload_len = INTEGER_LEN * 2 + block_len;
                 let total_len = PREAMBLE_LEN + payload_len;
                 check_len!(total_len);
-                write_preamble!(payload_len as u32, MSGID_PIECE);
+                write_preamble!(payload_len, MSGID_PIECE);
                 p.serialize_unchecked_len(&mut out[PREAMBLE_LEN..]);
                 Ok(total_len)
             }
@@ -585,7 +591,7 @@ impl Message<'_> {
                     Message::Suggest(..) => MSGID_SUGGEST,
                     _ => MSGID_ALLOWED_FAST,
                 };
-                write_preamble!(INTEGER_LEN as u32, msg_id);
+                write_preamble!(INTEGER_LEN, msg_id);
                 out[5..9].copy_from_slice(&v.to_be_bytes());
                 Ok(9)
             }
@@ -598,7 +604,7 @@ impl Message<'_> {
             Message::Extended(e) => {
                 check_len!(PREAMBLE_LEN + 2);
                 let msg_len = e.serialize(&mut out[PREAMBLE_LEN..], peer_extended_messages)?;
-                write_preamble!(msg_len as u32, MSGID_EXTENDED);
+                write_preamble!(msg_len, MSGID_EXTENDED);
                 Ok(PREAMBLE_LEN + msg_len)
             }
             Message::HashRequest(r) | Message::HashReject(r) => {
@@ -607,14 +613,14 @@ impl Message<'_> {
                     Message::HashRequest(..) => MSGID_HASH_REQUEST,
                     _ => MSGID_HASH_REJECT,
                 };
-                write_preamble!(HASH_REQUEST_LEN as u32, msg_id);
+                write_preamble!(HASH_REQUEST_LEN, msg_id);
                 Ok(PREAMBLE_LEN + r.serialize_unchecked_len(&mut out[PREAMBLE_LEN..]))
             }
             Message::Hashes(h) => {
                 let hashes = h.hashes.as_ref();
                 let msg_len = HASH_REQUEST_LEN + hashes.len();
                 check_len!(PREAMBLE_LEN + msg_len);
-                write_preamble!(msg_len as u32, MSGID_HASHES);
+                write_preamble!(msg_len, MSGID_HASHES);
                 h.request.serialize_unchecked_len(&mut out[PREAMBLE_LEN..]);
                 out[PREAMBLE_LEN + HASH_REQUEST_LEN..PREAMBLE_LEN + msg_len]
                     .copy_from_slice(hashes);
@@ -686,7 +692,7 @@ impl Message<'_> {
         if !(min..=max).contains(&msg_len) {
             return Err(MessageDeserializeError::IncorrectMsgLen {
                 received: len_prefix - 1,
-                expected: (if msg_len < min { min } else { max }) as u32,
+                expected: u32::try_from(if msg_len < min { min } else { max }).unwrap_or(u32::MAX),
                 msg_id: MsgIdDebug(msg_id),
             });
         }

@@ -98,7 +98,9 @@ impl Availability {
             };
             return;
         }
-        moved.pieces.extend(pieces.map(|piece| piece as u32));
+        moved
+            .pieces
+            .extend(pieces.map(|piece| u32::try_from(piece).expect("piece indexes fit in u32")));
     }
 }
 
