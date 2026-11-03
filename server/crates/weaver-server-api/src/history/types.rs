@@ -186,6 +186,8 @@ pub struct HistoryPageInput {
     pub categories: Option<Vec<String>>,
     pub sort_field: Option<HistorySortField>,
     pub sort_direction: Option<HistorySortDirection>,
+    /// Keep only rows that finished at or after this epoch second.
+    pub completed_since_epoch_sec: Option<i64>,
 }
 
 #[derive(Debug, Clone, SimpleObject)]

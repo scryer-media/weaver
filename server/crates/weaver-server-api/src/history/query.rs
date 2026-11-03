@@ -469,6 +469,11 @@ impl HistoryPageSqlPlan {
         if normalize_history_categories(input.categories.clone()).is_some() {
             return None;
         }
+        // The same holds for a finish-time floor: the dashboards' "finished
+        // today" link sets one, the default view never does.
+        if input.completed_since_epoch_sec.is_some() {
+            return None;
+        }
         // Only the default `completed_at DESC` ordering matches the indexed SQL
         // order (idx_job_history_completed_job → completed_at DESC, job_id DESC).
         // Any other sort field/direction is not indexed and its Rust tie-breaks
@@ -756,8 +761,10 @@ fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> Hist
     // Delete-operation badges are attached by the caller for the final page only
     // (see `load_history_page`); they do not affect search, sort, status, or
     // counts, so they are omitted here.
+    let completed_since = input.completed_since_epoch_sec;
     let matched_search: Vec<HistoryItem> = rows
         .into_iter()
+        .filter(|row| completed_since.is_none_or(|since| row.completed_at >= since))
         .map(|row| {
             if requires_full_display_projection {
                 history_item_from_row(&row, None)
@@ -1086,6 +1093,7 @@ mod tests {
             categories: None,
             sort_field: None,
             sort_direction: None,
+            completed_since_epoch_sec: None,
         }
     }
 
@@ -1130,6 +1138,26 @@ mod tests {
         // Items are produced by the same `history_item_from_row`, so equal ids in
         // equal order means byte-identical items for identical data.
         assert_eq!(sql.items, rust.items, "page items mismatch");
+    }
+
+    #[test]
+    fn a_finish_time_floor_keeps_only_rows_finished_since() {
+        let db = Database::open_in_memory().unwrap();
+        for row in [
+            history_row(1, "complete", 1_000),
+            history_row(2, "failed", 1_100),
+            history_row(3, "complete", 1_200),
+        ] {
+            db.insert_job_history(&row).unwrap();
+        }
+        let mut input = page_input(0, 25, None);
+        input.completed_since_epoch_sec = Some(1_100);
+        assert!(HistoryPageSqlPlan::for_input(&input).is_none());
+        let page = rust_page(&db, input, &HashSet::new());
+        let mut ids: Vec<u64> = page.items.iter().map(|item| item.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![2, 3]);
+        assert_eq!(page.counts.all, 2);
     }
 
     // The bug this guards: a facet list built from the rows a filtered page
