@@ -39,12 +39,7 @@ pub(crate) const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 pub struct DhtBuilder {}
 
 impl DhtBuilder {
-    #[allow(clippy::new_ret_no_self)]
-    pub async fn new() -> crate::dht::Result<Dht> {
-        DhtState::new().await
-    }
-
-    pub async fn with_config(config: DhtConfig<'_>) -> crate::dht::Result<Dht> {
+    pub async fn with_config(config: DhtConfig) -> crate::dht::Result<Dht> {
         DhtState::with_config(config).await
     }
 }

@@ -39,11 +39,11 @@ use crate::core::{
     spawn_utils::{spawn, spawn_with_cancel},
 };
 use crate::crate_version;
+use crate::network::SocketFactory;
 use governor::{
     Quota, clock::Clock, middleware::NoOpMiddleware, nanos::Nanos, state::InMemoryState,
     state::NotKeyed,
 };
-use librqbit_dualstack_sockets::{BindDevice, UdpSocket};
 use parking_lot::RwLock;
 use std::num::NonZeroU32;
 
@@ -1109,40 +1109,8 @@ impl core::fmt::Debug for ResponseOrError {
     }
 }
 
-/// The socket the DHT talks through.
-///
-/// The kernel socket is called directly; a custom transport goes through the
-/// [`DatagramSocket`] trait object.
-enum DhtSocket {
-    Udp(UdpSocket),
-    Custom(Arc<dyn DatagramSocket>),
-}
-
-impl DhtSocket {
-    fn bind_addr(&self) -> SocketAddr {
-        match self {
-            Self::Udp(sock) => sock.bind_addr(),
-            Self::Custom(sock) => sock.bind_addr(),
-        }
-    }
-
-    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-        match self {
-            Self::Udp(sock) => sock.recv_from(buf).await,
-            Self::Custom(sock) => sock.recv_from(buf).await,
-        }
-    }
-
-    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
-        match self {
-            Self::Udp(sock) => sock.send_to(buf, target).await,
-            Self::Custom(sock) => sock.send_to(buf, target).await,
-        }
-    }
-}
-
 struct DhtWorker {
-    socket: DhtSocket,
+    socket: Arc<dyn DatagramSocket>,
     resolver: Arc<dyn Resolver>,
     dht: Arc<DhtState>,
 }
@@ -1377,7 +1345,7 @@ impl DhtWorker {
 
     async fn framer(
         &self,
-        socket: &DhtSocket,
+        socket: &dyn DatagramSocket,
         mut input_rx: UnboundedReceiver<WorkerSendRequest>,
         output_tx: Sender<(Message<ByteBufOwned>, SocketAddr)>,
     ) -> crate::dht::Result<()> {
@@ -1452,7 +1420,7 @@ impl DhtWorker {
     ) -> crate::dht::Result<()> {
         let (out_tx, mut out_rx) = channel(1);
         let framer = self
-            .framer(&self.socket, in_rx, out_tx)
+            .framer(&*self.socket, in_rx, out_tx)
             .instrument(debug_span!("dht_framer"));
 
         let bootstrap = self.bootstrap(bootstrap_addrs);
@@ -1526,19 +1494,20 @@ impl DhtWorker {
 }
 
 #[derive(Default)]
-pub struct DhtConfig<'a> {
+pub struct DhtConfig {
     pub peer_id: Option<Id20>,
     pub bootstrap_addrs: Option<Vec<String>>,
     pub routing_table: Option<RoutingTable>,
     pub routing_table_v6: Option<RoutingTable>,
     pub listen_addr: Option<SocketAddr>,
     pub cancellation_token: Option<CancellationToken>,
-    pub bind_device: Option<&'a BindDevice>,
-    /// Send and receive DHT traffic through this socket instead of binding a
-    /// kernel UDP socket. When set, `listen_addr` and `bind_device` are
-    /// ignored and the DHT reports the socket's `bind_addr()` as its listen
-    /// address.
+    /// Send and receive DHT traffic through this socket. When set,
+    /// `listen_addr` and `sockets` are ignored and the DHT reports the
+    /// socket's `bind_addr()` as its listen address.
     pub socket: Option<Arc<dyn DatagramSocket>>,
+    /// With no `socket`, the factory that binds the DHT's socket at
+    /// `listen_addr`. A DHT given neither does not start.
+    pub sockets: Option<Arc<dyn SocketFactory>>,
     /// Look up bootstrap hostnames through this resolver; with none, only
     /// bootstrap addresses are asked.
     pub resolver: Option<Arc<dyn Resolver>>,
@@ -1570,35 +1539,25 @@ fn generate_node_id(prefix: &[u8]) -> Id20 {
 }
 
 impl DhtState {
-    pub async fn new() -> crate::dht::Result<Arc<Self>> {
-        Self::with_config(DhtConfig::default()).await
-    }
     pub fn cancellation_token(&self) -> &CancellationToken {
         &self.cancellation_token
     }
 
     #[inline(never)]
-    pub fn with_config<'a>(
-        mut config: DhtConfig<'a>,
-    ) -> BoxFuture<'a, crate::dht::Result<Arc<Self>>> {
+    pub fn with_config<'a>(mut config: DhtConfig) -> BoxFuture<'a, crate::dht::Result<Arc<Self>>> {
         async move {
-            let socket = match config.socket.take() {
-                Some(socket) => DhtSocket::Custom(socket),
-                None => {
+            let socket = match (config.socket.take(), config.sockets.take()) {
+                (Some(socket), _) => socket,
+                (None, Some(sockets)) => {
                     let addr = config
                         .listen_addr
                         .unwrap_or((Ipv6Addr::UNSPECIFIED, 0).into());
-                    DhtSocket::Udp(
-                        UdpSocket::bind_udp(
-                            addr,
-                            librqbit_dualstack_sockets::BindOpts {
-                                request_dualstack: true,
-                                reuseport: false,
-                                device: config.bind_device,
-                            },
-                        )
-                        .map_err(|e| Error::Bind(Box::new(e)))?,
-                    )
+                    sockets.bind_udp(addr).await.map_err(Error::Bind)?
+                }
+                (None, None) => {
+                    return Err(Error::Bind(std::io::Error::other(
+                        "the DHT was given no socket",
+                    )));
                 }
             };
 
@@ -1761,6 +1720,7 @@ mod tests {
     async fn start_dht(bootstrap_addr: SocketAddr) -> Dht {
         DhtState::with_config(DhtConfig {
             listen_addr: Some((Ipv4Addr::LOCALHOST, 0).into()),
+            sockets: Some(crate::test_support::socket_factory()),
             bootstrap_addrs: Some(vec![bootstrap_addr.to_string()]),
             ..Default::default()
         })
@@ -1892,6 +1852,7 @@ mod tests {
 
         let dht = DhtState::with_config(DhtConfig {
             listen_addr: Some((Ipv4Addr::LOCALHOST, 0).into()),
+            sockets: Some(crate::test_support::socket_factory()),
             bootstrap_addrs: Some(vec![format!("bootstrap.invalid:{}", bootstrap_addr.port())]),
             resolver: Some(resolver.clone()),
             ..Default::default()
@@ -1923,6 +1884,7 @@ mod tests {
 
         let dht = DhtState::with_config(DhtConfig {
             listen_addr: Some((Ipv4Addr::LOCALHOST, 0).into()),
+            sockets: Some(crate::test_support::socket_factory()),
             bootstrap_addrs: Some(Vec::new()),
             ..Default::default()
         })
@@ -1964,12 +1926,10 @@ mod tests {
 
     // Start a DHT on loopback whose one bootstrap node is `bootstrap`, a socket the
     // test holds: whatever the DHT sends lands there and nowhere else.
-    async fn start_dht_with(
-        bootstrap: &Arc<dyn DatagramSocket>,
-        config: DhtConfig<'static>,
-    ) -> Dht {
+    async fn start_dht_with(bootstrap: &Arc<dyn DatagramSocket>, config: DhtConfig) -> Dht {
         DhtState::with_config(DhtConfig {
             listen_addr: Some((Ipv4Addr::LOCALHOST, 0).into()),
+            sockets: Some(crate::test_support::socket_factory()),
             bootstrap_addrs: Some(vec![bootstrap.bind_addr().to_string()]),
             ..config
         })
@@ -2542,7 +2502,7 @@ mod tests {
         dht.routers.write().extend([known, other]);
         let socket = crate::test_support::loopback_udp().await;
         let worker = super::DhtWorker {
-            socket: super::DhtSocket::Custom(socket),
+            socket,
             resolver: Arc::new(Names(vec![new, known])),
             dht: dht.clone(),
         };

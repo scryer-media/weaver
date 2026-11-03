@@ -557,7 +557,7 @@ impl NatPmpMapper {
 
     /// The socket the mapper asks the gateway over, from which only the
     /// gateway's answers come through, and the address it asks from.
-    async fn connect(
+    async fn open_gateway(
         route: Result<GatewayRoute, String>,
         clients: &dyn HttpClients,
     ) -> anyhow::Result<(GatewaySocket, IpAddr)> {
@@ -587,7 +587,7 @@ impl NatPmpMapper {
     /// never answers does.
     pub async fn run(self, cancel: CancellationToken, events: PortMapEvents) -> anyhow::Result<()> {
         let reports = PortMapReports::new(PortmapTransport::NatPmp, events);
-        let (socket, local_ip) = match Self::connect(self.route, self.clients.as_ref()).await {
+        let (socket, local_ip) = match Self::open_gateway(self.route, self.clients.as_ref()).await {
             Ok(connected) => connected,
             Err(e) => {
                 debug!("NAT-PMP / PCP mapper has no gateway to ask: {e:#}");

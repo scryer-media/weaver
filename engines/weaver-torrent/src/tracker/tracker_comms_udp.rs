@@ -19,7 +19,6 @@ use crate::core::{
     spawn_utils::spawn_with_cancel,
 };
 use anyhow::{Context, bail};
-use librqbit_dualstack_sockets::{BindDevice, UdpSocket};
 use parking_lot::RwLock;
 use rand::RngExt;
 use tokio_util::sync::CancellationToken;
@@ -317,33 +316,8 @@ struct ClientLocked {
     transactions: HashMap<TransactionId, tokio::sync::oneshot::Sender<Vec<u8>>>,
 }
 
-/// The socket the UDP tracker client talks through.
-///
-/// The kernel socket is called directly; a custom transport goes through the
-/// [`DatagramSocket`] trait object.
-enum UdpTrackerSocket {
-    Udp(UdpSocket),
-    Custom(Arc<dyn DatagramSocket>),
-}
-
-impl UdpTrackerSocket {
-    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-        match self {
-            Self::Udp(sock) => sock.recv_from(buf).await,
-            Self::Custom(sock) => sock.recv_from(buf).await,
-        }
-    }
-
-    async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
-        match self {
-            Self::Udp(sock) => sock.send_to(buf, target).await,
-            Self::Custom(sock) => sock.send_to(buf, target).await,
-        }
-    }
-}
-
 struct ClientShared {
-    sock: UdpTrackerSocket,
+    sock: Arc<dyn DatagramSocket>,
     resolver: Arc<dyn Resolver>,
     locked: RwLock<ClientLocked>,
 }
@@ -366,32 +340,8 @@ impl Drop for TransactionIdGuard<'_> {
 }
 
 impl UdpTrackerClient {
-    /// A client on a kernel UDP socket of its own, whose tracker hostnames
-    /// `resolver` looks up.
-    pub async fn new(
-        cancel_token: CancellationToken,
-        bind_device: Option<&BindDevice>,
-        resolver: Arc<dyn Resolver>,
-    ) -> anyhow::Result<Self> {
-        let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
-        let sock = UdpSocket::bind_udp(
-            addr,
-            librqbit_dualstack_sockets::BindOpts {
-                device: bind_device,
-                ..Default::default()
-            },
-        )
-        .with_context(|| format!("error creating UDP socket at {addr}"))?;
-
-        Ok(Self::spawn(
-            cancel_token,
-            UdpTrackerSocket::Udp(sock),
-            resolver,
-        ))
-    }
-
-    /// Create a client that sends and receives tracker traffic through `socket`
-    /// instead of binding a kernel UDP socket.
+    /// Create a client that sends and receives tracker traffic through
+    /// `socket`.
     ///
     /// Tracker hostnames are looked up through `resolver`; with none, only
     /// trackers named by their address are asked.
@@ -401,12 +351,12 @@ impl UdpTrackerClient {
         resolver: Option<Arc<dyn Resolver>>,
     ) -> Self {
         let resolver = resolver.unwrap_or_else(|| Arc::new(NoNames));
-        Self::spawn(cancel_token, UdpTrackerSocket::Custom(socket), resolver)
+        Self::spawn(cancel_token, socket, resolver)
     }
 
     fn spawn(
         cancel_token: CancellationToken,
-        sock: UdpTrackerSocket,
+        sock: Arc<dyn DatagramSocket>,
         resolver: Arc<dyn Resolver>,
     ) -> Self {
         let client = Self {
@@ -573,14 +523,14 @@ impl UdpTrackerClient {
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write, net::SocketAddr, str::FromStr, sync::Arc};
+    use std::{net::SocketAddr, sync::Arc};
 
-    use crate::core::{hash_id::Id20, net::DatagramSocket, peer_id::generate_peer_id};
+    use crate::core::{hash_id::Id20, net::DatagramSocket};
     use tokio_util::sync::CancellationToken;
 
     use crate::tracker::tracker_comms_udp::{
         ACTION_CONNECT, AnnounceFields, CONNECTION_ID_MAGIC, EVENT_NONE, Request, Response,
-        ScrapeResponse, UdpTrackerClient, new_transaction_id,
+        ScrapeResponse, UdpTrackerClient,
     };
 
     #[tokio::test]
@@ -929,73 +879,5 @@ mod tests {
         token.cancel();
         drop(client);
         tracker.abort();
-    }
-
-    #[ignore]
-    #[tokio::test]
-    async fn test_announce() {
-        let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
-        sock.connect("opentor.net:6969").await.unwrap();
-
-        let tid = new_transaction_id();
-        let mut write_buf = [0u8; 16384];
-        let mut read_buf = vec![0u8; 4096];
-
-        let len = Request::Connect.serialize(tid, &mut write_buf).unwrap();
-
-        sock.send(&write_buf[..len]).await.unwrap();
-
-        let size = sock.recv(&mut read_buf).await.unwrap();
-
-        let (rtid, response) = Response::parse(&read_buf[..size], false).unwrap();
-        assert_eq!(tid, rtid);
-        let connection_id = match response {
-            Response::Connect(connection_id) => {
-                dbg!(connection_id)
-            }
-            other => panic!("unexpected response {:?}", other),
-        };
-
-        let hash = Id20::from_str("775459190aa65566591634203f8d9f17d341f969").unwrap();
-
-        let tid = new_transaction_id();
-        let request = Request::Announce(
-            connection_id,
-            AnnounceFields {
-                info_hash: hash,
-                peer_id: generate_peer_id(b"-xx1234-"),
-                downloaded: 0,
-                left: 0,
-                uploaded: 0,
-                event: EVENT_NONE,
-                key: 0, // whatever that is?
-                num_want: 50,
-                port: 24563,
-            },
-        );
-        let size = request.serialize(tid, &mut write_buf).unwrap();
-
-        sock.send(&write_buf[..size]).await.unwrap();
-        let size = sock.recv(&mut read_buf).await.unwrap();
-
-        {
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open("/tmp/proto.bin")
-                .unwrap();
-            f.write_all(&read_buf[..size]).unwrap();
-        }
-
-        dbg!(&read_buf[..size]);
-        let (rtid, response) = Response::parse(&read_buf[..size], false).unwrap();
-        assert_eq!(tid, rtid);
-        match response {
-            Response::Announce(r) => {
-                dbg!(r);
-            }
-            other => panic!("unexpected response {:?}", other),
-        }
     }
 }

@@ -1444,6 +1444,16 @@ impl Session {
                 None => None,
             };
 
+            // The sockets the DHT and the UDP trackers bind: the session's
+            // factory, else the kernel's on the session's device.
+            let datagram_sockets: Arc<dyn SocketFactory> = match opts.socket_factory.clone() {
+                Some(factory) => factory,
+                None => Arc::new(
+                    crate::network::KernelSockets::new(opts.bind_device_name.as_deref())
+                        .context("error opening the session's sockets")?,
+                ),
+            };
+
             let listen_result = if let Some(listen_opts) = opts.listen.take() {
                 Some(
                     listen_opts
@@ -1480,8 +1490,8 @@ impl Session {
                         DhtConfig {
                             bootstrap_addrs: dht_config.bootstrap_addrs,
                             cancellation_token: Some(swarm.clone()),
-                            bind_device: bind_device.as_ref(),
                             socket: dht_socket,
+                            sockets: Some(datagram_sockets.clone()),
                             resolver: Some(resolver.clone()),
                             node_id_prefix: dht_node_id_prefix,
                             client_version: dht_client_version,
@@ -1496,9 +1506,9 @@ impl Session {
                     DhtBuilder::with_config(DhtConfig {
                         bootstrap_addrs: dht_config.bootstrap_addrs,
                         cancellation_token: Some(swarm.child_token()),
-                        bind_device: bind_device.as_ref(),
                         listen_addr: Some(listen_addr),
                         socket: dht_socket,
+                        sockets: Some(datagram_sockets.clone()),
                         resolver: Some(resolver.clone()),
                         node_id_prefix: dht_node_id_prefix,
                         client_version: dht_client_version,
@@ -1589,24 +1599,17 @@ impl Session {
                 None
             };
 
-            let udp_tracker_client = match opts.socket_factory.as_ref() {
-                Some(factory) => {
-                    let addr: SocketAddr = if opts.ipv4_only {
-                        (Ipv4Addr::UNSPECIFIED, 0).into()
-                    } else {
-                        (Ipv6Addr::UNSPECIFIED, 0).into()
-                    };
-                    let socket = factory
-                        .bind_udp(addr)
-                        .await
-                        .context("error binding UDP tracker socket through socket factory")?;
-                    UdpTrackerClient::new_with_socket(token.clone(), socket, Some(resolver.clone()))
-                }
-                None => {
-                    UdpTrackerClient::new(token.clone(), bind_device.as_ref(), resolver.clone())
-                        .await
-                        .context("error creating UDP tracker client")?
-                }
+            let udp_tracker_client = {
+                let addr: SocketAddr = if opts.ipv4_only {
+                    (Ipv4Addr::UNSPECIFIED, 0).into()
+                } else {
+                    (Ipv6Addr::UNSPECIFIED, 0).into()
+                };
+                let socket = datagram_sockets
+                    .bind_udp(addr)
+                    .await
+                    .context("error binding the UDP tracker socket")?;
+                UdpTrackerClient::new_with_socket(token.clone(), socket, Some(resolver.clone()))
             };
 
             let lsd = {
@@ -3992,6 +3995,7 @@ mod tests {
         let node_addr = node.bind_addr();
         let dht = DhtState::with_config(DhtConfig {
             listen_addr: Some((Ipv4Addr::LOCALHOST, 0).into()),
+            sockets: Some(crate::test_support::socket_factory()),
             bootstrap_addrs: Some(vec![node_addr.to_string()]),
             ..Default::default()
         })

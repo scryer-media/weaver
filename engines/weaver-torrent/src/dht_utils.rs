@@ -365,7 +365,12 @@ mod tests {
         init_logging();
 
         let info_hash = Id20::from_str("cab507494d02ebb1178b38f2e9d7be299c86b862").unwrap();
-        let dht = DhtBuilder::new().await.unwrap();
+        let dht = DhtBuilder::with_config(crate::dht::DhtConfig {
+            sockets: Some(crate::test_support::socket_factory()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
 
         let peer_rx = dht
             .get_peers(info_hash, None)
