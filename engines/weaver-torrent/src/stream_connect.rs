@@ -17,8 +17,8 @@ use std::{
 use crate::core::hash_id::Id20;
 use anyhow::bail;
 use futures::TryFutureExt;
+use librqbit_dualstack_sockets::BindDevice;
 use librqbit_dualstack_sockets::ConnectOpts;
-use librqbit_utp::BindDevice;
 use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 use tracing::debug;
@@ -406,7 +406,7 @@ impl StreamConnector {
         tokio::pin!(utp_connect);
 
         let mut tcp_err: Option<Option<librqbit_dualstack_sockets::Error>> = None;
-        let mut utp_err: Option<Option<librqbit_utp::Error>> = None;
+        let mut utp_err: Option<Option<weaver_utp::Error>> = None;
 
         // wait until all fail, or one succeeds.
         loop {
@@ -461,19 +461,25 @@ impl StreamConnector {
 mod tests {
     use std::net::Ipv4Addr;
 
-    use librqbit_utp::UtpSocketUdp;
+    use crate::network::KernelSockets;
 
     use super::*;
     use crate::peer_info_reader::tests::Dialed;
 
+    async fn loopback_utp() -> UtpSocket {
+        UtpSocket::bind(
+            &KernelSockets::on_device(None),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Default::default(),
+        )
+        .await
+        .unwrap()
+    }
+
     /// A connector that may use TCP, and uTP when `utp` holds.
     async fn connector(utp: bool) -> StreamConnector {
         let utp_socket = match utp {
-            true => Some(UtpSocket::Udp(
-                UtpSocketUdp::new_udp((Ipv4Addr::LOCALHOST, 0).into())
-                    .await
-                    .unwrap(),
-            )),
+            true => Some(loopback_utp().await),
             false => None,
         };
         StreamConnector::new(StreamConnectorArgs {
@@ -495,9 +501,7 @@ mod tests {
     #[tokio::test]
     async fn a_utp_only_connection_dials_utp_and_never_tcp() {
         let connector = connector(true).await;
-        let theirs = UtpSocketUdp::new_udp((Ipv4Addr::LOCALHOST, 0).into())
-            .await
-            .unwrap();
+        let theirs = loopback_utp().await;
         let (accepted, connected) = tokio::join!(
             theirs.accept(),
             connector.connect(theirs.bind_addr(), Transports::Utp)

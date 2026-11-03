@@ -18,7 +18,8 @@ use crate::{
     tests::test_util::setup_test_logging,
 };
 
-// Create this from librqbit_utp: cargo run --release --example create_canary_file /tmp/canary_4096m 4096
+// A torrent of a canary file `create_canary` writes, served by the other
+// client.
 const TORRENT_FILENAME: &str = "/tmp/canary.torrent";
 
 // Where to download
@@ -41,6 +42,33 @@ fn parse_listen_and_client_addr() -> (SocketAddr, SocketAddr) {
     let client =
         std::env::var("E2E_CLIENT_ADDR").map_or(DEFAULT_OTHER_CLIENT_ADDR, |v| v.parse().unwrap());
     (listen, client)
+}
+
+// A file of `mib` MiB whose bytes count 0 to 255 over and over, so a
+// misplaced byte shows where it landed.
+fn write_canary(path: &std::path::Path, mib: u64) -> std::io::Result<()> {
+    use std::io::Write;
+    let pattern: Vec<u8> = (0..=u8::MAX).collect();
+    let mut file = std::io::BufWriter::new(
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)?,
+    );
+    for _ in 0..mib * 1024 * 1024 / pattern.len() as u64 {
+        file.write_all(&pattern)?;
+    }
+    file.flush()
+}
+
+// Writes the canary: E2E_CANARY_PATH (default /tmp/canary_4096m) of
+// E2E_CANARY_MIB MiB (default 4096).
+#[test]
+#[ignore]
+fn create_canary() {
+    let path = std::env::var("E2E_CANARY_PATH").unwrap_or_else(|_| "/tmp/canary_4096m".into());
+    let mib = std::env::var("E2E_CANARY_MIB").map_or(4096, |v| v.parse().unwrap());
+    write_canary(std::path::Path::new(&path), mib).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -90,8 +118,8 @@ async fn test_tcp_with_another_client() {
 // A test to download a canary file from another torrent client on 127.0.0.1:27312.
 // Disabled, uncomment if developing / testing / benchmarking.
 //
-// The canary file is created from librqbit_utp, then served from the other torrent client:
-// cargo run --release --example create_canary_file /tmp/canary_4096m 4096
+// The canary file is written by `create_canary`, then served from the other
+// torrent client.
 async fn test_with_another_client(sopts: SessionOptions, addr: SocketAddr) {
     #[cfg(unix)]
     {

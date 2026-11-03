@@ -102,7 +102,7 @@ use futures::{
     stream::{BoxStream, FuturesUnordered},
 };
 use http::StatusCode;
-use librqbit_utp::BindDevice;
+use librqbit_dualstack_sockets::BindDevice;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;

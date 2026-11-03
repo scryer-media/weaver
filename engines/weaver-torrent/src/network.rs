@@ -24,8 +24,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use librqbit_dualstack_sockets::PollSendToVectored;
-use librqbit_utp::{Transport, UtpSocketUdp, UtpStream};
+use weaver_utp::{DefaultUtpEnvironment, PollSendToVectored, Transport, UtpStream};
 
 pub use crate::core::net::{BoxFuture, DatagramSocket, NoNames, Resolved, Resolver};
 pub use crate::type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite};
@@ -157,46 +156,41 @@ impl Transport for DatagramTransport {
     }
 }
 
-// librqbit-utp does not export its default environment type by name, so it
-// is recovered from the `UtpSocketUdp` alias.
-pub(crate) trait UtpSocketEnv {
-    type Env;
-}
-
-impl<T, E> UtpSocketEnv for librqbit_utp::UtpSocket<T, E> {
-    type Env = E;
-}
-
-type DefaultUtpEnvironment = <UtpSocketUdp as UtpSocketEnv>::Env;
-
-/// The session's uTP socket: over a kernel UDP socket by default, or over a
-/// datagram socket from a [`SocketFactory`].
+/// The session's uTP socket, over a datagram socket from a
+/// [`SocketFactory`], or from [`KernelSockets`] when none is set.
 #[derive(Clone, Debug)]
-pub(crate) enum UtpSocket {
-    Udp(Arc<UtpSocketUdp>),
-    Custom(Arc<librqbit_utp::UtpSocket<DatagramTransport, DefaultUtpEnvironment>>),
-}
+pub(crate) struct UtpSocket(Arc<weaver_utp::UtpSocket<DatagramTransport, DefaultUtpEnvironment>>);
 
 impl UtpSocket {
+    /// A uTP socket over a datagram socket `factory` binds on `addr`.
+    pub(crate) async fn bind(
+        factory: &dyn SocketFactory,
+        addr: SocketAddr,
+        opts: weaver_utp::SocketOpts,
+    ) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        let transport = factory
+            .bind_udp(addr)
+            .await
+            .context("error binding UDP socket")?;
+        let sock = weaver_utp::UtpSocket::new_with_opts(
+            DatagramTransport(transport),
+            DefaultUtpEnvironment::default(),
+            opts,
+        )?;
+        Ok(Self(sock))
+    }
+
     pub(crate) fn bind_addr(&self) -> SocketAddr {
-        match self {
-            UtpSocket::Udp(s) => s.bind_addr(),
-            UtpSocket::Custom(s) => s.bind_addr(),
-        }
+        self.0.bind_addr()
     }
 
-    pub(crate) async fn accept(&self) -> librqbit_utp::Result<UtpStream> {
-        match self {
-            UtpSocket::Udp(s) => s.accept().await,
-            UtpSocket::Custom(s) => s.accept().await,
-        }
+    pub(crate) async fn accept(&self) -> weaver_utp::Result<UtpStream> {
+        self.0.accept().await
     }
 
-    pub(crate) async fn connect(&self, remote: SocketAddr) -> librqbit_utp::Result<UtpStream> {
-        match self {
-            UtpSocket::Udp(s) => s.connect(remote).await,
-            UtpSocket::Custom(s) => s.connect(remote).await,
-        }
+    pub(crate) async fn connect(&self, remote: SocketAddr) -> weaver_utp::Result<UtpStream> {
+        self.0.connect(remote).await
     }
 }
 
@@ -216,6 +210,13 @@ impl KernelSockets {
             .map(librqbit_dualstack_sockets::BindDevice::new_from_name)
             .transpose()?;
         Ok(Self { bind_device })
+    }
+
+    /// The kernel sockets of a session bound to `bind_device`, or to none.
+    pub(crate) fn on_device(bind_device: Option<&librqbit_dualstack_sockets::BindDevice>) -> Self {
+        Self {
+            bind_device: bind_device.cloned(),
+        }
     }
 
     fn bind_opts(&self) -> librqbit_dualstack_sockets::BindOpts<'_> {

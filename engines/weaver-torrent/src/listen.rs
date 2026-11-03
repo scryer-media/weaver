@@ -11,14 +11,13 @@ use std::{
 };
 
 use anyhow::Context;
-use librqbit_dualstack_sockets::{BindOpts, TcpListener};
-use librqbit_utp::{BindDevice, UtpSocketUdp, UtpSocketUdpOpts};
+use librqbit_dualstack_sockets::{BindDevice, BindOpts, TcpListener};
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::{
-    network::{DatagramTransport, SocketFactory, StreamListener, UtpSocket},
+    network::{KernelSockets, SocketFactory, StreamListener, UtpSocket},
     stream_connect::ConnectionKind,
     vectored_traits::AsyncReadVectored,
 };
@@ -88,7 +87,7 @@ pub struct ListenerOptions {
     pub mode: ListenerMode,
     pub listen_addr: SocketAddr,
     pub enable_upnp_port_forwarding: bool,
-    pub utp_opts: Option<librqbit_utp::SocketOpts>,
+    pub utp_opts: Option<weaver_utp::SocketOpts>,
     pub announce_port: Option<u16>,
     pub ipv4_only: bool,
     pub max_pending_incoming_handshake_checks: usize,
@@ -199,7 +198,7 @@ async fn bind(
     mode: ListenerMode,
     mut listen_addr: SocketAddr,
     ipv4_only: bool,
-    utp_opts: librqbit_utp::SocketOpts,
+    utp_opts: weaver_utp::SocketOpts,
     bind_device: Option<&BindDevice>,
     socket_factory: Option<&Arc<dyn SocketFactory>>,
     peers: bool,
@@ -240,20 +239,17 @@ async fn bind(
     };
 
     let utp_socket = if mode.utp_enabled() {
-        let bind_result: Result<UtpSocket, Box<dyn std::error::Error + Send + Sync>> =
-            match socket_factory {
-                Some(factory) => bind_custom_utp(factory.as_ref(), listen_addr, utp_opts)
-                    .await
-                    .map_err(Into::into),
-                None => UtpSocketUdp::new_udp_with_opts(
+        let bind_result = match socket_factory {
+            Some(factory) => UtpSocket::bind(factory.as_ref(), listen_addr, utp_opts).await,
+            None => {
+                UtpSocket::bind(
+                    &KernelSockets::on_device(bind_device),
                     listen_addr,
                     utp_opts,
-                    UtpSocketUdpOpts { bind_device },
                 )
                 .await
-                .map(UtpSocket::Udp)
-                .map_err(Into::into),
-            };
+            }
+        };
         match bind_result {
             Ok(sock) => {
                 listen_addr = sock.bind_addr();
@@ -269,7 +265,7 @@ async fn bind(
                 None
             }
             Err(e) => {
-                return Err(anyhow::Error::from_boxed(e));
+                return Err(e);
             }
         }
     } else {
@@ -282,23 +278,6 @@ async fn bind(
         utp_socket,
         addr: listen_addr,
     })
-}
-
-async fn bind_custom_utp(
-    factory: &dyn SocketFactory,
-    listen_addr: SocketAddr,
-    utp_opts: librqbit_utp::SocketOpts,
-) -> anyhow::Result<UtpSocket> {
-    let transport = factory
-        .bind_udp(listen_addr)
-        .await
-        .context("error binding UDP socket")?;
-    let sock = librqbit_utp::UtpSocket::new_with_opts(
-        DatagramTransport(transport),
-        Default::default(),
-        utp_opts,
-    )?;
-    Ok(UtpSocket::Custom(sock))
 }
 
 pub(crate) trait Accept {
