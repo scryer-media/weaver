@@ -86,7 +86,7 @@ pub use self::streaming::FileStream;
 // - live -> error
 pub enum ManagedTorrentState {
     Initializing(Arc<TorrentStateInitializing>),
-    Paused(TorrentStatePaused),
+    Paused(Box<TorrentStatePaused>),
     Live(Arc<TorrentStateLive>),
     Error(anyhow::Error),
 
@@ -939,7 +939,7 @@ impl ManagedTorrent {
                                     };
 
                                     paused.peers = checked.take_peers();
-                                    g.state = ManagedTorrentState::Paused(paused);
+                                    g.state = ManagedTorrentState::Paused(Box::new(paused));
                                     t.state_change_notify.notify_waiters();
                                     _start(&t, peer_rx, start_paused, session, Some(g), token)
                                 }
@@ -1258,7 +1258,7 @@ impl ManagedTorrent {
         let mut g = self.locked.write();
         if let ManagedTorrentState::Live(live) = &g.state {
             let paused = live.pause()?;
-            g.state = ManagedTorrentState::Paused(paused);
+            g.state = ManagedTorrentState::Paused(Box::new(paused));
             self.state_change_notify.notify_waiters();
         }
         Ok(())
@@ -1277,7 +1277,7 @@ impl ManagedTorrent {
         match &g.state {
             ManagedTorrentState::Live(live) => {
                 let paused = live.pause()?;
-                g.state = ManagedTorrentState::Paused(paused);
+                g.state = ManagedTorrentState::Paused(Box::new(paused));
                 g.paused = true;
                 self.state_change_notify.notify_waiters();
                 Ok(())
