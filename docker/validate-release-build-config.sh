@@ -5,6 +5,12 @@
 
 set -eu
 
+config_only=false
+if [ "${1:-}" = "--config-only" ]; then
+    config_only=true
+    shift
+fi
+
 workflow_file=${1:-.github/workflows/deploy.yml}
 
 if [ ! -f "$workflow_file" ]; then
@@ -66,6 +72,10 @@ sbom=$(workflow_value sbom)
     printf 'docker-publish must emit an SBOM; found %s\n' "$sbom" >&2
     exit 1
 }
+
+if [ "$config_only" = true ]; then
+    exit 0
+fi
 
 check_dir=$(mktemp -d)
 cleanup() {
