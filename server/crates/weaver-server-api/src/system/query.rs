@@ -710,6 +710,7 @@ async fn collect_server_health(
     let pool_busy = pre.iter().any(|snapshot| snapshot.busy > 0);
 
     let health = pool.health().lock().await;
+    let now = std::time::Instant::now();
     pre.into_iter()
         .enumerate()
         .map(|(idx, snapshot)| {
@@ -776,6 +777,7 @@ async fn collect_server_health(
                 failure_count: srv.failure_count,
                 consecutive_failures: srv.consecutive_failures,
                 premature_deaths: health.recent_premature_deaths(idx) as u32,
+                down: srv.state().is_down(now),
                 server_id: snapshot.server_id,
                 pool_index: idx,
             }

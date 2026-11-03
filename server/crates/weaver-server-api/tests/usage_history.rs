@@ -147,27 +147,7 @@ async fn jobs_finished_in_the_range_count_by_how_they_ended() {
         (3, "failed", start + 120),
         (4, "complete", start - 3 * 86_400),
     ] {
-        harness.insert_history_row(&weaver_server_core::JobHistoryRow {
-            protocol: weaver_server_core::jobs::Protocol::Nzb,
-            job_id: id,
-            job_hash: None,
-            name: format!("job-{id}"),
-            status: status.to_string(),
-            error_message: None,
-            total_bytes: 0,
-            downloaded_bytes: 0,
-            optional_recovery_bytes: 0,
-            optional_recovery_downloaded_bytes: 0,
-            failed_bytes: 0,
-            health: 1000,
-            category: None,
-            output_dir: None,
-            nzb_path: None,
-            created_at: at - 10,
-            completed_at: at,
-            metadata: None,
-            server_attribution: None,
-        });
+        harness.insert_history_row(&finished_row(id, status, at));
     }
     let response = harness
         .execute_with_variables(
@@ -228,4 +208,69 @@ async fn an_empty_ledger_reads_as_zero() {
             .iter()
             .all(|entry| entry["bytes"] == 0)
     );
+}
+
+fn finished_row(id: u64, status: &str, at: i64) -> weaver_server_core::JobHistoryRow {
+    weaver_server_core::JobHistoryRow {
+        protocol: weaver_server_core::jobs::Protocol::Nzb,
+        job_id: id,
+        job_hash: None,
+        name: format!("job-{id}"),
+        status: status.to_string(),
+        error_message: None,
+        total_bytes: 0,
+        downloaded_bytes: 0,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: None,
+        nzb_path: None,
+        created_at: at - 10,
+        completed_at: at,
+        metadata: None,
+        server_attribution: None,
+    }
+}
+
+// The Overview's finished count links to History from the same start; the
+// two must agree. History shows a cancelled job as failed, and a paused row
+// has not finished.
+#[tokio::test]
+async fn the_finished_count_matches_the_history_it_links_to() {
+    let harness = TestHarness::new().await;
+    let date = day(2024, 5, 2).unwrap();
+    let start = chrono::Local
+        .from_local_datetime(&date.and_hms_opt(0, 0, 0).unwrap())
+        .earliest()
+        .unwrap()
+        .timestamp();
+    for (id, status) in [
+        (1, "complete"),
+        (2, "failed"),
+        (3, "cancelled"),
+        (4, "paused"),
+    ] {
+        harness.insert_history_row(&finished_row(id, status, start + 3_600 + id as i64));
+    }
+    let response = harness
+        .execute_with_variables(
+            r#"query($since: Int!) {
+                usageHistory(range: { period: CUSTOM, fromDay: "2024-05-02", toDay: "2024-05-02" }) {
+                    finishedInRange { complete partial failed }
+                }
+                historyPage(input: { pageIndex: 0, pageSize: 50, completedSinceEpochSec: $since }) {
+                    totalCount
+                }
+            }"#,
+            variables(serde_json::json!({ "since": start })),
+        )
+        .await;
+    assert_no_errors(&response);
+    let data = response_data(&response);
+    let finished = &data["usageHistory"]["finishedInRange"];
+    assert_eq!(finished["complete"], 1);
+    assert_eq!(finished["failed"], 2);
+    assert_eq!(data["historyPage"]["totalCount"], 3);
 }

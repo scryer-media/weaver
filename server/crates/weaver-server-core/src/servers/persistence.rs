@@ -133,6 +133,20 @@ impl Database {
                         &[SqlArg::Text(crate::proxies::Consumer::Server(id).key())],
                     )
                     .await?;
+                    // A new server can take this id; it must not inherit the
+                    // removed server's data used.
+                    tx.execute(
+                        "DELETE FROM usage_daily WHERE consumer_kind = {} AND consumer_id = {}",
+                        &[
+                            SqlArg::Text(
+                                crate::operations::UsageConsumerKind::Server
+                                    .as_str()
+                                    .to_string(),
+                            ),
+                            SqlArg::Text(id.to_string()),
+                        ],
+                    )
+                    .await?;
                     Ok(changed > 0)
                 })
             })

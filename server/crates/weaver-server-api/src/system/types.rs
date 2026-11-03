@@ -96,6 +96,7 @@ impl From<DownloadBlockKind> for DownloadBlockKindGql {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, SimpleObject)]
+#[graphql(complex)]
 pub struct DownloadBlock {
     pub kind: DownloadBlockKindGql,
     /// The egress whose download quota is holding downloads, while one is.
@@ -111,6 +112,17 @@ pub struct DownloadBlock {
     pub scheduled_speed_limit: Option<u64>,
     /// Why a schedule rule is holding new downloads, while one is.
     pub schedule_hold_reason: Option<String>,
+}
+
+#[ComplexObject]
+impl DownloadBlock {
+    /// When a timed pause lifts by itself, in epoch milliseconds. Absent for
+    /// a pause that waits to be resumed by hand.
+    async fn resume_at_epoch_ms(&self, ctx: &Context<'_>) -> Option<f64> {
+        let scheduled = ctx.data_opt::<crate::ScheduledResumeCoordinator>()?;
+        let at = scheduled.resume_at().await;
+        (at > 0).then(|| at as f64 * 1000.0)
+    }
 }
 
 impl From<&DownloadBlockState> for DownloadBlock {
@@ -1271,6 +1283,10 @@ pub struct ServerHealth {
     pub consecutive_failures: u32,
     /// Connections that died before reaching a healthy age, recently.
     pub premature_deaths: u32,
+    /// Out of use: switched off by a fault, or in a transport cooldown still
+    /// running. A capacity hold is not down. The data-used ledger counts time
+    /// down by the same rule.
+    pub down: bool,
     /// The server's saved id, which the data-used ledger counts it under.
     pub server_id: Option<u32>,
     /// This server's position in the connection pool, which is its

@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 
-use chrono::{Datelike, Days, NaiveDate};
+use chrono::{Datelike, Days, Local, NaiveDate, TimeZone};
 
 use crate::StateError;
 use crate::persistence::Database;
@@ -26,6 +26,9 @@ mod tests;
 pub const USAGE_FLUSH_INTERVAL_SECS: u64 = 5;
 /// Daily rows older than this many days fold into one row per consumer.
 pub const USAGE_RETENTION_DAYS: u64 = 400;
+/// The most down time one reading may add. A host that slept, or a clock
+/// stepped forward, would otherwise land the whole gap on one day.
+pub const USAGE_MAX_DOWN_STEP_SECS: i64 = 60;
 /// The day a consumer's folded older rows are kept under. It sorts before
 /// every real date, so a range with a start never reads it.
 const EARLIER_DAY: &str = "0000-00-00";
@@ -155,6 +158,20 @@ pub fn week_start(today: NaiveDate) -> NaiveDate {
         .unwrap_or(today)
 }
 
+/// The seconds a local date really has: 86,400, or an hour either way on
+/// the days the clocks change.
+pub fn seconds_in_day(day: NaiveDate) -> u64 {
+    let start = |date: NaiveDate| {
+        date.and_hms_opt(0, 0, 0)
+            .and_then(|midnight| Local.from_local_datetime(&midnight).earliest())
+            .map(|moment| moment.timestamp())
+    };
+    match (start(day), day.succ_opt().and_then(start)) {
+        (Some(from), Some(to)) if to > from => u64::try_from(to - from).unwrap_or(86_400),
+        _ => 86_400,
+    }
+}
+
 fn retention_cutoff(today: NaiveDate) -> NaiveDate {
     today
         .checked_sub_days(Days::new(USAGE_RETENTION_DAYS))
@@ -242,6 +259,15 @@ pub fn summarize_usage(
     }
     for row in rows {
         let Some(day) = row.day else {
+            // Folded days sit before every date: only a range with no start
+            // reaches back to them.
+            if start.is_none() {
+                consumers
+                    .entry((row.kind.clone(), row.consumer_id.clone()))
+                    .or_insert_with(|| UsageConsumerSummary::empty(&row.kind, &row.consumer_id))
+                    .range
+                    .add(&row.counts);
+            }
             continue;
         };
         let key = (row.kind.clone(), row.consumer_id.clone());
@@ -458,9 +484,12 @@ impl UsageRecorder {
             self.prime(reading, now_epoch_sec);
             return;
         }
-        let elapsed = state
-            .last_tick_epoch_sec
-            .map_or(0, |last| now_epoch_sec.saturating_sub(last).max(0));
+        let elapsed = state.last_tick_epoch_sec.map_or(0, |last| {
+            now_epoch_sec
+                .saturating_sub(last)
+                .clamp(0, USAGE_MAX_DOWN_STEP_SECS)
+        });
+        let day_seconds = seconds_in_day(today);
         state.last_tick_epoch_sec = Some(now_epoch_sec);
 
         for server in &reading.servers {
@@ -510,15 +539,16 @@ impl UsageRecorder {
                 );
             }
             if !counts.is_zero() {
-                state
+                let pending = state
                     .pending
                     .entry((
                         today,
                         UsageConsumerKind::Server,
                         server.server_id.to_string(),
                     ))
-                    .or_default()
-                    .add(&counts);
+                    .or_default();
+                pending.add(&counts);
+                pending.down_seconds = pending.down_seconds.min(day_seconds);
             }
         }
 
@@ -640,7 +670,11 @@ const ADD_USAGE_DAY: &str = "INSERT INTO usage_daily
         bytes_downloaded = usage_daily.bytes_downloaded + excluded.bytes_downloaded,
         articles_tried = usage_daily.articles_tried + excluded.articles_tried,
         articles_succeeded = usage_daily.articles_succeeded + excluded.articles_succeeded,
-        down_seconds = usage_daily.down_seconds + excluded.down_seconds";
+        down_seconds = CASE
+            WHEN usage_daily.down_seconds + excluded.down_seconds > {}
+            THEN {}
+            ELSE usage_daily.down_seconds + excluded.down_seconds
+        END";
 
 // Rows past retention add into the consumer's earlier row, then go.
 const FOLD_OLD_DAYS: &str = "INSERT INTO usage_daily
@@ -673,6 +707,8 @@ impl Database {
             .rows
             .iter()
             .map(|row| {
+                // A day never holds more down time than it has seconds.
+                let day_cap = SqlArg::I64(to_i64(row.day.map_or(u64::MAX, seconds_in_day)));
                 (
                     ADD_USAGE_DAY,
                     vec![
@@ -683,6 +719,8 @@ impl Database {
                         SqlArg::I64(to_i64(row.counts.articles_tried)),
                         SqlArg::I64(to_i64(row.counts.articles_succeeded)),
                         SqlArg::I64(to_i64(row.counts.down_seconds)),
+                        day_cap.clone(),
+                        day_cap,
                     ],
                 )
             })
@@ -795,7 +833,8 @@ impl Database {
     }
 
     /// Jobs that finished in `[since, until)`, in epoch seconds, by how they
-    /// ended. Cancelled and paused rows are not counted.
+    /// ended. History shows a cancelled job as failed, so it counts as one; a
+    /// paused row has not finished and is not counted.
     pub fn count_finished_jobs(
         &self,
         since_epoch_sec: Option<i64>,
@@ -820,7 +859,7 @@ impl Database {
                 match row.text("status")?.as_str() {
                     "complete" => counts.complete = counts.complete.saturating_add(count),
                     "partial" => counts.partial = counts.partial.saturating_add(count),
-                    "cancelled" | "paused" => {}
+                    "paused" => {}
                     _ => counts.failed = counts.failed.saturating_add(count),
                 }
             }

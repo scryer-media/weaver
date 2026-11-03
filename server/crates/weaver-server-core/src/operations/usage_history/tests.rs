@@ -214,6 +214,72 @@ fn time_down_counts_between_two_down_readings_and_state_keeps_its_start() {
 }
 
 #[test]
+fn a_long_gap_between_readings_adds_at_most_one_step_of_down_time() {
+    let recorder = UsageRecorder::new();
+    let today = date(2026, 3, 4);
+    let down = ServerUsageReading {
+        state: disabled(),
+        ..server(1, 0, 0, 0)
+    };
+    recorder.prime(&reading(vec![down], &[]), 1_000);
+    // Three days asleep, or a clock stepped forward: one step, not the gap.
+    recorder.observe(&reading(vec![down], &[]), today, 1_000 + 3 * 86_400);
+    let rows = recorder.take(today).rows;
+    assert_eq!(rows[0].counts.down_seconds, USAGE_MAX_DOWN_STEP_SECS as u64);
+}
+
+#[test]
+fn a_day_never_holds_more_down_time_than_it_has_seconds() {
+    let db = Database::open_in_memory().unwrap();
+    let day = date(2026, 3, 4);
+    let down = |seconds| UsageDayRow {
+        counts: UsageCounts {
+            down_seconds: seconds,
+            ..UsageCounts::default()
+        },
+        ..row(day, UsageConsumerKind::Server, "1", 0)
+    };
+    for seconds in [80_000, 80_000] {
+        db.write_usage_flush(&UsageFlush {
+            rows: vec![down(seconds)],
+            fold_before: None,
+        })
+        .unwrap();
+    }
+    let kept = db.read_usage_days(Some(day), day, None).unwrap();
+    assert_eq!(kept[0].counts.down_seconds, seconds_in_day(day));
+}
+
+#[test]
+fn removing_a_server_removes_its_data_used() {
+    let db = Database::open_in_memory().unwrap();
+    let day = date(2026, 3, 4);
+    db.write_usage_flush(&UsageFlush {
+        rows: vec![
+            row(day, UsageConsumerKind::Server, "3", 10),
+            row(day, UsageConsumerKind::Server, "4", 20),
+            row(day, UsageConsumerKind::Category, "3", 30),
+        ],
+        fold_before: None,
+    })
+    .unwrap();
+    db.delete_server(3).unwrap();
+    let kept: Vec<_> = db
+        .read_usage_totals(None)
+        .unwrap()
+        .into_iter()
+        .map(|total| (total.kind, total.consumer_id))
+        .collect();
+    assert_eq!(
+        kept,
+        vec![
+            ("category".to_string(), "3".to_string()),
+            ("server".to_string(), "4".to_string()),
+        ]
+    );
+}
+
+#[test]
 fn a_restored_batch_goes_out_with_the_next_one() {
     let recorder = UsageRecorder::new();
     recorder.prime(&reading(vec![], &[]), 0);
@@ -480,6 +546,19 @@ fn assert_retention_fold(db: &Database) {
             .iter()
             .all(|r| r.day.is_some())
     );
+    // All as a range reaches back to the folded days, so it equals all time.
+    let rows = db
+        .read_usage_days(summary_read_from(UsagePeriod::All, today), today, None)
+        .unwrap();
+    let all_time = db.read_usage_totals(None).unwrap();
+    let summary = summarize_usage(
+        &rows,
+        &all_time,
+        today,
+        UsagePeriod::All,
+        UsageConsumerKind::Server,
+    );
+    assert_eq!(summary.total.range, summary.total.all_time);
 }
 
 #[test]
@@ -494,6 +573,7 @@ fn assert_finished_counts(db: &Database) {
         (3, "partial", 1_600),
         (4, "failed", 1_700),
         (5, "cancelled", 1_800),
+        (8, "paused", 1_900),
         (6, "complete", 500),
         (7, "failed", 3_000),
     ] {
@@ -525,7 +605,7 @@ fn assert_finished_counts(db: &Database) {
         FinishedJobCounts {
             complete: 2,
             partial: 1,
-            failed: 1,
+            failed: 2,
         }
     );
     assert_eq!(
@@ -533,7 +613,7 @@ fn assert_finished_counts(db: &Database) {
         FinishedJobCounts {
             complete: 3,
             partial: 1,
-            failed: 2,
+            failed: 3,
         }
     );
 }

@@ -764,7 +764,13 @@ fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> Hist
     let completed_since = input.completed_since_epoch_sec;
     let matched_search: Vec<HistoryItem> = rows
         .into_iter()
-        .filter(|row| completed_since.is_none_or(|since| row.completed_at >= since))
+        // "Finished since" lists what the Overview's finished count counts: a
+        // paused row has not finished.
+        .filter(|row| {
+            completed_since.is_none_or(|since| {
+                row.completed_at >= since && !row.status.eq_ignore_ascii_case("paused")
+            })
+        })
         .map(|row| {
             if requires_full_display_projection {
                 history_item_from_row(&row, None)
@@ -1147,6 +1153,7 @@ mod tests {
             history_row(1, "complete", 1_000),
             history_row(2, "failed", 1_100),
             history_row(3, "complete", 1_200),
+            history_row(4, "paused", 1_300),
         ] {
             db.insert_job_history(&row).unwrap();
         }

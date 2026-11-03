@@ -98,23 +98,14 @@ fn server_entry(servers: &mut Vec<ServerUsageReading>, id: u32) -> &mut ServerUs
 }
 
 fn state_reading(state: &weaver_nntp::ServerState, now: std::time::Instant) -> ServerStateReading {
-    match state {
-        weaver_nntp::ServerState::Healthy => ServerStateReading {
-            state: "healthy",
-            down: false,
+    ServerStateReading {
+        state: match state {
+            weaver_nntp::ServerState::Healthy => "healthy",
+            weaver_nntp::ServerState::Degraded { .. } => "degraded",
+            weaver_nntp::ServerState::CoolingDown { .. } => "cooling_down",
+            weaver_nntp::ServerState::Disabled { .. } => "disabled",
         },
-        weaver_nntp::ServerState::Degraded { .. } => ServerStateReading {
-            state: "degraded",
-            down: false,
-        },
-        weaver_nntp::ServerState::CoolingDown { until, reason, .. } => ServerStateReading {
-            state: "cooling_down",
-            down: *until > now && matches!(reason, weaver_nntp::health::CooldownReason::Transport),
-        },
-        weaver_nntp::ServerState::Disabled { until, .. } => ServerStateReading {
-            state: "disabled",
-            down: *until > now,
-        },
+        down: state.is_down(now),
     }
 }
 
