@@ -20,6 +20,8 @@ const FACADE_QUEUE_ITEM_FIELDS = `
     downloadedBytes
     optionalRecoveryBytes
     optionalRecoveryDownloadedBytes
+    remainingBytes
+    wantedBytes
     phaseProgress {
       phase
       completedBytes
@@ -55,6 +57,8 @@ const QUEUE_TABLE_ITEM_FIELDS = `
     downloadedBytes
     optionalRecoveryBytes
     optionalRecoveryDownloadedBytes
+    remainingBytes
+    wantedBytes
     phaseProgress {
       phase
       completedBytes
