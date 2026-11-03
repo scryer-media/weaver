@@ -133,6 +133,16 @@ test("a record reads the same as its text line did", () => {
   assert.deepEqual(record.kvPairs, text.kvPairs);
 });
 
+test("only a string quoted as one token is written bare", () => {
+  const record =
+    '{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"INFO","target":"weaver::jobs",' +
+    '"fields":{"message":"two","plain":"\\"plain\\"","name":"\\"a\\" b \\"c\\"","tail":"\\"a\\\\\\""}}';
+  assert.equal(
+    readLogLine(4, record).raw,
+    '2026-11-03T08:10:00.123456-07:00  INFO weaver::jobs: two plain="plain" name="\\"a\\" b \\"c\\"" tail="\\"a\\\\\\""',
+  );
+});
+
 test("a record's spans come before its target", () => {
   const line = readLogLine(
     0,

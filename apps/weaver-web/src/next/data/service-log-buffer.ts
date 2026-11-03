@@ -193,6 +193,18 @@ function quoted(text: string): boolean {
   return false;
 }
 
+/** Whether `text` is one string already quoted, every quote inside it escaped. */
+function debugQuoted(text: string): boolean {
+  if (text.length < 2 || !text.startsWith('"') || !text.endsWith('"')) return false;
+  let at = 1;
+  while (at < text.length - 1) {
+    if (text[at] === "\\") at += 2;
+    else if (text[at] === '"') return false;
+    else at += 1;
+  }
+  return at === text.length - 1;
+}
+
 /**
  * A field value as the text line writes it. A string already quoted, as a
  * `?` field's Debug text of a string is, stands as it is.
@@ -200,7 +212,7 @@ function quoted(text: string): boolean {
 function textValue(value: JsonValue): string {
   if (value.kind !== "string") return writeJson(value, null);
   const text = value.text;
-  if (text.length >= 2 && text.startsWith('"') && text.endsWith('"')) return text;
+  if (debugQuoted(text)) return text;
   return quoted(text) ? JSON.stringify(text) : text;
 }
 

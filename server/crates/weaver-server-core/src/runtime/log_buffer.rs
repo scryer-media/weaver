@@ -217,9 +217,22 @@ fn text_value(value: &serde_json::Value) -> String {
     }
 }
 
-// Whether the text is a string already quoted: a `"` at each end.
+// Whether the text is one string already quoted, as Debug writes one: a `"`
+// at each end and every quote between them escaped.
 fn is_quoted(text: &str) -> bool {
-    text.len() >= 2 && text.starts_with('"') && text.ends_with('"')
+    let bytes = text.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
+        return false;
+    }
+    let mut at = 1;
+    while at < bytes.len() - 1 {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'"' => return false,
+            _ => at += 1,
+        }
+    }
+    at == bytes.len() - 1
 }
 
 #[derive(serde::Deserialize)]
@@ -300,6 +313,15 @@ mod text_line_tests {
         assert_eq!(
             text_line(record),
             r#"2026-11-03T08:10:00.123456-07:00  INFO weaver::jobs: dbg name="plain""#
+        );
+    }
+
+    #[test]
+    fn a_string_quoted_at_each_end_but_not_as_one_token_is_quoted() {
+        let record = r#"{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"INFO","target":"weaver::jobs","fields":{"message":"two","name":"\"a\" b \"c\"","tail":"\"a\\\""}}"#;
+        assert_eq!(
+            text_line(record),
+            r#"2026-11-03T08:10:00.123456-07:00  INFO weaver::jobs: two name="\"a\" b \"c\"" tail="\"a\\\"""#
         );
     }
 

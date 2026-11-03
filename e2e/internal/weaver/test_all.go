@@ -1133,7 +1133,7 @@ func weaverLogString(raw json.RawMessage) (string, bool) {
 // anything else as compact JSON.
 func weaverLogValue(raw json.RawMessage) string {
 	if text, ok := weaverLogString(raw); ok {
-		if len(text) >= 2 && strings.HasPrefix(text, `"`) && strings.HasSuffix(text, `"`) {
+		if weaverDebugQuoted(text) {
 			return text
 		}
 		quote := text == "" || strings.IndexFunc(text, func(r rune) bool {
@@ -1149,6 +1149,26 @@ func weaverLogValue(raw json.RawMessage) string {
 		return string(raw)
 	}
 	return compact.String()
+}
+
+// weaverDebugQuoted reports whether text is one string already quoted, as
+// Debug writes one: a quote at each end and every quote between escaped.
+func weaverDebugQuoted(text string) bool {
+	if len(text) < 2 || text[0] != '"' || text[len(text)-1] != '"' {
+		return false
+	}
+	at := 1
+	for at < len(text)-1 {
+		switch text[at] {
+		case '\\':
+			at += 2
+		case '"':
+			return false
+		default:
+			at++
+		}
+	}
+	return at == len(text)-1
 }
 
 // weaverRecordText writes a weaver JSON log record as the text line

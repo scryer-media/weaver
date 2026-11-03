@@ -838,8 +838,8 @@ mod json_record_against_text {
         );
     }
 
-    // The text layer wrote `nan=NaN inf=inf ninf=-inf`; the record holds null
-    // for all three, so a reader of the JSON cannot tell NaN from infinity.
+    // A float that is not a number or is infinite reads in the record as the
+    // text the text line writes, `NaN` or `inf`, never as null.
     #[test]
     fn non_finite_floats_read_as_the_text_line_showed_them() {
         let (json, text) = both(|| {
@@ -851,8 +851,8 @@ mod json_record_against_text {
         assert_ne!(record["fields"]["inf"], Value::Null, "{}", json[0]);
     }
 
-    // A span with a field called `name` writes the key twice in one object;
-    // serde_json keeps the last, so the span's own name is lost.
+    // A span with a field called `name` keeps that field under the span's
+    // fields; the span's own name stays the span's name.
     #[test]
     fn a_span_field_called_name_keeps_the_span_name() {
         let (json, _) = both(|| {

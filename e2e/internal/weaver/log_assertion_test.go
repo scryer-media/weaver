@@ -82,6 +82,10 @@ func TestWeaverJSONRecordReadsAsItsTextLine(t *testing.T) {
 	if got := cleanWeaverLogLine(spans); got != `2026-11-03T08:10:00.123456-07:00  WARN request{id=3}:bare: weaver::http: slow name="plain"` {
 		t.Fatalf("spans read as %q", got)
 	}
+	twoTokens := `{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"INFO","target":"weaver::jobs","fields":{"message":"two","name":"\"a\" b \"c\"","tail":"\"a\\\""}}`
+	if got := cleanWeaverLogLine(twoTokens); got != `2026-11-03T08:10:00.123456-07:00  INFO weaver::jobs: two name="\"a\" b \"c\"" tail="\"a\\\""` {
+		t.Fatalf("a string quoted at each end read as %q", got)
+	}
 	if got := cleanWeaverLogLine("\x1b[32mplain\x1b[0m words"); got != "plain words" {
 		t.Fatalf("a text line read as %q", got)
 	}
