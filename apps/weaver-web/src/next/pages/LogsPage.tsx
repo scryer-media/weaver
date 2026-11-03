@@ -28,6 +28,7 @@ import {
   LOG_LEVELS,
   useServiceLogs,
   type LogLevelFilter,
+  type LogLine,
   type ServiceLogs,
 } from "../data/use-service-logs";
 import { NextShell } from "../shell/NextShell";
@@ -337,10 +338,28 @@ function LogList({ level, query }: { level: LogLevelFilter; query: string }) {
   const { lines, loading } = useLogsPart(LogLinesContext);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const followingRef = useRef(true);
-  const [selectedId, setSelectedId] = useState<number | null>(null);
+  // The open line, by its record: a line keeps its record when the buffer
+  // numbers it again. While one is open the tail stops following, so the
+  // record stays put; closing it follows again if the tail was following.
+  const [selected, setSelected] = useState<string | null>(null);
+  const selectedRef = useRef<string | null>(null);
+  const resumeRef = useRef(true);
+  const select = useCallback((source: string | null) => {
+    if (source !== null && selectedRef.current === null) {
+      resumeRef.current = followingRef.current;
+    }
+    if (source === null && selectedRef.current !== null) {
+      followingRef.current = resumeRef.current;
+    }
+    if (source !== null) {
+      followingRef.current = false;
+    }
+    selectedRef.current = source;
+    setSelected(source);
+  }, []);
   const onToggle = useCallback(
-    (id: number) => setSelectedId((current) => (current === id ? null : id)),
-    [],
+    (line: LogLine) => select(selectedRef.current === line.source ? null : line.source),
+    [select],
   );
   const virtualizer = useVirtualizer({
     count: lines.length,
@@ -352,8 +371,19 @@ function LogList({ level, query }: { level: LogLevelFilter; query: string }) {
   });
   const totalSize = virtualizer.getTotalSize();
   useLayoutEffect(() => {
-    followingRef.current = true;
+    if (selectedRef.current === null) {
+      followingRef.current = true;
+    } else {
+      resumeRef.current = true;
+    }
   }, [level, query]);
+  // A line that left the view, out of the buffer or filtered away, closes.
+  useLayoutEffect(() => {
+    const open = selectedRef.current;
+    if (open !== null && !lines.some((line) => line.source === open)) {
+      select(null);
+    }
+  }, [lines, select]);
   // Pinned again whenever the height changes as well as when lines arrive:
   // the rows at the tail are measured after they render, and a wrapped one is
   // taller than its estimate.
@@ -366,8 +396,13 @@ function LogList({ level, query }: { level: LogLevelFilter; query: string }) {
   const onScroll = () => {
     const scroller = scrollerRef.current;
     if (scroller) {
-      followingRef.current =
+      const atTail =
         scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= TAIL_SLACK_PX;
+      if (selectedRef.current === null) {
+        followingRef.current = atTail;
+      } else {
+        resumeRef.current = atTail;
+      }
     }
   };
 
@@ -396,7 +431,7 @@ function LogList({ level, query }: { level: LogLevelFilter; query: string }) {
             >
               <LogRow
                 line={lines[item.index]!}
-                selected={lines[item.index]!.id === selectedId}
+                selected={lines[item.index]!.source === selected}
                 onToggle={onToggle}
               />
             </div>

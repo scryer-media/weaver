@@ -41,7 +41,7 @@ export const LogRow = memo(function LogRow({
   line: LogLine;
   bare?: boolean;
   selected?: boolean;
-  onToggle?: (id: number) => void;
+  onToggle?: (line: LogLine) => void;
 }) {
   const row = (
     <div
@@ -54,12 +54,12 @@ export const LogRow = memo(function LogRow({
             onClick: () => {
               // Selecting text to copy it is not selecting the line.
               if (window.getSelection()?.toString()) return;
-              onToggle(line.id);
+              onToggle(line);
             },
             onKeyDown: (event: KeyboardEvent) => {
               if (event.key === "Enter" || event.key === " ") {
                 event.preventDefault();
-                onToggle(line.id);
+                onToggle(line);
               }
             },
           }
