@@ -2324,6 +2324,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c9356095b4b41197bba32173600e1582792cda618f65d12f68e2e77d273413c5"
 
 [[package]]
+name = "html-escape"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "491194d601b4fa9fac3c9571e014070a0ad1bc3392d1bc10419695196a8b3cc3"
+
+[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4290,9 +4296,9 @@ checksum = "04d056b875a9d2e6cb9a61d127afee9ac5999b9f87bcb32079d1318e505be714"
 
 [[package]]
 name = "s2n-tls"
-version = "0.3.45"
+version = "0.3.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0471cc924d5e3b2fa6bf1da91d2b74b0a608a4114b5343d80315b5e9f3601d8f"
+checksum = "056961b360cec496e2572ff77cf261af9d55c9d18eb51079ad7ece4b58de04ca"
 dependencies = [
  "errno",
  "hex",
@@ -4303,9 +4309,9 @@ dependencies = [
 
 [[package]]
 name = "s2n-tls-sys"
-version = "0.3.45"
+version = "0.3.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ddcb24a958908b7ba1dd49370c2f97c3c44043fc9aa18cd954c018e749d0f44"
+checksum = "bb636f37f6ca1cf91060a836d7078889d7276c456e5d4affbbe8244c9b85e6f0"
 dependencies = [
  "aws-lc-rs",
  "cc",
@@ -4315,9 +4321,9 @@ dependencies = [
 
 [[package]]
 name = "s2n-tls-tokio"
-version = "0.3.45"
+version = "0.3.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cca3c76101342dffd8d170fd9555a2ffbdc0155c09fc61c9342317ff91575451"
+checksum = "c6818eefc7d78532d9286390c0024a8208b2c4823e7f5fb32debf6f29ecb72af"
 dependencies = [
  "errno",
  "libc",
@@ -4368,7 +4374,7 @@ dependencies = [
  "aho-corasick",
  "chrono",
  "fixedbitset",
- "html-escape",
+ "html-escape 0.2.15",
  "serde",
  "smallvec",
  "unicode-normalization",
@@ -4558,9 +4564,9 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.29.2"
+version = "0.29.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "110c472f8f3db3fb0f3a41d9e288e36bb754f3dc0475a6c549d7754cdca62bed"
+checksum = "47e78cf4c24e122389175a1f0570faf86fce2c786fec113f4617e3ebf97b2789"
 dependencies = [
  "aws-lc-rs",
  "brotli",
@@ -5756,9 +5762,9 @@ dependencies = [
 
 [[package]]
 name = "unrar-rs"
-version = "0.15.0"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32877a1ea1bbb266cc0039f682ff826782b1dc29c205776c4b6558d13a100b62"
+checksum = "a57e3e98ad891f5435f6f62cdfe42ba15c0fa8b8bd2a183b18a2ce174508a749"
 dependencies = [
  "aws-lc-rs",
  "blake2s_simd",
@@ -6085,7 +6091,7 @@ name = "weaver-nzb"
 version = "0.16.5"
 dependencies = [
  "blake3",
- "html-escape",
+ "html-escape 0.3.0",
  "quick-xml",
  "serde",
  "serde_json",
