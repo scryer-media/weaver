@@ -3,23 +3,16 @@
 
 //! What a kernel datagram socket is set to before uTP runs over it: its
 //! datagrams are never fragmented, so a path-MTU probe larger than the path
-//! is dropped rather than split, and its receive buffer holds the receive
-//! window of every stream it may carry, so a burst waits in the kernel
-//! instead of being dropped while the engine is busy.
+//! is dropped rather than split, and its receive buffer is as large as the
+//! host allows, so a burst across however many streams the socket carries
+//! waits in the kernel instead of being dropped while the engine is busy.
 
 use std::{io, net::SocketAddr};
 
 use tracing::{debug, info, warn};
 
-/// The streams one uTP socket carries at most, as uTP is configured by
-/// default.
-const STREAMS: usize = 128;
-/// The receive window of one stream, as uTP is configured by default.
-const STREAM_WINDOW: usize = 1024 * 1024;
-
-/// The receive buffer asked for: every stream's window, and a quarter more
-/// for the acknowledgements and headers that ride beside the data.
-pub(crate) const RECEIVE_BUFFER: usize = STREAMS * (STREAM_WINDOW * 10 / 8);
+/// The most a socket's receive buffer can be asked for.
+const LARGEST_ASK: usize = i32::MAX as usize;
 
 /// Set `socket`, asked for at `requested`, for uTP. Neither setting is
 /// needed for the socket to work: one the host refuses is logged, and the
@@ -35,28 +28,32 @@ pub(crate) fn set_for_utp(socket: &tokio::net::UdpSocket, requested: SocketAddr)
 
     let socket = socket2::SockRef::from(socket);
     let before = socket.recv_buffer_size().ok();
-    if let Err(error) = socket.set_recv_buffer_size(RECEIVE_BUFFER) {
-        warn!(?before, wanted = RECEIVE_BUFFER, %error, "the socket's receive buffer was not raised");
-        return;
+    match raise_receive_buffer(&socket) {
+        Ok(now) => info!(?before, now, "the socket's receive buffer was raised"),
+        Err(error) => warn!(?before, %error, "the socket's receive buffer was not raised"),
     }
-    match socket.recv_buffer_size() {
-        Ok(now) if now >= RECEIVE_BUFFER => {
-            info!(?before, now, "the socket's receive buffer was raised");
+}
+
+/// Raise `socket`'s receive buffer as far as the host allows, and read back
+/// what it holds. A host that clamps an ask grants its limit at once; one
+/// that refuses an ask above its limit is asked for the largest size it
+/// accepts.
+pub(crate) fn raise_receive_buffer(socket: &socket2::SockRef<'_>) -> io::Result<usize> {
+    if socket.set_recv_buffer_size(LARGEST_ASK).is_err() {
+        // Accepted at `low`, refused above `high`.
+        let (mut low, mut high) = (socket.recv_buffer_size()?, LARGEST_ASK);
+        socket.set_recv_buffer_size(low)?;
+        while high - low > 1 {
+            let ask = low + (high - low) / 2;
+            if socket.set_recv_buffer_size(ask).is_ok() {
+                low = ask;
+            } else {
+                high = ask;
+            }
         }
-        Ok(now) => warn!(
-            ?before,
-            now,
-            wanted = RECEIVE_BUFFER,
-            "the host holds the socket's receive buffer below what uTP wants: datagrams may be \
-             dropped under load (raise the host's receive buffer limit)"
-        ),
-        Err(error) => warn!(
-            ?before,
-            wanted = RECEIVE_BUFFER,
-            %error,
-            "the socket's receive buffer was raised but cannot be read back"
-        ),
+        socket.set_recv_buffer_size(low)?;
     }
+    socket.recv_buffer_size()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -289,18 +286,16 @@ mod tests {
         net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     };
 
-    use super::{Family, RECEIVE_BUFFER, dont_fragment};
+    use super::{Family, dont_fragment};
     use crate::network::DatagramSocket;
 
-    // What the host grants a socket that asks for uTP's receive buffer.
-    fn granted(family: Family) -> usize {
+    // A fresh socket of `family`, at the host's default receive buffer.
+    fn fresh(family: Family) -> socket2::Socket {
         let domain = match family {
             Family::V4 => socket2::Domain::IPV4,
             Family::V6 => socket2::Domain::IPV6,
         };
-        let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None).unwrap();
-        socket.set_recv_buffer_size(RECEIVE_BUFFER).unwrap();
-        socket.recv_buffer_size().unwrap()
+        socket2::Socket::new(domain, socket2::Type::DGRAM, None).unwrap()
     }
 
     #[tokio::test]
@@ -320,7 +315,12 @@ mod tests {
             let buffer = socket2::SockRef::from(socket.socket())
                 .recv_buffer_size()
                 .unwrap();
-            assert_eq!(buffer, granted(family), "{family:?}");
+            // At least the host's default, and nothing larger is granted.
+            let other = fresh(family);
+            assert!(buffer >= other.recv_buffer_size().unwrap(), "{family:?}");
+            if other.set_recv_buffer_size(buffer * 2).is_ok() {
+                assert!(other.recv_buffer_size().unwrap() <= buffer, "{family:?}");
+            }
         }
     }
 
