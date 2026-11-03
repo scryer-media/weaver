@@ -5612,23 +5612,19 @@ async fn a_save_on_its_way_at_stop_lands_before_stops_own() {
         })
         .unwrap();
     run.await.unwrap();
-    // A write on no lane is a barrier: once the writer takes it, it takes
-    // nothing more until the held save lands, so whatever stop queues stays
-    // in the queue where the test can count it.
-    rig.db.try_queue_write("barrier", |_| Ok(())).unwrap();
-    while rig.db.queued_writes() != 0 {
-        tokio::task::yield_now().await;
-    }
+    let taken = rig.db.writes_taken();
+    let parked = rig.db.writes_parked();
 
     let service = rig.service.clone();
     let stopping = tokio::spawn(async move { service.stop().await });
-    // Stop's save reaches the queue, after the service's lock, and waits
-    // there behind the one on its way; stop waits for it to land, so it
-    // queues nothing more meanwhile.
-    while rig.db.queued_writes() == 0 {
+    // Stop's save is the next write the writer takes, and it takes it onto
+    // the torrent's lane, parked behind the one on its way; stop waits for
+    // it to land, so it queues nothing more meanwhile.
+    while rig.db.writes_taken() == taken {
         tokio::task::yield_now().await;
     }
-    assert_eq!(rig.db.queued_writes(), 1);
+    assert_eq!(rig.db.writes_taken(), taken + 1);
+    assert_eq!(rig.db.writes_parked(), parked + 1);
     assert!(!stopping.is_finished());
     release.send(()).unwrap();
     stopping.await.unwrap();
