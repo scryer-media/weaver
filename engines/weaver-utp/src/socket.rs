@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{UtpStream, spawn_utils::spawn_with_cancel};
 use crate::{
-    congestion::CongestionController,
+    congestion::{CongestionController, ledbat::LedbatParams},
     constants::{
         DEFAULT_MAX_ACTIVE_STREAMS_PER_SOCKET, DEFAULT_REMOTE_INACTIVITY_TIMEOUT, IPV4_HEADER,
         RX_BUF_SIZE_PER_VSOCK_DEFAULT, UDP_HEADER, UTP_HEADER,
@@ -48,9 +48,11 @@ type ConnectionId = SeqNr;
 // When we get incoming packets this connection id is used to pick the stream.
 type StreamRecvKey = (SocketAddr, ConnectionId);
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum CongestionControllerKind {
+    /// Delay-based: yields to other traffic on the link.
     #[default]
+    Ledbat,
     Cubic,
 }
 
@@ -58,11 +60,13 @@ pub enum CongestionControllerKind {
 pub struct CongestionConfig {
     pub kind: CongestionControllerKind,
     pub tracing: bool,
+    pub ledbat: LedbatParams,
 }
 
 impl CongestionConfig {
     pub(crate) fn create(&self, now: Instant, rmss: usize) -> Box<dyn CongestionController> {
         use crate::congestion::cubic::Cubic;
+        use crate::congestion::ledbat::Ledbat;
         use crate::congestion::tracing::TracingController;
 
         match (self.kind, self.tracing) {
@@ -71,6 +75,11 @@ impl CongestionConfig {
                 Box::new(TracingController::new(Cubic::new(now, rmss)))
             }
             (CongestionControllerKind::Cubic, false) => Box::new(Cubic::new(now, rmss)),
+            (CongestionControllerKind::Ledbat, true) => {
+                tracing::debug!("enabling congestion tracing");
+                Box::new(TracingController::new(Ledbat::new(rmss, self.ledbat)))
+            }
+            (CongestionControllerKind::Ledbat, false) => Box::new(Ledbat::new(rmss, self.ledbat)),
         }
     }
 }

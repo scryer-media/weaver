@@ -181,7 +181,7 @@ async fn test_rto_not_stuck_in_congestion_control() {
             link_mtu: Some(calc_mtu_for_mss(MSS)),
             congestion: crate::CongestionConfig {
                 tracing: true,
-                ..Default::default()
+                ..super::cubic()
             },
             ..Default::default()
         },
@@ -476,6 +476,7 @@ async fn test_rto_single_packet_retransmission_mss_sized() {
     let mut t = make_test_vsock(
         SocketOpts {
             link_mtu: Some(calc_mtu_for_mss(MSS)),
+            congestion: super::cubic(),
             ..Default::default()
         },
         false,

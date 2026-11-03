@@ -1,4 +1,5 @@
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
+// Modified by the Weaver authors, 2026-11-03.
 
 use std::time::Duration;
 
@@ -35,6 +36,7 @@ async fn test_mtu_probing() {
             mtu_probe_max_retransmissions: Some(0),
             vsock_tx_bufsize_bytes_initial: Some(non_zero_const!(1024 * 1024)), // so that we can write the initial large payload without blocking
             disable_nagle: true,
+            congestion: super::cubic(),
             ..Default::default()
         },
         false,
@@ -185,6 +187,7 @@ async fn probe_retry_if_emsgsize() {
     let mut t = make_test_vsock(
         SocketOpts {
             disable_nagle: true,
+            congestion: super::cubic(),
             ..Default::default()
         },
         false,

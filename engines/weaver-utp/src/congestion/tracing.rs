@@ -62,6 +62,18 @@ where
         );
     }
 
+    fn on_delay_sample(&mut self, sample: super::DelaySample) {
+        let before = self.inner.window();
+        self.inner.on_delay_sample(sample);
+        tracing::event!(
+            CONGESTION_TRACING_LOG_LEVEL,
+            ?sample,
+            before,
+            after = self.inner.window(),
+            "on_delay_sample"
+        );
+    }
+
     fn set_remote_window(&mut self, win: usize) {
         self.inner.set_remote_window(win);
     }

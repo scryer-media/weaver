@@ -168,6 +168,16 @@ impl DelayTracker {
         self.recent_at = (self.recent_at + 1) % RECENT_SAMPLES;
         Some(delay)
     }
+
+    // The delay the controller acts on: the lowest of the last three
+    // samples, never above the round trip of what this packet acknowledged.
+    pub(crate) fn controller_delay(&self, min_rtt: Option<Duration>) -> Duration {
+        let mut delay = self.recent.iter().copied().min().unwrap_or(0);
+        if let Some(rtt) = min_rtt {
+            delay = delay.min(u32::try_from(rtt.as_micros()).unwrap_or(u32::MAX));
+        }
+        Duration::from_micros(delay.into())
+    }
 }
 
 #[cfg(test)]
@@ -248,5 +258,20 @@ mod tests {
         // A drop of 10 ms or more is not drift; ours stays.
         t.on_packet(now, 100_000, 30_000, 0);
         assert_eq!(t.ours.base(), Some(44_000));
+    }
+
+    #[test]
+    fn the_controller_takes_the_lowest_recent_delay_under_the_rtt() {
+        let (mut t, now) = tracker();
+        t.on_packet(now, 1, 1, 10_000);
+        t.on_packet(now, 1, 1, 70_000);
+        t.on_packet(now, 1, 1, 50_000);
+        t.on_packet(now, 1, 1, 90_000);
+        // The last three are 60, 40 and 80 ms above the base.
+        assert_eq!(t.controller_delay(None), Duration::from_millis(40));
+        assert_eq!(
+            t.controller_delay(Some(Duration::from_millis(25))),
+            Duration::from_millis(25)
+        );
     }
 }

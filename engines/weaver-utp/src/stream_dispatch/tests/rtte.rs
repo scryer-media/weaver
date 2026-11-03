@@ -1,4 +1,5 @@
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
+// Modified by the Weaver authors, 2026-11-03.
 
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ async fn test_rtte_set_and_updated() {
     let mut t = make_test_vsock(
         SocketOpts {
             link_mtu: Some(calc_mtu_for_mss(1)),
+            congestion: super::cubic(),
             ..Default::default()
         },
         false,

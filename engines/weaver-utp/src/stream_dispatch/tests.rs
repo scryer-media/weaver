@@ -130,6 +130,15 @@ impl TestVsock {
     }
 }
 
+// These tests drive the machinery around the window, so they pin the
+// controller whose window grows on any ACK.
+fn cubic() -> crate::CongestionConfig {
+    crate::CongestionConfig {
+        kind: crate::CongestionControllerKind::Cubic,
+        ..Default::default()
+    }
+}
+
 fn make_test_vsock_args(opts: SocketOpts, args: StreamArgs, env: MockUtpEnvironment) -> TestVsock {
     let transport = RememberingTransport::new(ADDR_1);
     let socket = UtpSocket::new_with_opts(transport.clone(), env.clone(), opts).unwrap();

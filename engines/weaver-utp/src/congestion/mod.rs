@@ -2,11 +2,26 @@
 // Modified by the Weaver authors, 2026-11-03.
 
 pub mod cubic;
+pub mod ledbat;
 pub mod tracing;
+
+use std::time::Duration;
 
 use tokio::time::Instant;
 
 use crate::rtte::RttEstimator;
+
+/// A one-way delay sample that came with acknowledged data.
+#[derive(Debug, Clone, Copy)]
+pub struct DelaySample {
+    pub delay: Duration,
+    /// Bytes this packet acknowledged, selectively or not.
+    pub acked_bytes: usize,
+    pub in_flight_before: usize,
+    pub in_flight_after: usize,
+    /// The largest segment the sender may send next.
+    pub segment: usize,
+}
 
 #[allow(unused_variables)]
 pub trait CongestionController: Send + Sync + core::fmt::Debug {
@@ -31,4 +46,6 @@ pub trait CongestionController: Send + Sync + core::fmt::Debug {
     fn on_enter_recovery(&mut self, now: Instant);
 
     fn set_remote_window(&mut self, win: usize);
+
+    fn on_delay_sample(&mut self, sample: DelaySample) {}
 }

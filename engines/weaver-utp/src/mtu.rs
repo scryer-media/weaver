@@ -1,4 +1,5 @@
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
+// Modified by the Weaver authors, 2026-11-03.
 
 // Calculations for payload sizes that we should be sending, based on MTU and successfully
 // delivered payloads so far. Binary searches (probes) the payload size until convergence.
@@ -90,6 +91,11 @@ impl SegmentSizes {
 
     fn next_probe(&self) -> u16 {
         (self.min_ss + (self.max_ss - self.min_ss) / 2 + 1).min(self.max_ss)
+    }
+
+    // The largest segment the sender may try next, the probe's when one is due.
+    pub fn probe_size(&self) -> u16 {
+        self.next_probe().max(self.min_ss)
     }
 
     pub fn is_probing(&self) -> bool {

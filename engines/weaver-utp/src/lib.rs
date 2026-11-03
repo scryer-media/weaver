@@ -29,6 +29,7 @@ mod test_util;
 mod traits;
 mod utils;
 
+pub use congestion::ledbat::LedbatParams;
 pub use error::{Error, Result};
 pub use socket::{CongestionConfig, CongestionControllerKind, SocketOpts, UtpSocket};
 pub use stats::UtpStats;

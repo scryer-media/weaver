@@ -18,7 +18,7 @@ use tracing::{Level, debug, debug_span, event, trace, trace_span};
 
 use crate::{
     Error, UtpSocket,
-    congestion::CongestionController,
+    congestion::{CongestionController, DelaySample},
     constants::{
         ACK_DELAY, IMMEDIATE_ACK_EVERY_RMSS, RECOVERY_TRACING_LOG_LEVEL, RTTE_TRACING_LOG_LEVEL,
         SYNACK_RESEND_INTERNAL, UTP_HEADER, calc_pipe_expiry,
@@ -1134,6 +1134,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             (LastAck { .. }, _) => {}
         }
 
+        let in_flight_before = self
+            .user_tx_segments
+            .calc_flight_size(self.last_sent_seq_nr);
         let result = ProcessIncomingMessageResult {
             on_ack_result: self
                 .user_tx_segments
@@ -1163,12 +1166,25 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             result.on_ack_result.acked_bytes,
             &self.rtte,
         );
-        self.delay.on_packet(
+        let sampled = self.delay.on_packet(
             self.this_poll.now,
             self.timestamp_microseconds(),
             msg.header.timestamp_microseconds,
             msg.header.timestamp_difference_microseconds,
         );
+        let acked_bytes =
+            result.on_ack_result.acked_bytes + result.on_ack_result.newly_sacked_byte_count;
+        if sampled.is_some() && acked_bytes > 0 && in_flight_before > 0 {
+            self.congestion_controller.on_delay_sample(DelaySample {
+                delay: self.delay.controller_delay(result.on_ack_result.new_rtt),
+                acked_bytes,
+                in_flight_before,
+                in_flight_after: self
+                    .user_tx_segments
+                    .calc_flight_size(self.last_sent_seq_nr),
+                segment: self.segment_sizes.probe_size().into(),
+            });
+        }
         self.last_remote_window = msg.header.wnd_size;
 
         self.recovery.on_ack(
