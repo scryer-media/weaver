@@ -400,6 +400,17 @@ func (d *fullDashboard) setPhaseRunning(name string, detail string) {
 	d.scheduleRenderLocked()
 }
 
+// setPhaseDetail says what a phase is waiting on before it runs, leaving
+// its status as it is.
+func (d *fullDashboard) setPhaseDetail(name string, detail string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if phase, ok := d.phases[name]; ok {
+		phase.Detail = detail
+	}
+	d.scheduleRenderLocked()
+}
+
 func (d *fullDashboard) setSeedDetail(status, detail string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -1275,6 +1286,7 @@ func runFullPipeline(
 			phase.WeaverBin = weaverBin
 			if fullPhaseNeedsLocalWeaverImage(phase) && awaitWeaverImage != nil {
 				setupStarted = time.Now()
+				dashboard.setPhaseDetail(phase.Name, "waiting for Weaver image")
 				if err := awaitWeaverImage(); err != nil {
 					setupErr := fmt.Errorf("prepare local Weaver image: %w", err)
 					phaseResults <- recordPhaseSetupFailure(phase, phase.Command, setupStarted, setupErr)

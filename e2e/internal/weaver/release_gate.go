@@ -293,14 +293,19 @@ type weaverReleasePhase struct {
 }
 
 type weaverReleasePhaseStatus struct {
-	Flow       string    `json:"flow"`
-	Datastore  string    `json:"datastore"`
-	Project    string    `json:"project"`
-	Status     string    `json:"status"`
-	StartedAt  time.Time `json:"started_at"`
-	FinishedAt time.Time `json:"finished_at,omitempty"`
-	DurationMS int64     `json:"duration_ms,omitempty"`
-	Error      string    `json:"error,omitempty"`
+	Flow         string                     `json:"flow"`
+	Datastore    string                     `json:"datastore"`
+	Project      string                     `json:"project"`
+	Status       string                     `json:"status"`
+	QueuedAt     time.Time                  `json:"queued_at"`
+	QueueWaitMS  int64                      `json:"queue_wait_ms"`
+	StartedAt    time.Time                  `json:"started_at"`
+	FinishedAt   time.Time                  `json:"finished_at,omitempty"`
+	DurationMS   int64                      `json:"duration_ms,omitempty"`
+	PlaywrightMS int64                      `json:"playwright_ms,omitempty"`
+	LifecycleMS  int64                      `json:"lifecycle_ms,omitempty"`
+	Stages       []weaverReleaseStageTiming `json:"stages,omitempty"`
+	Error        string                     `json:"error,omitempty"`
 }
 
 type weaverReleasePhaseConfiguration struct {
@@ -334,6 +339,7 @@ type weaverReleasePhaseResult struct {
 	Phase    *weaverReleasePhase
 	Duration time.Duration
 	Err      error
+	Timing   weaverReleaseFlowTiming
 }
 
 const (
@@ -356,6 +362,7 @@ func runWeaverReleaseGate(parent context.Context, mode string) error {
 	if err != nil {
 		return err
 	}
+	emitProgressEvent(progressEvent{Kind: "phase_note", Detail: "checking corpus"})
 	ensureFixtureProfiles("release-gate")
 	runDir, err := newWeaverReleaseGateRunDir()
 	if err != nil {
@@ -384,6 +391,7 @@ func runWeaverReleaseGate(parent context.Context, mode string) error {
 	if err := writeWeaverReleaseLatestPointer(runDir); err != nil {
 		return err
 	}
+	emitProgressEvent(progressEvent{Kind: "phase_note", Detail: "checking images"})
 	if err := ensureLocalWeaverNNTPImage(); err != nil {
 		manifest.FinishedAt = time.Now().UTC()
 		manifest.Status = "failed"
@@ -422,7 +430,10 @@ func runWeaverReleaseGate(parent context.Context, mode string) error {
 	ctx, stop := signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 
-	results := runWeaverReleasePhases(ctx, phases, weaverReleaseGateJobs(len(phases)))
+	jobs := weaverReleaseGateJobs(len(phases))
+	fanoutStarted := time.Now()
+	results := runWeaverReleasePhases(ctx, phases, jobs)
+	fanoutWall := time.Since(fanoutStarted)
 	manifest.FinishedAt = time.Now().UTC()
 	manifest.Status = "passed"
 	var failures []error
@@ -446,7 +457,7 @@ func runWeaverReleaseGate(parent context.Context, mode string) error {
 	if err := writeWeaverReleaseJSON(manifestPath, manifest); err != nil {
 		failures = append(failures, err)
 	}
-	printWeaverReleaseSummary(results, runDir)
+	printWeaverReleaseSummary(results, runDir, jobs, fanoutWall)
 	return errors.Join(failures...)
 }
 
@@ -706,7 +717,18 @@ func runWeaverReleasePhases(ctx context.Context, phases []*weaverReleasePhase, j
 			Detail: "queued",
 		})
 	}
-	var completed atomic.Int64
+	// Every flow joins the queue now; the time until a worker takes it is
+	// its queue wait.
+	queuedAt := time.Now()
+	var completed, running atomic.Int64
+	noteQueue := func() {
+		done := int(completed.Load())
+		active := int(running.Load())
+		emitProgressEvent(progressEvent{
+			Kind:   "phase_note",
+			Detail: weaverReleaseQueueNote(len(phases)-done-active, active, done),
+		})
+	}
 	var workers sync.WaitGroup
 	for range jobs {
 		workers.Add(1)
@@ -714,17 +736,21 @@ func runWeaverReleasePhases(ctx context.Context, phases []*weaverReleasePhase, j
 			defer workers.Done()
 			for phase := range queue {
 				key := weaverReleaseFlowKey(phase)
+				running.Add(1)
 				emitProgressEvent(progressEvent{Kind: "flow_start", Name: key})
-				result := runWeaverReleasePhase(ctx, phase)
+				noteQueue()
+				result := runWeaverReleasePhase(ctx, phase, queuedAt)
 				status := "pass"
 				if result.Err != nil {
 					status = "fail"
 				}
+				running.Add(-1)
 				emitProgressEvent(progressEvent{
 					Kind:   "flow_done",
 					Status: status,
 					Name:   key,
-					Detail: result.Duration.Round(time.Second).String(),
+					Detail: fmt.Sprintf("%s (queued %s)",
+						result.Duration.Round(time.Second), result.Timing.QueueWait.Round(time.Second)),
 				})
 				emitProgressEvent(progressEvent{
 					Kind:    "phase_progress",
@@ -732,6 +758,7 @@ func runWeaverReleasePhases(ctx context.Context, phases []*weaverReleasePhase, j
 					Total:   len(phases),
 					Detail:  key,
 				})
+				noteQueue()
 				results <- result
 			}
 		}()
@@ -772,14 +799,17 @@ func weaverReleaseFlowKey(phase *weaverReleasePhase) string {
 	return phase.Flow + "/" + datastore
 }
 
-func runWeaverReleasePhase(parent context.Context, phase *weaverReleasePhase) weaverReleasePhaseResult {
+func runWeaverReleasePhase(parent context.Context, phase *weaverReleasePhase, queuedAt time.Time) weaverReleasePhaseResult {
 	started := time.Now()
+	queueWait := started.Sub(queuedAt)
 	status := weaverReleasePhaseStatus{
-		Flow:      phase.Flow,
-		Datastore: phase.Datastore,
-		Project:   phase.Project,
-		Status:    "running",
-		StartedAt: started.UTC(),
+		Flow:        phase.Flow,
+		Datastore:   phase.Datastore,
+		Project:     phase.Project,
+		Status:      "running",
+		QueuedAt:    queuedAt.UTC(),
+		QueueWaitMS: queueWait.Milliseconds(),
+		StartedAt:   started.UTC(),
 	}
 	_ = writeWeaverReleaseJSON(phase.StatusPath, status)
 	_ = writeWeaverReleaseJSON(filepath.Join(phase.ArtifactsDir, "status.json"), status)
@@ -819,6 +849,8 @@ func runWeaverReleasePhase(parent context.Context, phase *weaverReleasePhase) we
 			cmd.Env = mergeChildEnv(os.Environ(), env)
 			cmd.Stdout = io.MultiWriter(logFile, os.Stdout)
 			cmd.Stderr = io.MultiWriter(logFile, os.Stderr)
+			_, _ = fmt.Fprintf(logFile, "flow queued at %s, started at %s after %s in the queue\n",
+				queuedAt.UTC().Format(time.RFC3339), started.UTC().Format(time.RFC3339), queueWait.Round(time.Second))
 			err = cmd.Run()
 			_ = logFile.Close()
 		}
@@ -827,6 +859,7 @@ func runWeaverReleasePhase(parent context.Context, phase *weaverReleasePhase) we
 		err = fmt.Errorf("flow exceeded %s", timeout)
 	}
 	if exe != "" {
+		finalizeStarted := time.Now()
 		finalizeCtx, finalizeCancel := context.WithTimeout(context.Background(), time.Minute)
 		finalizeCmd := exec.CommandContext(finalizeCtx, exe, "release-finalize")
 		configureWeaverReleaseCommandCancellation(finalizeCmd)
@@ -839,10 +872,26 @@ func runWeaverReleasePhase(parent context.Context, phase *weaverReleasePhase) we
 		if errors.Is(finalizeCtx.Err(), context.DeadlineExceeded) {
 			finalizeErr = fmt.Errorf("release-flow finalizer exceeded one minute")
 		}
+		recordWeaverReleaseStage(phase.ArtifactsDir, weaverReleaseStageTiming{
+			Stage:      "finalize",
+			Kind:       weaverReleaseStageLifecycle,
+			StartedAt:  finalizeStarted.UTC(),
+			DurationMS: time.Since(finalizeStarted).Milliseconds(),
+			Error:      errorText(finalizeErr),
+		}, phase.LogPath)
 		err = errors.Join(err, finalizeErr)
 	}
+	duration := time.Since(started)
+	stages, stagesErr := readWeaverReleaseStageTimings(phase.ArtifactsDir)
+	if stagesErr != nil {
+		log.Printf("warning: read stage timings for %s: %v", weaverReleaseFlowKey(phase), stagesErr)
+	}
+	playwright, lifecycle := splitWeaverReleaseFlowTime(duration, stages)
 	status.FinishedAt = time.Now().UTC()
-	status.DurationMS = time.Since(started).Milliseconds()
+	status.DurationMS = duration.Milliseconds()
+	status.PlaywrightMS = playwright.Milliseconds()
+	status.LifecycleMS = lifecycle.Milliseconds()
+	status.Stages = stages
 	status.Status = "passed"
 	if err != nil {
 		status.Status = "failed"
@@ -851,7 +900,19 @@ func runWeaverReleasePhase(parent context.Context, phase *weaverReleasePhase) we
 	_ = writeWeaverReleaseJSON(phase.StatusPath, status)
 	_ = writeWeaverReleaseJSON(filepath.Join(phase.ArtifactsDir, "status.json"), status)
 	_ = writeWeaverReleaseArtifactIndex(phase)
-	return weaverReleasePhaseResult{Phase: phase, Duration: time.Since(started), Err: err}
+	return weaverReleasePhaseResult{
+		Phase:    phase,
+		Duration: duration,
+		Err:      err,
+		Timing: weaverReleaseFlowTiming{
+			Key:          weaverReleaseFlowKey(phase),
+			QueueWait:    queueWait,
+			Duration:     duration,
+			Playwright:   playwright,
+			Lifecycle:    lifecycle,
+			StageDetails: stages,
+		},
+	}
 }
 
 func redactWeaverReleaseEnv(env map[string]string) map[string]string {
@@ -1064,12 +1125,12 @@ func runWeaverBrowserReleaseFlow(ctx context.Context, spec weaverReleaseFlowSpec
 			err = errors.Join(err, fmt.Errorf("capture release evidence: %w", evidenceErr))
 		}
 		if !envBool("E2E_KEEP_STACKS", false) {
-			if downErr := dockerComposeDown(); downErr != nil {
+			if downErr := timeWeaverReleaseStage("teardown", weaverReleaseStageLifecycle, dockerComposeDown); downErr != nil {
 				err = errors.Join(err, downErr)
 			}
 		}
 	}()
-	if downErr := dockerComposeDown(); downErr != nil {
+	if downErr := timeWeaverReleaseStage("reset", weaverReleaseStageLifecycle, dockerComposeDown); downErr != nil {
 		log.Printf("warning: reset Weaver release flow stack: %v", downErr)
 	}
 	if strings.HasPrefix(spec.Name, "ui-backup-restore-") {
@@ -1109,13 +1170,18 @@ func runWeaverBrowserReleaseFlow(ctx context.Context, spec weaverReleaseFlowSpec
 		return runWeaverBandwidthAndServerQuotasReleaseFlow(ctx, spec, datastore)
 	}
 	if len(spec.SeedFixtures) > 0 {
-		if err := ensureSeedingInfrastructureErr(); err != nil {
-			return err
-		}
-		for _, slug := range spec.SeedFixtures {
-			if err := seedFixture(filepath.Join(testdataDir(), slug)); err != nil {
-				return fmt.Errorf("seed probe fixture %s: %w", slug, err)
+		if err := timeWeaverReleaseStage("seed", weaverReleaseStageLifecycle, func() error {
+			if err := ensureSeedingInfrastructureErr(); err != nil {
+				return err
 			}
+			for _, slug := range spec.SeedFixtures {
+				if err := seedFixture(filepath.Join(testdataDir(), slug)); err != nil {
+					return fmt.Errorf("seed probe fixture %s: %w", slug, err)
+				}
+			}
+			return nil
+		}); err != nil {
+			return err
 		}
 	}
 	if len(spec.Stages) > 0 {
@@ -1303,13 +1369,14 @@ func runWeaverRuntimeObservabilityReleaseFlow(
 	return nil
 }
 
-func startWeaverReleaseStack(spec weaverReleaseFlowSpec, datastore weaverDatastore) error {
+func startWeaverReleaseStack(spec weaverReleaseFlowSpec, datastore weaverDatastore) (err error) {
 	setEnv(weaverDatastoreEnv, string(datastore))
 	if envBool("E2E_WEAVER_MODE", false) {
-		if err := initializeWeaverE2EClock(); err != nil {
+		if err := timeWeaverReleaseStage("clock", weaverReleaseStageLifecycle, initializeWeaverE2EClock); err != nil {
 			return err
 		}
 	}
+	defer endWeaverReleaseStage("stack-up", weaverReleaseStageLifecycle, time.Now(), &err)
 	if datastore == weaverDatastorePostgres {
 		setEnv("E2E_WEAVER_DATABASE_URL", weaverComposePostgresURL())
 		waitForReleaseHostPorts([]string{"weaver-postgres"}, os.Getenv, probeHostPortHeld, releaseHostPortPoll)
@@ -2341,7 +2408,8 @@ func runWeaverPlaywrightAuditWith(run func(*exec.Cmd, string) error) error {
 	return run(cmd, "npm run audit (Weaver Playwright)")
 }
 
-func ensureLocalWeaverPlaywrightImage() error {
+func ensureLocalWeaverPlaywrightImage() (err error) {
+	defer endWeaverReleaseStage("image-check", weaverReleaseStageLifecycle, time.Now(), &err)
 	weaverPlaywrightImageMu.Lock()
 	defer weaverPlaywrightImageMu.Unlock()
 
@@ -2380,8 +2448,13 @@ func weaverPlaywrightImageFingerprint(root string) (string, error) {
 	return hex.EncodeToString(digest.Sum(nil)), nil
 }
 
-func runWeaverReleasePlaywright(ctx context.Context, script string) error {
-	err := runWeaverReleasePlaywrightOnce(ctx, script)
+func runWeaverReleasePlaywright(ctx context.Context, script string) (err error) {
+	stage := strings.TrimSpace(os.Getenv("E2E_WEAVER_ARTIFACT_STAGE"))
+	if stage == "" {
+		stage = script
+	}
+	defer endWeaverReleaseStage("playwright "+stage, weaverReleaseStagePlaywright, time.Now(), &err)
+	err = runWeaverReleasePlaywrightOnce(ctx, script)
 	if err == nil || !isWeaverBrowserCrash(err) {
 		return err
 	}
@@ -2472,7 +2545,8 @@ type weaverReleaseNntpConnections struct {
 	ConfiguredLimit int   `json:"configured_limit"`
 }
 
-func captureWeaverReleaseStageDiagnostics(stage string) error {
+func captureWeaverReleaseStageDiagnostics(stage string) (err error) {
+	defer endWeaverReleaseStage("evidence "+stage, weaverReleaseStageLifecycle, time.Now(), &err)
 	artifactsDir := strings.TrimSpace(os.Getenv("E2E_WEAVER_PLAYWRIGHT_ARTIFACTS_DIR"))
 	if artifactsDir == "" {
 		return errors.New("E2E_WEAVER_PLAYWRIGHT_ARTIFACTS_DIR is required")
@@ -2539,7 +2613,8 @@ func captureWeaverReleaseDiagnostics(dir string) error {
 	return errors.Join(errs...)
 }
 
-func captureWeaverReleaseDiagnosticsWithMarker(dir string) error {
+func captureWeaverReleaseDiagnosticsWithMarker(dir string) (err error) {
+	defer endWeaverReleaseStage("evidence final", weaverReleaseStageLifecycle, time.Now(), &err)
 	evidenceErr := captureWeaverReleaseDiagnostics(dir)
 	marker := map[string]any{
 		"captured_at": time.Now().UTC(),
@@ -2603,14 +2678,30 @@ func writeWeaverReleaseJSON(path string, value any) error {
 	return os.Rename(tmp, path)
 }
 
-func printWeaverReleaseSummary(results []weaverReleasePhaseResult, runDir string) {
+func printWeaverReleaseSummary(results []weaverReleasePhaseResult, runDir string, workers int, wall time.Duration) {
 	fmt.Println("\nWEAVER RELEASE GATE")
+	flows := make([]weaverReleaseFlowTiming, 0, len(results))
 	for _, result := range results {
 		status := "PASS"
 		if result.Err != nil {
 			status = "FAIL"
 		}
-		fmt.Printf("  %-4s %-42s %-8s %s\n", status, result.Phase.Flow, result.Phase.Datastore, result.Duration.Round(time.Second))
+		fmt.Printf("  %-4s %-42s %-8s %8s  queued %8s  playwright %8s  lifecycle %8s\n",
+			status, result.Phase.Flow, result.Phase.Datastore,
+			result.Duration.Round(time.Second), result.Timing.QueueWait.Round(time.Second),
+			result.Timing.Playwright.Round(time.Second), result.Timing.Lifecycle.Round(time.Second))
+		flows = append(flows, result.Timing)
+	}
+	fmt.Println("\nWALL CLOCK")
+	for _, line := range summarizeWeaverReleaseGateTiming(flows, workers, wall).lines() {
+		fmt.Printf("  %s\n", line)
+	}
+	if totals := weaverReleaseStageTotals(flows); len(totals) > 0 {
+		fmt.Println("  Σ by stage:")
+		for _, total := range totals {
+			fmt.Printf("    %-14s %-10s %s\n", total.Stage, total.Kind,
+				(time.Duration(total.DurationMS) * time.Millisecond).Round(time.Second))
+		}
 	}
 	fmt.Printf("  artifacts: %s\n", runDir)
 }

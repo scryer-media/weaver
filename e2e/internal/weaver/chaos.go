@@ -357,7 +357,8 @@ func requiresWeaverService(services []string) bool {
 	return false
 }
 
-func dockerComposeRestart(services ...string) error {
+func dockerComposeRestart(services ...string) (err error) {
+	defer endWeaverReleaseStage("restart", weaverReleaseStageLifecycle, time.Now(), &err)
 	log.Printf("restarting docker services: %s", strings.Join(services, ", "))
 	cmd := containerengine.Command(dockerComposeRestartArgs(services...)...)
 	cmd.Dir = e2eDir()
