@@ -569,9 +569,12 @@ func ensureRestartFixturesSeeded(slugs []string) error {
 }
 
 func ensureRestartInfrastructure() {
-	log.Println("starting restart-suite infrastructure with fresh NNTP build...")
-	if err := ensureNNTPHealthBinary(); err != nil {
-		log.Fatalf("build NNTP healthcheck for restart suite: %v", err)
+	log.Println("starting restart-suite infrastructure...")
+	// Every service started here is pull_policy: never on an image these
+	// ensure calls prepare, or a digest-pinned registry image, so the up
+	// below never builds.
+	if err := ensureLocalWeaverNNTPImage(); err != nil {
+		log.Fatalf("prepare NNTP fixture image for restart suite: %v", err)
 	}
 	if err := ensureNyuuImageBuilt(); err != nil {
 		log.Fatalf("build nyuu image for restart suite: %v", err)
@@ -580,10 +583,10 @@ func ensureRestartInfrastructure() {
 	if weaverUsesPostgresDatastore() {
 		services = append(services, "weaver-postgres")
 	}
-	args := append(dockerComposeArgs("up", "-d", "--build", "--quiet-pull"), services...)
+	args := append(dockerComposeArgs("up", "-d", "--quiet-pull"), services...)
 	cmd := containerengine.Command(args...)
 	cmd.Dir = e2eDir()
-	if err := runExternalCommand(cmd, "docker compose up --build for restart suite"); err != nil {
+	if err := runExternalCommand(cmd, "docker compose up for restart suite"); err != nil {
 		log.Fatalf("start restart-suite infrastructure: %v", err)
 	}
 	if err := refreshRuntimePortEnvFromRunningStack(); err != nil {

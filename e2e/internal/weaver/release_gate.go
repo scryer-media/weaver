@@ -2481,27 +2481,79 @@ func ensureLocalWeaverPlaywrightImage() (err error) {
 	defer endWeaverReleaseStage("image-check", weaverReleaseStageLifecycle, time.Now(), &err)
 	weaverPlaywrightImageMu.Lock()
 	defer weaverPlaywrightImageMu.Unlock()
+	return resolveWeaverPlaywrightImage(weaverPlaywrightImageOps{
+		fingerprint: func() (string, error) {
+			return weaverPlaywrightImageFingerprint(filepath.Join(e2eDir(), "playwright-weaver"))
+		},
+		label: func(image string) string {
+			return dockerImageLabel(image, weaverPlaywrightImageFingerprintLabel)
+		},
+		build: func() error {
+			cmd := containerengine.Command(dockerComposeArgs("build", "weaver-playwright")...)
+			cmd.Dir = e2eDir()
+			return runExternalCommand(cmd, "docker compose build weaver-playwright")
+		},
+	})
+}
 
-	fingerprint, err := weaverPlaywrightImageFingerprint(filepath.Join(e2eDir(), "playwright-weaver"))
+const (
+	weaverPlaywrightImageEnv        = "E2E_WEAVER_PLAYWRIGHT_IMAGE"
+	weaverPlaywrightFingerprintEnv  = "E2E_WEAVER_PLAYWRIGHT_SOURCE_FINGERPRINT"
+	weaverPlaywrightForceRebuildEnv = "E2E_FORCE_REBUILD_WEAVER_PLAYWRIGHT_IMAGE"
+)
+
+type weaverPlaywrightImageOps struct {
+	fingerprint func() (string, error)
+	label       func(image string) string
+	build       func() error
+}
+
+// weaverPlaywrightImageReady is the tag this process has already resolved,
+// under weaverPlaywrightImageMu. Every flow after the first pays nothing.
+var weaverPlaywrightImageReady string
+
+// resolveWeaverPlaywrightImage settles which Playwright image the flows run.
+// The source fingerprint hashes the whole build context, so it is taken once
+// per process; a flow process whose parent already resolved the image
+// inherits the tag and fingerprint through the environment and only checks
+// that the image still carries that fingerprint. A forced rebuild is spent
+// by the process that does it, so its flows do not rebuild again.
+func resolveWeaverPlaywrightImage(ops weaverPlaywrightImageOps) error {
+	image := strings.TrimSpace(os.Getenv(weaverPlaywrightImageEnv))
+	if weaverPlaywrightImageReady != "" && image == weaverPlaywrightImageReady {
+		return nil
+	}
+	force := envBool(weaverPlaywrightForceRebuildEnv, false)
+	if inherited := strings.TrimSpace(os.Getenv(weaverPlaywrightFingerprintEnv)); !force && image != "" &&
+		inherited != "" && ops.label(image) == inherited {
+		weaverPlaywrightImageReady = image
+		return nil
+	}
+
+	fingerprint, err := ops.fingerprint()
 	if err != nil {
 		return err
 	}
-	image := strings.TrimSpace(os.Getenv("E2E_WEAVER_PLAYWRIGHT_IMAGE"))
 	if image == "" {
 		// The tag carries the fingerprint so checkouts with different specs
 		// never move each other's tag mid-run.
 		image = weaverReleasePlaywrightRepository + ":" + shortFingerprint(fingerprint)
-		setEnv("E2E_WEAVER_PLAYWRIGHT_IMAGE", image)
+		setEnv(weaverPlaywrightImageEnv, image)
 	}
-	setEnv("E2E_WEAVER_PLAYWRIGHT_SOURCE_FINGERPRINT", fingerprint)
-	if !envBool("E2E_FORCE_REBUILD_WEAVER_PLAYWRIGHT_IMAGE", false) &&
-		dockerImageLabel(image, weaverPlaywrightImageFingerprintLabel) == fingerprint {
+	setEnv(weaverPlaywrightFingerprintEnv, fingerprint)
+	if !force && ops.label(image) == fingerprint {
 		log.Printf("reusing current Weaver Playwright image: %s (source fingerprint %s)", image, shortFingerprint(fingerprint))
+		weaverPlaywrightImageReady = image
 		return nil
 	}
-	cmd := containerengine.Command(dockerComposeArgs("build", "weaver-playwright")...)
-	cmd.Dir = e2eDir()
-	return runExternalCommand(cmd, "docker compose build weaver-playwright")
+	if err := ops.build(); err != nil {
+		return err
+	}
+	if force {
+		setEnv(weaverPlaywrightForceRebuildEnv, "0")
+	}
+	weaverPlaywrightImageReady = image
+	return nil
 }
 
 func weaverPlaywrightImageFingerprint(root string) (string, error) {
