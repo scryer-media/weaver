@@ -1,4 +1,5 @@
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
+// Modified by the Weaver authors, 2026-11-03.
 
 pub mod ext_close_reason;
 pub mod selective_ack;
@@ -122,7 +123,7 @@ impl UtpHeader {
 
                     #[allow(unused)]
                     {
-                        next_ext_pos = offset + 1;
+                        next_ext_pos = offset;
                     }
                     offset += 2 + payload.len();
                 }
@@ -246,5 +247,36 @@ mod tests {
         let mut buf = [0u8; 1024];
         let len = header.serialize(&mut buf).unwrap();
         assert_eq!(&buf[..len], packet);
+    }
+
+    // libtorrent writes the reason as a 32-bit field, two reserved zero
+    // bytes then the reason, after any SACK; it reads the last two bytes
+    // and skips the reserved ones whatever they hold.
+    #[test]
+    fn the_close_reason_is_two_reserved_bytes_then_the_reason() {
+        use crate::raw::{
+            Extensions, ext_close_reason::LibTorrentCloseReason, selective_ack::SelectiveAck,
+        };
+        let header = UtpHeader {
+            htype: Type::ST_FIN,
+            extensions: Extensions {
+                selective_ack: SelectiveAck::new_test([1]),
+                close_reason: Some(LibTorrentCloseReason(0x0102)),
+            },
+            ..Default::default()
+        };
+        let mut buf = [0u8; 64];
+        let len = header.serialize(&mut buf).unwrap();
+        assert_eq!(buf[1], 1, "SACK first");
+        assert_eq!(buf[20], 3, "then the close reason");
+        assert_eq!(&buf[len - 6..len], &[0, 4, 0, 0, 1, 2]);
+
+        buf[len - 4] = 0xab;
+        buf[len - 3] = 0xcd;
+        let (parsed, _) = UtpHeader::deserialize(&buf[..len]).unwrap();
+        assert_eq!(
+            parsed.extensions.close_reason,
+            Some(LibTorrentCloseReason(0x0102))
+        );
     }
 }
