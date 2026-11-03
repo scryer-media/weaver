@@ -6603,6 +6603,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "weaver-utp"
+version = "0.16.5"
+dependencies = [
+ "anyhow",
+ "bitvec",
+ "futures",
+ "libc",
+ "parking_lot",
+ "rand 0.10.3",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "weaver-yenc"
 version = "0.16.5"
 dependencies = [

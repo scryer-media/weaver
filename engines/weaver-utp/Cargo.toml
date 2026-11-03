@@ -1,0 +1,25 @@
+[package]
+name = "weaver-utp"
+description = "uTP transport over a caller-supplied datagram socket"
+publish = false
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+repository.workspace = true
+
+[dependencies]
+bitvec = { workspace = true }
+libc = { workspace = true }
+parking_lot = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+futures = { workspace = true }
+# `test-util` for the paused clock the in-memory transfers run on.
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }

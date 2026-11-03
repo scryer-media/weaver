@@ -1,0 +1,10 @@
+weaver-utp
+
+This crate is lifted from librqbit-utp 0.7.0, Copyright (c) the librqbit
+authors (Copyright 2021 Igor Katson), licensed under the Apache License,
+Version 2.0, whose text is in LICENSE.
+
+Lifted on 2026-11-03 by the Weaver authors. Files carrying the line
+"Modified by the Weaver authors, 2026-11-03." were changed after the lift.
+Files carrying the GPL-3.0-or-later header were written by the Weaver
+authors and are not part of librqbit-utp.

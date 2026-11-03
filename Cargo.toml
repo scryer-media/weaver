@@ -12,6 +12,7 @@ members = [
     "engines/weaver-graph",
     "engines/weaver-objects",
     "engines/weaver-torrent",
+    "engines/weaver-utp",
 ]
 exclude = ["fuzz"]
 resolver = "2"
