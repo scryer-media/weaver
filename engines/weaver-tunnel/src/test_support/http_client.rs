@@ -86,11 +86,12 @@ fn bridge(pin: Option<Pin>) -> Arc<Bridge> {
         .lock()
         .unwrap_or_else(PoisonError::into_inner);
     let bridge = bridges.entry(pin.clone()).or_insert_with(|| {
-        // No connect deadline: a test waits on what it checks.
-        let egress = Egress::new(0, SocketEgress::System, Duration::MAX);
         Bridge::start(
             runtime(),
-            Arc::new(SystemEgress { egress, pin }),
+            Arc::new(SystemEgress {
+                egress: system_egress(),
+                pin,
+            }),
             Duration::MAX,
             ("direct".into(), "client".into()),
         )
@@ -99,6 +100,24 @@ fn bridge(pin: Option<Pin>) -> Arc<Bridge> {
     Arc::clone(bridge)
 }
 
+/// The host's own egress, alone, as a route with nothing saved leaves, and
+/// with no connect deadline: a test waits on what it checks.
+pub fn system_dialer() -> Arc<dyn Dialer> {
+    Arc::new(system_egress())
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test's own route: the host's egress with nothing saved"
+)]
+fn system_egress() -> Egress {
+    Egress::new(0, SocketEgress::System, Duration::MAX)
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test's client, every connection of it through the system egress bridge"
+)]
 fn through(builder: reqwest::ClientBuilder, bridge: &Bridge) -> reqwest::Result<reqwest::Client> {
     let addr = bridge.addr().expect("a system egress bridge's address");
     let (user, password) = bridge.credentials();

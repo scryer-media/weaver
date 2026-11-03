@@ -59,6 +59,7 @@ const LIFTED: &[(&str, usize)] = &[
     ("engines/weaver-tunnel/src/lib.rs", 2),
     ("engines/weaver-tunnel/src/pipe.rs", 5),
     ("engines/weaver-tunnel/src/resolution.rs", 3),
+    ("engines/weaver-tunnel/src/test_support/http_client.rs", 2),
     ("engines/weaver-tunnel/src/transport.rs", 1),
     ("server/app/weaver/src/commands/nzb.rs", 1),
     ("server/app/weaver/src/main.rs", 1),
