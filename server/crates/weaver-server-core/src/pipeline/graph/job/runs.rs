@@ -15,10 +15,9 @@ use weaver_graph::{Emit, Engine, MemberId, NodeId, Why};
 use super::{GraphError, GraphJob};
 use crate::pipeline::graph::engine::{Heard, Reservation, Said};
 use crate::pipeline::graph::namespace::{Coming, Returned, WriteError};
-use crate::pipeline::graph::root::Root;
 use crate::pipeline::graph::status::RepairSlots;
 
-impl<R: Root> GraphJob<R> {
+impl GraphJob {
     // A terminal failure keeps worker ownership until the matching end
     // acknowledgments arrive. Late output and checkpoint acknowledgments
     // must not publish more files or start another step of the failed job.
@@ -47,6 +46,7 @@ impl<R: Root> GraphJob<R> {
         }
         Ok(())
     }
+
     // What a run said, or a repair lent off the loop came back with. A
     // stopped run's words carry an old generation and are not heard.
     pub(crate) fn run_said(

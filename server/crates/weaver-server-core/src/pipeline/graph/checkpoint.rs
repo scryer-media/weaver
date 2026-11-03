@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// A graph job's checkpoint: the tree's records, the job's and the root's
-// facts, which members have files, the kept envelopes, the holds paged to
-// scratch and which candidate each node was offered last, as the rows the
-// database keeps. It is taken after every step that reached the tree, when
-// the step's bytes are written, so it only ever describes bytes on disk;
-// holds in memory are left out and fetched again. A graceful stop pages
-// every hold it can to scratch first, so its last checkpoint leaves out only
-// what scratch could not take. The pipeline's parts that arrived and wait to
-// be placed are taken with it the same way: those spooled to the job's
-// working directory, never those still in memory.
+// A graph job's checkpoint: the tree's records, the root's facts, which
+// members have files, the kept envelopes, the holds paged to scratch and
+// which candidate each node was offered last, as the rows the database
+// keeps. It is taken after every step that reached the tree, when the step's
+// bytes are written, so it only ever describes bytes on disk; holds in
+// memory are left out and fetched again. A graceful stop pages every hold it
+// can to scratch first, so its last checkpoint leaves out only what scratch
+// could not take. The pipeline's parts that arrived and wait to be placed
+// are taken with it the same way: those spooled to the job's working
+// directory, never those still in memory.
 //
 // Each checkpoint is written as what it changed of the one before: a step
 // costs the database the rows it changed, not the job's. One writer per job:
@@ -37,8 +37,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use super::engine::{Heard, Said};
 use super::envelope::durable::KeptRecord;
 use super::job::GraphJob;
-use super::root::Root;
-use super::root::facts::{self, JobFacts, Parts, RootBlob, RootFactsError, RootRow};
+use super::root::facts::{self, Parts, RootFacts, RootFactsError};
 use crate::jobs::graph_checkpoint::{
     Changes, CoverageRow, CryptRow, Delta, EnvelopeRow, GraphCheckpoint, HeldPartRow, HoldRow,
     MemberRow, NodeRow, PartRow, Row,
@@ -47,16 +46,15 @@ use crate::jobs::ids::JobId;
 use crate::persistence::checkpoint_write::{CheckpointControl, CheckpointWrite};
 use crate::pipeline::Pipeline;
 
-// The root row's kind: the root is the object that fetches, not one the
-// builder makes.
+// The root row's kind: the root is the article object, not one the builder
+// makes.
 const ROOT_KIND: &str = "root";
 
 // A job's checkpoint, as a restore reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     pub(crate) tree: TreeRecord,
-    pub(crate) job: JobFacts,
-    pub(crate) root: RootBlob,
+    pub(crate) root: RootFacts,
     // What the writer holds of each member it holds anything of.
     pub(crate) files: BTreeMap<(NodeId, MemberId), FileState>,
     pub(crate) kept: Vec<KeptRecord>,
@@ -141,16 +139,12 @@ pub(crate) struct Pending(Arc<Mutex<Slot>>);
 #[derive(Default)]
 struct Slot {
     control: CheckpointControl,
-    // The root's facts parts as the job last encoded them, by part: what the
+    root: facts::Encoded,
+    // The root's facts parts as `root` last encoded them, by part: what the
     // database holds of them once what is queued is written, when it holds
     // the job at all. They are kept apart from `last`, so a step compares
     // only the parts it changed.
     root_parts: BTreeMap<i64, Arc<[u8]>>,
-    // Whether `root_parts` were compared with an encoding of the whole
-    // root: false until the first checkpoint after the rows were written
-    // or read, so that one names every part and what the database holds
-    // and the root no longer has is deleted.
-    root_read: bool,
     // `None` until a checkpoint is written or read: what the database holds
     // of the job is not known, so the next change is the whole job.
     held: Option<Held>,
@@ -234,7 +228,7 @@ impl HeldNode {
     // Bring the rows up to what the job has now of what `touched` says
     // changed, and put what changed into `delta`. `node` is `None` for an
     // id no tree could have, which names a node the job does not have.
-    fn step<R: Root>(&mut self, job: &GraphJob<R>, node: Option<NodeId>, touched: Touched, delta: &mut Delta) {
+    fn step(&mut self, job: &GraphJob, node: Option<NodeId>, touched: Touched, delta: &mut Delta) {
         let id = node.map(|node| i64::from(node.0));
         if touched.own {
             let now = node
@@ -361,17 +355,14 @@ impl Pending {
     // Queue what this checkpoint changes, the job's spooled held parts
     // `held_parts` with it, in key order; true when a write must be queued
     // to take it.
-    pub(crate) fn put<R: Root>(
-        &self,
-        job: &mut GraphJob<R>,
-        held_parts: Vec<HeldPartRow>,
-    ) -> bool {
+    #[cfg(test)]
+    pub(super) fn put(&self, job: &GraphJob, held_parts: Vec<HeldPartRow>) -> bool {
         self.put_with_feed(job, held_parts, None)
     }
 
-    fn put_with_feed<R: Root>(
+    fn put_with_feed(
         &self,
-        job: &mut GraphJob<R>,
+        job: &GraphJob,
         held_parts: Vec<HeldPartRow>,
         feed_verdict: Option<&crate::jobs::feed_verdict::FeedVerdict>,
     ) -> bool {
@@ -388,10 +379,9 @@ impl Pending {
             slot.feed_verdict = Some(verdict.clone());
         }
         let held = slot.held.get_or_insert_with(Held::default);
-        let (row, parts) = job.encode_root(!slot.root_read);
-        slot.root_read = true;
+        let encoding = job.encode_root(&mut slot.root, job.next_node());
         held.settled_bytes = job.settled_bytes();
-        let root = root_row(RootRow::VERSION, facts::encode(&row));
+        let root = root_row(encoding.version, encoding.bytes);
         if held.root.as_ref() != Some(&root) {
             delta.nodes.insert(root.key(), Some(root.clone()));
             held.root = Some(root);
@@ -434,7 +424,7 @@ impl Pending {
         };
         delta.compare(&was, &now);
         held.held_parts = now.held_parts;
-        let changed = root_parts(&mut slot.root_parts, parts);
+        let changed = root_parts(&mut slot.root_parts, encoding.parts);
         if delta.whole {
             let root = i64::from(NodeId::ROOT.0);
             delta
@@ -472,7 +462,7 @@ impl Pending {
     // The change a write takes, and the stamp of the last checkpoint it
     // carries: every checkpoint through it is in the database once the
     // write commits.
-    pub(crate) fn take(&self) -> (Option<Delta>, u64) {
+    pub(super) fn take(&self) -> (Option<Delta>, u64) {
         let mut slot = self.slot();
         (slot.queued.take(), slot.asked)
     }
@@ -529,20 +519,21 @@ impl Pending {
     // A write failed or was never queued, so what the database holds is not
     // known: the next checkpoint writes the whole job, and queues it. A move
     // waiting on a commit hears so, and waits on the next one.
-    pub(crate) fn forget(&self) {
+    fn forget(&self) {
         let mut slot = self.slot();
         slot.control.cancel();
         slot.held = None;
         slot.queued = None;
-        slot.root_read = false;
         slot.lost = true;
         if let Some(owed) = slot.owed.take() {
             owed.send(None);
         }
     }
 
-    // The database holds these rows, as a restore read them: the next
-    // checkpoint encodes the root whole and is compared with them.
+    // The database holds these rows, as a restore read them. A job's
+    // checkpoints are one `Pending`, told this before it takes any, so its
+    // encoder has read nothing and the next encoding reads the root whole
+    // and is compared with them.
     pub(crate) fn written(&self, rows: GraphCheckpoint) {
         let mut slot = self.slot();
         slot.feed_verdict = rows.feed_verdict;
@@ -575,7 +566,6 @@ impl Pending {
             held.nodes.entry(row.node).or_default().own.crypt.push(row);
         }
         slot.root_parts.clear();
-        slot.root_read = false;
         for row in rows.parts {
             if row.node == root {
                 slot.root_parts.insert(row.part, row.bytes);
@@ -706,12 +696,8 @@ impl Pipeline {
             .map(|graph| graph.pending().settled_bytes())
     }
 
-    // Checkpoint the job's tree as it stands now. A member's file that
-    // waits to move moves once the checkpoint that records the name it
-    // wants has committed: when it already has, the move runs here and the
-    // checkpoint is taken again to record it; otherwise the database's
-    // word that it has comes through the run mail, and a write is queued
-    // to carry it if none would.
+    // Checkpoint the job's tree as it stands now, again for as long as a
+    // member's file moved: the move is recorded by the next checkpoint.
     pub(crate) fn checkpoint_graph_job(&mut self, job_id: JobId) {
         let mail = self.graph_runs.written();
         loop {
@@ -719,114 +705,141 @@ impl Pipeline {
             let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
                 return;
             };
-            let pending = graph.pending().clone();
-            if pending.control().cancelled() {
+            if graph.pending().control().cancelled() {
                 return;
             }
-            let mut queue =
-                pending.put_with_feed(graph, held, self.post_probes.verdicts.get(&job_id));
-            graph.recorded(pending.stamp());
-            let mut moved = false;
-            if graph.awaits_commit() {
-                match pending.await_commit(graph.awaited(), job_id.0, &mail) {
-                    Some(committed) => match graph.committed(committed) {
-                        Ok(left) => moved = left,
-                        // A file that could not move fails the job, as it
-                        // does when the run mail says the commit.
-                        Err(error) => return self.after_graph_result(job_id, Err(error.into())),
-                    },
-                    None => queue |= graph.owe_mail(graph.awaited()),
-                }
-            }
-            if queue {
-                self.queue_graph_checkpoint(job_id, pending);
-            }
-            if !moved {
-                return;
+            let feed_verdict = self.post_probes.verdicts.get(&job_id);
+            match checkpoint_job(graph, job_id, &self.db, &mail, held, feed_verdict) {
+                Ok(true) => {}
+                Ok(false) => return,
+                // A file that could not move fails the job, as it does when
+                // the run mail says the commit.
+                Err(error) => return self.after_graph_result(job_id, Err(error.into())),
             }
         }
     }
 
     // Queue the write that takes the job's waiting change, if any, and says
-    // what it committed. A write dropped before it runs has failed.
+    // what it committed.
     fn queue_graph_checkpoint(&self, job_id: JobId, pending: Pending) {
-        let unwritten = Unwritten(Some(pending.clone()));
-        let mail = self.graph_runs.written();
-        let blocked_mail = mail.clone();
-        let queued = self.db.try_queue_graph_checkpoint(job_id, move || {
-            let mut unwritten = unwritten;
-            let writer = unwritten
-                .0
-                .as_ref()
-                .expect("checkpoint owns its pending state")
-                .clone();
-            let (delta, stamp) = writer.take();
-            let feed_verdict = delta.as_ref().and_then(|delta| delta.feed_verdict.clone());
-            let (rows, facts, whole) = delta.as_ref().map_or((0, 0, false), |delta| {
-                (delta.rows(), delta.facts(), delta.whole)
-            });
-            let control = writer.control();
-            let failed_control = control.clone();
-            let started = Instant::now();
-            CheckpointWrite {
-                delta: delta.map(Arc::new),
-                control,
-                blocked: Box::new(move |revision, error| {
-                    let _ = blocked_mail.send(Said {
-                        scope: job_id.0,
-                        node: NodeId::ROOT,
-                        generation: stamp,
-                        heard: Heard::CheckpointBlocked {
-                            control: failed_control.clone(),
-                            revision,
-                            error: error.to_owned(),
-                        },
-                    });
-                }),
-                finished: Box::new(move |written| {
-                    unwritten.0.take();
-                    match written {
-                        Ok(()) => {
-                            writer.committed(stamp, whole);
-                            if let Some(verdict) = feed_verdict {
-                                tracing::info!(
-                                    job_id = job_id.0,
-                                    stamp,
-                                    abandoned_files = verdict.abandoned_files.len(),
-                                    "server feed verdict committed with checkpoint refusals"
-                                );
-                            }
-                            debug!(
+        queue_checkpoint(&self.db, job_id, pending, self.graph_runs.written());
+    }
+}
+
+// Take one checkpoint of the job's tree as it stands now. A member's file
+// that waits to move moves once the checkpoint that records the name it
+// wants has committed: when it already has, the move runs here and the
+// caller checkpoints again to record it, which the result says; otherwise
+// the database's word that it has comes through `mail`, and a write is
+// queued to carry it if none would. Every job checkpoints through here,
+// the pipeline's and the ones outside it alike.
+pub(crate) fn checkpoint_job(
+    graph: &mut GraphJob,
+    job_id: JobId,
+    db: &crate::Database,
+    mail: &UnboundedSender<Said>,
+    held: Vec<HeldPartRow>,
+    feed_verdict: Option<&crate::jobs::feed_verdict::FeedVerdict>,
+) -> Result<bool, crate::pipeline::graph::namespace::WriteError> {
+    let pending = graph.pending().clone();
+    let mut queue = pending.put_with_feed(graph, held, feed_verdict);
+    graph.recorded(pending.stamp());
+    let mut moved = false;
+    if graph.awaits_commit() {
+        match pending.await_commit(graph.awaited(), job_id.0, mail) {
+            Some(committed) => moved = graph.committed(committed)?,
+            None => queue |= graph.owe_mail(graph.awaited()),
+        }
+    }
+    if queue {
+        queue_checkpoint(db, job_id, pending, mail.clone());
+    }
+    Ok(moved)
+}
+
+// Queue the write that takes the job's waiting change, if any, and says on
+// `mail` what it committed. A write dropped before it runs has failed.
+fn queue_checkpoint(
+    db: &crate::Database,
+    job_id: JobId,
+    pending: Pending,
+    mail: UnboundedSender<Said>,
+) {
+    let unwritten = Unwritten(Some(pending.clone()));
+    let blocked_mail = mail.clone();
+    let queued = db.try_queue_graph_checkpoint(job_id, move || {
+        let mut unwritten = unwritten;
+        let writer = unwritten
+            .0
+            .as_ref()
+            .expect("checkpoint owns its pending state")
+            .clone();
+        let (delta, stamp) = writer.take();
+        let feed_verdict = delta.as_ref().and_then(|delta| delta.feed_verdict.clone());
+        let (rows, facts, whole) = delta.as_ref().map_or((0, 0, false), |delta| {
+            (delta.rows(), delta.facts(), delta.whole)
+        });
+        let control = writer.control();
+        let failed_control = control.clone();
+        let started = Instant::now();
+        CheckpointWrite {
+            delta: delta.map(Arc::new),
+            control,
+            blocked: Box::new(move |revision, error| {
+                let _ = blocked_mail.send(Said {
+                    scope: job_id.0,
+                    node: NodeId::ROOT,
+                    generation: stamp,
+                    heard: Heard::CheckpointBlocked {
+                        control: failed_control.clone(),
+                        revision,
+                        error: error.to_owned(),
+                    },
+                });
+            }),
+            finished: Box::new(move |written| {
+                unwritten.0.take();
+                match written {
+                    Ok(()) => {
+                        writer.committed(stamp, whole);
+                        if let Some(verdict) = feed_verdict {
+                            tracing::info!(
                                 job_id = job_id.0,
                                 stamp,
-                                rows,
-                                facts,
-                                elapsed_us = started.elapsed().as_micros() as u64,
-                                "graph checkpoint written"
+                                abandoned_files = verdict.abandoned_files.len(),
+                                "server feed verdict committed with checkpoint refusals"
                             );
                         }
-                        Err(_) => writer.forget(),
+                        debug!(
+                            job_id = job_id.0,
+                            stamp,
+                            rows,
+                            facts,
+                            elapsed_us = started.elapsed().as_micros() as u64,
+                            "graph checkpoint written"
+                        );
                     }
-                }),
-            }
-        });
-        if let Err(error) = queued {
-            pending.forget();
-            // No writer owns this command. Forget its delta, but keep the
-            // failure actionable rather than masking it as cancellation.
-            pending.control().resume();
-            let _ = mail.send(Said {
-                scope: job_id.0,
-                node: NodeId::ROOT,
-                generation: pending.stamp(),
-                heard: Heard::CheckpointBlocked {
-                    control: pending.control(),
-                    revision: pending.control().revision(),
-                    error: error.to_string(),
-                },
-            });
-            warn!(job_id = job_id.0, error = %error, "could not queue the graph checkpoint");
+                    Err(_) => writer.forget(),
+                }
+            }),
         }
+    });
+    if let Err(error) = queued {
+        pending.forget();
+        // No writer owns this command. Forget its delta, but keep the
+        // failure actionable rather than masking it as cancellation.
+        pending.control().resume();
+        let _ = mail.send(Said {
+            scope: job_id.0,
+            node: NodeId::ROOT,
+            generation: pending.stamp(),
+            heard: Heard::CheckpointBlocked {
+                control: pending.control(),
+                revision: pending.control().revision(),
+                error: error.to_string(),
+            },
+        });
+        warn!(job_id = job_id.0, error = %error, "could not queue the graph checkpoint");
     }
 }
 
@@ -904,59 +917,6 @@ fn part_rows(node: i64, parts: &[Part]) -> impl Iterator<Item = PartRow> + '_ {
     })
 }
 
-// Every row of the snapshot, each table in key order: the root row with
-// every part the root's facts name, then each node's rows, the kept
-// envelopes' rows.
-#[cfg(test)]
-pub(crate) fn rows(snapshot: &Snapshot) -> GraphCheckpoint {
-    let root_id = i64::from(NodeId::ROOT.0);
-    let row = RootRow {
-        next_node: snapshot.tree.next_node,
-        job: snapshot.job.clone(),
-        root: snapshot.root.clone(),
-    };
-    let mut out = GraphCheckpoint {
-        nodes: vec![root_row(RootRow::VERSION, facts::encode(&row))],
-        envelopes: envelope_rows(&snapshot.kept),
-        ..GraphCheckpoint::default()
-    };
-    out.parts.extend(part_rows(root_id, &snapshot.root.parts));
-    for node in &snapshot.tree.nodes {
-        let rows = node_rows(
-            node,
-            |member| {
-                snapshot
-                    .files
-                    .get(&(node.node, member))
-                    .cloned()
-                    .unwrap_or_default()
-            },
-            snapshot
-                .passwords
-                .get(&node.node)
-                .map(|index| *index as i64),
-        );
-        out.nodes.extend(rows.nodes);
-        out.members.extend(rows.members);
-        out.coverage.extend(rows.coverage);
-        out.crypt.extend(rows.crypt);
-        out.parts.extend(rows.parts);
-        let holds: Vec<ScratchHold> = snapshot
-            .holds
-            .iter()
-            .filter(|record| record.node == node.node)
-            .map(|record| record.held)
-            .collect();
-        out.holds.extend(hold_rows(node.node, &holds));
-    }
-    out.nodes.sort_by_key(Row::key);
-    out.members.sort_by_key(Row::key);
-    out.coverage.sort_by_key(Row::key);
-    out.crypt.sort_by_key(Row::key);
-    out.parts.sort_by_key(Row::key);
-    out
-}
-
 fn root_row(version: u16, facts: Vec<u8>) -> NodeRow {
     NodeRow {
         node: i64::from(NodeId::ROOT.0),
@@ -976,7 +936,7 @@ fn root_row(version: u16, facts: Vec<u8>) -> NodeRow {
 // The rows the job has now of one node: its own, as `node_rows` takes
 // them, its kept envelopes' and its holds on scratch.
 #[cfg(test)]
-fn job_rows<R: Root>(job: &GraphJob<R>, node: NodeId) -> GraphCheckpoint {
+fn job_rows(job: &GraphJob, node: NodeId) -> GraphCheckpoint {
     let mut out = job
         .node(node)
         .map_or_else(GraphCheckpoint::default, |(record, files)| {
@@ -994,7 +954,7 @@ fn job_rows<R: Root>(job: &GraphJob<R>, node: NodeId) -> GraphCheckpoint {
 // The rows a step keeps match the job's, read whole: a change that marked
 // nothing a step reads again shows here.
 #[cfg(test)]
-fn audit<R: Root>(job: &GraphJob<R>, held: &Held) {
+fn audit(job: &GraphJob, held: &Held) {
     let nodes: std::collections::BTreeSet<i64> = job
         .touched_since(Generations::default())
         .into_keys()
@@ -1172,29 +1132,13 @@ fn envelope_rows(kept: &[KeptRecord]) -> Vec<EnvelopeRow> {
     out
 }
 
-// The root's row of a checkpoint: its facts blob, with the facts parts it
-// names. The whole checkpoint and the root's rows alone read the same.
-pub(crate) fn root(rows: &GraphCheckpoint) -> Result<RootRow, CheckpointError> {
+pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointError> {
     let root = rows
         .nodes
         .iter()
         .find(|row| row.node == i64::from(NodeId::ROOT.0))
         .filter(|row| row.kind == ROOT_KIND)
         .ok_or(CheckpointError::NoRoot)?;
-    let parts: Vec<Part> = rows
-        .parts
-        .iter()
-        .filter(|row| row.node == root.node)
-        .map(|row| Part {
-            key: row.part as u64,
-            bytes: Arc::clone(&row.bytes),
-        })
-        .collect();
-    Ok(facts::decode(version(root)?, &root.facts, &parts)?)
-}
-
-pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointError> {
-    let root = root(rows)?;
     let mut parts: BTreeMap<i64, Vec<Part>> = BTreeMap::new();
     for row in &rows.parts {
         parts.entry(row.node).or_default().push(Part {
@@ -1211,6 +1155,11 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
             reason: "facts parts of a node not in the checkpoint",
         });
     }
+    let root = facts::decode(
+        version(root)?,
+        &root.facts,
+        parts.get(&root.node).map_or(&[], Vec::as_slice),
+    )?;
     let mut nodes: BTreeMap<NodeId, NodeRecord> = BTreeMap::new();
     let mut passwords = BTreeMap::new();
     for row in &rows.nodes {
@@ -1442,8 +1391,7 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
             nodes: nodes.into_values().collect(),
             next_node: root.next_node,
         },
-        job: root.job,
-        root: root.root,
+        root,
         files,
         kept: kept.into_values().collect(),
         holds,
@@ -1583,4 +1531,4 @@ fn why_named(name: &str) -> Option<Why> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests;
+mod tests;

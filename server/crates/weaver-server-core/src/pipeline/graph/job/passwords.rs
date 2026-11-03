@@ -18,7 +18,6 @@ use std::fmt;
 use weaver_graph::{Builder, Effect, Marked, NodeId, Why};
 
 use super::GraphJob;
-use crate::pipeline::graph::root::Root;
 
 #[derive(Default)]
 pub(super) struct Passwords {
@@ -81,8 +80,8 @@ impl Passwords {
     }
 }
 
-impl<R: Root> GraphJob<R> {
-    // The candidates, in the order they are tried.
+impl GraphJob {
+    // The candidates the job tries, in order.
     #[cfg(test)]
     pub(crate) fn password_candidates(&self) -> &[String] {
         &self.passwords.candidates
@@ -109,6 +108,7 @@ impl<R: Root> GraphJob<R> {
             (!withheld && !record.members.is_empty()).then_some(candidate.as_str())
         })
     }
+
     // How many candidates each node has been offered, by node.
     #[cfg(test)]
     pub(crate) fn passwords_offered(&self) -> std::collections::BTreeMap<NodeId, usize> {

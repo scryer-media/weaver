@@ -249,7 +249,16 @@ impl<'a> FileOps<'a> {
                     break;
                 };
                 progress.fetch_add(lengths.piece_length(piece).into(), Ordering::Relaxed);
-                let had = self.has_piece(piece, &broken, &mut buf);
+                // A piece the storage wants as hashed is read whole, once,
+                // and goes to it from that buffer if it passes.
+                let mut whole = self
+                    .files
+                    .wants_hashed_piece(piece)
+                    .then(|| vec![0u8; lengths.piece_length(piece) as usize]);
+                let had = self.has_piece(piece, &broken, &mut buf, whole.as_deref_mut());
+                if let (Ok(true), Some(whole)) = (&had, whole) {
+                    self.files.on_piece_hashed(piece, whole.into());
+                }
                 if had.is_err() {
                     next.fetch_max(total, Ordering::Relaxed);
                 }
@@ -306,14 +315,17 @@ impl<'a> FileOps<'a> {
     /// is needed, whichever piece found it. Any other miss fails that piece
     /// alone (libtorrent `torrent::on_piece_hashed` skips the rest of a file
     /// only on eof, a missing file or a file too short).
+    /// When `whole` is given, the piece is read into it rather than through `buf`.
     fn has_piece(
         &self,
         piece: ValidPieceIndex,
         broken: &[AtomicU64],
         buf: &mut [u8],
+        mut whole: Option<&mut [u8]>,
     ) -> anyhow::Result<bool> {
         let lengths = self.torrent.lengths();
-        let mut pos = lengths.piece_offset(piece);
+        let start = lengths.piece_offset(piece);
+        let mut pos = start;
         let mut remaining = u64::from(lengths.piece_length(piece));
         let mut digest = self.digest(piece);
         let first = self
@@ -331,9 +343,22 @@ impl<'a> FileOps<'a> {
             if at >= broken[file].load(Ordering::Relaxed) {
                 return Ok(false);
             }
-            if let Err(err) =
-                update_hash_from_file(file, fi, at, self.files, &mut digest, buf, take.try_into()?)
-            {
+            let into = match whole.as_deref_mut() {
+                Some(whole) => {
+                    let from = usize::try_from(pos - start)?;
+                    &mut whole[from..from + usize::try_from(take)?]
+                }
+                None => &mut *buf,
+            };
+            if let Err(err) = update_hash_from_file(
+                file,
+                fi,
+                at,
+                self.files,
+                &mut digest,
+                into,
+                take.try_into()?,
+            ) {
                 debug!(
                     "error reading from file {file} ({:?}) at {at}: {err:#}",
                     fi.relative_filename
@@ -693,6 +718,94 @@ mod tests {
             vec![("a", payload(100, 1)), ("b", payload(3 * 32768 + 5, 2))],
             32768,
         )
+    }
+
+    /// A storage over `Files` that wants the pieces it names as a check
+    /// hashes them, and keeps what it was handed.
+    struct Wanting {
+        files: Files,
+        wanted: Vec<u32>,
+        hashed: std::sync::Mutex<Vec<(u32, bytes::Bytes)>>,
+    }
+
+    impl TorrentStorage for Wanting {
+        fn init(
+            &mut self,
+            shared: &ManagedTorrentShared,
+            metadata: &TorrentMetadata,
+        ) -> anyhow::Result<()> {
+            self.files.init(shared, metadata)
+        }
+
+        fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+            self.files.pread_exact(file_id, offset, buf)
+        }
+
+        fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+            self.files.pwrite_all(file_id, offset, buf)
+        }
+
+        fn remove_file(&self, file_id: usize, filename: &Path) -> anyhow::Result<()> {
+            self.files.remove_file(file_id, filename)
+        }
+
+        fn remove_directory_if_empty(&self, path: &Path) -> anyhow::Result<()> {
+            self.files.remove_directory_if_empty(path)
+        }
+
+        fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+            self.files.ensure_file_length(file_id, length)
+        }
+
+        fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+            self.files.take()
+        }
+
+        fn wants_hashed_piece(&self, piece: ValidPieceIndex) -> bool {
+            self.wanted.contains(&piece.get())
+        }
+
+        fn on_piece_hashed(&self, piece: ValidPieceIndex, bytes: bytes::Bytes) {
+            self.hashed.lock().unwrap().push((piece.get(), bytes));
+        }
+    }
+
+    /// A check hands the storage each piece it wants as it hashed it, read
+    /// once into one buffer: the files are read no more than for a check
+    /// that wants none, and a piece the check does not find is not handed.
+    #[test]
+    fn a_check_hands_a_wanted_piece_over_as_it_hashed_it() {
+        let t = two_files();
+        let metadata = metadata(&t.torrent_bytes());
+        let mut payload = t.v1_payload();
+        payload[3 * 32768 + 7] ^= 1;
+        let check = |wanted: Vec<u32>| {
+            let storage = Wanting {
+                files: Files::new(&metadata, &payload),
+                wanted,
+                hashed: Default::default(),
+            };
+            FileOps::new(&metadata, &storage, true)
+                .initial_check(4, &AtomicU64::new(0), &AtomicBool::new(false))
+                .unwrap();
+            let read = storage.files.1.load(Ordering::Relaxed);
+            let mut hashed = storage.hashed.into_inner().unwrap();
+            hashed.sort_by_key(|(piece, _)| *piece);
+            (read, hashed)
+        };
+        let (read_none, none) = check(Vec::new());
+        assert!(none.is_empty());
+        let (read, hashed) = check(vec![1, 3, 4]);
+        assert_eq!(read, read_none);
+        let lengths = metadata.lengths();
+        let pieces: Vec<u32> = hashed.iter().map(|(piece, _)| *piece).collect();
+        assert_eq!(pieces, [1, 4]);
+        for (piece, bytes) in hashed {
+            let piece = lengths.validate_piece_index(piece).unwrap();
+            let start = usize::try_from(lengths.piece_offset(piece)).unwrap();
+            let end = start + lengths.piece_length(piece) as usize;
+            assert_eq!(&bytes[..], &payload[start..end], "piece {piece}");
+        }
     }
 
     #[test]

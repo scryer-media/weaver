@@ -663,12 +663,8 @@ impl Lender for Inline {
     }
 }
 
-// Bytes that arrive before the member's front says what it is are on disk
-// at once, in its own file at their offsets, and nothing is held: a restart
-// reads back every byte the coverage says arrived, whatever order it came
-// in. Once the front decides a leaf, the file is simply its file.
 #[test]
-fn bytes_before_the_member_is_decided_are_on_disk_in_its_file() {
+fn bytes_before_the_member_is_decided_are_held_then_replayed_to_its_leaf() {
     let mut job = Job::new(PLENTY);
     let member = job.member("notes.bin", Some(11));
     // "Ra" could still be a RAR signature; the bytes after it say nothing
@@ -676,17 +672,13 @@ fn bytes_before_the_member_is_decided_are_on_disk_in_its_file() {
     job.send(member, 0, b"Ra", Provenance::Fresh);
     job.send(member, 6, b"world", Provenance::Fresh);
     assert!(job.tree.is_undecided(NodeId::ROOT, member));
-    assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
-    assert_eq!(job.accountant.usage().resident, 0);
-    let mut on_disk = Vec::new();
-    assert!(
-        job.writer
-            .read_posted(&job.tree, member, ByteRange::new(6, 11), &mut on_disk)
-    );
-    assert_eq!(on_disk, b"world");
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), 7);
+    assert!(!job.dir.path().join("notes.bin").exists());
 
     job.send(member, 2, b"ws, ", Provenance::Fresh);
     assert!(!job.tree.is_undecided(NodeId::ROOT, member));
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
+    assert_eq!(job.accountant.usage().resident, 0);
     assert_eq!(job.file("notes.bin"), b"Raws, world");
 }
 
@@ -715,63 +707,48 @@ fn routed_deliveries_reuse_the_writer_s_effect_room() {
     assert_eq!(job.file("notes.bin"), b"Raws, world");
 }
 
-// A store that cannot place bytes yet holds them for its volume; a breach
-// of the holds budgets refuses the store, and the member is a leaf that
-// nothing holds for.
 #[test]
-fn a_breach_refuses_the_member_to_a_leaf() {
+fn a_breach_refuses_the_member_to_a_leaf_which_receives_every_byte() {
     let mut job = Job::new(HoldBudgets {
         resident_limit: 4,
         scratch_total: 0,
         scratch_ceiling: 0,
         disk_reserve: 0,
     });
-    let member = job.member("a.7z", Some(map_at().end));
-    let mut front = seven_z().to_vec();
-    front.extend_from_slice(b"hello");
-    job.send(member, 0, &front, Provenance::Fresh);
+    let member = job.member("notes.bin", None);
+    job.send(member, 0, b"Ra", Provenance::Fresh);
+    job.send(member, 10, b"tail..", Provenance::Fresh);
     assert_eq!(
         job.writer.refused(NodeId::ROOT, member),
         Some(Why::HoldsBreached)
     );
-    assert!(job.out.iter().any(|effect| matches!(
-        effect,
-        Effect::Refused {
-            node: NodeId::ROOT,
-            member: refused,
-            why: Why::HoldsBreached,
-        } if *refused == member
-    )));
-    assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
+    assert!(job.out.contains(&Effect::Refused {
+        node: NodeId::ROOT,
+        member,
+        why: Why::HoldsBreached,
+    }));
     assert_eq!(job.accountant.usage().resident, 0);
+
+    // Decided now: the rest goes straight to the file.
+    job.send(member, 2, b"r! mid.", Provenance::Fresh);
+    job.close(member);
+    assert_eq!(job.file("notes.bin"), b"Rar! mid.\0tail..");
 }
 
-// Bytes a store holds past the resident budget page to scratch, and come
-// back intact once the store can place them.
 #[test]
 fn held_bytes_paged_to_scratch_come_back_intact() {
     let mut job = Job::new(HoldBudgets {
         resident_limit: 2,
         ..PLENTY
     });
-    let member = job.member("a.7z", Some(map_at().end));
-    let mut front = seven_z().to_vec();
-    front.extend_from_slice(b"hello");
-    job.send(member, 0, &front, Provenance::Fresh);
-    assert_eq!(job.accountant.usage().scratch, body().len());
-    job.send(member, map_at().start, MAP, Provenance::Fresh);
-    assert_eq!(job.file("inner.bin"), b"hello");
+    let member = job.member("notes.bin", None);
+    job.send(member, 0, b"Ra", Provenance::Fresh);
+    job.send(member, 4, b"back", Provenance::Fresh);
+    assert_eq!(job.accountant.usage().scratch, 4);
+    job.send(member, 2, b"rx", Provenance::Fresh);
+    job.close(member);
+    assert_eq!(job.file("notes.bin"), b"Rarxback");
     assert_eq!(job.accountant.usage().scratch, 0);
-}
-
-// The 7z's signature and its body in two pieces with a gap between: the
-// store cannot place the body until the map comes, so it holds "he" and
-// "lo" as two holds.
-fn send_split_body(job: &mut Job, member: MemberId) {
-    let mut front = seven_z().to_vec();
-    front.extend_from_slice(b"he");
-    job.send(member, 0, &front, Provenance::Fresh);
-    job.send(member, body().start + 3, b"lo", Provenance::Fresh);
 }
 
 // A hold paged to scratch under pressure is not a record: its span is
@@ -780,14 +757,15 @@ fn send_split_body(job: &mut Job, member: MemberId) {
 #[test]
 fn holds_paged_out_under_pressure_are_not_recorded_before_a_stop() {
     let mut job = Job::new(HoldBudgets {
-        resident_limit: 0,
+        resident_limit: 4,
         scratch_total: u64::MAX,
         scratch_ceiling: u64::MAX,
         disk_reserve: 0,
     });
-    let member = job.member("a.7z", Some(map_at().end));
-    send_split_body(&mut job, member);
-    assert_eq!(job.accountant.usage().scratch, 4);
+    let member = job.member("notes.bin", Some(11));
+    job.send(member, 0, b"Ra", Provenance::Fresh);
+    job.send(member, 6, b"world", Provenance::Fresh);
+    assert_eq!(job.accountant.usage().scratch, 5);
     assert!(job.writer.hold_records(NodeId::ROOT).is_empty());
 
     job.writer.page_out_holds().expect("page out");
@@ -797,13 +775,14 @@ fn holds_paged_out_under_pressure_are_not_recorded_before_a_stop() {
 #[test]
 fn holds_paged_out_at_a_stop_read_back_in_a_writer_rebuilt_from_their_records() {
     let mut job = Job::new(PLENTY);
-    let member = job.member("a.7z", Some(map_at().end));
-    send_split_body(&mut job, member);
-    assert_eq!(job.accountant.usage().resident, 4);
+    let member = job.member("notes.bin", Some(11));
+    job.send(member, 0, b"Ra", Provenance::Fresh);
+    job.send(member, 6, b"world", Provenance::Fresh);
+    assert_eq!(job.accountant.usage().resident, 7);
 
     job.writer.page_out_holds().expect("page out");
     assert_eq!(job.accountant.usage().resident, 0);
-    assert_eq!(job.accountant.usage().scratch, 4);
+    assert_eq!(job.accountant.usage().scratch, 7);
     let records: Vec<HoldRecord> = job
         .writer
         .hold_records(NodeId::ROOT)
@@ -831,29 +810,27 @@ fn holds_paged_out_at_a_stop_read_back_in_a_writer_rebuilt_from_their_records() 
     job.writer
         .restore_holds(&job.tree, &records)
         .expect("restore holds");
-    assert_eq!(job.accountant.usage().scratch, 4);
-    let start = body().start;
+    assert_eq!(job.accountant.usage().scratch, 7);
     let mut bytes = Vec::new();
     assert!(job.writer.access(&job.tree).read_at(
         NodeId::ROOT,
         member,
-        ByteRange::new(start + 3, start + 5),
+        ByteRange::new(6, 11),
         &mut bytes
     ));
-    assert_eq!(bytes, b"lo");
+    assert_eq!(bytes, b"world");
     bytes.clear();
     assert!(job.writer.access(&job.tree).read_at(
         NodeId::ROOT,
         member,
-        ByteRange::new(start, start + 2),
+        ByteRange::new(0, 2),
         &mut bytes
     ));
-    assert_eq!(bytes, b"he");
+    assert_eq!(bytes, b"Ra");
 
-    // And they go down as any hold does once the store can place them.
-    job.send(member, start + 2, b"l", Provenance::Fresh);
-    job.send(member, map_at().start, MAP, Provenance::Fresh);
-    assert_eq!(job.file("inner.bin"), b"hello");
+    // And they go down as any hold does once the member is decided.
+    job.send(member, 2, b"ws, ", Provenance::Fresh);
+    assert_eq!(job.file("notes.bin"), b"Raws, world");
     assert_eq!(job.accountant.usage().scratch, 0);
 }
 
@@ -2032,11 +2009,9 @@ fn segments_that_arrived_before_the_set_are_fed_when_it_covers_the_member() {
 #[test]
 fn dropping_the_writer_gives_its_holds_back() {
     let mut job = Job::new(PLENTY);
-    let member = job.member("a.7z", Some(map_at().end));
-    let mut front = seven_z().to_vec();
-    front.extend_from_slice(b"hello");
-    job.send(member, 0, &front, Provenance::Fresh);
-    assert_eq!(job.accountant.usage().resident, body().len());
+    let member = job.member("notes.bin", None);
+    job.send(member, 0, b"Ra", Provenance::Fresh);
+    assert_eq!(job.accountant.usage().resident, 2);
     let Job {
         writer, accountant, ..
     } = job;
@@ -2166,13 +2141,13 @@ fn a_member_given_back_logs_object_refused() {
         scratch_ceiling: 0,
         disk_reserve: 0,
     });
-    let member = job.member("a.7z", Some(map_at().end));
-    let mut front = seven_z().to_vec();
-    front.extend_from_slice(b"hello");
-    job.send(member, 0, &front, Provenance::Fresh);
+    let member = job.member("notes.bin", None);
+    job.send(member, 0, b"Ra", Provenance::Fresh);
+    job.send(member, 10, b"tail..", Provenance::Fresh);
+    job.send(member, 2, b"r! mid.", Provenance::Fresh);
     assert_eq!(
         lines.of("object refused"),
-        ["object refused job_id=1 node=0 kind=sevenz_store member=a.7z why=holds_breached"]
+        ["object refused job_id=1 node=0 kind= member=notes.bin why=holds_breached"]
     );
 }
 

@@ -495,19 +495,6 @@ pub(crate) struct Delta {
 }
 
 impl Delta {
-    // What `after` changes of `before`, which is the checkpoint the
-    // database holds or will once what is queued is written; `None` when
-    // nothing says what it holds. Both are in key order.
-    #[cfg(test)]
-    pub(crate) fn between(before: Option<&GraphCheckpoint>, after: &GraphCheckpoint) -> Self {
-        let mut out = Self {
-            whole: before.is_none(),
-            ..Self::default()
-        };
-        out.compare(before.unwrap_or(&GraphCheckpoint::default()), after);
-        out
-    }
-
     // What `after` changes of `before`, taken into this change: rows of one
     // part of the job, whose other rows are compared apart. Both are in key
     // order.
@@ -644,22 +631,6 @@ impl Database {
             .map_err(LoadError::Read)?;
         fetched.map(interpret).transpose().map_err(LoadError::Rows)
     }
-
-    // The root's row of the job's checkpoint with its facts parts, or
-    // `None` when it has no rows: the root's facts without the rest. Read
-    // in one transaction, as the whole checkpoint is.
-    pub(crate) fn load_graph_root(
-        &self,
-        job_id: JobId,
-    ) -> Result<Option<GraphCheckpoint>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "load_graph_root", |tx| {
-                Box::pin(async move { read_root(tx, job_id).await })
-            })
-            .await
-        })
-    }
 }
 
 // Whether the job `job_id` names is live: while its queue row or its torrent
@@ -672,11 +643,7 @@ pub(crate) fn live_job(job_id: &str) -> String {
     )
 }
 
-pub(crate) async fn write_delta(
-    tx: &mut SqlTx<'_>,
-    job_id: JobId,
-    delta: &Delta,
-) -> Result<(), StateError> {
+async fn write_delta(tx: &mut SqlTx<'_>, job_id: JobId, delta: &Delta) -> Result<(), StateError> {
     lock_active_job_for_write_tx(tx, job_id).await?;
     let id = job_id.0 as i64;
     let live = tx
@@ -760,72 +727,6 @@ async fn write<R: Row>(
     Ok(())
 }
 
-const NODE_COLUMNS: &str = "node_id, parent_node_id, parent_member_id, volumes, window_start, \
-     window_end, kind, state, reason, facts_version, facts, winning_password";
-const PART_COLUMNS: &str = "node_id, part, bytes";
-
-fn node_row(row: &SqlRow) -> Result<NodeRow, StateError> {
-    let pair = |first: &str, second: &str| -> Result<_, StateError> {
-        Ok(row.opt_i64(first)?.zip(row.opt_i64(second)?))
-    };
-    Ok(NodeRow {
-        node: row.i64("node_id")?,
-        parent: row.opt_i64("parent_node_id")?,
-        parent_member: row.opt_i64("parent_member_id")?,
-        volumes: row.opt_bytes("volumes")?,
-        window: pair("window_start", "window_end")?,
-        kind: row.text("kind")?,
-        state: row.text("state")?,
-        reason: row.opt_text("reason")?,
-        facts_version: row.i64("facts_version")?,
-        facts: row.bytes("facts")?,
-        winning_password: row.opt_i64("winning_password")?,
-    })
-}
-
-fn part_row(row: &SqlRow) -> Result<PartRow, StateError> {
-    Ok(PartRow {
-        node: row.i64("node_id")?,
-        part: row.i64("part")?,
-        bytes: Arc::from(row.bytes("bytes")?),
-    })
-}
-
-// The root's row of the job's checkpoint and its facts parts, and none of
-// the rest: what the root's facts are read from.
-async fn read_root(
-    tx: &mut SqlTx<'_>,
-    job_id: JobId,
-) -> Result<Option<GraphCheckpoint>, StateError> {
-    let args = [SqlArg::I64(job_id.0 as i64)];
-    let Some(root) = tx
-        .fetch_optional(
-            &format!("SELECT {NODE_COLUMNS} FROM graph_nodes WHERE job_id = {{}} AND node_id = 0"),
-            &args,
-        )
-        .await?
-    else {
-        return Ok(None);
-    };
-    let parts = tx
-        .fetch_all(
-            &format!(
-                "SELECT {PART_COLUMNS} FROM graph_facts_parts WHERE job_id = {{}} AND node_id = 0 \
-                 ORDER BY part"
-            ),
-            &args,
-        )
-        .await?
-        .iter()
-        .map(part_row)
-        .collect::<Result<_, StateError>>()?;
-    Ok(Some(GraphCheckpoint {
-        nodes: vec![node_row(&root)?],
-        parts,
-        ..GraphCheckpoint::default()
-    }))
-}
-
 // A checkpoint's rows as the database returned them, before any value in
 // them is read.
 struct Fetched {
@@ -849,7 +750,9 @@ async fn fetch_checkpoint(
     let args = [SqlArg::I64(job_id.0 as i64)];
     let nodes = tx
         .fetch_all(
-            &format!("SELECT {NODE_COLUMNS} FROM graph_nodes WHERE job_id = {{}} ORDER BY node_id"),
+            "SELECT node_id, parent_node_id, parent_member_id, volumes, window_start, window_end, \
+             kind, state, reason, facts_version, facts, winning_password \
+             FROM graph_nodes WHERE job_id = {} ORDER BY node_id",
             &args,
         )
         .await?;
@@ -1015,7 +918,13 @@ fn interpret(fetched: Fetched) -> Result<GraphCheckpoint, StateError> {
     let parts = fetched
         .parts
         .iter()
-        .map(part_row)
+        .map(|row| {
+            Ok(PartRow {
+                node: row.i64("node_id")?,
+                part: row.i64("part")?,
+                bytes: Arc::from(row.bytes("bytes")?),
+            })
+        })
         .collect::<Result<_, StateError>>()?;
     let holds = fetched
         .holds

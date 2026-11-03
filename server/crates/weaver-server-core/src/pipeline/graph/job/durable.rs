@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The job as a checkpoint takes it: the tree's records, the root's facts,
-// the job's count of repair reads and the phase it last reported, the
+// The job as a checkpoint takes it: the tree's records, the root's facts
+// with the job's count of repair reads and the phase it last reported, the
 // writer's files, kept envelopes and holds on scratch, and which candidate
 // each node was offered last. A node's own record and each of its members
 // are read on their own, so a checkpoint reads only what the tree, the
@@ -16,61 +16,11 @@ use weaver_graph::{CoverageRecord, MemberId, MemberRecord, NodeId, NodeRecord};
 
 use super::GraphJob;
 use crate::pipeline::graph::checkpoint::{FileState, Generations, MemberGenerations, Touched};
-#[cfg(test)]
-use crate::pipeline::graph::checkpoint::{HoldRecord, Snapshot};
 use crate::pipeline::graph::envelope::durable::KeptRecord;
 use crate::pipeline::graph::namespace::WriteError;
-use crate::pipeline::graph::root::Root;
-use crate::pipeline::graph::root::facts::{JobFacts, Parts, RootBlob, RootRow};
+use crate::pipeline::graph::root::facts::{Encoded, Encoding};
 
-impl<R: Root> GraphJob<R> {
-    // The whole job, its root's facts encoded whole.
-    #[cfg(test)]
-    pub(crate) fn snapshot(&self) -> Snapshot {
-        let tree = self.tree.records();
-        let mut files = BTreeMap::new();
-        let mut kept = Vec::new();
-        let mut holds = Vec::new();
-        let mut passwords = BTreeMap::new();
-        for node in &tree.nodes {
-            for member in &node.members {
-                let state = self.writer.file_state(node.node, member.member);
-                if state != FileState::default() {
-                    files.insert((node.node, member.member), state);
-                }
-            }
-            kept.extend(self.kept_records(node.node));
-            holds.extend(
-                self.hold_records(node.node)
-                    .into_iter()
-                    .map(|held| HoldRecord {
-                        node: node.node,
-                        held,
-                    }),
-            );
-            if let Some(index) = self.last_offered(node.node) {
-                passwords.insert(node.node, index);
-            }
-        }
-        Snapshot {
-            job: self.job_facts(),
-            root: RootBlob::of(&self.root),
-            tree,
-            files,
-            kept,
-            holds,
-            passwords,
-        }
-    }
-
-    fn job_facts(&self) -> JobFacts {
-        JobFacts {
-            read_backs: self.writer.read_backs(),
-            reported: self.reported,
-            pending_verifications: self.writer.pending_verifications(),
-        }
-    }
-
+impl GraphJob {
     pub(crate) fn generations(&self) -> Generations {
         Generations {
             tree: self.tree.generation(),
@@ -173,6 +123,10 @@ impl<R: Root> GraphJob<R> {
         Some((record, files))
     }
 
+    pub(crate) fn next_node(&self) -> u32 {
+        self.tree.next_node()
+    }
+
     // The node's kept envelopes.
     pub(crate) fn kept_records(&self, node: NodeId) -> Vec<KeptRecord> {
         self.writer.kept_records(node)
@@ -194,26 +148,21 @@ impl<R: Root> GraphJob<R> {
         self.passwords.last_offered(node)
     }
 
-    // The root row, its root's facts encoded again only where they changed
-    // since the job last encoded them, and the parts that encoding names;
-    // `whole` forgets what was kept, so the encoding reads the root whole
-    // and names every part.
-    pub(crate) fn encode_root(&mut self, whole: bool) -> (RootRow, Parts) {
-        if whole {
-            self.kept = R::Kept::default();
-        }
-        let (root, parts) = RootBlob::encode(&self.root, &mut self.kept);
-        let row = RootRow {
-            next_node: self.tree.next_node(),
-            job: self.job_facts(),
-            root,
-        };
-        (row, parts)
+    // The root's facts, with the job's count of repair reads and the phase
+    // it last reported, encoded into `encoded`.
+    pub(crate) fn encode_root(&self, encoded: &mut Encoded, next_node: u32) -> Encoding {
+        self.root.encode(
+            encoded,
+            next_node,
+            self.writer.read_backs(),
+            self.reported,
+            self.writer.pending_verifications(),
+        )
     }
 
-    // The bytes of the units the root's facts say this run does not fetch
-    // again: what the facts encoded now spare a restore.
+    // The post's encoded bytes of the articles the root's facts say this
+    // run does not fetch again: what the facts encoded now spare a restore.
     pub(crate) fn settled_bytes(&self) -> u64 {
-        self.root.settled_bytes()
+        self.root.map.settled_bytes()
     }
 }

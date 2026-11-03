@@ -245,6 +245,19 @@ pub trait TorrentStorage: Send + Sync {
         Ok(())
     }
 
+    /// Asked by a check of the files before it reads a piece: whether the storage wants the
+    /// piece's bytes as the check hashed them. One it wants is read whole into one buffer and
+    /// handed to [`Self::on_piece_hashed`] if it passes, so the storage need not read it again.
+    /// Default implementation wants none.
+    fn wants_hashed_piece(&self, _piece_index: ValidPieceIndex) -> bool {
+        false
+    }
+
+    /// A piece a check of the files read whole and found, as it hashed it: called from the
+    /// check's thread before the verdict reaches [`Self::on_piece_checked`]. Default
+    /// implementation does nothing.
+    fn on_piece_hashed(&self, _piece_index: ValidPieceIndex, _bytes: bytes::Bytes) {}
+
     /// Asked before a queued piece is handed to a peer, or a block of one is written: whether
     /// the storage has room for it. On false the piece stays queued, the block is discarded,
     /// and the peer waits on `room`, which the storage rings once it has room again. Default
@@ -320,6 +333,14 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn on_piece_checked(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
         (**self).on_piece_checked(piece_id)
+    }
+
+    fn wants_hashed_piece(&self, piece_id: ValidPieceIndex) -> bool {
+        (**self).wants_hashed_piece(piece_id)
+    }
+
+    fn on_piece_hashed(&self, piece_id: ValidPieceIndex, bytes: bytes::Bytes) {
+        (**self).on_piece_hashed(piece_id, bytes)
     }
 
     fn reserve_piece(&self, piece_id: ValidPieceIndex, room: &Arc<Notify>) -> bool {

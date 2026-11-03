@@ -8,8 +8,8 @@ use crate::runtime::hardware_profile::HardwareProfile;
 use crate::settings::record::SettingRecord;
 use crate::settings::{
     BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides, Leaf,
-    MetricsConfig, PerJobSeries, RetryOverrides, SeedTimeCounting, SeedingAction,
-    SeedingGoalMode, SeedingPolicy, TorrentConfig, TorrentEncryption, TorrentPeerProtocol,
+    MetricsConfig, PerJobSeries, RetryOverrides, SeedTimeCounting, SeedingAction, SeedingGoalMode,
+    SeedingPolicy, TorrentConfig, TorrentEncryption, TorrentPeerProtocol,
 };
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 

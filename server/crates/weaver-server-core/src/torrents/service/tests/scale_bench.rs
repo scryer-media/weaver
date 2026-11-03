@@ -2,8 +2,9 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // Torrents at scale through the whole service: WEAVER_BENCH_TORRENTS small
-// seeds (default 1000; a comma-separated list runs each count in turn) are
-// added from files already in place, seeded, listed, stopped and brought
+// seeds (default 1000; a comma-separated list runs each count in turn), of
+// a plain file and then of a RAR archive that unpacks, are added from files
+// already in place, seeded, listed, stopped and brought
 // back by a restarted service over the same database, as a server's boot
 // brings them back. It reports the wall time of each phase, a tick's and a
 // list's wall time with every torrent seeding, and the process's resident
@@ -79,11 +80,35 @@ async fn all_seeding(service: &TorrentService, changes: &mut watch::Receiver<u64
     }
 }
 
+// Every job in `jobs` complete, its archive unpacked when it has one,
+// waited for one after another on the queue's changes.
+async fn all_complete(db: &Database, changes: &mut watch::Receiver<u64>, jobs: &[JobId]) {
+    for &job_id in jobs {
+        loop {
+            changes.borrow_and_update();
+            if db
+                .get_torrent(job_id)
+                .unwrap()
+                .is_some_and(|torrent| torrent.completed_at_ms.is_some())
+            {
+                break;
+            }
+            changes.changed().await.unwrap();
+        }
+    }
+}
+
 fn ms(from: Instant) -> f64 {
     from.elapsed().as_secs_f64() * 1000.0
 }
 
-async fn run(count: usize) {
+// A small RAR archive of one stored file, the archive torrents' one file.
+const ARCHIVE: &[u8] = include_bytes!(concat!(
+    std::env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/rar5/rar5_store.rar"
+));
+
+async fn run(count: usize, archive: bool) {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open_in_memory().unwrap();
     let routes = Arc::new(FakeRoutes::default());
@@ -100,11 +125,16 @@ async fn run(count: usize) {
     let mut jobs = Vec::with_capacity(count);
     for at in 0..count {
         let name = format!("s{at}");
-        let data = [(at % 251) as u8; 3000];
+        let plain = [(at % 251) as u8; 3000];
+        let (file, data): (&str, &[u8]) = if archive {
+            ("set.rar", ARCHIVE)
+        } else {
+            ("a.bin", &plain)
+        };
         let save = dir.path().join("placed").join(&name);
         std::fs::create_dir_all(save.join(&name)).unwrap();
-        std::fs::write(save.join(&name).join("a.bin"), data).unwrap();
-        let metainfo = metainfo(&name, &[(&format!("{name}/a.bin"), &data)], 1024, false);
+        std::fs::write(save.join(&name).join(file), data).unwrap();
+        let metainfo = metainfo(&name, &[(file, data)], 1024, false);
         let job_id = service
             .add(AddRequest {
                 placement: Placement {
@@ -112,6 +142,7 @@ async fn run(count: usize) {
                     seed_mode: true,
                     ..Placement::default()
                 },
+                unpack: Some(archive),
                 ..request(AddSource::Metainfo(metainfo))
             })
             .await
@@ -121,14 +152,42 @@ async fn run(count: usize) {
     let added = ms(started);
     all_seeding(&service, &mut changes, &jobs).await;
     let seeding = ms(started);
+    // A seed of plain files is complete as added; an archive's completes
+    // once it has unpacked.
+    if archive {
+        all_complete(&db, &mut changes, &jobs).await;
+    }
+    let complete = ms(started);
+    // The archives' one file, unpacked beside each by then.
+    let unpacked = (0..count)
+        .filter(|at| {
+            dir.path()
+                .join("placed")
+                .join(format!("s{at}"))
+                .join(format!("s{at}"))
+                .join("small.txt")
+                .exists()
+        })
+        .count();
     let resident = resident_mib();
 
+    // Each tick on its own: a first tick that writes what the adds left
+    // reads apart from the steady ones after it.
+    let ticks: Vec<f64> = {
+        let mut ticks = Vec::new();
+        for _ in 0..3 {
+            let at = Instant::now();
+            service.tick().await;
+            ticks.push(ms(at));
+        }
+        ticks
+    };
+    let tick = ticks
+        .iter()
+        .map(|tick| format!("{tick:.1}"))
+        .collect::<Vec<_>>()
+        .join(" / ");
     let ticks = 3;
-    let at = Instant::now();
-    for _ in 0..ticks {
-        service.tick().await;
-    }
-    let tick = ms(at) / f64::from(ticks);
     let at = Instant::now();
     for _ in 0..ticks {
         assert_eq!(service.torrents(None).await.len(), count);
@@ -138,7 +197,8 @@ async fn run(count: usize) {
     let at = Instant::now();
     service.stop().await;
     let stopped = ms(at);
-    db.prune_orphan_active_state(crate::jobs::ids::JobId(u64::MAX)).unwrap();
+    db.prune_orphan_active_state(crate::jobs::ids::JobId(u64::MAX))
+        .unwrap();
 
     let again = bench_service(&db, dir.path(), &routes);
     let handle = queue();
@@ -153,9 +213,10 @@ async fn run(count: usize) {
     again.stop().await;
 
     println!(
-        "BENCH service scale {count} torrents: add {added:.0} ms, all seeding {seeding:.0} ms; \
-         tick {tick:.1} ms, list {list:.1} ms; stop {stopped:.0} ms; restart: start {opened:.0} ms, \
+        "BENCH service scale {count} {} torrents ({unpacked} unpacked): add {added:.0} ms, all seeding {seeding:.0} ms, all complete {complete:.0} ms; \
+         ticks {tick} ms, list {list:.1} ms; stop {stopped:.0} ms; restart: start {opened:.0} ms, \
          all seeding {back:.0} ms; resident MiB before {}, seeding {}, after restart {}",
+        if archive { "archive" } else { "plain" },
         mib(before),
         mib(resident),
         mib(resident_back),
@@ -171,6 +232,7 @@ async fn torrent_service_scale() {
         .map(|count| count.trim().parse().unwrap())
         .collect();
     for count in counts {
-        run(count).await;
+        run(count, false).await;
+        run(count, true).await;
     }
 }

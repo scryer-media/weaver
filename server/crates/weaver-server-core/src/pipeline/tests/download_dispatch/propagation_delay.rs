@@ -1092,9 +1092,7 @@ async fn egress_quota_block_outranks_server_quota_and_yields_to_a_pause() {
     pipeline
         .shared_state
         .hold(crate::jobs::Hold::manual(crate::jobs::HoldOwner::All));
-    pipeline
-        .apply_holds(pipeline.shared_state.holds())
-        .await;
+    pipeline.apply_holds(pipeline.shared_state.holds()).await;
     let state = pipeline.shared_state.download_block();
     assert_eq!(
         state.kind,
@@ -1104,9 +1102,7 @@ async fn egress_quota_block_outranks_server_quota_and_yields_to_a_pause() {
     pipeline
         .shared_state
         .release(crate::jobs::HoldOrigin::Manual, crate::jobs::HoldOwner::All);
-    pipeline
-        .apply_holds(pipeline.shared_state.holds())
-        .await;
+    pipeline.apply_holds(pipeline.shared_state.holds()).await;
 
     // Once the egress clears, the server quota underneath shows again.
     pipeline.shared_state.set_egress_quota_block(None);

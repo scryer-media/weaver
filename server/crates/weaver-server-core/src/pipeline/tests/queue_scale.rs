@@ -777,7 +777,10 @@ async fn a_speed_test_on_a_paused_queue_publishes_its_bytes_then_parks() {
     // The last articles land, then the test lets go of the queue.
     booked.bytes_downloaded.fetch_add(1_024, Ordering::Relaxed);
     handle
-        .resume(crate::jobs::HoldOrigin::SpeedTest, crate::jobs::HoldOwner::All)
+        .resume(
+            crate::jobs::HoldOrigin::SpeedTest,
+            crate::jobs::HoldOwner::All,
+        )
         .await
         .unwrap();
     drive.wait_for(|driving| !driving).await.unwrap();

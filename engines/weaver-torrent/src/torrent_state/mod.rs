@@ -1197,6 +1197,61 @@ impl ManagedTorrent {
         self.shared.options.seed.while_on(f)
     }
 
+    /// A piece of a seed-mode torrent checked now, as a peer's request
+    /// checks it before the piece is served (libtorrent
+    /// `peer_connection::fill_send_buffer`), whether the torrent runs or is
+    /// paused: true when it passed, now or before, and the storage heard
+    /// [`crate::storage::TorrentStorage::on_piece_checked`] when it passed
+    /// now. One that fails ends seed mode and every piece is checked again
+    /// (libtorrent `torrent::leave_seed_mode` with `check_files`). None
+    /// while the torrent neither runs nor is paused, or for no piece of it.
+    /// Reads the piece from disk: called off the async runtime.
+    pub fn check_seeded(&self, piece: u32) -> Option<anyhow::Result<bool>> {
+        let metadata = self.metadata.load();
+        let piece = metadata.as_ref()?.lengths().validate_piece_index(piece)?;
+        if let Some(live) = self.live() {
+            return Some(live.check_seeded(piece));
+        }
+        let left = {
+            let g = self.locked.read();
+            let ManagedTorrentState::Paused(paused) = &g.state else {
+                return None;
+            };
+            let seed = &self.shared.options.seed;
+            if !seed.unchecked(piece) {
+                return Some(Ok(true));
+            }
+            let ops = crate::file_ops::FileOps::new(
+                &paused.metadata,
+                &*paused.files,
+                self.shared.options.disable_v1_hashes,
+            );
+            if matches!(ops.check_piece(piece), Ok(crate::file_ops::Verdict::Passed)) {
+                let checked = paused.files.on_piece_checked(piece);
+                seed.checked(piece);
+                return Some(checked.map(|()| true));
+            }
+            seed.leave()
+        };
+        if left {
+            warn!(
+                piece = piece.get(),
+                "a piece failed its check in seed mode: checking every piece"
+            );
+            let session = self.shared.session.upgrade()?;
+            let id = self.shared.id;
+            tokio::spawn(async move {
+                let Some(handle) = session.get(crate::api::TorrentIdOrHash::Id(id)) else {
+                    return;
+                };
+                if let Err(error) = session.force_recheck(&handle).await {
+                    warn!(error = %error, "could not check a torrent that left seed mode");
+                }
+            });
+        }
+        Some(Ok(false))
+    }
+
     /// A running SSL torrent left without an identity stops its run and
     /// waits for one, as it was asked to run: its connections close and its
     /// announces stop.

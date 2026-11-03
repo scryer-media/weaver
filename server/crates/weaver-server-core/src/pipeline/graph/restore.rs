@@ -203,13 +203,11 @@ impl RestoreSeat {
             passwords: restore_passwords(&self.db, job_id, self.spec_password.as_deref())?,
             caps: caps_for(&self.db, &self.extraction_limits, &files),
             working_dir: self.working_dir,
-            kept_dir: None,
             accountant: self.accountant,
             free_disk: self.free_disk,
             slots: self.slots,
             mail: self.mail,
             nesting: super::limits::NESTING,
-            unpack: true,
             hardware: self.hardware,
             metrics: Some(self.metrics),
         };
@@ -218,7 +216,6 @@ impl RestoreSeat {
             job,
             settled,
             refetched,
-            ..
         } = GraphJob::restore(&snapshot, &files, job_id.0, storage, limit)?;
         // The next checkpoint writes only what it changes of these.
         let feed_verdict = rows.feed_verdict.clone();
@@ -260,7 +257,7 @@ impl RestoreSeat {
 // directory's own marker and the run's cache are the directory's, never the
 // job's, and stay. A file that cannot be removed stays; the job does not
 // read it.
-pub(super) fn sweep_unnamed(
+pub(crate) fn sweep_unnamed(
     working_dir: &Path,
     snapshot: &checkpoint::Snapshot,
     held_parts: &[crate::jobs::graph_checkpoint::HeldPartRow],
@@ -332,6 +329,12 @@ fn sweep_within(dir: &Path, at: &Path, named: &HashSet<PathBuf>, within: &HashSe
             );
         }
     }
+}
+
+// What a job's working directory holds that no archive made: the job's own
+// files, and the directory's.
+pub(crate) fn the_jobs(name: &Path) -> bool {
+    name == Path::new(weaver_graph::names::INTERNAL_DIR) || the_directorys(name)
 }
 
 // What the working directory holds for itself: its marker, the marker's

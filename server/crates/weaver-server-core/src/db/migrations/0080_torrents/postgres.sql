@@ -19,6 +19,9 @@ CREATE TABLE torrents (
     -- A seeding policy, as JSON, that overrides the category's and the
     -- global one field by field.
     policy_override  TEXT,
+    -- The files unpacking placed beside a torrent's own, relative to the
+    -- directory its files are in, as a JSON list; NULL when it placed none.
+    outputs          TEXT,
     CHECK (infohash_v1 IS NOT NULL OR infohash_v2 IS NOT NULL)
 );
 
@@ -64,7 +67,14 @@ CREATE TABLE torrent_counters (
     consecutive_seeding_s         BIGINT NOT NULL DEFAULT 0,
     last_activity_ms              BIGINT,
     last_announce_uploaded_bytes  BIGINT NOT NULL DEFAULT 0,
-    updated_at_ms                 BIGINT NOT NULL
+    updated_at_ms                 BIGINT NOT NULL,
+    -- The pieces a torrent has verified in its files, a bitfield with the
+    -- first piece in the high bit of the first byte; NULL before it has
+    -- kept any.
+    pieces                        BYTEA,
+    -- Whether a check of every piece had yet to find some of them: the
+    -- next run checks every piece again.
+    pieces_checking               BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 -- A category's seeding policy, as JSON, its upload cap (`off` for none

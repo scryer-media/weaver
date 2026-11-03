@@ -2,19 +2,15 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // A graph job back from its checkpoint. The promise is no refetch: what the
-// checkpoint says is on disk and the tree rebuilds from is read back and
-// delivered down the tree again, the rest is found in its file, and only
-// what is not there is fetched. In the plan's order:
+// checkpoint says is on disk is read back and delivered down the tree again,
+// and only what is not there is fetched. In the plan's order:
 //
 //   2. every node is rebuilt from its facts, and each node that was offered
 //      a candidate is offered it again, so its keys are derived anew
-//   3. every unit the root had in hand that it reads back is read through
-//      the inverse map and checked against what the root was handed; one
-//      that reads but does not match is damaged, one that does not read is
-//      fetched again. A unit it does not read back is trusted as the
-//      checkpoint left it once its file reaches past it, and only what it
-//      holds of the member's front is read, back into the namespace
-//   4. each unit read is delivered down the tree before the next is
+//   3. every article the root had in hand is read back through the inverse
+//      map and checked against the decoder's checksums; one that reads but
+//      does not match is damaged, one that does not read is fetched again
+//   4. each article read is delivered down the tree before the next is
 //      read, as it first came, so every object is where it was and a stream
 //      replays from its start
 //   5. the engines' runs are asked again for their slots; holds the
@@ -28,7 +24,6 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use weaver_graph::member::FIRST_BYTES;
 use weaver_graph::{ByteRange, MemberId, NodeId, Provenance, RestoreError, Tree, VolumeIndex};
 
 use super::loans::Loans;
@@ -37,8 +32,8 @@ use super::{GraphError, GraphJob, RootFile, Storage};
 use crate::pipeline::graph::checkpoint::{Pending, Snapshot};
 use crate::pipeline::graph::engine::Runs;
 use crate::pipeline::graph::namespace::{Arrival, NamespaceWriter, WriteError};
+use crate::pipeline::graph::root::ArticleRoot;
 use crate::pipeline::graph::root::facts::RootFactsError;
-use crate::pipeline::graph::root::{ArticleRoot, Root};
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RestoreFailure {
@@ -54,14 +49,12 @@ pub(crate) enum RestoreFailure {
     Step(#[from] GraphError),
 }
 
-pub(crate) struct Restored<R: Root = ArticleRoot> {
-    pub(crate) job: GraphJob<R>,
-    // Units this run does not fetch: read back, or lost for good.
+pub(crate) struct Restored {
+    pub(crate) job: GraphJob,
+    // Articles this run does not fetch: read back, or lost for good.
     pub(crate) settled: Vec<(VolumeIndex, u32)>,
-    // Units the checkpoint had that were not on disk.
+    // Articles the checkpoint had that were not on disk.
     pub(crate) refetched: Vec<(VolumeIndex, u32)>,
-    // The bytes the restore read back from disk.
-    pub(crate) read: u64,
 }
 
 // An article read back, and how each of its pieces is delivered again.
@@ -78,24 +71,10 @@ impl GraphJob {
         storage: Storage,
         limit: usize,
     ) -> Result<Restored, RestoreFailure> {
-        let root = ArticleRoot::restore(files, &snapshot.root.read::<ArticleRoot>()?)?;
-        Self::restore_with(snapshot, root, scope, storage, limit)
-    }
-}
-
-impl<R: Root> GraphJob<R> {
-    // The job its checkpoint describes, over a root already restored from
-    // the facts it kept.
-    pub(crate) fn restore_with(
-        snapshot: &Snapshot,
-        root: R,
-        scope: u64,
-        storage: Storage,
-        limit: usize,
-    ) -> Result<Restored<R>, RestoreFailure> {
         let mut tree = Tree::rebuild(&snapshot.tree, &storage.hardware)?;
         tree.nest_at_most(storage.nesting);
-        same_volumes(&tree, root.volume_count())?;
+        let root = ArticleRoot::restore(files, &snapshot.root)?;
+        same_post(&tree, files)?;
         let runs = Runs::new(
             scope,
             storage.slots,
@@ -110,10 +89,8 @@ impl<R: Root> GraphJob<R> {
             storage.free_disk,
         )
         .capped(storage.caps)
-        .metered(storage.metrics)
-        .keeping_in(storage.kept_dir)
-        .keeping(root.kept_files());
-        writer.restore_verifications(&snapshot.job.pending_verifications);
+        .metered(storage.metrics);
+        writer.restore_verifications(&snapshot.root.pending_verifications);
         writer.restore_members(&tree);
         for ((node, member), state) in &snapshot.files {
             if tree
@@ -133,7 +110,7 @@ impl<R: Root> GraphJob<R> {
         let mut settled = Vec::new();
         tree.settle_names(&mut settled);
         writer.moved(&mut tree, &settled)?;
-        writer.restore_read_backs(snapshot.job.read_backs);
+        writer.restore_read_backs(snapshot.root.read_backs);
         for kept in &snapshot.kept {
             writer.restore_kept(kept)?;
         }
@@ -141,20 +118,13 @@ impl<R: Root> GraphJob<R> {
         let mut job = Self {
             tree,
             root,
-            builder: match storage.unpack {
-                true => Box::new(runs.hardware()),
-                false => super::builder(false),
-            },
-            kept: R::Kept::default(),
+            builder: Box::new(runs.hardware()),
             writer,
             loans: Loans::new(runs.scope(), runs.mail(), runs.hardware()),
             runs,
             passwords: Passwords::new(storage.passwords),
-            reported: snapshot.job.reported,
+            reported: snapshot.root.reported,
             pending: Pending::default(),
-            moving: None,
-            relocated: None,
-            kept_existing: false,
             mail_owed: None,
             notes: Vec::new(),
             fed: super::runs::Fed::default(),
@@ -167,14 +137,14 @@ impl<R: Root> GraphJob<R> {
             NodeId::ROOT,
             job.namespace().members().map(|member| member.id),
         );
-        let (refetched, read) = job.read_back()?;
+        let refetched = job.read_back()?;
         job.writer.queue_rechecks(rejected);
         job.mark_damage()?;
         let mut effects = Vec::new();
         job.tree
             .close_again(&mut job.writer.placing(&mut *job.builder), &mut effects);
         job.settle(effects)?;
-        for volume in 0..job.root.volume_count() {
+        for volume in 0..job.root.map.volume_count() {
             job.after_member(VolumeIndex(volume as u32))?;
         }
         job.repair()?;
@@ -183,9 +153,8 @@ impl<R: Root> GraphJob<R> {
         // said then.
         job.notes.clear();
         Ok(Restored {
-            settled: job.root.settled(),
+            settled: job.root.map.settled(),
             refetched,
-            read,
             job,
         })
     }
@@ -206,99 +175,50 @@ impl<R: Root> GraphJob<R> {
         self.settle(effects)
     }
 
-    // Every unit the root had in hand that it reads back, read and delivered
-    // before the next is read: an object's inverse map for a later unit can
-    // lean on what the earlier ones rebuilt, as a cipher's chain does. A
-    // unit the root does not read back is only found in its file, and what
-    // it holds of the member's front goes back into the namespace. What is
-    // not there is the root's to fetch again: the unit waits, and the bytes
+    // Every article the root had in hand, read back and delivered before the
+    // next is read: an object's inverse map for a later article can lean on
+    // what the earlier ones rebuilt, as a cipher's chain does. What does not
+    // read is the root's to fetch again: the article waits, and the bytes
     // it covered are no longer covered, or said at any depth they reached.
     // A restore starts with the holds the checkpoint recorded on scratch,
     // read through as any bytes on disk are; any others it reads through are
-    // bytes an earlier unit's delivery moved there from disk, as a member
-    // bound by its bytes moves its file. Also returns how many bytes it read.
-    fn read_back(&mut self) -> Result<(Vec<(VolumeIndex, u32)>, u64), GraphError> {
+    // bytes an earlier article's delivery moved there from disk, as a member
+    // bound by its bytes moves its file.
+    fn read_back(&mut self) -> Result<Vec<(VolumeIndex, u32)>, GraphError> {
         let mut missing = Vec::new();
         let mut bytes = Vec::new();
-        let mut read = 0;
-        for index in 0..self.root.volume_count() {
+        for index in 0..self.root.map.volume_count() {
             let volume = VolumeIndex(index as u32);
             let member = MemberId(volume.0);
-            let reads_back = self.root.reads_back(&self.tree, member);
-            for (ordinal, range) in self.root.arrived_ranges(volume) {
-                if !reads_back {
-                    match self.keep_front(member, range) {
-                        Some(kept) => read += kept,
-                        None => missing.push((volume, ordinal, Some(range))),
-                    }
-                    continue;
-                }
+            for (ordinal, range) in self.root.map.arrived_ranges(volume) {
                 bytes.clear();
                 if !self
                     .writer
                     .access(&self.tree)
                     .read_at(NodeId::ROOT, member, range, &mut bytes)
                 {
-                    missing.push((volume, ordinal, Some(range)));
+                    missing.push((volume, ordinal));
                     continue;
                 }
-                read += bytes.len() as u64;
-                let bytes = Bytes::copy_from_slice(&bytes);
-                let pieces = self.pieces(volume, range, &bytes);
+                let read = Bytes::copy_from_slice(&bytes);
+                let pieces = self.pieces(volume, range, &read);
                 self.deliver_again(ReadBack { volume, pieces })?;
             }
         }
-        missing.extend(
-            self.root
-                .unseen()
-                .into_iter()
-                .map(|(volume, ordinal)| (volume, ordinal, None)),
-        );
+        missing.extend(self.root.map.unseen());
         let mut refetched = Vec::with_capacity(missing.len());
-        for (volume, ordinal, range) in missing {
-            self.unarrive(volume, ordinal, range);
+        for (volume, ordinal) in missing {
+            self.unarrive(volume, ordinal);
+            if let Some(found) = self
+                .tree
+                .namespace_mut(NodeId::ROOT)
+                .and_then(|namespace| namespace.get_mut(MemberId(volume.0)))
+            {
+                found.closed = false;
+            }
             refetched.push((volume, ordinal));
         }
-        Ok((refetched, read))
-    }
-
-    // A unit not read back, found in its file without reading it, and what
-    // it holds of the member's front read and kept in the namespace,
-    // unchecked, with the provenance each run arrived with: a recovery
-    // object knows a member by its front. None when its file does not hold
-    // it; else the bytes read.
-    fn keep_front(&mut self, member: MemberId, range: ByteRange) -> Option<u64> {
-        let access = self.writer.access(&self.tree);
-        if !access.written(NodeId::ROOT, member, range) {
-            return None;
-        }
-        let Some(front) = range.intersect(ByteRange::new(0, FIRST_BYTES as u64)) else {
-            return Some(0);
-        };
-        let mut bytes = Vec::new();
-        if !access.read_at(NodeId::ROOT, member, front, &mut bytes) {
-            return None;
-        }
-        let runs: Vec<(ByteRange, Provenance)> = self
-            .tree
-            .namespace(NodeId::ROOT)
-            .and_then(|namespace| namespace.get(member))
-            .map(|record| {
-                record
-                    .coverage
-                    .overlapping(front)
-                    .filter_map(|run| Some((run.range.intersect(front)?, run.provenance)))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if let Some(namespace) = self.tree.namespace_mut(NodeId::ROOT) {
-            for (run, provenance) in runs {
-                let from = (run.start - front.start) as usize;
-                let slice = &bytes[from..from + run.len() as usize];
-                namespace.keep_first_bytes(member, run.start, slice, provenance);
-            }
-        }
-        Some(front.len())
+        Ok(refetched)
     }
 
     // The article's bytes cut at its coverage runs, each with the
@@ -341,9 +261,9 @@ impl<R: Root> GraphJob<R> {
     pub(crate) fn in_memory(&self) -> Vec<(u32, u32)> {
         let mut out = Vec::new();
         let mut bytes = Vec::new();
-        for index in 0..self.root.volume_count() {
+        for index in 0..self.root.map.volume_count() {
             let volume = VolumeIndex(index as u32);
-            for (ordinal, range) in self.root.arrived_ranges(volume) {
+            for (ordinal, range) in self.root.map.arrived_ranges(volume) {
                 bytes.clear();
                 if !self
                     .writer
@@ -355,6 +275,7 @@ impl<R: Root> GraphJob<R> {
         }
         out.extend(
             self.root
+                .map
                 .unseen()
                 .into_iter()
                 .map(|(volume, ordinal)| (volume.0, ordinal)),
@@ -384,20 +305,19 @@ impl<R: Root> GraphJob<R> {
     }
 }
 
-// A root member the root carries is the root's volume of its number: its
+// A root member the post carries is the post's file of its number: its
 // identity is that index, never its name, which a recovery set's rename
-// changes. That the volumes are the ones checkpointed, by their names, is
-// the root's facts' check. The members past the root's volumes are files a
+// changes. That the post is the one checkpointed, by its names, is the
+// root's facts' check. The members past the post's files are files a
 // recovery set describes, which the root announced itself after them; a
 // further posting is the post's, so none of them is one.
-fn same_volumes(tree: &Tree, volumes: usize) -> Result<(), RestoreFailure> {
+fn same_post(tree: &Tree, files: &[RootFile]) -> Result<(), RestoreFailure> {
     let Some(namespace) = tree.namespace(NodeId::ROOT) else {
         return Err(RestoreFailure::Post(0));
     };
-    match namespace
-        .records()
-        .find(|member| member.id.0 as usize >= volumes && namespace.resolve(member.id) != member.id)
-    {
+    match namespace.records().find(|member| {
+        member.id.0 as usize >= files.len() && namespace.resolve(member.id) != member.id
+    }) {
         Some(member) => Err(RestoreFailure::Post(member.id.0)),
         None => Ok(()),
     }

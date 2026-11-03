@@ -1163,7 +1163,7 @@ async fn a_second_valid_copy_of_an_accepted_article_is_not_delivered() {
 // stands only until an intact one.
 #[test]
 fn a_duplicate_after_restart_is_dropped_as_before_it() {
-    use super::facts::{Encoded, Parts, decode_post, encode_post};
+    use super::facts::{Encoded, Parts, decode};
     let files = [file("plain.bin", &[100, 100, 100])];
     let copy = |ordinal: u32, byte: u8, crc32: u32, intact: bool| {
         let offset = u64::from(ordinal) * 90;
@@ -1177,11 +1177,11 @@ fn a_duplicate_after_restart_is_dropped_as_before_it() {
         article
     };
     let restarted = |root: &ArticleRoot| {
-        let (bytes, parts) = encode_post(root, &mut Encoded::default()).unwrap();
-        let Parts::All(parts) = parts else {
+        let encoding = root.encode(&mut Encoded::default(), 9, 0, None, Vec::new());
+        let Parts::All(parts) = encoding.parts else {
             panic!("a fresh encoding is whole");
         };
-        let facts = decode_post(&bytes, &parts).unwrap();
+        let facts = decode(encoding.version, &encoding.bytes, &parts).unwrap();
         ArticleRoot::restore(&files, &facts).unwrap()
     };
 
@@ -1381,10 +1381,9 @@ fn encodes_whole(
     held: &mut Held,
     step: usize,
 ) {
-    use super::Root;
     use super::facts::{Encoded, Parts};
-    let (bytes, parts) = root.encode(encoded).unwrap();
-    match parts {
+    let encoding = root.encode(encoded, 9, 2, Some(RootPhase::Done), Vec::new());
+    match encoding.parts {
         Parts::All(parts) => *held = self::held(parts),
         Parts::Changed(parts) => {
             for part in parts {
@@ -1395,9 +1394,19 @@ fn encodes_whole(
             }
         }
     }
-    let (whole, parts) = root.encode(&mut Encoded::default()).unwrap();
-    assert_eq!(bytes, whole, "step {step}");
-    let Parts::All(parts) = parts else {
+    let whole = root.encode(
+        &mut Encoded::default(),
+        9,
+        2,
+        Some(RootPhase::Done),
+        Vec::new(),
+    );
+    assert_eq!(
+        (encoding.version, &encoding.bytes),
+        (whole.version, &whole.bytes),
+        "step {step}"
+    );
+    let Parts::All(parts) = whole.parts else {
         panic!("a fresh encoding is whole");
     };
     assert_eq!(*held, self::held(parts), "step {step}");
@@ -1503,17 +1512,16 @@ fn an_encoding_of_what_changed_is_the_encoding_of_the_whole() {
 // the job.
 #[test]
 fn an_arrival_changes_the_same_parts_of_a_small_job_and_a_large_one() {
-    use super::Root;
     use super::facts::{Encoded, Parts};
     let changed = |articles: usize| {
         let mut root = ArticleRoot::new(&[file("a.bin", &vec![70; articles])]);
         let mut encoded = Encoded::default();
-        root.encode(&mut encoded).unwrap();
+        root.encode(&mut encoded, 9, 2, None, Vec::new());
         root.receive(with_segments(
             decoded(0, 5, 300, &[1; 60], None),
             &[(300, 330, 1), (330, 360, 2)],
         ));
-        let Parts::Changed(parts) = root.encode(&mut encoded).unwrap().1 else {
+        let Parts::Changed(parts) = root.encode(&mut encoded, 9, 2, None, Vec::new()).parts else {
             panic!("an encoding after the first is of what changed");
         };
         parts
@@ -1588,7 +1596,7 @@ fn an_arrival_reads_only_the_volumes_still_open() {
 // tells every loss, and knows which volumes are in hand.
 #[test]
 fn a_lost_article_is_told_from_its_own_volume_alone() {
-    use super::facts::{Encoded, Parts, decode_post, encode_post};
+    use super::facts::{Encoded, Parts, decode};
     let files: Vec<RootFile> = (0..50)
         .map(|volume| file(&format!("part{volume:02}.bin"), &[100; 20]))
         .collect();
@@ -1612,11 +1620,11 @@ fn a_lost_article_is_told_from_its_own_volume_alone() {
     assert_eq!(root.damage(), Vec::new());
     assert_eq!(root.map.visits(), (0, 0));
 
-    let (bytes, parts) = encode_post(&root, &mut Encoded::default()).unwrap();
-    let Parts::All(parts) = parts else {
+    let encoding = root.encode(&mut Encoded::default(), 9, 0, None, Vec::new());
+    let Parts::All(parts) = encoding.parts else {
         panic!("a fresh encoding is whole");
     };
-    let facts = decode_post(&bytes, &parts).unwrap();
+    let facts = decode(encoding.version, &encoding.bytes, &parts).unwrap();
     let mut restored = ArticleRoot::restore(&files, &facts).unwrap();
     assert_eq!(
         restored.map.coming().collect::<Vec<_>>(),
@@ -1688,9 +1696,9 @@ async fn a_restored_job_keeps_its_graph_job_and_root_phase() {
 
         // A row with the checkpoint its admission took.
         let working_dir = insert_active_job(&mut pipeline, restored_id, lantern.clone()).await;
-        let (mut admitted, _files, _) = job_with(&[file("lantern.bin", &[64, 64])], Vec::new());
+        let (admitted, _files, _) = job_with(&[file("lantern.bin", &[64, 64])], Vec::new());
         let pending = checkpoint::Pending::default();
-        assert!(pending.put(&mut admitted, Vec::new()));
+        assert!(pending.put(&admitted, Vec::new()));
         pipeline
             .db
             .save_graph_checkpoint(restored_id, Arc::new(pending.take().0.unwrap()))
@@ -1730,101 +1738,6 @@ async fn a_restored_job_keeps_its_graph_job_and_root_phase() {
             .unwrap()
             .as_deref(),
         Some("downloading")
-    );
-}
-
-// An article job restores from its checkpoint's rows as it was: the article
-// it had in hand reads back, nothing is fetched again, and the restored
-// job's checkpoint says what the first one's did.
-#[test]
-fn an_article_job_restores_from_its_checkpoint_rows() {
-    let files = [file("lantern.bin", &[100]), file("later.bin", &[100])];
-    let (mut job, dir, _) = job_with(&files, Vec::new());
-    job.intake(
-        decoded(0, 0, 0, &[7; 90], Some(90)),
-        &mut RepairSlots::default(),
-        1,
-    )
-    .unwrap();
-    let taken = job.snapshot();
-    let snapshot = checkpoint::snapshot(&checkpoint::rows(&taken)).unwrap();
-    // The rows keep no word of a member's front; a restore finds it again
-    // from the coverage.
-    let mut unfronted = taken.clone();
-    for node in &mut unfronted.tree.nodes {
-        for member in &mut node.members {
-            member.fronted = false;
-        }
-    }
-    assert_eq!(snapshot, unfronted);
-    let storage = crate::pipeline::graph::job::Storage {
-        working_dir: dir.path().to_path_buf(),
-        kept_dir: None,
-        accountant: Arc::new(HoldsAccountant::new(HoldBudgets {
-            resident_limit: u64::MAX,
-            scratch_total: u64::MAX,
-            scratch_ceiling: u64::MAX,
-            disk_reserve: 0,
-        })),
-        free_disk: CapacityReader::unknown(),
-        slots: 1,
-        mail: RunMail::default().sender(),
-        passwords: Vec::new(),
-        caps: crate::pipeline::graph::limits::Caps::unbounded(),
-        nesting: u32::MAX,
-        unpack: true,
-        hardware: Default::default(),
-        metrics: None,
-    };
-    let restored = GraphJob::restore(&snapshot, &files, 1, storage, 1).unwrap();
-    assert!(restored.refetched.is_empty());
-    assert!(restored.settled.contains(&(VolumeIndex(0), 0)));
-    let again = restored.job.snapshot();
-    assert_eq!(again.tree, taken.tree);
-    assert_eq!(again.root, taken.root);
-    assert_eq!(again.job.read_backs, taken.job.read_backs);
-}
-
-// An article job's restore reads every article back and checks it: one
-// whose bytes on disk no longer match its checksums is damaged.
-#[test]
-fn an_article_jobs_restore_reads_its_articles_back_and_checks_them() {
-    let files = [file("lantern.bin", &[90])];
-    let (mut job, dir, _) = job_with(&files, Vec::new());
-    let crc = crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, &[7; 90]) as u32;
-    job.intake(
-        with_segments(decoded(0, 0, 0, &[7; 90], Some(90)), &[(0, 90, crc)]),
-        &mut RepairSlots::default(),
-        1,
-    )
-    .unwrap();
-    let snapshot = checkpoint::snapshot(&checkpoint::rows(&job.snapshot())).unwrap();
-    drop(job);
-    std::fs::write(dir.path().join("lantern.bin"), [9; 90]).unwrap();
-    let storage = crate::pipeline::graph::job::Storage {
-        working_dir: dir.path().to_path_buf(),
-        kept_dir: None,
-        accountant: Arc::new(HoldsAccountant::new(HoldBudgets {
-            resident_limit: u64::MAX,
-            scratch_total: u64::MAX,
-            scratch_ceiling: u64::MAX,
-            disk_reserve: 0,
-        })),
-        free_disk: CapacityReader::unknown(),
-        slots: 1,
-        mail: RunMail::default().sender(),
-        passwords: Vec::new(),
-        caps: crate::pipeline::graph::limits::Caps::unbounded(),
-        nesting: u32::MAX,
-        unpack: true,
-        hardware: Default::default(),
-        metrics: None,
-    };
-    let restored = GraphJob::restore(&snapshot, &files, 1, storage, 1).unwrap();
-    assert!(restored.refetched.is_empty());
-    assert_eq!(
-        damaged_ranges(&restored.job, 0),
-        vec![ByteRange::new(0, 90)]
     );
 }
 
@@ -1873,56 +1786,51 @@ fn a_deferral_never_lowers_a_raised_article_and_is_never_lost() {
 
 #[test]
 fn pending_verification_changes_only_the_small_root_record() {
-    use super::facts::{Encoded, JobFacts, Parts, RootBlob, RootRow, decode, encode};
+    use super::facts::{Encoded, Parts, decode};
     let root = ArticleRoot::new(&[file("payload.bin", &vec![70; 400])]);
     let mut encoded = Encoded::default();
-    let (blob, first) = RootBlob::encode(&root, &mut encoded);
-    let Parts::All(parts) = first else {
+    let first = root.encode(&mut encoded, 9, 0, None, Vec::new());
+    let Parts::All(parts) = first.parts else {
         panic!("first encoding is whole");
     };
-    let row = |pending: Vec<(u32, u32)>| RootRow {
-        next_node: 9,
-        job: JobFacts {
-            pending_verifications: pending,
-            ..JobFacts::default()
-        },
-        root: blob.clone(),
-    };
     let pending = vec![(3, 7), (9, 2)];
-    let (_, again) = RootBlob::encode(&root, &mut encoded);
-    assert!(matches!(&again, Parts::Changed(changes) if changes.is_empty()));
-    let check = encode(&row(pending.clone()));
+    let check = root.encode(&mut encoded, 9, 0, None, pending.clone());
+    assert!(matches!(&check.parts, Parts::Changed(changes) if changes.is_empty()));
     assert_eq!(
-        decode(RootRow::VERSION, &check, &parts)
+        decode(check.version, &check.bytes, &parts)
             .unwrap()
-            .job
             .pending_verifications,
         pending
     );
-    assert_eq!(encode(&row(pending)), check);
-    assert_eq!(encode(&row(Vec::new())), encode(&row(Vec::new())));
-    assert_ne!(encode(&row(Vec::new())), check);
+    let same = root.encode(&mut encoded, 9, 0, None, pending);
+    assert_eq!(same.bytes, check.bytes);
+    assert!(matches!(&same.parts, Parts::Changed(changes) if changes.is_empty()));
+    let done = root.encode(&mut encoded, 9, 0, None, Vec::new());
+    assert!(matches!(&done.parts, Parts::Changed(changes) if changes.is_empty()));
+    assert_eq!(done.bytes, first.bytes);
 }
 
 // Facts the version before the root row kept its outstanding checks are
 // refused, not read with none outstanding.
 #[test]
 fn facts_of_the_previous_version_are_refused() {
-    use super::facts::{JobFacts, RootBlob, RootFactsError, RootRow, decode, encode};
+    use super::facts::{Encoded, Parts, RootFactsError, decode};
     let root = ArticleRoot::new(&[file("payload.bin", &[70])]);
-    let row = RootRow {
-        next_node: 9,
-        job: JobFacts {
-            pending_verifications: vec![(3, 7)],
-            ..JobFacts::default()
-        },
-        root: RootBlob::of(&root),
+    let mut encoded = Encoded::default();
+    let encoding = root.encode(&mut encoded, 9, 0, None, vec![(3, 7)]);
+    let Parts::All(parts) = encoding.parts else {
+        panic!("first encoding is whole");
     };
-    let bytes = encode(&row);
-    assert!(decode(RootRow::VERSION, &bytes, &row.root.parts).is_ok());
-    let previous = RootRow::VERSION - 1;
+    assert!(decode(encoding.version, &encoding.bytes, &parts).is_ok());
+    // Version four was the same MessagePack tuple without the trailing list.
+    let mut previous = root
+        .encode(&mut Encoded::default(), 9, 0, None, Vec::new())
+        .bytes;
+    assert_eq!(previous[0], 0x96);
+    assert_eq!(previous.pop(), Some(0x90));
+    previous[0] = 0x95;
     assert_eq!(
-        decode(previous, &bytes, &row.root.parts),
-        Err(RootFactsError::Version(previous))
+        decode(4, &previous, &parts),
+        Err(RootFactsError::Version(4))
     );
 }

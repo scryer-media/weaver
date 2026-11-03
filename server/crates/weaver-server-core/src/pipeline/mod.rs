@@ -61,8 +61,9 @@ use weaver_nntp::NntpClient;
 
 use self::download::{DownloadLaneMode, DownloadLaneRuntimeState, LaneParkReason};
 pub(crate) use self::extraction::ExtractionError;
+pub(crate) use self::extraction::ExtractionLimits;
+use self::extraction::ProcessMemoryBudget;
 pub(crate) use self::extraction::safety::ProcessMemoryPermit;
-use self::extraction::{ExtractionLimits, ProcessMemoryBudget};
 
 // Maximum number of retries for a single segment before giving up.
 const MAX_SEGMENT_RETRIES: u32 = 3;

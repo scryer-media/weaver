@@ -1419,17 +1419,11 @@ impl Tree {
     }
 
     // Whether the member's first bytes have not yet decided its owner. Its
-    // bytes are its own file's until an object claims it.
+    // bytes have nowhere final to go, so the owner holds them.
     pub fn is_undecided(&self, node: NodeId, member: MemberId) -> bool {
         self.nodes
             .get(&node)
             .is_some_and(|found| found.undecided.contains(&found.namespace.resolve(member)))
-    }
-
-    // Whether a window reads the member: a stretch of it is a volume of an
-    // object that has not claimed the member whole.
-    pub fn is_windowed(&self, node: NodeId, member: MemberId) -> bool {
-        !self.windows_on(node, member).is_empty()
     }
 
     // Whether more of the member's front can still come: it has not ended,

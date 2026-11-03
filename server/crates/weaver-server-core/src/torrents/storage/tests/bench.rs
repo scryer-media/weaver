@@ -3,7 +3,7 @@
 
 // The torrent engine's throughput on loopback, with no swarm: a session
 // fetches a large hybrid torrent from scripted seeders, through the piece
-// storage into a graph job, then serves every block of it to scripted
+// storage into its own files, then serves every block of it to scripted
 // leechers. The scripted peers run in a child process, so this process's CPU,
 // system calls and context switches are the engine's alone.
 //
@@ -15,7 +15,7 @@
 // Sizes come from the environment: WEAVER_BENCH_FILE_MIB (each file, default
 // 4096), WEAVER_BENCH_FILES (default 2), WEAVER_BENCH_PIECE_KIB (default
 // 4096), WEAVER_BENCH_PEERS (default 8), WEAVER_BENCH_DEPTH (requests a
-// scripted leecher keeps out, default 250), WEAVER_BENCH_DIR (where the job
+// scripted leecher keeps out, default 250), WEAVER_BENCH_DIR (where the torrent
 // writes, default the system temporary directory).
 
 use std::collections::{HashSet, VecDeque};
@@ -405,7 +405,7 @@ async fn torrent_loopback_throughput() {
         .split(',')
         .map(|port| SocketAddr::from((Ipv4Addr::LOCALHOST, port.parse::<u16>().unwrap())))
         .collect();
-    let (watched, mut in_hand) = watched_job(&layout, &dir.path().join("job"));
+    let (watched, mut in_hand) = watched_store(&layout, &dir.path().join("job"));
     let factory = PieceStorageFactory::new(
         Arc::clone(&layout),
         Arc::clone(&watched) as Arc<dyn Pieces>,

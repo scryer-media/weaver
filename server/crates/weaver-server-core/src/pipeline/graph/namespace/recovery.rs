@@ -1184,9 +1184,6 @@ impl NamespaceWriter {
             tree.closed_at(node, *member, &mut self.placing(builder), &mut claims);
         }
         for member in &renamed {
-            if self.kept_name(node, *member).is_some() {
-                continue;
-            }
             let length = tree
                 .namespace(node)
                 .and_then(|namespace| namespace.get(*member))

@@ -1668,6 +1668,15 @@ impl Database {
         )
     }
 
+    // A job outside the pipeline let its blocked checkpoint go: the failure
+    // no longer stands in a flush's way. Run on the job's lane behind that
+    // checkpoint, so it comes after the write that recorded the failure.
+    pub(crate) fn forget_checkpoint_failure(&self, job_id: crate::jobs::ids::JobId) {
+        self.checkpoint_failures.send_modify(|failures| {
+            failures.remove(&job_id);
+        });
+    }
+
     // Stop retry waits at shutdown without claiming any unwritten delta
     // committed. A database call already running is still awaited.
     pub(crate) fn stop_checkpoint_retries(&self) {

@@ -113,7 +113,7 @@ pub(super) fn build_job_report(
         }
     };
     job.apply_events(&db.get_job_events(job_id)?);
-    job.checkpoint_in_hand = db.load_graph_root(JobId(job_id))?.is_some();
+    job.checkpoint_in_hand = db.torrent_pieces(JobId(job_id))?.is_some();
     let analysis = analysis.with_weaver_version(environment.weaver_version);
     Ok(render(&analysis, Some(&job), environment))
 }

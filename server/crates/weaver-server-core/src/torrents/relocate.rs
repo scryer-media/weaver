@@ -1,31 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The job as the mover of its own directory. A move is a disk job like any
-// other, fenced behind the runs and the repair out when it is asked for
-// (libtorrent `torrent::move_storage`, a fence job of the disk thread): it
-// happens at the first step where nothing of the job is out on a thread,
-// and in one piece, so no step ever sees a path under the old directory
-// beside one under the new. Every open file is let go first, the whole
-// directory is renamed, or copied and then removed where the destination is
-// on another device, and every path the job holds is re-rooted
-// (libtorrent `storage_utils::move_storage`).
+// A torrent's files moving to another place (libtorrent
+// `storage_utils::move_storage`): the whole directory claimed for it, or the
+// files placed outside it each to its own name under a new directory. Every
+// handle on the files is let go first, so the move happens whole and no
+// write or read sees a path under the old place beside one under the new.
 
 use std::io;
 use std::path::{Path, PathBuf};
-
-use super::super::leaf::LeafError;
-use super::super::root::Root;
-use super::GraphJob;
-
-// What of the job is to move, and where.
-pub(crate) enum Relocation {
-    // Its directory, to the directory claimed for it.
-    Working(PathBuf),
-    // The kept files placed outside its directory, each to its own name
-    // under `to`, a file already there met as `existing` says.
-    Kept { to: PathBuf, existing: Existing },
-}
 
 // What a move of placed files does with a file already at its destination
 // (libtorrent `move_flags_t`).
@@ -40,87 +23,21 @@ pub(crate) enum Existing {
     Replace,
 }
 
-impl<R: Root> GraphJob<R> {
-    // Move the job's directory to `to`, the directory claimed for it, which
-    // exists and is empty. Done now when nothing of the job is out on a
-    // thread, else at the end of the first step where that holds; the
-    // outcome, now or then, comes from [`Self::relocated`].
-    pub(crate) fn relocate(&mut self, to: PathBuf) {
-        self.moving = Some(Relocation::Working(to));
-        self.try_relocate();
-    }
+// A move that failed: the path it failed at, and why.
+#[derive(Debug, thiserror::Error)]
+#[error("{}: {source}", path.display())]
+pub(crate) struct MoveError {
+    pub(crate) path: PathBuf,
+    #[source]
+    pub(crate) source: io::Error,
+}
 
-    // Move the kept files placed outside the job's directory to the same
-    // names under `to`, a directory that exists, fenced as
-    // [`Self::relocate`] is (libtorrent `torrent::move_storage` moves a
-    // torrent's files wherever they sit). The job's own directory stays. A
-    // file already at a destination is met as `existing` says.
-    pub(crate) fn relocate_kept(&mut self, to: PathBuf, existing: Existing) {
-        self.moving = Some(Relocation::Kept { to, existing });
-        self.try_relocate();
-    }
-
-    // Whether the last move of kept files left a file already at its
-    // destination in place, so the files no longer vouch for the pieces had
-    // and want a check. Told once.
-    pub(crate) fn kept_existing(&mut self) -> bool {
-        std::mem::take(&mut self.kept_existing)
-    }
-
-    // Whether a move is waiting or under way.
-    #[cfg(test)]
-    pub(crate) fn relocating(&self) -> bool {
-        self.moving.is_some()
-    }
-
-    // The move asked for, once it happened or failed: the directory the job
-    // now writes under, or why it still writes under the old one. Each
-    // outcome is given once.
-    pub(crate) fn relocated(&mut self) -> Option<Result<PathBuf, LeafError>> {
-        self.relocated.take()
-    }
-
-    // Move now if a move is waiting and nothing of the job is out.
-    pub(crate) fn try_relocate(&mut self) {
-        if self.moving.is_none() || self.awaits_mail() {
-            return;
+impl MoveError {
+    fn at(path: &Path) -> impl FnOnce(io::Error) -> Self + '_ {
+        move |source| Self {
+            path: path.to_path_buf(),
+            source,
         }
-        let outcome = match self.moving.take().expect("checked above") {
-            Relocation::Working(to) => {
-                let from = self.writer.working_dir().to_path_buf();
-                self.writer.release();
-                move_directory(&from, &to).map(|()| {
-                    self.writer.relocate(&from, &to);
-                    to
-                })
-            }
-            Relocation::Kept { to, existing } => {
-                match self.writer.kept_dir().map(Path::to_path_buf) {
-                    Some(from) => {
-                        self.writer.release_kept();
-                        let moves: Vec<(PathBuf, PathBuf)> = self
-                            .writer
-                            .kept_paths(&from)
-                            .into_iter()
-                            .zip(self.writer.kept_paths(&to))
-                            .collect();
-                        move_files(&from, &moves, existing).map(|kept| {
-                            self.kept_existing = kept;
-                            self.writer.rekeep(&to);
-                            to
-                        })
-                    }
-                    None => Err(LeafError::Io {
-                        path: to,
-                        source: io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "the job keeps no files outside its directory",
-                        ),
-                    }),
-                }
-            }
-        };
-        self.relocated = Some(outcome);
     }
 }
 
@@ -133,11 +50,11 @@ impl<R: Root> GraphJob<R> {
 // A file it replaced stays replaced, and a file it kept stays kept, as
 // libtorrent's do. The directories under `from` the move leaves empty go.
 // True when a file already at a destination was kept.
-fn move_files(
+pub(crate) fn move_files(
     from: &Path,
     moves: &[(PathBuf, PathBuf)],
     existing: Existing,
-) -> Result<bool, LeafError> {
+) -> Result<bool, MoveError> {
     move_files_using(from, moves, existing, |from, to| std::fs::rename(from, to))
 }
 
@@ -146,7 +63,7 @@ fn move_files_using(
     moves: &[(PathBuf, PathBuf)],
     existing: Existing,
     rename: impl Fn(&Path, &Path) -> io::Result<()>,
-) -> Result<bool, LeafError> {
+) -> Result<bool, MoveError> {
     let mut kept = false;
     let mut renamed = Vec::new();
     let mut copied = Vec::new();
@@ -164,7 +81,7 @@ fn move_files_using(
         if let Some(parent) = target.parent()
             && let Err(error) = std::fs::create_dir_all(parent)
         {
-            failed = Some(LeafError::io(parent)(error));
+            failed = Some(MoveError::at(parent)(error));
             break;
         }
         match rename(source, target) {
@@ -174,13 +91,13 @@ fn move_files_using(
                     Ok(_) => copied.push((source, target)),
                     Err(error) => {
                         let _ = std::fs::remove_file(target);
-                        failed = Some(LeafError::io(source)(error));
+                        failed = Some(MoveError::at(source)(error));
                         break;
                     }
                 }
             }
             Err(error) => {
-                failed = Some(LeafError::io(source)(error));
+                failed = Some(MoveError::at(source)(error));
                 break;
             }
         }
@@ -212,7 +129,7 @@ fn move_files_using(
 // Move the directory at `from` to `to`, an empty directory that exists:
 // renamed where one device holds both, else copied whole and then removed,
 // with nothing left at `to` when the copy fails partway.
-fn move_directory(from: &Path, to: &Path) -> Result<(), LeafError> {
+pub(crate) fn move_directory(from: &Path, to: &Path) -> Result<(), MoveError> {
     move_directory_using(from, to, |from, to| std::fs::rename(from, to))
 }
 
@@ -220,17 +137,17 @@ fn move_directory_using(
     from: &Path,
     to: &Path,
     rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
-) -> Result<(), LeafError> {
+) -> Result<(), MoveError> {
     // The claimed directory makes way for the rename, which on every
     // platform needs the destination absent.
-    std::fs::remove_dir(to).map_err(LeafError::io(to))?;
+    std::fs::remove_dir(to).map_err(MoveError::at(to))?;
     match rename(from, to) {
         Ok(()) => return Ok(()),
         Err(error) if error.kind() == io::ErrorKind::CrossesDevices => {}
         Err(error) => {
             // The claim stands as it was.
             let _ = std::fs::create_dir(to);
-            return Err(LeafError::Io {
+            return Err(MoveError {
                 path: from.to_path_buf(),
                 source: error,
             });
@@ -241,21 +158,21 @@ fn move_directory_using(
         let _ = std::fs::create_dir(to);
         return Err(error);
     }
-    std::fs::remove_dir_all(from).map_err(LeafError::io(from))
+    std::fs::remove_dir_all(from).map_err(MoveError::at(from))
 }
 
 // Copy the directory at `from`, as it is, to `to`, which need not exist.
-fn copy_tree(from: &Path, to: &Path) -> Result<(), LeafError> {
-    std::fs::create_dir_all(to).map_err(LeafError::io(to))?;
-    for entry in std::fs::read_dir(from).map_err(LeafError::io(from))? {
-        let entry = entry.map_err(LeafError::io(from))?;
+fn copy_tree(from: &Path, to: &Path) -> Result<(), MoveError> {
+    std::fs::create_dir_all(to).map_err(MoveError::at(to))?;
+    for entry in std::fs::read_dir(from).map_err(MoveError::at(from))? {
+        let entry = entry.map_err(MoveError::at(from))?;
         let source = entry.path();
         let target = to.join(entry.file_name());
-        let kind = entry.file_type().map_err(LeafError::io(&source))?;
+        let kind = entry.file_type().map_err(MoveError::at(&source))?;
         if kind.is_dir() {
             copy_tree(&source, &target)?;
         } else {
-            std::fs::copy(&source, &target).map_err(LeafError::io(&source))?;
+            std::fs::copy(&source, &target).map_err(MoveError::at(&source))?;
         }
     }
     Ok(())
@@ -351,7 +268,7 @@ mod tests {
             }
         })
         .unwrap_err();
-        assert!(matches!(error, LeafError::Io { ref path, .. } if path.ends_with("c.bin")));
+        assert!(matches!(error, MoveError { ref path, .. } if path.ends_with("c.bin")));
         let mut expected = expected;
         expected.push((PathBuf::from("c.bin"), b"cc".to_vec()));
         expected.sort();
@@ -427,7 +344,7 @@ mod tests {
             Err(io::Error::from(io::ErrorKind::PermissionDenied))
         })
         .unwrap_err();
-        assert!(matches!(error, LeafError::Io { ref path, .. } if *path == from));
+        assert!(matches!(error, MoveError { ref path, .. } if *path == from));
         assert_eq!(contents(&from), expected);
         assert!(to.is_dir());
         assert!(contents(&to).is_empty());

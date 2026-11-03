@@ -241,54 +241,8 @@ impl NamespaceWriter {
         range: weaver_graph::ByteRange,
         into: &mut Vec<u8>,
     ) -> bool {
-        self.read_root(tree, member, range, false, into)
-    }
-
-    // The posted bytes of a root member's range as they are in hand now,
-    // held bytes included, as a peer reading them back is served.
-    pub(crate) fn read_in_hand(
-        &self,
-        tree: &Tree,
-        member: MemberId,
-        range: ByteRange,
-        into: &mut Vec<u8>,
-    ) -> bool {
-        self.read_root(tree, member, range, true, into)
-    }
-
-    // `read_in_hand` straight into `out`, which is the range's length: a
-    // member read from its own file is read into it with no copy between.
-    pub(crate) fn read_in_hand_exact(
-        &self,
-        tree: &Tree,
-        member: MemberId,
-        range: ByteRange,
-        out: &mut [u8],
-    ) -> bool {
-        if self
-            .access(tree)
-            .read_own_exact(NodeId::ROOT, member, range, out)
-        {
-            return true;
-        }
-        let mut into = Vec::with_capacity(out.len());
-        let read = self.read_root(tree, member, range, true, &mut into) && into.len() == out.len();
-        if read {
-            out.copy_from_slice(&into);
-        }
-        read
-    }
-
-    fn read_root(
-        &self,
-        tree: &Tree,
-        member: MemberId,
-        range: ByteRange,
-        held: bool,
-        into: &mut Vec<u8>,
-    ) -> bool {
         let mut access = self.access(tree);
-        access.held = held;
+        access.held = false;
         access.read_at(NodeId::ROOT, member, range, into)
     }
 }

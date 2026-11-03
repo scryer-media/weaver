@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::sync::Arc;
-
 use crate::StateError;
-use crate::jobs::graph_checkpoint::{Delta, write_delta};
 use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
@@ -12,6 +9,7 @@ use crate::settings::SeedingPolicy;
 use crate::settings::model::tracker_host;
 use crate::torrents::model::{file_priorities_str, named_by_str};
 use crate::torrents::queries::{TORRENT_COLUMNS, torrent_by_infohash_tx};
+use crate::torrents::store::Kept;
 use crate::torrents::{
     FilePriority, TorrentCounters, TorrentInsert, TorrentIntent, TorrentRecord, TrackerEntry,
 };
@@ -276,29 +274,43 @@ impl Database {
         })
     }
 
-    // What the torrent's checkpoint changed, and its ledger and the peers
-    // and bans it begins with as they stood with it, each written only when
-    // given, in one transaction: a crash recovers the pieces and the
+    // The pieces the torrent has in its files, and its ledger and the peers
+    // and bans it begins with as they stood with them, each written only
+    // when given, in one transaction: a crash recovers the pieces and the
     // counters of one moment.
     pub(crate) fn save_torrent_checkpoint(
         &self,
         job_id: JobId,
-        delta: Option<Arc<Delta>>,
+        pieces: Option<&Kept>,
         counters: Option<&TorrentCounters>,
         peers: Option<&ResumePeers>,
     ) -> Result<(), StateError> {
         let resume = resume_update(job_id, counters, peers)?;
-        if delta.is_none() && resume.is_none() {
+        let pieces = pieces
+            .map(|kept| -> Result<_, StateError> {
+                Ok(vec![
+                    SqlArg::OptBytes(Some(kept.bits.clone())),
+                    SqlArg::Bool(kept.checking),
+                    SqlArg::I64(stored(job_id.0)?),
+                ])
+            })
+            .transpose()?;
+        if pieces.is_none() && resume.is_none() {
             return Ok(());
         }
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "save_torrent_checkpoint", |tx| {
-                let delta = delta.clone();
+                let pieces = pieces.clone();
                 let resume = resume.clone();
                 Box::pin(async move {
-                    if let Some(delta) = &delta {
-                        write_delta(tx, job_id, delta).await?;
+                    if let Some(args) = &pieces {
+                        tx.execute(
+                            "UPDATE torrent_counters SET pieces = {}, pieces_checking = {} \
+                             WHERE job_id = {}",
+                            args,
+                        )
+                        .await?;
                     }
                     if let Some((sql, args)) = &resume {
                         tx.execute(sql, args).await?;
@@ -307,6 +319,128 @@ impl Database {
                 })
             })
             .await
+        })
+    }
+
+    // The pieces [`Self::save_torrent_checkpoint`] last kept; None when it
+    // kept none.
+    pub(crate) fn torrent_pieces(&self, job_id: JobId) -> Result<Option<Kept>, StateError> {
+        let id = stored(job_id.0)?;
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT pieces, pieces_checking FROM torrent_counters WHERE job_id = {}",
+                &[SqlArg::I64(id)],
+            )
+            .await?;
+            let Some(row) = row else { return Ok(None) };
+            let Some(bits) = row.opt_bytes("pieces")? else {
+                return Ok(None);
+            };
+            Ok(Some(Kept {
+                bits,
+                checking: row.bool("pieces_checking")?,
+            }))
+        })
+    }
+
+    // Unpacking is over: the files it placed beside the torrent's own are
+    // kept on its row, with those an earlier unpacking that a crash cut
+    // short kept there, and its job's checkpoint goes, in one transaction.
+    // Run on the torrent's own lane, so no write of the job's checkpoint
+    // queued before it lands after.
+    pub(crate) fn finish_torrent_unpack(
+        &self,
+        job_id: JobId,
+        outputs: &[String],
+    ) -> Result<(), StateError> {
+        let id = stored(job_id.0)?;
+        let outputs = self.outputs_with(job_id, outputs)?;
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "finish_torrent_unpack", |tx| {
+                let outputs = outputs.clone();
+                Box::pin(async move {
+                    tx.execute(
+                        "UPDATE torrents SET outputs = {} WHERE job_id = {}",
+                        &[SqlArg::OptText(outputs), SqlArg::I64(id)],
+                    )
+                    .await?;
+                    for table in crate::jobs::graph_checkpoint::TABLES {
+                        tx.execute(
+                            &format!("DELETE FROM {table} WHERE job_id = {{}}"),
+                            &[SqlArg::I64(id)],
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })
+    }
+
+    // The files unpacking is about to place beside the torrent's own, kept
+    // on its row with those it kept before: a crash before
+    // [`Self::finish_torrent_unpack`] leaves none its delete does not know.
+    pub(crate) fn keep_torrent_outputs(
+        &self,
+        job_id: JobId,
+        outputs: &[String],
+    ) -> Result<(), StateError> {
+        let id = stored(job_id.0)?;
+        let outputs = self.outputs_with(job_id, outputs)?;
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE torrents SET outputs = {} WHERE job_id = {}",
+                &[SqlArg::OptText(outputs), SqlArg::I64(id)],
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    // The row's outputs with `outputs` added, as the row keeps them.
+    fn outputs_with(
+        &self,
+        job_id: JobId,
+        outputs: &[String],
+    ) -> Result<Option<String>, StateError> {
+        let mut kept = self.torrent_outputs(job_id)?;
+        for output in outputs {
+            if !kept.contains(output) {
+                kept.push(output.clone());
+            }
+        }
+        (!kept.is_empty())
+            .then(|| serde_json::to_string(&kept))
+            .transpose()
+            .map_err(|error| StateError::Database(error.to_string()))
+    }
+
+    // The files [`Self::finish_torrent_unpack`] kept, relative to the
+    // directory the torrent's files are in.
+    pub(crate) fn torrent_outputs(&self, job_id: JobId) -> Result<Vec<String>, StateError> {
+        let id = stored(job_id.0)?;
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT outputs FROM torrents WHERE job_id = {}",
+                &[SqlArg::I64(id)],
+            )
+            .await?;
+            let Some(text) = row
+                .map(|row| row.opt_text("outputs"))
+                .transpose()?
+                .flatten()
+            else {
+                return Ok(Vec::new());
+            };
+            serde_json::from_str(&text).map_err(|error| StateError::Database(error.to_string()))
         })
     }
 

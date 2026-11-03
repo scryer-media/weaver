@@ -38,6 +38,7 @@ pub(crate) struct Envelopes {
 // One node's envelopes, shared with the run that reads them.
 #[derive(Debug)]
 pub(crate) struct Shelf {
+    dir: PathBuf,
     node: NodeId,
     state: Mutex<Shelved>,
     changed: Condvar,
@@ -45,9 +46,6 @@ pub(crate) struct Shelf {
 
 #[derive(Debug, Default)]
 pub(crate) struct Shelved {
-    // The job's directory, where the envelope files are kept; it moves with
-    // the job.
-    dir: PathBuf,
     pub(crate) kept: BTreeMap<u32, Kept>,
     // The volumes bound to the object, by index, and whether any more can
     // join. An index orders them; a gap is not a volume.
@@ -125,11 +123,9 @@ impl Envelopes {
         let dir = &self.working_dir;
         Arc::clone(self.shelves.entry(node).or_insert_with(|| {
             Arc::new(Shelf {
+                dir: dir.clone(),
                 node,
-                state: Mutex::new(Shelved {
-                    dir: dir.clone(),
-                    ..Shelved::default()
-                }),
+                state: Mutex::default(),
                 changed: Condvar::new(),
             })
         }))
@@ -248,7 +244,7 @@ impl Envelopes {
         let started = shelf.update(|state| match state.kept.entry(envelope) {
             Entry::Occupied(_) => false,
             Entry::Vacant(free) => {
-                free.insert(Kept::in_file(Leaf::over(&state.dir, name, on_disk)));
+                free.insert(Kept::in_file(Leaf::over(&shelf.dir, name, on_disk)));
                 true
             }
         });
@@ -313,28 +309,6 @@ impl Envelopes {
         });
         kept.into_values().map(|kept| kept.leaf).collect()
     }
-
-    // Let go of every envelope file's handle ahead of the directory moving.
-    pub(crate) fn release(&self) {
-        for shelf in self.shelves.values() {
-            for kept in shelf.lock().kept.values_mut() {
-                kept.leaf.release();
-            }
-        }
-    }
-
-    // The job's directory moved from `from` to `to`: every shelf and every
-    // envelope file on it follows.
-    pub(crate) fn relocate(&mut self, from: &Path, to: &Path) {
-        self.working_dir = to.to_path_buf();
-        for shelf in self.shelves.values() {
-            let mut state = shelf.lock();
-            state.dir = to.to_path_buf();
-            for kept in state.kept.values_mut() {
-                kept.leaf.relocate(from, to);
-            }
-        }
-    }
 }
 
 // A job that goes away stops every run reading its envelopes, so no thread
@@ -398,8 +372,8 @@ impl Shelf {
         match state.kept.entry(envelope) {
             Entry::Occupied(kept) => Ok(kept.into_mut()),
             Entry::Vacant(free) => {
-                let name = free_envelope_name(&state.dir, self.node, envelope);
-                let mut leaf = Leaf::at(&state.dir, &name);
+                let name = free_envelope_name(&self.dir, self.node, envelope);
+                let mut leaf = Leaf::at(&self.dir, &name);
                 leaf.truncate()?;
                 Ok(free.insert(Kept::in_file(leaf)))
             }

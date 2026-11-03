@@ -1799,6 +1799,94 @@ async fn an_unwanted_member_found_while_unpacking_fails_the_job_and_keeps_the_to
     assert_eq!(*retired.borrow(), 1);
 }
 
+// A torrent of an archive keeps its archive as it came, seeds from it, and
+// unpacks what it holds beside it; it completes and seeds on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_torrent_unpacks_beside_its_files_and_seeds_from_them() {
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let member = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/originals/small.txt"
+    ));
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let bytes = metainfo("set.rar", &[("set.rar", archive)], 128, false);
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    let (layout, intake) = {
+        let live = rig.service.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        (
+            torrent.layout.clone().unwrap(),
+            torrent.intake.clone().unwrap(),
+        )
+    };
+    let mut published = rig.service.inner.published.subscribe();
+    let storage = PieceStorage::new(
+        Arc::clone(&layout),
+        intake as Arc<dyn Pieces>,
+        rig.service.resident(job_id),
+    );
+    let lengths = Lengths::new(
+        layout.files().map(|file| file.length).sum(),
+        layout.piece_length() as u32,
+    )
+    .unwrap();
+    for piece in 0..layout.piece_count() {
+        let range = layout.piece_range(piece);
+        let index = lengths.try_validate_piece_index(piece).unwrap();
+        assert!(storage.reserve_piece(index, &Arc::default()));
+        for span in layout.spans(piece) {
+            let at = (range.start + span.at) as usize;
+            storage
+                .pwrite_all(
+                    span.file,
+                    span.range.start,
+                    &archive[at..at + span.range.len() as usize],
+                )
+                .unwrap();
+        }
+        storage.on_piece_completed(index).unwrap();
+    }
+    // Every settle publishes what it did, completion among it.
+    published
+        .wait_for(|_| {
+            rig.db
+                .get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+        })
+        .await
+        .unwrap();
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+    let view = rig.service.torrent(job_id).await.unwrap();
+    let dir = PathBuf::from(view.storage_dir.unwrap());
+    assert_eq!(std::fs::read(dir.join("set.rar")).unwrap(), archive);
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), member);
+
+    // The unpacked file gone, every piece still reads from the archive.
+    std::fs::remove_file(dir.join("small.txt")).unwrap();
+    for piece in 0..layout.piece_count() {
+        let range = layout.piece_range(piece);
+        for span in layout.spans(piece) {
+            let at = (range.start + span.at) as usize;
+            let mut read = vec![0; span.range.len() as usize];
+            storage
+                .pread_exact(span.file, span.range.start, &mut read)
+                .unwrap();
+            assert_eq!(read, archive[at..at + read.len()], "piece {piece}");
+        }
+    }
+}
+
 // After a restart, before the tick restores its job, a torrent unpacking
 // refused reads as failed, as its history keeps it, and a removal then
 // goes to history as failed, as it would once the job is back.
@@ -2267,11 +2355,25 @@ fn a_checking_torrent_keeps_the_checkpoints_bytes() {
     assert_eq!(have, [1024, 2500]);
 }
 
+// The tee of a torrent whose files unpack.
+async fn tee_of(service: &TorrentService, job_id: JobId) -> Arc<crate::torrents::tee::Tee> {
+    let live = service.inner.live.lock().await;
+    let store = live[&job_id].store.as_ref().unwrap();
+    Arc::clone(store.tee().unwrap())
+}
+
+// How many pieces the torrent's last checkpoint says it has.
+fn kept_pieces(db: &Database, job_id: JobId) -> u32 {
+    db.torrent_pieces(job_id).unwrap().map_or(0, |kept| {
+        kept.bits.iter().map(|byte| byte.count_ones()).sum()
+    })
+}
+
 // The bytes in hand over the torrent's total leave padding out, as the total
 // and the session's progress do.
 #[test]
 fn padding_in_hand_is_not_progress() {
-    use crate::pipeline::graph::root::pieces::PieceFile;
+    use crate::torrents::layout::PieceFile;
 
     let file = |name: &str, length, padding| PieceFile {
         name: name.to_owned(),
@@ -2531,31 +2633,17 @@ async fn the_checkpoint_follows_the_verified_pieces_between_ticks() {
             torrent.layout.clone().unwrap(),
         )
     };
-    let on_disk = || {
-        rig.service
-            .kept_root(job_id, &layout)
-            .map_or(0, |root| root.have().count_ones() as u32)
-    };
+    let on_disk = || kept_pieces(&rig.db, job_id);
     let mut written = rig.service.written();
     let base = written.borrow().checkpoints;
     for piece in 0..pieces {
         let range = layout.piece_range(piece);
-        let shares = layout
-            .spans(piece)
-            .into_iter()
-            .filter_map(|span| {
-                let at = (range.start + span.at) as usize;
-                Some(crate::pipeline::graph::root::pieces::Verified {
-                    volume: span.volume?,
-                    piece,
-                    offset: span.range.start,
-                    bytes: bytes::Bytes::copy_from_slice(
-                        &bytes[at..at + span.range.len() as usize],
-                    ),
-                })
-            })
-            .collect();
-        intake.verified(shares).unwrap();
+        intake
+            .verified(
+                piece,
+                &bytes::Bytes::copy_from_slice(&bytes[range.start as usize..range.end as usize]),
+            )
+            .unwrap();
         let verified = piece + 1;
         if verified % CHECKPOINT_PIECES == 0 {
             let saves = base + u64::from(verified / CHECKPOINT_PIECES);
@@ -2612,22 +2700,12 @@ async fn the_checkpoint_between_ticks_carries_the_ledger_with_its_pieces() {
     let base = written.borrow().checkpoints;
     for piece in 0..pieces {
         let range = layout.piece_range(piece);
-        let shares = layout
-            .spans(piece)
-            .into_iter()
-            .filter_map(|span| {
-                let at = (range.start + span.at) as usize;
-                Some(crate::pipeline::graph::root::pieces::Verified {
-                    volume: span.volume?,
-                    piece,
-                    offset: span.range.start,
-                    bytes: bytes::Bytes::copy_from_slice(
-                        &bytes[at..at + span.range.len() as usize],
-                    ),
-                })
-            })
-            .collect();
-        intake.verified(shares).unwrap();
+        intake
+            .verified(
+                piece,
+                &bytes::Bytes::copy_from_slice(&bytes[range.start as usize..range.end as usize]),
+            )
+            .unwrap();
     }
     written
         .wait_for(|written| written.checkpoints > base)
@@ -2649,8 +2727,7 @@ async fn the_checkpoint_between_ticks_carries_the_ledger_with_its_pieces() {
     );
     assert_eq!(on_disk.downloaded_bytes, 1_805_238_272);
     assert_eq!(on_disk.active_duration_s, 24);
-    let root = rig.service.kept_root(job_id, &layout).unwrap();
-    assert_eq!(root.have().count_ones() as u32, pieces);
+    assert_eq!(kept_pieces(&rig.db, job_id), pieces);
     rig.service.stop().await;
 }
 
@@ -5474,7 +5551,6 @@ async fn a_torrents_saved_peers_and_bans_outlive_a_restart() {
 // on its way when the torrent stops lands before stop's own, never after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_save_on_its_way_at_stop_lands_before_stops_own() {
-    use std::task::Poll;
     use weaver_torrent::ResumePeers;
 
     let rig = rig(set_clock());
@@ -5511,14 +5587,18 @@ async fn a_save_on_its_way_at_stop_lands_before_stops_own() {
         .unwrap();
     run.await.unwrap();
 
-    let mut stopping = std::pin::pin!(rig.service.stop());
-    let waiting =
-        std::future::poll_fn(|cx| Poll::Ready(stopping.as_mut().poll(cx).is_pending())).await;
-    assert!(waiting);
-    // Stop's save waits behind the one on its way.
+    let service = rig.service.clone();
+    let stopping = tokio::spawn(async move { service.stop().await });
+    // Stop's save reaches the queue, after the service's lock, and waits
+    // there behind the one on its way: the wait is on the queue holding
+    // it, not on how far one poll of stop got.
+    while rig.db.queued_writes() == 0 {
+        tokio::task::yield_now().await;
+    }
     assert_eq!(rig.db.queued_writes(), 1);
+    assert!(!stopping.is_finished());
     release.send(()).unwrap();
-    stopping.await;
+    stopping.await.unwrap();
     assert_eq!(rig.db.torrent_peers(job_id).unwrap(), current);
 }
 
@@ -5727,19 +5807,23 @@ async fn a_second_checkpoint_writes_only_what_changed() {
     let rig = rig(set_clock());
     rig.routes.set_down(Some("down"));
     rig.service.open().await.unwrap();
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add(request(AddSource::Metainfo(metainfo(
+            "set.rar",
+            &[("set.rar", archive)],
+            128,
+            false,
+        ))))
         .await
         .unwrap();
     let job = |service: &TorrentService| {
         let service = service.clone();
-        async move {
-            service.inner.live.lock().await[&job_id]
-                .job
-                .clone()
-                .unwrap()
-        }
+        async move { tee_of(&service, job_id).await }
     };
     let first = job(&rig.service).await;
     rig.service.save_checkpoints([job_id].into()).await;
@@ -5749,6 +5833,9 @@ async fn a_second_checkpoint_writes_only_what_changed() {
     let again = first.with(|job| job.pending().tally());
     assert_eq!(again.checkpoints, whole.checkpoints + 1);
     assert_eq!(again.rows, whole.rows);
+    // The tee's checkpoint is queued, not awaited, by the save; a torrent
+    // whose pieces did not change queues nothing after it to wait on.
+    rig.db.flush_write_queue().await.unwrap();
     assert!(rig.db.load_graph_checkpoint(job_id).unwrap().is_some());
     rig.service.stop().await;
 
@@ -6181,29 +6268,11 @@ async fn a_tracker_rules_dht_pex_and_lsd_each_reach_its_torrents() {
     rig.service.stop().await;
 }
 
-// The job's raise puts the files it names at Maximum and leaves every other
-// file at its stored level; no raise leaves every level as stored, and an
-// ignored file stays ignored.
-#[test]
-fn a_raise_sets_maximum_on_the_raised_files_and_leaves_the_rest() {
-    use FilePriority::*;
-    let stored = [Normal, High, Ignored, Normal];
-    assert_eq!(raised_levels(&stored, vec![]), stored);
-    assert_eq!(
-        raised_levels(&stored, vec![1]),
-        [Normal, Maximum, Ignored, Normal]
-    );
-    assert_eq!(
-        raised_levels(&stored, vec![0, 2]),
-        [Maximum, High, Ignored, Normal]
-    );
-}
-
-// A file the job raises reaches the session at Maximum through the one
-// reconcile, an ignored file stays ignored under a raise, and a toggle the
-// session runs against what is stored is put back on the next pass.
+// The stored levels reach the session through the one reconcile, an
+// ignored file stays ignored, and a toggle the session runs against what is
+// stored is put back on the next pass.
 #[tokio::test(start_paused = true)]
-async fn a_raise_and_the_stored_toggles_reach_the_session_through_one_reconcile() {
+async fn the_stored_levels_and_toggles_reach_the_session_through_one_reconcile() {
     use FilePriority::*;
     let rig = rig(set_clock());
     on_loopback(&rig.routes);
@@ -6232,17 +6301,8 @@ async fn a_raise_and_the_stored_toggles_reach_the_session_through_one_reconcile(
         .unwrap();
     assert_eq!(handle.file_priorities(), [High, Normal, Ignored]);
 
-    {
-        let live = rig.service.inner.live.lock().await;
-        let job = live[&job_id].job.as_ref().unwrap();
-        job.with(|job| {
-            job.raise(1);
-            job.raise(2);
-        });
-    }
     rig.service.apply_picking().await;
-    assert_eq!(handle.file_priorities(), [High, Maximum, Ignored]);
-    // The operator's levels are what is stored; the raise is the job's.
+    assert_eq!(handle.file_priorities(), [High, Normal, Ignored]);
     let stored = rig.db.torrent_file_priorities(job_id).unwrap();
     assert_eq!(stored, [High, Normal, Ignored]);
 
@@ -7023,7 +7083,7 @@ async fn a_restart_during_a_check_shows_what_its_job_will_hold() {
     // on.
     assert!(again.restore_job(job_id).await);
     assert_eq!(written.borrow().checkpoints_read, 1);
-    assert!(again.inner.live.lock().await[&job_id].job.is_some());
+    assert!(again.inner.live.lock().await[&job_id].store.is_some());
     assert_eq!(in_hand(&again.torrent(job_id).await.unwrap()), kept);
     again.stop().await;
     seeding.stop().await;
@@ -7049,7 +7109,7 @@ async fn a_restored_torrent_attaches_as_soon_as_its_job_is_back() {
     again.restore_jobs().await;
     {
         let live = again.inner.live.lock().await;
-        assert!(live[&job_id].job.is_some());
+        assert!(live[&job_id].store.is_some());
         assert!(live[&job_id].attached.is_some());
     }
     assert!(again.inner.restoring.lock().unwrap().is_empty());
@@ -7199,13 +7259,21 @@ async fn a_corrupted_checkpoint_is_logged_and_the_torrent_starts_fresh() {
     let rig = rig(set_clock());
     rig.routes.set_down(Some("down"));
     rig.service.open().await.unwrap();
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add(request(AddSource::Metainfo(metainfo(
+            "set.rar",
+            &[("set.rar", archive)],
+            128,
+            false,
+        ))))
         .await
         .unwrap();
-    rig.service.inner.signal.mark(job_id);
-    rig.service.tick().await;
+    rig.service.save_checkpoints([job_id].into()).await;
     rig.service.stop().await;
     assert!(rig.db.load_graph_checkpoint(job_id).unwrap().is_some());
     let datastore = rig.db.datastore();
@@ -7227,7 +7295,7 @@ async fn a_corrupted_checkpoint_is_logged_and_the_torrent_starts_fresh() {
     );
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
     reopen(&again).await;
-    let heard = lines.of("a torrent's checkpoint did not restore; it starts fresh");
+    let heard = lines.of("a torrent's unpacking checkpoint did not restore; it starts fresh");
     assert_eq!(heard.len(), 1, "{heard:?}");
     assert!(
         heard[0].contains(&format!(" job_id={} error=", job_id.0)),
@@ -7236,6 +7304,355 @@ async fn a_corrupted_checkpoint_is_logged_and_the_torrent_starts_fresh() {
     let view = again.torrent(job_id).await.unwrap();
     assert_eq!(view.pieces.unwrap().have, 0);
     again.stop().await;
+}
+
+// A checkpoint the database fails to read is not one that does not
+// restore: the torrent is not restored, not failed and not started fresh,
+// its rows stand, and the next restore brings it back from them. Meanwhile
+// it shows why, and says so once, not at every try.
+#[tokio::test]
+async fn a_checkpoint_the_database_fails_to_read_holds_the_restore_until_it_reads() {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+
+    let rig = rig(set_clock());
+    rig.routes.set_down(Some("down"));
+    rig.service.open().await.unwrap();
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(metainfo(
+            "set.rar",
+            &[("set.rar", archive)],
+            128,
+            false,
+        ))))
+        .await
+        .unwrap();
+    rig.service.save_checkpoints([job_id].into()).await;
+    rig.service.stop().await;
+    assert!(rig.db.load_graph_checkpoint(job_id).unwrap().is_some());
+    let rename = |from: &'static str, to: &'static str| {
+        let datastore = rig.db.datastore();
+        rig.db
+            .run_sql_blocking(async move {
+                SqlRuntime::execute(
+                    datastore.read_exec(),
+                    &format!("ALTER TABLE {from} RENAME TO {to}"),
+                    &[] as &[SqlArg],
+                )
+                .await?;
+                Ok(())
+            })
+            .unwrap();
+    };
+    rename("graph_nodes", "graph_nodes_away");
+    assert!(matches!(
+        rig.db.load_graph_checkpoint(job_id),
+        Err(crate::LoadError::Read(_))
+    ));
+
+    let (lines, _guard) = crate::pipeline::graph::lines::Lines::capture_at(
+        "weaver_server_core::torrents",
+        tracing::Level::WARN,
+    );
+    let fresh = |lines: &crate::pipeline::graph::lines::Lines| {
+        let mut heard =
+            lines.of("a torrent's unpacking checkpoint did not restore; it starts fresh");
+        heard.extend(
+            lines.of("a torrent's unpacking checkpoint could not be read; it starts fresh"),
+        );
+        heard
+    };
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    let held = || lines.of("a torrent's restore is held; it is tried again");
+    assert_eq!(held().len(), 1, "{:?}", held());
+    assert!(
+        held()[0].contains(&format!(" job_id={} error=", job_id.0)),
+        "{:?}",
+        held()
+    );
+    assert!(fresh(&lines).is_empty(), "{:?}", fresh(&lines));
+    again.tick().await;
+    assert_eq!(held().len(), 1, "{:?}", held());
+    {
+        let live = again.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        assert!(torrent.store.is_none());
+        assert!(torrent.failed.is_none());
+        assert!(
+            matches!(
+                &torrent.observed(Engine::Absent).engine,
+                Engine::Error(why) if why.starts_with("its restore is held: ")
+            ),
+            "{:?}",
+            torrent.observed(Engine::Absent).engine
+        );
+    }
+
+    rename("graph_nodes_away", "graph_nodes");
+    again.tick().await;
+    {
+        let live = again.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        let store = torrent.store.as_ref().expect("restored once it reads");
+        assert!(store.tee().is_some());
+        assert_eq!(torrent.observed(Engine::Absent).engine, Engine::Absent);
+    }
+    assert!(fresh(&lines).is_empty(), "{:?}", fresh(&lines));
+    assert!(rig.db.load_graph_checkpoint(job_id).unwrap().is_some());
+    again.stop().await;
+}
+
+// A restart that finds a torrent's archive file gone, as when its drive is
+// not there yet, does not fail the torrent: the pieces its files no longer
+// give are had no longer, said once, and fetched again, and the torrent
+// stays with what it has. Its tee, whose checkpoint did not restore, starts
+// fresh.
+#[tokio::test]
+async fn a_restart_that_cannot_read_its_files_fetches_again_and_does_not_fail() {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(metainfo(
+            "set.rar",
+            &[("set.rar", archive)],
+            128,
+            false,
+        ))))
+        .await
+        .unwrap();
+    let (layout, intake) = {
+        let live = rig.service.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        (
+            torrent.layout.clone().unwrap(),
+            torrent.intake.clone().unwrap(),
+        )
+    };
+    let storage = PieceStorage::new(
+        Arc::clone(&layout),
+        intake as Arc<dyn Pieces>,
+        rig.service.resident(job_id),
+    );
+    let lengths = Lengths::new(
+        layout.files().map(|file| file.length).sum(),
+        layout.piece_length() as u32,
+    )
+    .unwrap();
+    let fed = 2;
+    for piece in 0..fed {
+        let range = layout.piece_range(piece);
+        let index = lengths.try_validate_piece_index(piece).unwrap();
+        assert!(storage.reserve_piece(index, &Arc::default()));
+        for span in layout.spans(piece) {
+            let at = (range.start + span.at) as usize;
+            storage
+                .pwrite_all(
+                    span.file,
+                    span.range.start,
+                    &archive[at..at + span.range.len() as usize],
+                )
+                .unwrap();
+        }
+        storage.on_piece_completed(index).unwrap();
+    }
+    let dir = PathBuf::from(
+        rig.service
+            .torrent(job_id)
+            .await
+            .unwrap()
+            .storage_dir
+            .unwrap(),
+    );
+    rig.service.save_checkpoints([job_id].into()).await;
+    rig.service.stop().await;
+    assert_eq!(
+        rig.service
+            .inner
+            .db
+            .torrent_pieces(job_id)
+            .unwrap()
+            .unwrap()
+            .had(&layout)
+            .0,
+        fed
+    );
+    std::fs::remove_file(dir.join("set.rar")).unwrap();
+    let datastore = rig.db.datastore();
+    rig.db
+        .run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.read_exec(),
+                "UPDATE graph_nodes SET facts = {} WHERE job_id = {} AND node_id = 0",
+                &[SqlArg::Bytes(vec![0xff; 4]), SqlArg::I64(job_id.0 as i64)],
+            )
+            .await?;
+            Ok(())
+        })
+        .unwrap();
+
+    let (lines, _guard) = crate::pipeline::graph::lines::Lines::capture_at(
+        "weaver_server_core::torrents",
+        tracing::Level::WARN,
+    );
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    let heard = lines.of("a torrent's pieces did not read from its files; they are fetched again");
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert!(
+        heard[0].contains(&format!(" job_id={} pieces={fed} ", job_id.0)),
+        "{heard:?}"
+    );
+    assert_eq!(
+        lines
+            .of("a torrent's unpacking checkpoint did not restore; it starts fresh")
+            .len(),
+        1
+    );
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+    let view = again.torrent(job_id).await.unwrap();
+    assert_eq!(view.pieces.unwrap().have, 0);
+    again.stop().await;
+}
+
+// A tee's checkpoint that the database refuses for good does not hold the
+// torrent's writes up for ever: as a job of the pipeline pauses for one,
+// the torrent's unpacking ends for it, said in its history, the checkpoint
+// is let go, and the writes behind it, the torrent's own and a flush of
+// every write, go through.
+#[tokio::test]
+async fn a_checkpoint_the_database_refuses_ends_unpacking_and_holds_no_write_up() {
+    use crate::persistence::sql_runtime::SqlRuntime;
+
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(metainfo(
+            "set.rar",
+            &[("set.rar", archive)],
+            128,
+            false,
+        ))))
+        .await
+        .unwrap();
+    rig.service.save_checkpoints([job_id].into()).await;
+    rig.db.flush_write_queue().await.unwrap();
+    let datastore = rig.db.datastore();
+    rig.db
+        .run_sql_blocking(async move {
+            for event in ["INSERT", "UPDATE"] {
+                SqlRuntime::execute(
+                    datastore.read_exec(),
+                    &format!(
+                        "CREATE TRIGGER refuse_graph_nodes_{event} BEFORE {event} ON graph_nodes \
+                         BEGIN SELECT RAISE(ABORT, 'refused for good'); END"
+                    ),
+                    &[],
+                )
+                .await?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    let (layout, intake) = {
+        let live = rig.service.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        (
+            torrent.layout.clone().unwrap(),
+            torrent.intake.clone().unwrap(),
+        )
+    };
+    let storage = PieceStorage::new(
+        Arc::clone(&layout),
+        intake as Arc<dyn Pieces>,
+        rig.service.resident(job_id),
+    );
+    let lengths = Lengths::new(
+        layout.files().map(|file| file.length).sum(),
+        layout.piece_length() as u32,
+    )
+    .unwrap();
+    let range = layout.piece_range(0);
+    let index = lengths.try_validate_piece_index(0).unwrap();
+    assert!(storage.reserve_piece(index, &Arc::default()));
+    for span in layout.spans(0) {
+        let at = (range.start + span.at) as usize;
+        storage
+            .pwrite_all(
+                span.file,
+                span.range.start,
+                &archive[at..at + span.range.len() as usize],
+            )
+            .unwrap();
+    }
+    let mut published = rig.service.inner.published.subscribe();
+    storage.on_piece_completed(index).unwrap();
+    rig.service.save_checkpoints([job_id].into()).await;
+
+    published
+        .wait_for(|_| rig.db.get_job_history(job_id.0).unwrap().is_some())
+        .await
+        .unwrap();
+    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert!(
+        history
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("Checkpoint could not be persisted"),
+        "{history:?}"
+    );
+    rig.service.save_checkpoints([job_id].into()).await;
+    rig.db.flush_write_queue().await.unwrap();
+    assert!(rig.service.torrent(job_id).await.is_some());
+    rig.service.stop().await;
+}
+
+// An unpacking a crash cut short after it recorded its files, run again,
+// finds them already beside the torrent's and places nothing new: what the
+// first one kept stays kept, so a deletion still takes it.
+#[tokio::test]
+async fn an_unpacking_run_again_keeps_the_files_the_first_one_placed() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(metainfo(
+            "set.rar",
+            &[("set.rar", b"rar")],
+            128,
+            false,
+        ))))
+        .await
+        .unwrap();
+    rig.db
+        .finish_torrent_unpack(job_id, &["small.txt".to_owned()])
+        .unwrap();
+    rig.db.finish_torrent_unpack(job_id, &[]).unwrap();
+    rig.db
+        .finish_torrent_unpack(job_id, &["small.txt".to_owned(), "notes.txt".to_owned()])
+        .unwrap();
+    assert_eq!(
+        rig.db.torrent_outputs(job_id).unwrap(),
+        ["small.txt", "notes.txt"]
+    );
+    rig.service.stop().await;
 }
 
 // An announce a tracker heard: its event, the torrent's key and peer id,
@@ -8501,13 +8918,11 @@ fn values(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_owned()).collect()
 }
 
-// The candidates the graph of torrent `job_id` holds.
+// The candidates the graph of torrent `job_id`'s tee holds.
 async fn graph_passwords(service: &TorrentService, job_id: JobId) -> Vec<String> {
-    let job = service.inner.live.lock().await[&job_id]
-        .job
-        .clone()
-        .unwrap();
-    job.with(|job| job.password_candidates().to_vec())
+    let live = service.inner.live.lock().await;
+    let tee = live[&job_id].store.as_ref().unwrap().tee().unwrap();
+    tee.with(|job| job.password_candidates().to_vec())
 }
 
 // A torrent under no rule tries exactly the global list; one under a rule
@@ -8532,10 +8947,14 @@ async fn a_torrents_archive_passwords_are_its_rules_then_the_global_list() {
         .insert_tracker_rule(&password_rule("*.b.test", &["b-only"]), EPOCH_MS)
         .unwrap();
     rig.service.reload_tracker_rules().await.unwrap();
-    let add = |name: &'static str, seed: u8, url: Option<&'static str>| {
+    let archive: &'static [u8] = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let add = |name: &'static str, url: Option<&'static str>| {
         let service = rig.service.clone();
         async move {
-            let bytes = plain(name, seed);
+            let bytes = metainfo(name, &[("set.rar", archive)], 128, false);
             let bytes = match url {
                 Some(url) => announcing(&bytes, url),
                 None => bytes,
@@ -8546,9 +8965,9 @@ async fn a_torrents_archive_passwords_are_its_rules_then_the_global_list() {
                 .unwrap()
         }
     };
-    let under_a = add("under-a", 1, Some("http://tracker.a.test/announce")).await;
-    let under_b = add("under-b", 2, Some("http://tracker.b.test/announce")).await;
-    let under_none = add("under-none", 3, None).await;
+    let under_a = add("under-a", Some("http://tracker.a.test/announce")).await;
+    let under_b = add("under-b", Some("http://tracker.b.test/announce")).await;
+    let under_none = add("under-none", None).await;
 
     let global: Vec<String> = rig
         .db
@@ -8664,33 +9083,6 @@ fn a_torrents_password_list_is_its_rules_then_the_global_list_once_each() {
     );
 }
 
-// A restored torrent's nodes retry its current list from the top: the
-// position each checkpoint kept goes back to the first candidate.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_restored_torrent_retries_its_passwords_from_the_top() {
-    let rig = rig(set_clock());
-    rig.routes.set_down(Some("down"));
-    rig.service.open().await.unwrap();
-    let job_id = rig
-        .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
-        .await
-        .unwrap();
-    let job = rig.service.inner.live.lock().await[&job_id]
-        .job
-        .clone()
-        .unwrap();
-    let mut snapshot = job.with(|job| job.snapshot());
-    snapshot.passwords.insert(weaver_graph::NodeId(1), 3);
-    snapshot.passwords.insert(weaver_graph::NodeId(2), 0);
-    retry_passwords_from_top(&mut snapshot);
-    assert_eq!(
-        snapshot.passwords.into_iter().collect::<Vec<_>>(),
-        [(weaver_graph::NodeId(1), 0), (weaver_graph::NodeId(2), 0)]
-    );
-    rig.service.stop().await;
-}
-
 // An idle seed's times run on at every tick, but its ledger is not written
 // at every tick for them: they go once TIMES_EVERY_MS has passed since it
 // was last written, and a stop writes them as they stand.
@@ -8746,4 +9138,428 @@ fn sequential_jobs_spread_their_times_over_the_whole_period() {
     let least = *per_tick.iter().min().unwrap();
     assert!(most <= 2 * even, "{most} in one tick, even share {even}");
     assert!(least > 0, "a tick took none");
+}
+
+// A save of a torrent's checkpoints does not hold the service's lock while
+// its tee's checkpoint waits on the job: an intake writing to disk may
+// hold the job, and every other torrent goes on meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_save_waiting_on_an_unpacking_job_holds_no_other_torrent_up() {
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(metainfo(
+            "set.rar",
+            &[("set.rar", archive)],
+            128,
+            false,
+        ))))
+        .await
+        .unwrap();
+    let tee = {
+        let live = rig.service.inner.live.lock().await;
+        Arc::clone(live[&job_id].store.as_ref().unwrap().tee().unwrap())
+    };
+    let tee_asked = Arc::clone(&tee);
+    let tee_asked = &tee_asked.asked;
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        tee.with(|_| {
+            held_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+    });
+    held_rx.recv().unwrap();
+    let mut asked = tee_asked.subscribe();
+    let service = rig.service.clone();
+    let save = tokio::spawn(async move { service.save_checkpoints([job_id].into()).await });
+    // The save reached the job's checkpoint, and cannot finish while the
+    // job is held; the service's lock is free all the same.
+    asked.wait_for(|asked| *asked > 0).await.unwrap();
+    drop(rig.service.inner.live.lock().await);
+    assert!(!save.is_finished());
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    save.await.unwrap();
+    rig.db.flush_write_queue().await.unwrap();
+    rig.service.stop().await;
+}
+
+// A recovery set made over the files of a torrent, plain ones among them.
+fn torrent_parity(files: &[(&str, &[u8])], blocks: u32) -> Vec<(String, Vec<u8>)> {
+    use par2_rs::create::{BlockSizing, Par2Creator, Par2CreatorOptions, RecoveryAmount};
+    let directory = tempfile::tempdir().unwrap();
+    let base = directory.path().join("protected");
+    std::fs::create_dir_all(&base).unwrap();
+    let paths = files
+        .iter()
+        .map(|(name, bytes)| {
+            let path = base.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        })
+        .collect();
+    let output = directory.path().join("out");
+    std::fs::create_dir_all(&output).unwrap();
+    let mut options = Par2CreatorOptions::with_output(output.join("set.par2"), Some(base), paths);
+    options.block_sizing = BlockSizing::Bytes(512);
+    options.recovery_amount = RecoveryAmount::Count(blocks);
+    let creator = Par2Creator::new(options);
+    let created = creator.create(&creator.plan().unwrap()).unwrap();
+    created
+        .output_paths
+        .iter()
+        .map(|path| {
+            (
+                path.file_name().unwrap().to_str().unwrap().to_owned(),
+                std::fs::read(path).unwrap(),
+            )
+        })
+        .collect()
+}
+
+// A torrent of an archive and a plain file under one recovery set: the
+// plain file never goes to the graph, the set's word on it notwithstanding.
+// Every piece whole, the archive unpacks, the torrent completes, and no
+// repair is tried over the file the graph never had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archive_and_a_plain_file_under_one_recovery_set_unpack_and_complete() {
+    let archive: &[u8] = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let member = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/originals/small.txt"
+    ));
+    let notes: Vec<u8> = (0..1500u32).map(|at| (at * 7 % 251) as u8).collect();
+    let parity = torrent_parity(&[("set.rar", archive), ("notes.txt", &notes)], 2);
+    let mut files: Vec<(String, Vec<u8>)> = vec![
+        ("set.rar".to_owned(), archive.to_vec()),
+        ("notes.txt".to_owned(), notes.clone()),
+    ];
+    files.extend(parity);
+    let listed: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    let whole: Vec<u8> = files.iter().flat_map(|(_, bytes)| bytes.clone()).collect();
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(metainfo(
+            "mixed", &listed, 256, false,
+        ))))
+        .await
+        .unwrap();
+    let (layout, intake) = {
+        let live = rig.service.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        (
+            torrent.layout.clone().unwrap(),
+            torrent.intake.clone().unwrap(),
+        )
+    };
+    let plan = crate::torrents::tee::Plan::of(&layout).unwrap();
+    let notes_at = layout
+        .files()
+        .position(|file| file.name.ends_with("notes.txt"))
+        .unwrap();
+    assert_eq!(plan.volume(notes_at), None);
+    let mut published = rig.service.inner.published.subscribe();
+    let storage = PieceStorage::new(
+        Arc::clone(&layout),
+        intake as Arc<dyn Pieces>,
+        rig.service.resident(job_id),
+    );
+    let lengths = Lengths::new(
+        layout.files().map(|file| file.length).sum(),
+        layout.piece_length() as u32,
+    )
+    .unwrap();
+    for piece in 0..layout.piece_count() {
+        let range = layout.piece_range(piece);
+        let index = lengths.try_validate_piece_index(piece).unwrap();
+        assert!(storage.reserve_piece(index, &Arc::default()));
+        for span in layout.spans(piece) {
+            let at = (range.start + span.at) as usize;
+            storage
+                .pwrite_all(
+                    span.file,
+                    span.range.start,
+                    &whole[at..at + span.range.len() as usize],
+                )
+                .unwrap();
+        }
+        storage.on_piece_completed(index).unwrap();
+    }
+    published
+        .wait_for(|_| {
+            rig.db.get_job_history(job_id.0).unwrap().is_some()
+                || rig
+                    .db
+                    .get_torrent(job_id)
+                    .unwrap()
+                    .unwrap()
+                    .completed_at_ms
+                    .is_some()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.db
+            .get_job_history(job_id.0)
+            .unwrap()
+            .map(|row| row.error_message),
+        None
+    );
+    let view = rig.service.torrent(job_id).await.unwrap();
+    let dir = PathBuf::from(view.storage_dir.unwrap());
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), member);
+    assert_eq!(std::fs::read(dir.join("notes.txt")).unwrap(), notes);
+    assert_eq!(std::fs::read(dir.join("set.rar")).unwrap(), archive);
+    rig.service.stop().await;
+}
+
+// Feed `pieces` of a torrent whole, from `payload`, through its storage.
+async fn feed(
+    service: &TorrentService,
+    job_id: JobId,
+    payload: &[u8],
+    pieces: std::ops::Range<u32>,
+) {
+    let (layout, intake) = {
+        let live = service.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        (
+            torrent.layout.clone().unwrap(),
+            torrent.intake.clone().unwrap(),
+        )
+    };
+    let storage = PieceStorage::new(
+        Arc::clone(&layout),
+        intake as Arc<dyn Pieces>,
+        service.resident(job_id),
+    );
+    let lengths = Lengths::new(
+        layout.files().map(|file| file.length).sum(),
+        layout.piece_length() as u32,
+    )
+    .unwrap();
+    for piece in pieces {
+        let range = layout.piece_range(piece);
+        let index = lengths.try_validate_piece_index(piece).unwrap();
+        assert!(storage.reserve_piece(index, &Arc::default()));
+        for span in layout.spans(piece) {
+            let at = (range.start + span.at) as usize;
+            storage
+                .pwrite_all(
+                    span.file,
+                    span.range.start,
+                    &payload[at..at + span.range.len() as usize],
+                )
+                .unwrap();
+        }
+        storage.on_piece_completed(index).unwrap();
+    }
+}
+
+// A torrent part delivered when the server stops takes its unpacking back
+// from the checkpoint it wrote, not from nothing, and with the rest of its
+// pieces unpacks and completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_part_delivered_unpacking_restored_from_its_checkpoint_unpacks() {
+    let archive: &[u8] = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let member = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/originals/small.txt"
+    ));
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(metainfo(
+            "set.rar",
+            &[("set.rar", archive)],
+            128,
+            false,
+        ))))
+        .await
+        .unwrap();
+    let count = {
+        let live = rig.service.inner.live.lock().await;
+        live[&job_id].layout.as_ref().unwrap().piece_count()
+    };
+    let half = count / 2;
+    assert!(half > 0 && half < count);
+    feed(&rig.service, job_id, archive, 0..half).await;
+    rig.service.save_checkpoints([job_id].into()).await;
+    rig.service.stop().await;
+    rig.db.flush_write_queue().await.unwrap();
+    let rows = rig.db.load_graph_checkpoint(job_id).unwrap().unwrap();
+    assert!(!rows.nodes.is_empty());
+
+    let (lines, _guard) = crate::pipeline::graph::lines::Lines::capture_at(
+        "weaver_server_core::torrents",
+        tracing::Level::WARN,
+    );
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    assert!(
+        lines
+            .of("a torrent's unpacking checkpoint did not restore; it starts fresh")
+            .is_empty()
+    );
+    let mut published = again.inner.published.subscribe();
+    feed(&again, job_id, archive, half..count).await;
+    published
+        .wait_for(|_| {
+            rig.db.get_job_history(job_id.0).unwrap().is_some()
+                || rig
+                    .db
+                    .get_torrent(job_id)
+                    .unwrap()
+                    .unwrap()
+                    .completed_at_ms
+                    .is_some()
+        })
+        .await
+        .unwrap();
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+    let dir = PathBuf::from(again.torrent(job_id).await.unwrap().storage_dir.unwrap());
+    assert_eq!(std::fs::read(dir.join("small.txt")).unwrap(), member);
+    assert_eq!(std::fs::read(dir.join("set.rar")).unwrap(), archive);
+    again.stop().await;
+}
+
+// A seed-mode add of an archive already in place unpacks it beside its
+// files from what the files hold, and completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seed_mode_add_of_an_archive_unpacks_it_and_completes() {
+    let archive: &[u8] = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let member = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/originals/small.txt"
+    ));
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("seeded");
+    std::fs::create_dir_all(save.join("placed")).unwrap();
+    std::fs::write(save.join("placed/set.rar"), archive).unwrap();
+    let handle = queue();
+    let mut changes = handle.state().subscribe_job_changes();
+    rig.service.publish_to(handle);
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            placement: Placement {
+                save_path: Some(save.to_string_lossy().into_owned()),
+                seed_mode: true,
+                ..Placement::default()
+            },
+            unpack: Some(true),
+            ..request(AddSource::Metainfo(metainfo(
+                "placed",
+                &[("set.rar", archive)],
+                1024,
+                false,
+            )))
+        })
+        .await
+        .unwrap();
+    loop {
+        changes.borrow_and_update();
+        let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+        if stored.completed_at_ms.is_some() || rig.db.get_job_history(job_id.0).unwrap().is_some() {
+            break;
+        }
+        changes.changed().await.unwrap();
+    }
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+    assert_eq!(
+        std::fs::read(save.join("placed/small.txt")).unwrap(),
+        member
+    );
+    rig.service.stop().await;
+}
+
+// A seed-mode add whose archive file is damaged gives the graph none of
+// it: the piece's seed-mode check fails, seed mode ends, every piece is
+// checked again, and the piece fetched from a peer is the one the graph
+// takes. The archive unpacks whole and the torrent completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seed_mode_archive_with_a_bad_file_is_fetched_again_and_unpacks_whole() {
+    let archive: &[u8] = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let member = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/originals/small.txt"
+    ));
+    let files = [("set.rar", archive)];
+    let bytes = metainfo("placed", &files, 1024, false);
+    let seeds = tempfile::tempdir().unwrap();
+    let seeding = seeder(seeds.path(), &bytes, &files).await;
+    let std::net::SocketAddr::V4(peer) = seeding.listen_addr().unwrap() else {
+        panic!("the seeder listens on IPv4 loopback");
+    };
+    let url = tracker(peer).await;
+
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let save = rig.dir.path().join("seeded");
+    std::fs::create_dir_all(save.join("placed")).unwrap();
+    let mut damaged = archive.to_vec();
+    let middle = damaged.len() / 2;
+    damaged[middle] ^= 0xff;
+    std::fs::write(save.join("placed/set.rar"), &damaged).unwrap();
+    let handle = queue();
+    let mut changes = handle.state().subscribe_job_changes();
+    rig.service.publish_to(handle);
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            placement: Placement {
+                save_path: Some(save.to_string_lossy().into_owned()),
+                seed_mode: true,
+                ..Placement::default()
+            },
+            unpack: Some(true),
+            ..request(AddSource::Metainfo(bytes))
+        })
+        .await
+        .unwrap();
+    tracked(&rig.service, job_id, &url).await;
+    loop {
+        changes.borrow_and_update();
+        let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
+        if stored.completed_at_ms.is_some() || rig.db.get_job_history(job_id.0).unwrap().is_some() {
+            break;
+        }
+        changes.changed().await.unwrap();
+    }
+    assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
+    assert_eq!(std::fs::read(save.join("placed/set.rar")).unwrap(), archive);
+    assert_eq!(
+        std::fs::read(save.join("placed/small.txt")).unwrap(),
+        member
+    );
+    rig.service.stop().await;
+    seeding.stop().await;
 }

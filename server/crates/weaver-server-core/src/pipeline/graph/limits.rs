@@ -535,7 +535,7 @@ impl crate::pipeline::Pipeline {
 
     // What a job outside the pipeline builds its graph with: the pipeline's
     // holds accountant, slots, extraction limits and the complete root's
-    // free-space reader.
+    // free-space reader, and the mail its runs speak on.
     pub(crate) fn graph_budget(&self) -> GraphBudget {
         GraphBudget {
             accountant: Arc::clone(&self.graph_holds),
@@ -545,7 +545,9 @@ impl crate::pipeline::Pipeline {
                 .storage_capacity()
                 .reader(crate::operations::disk::StorageRoot::Complete),
             mail: self.graph_runs.sender(),
+            written: self.graph_runs.written(),
             outside: Arc::clone(&self.graph_outside),
+            work: self.intermediate_dir.clone(),
         }
     }
 }
@@ -559,7 +561,11 @@ pub(crate) struct GraphBudget {
     pub(crate) free_disk: crate::operations::disk::CapacityReader,
     // Where the job's runs speak, and where it joins to hear them.
     pub(crate) mail: tokio::sync::mpsc::Sender<super::engine::Said>,
+    // Where the database's word on the job's checkpoints is said.
+    pub(crate) written: tokio::sync::mpsc::UnboundedSender<super::engine::Said>,
     pub(crate) outside: Arc<super::engine::Outside>,
+    // The directory the job's own scratch goes under.
+    pub(crate) work: std::path::PathBuf,
 }
 
 // A graph job's budget from the pipeline's extraction limits and the
