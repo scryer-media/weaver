@@ -1,0 +1,16 @@
+{
+  "slug": "yenc-lie-field-size",
+  "title": "Lantern.Reach.S01E03.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "The field post: 28 articles of 768,000 bytes whose every =ybegin header states size=1536000 while the file is 21,504,000 bytes and the 28th part begins at 20,736,001. Every article arrives, every body and checksum is right, and each part's begin= is true, so the file must come out byte-equal.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "segment_size": 768000,
+  "yencHeaderLies": [
+    {
+      "size": 1536000
+    }
+  ],
+  "expectedOutputBLAKE3": {
+    "lantern.reach.s01e03.mkv": "49647069b2641d8f67d3fea64dc0ca4f1ee04d4edd4154a935565293a20bf46e"
+  }
+}

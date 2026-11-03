@@ -91,6 +91,9 @@ type Scenario struct {
 	// canonical runs leave it out. The value says why: the behavior it pins is
 	// one weaver does not deliver yet.
 	Disabled string `json:"disabled,omitempty"`
+	// YencHeaderLies rewrite the headers of seeded articles after posting,
+	// leaving their bodies and the NZB as posted.
+	YencHeaderLies []ScenarioYencHeaderLie `json:"yencHeaderLies,omitempty"`
 }
 
 type ScenarioRuntimeAssertions struct {
@@ -1503,6 +1506,13 @@ var canonicalFixtureSlugs = []string{
 	"uu-mixed-yenc",
 	"uu-preamble-tail",
 	"uu-missing-middle",
+	// Lying yEnc headers. Nyuu posts these honestly and the seeder files the
+	// articles again with the lie told, see internal/weaver/yenc_header_lies.go.
+	"yenc-lie-field-size",
+	"yenc-lie-field-size-lost",
+	"yenc-lie-size-large",
+	"yenc-lie-end-below-begin",
+	"yenc-lie-overlap-par2",
 	"zip-corrupted",
 	"zip-encrypted",
 	"zip-unencrypted",

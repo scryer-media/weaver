@@ -143,6 +143,9 @@ var ScenarioOnly = map[string]string{
 	"adv-password-rar5":                        "stages rar5-encrypted's archive; the lane submits it with no password and with a wrong one",
 	"adv-password-7z":                          "stages 7z-encrypted's archive; the lane submits it with no password and with a wrong one",
 	"adv-password-zip":                         "stages zip-encrypted's archive; the lane submits it with no password and with a wrong one",
+	"yenc-lie-field-size-lost":                 "stages yenc-lie-field-size's payload under the same size lie and deletes one middle article",
+	"yenc-lie-size-large":                      "stages yenc-lie-field-size's payload with every header stating half as much again",
+	"yenc-lie-end-below-begin":                 "stages yenc-lie-field-size's payload with one part's end= below its begin=",
 }
 
 // Recipes is the corpus, one entry per scenario directory that owns bytes.
@@ -1586,6 +1589,43 @@ func Recipes() []Recipe {
 		},
 	})
 
+	// ---------------------------------------------------- lying yEnc headers
+	//
+	// The bytes here are ordinary; the lies are told at seed time, when the
+	// harness files the posted articles again with their `=ybegin` or
+	// `=ypart` line rewritten (see internal/weaver/yenc_header_lies.go). The
+	// scenarios that only restage these payloads under a different lie are
+	// listed in ScenarioOnly.
+	add(Recipe{
+		Slug: "yenc-lie-field-size", Family: "yEnc header lies", ByteReproducible: true,
+		Notes: "The field post: 28 articles of 768,000 bytes, 21,504,000 in all, every header stating size=1536000 while the 28th part begins at 20,736,001. " +
+			"Every reference decoder writes each part where its own begin= puts it, so a whole post is byte-equal whatever the size says.",
+		Build: func(ctx context.Context, env *Env) error {
+			return WritePRNG(env.OutputPath(yencLieFieldMedia), "lantern-reach", yencLieFieldBytes)
+		},
+		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
+			return map[string]string{yencLieFieldMedia: env.OutputPath(yencLieFieldMedia)}, nil
+		},
+	})
+
+	add(Recipe{
+		Slug: "yenc-lie-overlap-par2", Family: "yEnc header lies",
+		Notes: "Six articles of 768,000 bytes with a recovery set over them; at seed time the third part's begin= and end= move down by half an article, over the part before it. " +
+			"Every decoder writes the body where the header says, so the file is wrong where it lands and only the recovery set puts it back.",
+		Build: func(ctx context.Context, env *Env) error {
+			if err := WritePRNG(env.OutputPath(yencLieOverlapMedia), "copper-mesa", yencLieOverlapBytes); err != nil {
+				return err
+			}
+			return env.PAR2(ctx, PAR2Spec{
+				Base: yencLieOverlapMedia + ".par2", SliceSize: yencLieArticleBytes, RecoveryBlocks: 3, RecoveryFiles: 1,
+				Sources: []string{yencLieOverlapMedia},
+			})
+		},
+		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
+			return map[string]string{yencLieOverlapMedia: env.OutputPath(yencLieOverlapMedia)}, nil
+		},
+	})
+
 	// ------------------------------------------------------- direct store
 	recipes = append(recipes, DirectStoreRecipes()...)
 	recipes = append(recipes, PAR3Recipes()...)
@@ -1595,6 +1635,18 @@ func Recipes() []Recipe {
 	recipes = append(recipes, GraphBoundaryRecipes()...)
 	return recipes
 }
+
+// The lying-header payloads. An article is the field post's 768,000 bytes,
+// which the scenarios post with segment_size; the field payload is its 28
+// articles exactly, and the overlap payload six, enough for a part with a
+// neighbour on each side.
+const (
+	yencLieFieldMedia   = "lantern.reach.s01e03.mkv"
+	yencLieOverlapMedia = "copper.mesa.s01e02.mkv"
+	yencLieArticleBytes = 768000
+	yencLieFieldBytes   = 28 * yencLieArticleBytes
+	yencLieOverlapBytes = 6 * yencLieArticleBytes
+)
 
 // The uu fixtures' member names. They are invented titles, and they are also
 // the names the `begin` lines carry, which makes them the names a decoder

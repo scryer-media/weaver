@@ -232,6 +232,14 @@ func seedScenarioRelease(absDir string, scenario *Scenario) error {
 		}
 	}
 
+	if len(scenario.YencHeaderLies) > 0 {
+		told, err := tellYencHeaderLies(nntpHost(), nntpPort(), nzbData, scenario.YencHeaderLies)
+		if err != nil {
+			return fmt.Errorf("tell yEnc header lies for %s: %w", scenario.Slug, err)
+		}
+		logSeed("rewrote the yEnc headers of %d article(s)", told)
+	}
+
 	if len(scenario.DeleteSubjectContains) > 0 {
 		messageIDs, err := extractMessageIDsBySubjectContains(nzbData, scenario.DeleteSubjectContains, scenario.DeleteSubjectTailArticles)
 		if err != nil {
