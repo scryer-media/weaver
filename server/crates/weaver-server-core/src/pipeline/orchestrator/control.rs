@@ -290,7 +290,9 @@ impl Pipeline {
             let ids: BTreeSet<_> = pending
                 .iter()
                 .filter_map(|(id, intents, _)| {
-                    (intents.cancelled == Some(origin) && self.jobs.contains_key(id)).then_some(*id)
+                    (intents.cancelled == Some(origin)
+                        && (self.jobs.contains_key(id) || self.window_unreadable.contains(id)))
+                    .then_some(*id)
                 })
                 .collect();
             for id in &ids {
