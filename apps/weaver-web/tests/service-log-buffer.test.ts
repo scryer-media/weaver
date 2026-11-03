@@ -137,12 +137,15 @@ test("a record's spans come before its target", () => {
   const line = readLogLine(
     0,
     '{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"WARN","target":"weaver::http",' +
-      '"fields":{"message":"slow"},"spans":[{"name":"request","id":3},{"name":"bare"}]}',
+      '"fields":{"message":"slow","name":"\\"plain\\""},"spans":[{"name":"request","fields":{"id":3}},{"name":"bare"}]}',
   );
-  assert.equal(line.raw, "2026-11-03T08:10:00.123456-07:00  WARN request{id=3}:bare: weaver::http: slow");
+  assert.equal(
+    line.raw,
+    '2026-11-03T08:10:00.123456-07:00  WARN request{id=3}:bare: weaver::http: slow name="plain"',
+  );
   assert.equal(line.level, "warn");
   assert.equal(line.target, "weaver::http");
-  assert.equal(line.message, "slow");
+  assert.equal(line.message, 'slow name="plain"');
 });
 
 test("a line that is not a record reads as text", () => {

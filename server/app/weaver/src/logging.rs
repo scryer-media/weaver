@@ -15,7 +15,9 @@ use std::sync::OnceLock;
 use chrono::{DateTime, Local, SecondsFormat, TimeZone};
 use serde_json::Value;
 use tracing::field::{Field, Visit};
+use tracing::span::Record;
 use tracing::{Event, Subscriber};
+use tracing_subscriber::field::RecordFields;
 use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::fmt::{FmtContext, FormattedFields};
@@ -91,13 +93,22 @@ impl LogFormat {
 
 // One JSON object per event, on one line:
 //
-// `{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"INFO","target":"weaver::jobs","fields":{"message":"job added","job_id":7},"spans":[{"name":"request","id":3}]}`
+// `{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"INFO","target":"weaver::jobs","fields":{"message":"job added","job_id":7},"spans":[{"name":"request","fields":{"id":3}}]}`
 //
 // `timestamp` is local time with its offset, as `LocalTimer` writes it. The
 // event's fields, its message first, sit in a `fields` object in the order the
 // event names them. `spans` lists the spans the event happened in, outermost
-// first, each with its name and its fields; it is left out when there are
-// none.
+// first, each with its `name` and, when it has any, its own `fields` object in
+// the order the span names them; it is left out when there are none.
+//
+// A value is written as JSON where JSON can hold it: integers whole, `u64` and
+// `i64` included, and wider integers as strings. A float that is not a number
+// or is infinite, which JSON cannot hold, is written as the string the text
+// format shows for it: "NaN", "inf" or "-inf". A `?` field holds its Debug
+// text and a `%` field its Display text, both as strings.
+//
+// Span fields are kept by `JsonSpanFields`, which the layer must use with this
+// format.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct JsonRecord;
 
@@ -145,20 +156,13 @@ where
                 record.push_str("{\"name\":");
                 push_json_string(&mut record, span.name());
                 let extensions = span.extensions();
-                // A span's fields are kept already written as a JSON object
-                // when the layer writes its fields as JSON; any other shape is
-                // left out rather than mangled.
+                // The span's fields as `JsonSpanFields` kept them: one JSON
+                // object. Any other shape is left out rather than mangled.
                 if let Some(formatted) = extensions.get::<FormattedFields<N>>() {
                     let body = formatted.fields.trim();
-                    if let Some(inner) = body
-                        .strip_prefix('{')
-                        .and_then(|rest| rest.strip_suffix('}'))
-                        .map(str::trim)
-                        .filter(|inner| !inner.is_empty())
-                        && serde_json::from_str::<Value>(body).is_ok()
-                    {
-                        record.push(',');
-                        record.push_str(inner);
+                    if body.len() > 2 && body.starts_with('{') && body.ends_with('}') {
+                        record.push_str(",\"fields\":");
+                        record.push_str(body);
                     }
                 }
                 record.push('}');
@@ -173,6 +177,40 @@ where
     }
 }
 
+// A span's fields as one JSON object, in the order the span names them, for
+// `JsonRecord` to carry. Fields recorded later are added at the end.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct JsonSpanFields;
+
+impl<'writer> FormatFields<'writer> for JsonSpanFields {
+    fn format_fields<R: RecordFields>(
+        &self,
+        mut writer: Writer<'writer>,
+        fields: R,
+    ) -> fmt::Result {
+        let mut ordered = OrderedFields::default();
+        fields.record(&mut ordered);
+        writer.write_str(&ordered.object())
+    }
+
+    fn add_fields(&self, current: &mut FormattedFields<Self>, fields: &Record<'_>) -> fmt::Result {
+        let mut ordered = OrderedFields::default();
+        fields.record(&mut ordered);
+        if ordered.0.is_empty() {
+            return Ok(());
+        }
+        let more = ordered.object();
+        if current.fields.len() <= 2 {
+            current.fields = more;
+        } else {
+            current.fields.pop();
+            current.fields.push(',');
+            current.fields.push_str(&more[1..]);
+        }
+        Ok(())
+    }
+}
+
 fn push_json_string(out: &mut String, value: &str) {
     // Serializing a string cannot fail.
     out.push_str(&serde_json::to_string(value).unwrap_or_default());
@@ -183,6 +221,21 @@ fn push_json_string(out: &mut String, value: &str) {
 struct OrderedFields(Vec<(&'static str, Value)>);
 
 impl OrderedFields {
+    // The fields as one JSON object, in order.
+    fn object(&self) -> String {
+        let mut object = String::from("{");
+        for (index, (name, value)) in self.0.iter().enumerate() {
+            if index > 0 {
+                object.push(',');
+            }
+            push_json_string(&mut object, name);
+            object.push(':');
+            object.push_str(&value.to_string());
+        }
+        object.push('}');
+        object
+    }
+
     fn message_first(&self) -> impl Iterator<Item = &(&'static str, Value)> {
         let message = self.0.iter().filter(|(name, _)| *name == "message");
         message.chain(self.0.iter().filter(|(name, _)| *name != "message"))
@@ -213,7 +266,13 @@ impl Visit for OrderedFields {
     }
 
     fn record_f64(&mut self, field: &Field, value: f64) {
-        self.0.push((field.name(), Value::from(value)));
+        // JSON has no NaN or infinity; the text format's spelling survives.
+        let value = if value.is_finite() {
+            Value::from(value)
+        } else {
+            Value::String(value.to_string())
+        };
+        self.0.push((field.name(), value));
     }
 
     fn record_str(&mut self, field: &Field, value: &str) {
@@ -556,7 +615,6 @@ mod tests {
         use std::io::Write;
         use std::sync::{Arc, Mutex};
         use tracing_subscriber::fmt::MakeWriter;
-        use tracing_subscriber::fmt::format::JsonFields;
         use tracing_subscriber::layer::SubscriberExt;
 
         #[derive(Clone, Default)]
@@ -584,7 +642,7 @@ mod tests {
         let buffer = SharedBuffer::default();
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
-                .fmt_fields(JsonFields::new())
+                .fmt_fields(JsonSpanFields)
                 .event_format(JsonRecord)
                 .with_writer(buffer.clone())
                 .with_ansi(false),
@@ -641,8 +699,8 @@ mod tests {
         assert_eq!(
             record["spans"],
             serde_json::json!([
-                { "name": "request", "id": 3 },
-                { "name": "job", "job_id": 9 },
+                { "name": "request", "fields": { "id": 3 } },
+                { "name": "job", "fields": { "job_id": 9 } },
             ]),
             "{raw}"
         );
@@ -681,5 +739,167 @@ mod tests {
             parsed.offset().local_minus_utc(),
             Local::now().offset().local_minus_utc()
         );
+    }
+}
+
+// Real tracing events through JsonRecord, each line read back by serde_json
+// and compared with what the text layer wrote for the same event.
+#[cfg(test)]
+mod json_record_against_text {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    #[derive(Clone, Default)]
+    struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'w> MakeWriter<'w> for SharedBuffer {
+        type Writer = Self;
+        fn make_writer(&'w self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    // (json lines, old text lines) for the same events.
+    fn both(emit: impl Fn()) -> (Vec<String>, Vec<String>) {
+        let json = SharedBuffer::default();
+        let text = SharedBuffer::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .fmt_fields(JsonSpanFields)
+                    .event_format(JsonRecord)
+                    .with_writer(json.clone())
+                    .with_ansi(false),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_timer(LocalTimer)
+                    .with_writer(text.clone())
+                    .with_ansi(false),
+            );
+        tracing::subscriber::with_default(subscriber, emit);
+        let read = |b: &SharedBuffer| {
+            String::from_utf8(b.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        let _ = std::io::stdout().flush();
+        (read(&json), read(&text))
+    }
+
+    #[test]
+    fn every_escape_path_is_valid_json() {
+        let (json, _) = both(|| {
+            tracing::info!(
+                quote = "a\"b",
+                backslash = r"C:\x\y",
+                control = "nul\0esc\u{1b}del\u{7f}ls\u{2028}",
+                debug_bytes = ?b"\xff\xfe",
+                debug_str = ?"q\"",
+                big = u64::MAX,
+                neg = i64::MIN,
+                wide = u128::MAX,
+                "msg with \"quotes\" and \\ and \t tab"
+            );
+            tracing::info!(
+                nan = f64::NAN,
+                inf = f64::INFINITY,
+                ninf = f64::NEG_INFINITY,
+                "floats"
+            );
+            tracing::info!(only = 1_u64);
+            let span = tracing::info_span!("outer", job_id = 1_u64, name = "field-called-name");
+            let _g = span.enter();
+            tracing::info!(job_id = 2_u64, "inner");
+        });
+        assert_eq!(json.len(), 4, "{json:#?}");
+        for line in &json {
+            serde_json::from_str::<Value>(line).unwrap_or_else(|e| panic!("{e}: {line}"));
+        }
+        let first: Value = serde_json::from_str(&json[0]).unwrap();
+        assert_eq!(first["fields"]["big"], u64::MAX);
+        assert_eq!(
+            first["fields"]["control"],
+            "nul\0esc\u{1b}del\u{7f}ls\u{2028}"
+        );
+    }
+
+    // The text layer wrote `nan=NaN inf=inf ninf=-inf`; the record holds null
+    // for all three, so a reader of the JSON cannot tell NaN from infinity.
+    #[test]
+    fn non_finite_floats_read_as_the_text_line_showed_them() {
+        let (json, text) = both(|| {
+            tracing::info!(nan = f64::NAN, inf = f64::INFINITY, "floats");
+        });
+        let record: Value = serde_json::from_str(&json[0]).unwrap();
+        assert!(text[0].contains("nan=NaN inf=inf"), "{}", text[0]);
+        assert_ne!(record["fields"]["nan"], Value::Null, "{}", json[0]);
+        assert_ne!(record["fields"]["inf"], Value::Null, "{}", json[0]);
+    }
+
+    // A span with a field called `name` writes the key twice in one object;
+    // serde_json keeps the last, so the span's own name is lost.
+    #[test]
+    fn a_span_field_called_name_keeps_the_span_name() {
+        let (json, _) = both(|| {
+            let span = tracing::info_span!("outer", name = "field-called-name");
+            let _g = span.enter();
+            tracing::info!("inner");
+        });
+        let record: Value = serde_json::from_str(&json[0]).unwrap();
+        assert_eq!(record["spans"][0]["name"], "outer", "{}", json[0]);
+    }
+
+    // The span's fields as the text layer orders them: declaration order.
+    #[test]
+    fn span_fields_keep_their_declared_order() {
+        let (json, text) = both(|| {
+            let span = tracing::info_span!("req", zeta = 1_u64, alpha = 2_u64);
+            let _g = span.enter();
+            tracing::info!("inner");
+        });
+        assert!(text[0].contains("req{zeta=1 alpha=2}"), "{}", text[0]);
+        let line = weaver_server_core::runtime::log_buffer::text_line(&json[0]);
+        assert!(line.contains("req{zeta=1 alpha=2}"), "{line}");
+    }
+
+    // text_line against the old text layer for ordinary events, timestamp cut.
+    // One difference is by design: a JSON record cannot tell a `%` value from
+    // a string field, so a value holding a space is quoted, where the old
+    // layer wrote a `%` value bare.
+    #[test]
+    fn text_line_matches_the_old_text_layer() {
+        let (json, text) = both(|| {
+            tracing::info!(job_id = 7_u64, name = %"My Show", path = %"/data/a", "job added");
+            tracing::warn!(error = %"disk full", "write failed");
+            tracing::info!(err = ?std::io::Error::from(std::io::ErrorKind::NotFound), "dbg");
+            tracing::info!(name = ?String::from("plain"), "debug string");
+        });
+        let cut = |s: &str| s.split_once(' ').unwrap().1.to_owned();
+        let mut diffs = Vec::new();
+        for (j, t) in json.iter().zip(&text) {
+            let line = weaver_server_core::runtime::log_buffer::text_line(j);
+            let old = cut(t)
+                .replace("name=My Show", "name=\"My Show\"")
+                .replace("error=disk full", "error=\"disk full\"");
+            if cut(&line) != old {
+                diffs.push(format!("old: {}\nnew: {}", cut(t), cut(&line)));
+            }
+        }
+        assert!(diffs.is_empty(), "\n{}", diffs.join("\n"));
     }
 }

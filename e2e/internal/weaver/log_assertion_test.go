@@ -78,8 +78,8 @@ func TestWeaverJSONRecordReadsAsItsTextLine(t *testing.T) {
 	if got := cleanWeaverLogLine(record); got != want {
 		t.Fatalf("record read as\n%s\nwant\n%s", got, want)
 	}
-	spans := `{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"WARN","target":"weaver::http","fields":{"message":"slow"},"spans":[{"name":"request","id":3},{"name":"bare"}]}`
-	if got := cleanWeaverLogLine(spans); got != "2026-11-03T08:10:00.123456-07:00  WARN request{id=3}:bare: weaver::http: slow" {
+	spans := `{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"WARN","target":"weaver::http","fields":{"message":"slow","name":"\"plain\""},"spans":[{"name":"request","fields":{"id":3}},{"name":"bare"}]}`
+	if got := cleanWeaverLogLine(spans); got != `2026-11-03T08:10:00.123456-07:00  WARN request{id=3}:bare: weaver::http: slow name="plain"` {
 		t.Fatalf("spans read as %q", got)
 	}
 	if got := cleanWeaverLogLine("\x1b[32mplain\x1b[0m words"); got != "plain words" {

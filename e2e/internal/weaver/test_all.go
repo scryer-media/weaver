@@ -1129,9 +1129,13 @@ func weaverLogString(raw json.RawMessage) (string, bool) {
 
 // weaverLogValue writes a field value the way the text format reads: a string
 // bare unless it is empty or holds a space, a quote, an `=` or a control
-// character, anything else as compact JSON.
+// character, one already quoted (a `?` field's Debug text) as it stands,
+// anything else as compact JSON.
 func weaverLogValue(raw json.RawMessage) string {
 	if text, ok := weaverLogString(raw); ok {
+		if len(text) >= 2 && strings.HasPrefix(text, `"`) && strings.HasSuffix(text, `"`) {
+			return text
+		}
 		quote := text == "" || strings.IndexFunc(text, func(r rune) bool {
 			return unicode.IsSpace(r) || unicode.IsControl(r) || r == '"' || r == '='
 		}) >= 0
@@ -1186,12 +1190,16 @@ func weaverRecordText(line string) (string, bool) {
 			spanEntries, _ := weaverObjectEntries(span)
 			var parts []string
 			for _, entry := range spanEntries {
-				if entry.key == "name" {
+				switch entry.key {
+				case "name":
 					name, _ := weaverLogString(entry.value)
 					text.WriteString(name)
-					continue
+				case "fields":
+					own, _ := weaverObjectEntries(entry.value)
+					for _, field := range own {
+						parts = append(parts, field.key+"="+weaverLogValue(field.value))
+					}
 				}
-				parts = append(parts, entry.key+"="+weaverLogValue(entry.value))
 			}
 			if len(parts) > 0 {
 				text.WriteString("{" + strings.Join(parts, " ") + "}")

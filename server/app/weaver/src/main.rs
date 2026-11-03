@@ -41,13 +41,12 @@ use std::path::{Path, PathBuf};
 use clap::Parser;
 use tracing::error;
 use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::fmt::format::JsonFields;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 use crate::args::{Cli, Command};
-use crate::logging::{JsonRecord, LocalTimer, LogColor, LogFormat};
+use crate::logging::{JsonRecord, JsonSpanFields, LocalTimer, LogColor, LogFormat};
 
 const LOG_FILE_ENV: &str = "WEAVER_LOG_FILE";
 const DOTENV_FILE: &str = ".env";
@@ -176,7 +175,7 @@ async fn async_main() {
     // whatever stdout is set to: the viewer draws each line from its record
     // and shows the record itself on selection.
     let buffer_layer = tracing_subscriber::fmt::layer()
-        .fmt_fields(JsonFields::new())
+        .fmt_fields(JsonSpanFields)
         .event_format(JsonRecord)
         .with_writer(LogBufferWriter(log_ring_buffer.clone()))
         .with_ansi(false);
@@ -230,7 +229,7 @@ async fn async_main() {
     layers.push(match log_format {
         LogFormat::Json => Box::new(
             tracing_subscriber::fmt::layer()
-                .fmt_fields(JsonFields::new())
+                .fmt_fields(JsonSpanFields)
                 .event_format(JsonRecord)
                 .with_ansi(false),
         ),
@@ -244,7 +243,7 @@ async fn async_main() {
         layers.push(match log_format {
             LogFormat::Json => Box::new(
                 tracing_subscriber::fmt::layer()
-                    .fmt_fields(JsonFields::new())
+                    .fmt_fields(JsonSpanFields)
                     .event_format(JsonRecord)
                     .with_writer(writer)
                     .with_ansi(false),

@@ -158,20 +158,20 @@ impl Write for LogRingBuffer {
 // `{timestamp} {LEVEL} {spans}{target}: {message} {key=value ...}`.
 //
 // A string value is written bare unless it is empty or holds a space, a
-// quote, an `=` or a control character, in which case it is quoted. A line
-// that is not a record is returned as it is.
+// quote, an `=` or a control character, in which case it is quoted. One that
+// is already a quoted string, as a `?` field's Debug text of a string is, is
+// written as it stands. A line that is not a record is returned as it is.
 pub fn text_line(record: &str) -> String {
     let Ok(record) = serde_json::from_str::<TextRecord>(record) else {
         return record.to_owned();
     };
     let mut line = format!("{} {:>5} ", record.timestamp, record.level);
     for span in &record.spans {
-        let name = span.0.iter().find(|(key, _)| key == "name");
-        line.push_str(name.and_then(|(_, value)| value.as_str()).unwrap_or(""));
+        line.push_str(&span.name);
         let fields: Vec<String> = span
+            .fields
             .0
             .iter()
-            .filter(|(key, _)| key != "name")
             .map(|(key, value)| format!("{key}={}", text_value(value)))
             .collect();
         if !fields.is_empty() {
@@ -201,6 +201,7 @@ pub fn text_line(record: &str) -> String {
 
 fn text_value(value: &serde_json::Value) -> String {
     match value {
+        serde_json::Value::String(text) if is_quoted(text) => text.clone(),
         serde_json::Value::String(text) => {
             let quote = text.is_empty()
                 || text
@@ -216,6 +217,19 @@ fn text_value(value: &serde_json::Value) -> String {
     }
 }
 
+// Whether the text is a string already quoted: a `"` at each end.
+fn is_quoted(text: &str) -> bool {
+    text.len() >= 2 && text.starts_with('"') && text.ends_with('"')
+}
+
+#[derive(serde::Deserialize)]
+struct TextSpan {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    fields: InOrder,
+}
+
 #[derive(serde::Deserialize)]
 struct TextRecord {
     timestamp: String,
@@ -224,7 +238,7 @@ struct TextRecord {
     #[serde(default)]
     fields: InOrder,
     #[serde(default)]
-    spans: Vec<InOrder>,
+    spans: Vec<TextSpan>,
 }
 
 // A JSON object's entries in the order they were written.
@@ -273,10 +287,19 @@ mod text_line_tests {
 
     #[test]
     fn spans_come_before_the_target_as_text_writes_them() {
-        let record = r#"{"timestamp":"2026-11-03T08:10:00.123456Z","level":"ERROR","target":"weaver::http","fields":{"message":"failed"},"spans":[{"name":"request","id":3},{"name":"bare"}]}"#;
+        let record = r#"{"timestamp":"2026-11-03T08:10:00.123456Z","level":"ERROR","target":"weaver::http","fields":{"message":"failed"},"spans":[{"name":"request","fields":{"id":3}},{"name":"bare"}]}"#;
         assert_eq!(
             text_line(record),
             "2026-11-03T08:10:00.123456Z ERROR request{id=3}:bare: weaver::http: failed"
+        );
+    }
+
+    #[test]
+    fn a_debug_string_is_quoted_once() {
+        let record = r#"{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"INFO","target":"weaver::jobs","fields":{"message":"dbg","name":"\"plain\""}}"#;
+        assert_eq!(
+            text_line(record),
+            r#"2026-11-03T08:10:00.123456-07:00  INFO weaver::jobs: dbg name="plain""#
         );
     }
 

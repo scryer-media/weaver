@@ -193,10 +193,15 @@ function quoted(text: string): boolean {
   return false;
 }
 
-/** A field value as the text line writes it. */
+/**
+ * A field value as the text line writes it. A string already quoted, as a
+ * `?` field's Debug text of a string is, stands as it is.
+ */
 function textValue(value: JsonValue): string {
   if (value.kind !== "string") return writeJson(value, null);
-  return quoted(value.text) ? JSON.stringify(value.text) : value.text;
+  const text = value.text;
+  if (text.length >= 2 && text.startsWith('"') && text.endsWith('"')) return text;
+  return quoted(text) ? JSON.stringify(text) : text;
 }
 
 function entry(value: JsonValue | null | undefined, key: string): JsonValue | undefined {
@@ -226,11 +231,10 @@ export function readLogLine(id: number, source: string): LogLine {
   if (spans?.kind === "array" && spans.items.length > 0) {
     for (const span of spans.items) {
       head += text(entry(span, "name")) ?? "";
+      const own = entry(span, "fields");
       const fields =
-        span.kind === "object"
-          ? span.entries
-              .filter(([key]) => key !== "name")
-              .map(([key, value]) => `${key}=${textValue(value)}`)
+        own?.kind === "object"
+          ? own.entries.map(([key, value]) => `${key}=${textValue(value)}`)
           : [];
       if (fields.length > 0) head += `{${fields.join(" ")}}`;
       head += ":";
