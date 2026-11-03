@@ -136,7 +136,11 @@ impl Dialer for Revocable {
         }
         self.inner.bind_local_udp(local)
     }
+    // Where the leg leaves toward `to`, while it is not revoked.
     fn source_toward(&self, to: std::net::SocketAddr) -> Option<std::io::Result<std::net::IpAddr>> {
+        if self.is_revoked() {
+            return Some(Err(std::io::Error::other("the leg was revoked")));
+        }
         self.inner.source_toward(to)
     }
     fn budget(&self) -> Duration {

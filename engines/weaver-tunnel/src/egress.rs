@@ -217,6 +217,11 @@ impl SocketEgress {
             _ => local,
         };
         let socket = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
+        // An unspecified IPv6 address takes IPv4 as well, whatever the
+        // host's default.
+        if local.is_ipv6() && local.ip().is_unspecified() {
+            socket.set_only_v6(false)?;
+        }
         if let Self::Interface(name) = self {
             bind_interface(&socket, name, local.is_ipv6())?;
         }
@@ -243,6 +248,15 @@ mod connect_tests {
         let pinned = SocketEgress::SourceAddress(loopback);
         assert_eq!(pinned.source_toward(to).unwrap(), loopback);
         assert!(pinned.source_toward("[::1]:9".parse().unwrap()).is_err());
+    }
+
+    // A socket bound at the unspecified IPv6 address takes IPv4 as well.
+    #[test]
+    fn an_unspecified_v6_socket_is_dual_stack() {
+        let socket = SocketEgress::System
+            .bind_udp_at("[::]:0".parse().unwrap())
+            .unwrap();
+        assert!(!socket2::SockRef::from(&socket).only_v6().unwrap());
     }
 
     // A local socket binds where it is asked, or at the pinned source
