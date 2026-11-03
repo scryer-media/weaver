@@ -8,7 +8,9 @@
 // in the tree keeps it and the other gets a suffix, the same way the
 // download folder suffixes a job whose folder already exists. Which one is
 // higher is a matter of position alone, never of arrival, so a restart or
-// a different fetch order gives the same names.
+// a different fetch order gives the same names. A directory is no member's
+// alone: every member that names it, as itself or as a directory its path
+// runs through, shares it, and a file that wants its path takes a suffix.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -60,6 +62,10 @@ struct Entry {
 pub struct NameLedger {
     // Allocated name, as its path on disk, to the member holding it.
     taken: HashMap<String, Holder>,
+    // Every directory a name runs through or is, as its path on disk, and
+    // how many names hold it. No file takes one of these paths: a file
+    // that holds one when a name comes to run through it moves on.
+    dirs: HashMap<String, usize>,
     // A name, as its path on disk, a member was moved off whose file still
     // sits there: it is free again only once that file has moved, so no
     // other member is given a name a file is still written under.
@@ -99,14 +105,17 @@ impl NameLedger {
         // member it moves can move into a file it has not yet left; it then
         // stays shut until the holder's file has left it.
         let name = self.place(holder, &rank, &wanted, moved);
-        if let Some(old) = old.filter(|old| *old != name) {
-            if key(&old) != key(&name) {
-                self.taken.remove(&key(&old));
-                self.leaving.insert(key(&old), holder);
+        self.claim(holder, &name, moved);
+        if let Some(old) = old.as_ref().filter(|old| **old != name) {
+            if !is_directory(old) && (key(old) != key(&name) || is_directory(&name)) {
+                self.taken.remove(&key(old));
+            }
+            if !is_directory(old) && key(old) != key(&name) {
+                self.leaving.insert(key(old), holder);
             }
             moved.push(Moved {
                 holder,
-                old,
+                old: old.clone(),
                 new: name.clone(),
             });
         }
@@ -118,6 +127,9 @@ impl NameLedger {
                 name: name.clone(),
             },
         );
+        if let Some(old) = old {
+            self.unclaim(&old, moved);
+        }
         name
     }
 
@@ -128,15 +140,16 @@ impl NameLedger {
     pub fn restore(&mut self, holder: Holder, position: Position, wanted: &str, held: &str) {
         let held = confined(held);
         let rank = (position, holder);
-        let name = match self.taken.entry(key(&held)) {
-            std::collections::hash_map::Entry::Occupied(_) => {
-                self.place(holder, &rank, &confined(wanted), &mut Vec::new())
-            }
-            std::collections::hash_map::Entry::Vacant(free) => {
-                free.insert(holder);
-                held
-            }
+        let path = key(&held);
+        let name = if is_directory(&held) {
+            held
+        } else if self.taken.contains_key(&path) || self.dirs.contains_key(&path) {
+            self.place(holder, &rank, &confined(wanted), &mut Vec::new())
+        } else {
+            self.taken.insert(path, holder);
+            held
         };
+        self.claim(holder, &name, &mut Vec::new());
         self.entries.insert(
             holder,
             Entry {
@@ -162,7 +175,8 @@ impl NameLedger {
         for name in &freed {
             self.leaving.remove(name);
         }
-        if let Some(entry) = self.entries.remove(&holder) {
+        let entry = self.entries.remove(&holder);
+        if let Some(entry) = entry.as_ref().filter(|entry| !is_directory(&entry.name)) {
             let name = key(&entry.name);
             self.taken.remove(&name);
             freed.push(name);
@@ -173,6 +187,9 @@ impl NameLedger {
             if !self.leaving.contains_key(&name) {
                 self.take_wanted(name, moved);
             }
+        }
+        if let Some(entry) = entry {
+            self.unclaim(&entry.name, moved);
         }
     }
 
@@ -206,16 +223,20 @@ impl NameLedger {
         }
     }
 
-    // The highest ranked holder that wants the free name `name` and holds
+    // The highest ranked file that wants the free name `name` and holds
     // another takes it.
     fn take_wanted(&mut self, name: String, moved: &mut Vec<Moved>) {
-        if self.taken.contains_key(&name) {
+        if self.taken.contains_key(&name) || self.dirs.contains_key(&name) {
             return;
         }
         let Some((holder, wanted)) = self
             .entries
             .iter()
-            .filter(|(_, entry)| key(&entry.wanted) == name && key(&entry.name) != name)
+            .filter(|(_, entry)| {
+                !is_directory(&entry.wanted)
+                    && key(&entry.wanted) == name
+                    && key(&entry.name) != name
+            })
             .min_by(|(_, one), (_, other)| one.rank.cmp(&other.rank))
             .map(|(holder, entry)| (*holder, entry.wanted.clone()))
         else {
@@ -226,11 +247,13 @@ impl NameLedger {
         self.taken.remove(&key(&old));
         self.leaving.insert(key(&old), holder);
         self.taken.insert(name, holder);
+        self.claim(holder, &wanted, moved);
         moved.push(Moved {
             holder,
-            old,
+            old: old.clone(),
             new: wanted,
         });
+        self.unclaim(&old, moved);
     }
 
     // A restored holder's file still sits at `name`, which it is moving
@@ -248,13 +271,15 @@ impl NameLedger {
 
     pub fn clear(&mut self) {
         self.taken.clear();
+        self.dirs.clear();
         self.leaving.clear();
         self.entries.clear();
     }
 
     // The first of `wanted` and its suffixed forms that `holder` may take:
     // one that is free, its own, or held by a member it outranks, which is
-    // moved on to a name of its own.
+    // moved on to a name of its own. A directory is shared, so it takes
+    // the name it wants; a file never takes a directory's path.
     fn place(
         &mut self,
         holder: Holder,
@@ -262,6 +287,9 @@ impl NameLedger {
         wanted: &str,
         moved: &mut Vec<Moved>,
     ) -> String {
+        if is_directory(wanted) {
+            return wanted.to_owned();
+        }
         let (stem, extension) = split_extension(wanted);
         for n in 0u32.. {
             let candidate = match n {
@@ -269,6 +297,9 @@ impl NameLedger {
                 n => format!("{stem} ({n}){extension}"),
             };
             let key = key(&candidate);
+            if self.dirs.contains_key(&key) {
+                continue;
+            }
             match self.leaving.get(&key) {
                 Some(leaving) if *leaving != holder => continue,
                 Some(_) => {
@@ -301,13 +332,71 @@ impl NameLedger {
             return;
         };
         let name = self.place(other, &entry.rank, &entry.wanted, moved);
+        let old = entry.name.clone();
         moved.push(Moved {
             holder: other,
-            old: entry.name,
+            old: old.clone(),
             new: name.clone(),
         });
-        self.entries.insert(other, Entry { name, ..entry });
+        self.entries.insert(
+            other,
+            Entry {
+                name: name.clone(),
+                ..entry
+            },
+        );
+        self.claim(other, &name, moved);
+        self.unclaim(&old, moved);
     }
+
+    // `holder`'s name `name` holds every directory it runs through or is.
+    // Another member's file at one of those paths moves on.
+    fn claim(&mut self, holder: Holder, name: &str, moved: &mut Vec<Moved>) {
+        for dir in directories(name) {
+            *self.dirs.entry(dir.clone()).or_default() += 1;
+            if let Some(file) = self.taken.get(&dir).copied().filter(|file| *file != holder) {
+                self.taken.remove(&dir);
+                self.displace(file, moved);
+            }
+        }
+    }
+
+    // `name` no longer holds its directories. A path no name holds any more
+    // is free to the file that wanted it.
+    fn unclaim(&mut self, name: &str, moved: &mut Vec<Moved>) {
+        for dir in directories(name) {
+            let Some(count) = self.dirs.get_mut(&dir) else {
+                continue;
+            };
+            *count -= 1;
+            if *count == 0 {
+                self.dirs.remove(&dir);
+                if !self.leaving.contains_key(&dir) {
+                    self.take_wanted(dir, moved);
+                }
+            }
+        }
+    }
+}
+
+// A directory member is a name ending in a separator.
+fn is_directory(name: &str) -> bool {
+    name.ends_with('/')
+}
+
+// The directories a name holds, as paths on disk: every one its path runs
+// through, and its own path when it is a directory. "a/b/c.bin" holds "a"
+// and "a/b"; "a/b/" holds both too.
+fn directories(name: &str) -> Vec<String> {
+    let path = key(name);
+    let mut dirs: Vec<String> = path
+        .match_indices('/')
+        .map(|(at, _)| path[..at].to_owned())
+        .collect();
+    if is_directory(name) {
+        dirs.push(path);
+    }
+    dirs
 }
 
 // The directory of the working directory the job's own files live in:
@@ -619,7 +708,11 @@ mod tests {
             root(&mut ledger, 2, "./.WEAVER-CHUNKS\\b.bin"),
             ".weaver-chunks (1)/b.bin"
         );
-        assert_eq!(root(&mut ledger, 3, ".weaver-chunks"), ".weaver-chunks (1)");
+        // A file of the name the directory above takes is suffixed again.
+        assert_eq!(
+            root(&mut ledger, 3, ".weaver-chunks"),
+            ".weaver-chunks (1) (1)"
+        );
         assert_eq!(
             root(&mut ledger, 4, "dir/.weaver-chunks/c.bin"),
             "dir/.weaver-chunks/c.bin"
@@ -662,38 +755,102 @@ mod tests {
         assert_eq!(root(&mut ledger, 4, "noext"), "noext (1)");
     }
 
+    // A directory is shared: every member that names it writes into the
+    // one directory, so a second is never suffixed. A file still is.
     #[test]
-    fn a_second_directory_of_one_name_is_suffixed_before_its_separator() {
+    fn a_directory_of_one_name_is_shared() {
         let mut ledger = NameLedger::new();
         assert_eq!(root(&mut ledger, 1, "docs/"), "docs/");
-        assert_eq!(root(&mut ledger, 2, "docs/"), "docs (1)/");
+        assert_eq!(root(&mut ledger, 2, "docs/"), "docs/");
         assert_eq!(root(&mut ledger, 3, "v1.0\\"), "v1.0/");
-        assert_eq!(root(&mut ledger, 4, "v1.0/"), "v1.0 (1)/");
+        assert_eq!(root(&mut ledger, 4, "v1.0/"), "v1.0/");
         assert_eq!(root(&mut ledger, 5, "a.d/noext"), "a.d/noext");
         assert_eq!(root(&mut ledger, 6, "a.d/noext"), "a.d/noext (1)");
+        // One leaving keeps the directory for the other; once neither
+        // holds it, the file that wanted its path takes it.
+        ledger.release((ROOT, MemberId(1)), &mut Vec::new());
+        assert_eq!(root(&mut ledger, 7, "docs"), "docs (1)");
+        let mut moved = Vec::new();
+        ledger.release((ROOT, MemberId(2)), &mut moved);
+        assert_eq!(ledger.given((ROOT, MemberId(7))), Some("docs"));
+        assert_eq!(
+            moved,
+            vec![Moved {
+                holder: (ROOT, MemberId(7)),
+                old: "docs (1)".into(),
+                new: "docs".into(),
+            }]
+        );
     }
 
+    // A file never takes a directory's path: whichever arrives first, and
+    // whichever ranks higher, the directory keeps it and the file moves on.
     #[test]
     fn a_directory_and_a_file_of_one_name_never_share_its_path() {
         let mut ledger = NameLedger::new();
-        assert_eq!(root(&mut ledger, 1, "folder"), "folder");
-        assert_eq!(root(&mut ledger, 2, "folder/"), "folder (1)/");
-
-        // Whichever arrives first, the one that ranks higher keeps the name.
-        let mut ledger = NameLedger::new();
         assert_eq!(root(&mut ledger, 2, "folder/"), "folder/");
+        assert_eq!(root(&mut ledger, 1, "folder"), "folder (1)");
+
+        let mut ledger = NameLedger::new();
+        assert_eq!(root(&mut ledger, 1, "folder"), "folder");
         let mut moved = Vec::new();
-        let first = (ROOT, MemberId(1));
+        let directory = (ROOT, MemberId(2));
         assert_eq!(
-            ledger.allocate(first, at(&[1]), "folder", &mut moved),
-            "folder"
+            ledger.allocate(directory, at(&[2]), "folder/", &mut moved),
+            "folder/"
         );
         assert_eq!(
             moved,
             vec![Moved {
-                holder: (ROOT, MemberId(2)),
-                old: "folder/".into(),
-                new: "folder (1)/".into(),
+                holder: (ROOT, MemberId(1)),
+                old: "folder".into(),
+                new: "folder (1)".into(),
+            }]
+        );
+    }
+
+    // Two archives, one with a file "folder" and one with "folder/b.bin"
+    // and no directory entry: both paths cannot be on disk at once, so the
+    // file moves on, whichever arrives first. Once nothing runs through
+    // the directory, the file takes the name it wanted.
+    #[test]
+    fn a_file_never_takes_the_path_of_a_directory_a_name_runs_through() {
+        let (file, nested) = ((ROOT, MemberId(1)), (STORE, MemberId(0)));
+        let mut ledger = NameLedger::new();
+        let mut moved = Vec::new();
+        assert_eq!(
+            ledger.allocate(file, at(&[1]), "folder", &mut moved),
+            "folder"
+        );
+        assert_eq!(
+            ledger.allocate(nested, at(&[0, 0]), "Folder/b.bin", &mut moved),
+            "Folder/b.bin"
+        );
+        assert_eq!(
+            moved,
+            vec![Moved {
+                holder: file,
+                old: "folder".into(),
+                new: "folder (1)".into(),
+            }]
+        );
+
+        let mut ledger = NameLedger::new();
+        let mut moved = Vec::new();
+        ledger.allocate(nested, at(&[0, 0]), "folder/b.bin", &mut moved);
+        assert_eq!(
+            ledger.allocate(file, at(&[1]), "folder", &mut moved),
+            "folder (1)"
+        );
+        assert_eq!(moved, Vec::new());
+        ledger.release(nested, &mut moved);
+        assert_eq!(ledger.given(file), Some("folder"));
+        assert_eq!(
+            moved,
+            vec![Moved {
+                holder: file,
+                old: "folder (1)".into(),
+                new: "folder".into(),
             }]
         );
     }

@@ -1453,7 +1453,11 @@ fn the_segment_feed_is_evidence_unless_the_bytes_are_damage() {
 // The first three bytes of the signature leave the member undecided; the
 // rest binds it to the store, and the held front goes down after it.
 fn bound_store(job: &mut Job) -> (MemberId, NodeId) {
-    let member = job.member("pack.bin", None);
+    bound_store_at(job, "pack.bin")
+}
+
+fn bound_store_at(job: &mut Job, name: &str) -> (MemberId, NodeId) {
+    let member = job.member(name, None);
     job.send(member, 0, &SIGNATURE[..3], Provenance::Fresh);
     let mut rest = SIGNATURE[3..].to_vec();
     rest.extend_from_slice(b"hello");
@@ -1942,6 +1946,121 @@ fn a_shallower_member_that_claims_a_written_name_moves_the_deeper_file_aside() {
     assert_eq!(job.file("INNER.bin"), b"data");
     assert_eq!(job.file("inner (1).bin"), b"hello");
     assert!(!job.dir.path().join("3f9a.bin").exists());
+}
+
+// The store says each of `emits` of its namespace, in order.
+fn store_says(job: &mut Job, child: NodeId, emits: Vec<Emit>) {
+    let mut build = job.build();
+    for emit in emits {
+        job.writer
+            .said(
+                &mut job.tree,
+                &mut build,
+                &Source,
+                child,
+                emit,
+                &mut job.out,
+            )
+            .expect("said");
+    }
+}
+
+// A whole member of the store: announced, written and closed.
+fn store_file(member: u32, name: &str, bytes: &'static [u8]) -> Vec<Emit> {
+    vec![
+        Emit::Member {
+            member: MemberId(member),
+            name: name.into(),
+            length: Some(bytes.len() as u64),
+        },
+        Emit::Bytes {
+            member: MemberId(member),
+            offset: 0,
+            bytes: Bytes::from_static(bytes).into(),
+            provenance: Provenance::Fresh,
+        },
+        Emit::MemberClosed(MemberId(member)),
+    ]
+}
+
+// Two stores side by side: the first ranks higher, so its names win.
+fn two_stores(job: &mut Job) -> (NodeId, NodeId) {
+    let (_, higher) = bound_store(job);
+    let (_, lower) = bound_store_at(job, "pack2.bin");
+    (higher, lower)
+}
+
+fn directory(member: u32, name: &str) -> Vec<Emit> {
+    vec![
+        Emit::Member {
+            member: MemberId(member),
+            name: name.into(),
+            length: Some(0),
+        },
+        Emit::MemberClosed(MemberId(member)),
+    ]
+}
+
+// The lower store wrote its file "folder"; the higher one then names the
+// directory "folder/" and a file in it. The file moves aside, and the
+// directory and what goes in it wait for that move instead of being made
+// over the file.
+#[test]
+fn a_directory_named_over_a_written_file_waits_for_the_file_to_move() {
+    let mut job = Job::new(PLENTY);
+    let (higher, lower) = two_stores(&mut job);
+    store_says(&mut job, lower, store_file(1, "folder", b"data"));
+    assert_eq!(job.file("folder"), b"data");
+    let mut emits = directory(1, "folder/");
+    emits.extend(store_file(2, "folder/b.bin", b"hi"));
+    store_says(&mut job, higher, emits);
+    job.commit();
+    let file = job.tree.namespace(lower).unwrap().get(MemberId(1)).unwrap();
+    assert_eq!(file.output_name, "folder (1)");
+    assert_eq!(job.file("folder (1)"), b"data");
+    assert!(job.dir.path().join("folder").is_dir());
+    assert_eq!(job.file("folder/b.bin"), b"hi");
+}
+
+// Two archives hold one directory, and the lower one wrote it and a file
+// in it first. The directory is shared: neither moves, so the file stays
+// where its name says.
+#[test]
+fn a_directory_two_archives_hold_is_shared_and_never_moves() {
+    let mut job = Job::new(PLENTY);
+    let (higher, lower) = two_stores(&mut job);
+    let mut emits = directory(1, "folder/");
+    emits.extend(store_file(2, "folder/b.bin", b"data"));
+    store_says(&mut job, lower, emits);
+    store_says(&mut job, higher, directory(1, "folder/"));
+    job.commit();
+    for node in [higher, lower] {
+        let namespace = job.tree.namespace(node).unwrap();
+        assert_eq!(namespace.get(MemberId(1)).unwrap().output_name, "folder/");
+    }
+    assert_eq!(job.file("folder/b.bin"), b"data");
+    assert!(!job.dir.path().join("folder (1)").exists());
+}
+
+// One archive holds a file "folder", another "folder/b.bin" and no entry
+// for the directory. Both cannot be on disk; the file moves aside, and
+// both are written.
+#[test]
+fn a_file_and_a_path_through_its_name_are_both_written() {
+    let mut job = Job::new(PLENTY);
+    let (higher, lower) = two_stores(&mut job);
+    store_says(&mut job, higher, store_file(1, "folder", b"data"));
+    store_says(&mut job, lower, store_file(1, "folder/b.bin", b"hi"));
+    job.commit();
+    let file = job
+        .tree
+        .namespace(higher)
+        .unwrap()
+        .get(MemberId(1))
+        .unwrap();
+    assert_eq!(file.output_name, "folder (1)");
+    assert_eq!(job.file("folder (1)"), b"data");
+    assert_eq!(job.file("folder/b.bin"), b"hi");
 }
 
 #[test]

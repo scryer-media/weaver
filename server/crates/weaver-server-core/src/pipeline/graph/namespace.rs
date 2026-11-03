@@ -424,7 +424,7 @@ impl NamespaceWriter {
         self.caps.admit_member(tree, node, member)?;
         if Leaf::is_directory(&output_name) {
             self.settle(tree, builder, segments, node, member, out)?;
-            Leaf::at(&self.working_dir, &output_name).create_directory()?;
+            self.leaf(node, member, &output_name)?.create_directory()?;
         } else if length == Some(0) {
             return self.shut(tree, builder, segments, node, member, out);
         }

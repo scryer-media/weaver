@@ -296,27 +296,39 @@ impl NamespaceWriter {
     // file left stays shut until the checkpoint recording that move commits:
     // were another file to enter it sooner and the job stop first, the
     // restored row of the file that left would still say it sits there, and
-    // restore would open the newcomer's bytes as that file.
+    // restore would open the newcomer's bytes as that file. The directories
+    // the name runs through are held the same way: a name is shut while one
+    // of them is, and taken while another member's file sits at one. A
+    // directory is shared, so two directory members may sit at one name.
     fn free_at(&self, name: &str, mover: (NodeId, MemberId)) -> bool {
+        let directory = Leaf::is_directory(name);
         let name = key(name);
+        let above: Vec<&str> = name.match_indices('/').map(|(at, _)| &name[..at]).collect();
         let committed = self.committed;
-        let shut = self
-            .left
-            .get(&name)
-            .is_some_and(|left| left.is_none_or(|left| left > committed));
+        let shut = std::iter::once(name.as_str())
+            .chain(above.iter().copied())
+            .any(|path| {
+                self.left
+                    .get(path)
+                    .is_some_and(|left| left.is_none_or(|left| left > committed))
+            });
         if shut {
             return false;
         }
         // With no file waiting to move, every file sits at the name the
-        // ledger gave its member, and the ledger gives a name to one member.
+        // ledger gave its member, and the ledger gives a name to one member
+        // and never a file a directory's path.
         if self.moves.is_empty() {
             return true;
         }
         !self.files.iter().any(|(node, files)| {
-            files
-                .leaves
-                .iter()
-                .any(|(member, leaf)| (*node, *member) != mover && key(leaf.name()) == name)
+            files.leaves.iter().any(|(member, leaf)| {
+                let at = key(leaf.name());
+                let file = !Leaf::is_directory(leaf.name());
+                (*node, *member) != mover
+                    && ((at == name && (file || !directory))
+                        || (file && above.contains(&at.as_str())))
+            })
         })
     }
 }
