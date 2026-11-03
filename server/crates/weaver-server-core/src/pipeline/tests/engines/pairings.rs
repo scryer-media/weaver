@@ -391,6 +391,11 @@ async fn a_7z_one_deep_delivers_its_directory_empty_file_and_empty_directory() {
             .all(|file| file.depth == 2 && file.whole),
         "{delivery:?}"
     );
+    assert_eq!(
+        graph.empty.iter().collect::<Vec<_>>(),
+        [&delivered("pack/hollow/")],
+        "the empty directory is placed"
+    );
 }
 
 // Two gzip streams of one name in two directories of a stored 7z: each
