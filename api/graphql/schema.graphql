@@ -472,6 +472,10 @@ type DownloadBlock {
 	"""
 	speedLimitInForce: Int!
 	"""
+	Whether a schedule window sets the limit in force, even to unlimited.
+	"""
+	speedLimitBySchedule: Boolean!
+	"""
 	Why a schedule rule is holding new downloads, while one is.
 	"""
 	scheduleHoldReason: String

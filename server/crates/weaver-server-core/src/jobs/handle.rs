@@ -734,6 +734,9 @@ pub struct DownloadBlockState {
     // holds, even one set to unlimited, else the configured one (0 = none).
     #[serde(default)]
     pub speed_limit_in_force: u64,
+    // Whether a schedule window sets the limit in force, even to unlimited.
+    #[serde(default)]
+    pub speed_limit_by_schedule: bool,
     // Why a schedule rule is holding new downloads, while one is.
     #[serde(default)]
     pub schedule_hold_reason: Option<String>,
@@ -767,6 +770,7 @@ impl Default for DownloadBlockState {
             timezone_name: chrono::Local::now().offset().to_string(),
             scheduled_speed_limit: 0,
             speed_limit_in_force: 0,
+            speed_limit_by_schedule: false,
             schedule_hold_reason: None,
         }
     }
