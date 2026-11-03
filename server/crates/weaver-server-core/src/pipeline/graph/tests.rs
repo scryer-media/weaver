@@ -583,6 +583,35 @@ async fn a_graph_job_kept_across_a_pause_holds_its_extraction_clock() {
     retire_pipeline_database(pipeline).await;
 }
 
+// Every download paused, by hand or for a speed test, stops the job's
+// extraction as surely as its own pause: the clock holds for each, and runs
+// again only once nothing pauses the job. A job admitted while downloads
+// are paused starts with its clock held.
+#[tokio::test(start_paused = true)]
+async fn a_global_or_speed_test_pause_holds_the_extraction_clock() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_111);
+    let posts = vec![echo_volume(0, &payload(4 * ARTICLE, 8))];
+    let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
+    assert!(!pipeline.graph_jobs[&job_id].clock_held());
+    pipeline.shared_state.set_paused(true);
+    pipeline.apply_queue_intents().await;
+    assert!(pipeline.graph_jobs[&job_id].clock_held());
+    pipeline.shared_state.set_speed_test_paused(true);
+    pipeline.shared_state.set_paused(false);
+    pipeline.apply_queue_intents().await;
+    assert!(pipeline.graph_jobs[&job_id].clock_held());
+    pipeline.shared_state.set_speed_test_paused(false);
+    pipeline.apply_queue_intents().await;
+    assert!(!pipeline.graph_jobs[&job_id].clock_held());
+    pipeline.shared_state.set_paused(true);
+    pipeline.apply_queue_intents().await;
+    let graph = pipeline.graph_jobs.remove(&job_id).unwrap();
+    pipeline.install_graph_job(job_id, graph, Vec::new());
+    assert!(pipeline.graph_jobs[&job_id].clock_held());
+    retire_pipeline_database(pipeline).await;
+}
+
 #[tokio::test]
 async fn a_closed_checkpoint_writer_pauses_with_an_actionable_error() {
     let temp_dir = tempfile::tempdir().unwrap();

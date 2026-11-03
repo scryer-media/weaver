@@ -380,16 +380,9 @@ impl Pipeline {
             )
         };
 
-        // A graph job kept across a pause spends none of its extraction
-        // deadline while paused.
         let paused = matches!(new_run_state, crate::jobs::model::RunState::Paused);
-        if paused != matches!(old_run_state, crate::jobs::model::RunState::Paused)
-            && let Some(graph) = match self.graph_jobs.get_mut(&job_id) {
-                Some(graph) => Some(graph),
-                None => self.retiring_graph_jobs.get_mut(&job_id),
-            }
-        {
-            graph.hold_clock(paused);
+        if paused != matches!(old_run_state, crate::jobs::model::RunState::Paused) {
+            self.hold_extraction_clock(job_id);
         }
 
         self.metrics.post_state_moved(moved.0, moved.1);
@@ -580,5 +573,36 @@ impl Pipeline {
             new_run_state,
             persist_status,
         );
+    }
+}
+
+impl Pipeline {
+    // A graph job kept while its extraction is stopped spends none of its
+    // extraction deadline: while the job is paused, or every download is,
+    // by hand, by schedule or for a speed test.
+    pub(crate) fn hold_extraction_clock(&mut self, job_id: JobId) {
+        let paused = self.shared_state.is_paused()
+            || self.jobs.get(&job_id).is_some_and(|state| {
+                matches!(state.run_state, crate::jobs::model::RunState::Paused)
+            });
+        if let Some(graph) = match self.graph_jobs.get_mut(&job_id) {
+            Some(graph) => Some(graph),
+            None => self.retiring_graph_jobs.get_mut(&job_id),
+        } {
+            graph.hold_clock(paused);
+        }
+    }
+
+    // Every download paused or resumed: each graph job's clock follows.
+    pub(crate) fn hold_extraction_clocks(&mut self) {
+        let jobs: Vec<JobId> = self
+            .graph_jobs
+            .keys()
+            .chain(self.retiring_graph_jobs.keys())
+            .copied()
+            .collect();
+        for job_id in jobs {
+            self.hold_extraction_clock(job_id);
+        }
     }
 }

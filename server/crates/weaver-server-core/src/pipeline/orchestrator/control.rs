@@ -491,10 +491,12 @@ impl Pipeline {
             } else {
                 PipelineEvent::GlobalResumed
             });
+            self.hold_extraction_clocks();
         }
         if globals.speed_test_paused != self.applied_speed_test_pause {
             self.applied_speed_test_pause = globals.speed_test_paused;
             self.download_restart_durable_lead_retry_after.clear();
+            self.hold_extraction_clocks();
         }
         if self.configured_rate_limit != globals.speed_limit
             || self.scheduled_rate_limit != globals.scheduled_speed_limit
