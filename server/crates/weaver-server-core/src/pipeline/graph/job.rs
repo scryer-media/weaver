@@ -433,7 +433,13 @@ impl GraphJob {
 
     // Seam for status: the bytes still to come and out to bring of the
     // posted recovery file at `file_index` that nothing has decided on yet.
+    // One whose first bytes do not open a PAR2 or PAR3 volume is data, said
+    // by its first article.
     pub(crate) fn undecided_recovery(&self, file_index: u32) -> Option<(u64, u64)> {
+        let front = self.namespace().first_bytes(MemberId(file_index));
+        if !weaver_graph::sniff::may_open_par(front) {
+            return None;
+        }
         self.root.map.undecided(VolumeIndex(file_index))
     }
 

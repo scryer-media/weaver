@@ -161,6 +161,7 @@ const fn signature(kind: Kind, stands: Stands, magic: &'static [u8]) -> Signatur
 const SEVEN_Z_SIGNATURE: [u8; 6] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
 const SEVEN_Z_SIGNATURE_HEADER_LEN: usize = 32;
 const PAR2_MAGIC: &[u8; 8] = b"PAR2\0PKT";
+const PAR3_MAGIC: &[u8; 8] = b"PAR3\0PKT";
 const PAR2_PACKET_ALIGNMENT: u64 = 4;
 const PAR2_PACKET_HEADER_BYTES: usize = 64;
 const USTAR_MAGIC_AT: usize = 257;
@@ -248,7 +249,7 @@ const SIGNATURES: &[Signature] = &[
         holds: par2_header_looks_valid,
         ruled_out: |_| false,
     },
-    signature(Kind::Par3, Stands::Recurs, b"PAR3\x00PKT"),
+    signature(Kind::Par3, Stands::Recurs, PAR3_MAGIC),
     // A RAR5 recovery volume. A RAR3 one opens with parity and is known by
     // its name alone.
     signature(Kind::RarRecovery, Stands::AtHead, b"Rar!\x1aRev"),
@@ -393,6 +394,16 @@ fn named(name: &str) -> Option<Kind> {
         })
         .map(|(kind, _)| *kind)
         .or_else(|| numbered_piece(name).then_some(Kind::Split))
+}
+
+// Whether a member's first bytes may still open a PAR2 or PAR3 volume:
+// none yet may, and any that differ from both magics cannot, however many
+// more come.
+pub fn may_open_par(first_bytes: &[u8]) -> bool {
+    [PAR2_MAGIC, PAR3_MAGIC].iter().any(|magic| {
+        let seen = first_bytes.len().min(magic.len());
+        first_bytes[..seen] == magic[..seen]
+    })
 }
 
 // Whether a posted name is a recovery volume's, as PAR creators spell them:
