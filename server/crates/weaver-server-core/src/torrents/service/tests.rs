@@ -5612,12 +5612,19 @@ async fn a_save_on_its_way_at_stop_lands_before_stops_own() {
         })
         .unwrap();
     run.await.unwrap();
+    // A write on no lane is a barrier: once the writer takes it, it takes
+    // nothing more until the held save lands, so whatever stop queues stays
+    // in the queue where the test can count it.
+    rig.db.try_queue_write("barrier", |_| Ok(())).unwrap();
+    while rig.db.queued_writes() != 0 {
+        tokio::task::yield_now().await;
+    }
 
     let service = rig.service.clone();
     let stopping = tokio::spawn(async move { service.stop().await });
     // Stop's save reaches the queue, after the service's lock, and waits
-    // there behind the one on its way: the wait is on the queue holding
-    // it, not on how far one poll of stop got.
+    // there behind the one on its way; stop waits for it to land, so it
+    // queues nothing more meanwhile.
     while rig.db.queued_writes() == 0 {
         tokio::task::yield_now().await;
     }
