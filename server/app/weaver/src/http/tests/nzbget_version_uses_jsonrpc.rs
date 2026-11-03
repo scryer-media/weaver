@@ -4516,7 +4516,11 @@ async fn nzbget_hidden_history_does_not_consume_the_visible_page() {
     assert_eq!(all.as_array().unwrap().len(), 1000);
     assert!(!history_ids(&all).contains(&1));
     // Visibility changes neither retained history nor duplicate-check data.
-    assert_eq!(db.count_job_history(&Default::default()).unwrap(), 1001);
+    assert_eq!(
+        db.count_job_history(&Default::default(), weaver_server_core::HistoryRows::All)
+            .unwrap(),
+        1001
+    );
 }
 
 #[tokio::test]
@@ -4560,7 +4564,7 @@ async fn nzbget_history_delete_hides_the_row_and_final_delete_erases_it() {
         .find(|entry| entry["NZBID"] == 501)
         .unwrap();
     assert_eq!(hidden_entry["Kind"], "DUP");
-    // The row itself is untouched for the web UI and duplicate checks.
+    // The row is kept for history(true) and duplicate checks.
     assert!(db.get_job_history(501).unwrap().is_some());
 
     // HistoryFinalDelete, in the v13+ shape, erases the row outright.
@@ -4583,6 +4587,93 @@ async fn nzbget_history_delete_hides_the_row_and_final_delete_erases_it() {
     )
     .await;
     assert_eq!(missing, false);
+}
+
+// An Arr's "Remove Completed" sends a non-final HistoryDelete. NZBGet keeps
+// the entry as a hidden duplicate and its own history view stops showing it;
+// Weaver's history listings leave it out the same way.
+#[tokio::test]
+async fn nzbget_history_delete_takes_the_row_off_weavers_history_listings() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&nzbget_history_row(801, "complete", 1_700_000_100, None))
+        .unwrap();
+    db.insert_job_history(&nzbget_history_row(802, "complete", 1_700_000_200, None))
+        .unwrap();
+    let queue = scheduler_handle_with_jobs_and_db(vec![], db.clone()).await;
+    let handle = queue.handle.clone();
+    let app = nzbget_test_router(
+        db.clone(),
+        queue,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+    let hidden = rpc_result(
+        app.clone(),
+        "editqueue",
+        serde_json::json!(["HistoryDelete", 0, "", 801]),
+    )
+    .await;
+    assert_eq!(hidden, true);
+
+    let schema = async_graphql::Schema::build(
+        weaver_server_api::QueryRoot::default(),
+        weaver_server_api::MutationRoot::default(),
+        weaver_server_api::SubscriptionRoot::default(),
+    )
+    .data(db.clone())
+    .data(handle)
+    .finish();
+    let query = |text: &str| {
+        let request = async_graphql::Request::new(text).data(CallerScope::Local);
+        let schema = schema.clone();
+        async move {
+            let response = schema.execute(request).await;
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            response.data.into_json().unwrap()
+        }
+    };
+    let ids = |items: &serde_json::Value| {
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_u64().unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    let data = query("{ historyItems { id } historyItemsCount }").await;
+    assert_eq!(ids(&data["historyItems"]), vec![802]);
+    assert_eq!(data["historyItemsCount"], 1);
+    // Both page paths: the SQL one, and the Rust one a category facet takes.
+    for input in [
+        "{ pageIndex: 0, pageSize: 25 }",
+        r#"{ pageIndex: 0, pageSize: 25, categories: ["tv"] }"#,
+    ] {
+        let data = query(&format!(
+            "{{ historyPage(input: {input}) {{ items {{ id }} totalCount \
+             counts {{ all success failure }} categoryCounts {{ category count }} }} }}"
+        ))
+        .await;
+        let page = &data["historyPage"];
+        assert_eq!(ids(&page["items"]), vec![802], "{input}");
+        assert_eq!(page["totalCount"], 1, "{input}");
+        assert_eq!(
+            page["counts"],
+            serde_json::json!({ "all": 1, "success": 1, "failure": 0 }),
+            "{input}"
+        );
+        assert_eq!(
+            page["categoryCounts"],
+            serde_json::json!([{ "category": "tv", "count": 1 }]),
+            "{input}"
+        );
+    }
+
+    // The facade's history(true) still lists both, the hidden one as DUP.
+    let entries = rpc_result(app, "history", serde_json::json!([true])).await;
+    let mut listed = history_ids(&entries);
+    listed.sort_unstable();
+    assert_eq!(listed, vec![801, 802]);
 }
 
 #[tokio::test]

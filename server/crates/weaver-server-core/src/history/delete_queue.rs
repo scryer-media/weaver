@@ -59,10 +59,14 @@ impl Database {
                 if statuses.is_empty() {
                     continue;
                 }
-                let rows = match db.list_job_history(&HistoryFilter {
-                    statuses: Some(statuses),
-                    ..Default::default()
-                }) {
+                // Retention clears every row of a status, hidden ones too.
+                let rows = match db.list_job_history(
+                    &HistoryFilter {
+                        statuses: Some(statuses),
+                        ..Default::default()
+                    },
+                    crate::HistoryRows::All,
+                ) {
                     Ok(rows) => rows,
                     Err(error) => {
                         errors.push(error.to_string());

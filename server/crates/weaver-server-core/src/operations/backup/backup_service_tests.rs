@@ -1242,7 +1242,7 @@ async fn restore_requires_category_remap_for_external_paths() {
     assert_eq!(target_db.load_config().unwrap().data_dir, "/bootstrap");
     assert!(
         target_db
-            .list_job_history(&HistoryFilter::default())
+            .list_job_history(&HistoryFilter::default(), crate::HistoryRows::All)
             .unwrap()
             .is_empty()
     );
@@ -1427,7 +1427,7 @@ async fn staged_restore_rewrites_paths_without_mutating_the_live_runtime() {
     );
     assert_eq!(
         target_db
-            .list_job_history(&HistoryFilter::default())
+            .list_job_history(&HistoryFilter::default(), crate::HistoryRows::All)
             .unwrap()
             .len(),
         1
@@ -1567,7 +1567,7 @@ async fn sqlite_restore_resumes_after_every_promotion_phase() {
         );
         assert_eq!(
             restored
-                .list_job_history(&HistoryFilter::default())
+                .list_job_history(&HistoryFilter::default(), crate::HistoryRows::All)
                 .unwrap()
                 .len(),
             1,
@@ -1658,7 +1658,7 @@ async fn postgres_restore_resumes_after_every_promotion_phase() {
         assert!(outcome.is_some());
         assert_eq!(
             restored
-                .list_job_history(&HistoryFilter::default())
+                .list_job_history(&HistoryFilter::default(), crate::HistoryRows::All)
                 .unwrap()
                 .len(),
             1,

@@ -27,7 +27,7 @@ use weaver_server_core::post_processing::hooks::UrlStatus;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::SharedConfig;
 use weaver_server_core::{
-    Database, FieldUpdate, HistoryFilter, JobId, JobStatus, JobUpdate, SchedulerError,
+    Database, FieldUpdate, HistoryFilter, HistoryRows, JobId, JobStatus, JobUpdate, SchedulerError,
     SchedulerHandle,
 };
 
@@ -2136,12 +2136,16 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
         .collect::<Vec<_>>();
     let db = ctx.db.clone();
     let (rows, facade_states) = tokio::task::spawn_blocking(move || {
-        let rows = db.list_nzbget_history(
+        let rows = db.list_job_history(
             &HistoryFilter {
                 limit: Some(1000),
                 ..HistoryFilter::default()
             },
-            include_hidden,
+            if include_hidden {
+                HistoryRows::All
+            } else {
+                HistoryRows::Shown
+            },
         )?;
         let ids = rows
             .iter()

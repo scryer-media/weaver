@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use crate::StateError;
-use crate::history::model::HistoryFilter;
+use crate::history::model::{HistoryFilter, HistoryRows};
 use crate::history::record::{IntegrationEventRow, JobHistoryRow};
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, max_rows_for_engine};
@@ -107,26 +107,11 @@ impl Database {
         })
     }
 
+    // The visibility predicate is applied in SQL, before pagination.
     pub fn list_job_history(
         &self,
         filter: &HistoryFilter,
-    ) -> Result<Vec<JobHistoryRow>, StateError> {
-        self.list_job_history_with_visibility(filter, true)
-    }
-
-    // The facade's visibility predicate must be applied before pagination.
-    pub fn list_nzbget_history(
-        &self,
-        filter: &HistoryFilter,
-        include_hidden: bool,
-    ) -> Result<Vec<JobHistoryRow>, StateError> {
-        self.list_job_history_with_visibility(filter, include_hidden)
-    }
-
-    fn list_job_history_with_visibility(
-        &self,
-        filter: &HistoryFilter,
-        include_hidden: bool,
+        rows: HistoryRows,
     ) -> Result<Vec<JobHistoryRow>, StateError> {
         let datastore = self.datastore();
         let (base, ids) = split_history_ids(datastore.engine(), filter);
@@ -142,47 +127,50 @@ impl Database {
                 offset: None,
                 ..base.clone()
             };
-            let mut rows = match &ids {
+            let mut page = match &ids {
                 HistoryIdSplit::Whole => {
-                    return fetch_history_rows(&datastore, &base, include_hidden).await;
+                    return fetch_history_rows(&datastore, &base, rows).await;
                 }
                 HistoryIdSplit::In(chunks) => {
-                    let mut rows = Vec::new();
+                    let mut page = Vec::new();
                     for chunk in chunks {
                         let filter = HistoryFilter {
                             item_ids: Some(chunk.clone()),
                             ..through(0)
                         };
-                        rows.extend(fetch_history_rows(&datastore, &filter, include_hidden).await?);
+                        page.extend(fetch_history_rows(&datastore, &filter, rows).await?);
                     }
-                    rows.sort_by(|a, b| {
+                    page.sort_by(|a, b| {
                         (b.completed_at, b.job_id).cmp(&(a.completed_at, a.job_id))
                     });
-                    rows
+                    page
                 }
                 HistoryIdSplit::NotIn(excluded, _) => {
-                    let mut rows =
-                        fetch_history_rows(&datastore, &through(excluded.len()), include_hidden)
-                            .await?;
-                    rows.retain(|row| excluded.binary_search(&row.job_id).is_err());
-                    rows
+                    let mut page =
+                        fetch_history_rows(&datastore, &through(excluded.len()), rows).await?;
+                    page.retain(|row| excluded.binary_search(&row.job_id).is_err());
+                    page
                 }
             };
-            rows.drain(..offset.min(rows.len()));
+            page.drain(..offset.min(page.len()));
             if let Some(limit) = limit {
-                rows.truncate(limit);
+                page.truncate(limit);
             }
-            Ok(rows)
+            Ok(page)
         })
     }
 
-    pub fn count_job_history(&self, filter: &HistoryFilter) -> Result<u32, StateError> {
+    pub fn count_job_history(
+        &self,
+        filter: &HistoryFilter,
+        rows: HistoryRows,
+    ) -> Result<u32, StateError> {
         let datastore = self.datastore();
         let (base, ids) = split_history_ids(datastore.engine(), filter);
         self.run_sql_blocking_read(async move {
             let mut count = 0i64;
             for (filter, sign) in ids.statements(&base) {
-                count += sign * count_history_rows(&datastore, &filter).await?;
+                count += sign * count_history_rows(&datastore, &filter, rows).await?;
             }
             Ok(count.max(0) as u32)
         })
@@ -198,13 +186,15 @@ impl Database {
     pub fn count_job_history_by_category(
         &self,
         filter: &HistoryFilter,
+        rows: HistoryRows,
     ) -> Result<Vec<(String, u32)>, StateError> {
         let datastore = self.datastore();
         let (base, ids) = split_history_ids(datastore.engine(), filter);
         self.run_sql_blocking_read(async move {
             let mut counts = std::collections::BTreeMap::<String, i64>::new();
             for (filter, sign) in ids.statements(&base) {
-                for (category, count) in count_history_rows_by_category(&datastore, &filter).await?
+                for (category, count) in
+                    count_history_rows_by_category(&datastore, &filter, rows).await?
                 {
                     *counts.entry(category).or_default() += sign * count;
                 }
@@ -528,16 +518,14 @@ fn split_history_ids(
 async fn fetch_history_rows(
     datastore: &crate::persistence::sql_runtime::StoreDatastore,
     filter: &HistoryFilter,
-    include_hidden: bool,
+    rows: HistoryRows,
 ) -> Result<Vec<JobHistoryRow>, StateError> {
     let mut sql = String::from(JOB_HISTORY_SELECT_ALIASED);
     let mut args = Vec::new();
 
     append_history_from_clause(&mut sql, &mut args, filter);
     append_history_row_filter_predicates(&mut sql, &mut args, filter);
-    if !include_hidden {
-        sql.push_str(" AND h.nzbget_hidden = 0");
-    }
+    append_history_visibility(&mut sql, rows);
     sql.push_str(" ORDER BY h.completed_at DESC, h.job_id DESC");
 
     append_history_pagination(&mut sql, &mut args, filter);
@@ -549,12 +537,14 @@ async fn fetch_history_rows(
 async fn count_history_rows(
     datastore: &crate::persistence::sql_runtime::StoreDatastore,
     filter: &HistoryFilter,
+    rows: HistoryRows,
 ) -> Result<i64, StateError> {
     let mut sql = String::from("SELECT COUNT(*) AS count FROM ");
     let mut args = Vec::new();
 
     append_history_from_clause(&mut sql, &mut args, filter);
     append_history_row_filter_predicates(&mut sql, &mut args, filter);
+    append_history_visibility(&mut sql, rows);
 
     Ok(
         SqlRuntime::fetch_optional(datastore.read_exec(), &sql, &args)
@@ -568,6 +558,7 @@ async fn count_history_rows(
 async fn count_history_rows_by_category(
     datastore: &crate::persistence::sql_runtime::StoreDatastore,
     filter: &HistoryFilter,
+    rows: HistoryRows,
 ) -> Result<Vec<(String, i64)>, StateError> {
     let mut sql =
         String::from("SELECT COALESCE(h.category, '') AS category, COUNT(*) AS count FROM ");
@@ -575,6 +566,7 @@ async fn count_history_rows_by_category(
 
     append_history_from_clause(&mut sql, &mut args, filter);
     append_history_row_filter_predicates(&mut sql, &mut args, filter);
+    append_history_visibility(&mut sql, rows);
 
     sql.push_str(" GROUP BY COALESCE(h.category, '')");
 
@@ -582,6 +574,13 @@ async fn count_history_rows_by_category(
     rows.into_iter()
         .map(|row| Ok((row.text("category")?, row.i64("count")?)))
         .collect()
+}
+
+// The one visibility predicate every history listing and count shares.
+fn append_history_visibility(sql: &mut String, rows: HistoryRows) {
+    if rows == HistoryRows::Shown {
+        sql.push_str(" AND h.nzbget_hidden = 0");
+    }
 }
 
 fn append_history_pagination(sql: &mut String, args: &mut Vec<SqlArg>, filter: &HistoryFilter) {

@@ -45,7 +45,9 @@ fn insert_and_list() {
     let db = Database::open_in_memory().unwrap();
     db.insert_job_history(&sample_history()).unwrap();
 
-    let entries = db.list_job_history(&HistoryFilter::default()).unwrap();
+    let entries = db
+        .list_job_history(&HistoryFilter::default(), crate::HistoryRows::All)
+        .unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "test.nzb");
     assert_eq!(entries[0].total_bytes, 1_000_000);
@@ -103,7 +105,9 @@ fn filter_by_status() {
         statuses: Some(vec!["complete".to_string()]),
         ..Default::default()
     };
-    let entries = db.list_job_history(&filter).unwrap();
+    let entries = db
+        .list_job_history(&filter, crate::HistoryRows::All)
+        .unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].job_id, 1);
 }
@@ -114,6 +118,78 @@ fn delete_history() {
     db.insert_job_history(&sample_history()).unwrap();
     assert!(db.delete_job_history(1).unwrap());
     assert!(!db.delete_job_history(1).unwrap());
+}
+
+#[test]
+fn a_row_hidden_by_history_delete_leaves_the_shown_listing_and_counts_only() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&sample_history()).unwrap();
+    let mut other = sample_history();
+    other.job_id = 2;
+    other.category = Some("tv".to_string());
+    other.completed_at += 1;
+    db.insert_job_history(&other).unwrap();
+    let mut third = sample_history();
+    third.job_id = 3;
+    third.completed_at += 2;
+    db.insert_job_history(&third).unwrap();
+    assert!(db.set_nzbget_history_hidden(1, true).unwrap());
+
+    let all = HistoryFilter::default();
+    let ids = |rows: Vec<JobHistoryRow>| rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
+    assert_eq!(
+        ids(db
+            .list_job_history(&all, crate::HistoryRows::Shown)
+            .unwrap()),
+        vec![3, 2]
+    );
+    assert_eq!(
+        ids(db.list_job_history(&all, crate::HistoryRows::All).unwrap()),
+        vec![3, 2, 1]
+    );
+    // Applied before pagination: the hidden row takes no slot on a page.
+    let page = HistoryFilter {
+        limit: Some(1),
+        offset: Some(1),
+        ..Default::default()
+    };
+    assert_eq!(
+        ids(db
+            .list_job_history(&page, crate::HistoryRows::Shown)
+            .unwrap()),
+        vec![2]
+    );
+    assert_eq!(
+        db.count_job_history(&all, crate::HistoryRows::Shown)
+            .unwrap(),
+        2
+    );
+    assert_eq!(
+        db.count_job_history(&all, crate::HistoryRows::All).unwrap(),
+        3
+    );
+    assert_eq!(
+        db.count_job_history_by_category(&all, crate::HistoryRows::Shown)
+            .unwrap(),
+        vec![("movies".to_string(), 1), ("tv".to_string(), 1)]
+    );
+    assert_eq!(
+        db.count_job_history_by_category(&all, crate::HistoryRows::All)
+            .unwrap(),
+        vec![("movies".to_string(), 2), ("tv".to_string(), 1)]
+    );
+
+    // Still history: read by id, cleared by "clear history", deleted by id.
+    assert_eq!(db.get_job_history(1).unwrap().unwrap().job_id, 1);
+    let mut every_id = db.list_all_history_job_ids().unwrap();
+    every_id.sort_unstable();
+    assert_eq!(every_id, vec![1, 2, 3]);
+    assert!(db.delete_job_history(1).unwrap());
+    assert!(db.get_job_history(1).unwrap().is_none());
+    assert_eq!(
+        db.count_job_history(&all, crate::HistoryRows::All).unwrap(),
+        2
+    );
 }
 
 fn child_row_count(db: &Database, table: &'static str, job_id: u64) -> i64 {
@@ -244,7 +320,9 @@ fn list_with_limit_and_offset() {
         offset: Some(1),
         ..Default::default()
     };
-    let entries = db.list_job_history(&filter).unwrap();
+    let entries = db
+        .list_job_history(&filter, crate::HistoryRows::All)
+        .unwrap();
     assert_eq!(entries.len(), 2);
     // Ordered by completed_at DESC, so job_ids: 5, 4, 3, 2, 1
     // offset=1, limit=2 → jobs 4, 3
@@ -263,10 +341,13 @@ fn list_with_large_limit_is_stably_ordered_by_completion_and_id() {
     }
 
     let entries = db
-        .list_job_history(&HistoryFilter {
-            limit: Some(100),
-            ..Default::default()
-        })
+        .list_job_history(
+            &HistoryFilter {
+                limit: Some(100),
+                ..Default::default()
+            },
+            crate::HistoryRows::All,
+        )
         .unwrap();
 
     assert_eq!(entries.len(), 100);
@@ -303,30 +384,36 @@ fn list_filters_by_multiple_statuses_category_ids_and_metadata() {
     }
 
     let entries = db
-        .list_job_history(&HistoryFilter {
-            statuses: Some(vec!["failed".to_string(), "cancelled".to_string()]),
-            item_ids: Some(vec![2, 3, 4]),
-            category: Some("tv".to_string()),
-            metadata_has_key: Some("source".to_string()),
-            metadata_equals: Some(HistoryMetadataEquals {
-                key: "scryer_title_id".to_string(),
-                value: "title-2".to_string(),
-            }),
-            ..Default::default()
-        })
+        .list_job_history(
+            &HistoryFilter {
+                statuses: Some(vec!["failed".to_string(), "cancelled".to_string()]),
+                item_ids: Some(vec![2, 3, 4]),
+                category: Some("tv".to_string()),
+                metadata_has_key: Some("source".to_string()),
+                metadata_equals: Some(HistoryMetadataEquals {
+                    key: "scryer_title_id".to_string(),
+                    value: "title-2".to_string(),
+                }),
+                ..Default::default()
+            },
+            crate::HistoryRows::All,
+        )
         .unwrap();
 
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].job_id, 2);
     assert_eq!(
-        db.count_job_history(&HistoryFilter {
-            statuses: Some(vec!["failed".to_string(), "cancelled".to_string()]),
-            metadata_equals: Some(HistoryMetadataEquals {
-                key: "source".to_string(),
-                value: "scryer".to_string(),
-            }),
-            ..Default::default()
-        })
+        db.count_job_history(
+            &HistoryFilter {
+                statuses: Some(vec!["failed".to_string(), "cancelled".to_string()]),
+                metadata_equals: Some(HistoryMetadataEquals {
+                    key: "source".to_string(),
+                    value: "scryer".to_string(),
+                }),
+                ..Default::default()
+            },
+            crate::HistoryRows::All
+        )
         .unwrap(),
         2
     );
@@ -359,11 +446,17 @@ fn history_attribute_filters_are_exact_and_indexed() {
         limit: Some(1),
         ..Default::default()
     };
-    let entries = db.list_job_history(&filter).unwrap();
+    let entries = db
+        .list_job_history(&filter, crate::HistoryRows::All)
+        .unwrap();
 
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].job_id, 2);
-    assert_eq!(db.count_job_history(&filter).unwrap(), 1);
+    assert_eq!(
+        db.count_job_history(&filter, crate::HistoryRows::All)
+            .unwrap(),
+        1
+    );
 }
 
 #[test]
@@ -377,30 +470,39 @@ fn history_attribute_filters_exclude_hidden_metadata_keys() {
     db.insert_job_history(&entry).unwrap();
 
     assert!(
-        db.list_job_history(&HistoryFilter {
-            metadata_has_key: Some(CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string()),
-            ..Default::default()
-        })
+        db.list_job_history(
+            &HistoryFilter {
+                metadata_has_key: Some(CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string()),
+                ..Default::default()
+            },
+            crate::HistoryRows::All
+        )
         .unwrap()
         .is_empty()
     );
     assert_eq!(
-        db.count_job_history(&HistoryFilter {
-            metadata_equals: Some(HistoryMetadataEquals {
-                key: CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
-                value: "req-1".to_string(),
-            }),
-            ..Default::default()
-        })
+        db.count_job_history(
+            &HistoryFilter {
+                metadata_equals: Some(HistoryMetadataEquals {
+                    key: CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
+                    value: "req-1".to_string(),
+                }),
+                ..Default::default()
+            },
+            crate::HistoryRows::All
+        )
         .unwrap(),
         0
     );
 
     assert_eq!(
-        db.count_job_history(&HistoryFilter {
-            metadata_has_key: Some("public".to_string()),
-            ..Default::default()
-        })
+        db.count_job_history(
+            &HistoryFilter {
+                metadata_has_key: Some("public".to_string()),
+                ..Default::default()
+            },
+            crate::HistoryRows::All
+        )
         .unwrap(),
         1
     );
@@ -469,13 +571,21 @@ fn id_filters_past_the_parameter_limit_give_the_rows_one_statement_would() {
             expected(&|id| id > 20 && id <= 40),
         ),
     ] {
-        assert_eq!(ids_of(db.list_job_history(&filter).unwrap()), expected);
         assert_eq!(
-            db.count_job_history(&filter).unwrap() as usize,
+            ids_of(
+                db.list_job_history(&filter, crate::HistoryRows::All)
+                    .unwrap()
+            ),
+            expected
+        );
+        assert_eq!(
+            db.count_job_history(&filter, crate::HistoryRows::All)
+                .unwrap() as usize,
             expected.len()
         );
         assert_eq!(
-            db.count_job_history_by_category(&filter).unwrap(),
+            db.count_job_history_by_category(&filter, crate::HistoryRows::All)
+                .unwrap(),
             by_category(&expected)
         );
         let page = HistoryFilter {
@@ -484,7 +594,7 @@ fn id_filters_past_the_parameter_limit_give_the_rows_one_statement_would() {
             ..filter.clone()
         };
         assert_eq!(
-            ids_of(db.list_job_history(&page).unwrap()),
+            ids_of(db.list_job_history(&page, crate::HistoryRows::All).unwrap()),
             expected.iter().copied().skip(5).take(7).collect::<Vec<_>>()
         );
     }
