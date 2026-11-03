@@ -352,18 +352,55 @@ pub fn par2_index(first_bytes: &[u8]) -> bool {
     critical
 }
 
-// Kinds by the extensions their files are posted under, for members whose
-// bytes open no signature. A compound name such as `.tar.gz` is the signature's to decide; its
-// object announces the `.tar` inside.
-const NAMED: &[(Kind, &[&str])] = &[
-    (Kind::Tar, &[".tar"]),
-    (Kind::Bzip2, &[".bz2", ".tbz", ".tbz2", ".tar.bzip2"]),
-    (Kind::Deflate, &[".deflate"]),
-    (Kind::Brotli, &[".br"]),
-    (Kind::Sfv, &[".sfv"]),
-    (Kind::Zip, &[".zip"]),
-    (Kind::RarRecovery, &[".rev"]),
+// Kinds by the extensions their files are posted under. A compound name
+// such as `.tar.gz` ends in its outer kind's extension, whose object
+// announces the `.tar` inside. The name claims a member whose bytes open no
+// signature only for a kind marked `claims`: gzip, xz and zstd always open on
+// theirs, so bytes that open none under their names are a file of their own,
+// and those names only tell a listing's containers from its plain files.
+const NAMED: &[(Kind, Claims, &[&str])] = &[
+    (Kind::Tar, Claims::ByName, &[".tar"]),
+    (
+        Kind::Bzip2,
+        Claims::ByName,
+        &[".bz2", ".tbz", ".tbz2", ".tar.bzip2"],
+    ),
+    (Kind::Deflate, Claims::ByName, &[".deflate"]),
+    (Kind::Brotli, Claims::ByName, &[".br"]),
+    (Kind::Sfv, Claims::ByName, &[".sfv"]),
+    (Kind::Zip, Claims::ByName, &[".zip"]),
+    (Kind::RarRecovery, Claims::ByName, &[".rev"]),
+    (Kind::Gzip, Claims::BySignature, &[".gz", ".tgz"]),
+    (Kind::Xz, Claims::BySignature, &[".xz", ".txz"]),
+    (Kind::Zstd, Claims::BySignature, &[".zst", ".tzst"]),
 ];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Claims {
+    ByName,
+    BySignature,
+}
+
+// The kind a name's extension says, whether or not that name claims a
+// member by itself.
+fn kind_named(name: &str) -> Option<(Kind, Claims)> {
+    NAMED
+        .iter()
+        .find(|(_, _, extensions)| {
+            extensions
+                .iter()
+                .any(|extension| has_extension(name, extension))
+        })
+        .map(|(kind, claims, _)| (*kind, *claims))
+}
+
+// Whether a name is a container's an object opens: an archive, a tar, or a
+// compressed stream, by the extensions the sniffer knows them by. Recovery
+// data and SFVs are not containers.
+fn names_container(name: &str) -> bool {
+    kind_named(trimmed(name))
+        .is_some_and(|(kind, _)| !matches!(kind, Kind::Sfv | Kind::RarRecovery))
+}
 
 // A 7z posted under its own name whose start header fails its CRC is still
 // the store's: its signature header is whole and opens with the magic, and
@@ -384,14 +421,9 @@ fn trimmed(name: &str) -> &str {
 
 fn named(name: &str) -> Option<Kind> {
     let name = trimmed(name);
-    NAMED
-        .iter()
-        .find(|(_, extensions)| {
-            extensions
-                .iter()
-                .any(|extension| has_extension(name, extension))
-        })
-        .map(|(kind, _)| *kind)
+    kind_named(name)
+        .filter(|(_, claims)| *claims == Claims::ByName)
+        .map(|(kind, _)| kind)
         .or_else(|| numbered_piece(name).then_some(Kind::Split))
 }
 
@@ -442,8 +474,9 @@ pub enum Listed {
 
 // Each name of a listing, told by name alone: a RAR volume, `.rar` and the
 // old `.r00` … `.y99` numbering of a set whose `.rar` is listed; a 7z or a
-// zip, and zip's `.z01` parts of a listed `.zip`; a numbered piece of a
-// split file; a recovery file (an old `.p01` of a listed `.par` or `.par2`)
+// zip, and zip's `.z01` parts of a listed `.zip`; a tar or a compressed
+// stream, `.tar`, `.gz`, `.tgz`, `.bz2`, `.xz`, `.zst` and the rest of
+// `NAMED`; a numbered piece of a split file; a recovery file (an old `.p01` of a listed `.par` or `.par2`)
 // or an SFV. A short name with a letter and digits for an extension, a
 // `.s16` or a `.p12`, is a plain file when no set of its stem is listed.
 pub fn listed(names: &[&str]) -> Vec<Listed> {
@@ -469,7 +502,8 @@ pub fn listed(names: &[&str]) -> Vec<Listed> {
             let (letter, digits) =
                 extension.split_at(extension.chars().next().map_or(0, char::len_utf8));
             let numbered = !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit());
-            let container = matches!(extension, "rar" | "7z" | "zip")
+            let container = matches!(extension, "rar" | "7z")
+                || names_container(name)
                 || numbered_piece(name)
                 || (numbered
                     && digits.len() == 2
@@ -1077,6 +1111,9 @@ mod tests {
             "d.zip",
             "d.z01",
             "e.mkv.003",
+            "plain.tar",
+            "plain.tar.gz",
+            "plain.xz",
         ] {
             assert_eq!(of(name), Listed::Container, "{name}");
         }
@@ -1105,11 +1142,79 @@ mod tests {
             "x.p7",
             "a.r100",
             "a.z00x",
-            "plain.tar",
-            "plain.tar.gz",
-            "plain.xz",
         ] {
             assert_eq!(of(name), Listed::Plain, "{name}");
         }
+    }
+
+    #[test]
+    fn a_tar_or_compressed_stream_is_a_container_by_its_name() {
+        let containers = [
+            "a.tar",
+            "a.tar.gz",
+            "a.tgz",
+            "a.gz",
+            "a.tar.bz2",
+            "a.tbz",
+            "a.tbz2",
+            "a.bz2",
+            "a.tar.bzip2",
+            "a.tar.xz",
+            "a.txz",
+            "a.xz",
+            "a.tar.zst",
+            "a.tzst",
+            "a.zst",
+            "a.br",
+            "a.deflate",
+            "a.zip",
+            "A.TAR.GZ",
+            "a.tar.gz\"",
+            "a.tar.gz.001",
+            "a.tar.zst.002",
+        ];
+        for name in containers {
+            assert!(
+                names_container(name) || numbered_piece(trimmed(name)),
+                "{name}"
+            );
+        }
+        assert!(
+            listed(&containers)
+                .iter()
+                .all(|listed| *listed == Listed::Container)
+        );
+        let plain = [
+            "episode.mkv",
+            "a.g",
+            "a.z",
+            "a.xzz",
+            "file.tar.txt",
+            "a.tgzip",
+            "a.gzip",
+            "a.zstd",
+            "a.gz.txt",
+            "gz",
+            "a.sfv.mkv",
+        ];
+        for name in plain {
+            assert!(!names_container(name), "{name}");
+        }
+        assert!(listed(&plain).iter().all(|listed| *listed == Listed::Plain));
+        assert!(!names_container("a.sfv"));
+        assert!(!names_container("a.rev"));
+    }
+
+    #[test]
+    fn a_signed_kinds_name_never_claims_bytes_that_open_no_signature() {
+        for name in [
+            "a.gz", "a.tar.gz", "a.tgz", "a.xz", "a.txz", "a.zst", "a.tzst",
+        ] {
+            assert_eq!(sniff(name, &plain(512), Some(512)), Sniff::Leaf, "{name}");
+        }
+        assert_eq!(
+            sniff("a.tar.bz2", &plain(512), Some(512)),
+            object(Kind::Bzip2)
+        );
     }
 }
