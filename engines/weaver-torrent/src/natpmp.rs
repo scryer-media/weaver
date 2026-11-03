@@ -566,13 +566,20 @@ impl NatPmpMapper {
             .gateway_socket(SocketAddr::new(route.local_ip, 0))
             .await
             .with_context(|| format!("error binding the NAT-PMP socket to {}", route.local_ip))?;
-        if clients.egress(route.gateway) == Egress::NoRoute {
-            bail!(
+        // The gateway is asked from the socket's own address: the route
+        // toward it must leave from there.
+        let local_ip = socket.bind_addr().ip();
+        match clients.egress(route.gateway) {
+            Egress::NoRoute => bail!(
                 "error connecting to the gateway at {}: no route",
                 route.gateway
-            );
+            ),
+            Egress::From(from) if !local_ip.is_unspecified() && from != local_ip => bail!(
+                "error connecting to the gateway at {}: the route leaves from {from}, not {local_ip}",
+                route.gateway
+            ),
+            Egress::From(_) | Egress::Proxied => {}
         }
-        let local_ip = socket.bind_addr().ip();
         Ok((
             GatewaySocket {
                 socket,
@@ -1261,6 +1268,29 @@ mod tests {
             );
         }
         // The mapper is done: nothing more comes.
+        assert_eq!(running.events.recv().await, None);
+        running.task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_route_toward_the_gateway_from_elsewhere_fails_each_mapping() {
+        // The test route leaves toward a loopback address from that address,
+        // not from the socket's.
+        let route = GatewayRoute {
+            local_ip: Ipv4Addr::LOCALHOST.into(),
+            gateway: (Ipv4Addr::new(127, 0, 0, 2), NATPMP_PORT).into(),
+        };
+        let mut running = run_mapper_over(Ok(route), &[PortmapProtocol::Tcp, PortmapProtocol::Udp]);
+        for protocol in [PortmapProtocol::Tcp, PortmapProtocol::Udp] {
+            assert_eq!(
+                running.events.recv().await.unwrap(),
+                failed(
+                    protocol,
+                    "error connecting to the gateway at 127.0.0.2:5351: the route leaves from \
+                     127.0.0.2, not 127.0.0.1"
+                )
+            );
+        }
         assert_eq!(running.events.recv().await, None);
         running.task.await.unwrap().unwrap();
     }
