@@ -1170,8 +1170,8 @@ async fn test_a_magnets_run_starts_from_the_peers_its_fetchs_tracker_gave() -> a
 /// A session that announces to trackers and runs a DHT whose one bootstrap
 /// node is `node`, a loopback socket the test holds: whatever the DHT sends
 /// lands there and nowhere else.
-fn discovery_session_opts(
-    node: &std::sync::Arc<dyn crate::network::DatagramSocket>,
+fn discovery_session_opts<S: crate::network::DatagramSocket + ?Sized>(
+    node: &std::sync::Arc<S>,
 ) -> anyhow::Result<SessionOptions> {
     Ok(SessionOptions {
         dht: Some(crate::DhtSessionConfig {
@@ -1186,8 +1186,8 @@ fn discovery_session_opts(
 
 /// The DHT's next get_peers for `info_hash` to `node`, answering nothing
 /// else. Returns the request's transaction id and where it came from.
-async fn next_get_peers(
-    node: &std::sync::Arc<dyn crate::network::DatagramSocket>,
+async fn next_get_peers<S: crate::network::DatagramSocket + ?Sized>(
+    node: &std::sync::Arc<S>,
     info_hash: crate::core::hash_id::Id20,
 ) -> anyhow::Result<(crate::bencode::ByteBufOwned, SocketAddr)> {
     use crate::dht::bprotocol::{MessageKind, deserialize_message};
@@ -1207,13 +1207,12 @@ async fn next_get_peers(
 
 /// Whether the DHT has sent `node` a get_peers for `info_hash` by now.
 fn asked_for_peers(
-    node: &std::sync::Arc<dyn crate::network::DatagramSocket>,
+    node: &crate::network::KernelUdp,
     info_hash: crate::core::hash_id::Id20,
 ) -> bool {
     use crate::dht::bprotocol::{MessageKind, deserialize_message};
     let mut buf = [0u8; 2048];
-    use futures::FutureExt;
-    while let Some(Ok((len, _))) = node.recv_from(&mut buf).now_or_never() {
+    while let Ok((len, _)) = node.try_recv_from(&mut buf) {
         if let Ok(message) = deserialize_message::<crate::bencode::ByteBufOwned>(&buf[..len])
             && matches!(message.kind, MessageKind::GetPeersRequest(r) if r.info_hash == info_hash)
         {
@@ -1272,7 +1271,7 @@ async fn test_a_fetch_whose_tracker_names_a_peer_never_asks_the_dht() -> anyhow:
     let (_seeder, seeder_addr) = t.seed().await?;
     let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let url = format!("http://{}/announce", tracker.local_addr()?);
-    let node = crate::test_support::loopback_udp().await;
+    let node = crate::test_support::loopback_kernel_udp();
     let out = TempDir::with_prefix("test_fetch_tracker_peer_out")?;
     let session = Session::new_with_opts(out.path().into(), discovery_session_opts(&node)?).await?;
 
@@ -1353,7 +1352,7 @@ async fn test_a_fetch_whose_tracker_names_only_a_peer_without_extensions_goes_on
     let peer_addr = peer.local_addr()?;
     let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let url = format!("http://{}/announce", tracker.local_addr()?);
-    let node = crate::test_support::loopback_udp().await;
+    let node = crate::test_support::loopback_kernel_udp();
     let out = TempDir::with_prefix("test_fetch_tracker_peer_unable_out")?;
     let session = Session::new_with_opts(out.path().into(), discovery_session_opts(&node)?).await?;
 
@@ -1386,7 +1385,7 @@ async fn test_a_fetch_without_discovery_whose_tracker_fails_waits() -> anyhow::R
     let t = TestTorrent::new("test_fetch_tracker_fails_waits", 4096, 1024).await?;
     let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let url = format!("http://{}/announce", tracker.local_addr()?);
-    let node = crate::test_support::loopback_udp().await;
+    let node = crate::test_support::loopback_kernel_udp();
     let out = TempDir::with_prefix("test_fetch_tracker_fails_waits_out")?;
     let session = Session::new_with_opts(out.path().into(), discovery_session_opts(&node)?).await?;
 
@@ -1408,7 +1407,7 @@ async fn test_a_fetch_without_discovery_whose_tracker_fails_waits() -> anyhow::R
 async fn test_a_fetch_with_no_tracker_and_no_discovery_waits() -> anyhow::Result<()> {
     setup_test_logging();
     let t = TestTorrent::new("test_fetch_no_tracker_waits", 4096, 1024).await?;
-    let node = crate::test_support::loopback_udp().await;
+    let node = crate::test_support::loopback_kernel_udp();
     let out = TempDir::with_prefix("test_fetch_no_tracker_waits_out")?;
     let session = Session::new_with_opts(out.path().into(), discovery_session_opts(&node)?).await?;
 

@@ -5233,8 +5233,11 @@ mod tests {
         // one the ip_filter blocks; with none left the announce fails,
         // announce_skipped or banned_by_ip_filter, before anything is sent.
         let (http, http_at) = http_listener().await;
-        let udp = crate::test_support::loopback_udp().await;
-        let (hp, up) = (http_at.port().unwrap(), udp.bind_addr().port());
+        let udp = crate::test_support::loopback_kernel_udp();
+        let (hp, up) = (
+            http_at.port().unwrap(),
+            crate::network::DatagramSocket::bind_addr(&*udp).port(),
+        );
         let url = |s: &str| {
             Url::parse(
                 &s.replace("HP", &hp.to_string())
@@ -5284,7 +5287,10 @@ mod tests {
         assert!(clients.built.lock().is_empty());
         assert!(http.accept().now_or_never().is_none());
         let mut buf = [0u8; 64];
-        assert!(udp.recv_from(&mut buf).now_or_never().is_none());
+        assert_eq!(
+            udp.try_recv_from(&mut buf).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
         drop(peers);
         stopped.wait_idle().await;
         token.cancel();

@@ -283,7 +283,25 @@ impl StreamListener for KernelListener {
     }
 }
 
-struct KernelUdp(librqbit_dualstack_sockets::UdpSocket);
+pub(crate) struct KernelUdp(librqbit_dualstack_sockets::UdpSocket);
+
+#[cfg(test)]
+impl KernelSockets {
+    /// A datagram socket at `addr`, bound at once, as the kernel socket it is.
+    pub(crate) fn bind_kernel_udp(&self, addr: SocketAddr) -> io::Result<Arc<KernelUdp>> {
+        let socket = librqbit_dualstack_sockets::UdpSocket::bind_udp(addr, self.bind_opts())
+            .map_err(io::Error::other)?;
+        Ok(Arc::new(KernelUdp(socket)))
+    }
+}
+
+#[cfg(test)]
+impl KernelUdp {
+    /// A datagram already waiting, without waiting for one.
+    pub(crate) fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        self.0.socket().try_recv_from(buf)
+    }
+}
 
 impl DatagramSocket for KernelUdp {
     fn bind_addr(&self) -> SocketAddr {

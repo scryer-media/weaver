@@ -55,6 +55,14 @@ pub(crate) async fn loopback_udp() -> Arc<dyn DatagramSocket> {
     udp((Ipv4Addr::LOCALHOST, 0)).await
 }
 
+/// [`loopback_udp`], as the kernel socket it is, for a test that reads
+/// only what has already arrived.
+pub(crate) fn loopback_kernel_udp() -> Arc<crate::network::KernelUdp> {
+    sockets()
+        .bind_kernel_udp((Ipv4Addr::LOCALHOST, 0).into())
+        .expect("binding a loopback datagram socket")
+}
+
 /// [`loopback_udp`], from a caller that cannot wait: the kernel factory
 /// binds at once, inside the caller's runtime.
 pub(crate) fn loopback_udp_now() -> Arc<dyn DatagramSocket> {
