@@ -4845,6 +4845,87 @@ async fn an_add_reads_no_other_torrent() {
     );
 }
 
+// A rig whose service has one download slot and no session (the route is
+// down), not opened: nothing settles but what the test runs. With a way
+// to add the torrent of `seed`, and each torrent's turn: waiting for a
+// slot, and its rank.
+struct OneSlot {
+    rig: Rig,
+}
+
+impl OneSlot {
+    async fn new() -> Self {
+        let rig = rig(set_clock());
+        rig.routes.set_down(Some("down"));
+        rig.service.publish_to(queue());
+        let mut settings = rig.service.settings();
+        settings.torrent.max_active_downloads = 1;
+        rig.service.set_settings(settings).await;
+        Self { rig }
+    }
+
+    async fn add(&self, seed: u8) -> JobId {
+        self.rig
+            .service
+            .add(request(AddSource::Metainfo(plain(
+                &format!("set{seed}"),
+                seed,
+            ))))
+            .await
+            .unwrap()
+    }
+
+    async fn turns(&self, jobs: &[JobId]) -> Vec<(bool, Option<u32>)> {
+        let live = self.rig.service.inner.live.lock().await;
+        jobs.iter()
+            .map(|id| (live[id].queued, live[id].queue_rank))
+            .collect()
+    }
+}
+
+// A slot and a rank freed where no pass runs (a torrent removed, failed or
+// finished) go to the torrents after it at the next settle, not the next
+// tick (libtorrent `remove_torrent` and `torrent::finished` trigger the
+// recalculation).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slot_freed_without_a_pass_goes_out_at_the_next_settle() {
+    let one = OneSlot::new().await;
+    let service = &one.rig.service;
+    let [a, b, c, d] = [
+        one.add(1).await,
+        one.add(2).await,
+        one.add(3).await,
+        one.add(4).await,
+    ];
+    assert_eq!(
+        one.turns(&[a, b, c, d]).await,
+        [
+            (false, Some(1)),
+            (true, Some(2)),
+            (true, Some(3)),
+            (true, Some(4))
+        ]
+    );
+
+    service.remove(a, false, true).await.unwrap();
+    service.settle().await;
+    assert_eq!(
+        one.turns(&[b, c, d]).await,
+        [(false, Some(1)), (true, Some(2)), (true, Some(3))]
+    );
+
+    service.fail(b, "gone".into()).await;
+    service.settle().await;
+    assert_eq!(
+        one.turns(&[c, d]).await,
+        [(false, Some(1)), (true, Some(2))]
+    );
+
+    service.completed(c).await;
+    service.settle().await;
+    assert_eq!(one.turns(&[c, d]).await, [(false, None), (false, Some(1))]);
+}
+
 #[test]
 fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_default() {
     let mut record = TorrentRecord {

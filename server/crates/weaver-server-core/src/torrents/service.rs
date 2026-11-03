@@ -1881,6 +1881,8 @@ pub(super) struct Signal {
     dirty: Mutex<BTreeSet<JobId>>,
     unsaved: Mutex<BTreeMap<JobId, u32>>,
     refused: Mutex<BTreeMap<JobId, String>>,
+    // A slot or a rank moved where no pass runs: the next settle runs one.
+    pass_wanted: AtomicBool,
     wake: Notify,
 }
 
@@ -1911,6 +1913,19 @@ impl Signal {
 
     fn take(&self) -> BTreeSet<JobId> {
         std::mem::take(&mut *locked(&self.dirty))
+    }
+
+    // Ask for one pass over the queue at the next settle. Any number of
+    // asks before it runs are one pass (libtorrent `trigger_auto_manage`,
+    // posted once however many ask).
+    fn want_pass(&self) {
+        if !self.pass_wanted.swap(true, Ordering::AcqRel) {
+            self.wake.notify_one();
+        }
+    }
+
+    fn take_pass(&self) -> bool {
+        self.pass_wanted.swap(false, Ordering::AcqRel)
     }
 
     fn take_refused(&self, job_id: JobId) -> Option<String> {
@@ -2008,8 +2023,8 @@ struct Inner {
 // A snapshot of the download queue's end from the last pass, extended by
 // each torrent added since: the slots still free and the ranks given. A
 // torrent added after them changes no earlier torrent's turn or rank, so
-// it takes its own from here. What moved since the pass is corrected by
-// the next.
+// it takes its own from here. What moved since the pass (a torrent gone or
+// finished) is corrected by the next, which those ask for.
 #[derive(Debug, Clone, Copy)]
 struct QueueEnd {
     slots: status::Slots,
@@ -2494,6 +2509,9 @@ impl TorrentService {
             }
         }
         self.save_checkpoints(self.inner.signal.take_due()).await;
+        if self.inner.signal.take_pass() {
+            self.apply_queue().await;
+        }
         self.apply_picking().await;
         self.publish().await;
     }
@@ -2689,6 +2707,8 @@ impl TorrentService {
             }
             torrent.settle(now);
             torrent.record.completed_at_ms = Some(now);
+            // It seeds now: its slot and rank go to the torrents after it.
+            self.inner.signal.want_pass();
             self.inner.counters.event(TorrentEvent::Completed);
             if let Err(error) = self.inner.db.set_torrent_completed(job_id, now) {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's completion");
@@ -4069,6 +4089,8 @@ impl TorrentService {
     async fn fail(&self, job_id: JobId, error: String) {
         let torrent = self.inner.live.lock().await.remove(&job_id);
         let Some(mut torrent) = torrent else { return };
+        // Its slot and rank go to the torrents after it.
+        self.inner.signal.want_pass();
         self.inner.counters.event(TorrentEvent::Failed);
         self.detach(&mut torrent).await;
         self.retire(torrent, "failed", Some(error)).await;
@@ -4169,6 +4191,8 @@ impl TorrentService {
         }
         let mut torrent = live.remove(&job_id).ok_or(ActionError::NotFound(job_id))?;
         drop(live);
+        // Its slot and rank go to the torrents after it.
+        self.inner.signal.want_pass();
         if let Some(Resolving::Fetching(fetch)) = torrent.resolving.take() {
             fetch.abort();
             self.inner.counters.fetch(FetchOutcome::Cancelled);
