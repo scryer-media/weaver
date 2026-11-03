@@ -76,6 +76,9 @@ pub struct SchemaContext {
         Option<weaver_server_core::post_processing::executor::PostProcessingExecutor>,
     // The torrent client, when the server started with torrents on.
     pub torrents: Option<weaver_server_core::torrents::service::TorrentService>,
+    // The data-used-per-day recorder, for when each server entered its state.
+    // `None` where nothing records (tests).
+    pub usage_recorder: Option<Arc<weaver_server_core::operations::UsageRecorder>>,
 }
 
 // Render the GraphQL SDL for the public API without constructing any runtime
@@ -181,6 +184,7 @@ pub fn build_schema_with_backup(
     .data(context.log_buffer)
     .data(context.system_runtime)
     .data(context.nntp_pool)
+    .data(context.usage_recorder)
     .data(replay)
     .data(history_delete_manager)
     .data(staged_upload_manager)

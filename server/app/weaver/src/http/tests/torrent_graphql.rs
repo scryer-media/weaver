@@ -197,6 +197,7 @@ async fn endpoint(dir: &std::path::Path, db: Database, torrents: TorrentService)
         spawn_history_delete_worker: false,
         post_processing_executor: None,
         torrents: Some(torrents),
+        usage_recorder: None,
     });
     Router::new()
         .route("/graphql", post(super::super::graphql::graphql_handler))

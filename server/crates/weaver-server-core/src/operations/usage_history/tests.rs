@@ -28,7 +28,7 @@ fn disabled() -> Option<ServerStateReading> {
 fn server(id: u32, bytes: u64, tried: u64, ok: u64) -> ServerUsageReading {
     ServerUsageReading {
         server_id: id,
-        bytes,
+        bytes: Some(bytes),
         articles_tried: tried,
         articles_succeeded: ok,
         state: healthy(),
@@ -172,6 +172,23 @@ fn a_server_added_later_counts_articles_from_zero_and_bytes_from_now() {
             articles_succeeded: 3,
             down_seconds: 0,
         }
+    );
+}
+
+#[test]
+fn a_reading_without_a_byte_count_keeps_the_last_one() {
+    let recorder = UsageRecorder::new();
+    recorder.prime(&reading(vec![server(1, 1_000, 0, 0)], &[]), 0);
+    let today = date(2026, 3, 4);
+    let unknown = ServerUsageReading {
+        bytes: None,
+        ..server(1, 0, 0, 0)
+    };
+    recorder.observe(&reading(vec![unknown], &[]), today, 5);
+    recorder.observe(&reading(vec![server(1, 1_200, 0, 0)], &[]), today, 10);
+    assert_eq!(
+        recorder.take(today).rows,
+        vec![row(today, UsageConsumerKind::Server, "1", 200)]
     );
 }
 

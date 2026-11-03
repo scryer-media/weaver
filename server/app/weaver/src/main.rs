@@ -29,6 +29,7 @@ mod restart;
 mod shutdown;
 #[cfg(windows)]
 mod tray_ipc;
+mod usage;
 // The startup registration the tray owns and the upgrade helper restores; the
 // helper runs from a copy of this binary, so this binary carries it too.
 #[cfg(windows)]

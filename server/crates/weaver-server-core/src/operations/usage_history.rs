@@ -330,8 +330,10 @@ pub struct ServerStateReading {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerUsageReading {
     pub server_id: u32,
-    /// Body bytes fetched over the server's whole kept life.
-    pub bytes: u64,
+    /// Body bytes fetched over the server's whole kept life, when the
+    /// server has a byte count to read. A missing count leaves the server's
+    /// bytes where they were.
+    pub bytes: Option<u64>,
     /// Article attempts that reached the server since the process started.
     pub articles_tried: u64,
     pub articles_succeeded: u64,
@@ -348,7 +350,7 @@ pub struct UsageReading {
 
 #[derive(Debug, Clone, Copy)]
 struct ServerBaseline {
-    bytes: u64,
+    bytes: Option<u64>,
     articles_tried: u64,
     articles_succeeded: u64,
 }
@@ -473,7 +475,10 @@ impl UsageRecorder {
                         articles_succeeded: 0,
                     });
             let mut counts = UsageCounts {
-                bytes: forward(baseline.bytes, server.bytes),
+                bytes: match (baseline.bytes, server.bytes) {
+                    (Some(before), Some(now)) => forward(before, now),
+                    _ => 0,
+                },
                 articles_tried: forward(baseline.articles_tried, server.articles_tried),
                 articles_succeeded: forward(baseline.articles_succeeded, server.articles_succeeded),
                 down_seconds: 0,
@@ -481,7 +486,7 @@ impl UsageRecorder {
             state.servers.insert(
                 server.server_id,
                 ServerBaseline {
-                    bytes: server.bytes,
+                    bytes: server.bytes.or(baseline.bytes),
                     articles_tried: server.articles_tried,
                     articles_succeeded: server.articles_succeeded,
                 },
