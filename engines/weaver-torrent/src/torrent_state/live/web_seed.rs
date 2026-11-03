@@ -927,7 +927,7 @@ impl<'a> WebSeedConnection<'a> {
                     port,
                     addrs: addr.as_slice(),
                 }),
-                &ClientShape::FETCH,
+                &ClientShape::FETCH.for_torrent(self.layout.info_hash),
             )
             .with_context(|| format!("{url}: building its client"))?;
         self.pinned.lock().insert(key, client.clone());

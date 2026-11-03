@@ -233,11 +233,16 @@ impl std::fmt::Debug for ClientTls {
     }
 }
 
-/// A client's shape: what it is for, and the TLS identity it presents.
+/// A client's shape: what it is for, the TLS identity it presents, and the
+/// torrent it carries requests for.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ClientShape {
     pub used_for: ClientUse,
     pub tls: Option<ClientTls>,
+    /// The info-hash of the one torrent whose requests the client carries,
+    /// when it carries one torrent's alone: a web seed's. Clients for two
+    /// torrents never share a connection.
+    pub torrent: Option<crate::core::hash_id::Id20>,
 }
 
 impl ClientShape {
@@ -250,6 +255,15 @@ impl ClientShape {
         Self {
             used_for,
             tls: None,
+            torrent: None,
+        }
+    }
+
+    /// This shape, for the requests of the torrent `info_hash` alone.
+    pub fn for_torrent(self, info_hash: crate::core::hash_id::Id20) -> Self {
+        Self {
+            torrent: Some(info_hash),
+            ..self
         }
     }
 
