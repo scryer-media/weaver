@@ -315,6 +315,8 @@ func Run(args []string, programName string) {
 		return
 	}
 
+	startHarnessRun(args[0])
+
 	switch args[0] {
 	case "doctor":
 		if err := cmdDoctor(os.Stdout); err != nil {
@@ -952,6 +954,9 @@ func discoverRuntimePortState() (runtimePortState, error) {
 }
 
 func dockerComposeArgs(args ...string) []string {
+	if len(args) > 0 && (args[0] == "up" || args[0] == "run" || args[0] == "create") {
+		claimComposeProject(composeProject())
+	}
 	composeArgs := []string{"compose", "-p", composeProject()}
 	if envBool(nntpSeedImageActiveEnv, false) {
 		composeArgs = append(
