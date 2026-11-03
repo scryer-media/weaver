@@ -66,10 +66,10 @@ pub trait DatagramSocket: Send + Sync + 'static {
         self.poll_send_to(cx, &joined, target)
     }
 
-    /// Bytes the socket's route adds to each datagram to `target`, such as
-    /// a proxy's header. uTP sizes its packets that much smaller.
-    fn datagram_overhead(&self, _target: SocketAddr) -> usize {
-        0
+    /// The largest IP packet the socket's route carries, where it knows
+    /// it, such as a tunnel's MTU; uTP sends nothing larger.
+    fn link_mtu(&self) -> Option<u16> {
+        None
     }
 
     /// Whether the socket's datagrams leave with don't-fragment set, so a

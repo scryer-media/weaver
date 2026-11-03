@@ -1734,7 +1734,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
 
         let ss = SegmentSizes::new(SegmentSizesConfig {
             is_ipv4: remote.is_ipv4(),
-            link_mtu: socket.link_mtu_for(remote),
+            link_mtu: socket.probe_link_mtu(),
             ..Default::default()
         });
 

@@ -772,14 +772,13 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         Ok((sock, dispatcher))
     }
 
-    // The link MTU a new stream to `remote` probes up to: the link's, less
-    // what the transport adds, no higher than the streams that died on
-    // large packets allow.
-    pub(crate) fn link_mtu_for(&self, remote: SocketAddr) -> u16 {
-        let overhead = u16::try_from(self.transport.datagram_overhead(remote)).unwrap_or(u16::MAX);
+    // The link MTU a new stream probes up to: the link's, no larger than
+    // the transport's path carries, and no higher than the streams that
+    // died on large packets allow.
+    pub(crate) fn probe_link_mtu(&self) -> u16 {
         self.opts
             .link_mtu
-            .saturating_sub(overhead)
+            .min(self.transport.link_mtu().unwrap_or(u16::MAX))
             .min(self.mtu_ceiling.lock().get())
     }
 

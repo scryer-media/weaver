@@ -155,8 +155,8 @@ impl Transport for DatagramTransport {
         self.0.bind_addr()
     }
 
-    fn datagram_overhead(&self, target: SocketAddr) -> usize {
-        self.0.datagram_overhead(target)
+    fn link_mtu(&self) -> Option<u16> {
+        self.0.link_mtu()
     }
 
     fn dont_fragment(&self) -> bool {

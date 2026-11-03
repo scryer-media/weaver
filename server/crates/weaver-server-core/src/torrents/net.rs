@@ -362,11 +362,9 @@ impl DatagramSocket for Carried {
         })
     }
 
-    // The proxy's UDP header: reserved, fragment and address type, the
-    // target's address and its port.
-    fn datagram_overhead(&self, target: SocketAddr) -> usize {
-        let address = if target.is_ipv4() { 4 } else { 16 };
-        6 + address
+    // The tunnel's MTU: a larger packet is lost inside it.
+    fn link_mtu(&self) -> Option<u16> {
+        self.socket.link_mtu()
     }
 
     // Only uTP polls a send, and a ladder leg runs no uTP.
@@ -888,7 +886,7 @@ mod tests {
             self.0.local_addr().ok()
         }
         fn link_mtu(&self) -> Option<u16> {
-            None
+            Some(1280)
         }
         fn is_closed(&self) -> bool {
             false
@@ -960,6 +958,7 @@ mod tests {
         let udp = sockets.bind_udp(asked).await.unwrap();
         assert_eq!(*tunnel.bound.lock().unwrap(), [asked]);
         assert_eq!(udp.bind_addr().ip(), IpAddr::from([127, 0, 0, 1]));
+        assert_eq!(udp.link_mtu(), Some(1280), "the tunnel's MTU");
 
         let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let sent = udp

@@ -137,7 +137,15 @@ impl TestVsock {
 }
 
 fn make_test_vsock_args(opts: SocketOpts, args: StreamArgs, env: MockUtpEnvironment) -> TestVsock {
-    let transport = RememberingTransport::new(ADDR_1);
+    make_test_vsock_on(RememberingTransport::new(ADDR_1), opts, args, env)
+}
+
+fn make_test_vsock_on(
+    transport: RememberingTransport,
+    opts: SocketOpts,
+    args: StreamArgs,
+    env: MockUtpEnvironment,
+) -> TestVsock {
     let socket = UtpSocket::new_with_opts(transport.clone(), env.clone(), opts).unwrap();
     let (tx, rx) = unbounded_channel();
 
@@ -157,7 +165,12 @@ fn make_test_vsock_args(opts: SocketOpts, args: StreamArgs, env: MockUtpEnvironm
 // Our seq_nr == 101
 fn make_test_vsock(opts: SocketOpts, is_incoming: bool) -> TestVsock {
     let env = MockUtpEnvironment::new();
-    let args = if is_incoming {
+    let args = test_stream_args(&env, is_incoming);
+    make_test_vsock_args(opts, args, env)
+}
+
+fn test_stream_args(env: &MockUtpEnvironment, is_incoming: bool) -> StreamArgs {
+    if is_incoming {
         let remote_syn = UtpHeader {
             htype: ST_SYN,
             ..Default::default()
@@ -174,6 +187,5 @@ fn make_test_vsock(opts: SocketOpts, is_incoming: bool) -> TestVsock {
         let now = env.now();
         env.increment_now(Duration::from_secs(1));
         StreamArgs::new_outgoing(&remote_ack, now, env.now())
-    };
-    make_test_vsock_args(opts, args, env)
+    }
 }
