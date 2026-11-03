@@ -583,7 +583,7 @@ func runInterruptDuringPar2PassStopsThePass(ctx *restartCaseContext) (restartCas
 	preStatus := jobStatusFromDB(preDB, jobID)
 	preKinds, _ := jobEventKinds(caseDBPath(ctx), jobID)
 
-	lines := strings.Split(stripANSIEscapeSequences(string(firstRun)), "\n")
+	lines := strings.Split(cleanWeaverLog(string(firstRun)), "\n")
 	stoppedAt := -1
 	for i, line := range lines {
 		if strings.Contains(line, "pipeline stopped") {
@@ -628,7 +628,7 @@ func runInterruptDuringPar2PassStopsThePass(ctx *restartCaseContext) (restartCas
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	secondRun := stripANSIEscapeSequences(string(full[len(firstRun):]))
+	secondRun := cleanWeaverLog(string(full[len(firstRun):]))
 	startedAgain := len(graphLogEvents(secondRun, jobID, "graph repair worker started")) > 0
 	cancelled := false
 	for _, started := range graphLogEvents(string(firstRun), jobID, "graph repair worker started") {

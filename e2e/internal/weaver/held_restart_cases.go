@@ -149,7 +149,7 @@ func runHeldPartRestart(ctx *restartCaseContext, slug string) (restartCaseResult
 	// This process has exactly one job and no bytes preceding any held first
 	// article. The existing buffered-write gauge therefore observes the park,
 	// rather than merely a BODY request which could still be in flight.
-	if err := ctx.pollFor("decoded UU part waiting for the held prefix", func() (bool, error) {
+	if err := ctx.pollJob("decoded UU part waiting for the held prefix", dbPath, jobID, func() (bool, error) {
 		response, err := weaverHTTPClient(ctx.weaverURL, ctx.Timeout).Get(adversarialMetricsURL(ctx.weaverURL))
 		if err != nil {
 			return false, err
@@ -170,7 +170,7 @@ func runHeldPartRestart(ctx *restartCaseContext, slug string) (restartCaseResult
 		return restartCaseResult{}, err
 	}
 	var paused heldRestartEvidence
-	if err := ctx.pollFor("paused job with committed held spool bytes", func() (bool, error) {
+	if err := ctx.pollJob("paused job with committed held spool bytes", dbPath, jobID, func() (bool, error) {
 		if status, ok := restartJobStatusFromDB(dbPath, jobID); !ok || status != "PAUSED" {
 			return false, nil
 		}

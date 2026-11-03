@@ -100,7 +100,7 @@ func runCommittedFeedVerdictRestart(ctx *restartCaseContext) (restartCaseResult,
 	}
 	dbPath := caseDBPath(ctx)
 	var committed restartFeedVerdict
-	if err := ctx.pollFor("committed abandoned-file verdict", func() (bool, error) {
+	if err := ctx.pollJob("committed abandoned-file verdict", dbPath, jobID, func() (bool, error) {
 		committed, err = readRestartFeedVerdict(dbPath, jobID)
 		return committed.Version == 1 && committed.Reason != "" && reflect.DeepEqual(committed.AbandonedFiles, []int{abandonedIndex}), err
 	}); err != nil {
@@ -109,7 +109,7 @@ func runCommittedFeedVerdictRestart(ctx *restartCaseContext) (restartCaseResult,
 	if err := pauseQueueItemGraphQL(ctx.weaverURL, jobID); err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := ctx.pollFor("persisted pause after feed verdict", func() (bool, error) {
+	if err := ctx.pollJob("persisted pause after feed verdict", dbPath, jobID, func() (bool, error) {
 		status, ok := restartJobStatusFromDB(dbPath, jobID)
 		return ok && status == "PAUSED", nil
 	}); err != nil {

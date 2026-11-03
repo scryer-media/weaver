@@ -1480,7 +1480,7 @@ fn an_encoding_of_what_changed_is_the_encoding_of_the_whole() {
             );
         }),
         Box::new(|root| {
-            root.damage();
+            root.damage().unwrap();
         }),
         Box::new(move |root| root.map.unarrive(a, 33)),
         Box::new(|root| {
@@ -1612,12 +1612,12 @@ fn a_lost_article_is_told_from_its_own_volume_alone() {
 
     root.map.lost(VolumeIndex(49), 5);
     assert_eq!(
-        root.damage(),
+        root.damage().unwrap(),
         vec![(VolumeIndex(49), ByteRange::new(450, 540))]
     );
     assert_eq!(root.map.visits(), (1, 1));
 
-    assert_eq!(root.damage(), Vec::new());
+    assert_eq!(root.damage().unwrap(), Vec::new());
     assert_eq!(root.map.visits(), (0, 0));
 
     let encoding = root.encode(&mut Encoded::default(), 9, 0, None, Vec::new());
@@ -1636,7 +1636,7 @@ fn a_lost_article_is_told_from_its_own_volume_alone() {
     assert!(restored.map.volume_waiting(VolumeIndex(49)));
     restored.map.visits();
     assert_eq!(
-        restored.damage(),
+        restored.damage().unwrap(),
         vec![(VolumeIndex(49), ByteRange::new(450, 540))]
     );
     assert_eq!(restored.map.visits(), (1, 1));
@@ -1833,4 +1833,434 @@ fn facts_of_the_previous_version_are_refused() {
         decode(4, &previous, &parts),
         Err(RootFactsError::Version(4))
     );
+}
+
+// The field post: 750 KiB articles, the twenty-seventh of twenty-eight in
+// hand with its part ending at 20736000 while its header declares the
+// file 1536000 bytes long, and the last article lost. A length that ends
+// before the article's own part is no length, so nothing falls across the
+// lost run, and its damage is told from the start the parts agree on, as
+// far as its encoded bytes reach, never inverted.
+#[test]
+fn a_lost_run_across_falling_boundaries_is_told_not_inverted() {
+    const ARTICLE: u64 = 768_000;
+    const ENCODED: u32 = 787_000;
+    let mut root = ArticleRoot::new(&[file("payload.bin", &[ENCODED; 28])]);
+    root.receive(decoded(
+        0,
+        26,
+        26 * ARTICLE,
+        &vec![7; ARTICLE as usize],
+        Some(2 * ARTICLE),
+    ));
+    assert_eq!(
+        root.map.known_in(0, 1),
+        vec![(26, 19_968_000), (27, 20_736_000)]
+    );
+    root.map.lost(VolumeIndex(0), 27);
+    // Every other article still waits, and nothing tells where the file
+    // ends, so the run waits to be told.
+    assert!(root.damage().unwrap().is_empty());
+    for ordinal in 0..26 {
+        root.map.lost(VolumeIndex(0), ordinal);
+    }
+    let damage = root.damage().unwrap();
+    assert!(
+        damage.contains(&(
+            VolumeIndex(0),
+            ByteRange::new(20_736_000, 20_736_000 + u64::from(ENCODED))
+        )),
+        "{damage:?}"
+    );
+}
+
+// A poster whose every header declares the file 1536000 bytes long while
+// its parts run to 21504000: the reference decoders write each part where
+// its own header puts it and never cut the file at the declared size, so
+// every byte lands, the file is the parts' length, and nothing is damaged.
+#[test]
+fn a_declared_size_below_the_parts_never_cuts_the_file() {
+    const ARTICLE: u64 = 768_000;
+    let (mut job, dir, _) = job_with(&[file("payload.bin", &[787_000; 28])], Vec::new());
+    for ordinal in 0..28u32 {
+        job.intake(
+            decoded(
+                0,
+                ordinal,
+                u64::from(ordinal) * ARTICLE,
+                &vec![ordinal as u8; ARTICLE as usize],
+                Some(2 * ARTICLE),
+            ),
+            &mut RepairSlots::default(),
+            1,
+        )
+        .unwrap();
+    }
+    assert_eq!(damaged_ranges(&job, 0), Vec::new());
+    let member = job.namespace().get(MemberId(0)).unwrap();
+    assert_eq!(
+        (member.length, member.reached, member.closed),
+        (Some(28 * ARTICLE), Some(28 * ARTICLE), true)
+    );
+    let path = dir.path().join("payload.bin");
+    let written = std::fs::read(&path).unwrap();
+    let differs = written
+        .chunks(ARTICLE as usize)
+        .enumerate()
+        .position(|(ordinal, bytes)| bytes.iter().any(|byte| *byte != ordinal as u8));
+    assert_eq!((written.len() as u64, differs), (28 * ARTICLE, None));
+}
+
+// The same post with its last article lost and nothing to repair it: the
+// loss is told where the parts put it, from 20736000, and the job goes on.
+#[test]
+fn a_lost_last_article_under_a_declared_size_below_the_parts_is_told() {
+    const ARTICLE: u64 = 768_000;
+    let (mut job, _dir, _) = job_with(&[file("payload.bin", &[787_000; 28])], Vec::new());
+    for ordinal in 0..27u32 {
+        job.intake(
+            decoded(
+                0,
+                ordinal,
+                u64::from(ordinal) * ARTICLE,
+                &vec![ordinal as u8; ARTICLE as usize],
+                Some(2 * ARTICLE),
+            ),
+            &mut RepairSlots::default(),
+            1,
+        )
+        .unwrap();
+    }
+    job.lost(VolumeIndex(0), 27, &mut RepairSlots::default(), 1)
+        .unwrap();
+    // The tail is lost from where the twenty-seventh part ended, as far as
+    // the last article's encoded bytes reach, and the member closes there.
+    let tail = ByteRange::new(27 * ARTICLE, 27 * ARTICLE + 787_000);
+    assert_eq!(damaged_ranges(&job, 0), vec![tail]);
+    let member = job.namespace().get(MemberId(0)).unwrap();
+    assert_eq!((member.length, member.closed), (Some(tail.end), true));
+}
+
+// A graph job whose own record contradicts itself fails alone: its
+// checkpoint goes with it, and a job beside it runs on, its graph and its
+// checkpoint untouched.
+#[tokio::test]
+async fn an_inconsistent_graph_job_fails_alone() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let (faulty, beside) = (JobId(91_101), JobId(91_102));
+    for job_id in [faulty, beside] {
+        let lantern = spec(
+            "lantern alone",
+            vec![("lantern.bin".to_string(), FileRole::Standalone, 2)],
+        );
+        insert_active_job(&mut pipeline, job_id, lantern).await;
+        let (admitted, _files, _) = job_with(&[file("lantern.bin", &[64, 64])], Vec::new());
+        let pending = checkpoint::Pending::default();
+        assert!(pending.put(&admitted, Vec::new()));
+        pipeline
+            .db
+            .save_graph_checkpoint(job_id, Arc::new(pending.take().0.unwrap()))
+            .unwrap();
+        assert!(pipeline.db.has_graph_checkpoint(job_id).unwrap());
+    }
+    let inconsistent =
+        crate::pipeline::graph::job::GraphError::Inconsistent(super::source::Inconsistent {
+            volume: VolumeIndex(0),
+            start: 27,
+            end: 28,
+        });
+    pipeline.after_graph_result(faulty, Err(inconsistent));
+    crate::pipeline::tests::settle_failed_releases(&mut pipeline).await;
+    pipeline.db.flush_write_queue().await.unwrap();
+
+    assert!(matches!(
+        crate::pipeline::tests::job_status_for_assert(&pipeline, faulty),
+        Some(JobStatus::Failed { .. })
+    ));
+    assert!(!pipeline.db.has_graph_checkpoint(faulty).unwrap());
+    assert!(!matches!(
+        crate::pipeline::tests::job_status_for_assert(&pipeline, beside),
+        Some(JobStatus::Failed { .. }) | None
+    ));
+    assert!(pipeline.graph_jobs.contains_key(&beside));
+    assert!(pipeline.db.has_graph_checkpoint(beside).unwrap());
+    pipeline
+        .graph_jobs
+        .get_mut(&beside)
+        .unwrap()
+        .intake(
+            decoded(0, 0, 0, &[7; 64], Some(128)),
+            &mut RepairSlots::default(),
+            1,
+        )
+        .unwrap();
+    retire_pipeline_database(pipeline).await;
+}
+
+// The field post's checkpoint, as 0.16.6 wrote it on its way down: the
+// twenty-seven articles in hand, each header declaring the file 1536000
+// bytes long, and the last lost. A restart restores it and tells the loss
+// again from where the parts put it; the job is back, not failed, and the
+// process lives.
+#[tokio::test]
+async fn the_field_checkpoint_restores_and_the_job_goes_on() {
+    const ARTICLE: u64 = 768_000;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(91_103);
+    let field = JobSpec {
+        name: "lantern field".to_string(),
+        password: None,
+        total_bytes: 28 * 787_000,
+        category: None,
+        metadata: vec![],
+        files: vec![FileSpec {
+            filename: "lantern.mkv".to_string(),
+            role: FileRole::Standalone,
+            groups: vec!["alt.binaries.test".to_string()],
+            posted_at_epoch: None,
+            segments: (0..28)
+                .map(|ordinal| SegmentSpec {
+                    ordinal,
+                    article_number: ordinal,
+                    bytes: 787_000,
+                    message_ids: crate::jobs::MessageIds::new(vec![format!(
+                        "lantern-field-{ordinal}@example.com"
+                    )]),
+                })
+                .collect(),
+        }],
+    };
+    let working_dir = {
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let working_dir = insert_active_job(&mut pipeline, job_id, field.clone()).await;
+        let (mut admitted, _files, _) =
+            job_with(&[file("lantern.mkv", &[787_000; 28])], Vec::new());
+        for ordinal in 0..27u32 {
+            admitted
+                .intake(
+                    decoded(
+                        0,
+                        ordinal,
+                        u64::from(ordinal) * ARTICLE,
+                        &vec![ordinal as u8; ARTICLE as usize],
+                        Some(2 * ARTICLE),
+                    ),
+                    &mut RepairSlots::default(),
+                    1,
+                )
+                .unwrap();
+        }
+        admitted
+            .lost(VolumeIndex(0), 27, &mut RepairSlots::default(), 1)
+            .unwrap();
+        let pending = checkpoint::Pending::default();
+        assert!(pending.put(&admitted, Vec::new()));
+        pipeline
+            .db
+            .save_graph_checkpoint(job_id, Arc::new(pending.take().0.unwrap()))
+            .unwrap();
+        retire_pipeline_database(pipeline).await;
+        working_dir
+    };
+
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline
+        .restore_job(crate::RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec: field,
+            detected_archives: Default::default(),
+            file_identities: Default::default(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+            restart: None,
+        })
+        .await
+        .unwrap();
+    assert!(!pipeline.blocked_restores.contains_key(&job_id));
+    assert!(pipeline.graph_jobs.contains_key(&job_id));
+    assert!(!matches!(
+        crate::pipeline::tests::job_status_for_assert(&pipeline, job_id),
+        Some(JobStatus::Failed { .. }) | None
+    ));
+    retire_pipeline_database(pipeline).await;
+}
+
+// The field post with only its first two articles in hand, exactly the
+// 1536000 bytes its headers declare, and the other twenty-six lost: the
+// lost run's edges meet at the declared end, and the run is still told,
+// from there as far as its encoded bytes reach, never as nothing.
+#[test]
+fn a_lost_run_meeting_the_declared_size_is_told_not_empty() {
+    const ARTICLE: u64 = 768_000;
+    const ENCODED: u32 = 787_000;
+    let (mut job, _dir, _) = job_with(&[file("payload.bin", &[ENCODED; 28])], Vec::new());
+    for ordinal in 0..2u32 {
+        job.intake(
+            decoded(
+                0,
+                ordinal,
+                u64::from(ordinal) * ARTICLE,
+                &vec![ordinal as u8; ARTICLE as usize],
+                Some(2 * ARTICLE),
+            ),
+            &mut RepairSlots::default(),
+            1,
+        )
+        .unwrap();
+    }
+    for ordinal in 2..28 {
+        job.lost(VolumeIndex(0), ordinal, &mut RepairSlots::default(), 1)
+            .unwrap();
+    }
+    assert_eq!(
+        damaged_ranges(&job, 0),
+        vec![ByteRange::new(
+            2 * ARTICLE,
+            2 * ARTICLE + 26 * u64::from(ENCODED)
+        )]
+    );
+}
+
+// A post of `volumes` files of `parts` articles of `part` decoded bytes,
+// each posted at `posted` encoded bytes, every article declaring `declared`
+// as its file's length, laid down whole through the job. Hands back the
+// job, its directory and the furthest any file on disk reached while the
+// articles landed.
+fn lay_down_declaring(
+    volumes: u32,
+    parts: u32,
+    part: usize,
+    posted: u32,
+    declared: u64,
+) -> (GraphJob, tempfile::TempDir, u64, Vec<Vec<u8>>) {
+    let names: Vec<String> = (0..volumes).map(|at| format!("part{at}.bin")).collect();
+    let files: Vec<RootFile> = names
+        .iter()
+        .map(|name| file(name, &vec![posted; parts as usize]))
+        .collect();
+    let (mut job, dir, _) = job_with(&files, Vec::new());
+    let bodies: Vec<Vec<u8>> = (0..volumes)
+        .map(|volume| {
+            (0..part * parts as usize)
+                .map(|at| (at as u32 ^ volume.wrapping_mul(131)) as u8)
+                .collect()
+        })
+        .collect();
+    let mut furthest = 0;
+    for volume in 0..volumes {
+        for ordinal in 0..parts {
+            let offset = u64::from(ordinal) * part as u64;
+            let body = &bodies[volume as usize][offset as usize..offset as usize + part];
+            job.intake(
+                decoded(volume, ordinal, offset, body, Some(declared)),
+                &mut RepairSlots::default(),
+                1,
+            )
+            .unwrap();
+            for name in &names {
+                if let Ok(found) = std::fs::metadata(dir.path().join(name)) {
+                    furthest = furthest.max(found.len());
+                }
+            }
+        }
+    }
+    (job, dir, furthest, bodies)
+}
+
+// Every member closed whole, and each file on disk is its bytes, no more.
+fn assert_whole(job: &GraphJob, dir: &tempfile::TempDir, bodies: &[Vec<u8>]) {
+    for (volume, body) in bodies.iter().enumerate() {
+        let record = job
+            .tree()
+            .namespace(NodeId::ROOT)
+            .and_then(|namespace| namespace.get(MemberId(volume as u32)))
+            .unwrap();
+        assert!(record.closed && record.is_complete(), "member {volume}");
+        assert!(
+            damaged_ranges(job, volume as u32).is_empty(),
+            "member {volume}"
+        );
+        assert_eq!(record.length, Some(body.len() as u64), "member {volume}");
+        let path = dir.path().join(format!("part{volume}.bin"));
+        assert_eq!(&std::fs::read(&path).unwrap(), body, "member {volume}");
+    }
+}
+
+// Four volumes of about 130 KB whose every header declares 600 GiB: the
+// lie sizes no file. Nothing on disk ever reaches past the post's bytes,
+// nothing is booked past them, and every file closes at its real length.
+#[tokio::test]
+async fn a_declared_length_past_the_posted_bytes_sizes_no_file() {
+    const PART: usize = 65_000;
+    const POSTED: u32 = 66_400;
+    let (job, dir, furthest, bodies) =
+        lay_down_declaring(4, 2, PART, POSTED, 600 * 1024 * 1024 * 1024);
+    assert!(
+        furthest <= 2 * u64::from(POSTED),
+        "a file reached {furthest} bytes"
+    );
+    assert_whole(&job, &dir, &bodies);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let booked: u64 = (0..4)
+            .map(|volume| {
+                std::fs::metadata(dir.path().join(format!("part{volume}.bin")))
+                    .unwrap()
+                    .blocks()
+                    * 512
+            })
+            .sum();
+        assert!(booked <= 4 * 1024 * 1024, "{booked} bytes booked on disk");
+    }
+}
+
+// The field post's shape: every header declares two parts' worth, far
+// below where the later parts begin. Every byte arrives: each part lands
+// where its own header puts it, and the file is whole.
+#[tokio::test]
+async fn a_declared_length_below_the_parts_still_completes() {
+    const PART: usize = 7_680;
+    let (job, dir, _, bodies) = lay_down_declaring(1, 28, PART, 7_900, 2 * PART as u64);
+    assert_whole(&job, &dir, &bodies);
+}
+
+// A post that lists no encoded sizes bounds a declared length by its
+// articles times the largest one seen.
+#[tokio::test]
+async fn a_post_without_sizes_bounds_a_length_by_its_articles() {
+    const PART: usize = 65_000;
+    let (job, dir, furthest, bodies) = lay_down_declaring(2, 2, PART, 0, 1 << 40);
+    assert!(
+        furthest <= 2 * PART as u64,
+        "a file reached {furthest} bytes"
+    );
+    assert_whole(&job, &dir, &bodies);
+    let root = ArticleRoot::new(&[file("plain.bin", &[0, 0, 0])]);
+    let article = decoded(0, 0, 0, &[7; 90], Some(270));
+    assert_eq!(root.accepted_length(&article), Some(270));
+    let article = decoded(0, 0, 0, &[7; 90], Some(271));
+    assert_eq!(root.accepted_length(&article), None);
+}
+
+// Every byte arrives and every header declares a mebibyte more than the
+// file: the file closes at its real length, with no trailing zeros, and
+// the member is whole.
+#[tokio::test]
+async fn a_declared_length_a_mebibyte_long_closes_at_the_real_length() {
+    const PART: usize = 65_000;
+    let real = 2 * PART as u64;
+    let (job, dir, furthest, bodies) = lay_down_declaring(1, 2, PART, 66_400, real + (1 << 20));
+    assert!(furthest <= 2 * 66_400, "the file reached {furthest} bytes");
+    assert_whole(&job, &dir, &bodies);
 }

@@ -617,9 +617,6 @@ impl Pipeline {
         if !self.job_order.contains(&job_id) {
             self.job_order.push(job_id);
         }
-        if !reprocess {
-            self.raise_added_script_event(job_id);
-        }
 
         crate::runtime::perf_probe::record(
             "pipeline.add_job.runtime_state_inserted",
@@ -854,10 +851,13 @@ impl Pipeline {
             }
         }
         let original = request.clone();
+        let created = restart
+            .as_ref()
+            .map(|read| (read.created_at_epoch_ms, read.reentry));
         let (stored, summaries) = restart.map_or((None, None), |read| {
             (Some(read.runtime), Some(read.summaries))
         });
-        match self.restore_job_inner(request, summaries).await {
+        match self.restore_job_inner(request, summaries, created).await {
             Ok(()) => {
                 self.blocked_restores.remove(&original.job_id);
                 let holds = |values: &crate::pipeline::ActiveRuntimeValues| {
@@ -1019,6 +1019,9 @@ impl Pipeline {
         &mut self,
         request: RestoreJobRequest,
         summaries: Option<FileSummaries>,
+        // When the job was added, as its row stores it, and whether it is
+        // entering the queue window again rather than arriving.
+        created: Option<(f64, bool)>,
     ) -> Result<(), crate::SchedulerError> {
         let RestoreJobRequest {
             job_id,
@@ -1242,12 +1245,14 @@ impl Pipeline {
             .await
         };
 
-        self.emit_job_event(PipelineEvent::JobCreated {
-            job_id,
-            name: spec.name.clone(),
-            total_files: spec.files.len() as u32,
-            total_bytes: spec.total_bytes,
-        });
+        if !created.is_some_and(|(_, reentry)| reentry) {
+            self.emit_job_event(PipelineEvent::JobCreated {
+                job_id,
+                name: spec.name.clone(),
+                total_files: spec.files.len() as u32,
+                total_bytes: spec.total_bytes,
+            });
+        }
 
         // Resolve the category's shared decoded-byte counter once, here, so the
         // per-segment accounting site does a single `Relaxed` `fetch_add`
@@ -1329,7 +1334,8 @@ impl Pipeline {
             }),
             articles,
             created_at: std::time::Instant::now(),
-            created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
+            created_at_epoch_ms: created
+                .map_or_else(crate::jobs::model::epoch_ms_now, |(at, _)| at),
             queued_repair_at_epoch_ms,
             queued_extract_at_epoch_ms,
             paused_resume_status: paused_resume_status.clone(),

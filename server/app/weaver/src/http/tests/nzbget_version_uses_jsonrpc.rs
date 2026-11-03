@@ -2698,7 +2698,7 @@ async fn nzbget_rate_persists_limit_and_pausescan_toggles_watch_folder() {
 async fn nzbget_history_reports_compound_status_history_time_and_stage_timings() {
     let db = Database::open_in_memory().unwrap();
     // A fifth of the job was optional recovery data, so it stays repairable
-    // down to 80% health.
+    // down to (1000 - 400) / (1000 - 200) = 75% health.
     let mut complete = nzbget_history_row(400, "complete", 1_700_000_400, None);
     complete.total_bytes = 1_000;
     complete.optional_recovery_bytes = 200;
@@ -2744,7 +2744,7 @@ async fn nzbget_history_reports_compound_status_history_time_and_stage_timings()
     assert_eq!(by_id(400)["DownloadTimeSec"], 300);
     assert_eq!(by_id(400)["RepairTimeSec"], 40);
     assert_eq!(by_id(400)["PostTotalTimeSec"], 40);
-    assert_eq!(by_id(400)["CriticalHealth"], 800);
+    assert_eq!(by_id(400)["CriticalHealth"], 750);
     assert_eq!(by_id(401)["CriticalHealth"], 1000);
     assert_eq!(by_id(401)["Status"], "DELETED/HEALTH");
     assert_eq!(by_id(401)["DownloadTimeSec"], 0);
@@ -2764,8 +2764,10 @@ async fn nzbget_listfiles_reports_nzb_files_with_progress() {
         vec![],
     );
     // The job's snapshot as its download publishes it: 150_000 bytes of
-    // alpha.rar in, nothing of beta.par2.
+    // alpha.rar in, nothing of beta.par2, which is held back until a loss
+    // asks for it.
     job.file_remaining_bytes = vec![450_000, 100_000];
+    job.file_parked_bytes = vec![0, 100_000];
     db.create_active_job(&weaver_server_core::ActiveJob {
         job_id: JobId(55),
         nzb_hash: [7u8; 32],
@@ -2805,12 +2807,15 @@ async fn nzbget_listfiles_reports_nzb_files_with_progress() {
     assert_eq!(alpha["NZBID"], 55);
     assert_eq!(alpha["FileSizeLo"], 600_000);
     assert_eq!(alpha["RemainingSizeLo"], 450_000);
+    assert_eq!(alpha["Paused"], false);
     let beta = files
         .iter()
         .find(|file| file["Filename"] == "beta.par2")
         .unwrap();
     assert_eq!(beta["FileSizeLo"], 100_000);
     assert_eq!(beta["RemainingSizeLo"], 100_000);
+    assert_eq!(beta["Paused"], true);
+    assert_eq!(beta["Progress"], 0);
 
     let (status, payload) = post_nzbget(
         app,
@@ -4511,7 +4516,11 @@ async fn nzbget_hidden_history_does_not_consume_the_visible_page() {
     assert_eq!(all.as_array().unwrap().len(), 1000);
     assert!(!history_ids(&all).contains(&1));
     // Visibility changes neither retained history nor duplicate-check data.
-    assert_eq!(db.count_job_history(&Default::default()).unwrap(), 1001);
+    assert_eq!(
+        db.count_job_history(&Default::default(), weaver_server_core::HistoryRows::All)
+            .unwrap(),
+        1001
+    );
 }
 
 #[tokio::test]
@@ -4555,7 +4564,7 @@ async fn nzbget_history_delete_hides_the_row_and_final_delete_erases_it() {
         .find(|entry| entry["NZBID"] == 501)
         .unwrap();
     assert_eq!(hidden_entry["Kind"], "DUP");
-    // The row itself is untouched for the web UI and duplicate checks.
+    // The row is kept for history(true) and duplicate checks.
     assert!(db.get_job_history(501).unwrap().is_some());
 
     // HistoryFinalDelete, in the v13+ shape, erases the row outright.
@@ -4578,6 +4587,93 @@ async fn nzbget_history_delete_hides_the_row_and_final_delete_erases_it() {
     )
     .await;
     assert_eq!(missing, false);
+}
+
+// An Arr's "Remove Completed" sends a non-final HistoryDelete. NZBGet keeps
+// the entry as a hidden duplicate and its own history view stops showing it;
+// Weaver's history listings leave it out the same way.
+#[tokio::test]
+async fn nzbget_history_delete_takes_the_row_off_weavers_history_listings() {
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&nzbget_history_row(801, "complete", 1_700_000_100, None))
+        .unwrap();
+    db.insert_job_history(&nzbget_history_row(802, "complete", 1_700_000_200, None))
+        .unwrap();
+    let queue = scheduler_handle_with_jobs_and_db(vec![], db.clone()).await;
+    let handle = queue.handle.clone();
+    let app = nzbget_test_router(
+        db.clone(),
+        queue,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+    let hidden = rpc_result(
+        app.clone(),
+        "editqueue",
+        serde_json::json!(["HistoryDelete", 0, "", 801]),
+    )
+    .await;
+    assert_eq!(hidden, true);
+
+    let schema = async_graphql::Schema::build(
+        weaver_server_api::QueryRoot::default(),
+        weaver_server_api::MutationRoot::default(),
+        weaver_server_api::SubscriptionRoot::default(),
+    )
+    .data(db.clone())
+    .data(handle)
+    .finish();
+    let query = |text: &str| {
+        let request = async_graphql::Request::new(text).data(CallerScope::Local);
+        let schema = schema.clone();
+        async move {
+            let response = schema.execute(request).await;
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            response.data.into_json().unwrap()
+        }
+    };
+    let ids = |items: &serde_json::Value| {
+        items
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_u64().unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    let data = query("{ historyItems { id } historyItemsCount }").await;
+    assert_eq!(ids(&data["historyItems"]), vec![802]);
+    assert_eq!(data["historyItemsCount"], 1);
+    // Both page paths: the SQL one, and the Rust one a category facet takes.
+    for input in [
+        "{ pageIndex: 0, pageSize: 25 }",
+        r#"{ pageIndex: 0, pageSize: 25, categories: ["tv"] }"#,
+    ] {
+        let data = query(&format!(
+            "{{ historyPage(input: {input}) {{ items {{ id }} totalCount \
+             counts {{ all success failure }} categoryCounts {{ category count }} }} }}"
+        ))
+        .await;
+        let page = &data["historyPage"];
+        assert_eq!(ids(&page["items"]), vec![802], "{input}");
+        assert_eq!(page["totalCount"], 1, "{input}");
+        assert_eq!(
+            page["counts"],
+            serde_json::json!({ "all": 1, "success": 1, "failure": 0 }),
+            "{input}"
+        );
+        assert_eq!(
+            page["categoryCounts"],
+            serde_json::json!([{ "category": "tv", "count": 1 }]),
+            "{input}"
+        );
+    }
+
+    // The facade's history(true) still lists both, the hidden one as DUP.
+    let entries = rpc_result(app, "history", serde_json::json!([true])).await;
+    let mut listed = history_ids(&entries);
+    listed.sort_unstable();
+    assert_eq!(listed, vec![801, 802]);
 }
 
 #[tokio::test]
@@ -5146,6 +5242,8 @@ fn sort_test_job(job_id: u64, name: &str, total: u64, priority: &str, created_ms
     let mut job = reorder_test_job(job_id);
     job.name = name.to_string();
     job.total_bytes = total;
+    job.wanted_bytes = total;
+    job.remaining_bytes = total;
     job.metadata = vec![("priority".to_string(), priority.to_string())];
     job.created_at_epoch_ms = created_ms;
     job
@@ -5556,4 +5654,86 @@ async fn nzbget_priority_reports_the_value_the_client_set() {
         .unwrap();
     let groups = rpc_result(app, "listgroups", serde_json::json!([])).await;
     assert_eq!(group_priority(&groups, id), (50, 50));
+}
+
+#[tokio::test]
+async fn nzbget_reports_nothing_remaining_once_a_clean_post_has_arrived() {
+    // Every wanted article has arrived; only the recovery held back until a
+    // loss asks for it is left. NZBGet lists that as paused, so a client that
+    // reads remaining less paused sees nothing still to come.
+    let mut job = nzbget_test_job(
+        98,
+        JobStatus::Downloading,
+        weaver_server_core::DownloadState::Downloading,
+        1_000,
+        870,
+        vec![],
+    );
+    job.wanted_bytes = 900;
+    job.remaining_bytes = 0;
+    let app = nzbget_test_router(
+        Database::open_in_memory().unwrap(),
+        scheduler_handle_with_jobs(vec![job]).await,
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    let groups = rpc_result(app.clone(), "listgroups", serde_json::json!([])).await;
+    let group = &groups[0];
+    assert_eq!(group["FileSizeLo"], 1_000);
+    assert_eq!(group["RemainingSizeLo"], 100);
+    assert_eq!(group["PausedSizeLo"], 100);
+    assert_eq!(group["DownloadedSizeLo"], 900);
+    assert_eq!(
+        group["RemainingSizeMB"].as_u64().unwrap() - group["PausedSizeMB"].as_u64().unwrap(),
+        0
+    );
+
+    let status = rpc_result(app, "status", serde_json::json!([])).await;
+    assert_eq!(status["RemainingSizeLo"], 0);
+}
+
+#[tokio::test]
+async fn nzbget_lists_every_group_and_the_files_of_a_job_past_the_queue_window() {
+    // The pipeline installs the first 100 queued jobs; the rest are rows.
+    const WINDOW: usize = 100;
+    const QUEUED: u64 = WINDOW as u64 + 10;
+    let db = Database::open_in_memory().unwrap();
+    let handle =
+        scheduler_handle_with_jobs_and_db((1..=QUEUED).map(reorder_test_job).collect(), db.clone())
+            .await;
+    let diagnostics = handle.pipeline_diagnostics().await.unwrap();
+    let mut installed: Vec<u64> = diagnostics.jobs.iter().map(|job| job.job_id).collect();
+    installed.sort_unstable();
+    assert_eq!(installed, (1..=WINDOW as u64).collect::<Vec<_>>());
+    let app = nzbget_test_router(
+        db,
+        handle.clone(),
+        test_config(),
+        api_key_cache("control-key", "control"),
+    );
+
+    // Every row is listed, in queue order.
+    assert_eq!(
+        listgroups_ids(app.clone()).await,
+        (1..=QUEUED).collect::<Vec<_>>()
+    );
+
+    // The files of a job past the window come from its stored NZB.
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "listfiles", "params": [0, 0, QUEUED], "id": "files"}),
+        "Bearer control-key",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let files = payload["result"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["NZBID"], QUEUED);
+    assert_eq!(files[0]["Filename"], "payload.bin");
+
+    // Neither read installed it.
+    let diagnostics = handle.pipeline_diagnostics().await.unwrap();
+    assert_eq!(diagnostics.jobs.len(), WINDOW);
+    assert!(diagnostics.jobs.iter().all(|job| job.job_id != QUEUED));
 }

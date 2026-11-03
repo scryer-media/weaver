@@ -47,6 +47,16 @@ impl Class {
     }
 }
 
+// The map derived an inverted range from the post's data: a fault of the
+// job's record, which fails the job and never the daemon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the article map of {volume} placed articles {start}..{end} at an inverted range")]
+pub(crate) struct Inconsistent {
+    pub(crate) volume: VolumeIndex,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
 // A change of class the download queue has to apply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Move {
@@ -156,6 +166,10 @@ struct Volume {
     // The post's encoded bytes of the articles no longer waited on: in hand,
     // or lost for good. Kept by the one path that changes a state.
     settled_bytes: u64,
+    // The decoded bytes of the articles in hand. One that arrived in a run
+    // whose placement this run never saw counts its encoded bytes, the most
+    // it can have decoded to. Kept beside `settled_bytes`.
+    arrived_decoded: u64,
     // Decoded offsets known exactly, by boundary index: boundary `k` is
     // where article `k` starts, and boundary `articles.len()` is the end.
     known: BTreeMap<usize, u64>,
@@ -169,6 +183,8 @@ struct Volume {
     // The articles a queueing can bring back: waiting, and parked. Filed
     // beside `parkable`.
     parked: BTreeSet<usize>,
+    // The post's encoded bytes of the parked articles. Kept beside `parked`.
+    parked_bytes: u64,
     // The articles carry no position of their own, so the volume can only
     // be placed in order, from the front.
     ordered_only: bool,
@@ -209,10 +225,12 @@ impl Volume {
             articles,
             encoded_len: encoded,
             settled_bytes: 0,
+            arrived_decoded: 0,
             known: BTreeMap::from([(0, 0)]),
             disorder: 0,
             parkable: (0..sizes.len()).collect(),
             parked: BTreeSet::new(),
+            parked_bytes: 0,
             ordered_only: false,
             starts: BTreeMap::new(),
             cut: BTreeSet::new(),
@@ -235,13 +253,19 @@ impl Volume {
         }
         // Another copy, or none: what its tail lacked is asked again.
         self.cut.remove(&index);
+        let size = self.encoded_at(index + 1) - self.encoded_at(index);
         if (was == State::Waiting) != (state == State::Waiting) {
-            let size = self.encoded_at(index + 1) - self.encoded_at(index);
             self.settled_bytes = match state {
                 State::Waiting => self.settled_bytes - size,
                 _ => self.settled_bytes + size,
             };
         }
+        let decoded = |state: State| match state {
+            State::Arrived(Some(range)) => range.end - range.start,
+            State::Arrived(None) => size,
+            State::Waiting | State::Lost { .. } => 0,
+        };
+        self.arrived_decoded = self.arrived_decoded - decoded(was) + decoded(state);
         self.articles[index].state = state;
         open.file(self.at, index, state);
         self.file_parkable(index);
@@ -296,6 +320,20 @@ impl Volume {
         self.marks.mark(Chunk::Articles(chunk));
     }
 
+    // A recovery volume nothing has yet decided on: none of it parked,
+    // nothing asked for, nothing past its first article in hand. Until its
+    // first article is read and the recovery parks the rest, it is presumed
+    // held back whole, as a job that never ran presumes. Its bytes still to
+    // come and its bytes out to bring, both all of it.
+    fn undecided(&self) -> Option<(u64, u64)> {
+        let decided = !self.parked.is_empty()
+            || self.articles.iter().enumerate().any(|(index, article)| {
+                matches!(article.class, Class::Critical | Class::Recovery)
+                    || (index > 0 && article.state != State::Waiting)
+            });
+        (!decided).then(|| (self.encoded_len - self.settled_bytes, self.encoded_len))
+    }
+
     fn file_parkable(&mut self, index: usize) {
         let article = self.articles[index];
         let waiting = article.state == State::Waiting;
@@ -304,10 +342,13 @@ impl Volume {
         } else {
             self.parkable.remove(&index);
         }
+        let size = self.encoded_at(index + 1) - self.encoded_at(index);
         if waiting && article.class == Class::Parked {
-            self.parked.insert(index);
-        } else {
-            self.parked.remove(&index);
+            if self.parked.insert(index) {
+                self.parked_bytes += size;
+            }
+        } else if self.parked.remove(&index) {
+            self.parked_bytes -= size;
         }
     }
 
@@ -372,6 +413,31 @@ impl Volume {
             low = low.max(above_at.saturating_sub(self.encoded_at(*above) - encoded));
         }
         (low, high.max(low))
+    }
+
+    // Where the bytes of the articles from boundary `start` to boundary
+    // `end` can lie: from the lowest place of the first to the highest of
+    // the last. A post's headers can fall across the run or meet at it, a
+    // declared file length at or below an earlier part's end; the parts
+    // before the run then stand, as every reference decoder writes each
+    // part where its own header puts it, and the run reaches as far past
+    // its start as its encoded bytes can decode to. A run holds a lost
+    // article, so it is never told empty while its articles carry bytes.
+    //
+    // A range the post's data derives is checked, never asserted: should
+    // the map still hold one inverted, the job fails on it and the daemon
+    // runs on.
+    fn span(&self, start: usize, end: usize) -> Result<ByteRange, Inconsistent> {
+        let low = self.bounds(start).0;
+        let high = self.bounds(end).1;
+        let reach = low.saturating_add(self.encoded_at(end) - self.encoded_at(start));
+        ByteRange::try_from([low, if high <= low { reach } else { high }]).map_err(|_| {
+            Inconsistent {
+                volume: self.at,
+                start,
+                end,
+            }
+        })
     }
 
     // The covering articles a queueing can bring back. With none parked
@@ -446,7 +512,11 @@ impl Volume {
     // volume's end, which is told once nothing else can arrive. The runs are
     // read off the lost articles `open` files, and the volume leaves the
     // untold ones once none of its runs waits to be told.
-    fn take_damage(&mut self, open: &mut Open, out: &mut Vec<ByteRange>) {
+    fn take_damage(
+        &mut self,
+        open: &mut Open,
+        out: &mut Vec<ByteRange>,
+    ) -> Result<(), Inconsistent> {
         let settled = !open.waiting.contains_key(&self.at);
         let mut runs = Vec::new();
         if let Some(lost) = open.lost.get(&self.at) {
@@ -479,7 +549,7 @@ impl Volume {
                 untold = true;
                 continue;
             }
-            let range = ByteRange::new(self.bounds(start).0, self.bounds(end).1);
+            let range = self.span(start, end)?;
             if !range.is_empty() {
                 out.push(range);
             }
@@ -491,6 +561,7 @@ impl Volume {
         if !untold {
             open.untold.remove(&self.at);
         }
+        Ok(())
     }
 
     // The tail of an article that arrived short: one whose bytes end before
@@ -589,6 +660,30 @@ impl ArticleMap {
             found.cut_after(&mut self.open, before);
         }
         found.cut_after(&mut self.open, index);
+    }
+
+    // The file lengths the volume's articles can reach, `part` being the
+    // decoded bytes of the article in hand: above where its last article
+    // begins and no further than where it ends, each article as long as
+    // this one, and never past the post's encoded bytes for the file, at or
+    // above its decoded bytes as encoding only adds. A length outside books
+    // a file the post cannot fill, or one its parts run past: either way it
+    // is a lie, every part is written where its own header puts it, and the
+    // file reaches as far as its bytes land (nzbfast
+    // `crates/nzbfast-engine/src/get/workers.rs:777-867`,
+    // `crates/nzbfast-unpack/src/repair/sidefetch.rs:376-382`; sabctools
+    // `src/yenc.cc:339-377`; NZBGet `daemon/nntp/ArticleWriter.cpp:557-558`).
+    pub(crate) fn reachable(&self, volume: VolumeIndex, part: u64, length: u64) -> bool {
+        let Some(found) = self.volumes.get(volume.0 as usize) else {
+            return false;
+        };
+        let articles = found.articles.len() as u64;
+        let posted = match found.encoded_len {
+            0 => u64::MAX,
+            posted => posted,
+        };
+        articles.saturating_sub(1).saturating_mul(part) < length
+            && length <= articles.saturating_mul(part).min(posted)
     }
 
     // The file's decoded length, which the first decoded article declares.
@@ -726,12 +821,57 @@ impl ArticleMap {
     }
 
     // Each volume's encoded bytes still waited on, as the post declares
-    // them: the articles neither in hand nor lost for good.
+    // them: the articles neither in hand nor lost for good, and not parked.
+    // A parked article is fetched only once something asks for it, so until
+    // then it is not still to come.
     pub(crate) fn remaining(&self) -> Vec<u64> {
+        self.volumes
+            .iter()
+            .map(|found| found.encoded_len - found.settled_bytes - found.parked_bytes)
+            .collect()
+    }
+
+    // The bytes still to come and out to bring of a recovery volume nothing
+    // has yet decided on; None once its recovery has parked it or anything
+    // asked for it.
+    pub(crate) fn undecided(&self, volume: VolumeIndex) -> Option<(u64, u64)> {
+        self.volumes
+            .get(volume.0 as usize)
+            .and_then(Volume::undecided)
+    }
+
+    // Each volume's encoded bytes neither in hand nor lost for good, parked
+    // or not.
+    pub(crate) fn waiting(&self) -> Vec<u64> {
         self.volumes
             .iter()
             .map(|found| found.encoded_len - found.settled_bytes)
             .collect()
+    }
+
+    // Each volume's encoded bytes parked until something asks for them.
+    pub(crate) fn parked(&self) -> Vec<u64> {
+        self.volumes
+            .iter()
+            .map(|found| found.parked_bytes)
+            .collect()
+    }
+
+    // The encoded bytes of every article not parked, as the post declares
+    // them: in hand, lost for good, or still to come.
+    pub(crate) fn wanted_bytes(&self) -> u64 {
+        self.volumes
+            .iter()
+            .map(|found| found.encoded_len - found.parked_bytes)
+            .sum()
+    }
+
+    // The volume's decoded bytes in hand. An article an earlier run brought
+    // counts, as it came over the wire then.
+    pub(crate) fn arrived_bytes(&self, volume: VolumeIndex) -> u64 {
+        self.volumes
+            .get(volume.0 as usize)
+            .map_or(0, |found| found.arrived_decoded)
     }
 
     // How many volumes have every article in hand.
@@ -795,14 +935,17 @@ impl ArticleMap {
 
     // The ranges of lost articles that can now be marked damaged: only the
     // volumes holding one not yet told are visited.
-    pub(crate) fn take_damage(&mut self, out: &mut Vec<(VolumeIndex, ByteRange)>) {
+    pub(crate) fn take_damage(
+        &mut self,
+        out: &mut Vec<(VolumeIndex, ByteRange)>,
+    ) -> Result<(), Inconsistent> {
         let mut ranges = Vec::new();
         let mut next = self.open.untold.first().copied();
         while let Some(volume) = next {
             self.open.visit(1, 0);
             ranges.clear();
             if let Some(found) = self.volumes.get_mut(volume.0 as usize) {
-                found.take_damage(&mut self.open, &mut ranges);
+                found.take_damage(&mut self.open, &mut ranges)?;
             }
             out.extend(ranges.iter().map(|range| (volume, *range)));
             next = self
@@ -812,6 +955,7 @@ impl ArticleMap {
                 .next()
                 .copied();
         }
+        Ok(())
     }
 
     // Answer a seek, and move the articles that carry it to `class` when

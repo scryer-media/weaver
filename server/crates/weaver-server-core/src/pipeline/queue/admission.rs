@@ -68,6 +68,9 @@ impl Queue {
                 request.status == JobStatus::Paused,
             );
             info.download_wait_reason = Some("Restoring saved job".into());
+            if let Some(read) = &request.restart {
+                info.created_at_epoch_ms = read.created_at_epoch_ms;
+            }
             let mut row = JobRow::new(info);
             row.report.restoring = true;
             row.intents.restore = Some(request);
@@ -171,6 +174,7 @@ pub(super) fn initial_info(
     working_dir: &std::path::Path,
     initially_paused: bool,
 ) -> JobInfo {
+    let wanted_bytes = spec.wanted_bytes();
     JobInfo {
         job_id: id,
         job_hash: Some(hash),
@@ -202,6 +206,9 @@ pub(super) fn initial_info(
         completed_files: 0,
         remaining_par_files: 0,
         file_remaining_bytes: Vec::new(),
+        file_parked_bytes: Vec::new(),
+        remaining_bytes: wanted_bytes,
+        wanted_bytes,
         password: spec.password.clone(),
         category: spec.category.clone(),
         metadata: spec.metadata.clone(),

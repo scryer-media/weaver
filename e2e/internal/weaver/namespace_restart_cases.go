@@ -277,7 +277,7 @@ func runNamespaceRestart(ctx *restartCaseContext, slug, movedName string, remove
 		return restartCaseResult{}, err
 	}
 	dbPath := caseDBPath(ctx)
-	if err := ctx.pollFor("committed namespace sentinel", func() (bool, error) {
+	if err := ctx.pollJob("committed namespace sentinel", dbPath, jobID, func() (bool, error) {
 		return committedNamespaceSentinel(dbPath, jobID, sentinel, scenario.ExpectedOutputBLAKE3[namespaceRestartSentinel], segments, ranges)
 	}); err != nil {
 		return restartCaseResult{}, err

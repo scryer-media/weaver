@@ -839,7 +839,13 @@ async fn download_phase_rate_matches_the_global_speed_gauge() {
     insert_active_job(
         &mut pipeline,
         job_id,
-        standalone_job_spec("Wire Rate", &[("payload.bin".to_string(), 1_024)]),
+        standalone_job_spec(
+            "Wire Rate",
+            &[
+                ("payload-0.bin".to_string(), 512),
+                ("payload-1.bin".to_string(), 512),
+            ],
+        ),
     )
     .await;
     pipeline.active_downloads_by_job.insert(job_id, 1);
@@ -862,6 +868,11 @@ async fn download_phase_rate_matches_the_global_speed_gauge() {
 
     // Accepted payload advances progress without inventing wire traffic.
     pipeline.jobs.get_mut(&job_id).unwrap().downloaded_bytes = 512;
+    pipeline
+        .graph_jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .arrived_before(|volume, _| volume != weaver_graph::VolumeIndex(0));
     pipeline.report_job(job_id);
     counters.decoded.store(512, Ordering::Relaxed);
     pipeline.shared_state.queue.sample_counters(
@@ -1350,6 +1361,16 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
         .await
         .unwrap();
     pipeline.apply_queue_intents().await;
+    assert_eq!(
+        pipeline.shared_state.download_block().speed_limit_in_force,
+        512 * 1024
+    );
+    assert!(
+        !pipeline
+            .shared_state
+            .download_block()
+            .speed_limit_by_schedule
+    );
 
     pipeline.report_all_for_test();
     SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
@@ -1379,6 +1400,16 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
             pipeline.shared_state.download_block().scheduled_speed_limit,
             128 * 1024
         );
+        assert_eq!(
+            pipeline.shared_state.download_block().speed_limit_in_force,
+            128 * 1024
+        );
+        assert!(
+            pipeline
+                .shared_state
+                .download_block()
+                .speed_limit_by_schedule
+        );
     }
 
     pipeline.report_all_for_test();
@@ -1407,6 +1438,18 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
     assert_eq!(pipeline.scheduled_rate_limit, Some(0));
     assert_eq!(pipeline.rate_limiter.rate(), 0);
     assert!(pipeline.global_paused);
+    // The published limit in force says so too, not the configured one.
+    assert_eq!(
+        pipeline.shared_state.download_block().speed_limit_in_force,
+        0
+    );
+    // An unlimited window is still the schedule's limit.
+    assert!(
+        pipeline
+            .shared_state
+            .download_block()
+            .speed_limit_by_schedule
+    );
 }
 
 #[tokio::test]

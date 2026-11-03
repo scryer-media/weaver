@@ -20,6 +20,8 @@ const FACADE_QUEUE_ITEM_FIELDS = `
     downloadedBytes
     optionalRecoveryBytes
     optionalRecoveryDownloadedBytes
+    remainingBytes
+    wantedBytes
     phaseProgress {
       phase
       completedBytes
@@ -55,6 +57,8 @@ const QUEUE_TABLE_ITEM_FIELDS = `
     downloadedBytes
     optionalRecoveryBytes
     optionalRecoveryDownloadedBytes
+    remainingBytes
+    wantedBytes
     phaseProgress {
       phase
       completedBytes
@@ -482,6 +486,8 @@ const DOWNLOAD_BLOCK_FIELDS = `
     windowEndsAtEpochMs
     timezoneName
     scheduledSpeedLimit
+    speedLimitInForce
+    speedLimitBySchedule
     scheduleHoldReason
   }
 `;
@@ -1251,7 +1257,7 @@ export const HISTORY_FACADE_EVENTS_SUBSCRIPTION = gql`
 export const SERVICE_LOGS_QUERY = gql`
   query ServiceLogs($limit: Int) {
     serviceLogs(limit: $limit) {
-      lines
+      records
       count
     }
   }

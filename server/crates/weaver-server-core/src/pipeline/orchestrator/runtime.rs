@@ -270,12 +270,18 @@ impl Pipeline {
             queue_walk_due: false,
             restores_waiting: false,
             restore_pass: None,
+            window_parked: HashMap::new(),
+            window_parked_articles: 0,
+            window_stored: HashMap::new(),
+            window_due: HashSet::new(),
+            window_unreadable: HashSet::new(),
             dispatch_hold_watch: Vec::new(),
             queue_positions: None,
             queue_positions_lost: Arc::default(),
             semantic_terminal_causes: HashMap::new(),
             pipeline_failure_stages: HashMap::new(),
             job_order: Vec::new(),
+            stored_queue_order: Vec::new(),
             active_downloads: 0,
             active_download_connections: 0,
             active_completion_critical_connections: 0,
@@ -385,6 +391,7 @@ impl Pipeline {
             reconcile_signatures: HashMap::new(),
             download_restart_durable_lead_retry_after: HashMap::new(),
             checkpoint_progress_articles: HashMap::new(),
+            released_remaining: HashMap::new(),
             download_lane_owners: HashMap::new(),
             #[cfg(test)]
             audit_lane_holdings: false,
@@ -594,6 +601,60 @@ impl Pipeline {
         ) as u32
     }
 
+    // The recovery volumes' size and what of them came: the graph's articles
+    // in hand for a graph job, the assembly's otherwise. The one figure the
+    // live report and the history row both read.
+    pub(crate) fn optional_recovery_bytes(&self, state: &JobState) -> (u64, u64) {
+        let (total, assembled) = state.optional_recovery_bytes();
+        let Some(graph) = self.graph_jobs.get(&state.job_id) else {
+            return (total, assembled);
+        };
+        let arrived: u64 = (0u32..)
+            .zip(&state.spec.files)
+            .filter(|(_, file)| file.role.is_recovery())
+            .map(|(index, _)| graph.arrived_bytes(index))
+            .sum();
+        (total, arrived.min(total))
+    }
+
+    // The job's bytes still to come and the bytes it is out to bring, both
+    // as the post declares them: what its graph root waits on, the recovery
+    // it parked left out. A paused job holds no root and says what its root
+    // last said; a job that never ran says what a run starts out to bring.
+    pub(crate) fn remaining_figures(&self, state: &JobState) -> (u64, u64) {
+        if let Some(graph) = self.graph_jobs.get(&state.job_id) {
+            return Self::graph_remaining(graph, &state.spec);
+        }
+        if let Some(figures) = self.released_remaining.get(&state.job_id) {
+            return *figures;
+        }
+        state.unstarted_remaining()
+    }
+
+    // What the root says, less each file named as recovery that the root
+    // has not yet decided on: from the start until its first article is
+    // read, it counts as held back, as it did before the job ran, so the
+    // figures do not rise by the recovery and fall again a moment later.
+    pub(crate) fn graph_remaining(
+        graph: &crate::pipeline::graph::job::GraphJob,
+        spec: &crate::jobs::model::JobSpec,
+    ) -> (u64, u64) {
+        let (held_remaining, held_wanted) = (0u32..)
+            .zip(&spec.files)
+            .filter(|(_, file)| file.role.is_recovery())
+            .filter_map(|(index, _)| graph.undecided_recovery(index))
+            .fold((0u64, 0u64), |(remaining, wanted), (left, posted)| {
+                (remaining + left, wanted + posted)
+            });
+        let wanted = graph.wanted_bytes().saturating_sub(held_wanted);
+        let remaining: u64 = graph
+            .remaining_bytes()
+            .iter()
+            .sum::<u64>()
+            .saturating_sub(held_remaining);
+        (remaining.min(wanted), wanted)
+    }
+
     pub(crate) fn effective_downloaded_bytes(state: &JobState) -> u64 {
         state
             .downloaded_bytes
@@ -617,6 +678,7 @@ impl Pipeline {
         self.download_restart_durable_lead_retry_after
             .remove(&job_id);
         self.checkpoint_progress_articles.remove(&job_id);
+        self.released_remaining.remove(&job_id);
         self.propagation_ready_at.remove(&job_id);
     }
 
@@ -1114,8 +1176,16 @@ impl Pipeline {
                             Ok(()) = self.script_effects_rx.changed() => {
                                 turn_timer.resume();
                                 for job_id in self.db.take_script_effects() {
-                                    self.apply_queue_script_effects(JobId(job_id));
-                                    self.report_job(JobId(job_id));
+                                    let job_id = JobId(job_id);
+                                    // A job out of the queue window is called
+                                    // in, and its install applies them.
+                                    if self.window_parked(job_id) {
+                                        self.window_due.insert(job_id);
+                                        self.queue_walk_due = true;
+                                        continue;
+                                    }
+                                    self.apply_queue_script_effects(job_id);
+                                    self.report_job(job_id);
                                 }
                             }
                             Some(event) = self.terminal_post_processing_done_rx.recv() => {

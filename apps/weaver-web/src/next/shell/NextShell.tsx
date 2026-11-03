@@ -461,10 +461,11 @@ const UpdateBlock = memo(function UpdateBlock({
  */
 const ThroughputBlock = memo(function ThroughputBlock() {
   const t = useTranslate();
-  const { speed, peakSpeed } = useNextData("speed", "peakSpeed");
+  const { speed, peakSpeed, isPaused } = useNextData("speed", "peakSpeed", "isPaused");
   const { inForce, bySchedule } = useSpeedLimitInForce();
   const { openDialog, dialog } = useSpeedLimitDialog();
-  const now = splitSpeed(speed);
+  // Held, nothing moves: 0 at once, not once the daemon's rate window drains.
+  const now = splitSpeed(isPaused ? 0 : speed);
   const peak = splitSpeed(peakSpeed);
   const limit = splitSpeed(inForce);
   const title = bySchedule ? t("next.speedLimit.bySchedule") : t("next.speedLimit.buttonTitle");

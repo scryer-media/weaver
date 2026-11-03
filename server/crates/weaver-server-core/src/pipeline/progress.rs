@@ -7,6 +7,9 @@ use super::*;
 pub(crate) struct JobPhaseRuntime {
     pub(super) counters: Arc<PhaseCounters>,
     pub(super) started_at_epoch_ms: f64,
+    // Whether the open phase holds the pipeline live, so the periodic
+    // drivers keep sampling its bytes.
+    pub(super) holds_live: bool,
 }
 
 // The metric stage label for a user-visible job phase. Verification and
@@ -29,6 +32,23 @@ impl Pipeline {
         phase: JobPhase,
         initial_total: Option<u64>,
     ) -> Arc<PhaseCounters> {
+        self.open_phase(job_id, phase, initial_total, phase != JobPhase::Downloading)
+    }
+
+    // A phase with no bytes to sample, such as the graph's repair or
+    // extraction: its row and stage clock open, but nothing in it moves for
+    // the drivers to sample, so it does not hold the pipeline live.
+    pub(crate) fn phase_begin_unsampled(&mut self, job_id: JobId, phase: JobPhase) {
+        self.open_phase(job_id, phase, None, false);
+    }
+
+    fn open_phase(
+        &mut self,
+        job_id: JobId,
+        phase: JobPhase,
+        initial_total: Option<u64>,
+        holds_live: bool,
+    ) -> Arc<PhaseCounters> {
         let key = (job_id, phase);
         if let Some(runtime) = self.phase_progress.get(&key) {
             return Arc::clone(&runtime.counters);
@@ -41,6 +61,7 @@ impl Pipeline {
         let runtime = JobPhaseRuntime {
             counters: Arc::clone(&counters),
             started_at_epoch_ms: crate::jobs::epoch_ms_now(),
+            holds_live,
         };
         self.shared_state.queue.begin_phase(
             job_id,
@@ -49,7 +70,7 @@ impl Pipeline {
             runtime.started_at_epoch_ms,
         );
         self.phase_progress.insert(key, runtime);
-        if phase != JobPhase::Downloading {
+        if holds_live {
             self.post_download_phases += 1;
         }
         // Stage timing rides the phase lifecycle, which is per job per phase —
@@ -63,8 +84,8 @@ impl Pipeline {
     pub(crate) fn phase_end(&mut self, job_id: JobId, phase: JobPhase) {
         self.shared_state.queue.end_phase(job_id, phase);
         self.note_stage_finished(job_id, stage_kind_for_phase(phase));
-        let removed = self.phase_progress.remove(&(job_id, phase)).is_some();
-        if removed && phase != JobPhase::Downloading {
+        let removed = self.phase_progress.remove(&(job_id, phase));
+        if removed.is_some_and(|runtime| runtime.holds_live) {
             self.post_download_phases = self.post_download_phases.saturating_sub(1);
         }
     }
@@ -155,12 +176,12 @@ impl Pipeline {
 
     pub(crate) fn clear_job_phase_progress_runtime(&mut self, job_id: JobId) {
         let mut removed_post_download = 0;
-        self.phase_progress.retain(|(jid, phase), _| {
+        self.phase_progress.retain(|(jid, phase), runtime| {
             let keep = *jid != job_id;
             if !keep {
                 self.shared_state.queue.end_phase(job_id, *phase);
             }
-            if !keep && *phase != JobPhase::Downloading {
+            if !keep && runtime.holds_live {
                 removed_post_download += 1;
             }
             keep

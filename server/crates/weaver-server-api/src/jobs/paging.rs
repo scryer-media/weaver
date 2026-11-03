@@ -56,6 +56,10 @@ pub(crate) struct WalkedRow {
     category: Option<u32>,
     total_bytes: u64,
     downloaded_bytes: u64,
+    // The declared bytes still to come and the declared bytes the job is
+    // out to bring, as its report says them.
+    remaining: u64,
+    wanted: u64,
     progress: f64,
     rate: u64,
     propagating: bool,
@@ -100,8 +104,10 @@ impl WalkedRow {
         self.download_rank() == 1 || self.rate > 0
     }
 
+    // The recovery a job holds back until a loss asks for it is not still
+    // to come, so a clean post's download ends at zero.
     fn remaining_bytes(&self) -> u64 {
-        self.total_bytes.saturating_sub(self.downloaded_bytes)
+        self.remaining
     }
 
     // Counted in the queue's bytes still to fetch: whatever waits for or
@@ -189,6 +195,8 @@ impl QueueWalk {
                 category,
                 total_bytes: job.total_bytes,
                 downloaded_bytes: job.downloaded_bytes,
+                remaining: job.remaining_bytes.min(job.wanted_bytes),
+                wanted: job.wanted_bytes,
                 progress: job_progress(job),
                 rate: view
                     .phase_progress()
@@ -558,8 +566,10 @@ impl EtaTotals {
             if !row.counts_toward_eta() {
                 continue;
             }
-            total_bytes += row.total_bytes;
-            downloaded_bytes += row.downloaded_bytes;
+            // Both in the declared bytes the remaining counts, so the bytes
+            // the time-left speed samples move as the remaining falls.
+            total_bytes += row.wanted;
+            downloaded_bytes += row.wanted - row.remaining;
             if row.leads() {
                 if !page.is_empty() {
                     leads.push(index);
@@ -844,6 +854,9 @@ mod tests {
             total_files: 1,
             completed_files: 0,
             file_remaining_bytes: Vec::new(),
+            file_parked_bytes: Vec::new(),
+            remaining_bytes: total_bytes,
+            wanted_bytes: total_bytes,
             remaining_par_files: 0,
             password: None,
             category: category.map(str::to_string),
@@ -1241,5 +1254,32 @@ mod tests {
         assert_eq!(cache.reads(), 1);
         cache.attach(db.clone(), 8, &mut page).await.unwrap();
         assert_eq!(cache.reads(), 2, "a new revision reads again");
+    }
+
+    #[test]
+    fn time_left_counts_what_each_job_still_has_to_come() {
+        // The download has every wanted article; only recovery held back
+        // until a loss asks for it is undone. The queued job has some of its
+        // files left. Time left counts only what is still to come.
+        let mut downloading = job(1, JobStatus::Downloading, None, 1_000);
+        downloading.downloaded_bytes = 870;
+        downloading.wanted_bytes = 900;
+        downloading.remaining_bytes = 0;
+        let mut queued = job(2, JobStatus::Queued, None, 500);
+        queued.wanted_bytes = 400;
+        queued.remaining_bytes = 150;
+        let state = SharedPipelineState::new(PipelineMetrics::new(), vec![downloading, queued]);
+        let walk = QueueWalk::read(&state, WalkNeeds::default());
+        let plan = PagePlan::plan(&walk, &page_input(0, 10), ROWS);
+
+        assert_eq!(plan.remaining_bytes, 150);
+        assert_eq!(plan.eta_total_bytes, 1_300);
+        assert_eq!(plan.eta_downloaded_bytes, 1_150);
+        let through: Vec<(u64, u64)> = plan
+            .eta_through
+            .iter()
+            .map(|eta| (eta.id, eta.bytes_through))
+            .collect();
+        assert_eq!(through, vec![(1, 0), (2, 150)]);
     }
 }

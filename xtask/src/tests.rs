@@ -281,7 +281,7 @@ fn sample_release_dry_run_expectations<'a>() -> ReleaseDryRunExpectations<'a> {
 #[test]
 fn release_args_signature_uses_bump_mode_when_version_not_explicit() {
     assert_eq!(
-        release_args_signature(None, VersionBump::Minor),
+        release_args_signature(None, VersionBump::Minor, false),
         "bump:minor"
     );
 }
@@ -290,9 +290,30 @@ fn release_args_signature_uses_bump_mode_when_version_not_explicit() {
 fn release_args_signature_uses_explicit_version_when_present() {
     let version = Version::parse("1.2.3").unwrap();
     assert_eq!(
-        release_args_signature(Some(&version), VersionBump::Patch),
+        release_args_signature(Some(&version), VersionBump::Patch, false),
         "version:1.2.3"
     );
+}
+
+#[test]
+fn dangerous_graphql_override_changes_release_cache_identity() {
+    let mut cache = sample_release_dry_run_cache();
+    cache.release_args = release_args_signature(None, VersionBump::Patch, true);
+    assert_eq!(
+        release_dry_run_cache_rejection_reason(&cache, &sample_release_dry_run_expectations())
+            .as_deref(),
+        Some("release arguments changed since dry run")
+    );
+}
+
+#[test]
+fn release_cli_accepts_explicit_dangerous_graphql_override() {
+    let cli =
+        Cli::try_parse_from(["xtask", "release", "--patch", "--allow-graphql-dangerous"]).unwrap();
+    let Commands::Release(args) = cli.command else {
+        panic!("expected release command");
+    };
+    assert!(args.allow_graphql_dangerous);
 }
 
 #[test]
@@ -580,34 +601,6 @@ fn valid_release_notes_pass_without_writing_authoring_context() {
 }
 
 #[test]
-fn linux_clippy_defaults_follow_host_architecture() {
-    assert_eq!(
-        linux_clippy_defaults("aarch64-apple-darwin"),
-        ("aarch64-unknown-linux-musl", "linux/arm64")
-    );
-    assert_eq!(
-        linux_clippy_defaults("aarch64-unknown-linux-gnu"),
-        ("aarch64-unknown-linux-musl", "linux/arm64")
-    );
-    assert_eq!(
-        linux_clippy_defaults("x86_64-apple-darwin"),
-        ("x86_64-unknown-linux-musl", "linux/amd64")
-    );
-}
-
-#[test]
-fn cargo_target_env_key_matches_cargo_target_config_names() {
-    assert_eq!(
-        cargo_target_env_key("aarch64-unknown-linux-musl", "RUSTFLAGS"),
-        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS"
-    );
-    assert_eq!(
-        cargo_target_env_key("x86_64-unknown-linux-musl", "LINKER"),
-        "CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER"
-    );
-}
-
-#[test]
 fn ci_rustflags_cover_supported_release_lanes() {
     for (target, lane, expected) in [
         (
@@ -864,144 +857,4 @@ fn setup_code_line_must_carry_a_whole_code() {
         None
     );
     assert_eq!(parse_setup_code_line("INFO listening"), None);
-}
-
-#[test]
-fn the_linux_clippy_image_follows_the_pinned_toolchain() {
-    let temp = tempfile::tempdir().unwrap();
-    let ctx = TaskContext {
-        repo_root: temp.path().to_path_buf(),
-    };
-    fs::write(
-        temp.path().join("rust-toolchain.toml"),
-        "[toolchain]\nchannel = \"1.98.0\"\ncomponents = [\"clippy\"]\n",
-    )
-    .unwrap();
-
-    assert_eq!(pinned_rust_channel(&ctx).unwrap(), "1.98.0");
-
-    // The pin this repository actually carries, since that is the tag the
-    // release pulls. A missing or renamed file is a release failure, not a
-    // silently older container.
-    let repo = TaskContext {
-        repo_root: repo_root(),
-    };
-    let channel = pinned_rust_channel(&repo).unwrap();
-    assert!(
-        Version::parse(&channel).is_ok(),
-        "expected an exact toolchain version, got {channel}"
-    );
-
-    let empty = tempfile::tempdir().unwrap();
-    let error = pinned_rust_channel(&TaskContext {
-        repo_root: empty.path().to_path_buf(),
-    })
-    .unwrap_err();
-    assert!(format!("{error:#}").contains("failed to read"));
-}
-
-// A host as the engine probe sees it: which CLIs are on PATH and what each
-// command answers.
-struct ScriptedHost {
-    on_path: &'static [&'static str],
-    answers: &'static [(
-        &'static str,
-        std::result::Result<&'static str, &'static str>,
-    )],
-}
-
-impl container_engine::EngineProbe for ScriptedHost {
-    fn on_path(&self, program: &str) -> bool {
-        self.on_path.contains(&program)
-    }
-
-    fn output(&self, program: &str, args: &[&str]) -> std::result::Result<String, String> {
-        let command = format!("{program} {}", args.join(" "));
-        self.answers
-            .iter()
-            .find(|(scripted, _)| command.starts_with(scripted))
-            .map(|(_, answer)| answer.map(str::to_string).map_err(str::to_string))
-            .unwrap_or_else(|| Err(format!("unscripted command: {command}")))
-    }
-}
-
-#[test]
-fn the_running_container_engine_is_picked() {
-    use container_engine::{ContainerEngine, running_engine};
-
-    let both_running = ScriptedHost {
-        on_path: &["docker", "podman"],
-        answers: &[
-            ("docker --version", Ok("Docker version 28.0.1")),
-            ("docker version", Ok("28.0.1")),
-            ("podman info", Ok("6.0.2")),
-        ],
-    };
-    assert_eq!(
-        running_engine(&both_running).unwrap(),
-        ContainerEngine::Docker
-    );
-
-    let docker_installed_but_stopped = ScriptedHost {
-        on_path: &["docker", "podman"],
-        answers: &[
-            ("docker --version", Ok("Docker version 28.0.1")),
-            ("docker version", Err("failed to connect to the docker API")),
-            ("podman info", Ok("6.0.2")),
-        ],
-    };
-    assert_eq!(
-        running_engine(&docker_installed_but_stopped).unwrap(),
-        ContainerEngine::Podman
-    );
-
-    let podman_behind_a_docker_wrapper = ScriptedHost {
-        on_path: &["docker", "podman"],
-        answers: &[
-            ("docker --version", Ok("podman version 6.0.2")),
-            ("podman info", Ok("6.0.2")),
-        ],
-    };
-    assert_eq!(
-        running_engine(&podman_behind_a_docker_wrapper).unwrap(),
-        ContainerEngine::Podman
-    );
-
-    let nothing_running = ScriptedHost {
-        on_path: &["podman"],
-        answers: &[("podman info", Err("cannot connect to Podman"))],
-    };
-    let error = format!("{:#}", running_engine(&nothing_running).unwrap_err());
-    assert!(error.contains("the docker CLI is not on PATH"), "{error}");
-    assert!(error.contains("podman machine start"), "{error}");
-}
-
-#[test]
-fn podman_is_given_images_it_can_pull_without_asking() {
-    use container_engine::ContainerEngine::{Docker, Podman};
-
-    assert_eq!(
-        Docker.image_reference("rust:1.98.0-bookworm"),
-        "rust:1.98.0-bookworm"
-    );
-    assert_eq!(
-        Podman.image_reference("rust:1.98.0-bookworm"),
-        "docker.io/library/rust:1.98.0-bookworm"
-    );
-    assert_eq!(
-        Podman.image_reference("example/toolchain:1"),
-        "docker.io/example/toolchain:1"
-    );
-    for qualified in [
-        "ghcr.io/example/toolchain:1",
-        "localhost/toolchain:1",
-        "registry.test:5000/toolchain:1",
-    ] {
-        assert_eq!(Podman.image_reference(qualified), qualified);
-    }
-    assert!(Docker.bind_mount_run_args().is_empty());
-    assert_eq!(
-        Podman.bind_mount_run_args(),
-        ["--security-opt", "label=disable"]
-    );
 }

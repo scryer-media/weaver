@@ -20,6 +20,7 @@ mod orchestrator;
 mod post_health;
 mod progress;
 pub mod queue;
+mod queue_window;
 mod server_attribution;
 mod support_facts;
 #[cfg(any(test, feature = "test-support"))]
@@ -1308,6 +1309,18 @@ pub struct Pipeline {
     // When a restart's installs began, and how many have gone in since: the
     // pass is logged once, when the last restore is in.
     pub(crate) restore_pass: Option<(Instant, usize)>,
+    // The queue window (`queue_window`): the jobs out of it, each with the
+    // articles it still counts toward the queue's depth, and their sum.
+    pub(crate) window_parked: HashMap<JobId, u64>,
+    pub(crate) window_parked_articles: u64,
+    // The runtime columns an installed job's active row is known to hold,
+    // so leaving the window writes only what changed.
+    pub(crate) window_stored: HashMap<JobId, completion::finalize::ActiveRuntimeValues>,
+    // Jobs out of the window that a script's directives call back in.
+    pub(crate) window_due: HashSet<JobId>,
+    // Jobs out of the window whose rows could not be read back; a restart
+    // reads them again.
+    pub(crate) window_unreadable: HashSet<JobId>,
     // Each row's stored queue position as last written, loaded from the
     // database on the first order change.
     pub(crate) queue_positions: Option<HashMap<JobId, i64>>,
@@ -1326,6 +1339,9 @@ pub struct Pipeline {
         HashMap<JobId, crate::post_processing::model::PipelineFailureStage>,
     // Job dispatch order (FIFO by submission). First Downloading job is active.
     pub(super) job_order: Vec<JobId>,
+    // The whole queue's order, installed jobs and parked ones alike, as it
+    // was last stored: a reorder among parked jobs is stored too.
+    pub(super) stored_queue_order: Vec<JobId>,
     // Number of in-flight article downloads (primary + recovery).
     pub(super) active_downloads: usize,
     // Number of NNTP connection tasks currently fetching articles.
@@ -1556,6 +1572,10 @@ pub struct Pipeline {
     pub(super) download_restart_durable_lead_retry_after: HashMap<JobId, Instant>,
     // The one over-limit article reserved until its result is processed or returned.
     pub(super) checkpoint_progress_articles: HashMap<JobId, (u64, SegmentId)>,
+    // The bytes still to come and the bytes wanted of each paused job, as its
+    // graph root last said them before its articles were released, so a
+    // paused job reports the figures it stopped at.
+    pub(super) released_remaining: HashMap<JobId, (u64, u64)>,
     pub(super) download_lane_owners: HashMap<u64, DownloadLaneOwner>,
     // Set by the download-dispatch test fixtures: every dispatch pass and
     // every lane result batch then checks that the in-flight gauges are what

@@ -559,7 +559,13 @@ impl Leaf {
         };
         let path = dir.join(relative_path(&wants));
         let had_file = self.file.take().is_some() || self.path.exists();
-        if had_file && path != self.path {
+        if had_file && path != self.path && self.directory {
+            // A directory is shared and holds no bytes of its own: it is
+            // made where it is wanted, whoever else already made it, and
+            // the empty one it waited in goes.
+            std::fs::create_dir_all(&path).map_err(LeafError::io(&path))?;
+            remove_directory(&self.path)?;
+        } else if had_file && path != self.path {
             create_parent(&path)?;
             crate::runtime::fs::rename_path_exclusive(&self.path, &path)
                 .map_err(LeafError::io(&self.path))?;
@@ -569,9 +575,13 @@ impl Leaf {
         Ok(Some(std::mem::replace(&mut self.name, wants)))
     }
 
-    // The member is gone with its subtree.
+    // The member is gone with its subtree. A directory goes only once
+    // nothing is left in it.
     pub(crate) fn remove(mut self) -> Result<(), LeafError> {
         self.file = None;
+        if self.directory {
+            return remove_directory(&self.path);
+        }
         match std::fs::remove_file(&self.path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(LeafError::Io {
                 path: self.path,
@@ -626,6 +636,25 @@ fn relative_path(output_name: &str) -> PathBuf {
         }
     }
     safe
+}
+
+// Remove the directory at `path` unless something is still in it: a
+// directory is shared, and what another member wrote into it stays.
+fn remove_directory(path: &Path) -> Result<(), LeafError> {
+    match std::fs::remove_dir(path) {
+        Err(error)
+            if !matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Err(LeafError::Io {
+                path: path.to_path_buf(),
+                source: error,
+            })
+        }
+        _ => Ok(()),
+    }
 }
 
 fn create_parent(path: &Path) -> Result<(), LeafError> {

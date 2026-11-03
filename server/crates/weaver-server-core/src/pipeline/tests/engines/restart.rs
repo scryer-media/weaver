@@ -156,7 +156,16 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
                     }
                     inspect(rows);
                 };
+                let figures = |pipeline: &Pipeline| {
+                    pipeline
+                        .job_report(JOB)
+                        .map(|report| (report.remaining_bytes, report.wanted_bytes))
+                };
+                let before = figures(&pipeline);
                 pipeline = restart(&temp_dir, pipeline, scenario, &mut owed, &mut going_down).await;
+                if let (Some(before), Some(after)) = (before, figures(&pipeline)) {
+                    graph.restored_remaining.push((before, after));
+                }
                 in_memory.extend(owed.iter().copied());
                 restarts += 1;
             }

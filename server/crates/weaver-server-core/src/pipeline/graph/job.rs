@@ -34,7 +34,7 @@ use super::namespace::{Coming, NamespaceWriter, SetState, WriteError};
 use super::root::intake::Decoded;
 use super::root::phase::{self, Activity, RootPhase};
 use super::root::sample;
-use super::root::source::{Class, Move};
+use super::root::source::{Class, Inconsistent, Move};
 use super::root::{ArticleRoot, Ask};
 use super::status::RepairSlots;
 use crate::operations::disk::CapacityReader;
@@ -44,6 +44,10 @@ use crate::pipeline::ExtractionError;
 pub(crate) enum GraphError {
     #[error("the namespace write path failed")]
     Write(#[from] WriteError),
+    // The job's own record contradicts itself: it fails, and every other
+    // job runs on.
+    #[error("the graph job's record is inconsistent")]
+    Inconsistent(#[from] Inconsistent),
 }
 
 impl GraphError {
@@ -51,7 +55,12 @@ impl GraphError {
     // extractors class theirs, a refusal as the refusal, anything else
     // terminal.
     pub(crate) fn to_extraction(&self) -> ExtractionError {
-        let Self::Write(write) = self;
+        let write = match self {
+            Self::Write(write) => write,
+            Self::Inconsistent(inconsistent) => {
+                return ExtractionError::terminal(format!("{self}: {inconsistent}"));
+            }
+        };
         let message = format!("{self}: {write}");
         match write {
             WriteError::Leaf(LeafError::Io { source, .. }) => {
@@ -118,6 +127,8 @@ pub(crate) enum Note {
     Landed(VolumeIndex),
     // A set's repair came back and was applied, rebuilding these slices.
     Repaired(u64),
+    // An archive was given up on as an archive for this member.
+    GivenBack(super::namespace::GivenBack),
 }
 
 // A root member as the post lists it.
@@ -210,7 +221,14 @@ impl GraphJob {
 
     // What the job did since this was last asked.
     pub(crate) fn take_notes(&mut self) -> Vec<Note> {
-        std::mem::take(&mut self.notes)
+        let mut notes = std::mem::take(&mut self.notes);
+        notes.extend(
+            self.writer
+                .take_given_back()
+                .into_iter()
+                .map(Note::GivenBack),
+        );
+        notes
     }
 
     // The phase the job last reported, if it reported one.
@@ -349,6 +367,17 @@ impl GraphJob {
         &self.writer
     }
 
+    // The job paused or resumed: its extraction deadline does not run
+    // while it is paused.
+    pub(crate) fn hold_clock(&mut self, paused: bool) {
+        self.writer.hold_clock(paused);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clock_held(&self) -> bool {
+        self.writer.clock_held()
+    }
+
     pub(crate) fn pending(&self) -> &Pending {
         &self.pending
     }
@@ -385,16 +414,60 @@ impl GraphJob {
         self.root.checksums_held(VolumeIndex(member.0))
     }
 
-    // Seam for status: each posted file's encoded bytes not yet downloaded,
-    // in the post's file order.
+    // Seam for status: each posted file's encoded bytes still to come, in
+    // the post's file order. A parked article is not still to come: it is
+    // fetched only once something asks for it.
     pub(crate) fn remaining_bytes(&self) -> Vec<u64> {
         self.root.map.remaining()
+    }
+
+    // Seam for status: each posted file's encoded bytes not yet in hand nor
+    // lost for good, parked or not, in the post's file order.
+    pub(crate) fn waiting_bytes(&self) -> Vec<u64> {
+        self.root.map.waiting()
+    }
+
+    // Seam for status: each posted file's encoded bytes held back until
+    // something asks for them, in the post's file order.
+    pub(crate) fn parked_bytes(&self) -> Vec<u64> {
+        self.root.map.parked()
+    }
+
+    // Seam for status: the encoded bytes the download is out to bring, as
+    // the post declares them: every article but those parked until
+    // something asks for them.
+    pub(crate) fn wanted_bytes(&self) -> u64 {
+        self.root.map.wanted_bytes()
+    }
+
+    // Seam for status: the bytes still to come and out to bring of the
+    // posted recovery file at `file_index` that nothing has decided on yet.
+    // One whose first bytes do not open a PAR2 or PAR3 volume is data, said
+    // by its first article.
+    pub(crate) fn undecided_recovery(&self, file_index: u32) -> Option<(u64, u64)> {
+        let front = self.namespace().first_bytes(MemberId(file_index));
+        if !weaver_graph::sniff::may_open_par(front) {
+            return None;
+        }
+        self.root.map.undecided(VolumeIndex(file_index))
+    }
+
+    // Seam for status: the posted file at `file_index` has an article
+    // neither in hand nor lost for good, parked or not.
+    pub(crate) fn file_waiting(&self, file_index: u32) -> bool {
+        self.root.map.volume_waiting(VolumeIndex(file_index))
     }
 
     // Seam for status: how many posted files the download has brought
     // whole, every article in hand.
     pub(crate) fn whole_file_count(&self) -> usize {
         self.root.map.whole_count()
+    }
+
+    // Seam for status: the encoded bytes in hand of the posted file at
+    // `file_index`, as the post declares them.
+    pub(crate) fn arrived_bytes(&self, file_index: u32) -> u64 {
+        self.root.map.arrived_bytes(VolumeIndex(file_index))
     }
 
     // Seam for status: the job is fetching repair data. Its payload is in,
@@ -609,7 +682,7 @@ impl GraphJob {
     ) -> Result<bool, GraphError> {
         let volume = decoded.volume;
         let member = MemberId(volume.0);
-        let length = decoded.length;
+        let length = self.root.accepted_length(&decoded);
         let Some(arrival) = self.root.receive(decoded) else {
             return Ok(false);
         };

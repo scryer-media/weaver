@@ -122,7 +122,14 @@ impl Pipeline {
                 if counts { bytes } else { 0 },
             );
         }
+        // A job restored mid-phase takes up that phase's stage clock again.
+        let reported = graph.reported_phase();
+        self.released_remaining.remove(&job_id);
         self.graph_jobs.insert(job_id, graph);
+        if let Some(phase) = reported {
+            self.time_graph_stage(job_id, phase);
+        }
+        self.hold_extraction_clock(job_id);
         self.adopt_held_parts(held_parts);
         let result = self.start_graph_runs(job_id);
         self.after_graph_result(job_id, result);

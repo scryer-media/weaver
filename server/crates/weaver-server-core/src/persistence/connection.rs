@@ -1654,6 +1654,24 @@ impl Database {
         self.try_send_with_retry(command, label)
     }
 
+    // A marker at the end of the job's lane: it answers once every write
+    // queued for the job before it has run, each to its commit, as writes
+    // on one lane run in order. Queue the markers of several jobs before
+    // awaiting any, and their lanes are passed once.
+    pub(crate) fn queue_job_writes_marker(
+        &self,
+        job_id: crate::jobs::ids::JobId,
+    ) -> Result<oneshot::Receiver<()>, StateError> {
+        let (reached, rx) = oneshot::channel();
+        self.try_queue_job_write(job_id, "job_writes_committed", move |_| {
+            let _ = reached.send(());
+            Ok(())
+        })?;
+        #[cfg(test)]
+        JOB_WRITE_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(rx)
+    }
+
     pub(crate) fn try_queue_graph_checkpoint(
         &self,
         job_id: crate::jobs::ids::JobId,
@@ -2157,6 +2175,11 @@ fn close_line(overflow: &Mutex<Option<VecDeque<QueuedWrite>>>, context: &'static
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
+
+// Each wait for a job's queued writes, counted for the tests.
+#[cfg(test)]
+pub(crate) static JOB_WRITE_WAITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(test)]
 mod tests;

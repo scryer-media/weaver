@@ -444,6 +444,61 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
     assert!(!dir.path().join("stray").exists());
 }
 
+// A directory member the checkpoint names stays, but what is in it is the
+// job's only as far as the checkpoint names it: a file a committed
+// checkpoint took back from it, or one written after the last that
+// committed, goes like any other.
+#[test]
+fn a_restore_sweeps_inside_a_directory_its_checkpoint_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut taken = full();
+    taken.tree.nodes[1].members[0].output_name = "folder/".to_owned();
+    std::fs::create_dir_all(dir.path().join("folder/deeper")).unwrap();
+    std::fs::write(dir.path().join("folder/obsolete.txt"), b"bytes").unwrap();
+    std::fs::write(dir.path().join("folder/deeper/late.bin"), b"bytes").unwrap();
+    let rows = rows(&taken);
+    let restored = snapshot(&rows).unwrap();
+    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts);
+    assert!(dir.path().join("folder").is_dir());
+    assert!(!dir.path().join("folder/obsolete.txt").exists());
+    assert!(!dir.path().join("folder/deeper").exists());
+}
+
+// One archive names the directory "Folder/" and the file "folder/b.bin"
+// in it (a Windows-made archive whose entries disagree in case). On a
+// case-insensitive disk the file is written into the one directory, which
+// sits on disk as "Folder". The checkpoint names both; a restore must keep
+// the file. Only meaningful where the disk folds case.
+#[test]
+fn a_restore_keeps_a_named_file_whose_directory_differs_in_case() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("Folder")).unwrap();
+    std::fs::write(dir.path().join("Folder/b.bin"), b"bytes").unwrap();
+    if !dir.path().join("folder/b.bin").exists() {
+        // A case-sensitive disk keeps two paths; nothing to test.
+        return;
+    }
+    let mut taken = full();
+    taken.tree.nodes[1].members[0].output_name = "Folder/".to_owned();
+    taken.tree.nodes[1].members.push(member(1, "folder/b.bin"));
+    taken.files.insert(
+        (NodeId(1), MemberId(1)),
+        FileState {
+            has_file: true,
+            on_disk: None,
+            refused: None,
+        },
+    );
+    let rows = rows(&taken);
+    let restored = snapshot(&rows).unwrap();
+    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts);
+    assert!(dir.path().join("Folder").is_dir());
+    assert!(
+        dir.path().join("Folder/b.bin").exists(),
+        "the restore removed a file its checkpoint names"
+    );
+}
+
 // A member's file the checkpoint says waits to move, gone from where it sat
 // and found at the name it wants, moved before the checkpoint that would
 // have said so: the restore keeps it there, opens it there, and the name it

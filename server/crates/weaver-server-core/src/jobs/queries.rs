@@ -176,6 +176,13 @@ impl Database {
             .remove(&job_id))
     }
 
+    // One active job's row alone, as `load_active_job_rows` reads each.
+    pub fn load_active_job_row(&self, job_id: JobId) -> Result<Option<RecoveredJob>, StateError> {
+        Ok(self
+            .load_active_jobs_where(Some(job_id), false)?
+            .remove(&job_id))
+    }
+
     fn load_active_jobs_where(
         &self,
         only: Option<JobId>,

@@ -91,13 +91,16 @@ export function useSpeedLimitDialog() {
 }
 
 /**
- * The limit actually in force: a schedule's limit while one holds, otherwise
- * the configured ceiling. Zero is unlimited.
+ * The limit the daemon holds the wire to now: a schedule's while one holds,
+ * even one set to unlimited, otherwise the configured ceiling. Zero is
+ * unlimited.
  */
 export function useSpeedLimitInForce() {
-  const { speedLimit, downloadBlock } = useNextData("speedLimit", "downloadBlock");
-  const scheduled = downloadBlock.scheduledSpeedLimit;
-  return { inForce: scheduled > 0 ? scheduled : speedLimit, bySchedule: scheduled > 0 };
+  const { downloadBlock } = useNextData("downloadBlock");
+  return {
+    inForce: downloadBlock.speedLimitInForce,
+    bySchedule: downloadBlock.speedLimitBySchedule,
+  };
 }
 
 /** The queue header's button: the limit in force, opening the dialog. */

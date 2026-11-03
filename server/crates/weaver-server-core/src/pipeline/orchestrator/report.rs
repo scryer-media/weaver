@@ -135,7 +135,7 @@ impl Pipeline {
         }
         let total = state.spec.total_bytes;
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
-            state.optional_recovery_bytes();
+            self.optional_recovery_bytes(state);
         let health = health_milli(total, state.failed_bytes);
         let status = if self.awaiting_queue_script_barrier(state.job_id)
             && state.status == JobStatus::Downloading
@@ -147,26 +147,44 @@ impl Pipeline {
         };
         let (download_state, post_state, run_state) =
             crate::jobs::model::runtime_lanes_from_status_snapshot(&status);
-        let is_par_volume = |role: &weaver_model::files::FileRole| {
+        // The recovery files, index included, as NZBGet counts its par files.
+        let is_par_file = |role: &weaver_model::files::FileRole| {
             matches!(
                 role,
-                weaver_model::files::FileRole::Par2 {
-                    is_index: false,
-                    ..
-                }
+                weaver_model::files::FileRole::Par2 { .. }
+                    | weaver_model::files::FileRole::Par3 { .. }
             )
         };
-        let remaining_par_files = match state.articles.assembly() {
-            Some(assembly) => assembly
-                .files()
-                .filter(|file| is_par_volume(file.role()) && !file.is_complete())
-                .count() as u32,
-            None => state
-                .spec
-                .files
-                .iter()
-                .filter(|file| is_par_volume(&file.role))
-                .count() as u32,
+        // The recovery files with articles still to fetch, parked or not: the
+        // graph's article map says for a graph job, whose assembly no article
+        // marks. An article every server lacked is not still to fetch.
+        let remaining_par_files = if let Some(graph) = self.graph_jobs.get(&state.job_id) {
+            (0u32..)
+                .zip(&state.spec.files)
+                .filter(|(index, file)| is_par_file(&file.role) && graph.file_waiting(*index))
+                .count() as u32
+        } else {
+            match state.articles.assembly() {
+                Some(assembly) => assembly
+                    .files()
+                    .filter(|file| is_par_file(file.role()) && !file.is_complete())
+                    .count() as u32,
+                None => state
+                    .spec
+                    .files
+                    .iter()
+                    .filter(|file| is_par_file(&file.role))
+                    .count() as u32,
+            }
+        };
+        let (remaining_bytes, wanted_bytes) = self.remaining_figures(state);
+        // Done is what is wanted less what is still to come, in the same
+        // declared bytes, so a download that brought everything it wanted
+        // reads 100% whatever recovery stayed parked.
+        let progress = if wanted_bytes == 0 {
+            Self::effective_progress(state)
+        } else {
+            ((wanted_bytes - remaining_bytes) as f64 / wanted_bytes as f64).clamp(0.0, 1.0)
         };
         let download_wait = self.download_wait_by_job.get(&state.job_id);
         Some(JobInfo {
@@ -191,7 +209,7 @@ impl Pipeline {
                 .is_some_and(|graph| graph.fetching_repair_data()),
             post_state,
             run_state,
-            progress: Self::effective_progress(state),
+            progress,
             total_bytes: total,
             downloaded_bytes: Self::effective_downloaded_bytes(state),
             optional_recovery_bytes,
@@ -212,8 +230,15 @@ impl Pipeline {
             file_remaining_bytes: self
                 .graph_jobs
                 .get(&state.job_id)
-                .map(super::super::graph::job::GraphJob::remaining_bytes)
+                .map(super::super::graph::job::GraphJob::waiting_bytes)
                 .unwrap_or_default(),
+            file_parked_bytes: self
+                .graph_jobs
+                .get(&state.job_id)
+                .map(super::super::graph::job::GraphJob::parked_bytes)
+                .unwrap_or_default(),
+            remaining_bytes,
+            wanted_bytes,
             remaining_par_files,
             password: state.spec.password.clone(),
             category: state.spec.category.clone(),

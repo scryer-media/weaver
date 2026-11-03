@@ -36,6 +36,23 @@ impl Queue {
             if let Some(row) = inner.job_mut(id)
                 && let std::collections::hash_map::Entry::Vacant(entry) = row.phases.entry(phase)
             {
+                // A later phase shows from the moment it opens, so a phase
+                // the drivers never sample still says when it started.
+                if phase != JobPhase::Downloading {
+                    let completed = counters.completed_bytes.load(Ordering::Relaxed);
+                    let total = counters.total_bytes.load(Ordering::Relaxed);
+                    row.sampled_phases.push(JobPhaseProgress {
+                        phase,
+                        completed_bytes: completed,
+                        total_bytes: total,
+                        progress_percent: 0.0,
+                        rate_bps: None,
+                        estimated_remaining_ms: None,
+                        started_at_epoch_ms: started,
+                        updated_at_epoch_ms: started,
+                    });
+                    row.sampled_phases.sort_by_key(|sample| sample.phase);
+                }
                 entry.insert(PhaseSample {
                     counters,
                     started,
@@ -190,15 +207,34 @@ impl Queue {
                     if download && !downloading {
                         continue;
                     }
-                    let completed = if download {
+                    let job = &row.report.job;
+                    // The download counts in the post's declared bytes: what
+                    // it is out to bring, less what is still to come, so it
+                    // ends at its total whatever recovery stayed parked and
+                    // its time left is what is still to come at the wire
+                    // rate, which counts the same encoded bytes.
+                    let (completed, total) = if download && job.wanted_bytes > 0 {
+                        (
+                            job.wanted_bytes.saturating_sub(job.remaining_bytes),
+                            job.wanted_bytes,
+                        )
+                    } else if download {
                         // Decoder throughput includes replacement articles.
                         // Only the report accounts for unique accepted bytes.
-                        row.report.job.downloaded_bytes
+                        (
+                            job.downloaded_bytes,
+                            sample.counters.total_bytes.load(Ordering::Relaxed),
+                        )
                     } else {
-                        sample.counters.completed_bytes.load(Ordering::Relaxed)
+                        (
+                            sample.counters.completed_bytes.load(Ordering::Relaxed),
+                            sample.counters.total_bytes.load(Ordering::Relaxed),
+                        )
                     };
-                    let total = sample.counters.total_bytes.load(Ordering::Relaxed);
-                    if total == 0 {
+                    // A download with nothing to fetch is not shown. A later
+                    // phase with no byte total, such as a repair, is still
+                    // shown with its start, so its time can be read.
+                    if download && total == 0 {
                         continue;
                     }
                     // The download rate needs no warm-up: it never starts a
@@ -218,8 +254,11 @@ impl Queue {
                         phase,
                         completed_bytes: completed,
                         total_bytes: total,
-                        progress_percent: ((completed as f64 / total.max(completed) as f64) * 100.0)
-                            as f32,
+                        progress_percent: if total.max(completed) == 0 {
+                            0.0
+                        } else {
+                            ((completed as f64 / total.max(completed) as f64) * 100.0) as f32
+                        },
                         rate_bps,
                         estimated_remaining_ms: rate_bps
                             .filter(|rate| *rate > 0 && completed < total)

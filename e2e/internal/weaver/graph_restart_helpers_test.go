@@ -421,3 +421,21 @@ func TestRefuseArchiveRefusesOnlyTheNamedJobOnSQLite(t *testing.T) {
 		t.Fatalf("after the lift: %v", err)
 	}
 }
+
+// A restart wait ends on the state it reads, never on the case timeout: a
+// check that holds only on its third read still resolves when the case
+// timeout has already run out.
+func TestRestartPollForEndsOnStateNotTheCaseTimeout(t *testing.T) {
+	ctx := &restartCaseContext{Timeout: 0}
+	reads := 0
+	err := ctx.pollFor("third read", func() (bool, error) {
+		reads++
+		return reads == 3, nil
+	})
+	if err != nil {
+		t.Fatalf("pollFor = %v, want nil", err)
+	}
+	if reads != 3 {
+		t.Fatalf("reads = %d, want 3", reads)
+	}
+}

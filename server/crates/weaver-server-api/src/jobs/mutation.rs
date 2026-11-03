@@ -1465,7 +1465,10 @@ async fn submit_uploaded_nzb(
 async fn history_items_from_db(db: Database, live_jobs: HashSet<u64>) -> Result<Vec<HistoryItem>> {
     tokio::task::spawn_blocking(move || {
         let rows = crate::history::query::exclude_live_rows(
-            db.list_job_history(&weaver_server_core::HistoryFilter::default())?,
+            db.list_job_history(
+                &weaver_server_core::HistoryFilter::default(),
+                weaver_server_core::HistoryRows::Shown,
+            )?,
             &live_jobs,
         );
         let ids = rows.iter().map(|row| row.job_id).collect::<Vec<_>>();

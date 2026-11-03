@@ -467,6 +467,15 @@ type DownloadBlock {
 	timezoneName: String!
 	scheduledSpeedLimit: Int!
 	"""
+	Speed limit the downloads run under now: the schedule's while one
+	holds, even one set to unlimited, else the configured one. 0 is none.
+	"""
+	speedLimitInForce: Int!
+	"""
+	Whether a schedule window sets the limit in force, even to unlimited.
+	"""
+	speedLimitBySchedule: Boolean!
+	"""
 	Why a schedule rule is holding new downloads, while one is.
 	"""
 	scheduleHoldReason: String
@@ -677,6 +686,7 @@ enum EventKind {
 	EXTRACTION_PROGRESS
 	EXTRACTION_COMPLETE
 	EXTRACTION_FAILED
+	ARCHIVE_DEMOTED
 	MOVE_TO_COMPLETE_STARTED
 	MOVE_TO_COMPLETE_FINISHED
 	SEGMENT_RETRY_SCHEDULED
@@ -2679,7 +2689,7 @@ type QueryRoot {
 	"""
 	pathStorage(path: String!): ConfiguredStorage!
 	"""
-	Return recent log lines from the in-memory ring buffer.
+	Return recent log records from the in-memory ring buffer.
 	"""
 	serviceLogs(limit: Int! = 250): ServiceLogsPayload!
 	"""
@@ -2834,6 +2844,18 @@ type QueueItem {
 	downloadedBytes: Int!
 	optionalRecoveryBytes: Int!
 	optionalRecoveryDownloadedBytes: Int!
+	"""
+	Declared bytes still to come: every article neither in hand nor lost,
+	less the recovery held back until a loss asks for it. Reaches 0 when
+	the download has brought everything it wants.
+	"""
+	remainingBytes: Int!
+	"""
+	Declared bytes the download is out to bring: the post less the
+	recovery still held back. `progressPercent` is this less
+	`remainingBytes`, over this.
+	"""
+	wantedBytes: Int!
 	phaseProgress: [QueuePhaseProgress!]!
 	failedBytes: Int!
 	health: Int!
@@ -4246,8 +4268,15 @@ type ServerRestartCapability {
 }
 
 type ServiceLogsPayload {
-	lines: [String!]!
+	"""
+	One JSON record per line, oldest first.
+	"""
+	records: [String!]!
 	count: Int!
+	"""
+	The same lines as text, rendered from the records when asked for.
+	"""
+	lines: [String!]!
 }
 
 type SpeedTestFailure {
@@ -4462,9 +4491,13 @@ type SubscriptionRoot {
 	"""
 	queueEvents(after: String, filter: QueueFilterInput): QueueEvent!
 	"""
-	Subscribe to live log lines from the service.
+	Subscribe to live log lines from the service, as text.
 	"""
 	serviceLogLines: String!
+	"""
+	Subscribe to live log records from the service, one JSON object each.
+	"""
+	serviceLogRecords: String!
 	"""
 	Subscribe to release-check state changes, including the initial snapshot.
 	"""

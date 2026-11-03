@@ -11,9 +11,23 @@ const METRICS_UPDATE_INTERVAL: std::time::Duration = std::time::Duration::from_m
 
 #[Subscription]
 impl SystemSubscription {
-    /// Subscribe to live log lines from the service.
+    /// Subscribe to live log lines from the service, as text.
     #[graphql(guard = "AdminGuard")]
     async fn service_log_lines(&self, ctx: &Context<'_>) -> Result<impl Stream<Item = String>> {
+        let buffer = ctx.data::<LogRingBuffer>()?;
+        let rx = buffer.subscribe();
+        Ok(
+            tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|result| {
+                result
+                    .ok()
+                    .map(|record| weaver_server_core::runtime::log_buffer::text_line(&record))
+            }),
+        )
+    }
+
+    /// Subscribe to live log records from the service, one JSON object each.
+    #[graphql(guard = "AdminGuard")]
+    async fn service_log_records(&self, ctx: &Context<'_>) -> Result<impl Stream<Item = String>> {
         let buffer = ctx.data::<LogRingBuffer>()?;
         let rx = buffer.subscribe();
         Ok(tokio_stream::wrappers::BroadcastStream::new(rx).filter_map(|result| result.ok()))

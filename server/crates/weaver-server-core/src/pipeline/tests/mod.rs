@@ -66,6 +66,7 @@ mod post_processing_pause;
 mod provider_scheduling;
 mod queue;
 mod queue_scale;
+mod queue_window;
 mod restore_history;
 mod script_events;
 mod server_attribution;
@@ -406,6 +407,9 @@ fn finished_job_info(job_id: JobId) -> JobInfo {
         completed_files: 0,
         remaining_par_files: 0,
         file_remaining_bytes: Vec::new(),
+        file_parked_bytes: Vec::new(),
+        remaining_bytes: 0,
+        wanted_bytes: 0,
         password: None,
         category: None,
         metadata: vec![],
