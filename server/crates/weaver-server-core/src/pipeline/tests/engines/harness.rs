@@ -835,6 +835,8 @@ pub(in crate::pipeline::tests) struct Outcome {
     pub(in crate::pipeline::tests) history_metadata: Option<String>,
     // The job's history row, as stored.
     pub(in crate::pipeline::tests) history: Option<crate::JobHistoryRow>,
+    // How many times each job stage's duration was observed, by stage name.
+    pub(in crate::pipeline::tests) stages_timed: Vec<(&'static str, u64)>,
 }
 
 // The kind of every object a graph run's tree held, by its name, sorted.
@@ -1050,6 +1052,14 @@ pub(in crate::pipeline::tests) async fn try_run(scenario: &Scenario) -> Result<O
     let validated_password = pipeline.db.validated_archive_password(JOB.0).unwrap();
     let history = pipeline.db.get_job_history(JOB.0).unwrap();
     let history_metadata = history.as_ref().and_then(|row| row.metadata.clone());
+    let stages_timed = pipeline
+        .metrics
+        .job_lifecycle
+        .snapshot()
+        .stage_duration
+        .into_iter()
+        .map(|(stage, histogram)| (stage, histogram.count))
+        .collect();
     retire_pipeline_database(pipeline).await;
     Ok(Outcome {
         status,
@@ -1069,6 +1079,7 @@ pub(in crate::pipeline::tests) async fn try_run(scenario: &Scenario) -> Result<O
         validated_password,
         history_metadata,
         history,
+        stages_timed,
     })
 }
 

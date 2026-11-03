@@ -16,10 +16,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use weaver_server_api::{
     Attribute, AttributeInput, CLIENT_REQUEST_ID_ATTRIBUTE_KEY, PRIORITY_ATTRIBUTE_KEY, QueueItem,
-    QueueItemState, QueuePhase, QueueStateFacts, SubmissionOptions, SubmitNzbError,
-    fetch_nzb_from_url, history_item_from_row, normalize_priority_value, queue_item_from_job,
-    queue_item_state, queue_item_state_for_download_accounting, queue_table_item_from_job,
-    submit_metadata, submit_nzb_bytes_with_options,
+    QueueItemState, QueuePhase, QueuePhaseProgress, QueueStateFacts, SubmissionOptions,
+    SubmitNzbError, fetch_nzb_from_url, history_item_from_row, normalize_priority_value,
+    queue_item_from_job, queue_item_state, queue_item_state_for_download_accounting,
+    queue_table_item_from_job, submit_metadata, submit_nzb_bytes_with_options,
 };
 use weaver_server_core::auth::{ApiKeyCache, CallerScope, LoginAuthCache};
 use weaver_server_core::history::{HistoryFailureKind, NzbgetMarkStatus};
@@ -1949,10 +1949,10 @@ fn post_progress_info(item: &QueueItem, post_started_at: Option<i64>) -> PostPro
     let stage_progress = progress
         .map(|entry| (entry.progress_percent.clamp(0.0, 100.0) * 10.0) as u64)
         .unwrap_or(0);
+    let now = unix_now_secs() as f64 * 1000.0;
+    let sampled_at = |entry: &QueuePhaseProgress| stage_measured_to(entry, now);
     let stage_time_sec = progress
-        .map(|entry| {
-            ((entry.updated_at_epoch_ms - entry.started_at_epoch_ms) / 1000.0).max(0.0) as u64
-        })
+        .map(|entry| ((sampled_at(entry) - entry.started_at_epoch_ms) / 1000.0).max(0.0) as u64)
         .unwrap_or(0);
     let text = match progress {
         Some(entry) if entry.progress_percent > 0.0 => {
@@ -1962,10 +1962,7 @@ fn post_progress_info(item: &QueueItem, post_started_at: Option<i64>) -> PostPro
     };
     // Measured to the same moment as the stage time, so the total never
     // reads less than the stage it contains.
-    let observed_at = progress.map_or_else(
-        || unix_now_secs() as f64 * 1000.0,
-        |entry| entry.updated_at_epoch_ms,
-    );
+    let observed_at = progress.map_or(now, sampled_at);
     let total_time_sec = post_started_at
         .map(|start| ((observed_at - start as f64) / 1000.0).max(0.0) as u64)
         .unwrap_or(0)
@@ -1985,6 +1982,16 @@ fn post_progress_info(item: &QueueItem, post_started_at: Option<i64>) -> PostPro
 // recovery never does.
 fn critical_health(item: &QueueItem) -> u64 {
     critical_health_of(item.total_bytes, item.optional_recovery_bytes)
+}
+
+// The moment a stage is measured to: its last sample. One with no byte
+// total, such as a repair, is never sampled, so it is measured to `now`.
+fn stage_measured_to(entry: &QueuePhaseProgress, now: f64) -> f64 {
+    if entry.total_bytes > 0.0 {
+        entry.updated_at_epoch_ms
+    } else {
+        now
+    }
 }
 
 // NZBGet's Health: the share of the non-recovery bytes that arrived, as
@@ -4498,5 +4505,21 @@ mod health_and_stage_tests {
         assert_eq!(nzbget_health_of(1000, 100, 90), 900);
         assert_eq!(nzbget_health_of(1_000_000, 0, 1), 999);
         assert_eq!(nzbget_health_of(100, 100, 5), 1000);
+    }
+
+    #[test]
+    fn a_stage_with_no_byte_total_is_measured_to_now() {
+        let entry = |total_bytes: f64| QueuePhaseProgress {
+            phase: QueuePhase::Repairing,
+            completed_bytes: 0.0,
+            total_bytes,
+            progress_percent: 0.0,
+            rate_bps: None,
+            estimated_remaining_ms: None,
+            started_at_epoch_ms: 1_000.0,
+            updated_at_epoch_ms: 1_000.0,
+        };
+        assert_eq!(stage_measured_to(&entry(0.0), 9_000.0), 9_000.0);
+        assert_eq!(stage_measured_to(&entry(10.0), 9_000.0), 1_000.0);
     }
 }

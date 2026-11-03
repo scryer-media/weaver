@@ -36,6 +36,23 @@ impl Queue {
             if let Some(row) = inner.job_mut(id)
                 && let std::collections::hash_map::Entry::Vacant(entry) = row.phases.entry(phase)
             {
+                // A later phase shows from the moment it opens, so a phase
+                // the drivers never sample still says when it started.
+                if phase != JobPhase::Downloading {
+                    let completed = counters.completed_bytes.load(Ordering::Relaxed);
+                    let total = counters.total_bytes.load(Ordering::Relaxed);
+                    row.sampled_phases.push(JobPhaseProgress {
+                        phase,
+                        completed_bytes: completed,
+                        total_bytes: total,
+                        progress_percent: 0.0,
+                        rate_bps: None,
+                        estimated_remaining_ms: None,
+                        started_at_epoch_ms: started,
+                        updated_at_epoch_ms: started,
+                    });
+                    row.sampled_phases.sort_by_key(|sample| sample.phase);
+                }
                 entry.insert(PhaseSample {
                     counters,
                     started,
@@ -198,7 +215,10 @@ impl Queue {
                         sample.counters.completed_bytes.load(Ordering::Relaxed)
                     };
                     let total = sample.counters.total_bytes.load(Ordering::Relaxed);
-                    if total == 0 {
+                    // A download with nothing to fetch is not shown. A later
+                    // phase with no byte total, such as a repair, is still
+                    // shown with its start, so its time can be read.
+                    if download && total == 0 {
                         continue;
                     }
                     // The download rate needs no warm-up: it never starts a
@@ -218,8 +238,11 @@ impl Queue {
                         phase,
                         completed_bytes: completed,
                         total_bytes: total,
-                        progress_percent: ((completed as f64 / total.max(completed) as f64) * 100.0)
-                            as f32,
+                        progress_percent: if total.max(completed) == 0 {
+                            0.0
+                        } else {
+                            ((completed as f64 / total.max(completed) as f64) * 100.0) as f32
+                        },
                         rate_bps,
                         estimated_remaining_ms: rate_bps
                             .filter(|rate| *rate > 0 && completed < total)

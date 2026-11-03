@@ -5,11 +5,14 @@
 // what recovery was fetched, read off the live report and the history row
 // the job leaves.
 
+use sevenz_turbo::encoder_options::Lzma2Options;
 use weaver_graph::recovery::RepairOutcome;
 
 use super::harness::{ARTICLE, Outcome, Post, Scenario, par2_set, par3_set, payload, run};
 use super::rar::with_par2;
 use crate::JobHistoryRow;
+use crate::jobs::JobPhase;
+use crate::jobs::ids::JobId;
 use crate::pipeline::health_milli;
 use crate::pipeline::tests::direct_store::single_member_store_set;
 
@@ -204,6 +207,114 @@ async fn an_extracted_rar_set_accounts_every_byte() {
     assert_eq!(graph.files["lantern beacon/beacon.bin"], body);
     assert_accounted(&scenario, &graph, 0);
     assert!(history(&graph).optional_recovery_downloaded_bytes > 0);
+}
+
+// How often the run timed `stage`.
+fn timed(outcome: &Outcome, stage: &str) -> u64 {
+    outcome
+        .stages_timed
+        .iter()
+        .find(|(name, _)| *name == stage)
+        .map_or(0, |(_, count)| *count)
+}
+
+// A repaired post times its repair once, however often the root went back
+// to fetch recovery for it.
+#[tokio::test]
+async fn a_repaired_post_times_its_repair_stage_once() {
+    let graph = run(&Scenario::new(covered(78)).lost(0, 1)).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(timed(&graph, "repair"), 1, "{:?}", graph.events);
+}
+
+// A clean post with recovery times its verification once.
+#[tokio::test]
+async fn a_clean_post_times_its_verify_stage() {
+    let graph = run(&Scenario::new(covered(80))).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(timed(&graph, "verify"), 1, "{:?}", graph.events);
+}
+
+// A coded 7z read after it lands times its extraction once. A stored RAR
+// set extracts as it streams in, inside the download, and has no stage of
+// its own.
+#[tokio::test]
+async fn a_coded_7z_times_its_extract_stage() {
+    let archive = super::sevenz::container(Lzma2Options::from_level(1).into(), None);
+    let graph = run(&Scenario::new(vec![Post::plain("lantern.7z", archive)])).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(timed(&graph, "extract"), 1, "{:?}", graph.events);
+}
+
+// A covered file whose loss PAR2 repairs, beside an uncovered .nfo whose
+// only article every server lacks: Complete, one slice repaired, and the
+// .nfo's bytes stay failed. The job page calls those never recovered.
+#[tokio::test]
+async fn a_lost_nfo_beside_a_repair_stays_failed_on_a_complete_job() {
+    let data = payload(4 * ARTICLE, 91);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
+    let nfo = payload(ARTICLE / 2, 92);
+    posts.push(Post::plain("lantern.nfo", nfo.clone()));
+    let graph = run(&Scenario::new(posts).lost(0, 1).lost(3, 0)).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(
+        graph.graph().outcomes,
+        vec![Some(RepairOutcome::Repaired { slices: 1 })]
+    );
+    let row = history(&graph);
+    assert_eq!(row.failed_bytes, nfo.len() as u64);
+    assert!(row.health < 1000);
+}
+
+// A phase opened with no byte total, as the graph opens its repair, shows
+// in the job's phase rows from its start, and does not hold the pipeline
+// live while it waits.
+#[tokio::test]
+async fn a_phase_with_no_total_shows_its_row_without_holding_the_pipeline_live() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _intermediate_dir, _complete_dir) =
+        crate::pipeline::tests::new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(99);
+    pipeline.shared_state.queue.write(|inner| {
+        inner.push_job(crate::pipeline::queue::JobRow::new(
+            crate::pipeline::tests::finished_job_info(job_id),
+        ));
+        crate::pipeline::queue::Change::changed(())
+    });
+    pipeline.phase_begin_unsampled(job_id, JobPhase::Repairing);
+    let rows = pipeline
+        .shared_state
+        .get_job(job_id)
+        .unwrap()
+        .phase_progress;
+    assert_eq!(
+        rows.iter().map(|row| row.phase).collect::<Vec<_>>(),
+        [JobPhase::Repairing]
+    );
+    assert!(rows[0].started_at_epoch_ms > 0.0);
+    assert!(!pipeline.pipeline_is_live());
+    pipeline.shared_state.queue.sample_counters(
+        &pipeline.metrics,
+        &pipeline.event_tx,
+        std::time::Instant::now(),
+    );
+    let rows = pipeline
+        .shared_state
+        .get_job(job_id)
+        .unwrap()
+        .phase_progress;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].progress_percent, 0.0);
+    pipeline.phase_end(job_id, JobPhase::Repairing);
+    assert!(
+        pipeline
+            .shared_state
+            .get_job(job_id)
+            .unwrap()
+            .phase_progress
+            .is_empty()
+    );
 }
 
 // A clean post under PAR3 leaves both its PAR3 volumes to fetch, as NZBGet
