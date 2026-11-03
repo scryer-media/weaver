@@ -145,6 +145,8 @@ fn job(status: JobStatus) -> JobInfo {
         completed_files: 0,
         remaining_par_files: 0,
         file_remaining_bytes: Vec::new(),
+        remaining_bytes: 0,
+        wanted_bytes: 0,
         password: None,
         category: None,
         metadata: Vec::new(),

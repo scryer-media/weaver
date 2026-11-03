@@ -155,16 +155,13 @@ impl Pipeline {
                     | weaver_model::files::FileRole::Par3 { .. }
             )
         };
-        // The recovery files with articles still to fetch: the graph's
-        // article map says for a graph job, whose assembly no article
+        // The recovery files with articles still to fetch, parked or not: the
+        // graph's article map says for a graph job, whose assembly no article
         // marks. An article every server lacked is not still to fetch.
         let remaining_par_files = if let Some(graph) = self.graph_jobs.get(&state.job_id) {
-            state
-                .spec
-                .files
-                .iter()
-                .zip(graph.remaining_bytes())
-                .filter(|(file, remaining)| is_par_file(&file.role) && *remaining > 0)
+            (0u32..)
+                .zip(&state.spec.files)
+                .filter(|(index, file)| is_par_file(&file.role) && graph.file_waiting(*index))
                 .count() as u32
         } else {
             match state.articles.assembly() {
@@ -179,6 +176,15 @@ impl Pipeline {
                     .filter(|file| is_par_file(&file.role))
                     .count() as u32,
             }
+        };
+        let (remaining_bytes, wanted_bytes) = self.remaining_figures(state);
+        // Done is what is wanted less what is still to come, in the same
+        // declared bytes, so a download that brought everything it wanted
+        // reads 100% whatever recovery stayed parked.
+        let progress = if wanted_bytes == 0 {
+            Self::effective_progress(state)
+        } else {
+            ((wanted_bytes - remaining_bytes) as f64 / wanted_bytes as f64).clamp(0.0, 1.0)
         };
         let download_wait = self.download_wait_by_job.get(&state.job_id);
         Some(JobInfo {
@@ -203,7 +209,7 @@ impl Pipeline {
                 .is_some_and(|graph| graph.fetching_repair_data()),
             post_state,
             run_state,
-            progress: Self::effective_progress(state),
+            progress,
             total_bytes: total,
             downloaded_bytes: Self::effective_downloaded_bytes(state),
             optional_recovery_bytes,
@@ -226,6 +232,8 @@ impl Pipeline {
                 .get(&state.job_id)
                 .map(super::super::graph::job::GraphJob::remaining_bytes)
                 .unwrap_or_default(),
+            remaining_bytes,
+            wanted_bytes,
             remaining_par_files,
             password: state.spec.password.clone(),
             category: state.spec.category.clone(),

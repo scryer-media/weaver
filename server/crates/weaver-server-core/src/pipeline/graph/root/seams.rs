@@ -124,6 +124,7 @@ impl Pipeline {
         }
         // A job restored mid-phase takes up that phase's stage clock again.
         let reported = graph.reported_phase();
+        self.released_remaining.remove(&job_id);
         self.graph_jobs.insert(job_id, graph);
         if let Some(phase) = reported {
             self.time_graph_stage(job_id, phase);

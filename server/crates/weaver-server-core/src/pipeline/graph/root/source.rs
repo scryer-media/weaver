@@ -173,6 +173,8 @@ struct Volume {
     // The articles a queueing can bring back: waiting, and parked. Filed
     // beside `parkable`.
     parked: BTreeSet<usize>,
+    // The post's encoded bytes of the parked articles. Kept beside `parked`.
+    parked_bytes: u64,
     // The articles carry no position of their own, so the volume can only
     // be placed in order, from the front.
     ordered_only: bool,
@@ -218,6 +220,7 @@ impl Volume {
             disorder: 0,
             parkable: (0..sizes.len()).collect(),
             parked: BTreeSet::new(),
+            parked_bytes: 0,
             ordered_only: false,
             starts: BTreeMap::new(),
             cut: BTreeSet::new(),
@@ -315,10 +318,13 @@ impl Volume {
         } else {
             self.parkable.remove(&index);
         }
+        let size = self.encoded_at(index + 1) - self.encoded_at(index);
         if waiting && article.class == Class::Parked {
-            self.parked.insert(index);
-        } else {
-            self.parked.remove(&index);
+            if self.parked.insert(index) {
+                self.parked_bytes += size;
+            }
+        } else if self.parked.remove(&index) {
+            self.parked_bytes -= size;
         }
     }
 
@@ -737,12 +743,23 @@ impl ArticleMap {
     }
 
     // Each volume's encoded bytes still waited on, as the post declares
-    // them: the articles neither in hand nor lost for good.
+    // them: the articles neither in hand nor lost for good, and not parked.
+    // A parked article is fetched only once something asks for it, so until
+    // then it is not still to come.
     pub(crate) fn remaining(&self) -> Vec<u64> {
         self.volumes
             .iter()
-            .map(|found| found.encoded_len - found.settled_bytes)
+            .map(|found| found.encoded_len - found.settled_bytes - found.parked_bytes)
             .collect()
+    }
+
+    // The encoded bytes of every article not parked, as the post declares
+    // them: in hand, lost for good, or still to come.
+    pub(crate) fn wanted_bytes(&self) -> u64 {
+        self.volumes
+            .iter()
+            .map(|found| found.encoded_len - found.parked_bytes)
+            .sum()
     }
 
     // The volume's decoded bytes in hand. An article an earlier run brought

@@ -952,6 +952,18 @@ pub struct JobInfo {
     // the post declares their sizes. Empty when no download runs for the job.
     #[serde(default)]
     pub file_remaining_bytes: Vec<u64>,
+    // The post's encoded bytes still to come: every article neither in hand
+    // nor lost for good, less the recovery parked until something asks for
+    // it. A clean post ends its download at zero; recovery fetched after a
+    // loss counts from the moment it is asked for.
+    #[serde(default)]
+    pub remaining_bytes: u64,
+    // The post's encoded bytes the download is out to bring: every article
+    // but the recovery still parked. What is done of it is this less
+    // `remaining_bytes`, so the two measure the same declared bytes and the
+    // download ends at exactly 100%.
+    #[serde(default)]
+    pub wanted_bytes: u64,
     // PAR2 recovery volumes not yet fetched (fetched on demand).
     #[serde(default)]
     pub remaining_par_files: u32,

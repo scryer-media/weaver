@@ -84,6 +84,8 @@ fn job(id: u64) -> JobInfo {
         remaining_par_files: 8,
         // A job's per-file remaining bytes: one entry per file.
         file_remaining_bytes: vec![70 << 20; 60],
+        remaining_bytes: 0,
+        wanted_bytes: 0,
         password: None,
         category: Some("tv".to_string()),
         metadata: vec![

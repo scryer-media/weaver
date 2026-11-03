@@ -839,7 +839,13 @@ async fn download_phase_rate_matches_the_global_speed_gauge() {
     insert_active_job(
         &mut pipeline,
         job_id,
-        standalone_job_spec("Wire Rate", &[("payload.bin".to_string(), 1_024)]),
+        standalone_job_spec(
+            "Wire Rate",
+            &[
+                ("payload-0.bin".to_string(), 512),
+                ("payload-1.bin".to_string(), 512),
+            ],
+        ),
     )
     .await;
     pipeline.active_downloads_by_job.insert(job_id, 1);
@@ -862,6 +868,11 @@ async fn download_phase_rate_matches_the_global_speed_gauge() {
 
     // Accepted payload advances progress without inventing wire traffic.
     pipeline.jobs.get_mut(&job_id).unwrap().downloaded_bytes = 512;
+    pipeline
+        .graph_jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .arrived_before(|volume, _| volume != weaver_graph::VolumeIndex(0));
     pipeline.report_job(job_id);
     counters.decoded.store(512, Ordering::Relaxed);
     pipeline.shared_state.queue.sample_counters(

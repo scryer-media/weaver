@@ -161,6 +161,8 @@ pub async fn recover_server_state(
             completed_files: 0,
             remaining_par_files: 0,
             file_remaining_bytes: Vec::new(),
+            remaining_bytes: 0,
+            wanted_bytes: 0,
             password: None,
             category: recovered.category,
             metadata: recovered.metadata,
@@ -340,6 +342,8 @@ pub async fn recover_server_state(
                     completed_files: 0,
                     remaining_par_files: 0,
                     file_remaining_bytes: Vec::new(),
+                    remaining_bytes: 0,
+                    wanted_bytes: 0,
                     password: None,
                     category: row.category,
                     metadata: row
