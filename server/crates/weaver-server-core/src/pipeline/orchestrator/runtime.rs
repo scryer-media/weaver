@@ -617,7 +617,7 @@ impl Pipeline {
     // last said; a job that never ran says what a run starts out to bring.
     pub(crate) fn remaining_figures(&self, state: &JobState) -> (u64, u64) {
         if let Some(graph) = self.graph_jobs.get(&state.job_id) {
-            return Self::graph_remaining(graph);
+            return Self::graph_remaining(graph, &state.spec);
         }
         if let Some(figures) = self.released_remaining.get(&state.job_id) {
             return *figures;
@@ -625,9 +625,27 @@ impl Pipeline {
         state.unstarted_remaining()
     }
 
-    pub(crate) fn graph_remaining(graph: &crate::pipeline::graph::job::GraphJob) -> (u64, u64) {
-        let wanted = graph.wanted_bytes();
-        let remaining: u64 = graph.remaining_bytes().iter().sum();
+    // What the root says, less each file named as recovery that the root
+    // has not yet decided on: from the start until its first article is
+    // read, it counts as held back, as it did before the job ran, so the
+    // figures do not rise by the recovery and fall again a moment later.
+    pub(crate) fn graph_remaining(
+        graph: &crate::pipeline::graph::job::GraphJob,
+        spec: &crate::jobs::model::JobSpec,
+    ) -> (u64, u64) {
+        let (held_remaining, held_wanted) = (0u32..)
+            .zip(&spec.files)
+            .filter(|(_, file)| file.role.is_recovery())
+            .filter_map(|(index, _)| graph.undecided_recovery(index))
+            .fold((0u64, 0u64), |(remaining, wanted), (left, posted)| {
+                (remaining + left, wanted + posted)
+            });
+        let wanted = graph.wanted_bytes().saturating_sub(held_wanted);
+        let remaining: u64 = graph
+            .remaining_bytes()
+            .iter()
+            .sum::<u64>()
+            .saturating_sub(held_remaining);
         (remaining.min(wanted), wanted)
     }
 

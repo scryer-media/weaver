@@ -364,7 +364,8 @@ async fn a_clean_post_ends_its_download_with_nothing_remaining() {
     assert_eq!(report.wanted_bytes, posted(posts) - parked);
     assert_eq!(report.remaining_bytes, 0);
     assert_eq!(report.progress, 1.0);
-    assert_eq!(report.file_remaining_bytes.iter().sum::<u64>(), 0);
+    // Each file waits only on what it holds back.
+    assert_eq!(report.file_remaining_bytes, report.file_parked_bytes);
     let seen = &graph.graph().remaining;
     assert!(
         seen.windows(2).all(|pair| pair[1].0 <= pair[0].0),
@@ -388,13 +389,10 @@ async fn a_loss_grows_remaining_by_the_recovery_it_asks_for() {
     assert_eq!(report.remaining_bytes, 0);
     assert_eq!(report.progress, 1.0);
     let seen = &graph.graph().remaining;
+    // Until its head is read the volume is held back whole, so the fewest
+    // bytes wanted leave out all of it, the head too.
     let parked_most = seen.iter().map(|(_, wanted)| *wanted).min().unwrap();
-    let head = posts[2].articles(ARTICLE).next().unwrap().len() as u64;
-    assert_eq!(
-        report.wanted_bytes - parked_most,
-        fetched - head,
-        "{seen:?}"
-    );
+    assert_eq!(report.wanted_bytes - parked_most, fetched, "{seen:?}");
     assert!(
         seen.windows(2).any(|pair| pair[1].0 > pair[0].0),
         "{seen:?}"

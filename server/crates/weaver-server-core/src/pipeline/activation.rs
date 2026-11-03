@@ -199,9 +199,9 @@ impl Pipeline {
     // still out is disowned. The caller removes a job that leaves.
     pub(crate) fn release_job_articles(&mut self, job_id: JobId) {
         let graph = self.graph_jobs.get(&job_id);
-        if let Some(graph) = graph {
-            self.released_remaining
-                .insert(job_id, Self::graph_remaining(graph));
+        if let (Some(graph), Some(state)) = (graph, self.jobs.get(&job_id)) {
+            let figures = Self::graph_remaining(graph, &state.spec);
+            self.released_remaining.insert(job_id, figures);
         }
         let held = Self::held_parts(&self.uu_files, &self.unanchored_parked, job_id);
         let summaries = self

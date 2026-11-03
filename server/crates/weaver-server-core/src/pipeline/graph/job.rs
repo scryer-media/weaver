@@ -403,11 +403,29 @@ impl GraphJob {
         self.root.map.remaining()
     }
 
+    // Seam for status: each posted file's encoded bytes not yet in hand nor
+    // lost for good, parked or not, in the post's file order.
+    pub(crate) fn waiting_bytes(&self) -> Vec<u64> {
+        self.root.map.waiting()
+    }
+
+    // Seam for status: each posted file's encoded bytes held back until
+    // something asks for them, in the post's file order.
+    pub(crate) fn parked_bytes(&self) -> Vec<u64> {
+        self.root.map.parked()
+    }
+
     // Seam for status: the encoded bytes the download is out to bring, as
     // the post declares them: every article but those parked until
     // something asks for them.
     pub(crate) fn wanted_bytes(&self) -> u64 {
         self.root.map.wanted_bytes()
+    }
+
+    // Seam for status: the bytes still to come and out to bring of the
+    // posted recovery file at `file_index` that nothing has decided on yet.
+    pub(crate) fn undecided_recovery(&self, file_index: u32) -> Option<(u64, u64)> {
+        self.root.map.undecided(VolumeIndex(file_index))
     }
 
     // Seam for status: the posted file at `file_index` has an article
