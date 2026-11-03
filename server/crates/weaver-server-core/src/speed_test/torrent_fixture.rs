@@ -18,6 +18,7 @@ use weaver_torrent::{
     AddTorrent, AddTorrentOptions, CreateTorrentOptions, ListenerMode, ListenerOptions, Session,
     SessionOptions, create_torrent,
 };
+use weaver_tunnel::pipe::{Dialer, Purpose, Target};
 
 use super::TestTorrentSource;
 
@@ -53,6 +54,9 @@ struct Shared {
     info_hash: Mutex<[u8; 20]>,
     answer: Mutex<Answer>,
     announces: watch::Sender<Vec<Announce>>,
+    // The routing layer's direct route, which the fixture's peer dials in
+    // through.
+    direct: Arc<dyn Dialer>,
 }
 
 pub struct TorrentFixture {
@@ -82,6 +86,7 @@ impl TorrentFixture {
             info_hash: Mutex::new([0; 20]),
             answer: Mutex::new(Answer::default()),
             announces: watch::channel(Vec::new()).0,
+            direct: direct_route(),
         });
         let serving = shared.clone();
         tokio::spawn(async move {
@@ -257,7 +262,7 @@ async fn announce(query: &str, shared: &Shared) -> Vec<u8> {
     let answer = shared.answer.lock().unwrap().clone();
     if answer.connect_in && announce.event.as_deref() == Some("started") {
         let info_hash = *shared.info_hash.lock().unwrap();
-        let _ = trade_handshakes(announce.port, info_hash).await;
+        let _ = trade_handshakes(shared.direct.as_ref(), announce.port, info_hash).await;
     }
     shared
         .announces
@@ -284,9 +289,37 @@ async fn announce(query: &str, shared: &Shared) -> Vec<u8> {
     body
 }
 
-// Connect to the peer on `port` and trade handshakes with it.
-async fn trade_handshakes(port: u16, info_hash: [u8; 20]) -> std::io::Result<()> {
-    let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await?;
+// The host's own egress, alone, as a runtime with nothing saved routes it.
+fn direct_route() -> Arc<dyn Dialer> {
+    crate::proxies::NetworkRuntime::new(
+        crate::Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap()
+    .egress_dialer(
+        crate::proxies::SYSTEM_EGRESS_ID,
+        std::time::Duration::from_secs(30),
+    )
+    .unwrap()
+}
+
+// Connect to the peer on `port` through `direct` and trade handshakes with
+// it.
+async fn trade_handshakes(
+    direct: &dyn Dialer,
+    port: u16,
+    info_hash: [u8; 20],
+) -> std::io::Result<()> {
+    let mut stream = direct
+        .dial(&Target {
+            host: Ipv4Addr::LOCALHOST.to_string(),
+            port,
+            purpose: Purpose::Torrent,
+            addresses: vec![Ipv4Addr::LOCALHOST.into()],
+        })
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .stream;
     stream.write_all(&handshake(info_hash)).await?;
     let mut answer = [0u8; 68];
     stream.read_exact(&mut answer).await?;
