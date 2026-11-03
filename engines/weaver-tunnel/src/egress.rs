@@ -218,12 +218,31 @@ impl SocketEgress {
         };
         let socket = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
         // An unspecified IPv6 address takes IPv4 as well, whatever the
-        // host's default.
-        if local.is_ipv6() && local.ip().is_unspecified() {
-            socket.set_only_v6(false)?;
-        }
+        // host's default, unless the host keeps the socket to IPv6.
+        let dual_stack = local.is_ipv6()
+            && local.ip().is_unspecified()
+            && match socket.set_only_v6(false) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::debug!(%local, %error, "the host keeps the socket to IPv6 alone");
+                    false
+                }
+            };
         if let Self::Interface(name) = self {
             bind_interface(&socket, name, local.is_ipv6())?;
+            // Where the device is held per family, a dual-stack socket's
+            // IPv4 traffic is held to it as well, or the socket keeps to
+            // IPv6.
+            if dual_stack
+                && cfg!(target_os = "macos")
+                && let Err(error) = bind_interface(&socket, name, false)
+            {
+                tracing::debug!(
+                    %local, %error,
+                    "the device cannot hold the socket's IPv4 traffic; it keeps to IPv6"
+                );
+                socket.set_only_v6(true)?;
+            }
         }
         socket.bind(&local.into())?;
         socket.set_nonblocking(true)?;
@@ -257,6 +276,44 @@ mod connect_tests {
             .bind_udp_at("[::]:0".parse().unwrap())
             .unwrap();
         assert!(!socket2::SockRef::from(&socket).only_v6().unwrap());
+    }
+
+    // A dual-stack socket on an interface is held to the device for both
+    // families, or keeps to IPv6 where the device cannot hold its IPv4.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_dual_stack_socket_on_an_interface_is_held_to_it_for_ipv4_too() {
+        let device = if cfg!(target_os = "linux") {
+            "lo"
+        } else {
+            "lo0"
+        };
+        let socket =
+            match SocketEgress::Interface(device.into()).bind_udp_at("[::]:0".parse().unwrap()) {
+                Ok(socket) => socket,
+                // Binding to a device needs a privilege some Linux hosts withhold.
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+                Err(error) => panic!("{error}"),
+            };
+        let socket = socket2::SockRef::from(&socket);
+        #[cfg(target_os = "macos")]
+        {
+            let name = std::ffi::CString::new(device).unwrap();
+            // SAFETY: CString supplies the NUL-terminated name required by libc.
+            let index = std::num::NonZeroU32::new(unsafe { libc::if_nametoindex(name.as_ptr()) });
+            assert_eq!(socket.device_index_v6().unwrap(), index);
+            // The IPv4 device option is refused on an IPv6 socket, so the
+            // socket keeps to IPv6 rather than send IPv4 off the device.
+            if !socket.only_v6().unwrap() {
+                assert_eq!(socket.device_index_v4().unwrap(), index);
+            }
+        }
+        // One option holds both families.
+        #[cfg(target_os = "linux")]
+        {
+            assert!(!socket.only_v6().unwrap());
+            assert_eq!(socket.device().unwrap().as_deref(), Some(device.as_bytes()));
+        }
     }
 
     // A local socket binds where it is asked, or at the pinned source
