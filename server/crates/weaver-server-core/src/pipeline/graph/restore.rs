@@ -18,7 +18,7 @@ use super::checkpoint::{self, CheckpointError};
 use super::engine::Said;
 use super::hardware::Hardware;
 use super::job::restore::{RestoreFailure, Restored};
-use super::job::{GraphJob, RootFile, Storage};
+use super::job::{GraphError, GraphJob, RootFile, Storage};
 use super::limits::caps_for;
 use crate::LoadError;
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
@@ -62,7 +62,9 @@ impl GraphRestoreError {
     // job of it: a value of a type or shape it does not take, a name it
     // does not have, facts at a version it does not read, or records it
     // cannot make the tree or the root of. Each is found before the rebuild
-    // touches a file. A read that failed, or a rebuild that failed writing,
+    // touches a file. So is a record the rebuild found contradicting itself:
+    // told again, it would fault again on every start, so the job starts
+    // afresh instead. A read that failed, or a rebuild that failed writing,
     // is not this.
     fn not_this_builds(&self) -> bool {
         matches!(
@@ -70,7 +72,10 @@ impl GraphRestoreError {
             Self::Rows(_)
                 | Self::Checkpoint(_)
                 | Self::Rebuild(
-                    RestoreFailure::Tree(_) | RestoreFailure::Root(_) | RestoreFailure::Post(_)
+                    RestoreFailure::Tree(_)
+                        | RestoreFailure::Root(_)
+                        | RestoreFailure::Post(_)
+                        | RestoreFailure::Step(GraphError::Inconsistent(_))
                 )
         )
     }
@@ -372,4 +377,32 @@ fn restore_passwords(
             .map(|candidate| candidate.value().to_owned())
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use weaver_graph::VolumeIndex;
+
+    use super::{GraphError, GraphRestoreError, RestoreFailure};
+    use crate::pipeline::graph::root::source::Inconsistent;
+
+    // A record the rebuild finds contradicting itself would fault again on
+    // every start: the job starts afresh, as from a checkpoint this build
+    // does not restore. A rebuild that failed writing is still held.
+    #[test]
+    fn a_rebuild_that_finds_its_record_inconsistent_starts_afresh() {
+        let inconsistent = GraphError::Inconsistent(Inconsistent {
+            volume: VolumeIndex(0),
+            start: 27,
+            end: 28,
+        });
+        assert!(GraphRestoreError::Rebuild(RestoreFailure::Step(inconsistent)).not_this_builds());
+        let write = GraphError::Write(
+            crate::pipeline::graph::namespace::WriteError::UnknownMember {
+                node: weaver_graph::NodeId::ROOT,
+                member: weaver_graph::MemberId(9),
+            },
+        );
+        assert!(!GraphRestoreError::Rebuild(RestoreFailure::Step(write)).not_this_builds());
+    }
 }

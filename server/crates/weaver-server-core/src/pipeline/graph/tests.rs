@@ -1483,3 +1483,216 @@ async fn a_restart_parks_the_volume_again_from_the_objects_wants() {
     }
     retire_pipeline_database(pipeline).await;
 }
+
+// The field post: 750 KiB articles whose every header declares the file
+// 1536000 bytes long while the parts run to 21504000. The reference
+// decoders write each part where its own `=ypart` puts it and never cut a
+// file at its `=ybegin size=`, so the post delivers whole; with its last
+// article lost and nothing to rebuild it, the one file is damaged and
+// nothing usable came out, so the job fails, never Partial, and never
+// takes the daemon down.
+const FIELD_ARTICLE: usize = 768_000;
+const FIELD_DECLARED: u64 = 1_536_000;
+
+async fn decode_field(pipeline: &mut Pipeline, job_id: JobId, post: &Post, ordinal: u32) {
+    decode_declaring(
+        pipeline,
+        job_id,
+        post,
+        FIELD_ARTICLE,
+        FIELD_DECLARED,
+        ordinal,
+    )
+    .await;
+}
+
+// Article `ordinal` of the job's first file, cut at `article` bytes, its
+// header declaring the file `declared` bytes long.
+async fn decode_declaring(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    post: &Post,
+    article: usize,
+    declared: u64,
+    ordinal: u32,
+) {
+    let body = post
+        .articles(article)
+        .nth(ordinal as usize)
+        .unwrap()
+        .to_vec();
+    let offset = ordinal as u64 * article as u64;
+    let len = body.len() as u64;
+    let crc = par2_rs::checksum::crc32(&body);
+    pipeline
+        .handle_decode_success(
+            DecodeResult {
+                segment_id: segment_id(job_id, 0, ordinal),
+                raw_size: len,
+                encoding: SegmentEncoding::Yenc,
+                yenc_layout: YencLayoutAssertions {
+                    file_size: declared,
+                    part: Some(ordinal + 1),
+                    total: Some(post.articles(article).count() as u32),
+                    begin: Some(offset + 1),
+                    end: Some(offset + len),
+                },
+                crc_valid: true,
+                part_crc_verified: true,
+                part_crc: crc,
+                truncation_suspected: false,
+                expected_file_crc: None,
+                data: DecodedChunk::from(body),
+                yenc_name: post.name.clone(),
+                checkpoint_plan: weaver_yenc::CheckpointPlan::None,
+                segments: vec![weaver_yenc::Segment {
+                    file_offset: offset,
+                    len,
+                    crc32: crc,
+                }],
+            },
+            SegmentSource {
+                source_server_idx: Some(0),
+                exclude_servers: Vec::new(),
+            },
+        )
+        .await;
+}
+
+#[tokio::test]
+async fn a_declared_size_below_a_later_part_delivers_or_fails_by_its_bytes() {
+    for lose_last in [false, true] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let job_id = JobId(92_301);
+        let post = Post::plain("lantern.mkv", payload(28 * FIELD_ARTICLE, 31));
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        insert_active_job(
+            &mut pipeline,
+            job_id,
+            spec("lantern field", std::slice::from_ref(&post), FIELD_ARTICLE),
+        )
+        .await;
+        let working_dir = pipeline.jobs[&job_id].working_dir.clone();
+        for ordinal in 0..27 {
+            decode_field(&mut pipeline, job_id, &post, ordinal).await;
+        }
+        if lose_last {
+            pipeline
+                .book_terminal_segment(segment_id(job_id, 0, 27), SegmentTerminalState::Missing);
+        } else {
+            decode_field(&mut pipeline, job_id, &post, 27).await;
+        }
+        let (status, damaged) = match lose_last {
+            false => (JobStatus::Complete, Vec::new()),
+            true => (
+                JobStatus::Failed {
+                    error: String::new(),
+                },
+                vec![(
+                    MemberId(0),
+                    ByteRange::new(
+                        27 * FIELD_ARTICLE as u64,
+                        27 * FIELD_ARTICLE as u64 + 768_000,
+                    ),
+                )],
+            ),
+        };
+        let namespace = pipeline.graph_jobs[&job_id].namespace();
+        assert_eq!(
+            namespace.damaged_ranges().collect::<Vec<_>>(),
+            damaged,
+            "lose_last={lose_last}"
+        );
+        let ruled = pipeline.graph_terminal_status(job_id).unwrap();
+        assert_eq!(
+            std::mem::discriminant(&ruled),
+            std::mem::discriminant(&status),
+            "lose_last={lose_last}: {ruled:?}"
+        );
+        if !lose_last {
+            let written = read(&working_dir.join("lantern.mkv"));
+            let differs = written.iter().zip(&post.bytes).position(|(a, b)| a != b);
+            assert_eq!((written.len(), differs), (post.bytes.len(), None));
+        }
+        retire_pipeline_database(pipeline).await;
+    }
+}
+
+// The field post with only its first two articles arriving, exactly the
+// 1536000 bytes its headers declare, and the other twenty-six lost. Nothing
+// rebuilds them, so no usable file came out: the job fails, never Partial,
+// and never Complete on a file cut to the declared size.
+#[tokio::test]
+async fn only_the_declared_size_arriving_fails() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_302);
+    let post = Post::plain("lantern.mkv", payload(28 * FIELD_ARTICLE, 37));
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        spec("lantern field", std::slice::from_ref(&post), FIELD_ARTICLE),
+    )
+    .await;
+    for ordinal in 0..2 {
+        decode_field(&mut pipeline, job_id, &post, ordinal).await;
+    }
+    for ordinal in 2..28 {
+        pipeline.book_terminal_segment(
+            segment_id(job_id, 0, ordinal),
+            SegmentTerminalState::Missing,
+        );
+    }
+    let namespace = pipeline.graph_jobs[&job_id].namespace();
+    let damaged = namespace.damaged_ranges().collect::<Vec<_>>();
+    assert_eq!(
+        damaged
+            .iter()
+            .map(|(member, range)| (*member, range.start))
+            .collect::<Vec<_>>(),
+        vec![(MemberId(0), FIELD_DECLARED)],
+        "{damaged:?}"
+    );
+    let ruled = pipeline.graph_terminal_status(job_id);
+    assert!(matches!(ruled, Some(JobStatus::Failed { .. })), "{ruled:?}");
+    retire_pipeline_database(pipeline).await;
+}
+
+// The same shape, scaled to the harness's articles, with a PAR2 set that
+// covers the loss: the twenty-six lost articles are rebuilt and the file
+// is the post, whole.
+#[tokio::test]
+async fn only_the_declared_size_arriving_is_repaired_by_par2() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_303);
+    let data = payload(28 * ARTICLE, 39);
+    let mut posts = vec![Post::plain("lantern.mkv", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.mkv", &data)], 28));
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    decode_all(&mut pipeline, job_id, &posts, 1).await;
+    for ordinal in 0..2 {
+        decode_declaring(
+            &mut pipeline,
+            job_id,
+            &posts[0],
+            ARTICLE,
+            2 * ARTICLE as u64,
+            ordinal,
+        )
+        .await;
+    }
+    for ordinal in 2..28 {
+        pipeline.book_terminal_segment(
+            segment_id(job_id, 0, ordinal),
+            SegmentTerminalState::Missing,
+        );
+    }
+    decode_all(&mut pipeline, job_id, &posts, 2).await;
+    hear_repair(&mut pipeline, job_id).await;
+    let ruled = pipeline.graph_terminal_status(job_id);
+    assert!(matches!(ruled, Some(JobStatus::Complete)), "{ruled:?}");
+    let written = read(&working_dir.join("lantern.mkv"));
+    let differs = written.iter().zip(&data).position(|(a, b)| a != b);
+    assert_eq!((written.len(), differs), (data.len(), None));
+    retire_pipeline_database(pipeline).await;
+}

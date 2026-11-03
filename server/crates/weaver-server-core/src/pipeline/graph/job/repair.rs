@@ -223,7 +223,7 @@ impl GraphJob {
     // be told, which marks them on every member they land in at every
     // depth; whatever covers them repairs them.
     pub(super) fn mark_damage(&mut self) -> Result<(), GraphError> {
-        let lost = self.root.damage();
+        let lost = self.root.damage()?;
         if lost.is_empty() {
             return Ok(());
         }
