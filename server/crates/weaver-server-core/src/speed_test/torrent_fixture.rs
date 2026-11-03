@@ -197,7 +197,9 @@ async fn session(dir: &Path) -> Arc<Session> {
                 enable_upnp_port_forwarding: false,
                 ..Default::default()
             }),
-            ..Default::default()
+            ..weaver_torrent::SessionOptions::new(std::sync::Arc::new(
+                weaver_torrent::network::KernelSockets::new(None).expect("the kernel's sockets"),
+            ))
         },
     )
     .await

@@ -2146,7 +2146,9 @@ async fn sharing(
                 enable_upnp_port_forwarding: false,
                 ..ListenerOptions::default()
             }),
-            ..SessionOptions::default()
+            ..SessionOptions::new(Arc::new(
+                weaver_torrent::network::KernelSockets::new(None).unwrap(),
+            ))
         },
     )
     .await

@@ -60,7 +60,7 @@ async fn test_utp_with_another_client() {
                 enable_tcp: false,
                 ..Default::default()
             }),
-            ..Default::default()
+            ..crate::test_support::session_options()
         },
         client_addr,
     )
@@ -80,7 +80,7 @@ async fn test_tcp_with_another_client() {
                 listen_addr,
                 ..Default::default()
             }),
-            ..Default::default()
+            ..crate::test_support::session_options()
         },
         client_addr,
     )

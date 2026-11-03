@@ -362,9 +362,7 @@ async fn test_a_listener_whose_transport_forwards_a_port_announces_it() -> anyho
             announce_port: Some(CONFIGURED),
             ..Default::default()
         }),
-        socket_factory: Some(std::sync::Arc::new(Forwarding(std::sync::Mutex::new(
-            Some(received),
-        )))),
+        socket_factory: std::sync::Arc::new(Forwarding(std::sync::Mutex::new(Some(received)))),
         ..tracker_session_opts()?
     };
     let t = TestTorrent::new("test_forwarded_port", 2048, 1024).await?;
@@ -471,7 +469,7 @@ async fn test_an_announce_names_no_address_on_a_socket_factory_bound_to_a_source
             listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
             ..Default::default()
         }),
-        socket_factory: Some(factory),
+        socket_factory: factory,
         ..tracker_session_opts()?
     })
     .await?;

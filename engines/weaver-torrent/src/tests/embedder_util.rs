@@ -47,7 +47,7 @@ pub fn isolated_session_opts(listen: bool) -> SessionOptions {
             listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
             ..Default::default()
         }),
-        ..Default::default()
+        ..crate::test_support::session_options()
     }
 }
 

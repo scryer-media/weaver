@@ -185,8 +185,7 @@ pub(super) async fn connector() -> (
     let (tx, rx) = mpsc::unbounded_channel();
     let connector = StreamConnector::new(StreamConnectorArgs {
         enable_tcp: true,
-        socket_factory: Some(Arc::new(Dialed(tx))),
-        ..Default::default()
+        ..StreamConnectorArgs::over(Arc::new(Dialed(tx)))
     })
     .await
     .unwrap();
@@ -577,9 +576,8 @@ async fn a_plaintext_only_peer_sends_the_metadata_over_the_next_connection_at_on
     let (tx, mut dials) = mpsc::unbounded_channel();
     let connector = StreamConnector::new(StreamConnectorArgs {
         enable_tcp: true,
-        socket_factory: Some(Arc::new(Dialed(tx))),
         encryption: EncryptionPolicy::Prefer,
-        ..Default::default()
+        ..StreamConnectorArgs::over(Arc::new(Dialed(tx)))
     })
     .await
     .unwrap();

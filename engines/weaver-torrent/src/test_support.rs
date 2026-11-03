@@ -31,6 +31,11 @@ pub(crate) fn socket_factory() -> std::sync::Arc<dyn crate::network::SocketFacto
     std::sync::Arc::new(sockets())
 }
 
+/// A session's default options, over the kernel's sockets.
+pub(crate) fn session_options() -> crate::SessionOptions {
+    crate::SessionOptions::new(socket_factory())
+}
+
 /// A datagram socket bound at `addr`.
 pub(crate) async fn udp(addr: impl Into<SocketAddr>) -> Arc<dyn DatagramSocket> {
     let addr = addr.into();

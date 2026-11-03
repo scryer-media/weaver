@@ -74,8 +74,8 @@ async fn test_session_peer_id_fingerprint_is_the_dht_node_id_prefix() -> anyhow:
             }),
             persistence: None,
             disable_local_service_discovery: true,
-            socket_factory: Some(Arc::new(LoopbackUdpOnly)),
-            ..Default::default()
+            socket_factory: Arc::new(LoopbackUdpOnly),
+            ..crate::test_support::session_options()
         },
     )
     .await?;
@@ -141,8 +141,8 @@ async fn test_a_session_names_its_client_to_the_dht() -> anyhow::Result<()> {
                 }),
                 persistence: None,
                 disable_local_service_discovery: true,
-                socket_factory: Some(Arc::new(LoopbackUdpOnly)),
-                ..Default::default()
+                socket_factory: Arc::new(LoopbackUdpOnly),
+                ..crate::test_support::session_options()
             },
         )
         .await?;

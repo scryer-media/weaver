@@ -388,7 +388,13 @@ mod tests {
             },
             &unable(),
             None,
-            Arc::new(StreamConnector::new(Default::default()).await.unwrap()),
+            Arc::new(
+                StreamConnector::new(crate::stream_connect::StreamConnectorArgs::over(
+                    crate::test_support::socket_factory(),
+                ))
+                .await
+                .unwrap(),
+            ),
             crate::client_name_and_version().to_owned(),
         )
         .await

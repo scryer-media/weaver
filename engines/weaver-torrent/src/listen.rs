@@ -11,8 +11,6 @@ use std::{
 };
 
 use anyhow::Context;
-use librqbit_dualstack_sockets::{BindOpts, TcpListener};
-use librqbit_utp::{BindDevice, UtpSocketUdp, UtpSocketUdpOpts};
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -36,8 +34,7 @@ impl std::fmt::Display for ListenFailed {
 
 /// A listener's sockets, and the address they took.
 pub(crate) struct Listening {
-    pub tcp_socket: Option<TcpListener>,
-    pub custom_tcp_socket: Option<Box<dyn StreamListener>>,
+    pub tcp_socket: Option<Box<dyn StreamListener>>,
     pub utp_socket: Option<UtpSocket>,
     pub addr: SocketAddr,
 }
@@ -46,9 +43,8 @@ pub(crate) struct ListenResult {
     /// The SSL listener: SSL torrents' peers connect to it, TLS from their
     /// first byte.
     pub ssl: Option<Listening>,
-    pub tcp_socket: Option<TcpListener>,
-    /// The TCP listener created by a `SocketFactory`, used instead of `tcp_socket`.
-    pub custom_tcp_socket: Option<Box<dyn StreamListener>>,
+    /// The TCP listener the session's `SocketFactory` opened.
+    pub tcp_socket: Option<Box<dyn StreamListener>>,
     pub utp_socket: Option<UtpSocket>,
     pub enable_upnp_port_forwarding: bool,
     pub addr: SocketAddr,
@@ -119,8 +115,7 @@ impl ListenerOptions {
         mut self,
         parent_span: Option<tracing::Id>,
         cancellation_token: CancellationToken,
-        bind_device: Option<&BindDevice>,
-        socket_factory: Option<&Arc<dyn SocketFactory>>,
+        socket_factory: &Arc<dyn SocketFactory>,
     ) -> anyhow::Result<ListenResult> {
         let mut utp_opts = self.utp_opts.take().unwrap_or_default();
         utp_opts.cancellation_token = cancellation_token.clone();
@@ -141,25 +136,20 @@ impl ListenerOptions {
         let bound = bind(
             self.mode,
             listen_addr,
-            self.ipv4_only,
             utp_opts.clone(),
-            bind_device,
             socket_factory,
             true,
         )
         .await?;
         let listen_addr = bound.addr;
-        let (tcp_socket, custom_tcp_socket, utp_socket) =
-            (bound.tcp_socket, bound.custom_tcp_socket, bound.utp_socket);
+        let (tcp_socket, utp_socket) = (bound.tcp_socket, bound.utp_socket);
 
         let ssl = match self.ssl_listen_port {
             Some(port) => Some(
                 bind(
                     self.mode,
                     SocketAddr::new(listen_addr.ip(), port),
-                    self.ipv4_only,
                     utp_opts,
-                    bind_device,
                     socket_factory,
                     false,
                 )
@@ -182,7 +172,6 @@ impl ListenerOptions {
         Ok(ListenResult {
             ssl,
             tcp_socket,
-            custom_tcp_socket,
             utp_socket,
             announce_port,
             addr: listen_addr,
@@ -198,14 +187,11 @@ impl ListenerOptions {
 async fn bind(
     mode: ListenerMode,
     mut listen_addr: SocketAddr,
-    ipv4_only: bool,
     utp_opts: librqbit_utp::SocketOpts,
-    bind_device: Option<&BindDevice>,
-    socket_factory: Option<&Arc<dyn SocketFactory>>,
+    factory: &Arc<dyn SocketFactory>,
     peers: bool,
 ) -> anyhow::Result<Listening> {
-    let mut custom_tcp_socket = None;
-    let tcp_socket = if let (true, Some(factory)) = (mode.tcp_enabled(), socket_factory) {
+    let tcp_socket = if mode.tcp_enabled() {
         let listening = if peers {
             factory.listen_peers_tcp(listen_addr)
         } else {
@@ -217,44 +203,13 @@ async fn bind(
             "Listening on TCP {:?} for incoming peer connections",
             listen_addr
         );
-        custom_tcp_socket = Some(listener);
-        None
-    } else if mode.tcp_enabled() {
-        let listener = TcpListener::bind_tcp(
-            listen_addr,
-            BindOpts {
-                request_dualstack: !ipv4_only,
-                reuseport: false,
-                device: bind_device,
-            },
-        )
-        .context("error starting TCP listener")?;
-        listen_addr = listener.bind_addr();
-        info!(
-            "Listening on TCP {:?} for incoming peer connections",
-            listen_addr
-        );
         Some(listener)
     } else {
         None
     };
 
     let utp_socket = if mode.utp_enabled() {
-        let bind_result: Result<UtpSocket, Box<dyn std::error::Error + Send + Sync>> =
-            match socket_factory {
-                Some(factory) => bind_custom_utp(factory.as_ref(), listen_addr, utp_opts)
-                    .await
-                    .map_err(Into::into),
-                None => UtpSocketUdp::new_udp_with_opts(
-                    listen_addr,
-                    utp_opts,
-                    UtpSocketUdpOpts { bind_device },
-                )
-                .await
-                .map(UtpSocket::Udp)
-                .map_err(Into::into),
-            };
-        match bind_result {
+        match bind_utp(factory.as_ref(), listen_addr, utp_opts).await {
             Ok(sock) => {
                 listen_addr = sock.bind_addr();
                 info!(
@@ -263,14 +218,12 @@ async fn bind(
                 );
                 Some(sock)
             }
-            Err(e) if tcp_socket.is_some() || custom_tcp_socket.is_some() => {
+            Err(e) if tcp_socket.is_some() => {
                 // If we listen over TCP, it's not a fatal error if we can't listen over uTP.
                 tracing::error!("Error listening on UDP {listen_addr:?}: {e:#}");
                 None
             }
-            Err(e) => {
-                return Err(anyhow::Error::from_boxed(e));
-            }
+            Err(e) => return Err(e),
         }
     } else {
         None
@@ -278,13 +231,13 @@ async fn bind(
 
     Ok(Listening {
         tcp_socket,
-        custom_tcp_socket,
         utp_socket,
         addr: listen_addr,
     })
 }
 
-async fn bind_custom_utp(
+/// A uTP socket over a datagram socket `factory` binds on `listen_addr`.
+pub(crate) async fn bind_utp(
     factory: &dyn SocketFactory,
     listen_addr: SocketAddr,
     utp_opts: librqbit_utp::SocketOpts,
@@ -298,7 +251,7 @@ async fn bind_custom_utp(
         Default::default(),
         utp_opts,
     )?;
-    Ok(UtpSocket::Custom(sock))
+    Ok(UtpSocket(sock))
 }
 
 pub(crate) trait Accept {
@@ -313,23 +266,6 @@ pub(crate) trait Accept {
             impl AsyncWrite + Unpin + Send + 'static,
         ),
     )>;
-}
-
-impl Accept for TcpListener {
-    const KIND: ConnectionKind = ConnectionKind::Tcp;
-    async fn accept(
-        &self,
-    ) -> anyhow::Result<(
-        SocketAddr,
-        (
-            impl AsyncReadVectored + Send + 'static,
-            impl AsyncWrite + Send + 'static,
-        ),
-    )> {
-        let (stream, addr) = self.accept().await.context("error accepting TCP")?;
-        let (read, write) = stream.into_split();
-        Ok((addr, (read, write)))
-    }
 }
 
 impl Accept for Box<dyn StreamListener + '_> {

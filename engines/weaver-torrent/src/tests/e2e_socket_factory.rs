@@ -125,8 +125,8 @@ fn session_opts(
         disable_local_service_discovery: true,
         listen,
         connect,
-        socket_factory: Some(factory.clone()),
-        ..Default::default()
+        socket_factory: factory.clone(),
+        ..crate::test_support::session_options()
     }
 }
 
@@ -282,8 +282,7 @@ async fn test_stream_connector_dials_through_factory() -> anyhow::Result<()> {
 
     let connector = StreamConnector::new(StreamConnectorArgs {
         enable_tcp: true,
-        socket_factory: Some(factory.clone()),
-        ..Default::default()
+        ..StreamConnectorArgs::over(factory.clone())
     })
     .await?;
 

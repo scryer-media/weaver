@@ -152,10 +152,10 @@ async fn a_paused_hash_stops_searching_and_announcing_until_resumed() -> anyhow:
                 announce_port: Some(6881),
                 ..Default::default()
             }),
-            socket_factory: Some(Arc::new(Loopback)),
+            socket_factory: Arc::new(Loopback),
             disable_local_service_discovery: true,
             persistence: None,
-            ..Default::default()
+            ..crate::test_support::session_options()
         },
     )
     .await?;

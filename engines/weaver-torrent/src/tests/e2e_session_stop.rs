@@ -178,8 +178,8 @@ async fn test_stop_returns_once_the_dht_socket_is_gone() -> anyhow::Result<()> {
             }),
             persistence: None,
             disable_local_service_discovery: true,
-            socket_factory: Some(factory.clone()),
-            ..Default::default()
+            socket_factory: factory.clone(),
+            ..crate::test_support::session_options()
         },
     )
     .await?;
@@ -236,7 +236,7 @@ async fn announced(
                 listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
                 ..Default::default()
             }),
-            socket_factory: Some(factory.clone()),
+            socket_factory: factory.clone(),
             ..tracker_session_opts()?
         },
     )

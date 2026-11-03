@@ -571,6 +571,14 @@ pub fn tracker_client(
     Ok(Arc::new(clients))
 }
 
+// The host's loopback interface, for a leg bound to it.
+#[cfg(test)]
+pub(crate) const LOOPBACK_DEVICE: &str = if cfg!(target_os = "linux") {
+    "lo"
+} else {
+    "lo0"
+};
+
 // A leg on the host's own sockets.
 #[cfg(test)]
 pub(crate) fn system_dialer() -> Arc<dyn Dialer> {

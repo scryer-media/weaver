@@ -255,8 +255,7 @@ fn dht_peers(
 /// `session_impl::remap_ports` maps a socket only once it is open).
 fn listening_protocols(listen: &crate::listen::ListenResult) -> Vec<PortmapProtocol> {
     [
-        (listen.tcp_socket.is_some() || listen.custom_tcp_socket.is_some())
-            .then_some(PortmapProtocol::Tcp),
+        listen.tcp_socket.is_some().then_some(PortmapProtocol::Tcp),
         listen.utp_socket.is_some().then_some(PortmapProtocol::Udp),
     ]
     .into_iter()
@@ -831,8 +830,7 @@ pub struct DhtSessionConfig {
     /// The DHT listen port. Priority: this explicit port -> persisted port
     /// (when persistence is enabled) -> random. The bind IP is derived from
     /// `SessionOptions::ipv4_only` (`0.0.0.0` if true, `[::]` otherwise).
-    /// Use `SessionOptions::bind_device_name` to scope the bind to a specific
-    /// network interface.
+    /// The socket is bound through `SessionOptions::socket_factory`.
     pub port: Option<u16>,
     /// Persistence behavior. If None, persistence is disabled.
     pub persistence: Option<DhtPersistenceConfig>,
@@ -935,7 +933,8 @@ pub struct SessionOptions {
     /// Defaults to DHT enabled with persistence.
     pub dht: Option<DhtSessionConfig>,
 
-    /// What network device to bind to for DHT, BT-UDP, BT-TCP, trackers and LSD.
+    /// The network device LSD binds to, and port mapping maps on. The
+    /// session's other sockets are `socket_factory`'s.
     /// On OSX will use IP(V6)_BOUND_IF, on Linux will use SO_BINDTODEVICE.
     pub bind_device_name: Option<String>,
 
@@ -1041,9 +1040,11 @@ pub struct SessionOptions {
     /// Force IPv4 only.
     pub ipv4_only: bool,
 
-    /// Create peer sockets with this factory instead of binding kernel
-    /// sockets. See [`SocketFactory`] for what it covers.
-    pub socket_factory: Option<Arc<dyn SocketFactory>>,
+    /// Every socket the session opens toward the internet: its peers' TCP
+    /// dials and listeners, its uTP socket, its DHT socket, and its UDP
+    /// trackers' socket. See [`SocketFactory`] for what it covers;
+    /// [`KernelSockets`](crate::network::KernelSockets) opens the kernel's.
+    pub socket_factory: Arc<dyn SocketFactory>,
 
     /// The resolver for every name the session looks up: DHT bootstrap
     /// nodes, UDP and HTTP trackers, and web seeds, whose addresses are
@@ -1082,8 +1083,10 @@ pub struct SessionOptions {
     pub trackers_changed: Option<Arc<Notify>>,
 }
 
-impl Default for SessionOptions {
-    fn default() -> Self {
+impl SessionOptions {
+    /// The default options of a session whose sockets `socket_factory`
+    /// opens.
+    pub fn new(socket_factory: Arc<dyn SocketFactory>) -> Self {
         Self {
             dht: Some(DhtSessionConfig::default()),
             bind_device_name: None,
@@ -1114,7 +1117,7 @@ impl Default for SessionOptions {
             lsd_socket: None,
             disable_pex: false,
             ipv4_only: false,
-            socket_factory: None,
+            socket_factory,
             resolver: None,
             http_client: None,
             encryption: crate::mse::EncryptionPolicy::Disabled,
@@ -1402,14 +1405,6 @@ struct PeerRequest<'a> {
 }
 
 impl Session {
-    /// Create a new session with default options.
-    /// The passed in folder will be used as a default unless overridden per torrent.
-    /// It will run a DHT server/client, a TCP listener and .
-    #[inline(never)]
-    pub fn new(default_output_folder: PathBuf) -> BoxFuture<'static, anyhow::Result<Arc<Self>>> {
-        Self::new_with_opts(default_output_folder, SessionOptions::default())
-    }
-
     pub fn cancellation_token(&self) -> &CancellationToken {
         &self.cancellation_token
     }
@@ -1444,15 +1439,8 @@ impl Session {
                 None => None,
             };
 
-            // The sockets the DHT and the UDP trackers bind: the session's
-            // factory, else the kernel's on the session's device.
-            let datagram_sockets: Arc<dyn SocketFactory> = match opts.socket_factory.clone() {
-                Some(factory) => factory,
-                None => Arc::new(
-                    crate::network::KernelSockets::new(opts.bind_device_name.as_deref())
-                        .context("error opening the session's sockets")?,
-                ),
-            };
+            // The sockets the DHT and the UDP trackers bind.
+            let datagram_sockets = Arc::clone(&opts.socket_factory);
 
             let listen_result = if let Some(listen_opts) = opts.listen.take() {
                 Some(
@@ -1460,8 +1448,7 @@ impl Session {
                         .start(
                             opts.root_span.as_ref().and_then(|s| s.id()),
                             swarm.child_token(),
-                            bind_device.as_ref(),
-                            opts.socket_factory.as_ref(),
+                            &opts.socket_factory,
                         )
                         .await
                         .context(crate::listen::ListenFailed)?,
@@ -1471,17 +1458,14 @@ impl Session {
             };
 
             let dht = if let Some(dht_config) = opts.dht.take() {
-                // With a socket factory the DHT runs over a datagram socket the
-                // factory binds; the factory decides the real address.
-                let dht_socket = match opts.socket_factory.as_ref() {
-                    Some(factory) => Some(
-                        factory
-                            .bind_udp(dht_listen_addr(dht_config.port, None, opts.ipv4_only))
-                            .await
-                            .context("error binding DHT socket through socket factory")?,
-                    ),
-                    None => None,
-                };
+                // The DHT runs over a datagram socket the factory binds; the
+                // factory decides the real address.
+                let dht_socket = Some(
+                    datagram_sockets
+                        .bind_udp(dht_listen_addr(dht_config.port, None, opts.ipv4_only))
+                        .await
+                        .context("error binding DHT socket through socket factory")?,
+                );
                 let dht = if let Some(persistence_config) = dht_config.persistence {
                     PersistentDht::create_from_config(
                         persistence_config,
@@ -1579,7 +1563,6 @@ impl Session {
                 StreamConnector::new(StreamConnectorArgs {
                     enable_tcp: opts.connect.as_ref().map(|c| c.enable_tcp).unwrap_or(true),
                     utp_socket: listen_result.as_ref().and_then(|l| l.utp_socket.clone()),
-                    bind_device: bind_device.clone(),
                     ipv4_only: opts.ipv4_only,
                     socket_factory: opts.socket_factory.clone(),
                     encryption: opts.encryption,
@@ -1711,12 +1694,11 @@ impl Session {
                 let protocols = listening_protocols(&listen);
                 let max = listen.max_pending_incoming_handshake_checks;
                 let forwarded = listen
-                    .custom_tcp_socket
+                    .tcp_socket
                     .as_ref()
                     .and_then(|listener| listener.port_mappings());
                 let plain = crate::listen::Listening {
                     tcp_socket: listen.tcp_socket.take(),
-                    custom_tcp_socket: listen.custom_tcp_socket.take(),
                     utp_socket: listen.utp_socket.take(),
                     addr: listen.addr,
                 };
@@ -1972,17 +1954,6 @@ impl Session {
     ) {
         let addr = listening.addr;
         if let Some(tcp) = listening.tcp_socket {
-            let this = self.clone();
-            self.spawn_on_swarm(
-                debug_span!(parent: self.rs(), "tcp_listen", ?addr, tls),
-                "tcp_listen",
-                async move {
-                    this.task_listener(tcp, tls, max_pending_incoming_handshake_checks)
-                        .await
-                },
-            );
-        }
-        if let Some(tcp) = listening.custom_tcp_socket {
             let this = self.clone();
             self.spawn_on_swarm(
                 debug_span!(parent: self.rs(), "tcp_listen", ?addr, tls),
@@ -4046,7 +4017,7 @@ mod tests {
                 listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
                 ..Default::default()
             }
-            .start(None, token.clone(), None, None)
+            .start(None, token.clone(), &crate::test_support::socket_factory())
             .await
             .unwrap();
             assert_eq!(listening_protocols(&listen), expected, "{mode:?}");
@@ -4161,7 +4132,7 @@ mod tests {
                 dht: None,
                 disable_local_service_discovery: true,
                 trackers: HashSet::from([url("http://session.test/announce")]),
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await
@@ -4243,7 +4214,7 @@ mod tests {
                 dht: None,
                 disable_local_service_discovery: false,
                 lsd_socket: Some(Box::new(RecordingSocket(sent_tx))),
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await
@@ -4416,7 +4387,7 @@ mod tests {
                 }),
                 connections_limit,
                 connections_slack,
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await
@@ -4494,7 +4465,7 @@ mod tests {
                 persistence: None,
                 disable_trackers: true,
                 disable_local_service_discovery: true,
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await
@@ -4600,7 +4571,7 @@ mod tests {
                 persistence: None,
                 disable_trackers: true,
                 disable_local_service_discovery: true,
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await
@@ -4697,7 +4668,7 @@ mod tests {
                 persistence: None,
                 disable_trackers: true,
                 disable_local_service_discovery: true,
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await
@@ -4863,7 +4834,7 @@ mod tests {
                         listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
                         ..Default::default()
                     }),
-                    ..Default::default()
+                    ..crate::test_support::session_options()
                 },
             )
             .await
@@ -5073,8 +5044,8 @@ mod tests {
                     listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
                     ..Default::default()
                 }),
-                socket_factory: Some(factory),
-                ..Default::default()
+                socket_factory: factory,
+                ..crate::test_support::session_options()
             },
         )
         .await
@@ -5145,7 +5116,7 @@ mod tests {
                         disable_local_service_discovery: true,
                         listen: None,
                         shared_limits: Some(shared),
-                        ..Default::default()
+                        ..crate::test_support::session_options()
                     },
                 )
                 .await
@@ -5309,7 +5280,7 @@ mod tests {
                 }),
                 // A test greets the seed from this host more than once.
                 allow_multiple_connections_per_ip: true,
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await
@@ -5573,7 +5544,7 @@ mod tests {
                             ..Default::default()
                         }),
                     }),
-                    ..Default::default()
+                    ..crate::test_support::session_options()
                 },
             )
             .await
@@ -5622,7 +5593,7 @@ mod tests {
         let session = Session::new_with_opts(
             dir.path().into(),
             SessionOptions {
-                socket_factory: Some(Arc::new(Dialed(tx))),
+                socket_factory: Arc::new(Dialed(tx)),
                 encryption: EncryptionPolicy::Prefer,
                 connect: Some(super::ConnectionOptions {
                     enable_tcp: true,
@@ -5911,7 +5882,7 @@ mod tests {
                         .unwrap()
                         .to_string(),
                 ),
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await;
@@ -5941,7 +5912,7 @@ mod tests {
             &dir,
             SessionOptions {
                 ipv4_only: true,
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await;
@@ -5964,7 +5935,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_running_session_judges_incoming_connections_by_its_filter_as_it_changes() {
         let dir = TempDir::with_prefix("incoming_refiltered").unwrap();
-        let session = quiet_session(&dir, SessionOptions::default()).await;
+        let session = quiet_session(&dir, crate::test_support::session_options()).await;
         assert_eq!(check_once(&session, "10.0.0.1:6881"), None);
         assert_eq!(check_once(&session, "10.0.0.2:80"), None);
 
@@ -6000,7 +5971,7 @@ mod tests {
             &dir,
             SessionOptions {
                 ipv4_only: true,
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await;

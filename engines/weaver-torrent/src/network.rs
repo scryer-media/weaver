@@ -7,14 +7,12 @@
 
 //! Pluggable network transport for a [`Session`](crate::Session).
 //!
-//! By default a session binds and connects kernel sockets itself. An embedder
-//! that needs peer traffic to flow through something else (a userspace network
-//! stack, a VPN tunnel, a network namespace, a test harness) can implement
-//! [`SocketFactory`] and pass it in
+//! A session opens no socket toward the internet itself: every one comes from
+//! the [`SocketFactory`] in
 //! [`SessionOptions::socket_factory`](crate::SessionOptions::socket_factory).
-//!
-//! When no factory is set, nothing in this module is on the hot path: the
-//! session keeps using concrete kernel sockets exactly as before.
+//! [`KernelSockets`] opens the kernel's; an embedder that needs peer traffic
+//! to flow through something else (a userspace network stack, a VPN tunnel,
+//! a network namespace, a test harness) implements its own.
 
 use std::{
     future::Future,
@@ -56,16 +54,16 @@ pub trait StreamListener: Send + Sync + 'static {
 
 /// Creates the sockets a [`Session`](crate::Session) uses for peer traffic.
 ///
-/// Set it in [`SessionOptions::socket_factory`](crate::SessionOptions::socket_factory)
-/// to replace kernel sockets with another transport. Every `addr` passed to a
+/// The session's is [`SessionOptions::socket_factory`](crate::SessionOptions::socket_factory).
+/// Every `addr` passed to a
 /// method may be an unspecified address (`0.0.0.0` or `[::]`) and may carry
 /// port 0; the factory decides what it actually binds, and reports it back
 /// through [`StreamListener::local_addr`] and [`DatagramSocket::bind_addr`].
 ///
-/// With a factory set:
 /// - outgoing peer TCP connections are dialed with [`SocketFactory::connect_tcp`];
 /// - the incoming peer TCP listener is created with [`SocketFactory::listen_tcp`];
-/// - the uTP socket (incoming and outgoing uTP) runs over [`SocketFactory::bind_udp`].
+/// - the uTP socket (incoming and outgoing uTP), the DHT socket and the UDP
+///   trackers' socket run over [`SocketFactory::bind_udp`].
 ///
 /// `SessionOptions::bind_device_name` does not apply to sockets created by the
 /// factory.
@@ -169,41 +167,30 @@ impl<T, E> UtpSocketEnv for librqbit_utp::UtpSocket<T, E> {
 
 type DefaultUtpEnvironment = <UtpSocketUdp as UtpSocketEnv>::Env;
 
-/// The session's uTP socket: over a kernel UDP socket by default, or over a
-/// datagram socket from a [`SocketFactory`].
+/// The session's uTP socket, over a datagram socket from its
+/// [`SocketFactory`].
 #[derive(Clone, Debug)]
-pub(crate) enum UtpSocket {
-    Udp(Arc<UtpSocketUdp>),
-    Custom(Arc<librqbit_utp::UtpSocket<DatagramTransport, DefaultUtpEnvironment>>),
-}
+pub(crate) struct UtpSocket(
+    pub(crate) Arc<librqbit_utp::UtpSocket<DatagramTransport, DefaultUtpEnvironment>>,
+);
 
 impl UtpSocket {
     pub(crate) fn bind_addr(&self) -> SocketAddr {
-        match self {
-            UtpSocket::Udp(s) => s.bind_addr(),
-            UtpSocket::Custom(s) => s.bind_addr(),
-        }
+        self.0.bind_addr()
     }
 
     pub(crate) async fn accept(&self) -> librqbit_utp::Result<UtpStream> {
-        match self {
-            UtpSocket::Udp(s) => s.accept().await,
-            UtpSocket::Custom(s) => s.accept().await,
-        }
+        self.0.accept().await
     }
 
     pub(crate) async fn connect(&self, remote: SocketAddr) -> librqbit_utp::Result<UtpStream> {
-        match self {
-            UtpSocket::Udp(s) => s.connect(remote).await,
-            UtpSocket::Custom(s) => s.connect(remote).await,
-        }
+        self.0.connect(remote).await
     }
 }
 
-/// The kernel sockets a session opens when it is given no factory, as a
-/// factory: TCP dialled and listened on, and UDP bound, by the same calls
-/// and on the same device. A caller that watches a session's sockets wraps
-/// this and hands the session the wrapper.
+/// The kernel's sockets, as a factory: TCP dialled and listened on, and UDP
+/// bound, on one device or none. A caller that watches a session's sockets
+/// wraps this and hands the session the wrapper.
 pub struct KernelSockets {
     bind_device: Option<librqbit_dualstack_sockets::BindDevice>,
 }

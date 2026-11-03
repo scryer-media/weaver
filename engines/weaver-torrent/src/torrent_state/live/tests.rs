@@ -4021,7 +4021,7 @@ async fn our_dht_port_goes_once_to_a_dht_peer_and_its_port_adds_its_node() {
             bootstrap_addrs: Some(Vec::new()),
             ..Default::default()
         }),
-        socket_factory: Some(udp.clone()),
+        socket_factory: udp.clone(),
         ..isolated_session_opts(false)
     };
     let h = Harness::build_on(
@@ -4833,7 +4833,7 @@ impl crate::network::SocketFactory for UnansweredDials {
 async fn the_connect_timeout_grows_by_three_seconds_per_failure() {
     let (tx, mut dials) = unbounded_channel();
     let opts = SessionOptions {
-        socket_factory: Some(Arc::new(UnansweredDials(tx))),
+        socket_factory: Arc::new(UnansweredDials(tx)),
         ..isolated_session_opts(false)
     };
     let add = AddTorrentOptions {
@@ -5140,9 +5140,7 @@ async fn dialing_with(
     use tokio::io::AsyncReadExt;
     let (tx, mut dialed) = unbounded_channel();
     let opts = SessionOptions {
-        socket_factory: Some(Arc::new(DialedTcp(crate::peer_info_reader::tests::Dialed(
-            tx,
-        )))),
+        socket_factory: Arc::new(DialedTcp(crate::peer_info_reader::tests::Dialed(tx))),
         connect: Some(crate::stream_connect::ConnectionOptions {
             enable_tcp: true,
             peer_opts: Some(peer_opts),
@@ -6608,7 +6606,7 @@ async fn a_private_torrent_offers_no_dht_and_no_metadata() {
             bootstrap_addrs: Some(Vec::new()),
             ..Default::default()
         }),
-        socket_factory: Some(udp.clone()),
+        socket_factory: udp.clone(),
         ..isolated_session_opts(false)
     };
     let name = "private_no_dht_no_metadata";

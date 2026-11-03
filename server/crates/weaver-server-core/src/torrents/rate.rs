@@ -225,7 +225,10 @@ mod tests {
                 disable_local_service_discovery: true,
                 listen: None,
                 persistence: None,
-                ..Default::default()
+                ..weaver_torrent::SessionOptions::new(std::sync::Arc::new(
+                    weaver_torrent::network::KernelSockets::new(None)
+                        .expect("the kernel's sockets"),
+                ))
             },
         )
         .await
