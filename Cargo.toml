@@ -60,13 +60,13 @@ bitvec = { version = "1.1", default-features = false, features = ["std"] }
 # The torrent session.
 weaver-torrent = { path = "engines/weaver-torrent" }
 anyhow = "1"
-arc-swap = "1.7"
+arc-swap = "1.9"
 arrayvec = "0.7"
 async-compression = "0.4"
 async-stream = "0.3"
 async-trait = "0.1"
 atoi = "2"
-backon = "1.5"
+backon = "1.6"
 bstr = "1"
 byteorder = "1"
 chardetng = "1"
