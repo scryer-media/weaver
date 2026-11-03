@@ -17,7 +17,7 @@
 use std::{
     future::Future,
     io::{self, IoSlice},
-    net::{IpAddr, SocketAddr, SocketAddrV6},
+    net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV6},
     sync::Arc,
     task::{Context, Poll},
 };
@@ -240,19 +240,98 @@ impl KernelSockets {
         Ok(Self { bind_device })
     }
 
-    fn bind_opts(&self) -> librqbit_dualstack_sockets::BindOpts<'_> {
+    // A socket bound at the unspecified IPv6 address takes IPv4 as well,
+    // unless it is one of a pair.
+    fn bind_opts(&self, paired: bool) -> librqbit_dualstack_sockets::BindOpts<'_> {
         librqbit_dualstack_sockets::BindOpts {
-            request_dualstack: true,
+            request_dualstack: !paired,
             reuseport: false,
             device: self.bind_device.as_ref(),
         }
     }
 
+    // Whether a bind at `addr` opens a socket for each family, IPv6 alone at
+    // `addr` and IPv4 on its port, each held to the device: the unspecified
+    // IPv6 address on a device, which one socket cannot hold to it for both
+    // families on every host.
+    fn paired(&self, addr: SocketAddr) -> bool {
+        self.bind_device.is_some() && addr.is_ipv6() && addr.ip().is_unspecified()
+    }
+
     /// A datagram socket at `addr`, at the kernel's defaults.
     fn kernel_udp(&self, addr: SocketAddr) -> io::Result<KernelUdp> {
-        let socket = librqbit_dualstack_sockets::UdpSocket::bind_udp(addr, self.bind_opts())
-            .map_err(io::Error::other)?;
+        self.kernel_udp_as(addr, false)
+    }
+
+    fn kernel_udp_as(&self, addr: SocketAddr, paired: bool) -> io::Result<KernelUdp> {
+        let socket = librqbit_dualstack_sockets::UdpSocket::bind_udp(addr, self.bind_opts(paired))
+            .map_err(bind_error)?;
         Ok(KernelUdp(socket))
+    }
+
+    // The datagram sockets at `addr`, each set for uTP with a receive buffer
+    // of `utp` bytes when it holds one.
+    fn datagrams(
+        &self,
+        addr: SocketAddr,
+        utp: Option<usize>,
+    ) -> io::Result<Arc<dyn DatagramSocket>> {
+        let set = |socket: KernelUdp, at: SocketAddr| {
+            if let Some(receive_buffer) = utp {
+                crate::udp_options::set_for_utp(socket.0.socket(), at, receive_buffer);
+            }
+            socket
+        };
+        if !self.paired(addr) {
+            return Ok(Arc::new(set(self.kernel_udp(addr)?, addr)));
+        }
+        let (v6, v4) = bind_pair(
+            addr,
+            |at| self.kernel_udp_as(at, true),
+            |socket| socket.0.bind_addr().port(),
+        )?;
+        let (v6_addr, v4_addr) = (v6.0.bind_addr(), v4.0.bind_addr());
+        Ok(Arc::new(PairedUdp {
+            v6: set(v6, v6_addr),
+            v4: set(v4, v4_addr),
+        }))
+    }
+}
+
+// The io error a failed bind carries, so a port in use is told apart.
+fn bind_error(error: librqbit_dualstack_sockets::Error) -> io::Error {
+    match error {
+        librqbit_dualstack_sockets::Error::Bind(error) => error,
+        error => io::Error::other(error),
+    }
+}
+
+// How many free IPv6 ports a pair tries before giving up on one IPv4 also
+// has free.
+const PAIR_ATTEMPTS: usize = 16;
+
+// A socket for each family on one port: IPv6 alone at `addr`, then IPv4 on
+// the port it took. Port 0 lets the kernel choose, and a port it chose for
+// IPv6 that IPv4 holds is given up for another.
+fn bind_pair<T>(
+    addr: SocketAddr,
+    bind: impl Fn(SocketAddr) -> io::Result<T>,
+    port_of: impl Fn(&T) -> u16,
+) -> io::Result<(T, T)> {
+    let mut attempts = 1;
+    loop {
+        let v6 = bind(addr)?;
+        match bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port_of(&v6)))) {
+            Ok(v4) => return Ok((v6, v4)),
+            Err(error)
+                if addr.port() == 0
+                    && error.kind() == io::ErrorKind::AddrInUse
+                    && attempts < PAIR_ATTEMPTS =>
+            {
+                attempts += 1;
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -284,10 +363,21 @@ impl SocketFactory for KernelSockets {
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
         Box::pin(async move {
-            let listener =
-                librqbit_dualstack_sockets::TcpListener::bind_tcp(addr, self.bind_opts())
-                    .map_err(io::Error::other)?;
-            Ok(Box::new(KernelListener(listener)) as Box<dyn StreamListener>)
+            let listen = |at, paired| {
+                librqbit_dualstack_sockets::TcpListener::bind_tcp(at, self.bind_opts(paired))
+                    .map_err(bind_error)
+            };
+            if !self.paired(addr) {
+                return Ok(
+                    Box::new(KernelListener(listen(addr, false)?)) as Box<dyn StreamListener>
+                );
+            }
+            let (v6, v4) = bind_pair(
+                addr,
+                |at| listen(at, true),
+                |listener| listener.bind_addr().port(),
+            )?;
+            Ok(Box::new(PairedListener { v6, v4 }) as Box<dyn StreamListener>)
         })
     }
 
@@ -295,7 +385,7 @@ impl SocketFactory for KernelSockets {
         &'a self,
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
-        Box::pin(async move { Ok(Arc::new(self.kernel_udp(addr)?) as Arc<dyn DatagramSocket>) })
+        Box::pin(async move { self.datagrams(addr, None) })
     }
 
     fn bind_utp<'a>(
@@ -303,11 +393,7 @@ impl SocketFactory for KernelSockets {
         addr: SocketAddr,
         receive_buffer: usize,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
-        Box::pin(async move {
-            let socket = self.kernel_udp(addr)?;
-            crate::udp_options::set_for_utp(socket.0.socket(), addr, receive_buffer);
-            Ok(Arc::new(socket) as Arc<dyn DatagramSocket>)
-        })
+        Box::pin(async move { self.datagrams(addr, Some(receive_buffer)) })
     }
 
     // The port mapper asks the gateway from a socket of its own, bound as
@@ -339,6 +425,109 @@ impl StreamListener for KernelListener {
                 Box::new(write) as BoxAsyncWrite,
             ))
         })
+    }
+}
+
+// A listener for each family on one port, taking a peer from either.
+struct PairedListener {
+    v6: librqbit_dualstack_sockets::TcpListener,
+    v4: librqbit_dualstack_sockets::TcpListener,
+}
+
+impl StreamListener for PairedListener {
+    fn local_addr(&self) -> SocketAddr {
+        self.v6.bind_addr()
+    }
+
+    fn accept<'a>(
+        &'a self,
+    ) -> BoxFuture<'a, io::Result<(SocketAddr, BoxAsyncReadVectored, BoxAsyncWrite)>> {
+        Box::pin(async move {
+            let (stream, peer) = tokio::select! {
+                accepted = self.v6.accept() => accepted?,
+                accepted = self.v4.accept() => accepted?,
+            };
+            let (read, write) = stream.into_split();
+            Ok((
+                peer,
+                Box::new(read) as BoxAsyncReadVectored,
+                Box::new(write) as BoxAsyncWrite,
+            ))
+        })
+    }
+}
+
+// A datagram socket for each family on one port: datagrams come in on
+// either, and each goes out on the one of its target's family.
+struct PairedUdp {
+    v6: KernelUdp,
+    v4: KernelUdp,
+}
+
+impl PairedUdp {
+    // The socket for `target`, an IPv4-mapped IPv6 address taken as IPv4.
+    fn toward(&self, target: SocketAddr) -> (&KernelUdp, SocketAddr) {
+        match target {
+            SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+                Some(ip) => (&self.v4, SocketAddr::new(ip.into(), v6.port())),
+                None => (&self.v6, target),
+            },
+            SocketAddr::V4(_) => (&self.v4, target),
+        }
+    }
+}
+
+impl DatagramSocket for PairedUdp {
+    fn bind_addr(&self) -> SocketAddr {
+        self.v6.bind_addr()
+    }
+
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
+        Box::pin(async move {
+            let (v6, v4) = (self.v6.0.socket(), self.v4.0.socket());
+            loop {
+                let socket = tokio::select! {
+                    ready = v6.readable() => { ready?; v6 }
+                    ready = v4.readable() => { ready?; v4 }
+                };
+                match socket.try_recv_from(buf) {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                    received => return received,
+                }
+            }
+        })
+    }
+
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<usize>> {
+        let (socket, target) = self.toward(target);
+        socket.send_to(buf, target)
+    }
+
+    fn poll_send_to(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        let (socket, target) = self.toward(target);
+        socket.poll_send_to(cx, buf, target)
+    }
+
+    fn poll_send_to_vectored(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        let (socket, target) = self.toward(target);
+        socket.poll_send_to_vectored(cx, bufs, target)
     }
 }
 
@@ -447,6 +636,85 @@ impl DatagramSocket for KernelUdp {
                     return Poll::Ready(sent);
                 }
             }
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    use std::{
+        io,
+        net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    };
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{KernelSockets, SocketFactory};
+
+    // The loopback device, which an Interface leg can be held to.
+    const LOOPBACK: &str = if cfg!(target_os = "linux") {
+        "lo"
+    } else {
+        "lo0"
+    };
+
+    // Whether the host withholds holding a socket to a device.
+    fn withheld(error: &io::Error) -> bool {
+        matches!(
+            error
+                .get_ref()
+                .and_then(|error| error.downcast_ref::<librqbit_dualstack_sockets::Error>()),
+            Some(librqbit_dualstack_sockets::Error::BindDeviceSetDeviceError(error))
+                if error.kind() == io::ErrorKind::PermissionDenied
+        )
+    }
+
+    #[tokio::test]
+    async fn an_interface_leg_at_the_unspecified_v6_address_reaches_both_families() {
+        let leg = KernelSockets::new(Some(LOOPBACK)).unwrap();
+        let unspecified = SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0));
+        let socket = match leg
+            .bind_utp(unspecified, crate::udp_options::STREAM_WINDOW)
+            .await
+        {
+            Ok(socket) => socket,
+            // Holding a socket to a device needs a privilege some Linux
+            // hosts withhold.
+            Err(error) if withheld(&error) => return,
+            Err(error) => panic!("{error}"),
+        };
+        let port = socket.bind_addr().port();
+        assert_eq!(socket.bind_addr(), (Ipv6Addr::UNSPECIFIED, port).into());
+        let mut buf = [0u8; 16];
+        for ip in [
+            std::net::IpAddr::from(Ipv4Addr::LOCALHOST),
+            Ipv6Addr::LOCALHOST.into(),
+        ] {
+            let peer = tokio::net::UdpSocket::bind((ip, 0)).await.unwrap();
+            let peer_addr = peer.local_addr().unwrap();
+            // Out on the socket of the peer's family, from the leg's port.
+            socket.send_to(b"out", peer_addr).await.unwrap();
+            let (len, from) = peer.recv_from(&mut buf).await.unwrap();
+            assert_eq!((&buf[..len], from), (&b"out"[..], (ip, port).into()));
+            // In on it, from the peer's own address.
+            peer.send_to(b"in", from).await.unwrap();
+            let (len, from) = socket.recv_from(&mut buf).await.unwrap();
+            assert_eq!((&buf[..len], from), (&b"in"[..], peer_addr));
+        }
+
+        let listener = leg.listen_tcp(unspecified).await.unwrap();
+        let port = listener.local_addr().port();
+        for ip in [
+            std::net::IpAddr::from(Ipv4Addr::LOCALHOST),
+            Ipv6Addr::LOCALHOST.into(),
+        ] {
+            let mut peer = tokio::net::TcpStream::connect((ip, port)).await.unwrap();
+            let (from, mut read, _write) = listener.accept().await.unwrap();
+            assert_eq!(from, peer.local_addr().unwrap());
+            peer.write_all(b"hi").await.unwrap();
+            let mut got = [0u8; 2];
+            read.read_exact(&mut got).await.unwrap();
+            assert_eq!(&got, b"hi");
         }
     }
 }
