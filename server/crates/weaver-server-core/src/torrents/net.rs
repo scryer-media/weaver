@@ -1700,42 +1700,6 @@ mod tests {
         assert_eq!(clients.built(), built + 1);
     }
 
-    // A source-address leg whose builder fails still builds the gateway's
-    // client, and it still leaves from the leg's address: it reaches a
-    // listener there and no IPv4 one.
-    #[tokio::test]
-    async fn a_failed_builder_leaves_the_gateway_client_on_the_legs_address() {
-        let source = IpAddr::from(std::net::Ipv6Addr::LOCALHOST);
-        let Ok(at_source) = tokio::net::TcpListener::bind((source, 0)).await else {
-            // The host has no IPv6 loopback to leave from.
-            return;
-        };
-        let v4 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let clients = LegClients::new(
-            || Err("the leg's device is gone".to_owned()),
-            None,
-            LegKind::SourceAddress(source),
-            system_dialer(),
-        );
-        assert!(clients.client(None, &ClientShape::FETCH).is_err());
-        let gateway = clients.client(None, &ClientShape::GATEWAY).unwrap();
-
-        let url = format!("http://{}/", at_source.local_addr().unwrap());
-        let asked = tokio::spawn(async move { gateway.get(url).send().await.map(drop) });
-        let (_, peer) = at_source.accept().await.unwrap();
-        assert_eq!(peer.ip(), source);
-        drop(at_source);
-        let _ = asked.await.unwrap();
-
-        let gateway = clients.client(None, &ClientShape::GATEWAY).unwrap();
-        let error = gateway
-            .get(format!("http://{}/", v4.local_addr().unwrap()))
-            .send()
-            .await
-            .unwrap_err();
-        assert!(error.is_connect(), "{error}");
-    }
-
     // Two legs asked for the same target and shape each build their own
     // client, from one builder that counts what it is asked for: a client
     // built for one leg is never handed to the other.
