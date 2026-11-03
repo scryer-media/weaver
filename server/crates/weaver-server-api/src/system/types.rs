@@ -121,7 +121,7 @@ impl DownloadBlock {
     async fn resume_at_epoch_ms(&self, ctx: &Context<'_>) -> Option<f64> {
         let scheduled = ctx.data_opt::<crate::ScheduledResumeCoordinator>()?;
         let at = scheduled.resume_at().await;
-        (at > 0).then(|| at as f64 * 1000.0)
+        (at > 0).then_some(at as f64 * 1000.0)
     }
 }
 
