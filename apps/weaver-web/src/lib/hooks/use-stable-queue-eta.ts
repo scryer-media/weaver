@@ -16,7 +16,7 @@ export interface EtaJobInput {
 export interface EtaConditions {
   /** Everything is held: nothing moves until it resumes. */
   paused: boolean;
-  /** The download speed limit in bytes per second, 0 for none. */
+  /** The speed limit in force in bytes per second, 0 for none. */
   speedLimit: number;
 }
 
@@ -53,8 +53,10 @@ function activeEtaJobs(jobs: EtaJobInput[]): EtaJobInput[] {
   return jobs.filter((job) => ACTIVE_ETA_STATUSES.has(job.status));
 }
 
+// Which jobs are counted, not how big they are: a total that moves, as a
+// job's recovery is parked or asked for, leaves the speed as it was.
 function buildQueueSignature(jobs: EtaJobInput[]): string {
-  return jobs.map((job) => `${job.id}:${job.status}:${job.totalBytes}`).join("|");
+  return jobs.map((job) => `${job.id}:${job.status}`).join("|");
 }
 
 function sumDownloadedBytes(jobs: EtaJobInput[]): number {

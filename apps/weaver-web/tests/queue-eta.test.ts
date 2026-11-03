@@ -17,22 +17,29 @@ const TICK_MS = 1_000;
 const TOTAL = 100_000 * MB;
 
 // The queue as the page samples it: one job holding the daemon's totals.
-function sample(downloaded: number) {
+function sample(total: number, downloaded: number) {
   return [
-    { id: 0, status: "DOWNLOADING", totalBytes: TOTAL, downloadedBytes: downloaded, remainingBytes: TOTAL - downloaded },
+    { id: 0, status: "DOWNLOADING", totalBytes: total, downloadedBytes: downloaded, remainingBytes: total - downloaded },
   ];
+}
+
+// The conditions as the page builds them: the limit the daemon says it holds
+// the wire to.
+function inForce(limit: number): EtaConditions {
+  return { paused: false, speedLimit: limit };
 }
 
 // Drives the estimator one display tick at a time on a clock the test owns.
 class Clock {
   now = 0;
   downloaded = 0;
+  total = TOTAL;
   readonly state: EtaEstimatorState = createEtaEstimator();
 
   tick(rate: number, conditions: EtaConditions, shown = rate): number {
     this.now += TICK_MS;
     this.downloaded += (rate * TICK_MS) / 1_000;
-    return nextEtaSpeed(this.state, sample(this.downloaded), shown, this.now, conditions);
+    return nextEtaSpeed(this.state, sample(this.total, this.downloaded), shown, this.now, conditions);
   }
 
   run(seconds: number, rate: number, conditions: EtaConditions): number {
@@ -109,4 +116,43 @@ test("a removed limit starts the window again", () => {
 
   clock.tick(10 * MB, FREE, 2 * MB);
   assert.ok(clock.run(30, 10 * MB, FREE) >= 9.5 * MB);
+});
+
+test("a schedule above the configured limit is the limit time left reads", () => {
+  const clock = new Clock();
+  // Configured 10 MB/s, a schedule window of 50 MB/s holds.
+  const shown = clock.run(120, 50 * MB, inForce(50 * MB));
+  assert.ok(shown >= 45 * MB, `${shown}`);
+});
+
+test("a schedule set to unlimited lifts the time-left cap at once", () => {
+  const clock = new Clock();
+  clock.run(120, 10 * MB, inForce(10 * MB));
+
+  // The window opens unlimited over a configured 10 MB/s: the daemon holds
+  // the wire to nothing, and the old samples go with the old limit.
+  clock.tick(50 * MB, inForce(0), 10 * MB);
+  const shown = clock.run(30, 50 * MB, inForce(0));
+  assert.ok(shown >= 45 * MB, `${shown}`);
+});
+
+test("a schedule that drops the wire counts as a limit change", () => {
+  const clock = new Clock();
+  clock.run(120, 50 * MB, inForce(0));
+
+  // The daemon's rate still shows the old speed for this tick.
+  const next = clock.tick(5 * MB, inForce(5 * MB), 50 * MB);
+  assert.ok(next <= 5 * MB, `${next}`);
+});
+
+test("a queue total that moves leaves the speed as it was", () => {
+  const clock = new Clock();
+  clock.run(120, 10 * MB, FREE);
+
+  // A job starts and its recovery is counted, then parked: the total moves
+  // while one burst sample comes in.
+  clock.total += 100 * MB;
+  const moved = clock.tick(10 * MB, FREE, 30 * MB);
+  assert.notEqual(moved, 30 * MB);
+  assert.ok(moved < 12 * MB, `${moved}`);
 });

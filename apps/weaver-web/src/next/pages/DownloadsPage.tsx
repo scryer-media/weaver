@@ -69,7 +69,7 @@ import { countLabel } from "../i18n/labels";
 import { NextShell } from "../shell/NextShell";
 import { AttentionBlock, CategoryListBlock, ProvidersBlock } from "../shell/rail-blocks";
 import { AddNzbDialog } from "../features/AddNzbDialog";
-import { SpeedLimitControl } from "../features/SpeedLimitDialog";
+import { SpeedLimitControl, useSpeedLimitInForce } from "../features/SpeedLimitDialog";
 import { DownloadInspector } from "./downloads/DownloadInspector";
 import { DownloadRow } from "./downloads/DownloadRow";
 import { QueueEtaContext } from "./downloads/queue-eta";
@@ -121,7 +121,8 @@ function sortJobs(
 }
 
 export function DownloadsPage() {
-  const { queue, categories: configured, speed, isPaused, speedLimit, downloadBlock } = useNextData();
+  const { queue, categories: configured, speed, isPaused, downloadBlock } = useNextData();
+  const { inForce: speedLimit } = useSpeedLimitInForce();
   const statusLabel = useStatusLabel();
   const t = useTranslate();
 
