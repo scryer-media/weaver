@@ -578,3 +578,66 @@ async fn a_held_recovery_volume_reads_as_fetching_repair_data() {
         "not repaired"
     );
 }
+
+// The field post's lie: every header declares a file two articles long, on
+// a file of 28 articles whose parts begin far past it. Every reference
+// decoder writes each part at its own `=ypart begin` and closes the file at
+// the furthest byte written (sabctools `src/yenc.cc:339-377`, NZBGet
+// `daemon/nntp/ArticleWriter.cpp:557-558`), so every byte arrives and the
+// file is delivered whole.
+#[tokio::test]
+async fn a_post_declaring_two_articles_of_many_is_delivered_whole() {
+    let data = payload(28 * ARTICLE, 113);
+    let posts = vec![Post::plain("lantern.bin", data.clone())];
+    let graph = run(&Scenario::new(posts).declares(0, 2 * ARTICLE as u64)).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert!(graph.files["lantern beacon/lantern.bin"] == data);
+    assert_fetched_once(&graph);
+}
+
+// The field post's geometry under a recovery set: parts of three slices'
+// worth, slices larger than a part, the set spread over volumes posted in
+// parts of the same size, and every header of every file declaring a file
+// of `declared(file)` bytes. The file's parts 1 to 26 are lost.
+fn field_set(seed: u8, declared: impl Fn(&Post) -> u64) -> (Vec<u8>, Scenario) {
+    const PART: usize = 3 * ARTICLE;
+    let data = payload(28 * PART, seed);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(super::harness::par2_volumes_sliced(
+        "lantern",
+        &[("lantern.bin", &data)],
+        4 * ARTICLE as u64,
+        24,
+        4,
+    ));
+    let sizes: Vec<u64> = posts.iter().map(&declared).collect();
+    let mut scenario = Scenario::new(posts).framed(PART);
+    for (file, size) in sizes.into_iter().enumerate() {
+        scenario = scenario.declares(file as u32, size);
+    }
+    for ordinal in 1..27 {
+        scenario = scenario.lost(0, ordinal);
+    }
+    (data, scenario)
+}
+
+// The lie on the recovery volumes too: each volume's parts past its
+// declared size are fetched where their own headers place them, and the
+// set rebuilds the file whole.
+#[tokio::test]
+async fn a_set_declaring_two_parts_of_many_still_repairs() {
+    let (data, scenario) = field_set(114, |_| 6 * ARTICLE as u64);
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert!(graph.files["lantern beacon/lantern.bin"] == data);
+}
+
+// Every header declares a file a mebibyte longer than it is: the set
+// rebuilds the file, which ends at its real length.
+#[tokio::test]
+async fn a_set_declaring_a_mebibyte_more_still_repairs() {
+    let (data, scenario) = field_set(115, |post| post.bytes.len() as u64 + (1 << 20));
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert!(graph.files["lantern beacon/lantern.bin"] == data);
+}

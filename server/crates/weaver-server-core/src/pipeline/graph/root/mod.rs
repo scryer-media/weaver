@@ -103,19 +103,18 @@ impl ArticleRoot {
         Some(decoded.into_arrival())
     }
 
-    // The file length the article declares, when it can be the file's: no
-    // more than the post can deliver, and no less than where the article's
-    // own part ends. Either way a length is a lie and sizes nothing; the
-    // file reaches as far as its bytes land, each part where its own header
-    // puts it (nzbfast `crates/nzbfast-engine/src/get/workers.rs:777-867`).
+    // The file length the article declares, when it can be the file's:
+    // one the post's articles can reach with parts the size of this one's,
+    // and no less than where this one ends. Otherwise it sizes nothing and
+    // bounds no part.
     pub(crate) fn accepted_length(&self, decoded: &Decoded) -> Option<u64> {
-        let cap = self
-            .map
-            .posted_cap(decoded.volume, decoded.bytes.len() as u64);
-        let own_end = decoded.declared_end.filter(|_| decoded.positioned);
-        decoded
-            .length
-            .filter(|length| *length <= cap && own_end.is_none_or(|end| end <= *length))
+        let own_end = decoded
+            .declared_end
+            .unwrap_or(decoded.offset + decoded.bytes.len() as u64);
+        let part = own_end.saturating_sub(decoded.offset);
+        decoded.length.filter(|length| {
+            own_end <= *length && self.map.reachable(decoded.volume, part, *length)
+        })
     }
 
     // Answer one round of seeks. A deferred seek parks; a recovery seek is

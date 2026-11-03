@@ -190,10 +190,20 @@ impl Pipeline {
         if ids.is_empty() {
             return Vec::new();
         }
+        let markers: Vec<_> = ids
+            .iter()
+            .map(|id| (*id, self.db.queue_job_writes_marker(*id)))
+            .collect();
         let mut waited = HashMap::new();
-        for id in &ids {
-            if let Err(error) = self.db.job_writes_committed(*id).await {
-                waited.insert(*id, error.to_string());
+        for (id, marker) in markers {
+            let reached = match marker {
+                Ok(marker) => marker
+                    .await
+                    .map_err(|_| "database writer queue closed".to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            if let Err(error) = reached {
+                waited.insert(id, error);
             }
         }
         let db = self.db.clone();

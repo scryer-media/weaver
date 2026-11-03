@@ -1654,13 +1654,14 @@ impl Database {
         self.try_send_with_retry(command, label)
     }
 
-    // Waits until every write queued for the job before this call has run.
-    // A marker joins the end of the job's lane and answers once it is
-    // reached; writes on one lane run in order, each to its commit.
-    pub(crate) async fn job_writes_committed(
+    // A marker at the end of the job's lane: it answers once every write
+    // queued for the job before it has run, each to its commit, as writes
+    // on one lane run in order. Queue the markers of several jobs before
+    // awaiting any, and their lanes are passed once.
+    pub(crate) fn queue_job_writes_marker(
         &self,
         job_id: crate::jobs::ids::JobId,
-    ) -> Result<(), StateError> {
+    ) -> Result<oneshot::Receiver<()>, StateError> {
         let (reached, rx) = oneshot::channel();
         self.try_queue_job_write(job_id, "job_writes_committed", move |_| {
             let _ = reached.send(());
@@ -1668,8 +1669,7 @@ impl Database {
         })?;
         #[cfg(test)]
         JOB_WRITE_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        rx.await
-            .map_err(|_| StateError::Database("database writer queue closed".to_string()))
+        Ok(rx)
     }
 
     pub(crate) fn try_queue_graph_checkpoint(
