@@ -8,6 +8,7 @@ use super::*;
 use crate::jobs::handle::QueueMoveTarget;
 use crate::jobs::phase_progress::JobPhase;
 use crate::pipeline::nzb_admission::NZB_SLOT_WAIT_REASON;
+use crate::pipeline::queue_window::QUEUE_WINDOW;
 
 const QUEUED: u64 = 200;
 
@@ -46,6 +47,23 @@ fn row_walks() -> u64 {
     crate::pipeline::queue::ROW_WALKS.load(Ordering::Relaxed)
 }
 
+// Turns until the queue window has nothing left to install.
+async fn settle_window(pipeline: &mut Pipeline) {
+    pipeline.apply_queue_intents().await;
+    while pipeline.restores_waiting {
+        pipeline.apply_queue_intents().await;
+    }
+}
+
+fn row_run_state(pipeline: &Pipeline, id: JobId) -> crate::RunState {
+    pipeline.shared_state.queue.read(|inner| {
+        inner
+            .job(id)
+            .map(|row| row.info(&inner.globals).run_state)
+            .unwrap()
+    })
+}
+
 #[tokio::test]
 async fn a_job_waiting_for_a_slot_stores_the_reason_the_dispatch_pass_computes() {
     let temp = tempfile::tempdir().unwrap();
@@ -80,13 +98,25 @@ async fn a_turn_with_no_new_intent_walks_no_queue_row() {
 
     // An intent is acted on by the next turn's walk, and the turn after it
     // walks nothing again.
-    handle.pause_job(JobId(QUEUED)).await.unwrap();
+    let in_window = JobId(QUEUE_WINDOW as u64 / 2);
+    handle.pause_job(in_window).await.unwrap();
     pipeline.apply_queue_intents().await;
     assert!(row_walks() > settled);
+    assert_eq!(pipeline.jobs[&in_window].run_state, crate::RunState::Paused);
+    let acted = row_walks();
+    pipeline.apply_queue_intents().await;
+    assert_eq!(row_walks(), acted);
+
+    // A job past the window is installed to act on its intent, which calls
+    // for one more walk; after it, turns walk nothing again.
+    handle.pause_job(JobId(QUEUED)).await.unwrap();
+    pipeline.apply_queue_intents().await;
     assert_eq!(
-        pipeline.jobs[&JobId(QUEUED)].run_state,
+        row_run_state(&pipeline, JobId(QUEUED)),
         crate::RunState::Paused
     );
+    assert!(!pipeline.jobs.contains_key(&JobId(QUEUED)));
+    pipeline.apply_queue_intents().await;
     let acted = row_walks();
     pipeline.apply_queue_intents().await;
     assert_eq!(row_walks(), acted);
@@ -105,10 +135,10 @@ async fn a_batch_pause_is_one_queue_change_and_pauses_every_job() {
     assert_eq!(queue.revision(), revision + 1);
     assert_eq!(queue.read(|inner| inner.intent_epoch()), epoch + 1);
 
-    pipeline.apply_queue_intents().await;
+    settle_window(&mut pipeline).await;
     for id in (1..=QUEUED).map(JobId) {
         assert_eq!(
-            pipeline.jobs[&id].run_state,
+            row_run_state(&pipeline, id),
             crate::RunState::Paused,
             "job {}",
             id.0
@@ -152,8 +182,14 @@ async fn a_reorder_keeps_every_row_where_its_index_says() {
             assert_eq!(inner.job_position(*id), Some(position));
         }
     });
-    pipeline.apply_queue_intents().await;
-    assert_eq!(pipeline.job_order, expected);
+    settle_window(&mut pipeline).await;
+    // The installed jobs keep the queue's order.
+    let installed: Vec<JobId> = expected
+        .iter()
+        .copied()
+        .filter(|id| pipeline.jobs.contains_key(id))
+        .collect();
+    assert_eq!(pipeline.job_order, installed);
 
     // The stored positions sort the rows into the same order, which is the
     // order a restart restores.
@@ -326,8 +362,21 @@ async fn a_restart_restores_a_long_queue_a_batch_a_turn_holding_no_article_lists
         pipeline.apply_queue_intents().await;
         turns += 1;
     }
-    assert_eq!(pipeline.jobs.len(), QUEUED as usize);
-    assert_eq!(turns, (QUEUED as usize).div_ceil(RESTORE_BATCH));
+    // Only the window is installed: the first rows in queue order, and the
+    // holder moved to the bottom. Every row stays.
+    let window = QUEUE_WINDOW + 1;
+    assert_eq!(pipeline.jobs.len(), window);
+    assert!(pipeline.jobs.contains_key(&LATE_HOLDER));
+    assert!(
+        order[..QUEUE_WINDOW]
+            .iter()
+            .all(|id| pipeline.jobs.contains_key(id))
+    );
+    assert_eq!(
+        pipeline.shared_state.queue.read(|inner| inner.jobs.len()),
+        QUEUED as usize
+    );
+    assert_eq!(turns, window.div_ceil(RESTORE_BATCH));
     // A restore that changes nothing in its row writes nothing back.
     assert_eq!(RUNTIME_WRITES.load(Ordering::Relaxed), writes);
     // No job here ever started, so each waits its turn holding the
@@ -353,7 +402,7 @@ async fn a_restart_restores_a_long_queue_a_batch_a_turn_holding_no_article_lists
 #[tokio::test]
 async fn a_restart_reads_each_jobs_file_rows_when_it_installs_it() {
     const DOWNLOADING: JobId = JobId(1);
-    const WAITING: JobId = JobId(QUEUED);
+    const WAITING: JobId = JobId(QUEUE_WINDOW as u64);
     let temp = tempfile::tempdir().unwrap();
     let (pipeline, _handle) = long_queue(&temp, 2).await;
     pipeline
@@ -415,7 +464,7 @@ async fn a_restart_reads_each_jobs_file_rows_when_it_installs_it() {
         pipeline.apply_queue_intents().await;
     }
     assert!(pipeline.restore_pass.is_none());
-    assert_eq!(pipeline.jobs.len(), QUEUED as usize);
+    assert_eq!(pipeline.jobs.len(), QUEUE_WINDOW);
     assert_eq!(pipeline.jobs[&DOWNLOADING].status, JobStatus::Downloading);
     for job_id in [DOWNLOADING, WAITING] {
         assert_eq!(

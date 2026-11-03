@@ -99,7 +99,8 @@ impl Pipeline {
         let pending = row.admission.is_some()
             || row.intents.restore.is_some()
             || row.intents.paused == Some(false)
-            || self.jobs.contains_key(&row.id);
+            || self.jobs.contains_key(&row.id)
+            || self.window_parked(row.id);
         // Only a pending edit can move the priority off the reported metadata.
         let priority = if row.intents.update.is_some() {
             metadata_priority(&row.info(globals).metadata)
@@ -355,8 +356,8 @@ impl Pipeline {
     }
 
     // Whether the row's job would download now but holds no slot: an intake,
-    // a restore or a resume that is not paused, or an installed job that is
-    // not paused, none of them cancelled.
+    // a restore or a resume that is not paused, or an installed job or one
+    // out of the queue window that is not paused, none of them cancelled.
     pub(crate) fn waits_for_nzb_slot(&self, row: &crate::pipeline::queue::JobRow) -> bool {
         !self.nzb_admitted.contains(&row.id)
             && row.intents.cancelled.is_none()
@@ -374,10 +375,12 @@ impl Pipeline {
                 || self
                     .jobs
                     .get(&row.id)
-                    .is_some_and(|state| state.run_state != crate::RunState::Paused))
+                    .is_some_and(|state| state.run_state != crate::RunState::Paused)
+                || (self.window_parked(row.id)
+                    && row.report.job.run_state != crate::RunState::Paused))
     }
 
-    fn nzb_work_in_flight(&self, id: JobId) -> bool {
+    pub(crate) fn nzb_work_in_flight(&self, id: JobId) -> bool {
         self.download_lane_owners.values().any(|lane| {
             lane.outstanding
                 .keys()

@@ -52,3 +52,4 @@ pub use metrics_store::{
     RawMetricsHistoryPoint, RollupMetricsHistoryPoint,
 };
 pub use recovery::{RecoveredServerState, RestoreCandidate, recover_server_state};
+pub(crate) use recovery::{read_stored_files, restore_request};

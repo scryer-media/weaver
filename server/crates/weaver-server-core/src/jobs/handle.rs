@@ -802,6 +802,11 @@ pub struct RestoreJobRequest {
 pub struct RestartRead {
     pub(crate) runtime: crate::pipeline::StoredRuntimeValues,
     pub(crate) summaries: crate::jobs::model::FileSummaries,
+    // When the job was added, as its row stores it.
+    pub(crate) created_at_epoch_ms: f64,
+    // The job is entering the queue window again, not arriving: it raises
+    // no creation event.
+    pub(crate) reentry: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
