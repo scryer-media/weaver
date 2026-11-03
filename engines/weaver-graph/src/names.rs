@@ -319,6 +319,19 @@ pub const INTERNAL_DIR: &str = ".weaver-chunks";
 // written under it either.
 pub const CACHE_DIR: &str = ".weaver-cache";
 
+// Every name at the top of the working directory that the job keeps for
+// itself and never publishes: the two directories above, the staging
+// directory, and the working directory's marker and the replacement written
+// for it. Completion leaves each out of the delivery, so no output is
+// written under one.
+const RESERVED: [&str; 5] = [
+    INTERNAL_DIR,
+    CACHE_DIR,
+    ".weaver-staging",
+    ".weaver-job-dir",
+    ".weaver-job-dir.upgrade",
+];
+
 // A name an archive gave, kept inside the folder it is written under. This
 // is the one confinement every output name passes: the leaf that writes it
 // only asserts what is decided here. Either separator splits the name, and
@@ -326,8 +339,8 @@ pub const CACHE_DIR: &str = ".weaver-cache";
 // start at the root. A NUL, which no file system takes in a name, becomes
 // `_`. A part spelled like a drive (`C:`) is an ordinary directory where
 // paths have no drives; on Windows, where a colon in any part names a drive
-// (`C:`, `C:foo`) or a file's stream, every colon becomes `_`. A path that starts at the internal directory, or at the
-// cache directory beside it, starts at that directory's first suffixed name
+// (`C:`, `C:foo`) or a file's stream, every colon becomes `_`. A path that
+// starts at a reserved name starts at that name's first suffixed form
 // instead. A trailing separator, which names a directory, is kept.
 fn confined(wanted: &str) -> String {
     let mut parts: Vec<String> = wanted
@@ -338,7 +351,7 @@ fn confined(wanted: &str) -> String {
     match parts.first_mut() {
         None => return "_".to_owned(),
         Some(first) => {
-            if let Some(reserved) = [INTERNAL_DIR, CACHE_DIR]
+            if let Some(reserved) = RESERVED
                 .into_iter()
                 .find(|reserved| first.eq_ignore_ascii_case(reserved))
             {
@@ -614,6 +627,29 @@ mod tests {
         assert_eq!(
             root(&mut ledger, 5, ".Weaver-Cache/d.bin"),
             ".weaver-cache (1)/d.bin"
+        );
+    }
+
+    // Completion publishes nothing at a name the job keeps for itself, so
+    // an archive's member that wants one is written beside it instead.
+    #[test]
+    fn no_name_lands_where_completion_publishes_nothing() {
+        let mut ledger = NameLedger::new();
+        assert_eq!(
+            root(&mut ledger, 1, ".weaver-staging/payload.bin"),
+            ".weaver-staging (1)/payload.bin"
+        );
+        assert_eq!(
+            root(&mut ledger, 2, ".weaver-job-dir"),
+            ".weaver-job-dir (1)"
+        );
+        assert_eq!(
+            root(&mut ledger, 3, ".weaver-job-dir.upgrade"),
+            ".weaver-job-dir.upgrade (1)"
+        );
+        assert_eq!(
+            root(&mut ledger, 4, "dir/.weaver-job-dir"),
+            "dir/.weaver-job-dir"
         );
     }
 
