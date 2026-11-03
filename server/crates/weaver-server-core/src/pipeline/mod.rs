@@ -1339,6 +1339,9 @@ pub struct Pipeline {
         HashMap<JobId, crate::post_processing::model::PipelineFailureStage>,
     // Job dispatch order (FIFO by submission). First Downloading job is active.
     pub(super) job_order: Vec<JobId>,
+    // The whole queue's order, installed jobs and parked ones alike, as it
+    // was last stored: a reorder among parked jobs is stored too.
+    pub(super) stored_queue_order: Vec<JobId>,
     // Number of in-flight article downloads (primary + recovery).
     pub(super) active_downloads: usize,
     // Number of NNTP connection tasks currently fetching articles.

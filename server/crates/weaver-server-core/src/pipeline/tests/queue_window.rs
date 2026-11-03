@@ -203,3 +203,27 @@ async fn a_restart_installs_only_the_window_and_lists_every_row_in_place() {
                 || pipeline.nzb_admitted.contains(&job.job_id))
     );
 }
+
+// A reorder among jobs out of the window changes no installed job, and is
+// stored all the same: a restart before they enter keeps it.
+#[tokio::test]
+async fn a_reorder_among_parked_jobs_is_stored() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, handle) = long_queue(&temp, 2).await;
+    let (moved, past) = (JobId(150), JobId(151));
+    assert!(!pipeline.jobs.contains_key(&moved) && !pipeline.jobs.contains_key(&past));
+    handle
+        .reorder_jobs(vec![(moved, QueueMoveTarget::Offset(1))])
+        .await
+        .unwrap();
+    settle(&mut pipeline).await;
+    assert!(!pipeline.jobs.contains_key(&moved) && !pipeline.jobs.contains_key(&past));
+    pipeline.db.flush_write_queue().await.unwrap();
+    let stored = pipeline.db.load_active_job_queue_positions().unwrap();
+    assert!(
+        stored[&past] < stored[&moved],
+        "stored {} before {}",
+        stored[&moved],
+        stored[&past]
+    );
+}
