@@ -2764,8 +2764,10 @@ async fn nzbget_listfiles_reports_nzb_files_with_progress() {
         vec![],
     );
     // The job's snapshot as its download publishes it: 150_000 bytes of
-    // alpha.rar in, nothing of beta.par2.
+    // alpha.rar in, nothing of beta.par2, which is held back until a loss
+    // asks for it.
     job.file_remaining_bytes = vec![450_000, 100_000];
+    job.file_parked_bytes = vec![0, 100_000];
     db.create_active_job(&weaver_server_core::ActiveJob {
         job_id: JobId(55),
         nzb_hash: [7u8; 32],
@@ -2805,12 +2807,15 @@ async fn nzbget_listfiles_reports_nzb_files_with_progress() {
     assert_eq!(alpha["NZBID"], 55);
     assert_eq!(alpha["FileSizeLo"], 600_000);
     assert_eq!(alpha["RemainingSizeLo"], 450_000);
+    assert_eq!(alpha["Paused"], false);
     let beta = files
         .iter()
         .find(|file| file["Filename"] == "beta.par2")
         .unwrap();
     assert_eq!(beta["FileSizeLo"], 100_000);
     assert_eq!(beta["RemainingSizeLo"], 100_000);
+    assert_eq!(beta["Paused"], true);
+    assert_eq!(beta["Progress"], 0);
 
     let (status, payload) = post_nzbget(
         app,

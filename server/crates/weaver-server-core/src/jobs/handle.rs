@@ -952,6 +952,11 @@ pub struct JobInfo {
     // the post declares their sizes. Empty when no download runs for the job.
     #[serde(default)]
     pub file_remaining_bytes: Vec<u64>,
+    // Of each NZB file's bytes not yet downloaded, those of recovery held
+    // back until a loss asks for it, in the same order. Empty when no
+    // download runs for the job.
+    #[serde(default)]
+    pub file_parked_bytes: Vec<u64>,
     // The post's encoded bytes still to come: every article neither in hand
     // nor lost for good, less the recovery parked until something asks for
     // it. A clean post ends its download at zero; recovery fetched after a

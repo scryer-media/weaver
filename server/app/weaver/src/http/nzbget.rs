@@ -3570,6 +3570,13 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
                     .unwrap_or(total)
                     .min(total)
             };
+            // Recovery held back until a loss asks for it lists as NZBGet
+            // lists its paused par files: paused, still to come.
+            let held_back = !job_done
+                && info
+                    .file_parked_bytes
+                    .get(index)
+                    .is_some_and(|parked| *parked > 0);
             let (file_lo, file_hi) = size_parts(total);
             let (remaining_lo, remaining_hi) = size_parts(remaining);
             let filename = file
@@ -3591,7 +3598,7 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
                 "RemainingSizeHi": remaining_hi,
                 "PostTime": file.date,
                 "FilenameConfirmed": true,
-                "Paused": paused,
+                "Paused": paused || held_back,
                 "ActiveDownloads": 0,
                 "Progress": (total.saturating_sub(remaining))
                     .saturating_mul(1000)

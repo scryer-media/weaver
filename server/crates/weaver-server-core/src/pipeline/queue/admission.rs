@@ -203,6 +203,7 @@ pub(super) fn initial_info(
         completed_files: 0,
         remaining_par_files: 0,
         file_remaining_bytes: Vec::new(),
+        file_parked_bytes: Vec::new(),
         remaining_bytes: wanted_bytes,
         wanted_bytes,
         password: spec.password.clone(),

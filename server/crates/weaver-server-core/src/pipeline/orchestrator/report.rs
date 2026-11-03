@@ -230,7 +230,12 @@ impl Pipeline {
             file_remaining_bytes: self
                 .graph_jobs
                 .get(&state.job_id)
-                .map(super::super::graph::job::GraphJob::remaining_bytes)
+                .map(super::super::graph::job::GraphJob::waiting_bytes)
+                .unwrap_or_default(),
+            file_parked_bytes: self
+                .graph_jobs
+                .get(&state.job_id)
+                .map(super::super::graph::job::GraphJob::parked_bytes)
                 .unwrap_or_default(),
             remaining_bytes,
             wanted_bytes,

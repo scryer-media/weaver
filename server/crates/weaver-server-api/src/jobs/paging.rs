@@ -854,6 +854,7 @@ mod tests {
             total_files: 1,
             completed_files: 0,
             file_remaining_bytes: Vec::new(),
+            file_parked_bytes: Vec::new(),
             remaining_bytes: total_bytes,
             wanted_bytes: total_bytes,
             remaining_par_files: 0,
