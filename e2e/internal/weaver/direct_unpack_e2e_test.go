@@ -19,7 +19,7 @@ import (
 func unpackJobLog(raw string, job int) string {
 	var lines []string
 	for _, line := range strings.Split(raw, "\n") {
-		line = ansiEscape.ReplaceAllString(line, "")
+		line = cleanWeaverLogLine(line)
 		if !isWeaverDebugRingReplay(line) && directLogJobID(line) == strconv.Itoa(job) {
 			lines = append(lines, line)
 		}

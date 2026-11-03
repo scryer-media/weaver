@@ -49,9 +49,22 @@ impl From<CoreDirectoryBrowseListing> for DirectoryBrowseResult {
 }
 
 #[derive(Debug, Clone, SimpleObject)]
+#[graphql(complex)]
 pub struct ServiceLogsPayload {
-    pub lines: Vec<String>,
+    /// One JSON record per line, oldest first.
+    pub records: Vec<String>,
     pub count: i32,
+}
+
+#[ComplexObject]
+impl ServiceLogsPayload {
+    /// The same lines as text, rendered from the records when asked for.
+    async fn lines(&self) -> Vec<String> {
+        self.records
+            .iter()
+            .map(|record| weaver_server_core::runtime::log_buffer::text_line(record))
+            .collect()
+    }
 }
 
 /// The live log filter. Changes last until the process exits.

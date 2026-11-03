@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { memo } from "react";
+import { memo, type KeyboardEvent } from "react";
 import { LOG_LEVEL_COLORS } from "../data/palette";
-import type { LogKeyValue, LogLine } from "../data/service-log-buffer";
+import { recordJson, type LogKeyValue, type LogLine } from "../data/service-log-buffer";
 
 /** Split the message so its `key=value` tail can be tinted separately. */
 function messageFragments(line: LogLine) {
@@ -28,10 +28,43 @@ function messageFragments(line: LogLine) {
  *
  * `bare` drops the stamp, level and target columns, for a line that is plain
  * text rather than a log record: a guessed level would only mislabel it.
+ *
+ * With `onToggle`, clicking the line selects it, and a selected line shows
+ * its record's JSON beneath it.
  */
-export const LogRow = memo(function LogRow({ line, bare = false }: { line: LogLine; bare?: boolean }) {
-  return (
-    <div className="flex flex-wrap gap-x-[14px] gap-y-0.5 border-b border-wv-log-line px-4 sm:px-6 py-1.5 font-wv-mono text-[11.5px] leading-[1.55] sm:flex-nowrap">
+export const LogRow = memo(function LogRow({
+  line,
+  bare = false,
+  selected = false,
+  onToggle,
+}: {
+  line: LogLine;
+  bare?: boolean;
+  selected?: boolean;
+  onToggle?: (id: number) => void;
+}) {
+  const row = (
+    <div
+      className="flex flex-wrap gap-x-[14px] gap-y-0.5 border-b border-wv-log-line px-4 sm:px-6 py-1.5 font-wv-mono text-[11.5px] leading-[1.55] sm:flex-nowrap"
+      {...(onToggle
+        ? {
+            role: "button",
+            tabIndex: 0,
+            "aria-expanded": selected,
+            onClick: () => {
+              // Selecting text to copy it is not selecting the line.
+              if (window.getSelection()?.toString()) return;
+              onToggle(line.id);
+            },
+            onKeyDown: (event: KeyboardEvent) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                onToggle(line.id);
+              }
+            },
+          }
+        : {})}
+    >
       <span className="w-[34px] flex-none text-right text-wv-dim">{line.id + 1}</span>
       {bare ? null : (
         <>
@@ -58,6 +91,15 @@ export const LogRow = memo(function LogRow({ line, bare = false }: { line: LogLi
           </span>
         ))}
       </span>
+    </div>
+  );
+  if (!selected) return row;
+  return (
+    <div className="bg-wv-selected">
+      {row}
+      <pre className="overflow-x-auto border-b border-wv-log-line px-4 py-2 font-wv-mono text-[11.5px] leading-[1.55] text-wv-secondary select-text sm:px-6">
+        {recordJson(line)}
+      </pre>
     </div>
   );
 });

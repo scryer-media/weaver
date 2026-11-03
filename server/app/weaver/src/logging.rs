@@ -13,8 +13,13 @@ use std::io::Write;
 use std::sync::OnceLock;
 
 use chrono::{DateTime, Local, SecondsFormat, TimeZone};
-use tracing_subscriber::fmt::format::Writer;
+use serde_json::Value;
+use tracing::field::{Field, Visit};
+use tracing::{Event, Subscriber};
+use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
 use tracing_subscriber::fmt::time::FormatTime;
+use tracing_subscriber::fmt::{FmtContext, FormattedFields};
+use tracing_subscriber::registry::LookupSpan;
 
 // Renders a log timestamp as RFC 3339 in the zone of `now`.
 //
@@ -46,15 +51,16 @@ pub(crate) const LOG_FORMAT_ENV: &str = "WEAVER_LOG_FORMAT";
 // Environment variable selecting stdout colouring.
 pub(crate) const LOG_COLOR_ENV: &str = "WEAVER_LOG_COLOR";
 
-// Record format for the stdout and log-file layers.
+// Record format for the stdout and log-file layers. JSON unless the
+// operator asks for text.
 //
-// The in-memory ring buffer that backs the web log viewer is deliberately not
-// covered: the viewer parses the human-readable `tracing` line format, so that
-// layer keeps its format regardless of what stdout is doing.
+// The in-memory ring buffer that backs the web log viewer is not covered: it
+// always holds JSON records, which the viewer draws as lines itself, whatever
+// stdout is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum LogFormat {
-    #[default]
     Text,
+    #[default]
     Json,
 }
 
@@ -68,8 +74,9 @@ impl LogFormat {
     }
 
     // Resolve the format from the CLI flag, then the environment, then the
-    // default. An unrecognised value falls back to text rather than aborting
-    // startup: a mistyped log format must never keep the service down.
+    // default. An unrecognised value falls back to the default rather than
+    // aborting startup: a mistyped log format must never keep the service
+    // down.
     pub(crate) fn resolve(cli: Option<&str>, env: Option<&OsString>) -> Self {
         if let Some(value) = cli
             && let Some(format) = Self::parse(value)
@@ -79,6 +86,148 @@ impl LogFormat {
         env.and_then(|value| value.to_str())
             .and_then(Self::parse)
             .unwrap_or_default()
+    }
+}
+
+// One JSON object per event, on one line:
+//
+// `{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"INFO","target":"weaver::jobs","fields":{"message":"job added","job_id":7},"spans":[{"name":"request","id":3}]}`
+//
+// `timestamp` is local time with its offset, as `LocalTimer` writes it. The
+// event's fields, its message first, sit in a `fields` object in the order the
+// event names them. `spans` lists the spans the event happened in, outermost
+// first, each with its name and its fields; it is left out when there are
+// none.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct JsonRecord;
+
+impl<S, N> FormatEvent<S, N> for JsonRecord
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        let metadata = event.metadata();
+        let mut fields = OrderedFields::default();
+        event.record(&mut fields);
+
+        let mut record = String::with_capacity(256);
+        record.push_str("{\"timestamp\":");
+        push_json_string(
+            &mut record,
+            &render_timestamp(Local::now(), SecondsFormat::Micros),
+        );
+        record.push_str(",\"level\":");
+        push_json_string(&mut record, metadata.level().as_str());
+        record.push_str(",\"target\":");
+        push_json_string(&mut record, metadata.target());
+        record.push_str(",\"fields\":{");
+        for (index, (name, value)) in fields.message_first().enumerate() {
+            if index > 0 {
+                record.push(',');
+            }
+            push_json_string(&mut record, name);
+            record.push(':');
+            record.push_str(&value.to_string());
+        }
+        record.push('}');
+
+        if let Some(scope) = ctx.event_scope() {
+            let mut first = true;
+            for span in scope.from_root() {
+                record.push_str(if first { ",\"spans\":[" } else { "," });
+                first = false;
+                record.push_str("{\"name\":");
+                push_json_string(&mut record, span.name());
+                let extensions = span.extensions();
+                // A span's fields are kept already written as a JSON object
+                // when the layer writes its fields as JSON; any other shape is
+                // left out rather than mangled.
+                if let Some(formatted) = extensions.get::<FormattedFields<N>>() {
+                    let body = formatted.fields.trim();
+                    if let Some(inner) = body
+                        .strip_prefix('{')
+                        .and_then(|rest| rest.strip_suffix('}'))
+                        .map(str::trim)
+                        .filter(|inner| !inner.is_empty())
+                        && serde_json::from_str::<Value>(body).is_ok()
+                    {
+                        record.push(',');
+                        record.push_str(inner);
+                    }
+                }
+                record.push('}');
+            }
+            if !first {
+                record.push(']');
+            }
+        }
+        record.push('}');
+        writer.write_str(&record)?;
+        writer.write_char('\n')
+    }
+}
+
+fn push_json_string(out: &mut String, value: &str) {
+    // Serializing a string cannot fail.
+    out.push_str(&serde_json::to_string(value).unwrap_or_default());
+}
+
+// An event's fields in the order the event names them.
+#[derive(Default)]
+struct OrderedFields(Vec<(&'static str, Value)>);
+
+impl OrderedFields {
+    fn message_first(&self) -> impl Iterator<Item = &(&'static str, Value)> {
+        let message = self.0.iter().filter(|(name, _)| *name == "message");
+        message.chain(self.0.iter().filter(|(name, _)| *name != "message"))
+    }
+}
+
+impl Visit for OrderedFields {
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.0.push((field.name(), Value::from(value)));
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.0.push((field.name(), Value::from(value)));
+    }
+
+    fn record_i128(&mut self, field: &Field, value: i128) {
+        self.0
+            .push((field.name(), Value::String(value.to_string())));
+    }
+
+    fn record_u128(&mut self, field: &Field, value: u128) {
+        self.0
+            .push((field.name(), Value::String(value.to_string())));
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.0.push((field.name(), Value::from(value)));
+    }
+
+    fn record_f64(&mut self, field: &Field, value: f64) {
+        self.0.push((field.name(), Value::from(value)));
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.0.push((field.name(), Value::String(value.to_owned())));
+    }
+
+    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
+        self.0
+            .push((field.name(), Value::String(value.to_string())));
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        self.0
+            .push((field.name(), Value::String(format!("{value:?}"))));
     }
 }
 
@@ -217,8 +366,9 @@ mod tests {
     }
 
     #[test]
-    fn log_format_defaults_to_text_and_accepts_json() {
-        assert_eq!(LogFormat::resolve(None, None), LogFormat::Text);
+    fn log_format_defaults_to_json_and_accepts_text() {
+        assert_eq!(LogFormat::resolve(None, None), LogFormat::Json);
+        assert_eq!(LogFormat::resolve(Some("text"), None), LogFormat::Text);
         assert_eq!(LogFormat::resolve(None, Some(&os("json"))), LogFormat::Json);
         assert_eq!(
             LogFormat::resolve(None, Some(&os("  JSON  "))),
@@ -248,6 +398,10 @@ mod tests {
         );
         assert_eq!(
             LogFormat::resolve(Some("yaml"), Some(&os("xml"))),
+            LogFormat::Json
+        );
+        assert_eq!(
+            LogFormat::resolve(Some("yaml"), Some(&os("text"))),
             LogFormat::Text
         );
         assert_eq!(LogFormat::parse("yaml"), None);
@@ -342,10 +496,8 @@ mod tests {
         );
     }
 
-    // Locks the contract between the ring-buffer line format and the web log
-    // viewer's parser: the viewer splits a leading RFC 3339 timestamp off each
-    // line, so an emitted line must still start with one once the timer moved
-    // off UTC.
+    // The text format, which an operator can still ask for, starts each line
+    // with an RFC 3339 timestamp in local time and then the level.
     #[test]
     fn emitted_lines_start_with_a_parseable_timestamp_then_the_level() {
         use std::io::Write;
@@ -397,6 +549,118 @@ mod tests {
             rest.trim_start().starts_with("INFO"),
             "level should follow the timestamp, line was {line:?}"
         );
+    }
+
+    // Everything one JSON-record layer wrote while `emit` ran.
+    fn json_records(emit: impl FnOnce()) -> String {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::fmt::format::JsonFields;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for SharedBuffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("buffer lock").extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'writer> MakeWriter<'writer> for SharedBuffer {
+            type Writer = Self;
+
+            fn make_writer(&'writer self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buffer = SharedBuffer::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .fmt_fields(JsonFields::new())
+                .event_format(JsonRecord)
+                .with_writer(buffer.clone())
+                .with_ansi(false),
+        );
+        tracing::subscriber::with_default(subscriber, emit);
+        let raw = buffer.0.lock().expect("buffer lock").clone();
+        String::from_utf8(raw).expect("utf-8")
+    }
+
+    #[test]
+    fn a_json_record_is_one_object_per_event_with_its_fields_in_order() {
+        let raw = json_records(|| {
+            tracing::info!(job_id = 7_u64, name = "My Show", ok = true, "job added");
+            tracing::warn!(error = %"disk full\nretrying", "write failed");
+        });
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(lines.len(), 2, "{raw}");
+
+        let record: Value = serde_json::from_str(lines[0]).expect("json");
+        assert_eq!(record["level"], "INFO");
+        assert_eq!(record["target"], module_path!());
+        assert_eq!(record["fields"]["message"], "job added");
+        assert_eq!(record["fields"]["job_id"], 7);
+        assert_eq!(record["fields"]["name"], "My Show");
+        assert_eq!(record["fields"]["ok"], true);
+        assert!(record.get("spans").is_none(), "{raw}");
+        // The fields keep the event's order, message first, so a reader
+        // matching `message job_id=` still finds them together.
+        assert!(
+            lines[0].contains(
+                r#""fields":{"message":"job added","job_id":7,"name":"My Show","ok":true}"#
+            ),
+            "{raw}"
+        );
+        // Keys read top-down the way a person scans a record.
+        assert!(lines[0].starts_with(r#"{"timestamp":""#), "{raw}");
+
+        // A newline inside a value stays inside the one record.
+        let record: Value = serde_json::from_str(lines[1]).expect("json");
+        assert_eq!(record["level"], "WARN");
+        assert_eq!(record["fields"]["error"], "disk full\nretrying");
+    }
+
+    #[test]
+    fn a_json_record_carries_the_spans_it_happened_in() {
+        let raw = json_records(|| {
+            let outer = tracing::info_span!("request", id = 3_u64);
+            let _outer = outer.enter();
+            let inner = tracing::info_span!("job", job_id = 9_u64);
+            let _inner = inner.enter();
+            tracing::info!("inside");
+        });
+        let record: Value = serde_json::from_str(raw.trim_end()).expect("json");
+        assert_eq!(
+            record["spans"],
+            serde_json::json!([
+                { "name": "request", "id": 3 },
+                { "name": "job", "job_id": 9 },
+            ]),
+            "{raw}"
+        );
+    }
+
+    #[test]
+    fn a_json_record_is_stamped_in_local_time() {
+        let raw = json_records(|| tracing::info!("stamp"));
+        let record: Value = serde_json::from_str(raw.trim_end()).expect("json");
+        let stamp = record["timestamp"].as_str().expect("timestamp");
+        let parsed = DateTime::parse_from_rfc3339(stamp).expect("rfc3339");
+        assert_eq!(
+            parsed.offset().local_minus_utc(),
+            Local::now().offset().local_minus_utc()
+        );
+        // Microseconds, as the text format writes them.
+        let fraction = stamp.split('.').nth(1).expect("fraction");
+        assert_eq!(fraction.chars().take_while(char::is_ascii_digit).count(), 6);
     }
 
     #[test]

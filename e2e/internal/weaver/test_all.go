@@ -4,6 +4,7 @@
 package weaver
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // --- test-all ---
@@ -1045,11 +1047,11 @@ const weaverDebugRingTarget = "weaver_server_core::runtime::job_debug_ring:"
 // stall-diagnostics records the debug ring writes rather than an event in its
 // own right. Every scan that looks for an event's message skips these.
 func isWeaverDebugRingReplay(line string) bool {
-	return strings.Contains(ansiEscape.ReplaceAllString(line, ""), weaverDebugRingTarget)
+	return strings.Contains(cleanWeaverLogLine(line), weaverDebugRingTarget)
 }
 
 func directLogJobID(line string) string {
-	clean := ansiEscape.ReplaceAllString(line, "")
+	clean := cleanWeaverLogLine(line)
 	start := strings.Index(clean, "job_id=")
 	if start < 0 {
 		return ""
@@ -1065,6 +1067,155 @@ func directLogJobID(line string) string {
 // ansiEscape matches the SGR sequences weaver's tracing writer emits around
 // every field name and separator.
 var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;]*[A-Za-z]`)
+
+// cleanWeaverLogLine reads one weaver log line as text: colour stripped, and a
+// JSON record, weaver's default format, written as the text format writes it.
+func cleanWeaverLogLine(line string) string {
+	clean := ansiEscape.ReplaceAllString(line, "")
+	if text, ok := weaverRecordText(clean); ok {
+		return text
+	}
+	return clean
+}
+
+// cleanWeaverLog is cleanWeaverLogLine over a whole log.
+func cleanWeaverLog(raw string) string {
+	lines := strings.Split(stripANSIEscapeSequences(raw), "\n")
+	for i, line := range lines {
+		if text, ok := weaverRecordText(line); ok {
+			lines[i] = text
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+type weaverLogEntry struct {
+	key   string
+	value json.RawMessage
+}
+
+// weaverObjectEntries reads a JSON object's entries in the order written.
+func weaverObjectEntries(raw []byte) ([]weaverLogEntry, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if token, err := decoder.Token(); err != nil || token != json.Delim('{') {
+		return nil, false
+	}
+	var entries []weaverLogEntry
+	for decoder.More() {
+		token, err := decoder.Token()
+		key, isKey := token.(string)
+		if err != nil || !isKey {
+			return nil, false
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, false
+		}
+		entries = append(entries, weaverLogEntry{key, value})
+	}
+	if token, err := decoder.Token(); err != nil || token != json.Delim('}') {
+		return nil, false
+	}
+	return entries, true
+}
+
+func weaverLogString(raw json.RawMessage) (string, bool) {
+	var text string
+	if len(raw) == 0 || raw[0] != '"' || json.Unmarshal(raw, &text) != nil {
+		return "", false
+	}
+	return text, true
+}
+
+// weaverLogValue writes a field value the way the text format reads: a string
+// bare unless it is empty or holds a space, a quote, an `=` or a control
+// character, anything else as compact JSON.
+func weaverLogValue(raw json.RawMessage) string {
+	if text, ok := weaverLogString(raw); ok {
+		quote := text == "" || strings.IndexFunc(text, func(r rune) bool {
+			return unicode.IsSpace(r) || unicode.IsControl(r) || r == '"' || r == '='
+		}) >= 0
+		if quote {
+			return strconv.Quote(text)
+		}
+		return text
+	}
+	var compact bytes.Buffer
+	if json.Compact(&compact, raw) != nil {
+		return string(raw)
+	}
+	return compact.String()
+}
+
+// weaverRecordText writes a weaver JSON log record as the text line
+// `{timestamp} {LEVEL} {spans}{target}: {message} {key=value ...}`.
+func weaverRecordText(line string) (string, bool) {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "{") {
+		return "", false
+	}
+	entries, ok := weaverObjectEntries([]byte(line))
+	if !ok {
+		return "", false
+	}
+	var timestamp, level, target string
+	var haveTimestamp, haveLevel, haveTarget bool
+	var fields, spans json.RawMessage
+	for _, entry := range entries {
+		switch entry.key {
+		case "timestamp":
+			timestamp, haveTimestamp = weaverLogString(entry.value)
+		case "level":
+			level, haveLevel = weaverLogString(entry.value)
+		case "target":
+			target, haveTarget = weaverLogString(entry.value)
+		case "fields":
+			fields = entry.value
+		case "spans":
+			spans = entry.value
+		}
+	}
+	if !haveTimestamp || !haveLevel || !haveTarget {
+		return "", false
+	}
+	var text strings.Builder
+	fmt.Fprintf(&text, "%s %5s ", timestamp, level)
+	var spanList []json.RawMessage
+	if len(spans) > 0 && json.Unmarshal(spans, &spanList) == nil && len(spanList) > 0 {
+		for _, span := range spanList {
+			spanEntries, _ := weaverObjectEntries(span)
+			var parts []string
+			for _, entry := range spanEntries {
+				if entry.key == "name" {
+					name, _ := weaverLogString(entry.value)
+					text.WriteString(name)
+					continue
+				}
+				parts = append(parts, entry.key+"="+weaverLogValue(entry.value))
+			}
+			if len(parts) > 0 {
+				text.WriteString("{" + strings.Join(parts, " ") + "}")
+			}
+			text.WriteString(":")
+		}
+		text.WriteString(" ")
+	}
+	text.WriteString(target + ":")
+	fieldEntries, _ := weaverObjectEntries(fields)
+	for _, entry := range fieldEntries {
+		text.WriteString(" ")
+		if entry.key == "message" {
+			if message, ok := weaverLogString(entry.value); ok {
+				text.WriteString(message)
+			} else {
+				text.WriteString(weaverLogValue(entry.value))
+			}
+			continue
+		}
+		text.WriteString(entry.key + "=" + weaverLogValue(entry.value))
+	}
+	return text.String(), true
+}
 
 func functionalPollInterval(jobs []testJob) time.Duration {
 	if functionalHasPendingFileIdentityRewrite(jobs) {

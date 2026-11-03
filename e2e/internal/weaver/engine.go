@@ -37,7 +37,7 @@ func graphLogEventsOfJobs(raw string, message string, jobIDs []int) []map[string
 	}
 	var events []map[string]string
 	for _, rawLine := range strings.Split(raw, "\n") {
-		line := ansiEscape.ReplaceAllString(rawLine, "")
+		line := cleanWeaverLogLine(rawLine)
 		if !strings.Contains(line, graphLogTarget) || isWeaverDebugRingReplay(line) {
 			continue
 		}

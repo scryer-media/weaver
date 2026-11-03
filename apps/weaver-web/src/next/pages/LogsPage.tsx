@@ -3,6 +3,7 @@
 
 import {
   createContext,
+  useCallback,
   useContext,
   useLayoutEffect,
   useMemo,
@@ -336,6 +337,11 @@ function LogList({ level, query }: { level: LogLevelFilter; query: string }) {
   const { lines, loading } = useLogsPart(LogLinesContext);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const followingRef = useRef(true);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const onToggle = useCallback(
+    (id: number) => setSelectedId((current) => (current === id ? null : id)),
+    [],
+  );
   const virtualizer = useVirtualizer({
     count: lines.length,
     getScrollElement: () => scrollerRef.current,
@@ -388,7 +394,11 @@ function LogList({ level, query }: { level: LogLevelFilter; query: string }) {
               className="absolute top-0 left-0 w-full"
               style={{ transform: `translateY(${item.start}px)` }}
             >
-              <LogRow line={lines[item.index]!} />
+              <LogRow
+                line={lines[item.index]!}
+                selected={lines[item.index]!.id === selectedId}
+                onToggle={onToggle}
+              />
             </div>
           ))}
         </div>

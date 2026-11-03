@@ -1251,7 +1251,7 @@ export const HISTORY_FACADE_EVENTS_SUBSCRIPTION = gql`
 export const SERVICE_LOGS_QUERY = gql`
   query ServiceLogs($limit: Int) {
     serviceLogs(limit: $limit) {
-      lines
+      records
       count
     }
   }
