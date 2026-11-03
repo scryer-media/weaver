@@ -1593,11 +1593,7 @@ pub(in crate::pipeline::tests) fn collect(
         if path.is_dir() {
             collect(root, &path, files);
         } else {
-            let name = path
-                .strip_prefix(root)
-                .unwrap()
-                .to_string_lossy()
-                .into_owned();
+            let name = delivered_name(path.strip_prefix(root).unwrap());
             files.insert(name, std::fs::read(&path).unwrap());
         }
     }
@@ -1625,9 +1621,19 @@ fn collect_empty(root: &Path, dir: &Path, empty: &mut BTreeSet<String>) {
         }
     }
     if !held && dir != root {
-        let name = dir.strip_prefix(root).unwrap().to_string_lossy();
+        let name = delivered_name(dir.strip_prefix(root).unwrap());
         empty.insert(format!("{name}/"));
     }
+}
+
+// A delivered path below the output root, named as the engine names it:
+// its components joined by `/` on every host.
+fn delivered_name(relative: &Path) -> String {
+    relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 // Where a job stood while the server held every article of one post, and

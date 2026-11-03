@@ -76,10 +76,7 @@ pub(super) fn tar(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
 }
 
 fn delivered(name: &str) -> String {
-    std::path::Path::new("lantern beacon")
-        .join(name)
-        .to_string_lossy()
-        .into_owned()
+    format!("lantern beacon/{name}")
 }
 
 // The job completed and delivered exactly `expected`.
