@@ -22,6 +22,7 @@ import {
 } from "@/graphql/queries";
 import { authHeaders } from "@/graphql/client";
 import { copyText } from "@/lib/clipboard";
+import { criticalHealthMilli, HEALTH_TONE_CLASS, healthTone } from "@/lib/health-tone";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { openUrlAsDownload, readDownloadErrorMessage, saveResponseAsDownload } from "@/lib/download";
 import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
@@ -597,9 +598,9 @@ function JobDetailContent() {
             valueClassName={
               !verified && !done && !failed
                 ? "text-wv-muted"
-                : job.health >= 1000
-                  ? "text-wv-accent"
-                  : "text-wv-error"
+                : HEALTH_TONE_CLASS[
+                    healthTone(job.health, criticalHealthMilli(job.totalBytes, job.optionalRecoveryBytes))
+                  ]
             }
             note={
               verified || done || failed
