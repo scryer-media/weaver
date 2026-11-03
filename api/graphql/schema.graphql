@@ -2834,6 +2834,18 @@ type QueueItem {
 	downloadedBytes: Int!
 	optionalRecoveryBytes: Int!
 	optionalRecoveryDownloadedBytes: Int!
+	"""
+	Declared bytes still to come: every article neither in hand nor lost,
+	less the recovery held back until a loss asks for it. Reaches 0 when
+	the download has brought everything it wants.
+	"""
+	remainingBytes: Int!
+	"""
+	Declared bytes the download is out to bring: the post less the
+	recovery still held back. `progressPercent` is this less
+	`remainingBytes`, over this.
+	"""
+	wantedBytes: Int!
 	phaseProgress: [QueuePhaseProgress!]!
 	failedBytes: Int!
 	health: Int!
