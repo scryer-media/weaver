@@ -707,6 +707,36 @@ fn routed_deliveries_reuse_the_writer_s_effect_room() {
     assert_eq!(job.file("notes.bin"), b"Raws, world");
 }
 
+// Members nothing held, each refused for breaching the holds, are one
+// archive given up on in their namespace: one event.
+#[test]
+fn members_nothing_held_breaching_the_holds_are_one_event() {
+    let mut job = Job::new(HoldBudgets {
+        resident_limit: 4,
+        scratch_total: 0,
+        scratch_ceiling: 0,
+        disk_reserve: 0,
+    });
+    let first = job.member("pack.r00", None);
+    let second = job.member("pack.r01", None);
+    for member in [first, second] {
+        job.send(member, 0, b"Ra", Provenance::Fresh);
+        job.send(member, 10, b"tail..", Provenance::Fresh);
+        assert_eq!(
+            job.writer.refused(NodeId::ROOT, member),
+            Some(Why::HoldsBreached)
+        );
+    }
+    assert_eq!(
+        job.writer.take_given_back(),
+        [super::GivenBack {
+            member: "pack.r00".to_string(),
+            container: String::new(),
+            why: Why::HoldsBreached,
+        }]
+    );
+}
+
 #[test]
 fn a_breach_refuses_the_member_to_a_leaf_which_receives_every_byte() {
     let mut job = Job::new(HoldBudgets {

@@ -514,3 +514,57 @@ async fn a_store_handed_to_an_engine_is_not_given_up() {
     let given = given_back(&mut refusing);
     assert!(given.is_empty(), "{given:#?}");
 }
+
+// An archive handed to an engine whose run then gives it up, for the same
+// reason the store handed it over, was given up: one event.
+#[tokio::test]
+async fn an_engine_that_gives_up_a_handed_over_archive_is_one_event() {
+    let mut refusing = refusing(Mode::HandoffRefused, 3, &[]);
+    refusing.deliver_all();
+    assert!(
+        given_back(&mut refusing).is_empty(),
+        "the handoff itself is no event"
+    );
+    // The hand-off already holds the reason, so wait for the engine that
+    // took the archive to give it back and leave.
+    assert_eq!(refusing.job.tree().engines().len(), 1);
+    while !refusing.job.tree().engines().is_empty() {
+        let said = refusing.mail.recv().await.unwrap();
+        refusing
+            .job
+            .run_said(said, &mut RepairSlots::default(), 1)
+            .unwrap();
+    }
+    assert_eq!(refusing.refused(0), Some(Why::Unsupported));
+    let given = given_back(&mut refusing);
+    assert_eq!(given.len(), 1, "{given:#?}");
+}
+
+// One event per archive across the other ways a
+// multi-volume store gives its volumes back.
+#[test]
+fn each_refusing_store_shape_is_one_event() {
+    for mode in [Mode::Refuse, Mode::Hold, Mode::Staging] {
+        let mut refusing = refusing(mode, 4, &[]);
+        refusing.deliver_all();
+        let given = given_back(&mut refusing);
+        assert_eq!(given.len(), 1, "{mode:?}: {given:#?}");
+    }
+}
+
+#[test]
+fn a_locked_store_no_candidate_opens_is_one_event() {
+    let mut refusing = refusing(Mode::Locked, 3, &WRONG);
+    refusing.deliver_all();
+    let given = given_back(&mut refusing);
+    assert_eq!(given.len(), 1, "{given:#?}");
+}
+
+#[tokio::test]
+async fn a_refusing_engine_over_three_volumes_is_one_event() {
+    let mut refusing = refusing(Mode::RefusingEngine, 3, &[]);
+    refusing.deliver_all();
+    refusing.until_refused(0).await;
+    let given = given_back(&mut refusing);
+    assert_eq!(given.len(), 1, "{given:#?}");
+}

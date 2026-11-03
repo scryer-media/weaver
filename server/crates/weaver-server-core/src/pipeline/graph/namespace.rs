@@ -223,9 +223,9 @@ pub(crate) struct NamespaceWriter {
     // Archives given up on since the job last asked, for its events.
     given_back: Vec<GivenBack>,
     // The archives already given up on: the object that gave its members
-    // back, or the member itself when nothing held it. One archive is one
-    // event however many volumes it had.
-    given_up: BTreeSet<(NodeId, Option<MemberId>)>,
+    // back (true), or the namespace whose members nothing held (false). One
+    // archive is one event however many volumes it had.
+    given_up: BTreeSet<(NodeId, bool)>,
     #[cfg(test)]
     diagnostics: Vec<weaver_graph::recovery::RepairDiagnostic>,
     placements: Vec<Placement>,
@@ -1825,36 +1825,41 @@ impl NamespaceWriter {
     // it. Said once, when the reason is new. When `given_up`, the archive it
     // belonged to is noted for the job's events, once per archive.
     fn refuse(&mut self, tree: &Tree, node: NodeId, member: MemberId, why: Why, given_up: bool) {
-        if self.files_mut(node).refuse(member, why) == Some(why) {
-            return;
-        }
+        // Said before: an engine handed the member gives it back for the
+        // reason it was handed over for.
+        let said = self.files_mut(node).refuse(member, why) == Some(why);
         // The object that gave the member back, if one had it.
         let object = tree.refused_by(node, member);
         let kind = object
             .and_then(|object| tree.kind(object))
             .map(|kind| kind.to_string())
             .unwrap_or_default();
-        let member_id = member;
-        let member = member_name(tree, node, member);
+        let name = member_name(tree, node, member);
+        // Noted whether or not the reason is new: a member handed to an
+        // engine already holds the reason the engine gives it back for.
+        // Members nothing held are one archive per namespace.
+        let archive = match object {
+            Some(object) => (object, true),
+            None => (node, false),
+        };
+        if given_up && self.given_up.insert(archive) {
+            self.given_back.push(GivenBack {
+                member: name.clone(),
+                container: kind.clone(),
+                why,
+            });
+        }
+        if said {
+            return;
+        }
         tracing::info!(
             job_id = self.scope,
             node = node.0,
             kind = %kind,
-            member = %member,
+            member = %name,
             why = %why_name(why),
             "object refused"
         );
-        let archive = match object {
-            Some(object) => (object, None),
-            None => (node, Some(member_id)),
-        };
-        if given_up && self.given_up.insert(archive) {
-            self.given_back.push(GivenBack {
-                member,
-                container: kind,
-                why,
-            });
-        }
     }
 
     fn files_mut(&mut self, node: NodeId) -> &mut Files {
