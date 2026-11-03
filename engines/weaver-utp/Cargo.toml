@@ -4,7 +4,7 @@ description = "uTP transport over a caller-supplied datagram socket"
 publish = false
 version.workspace = true
 edition.workspace = true
-license = "Apache-2.0"
+license-file.workspace = true
 repository.workspace = true
 
 [dependencies]
