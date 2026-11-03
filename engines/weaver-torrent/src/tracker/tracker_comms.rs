@@ -707,7 +707,7 @@ impl std::fmt::Display for Refused {
 impl std::error::Error for Refused {}
 
 impl Refused {
-    fn new(reason: String, interval: Option<Duration>, failure: bool) -> anyhow::Error {
+    fn error(reason: String, interval: Option<Duration>, failure: bool) -> anyhow::Error {
         let interval = interval.unwrap_or(tracker_comms_http::DEFAULT_INTERVAL);
         anyhow::Error::new(Self {
             reason,
@@ -730,7 +730,7 @@ fn read_answer(bytes: &[u8]) -> anyhow::Result<tracker_comms_http::TrackerRespon
     if let Ok((error, _)) =
         crate::bencode::from_bytes_with_rest::<tracker_comms_http::TrackerError>(bytes)
     {
-        return Err(Refused::new(
+        return Err(Refused::error(
             format!(
                 "tracker returned failure. Failure reason: {}",
                 error.failure_reason
@@ -742,7 +742,7 @@ fn read_answer(bytes: &[u8]) -> anyhow::Result<tracker_comms_http::TrackerRespon
     crate::bencode::from_bytes_with_rest::<tracker_comms_http::TrackerResponse>(bytes)
         .map(|(response, _)| response)
         .map_err(|e| {
-            Refused::new(
+            Refused::error(
                 format!(
                     "error deserializing the tracker's answer: {}",
                     e.into_kind()

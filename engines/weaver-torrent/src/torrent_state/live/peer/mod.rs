@@ -1689,7 +1689,7 @@ impl LivePeerState {
     /// (libtorrent `peer_connection::incoming_request`).
     pub fn invalid_request(&mut self, peer_chokes_us: bool) -> bool {
         self.invalid_requests = self.invalid_requests.saturating_add(1);
-        if self.peer_interested || !self.is_choked() || self.invalid_requests % 10 != 0 {
+        if self.peer_interested || !self.is_choked() || !self.invalid_requests.is_multiple_of(10) {
             return true;
         }
         if self.invalid_requests > 300 && !peer_chokes_us {

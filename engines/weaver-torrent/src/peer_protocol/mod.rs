@@ -1464,7 +1464,7 @@ mod tests {
         let offer = plain().offering_v2(true);
         assert!(offer.offers_v2());
         let mut buf = [0u8; 68];
-        offer.serialize_unchecked_len(&mut buf);
+        assert_eq!(offer.serialize_unchecked_len(&mut buf), buf.len());
         assert_eq!(buf[20 + 7] & 0x10, 0x10);
         assert_eq!(&buf[20..27], &plain().reserved.to_be_bytes()[..7]);
         assert!(Handshake::deserialize(&buf).unwrap().0.offers_v2());

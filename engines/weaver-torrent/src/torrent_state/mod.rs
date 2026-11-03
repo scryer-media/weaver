@@ -107,7 +107,7 @@ impl ManagedTorrentState {
 
     fn assert_paused(self) -> TorrentStatePaused {
         match self {
-            Self::Paused(paused) => paused,
+            Self::Paused(paused) => *paused,
             _ => panic!("Expected paused state"),
         }
     }
@@ -1149,8 +1149,7 @@ impl ManagedTorrent {
             metadata,
             Some(wanted_files(&g.files)),
             files,
-            true,
-            None,
+            initializing::InitialCheck::Full,
             Some(g.piece_priorities.clone()),
             peers,
         )))

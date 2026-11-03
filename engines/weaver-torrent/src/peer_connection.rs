@@ -454,7 +454,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
         let mut write_buf = self.frame_buf();
         let my_handshake = self.greeting(speaks_v2);
-        let hlen = my_handshake.serialize_unchecked_len(&mut *write_buf);
+        let hlen = my_handshake.serialize_unchecked_len(&mut write_buf);
         with_timeout(
             "writing handshake",
             self.options.handshake_timeout(),
@@ -503,7 +503,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         // answer too (libtorrent `peer_connection::associated_info_hash`).
         let handshake = self.greeting(false);
         let greeting = handshake.info_hash;
-        let hsz = handshake.serialize_unchecked_len(&mut *write_buf);
+        let hsz = handshake.serialize_unchecked_len(&mut write_buf);
 
         // Connecting includes sending our handshake: an encrypted connection
         // carries it inside the encryption handshake.
@@ -633,7 +633,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 .map_err(Error::Anyhow)?;
             let my_extended = Message::Extended(ExtendedMessage::Handshake(my_extended));
             trace!("sending extended handshake: {:?}", &my_extended);
-            let esz = my_extended.serialize(&mut *write_buf, &Default::default)?;
+            let esz = my_extended.serialize(&mut write_buf, &Default::default)?;
             send(
                 &mut up,
                 &mut write,
@@ -651,7 +651,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             if self.handler.should_send_bitfield() {
                 let len = self
                     .handler
-                    .serialize_bitfield_message_to_buf(&mut *write_buf)
+                    .serialize_bitfield_message_to_buf(&mut write_buf)
                     .map_err(Error::Anyhow)?;
                 send(
                     &mut up,
@@ -688,17 +688,17 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 };
 
                 let len = match req {
-                    WriterRequest::Message(msg) => msg.serialize(&mut *write_buf, ext_msg_ids)?,
+                    WriterRequest::Message(msg) => msg.serialize(&mut write_buf, ext_msg_ids)?,
                     WriterRequest::UtMetadata(utm) => {
                         Message::Extended(ExtendedMessage::UtMetadata(utm.as_borrowed()))
-                            .serialize(&mut *write_buf, ext_msg_ids)?
+                            .serialize(&mut write_buf, ext_msg_ids)?
                     }
                     WriterRequest::UtPex(ut_pex) => {
                         Message::Extended(ExtendedMessage::UtPex(ut_pex.as_borrowed()))
-                            .serialize(&mut *write_buf, ext_msg_ids)?
+                            .serialize(&mut write_buf, ext_msg_ids)?
                     }
                     WriterRequest::Hashes(hashes) => Message::Hashes(hashes.as_borrowed())
-                        .serialize(&mut *write_buf, ext_msg_ids)?,
+                        .serialize(&mut write_buf, ext_msg_ids)?,
                     WriterRequest::ReadChunkRequest(chunk) => {
                         if !self.handler.claim_upload(&chunk) {
                             trace!(?chunk, "upload taken off the queue before it was sent");
@@ -747,7 +747,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         }
 
                         // this whole section is an optimization
-                        let preamble_len = serialize_piece_preamble(&chunk, &mut *write_buf);
+                        let preamble_len = serialize_piece_preamble(&chunk, &mut write_buf);
                         let full_len = preamble_len + chunk.size as usize;
                         if !skip_reading_for_e2e_tests {
                             self.spawner
@@ -1209,7 +1209,7 @@ mod tests {
                 }
             }
             // Theirs: a have, a block of 100 bytes, a have.
-            let mut wire = vec![0; 200];
+            let mut wire = [0; 200];
             let block = [9; 100];
             let mut len = 0;
             for msg in [

@@ -1105,7 +1105,7 @@ fn v2_layout<B>(tree: &FileTree<B>, piece_length: u32) -> crate::core::Result<Ve
             attr,
         });
         offset += length;
-        if offset % piece_length != 0 {
+        if !offset.is_multiple_of(piece_length) {
             let pad = piece_length - offset % piece_length;
             if offset > MAX_FILE_OFFSET - pad {
                 return Err(Error::V2InvalidLength);
@@ -1975,7 +1975,8 @@ mod tests {
     }
 
     fn seeds_of(torrent: &[u8]) -> Vec<(String, WebSeedKind)> {
-        let t = torrent_from_bytes(torrent).expect(&String::from_utf8_lossy(torrent));
+        let t = torrent_from_bytes(torrent)
+            .unwrap_or_else(|_| panic!("{}", String::from_utf8_lossy(torrent)));
         let multi_file = t
             .info
             .data

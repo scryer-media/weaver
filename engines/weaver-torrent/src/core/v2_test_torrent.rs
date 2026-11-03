@@ -154,7 +154,7 @@ impl TestTorrent {
                 _ => None,
             })
             .collect();
-        out.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        out.sort_by_key(|a| a.0.0);
         out
     }
 

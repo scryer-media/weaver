@@ -731,7 +731,7 @@ async fn a_snub_gives_back_one_piece_the_newest_that_waits_on_the_peer_alone() {
     let (peer, mut rx) = h.peer("127.0.0.1:6881");
     tokio::time::pause();
     peer.on_i_am_unchoked();
-    let mut take_and_ask = || {
+    let take_and_ask = || {
         let piece = peer.acquire_next_piece().unwrap().piece().unwrap().get();
         for block in 0..CHUNKS_PER_PIECE {
             h.peers
@@ -4464,7 +4464,7 @@ async fn our_pex_message_lists_each_connected_peer_where_it_listens_flagged_for_
 
     let sorted = |msg: UtPex<ByteBufOwned>| {
         let mut wire = Vec::new();
-        crate::bencode::bencode_serialize_to_writer(&msg.as_borrowed(), &mut wire).unwrap();
+        crate::bencode::bencode_serialize_to_writer(msg.as_borrowed(), &mut wire).unwrap();
         let msg = crate::bencode::from_bytes::<UtPex<ByteBuf>>(&wire).unwrap();
         let mut added: Vec<_> = msg.added_peers().map(|p| (p.addr, p.flags)).collect();
         let mut dropped: Vec<_> = msg.dropped_peers().map(|p| p.addr).collect();

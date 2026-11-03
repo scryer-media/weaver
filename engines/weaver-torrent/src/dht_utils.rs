@@ -41,13 +41,19 @@ pub enum ReadMetainfoResult<Rx> {
     },
 }
 
+/// The peers a torrent's metadata is asked of: those on its list, then
+/// those the stream names.
+pub struct MetadataPeers<A> {
+    pub list: PeerList,
+    pub stream: A,
+}
+
 pub async fn read_metainfo_from_peer_receiver<
     A: Stream<Item = (SocketAddr, PeerSourceFlag)> + Unpin,
 >(
     peer_id: Id20,
     info_hashes: InfoHashes,
-    peers: PeerList,
-    addrs_stream: A,
+    peers: MetadataPeers<A>,
     unable: &tokio::sync::watch::Sender<HashSet<SocketAddr>>,
     peer_connection_options: Option<PeerConnectionOptions>,
     connector: Arc<StreamConnector>,
@@ -85,7 +91,7 @@ pub async fn read_metainfo_from_peer_receiver<
         }
     };
 
-    match first_answer(peers, addrs_stream, unable, read_info_guarded).await {
+    match first_answer(peers.list, peers.stream, unable, read_info_guarded).await {
         (Some((info, info_bytes)), rx, seen, peers) => ReadMetainfoResult::Found {
             info,
             info_bytes,
@@ -202,10 +208,12 @@ mod tests {
 
     /// Asks a peer for metadata: records when, and answers once it has been
     /// asked `fails + 1` times.
+    type Asked = Arc<Mutex<Vec<(SocketAddr, Instant)>>>;
+
     fn asker(
         fails: usize,
     ) -> (
-        Arc<Mutex<Vec<(SocketAddr, Instant)>>>,
+        Asked,
         impl Fn(SocketAddr, &Arc<PeerStates>) -> std::future::Ready<anyhow::Result<SocketAddr>>,
     ) {
         let asked = Arc::new(Mutex::new(Vec::new()));
@@ -369,8 +377,10 @@ mod tests {
                 v1: Some(info_hash),
                 v2: None,
             },
-            PeerList::default(),
-            peer_rx,
+            MetadataPeers {
+                list: PeerList::default(),
+                stream: peer_rx,
+            },
             &unable(),
             None,
             Arc::new(StreamConnector::new(Default::default()).await.unwrap()),

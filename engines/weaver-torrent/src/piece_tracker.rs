@@ -739,12 +739,7 @@ impl PieceTracker {
         let info = self.inflight.get(&piece);
         let owner = info.is_some_and(|info| info.peer == peer);
         self.missing_chunks(piece).filter(move |chunk| {
-            owner
-                || info.is_some_and(|info| {
-                    info.duplicates
-                        .iter()
-                        .any(|d| *d == (chunk.chunk_index, peer))
-                })
+            owner || info.is_some_and(|info| info.duplicates.contains(&(chunk.chunk_index, peer)))
         })
     }
 

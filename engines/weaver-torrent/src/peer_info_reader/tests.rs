@@ -27,7 +27,7 @@ use crate::{
         constants::CHUNK_SIZE,
         hash_id::{Id20, InfoHashes},
     },
-    dht_utils::{ReadMetainfoResult, read_metainfo_from_peer_receiver},
+    dht_utils::{MetadataPeers, ReadMetainfoResult, read_metainfo_from_peer_receiver},
     mse::EncryptionPolicy,
     network::{
         AsyncReadVectoredIntoCompat, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture,
@@ -541,8 +541,10 @@ async fn two_peers_send_the_metadata_between_them() {
     let found = read_metainfo_from_peer_receiver(
         Id20::new([1; 20]),
         hashes,
-        PeerList::resumed([addr(1), addr(2)], []),
-        futures::stream::pending(),
+        MetadataPeers {
+            list: PeerList::resumed([addr(1), addr(2)], []),
+            stream: futures::stream::pending(),
+        },
         &tokio::sync::watch::Sender::new(Default::default()),
         None,
         connector,
@@ -600,8 +602,10 @@ async fn a_plaintext_only_peer_sends_the_metadata_over_the_next_connection_at_on
     let fetch = read_metainfo_from_peer_receiver(
         Id20::new([1; 20]),
         hashes,
-        PeerList::resumed([addr(1)], []),
-        futures::stream::pending(),
+        MetadataPeers {
+            list: PeerList::resumed([addr(1)], []),
+            stream: futures::stream::pending(),
+        },
         &unable,
         None,
         connector.clone(),
