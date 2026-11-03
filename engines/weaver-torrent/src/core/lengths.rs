@@ -102,7 +102,7 @@ impl Lengths {
         }
         // At most MAX_NUM_PIECES + 1, and a piece is at most `piece_length`.
         let total_pieces = u32::try_from(total_length.div_ceil(u64::from(piece_length)))
-            .map_err(|_| Error::TooManyPieces)?;
+            .expect("at most MAX_NUM_PIECES + 1 pieces");
         let last_piece_length =
             u32::try_from(last_element_size(total_length, u64::from(piece_length)))
                 .expect("the last piece is at most a piece long");
