@@ -704,7 +704,7 @@ fn bearer(headers: &HeaderMap) -> bool {
 
 // The parameters an action cannot do without (qBittorrent
 // `APIController::requireParams`).
-fn require(params: &Params, names: &[&str]) -> Result<(), Response> {
+fn require(params: &Params, names: &[&str]) -> Result<(), Box<Response>> {
     let missing: Vec<&str> = names
         .iter()
         .copied()
@@ -713,10 +713,10 @@ fn require(params: &Params, names: &[&str]) -> Result<(), Response> {
     if missing.is_empty() {
         return Ok(());
     }
-    Err(text(
+    Err(Box::new(text(
         StatusCode::BAD_REQUEST,
         format!("Missing required parameters: {}", missing.join(", ")),
-    ))
+    )))
 }
 
 // qBittorrent `AuthController::loginAction`: a session for the key the
@@ -860,7 +860,7 @@ async fn torrents(
     scope: CallerScope,
 ) -> Response {
     if let Err(response) = require(&params, torrents_required(action)) {
-        return response;
+        return *response;
     }
     if action == "add" {
         return add(ctx, params).await;
@@ -996,7 +996,7 @@ async fn transfer_action(ctx: &TorrentFacadeContext, action: &str, params: &Para
         _ => &[],
     };
     if let Err(response) = require(params, required) {
-        return response;
+        return *response;
     }
     let bandwidth = ctx.inner.config.read().await.bandwidth;
     // A global limit as qBittorrent reads one: 0 is none.
@@ -1571,11 +1571,9 @@ async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     let has_metadata = view.pieces.is_some();
     // The average rates over the time spent downloading and the time active.
     let average = |bytes: u64, secs: u64| {
-        if secs > 0 {
-            json!(bytes / secs)
-        } else {
-            json!(-1)
-        }
+        bytes
+            .checked_div(secs)
+            .map_or(json!(-1), |rate| json!(rate))
     };
     let fields = object([
         (
@@ -1708,9 +1706,7 @@ async fn files(ctx: &TorrentFacadeContext, params: &Params) -> Response {
 // whether the torrent is done.
 fn file_list(view: &TorrentView, indexes: impl IntoIterator<Item = usize>) -> Vec<Value> {
     // The pieces each file spans, from where it starts in the torrent.
-    let piece_size = view
-        .pieces
-        .map_or(1, |pieces| u64::from(pieces.size).max(1));
+    let piece_size = view.pieces.map_or(1, |pieces| pieces.size.max(1));
     let mut start = 0u64;
     let ranges: Vec<[u64; 2]> = view
         .files
@@ -2129,12 +2125,12 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
         .map(str::to_owned);
     let policy_override = match share_policy(&params, None, false) {
         Ok(policy) => policy,
-        Err(response) => return response,
+        Err(response) => return *response,
     };
     let (upload_limit, download_limit) =
         match (add_limit(&params, "upLimit"), add_limit(&params, "dlLimit")) {
             (Ok(upload), Ok(download)) => (upload, download),
-            (Err(response), _) | (_, Err(response)) => return response,
+            (Err(response), _) | (_, Err(response)) => return *response,
         };
     let mut sources = Vec::with_capacity(params.files.len() + urls.len());
     for (name, body) in &params.files {
@@ -2276,18 +2272,22 @@ fn placement(params: &Params) -> Placement {
 // One share limit over the level's current one: absent leaves it as it
 // is, `-2` inherits, `-1` is no goal at this level whatever the levels
 // above set, and a value from 0 up is the goal.
-fn share_limit(params: &Params, name: &str, current: Leaf<f64>) -> Result<Leaf<f64>, Response> {
+fn share_limit(
+    params: &Params,
+    name: &str,
+    current: Leaf<f64>,
+) -> Result<Leaf<f64>, Box<Response>> {
     let Some(value) = params.get(name) else {
         return Ok(current);
     };
     match value.trim().parse::<f64>() {
         Ok(value) if value >= 0.0 => Ok(Leaf::Set(value)),
-        Ok(value) if value == -2.0 => Ok(Leaf::Inherit),
-        Ok(value) if value == -1.0 => Ok(Leaf::Off),
-        _ => Err(text(
+        Ok(-2.0) => Ok(Leaf::Inherit),
+        Ok(-1.0) => Ok(Leaf::Off),
+        _ => Err(Box::new(text(
             StatusCode::BAD_REQUEST,
             format!("{name} is not a limit"),
-        )),
+        ))),
     }
 }
 
@@ -2300,16 +2300,16 @@ fn share_named<T>(
     name: &str,
     of: fn(&str) -> Option<Option<T>>,
     strict: bool,
-) -> Result<Option<Option<T>>, Response> {
+) -> Result<Option<Option<T>>, Box<Response>> {
     let Some(value) = params.get(name) else {
         return Ok(None);
     };
     match of(value.trim()) {
         Some(named) => Ok(Some(named)),
-        None if strict => Err(text(
+        None if strict => Err(Box::new(text(
             StatusCode::BAD_REQUEST,
             format!("'{name}' parameter has invalid value"),
-        )),
+        ))),
         None => Ok(Some(None)),
     }
 }
@@ -2339,9 +2339,9 @@ fn share_policy(
     params: &Params,
     current: Option<SeedingPolicy>,
     strict: bool,
-) -> Result<Option<SeedingPolicy>, Response> {
+) -> Result<Option<SeedingPolicy>, Box<Response>> {
     if params.get("shareLimitAction").map(str::trim) == Some("EnableSuperSeeding") {
-        return Err(unavailable("Super seeding"));
+        return Err(Box::new(unavailable("Super seeding")));
     }
     let current = current.unwrap_or_default();
     fn named<T>(named: Option<Option<T>>, current: Leaf<T>) -> Leaf<T> {
@@ -2388,7 +2388,7 @@ async fn set_share_limits(ctx: &TorrentFacadeContext, params: &Params) -> Respon
     for view in ctx.targets(params).await {
         let policy = match share_policy(params, view.seeding_override, false) {
             Ok(policy) => policy,
-            Err(response) => return response,
+            Err(response) => return *response,
         };
         match torrents.set_policy_override(view.job_id, policy).await {
             Ok(()) | Err(ActionError::NotFound(_)) => {}
@@ -2542,20 +2542,20 @@ enum Direction {
 
 // A limit in bytes a second as the client names it under `key`: its 0 and
 // any negative number are no limit.
-fn rate_limit_of(params: &Params, key: &str) -> Option<Result<Option<u64>, Response>> {
+fn rate_limit_of(params: &Params, key: &str) -> Option<Result<Option<u64>, Box<Response>>> {
     params
         .get(key)
         .map(|limit| match limit.trim().parse::<i64>() {
             Ok(limit) => Ok(u64::try_from(limit).ok().filter(|limit| *limit > 0)),
-            Err(_) => Err(text(
+            Err(_) => Err(Box::new(text(
                 StatusCode::BAD_REQUEST,
                 format!("{key} is not a number"),
-            )),
+            ))),
         })
 }
 
 // A limit an added torrent takes, none when the client names none.
-fn add_limit(params: &Params, key: &str) -> Result<Option<u64>, Response> {
+fn add_limit(params: &Params, key: &str) -> Result<Option<u64>, Box<Response>> {
     rate_limit_of(params, key).unwrap_or(Ok(None))
 }
 
@@ -2568,7 +2568,7 @@ async fn set_rate_limit(
 ) -> Response {
     let limit = match rate_limit_of(params, "limit") {
         Some(Ok(limit)) => Some(limit),
-        Some(Err(response)) => return response,
+        Some(Err(response)) => return *response,
         None => return text(StatusCode::BAD_REQUEST, "limit is not a number"),
     };
     let (upload, download) = match direction {
@@ -2888,16 +2888,16 @@ fn category_options(
     params: &Params,
     scope: CallerScope,
     current: Option<&CategoryConfig>,
-) -> Result<(Option<String>, Option<SeedingPolicy>), Response> {
+) -> Result<(Option<String>, Option<SeedingPolicy>), Box<Response>> {
     if CATEGORY_OPTIONS
         .iter()
         .any(|name| params.get(name).is_some())
         && !scope.is_admin()
     {
-        return Err(forbidden());
+        return Err(Box::new(forbidden()));
     }
     if params.flag("downloadPathEnabled") == Some(true) {
-        return Err(unavailable("A download path"));
+        return Err(Box::new(unavailable("A download path")));
     }
     let dest_dir = match params.get("savePath").map(str::trim) {
         None => current.and_then(|category| category.dest_dir.clone()),
@@ -2940,7 +2940,7 @@ async fn create_category(
         }
         match category_options(&config, params, scope, None) {
             Ok(options) => options,
-            Err(response) => return response,
+            Err(response) => return *response,
         }
     };
     let db = inner.db.clone();
@@ -2996,7 +2996,7 @@ async fn edit_category(
                 seeding,
                 ..current.clone()
             },
-            Err(response) => return response,
+            Err(response) => return *response,
         }
     };
     let db = inner.db.clone();
@@ -3317,7 +3317,7 @@ async fn ban_peers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
 // holding `path`, -1 where that cannot be read.
 async fn free_space(params: &Params) -> Response {
     if let Err(response) = require(params, &["path"]) {
-        return response;
+        return *response;
     }
     let path = PathBuf::from(params.get("path").unwrap_or_default());
     let free = tokio::task::spawn_blocking(move || probe_disk_space(&path))
@@ -3335,7 +3335,7 @@ async fn free_space(params: &Params) -> Response {
 // entries.
 async fn directory_content(params: &Params) -> Response {
     if let Err(response) = require(params, &["dirPath"]) {
-        return response;
+        return *response;
     }
     let dir = params.get("dirPath").unwrap_or_default();
     if dir.is_empty() || dir.starts_with(':') || !Path::new(dir).is_absolute() {
@@ -3415,7 +3415,7 @@ fn list_directory(dir: &Path, mode: &str, with_metadata: bool) -> Response {
 // an empty jar is all a client can set.
 fn set_cookies(params: &Params) -> Response {
     if let Err(response) = require(params, &["cookies"]) {
-        return response;
+        return *response;
     }
     match serde_json::from_str::<Value>(params.get("cookies").unwrap_or_default().trim()) {
         Err(error) => text(StatusCode::BAD_REQUEST, error.to_string()),
@@ -3451,7 +3451,7 @@ async fn interface_list() -> Response {
 // interface `iface` names, of every interface where it names none.
 async fn interface_addresses(params: &Params) -> Response {
     if let Err(response) = require(params, &["iface"]) {
-        return response;
+        return *response;
     }
     let wanted = params.get("iface").unwrap_or_default();
     match interfaces().await {
@@ -3589,7 +3589,7 @@ async fn rss(ctx: &TorrentFacadeContext, action: &str, params: &Params) -> Respo
         _ => &[],
     };
     if let Err(response) = require(params, required) {
-        return response;
+        return *response;
     }
     let get = |name: &str| params.get(name).unwrap_or_default();
     match action {

@@ -2980,7 +2980,9 @@ async fn a_cookie_changes_nothing_from_another_origin() {
     let by_cookie = || (header::COOKIE.as_str(), sid.clone());
     let pause = "/api/v2/torrents/stop?hashes=all";
     let read = "/api/v2/torrents/info";
-    let cases: [(&str, &[(&str, &str)], StatusCode); 9] = [
+    // A path, the headers sent with it, and the status it gets.
+    type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], StatusCode);
+    let cases: [Case; 9] = [
         (
             pause,
             &[("sec-fetch-site", "cross-site")],
