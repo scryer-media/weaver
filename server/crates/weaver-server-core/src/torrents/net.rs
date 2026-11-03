@@ -643,16 +643,17 @@ where
     // at, and follows no redirect. Through the leg's bridge, the bridge is
     // handed that address, so the leg dials exactly it; with none, the
     // name, which the leg's exit resolves. The gateway a port mapper asks
-    // is on the local network: its client never goes through a proxy.
+    // is on the local network: its client, the leg's otherwise, never goes
+    // through a proxy.
     fn builder(
         &self,
         target: Option<HttpTarget<'_>>,
         shape: &ClientShape,
     ) -> anyhow::Result<reqwest::ClientBuilder> {
-        if shape.used_for == ClientUse::Gateway {
-            return shape.apply(reqwest::Client::builder().no_proxy());
-        }
         let builder = (self.base)().map_err(anyhow::Error::msg)?;
+        if shape.used_for == ClientUse::Gateway {
+            return shape.apply(builder.no_proxy());
+        }
         let (host, port, addrs) = target.map_or(("", 0, &[][..]), |target| {
             (target.host, target.port, target.addrs)
         });
@@ -692,21 +693,18 @@ where
                 )
             },
         );
-        if let Some(client) = self
-            .kept
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(&key)
-        {
+        // Built under the lock, so callers racing for one key build it once.
+        let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(client) = kept.get(&key) {
             return Ok(client.clone());
         }
         let client = self.builder(target, shape)?.build()?;
         self.built.fetch_add(1, Ordering::Relaxed);
-        let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
         if kept.len() >= CLIENTS_KEPT {
             kept.clear();
         }
-        Ok(kept.entry(key).or_insert(client).clone())
+        kept.insert(key, client.clone());
+        Ok(client)
     }
 
     // A request leaves as the leg's sockets do: through the bridge from
@@ -717,7 +715,10 @@ where
         }
         match self.dialer.source_toward(to) {
             Some(Ok(from)) => Egress::From(from),
-            Some(Err(_)) => Egress::NoRoute,
+            Some(Err(error)) => {
+                tracing::debug!(%to, %error, "the leg has no route toward the address");
+                Egress::NoRoute
+            }
             None => Egress::Proxied,
         }
     }
@@ -1464,6 +1465,120 @@ mod tests {
         next.client(target(), &announce).unwrap();
         assert_eq!(next.built(), 1);
         assert_eq!(clients.built(), 3);
+    }
+
+    // A web seed's client is its torrent's alone: a second ask for one
+    // torrent's seed takes the client built for it, another torrent's seed
+    // on the same host gets its own, so their requests never share a
+    // connection.
+    #[test]
+    fn a_web_seed_client_is_its_torrents_alone() {
+        let clients = LegClients::new(
+            || Ok(reqwest::Client::builder().no_proxy()),
+            None,
+            LegKind::System,
+            system_dialer(),
+        );
+        let checked = [IpAddr::from([127, 0, 0, 1])];
+        let target = || {
+            Some(HttpTarget {
+                host: "seed.test",
+                port: 80,
+                addrs: &checked,
+            })
+        };
+        let one = ClientShape::FETCH.for_torrent(weaver_torrent::core::Id20::new([1; 20]));
+        let other = ClientShape::FETCH.for_torrent(weaver_torrent::core::Id20::new([2; 20]));
+        clients.client(target(), &one).unwrap();
+        clients.client(target(), &one).unwrap();
+        assert_eq!(clients.built(), 1);
+        clients.client(target(), &other).unwrap();
+        assert_eq!(clients.built(), 2);
+    }
+
+    // Callers asking at once for one client get the one built for the
+    // first of them.
+    #[test]
+    fn callers_asking_at_once_build_one_client() {
+        let clients = LegClients::new(
+            || Ok(reqwest::Client::builder().no_proxy()),
+            None,
+            LegKind::System,
+            system_dialer(),
+        );
+        let checked = [IpAddr::from([127, 0, 0, 1])];
+        let announce = ClientShape::of(ClientUse::Tracker { title_case: false });
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    clients
+                        .client(
+                            Some(HttpTarget {
+                                host: "tracker.test",
+                                port: 6969,
+                                addrs: &checked,
+                            }),
+                            &announce,
+                        )
+                        .unwrap();
+                });
+            }
+        });
+        assert_eq!(clients.built(), 1);
+    }
+
+    // A session's next leg asks with its own clients: one built on the leg
+    // before, for the same target and shape, never reaches it. Each leg's
+    // builder names it in the User-Agent its requests carry.
+    #[tokio::test]
+    async fn a_next_leg_never_gets_the_last_legs_client() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !head.ends_with(b"\r\n\r\n") {
+                let read = stream.read(&mut buf).await.unwrap();
+                assert!(read > 0, "the request ended early");
+                head.extend_from_slice(&buf[..read]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8(head).unwrap().to_ascii_lowercase()
+        });
+        let leg = |name: &'static str| {
+            LegClients::new(
+                move || Ok(reqwest::Client::builder().no_proxy().user_agent(name)),
+                None,
+                LegKind::System,
+                system_dialer(),
+            )
+        };
+        let checked = [IpAddr::from([127, 0, 0, 1])];
+        let target = || {
+            Some(HttpTarget {
+                host: "seed.test",
+                port,
+                addrs: &checked,
+            })
+        };
+        let last = leg("last-leg");
+        last.client(target(), &ClientShape::FETCH).unwrap();
+        let next = leg("next-leg");
+        let client = next.client(target(), &ClientShape::FETCH).unwrap();
+        assert_eq!(next.built(), 1);
+        client
+            .get(format!("http://seed.test:{port}/f"))
+            .send()
+            .await
+            .unwrap();
+        let head = served.await.unwrap();
+        assert!(head.contains("user-agent: next-leg\r\n"), "{head}");
     }
 
     // A leg's client for a web seed's target dials the host at the checked
