@@ -28,7 +28,7 @@ pub(super) mod tests;
 use weaver_graph::{ByteRange, NodeId, Pull, Purpose, Seek, Segment, VolumeIndex, Weight, When};
 
 use self::intake::{Checksums, Decoded};
-use self::source::{ArticleMap, Class};
+use self::source::{ArticleMap, Class, Inconsistent};
 use self::window::{Bid, Window};
 use crate::pipeline::graph::job::RootFile;
 use crate::pipeline::graph::namespace::{Arrival, Segments};
@@ -156,10 +156,10 @@ impl ArticleRoot {
     }
 
     // The ranges of lost articles that can now be marked damaged.
-    pub(crate) fn damage(&mut self) -> Vec<(VolumeIndex, ByteRange)> {
+    pub(crate) fn damage(&mut self) -> Result<Vec<(VolumeIndex, ByteRange)>, Inconsistent> {
         let mut out = Vec::new();
-        self.map.take_damage(&mut out);
-        out
+        self.map.take_damage(&mut out)?;
+        Ok(out)
     }
 }
 

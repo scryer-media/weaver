@@ -47,6 +47,16 @@ impl Class {
     }
 }
 
+// The map derived an inverted range from the post's data: a fault of the
+// job's record, which fails the job and never the daemon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the article map of {volume} placed articles {start}..{end} at an inverted range")]
+pub(crate) struct Inconsistent {
+    pub(crate) volume: VolumeIndex,
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
 // A change of class the download queue has to apply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Move {
@@ -405,6 +415,30 @@ impl Volume {
         (low, high.max(low))
     }
 
+    // Where the bytes of the articles from boundary `start` to boundary
+    // `end` can lie: from the lowest place of the first to the highest of
+    // the last. A post's headers can fall across the run, a declared file
+    // length or a part's end below an earlier part's start; the parts
+    // before the run then stand, as every reference decoder writes each
+    // part where its own header puts it, and the run reaches as far past
+    // its start as its encoded bytes can decode to.
+    //
+    // A range the post's data derives is checked, never asserted: should
+    // the map still hold one inverted, the job fails on it and the daemon
+    // runs on.
+    fn span(&self, start: usize, end: usize) -> Result<ByteRange, Inconsistent> {
+        let low = self.bounds(start).0;
+        let high = self.bounds(end).1;
+        let reach = low.saturating_add(self.encoded_at(end) - self.encoded_at(start));
+        ByteRange::try_from([low, if high < low { reach } else { high }]).map_err(|_| {
+            Inconsistent {
+                volume: self.at,
+                start,
+                end,
+            }
+        })
+    }
+
     // The covering articles a queueing can bring back. With none parked
     // there is no run to find.
     fn parked_covering(&self, range: ByteRange) -> impl Iterator<Item = usize> + '_ {
@@ -477,7 +511,11 @@ impl Volume {
     // volume's end, which is told once nothing else can arrive. The runs are
     // read off the lost articles `open` files, and the volume leaves the
     // untold ones once none of its runs waits to be told.
-    fn take_damage(&mut self, open: &mut Open, out: &mut Vec<ByteRange>) {
+    fn take_damage(
+        &mut self,
+        open: &mut Open,
+        out: &mut Vec<ByteRange>,
+    ) -> Result<(), Inconsistent> {
         let settled = !open.waiting.contains_key(&self.at);
         let mut runs = Vec::new();
         if let Some(lost) = open.lost.get(&self.at) {
@@ -510,7 +548,7 @@ impl Volume {
                 untold = true;
                 continue;
             }
-            let range = ByteRange::new(self.bounds(start).0, self.bounds(end).1);
+            let range = self.span(start, end)?;
             if !range.is_empty() {
                 out.push(range);
             }
@@ -522,6 +560,7 @@ impl Volume {
         if !untold {
             open.untold.remove(&self.at);
         }
+        Ok(())
     }
 
     // The tail of an article that arrived short: one whose bytes end before
@@ -871,14 +910,17 @@ impl ArticleMap {
 
     // The ranges of lost articles that can now be marked damaged: only the
     // volumes holding one not yet told are visited.
-    pub(crate) fn take_damage(&mut self, out: &mut Vec<(VolumeIndex, ByteRange)>) {
+    pub(crate) fn take_damage(
+        &mut self,
+        out: &mut Vec<(VolumeIndex, ByteRange)>,
+    ) -> Result<(), Inconsistent> {
         let mut ranges = Vec::new();
         let mut next = self.open.untold.first().copied();
         while let Some(volume) = next {
             self.open.visit(1, 0);
             ranges.clear();
             if let Some(found) = self.volumes.get_mut(volume.0 as usize) {
-                found.take_damage(&mut self.open, &mut ranges);
+                found.take_damage(&mut self.open, &mut ranges)?;
             }
             out.extend(ranges.iter().map(|range| (volume, *range)));
             next = self
@@ -888,6 +930,7 @@ impl ArticleMap {
                 .next()
                 .copied();
         }
+        Ok(())
     }
 
     // Answer a seek, and move the articles that carry it to `class` when

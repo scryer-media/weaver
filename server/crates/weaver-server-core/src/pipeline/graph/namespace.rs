@@ -1624,8 +1624,13 @@ impl NamespaceWriter {
             None => leaf.write(offset, bytes, record.length)?,
         }
         let took = started.elapsed();
+        // Every byte to its length is in: the file takes that length, or
+        // reaches as far as bytes landed past a length its articles
+        // declared, as the tree closes the member. A post's `=ybegin size=`
+        // never cuts the parts after it.
         if let Some(length) = record.length.filter(|_| record.is_complete()) {
-            leaf.close(length)?;
+            let reached = record.coverage.runs().last().map_or(0, |run| run.range.end);
+            leaf.close(length.max(reached))?;
         }
         if let Some(metrics) = &self.metrics {
             metrics.disk_write_latency_us.store(

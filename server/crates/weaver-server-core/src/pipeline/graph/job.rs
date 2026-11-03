@@ -34,7 +34,7 @@ use super::namespace::{Coming, NamespaceWriter, SetState, WriteError};
 use super::root::intake::Decoded;
 use super::root::phase::{self, Activity, RootPhase};
 use super::root::sample;
-use super::root::source::{Class, Move};
+use super::root::source::{Class, Inconsistent, Move};
 use super::root::{ArticleRoot, Ask};
 use super::status::RepairSlots;
 use crate::operations::disk::CapacityReader;
@@ -44,6 +44,10 @@ use crate::pipeline::ExtractionError;
 pub(crate) enum GraphError {
     #[error("the namespace write path failed")]
     Write(#[from] WriteError),
+    // The job's own record contradicts itself: it fails, and every other
+    // job runs on.
+    #[error("the graph job's record is inconsistent")]
+    Inconsistent(#[from] Inconsistent),
 }
 
 impl GraphError {
@@ -51,7 +55,12 @@ impl GraphError {
     // extractors class theirs, a refusal as the refusal, anything else
     // terminal.
     pub(crate) fn to_extraction(&self) -> ExtractionError {
-        let Self::Write(write) = self;
+        let write = match self {
+            Self::Write(write) => write,
+            Self::Inconsistent(inconsistent) => {
+                return ExtractionError::terminal(format!("{self}: {inconsistent}"));
+            }
+        };
         let message = format!("{self}: {write}");
         match write {
             WriteError::Leaf(LeafError::Io { source, .. }) => {
