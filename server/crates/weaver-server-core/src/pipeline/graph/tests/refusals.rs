@@ -484,7 +484,7 @@ impl tracing::Subscriber for Captured {
     fn exit(&self, _: &tracing::span::Id) {}
 }
 
-// ADVERSARY (uncommitted): one archive given up on is one demotion. The
+// One archive given up on is one demotion. The
 // job's event history should say so once, not once per volume; and an
 // archive handed to an engine that then reads it was not given up on.
 fn given_back(refusing: &mut Refusing) -> Vec<String> {
@@ -500,7 +500,7 @@ fn given_back(refusing: &mut Refusing) -> Vec<String> {
 }
 
 #[test]
-fn adversary_a_refused_five_volume_store_is_one_demotion_event() {
+fn a_refused_five_volume_store_is_one_demotion_event() {
     let mut refusing = refusing(Mode::Refuse, 5, &[]);
     refusing.deliver_all();
     let given = given_back(&mut refusing);
@@ -508,7 +508,7 @@ fn adversary_a_refused_five_volume_store_is_one_demotion_event() {
 }
 
 #[tokio::test]
-async fn adversary_a_store_handed_to_an_engine_is_not_given_up() {
+async fn a_store_handed_to_an_engine_is_not_given_up() {
     let mut refusing = refusing(Mode::NeedsEngine, 2, &[]);
     refusing.deliver_all();
     let given = given_back(&mut refusing);
