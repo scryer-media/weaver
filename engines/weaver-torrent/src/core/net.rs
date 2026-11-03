@@ -328,11 +328,26 @@ pub trait HttpClients: Send + Sync + 'static {
 }
 
 /// The clients of a session given none: it makes no HTTP request, so it
-/// fetches nothing by URL and announces to no HTTP tracker. Its traffic
-/// leaves on the host's own route, and its port mapper asks the gateway
-/// from the host's own socket.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoClients;
+/// fetches nothing by URL and announces to no HTTP tracker. Where its
+/// traffic leaves, and the socket its port mapper asks the gateway from,
+/// are its sockets' to say.
+#[derive(Clone)]
+pub struct NoClients {
+    sockets: Arc<dyn crate::network::SocketFactory>,
+}
+
+impl NoClients {
+    /// The clients of a session whose sockets come from `sockets`.
+    pub fn over(sockets: Arc<dyn crate::network::SocketFactory>) -> Self {
+        Self { sockets }
+    }
+}
+
+impl std::fmt::Debug for NoClients {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoClients").finish_non_exhaustive()
+    }
+}
 
 impl HttpClients for NoClients {
     fn client(
@@ -344,12 +359,13 @@ impl HttpClients for NoClients {
     }
 
     fn egress(&self, to: SocketAddr) -> Egress {
-        match crate::network::host_source_toward(to) {
-            Ok(ip) => Egress::From(ip),
-            Err(error) => {
-                tracing::debug!(%to, %error, "the host has no route toward the address");
+        match self.sockets.source_toward(to) {
+            Some(Ok(ip)) => Egress::From(ip),
+            Some(Err(error)) => {
+                tracing::debug!(%to, %error, "the sockets have no route toward the address");
                 Egress::NoRoute
             }
+            None => Egress::Proxied,
         }
     }
 
@@ -357,10 +373,7 @@ impl HttpClients for NoClients {
         &'a self,
         local: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
-        Box::pin(async move {
-            let sockets = crate::network::KernelSockets::new(None).map_err(io::Error::other)?;
-            crate::network::SocketFactory::bind_udp(&sockets, local).await
-        })
+        self.sockets.gateway_socket(local)
     }
 }
 

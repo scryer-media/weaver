@@ -167,20 +167,73 @@ mod tests {
         assert!(!found.point_to_point, "{found:?}");
     }
 
-    // A session given no clients leaves on the host's own route, and asks
-    // the gateway from the host's own socket.
+    // Kernel sockets that say traffic toward any address leaves from `0`.
+    struct LeavingFrom(IpAddr, crate::network::KernelSockets);
+
+    impl crate::network::SocketFactory for LeavingFrom {
+        fn connect_tcp<'a>(
+            &'a self,
+            addr: SocketAddr,
+        ) -> crate::network::BoxFuture<
+            'a,
+            std::io::Result<(
+                crate::type_aliases::BoxAsyncReadVectored,
+                crate::type_aliases::BoxAsyncWrite,
+            )>,
+        > {
+            self.1.connect_tcp(addr)
+        }
+        fn listen_tcp<'a>(
+            &'a self,
+            addr: SocketAddr,
+        ) -> crate::network::BoxFuture<'a, std::io::Result<Box<dyn crate::network::StreamListener>>>
+        {
+            self.1.listen_tcp(addr)
+        }
+        fn bind_udp<'a>(
+            &'a self,
+            addr: SocketAddr,
+        ) -> crate::network::BoxFuture<
+            'a,
+            std::io::Result<std::sync::Arc<dyn crate::network::DatagramSocket>>,
+        > {
+            self.1.bind_udp(addr)
+        }
+        fn source_toward(&self, _: SocketAddr) -> Option<std::io::Result<IpAddr>> {
+            Some(Ok(self.0))
+        }
+        fn gateway_socket<'a>(
+            &'a self,
+            local: SocketAddr,
+        ) -> crate::network::BoxFuture<
+            'a,
+            std::io::Result<std::sync::Arc<dyn crate::network::DatagramSocket>>,
+        > {
+            self.1.gateway_socket(local)
+        }
+    }
+
+    // A session given no clients leaves where its sockets say, and asks the
+    // gateway from a socket of theirs; sockets that say nothing leave through
+    // a proxy, whose gateway no port mapper asks.
     #[tokio::test]
-    async fn a_session_given_no_clients_takes_the_hosts_route() {
+    async fn a_session_given_no_clients_takes_its_sockets_route() {
         let to = SocketAddr::from((Ipv4Addr::LOCALHOST, 9));
-        assert_eq!(
-            crate::NoClients.egress(to),
-            Egress::From(Ipv4Addr::LOCALHOST.into())
-        );
-        let socket = crate::NoClients
-            .gateway_socket(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+        let loopback = IpAddr::from(Ipv4Addr::LOCALHOST);
+        let saying = crate::NoClients::over(std::sync::Arc::new(LeavingFrom(
+            loopback,
+            crate::test_support::sockets(),
+        )));
+        assert_eq!(saying.egress(to), Egress::From(loopback));
+        let socket = saying
+            .gateway_socket(SocketAddr::new(loopback, 0))
             .await
             .unwrap();
-        assert_eq!(socket.bind_addr().ip(), IpAddr::from(Ipv4Addr::LOCALHOST));
+        assert_eq!(socket.bind_addr().ip(), loopback);
+
+        let kernel = crate::NoClients::over(crate::test_support::socket_factory());
+        assert_eq!(kernel.egress(to), Egress::Proxied);
+        assert!(source_toward(&kernel, to).is_err());
     }
 
     #[test]

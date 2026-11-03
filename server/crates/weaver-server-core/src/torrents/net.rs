@@ -339,6 +339,19 @@ impl SocketFactory for LegSockets {
             }) as Arc<dyn DatagramSocket>)
         })
     }
+
+    // Where the leg's route sends traffic toward `to` from, as its requests
+    // leave.
+    fn source_toward(&self, to: SocketAddr) -> Option<io::Result<IpAddr>> {
+        self.dialer.source_toward(to)
+    }
+
+    fn gateway_socket<'a>(
+        &'a self,
+        local: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        gateway_socket(&self.dialer, local)
+    }
 }
 
 // A socket in the leg's tunnel, as the session's datagram socket.
@@ -729,17 +742,26 @@ where
         &'a self,
         local: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
-        let bound = self.dialer.bind_local_udp(local);
-        Box::pin(async move {
-            let socket = bound.unwrap_or_else(|| {
-                Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "the leg binds no socket of its own",
-                ))
-            })?;
-            Ok(Arc::new(tokio::net::UdpSocket::from_std(socket)?) as Arc<dyn DatagramSocket>)
-        })
+        gateway_socket(&self.dialer, local)
     }
+}
+
+// A socket at `local` that `dialer`'s route binds as it binds its own, for
+// a port mapper to ask the gateway from.
+fn gateway_socket<'a>(
+    dialer: &Arc<dyn Dialer>,
+    local: SocketAddr,
+) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+    let bound = dialer.bind_local_udp(local);
+    Box::pin(async move {
+        let socket = bound.unwrap_or_else(|| {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the leg binds no socket of its own",
+            ))
+        })?;
+        Ok(Arc::new(tokio::net::UdpSocket::from_std(socket)?) as Arc<dyn DatagramSocket>)
+    })
 }
 
 #[cfg(any(
@@ -925,6 +947,21 @@ mod tests {
         let mut got = [0u8; 3];
         let (len, from) = other.recv_from(&mut got).await.unwrap();
         assert_eq!((&got[..len], from), (&b"dht"[..], udp.bind_addr()));
+    }
+
+    // The engine's port mapper asks the leg's sockets for its route and its
+    // gateway socket, as it asks the leg's clients.
+    #[tokio::test]
+    async fn a_source_address_legs_sockets_give_the_mapper_its_route() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let sockets = LegSockets::new(loopback_egress(), &LegKind::SourceAddress(loopback));
+        let gateway = SocketAddr::from(([127, 0, 0, 1], 5351));
+        assert_eq!(sockets.source_toward(gateway).unwrap().unwrap(), loopback);
+        let socket = sockets
+            .gateway_socket(SocketAddr::new(loopback, 0))
+            .await
+            .unwrap();
+        assert_eq!(socket.bind_addr().ip(), loopback);
     }
 
     // A tunnel's datagrams, each socket a loopback socket that stands for

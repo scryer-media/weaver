@@ -1557,7 +1557,7 @@ impl Session {
             let http_clients: Arc<dyn HttpClients> = opts
                 .http_client
                 .take()
-                .unwrap_or_else(|| Arc::new(NoClients));
+                .unwrap_or_else(|| Arc::new(NoClients::over(Arc::clone(&opts.socket_factory))));
 
             let stream_connector = Arc::new(
                 StreamConnector::new(StreamConnectorArgs {

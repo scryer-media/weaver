@@ -17,7 +17,7 @@
 use std::{
     future::Future,
     io::{self, IoSlice},
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::Arc,
     task::{Context, Poll},
 };
@@ -103,6 +103,28 @@ pub trait SocketFactory: Send + Sync + 'static {
         &'a self,
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>>;
+
+    /// The local address traffic toward `to` leaves from on this route, or
+    /// why it has none. None when the route does not say, as one through a
+    /// proxy does not.
+    fn source_toward(&self, _to: SocketAddr) -> Option<io::Result<IpAddr>> {
+        None
+    }
+
+    /// A datagram socket bound at `local` on the network the gateway is
+    /// reached on: the one a port mapper asks the gateway from. A route with
+    /// no such socket has no gateway to ask.
+    fn gateway_socket<'a>(
+        &'a self,
+        local: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        Box::pin(async move {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("no socket to ask the gateway from {local}"),
+            ))
+        })
+    }
 }
 
 impl std::fmt::Debug for dyn SocketFactory {
@@ -222,21 +244,6 @@ impl KernelSockets {
     }
 }
 
-/// The address the host's own route toward `to` leaves from. Connecting a
-/// datagram socket picks the route and sends nothing.
-pub(crate) fn host_source_toward(to: SocketAddr) -> io::Result<std::net::IpAddr> {
-    use socket2::{Domain, Protocol, Socket, Type};
-    let any = match to {
-        SocketAddr::V4(_) => SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)),
-        SocketAddr::V6(_) => SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
-    };
-    let socket = Socket::new(Domain::for_address(any), Type::DGRAM, Some(Protocol::UDP))?;
-    socket.bind(&any.into())?;
-    let socket = std::net::UdpSocket::from(socket);
-    socket.connect(to)?;
-    Ok(socket.local_addr()?.ip())
-}
-
 impl SocketFactory for KernelSockets {
     fn connect_tcp<'a>(
         &'a self,
@@ -277,6 +284,15 @@ impl SocketFactory for KernelSockets {
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
         Box::pin(async move { Ok(Arc::new(self.kernel_udp(addr)?) as Arc<dyn DatagramSocket>) })
+    }
+
+    // The port mapper asks the gateway from a socket of its own, bound as
+    // every other socket here is.
+    fn gateway_socket<'a>(
+        &'a self,
+        local: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        self.bind_udp(local)
     }
 }
 
