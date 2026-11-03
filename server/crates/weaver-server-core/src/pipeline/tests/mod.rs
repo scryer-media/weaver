@@ -66,6 +66,7 @@ mod post_processing_pause;
 mod provider_scheduling;
 mod queue;
 mod queue_scale;
+mod queue_window;
 mod restore_history;
 mod script_events;
 mod server_attribution;
