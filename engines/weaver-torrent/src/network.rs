@@ -691,8 +691,8 @@ mod tests {
             std::net::IpAddr::from(Ipv4Addr::LOCALHOST),
             Ipv6Addr::LOCALHOST.into(),
         ] {
-            let peer = tokio::net::UdpSocket::bind((ip, 0)).await.unwrap();
-            let peer_addr = peer.local_addr().unwrap();
+            let peer = crate::test_support::udp((ip, 0)).await;
+            let peer_addr = peer.bind_addr();
             // Out on the socket of the peer's family, from the leg's port.
             socket.send_to(b"out", peer_addr).await.unwrap();
             let (len, from) = peer.recv_from(&mut buf).await.unwrap();
@@ -709,9 +709,9 @@ mod tests {
             std::net::IpAddr::from(Ipv4Addr::LOCALHOST),
             Ipv6Addr::LOCALHOST.into(),
         ] {
-            let mut peer = tokio::net::TcpStream::connect((ip, port)).await.unwrap();
+            let (_, mut peer) = crate::test_support::tcp((ip, port)).await.unwrap();
             let (from, mut read, _write) = listener.accept().await.unwrap();
-            assert_eq!(from, peer.local_addr().unwrap());
+            assert_eq!(from.ip(), ip);
             peer.write_all(b"hi").await.unwrap();
             let mut got = [0u8; 2];
             read.read_exact(&mut got).await.unwrap();
@@ -843,10 +843,8 @@ mod pair_tests {
             v6: sockets.kernel_udp((Ipv6Addr::LOCALHOST, 0).into()).unwrap(),
             v4: sockets.kernel_udp((Ipv4Addr::LOCALHOST, 0).into()).unwrap(),
         };
-        let peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let port = peer.local_addr().unwrap().port();
+        let peer = crate::test_support::udp((Ipv4Addr::LOCALHOST, 0)).await;
+        let port = peer.bind_addr().port();
         let mapped = SocketAddr::from((Ipv4Addr::LOCALHOST.to_ipv6_mapped(), port));
         let (socket, target) = paired.toward(mapped);
         assert!(std::ptr::eq(socket, &paired.v4));

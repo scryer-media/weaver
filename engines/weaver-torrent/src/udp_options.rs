@@ -272,22 +272,20 @@ mod unix {
         name: libc::c_int,
         value: libc::c_int,
     ) -> io::Result<()> {
+        let len = int_len()?;
         // SAFETY: `fd` is an open socket for the call, and the option at
         // `level`/`name` takes an int, which `value` is.
-        let done = unsafe {
-            libc::setsockopt(
-                fd,
-                level,
-                name,
-                (&raw const value).cast(),
-                mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
+        let done = unsafe { libc::setsockopt(fd, level, name, (&raw const value).cast(), len) };
         if done == 0 {
             Ok(())
         } else {
             Err(io::Error::last_os_error())
         }
+    }
+
+    // The length of the int a socket option is.
+    fn int_len() -> io::Result<libc::socklen_t> {
+        libc::socklen_t::try_from(mem::size_of::<libc::c_int>()).map_err(io::Error::other)
     }
 
     #[cfg(test)]
@@ -297,7 +295,7 @@ mod unix {
         name: libc::c_int,
     ) -> io::Result<libc::c_int> {
         let mut value: libc::c_int = 0;
-        let mut len = mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let mut len = int_len()?;
         // SAFETY: as in `set_int`; `value` has room for the int the option is.
         let done =
             unsafe { libc::getsockopt(fd, level, name, (&raw mut value).cast(), &raw mut len) };
