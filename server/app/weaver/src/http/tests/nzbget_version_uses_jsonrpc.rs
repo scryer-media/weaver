@@ -5699,11 +5699,9 @@ async fn nzbget_lists_every_group_and_the_files_of_a_job_past_the_queue_window()
     const WINDOW: usize = 100;
     const QUEUED: u64 = WINDOW as u64 + 10;
     let db = Database::open_in_memory().unwrap();
-    let handle = scheduler_handle_with_jobs_and_db(
-        (1..=QUEUED).map(reorder_test_job).collect(),
-        db.clone(),
-    )
-    .await;
+    let handle =
+        scheduler_handle_with_jobs_and_db((1..=QUEUED).map(reorder_test_job).collect(), db.clone())
+            .await;
     let diagnostics = handle.pipeline_diagnostics().await.unwrap();
     let mut installed: Vec<u64> = diagnostics.jobs.iter().map(|job| job.job_id).collect();
     installed.sort_unstable();
