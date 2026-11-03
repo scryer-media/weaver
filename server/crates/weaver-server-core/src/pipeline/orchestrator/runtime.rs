@@ -281,6 +281,7 @@ impl Pipeline {
             semantic_terminal_causes: HashMap::new(),
             pipeline_failure_stages: HashMap::new(),
             job_order: Vec::new(),
+            stored_queue_order: Vec::new(),
             active_downloads: 0,
             active_download_connections: 0,
             active_completion_critical_connections: 0,

@@ -274,7 +274,10 @@ impl Pipeline {
             .collect();
         if installed_order != self.job_order {
             self.job_order = installed_order;
+        }
+        if order != self.stored_queue_order {
             self.persist_queue_order(&order).await;
+            self.stored_queue_order = order;
         }
         use crate::jobs::handle::CancellationOrigin;
         for origin in [
