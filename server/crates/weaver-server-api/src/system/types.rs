@@ -1271,6 +1271,8 @@ pub struct ServerHealth {
     pub consecutive_failures: u32,
     /// Connections that died before reaching a healthy age, recently.
     pub premature_deaths: u32,
+    /// The server's saved id, which the data-used ledger counts it under.
+    pub server_id: Option<u32>,
     /// This server's position in the connection pool, which is its
     /// `ServerId`. Two configured servers may share a host and port, so the
     /// pool position, not the address, says which server this is.
@@ -1281,6 +1283,20 @@ pub struct ServerHealth {
 
 #[ComplexObject]
 impl ServerHealth {
+    /// When this server was first seen in its current state, in epoch
+    /// milliseconds. Absent until the data-used ledger has read it once.
+    async fn state_since_epoch_ms(&self, ctx: &Context<'_>) -> Option<u64> {
+        let recorder = ctx
+            .data_opt::<Option<std::sync::Arc<weaver_server_core::operations::UsageRecorder>>>()?
+            .as_ref()?;
+        let (state, since) = recorder.server_state_since(self.server_id?)?;
+        if state != self.state {
+            return None;
+        }
+        u64::try_from(since)
+            .ok()
+            .map(|sec| sec.saturating_mul(1000))
+    }
     async fn legs(&self, ctx: &Context<'_>) -> Vec<crate::networking::NetworkLegFlow> {
         let Some(handle) = ctx.data_opt::<weaver_server_core::SchedulerHandle>() else {
             return Vec::new();
