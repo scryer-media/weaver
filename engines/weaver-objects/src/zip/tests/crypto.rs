@@ -1,0 +1,699 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use super::*;
+use ::zip::unstable::write::FileOptionsExt;
+
+const PASSWORD: &str = "zip-test-passphrase";
+
+fn encrypted(plain: &[u8]) -> Vec<u8> {
+    let mut archive = write(&[Entry::File("alpha.bin", plain, stored())]);
+    let end = records::find_end(&archive).unwrap();
+    let central = end.offset as usize;
+    let data = records::local_len(&archive).unwrap() as usize;
+    archive[6..8].copy_from_slice(&1u16.to_le_bytes());
+    archive[18..22].copy_from_slice(&(plain.len() as u32 + 12).to_le_bytes());
+    archive[central + 8..central + 10].copy_from_slice(&1u16.to_le_bytes());
+    archive[central + 20..central + 24].copy_from_slice(&(plain.len() as u32 + 12).to_le_bytes());
+    archive[end.at as usize + 16..end.at as usize + 20]
+        .copy_from_slice(&(central as u32 + 12).to_le_bytes());
+    let cipher = super::super::crypto::encrypt_fixture(PASSWORD, plain);
+    archive.splice(data..data + plain.len(), cipher);
+    // The independent library reader checks the fixture and its CRC.
+    let mut reader = ::zip::ZipArchive::new(Cursor::new(&archive)).unwrap();
+    let mut member = reader.by_index_decrypt(0, PASSWORD.as_bytes()).unwrap();
+    let mut decoded = Vec::new();
+    std::io::Read::read_to_end(&mut member, &mut decoded).unwrap();
+    assert!(decoded == plain);
+    drop(member);
+    drop(reader);
+    archive
+}
+
+fn encrypted_descriptor(plain: &[u8]) -> Vec<u8> {
+    let mut archive = encrypted(plain);
+    let end = records::find_end(&archive).unwrap();
+    let central = end.offset as usize;
+    let data = records::local_len(&archive).unwrap() as usize;
+    archive[6..8].copy_from_slice(&9u16.to_le_bytes());
+    archive[10..12].fill(0);
+    archive[central + 8..central + 10].copy_from_slice(&9u16.to_le_bytes());
+    archive[central + 12..central + 14].fill(0);
+    let cipher = super::super::crypto::encrypt_fixture_with_check(PASSWORD, plain, 0);
+    archive[data..central].copy_from_slice(&cipher);
+    archive[end.at as usize + 16..end.at as usize + 20]
+        .copy_from_slice(&(central as u32 + 16).to_le_bytes());
+    let mut descriptor = 0x0807_4b50u32.to_le_bytes().to_vec();
+    descriptor.extend(crate::grid::crc32(plain).to_le_bytes());
+    descriptor.extend((plain.len() as u32 + 12).to_le_bytes());
+    descriptor.extend((plain.len() as u32).to_le_bytes());
+    archive.splice(central..central, descriptor);
+    archive
+}
+
+fn offer(owner: &mut Owner, password: &str) {
+    let mut out = Vec::new();
+    owner.object.offer_password(password, &mut out);
+    owner.apply(out);
+    owner.settle();
+}
+
+fn false_password(archive: &[u8]) -> String {
+    use zeroize::Zeroizing;
+    let header = records::local(archive).unwrap();
+    let data = records::local_len(archive).unwrap() as usize;
+    let encrypted_header: [u8; 12] = archive[data..data + 12].try_into().unwrap();
+    (0..65_536)
+        .map(|index| format!("candidate-{index}"))
+        .find(|password| {
+            let mut cipher = super::super::crypto::Cipher::new(&header);
+            cipher.header = Some(encrypted_header);
+            cipher.unlock(&[Zeroizing::new(password.clone())], Provenance::Fresh)
+        })
+        .expect("a deterministic candidate passes the one-byte check")
+}
+
+#[test]
+fn zipcrypto_streams_plaintext_before_the_remaining_ciphertext_arrives() {
+    let plain = payload(81, 200_003);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + super::super::crypto::HEADER;
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, start + 4096));
+    assert!(
+        !owner.members.is_empty(),
+        "{:?}; {:?}",
+        owner.said,
+        records::local(&archive)
+    );
+    assert!(owner.member("alpha.bin").bytes == plain[..4096]);
+    assert!(!owner.member("alpha.bin").closed);
+    owner.deliver(0, ByteRange::new(start + 4096, archive.len() as u64));
+    owner.close(0);
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+    assert!(
+        !owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::NeedsEngine(_)))
+    );
+}
+
+#[test]
+fn zipcrypto_sparse_pieces_wait_for_the_prefix_and_reproduce_the_ciphertext() {
+    let plain = payload(82, 210_007);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + super::super::crypto::HEADER;
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(120_000, 160_000));
+    owner.deliver(0, ByteRange::new(80_000, 120_000));
+    owner.deliver(0, ByteRange::new(0, start + 4096));
+    owner.deliver(0, ByteRange::new(start + 4096, 80_000));
+    owner.deliver(0, ByteRange::new(160_000, archive.len() as u64));
+    owner.close(0);
+    assert!(
+        owner.member("alpha.bin").bytes == plain,
+        "len={} closed={} said={:?}",
+        owner.member("alpha.bin").bytes.len(),
+        owner.member("alpha.bin").closed,
+        owner.said
+    );
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+    assert_eq!(owner.held(), 0);
+}
+
+#[test]
+fn zipcrypto_rejects_a_wrong_password_and_opens_with_the_next() {
+    let plain = payload(83, 170_011);
+    let archive = encrypted(&plain);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    offer(&mut owner, "incorrect-passphrase");
+    owner.whole(4096);
+    assert!(!owner.member("alpha.bin").closed);
+    assert!(owner.said.contains(&Emit::NeedsPassword));
+    offer(&mut owner, PASSWORD);
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+}
+
+#[test]
+fn zipcrypto_restores_without_secret_keys_and_rederives_them_from_plaintext() {
+    let plain = payload(84, 220_003);
+    let archive = encrypted(&plain);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, 100_000));
+    let saved = rmp_serde::to_vec(&owner.object).unwrap();
+    assert!(
+        !saved
+            .windows(PASSWORD.len())
+            .any(|part| part == PASSWORD.as_bytes())
+    );
+    owner.object = rmp_serde::from_slice(&saved).unwrap();
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(100_000, archive.len() as u64));
+    owner.close(0);
+    assert!(owner.member("alpha.bin").bytes == plain, "{:?}", owner.said);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+}
+
+#[test]
+fn stored_plain_encrypted_and_empty_entries_share_the_zip_map() {
+    let alpha = payload(85, 100_003);
+    let beta = payload(86, 130_007);
+    let options = stored()
+        .with_deprecated_encryption(PASSWORD.as_bytes())
+        .unwrap();
+    let archive = write(&[
+        Entry::File("alpha.bin", &alpha, stored()),
+        Entry::File("beta.bin", &beta, options),
+        Entry::File("empty.bin", &[], options),
+    ]);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    offer(&mut owner, PASSWORD);
+    owner.whole(4096);
+    assert!(owner.member("alpha.bin").bytes == alpha);
+    assert!(owner.member("beta.bin").bytes == beta);
+    assert!(owner.member("empty.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+}
+
+#[test]
+fn zipcrypto_retries_a_password_that_passes_its_one_byte_header_check() {
+    let plain = payload(87, 90_003);
+    let archive = encrypted(&plain);
+    let false_password = false_password(&archive);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    offer(&mut owner, &false_password);
+    owner.whole(4096);
+    assert!(!owner.member("alpha.bin").closed);
+    assert!(owner.said.contains(&Emit::NeedsPassword));
+    offer(&mut owner, PASSWORD);
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+    assert!(owner.said.contains(&Emit::Retract(MemberId(0))));
+}
+
+#[test]
+fn repairing_a_zipcrypto_prefix_replays_its_feedback_suffix_before_closing() {
+    let plain = payload(88, 180_007);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let mut damaged = archive.clone();
+    damaged[start as usize + 20] ^= 0x5a;
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, start + 20));
+    owner.deliver_as(
+        0,
+        ByteRange::new(start + 20, start + 21),
+        Provenance::Damaged,
+        Some(&damaged[start as usize + 20..start as usize + 21]),
+    );
+    owner.deliver(0, ByteRange::new(start + 21, archive.len() as u64));
+    assert!(!owner.member("alpha.bin").closed);
+    assert!(owner.member("alpha.bin").bytes != plain);
+    owner.deliver(0, ByteRange::new(start + 20, start + 21));
+    assert!(owner.member("alpha.bin").bytes == plain, "{:?}", owner.said);
+    assert!(owner.member("alpha.bin").closed, "{:?}", owner.said);
+    assert!(owner.posted(0) == Some(archive));
+}
+
+#[test]
+fn zipcrypto_inverse_postings_are_sparse_and_survive_live_key_invalidation() {
+    use weaver_graph::Placement;
+    let plain = payload(89, 200_003);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    offer(&mut owner, PASSWORD);
+    owner.whole(4096);
+    let whole = ByteRange::new(0, archive.len() as u64);
+    let posted = owner.object.posting(&[(VolumeIndex(0), whole)]);
+    owner
+        .object
+        .unposted(VolumeIndex(0), ByteRange::at(start + 70_003, 11));
+    for range in [
+        ByteRange::at(start + 130_001, 257),
+        ByteRange::new(0, start + 3),
+        whole,
+        ByteRange::at(start + 64_999, 33),
+    ] {
+        let mut bytes = Vec::new();
+        assert!(posted.posted(
+            VolumeIndex(0),
+            range,
+            &mut |placement, into| {
+                match placement {
+                    Placement::Member { range, .. } => {
+                        into.extend_from_slice(&plain[range.start as usize..range.end as usize])
+                    }
+                    Placement::Envelope { envelope, range } => {
+                        let Some(bytes) = owner.object.envelope(*envelope, *range) else {
+                            return false;
+                        };
+                        into.extend_from_slice(&bytes);
+                    }
+                    Placement::Held { .. } => return false,
+                }
+                true
+            },
+            &mut bytes
+        ));
+        assert!(bytes == archive[range.start as usize..range.end as usize]);
+    }
+}
+
+#[test]
+fn a_zipcrypto_local_header_starts_without_a_terminal_article_extent() {
+    use weaver_graph::{Delivery, Evidenced};
+    let plain = payload(90, 100_003);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let mut object = Zip::new();
+    let volume = VolumeIndex(crate::zip_engine::naming::LAST);
+    object.bound(volume, "alpha.zip", &archive[..32], None);
+    object.offer_password(PASSWORD, &mut Vec::new());
+    let mut out = Vec::new();
+    object.deliver(
+        Delivery {
+            volume,
+            offset: 0,
+            bytes: &Evidenced::from(archive[..start as usize + 4096].to_vec()),
+            provenance: Provenance::Fresh,
+        },
+        &mut |_, _| false,
+        &mut out,
+    );
+    assert!(out.iter().any(
+        |emit| matches!(emit, Emit::Bytes { offset: 0, bytes, .. } if bytes[..] == plain[..4096])
+    ));
+    assert!(
+        !out.iter()
+            .any(|emit| matches!(emit, Emit::NeedsEngine(_) | Emit::Refuse(_)))
+    );
+}
+
+#[test]
+fn zipcrypto_compression_falls_back_for_compression_and_unknown_local_sizes_for_extent() {
+    let plain = payload(91, 20_003);
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Deflated)
+        .with_deprecated_encryption(PASSWORD.as_bytes())
+        .unwrap();
+    let mut owner = Owner::single(
+        Zip::new(),
+        write(&[Entry::File("alpha.bin", &plain, options)]),
+    );
+    owner.whole(4096);
+    assert_eq!(owner.said, vec![Emit::NeedsEngine(Why::Compressed)]);
+    let options = stored()
+        .with_deprecated_encryption(PASSWORD.as_bytes())
+        .unwrap();
+    let mut owner = Owner::single(
+        Zip::new(),
+        write(&[Entry::File("alpha.bin", &plain, options)]),
+    );
+    owner.pull = Pull::Unseekable;
+    owner.whole(4096);
+    assert_eq!(owner.said, vec![Emit::NeedsEngine(Why::UnboundedEntry)]);
+}
+
+#[test]
+fn completed_zipcrypto_restore_skips_an_earlier_false_positive_candidate() {
+    let plain = payload(92, 100_003);
+    let archive = encrypted(&plain);
+    let wrong = false_password(&archive);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    offer(&mut owner, &wrong);
+    offer(&mut owner, PASSWORD);
+    owner.whole(4096);
+    assert!(owner.member("alpha.bin").closed);
+    let saved = rmp_serde::to_vec(&owner.object).unwrap();
+    owner.object = rmp_serde::from_slice(&saved).unwrap();
+    offer(&mut owner, PASSWORD);
+    assert!(owner.posted(0) == Some(archive.clone()));
+    owner.object = rmp_serde::from_slice(&saved).unwrap();
+    offer(&mut owner, &wrong);
+    offer(&mut owner, PASSWORD);
+    // An inverse read must prove the selected candidate before returning
+    // ciphertext, even when no new delivery drove the restored store.
+    assert!(owner.posted(0) == Some(archive.clone()));
+    owner.deliver(0, ByteRange::new(80_000, 84_096));
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+}
+
+#[test]
+fn partial_zipcrypto_restore_retries_the_original_false_positive_after_full_crc() {
+    let plain = payload(93, 180_007);
+    let archive = encrypted(&plain);
+    let wrong = false_password(&archive);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, &wrong);
+    owner.deliver(0, ByteRange::new(0, 80_000));
+    assert!(!owner.member("alpha.bin").closed);
+    assert!(owner.member("alpha.bin").bytes != plain[..owner.member("alpha.bin").bytes.len()]);
+    owner.object = rmp_serde::from_slice(&rmp_serde::to_vec(&owner.object).unwrap()).unwrap();
+    offer(&mut owner, &wrong);
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(80_000, archive.len() as u64));
+    owner.close(0);
+    assert!(owner.member("alpha.bin").bytes == plain, "{:?}", owner.said);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+}
+
+#[test]
+fn a_changed_candidate_list_after_partial_restore_never_fabricates_ciphertext() {
+    let plain = payload(94, 180_007);
+    let archive = encrypted(&plain);
+    let wrong = false_password(&archive);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, &wrong);
+    owner.deliver(0, ByteRange::new(0, 80_000));
+    owner.object = rmp_serde::from_slice(&rmp_serde::to_vec(&owner.object).unwrap()).unwrap();
+    offer(&mut owner, PASSWORD);
+    let mut recovered = Vec::new();
+    assert!(!owner.read_posted(VolumeIndex(0), ByteRange::new(0, 80_000), &mut recovered));
+    assert!(!owner.member("alpha.bin").closed);
+}
+
+#[test]
+fn zipcrypto_spanned_volumes_reproduce_every_original_volume() {
+    let plain = payload(95, 190_003);
+    let volumes = spanned(&encrypted(&plain), 3);
+    let mut owner = Owner::new(Zip::new(), volumes.clone());
+    offer(&mut owner, PASSWORD);
+    for volume in [2, 0, 1] {
+        owner.frames(volume, 4096);
+    }
+    for volume in [2, 0, 1] {
+        owner.close(volume);
+    }
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.member("alpha.bin").closed);
+    for (volume, (_, bytes)) in volumes.into_iter().enumerate() {
+        assert!(owner.posted(volume) == Some(bytes));
+    }
+}
+
+#[test]
+fn zipcrypto_metadata_mismatch_and_strong_encryption_are_explicit_fallbacks() {
+    let plain = payload(96, 100_003);
+    let mut archive = encrypted(&plain);
+    let central = records::find_end(&archive).unwrap().offset as usize;
+    archive[14] ^= 1;
+    let mut owner = Owner::single(Zip::new(), archive);
+    offer(&mut owner, PASSWORD);
+    owner.whole(4096);
+    assert!(owner.said.contains(&Emit::NeedsEngine(Why::Unsupported)));
+    let mut archive = encrypted(&plain);
+    archive[6..8].copy_from_slice(&65u16.to_le_bytes());
+    archive[central + 8..central + 10].copy_from_slice(&65u16.to_le_bytes());
+    let mut owner = Owner::single(Zip::new(), archive);
+    owner.whole(4096);
+    assert_eq!(owner.said, vec![Emit::NeedsEngine(Why::Unsupported)]);
+}
+
+#[test]
+fn known_size_zipcrypto_with_descriptor_streams_before_its_tail() {
+    let plain = payload(97, 200_003);
+    let archive = encrypted_descriptor(&plain);
+    let data = records::local_len(&archive).unwrap() + 12;
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, data + 4096));
+    assert!(owner.member("alpha.bin").bytes == plain[..4096]);
+    assert!(!owner.member("alpha.bin").closed);
+    owner.deliver(0, ByteRange::new(data + 4096, archive.len() as u64));
+    owner.close(0);
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive.clone()));
+    assert!(
+        !owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::NeedsEngine(_)))
+    );
+    let mut reader = ::zip::ZipArchive::new(Cursor::new(archive)).unwrap();
+    let mut member = reader.by_index_decrypt(0, PASSWORD.as_bytes()).unwrap();
+    let mut decoded = Vec::new();
+    std::io::Read::read_to_end(&mut member, &mut decoded).unwrap();
+    assert!(decoded == plain);
+}
+
+#[test]
+fn known_sizes_with_deferred_crc_wait_for_the_descriptor_without_condemning_the_password() {
+    let plain = payload(98, 200_003);
+    let mut archive = encrypted_descriptor(&plain);
+    let data = records::local_len(&archive).unwrap() + 12;
+    let descriptor = data + plain.len() as u64;
+    archive[14..18].fill(0);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, descriptor));
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(!owner.member("alpha.bin").closed);
+    owner.deliver(0, ByteRange::new(descriptor, archive.len() as u64));
+    owner.close(0);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+    assert!(!owner.said.contains(&Emit::NeedsPassword));
+}
+
+#[test]
+fn a_pending_zipcrypto_repair_survives_a_checkpoint_before_its_replay() {
+    use weaver_graph::{Delivery, Evidenced, Placement};
+    let plain = payload(99, 180_007);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let repair = ByteRange::at(start + 20, 1);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, repair.start));
+    owner.deliver_as(
+        0,
+        repair,
+        Provenance::Damaged,
+        Some(&[archive[repair.start as usize] ^ 0x5a]),
+    );
+    owner.deliver(0, ByteRange::new(repair.end, archive.len() as u64));
+    let previous = owner.member("alpha.bin").bytes.clone();
+    let mut out = Vec::new();
+    owner.object.deliver(
+        Delivery {
+            volume: VolumeIndex(0),
+            offset: repair.start,
+            bytes: &Evidenced::from(vec![archive[repair.start as usize]]),
+            provenance: Provenance::Fresh,
+        },
+        &mut |placement, into| {
+            if let Placement::Member { range, .. } = placement {
+                into.extend_from_slice(&previous[range.start as usize..range.end as usize]);
+                true
+            } else {
+                false
+            }
+        },
+        &mut out,
+    );
+    assert!(out.iter().any(|emit| matches!(emit, Emit::Again { .. })));
+    assert!(
+        !owner
+            .object
+            .map
+            .as_ref()
+            .unwrap()
+            .entry(MemberId(0))
+            .unwrap()
+            .cipher
+            .as_ref()
+            .unwrap()
+            .pending
+            .is_empty()
+    );
+    owner
+        .delivered
+        .get_mut(&0)
+        .unwrap()
+        .write(repair, Provenance::Fresh);
+    owner.object = rmp_serde::from_slice(&rmp_serde::to_vec(&owner.object).unwrap()).unwrap();
+    offer(&mut owner, PASSWORD);
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+    assert!(
+        owner
+            .object
+            .map
+            .as_ref()
+            .unwrap()
+            .entry(MemberId(0))
+            .unwrap()
+            .cipher
+            .as_ref()
+            .unwrap()
+            .pending
+            .is_empty()
+    );
+}
+
+fn payload_with_crc(target: u32) -> Vec<u8> {
+    let mut plain = payload(100, 10_003);
+    let suffix = plain.len();
+    plain.extend([0u8; 4]);
+    let base = crate::grid::crc32(&plain);
+    let mut basis = [(0u32, 0u32); 32];
+    for bit in 0..32 {
+        plain[suffix + bit / 8] = 1 << (bit % 8);
+        let mut value = crate::grid::crc32(&plain) ^ base;
+        plain[suffix + bit / 8] = 0;
+        let mut mask = 1u32 << bit;
+        for pivot in (0..32).rev() {
+            if value & (1 << pivot) == 0 {
+                continue;
+            }
+            if basis[pivot].0 == 0 {
+                basis[pivot] = (value, mask);
+                break;
+            }
+            value ^= basis[pivot].0;
+            mask ^= basis[pivot].1;
+        }
+    }
+    let mut value = target ^ base;
+    let mut mask = 0u32;
+    for pivot in (0..32).rev() {
+        if value & (1 << pivot) != 0 {
+            value ^= basis[pivot].0;
+            mask ^= basis[pivot].1;
+        }
+    }
+    assert_eq!(value, 0);
+    plain[suffix..].copy_from_slice(&mask.to_le_bytes());
+    assert_eq!(crate::grid::crc32(&plain), target);
+    plain
+}
+
+#[test]
+fn an_unsigned_descriptor_crc_can_equal_the_optional_signature() {
+    let plain = payload_with_crc(0x0807_4b50);
+    let mut archive = encrypted_descriptor(&plain);
+    let descriptor = records::local_len(&archive).unwrap() as usize + 12 + plain.len();
+    let end = records::find_end(&archive).unwrap();
+    archive[end.at as usize + 16..end.at as usize + 20]
+        .copy_from_slice(&(end.offset as u32 - 4).to_le_bytes());
+    archive.drain(descriptor..descriptor + 4);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, PASSWORD);
+    owner.whole(257);
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+    assert!(!owner.said.iter().any(|emit| matches!(
+        emit,
+        Emit::Damaged { .. } | Emit::NeedsEngine(_) | Emit::Refuse(_)
+    )));
+}
+
+#[test]
+fn a_small_zipcrypto_entry_can_use_a_zip64_data_descriptor() {
+    let plain = payload(101, 100_003);
+    let mut archive = encrypted_descriptor(&plain);
+    let local = records::local_len(&archive).unwrap() as usize;
+    let old_directory = records::find_end(&archive).unwrap().offset;
+    archive[18..22].copy_from_slice(&u32::MAX.to_le_bytes());
+    archive[22..26].copy_from_slice(&u32::MAX.to_le_bytes());
+    archive[28..30].copy_from_slice(&20u16.to_le_bytes());
+    let mut extra = vec![1, 0, 16, 0];
+    extra.extend((plain.len() as u64).to_le_bytes());
+    extra.extend((plain.len() as u64 + 12).to_le_bytes());
+    archive.splice(local..local, extra);
+    let descriptor = local + 20 + 12 + plain.len();
+    let mut wide = 0x0807_4b50u32.to_le_bytes().to_vec();
+    wide.extend(crate::grid::crc32(&plain).to_le_bytes());
+    wide.extend((plain.len() as u64 + 12).to_le_bytes());
+    wide.extend((plain.len() as u64).to_le_bytes());
+    archive.splice(descriptor..descriptor + 16, wide);
+    let end = records::find_end(&archive).unwrap();
+    archive[end.at as usize + 16..end.at as usize + 20]
+        .copy_from_slice(&(old_directory as u32 + 28).to_le_bytes());
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, PASSWORD);
+    owner.whole(4096);
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+    assert!(!owner.said.iter().any(|emit| matches!(
+        emit,
+        Emit::Damaged { .. } | Emit::NeedsEngine(_) | Emit::Refuse(_)
+    )));
+}
+
+#[test]
+fn an_inverse_frontier_is_bound_to_the_candidate_that_produced_it() {
+    use weaver_graph::{Coverage, Placement};
+    use zeroize::Zeroizing;
+    let plain = payload(102, 100_003);
+    let archive = encrypted(&plain);
+    let wrong = false_password(&archive);
+    let data = records::local_len(&archive).unwrap() as usize;
+    let mut cipher = super::super::crypto::Cipher::new(&records::local(&archive).unwrap());
+    cipher.header = Some(archive[data..data + 12].try_into().unwrap());
+    assert!(cipher.unlock(&[Zeroizing::new(wrong.clone())], Provenance::Fresh));
+    let wrong_plain = std::sync::Arc::make_mut(cipher.open.as_mut().unwrap())
+        .decrypt(
+            0,
+            &archive[data + 12..data + 12 + plain.len()],
+            Provenance::Fresh,
+            &Coverage::new(),
+            &mut |_, _| false,
+        )
+        .unwrap()
+        .0;
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    offer(&mut owner, &wrong);
+    offer(&mut owner, PASSWORD);
+    owner.whole(4096);
+    let body = ByteRange::at(data as u64 + 12, plain.len() as u64);
+    let posted = owner.object.posting(&[(VolumeIndex(0), body)]);
+    for (offset, source) in [(0u64, &wrong_plain), (4096, &plain)] {
+        let range = ByteRange::at(body.start + offset, 4096);
+        let mut output = Vec::new();
+        assert!(posted.posted(
+            VolumeIndex(0),
+            range,
+            &mut |placement, into| {
+                if let Placement::Member { range, .. } = placement {
+                    into.extend_from_slice(&source[range.start as usize..range.end as usize]);
+                    true
+                } else {
+                    false
+                }
+            },
+            &mut output
+        ));
+        assert!(output == archive[range.start as usize..range.end as usize]);
+    }
+}

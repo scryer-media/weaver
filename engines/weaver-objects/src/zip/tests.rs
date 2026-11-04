@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+mod crypto;
 mod facts;
 mod owner;
 
@@ -316,13 +317,13 @@ fn a_deflated_entry_sends_the_whole_container_to_an_engine_before_any_member() {
 }
 
 #[test]
-fn an_encrypted_entry_goes_to_an_engine_that_has_the_password() {
+fn an_aes_entry_explicitly_requires_an_unsupported_cipher_engine() {
     let alpha = payload(7, 2_000);
     let options = stored().with_aes_encryption(::zip::AesMode::Aes256, "a-test-passphrase");
     let bytes = write(&[Entry::File("alpha.bin", &alpha, options)]);
     let mut owner = Owner::single(Zip::new(), bytes);
     owner.whole(4096);
-    assert_eq!(owner.said, vec![Emit::NeedsEngine(Why::Encrypted)]);
+    assert_eq!(owner.said, vec![Emit::NeedsEngine(Why::Unsupported)]);
     assert!(owner.members.is_empty());
 }
 

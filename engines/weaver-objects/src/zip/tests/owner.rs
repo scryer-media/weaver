@@ -45,7 +45,7 @@ pub(super) struct Owner {
     index: Vec<VolumeIndex>,
     next: u32,
     // What each volume was delivered, by provenance, as its member keeps it.
-    delivered: BTreeMap<u32, Coverage>,
+    pub(super) delivered: BTreeMap<u32, Coverage>,
     // What came from outside, by volume: delivered, or a seek's answer.
     fetched: BTreeMap<u32, Coverage>,
     // Seeks answered over bytes that had come already.
@@ -217,6 +217,7 @@ impl Owner {
             .write(range, provenance);
         let mut out = Vec::new();
         let held = &self.held;
+        let members = &self.members;
         self.object.deliver(
             Delivery {
                 volume,
@@ -226,6 +227,16 @@ impl Owner {
             },
             &mut |placement, into| match placement {
                 Placement::Held { range } => read_held(held, volume, *range, into),
+                Placement::Member { member, range } => {
+                    let Some(got) = members
+                        .get(&member.0)
+                        .filter(|got| got.coverage.covered(*range))
+                    else {
+                        return false;
+                    };
+                    into.extend_from_slice(&got.bytes[range.start as usize..range.end as usize]);
+                    true
+                }
                 _ => false,
             },
             &mut out,
@@ -317,7 +328,7 @@ impl Owner {
         self.held.len()
     }
 
-    fn apply(&mut self, out: Vec<Emit>) {
+    pub(super) fn apply(&mut self, out: Vec<Emit>) {
         let mut again = Vec::new();
         for emit in out {
             match emit {
@@ -425,7 +436,12 @@ impl Owner {
 
     // The bytes a range of a volume was posted with, rebuilt from the
     // members, the store's envelope and what is held.
-    fn read_posted(&self, volume: VolumeIndex, range: ByteRange, into: &mut Vec<u8>) -> bool {
+    pub(super) fn read_posted(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        into: &mut Vec<u8>,
+    ) -> bool {
         let mut read = |placement: &Placement, into: &mut Vec<u8>| -> bool {
             match placement {
                 Placement::Member { member, range } => {
