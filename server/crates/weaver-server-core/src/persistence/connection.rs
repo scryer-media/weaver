@@ -795,6 +795,9 @@ enum DbWriteCommand {
         // the write a barrier against every other queued write.
         lane: Option<WriteLane>,
         op: WriteOp,
+        // Answers with the write's outcome once it has run. A write that
+        // never runs drops it, which its receiver reads as a failure.
+        committed: Option<oneshot::Sender<Result<(), String>>>,
     },
     GraphCheckpoint {
         job_id: crate::jobs::ids::JobId,
@@ -980,11 +983,20 @@ async fn execute_write_command(
             .await
             .ok();
         }
-        DbWriteCommand::Write { label, op, .. } => {
+        DbWriteCommand::Write {
+            label,
+            op,
+            committed,
+            ..
+        } => {
             let writer_db = writer_db.clone();
             tokio::task::spawn_blocking(move || {
-                if let Err(error) = op(&writer_db) {
+                let outcome = op(&writer_db).map_err(|error| error.to_string());
+                if let Err(error) = &outcome {
                     tracing::warn!(label, error = %error, "failed to run ordered database write");
+                }
+                if let Some(committed) = committed {
+                    let _ = committed.send(outcome);
                 }
             })
             .await
@@ -1633,6 +1645,7 @@ impl Database {
             label,
             lane: None,
             op: Box::new(op),
+            committed: None,
         };
         self.try_send_with_retry(command, label)
     }
@@ -1646,10 +1659,35 @@ impl Database {
         label: &'static str,
         op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
     ) -> Result<(), StateError> {
+        self.queue_job_write(job_id, label, op, None)
+    }
+
+    // [`Self::try_queue_job_write`] whose receiver answers with the write's
+    // outcome once it has run. A write that fails, or never runs because the
+    // lane closed, answers with an error or not at all.
+    pub(crate) fn try_queue_job_write_committed(
+        &self,
+        job_id: crate::jobs::ids::JobId,
+        label: &'static str,
+        op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
+    ) -> Result<oneshot::Receiver<Result<(), String>>, StateError> {
+        let (committed, rx) = oneshot::channel();
+        self.queue_job_write(job_id, label, op, Some(committed))?;
+        Ok(rx)
+    }
+
+    fn queue_job_write(
+        &self,
+        job_id: crate::jobs::ids::JobId,
+        label: &'static str,
+        op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
+        committed: Option<oneshot::Sender<Result<(), String>>>,
+    ) -> Result<(), StateError> {
         let command = DbWriteCommand::Write {
             label,
             lane: Some(WriteLane::Job(job_id.0)),
             op: Box::new(op),
+            committed,
         };
         self.try_send_with_retry(command, label)
     }
@@ -1705,6 +1743,7 @@ impl Database {
             label: LABEL,
             lane: Some(WriteLane::ServerAttribution),
             op: Box::new(op),
+            committed: None,
         };
         self.try_send_with_retry(command, LABEL)
     }

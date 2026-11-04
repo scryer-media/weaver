@@ -130,6 +130,7 @@ async fn paused_checkpoints_release_execution(direct_lanes: bool) {
             following.send(()).unwrap();
             Ok(())
         }),
+        committed: None,
     });
     // A flush that reports a paused checkpoint drops its receiver. Such an
     // abandoned barrier must not hold unrelated jobs behind the paused lane.

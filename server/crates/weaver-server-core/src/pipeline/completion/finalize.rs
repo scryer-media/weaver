@@ -14,6 +14,8 @@ pub(crate) mod deobfuscate;
 mod output;
 #[cfg(test)]
 pub(in crate::pipeline) use output::member_crc32_by_path;
+#[cfg(test)]
+pub(in crate::pipeline) use output::BEFORE_FIRST_MOVE;
 mod status;
 #[cfg(test)]
 pub(crate) use status::RUNTIME_WRITES;

@@ -51,6 +51,7 @@ mod cancel_batch;
 mod control_lifecycle;
 mod core;
 mod decode_stage;
+mod delivered_restore;
 pub(in crate::pipeline) mod direct_store;
 mod download_dispatch;
 pub(in crate::pipeline) mod engines;

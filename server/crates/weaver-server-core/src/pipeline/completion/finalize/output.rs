@@ -388,6 +388,33 @@ async fn validate_script_move_destination(
     Ok(())
 }
 
+// Waits for the moving row to commit. A write that failed, or a writer
+// lane that closed before running it, fails the move before any file has
+// left the working directory, and the still-empty claim is given back.
+async fn moving_row_committed(
+    durable: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+    dest: &std::path::Path,
+) -> Result<(), MoveToCompleteFailure> {
+    let outcome = match durable {
+        Some(committed) => committed
+            .await
+            .unwrap_or_else(|_| Err("the database writer closed before it ran".into())),
+        None => Err("the write could not be queued".into()),
+    };
+    if let Err(error) = outcome {
+        let _ = tokio::fs::remove_dir(dest).await;
+        return Err(MoveToCompleteFailure::Operational(format!(
+            "could not record the move before starting it: {error}"
+        )));
+    }
+    Ok(())
+}
+
+// Runs once the moving row has committed and before any file moves.
+#[cfg(test)]
+pub(crate) static BEFORE_FIRST_MOVE: std::sync::Mutex<Option<Box<dyn FnOnce(JobId) + Send>>> =
+    std::sync::Mutex::new(None);
+
 async fn run_move_to_complete(
     job_id: JobId,
     working_dir: PathBuf,
@@ -1100,9 +1127,17 @@ impl Pipeline {
         self.phase_end(job_id, JobPhase::Extracting);
         self.phase_end(job_id, JobPhase::Repairing);
         let phase_counters = self.phase_begin(job_id, JobPhase::Moving, None);
-        self.transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"));
         self.reserved_complete_destinations
             .insert(job_id, dest.clone());
+        // The moving row, naming `dest`, must be durable before the first file
+        // leaves the working directory: a restart then finds the delivery and
+        // never fetches the job again. SABnzbd keeps a finished download in
+        // its saved postprocessor queue (sabnzbd/postproc.py:144) and marks it
+        // moving before the first file moves (sabnzbd/postproc.py:517);
+        // NZBGet writes the post stage into its queue file
+        // (daemon/queue/DiskState.cpp:552).
+        let durable =
+            self.transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"));
         self.inflight_moves.insert(job_id);
 
         self.emit_job_event(PipelineEvent::MoveToCompleteStarted { job_id });
@@ -1127,6 +1162,14 @@ impl Pipeline {
             }
             let move_started = Instant::now();
             let result = async {
+                moving_row_committed(durable, &dest).await?;
+                #[cfg(test)]
+                {
+                    let hook = BEFORE_FIRST_MOVE.lock().unwrap().take();
+                    if let Some(hook) = hook {
+                        let _ = tokio::task::spawn_blocking(move || hook(job_id)).await;
+                    }
+                }
                 if let Some((db, context)) = script_validation {
                     validate_script_move_destination(db, context, &dest).await?;
                 }
