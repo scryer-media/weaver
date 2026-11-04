@@ -22,5 +22,6 @@ mod e2e_socket_factory;
 mod e2e_ssl;
 mod e2e_stream;
 pub(crate) mod e2e_tracker_announces;
+mod e2e_utp_interop;
 pub mod embedder_util;
 pub mod test_util;
