@@ -24,7 +24,7 @@ pub(crate) fn window_size(max_concurrent_nzbs: usize) -> usize {
 }
 
 // A job that never started: queued, or paused to go back to queued.
-fn waits_its_turn(status: &JobStatus, paused_resume_status: Option<&JobStatus>) -> bool {
+pub(crate) fn waits_its_turn(status: &JobStatus, paused_resume_status: Option<&JobStatus>) -> bool {
     match status {
         JobStatus::Queued => true,
         JobStatus::Paused => paused_resume_status.is_none_or(|resume| *resume == JobStatus::Queued),
@@ -43,6 +43,47 @@ fn row_priority(row: &JobRow, globals: &crate::pipeline::queue::Globals) -> u8 {
 
 // What a window install reads of a job that is not installed: its active row
 // and the files of its stored NZB, as a restart reads it.
+pub(crate) struct ParkedLoads {
+    db: crate::Database,
+    markers: Vec<(JobId, Result<tokio::sync::oneshot::Receiver<()>, String>)>,
+}
+
+impl ParkedLoads {
+    // Each job read back, in the order named, one parse of each stored NZB,
+    // spread over the cores.
+    pub(crate) async fn read(self) -> Vec<(JobId, Result<Option<RestoreJobRequest>, String>)> {
+        let Self { db, markers } = self;
+        if markers.is_empty() {
+            return Vec::new();
+        }
+        let mut ids = Vec::with_capacity(markers.len());
+        let mut waited = HashMap::new();
+        for (id, marker) in markers {
+            ids.push(id);
+            let reached = match marker {
+                Ok(marker) => marker
+                    .await
+                    .map_err(|_| "database writer queue closed".to_string()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = reached {
+                waited.insert(id, error);
+            }
+        }
+        tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+            ids.into_par_iter()
+                .map(|id| match waited.get(&id) {
+                    Some(error) => (id, Err(error.clone())),
+                    None => (id, load_parked_job(&db, id)),
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
+    }
+}
+
 fn load_parked_job(
     db: &crate::Database,
     job_id: JobId,
@@ -180,53 +221,34 @@ impl Pipeline {
         self.window_parked.contains_key(&id)
     }
 
-    // Read the parked jobs named from the database, off the actor, one parse
-    // of each stored NZB, spread over the cores. Each job's queued writes
-    // land first, so an edit it was given while parked is in the row read.
-    pub(crate) async fn load_parked_jobs(
-        &mut self,
-        ids: Vec<JobId>,
-    ) -> Vec<(JobId, Result<Option<RestoreJobRequest>, String>)> {
-        if ids.is_empty() {
-            return Vec::new();
-        }
-        let markers: Vec<_> = ids
-            .iter()
-            .map(|id| (*id, self.db.queue_job_writes_marker(*id)))
+    // The parked jobs named, to be read from the database off the actor.
+    // Each job's queued writes land first, so an edit it was given while
+    // parked is in the row read: the marker at the end of each job's lane is
+    // queued here, before any is awaited.
+    pub(crate) fn parked_loads(&self, ids: Vec<JobId>) -> ParkedLoads {
+        let markers = ids
+            .into_iter()
+            .map(|id| {
+                let marker = self
+                    .db
+                    .queue_job_writes_marker(id)
+                    .map_err(|error| error.to_string());
+                (id, marker)
+            })
             .collect();
-        let mut waited = HashMap::new();
-        for (id, marker) in markers {
-            let reached = match marker {
-                Ok(marker) => marker
-                    .await
-                    .map_err(|_| "database writer queue closed".to_string()),
-                Err(error) => Err(error.to_string()),
-            };
-            if let Err(error) = reached {
-                waited.insert(id, error);
-            }
+        ParkedLoads {
+            db: self.db.clone(),
+            markers,
         }
-        let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
-            use rayon::prelude::*;
-            ids.into_par_iter()
-                .map(|id| match waited.get(&id) {
-                    Some(error) => (id, Err(error.clone())),
-                    None => (id, load_parked_job(&db, id)),
-                })
-                .collect()
-        })
-        .await
-        .unwrap_or_default()
     }
 
     // A parked job read back for its install leaves the parked count; one
     // that cannot be read stays parked, out of the window, until a restart.
-    pub(crate) fn take_parked_load(
+    pub(crate) fn take_parked_load<T>(
         &mut self,
         id: JobId,
-        loaded: Result<Option<RestoreJobRequest>, String>,
-    ) -> Option<RestoreJobRequest> {
+        loaded: Result<Option<T>, String>,
+    ) -> Option<T> {
         match loaded {
             Ok(Some(request)) => {
                 self.unpark_window_job(id);

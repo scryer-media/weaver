@@ -378,13 +378,9 @@ impl Pipeline {
                 || globals.paused
                 || globals.scheduled_pause
                 || globals.speed_test_paused;
-            let job_stopped = inner
-                .jobs
-                .iter()
-                .find(|row| row.id == job_id)
-                .is_none_or(|row| {
-                    row.intents.cancelled.is_some() || row.intents.paused == Some(true)
-                });
+            let job_stopped = inner.job(job_id).is_none_or(|row| {
+                row.intents.cancelled.is_some() || row.intents.paused == Some(true)
+            });
             !stopping && !job_stopped
         })
     }
@@ -455,6 +451,7 @@ impl Pipeline {
                 observation.policy_elapsed,
                 pressure_clear,
                 observation.cold,
+                observation.fed,
             );
         }
 
@@ -870,6 +867,7 @@ impl Pipeline {
                             payload_bytes: 0,
                             policy_elapsed: Duration::ZERO,
                             pressure_clear: false,
+                            fed: false,
                             batch_complete: true,
                             batch_clean: policy_outcome,
                             unresolved_count: u64::from(!policy_outcome),

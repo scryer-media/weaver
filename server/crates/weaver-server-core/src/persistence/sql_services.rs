@@ -136,15 +136,25 @@ impl SqliteServices {
             .busy_timeout(Duration::from_millis(10_000))
             .pragma("auto_vacuum", "INCREMENTAL")
             .pragma("synchronous", "NORMAL")
-            .pragma("cache_size", "-16000")
             .pragma("mmap_size", "16777216")
             .pragma("temp_store", "MEMORY")
             .log_slow_statements(
                 LevelFilter::Warn,
                 Duration::from_millis(SLOW_STATEMENT_WARN_MS),
             );
-        if !is_memory {
-            connect_opts = connect_opts.journal_mode(SqliteJournalMode::Wal);
+        if is_memory {
+            connect_opts = connect_opts.pragma("cache_size", "-16000");
+        } else {
+            // A file database sits on whatever disk the user has, spinning ones
+            // included: a 64 MB page cache keeps the hot tables off the disk, a
+            // 16 MB WAL between checkpoints turns many small commits into fewer
+            // long writes, and the size limit truncates the WAL back after a
+            // checkpoint so one burst does not leave it large for good.
+            connect_opts = connect_opts
+                .journal_mode(SqliteJournalMode::Wal)
+                .pragma("cache_size", "-65536")
+                .pragma("wal_autocheckpoint", "4000")
+                .pragma("journal_size_limit", "67108864");
         }
 
         // The run goes over one connection. A connection keeps the schema it
@@ -483,5 +493,17 @@ mod tests {
             parse_postgres_synchronous_commit(Some("off; DROP TABLE jobs")),
             "off"
         );
+    }
+
+    #[tokio::test]
+    async fn a_memory_database_keeps_its_cache_size() {
+        let services = SqliteServices::new_url("sqlite://:memory:", MigrationMode::Apply)
+            .await
+            .unwrap();
+        let (cache_size,): (i64,) = sqlx::query_as("PRAGMA cache_size")
+            .fetch_one(services.pool())
+            .await
+            .unwrap();
+        assert_eq!(cache_size, -16000);
     }
 }

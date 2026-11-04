@@ -82,6 +82,8 @@ impl DatabaseRuntimeWorker {
     {
         #[cfg(test)]
         blocking_call_probe::note(caller);
+        #[cfg(test)]
+        actor_thread::note(caller);
         match self {
             Self::Sqlite { writer, .. } => writer.block_on(caller, future),
             Self::Postgres(worker) => worker.block_on(future),
@@ -100,6 +102,8 @@ impl DatabaseRuntimeWorker {
     {
         #[cfg(test)]
         blocking_call_probe::note(caller);
+        #[cfg(test)]
+        actor_thread::note(caller);
         match self {
             Self::Sqlite { writer, .. } => writer.block_on_local(caller, build),
             Self::Postgres(_) => Err(StateError::Database(
@@ -120,6 +124,8 @@ impl DatabaseRuntimeWorker {
     {
         #[cfg(test)]
         blocking_call_probe::note(caller);
+        #[cfg(test)]
+        actor_thread::note(caller);
         match self {
             Self::Sqlite { reads, .. } => reads.block_on(caller, future),
             Self::Postgres(worker) => worker.block_on(future),
@@ -2221,6 +2227,56 @@ fn close_line(overflow: &Mutex<Option<VecDeque<QueuedWrite>>>, context: &'static
     *overflow
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+// The database calls made from the pipeline actor's own thread, counted
+// by call site for the tests: a call there stalls every turn behind it.
+#[cfg(test)]
+pub(crate) mod actor_thread {
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    thread_local! {
+        static ON_ACTOR: Cell<bool> = const { Cell::new(false) };
+    }
+
+    static CALLS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+
+    pub(crate) fn note(caller: &'static std::panic::Location<'static>) {
+        if ON_ACTOR.with(Cell::get) {
+            *CALLS
+                .lock()
+                .expect("actor thread counter poisoned")
+                .entry(super::caller_label(caller))
+                .or_default() += 1;
+        }
+    }
+
+    pub(crate) fn total() -> u64 {
+        CALLS
+            .lock()
+            .expect("actor thread counter poisoned")
+            .values()
+            .sum()
+    }
+
+    // Marks the thread polling the wrapped future as the actor's.
+    pub(crate) struct OnActor<F>(pub(crate) std::pin::Pin<Box<F>>);
+
+    impl<F: std::future::Future> std::future::Future for OnActor<F> {
+        type Output = F::Output;
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<F::Output> {
+            ON_ACTOR.with(|on| on.set(true));
+            let polled = self.0.as_mut().poll(cx);
+            ON_ACTOR.with(|on| on.set(false));
+            polled
+        }
+    }
 }
 
 // Each wait for a job's queued writes, counted for the tests.

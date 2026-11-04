@@ -131,21 +131,6 @@ impl Pipeline {
             spec_password,
         }
     }
-
-    // Rebuild a graph job from its checkpoint before its queues are built.
-    // The reads back happen off the pipeline thread.
-    pub(crate) async fn restore_graph_job(
-        &self,
-        job_id: JobId,
-        spec: &JobSpec,
-        working_dir: &Path,
-    ) -> Result<GraphRestore, GraphRestoreError> {
-        let seat = self.graph_restore_seat(spec.password.clone(), working_dir);
-        let files = root_files(spec);
-        tokio::task::spawn_blocking(move || seat.restore(job_id, files))
-            .await
-            .map_err(|error| GraphRestoreError::Join(error.to_string()))?
-    }
 }
 
 // The root's files as the job's spec lists them, article by article.
@@ -164,6 +149,14 @@ pub(crate) fn root_files(spec: &JobSpec) -> Vec<RootFile> {
 }
 
 impl RestoreSeat {
+    // The seat for one job: its password, and its working directory as its
+    // install found it.
+    pub(crate) fn for_job(mut self, spec_password: Option<String>, working_dir: &Path) -> Self {
+        self.spec_password = spec_password;
+        self.working_dir = working_dir.to_path_buf();
+        self
+    }
+
     pub(crate) fn working_dir(&self) -> &Path {
         &self.working_dir
     }
