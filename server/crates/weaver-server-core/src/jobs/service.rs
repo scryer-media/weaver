@@ -803,11 +803,20 @@ impl Pipeline {
     // The context an install's reads run in, gathered on the pipeline
     // thread so the reads themselves run off it.
     pub(crate) fn install_seat(&self, job_id: JobId) -> InstallSeat {
+        // A job whose work crashed the daemon gets no graph seat: its
+        // restore would replay the job's own facts into the same panic, and
+        // under abort that panic is the daemon's. The install reads its row
+        // and parks it; nothing of the job is rebuilt.
+        let graph = self
+            .crash_marks
+            .get(job_id)
+            .is_none()
+            .then(|| self.graph_restore_seat(None, std::path::Path::new("")));
         InstallSeat {
             db: self.db.clone(),
             intermediate_dir: self.intermediate_dir.clone(),
             staging_dir: self.deterministic_extraction_staging_dir(job_id),
-            graph: self.graph_restore_seat(None, std::path::Path::new("")),
+            graph,
         }
     }
 
@@ -838,9 +847,10 @@ impl Pipeline {
             return Err(crate::SchedulerError::JobExists(request.job_id));
         }
         // A job whose work crashed the daemon would restore into the same
-        // panic: it is parked paused before any of it is restored, its
-        // checkpoint left as it is. Its marker stays until a resume takes it,
-        // so every start before then parks it again.
+        // panic: its install read no graph (`install_seat`), and it is parked
+        // paused before any of it is restored, its checkpoint left as it is.
+        // Its marker stays until a resume takes it, so every start before
+        // then parks it again.
         if let Some(reason) = self
             .crash_marks
             .get(request.job_id)
@@ -1443,7 +1453,8 @@ pub(crate) struct InstallSeat {
     db: crate::Database,
     intermediate_dir: PathBuf,
     staging_dir: PathBuf,
-    graph: crate::pipeline::graph::restore::RestoreSeat,
+    // None for a job whose work crashed the daemon: nothing of it is rebuilt.
+    graph: Option<crate::pipeline::graph::restore::RestoreSeat>,
 }
 
 // What an install read for one job, off the pipeline thread.
@@ -1557,7 +1568,7 @@ async fn read_restored(
     db: &crate::Database,
     intermediate_dir: &std::path::Path,
     staging_dir: &std::path::Path,
-    graph: crate::pipeline::graph::restore::RestoreSeat,
+    graph: Option<crate::pipeline::graph::restore::RestoreSeat>,
     request: &mut RestoreJobRequest,
     restart: Option<&crate::RestartRead>,
 ) -> Result<RestoredFacts, String> {
@@ -1657,7 +1668,7 @@ async fn read_restored(
     }
     let graph = if waiting_summaries.is_some() || delivering {
         None
-    } else {
+    } else if let Some(graph) = graph {
         let seat = graph.for_job(spec.password.clone(), &working_dir);
         let files = crate::pipeline::graph::restore::root_files(&spec);
         match tokio::task::spawn_blocking(move || seat.restore(job_id, files))
@@ -1671,6 +1682,8 @@ async fn read_restored(
             Err(crate::pipeline::graph::restore::GraphRestoreError::NoCheckpoint(_)) => None,
             Err(error) => return Err(internal(error.to_string())),
         }
+    } else {
+        None
     };
     let staging_exists = tokio::fs::try_exists(staging_dir).await.unwrap_or(false);
     // One read of the row, decrypt of the supplied passwords and parse of

@@ -584,6 +584,9 @@ impl Database {
         job_id: JobId,
         delta: Arc<Delta>,
     ) -> Result<(), StateError> {
+        #[cfg(test)]
+        self.graph_checkpoint_writes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "save_graph_checkpoint", |tx| {

@@ -94,6 +94,10 @@ pub(crate) struct GraphRestore {
 // What a graph job's restore takes from the pipeline, gathered on the
 // pipeline thread so the restore itself, every read back included, runs off
 // it.
+// How many restores were entered, for the tests that show one was not.
+#[cfg(test)]
+pub(crate) static RESTORES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub(crate) struct RestoreSeat {
     db: crate::Database,
     working_dir: PathBuf,
@@ -164,12 +168,15 @@ impl RestoreSeat {
     // Read the job's checkpoint back and rebuild the job from it. A
     // checkpoint this build does not restore is none: the job starts afresh
     // and fetches every article, and its first checkpoint replaces the old
-    // rows whole. Blocks: called off the pipeline thread.
+    // rows whole. Blocks: called off the pipeline thread. A job whose work
+    // crashed the daemon never reaches here: its install is given no seat.
     pub(crate) fn restore(
         self,
         job_id: JobId,
         files: Vec<RootFile>,
     ) -> Result<GraphRestore, GraphRestoreError> {
+        #[cfg(test)]
+        RESTORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // A restore replays the job's own facts: a panic in it is the job's.
         let _job = crate::runtime::panic_trap::JobScope::enter(job_id);
         let loaded = self.db.load_graph_checkpoint(job_id);

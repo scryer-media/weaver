@@ -1809,9 +1809,11 @@ impl Pipeline {
             };
             if let Err(error) = graph.page_out_holds() {
                 warn!(job_id = job_id.0, %error, "could not page graph holds out at shutdown");
+                self.flush_graph_checkpoint(job_id);
                 continue;
             }
             self.checkpoint_graph_job(job_id);
+            self.flush_graph_checkpoint(job_id);
         }
     }
 

@@ -25,6 +25,12 @@ mod heartbeat;
 mod http;
 mod job_debug_layer;
 mod logging;
+// The static x86_64 musl build's memmove; tests check it on any x86_64.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(test, all(target_os = "linux", target_env = "musl"))
+))]
+mod memmove;
 mod restart;
 mod shutdown;
 #[cfg(windows)]
