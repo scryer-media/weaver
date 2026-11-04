@@ -51,7 +51,7 @@ mod cancel_batch;
 mod control_lifecycle;
 mod core;
 mod decode_stage;
-mod delivered_restore;
+pub(in crate::pipeline) mod delivered_restore;
 pub(in crate::pipeline) mod direct_store;
 mod download_dispatch;
 pub(in crate::pipeline) mod engines;
@@ -365,6 +365,7 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         paused_resume_download_state: None,
         paused_resume_post_state: None,
         failure_error: None,
+        delivered: None,
         working_dir,
         downloaded_bytes: 0,
         restored_download_floor_bytes: 0,
@@ -1734,6 +1735,7 @@ async fn insert_active_job_with_persisted_nzb_named(
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             failure_error: None,
+            delivered: None,
             working_dir: working_dir.clone(),
             downloaded_bytes: 0,
             restored_download_floor_bytes: 0,

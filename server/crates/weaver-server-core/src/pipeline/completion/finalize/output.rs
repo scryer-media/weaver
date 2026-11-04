@@ -1611,6 +1611,7 @@ impl Pipeline {
             crate::post_processing::model::PipelineOutcome::Failed { stage, .. } => Some(*stage),
             crate::post_processing::model::PipelineOutcome::Succeeded => None,
         };
+        let verdict = self.delivered_verdict(job_id);
         let par_status = if matches!(
             pipeline_failure_stage,
             Some(
@@ -1619,7 +1620,10 @@ impl Pipeline {
             )
         ) {
             1
-        } else if self.graph_recovery_verified(job_id) {
+        } else if verdict
+            .as_ref()
+            .is_some_and(|verdict| verdict.recovery_verified)
+        {
             2
         } else {
             0
@@ -1629,16 +1633,28 @@ impl Pipeline {
             Some(crate::post_processing::model::PipelineFailureStage::Extract)
         ) {
             1
-        } else if self.graph_unpacked(job_id) {
+        } else if verdict.as_ref().is_some_and(|verdict| verdict.unpacked) {
             2
         } else {
             0
         };
+        let delivered = verdict.filter(|_| pipeline_failure_stage.is_none());
         crate::post_processing::model::PostProcessingFacts {
             outcome,
             par_status,
             unpack_status,
+            delivered,
         }
+    }
+
+    // What the job's delivery came to: its graph's ruling while it has one,
+    // else the ruling its row kept when its final move began.
+    pub(in crate::pipeline) fn delivered_verdict(
+        &self,
+        job_id: JobId,
+    ) -> Option<crate::post_processing::model::DeliveredVerdict> {
+        self.graph_delivered_verdict(job_id)
+            .or_else(|| self.jobs.get(&job_id)?.delivered.clone())
     }
 
     // The context a job's scripts are handed, told `facts` about how its

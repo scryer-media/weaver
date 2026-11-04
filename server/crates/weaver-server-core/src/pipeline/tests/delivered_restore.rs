@@ -95,7 +95,7 @@ async fn move_without_hearing_it(
 }
 
 // Restarts on the same directories and restores the job as startup does.
-async fn restart_and_restore(
+pub(in crate::pipeline) async fn restart_and_restore(
     temp: &tempfile::TempDir,
     intermediate_dir: &std::path::Path,
     job_id: JobId,

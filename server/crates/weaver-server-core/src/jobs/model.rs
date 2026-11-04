@@ -780,6 +780,9 @@ pub struct JobState {
     pub paused_resume_post_state: Option<PostState>,
     // Last terminal error associated with this job.
     pub failure_error: Option<String>,
+    // What the graph ruled of a delivery restored after its final move
+    // began, read back from the job's row; the graph itself is not restored.
+    pub delivered: Option<crate::post_processing::model::DeliveredVerdict>,
     // Per-job working directory (subdirectory under intermediate_dir).
     // All download/decode/verify/repair/extract I/O happens here.
     pub working_dir: PathBuf,

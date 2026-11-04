@@ -129,6 +129,16 @@ impl Pipeline {
                 _ => None,
             })
             .map(|dir| dir.to_string_lossy().into_owned());
+        // The moving row keeps what the delivery ruled, in the same
+        // statement: a restart from here on has no graph to ask.
+        let post_processing_outcome = (values.status == "moving")
+            .then(|| {
+                self.fresh_post_processing_facts(
+                    job_id,
+                    crate::post_processing::model::PipelineOutcome::Succeeded,
+                )
+            })
+            .and_then(|facts| serde_json::to_string(&facts).ok());
         let ActiveRuntimeValues {
             status,
             download_state,
@@ -149,22 +159,22 @@ impl Pipeline {
         match self
             .db
             .try_queue_job_write_committed(job_id, "set_active_job_runtime", move |db| {
-                    db.set_active_job_runtime_at(
-                        job_id,
-                        output_dir.as_deref(),
-                        status,
-                        download_state,
-                        post_state,
-                        run_state,
-                        error.as_deref(),
-                        queued_repair_at_epoch_ms,
-                        queued_extract_at_epoch_ms,
-                        paused_resume_status,
-                        paused_resume_download_state,
-                        paused_resume_post_state,
-                    )
-                })
-        {
+                db.set_active_job_runtime_at(
+                    job_id,
+                    output_dir.as_deref(),
+                    post_processing_outcome.as_deref(),
+                    status,
+                    download_state,
+                    post_state,
+                    run_state,
+                    error.as_deref(),
+                    queued_repair_at_epoch_ms,
+                    queued_extract_at_epoch_ms,
+                    paused_resume_status,
+                    paused_resume_download_state,
+                    paused_resume_post_state,
+                )
+            }) {
             Ok(committed) => Some(committed),
             Err(error) => {
                 tracing::error!(
@@ -429,10 +439,14 @@ impl Pipeline {
     }
 
     pub(crate) fn transition_completed_runtime(&mut self, job_id: JobId) {
-        // The job rules on what it delivered.
-        let status = self
-            .graph_terminal_status(job_id)
-            .unwrap_or(JobStatus::Complete);
+        // The job rules on what it delivered: its graph while it has one,
+        // else what the graph ruled before a restart.
+        let status = self.graph_terminal_status(job_id).unwrap_or_else(|| {
+            match self.delivered_verdict(job_id) {
+                Some(verdict) if verdict.partial => JobStatus::Partial,
+                _ => JobStatus::Complete,
+            }
+        });
         let persisted = status.persisted_status();
         self.transition_postprocessing_status(job_id, status, Some(persisted));
     }

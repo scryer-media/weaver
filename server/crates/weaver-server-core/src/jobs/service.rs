@@ -592,6 +592,7 @@ impl Pipeline {
                 .initially_paused
                 .then_some(crate::jobs::model::PostState::Idle),
             failure_error: None,
+            delivered: None,
             working_dir: working_dir.clone(),
             downloaded_bytes: restart
                 .as_ref()
@@ -919,6 +920,7 @@ impl Pipeline {
             paused_resume_download_state: request.paused_resume_download_state,
             paused_resume_post_state: request.paused_resume_post_state,
             failure_error: Some(format!("Checkpoint could not be restored: {error}")),
+            delivered: None,
             working_dir: request.working_dir.clone(),
             downloaded_bytes: 0,
             restored_download_floor_bytes: 0,
@@ -1205,8 +1207,7 @@ impl Pipeline {
                         file_id: NzbFileId { job_id, file_index },
                         segment_number: seg.ordinal,
                     };
-                    (delivering || settled.contains(&segment_id))
-                        .then_some(u64::from(seg.bytes))
+                    (delivering || settled.contains(&segment_id)).then_some(u64::from(seg.bytes))
                 })
             })
             .sum();
@@ -1372,6 +1373,7 @@ impl Pipeline {
                 JobStatus::Failed { ref error } => Some(error.clone()),
                 _ => None,
             },
+            delivered: None,
             working_dir,
             downloaded_bytes,
             restored_download_floor_bytes,
@@ -1423,6 +1425,24 @@ impl Pipeline {
             .cloned()
         {
             self.persist_file_identities(job_id, &file_identities).await;
+        }
+        // A delivery that had begun keeps what its graph ruled, read back
+        // from its row: the graph is not restored, and the terminal pass
+        // decides from this.
+        if delivering {
+            let delivered = match self
+                .db_blocking(move |db| db.job_post_processing_facts(job_id.0))
+                .await
+            {
+                Ok(facts) => facts.and_then(|facts| facts.delivered),
+                Err(error) => {
+                    tracing::warn!(job_id = job_id.0, %error, "could not read what the delivery ruled");
+                    None
+                }
+            };
+            if let Some(state) = self.jobs.get_mut(&job_id) {
+                state.delivered = delivered;
+            }
         }
         self.reconcile_job_progress(job_id).await;
         let restored_terminal_post_processing =
