@@ -265,6 +265,16 @@ impl NameLedger {
         }
     }
 
+    // Whether the holder was given another name only while the one it wants
+    // is leaving: once that one is vacated the holder takes it, so the name
+    // it holds now is not the one it keeps.
+    pub fn held_off(&self, holder: Holder) -> bool {
+        self.entries.get(&holder).is_some_and(|entry| {
+            let wanted = key(&entry.wanted);
+            wanted != key(&entry.name) && self.leaving.contains_key(&wanted)
+        })
+    }
+
     pub fn given(&self, holder: Holder) -> Option<&str> {
         self.entries.get(&holder).map(|entry| entry.name.as_str())
     }

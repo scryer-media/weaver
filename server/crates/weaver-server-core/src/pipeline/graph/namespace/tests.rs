@@ -1406,6 +1406,178 @@ fn a_file_waits_off_a_name_another_file_still_sits_at() {
     assert!(!job.dir.path().join("x.bin").exists());
 }
 
+// Whether the member's file waits under the internal directory.
+fn waits(job: &Job, member: MemberId) -> bool {
+    job.writer.files[&NodeId::ROOT].leaves[&member]
+        .name()
+        .starts_with(weaver_graph::names::INTERNAL_DIR)
+}
+
+// A move waiting for one member holds the names it involves, never the
+// rest: a member whose name nothing holds opens its file there at once.
+#[test]
+fn a_free_name_opens_at_once_while_another_members_move_waits() {
+    let mut job = Job::new(PLENTY);
+    let first = job.member("3f9a.bin", Some(5));
+    job.send(first, 0, b"alpha", Provenance::Fresh);
+    let mut build = job.build();
+    job.writer
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, first, "show.mkv")
+        .expect("rename");
+    assert!(job.writer.moves_waiting());
+    let second = job.member("extra.bin", Some(5));
+    job.send(second, 0, b"bravo", Provenance::Fresh);
+    assert!(!waits(&job, second));
+    assert_eq!(job.file("extra.bin"), b"bravo");
+    assert_eq!(job.writer.file_state(NodeId::ROOT, second).on_disk, None);
+    job.commit();
+    assert_eq!(job.file("show.mkv"), b"alpha");
+    assert_eq!(job.file("extra.bin"), b"bravo");
+    assert!(!job.dir.path().join("3f9a.bin").exists());
+}
+
+// The name a waiting move wants is that member's: a file for another member
+// at that name waits off it, and once the move has run both files stand
+// where they belong, neither written over.
+#[test]
+fn a_name_a_waiting_move_wants_is_held_for_it() {
+    let mut job = Job::new(PLENTY);
+    let (first, second) = (MemberId(1), MemberId(2));
+    std::fs::write(job.dir.path().join("x.bin"), b"alpha").expect("file");
+    job.writer
+        .files_mut(NodeId::ROOT)
+        .leaves
+        .insert(first, Leaf::at(job.dir.path(), "x.bin"));
+    job.writer.intend(NodeId::ROOT, first, "y.bin");
+    let leaf = job.writer.new_leaf((NodeId::ROOT, second), "y.bin", false);
+    job.writer
+        .files_mut(NodeId::ROOT)
+        .leaves
+        .insert(second, leaf);
+    assert!(waits(&job, second));
+    assert_eq!(
+        job.writer.files[&NodeId::ROOT].leaves[&second].wants(),
+        Some("y.bin")
+    );
+}
+
+// A name a file left stays shut until the checkpoint recording it left has
+// committed, and so does every name that runs through it as a directory.
+#[test]
+fn a_left_name_and_the_names_under_it_stay_shut_until_recorded() {
+    let mut job = Job::new(PLENTY);
+    let first = MemberId(1);
+    std::fs::write(job.dir.path().join("box"), b"alpha").expect("file");
+    job.writer
+        .files_mut(NodeId::ROOT)
+        .leaves
+        .insert(first, Leaf::at(job.dir.path(), "box"));
+    job.writer.intend(NodeId::ROOT, first, "crate.bin");
+    job.writer.recorded(1);
+    assert!(job.writer.commit_moves(&mut job.tree, 1).expect("commit"));
+    assert_eq!(job.file("crate.bin"), b"alpha");
+    assert!(job.writer.moves.is_empty());
+    for (member, name) in [(MemberId(2), "box"), (MemberId(3), "box/inner.bin")] {
+        let leaf = job.writer.new_leaf((NodeId::ROOT, member), name, false);
+        assert!(
+            leaf.name().starts_with(weaver_graph::names::INTERNAL_DIR),
+            "{name}"
+        );
+    }
+    job.writer.recorded(2);
+    assert!(job.writer.commit_moves(&mut job.tree, 2).expect("commit"));
+    assert!(!job.writer.moves_waiting());
+    for (member, name) in [(MemberId(4), "box"), (MemberId(5), "box/inner.bin")] {
+        let leaf = job.writer.new_leaf((NodeId::ROOT, member), name, false);
+        assert_eq!(leaf.name(), name);
+    }
+}
+
+// A member renamed twice before its file moved: the database still gives
+// it the first new name, as the one its file waits for, until a checkpoint
+// saying otherwise commits. A file for another member given that name
+// meanwhile waits off it, so a restore from the earlier checkpoint finds
+// nothing in the way of the move it holds to.
+#[test]
+fn a_name_the_database_still_gives_a_renamed_member_stays_shut() {
+    let mut job = Job::new(PLENTY);
+    let first = job.member("3f9a.bin", Some(5));
+    job.send(first, 0, b"alpha", Provenance::Fresh);
+    let mut build = job.build();
+    job.writer
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, first, "x.bin")
+        .expect("rename");
+    job.writer.recorded(1);
+    job.writer
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, first, "y.bin")
+        .expect("rename");
+    let second = job.member("x.bin", Some(5));
+    assert_eq!(job.root().get(second).unwrap().output_name, "x.bin");
+    job.send(second, 0, b"bravo", Provenance::Fresh);
+    assert!(!job.dir.path().join("x.bin").exists());
+    assert!(waits(&job, second));
+    job.commit();
+    assert_eq!(job.file("y.bin"), b"alpha");
+    assert_eq!(job.file("x.bin"), b"bravo");
+    assert!(!job.dir.path().join("3f9a.bin").exists());
+}
+
+// A file opened at its name while another member's move waits, then the
+// job stops before the checkpoint covering that move commits. Restored from
+// the checkpoint, each member's bytes are where the database gives them:
+// the new file at its name, the waiting one where it sat, and the move then
+// runs over nothing.
+#[test]
+fn a_restore_finds_a_file_opened_while_a_move_waited_at_its_name() {
+    let mut job = Job::new(PLENTY);
+    let first = job.member("3f9a.bin", Some(5));
+    job.send(first, 0, b"alpha", Provenance::Fresh);
+    let mut build = job.build();
+    job.writer
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, first, "show.mkv")
+        .expect("rename");
+    let second = job.member("extra.bin", Some(5));
+    job.send(second, 0, b"bravo", Provenance::Fresh);
+    let first_file = job.writer.file_state(NodeId::ROOT, first);
+    let second_file = job.writer.file_state(NodeId::ROOT, second);
+    assert_eq!(first_file.on_disk.as_deref(), Some("3f9a.bin"));
+    assert_eq!(second_file.on_disk, None);
+    job.writer.recorded(1);
+
+    job.writer = NamespaceWriter::new(
+        1,
+        job.dir.path().to_path_buf(),
+        Arc::clone(&job.accountant),
+        CapacityReader::unknown(),
+    );
+    job.writer
+        .restore_file(&job.tree, NodeId::ROOT, first, &first_file)
+        .unwrap();
+    job.writer
+        .restore_file(&job.tree, NodeId::ROOT, second, &second_file)
+        .unwrap();
+    for (member, name, bytes) in [
+        (first, "3f9a.bin", b"alpha"),
+        (second, "extra.bin", b"bravo"),
+    ] {
+        assert_eq!(job.writer.files[&NodeId::ROOT].leaves[&member].name(), name);
+        let mut read = Vec::new();
+        assert!(
+            job.writer
+                .read_posted(&job.tree, member, ByteRange::new(0, 5), &mut read)
+        );
+        assert_eq!(read, bytes);
+    }
+    assert_eq!(
+        job.writer.files[&NodeId::ROOT].leaves[&first].wants(),
+        Some("show.mkv")
+    );
+    job.commit();
+    assert_eq!(job.file("show.mkv"), b"alpha");
+    assert_eq!(job.file("extra.bin"), b"bravo");
+    assert!(!job.dir.path().join("3f9a.bin").exists());
+}
+
 #[test]
 fn damaged_bytes_are_written_and_marked_and_a_repair_overwrites_them() {
     let mut job = Job::new(PLENTY).with_set(Some(Fix {
