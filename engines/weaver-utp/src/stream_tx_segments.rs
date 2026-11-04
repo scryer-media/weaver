@@ -285,6 +285,22 @@ impl Segments {
         self.segments.front().is_some_and(|s| s.is_mtu_probe())
     }
 
+    pub fn sole_outstanding_is_mtu_probe(&self) -> bool {
+        let mut outstanding = self
+            .segments
+            .iter()
+            .filter(|s| !s.is_delivered && s.send_count() > 0);
+        outstanding.next().is_some_and(|s| s.is_mtu_probe()) && outstanding.next().is_none()
+    }
+
+    #[cfg(test)]
+    pub fn outstanding_packets(&self) -> usize {
+        self.segments
+            .iter()
+            .filter(|s| !s.is_delivered && s.send_count() > 0)
+            .count()
+    }
+
     pub fn total_len_packets(&self) -> usize {
         self.segments.len()
     }

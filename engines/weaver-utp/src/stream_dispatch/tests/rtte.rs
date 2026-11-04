@@ -97,3 +97,37 @@ async fn test_rtte_set_and_updated() {
             && t.vsock.rtte.roundtrip_time() < Duration::from_secs(2)
     );
 }
+
+#[tokio::test]
+async fn confirmation_without_an_rtt_sample_uses_the_configured_floor() {
+    let floor = Duration::from_millis(800);
+    let mut t = make_test_vsock(
+        SocketOpts {
+            min_timeout: Some(floor),
+            ..Default::default()
+        },
+        true,
+    );
+    assert!(!t.vsock.confirmed);
+    assert_eq!(
+        t.vsock.rtte.retransmission_timeout(),
+        Duration::from_secs(3)
+    );
+    t.poll_once_assert_pending().await;
+    t.take_sent();
+    let initial_rtt = t.vsock.rtte.roundtrip_time();
+    t.send_msg(
+        UtpHeader {
+            htype: ST_STATE,
+            seq_nr: 1.into(),
+            ack_nr: 100.into(),
+            wnd_size: 1024 * 1024,
+            ..Default::default()
+        },
+        "",
+    );
+    t.poll_once_assert_pending().await;
+    assert!(t.vsock.confirmed);
+    assert_eq!(t.vsock.rtte.roundtrip_time(), initial_rtt);
+    assert_eq!(t.vsock.rtte.retransmission_timeout(), floor);
+}

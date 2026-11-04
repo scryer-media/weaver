@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-// The round trip assumed, and the timeout, before any has been measured.
+// The assumed round trip, and the timeout before connection confirmation.
 const RTTE_INITIAL_RTT: Duration = Duration::from_millis(300);
 const RTTE_INITIAL_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -31,7 +31,8 @@ enum RttState {
 #[derive(Clone, Copy)]
 pub struct RttEstimator {
     state: RttState,
-    // The least timeout once a round trip is known.
+    confirmed: bool,
+    // The least timeout after connection confirmation.
     min_timeout: Duration,
     // Timeouts in a row, with no valid packet from the remote between.
     timeouts: u32,
@@ -61,6 +62,7 @@ impl RttEstimator {
     pub fn new(min_timeout: Duration) -> Self {
         Self {
             state: RttState::Initial,
+            confirmed: false,
             min_timeout,
             timeouts: 0,
 
@@ -100,11 +102,14 @@ impl RttEstimator {
             return t;
         }
 
+        if !self.confirmed {
+            return RTTE_INITIAL_TIMEOUT;
+        }
         if self.timeouts >= BACKOFF_CAPPED_AT {
             return RTTE_MAX_RTO;
         }
         let base = match self.state {
-            RttState::Initial => RTTE_INITIAL_TIMEOUT,
+            RttState::Initial => self.min_timeout,
             RttState::Subsequent { srtt, rttvar } => (srtt + rttvar * 2).max(self.min_timeout),
         };
         let backoff = match self.timeouts {
@@ -139,8 +144,13 @@ impl RttEstimator {
         self.timeouts
     }
 
-    /// A valid packet from the remote ends a run of timeouts.
+    pub fn confirm(&mut self) {
+        self.confirmed = true;
+    }
+
+    /// A valid packet confirms the connection and ends a run of timeouts.
     pub fn on_valid_packet(&mut self) {
+        self.confirm();
         self.timeouts = 0;
     }
 }
@@ -158,8 +168,20 @@ mod tests {
     }
 
     #[test]
+    fn confirmation_without_a_round_trip_uses_the_floor() {
+        let mut r = RttEstimator::new(FLOOR);
+        r.sample(Duration::from_millis(20));
+        assert_eq!(r.retransmission_timeout(), Duration::from_secs(3));
+        let mut r = RttEstimator::new(FLOOR);
+        r.on_valid_packet();
+        assert_eq!(r.retransmission_timeout(), FLOOR);
+        assert_eq!(r.roundtrip_time(), RTTE_INITIAL_RTT);
+    }
+
+    #[test]
     fn a_short_round_trip_waits_the_floor() {
         let mut r = RttEstimator::new(FLOOR);
+        r.confirm();
         r.sample(Duration::from_millis(20));
         assert_eq!(r.retransmission_timeout(), FLOOR);
     }
@@ -167,6 +189,7 @@ mod tests {
     #[test]
     fn a_long_round_trip_waits_it_and_twice_its_deviation() {
         let mut r = RttEstimator::new(FLOOR);
+        r.confirm();
         r.sample(Duration::from_millis(400));
         // 400 ms with a deviation of half of it.
         assert_eq!(r.retransmission_timeout(), Duration::from_millis(800));
@@ -175,6 +198,7 @@ mod tests {
     #[test]
     fn timeouts_in_a_row_add_seconds_doubling_up_to_a_minute() {
         let mut r = RttEstimator::new(FLOOR);
+        r.confirm();
         r.sample(Duration::from_millis(20));
         let mut waits = vec![];
         for _ in 0..8 {

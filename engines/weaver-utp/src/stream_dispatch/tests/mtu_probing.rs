@@ -87,6 +87,152 @@ async fn abandoning_a_probe_counts_its_last_timeout_without_backoff() {
     }
 }
 
+// Put a probe in flight, with optional payload still waiting behind it.
+async fn probe_in_flight(
+    queued_data: bool,
+    retries: usize,
+    forced_rto: Option<Duration>,
+) -> (super::TestVsock, usize) {
+    let mut t = make_test_vsock(
+        SocketOpts {
+            mtu_probe_max_retransmissions: Some(retries),
+            disable_nagle: true,
+            ..Default::default()
+        },
+        false,
+    );
+    if let Some(rto) = forced_rto {
+        t.vsock.rtte.force_timeout(rto);
+    }
+    let floor = usize::from(t.vsock.segment_sizes.mss());
+    let probe = usize::from(t.vsock.segment_sizes.probe_size());
+    let extra = if queued_data { floor } else { 0 };
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(&vec![7; floor + probe + extra])
+        .await
+        .unwrap();
+    t.poll_once_assert_pending().await;
+    let sent = t.take_sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].payload().len(), floor);
+    t.send_msg(
+        UtpHeader {
+            htype: ST_STATE,
+            seq_nr: 1.into(),
+            ack_nr: sent[0].header.seq_nr,
+            wnd_size: 1024 * 1024,
+            ..Default::default()
+        },
+        "",
+    );
+    t.poll_once_assert_pending().await;
+    let sent = t.take_sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].payload().len(), probe);
+    assert_eq!(sent[0].header.seq_nr, 102.into());
+    (t, floor)
+}
+
+fn expire_retransmit(t: &mut super::TestVsock) {
+    use crate::traits::UtpEnvironment;
+    let deadline = t.vsock.timers.retransmit.poll_at().unwrap();
+    t.env.increment_now(deadline.duration_since(t.env.now()));
+}
+
+#[tokio::test]
+async fn an_unsent_probe_does_not_hide_the_data_timeout() {
+    let mut t = make_test_vsock(
+        SocketOpts {
+            mtu_probe_max_retransmissions: Some(0),
+            disable_nagle: true,
+            ..Default::default()
+        },
+        false,
+    );
+    let floor = usize::from(t.vsock.segment_sizes.mss());
+    let probe = usize::from(t.vsock.segment_sizes.probe_size());
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(&vec![7; floor + probe])
+        .await
+        .unwrap();
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.take_sent().len(), 1);
+    assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 2);
+    assert_eq!(t.vsock.user_tx_segments.outstanding_packets(), 1);
+    expire_retransmit(&mut t);
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.vsock.rtte.timeouts(), 1);
+    assert_eq!(t.vsock.congestion_controller.window(), floor);
+    let sent = t.take_sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].header.seq_nr, 101.into());
+    assert_eq!(sent[0].payload().len(), floor);
+    assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 2);
+}
+
+#[tokio::test]
+async fn a_probe_with_unsent_queued_data_keeps_its_timeout_exemption() {
+    let (mut t, floor) = probe_in_flight(true, 1, None).await;
+    // The queued segment has payload in the write buffer, but is not in flight.
+    assert!(t.vsock.user_tx_segments.enqueue(floor, false));
+    assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 2);
+    assert_eq!(t.vsock.user_tx_segments.outstanding_packets(), 1);
+    let window = t.vsock.congestion_controller.window();
+    expire_retransmit(&mut t);
+    t.poll_once_assert_pending().await;
+    let sent = t.take_sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].header.seq_nr, 102.into());
+    assert_eq!(t.vsock.rtte.timeouts(), 0);
+    assert_eq!(t.vsock.congestion_controller.window(), window);
+}
+
+#[tokio::test]
+async fn a_probe_with_other_sent_data_takes_a_real_timeout() {
+    let (mut t, floor) = probe_in_flight(true, 1, None).await;
+    // Exercise a probe followed by another sent segment, independently of
+    // the segmenter's policy of pausing new segmentation behind a probe.
+    assert!(t.vsock.user_tx_segments.enqueue(floor, false));
+    t.vsock.congestion_controller.set_window(64 * 1024);
+    t.poll_once_assert_pending().await;
+    let sent = t.take_sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].header.seq_nr, 103.into());
+    assert_eq!(t.vsock.user_tx_segments.outstanding_packets(), 2);
+    expire_retransmit(&mut t);
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.vsock.rtte.timeouts(), 1);
+    assert_eq!(t.vsock.congestion_controller.window(), floor);
+    assert_eq!(t.take_sent()[0].header.seq_nr, 102.into());
+}
+
+#[tokio::test]
+async fn a_probe_with_an_unacked_fin_is_not_abandoned_as_a_lone_probe() {
+    // Exercise the RTO before the local-FIN final-chance timer expires.
+    let (mut t, floor) = probe_in_flight(false, 0, Some(Duration::from_millis(500))).await;
+    // Dropping both halves sends FIN once all buffered data has been sent.
+    drop(t.stream.take());
+    t.poll_once_assert_pending().await;
+    let sent = t.take_sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].header.get_type(), ST_FIN);
+    assert_eq!(sent[0].header.seq_nr, 103.into());
+    expire_retransmit(&mut t);
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.vsock.rtte.timeouts(), 1);
+    assert_eq!(t.vsock.congestion_controller.window(), floor);
+    let sent = t.take_sent();
+    assert_eq!(sent[0].header.seq_nr, 102.into());
+    assert_eq!(
+        sent[0].payload().len(),
+        usize::from(t.vsock.segment_sizes.probe_size())
+    );
+}
+
 #[tokio::test]
 async fn test_mtu_probing() {
     setup_test_logging();

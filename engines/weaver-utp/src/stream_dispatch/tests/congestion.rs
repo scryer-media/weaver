@@ -247,3 +247,65 @@ async fn ledbat_grows_under_target_and_backs_off_over_it() {
         window = shrunk;
     }
 }
+
+#[tokio::test]
+async fn the_next_new_packet_stays_inside_the_last_loss_gate() {
+    let mut t = make_test_vsock(
+        SocketOpts {
+            link_mtu: Some(non_zero_const!(576)),
+            disable_nagle: true,
+            ..Default::default()
+        },
+        false,
+    );
+    let mss = usize::from(t.vsock.segment_sizes.mss());
+    t.vsock.congestion_controller.set_window(8 * mss);
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(&vec![0; 6 * mss])
+        .await
+        .unwrap();
+    t.poll_once_assert_pending().await;
+    let sent = t.take_sent();
+    assert_eq!(sent.len(), 6);
+    assert_eq!(sent.last().unwrap().header.seq_nr, 106.into());
+    let ack = |ack_nr| UtpHeader {
+        htype: ST_STATE,
+        seq_nr: 1.into(),
+        ack_nr,
+        wnd_size: 1024 * 1024,
+        ..Default::default()
+    };
+    for _ in 0..4 {
+        t.send_msg(ack(100.into()), "");
+    }
+    t.poll_once_assert_pending().await;
+    assert!(t.vsock.recovery.is_recovering());
+    let cut_window = t.vsock.congestion_controller.window();
+    assert_eq!(cut_window, 4 * mss);
+    t.take_sent();
+    t.send_msg(ack(106.into()), "");
+    t.poll_once_assert_pending().await;
+    assert!(!t.vsock.recovery.is_recovering());
+    t.take_sent();
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(&vec![0; 2 * mss])
+        .await
+        .unwrap();
+    t.poll_once_assert_pending().await;
+    let sent = t.take_sent();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0].header.seq_nr, 107.into());
+    // Past the cut timer, but before the mock retransmission deadline.
+    t.env.increment_now(Duration::from_millis(101));
+    for _ in 0..4 {
+        t.send_msg(ack(106.into()), "");
+    }
+    t.poll_once_assert_pending().await;
+    assert!(t.vsock.recovery.is_recovering());
+    assert_eq!(t._socket.stats().snapshot().packets_lost, 2);
+    assert_eq!(t.vsock.congestion_controller.window(), cut_window);
+}

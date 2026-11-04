@@ -55,7 +55,7 @@ pub struct Ledbat {
     mss: usize,
     rwnd: usize,
     // A loss cuts the window only for a packet sent after this one, the
-    // last sent when the window was last cut or timed out.
+    // next new send when the window was last cut or timed out.
     loss_gate: Option<SeqNr>,
     // Nor before this.
     next_cut: Option<Instant>,
@@ -129,7 +129,7 @@ impl Ledbat {
         self.cwnd_bytes().min(self.rwnd).max(self.mss)
     }
 
-    pub fn sshthresh(&self) -> usize {
+    pub fn recovery_window(&self) -> usize {
         self.cwnd_bytes()
     }
 
@@ -181,11 +181,11 @@ impl Ledbat {
         self.floor();
     }
 
-    pub fn on_retransmission_timeout(&mut self, _now: Instant, sent_up_to: SeqNr) {
+    pub fn on_retransmission_timeout(&mut self, _now: Instant, next_seq_nr: SeqNr) {
         self.cwnd = (self.mss as i64) << FRAC;
         self.slow_start = true;
         // What was in flight is counted lost already.
-        self.loss_gate = Some(sent_up_to);
+        self.loss_gate = Some(next_seq_nr);
     }
 
     // An idle direction keeps two thirds of its window, then slow-starts.
@@ -197,7 +197,7 @@ impl Ledbat {
 
     // Losses come in bursts: one cut per window of packets, and no more
     // than one per cut timer.
-    pub fn on_enter_recovery(&mut self, now: Instant, lost: SeqNr, sent_up_to: SeqNr) {
+    pub fn on_enter_recovery(&mut self, now: Instant, lost: SeqNr, next_seq_nr: SeqNr) {
         if self.loss_gate.is_some_and(|gate| lost <= gate) {
             return;
         }
@@ -205,7 +205,7 @@ impl Ledbat {
             return;
         }
         self.next_cut = Some(now + self.params.cwnd_reduce_timer);
-        self.loss_gate = Some(sent_up_to);
+        self.loss_gate = Some(next_seq_nr);
         self.cut();
     }
 

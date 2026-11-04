@@ -369,6 +369,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             trace!("retransmit timer expired");
             self.socket.stats.rto_timeouts_count.increment(1);
 
+            let only_packet_outstanding = self.user_tx_segments.sole_outstanding_is_mtu_probe()
+                && !(self.fin_sends > 0 && self.state.our_fin_if_unacked().is_some());
             let seg = self.user_tx_segments.iter_mut_for_sending(None).next();
             if let Some(mut seg) = seg {
                 if self.timers.retransmit.report_expiry() {
@@ -383,8 +385,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         socket.restrict_mtu(packet_mtu(payload, is_ipv4));
                     }
                 };
-                // A lost probe is too large, not a sign of a dead remote.
-                if !seg.is_mtu_probe() {
+                // Only a lone probe can attribute the timeout solely to its size.
+                let sole_probe = seg.is_mtu_probe() && only_packet_outstanding;
+                if !sole_probe {
                     let timeouts = self.rtte.timeouts() as usize + 1;
                     if timeouts > self.socket_opts.num_resends || !self.confirmed {
                         debug!(timeouts, confirmed = self.confirmed, "timed out");
@@ -405,12 +408,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         "RTO expired: sent ST_DATA"
                     );
 
-                    // RTO triggers a bunch of behaviors to reduce congestion and slow everything down.
-                    // However for MTU probes we don't need that as they are presumably lost not due to
-                    // congestion, but due to them being too large.
-                    if !seg.is_mtu_probe() {
-                        self.congestion_controller
-                            .on_retransmission_timeout(self.this_poll.now, self.last_sent_seq_nr);
+                    // A lone probe can fail because it is too large. Other
+                    // outstanding packets make this a congestion timeout.
+                    if !sole_probe {
+                        self.congestion_controller.on_retransmission_timeout(
+                            self.this_poll.now,
+                            self.highest_sent_seq_nr + 1,
+                        );
                         self.rtte.on_rto_timeout();
                         self.recovery
                             .on_rto_timeout(self.last_sent_seq_nr, &self.socket.stats);
@@ -862,7 +866,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         match self.user_tx_segments.pop_expired_mtu_probe(
-            self.timers.retransmit.expired(self.this_poll.now),
+            self.timers.retransmit.expired(self.this_poll.now)
+                && self.user_tx_segments.sole_outstanding_is_mtu_probe()
+                && !(self.fin_sends > 0 && self.state.our_fin_if_unacked().is_some()),
             self.socket_opts.mtu_probe_max_retransmissions,
         ) {
             PopExpiredProbe::Expired {
@@ -1296,6 +1302,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             &result.on_ack_result,
             &mut self.user_tx_segments,
             self.last_sent_seq_nr,
+            self.highest_sent_seq_nr + 1,
             &mut self.congestion_controller,
             self.this_poll.now,
             self.rtte.roundtrip_time(),
@@ -1854,6 +1861,12 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             user_tx,
             rtte: {
                 let mut rtte = RttEstimator::new(socket.opts().min_timeout);
+                if !matches!(
+                    state,
+                    VirtualSocketState::SynReceived | VirtualSocketState::SynAckSent { .. }
+                ) {
+                    rtte.confirm();
+                }
                 if let Some(rtt) = rtt {
                     rtte.sample(rtt);
                 }

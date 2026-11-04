@@ -113,9 +113,9 @@ async fn the_ceiling_is_the_largest_of_the_last_three_failed_mtus() {
     t._socket.restrict_mtu(1100);
     assert_eq!(new_streams_max_ss(&t), 1452, "fewer than three: the link's");
     t._socket.restrict_mtu(1000);
-    assert_eq!(new_streams_max_ss(&t), 1200 - 48);
+    assert_eq!(new_streams_max_ss(&t), 1200 - 1 - 48);
     t._socket.restrict_mtu(1000);
-    assert_eq!(new_streams_max_ss(&t), 1100 - 48, "the oldest gone");
+    assert_eq!(new_streams_max_ss(&t), 1100 - 1 - 48, "the oldest gone");
 }
 
 #[tokio::test]
@@ -168,5 +168,5 @@ async fn a_stream_that_dies_on_a_probe_lowers_the_ceiling() {
     let mtu = u16::try_from(probe).unwrap() + 48;
     t._socket.restrict_mtu(mtu);
     t._socket.restrict_mtu(mtu);
-    assert_eq!(new_streams_max_ss(&t), mtu - 48);
+    assert_eq!(new_streams_max_ss(&t), mtu - 1 - 48);
 }

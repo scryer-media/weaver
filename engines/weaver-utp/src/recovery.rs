@@ -197,6 +197,7 @@ impl Recovery {
         on_ack_result: &OnAckResult,
         tx_segs: &mut Segments,
         last_sent_seq_nr: SeqNr,
+        next_seq_nr: SeqNr,
         congestion_controller: &mut Ledbat,
         now: Instant,
         rtt: Duration,
@@ -242,12 +243,12 @@ impl Recovery {
                 // A lost probe was too large, which says nothing of congestion.
                 if !tx_segs.first_is_mtu_probe() {
                     stats.packets_lost.increment(1);
-                    congestion_controller.on_enter_recovery(now, high_ack + 1, last_sent_seq_nr);
+                    congestion_controller.on_enter_recovery(now, high_ack + 1, next_seq_nr);
                 }
 
                 let high_rxt = high_ack;
                 let pipe_estimate = tx_segs.calc_pipe(high_rxt, last_sent_seq_nr, rtt, now);
-                let cwnd = congestion_controller.sshthresh();
+                let cwnd = congestion_controller.recovery_window();
 
                 let rec = Recovering {
                     recovery_point: last_sent_seq_nr,
@@ -335,6 +336,7 @@ mod tests {
                 &OnAckResult::default(),
                 &mut segs,
                 14.into(),
+                15.into(),
                 &mut cc,
                 Instant::now(),
                 Duration::from_millis(50),

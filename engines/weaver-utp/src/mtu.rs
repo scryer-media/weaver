@@ -7,9 +7,9 @@
 // delivered payloads so far. Binary searches (probes) the payload size until convergence.
 use crate::constants::{IPV4_HEADER, IPV6_HEADER, UDP_HEADER, UTP_HEADER};
 
-// The MTUs of the last three streams that died on a packet larger than
-// they had seen delivered. Later streams probe no higher than the largest
-// of them; until three have died, no higher than the link.
+// The ceilings below the last three MTUs that streams died probing.
+// Later streams probe no higher than the largest ceiling; until three
+// have died, no higher than the link.
 #[derive(Debug)]
 pub(crate) struct MtuCeiling {
     failed: [u16; 3],
@@ -27,7 +27,7 @@ impl Default for MtuCeiling {
 
 impl MtuCeiling {
     pub fn restrict(&mut self, mtu: u16) {
-        self.failed[self.next] = mtu;
+        self.failed[self.next] = mtu.saturating_sub(1);
         self.next = (self.next + 1) % self.failed.len();
     }
 
