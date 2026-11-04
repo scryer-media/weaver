@@ -1,0 +1,21 @@
+{
+  "slug": "zip-store-encrypted-lying-header",
+  "title": "zip-store-encrypted-lying-header.2026.TEST",
+  "description": "The local header exaggerates plaintext length while the central directory remains correct; the store falls back and ZipEngine recovers exactly the real member with its CRC verified.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "password": "e2e-test-password",
+  "segment_size": 768000,
+  "runtimeAssertions": {
+    "archiveModes": [
+      {
+        "archive": "archive.zip",
+        "requireKind": "zip_engine"
+      }
+    ]
+  },
+  "expectedOutputBLAKE3": {
+    "feature.mkv": "8d3de71a518f9bfb6a290d350c2cf1b3cab0a56ad2249d60216ab0ee1b95c2a3"
+  },
+  "exactOutputFiles": true
+}

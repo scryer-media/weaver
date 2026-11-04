@@ -103,6 +103,7 @@ type ScenarioRuntimeAssertions struct {
 	DirectUnpack        *ScenarioDirectUnpackAssertion        `json:"directUnpack,omitempty"`
 	QueueLiveness       *ScenarioQueueLivenessAssertion       `json:"queueLiveness,omitempty"`
 	Log                 *ScenarioLogAssertion                 `json:"log,omitempty"`
+	ArchiveModes        []ScenarioArchiveModeAssertion        `json:"archiveModes,omitempty"`
 }
 
 // ScenarioLogAssertion pins what weaver said about a job in its own log. The
@@ -1520,6 +1521,12 @@ var canonicalFixtureSlugs = []string{
 	"yenc-lie-overlap-par2",
 	"zip-corrupted",
 	"zip-encrypted",
+	"zip-store-encrypted-single",
+	"zip-store-encrypted-multi-member",
+	"zip-store-encrypted-descriptor",
+	"zip-store-encrypted-lying-header",
+	"zip-store-encrypted-nested-seek",
+	"zip-store-encrypted-nested-no-seek",
 	"zip-unencrypted",
 	"zip-deflate-lost-article",
 	"zip-cp437-empty-dirs",

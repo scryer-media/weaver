@@ -39,6 +39,10 @@ use weaver_graph::recovery::RepairOutcome;
 
 const ZIP_FRONT: &[u8] = b"PK\x03\x04";
 
+thread_local! {
+    pub(super) static SEEK_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 // A stand-in for a format's object: it asks for what it was told to until
 // it is answered, and remembers the answers.
 struct Probe {
@@ -420,6 +424,65 @@ fn a_data_seek_moves_the_articles_that_cover_it_into_the_window() {
         ]
     );
     assert_eq!(*answers.lock().unwrap(), vec![Pull::Moved(1)]);
+}
+
+#[test]
+fn answered_bids_are_not_mapped_again_but_other_bootstrap_ranges_are() {
+    let mut root = ArticleRoot::new(&[file("first.bin", &[100]), file("second.bin", &[100])]);
+    for (volume, range) in [
+        (0, ByteRange::new(0, 100)),
+        (0, ByteRange::new(25, 75)),
+        (1, ByteRange::new(0, 100)),
+    ] {
+        root.window.bid(super::window::Bid {
+            volume: VolumeIndex(volume),
+            range,
+            weight: Weight::FIRST,
+            bidder: NodeId::ROOT,
+            in_order: false,
+        });
+    }
+    let asks = [data_bid(0, 1, 1, false), data_bid(0, 1, 2, false)];
+    SEEK_CALLS.with(|calls| calls.set(0));
+    let answers = root.answer(&asks, |_| true);
+
+    // Each asker gets its own answer. Only the extra range and the other
+    // volume still need a mapping after those answers.
+    assert_eq!(answers, vec![Pull::Moved(1), Pull::Moved(0)]);
+    assert_eq!(windowed(&root.map.take_moves()), vec![0, 1]);
+    assert_eq!(SEEK_CALLS.with(std::cell::Cell::get), 4);
+}
+
+#[test]
+fn a_non_window_answer_does_not_replace_a_bootstrap_bid() {
+    for seek in [
+        Seek::data(VolumeIndex(0), ByteRange::new(0, 100), Weight::FIRST),
+        Seek::deferred(VolumeIndex(0), ByteRange::new(0, 100)),
+    ] {
+        let mut root = ArticleRoot::new(&[file("part.bin", &[100])]);
+        root.window.bid(super::window::Bid {
+            volume: VolumeIndex(0),
+            range: ByteRange::new(0, 100),
+            weight: Weight::FIRST,
+            bidder: NodeId::ROOT,
+            in_order: false,
+        });
+        let asks = [Ask {
+            seek,
+            bidder: NodeId(1),
+            in_order: false,
+        }];
+        SEEK_CALLS.with(|calls| calls.set(0));
+        assert_eq!(root.answer(&asks, |_| true), vec![Pull::Moved(1)]);
+        assert_eq!(SEEK_CALLS.with(std::cell::Cell::get), 2);
+        let moves = root.map.take_moves();
+        assert_eq!(moves.len(), 1);
+        if seek.when == weaver_graph::When::Deferred {
+            assert!(matches!(moves[0].class, Class::Window(_)));
+        } else {
+            assert_eq!(moves[0].class, Class::Critical);
+        }
+    }
 }
 
 #[test]

@@ -1628,6 +1628,7 @@ func Recipes() []Recipe {
 
 	// ------------------------------------------------------- direct store
 	recipes = append(recipes, DirectStoreRecipes()...)
+	recipes = append(recipes, ZipStoreEncryptedRecipes()...)
 	recipes = append(recipes, PAR3Recipes()...)
 	recipes = append(recipes, SpeedTestRecipes()...)
 	recipes = append(recipes, AdversarialRecipes()...)
