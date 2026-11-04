@@ -79,7 +79,7 @@ pub fn sniff_among<'a>(
     match sniff(name, first_bytes, length) {
         Sniff::Leaf
             if listing_by_content(first_bytes, length)
-                && !beside.any(|other| names_listing_or_recovery(other)) =>
+                && !beside.any(names_listing_or_recovery) =>
         {
             Sniff::Object(Kind::Sfv)
         }

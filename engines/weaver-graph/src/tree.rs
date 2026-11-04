@@ -2368,7 +2368,7 @@ impl Tree {
             (
                 record.name.clone(),
                 record.length,
-                record.said(prefix, &members.namespace),
+                record.said(prefix, members.namespace),
             )
         }) else {
             return;
