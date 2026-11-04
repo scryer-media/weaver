@@ -1281,6 +1281,7 @@ fn lane_write(
             label: "lane_probe",
             lane,
             op: Box::new(op),
+            committed: None,
         },
     }
 }

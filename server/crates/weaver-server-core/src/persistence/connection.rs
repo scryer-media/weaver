@@ -80,6 +80,8 @@ impl DatabaseRuntimeWorker {
         T: Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + Send + 'static,
     {
+        #[cfg(test)]
+        blocking_call_probe::note(caller);
         match self {
             Self::Sqlite { writer, .. } => writer.block_on(caller, future),
             Self::Postgres(worker) => worker.block_on(future),
@@ -96,6 +98,8 @@ impl DatabaseRuntimeWorker {
         Build: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + 'static,
     {
+        #[cfg(test)]
+        blocking_call_probe::note(caller);
         match self {
             Self::Sqlite { writer, .. } => writer.block_on_local(caller, build),
             Self::Postgres(_) => Err(StateError::Database(
@@ -114,6 +118,8 @@ impl DatabaseRuntimeWorker {
         T: Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + Send + 'static,
     {
+        #[cfg(test)]
+        blocking_call_probe::note(caller);
         match self {
             Self::Sqlite { reads, .. } => reads.block_on(caller, future),
             Self::Postgres(worker) => worker.block_on(future),
@@ -130,6 +136,8 @@ impl DatabaseRuntimeWorker {
         Build: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + 'static,
     {
+        #[cfg(test)]
+        blocking_call_probe::note(caller);
         match self {
             Self::Sqlite { writer, .. } => writer.block_on_local(caller, build),
             Self::Postgres(worker) => worker.block_on_local(build),
@@ -795,6 +803,9 @@ enum DbWriteCommand {
         // the write a barrier against every other queued write.
         lane: Option<WriteLane>,
         op: WriteOp,
+        // Answers with the write's outcome once it has run. A write that
+        // never runs drops it, which its receiver reads as a failure.
+        committed: Option<oneshot::Sender<Result<(), String>>>,
     },
     GraphCheckpoint {
         job_id: crate::jobs::ids::JobId,
@@ -980,11 +991,20 @@ async fn execute_write_command(
             .await
             .ok();
         }
-        DbWriteCommand::Write { label, op, .. } => {
+        DbWriteCommand::Write {
+            label,
+            op,
+            committed,
+            ..
+        } => {
             let writer_db = writer_db.clone();
             tokio::task::spawn_blocking(move || {
-                if let Err(error) = op(&writer_db) {
+                let outcome = op(&writer_db).map_err(|error| error.to_string());
+                if let Err(error) = &outcome {
                     tracing::warn!(label, error = %error, "failed to run ordered database write");
+                }
+                if let Some(committed) = committed {
+                    let _ = committed.send(outcome);
                 }
             })
             .await
@@ -1633,6 +1653,7 @@ impl Database {
             label,
             lane: None,
             op: Box::new(op),
+            committed: None,
         };
         self.try_send_with_retry(command, label)
     }
@@ -1646,10 +1667,35 @@ impl Database {
         label: &'static str,
         op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
     ) -> Result<(), StateError> {
+        self.queue_job_write(job_id, label, op, None)
+    }
+
+    // [`Self::try_queue_job_write`] whose receiver answers with the write's
+    // outcome once it has run. A write that fails, or never runs because the
+    // lane closed, answers with an error or not at all.
+    pub(crate) fn try_queue_job_write_committed(
+        &self,
+        job_id: crate::jobs::ids::JobId,
+        label: &'static str,
+        op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
+    ) -> Result<oneshot::Receiver<Result<(), String>>, StateError> {
+        let (committed, rx) = oneshot::channel();
+        self.queue_job_write(job_id, label, op, Some(committed))?;
+        Ok(rx)
+    }
+
+    fn queue_job_write(
+        &self,
+        job_id: crate::jobs::ids::JobId,
+        label: &'static str,
+        op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
+        committed: Option<oneshot::Sender<Result<(), String>>>,
+    ) -> Result<(), StateError> {
         let command = DbWriteCommand::Write {
             label,
             lane: Some(WriteLane::Job(job_id.0)),
             op: Box::new(op),
+            committed,
         };
         self.try_send_with_retry(command, label)
     }
@@ -1705,6 +1751,7 @@ impl Database {
             label: LABEL,
             lane: Some(WriteLane::ServerAttribution),
             op: Box::new(op),
+            committed: None,
         };
         self.try_send_with_retry(command, LABEL)
     }
@@ -2183,3 +2230,33 @@ pub(crate) static JOB_WRITE_WAITS: std::sync::atomic::AtomicU64 =
 
 #[cfg(test)]
 mod tests;
+
+// Every blocking database call made on the thread that armed it, by the
+// caller's location: a test proves an actor turn reads nothing by arming the
+// probe on the actor's thread, running the turn, and taking the list.
+#[cfg(test)]
+pub(crate) mod blocking_call_probe {
+    use std::cell::RefCell;
+    use std::panic::Location;
+
+    thread_local! {
+        static CALLS: RefCell<Option<Vec<&'static Location<'static>>>> =
+            const { RefCell::new(None) };
+    }
+
+    pub(crate) fn arm() {
+        CALLS.with(|calls| *calls.borrow_mut() = Some(Vec::new()));
+    }
+
+    pub(crate) fn take() -> Vec<&'static Location<'static>> {
+        CALLS.with(|calls| calls.borrow_mut().take().unwrap_or_default())
+    }
+
+    pub(super) fn note(caller: &'static Location<'static>) {
+        CALLS.with(|calls| {
+            if let Some(calls) = calls.borrow_mut().as_mut() {
+                calls.push(caller);
+            }
+        });
+    }
+}

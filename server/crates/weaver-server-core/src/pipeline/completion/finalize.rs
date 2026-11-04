@@ -13,6 +13,8 @@ pub(crate) mod claims;
 pub(crate) mod deobfuscate;
 mod output;
 #[cfg(test)]
+pub(in crate::pipeline) use output::BEFORE_FIRST_MOVE;
+#[cfg(test)]
 pub(in crate::pipeline) use output::member_crc32_by_path;
 mod status;
 #[cfg(test)]

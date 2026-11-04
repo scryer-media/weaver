@@ -909,8 +909,14 @@ impl Pipeline {
         interval
     }
 
-    async fn handle_terminal_post_processing_event(&mut self, event: TerminalPostProcessingEvent) {
+    pub(in crate::pipeline) async fn handle_terminal_post_processing_event(
+        &mut self,
+        event: TerminalPostProcessingEvent,
+    ) {
         match event {
+            TerminalPostProcessingEvent::ScriptsAdmitted(admitted) => {
+                self.handle_terminal_scripts_admitted(admitted);
+            }
             TerminalPostProcessingEvent::QueueAdmitted(job_id) => {
                 self.handle_queue_scripts_admitted(job_id);
             }

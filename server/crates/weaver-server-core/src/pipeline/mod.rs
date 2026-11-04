@@ -802,12 +802,28 @@ pub(super) struct MoveToCompleteDone {
 }
 
 pub(super) enum TerminalPostProcessingEvent {
+    ScriptsAdmitted(TerminalScriptsAdmitted),
     QueueAdmitted(JobId),
     QueueDone(JobId, Result<(), crate::StateError>),
     AddedScriptsDone(JobId, Result<(), crate::StateError>),
     Started(JobId),
     Done(TerminalPostProcessingDone),
     CancelJobsDone(orchestrator::CancelJobsDone),
+}
+
+// What the script settings said when a job's terminal pass began: read off
+// the actor, so the turn that hears a move finish reads no setting itself.
+pub(super) struct TerminalScriptsAdmitted {
+    pub(super) job_id: JobId,
+    pub(super) facts: crate::post_processing::model::PostProcessingFacts,
+    pub(super) primary_failure: Option<String>,
+    pub(super) admission: Result<
+        Option<crate::post_processing::executor::PostProcessingJobAdmission>,
+        crate::StateError,
+    >,
+    // Whether a queue script could have an event of the job queued or
+    // running, asked only when the admission runs no script of its own.
+    pub(super) queue_events_may_hold: bool,
 }
 
 pub(super) struct TerminalPostProcessingDone {

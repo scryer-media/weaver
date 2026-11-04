@@ -984,6 +984,7 @@ impl Database {
         self.set_active_job_runtime_at(
             job_id,
             None,
+            None,
             status,
             download_state,
             post_state,
@@ -1000,7 +1001,9 @@ impl Database {
     // [`Self::set_active_job_runtime`] that also moves the job's recorded
     // output directory in the same statement, so a restart can never read the
     // new runtime against the old location or the other way round. `None`
-    // keeps the directory already recorded.
+    // keeps the directory already recorded. `post_processing_outcome`, when
+    // given, is kept in the same statement too: the moving row carries what
+    // the delivery ruled.
     #[expect(
         clippy::too_many_arguments,
         reason = "active job runtime is persisted as one atomic SQL update"
@@ -1009,6 +1012,7 @@ impl Database {
         &self,
         job_id: JobId,
         output_dir: Option<&str>,
+        post_processing_outcome: Option<&str>,
         status: &str,
         download_state: Option<&str>,
         post_state: Option<&str>,
@@ -1023,6 +1027,7 @@ impl Database {
         let datastore = self.datastore();
         let args = vec![
             SqlArg::OptText(output_dir.map(str::to_string)),
+            SqlArg::OptText(post_processing_outcome.map(str::to_string)),
             SqlArg::Text(status.to_string()),
             SqlArg::OptText(download_state.map(str::to_string)),
             SqlArg::OptText(post_state.map(str::to_string)),
@@ -1044,6 +1049,7 @@ impl Database {
                             tx.execute(
                                 "UPDATE active_jobs
                                  SET output_dir = COALESCE({}, output_dir),
+                                     post_processing_outcome = COALESCE({}, post_processing_outcome),
                                      status = {},
                                      download_state = {},
                                      post_state = {},
@@ -1068,6 +1074,7 @@ impl Database {
                         datastore.read_exec(),
                         "UPDATE active_jobs
                          SET output_dir = COALESCE({}, output_dir),
+                             post_processing_outcome = COALESCE({}, post_processing_outcome),
                              status = {},
                              download_state = {},
                              post_state = {},

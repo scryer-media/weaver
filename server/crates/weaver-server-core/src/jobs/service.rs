@@ -598,6 +598,7 @@ impl Pipeline {
                 .initially_paused
                 .then_some(crate::jobs::model::PostState::Idle),
             failure_error: None,
+            delivered: None,
             working_dir: working_dir.clone(),
             downloaded_bytes: restart
                 .as_ref()
@@ -946,6 +947,7 @@ impl Pipeline {
             paused_resume_download_state: request.paused_resume_download_state,
             paused_resume_post_state: request.paused_resume_post_state,
             failure_error: Some(reason),
+            delivered: None,
             working_dir: request.working_dir.clone(),
             downloaded_bytes: 0,
             restored_download_floor_bytes: 0,
@@ -1086,6 +1088,14 @@ impl Pipeline {
                 .is_none_or(|resume| matches!(resume, JobStatus::Queued)),
             _ => false,
         };
+        // A job whose row says its delivery began has every article in hand
+        // and goes on from its row, never from a checkpoint: it moves into the
+        // destination the row names, or runs its terminal pass on what was
+        // delivered. It is never fetched again.
+        let delivering = matches!(
+            status,
+            JobStatus::Moving | JobStatus::QueuedPostProcessing | JobStatus::PostProcessing
+        );
         let mut spec = spec;
         // The summaries a job waiting its turn installs with when the
         // restart let its lists go, and the password candidates read with
@@ -1164,7 +1174,7 @@ impl Pipeline {
         // articles are on disk, so the queue skips exactly those. A job with
         // no checkpoint has nothing that says what its files hold: it is
         // admitted afresh from its spec and fetches from the start.
-        let (graph_restore, skip, held_parts) = if waiting_summaries.is_some() {
+        let (graph_restore, skip, held_parts) = if waiting_summaries.is_some() || delivering {
             (None, HashSet::new(), Vec::new())
         } else {
             match self.restore_graph_job(job_id, &spec, &working_dir).await {
@@ -1189,7 +1199,7 @@ impl Pipeline {
         // article: no checkpoint, and nothing that says it was ever handed
         // work. Every other job is built as it ran, and a paused one then
         // lets its articles go, as a pause does.
-        let waits_its_turn = graph_restore.is_none() && fresh;
+        let waits_its_turn = graph_restore.is_none() && (fresh || delivering);
         // Every article not in hand is queued again.
         let queue_depth: usize = match &waiting_summaries {
             Some(summaries) => summaries.0.iter().map(|file| file.remaining as usize).sum(),
@@ -1206,7 +1216,9 @@ impl Pipeline {
                                 file_id: NzbFileId { job_id, file_index },
                                 segment_number: seg.ordinal,
                             };
-                            !skip.contains(&segment_id) && !held.contains(&segment_id)
+                            !delivering
+                                && !skip.contains(&segment_id)
+                                && !held.contains(&segment_id)
                         })
                         .count()
                 })
@@ -1228,9 +1240,7 @@ impl Pipeline {
                         file_id: NzbFileId { job_id, file_index },
                         segment_number: seg.ordinal,
                     };
-                    settled
-                        .contains(&segment_id)
-                        .then_some(u64::from(seg.bytes))
+                    (delivering || settled.contains(&segment_id)).then_some(u64::from(seg.bytes))
                 })
             })
             .sum();
@@ -1308,7 +1318,7 @@ impl Pipeline {
                 file_id: NzbFileId { job_id, file_index },
                 segment_number: ordinal,
             };
-            skip.contains(&segment_id) || held.contains(&segment_id)
+            delivering || skip.contains(&segment_id) || held.contains(&segment_id)
         };
         let articles = JobArticles::Queued(if let Some(summaries) = waiting_summaries {
             summaries
@@ -1396,6 +1406,7 @@ impl Pipeline {
                 JobStatus::Failed { ref error } => Some(error.clone()),
                 _ => None,
             },
+            delivered: None,
             working_dir,
             downloaded_bytes,
             restored_download_floor_bytes,
@@ -1448,9 +1459,30 @@ impl Pipeline {
         {
             self.persist_file_identities(job_id, &file_identities).await;
         }
+        // A delivery that had begun keeps what its graph ruled, read back
+        // from its row: the graph is not restored, and the terminal pass
+        // decides from this.
+        if delivering {
+            let delivered = match self
+                .db_blocking(move |db| db.job_post_processing_facts(job_id.0))
+                .await
+            {
+                Ok(facts) => facts.and_then(|facts| facts.delivered),
+                Err(error) => {
+                    tracing::warn!(job_id = job_id.0, %error, "could not read what the delivery ruled");
+                    None
+                }
+            };
+            if let Some(state) = self.jobs.get_mut(&job_id) {
+                state.delivered = delivered;
+            }
+        }
         self.reconcile_job_progress(job_id).await;
         let restored_terminal_post_processing =
             self.recover_restored_terminal_post_processing(job_id);
+        if matches!(status, JobStatus::Moving) {
+            self.resume_restored_move(job_id).await;
+        }
 
         if self
             .jobs
