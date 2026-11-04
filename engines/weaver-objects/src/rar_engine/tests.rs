@@ -970,10 +970,11 @@ impl Volumes for Counted {
 }
 
 // A pool that lends threads of its own, recording how many each spread
-// asked for.
+// asked for, and how many each spread beside the run's thread started.
 #[derive(Default)]
 struct Lent {
     spreads: Mutex<Vec<usize>>,
+    besides: Mutex<Vec<usize>>,
 }
 
 impl weaver_graph::Pool for Lent {
@@ -985,6 +986,17 @@ impl weaver_graph::Pool for Lent {
             }
         });
     }
+
+    fn spread_beside(&self, work: &(dyn Fn() + Sync), caller: &mut dyn FnMut(&dyn Fn())) {
+        let started = std::sync::atomic::AtomicUsize::new(0);
+        thread::scope(|scope| {
+            caller(&|| {
+                started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                scope.spawn(work);
+            });
+        });
+        self.besides.lock().unwrap().push(started.into_inner());
+    }
 }
 
 // What a run on `threads` of a lent pool said.
@@ -995,6 +1007,8 @@ struct OnThreads {
     reads: Vec<(u32, u64)>,
     // The threads each spread asked of the pool.
     spreads: Vec<usize>,
+    // The workers each spread beside the run's thread started.
+    besides: Vec<usize>,
 }
 
 impl OnThreads {
@@ -1082,11 +1096,13 @@ fn on_budget(volumes: Vec<Vec<u8>>, memory_bytes: Option<u64>, threads: usize) -
     );
     let reads = std::mem::take(&mut *counted.reads.lock().unwrap());
     let spreads = std::mem::take(&mut *lent.spreads.lock().unwrap());
+    let besides = std::mem::take(&mut *lent.besides.lock().unwrap());
     OnThreads {
         said: said(&emits),
         sums: checksums(&emits),
         reads,
         spreads,
+        besides,
     }
 }
 
@@ -1307,14 +1323,10 @@ fn a_file_that_fails_beside_others_ends_the_run_as_it_would_alone() {
     );
     assert!(alone.contains(&Said::Closed(0)));
     assert!(!alone.contains(&Said::Member(2, "file2.bin".into(), Some(274))));
-    // Alone, the failing file's bytes stream out before its checksum fails;
-    // beside others it is decoded whole first, so none are said. Either way
-    // the file is retracted.
-    let unfailed: Vec<&Said> = alone
-        .iter()
-        .filter(|said| !matches!(said, Said::Bytes(1, _)))
-        .collect();
-    assert_eq!(beside.iter().collect::<Vec<_>>(), unfailed);
+    // Beside others the failing file is decoded whole first, and then said
+    // as it streamed out alone: its bytes, as far as its decode came, before
+    // its checksum fails and it is retracted.
+    assert_eq!(beside, alone);
     assert!(!spreads.is_empty());
 }
 
@@ -1435,4 +1447,264 @@ fn a_copy_of_the_headers_decodes_a_member_whose_continuations_it_never_parsed() 
         }
         assert_eq!(decoding.join().unwrap().unwrap(), expected);
     }
+}
+
+// A file posted over three volumes, then three files whole in the last;
+// `flip` names a file one byte of whose last part is posted wrong.
+fn overlapping(flip: Option<u8>) -> Vec<Vec<u8>> {
+    let body = |at: u8, length: usize| -> Vec<u8> {
+        (0..length)
+            .map(|byte| (byte as u8).wrapping_mul(3) ^ at)
+            .collect()
+    };
+    let posted = |at: u8, bytes: &[u8]| -> Vec<u8> {
+        let mut posted = bytes.to_vec();
+        if flip == Some(at) {
+            posted[5] ^= 0x20;
+        }
+        posted
+    };
+    let whole = |at: u8| {
+        let bytes = body(at, 400 + usize::from(at) * 50);
+        rar5::file(
+            &format!("file{at}.bin"),
+            0,
+            &posted(at, &bytes),
+            bytes.len() as u64,
+            Some(crc32(&bytes)),
+        )
+    };
+    let first = body(0, 3000);
+    let length = first.len() as u64;
+    vec![
+        [
+            rar5::start(Some(0)),
+            rar5::file("file0.bin", rar5::SPLIT_AFTER, &first[..1000], length, None),
+            rar5::end(true),
+        ]
+        .concat(),
+        [
+            rar5::start(Some(1)),
+            rar5::file(
+                "file0.bin",
+                rar5::SPLIT_BEFORE | rar5::SPLIT_AFTER,
+                &first[1000..2000],
+                length,
+                None,
+            ),
+            rar5::end(true),
+        ]
+        .concat(),
+        [
+            rar5::start(Some(2)),
+            rar5::file(
+                "file0.bin",
+                rar5::SPLIT_BEFORE,
+                &posted(0, &first[2000..]),
+                length,
+                Some(crc32(&first)),
+            ),
+            whole(1),
+            whole(2),
+            whole(3),
+            rar5::end(false),
+        ]
+        .concat(),
+    ]
+}
+
+// A run over `volumes` on `threads` of `pool`, the first volume in when it
+// starts, and the rest once the run waits on the second.
+fn arriving_on(volumes: Vec<Vec<u8>>, threads: usize, pool: Arc<dyn weaver_graph::Pool>) -> Vec<Emit> {
+    let mut released = vec![false; volumes.len()];
+    released[0] = true;
+    let count = volumes.len() as u32;
+    let gate = Gate::new(volumes, &released);
+    thread::scope(|scope| {
+        let run = scope.spawn(|| {
+            let mut emits = Vec::new();
+            let mut sink = |emit| {
+                emits.push(emit);
+                true
+            };
+            RarEngine::new().start().run(
+                Arc::clone(&gate) as Arc<dyn Volumes>,
+                &mut sink,
+                weaver_graph::Budget {
+                    memory_bytes: None,
+                    threads,
+                    pool: Some(pool),
+                },
+            );
+            emits
+        });
+        gate.wait_for_reader(1);
+        for volume in 1..count {
+            gate.release(volume);
+        }
+        run.join().unwrap()
+    })
+}
+
+fn arriving(volumes: Vec<Vec<u8>>, threads: usize) -> OnThreads {
+    let lent = Arc::new(Lent::default());
+    let emits = arriving_on(volumes, threads, Arc::clone(&lent) as Arc<dyn weaver_graph::Pool>);
+    OnThreads {
+        said: said(&emits),
+        sums: checksums(&emits),
+        reads: Vec::new(),
+        spreads: std::mem::take(&mut *lent.spreads.lock().unwrap()),
+        besides: std::mem::take(&mut *lent.besides.lock().unwrap()),
+    }
+}
+
+// A file decoding on the run's thread while the last of its volumes come in
+// holds back none of the files after it: once their bytes are in, they
+// decode beside it, and every file is said as if one by one.
+#[test]
+fn files_after_one_still_decoding_decode_beside_it_and_are_said_in_order() {
+    let alone = arriving(overlapping(None), 1);
+    let beside = arriving(overlapping(None), 4);
+    assert!(alone.said.contains(&Said::Closed(3)), "{:?}", alone.said);
+    assert_eq!(beside.said, alone.said);
+    assert_eq!(beside.sums, alone.sums);
+    assert!(alone.besides.is_empty(), "{:?}", alone.besides);
+    // The second and third files decode beside the first. The last waits
+    // for the header after it, the set's end record, so it decodes alone.
+    assert_eq!(beside.besides, vec![2, 0]);
+    assert!(beside.spreads.is_empty(), "{:?}", beside.spreads);
+}
+
+// A file that fails beside one still decoding fails the run only once that
+// one closes, and as it would have failed alone.
+#[test]
+fn a_file_that_fails_beside_one_still_decoding_fails_the_run_after_it_closes() {
+    let alone = arriving(overlapping(Some(2)), 1);
+    let beside = arriving(overlapping(Some(2)), 4);
+    assert!(alone.said.contains(&Said::Closed(1)), "{:?}", alone.said);
+    assert!(alone.said.contains(&Said::Retract(2)), "{:?}", alone.said);
+    assert_eq!(beside.said, alone.said);
+    assert_eq!(beside.besides, vec![2]);
+}
+
+// The file on the run's thread fails: the files decoded beside it are never
+// said, as the walk would never have reached them.
+#[test]
+fn files_decoded_beside_one_that_fails_are_never_said() {
+    let alone = arriving(overlapping(Some(0)), 1);
+    let beside = arriving(overlapping(Some(0)), 4);
+    assert!(alone.said.contains(&Said::Retract(0)), "{:?}", alone.said);
+    assert!(
+        !alone
+            .said
+            .iter()
+            .any(|said| matches!(said, Said::Member(1.., _, _))),
+        "{:?}",
+        alone.said
+    );
+    assert_eq!(beside.said, alone.said);
+    assert_eq!(beside.besides, vec![2]);
+}
+
+// A pool whose workers beside the run's thread wait to be let go, so a test
+// can stop the run while they are out.
+#[derive(Default)]
+struct Held {
+    state: Mutex<(usize, bool, usize)>,
+    changed: Condvar,
+}
+
+impl Held {
+    fn started(&self) -> usize {
+        self.state.lock().unwrap().0
+    }
+
+    fn wait_started(&self) {
+        let mut state = self.state.lock().unwrap();
+        while state.0 == 0 {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn let_go(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.changed.notify_all();
+    }
+
+    fn returned(&self) -> usize {
+        self.state.lock().unwrap().2
+    }
+}
+
+impl weaver_graph::Pool for Held {
+    fn spread(&self, workers: usize, work: &(dyn Fn() + Sync)) {
+        thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(work);
+            }
+        });
+    }
+
+    fn spread_beside(&self, work: &(dyn Fn() + Sync), caller: &mut dyn FnMut(&dyn Fn())) {
+        thread::scope(|scope| {
+            caller(&|| {
+                self.state.lock().unwrap().0 += 1;
+                self.changed.notify_all();
+                scope.spawn(|| {
+                    let mut state = self.state.lock().unwrap();
+                    while !state.1 {
+                        state = self.changed.wait(state).unwrap();
+                    }
+                    drop(state);
+                    work();
+                    self.state.lock().unwrap().2 += 1;
+                });
+            });
+        });
+    }
+}
+
+// The owner stops a run while files decode beside it: the run returns only
+// once every worker has, nothing it says after is heard, and the next run
+// says the set from its first file.
+#[test]
+fn a_run_stopped_while_files_decode_beside_it_joins_them_and_the_next_says_all() {
+    let held = Arc::new(Held::default());
+    let mut released = vec![false; 3];
+    released[0] = true;
+    let gate = Gate::new(overlapping(None), &released);
+    let after = std::sync::atomic::AtomicUsize::new(0);
+    let returned = thread::scope(|scope| {
+        let run = scope.spawn(|| {
+            let mut stopped = false;
+            let mut sink = |_emit| {
+                if stopped {
+                    after.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return false;
+                }
+                stopped = held.started() > 0;
+                !stopped
+            };
+            RarEngine::new().start().run(
+                Arc::clone(&gate) as Arc<dyn Volumes>,
+                &mut sink,
+                weaver_graph::Budget {
+                    memory_bytes: None,
+                    threads: 4,
+                    pool: Some(Arc::clone(&held) as Arc<dyn weaver_graph::Pool>),
+                },
+            );
+            held.returned()
+        });
+        gate.wait_for_reader(1);
+        gate.release(1);
+        gate.release(2);
+        held.wait_started();
+        held.let_go();
+        run.join().unwrap()
+    });
+    assert_eq!(returned, held.started());
+    assert_eq!(after.load(std::sync::atomic::Ordering::Relaxed), 0);
+    let alone = on_threads(overlapping(None), 1);
+    assert_eq!(arriving(overlapping(None), 4).said, alone.said);
 }
