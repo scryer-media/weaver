@@ -73,6 +73,7 @@ mod checkpoint_cost;
 mod classic_rar_crypt;
 mod classic_sfv;
 mod classic_streams;
+mod classic_uu;
 mod classic_zip64;
 mod dead_posts;
 mod deep;
