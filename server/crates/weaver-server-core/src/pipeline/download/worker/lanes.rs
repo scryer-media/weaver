@@ -455,6 +455,7 @@ impl Pipeline {
                 observation.policy_elapsed,
                 pressure_clear,
                 observation.cold,
+                observation.fed,
             );
         }
 
@@ -870,6 +871,7 @@ impl Pipeline {
                             payload_bytes: 0,
                             policy_elapsed: Duration::ZERO,
                             pressure_clear: false,
+                            fed: false,
                             batch_complete: true,
                             batch_clean: policy_outcome,
                             unresolved_count: u64::from(!policy_outcome),

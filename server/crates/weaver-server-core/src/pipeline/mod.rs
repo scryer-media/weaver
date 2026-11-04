@@ -514,6 +514,11 @@ pub(super) struct DownloadLaneObservation {
     // Whether byte pressure was clear when the batch was leased. Samples
     // taken under pressure say nothing about the depth under test.
     pub(super) pressure_clear: bool,
+    // The lane held a full rung of articles, in flight and queued behind,
+    // when this response was read. A response read with less waited on the
+    // lane's next lease, so its time says how late the work came as well as
+    // how fast the server is.
+    pub(super) fed: bool,
     pub(super) batch_complete: bool,
     pub(super) batch_clean: bool,
     pub(super) unresolved_count: u64,

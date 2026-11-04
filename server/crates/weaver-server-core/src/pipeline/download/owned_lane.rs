@@ -1697,6 +1697,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                     payload_bytes: 0,
                     policy_elapsed: std::time::Duration::ZERO,
                     pressure_clear: work_context.pressure_clear,
+                    fed: false,
                     // Nothing was measured, so this must not close a depth
                     // trial window.
                     batch_complete: discarded,
@@ -1818,6 +1819,10 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             lane.set_body_activity(head_context.body_activity.clone());
             lane.set_checkpoint_plan(head_context.checkpoint_plan.clone());
         }
+        // What the lane holds as this response is read, the response's own
+        // request among it: a full rung means the pipe never waited on the
+        // lane's next lease.
+        let held = inflight.len() + pending.len();
         let Some((trace, meta)) = lane.ring_read_next() else {
             break (LaneParkReason::Error, false);
         };
@@ -1849,6 +1854,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 payload_bytes,
                 policy_elapsed,
                 pressure_clear: work_context.pressure_clear,
+                fed: held >= usize::from(work_context.mode.depth()),
                 batch_complete: meta.batch_complete,
                 batch_clean: meta.batch_clean,
                 unresolved_count: meta.unresolved_count,
@@ -2210,6 +2216,7 @@ fn unresolved_result(
             payload_bytes: 0,
             policy_elapsed: std::time::Duration::ZERO,
             pressure_clear,
+            fed: false,
             batch_complete: true,
             batch_clean: false,
             unresolved_count,
@@ -2362,6 +2369,7 @@ mod tests {
             payload_bytes: 0,
             policy_elapsed: std::time::Duration::ZERO,
             pressure_clear: true,
+            fed: false,
             batch_complete: false,
             batch_clean: true,
             unresolved_count: 0,
@@ -2435,6 +2443,7 @@ mod tests {
                 payload_bytes: 0,
                 policy_elapsed: std::time::Duration::ZERO,
                 pressure_clear: true,
+                fed: false,
                 batch_complete: false,
                 batch_clean: true,
                 unresolved_count: 0,
@@ -2747,6 +2756,7 @@ mod tests {
                 payload_bytes: 0,
                 policy_elapsed: Duration::ZERO,
                 pressure_clear: true,
+                fed: false,
                 batch_complete: true,
                 batch_clean: true,
                 unresolved_count: 0,
@@ -2847,6 +2857,7 @@ mod tests {
                 payload_bytes: 0,
                 policy_elapsed: Duration::ZERO,
                 pressure_clear: true,
+                fed: false,
                 batch_complete: true,
                 batch_clean: true,
                 unresolved_count: 0,
