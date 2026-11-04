@@ -1443,12 +1443,17 @@ impl Session {
             // The sockets the DHT and the UDP trackers bind.
             let datagram_sockets = Arc::clone(&opts.socket_factory);
 
+            let connection_slots = match &opts.shared_limits {
+                Some(shared) => Arc::clone(&shared.slots),
+                None => Arc::new(ConnectionSlots::new(
+                    opts.connections_limit,
+                    opts.connections_slack,
+                    opts.connection_speed,
+                )),
+            };
             let listen_result = if let Some(mut listen_opts) = opts.listen.take() {
                 // uTP drops a SYN once its streams pass twice the limit.
-                let connections_limit = match &opts.shared_limits {
-                    Some(shared) => shared.slots.limit(),
-                    None => opts.connections_limit,
-                };
+                let connections_limit = connection_slots.limit();
                 session_utp_opts(
                     listen_opts.utp_opts.get_or_insert_with(Default::default),
                     connections_limit,
@@ -1459,7 +1464,7 @@ impl Session {
                             opts.root_span.as_ref().and_then(|s| s.id()),
                             swarm.child_token(),
                             &opts.socket_factory,
-                            connections_limit,
+                            &connection_slots,
                         )
                         .await
                         .context(crate::listen::ListenFailed)?,
@@ -1682,14 +1687,7 @@ impl Session {
                     )),
                 },
                 udp_tracker_client,
-                connection_slots: match &opts.shared_limits {
-                    Some(shared) => Arc::clone(&shared.slots),
-                    None => Arc::new(ConnectionSlots::new(
-                        opts.connections_limit,
-                        opts.connections_slack,
-                        opts.connection_speed,
-                    )),
-                },
+                connection_slots,
                 ratelimits: Limits::new(opts.ratelimits),
                 ipv4_only: opts.ipv4_only,
                 trackers: opts.trackers,
@@ -4046,6 +4044,11 @@ mod tests {
             (ListenerMode::TcpAndUtp, vec![Tcp, Udp]),
         ] {
             let token = tokio_util::sync::CancellationToken::new();
+            let slots = crate::connection_slots::ConnectionSlots::new(
+                super::DEFAULT_CONNECTIONS_LIMIT,
+                crate::connection_slots::DEFAULT_CONNECTIONS_SLACK,
+                crate::connection_slots::DEFAULT_CONNECTION_SPEED,
+            );
             let listen = ListenerOptions {
                 mode,
                 listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
@@ -4055,7 +4058,7 @@ mod tests {
                 None,
                 token.clone(),
                 &crate::test_support::socket_factory(),
-                super::DEFAULT_CONNECTIONS_LIMIT,
+                &slots,
             )
             .await
             .unwrap();
@@ -4181,6 +4184,93 @@ mod tests {
         assert_eq!(serialized["utp"]["packets_lost"], 3);
         assert_eq!(serialized["utp"]["max_congestion_window_bytes"], 3000);
         session.stop().await;
+    }
+
+    #[tokio::test]
+    async fn shared_limit_changes_reach_every_plain_and_ssl_utp_listener() {
+        let shared = super::SharedLimits::new(
+            super::SessionLimits {
+                connections_limit: 3,
+                unchoke_slots_limit: usize::MAX,
+                connection_speed: std::num::NonZeroU32::new(30).unwrap(),
+            },
+            0,
+            1,
+        );
+        let dir = TempDir::new().unwrap();
+        let open = |name: &str| {
+            let shared = shared.clone();
+            let path = dir.path().join(name);
+            async move {
+                Session::new_with_opts(
+                    path,
+                    SessionOptions {
+                        dht: None,
+                        persistence: None,
+                        disable_trackers: true,
+                        disable_local_service_discovery: true,
+                        shared_limits: Some(shared),
+                        listen: Some(crate::ListenerOptions {
+                            mode: crate::ListenerMode::UtpOnly,
+                            listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                            ssl_listen_port: Some(0),
+                            utp_opts: Some(weaver_utp::SocketOpts {
+                                connections_limit: std::num::NonZeroUsize::new(99),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        }),
+                        ..crate::test_support::session_options()
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        };
+        let first = open("first").await;
+        assert_eq!(first.utp_sockets.len(), 2);
+        assert!(
+            first
+                .utp_sockets
+                .iter()
+                .all(|socket| socket.0.connections_limit() == Some(3))
+        );
+
+        let mut limits = first.limits();
+        limits.connections_limit = 1;
+        first.set_limits(limits);
+        let second = open("second").await;
+        assert_eq!(second.utp_sockets.len(), 2);
+        for session in [&first, &second] {
+            assert!(
+                session
+                    .utp_sockets
+                    .iter()
+                    .all(|socket| socket.0.connections_limit() == Some(1))
+            );
+        }
+        limits.connections_limit = 4;
+        second.set_limits(limits);
+        for session in [&first, &second] {
+            assert!(
+                session
+                    .utp_sockets
+                    .iter()
+                    .all(|socket| socket.0.connections_limit() == Some(4))
+            );
+        }
+        limits.connections_limit = 0;
+        first.set_limits(limits);
+        for session in [&first, &second] {
+            assert!(
+                session
+                    .utp_sockets
+                    .iter()
+                    .all(|socket| socket.0.connections_limit() == Some(0))
+            );
+        }
+        first.stop().await;
+        second.stop().await;
     }
 
     /// A one-piece torrent whose announce-list is `[[a1, a2], [b1]]`.

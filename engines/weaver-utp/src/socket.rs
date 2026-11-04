@@ -10,7 +10,7 @@ use std::{
     num::NonZeroUsize,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     task::Poll,
     time::Duration,
@@ -171,9 +171,6 @@ impl SocketOpts {
             remote_inactivity_timeout: self
                 .remote_inactivity_timeout
                 .unwrap_or(DEFAULT_REMOTE_INACTIVITY_TIMEOUT),
-            syn_flood_streams: self
-                .connections_limit
-                .map(|limit| limit.get().saturating_mul(2)),
             wait_for_last_ack: !self.dont_wait_for_lastack,
             mtu_probe_max_retransmissions: self.mtu_probe_max_retransmissions.unwrap_or(1),
             #[cfg(test)]
@@ -197,8 +194,6 @@ pub(crate) struct ValidatedSocketOpts {
     pub connect_timeout: Duration,
 
     pub remote_inactivity_timeout: Duration,
-    // Streams past which a SYN is dropped unanswered.
-    pub syn_flood_streams: Option<usize>,
 
     pub wait_for_last_ack: bool,
 
@@ -336,6 +331,11 @@ impl<T, E> AcceptQueue<T, E> {
     }
 
     fn try_cache_syn(&mut self, syn: Syn) -> Option<Syn> {
+        if self.syns.iter().any(|pending| {
+            pending.remote == syn.remote && pending.header.connection_id == syn.header.connection_id
+        }) {
+            return None;
+        }
         if self.syns.len() < ACCEPT_QUEUE_MAX_SYNS {
             self.syns.push_back(syn);
             return None;
@@ -590,13 +590,24 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     }
 
     async fn on_syn(&mut self, remote: SocketAddr, msg: UtpMessage) -> crate::Result<()> {
-        if let Some(limit) = self.socket.opts.syn_flood_streams
-            && self.streams.len() > limit
-        {
-            trace!(
-                streams = self.streams.len(),
-                "dropping SYN, too many streams"
-            );
+        let pending = self
+            .accept_queue
+            .syns
+            .iter()
+            .filter(|syn| {
+                !self
+                    .streams
+                    .contains_key(&(syn.remote, syn.header.connection_id + 1))
+            })
+            .count();
+        let registered = self.streams.len().saturating_add(pending);
+        let limit = self
+            .socket
+            .connections_limit
+            .load(Ordering::Relaxed)
+            .saturating_mul(2);
+        if registered > limit {
+            trace!(streams = registered, "dropping SYN, too many streams");
             self.socket.stats.syn_flood_dropped.increment(1);
             return Ok(());
         }
@@ -668,6 +679,7 @@ pub struct UtpSocket<T, E> {
 
     local_addr: SocketAddr,
     opts: ValidatedSocketOpts,
+    connections_limit: AtomicUsize,
 
     pub(crate) cancellation_token: CancellationToken,
 
@@ -686,8 +698,19 @@ impl<T: Transport, E: UtpEnvironment> std::fmt::Debug for UtpSocket<T, E> {
 
 impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
     pub fn new_with_opts(transport: T, env: Env, opts: SocketOpts) -> crate::Result<Arc<Self>> {
+        Self::new_with_opts_and_init(transport, env, opts, |_| {})
+    }
+
+    /// Initialize the socket before its dispatcher can receive any packet.
+    pub fn new_with_opts_and_init(
+        transport: T,
+        env: Env,
+        opts: SocketOpts,
+        initialize: impl FnOnce(&Arc<Self>),
+    ) -> crate::Result<Arc<Self>> {
         let parent_span = opts.parent_span.clone();
         let (sock, dispatcher) = Self::new_with_opts_and_dispatcher(transport, env, opts)?;
+        initialize(&sock);
         let span = debug_span!(parent: parent_span, "utp_socket", addr=?sock.transport.bind_addr());
         spawn_with_cancel(
             span,
@@ -715,6 +738,9 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             control_requests: control_tx,
             local_addr,
             opts: validated_opts,
+            connections_limit: AtomicUsize::new(
+                opts.connections_limit.map_or(usize::MAX, NonZeroUsize::get),
+            ),
             env: env.copy(),
             accept_requests: accept_tx,
             cancellation_token: opts.cancellation_token.clone(),
@@ -774,6 +800,19 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
 
     pub fn bind_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Change the connection limit used for incoming SYN admission.
+    /// A zero limit stays zero; `usize::MAX` leaves no finite bound.
+    pub fn set_connections_limit(&self, limit: usize) {
+        self.connections_limit.store(limit, Ordering::Relaxed);
+    }
+
+    /// The effective connection limit; `None` means no finite bound.
+    /// Unset options and `usize::MAX` both have that meaning.
+    pub fn connections_limit(&self) -> Option<usize> {
+        let limit = self.connections_limit.load(Ordering::Relaxed);
+        (limit != usize::MAX).then_some(limit)
     }
 
     /// The socket's counters.
@@ -985,6 +1024,72 @@ mod tests {
         );
         assert!(transport.take_sent_utpmessages().is_empty(), "unanswered");
         assert_eq!(socket.stats().snapshot().syn_rst, 0);
+    }
+
+    #[tokio::test]
+    async fn a_changed_connection_limit_bounds_pending_syns_immediately() {
+        use crate::{
+            SocketOpts, UtpSocket,
+            message::UtpMessage,
+            raw::{Type, UtpHeader},
+            test_util::{ADDR_1, ADDR_2, env::MockUtpEnvironment, transport::RememberingTransport},
+        };
+
+        let (socket, mut dispatcher) = UtpSocket::new_with_opts_and_dispatcher(
+            RememberingTransport::new(ADDR_1),
+            MockUtpEnvironment::new(),
+            SocketOpts {
+                connections_limit: std::num::NonZeroUsize::new(3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let syn = |id: u16| {
+            UtpMessage::new_test(
+                UtpHeader {
+                    htype: Type::ST_SYN,
+                    connection_id: id.into(),
+                    ..Default::default()
+                },
+                b"",
+            )
+        };
+        for id in 0..3 {
+            dispatcher.on_recv(ADDR_2, syn(id)).await.unwrap();
+        }
+        dispatcher.on_recv(ADDR_2, syn(0)).await.unwrap();
+        assert_eq!(
+            dispatcher.accept_queue.syns.len(),
+            3,
+            "a retransmission is one pending SYN"
+        );
+
+        socket.set_connections_limit(1);
+        dispatcher.on_recv(ADDR_2, syn(3)).await.unwrap();
+        assert_eq!(dispatcher.accept_queue.syns.len(), 3);
+        assert_eq!(socket.stats().snapshot().syn_flood_dropped, 1);
+
+        socket.set_connections_limit(2);
+        dispatcher.on_recv(ADDR_2, syn(3)).await.unwrap();
+        dispatcher.on_recv(ADDR_2, syn(4)).await.unwrap();
+        assert_eq!(
+            dispatcher.accept_queue.syns.len(),
+            5,
+            "at twice the limit a SYN is still accepted"
+        );
+        dispatcher.on_recv(ADDR_2, syn(5)).await.unwrap();
+        assert_eq!(dispatcher.accept_queue.syns.len(), 5);
+        assert_eq!(socket.stats().snapshot().syn_flood_dropped, 2);
+
+        socket.set_connections_limit(usize::MAX);
+        assert_eq!(socket.connections_limit(), None);
+        dispatcher.on_recv(ADDR_2, syn(5)).await.unwrap();
+        assert_eq!(dispatcher.accept_queue.syns.len(), 6);
+        socket.set_connections_limit(0);
+        assert_eq!(socket.connections_limit(), Some(0));
+        dispatcher.on_recv(ADDR_2, syn(6)).await.unwrap();
+        assert_eq!(dispatcher.accept_queue.syns.len(), 6);
+        assert_eq!(socket.stats().snapshot().syn_flood_dropped, 3);
     }
 
     #[tokio::test]

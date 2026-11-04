@@ -200,9 +200,9 @@ impl Transport for DatagramTransport {
 /// The session's uTP socket, over a datagram socket from its
 /// [`SocketFactory`].
 #[derive(Clone, Debug)]
-pub(crate) struct UtpSocket(
-    pub(crate) Arc<weaver_utp::UtpSocket<DatagramTransport, DefaultUtpEnvironment>>,
-);
+pub(crate) struct UtpSocket(pub(crate) Arc<UtpSocketInner>);
+
+pub(crate) type UtpSocketInner = weaver_utp::UtpSocket<DatagramTransport, DefaultUtpEnvironment>;
 
 impl UtpSocket {
     pub(crate) fn bind_addr(&self) -> SocketAddr {

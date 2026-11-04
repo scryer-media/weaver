@@ -444,6 +444,7 @@ mod tests {
             (Ipv4Addr::LOCALHOST, 0).into(),
             Default::default(),
             crate::udp_options::STREAM_WINDOW,
+            None,
         )
         .await
         .unwrap()
@@ -459,6 +460,7 @@ mod tests {
                     (Ipv4Addr::LOCALHOST, 0).into(),
                     Default::default(),
                     crate::udp_options::STREAM_WINDOW,
+                    None,
                 )
                 .await
                 .unwrap(),
