@@ -17,7 +17,7 @@ use unrar_rs::{
 };
 use weaver_graph::{ByteRange, Emit, Why};
 
-use super::image::SparseImage;
+use super::image::{SparseImage, readable};
 use crate::kept::Kept;
 
 // What read_signature reads before it scans.
@@ -83,7 +83,7 @@ fn data_end(facts: &RarVolumeFacts) -> u64 {
 fn hole(kept: &Kept, from: u64, closed: bool) -> u64 {
     let mut at = from;
     for (range, _, provenance) in kept.runs() {
-        if (!closed && provenance.is_damaged()) || range.end <= at {
+        if !readable(provenance, closed) || range.end <= at {
             continue;
         }
         if range.start > at {
