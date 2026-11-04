@@ -199,6 +199,75 @@ fn arrivals_in_order_decipher_in_one_call_each_and_keep_only_seeds() {
     assert_eq!(out.bytes, plain);
 }
 
+// The cipher blocks staged and the decipher calls made since the last look.
+fn counted() -> (usize, usize) {
+    COUNTED.with(|counted| counted.replace((0, 0)))
+}
+
+// An article in order, on the block grid or off it, stages at most its two
+// edge blocks and deciphers in one call: its body goes to the cipher from
+// the bytes it came in.
+#[test]
+fn an_article_in_order_stages_only_its_edges_and_deciphers_once() {
+    let (plain, cipher) = two_strides();
+    for frame in [768_000, 768_013] {
+        let mut stream = cbc(&plain, &cipher);
+        let mut out = Out::default();
+        counted();
+        for range in frames(cipher.len(), frame) {
+            let bytes = &cipher[range.start as usize..range.end as usize];
+            out.deliver(&mut stream, range.start, bytes, Provenance::Fresh);
+            let (staged, deciphered) = counted();
+            assert!(staged <= 2, "{frame} {range}: {staged} staged");
+            assert_eq!(deciphered, 1, "{frame} {range}");
+        }
+        assert_eq!(out.bytes, plain);
+    }
+}
+
+// A repair read back over what came out, a slice at a time, is written as
+// it is given: each slice deciphers in one call and stages at most its edge
+// blocks. A block an article was cut inside keeps its cut through it, so a
+// span un-said from there still comes out again whole.
+#[test]
+fn a_repair_over_what_came_out_deciphers_once_and_keeps_its_cuts() {
+    let (plain, cipher) = two_strides();
+    let mut stream = cbc(&plain, &cipher);
+    let mut out = Out::default();
+    for range in frames(cipher.len(), 768_013) {
+        let bytes = &cipher[range.start as usize..range.end as usize];
+        out.deliver(&mut stream, range.start, bytes, Provenance::Fresh);
+    }
+    counted();
+    for range in frames(cipher.len(), 1 << 20) {
+        let bytes = &cipher[range.start as usize..range.end as usize];
+        out.deliver(&mut stream, range.start, bytes, Provenance::Repaired);
+        let (staged, deciphered) = counted();
+        assert!(staged <= 2, "{range}: {staged} staged");
+        assert_eq!(deciphered, 1, "{range}");
+    }
+    let (plain_len, cipher_len) = (plain.len() as u64, cipher.len() as u64);
+    assert_eq!(out.bytes, plain);
+    assert_eq!(
+        out.coverage.placed(ByteRange::new(0, plain_len)),
+        Some(Provenance::Repaired)
+    );
+    let seam = 768_013;
+    let from = block_floor(seam);
+    out.coverage.erase(ByteRange::new(from, plain_len));
+    out.padding
+        .forget(plain_len, ByteRange::new(from, cipher_len));
+    let said = out.deliver(
+        &mut stream,
+        seam,
+        &cipher[seam as usize..],
+        Provenance::Repaired,
+    );
+    assert_eq!(said.first().map(|plain| plain.offset), Some(from));
+    assert!(out.coverage.verified(ByteRange::new(0, plain_len)));
+    assert_eq!(out.bytes, plain);
+}
+
 // A span un-said from inside a block, as its owner un-says it: from the
 // start of that block. The bytes before the span do not come again, and the
 // block comes out again whole from what the chain kept when the span's

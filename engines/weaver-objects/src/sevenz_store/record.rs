@@ -48,6 +48,19 @@ impl Placed for FolderPlaced<'_> {
         }
         (cursor >= range.end).then_some(worst)
     }
+
+    fn first_placed(&self, range: ByteRange) -> Option<u64> {
+        self.map
+            .entries_in(self.folder, range)
+            .find_map(|(member, entry)| {
+                let part = range.intersect(entry.span())?;
+                let said = self.members.get(member.0 as usize)?;
+                let at = said
+                    .coverage
+                    .first_placed(part.shift(-(entry.offset as i64)))?;
+                Some(at + entry.offset)
+            })
+    }
 }
 
 impl SevenZipStore {

@@ -144,6 +144,48 @@ impl Block {
     fn holds(&self, within: ByteRange) -> bool {
         (within.start..within.end).all(|index| self.have & (1u16 << index) != 0)
     }
+
+    // The block's marks without its bytes: what blocks alike share.
+    fn marks(&self) -> Block {
+        Block {
+            cipher: [0; 16],
+            ..*self
+        }
+    }
+}
+
+// Whole blocks of one arrival that go to the cipher without being staged:
+// the marks they all carry, and which of them an earlier arrival cut.
+struct Overlay<'a> {
+    range: ByteRange,
+    cipher: &'a [u8],
+    marks: Block,
+    // The starts of the cut blocks, in order: each keeps its cut.
+    cut: &'a [u64],
+}
+
+// Notes the marks of `range` onto the stretches of blocks alike.
+fn note(marks: &mut Vec<(ByteRange, Block)>, range: ByteRange, block: Block) {
+    match marks.last_mut() {
+        Some((stretch, last)) if stretch.end == range.start && *last == block => {
+            *stretch = ByteRange::new(stretch.start, range.end);
+        }
+        _ => marks.push((range, block)),
+    }
+}
+
+// Work a test counts: cipher blocks staged and decipher calls.
+#[cfg(test)]
+thread_local! {
+    static COUNTED: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+fn count(staged: usize, deciphered: usize) {
+    COUNTED.with(|counted| {
+        let (s, d) = counted.get();
+        counted.set((s + staged, d + deciphered));
+    });
 }
 
 // What of a cipher stream's plaintext its owner has placed. The owner's
@@ -154,6 +196,9 @@ pub trait Placed {
     // The worst provenance `range` was placed in, or `None` while a byte of
     // it never was.
     fn placed(&self, range: ByteRange) -> Option<Provenance>;
+
+    // Where the first byte of `range` that was placed is, if any was.
+    fn first_placed(&self, range: ByteRange) -> Option<u64>;
 }
 
 impl Placed for Coverage {
@@ -163,6 +208,11 @@ impl Placed for Coverage {
                 .map(|run| run.provenance)
                 .fold(Provenance::Fresh, worse)
         })
+    }
+
+    fn first_placed(&self, range: ByteRange) -> Option<u64> {
+        let run = self.overlapping(range).next()?;
+        Some(run.range.start.max(range.start))
     }
 }
 
@@ -297,6 +347,8 @@ impl Staged {
 
     // Stages the block at `at`, over one staged there before.
     fn insert(&mut self, at: u64, block: Block) {
+        #[cfg(test)]
+        count(1, 0);
         if let Some((start, run)) = self.runs.range_mut(..=at).next_back() {
             let end = run_end(*start, run);
             if at < end {
@@ -326,19 +378,27 @@ impl Staged {
         end
     }
 
-    // Copies of the blocks of `range`, every one of which is staged.
-    fn blocks(&self, range: ByteRange) -> Option<Vec<Block>> {
-        let mut blocks = Vec::with_capacity((range.len() / BLOCK) as usize);
+    // The cipher of the blocks of `range` onto `cipher`, each block's marks
+    // to `each`; `None` when one is not staged.
+    fn copy(
+        &self,
+        range: ByteRange,
+        cipher: &mut Vec<u8>,
+        each: &mut dyn FnMut(u64, &Block),
+    ) -> Option<()> {
         let mut at = range.start;
         while at < range.end {
             let (start, run) = self.run_at(at)?;
             let from = ((at - start) / BLOCK) as usize;
             let take = (run.len() - from).min(((range.end - at) / BLOCK) as usize);
             (take > 0).then_some(())?;
-            blocks.extend(run.range(from..from + take));
-            at += take as u64 * BLOCK;
+            for block in run.range(from..from + take) {
+                cipher.extend_from_slice(&block.cipher);
+                each(at, block);
+                at += BLOCK;
+            }
         }
-        Some(blocks)
+        Some(())
     }
 
     // Unstages the blocks of `range`, keeping the rest of every run it cuts.
@@ -427,6 +487,16 @@ struct Seen<'a> {
 }
 
 impl Seen<'_> {
+    // Whether a block of `range` may have come out: one did only where every
+    // payload byte of it was placed, and a block past the payload is never
+    // judged here.
+    fn may_have_come_out(&self, range: ByteRange) -> bool {
+        let payload = ByteRange::new(range.start, range.end.min(self.plain_len).max(range.start));
+        payload.is_empty()
+            || self.placed.first_placed(payload).is_some()
+            || self.now.first_placed(payload).is_some()
+    }
+
     // How the plaintext of whole blocks `range` came out, or `None` while a
     // byte of it has not.
     fn came_out(&self, range: ByteRange) -> Option<Provenance> {
@@ -596,15 +666,157 @@ impl Chain {
         let first = block_floor(range.start);
         let around = ByteRange::new(first.saturating_sub(BLOCK), block_ceil(range.end) + BLOCK);
         let around = around.intersect(whole).unwrap_or(range);
-        self.file_ciphers(key, seen, around, plain);
-        // A block is staged, over what it held before, while it has not come
-        // out or once it changes, in its bytes or in how far they can be
-        // trusted: the cipher of one that came out was filed above.
+        // The arrival's whole blocks go to the cipher straight from the
+        // arrival, written as given, when none of them is staged and every
+        // cipher filed for them may go: a fresh copy over blocks none of
+        // which came out, or a repair over anything. Only its edges, and a
+        // first block whose predecessor is not in, are staged block by block,
+        // and only around them is a cipher that came out filed first.
+        let mid = ByteRange::new(
+            block_ceil(range.start),
+            block_floor(range.end).max(block_ceil(range.start)),
+        );
+        let mut cut = Vec::new();
+        let open = !mid.is_empty()
+            && provenance.is_verified()
+            && self.staged.first_in(mid.start, mid.end).is_none()
+            && (provenance == Provenance::Repaired || !seen.may_have_come_out(mid))
+            && (self.checkpoints.range(mid.start + BLOCK..=mid.end))
+                .all(|(_, filed)| provenance == Provenance::Repaired || !filed.repaired);
+        if open {
+            self.file_ciphers(key, seen, ByteRange::new(around.start, mid.start), plain);
+            self.file_ciphers(key, seen, ByteRange::new(mid.end, around.end), plain);
+            let filed: Vec<u64> = (self.checkpoints.range(mid.start + BLOCK..=mid.end))
+                .map(|(&at, _)| at)
+                .collect();
+            for at in filed {
+                if self.checkpoints.remove(&at).is_some_and(|block| block.cut) {
+                    cut.push(at - BLOCK);
+                }
+            }
+        } else {
+            self.file_ciphers(key, seen, around, plain);
+        }
+        let arrival = (offset, bytes, provenance);
         let mut changed = Vec::new();
-        let mut cursor = range.start;
-        while cursor < range.end {
+        let mut overlay = None;
+        if open {
+            self.stage(
+                seen,
+                ByteRange::new(range.start, mid.start),
+                arrival,
+                &mut changed,
+            );
+            let mut lead = mid;
+            if self.preceding_block(mid.start).is_none() {
+                // Its first block waits for the one before it, and seeds the
+                // rest.
+                let at = (mid.start - offset) as usize;
+                let mut block = Block::of(&bytes[at..at + BLOCK as usize], provenance);
+                if cut.first() == Some(&mid.start) {
+                    cut.remove(0);
+                    block.cut = true;
+                }
+                self.staged.insert(mid.start, block);
+                changed.push(mid.start);
+                lead = ByteRange::new(mid.start + BLOCK, mid.end);
+            }
+            if !lead.is_empty() {
+                overlay = Some(lead);
+            }
+            self.stage(
+                seen,
+                ByteRange::new(mid.end, range.end),
+                arrival,
+                &mut changed,
+            );
+        } else {
+            self.stage(seen, range, arrival, &mut changed);
+        }
+        // A changed block re-chains the one after it, staged or out. Both
+        // are in offset order, each once. The arrival's last whole block
+        // re-chains the one after it the same way.
+        let mut dirty = Vec::with_capacity(changed.len() + 2);
+        let last = overlay
+            .filter(|_| mid.end == range.end)
+            .map(|_| mid.end - BLOCK);
+        let changed = changed.into_iter().chain(last);
+        for start in changed {
+            if dirty.last() != Some(&start) && Some(start) != last {
+                dirty.push(start);
+            }
+            let next = start + BLOCK;
+            if self.staged.contains(next) {
+                dirty.push(next);
+            } else if let Some(follower) = self.checkpoints.remove(&(next + BLOCK)) {
+                self.staged.insert(next, follower);
+                dirty.push(next);
+            }
+        }
+        // The run the arrival's whole blocks decipher in starts at the block
+        // before them when that one deciphers now too.
+        let mut overlay = overlay.map(|lead| {
+            let head = lead.start.checked_sub(BLOCK);
+            let start = match head {
+                Some(head)
+                    if dirty.binary_search(&head).is_ok() && self.run_from(head).is_some() =>
+                {
+                    head
+                }
+                _ => lead.start,
+            };
+            (start, lead)
+        });
+        let mut touched = around;
+        let mut pending = dirty.into_iter().peekable();
+        loop {
+            let next = pending.peek().copied();
+            if let Some((start, lead)) = overlay
+                && next.is_none_or(|next| next >= start)
+            {
+                overlay = None;
+                let run = ByteRange::new(start, self.staged.whole_from(lead.end));
+                while pending.next_if(|next| *next < run.end).is_some() {}
+                touched = ByteRange::new(touched.start.min(run.start), touched.end.max(run.end));
+                let cipher = &bytes[(lead.start - offset) as usize..(lead.end - offset) as usize];
+                let marks = Block::of(&[0; 16], provenance);
+                let lead = Overlay {
+                    range: lead,
+                    cipher,
+                    marks,
+                    cut: &cut,
+                };
+                self.decrypt_range(key, seen, run, Some(lead), out);
+                continue;
+            }
+            let Some(start) = pending.next() else {
+                break;
+            };
+            if let Some(run) = self.run_from(start) {
+                // The run took every dirty block inside it.
+                while pending.next_if(|next| *next < run.end).is_some() {}
+                touched = ByteRange::new(touched.start.min(run.start), touched.end.max(run.end));
+                self.decrypt_range(key, seen, run, None, out);
+            }
+        }
+        self.prune_checkpoints(seen, touched);
+    }
+
+    // Stages the blocks of `part` of an arrival, each over what it held
+    // before, while it has not come out or once it changes, in its bytes or
+    // in how far they can be trusted: the cipher of one that came out was
+    // filed already. The blocks staged go onto `changed`, in offset order.
+    fn stage(
+        &mut self,
+        seen: &Seen<'_>,
+        part: ByteRange,
+        (offset, bytes, provenance): (u64, &[u8], Provenance),
+        changed: &mut Vec<u64>,
+    ) {
+        let mut cursor = part.start;
+        while cursor < part.end {
             let start = block_floor(cursor);
-            let end = (start + BLOCK).min(range.end);
+            let end = (start + BLOCK).min(part.end);
             let piece = &bytes[(cursor - offset) as usize..(end - offset) as usize];
             let at = (cursor - start) as usize;
             cursor = end;
@@ -629,32 +841,6 @@ impl Chain {
                 kept.cut = block.cut;
             }
         }
-        // A changed block re-chains the one after it, staged or out. Both
-        // are in offset order, each once.
-        let mut dirty = Vec::with_capacity(changed.len() + 1);
-        for start in changed {
-            if dirty.last() != Some(&start) {
-                dirty.push(start);
-            }
-            let next = start + BLOCK;
-            if self.staged.contains(next) {
-                dirty.push(next);
-            } else if let Some(follower) = self.checkpoints.remove(&(next + BLOCK)) {
-                self.staged.insert(next, follower);
-                dirty.push(next);
-            }
-        }
-        let mut touched = around;
-        let mut pending = dirty.into_iter().peekable();
-        while let Some(start) = pending.next() {
-            if let Some(run) = self.run_from(start) {
-                // The run took every dirty block inside it.
-                while pending.next_if(|next| *next < run.end).is_some() {}
-                touched = ByteRange::new(touched.start.min(run.start), touched.end.max(run.end));
-                self.decrypt_range(key, seen, run, out);
-            }
-        }
-        self.prune_checkpoints(seen, touched);
     }
 
     // Before a byte of `around` changes, the cipher of each of its blocks
@@ -675,10 +861,21 @@ impl Chain {
                 && !chain.checkpoints.contains_key(&(start + BLOCK))
                 && seen.came_out(block_at(start)).is_some()
         };
+        // Below the payload's end, a block came out only where a byte of it
+        // was placed, so the blocks before the next placed byte are skipped.
+        let skip = |start: u64| {
+            let payload = ByteRange::new(start, around.end.min(seen.plain_len).max(start));
+            let placed = [
+                seen.placed.first_placed(payload),
+                seen.now.first_placed(payload),
+            ];
+            let next = placed.into_iter().flatten().min().unwrap_or(payload.end);
+            start.max(block_floor(next))
+        };
         let mut start = around.start;
         while start < around.end {
             if !missing(self, start) {
-                start += BLOCK;
+                start = skip(start + BLOCK);
                 continue;
             }
             let mut end = start + BLOCK;
@@ -726,65 +923,143 @@ impl Chain {
         self.checkpoints.get(&block_start).or_else(staged).copied()
     }
 
-    // Deciphers one run of staged blocks, filing its checkpoints before the
-    // cipher is gone.
+    // Deciphers one run, its staged blocks and the arrival's whole blocks
+    // `overlay` names, in one call over one buffer, filing its checkpoints
+    // before the cipher is gone.
     fn decrypt_range(
         &mut self,
         key: &MemberCipherKey,
         seen: &mut Seen<'_>,
         run: ByteRange,
+        overlay: Option<Overlay<'_>>,
         out: &mut Vec<Plain>,
     ) -> Option<()> {
         let preceding = self.preceding_block(run.start)?;
-        let blocks = self.staged.blocks(run)?;
-        let mut cipher = Vec::with_capacity(run.len() as usize);
-        for block in &blocks {
-            cipher.extend_from_slice(&block.cipher);
-        }
-        key.decrypt_range(&preceding.cipher, &mut cipher).ok()?;
-        self.staged.remove(run);
         let (start, len) = (run.start, run.len());
+        let mut cipher = Vec::with_capacity(len as usize);
+        // The marks of the run's blocks, in stretches of blocks alike.
+        let mut marks = Vec::new();
+        let (before, after) = match &overlay {
+            Some(lead) => (
+                ByteRange::new(start, lead.range.start),
+                ByteRange::new(lead.range.end, run.end),
+            ),
+            None => (run, ByteRange::at(run.end, 0)),
+        };
+        let mut each = |at: u64, block: &Block| note(&mut marks, block_at(at), block.marks());
+        self.staged.copy(before, &mut cipher, &mut each)?;
+        if let Some(lead) = &overlay {
+            cipher.extend_from_slice(lead.cipher);
+            let cut = Block {
+                cut: true,
+                ..lead.marks
+            };
+            let mut at = lead.range.start;
+            for &block in lead.cut.iter().chain([&lead.range.end]) {
+                if block > at {
+                    note(&mut marks, ByteRange::new(at, block), lead.marks);
+                }
+                if block < lead.range.end {
+                    note(&mut marks, block_at(block), cut);
+                    at = block + BLOCK;
+                }
+            }
+        }
+        let mut each = |at: u64, block: &Block| note(&mut marks, block_at(at), block.marks());
+        self.staged.copy(after, &mut cipher, &mut each)?;
         // The run's frontier block, its own predecessor, and one block per
         // stride boundary the range crosses, each under the offset it ends at,
         // so a lookup keyed by a block start finds the predecessor it needs.
-        self.checkpoints
-            .insert(start + len, blocks[blocks.len() - 1]);
+        let mut kept = vec![start + len];
         if start > 0 {
-            self.checkpoints.insert(start, preceding);
+            kept.push(start);
         }
         let mut at = start.div_ceil(STRIDE).saturating_mul(STRIDE).max(STRIDE);
         while at < start + len {
             if at >= start + BLOCK {
-                self.checkpoints
-                    .insert(at, blocks[((at - start) / BLOCK - 1) as usize]);
+                kept.push(at);
             }
             at = at.saturating_add(STRIDE);
         }
         // Either side of a block that comes out damaged, so a repair can
-        // re-decipher it and the block it seeds; a cut block itself.
-        let mut seed = preceding;
-        let mut provenances = Vec::with_capacity(blocks.len());
-        for (index, block) in blocks.iter().enumerate() {
-            let provenance = worse(block.provenance(), seed.provenance());
-            let at = start + index as u64 * BLOCK;
-            if provenance.is_damaged() || block.cut {
-                self.checkpoints.insert(at + BLOCK, *block);
+        // re-decipher it and the block it seeds; a cut block itself. A
+        // block's provenance is the worse of its own and its seed's, so in a
+        // stretch of blocks alike only the first can differ from the rest.
+        let mut pieces: Vec<(ByteRange, Provenance)> = Vec::new();
+        let mut seed = preceding.provenance();
+        for (stretch, block) in &marks {
+            let own = block.provenance();
+            let head = ByteRange::at(stretch.start, BLOCK);
+            let rest = ByteRange::new(head.end, stretch.end);
+            for (part, provenance) in [(head, worse(own, seed)), (rest, own)] {
+                if part.is_empty() {
+                    continue;
+                }
+                if provenance.is_damaged() || block.cut {
+                    for at in (part.start..part.end).step_by(BLOCK as usize) {
+                        kept.push(at + BLOCK);
+                        if provenance.is_damaged() && at > 0 {
+                            kept.push(at);
+                        }
+                    }
+                }
+                match pieces.last_mut() {
+                    Some((piece, last)) if *last == provenance => {
+                        *piece = ByteRange::new(piece.start, part.end);
+                    }
+                    _ => pieces.push((part, provenance)),
+                }
             }
-            if provenance.is_damaged() && at > 0 {
-                self.checkpoints.insert(at, seed);
-            }
-            provenances.push(provenance);
-            seed = *block;
+            seed = own;
         }
+        // Each kept block is the one ending at its offset.
+        let block_ending = |end: u64| -> Block {
+            if end == start {
+                return preceding;
+            }
+            let at = end - BLOCK;
+            let index = marks.partition_point(|(stretch, _)| stretch.end <= at);
+            let mut block = marks[index].1;
+            let from = (at - start) as usize;
+            block
+                .cipher
+                .copy_from_slice(&cipher[from..from + BLOCK as usize]);
+            block
+        };
+        let filed: Vec<(u64, Block)> = kept
+            .into_iter()
+            .map(|end| (end, block_ending(end)))
+            .collect();
+        key.decrypt_range(&preceding.cipher, &mut cipher).ok()?;
+        #[cfg(test)]
+        count(0, 1);
+        self.staged.remove(run);
+        self.checkpoints.extend(filed);
         // The payload goes out for the owner to place, the plaintext past it
-        // to the owner's padding, grouped by how it came out.
+        // to the owner's padding, grouped by how it came out. A run that
+        // came out alike goes out in the buffer it was deciphered in.
         let (plain_len, padding) = (self.plain_len, self.cipher_len - self.plain_len);
-        let mut piece = ByteRange::at(start, 0);
-        for group in provenances.chunk_by(|left, right| left == right) {
-            let provenance = group[0];
-            piece = ByteRange::at(piece.end, group.len() as u64 * BLOCK);
+        let payload_of = |piece: ByteRange| {
+            ByteRange::new(piece.start, piece.end.min(plain_len).max(piece.start))
+        };
+        if let [(piece, provenance)] = pieces[..] {
+            seen.padding
+                .retain(padding, plain_len, piece.start, &cipher, provenance);
+            let payload = payload_of(piece);
+            if !payload.is_empty() {
+                seen.now.write(payload, provenance);
+                cipher.truncate(payload.len() as usize);
+                out.push(Plain {
+                    offset: payload.start,
+                    bytes: cipher,
+                    provenance,
+                });
+            }
+            return Some(());
+        }
+        for (piece, provenance) in pieces {
             let bytes = &cipher[(piece.start - start) as usize..(piece.end - start) as usize];
-            let payload = ByteRange::new(piece.start, piece.end.min(plain_len).max(piece.start));
+            let payload = payload_of(piece);
             if !payload.is_empty() {
                 seen.now.write(payload, provenance);
                 let offset = piece.start;
