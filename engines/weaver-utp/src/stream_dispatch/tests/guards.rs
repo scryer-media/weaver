@@ -11,8 +11,12 @@ use tokio::io::AsyncWriteExt;
 use crate::{
     Error, SocketOpts,
     raw::{Type::*, UtpHeader},
-    stream_dispatch::tests::make_test_vsock,
-    test_util::setup_test_logging,
+    stream_dispatch::{
+        StreamArgs,
+        tests::{make_test_vsock, make_test_vsock_args},
+    },
+    test_util::{env::MockUtpEnvironment, setup_test_logging},
+    traits::UtpEnvironment,
 };
 
 fn patient() -> SocketOpts {
@@ -137,4 +141,78 @@ async fn data_never_carries_a_sack_and_a_resend_none_left_over() {
         data.iter()
             .all(|m| m.header.extensions.selective_ack.is_none())
     );
+}
+
+async fn with_a_packet_acknowledged(seq_nr: u16) -> super::TestVsock {
+    let env = MockUtpEnvironment::new();
+    let header = UtpHeader {
+        htype: ST_STATE,
+        seq_nr: 1.into(),
+        ack_nr: crate::seq_nr::SeqNr::from(seq_nr) - 1,
+        wnd_size: 1024 * 1024,
+        ..Default::default()
+    };
+    let args = StreamArgs::new_outgoing(&header, env.now(), env.now());
+    let mut t = make_test_vsock_args(patient(), args, env);
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(b"hello")
+        .await
+        .unwrap();
+    t.poll_once_assert_pending().await;
+    let sent = t.take_sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].header.seq_nr, seq_nr.into());
+    t.send_msg(
+        UtpHeader {
+            ack_nr: seq_nr.into(),
+            ..header
+        },
+        "",
+    );
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 0);
+    assert_eq!(t.vsock.user_tx_segments.acked_seq_nr(), seq_nr.into());
+    t.assert_sent_empty();
+    t
+}
+
+#[tokio::test]
+async fn an_ack_four_below_the_acknowledged_sequence_is_ignored() {
+    for seq_nr in [101, 1, 0] {
+        let mut t = with_a_packet_acknowledged(seq_nr).await;
+        let previous_window = t.vsock.last_remote_window;
+        t.send_msg(
+            UtpHeader {
+                htype: ST_STATE,
+                seq_nr: 1.into(),
+                ack_nr: t.vsock.user_tx_segments.acked_seq_nr() - 4,
+                wnd_size: 17,
+                ..Default::default()
+            },
+            "",
+        );
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.vsock.last_remote_window, previous_window);
+    }
+}
+
+#[tokio::test]
+async fn an_ack_three_below_the_acknowledged_sequence_is_kept() {
+    for seq_nr in [101, 1, 0] {
+        let mut t = with_a_packet_acknowledged(seq_nr).await;
+        t.send_msg(
+            UtpHeader {
+                htype: ST_STATE,
+                seq_nr: 1.into(),
+                ack_nr: t.vsock.user_tx_segments.acked_seq_nr() - 3,
+                wnd_size: 17,
+                ..Default::default()
+            },
+            "",
+        );
+        t.poll_once_assert_pending().await;
+        assert_eq!(t.vsock.last_remote_window, 17);
+    }
 }

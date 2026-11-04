@@ -1106,6 +1106,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             trace!(%self.highest_sent_seq_nr, "dropping packet, it acks what we never sent");
             return Ok(Default::default());
         }
+        if hdr.htype != ST_SYN && hdr.ack_nr < self.user_tx_segments.acked_seq_nr() - 3 {
+            trace!(acked_seq_nr = %self.user_tx_segments.acked_seq_nr(), "dropping packet, its ack is too old");
+            return Ok(Default::default());
+        }
 
         match (self.state, hdr.get_type()) {
             // From real world packets: if ST_RESET acks our FIN, it's ok

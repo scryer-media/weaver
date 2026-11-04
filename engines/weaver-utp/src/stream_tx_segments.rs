@@ -269,6 +269,10 @@ impl Segments {
         }
     }
 
+    pub fn acked_seq_nr(&self) -> SeqNr {
+        self.snd_una - 1
+    }
+
     pub fn first_seq_nr(&self) -> Option<SeqNr> {
         if self.segments.is_empty() {
             None
