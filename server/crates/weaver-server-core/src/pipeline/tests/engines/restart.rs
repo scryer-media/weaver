@@ -1816,6 +1816,8 @@ impl Reopened {
         assert!(pipeline.jobs[&JOB].articles.active().is_none());
         pipeline.dispatch_downloads();
         assert_eq!(pipeline.active_downloads, 0);
+        // The pause goes on the job's writer lane.
+        pipeline.db.flush_write_queue().await.unwrap();
         let row = pipeline
             .db
             .load_active_jobs()
@@ -2487,6 +2489,7 @@ async fn a_job_blocked_on_its_checkpoint_resumes_into_the_status_its_lanes_name(
             Some(resume),
             "{status:?}"
         );
+        pipeline.db.flush_write_queue().await.unwrap();
         let row = pipeline
             .db
             .load_active_jobs()

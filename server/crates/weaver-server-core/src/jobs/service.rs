@@ -18,11 +18,12 @@ use crate::pipeline::Pipeline;
 use crate::{DownloadQueue, DownloadWork, RestoreJobRequest};
 
 impl Pipeline {
-    async fn restore_has_open_download_finalization(&self, job_id: JobId) -> bool {
-        let events = match self
-            .db_blocking(move |db| db.get_job_events(job_id.0))
-            .await
-        {
+    // Whether the job's events leave its download finalization open.
+    pub(crate) fn download_finalization_open(
+        job_id: JobId,
+        events: Result<Vec<crate::history::timeline::JobEvent>, crate::StateError>,
+    ) -> bool {
+        let events = match events {
             Ok(events) => events,
             Err(error) => {
                 error!(
@@ -55,8 +56,8 @@ impl Pipeline {
         finalization_open
     }
 
-    async fn restore_download_finalization_runtime(&mut self, job_id: JobId) -> bool {
-        if !self.restore_has_open_download_finalization(job_id).await {
+    fn restore_download_finalization_runtime(&mut self, job_id: JobId, open: bool) -> bool {
+        if !open {
             self.jobs_finalizing_download.remove(&job_id);
             return false;
         }
@@ -118,7 +119,7 @@ impl Pipeline {
         }
     }
 
-    fn normalize_paused_resume_status(
+    pub(crate) fn normalize_paused_resume_status(
         paused_resume_status: Option<JobStatus>,
     ) -> Option<JobStatus> {
         paused_resume_status.map(|status| match status {
@@ -127,7 +128,9 @@ impl Pipeline {
         })
     }
 
-    async fn persist_file_identities(
+    // Written on the job's lane: nothing the install does next reads them
+    // back.
+    fn persist_file_identities(
         &self,
         job_id: JobId,
         identities: &HashMap<u32, ActiveFileIdentity>,
@@ -137,13 +140,15 @@ impl Pipeline {
         }
         let identities = identities.values().cloned().collect::<Vec<_>>();
         if let Err(error) = self
-            .db_blocking(move |db| db.save_file_identities(job_id, &identities))
-            .await
+            .db
+            .try_queue_job_write(job_id, "save_file_identities", move |db| {
+                db.save_file_identities(job_id, &identities)
+            })
         {
             warn!(
                 job_id = job_id.0,
                 error = %error,
-                "failed to persist file identities"
+                "failed to queue the file identities write"
             );
         }
     }
@@ -765,7 +770,7 @@ impl Pipeline {
             .clone()
             .restart(job_id, password, reprocess, self.event_tx.clone())
             .await?;
-        self.apply_queue_intents().await;
+        self.run_queue_intents().await;
         Ok(())
     }
 
@@ -779,85 +784,76 @@ impl Pipeline {
         }
     }
 
+    // The context an install's reads run in, gathered on the pipeline
+    // thread so the reads themselves run off it.
+    pub(crate) fn install_seat(&self, job_id: JobId) -> InstallSeat {
+        InstallSeat {
+            db: self.db.clone(),
+            intermediate_dir: self.intermediate_dir.clone(),
+            staging_dir: self.deterministic_extraction_staging_dir(job_id),
+            graph: self.graph_restore_seat(None, std::path::Path::new("")),
+        }
+    }
+
+    // Install a job: read what it installs from, then put it in place.
     pub(crate) async fn install_restored_job(
         &mut self,
-        mut request: RestoreJobRequest,
+        request: RestoreJobRequest,
     ) -> Result<(), crate::SchedulerError> {
         if self.jobs.contains_key(&request.job_id) {
             return Err(crate::SchedulerError::JobExists(request.job_id));
         }
-        // What a restart read of the job's row. An install that changes none
-        // of its runtime columns writes nothing back. A job installed again
-        // later reads its row afresh.
-        let restart = request.restart.take();
-        // The status the job goes back to when unpaused: the stored one, else
-        // the one its stored resume lanes name, else the one its lanes at
-        // shutdown name. Read here once, so the job installs with it whether
-        // its restore succeeds or blocks.
-        request.paused_resume_status = Self::normalize_paused_resume_status(
-            request.paused_resume_status.take().or_else(|| {
-                request
-                    .paused_resume_download_state
-                    .zip(request.paused_resume_post_state)
-                    .or(request.download_state.zip(request.post_state))
-                    .map(|(download_state, post_state)| {
-                        crate::jobs::model::derive_legacy_job_status(
-                            download_state,
-                            post_state,
-                            crate::jobs::model::RunState::Active,
-                            None,
-                        )
-                    })
-            }),
-        );
-        // A restart reads only each job's row before it serves; the job's file
-        // rows are read here, as it installs, a batch of jobs a turn.
-        if restart.is_some() {
-            let id = request.job_id;
-            match self.db_blocking(move |db| db.load_active_job(id)).await {
-                Ok(Some(recovered)) => {
-                    request.file_identities = recovered.file_identities;
-                    request.detected_archives = recovered.detected_archives;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    self.install_blocked_restore(
-                        request,
-                        format!("its file state could not be read: {error}"),
-                    )
-                    .await;
-                    return Ok(());
-                }
-            }
+        let seat = self.install_seat(request.job_id);
+        let read = read_install(seat, request).await;
+        self.install_read(read)
+    }
+
+    // Put a job in place from what its install read. A job that cannot be
+    // restored is installed blocked: retained, paused, with the reason.
+    pub(crate) fn install_read(&mut self, read: InstallRead) -> Result<(), crate::SchedulerError> {
+        let InstallRead {
+            request,
+            restart,
+            server_attribution,
+            support_facts,
+            restored,
+        } = read;
+        if self.jobs.contains_key(&request.job_id) {
+            return Err(crate::SchedulerError::JobExists(request.job_id));
         }
-        let root = self.intermediate_dir.clone();
-        let path = request.working_dir.clone();
-        let id = request.job_id;
-        let db = self.db.clone();
-        match tokio::task::spawn_blocking(move || {
-            crate::jobs::working_dir::recover_working_dir_rename(&db, &root, &path, id)
-        })
-        .await
-        {
-            Ok(Ok(path)) => request.working_dir = path,
-            result => {
-                let error = match result {
-                    Ok(Err(error)) => error.to_string(),
-                    Err(error) => error.to_string(),
-                    Ok(Ok(_)) => unreachable!(),
-                };
-                self.install_blocked_restore(request, error).await;
+        let restored = match restored {
+            Ok(restored) => restored,
+            Err(error) => {
+                self.install_blocked_restore(request, error, server_attribution, support_facts);
                 return Ok(());
             }
-        }
+        };
+        let (server_attribution, support_facts) = match (server_attribution, support_facts) {
+            (Ok(attribution), Ok(facts)) => (attribution, facts),
+            (Err(error), facts) => {
+                let error = crate::SchedulerError::from(error).to_string();
+                self.install_blocked_restore(request, error, Ok(Default::default()), facts);
+                return Ok(());
+            }
+            (attribution, Err(error)) => {
+                let error = crate::SchedulerError::from(error).to_string();
+                self.install_blocked_restore(request, error, attribution, Ok(Default::default()));
+                return Ok(());
+            }
+        };
         let original = request.clone();
         let created = restart
             .as_ref()
             .map(|read| (read.created_at_epoch_ms, read.reentry));
-        let (stored, summaries) = restart.map_or((None, None), |read| {
-            (Some(read.runtime), Some(read.summaries))
-        });
-        match self.restore_job_inner(request, summaries, created).await {
+        let stored = restart.map(|read| read.runtime);
+        let blocked_with = (server_attribution.clone(), support_facts.clone());
+        match self.restore_job_inner(
+            request,
+            restored,
+            created,
+            server_attribution,
+            support_facts,
+        ) {
             Ok(()) => {
                 self.blocked_restores.remove(&original.job_id);
                 let holds = |values: &crate::pipeline::ActiveRuntimeValues| {
@@ -871,30 +867,38 @@ impl Pipeline {
                 }
             }
             Err(error) => {
-                self.install_blocked_restore(original, error.to_string())
-                    .await;
+                let (attribution, facts) = blocked_with;
+                self.install_blocked_restore(
+                    original,
+                    error.to_string(),
+                    Ok(attribution),
+                    Ok(facts),
+                );
             }
         }
         // A blocked restore is a retained queue entry and must be published.
         Ok(())
     }
 
-    async fn install_blocked_restore(&mut self, request: RestoreJobRequest, error: String) {
+    fn install_blocked_restore(
+        &mut self,
+        request: RestoreJobRequest,
+        error: String,
+        server_attribution: Result<
+            crate::jobs::server_attribution::JobServerAttribution,
+            crate::StateError,
+        >,
+        support_facts: Result<crate::jobs::support_facts::JobSupportFacts, crate::StateError>,
+    ) {
         let job_id = request.job_id;
-        let server_attribution = self
-            .db_blocking(move |db| db.load_active_server_attribution(job_id))
-            .await
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, job_id = job_id.0, "could not load blocked job attribution");
-                Default::default()
-            });
-        let support_facts = self
-            .db_blocking(move |db| db.load_job_support_facts(job_id))
-            .await
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, job_id = job_id.0, "could not load blocked job support facts");
-                Default::default()
-            });
+        let server_attribution = server_attribution.unwrap_or_else(|error| {
+            tracing::warn!(%error, job_id = job_id.0, "could not load blocked job attribution");
+            Default::default()
+        });
+        let support_facts = support_facts.unwrap_or_else(|error| {
+            tracing::warn!(%error, job_id = job_id.0, "could not load blocked job support facts");
+            Default::default()
+        });
         let identities = if request.file_identities.is_empty() {
             Self::build_initial_file_identities(&request.spec, &request.detected_archives)
         } else {
@@ -951,27 +955,28 @@ impl Pipeline {
         self.blocked_restores.insert(job_id, request);
         self.remove_pending_completion_check(job_id);
         self.update_queue_metrics();
-        // Await this write: the next startup must retain the pause even if
-        // filesystem recovery succeeds by then.
-        if let Err(persist_error) = self
-            .db_blocking(move |db| {
-                db.set_active_job_runtime(
-                    job_id,
-                    "paused",
-                    Some("queued"),
-                    Some("idle"),
-                    Some("paused"),
-                    Some(&message),
-                    queued_repair,
-                    queued_extract,
-                    resume_status,
-                    resume_download,
-                    resume_post,
-                )
-            })
-            .await
+        // The next startup must retain the pause even if filesystem recovery
+        // succeeds by then: the write goes on the job's lane, ahead of any
+        // the job makes later.
+        if let Err(persist_error) =
+            self.db
+                .try_queue_job_write(job_id, "set_active_job_runtime", move |db| {
+                    db.set_active_job_runtime(
+                        job_id,
+                        "paused",
+                        Some("queued"),
+                        Some("idle"),
+                        Some("paused"),
+                        Some(&message),
+                        queued_repair,
+                        queued_extract,
+                        resume_status,
+                        resume_download,
+                        resume_post,
+                    )
+                })
         {
-            tracing::error!(job_id = job_id.0, %persist_error, "failed to persist blocked restore pause");
+            tracing::error!(job_id = job_id.0, %persist_error, "failed to queue the blocked restore pause");
         }
         tracing::warn!(job_id = job_id.0, %error, "placement recovery blocked; job retained paused");
     }
@@ -1013,20 +1018,21 @@ impl Pipeline {
         self.resume_job_runtime(job_id)
     }
 
-    // `summaries` are those of the article lists a restart let go, which a
-    // job waiting its turn installs with in place of the lists.
-    async fn restore_job_inner(
+    // Put a restored job in place from what its install read.
+    fn restore_job_inner(
         &mut self,
         request: RestoreJobRequest,
-        summaries: Option<FileSummaries>,
+        restored: RestoredFacts,
         // When the job was added, as its row stores it, and whether it is
         // entering the queue window again rather than arriving.
         created: Option<(f64, bool)>,
+        server_attribution: crate::jobs::server_attribution::JobServerAttribution,
+        support_facts: crate::jobs::support_facts::JobSupportFacts,
     ) -> Result<(), crate::SchedulerError> {
         let RestoreJobRequest {
             job_id,
             job_hash,
-            spec,
+            spec: _,
             detected_archives,
             file_identities,
             status,
@@ -1041,84 +1047,18 @@ impl Pipeline {
             working_dir,
             restart: _,
         } = request;
+        let RestoredFacts {
+            mut spec,
+            waiting_summaries,
+            graph,
+            staging_exists,
+            nzb_password_candidates,
+            finalization_open,
+        } = restored;
         if self.jobs.contains_key(&job_id) {
             return Err(crate::SchedulerError::JobExists(job_id));
         }
-        // A job that never started waits its turn: queued, or paused to go
-        // back to queued, with no checkpoint.
-        let fresh = match &status {
-            JobStatus::Queued => true,
-            JobStatus::Paused => paused_resume_status
-                .as_ref()
-                .is_none_or(|resume| matches!(resume, JobStatus::Queued)),
-            _ => false,
-        };
-        let mut spec = spec;
-        // The summaries a job waiting its turn installs with when the
-        // restart let its lists go, and the password candidates read with
-        // the lists when they are read back.
-        let mut waiting_summaries = None;
-        let mut read_passwords = None;
-        if spec.lacks_article_lists() {
-            // Read back from the stored NZB the restart kept only the files
-            // of, off the pipeline thread, with one parse that also gives
-            // the job's password candidates. A job that waits its turn reads
-            // nothing: its lists are read when it is handed a slot.
-            enum Stored {
-                Waits(FileSummaries),
-                Read(JobSpec, Option<Vec<crate::jobs::ArchivePasswordCandidate>>),
-            }
-            let category = spec.category.clone();
-            let metadata = spec.metadata.clone();
-            let summaries =
-                summaries.filter(|summaries| fresh && summaries.0.len() == spec.files.len());
-            let stored = self
-                .db_blocking(move |db| {
-                    if let Some(summaries) = summaries
-                        && !db
-                            .has_graph_checkpoint(job_id)
-                            .map_err(|error| format!("checkpoint could not be read: {error}"))?
-                    {
-                        return Ok(Stored::Waits(summaries));
-                    }
-                    crate::pipeline::read_stored_spec_and_passwords(db, job_id, category, metadata)
-                        .map(|(spec, passwords)| Stored::Read(spec, passwords))
-                })
-                .await
-                .map_err(crate::SchedulerError::Internal)?;
-            match stored {
-                Stored::Waits(summaries) => waiting_summaries = Some(summaries),
-                Stored::Read(stored, passwords) => {
-                    if stored.files.len() != spec.files.len()
-                        || stored
-                            .files
-                            .iter()
-                            .zip(&spec.files)
-                            .any(|(stored, kept)| stored.filename != kept.filename)
-                    {
-                        return Err(crate::SchedulerError::Internal(
-                            "stored NZB no longer matches the job's files".to_string(),
-                        ));
-                    }
-                    for (file, stored) in spec.files.iter_mut().zip(stored.files) {
-                        file.segments = stored.segments;
-                    }
-                    read_passwords = Some(passwords);
-                }
-            }
-        }
-        if working_dir.starts_with(&self.intermediate_dir)
-            && tokio::fs::try_exists(&working_dir).await.unwrap_or(false)
-            && let Err(error) =
-                stamp_working_dir(&self.intermediate_dir, &working_dir, job_id).await
-        {
-            tracing::warn!(
-                job_id = job_id.0,
-                dir = %working_dir.display(),
-                error = %error,
-                "failed to stamp restored working directory as Weaver-owned"
-            );
-        }
+        let fresh = crate::pipeline::waits_its_turn(&status, paused_resume_status.as_ref());
 
         // The identities the row holds; only ones that differ are written.
         let stored_identities = file_identities.clone();
@@ -1131,20 +1071,13 @@ impl Pipeline {
         // articles are on disk, so the queue skips exactly those. A job with
         // no checkpoint has nothing that says what its files hold: it is
         // admitted afresh from its spec and fetches from the start.
-        let (graph_restore, skip, held_parts) = if waiting_summaries.is_some() {
-            (None, HashSet::new(), Vec::new())
-        } else {
-            match self.restore_graph_job(job_id, &spec, &working_dir).await {
-                Ok(restored) => {
-                    self.post_probes
-                        .restore_verdict(job_id, restored.feed_verdict);
-                    (Some(restored.job), restored.skip, restored.held)
-                }
-                Err(crate::pipeline::graph::restore::GraphRestoreError::NoCheckpoint(_)) => {
-                    (None, HashSet::new(), Vec::new())
-                }
-                Err(error) => return Err(crate::SchedulerError::Internal(error.to_string())),
+        let (graph_restore, skip, held_parts) = match graph {
+            Some(restored) => {
+                self.post_probes
+                    .restore_verdict(job_id, restored.feed_verdict);
+                (Some(restored.job), restored.skip, restored.held)
             }
+            None => (None, HashSet::new(), Vec::new()),
         };
         // The parts that arrived and wait to be placed are in hand too, but
         // not yet on the job's files.
@@ -1205,45 +1138,8 @@ impl Pipeline {
         let paused_resume_status = matches!(status, JobStatus::Paused)
             .then_some(paused_resume_status)
             .flatten();
-        let restored_staging_dir = {
-            let staging_dir = self.deterministic_extraction_staging_dir(job_id);
-            tokio::fs::try_exists(&staging_dir)
-                .await
-                .unwrap_or(false)
-                .then_some(staging_dir)
-        };
-
-        let server_attribution = self
-            .db_blocking(move |db| db.load_active_server_attribution(job_id))
-            .await?;
-        let support_facts = self
-            .db_blocking(move |db| db.load_job_support_facts(job_id))
-            .await?;
-        // One read of the row, decrypt of the supplied passwords and parse of
-        // the persisted NZB per restored job, off the pipeline thread, instead
-        // of one per archive file. Anything short of a parsed NZB leaves the
-        // harvest to read the row itself, as before.
-        let nzb_password_candidates = if let Some(passwords) = read_passwords {
-            passwords
-        } else if waiting_summaries.is_some() {
-            // Its NZB is parsed once it is handed a slot; the harvest reads
-            // the row itself.
-            None
-        } else {
-            self.db_blocking(
-                move |db| match db.load_active_job_password_sources(job_id) {
-                    Ok(Some(((nzb_path, Some(nzb_zstd)), supplied))) => {
-                        crate::pipeline::persisted_nzb_password_candidates(&nzb_path, &nzb_zstd)
-                            .ok()
-                            .map(|nzb| {
-                                crate::pipeline::job_carried_password_candidates(&supplied, nzb)
-                            })
-                    }
-                    _ => None,
-                },
-            )
-            .await
-        };
+        let restored_staging_dir =
+            staging_exists.then(|| self.deterministic_extraction_staging_dir(job_id));
 
         if !created.is_some_and(|(_, reentry)| reentry) {
             self.emit_job_event(PipelineEvent::JobCreated {
@@ -1403,7 +1299,7 @@ impl Pipeline {
         {
             self.park_job_articles(job_id);
         }
-        self.restore_download_finalization_runtime(job_id).await;
+        self.restore_download_finalization_runtime(job_id, finalization_open);
         self.note_download_activity(job_id);
         self.job_order.push(job_id);
         if let Some(file_identities) = self
@@ -1413,9 +1309,9 @@ impl Pipeline {
             .filter(|identities| **identities != stored_identities)
             .cloned()
         {
-            self.persist_file_identities(job_id, &file_identities).await;
+            self.persist_file_identities(job_id, &file_identities);
         }
-        self.reconcile_job_progress(job_id).await;
+        self.schedule_job_completion_check(job_id);
         let restored_terminal_post_processing =
             self.recover_restored_terminal_post_processing(job_id);
 
@@ -1479,6 +1375,270 @@ impl Pipeline {
         }
         Ok(())
     }
+}
+
+// What an install's reads take from the pipeline.
+pub(crate) struct InstallSeat {
+    db: crate::Database,
+    intermediate_dir: PathBuf,
+    staging_dir: PathBuf,
+    graph: crate::pipeline::graph::restore::RestoreSeat,
+}
+
+// What an install read for one job, off the pipeline thread.
+pub(crate) struct InstallRead {
+    // The request as read: its file state and its working directory.
+    request: RestoreJobRequest,
+    // What a restart read of the job's row, taken off the request.
+    restart: Option<crate::RestartRead>,
+    server_attribution:
+        Result<crate::jobs::server_attribution::JobServerAttribution, crate::StateError>,
+    support_facts: Result<crate::jobs::support_facts::JobSupportFacts, crate::StateError>,
+    // What the job is put in place from, or why it cannot be restored.
+    restored: Result<RestoredFacts, String>,
+}
+
+impl InstallRead {
+    pub(crate) fn job_id(&self) -> JobId {
+        self.request.job_id
+    }
+}
+
+pub(crate) struct RestoredFacts {
+    // The spec with the article lists read back, where they were.
+    spec: JobSpec,
+    // The summaries a job waiting its turn installs with, its lists unread.
+    waiting_summaries: Option<FileSummaries>,
+    graph: Option<crate::pipeline::graph::restore::GraphRestore>,
+    staging_exists: bool,
+    nzb_password_candidates: Option<Vec<crate::jobs::ArchivePasswordCandidate>>,
+    finalization_open: bool,
+}
+
+// One job of a batch a walk installs: a restart's restore, or a job entering
+// the queue window, read back from its rows first.
+pub(crate) enum InstallEntry {
+    Ticket(InstallRead),
+    Entered {
+        job_id: JobId,
+        read: Result<Option<InstallRead>, String>,
+    },
+}
+
+async fn off_thread<R: Send + 'static>(
+    db: &crate::Database,
+    read: impl FnOnce(&crate::Database) -> R + Send + 'static,
+) -> R {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || read(&db))
+        .await
+        .expect("install read panicked")
+}
+
+// Every read an install makes, off the pipeline thread.
+pub(crate) async fn read_install(seat: InstallSeat, mut request: RestoreJobRequest) -> InstallRead {
+    let InstallSeat {
+        db,
+        intermediate_dir,
+        staging_dir,
+        graph,
+    } = seat;
+    let job_id = request.job_id;
+    // What a restart read of the job's row. An install that changes none
+    // of its runtime columns writes nothing back. A job installed again
+    // later reads its row afresh.
+    let restart = request.restart.take();
+    // The status the job goes back to when unpaused: the stored one, else
+    // the one its stored resume lanes name, else the one its lanes at
+    // shutdown name. Read here once, so the job installs with it whether
+    // its restore succeeds or blocks.
+    request.paused_resume_status = Pipeline::normalize_paused_resume_status(
+        request.paused_resume_status.take().or_else(|| {
+            request
+                .paused_resume_download_state
+                .zip(request.paused_resume_post_state)
+                .or(request.download_state.zip(request.post_state))
+                .map(|(download_state, post_state)| {
+                    crate::jobs::model::derive_legacy_job_status(
+                        download_state,
+                        post_state,
+                        crate::jobs::model::RunState::Active,
+                        None,
+                    )
+                })
+        }),
+    );
+    let restored = read_restored(
+        &db,
+        &intermediate_dir,
+        &staging_dir,
+        graph,
+        &mut request,
+        restart.as_ref(),
+    )
+    .await;
+    let server_attribution =
+        off_thread(&db, move |db| db.load_active_server_attribution(job_id)).await;
+    let support_facts = off_thread(&db, move |db| db.load_job_support_facts(job_id)).await;
+    InstallRead {
+        request,
+        restart,
+        server_attribution,
+        support_facts,
+        restored,
+    }
+}
+
+async fn read_restored(
+    db: &crate::Database,
+    intermediate_dir: &std::path::Path,
+    staging_dir: &std::path::Path,
+    graph: crate::pipeline::graph::restore::RestoreSeat,
+    request: &mut RestoreJobRequest,
+    restart: Option<&crate::RestartRead>,
+) -> Result<RestoredFacts, String> {
+    let job_id = request.job_id;
+    // A restart reads only each job's row before it serves; the job's file
+    // rows are read here, as it installs, a batch of jobs a turn.
+    if restart.is_some() {
+        match off_thread(db, move |db| db.load_active_job(job_id)).await {
+            Ok(Some(recovered)) => {
+                request.file_identities = recovered.file_identities;
+                request.detected_archives = recovered.detected_archives;
+            }
+            Ok(None) => {}
+            Err(error) => return Err(format!("its file state could not be read: {error}")),
+        }
+    }
+    let root = intermediate_dir.to_path_buf();
+    let path = request.working_dir.clone();
+    request.working_dir = off_thread(db, move |db| {
+        crate::jobs::working_dir::recover_working_dir_rename(db, &root, &path, job_id)
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    let internal = |error: String| crate::SchedulerError::Internal(error).to_string();
+    let fresh =
+        crate::pipeline::waits_its_turn(&request.status, request.paused_resume_status.as_ref());
+    let mut spec = request.spec.clone();
+    // The summaries a job waiting its turn installs with when the restart
+    // let its lists go, and the password candidates read with the lists
+    // when they are read back.
+    let mut waiting_summaries = None;
+    let mut read_passwords = None;
+    if spec.lacks_article_lists() {
+        // Read back from the stored NZB the restart kept only the files of,
+        // with one parse that also gives the job's password candidates. A
+        // job that waits its turn reads nothing: its lists are read when it
+        // is handed a slot.
+        enum Stored {
+            Waits(FileSummaries),
+            Read(JobSpec, Option<Vec<crate::jobs::ArchivePasswordCandidate>>),
+        }
+        let category = spec.category.clone();
+        let metadata = spec.metadata.clone();
+        let summaries = restart
+            .map(|read| read.summaries.clone())
+            .filter(|summaries| fresh && summaries.0.len() == spec.files.len());
+        let stored = off_thread(db, move |db| {
+            if let Some(summaries) = summaries
+                && !db
+                    .has_graph_checkpoint(job_id)
+                    .map_err(|error| format!("checkpoint could not be read: {error}"))?
+            {
+                return Ok(Stored::Waits(summaries));
+            }
+            crate::pipeline::read_stored_spec_and_passwords(db, job_id, category, metadata)
+                .map(|(spec, passwords)| Stored::Read(spec, passwords))
+        })
+        .await
+        .map_err(internal)?;
+        match stored {
+            Stored::Waits(summaries) => waiting_summaries = Some(summaries),
+            Stored::Read(stored, passwords) => {
+                if stored.files.len() != spec.files.len()
+                    || stored
+                        .files
+                        .iter()
+                        .zip(&spec.files)
+                        .any(|(stored, kept)| stored.filename != kept.filename)
+                {
+                    return Err(internal(
+                        "stored NZB no longer matches the job's files".to_string(),
+                    ));
+                }
+                for (file, stored) in spec.files.iter_mut().zip(stored.files) {
+                    file.segments = stored.segments;
+                }
+                read_passwords = Some(passwords);
+            }
+        }
+    }
+    let working_dir = request.working_dir.clone();
+    if working_dir.starts_with(intermediate_dir)
+        && tokio::fs::try_exists(&working_dir).await.unwrap_or(false)
+        && let Err(error) = stamp_working_dir(intermediate_dir, &working_dir, job_id).await
+    {
+        tracing::warn!(
+            job_id = job_id.0,
+            dir = %working_dir.display(),
+            error = %error,
+            "failed to stamp restored working directory as Weaver-owned"
+        );
+    }
+    let graph = if waiting_summaries.is_some() {
+        None
+    } else {
+        let seat = graph.for_job(spec.password.clone(), &working_dir);
+        let files = crate::pipeline::graph::restore::root_files(&spec);
+        match tokio::task::spawn_blocking(move || seat.restore(job_id, files))
+            .await
+            .map_err(|error| {
+                crate::pipeline::graph::restore::GraphRestoreError::Join(error.to_string())
+            })
+            .and_then(|restored| restored)
+        {
+            Ok(restored) => Some(restored),
+            Err(crate::pipeline::graph::restore::GraphRestoreError::NoCheckpoint(_)) => None,
+            Err(error) => return Err(internal(error.to_string())),
+        }
+    };
+    let staging_exists = tokio::fs::try_exists(staging_dir).await.unwrap_or(false);
+    // One read of the row, decrypt of the supplied passwords and parse of
+    // the persisted NZB per restored job, instead of one per archive file.
+    // Anything short of a parsed NZB leaves the harvest to read the row
+    // itself, as before.
+    let nzb_password_candidates = if let Some(passwords) = read_passwords {
+        passwords
+    } else if waiting_summaries.is_some() {
+        // Its NZB is parsed once it is handed a slot; the harvest reads the
+        // row itself.
+        None
+    } else {
+        off_thread(db, move |db| {
+            match db.load_active_job_password_sources(job_id) {
+                Ok(Some(((nzb_path, Some(nzb_zstd)), supplied))) => {
+                    crate::pipeline::persisted_nzb_password_candidates(&nzb_path, &nzb_zstd)
+                        .ok()
+                        .map(|nzb| crate::pipeline::job_carried_password_candidates(&supplied, nzb))
+                }
+                _ => None,
+            }
+        })
+        .await
+    };
+    let finalization_open = Pipeline::download_finalization_open(
+        job_id,
+        off_thread(db, move |db| db.get_job_events(job_id.0)).await,
+    );
+    Ok(RestoredFacts {
+        spec,
+        waiting_summaries,
+        graph,
+        staging_exists,
+        nzb_password_candidates,
+        finalization_open,
+    })
 }
 
 #[cfg(test)]

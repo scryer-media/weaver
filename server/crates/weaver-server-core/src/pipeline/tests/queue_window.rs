@@ -235,7 +235,7 @@ async fn a_reorder_among_parked_jobs_is_stored() {
 async fn a_parked_job_enters_with_the_edit_it_was_given() {
     use crate::persistence::connection::JOB_WRITE_WAITS;
     let temp = tempfile::tempdir().unwrap();
-    let (mut pipeline, _handle) = long_queue(&temp, 2).await;
+    let (pipeline, _handle) = long_queue(&temp, 2).await;
     let id = JobId(900);
     assert!(pipeline.window_parked(id));
     // The edit's write waits in the job's queue until the gate opens.
@@ -256,7 +256,7 @@ async fn a_parked_job_enters_with_the_edit_it_was_given() {
     let waits = JOB_WRITE_WAITS.load(Ordering::Relaxed);
     let loaded = std::cell::Cell::new(false);
     let load = async {
-        let read = pipeline.load_parked_jobs(vec![id]).await;
+        let read = pipeline.parked_loads(vec![id]).read().await;
         loaded.set(true);
         read
     };

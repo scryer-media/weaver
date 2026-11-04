@@ -840,6 +840,136 @@ async fn a_speed_test_on_a_paused_queue_publishes_its_bytes_then_parks() {
     runner.await.unwrap();
 }
 
+// The database's one writer held busy by a write that waits for the test,
+// as a slow disk holds it. Sending on the returned channel lets it go.
+async fn hold_writer(db: &crate::Database) -> std::sync::mpsc::Sender<()> {
+    let (release, gate) = std::sync::mpsc::channel::<()>();
+    let (held, holding) = tokio::sync::oneshot::channel();
+    db.try_queue_write("test_hold_writer", move |_| {
+        let _ = held.send(());
+        let _ = gate.recv();
+        Ok(())
+    })
+    .unwrap();
+    holding.await.unwrap();
+    release
+}
+
+// Whether one turn of the queue's intents runs to its end on its first
+// poll: a turn that waited on the database would not.
+fn turn_completes(pipeline: &mut Pipeline) -> bool {
+    use std::future::Future;
+    let mut turn = std::pin::pin!(pipeline.run_queue_intents());
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    turn.as_mut().poll(&mut cx).is_ready()
+}
+
+#[tokio::test]
+async fn a_slot_is_taken_while_the_database_is_busy_and_held_once_it_commits() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, handle) = long_queue(&temp, 2).await;
+    handle
+        .set_max_concurrent_nzbs(std::num::NonZeroU32::new(3).unwrap())
+        .await
+        .unwrap();
+    let release = hold_writer(&pipeline.db).await;
+    assert!(turn_completes(&mut pipeline));
+    // The slot's write is out: it counts as held, and the job holds it
+    // once the write commits.
+    assert_eq!(pipeline.nzb_admitted.len(), 2);
+    assert_eq!(pipeline.nzb_admitting.len(), 1);
+    let taking = *pipeline.nzb_admitting.iter().next().unwrap();
+    assert!(turn_completes(&mut pipeline));
+    assert_eq!(pipeline.nzb_admitting.len(), 1);
+    release.send(()).unwrap();
+    pipeline.apply_queue_intents().await;
+    assert_eq!(pipeline.nzb_admitted.len(), 3);
+    assert!(pipeline.nzb_admitted.contains(&taking));
+    assert!(pipeline.nzb_admitting.is_empty());
+}
+
+#[tokio::test]
+async fn a_paused_job_lets_its_slot_go_while_the_database_is_busy() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, handle) = long_queue(&temp, 2).await;
+    let paused = *pipeline.nzb_admitted.iter().min().unwrap();
+    handle.pause_job(paused).await.unwrap();
+    let release = hold_writer(&pipeline.db).await;
+    // The pause, its marker, and the release of its slot each go on the
+    // writer without the turn waiting for it.
+    assert!(turn_completes(&mut pipeline));
+    assert!(turn_completes(&mut pipeline));
+    assert!(pipeline.nzb_releasing.contains(&paused));
+    assert!(pipeline.nzb_admitted.contains(&paused));
+    release.send(()).unwrap();
+    pipeline.apply_queue_intents().await;
+    assert!(!pipeline.nzb_admitted.contains(&paused));
+    assert_eq!(pipeline.nzb_admitted.len(), 2);
+}
+
+#[tokio::test]
+async fn a_job_enters_the_window_while_the_database_is_busy() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, handle) = long_queue(&temp, 2).await;
+    let entering = JobId(QUEUED);
+    assert!(pipeline.window_parked(entering));
+    handle
+        .reorder_jobs(vec![(entering, QueueMoveTarget::Top)])
+        .await
+        .unwrap();
+    let release = hold_writer(&pipeline.db).await;
+    // Its read back waits behind the job's writes, off the turn.
+    assert!(turn_completes(&mut pipeline));
+    assert!(pipeline.installing.contains(&entering));
+    assert!(!pipeline.jobs.contains_key(&entering));
+    release.send(()).unwrap();
+    pipeline.apply_queue_intents().await;
+    assert!(pipeline.jobs.contains_key(&entering));
+    assert!(!pipeline.window_parked(entering));
+    assert!(pipeline.installing.is_empty());
+}
+
+#[tokio::test]
+async fn a_restart_installs_its_restores_while_the_database_is_busy() {
+    use crate::pipeline::orchestrator::RESTORE_BATCH;
+    let temp = tempfile::tempdir().unwrap();
+    let Restarted { mut pipeline, .. } = restarted_long_queue(&temp).await;
+    let release = hold_writer(&pipeline.db).await;
+    assert!(turn_completes(&mut pipeline));
+    assert_eq!(pipeline.installing.len(), RESTORE_BATCH);
+    assert!(pipeline.jobs.is_empty());
+    release.send(()).unwrap();
+    pipeline.apply_queue_intents().await;
+    assert_eq!(pipeline.jobs.len(), RESTORE_BATCH);
+}
+
+#[tokio::test]
+async fn a_reorder_after_a_lost_position_write_waits_on_no_read() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, handle) = long_queue(&temp, 2).await;
+    // The stored positions are unknown once a write has not committed.
+    pipeline
+        .queue_positions_lost
+        .store(true, std::sync::atomic::Ordering::Release);
+    handle
+        .reorder_jobs(vec![(JobId(2), QueueMoveTarget::Bottom)])
+        .await
+        .unwrap();
+    let release = hold_writer(&pipeline.db).await;
+    assert!(turn_completes(&mut pipeline));
+    release.send(()).unwrap();
+    pipeline.apply_queue_intents().await;
+    pipeline.db.flush_write_queue().await.unwrap();
+    let stored = pipeline.db.load_active_job_queue_positions().unwrap();
+    let order = pipeline
+        .shared_state
+        .queue
+        .read(|inner| inner.jobs.iter().map(|row| row.id).collect::<Vec<_>>());
+    let mut by_position = order.clone();
+    by_position.sort_by_key(|id| stored[id]);
+    assert_eq!(by_position, order);
+}
+
 // On a long queue, the turn that hears a download result and the turn that
 // refills a lane visit no queue row and ask the database nothing: neither
 // grows with the queue.

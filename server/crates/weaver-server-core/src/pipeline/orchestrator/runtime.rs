@@ -124,6 +124,10 @@ impl Pipeline {
         let admission_db = db.clone();
         let nzb_pause_releases =
             tokio::task::spawn_blocking(move || admission_db.load_nzb_pause_releases()).await??;
+        let positions_db = db.clone();
+        let queue_positions =
+            tokio::task::spawn_blocking(move || positions_db.load_active_job_queue_positions())
+                .await??;
         let download_stall_recovery = download::download_stall_recovery_from_env_value(
             std::env::var(download::DOWNLOAD_STALL_RECOVERY_ENV).ok(),
         );
@@ -195,6 +199,7 @@ impl Pipeline {
         let (move_done_tx, move_done_rx) = mpsc::channel(32);
         let (failed_release_tx, failed_release_rx) = mpsc::channel(32);
         let (job_activated_tx, job_activated_rx) = mpsc::channel(32);
+        let (db_reply_tx, db_reply_rx) = mpsc::unbounded_channel();
         let (terminal_post_processing_done_tx, terminal_post_processing_done_rx) =
             mpsc::channel(32);
         let script_effects_rx = db.subscribe_script_effects();
@@ -266,6 +271,9 @@ impl Pipeline {
             nzb_seen: HashSet::new(),
             nzb_pause_releases,
             nzb_reprocess_pending: HashSet::new(),
+            nzb_admitting: HashSet::new(),
+            nzb_releasing: HashSet::new(),
+            installing: HashSet::new(),
             queue_walk_mark: None,
             queue_walk_due: false,
             restores_waiting: false,
@@ -276,7 +284,7 @@ impl Pipeline {
             window_due: HashSet::new(),
             window_unreadable: HashSet::new(),
             dispatch_hold_watch: Vec::new(),
-            queue_positions: None,
+            queue_positions: Some(queue_positions),
             queue_positions_lost: Arc::default(),
             semantic_terminal_causes: HashMap::new(),
             pipeline_failure_stages: HashMap::new(),
@@ -354,6 +362,8 @@ impl Pipeline {
             nntp_handoff_drained_rx,
             job_activated_tx,
             job_activated_rx,
+            db_reply_tx,
+            db_reply_rx,
             move_done_tx,
             move_done_rx,
             failed_release_tx,
@@ -990,7 +1000,7 @@ impl Pipeline {
                         Some(said) = self.graph_runs.recv() => self.graph_run_said(said),
                     }
                 }
-                self.apply_queue_intents().await;
+                self.run_queue_intents().await;
                 // A recorded cancel is settled before exit: its archive decides
                 // the job, and that answer returns on the done channel.
                 // No cancel is taken once shutdown starts, so the ones to wait
@@ -1019,7 +1029,7 @@ impl Pipeline {
                 }
                 break;
             }
-            self.apply_queue_intents().await;
+            self.run_queue_intents().await;
             // Whether this turn was woken by, or found, anything other than a
             // periodic tick. Only such a turn can have changed what the job
             // snapshot shows or what dispatch would hand out.
@@ -1112,7 +1122,9 @@ impl Pipeline {
                 let drive = self.has_work_to_drive();
                 // While a restart's restores wait, the wait does not block:
                 // whatever is ready is heard first, else the next batch goes.
+                // A batch out is waited on as any answer is.
                 let restoring = self.restores_waiting;
+                let next_batch = restoring && self.installing.is_empty();
                 turn_timer.pause();
                 macro_rules! turn_select {
                     ($($biased:tt)?) => {
@@ -1170,6 +1182,10 @@ impl Pipeline {
                             Some(done) = self.job_activated_rx.recv() => {
                                 turn_timer.resume();
                                 self.handle_job_activated(done);
+                            }
+                            Some(reply) = self.db_reply_rx.recv() => {
+                                turn_timer.resume();
+                                self.handle_db_reply(reply);
                             }
                             Some(done) = self.move_done_rx.recv() => {
                                 turn_timer.resume();
@@ -1288,14 +1304,14 @@ impl Pipeline {
                                 count_periodic_tick();
                                 self.reconcile_candidate_jobs().await;
                             }
-                            () = std::future::ready(()), if restoring => {
+                            () = std::future::ready(()), if next_batch => {
                                 turn_timer.resume();
                                 idle_tick = true;
                             }
                         }
                     };
                 }
-                if restoring {
+                if next_batch {
                     turn_select!(biased)
                 } else {
                     turn_select!()
