@@ -207,7 +207,7 @@ impl Recovery {
 
         match &mut self.phase {
             RecoveryPhase::IgnoringUntilRecoveryPoint { recovery_point } => {
-                if header.ack_nr >= *recovery_point {
+                if header.ack_nr.is_at_or_after(*recovery_point) {
                     event!(RECOVERY_TRACING_LOG_LEVEL, ?recovery_point, ?header.ack_nr, "exiting IgnoringUntilRecoveryPoint");
                     self.phase = RecoveryPhase::CountingDuplicates { dup_acks: 0 }
                 }
@@ -266,7 +266,7 @@ impl Recovery {
                 self.phase = RecoveryPhase::Recovering(rec);
             }
             RecoveryPhase::Recovering(rec) => {
-                if header.ack_nr >= rec.recovery_point {
+                if header.ack_nr.is_at_or_after(rec.recovery_point) {
                     // A full acknowledgement: LEDBAT keeps the window the loss left.
                     event!(RECOVERY_TRACING_LOG_LEVEL, ?rec.recovery_point, ?header.ack_nr, prev_cwnd=rec.cwnd,
                         ?congestion_controller, ?rec.total_retransmitted_segments, ?rtt, "exited recovery");

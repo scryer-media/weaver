@@ -29,7 +29,7 @@ use crate::{
     congestion::{DelaySample, ledbat::Ledbat},
     constants::{
         ACK_DELAY, IMMEDIATE_ACK_EVERY_RMSS, RECOVERY_TRACING_LOG_LEVEL, RTTE_TRACING_LOG_LEVEL,
-        SYNACK_RESEND_INTERNAL, UTP_HEADER, calc_pipe_expiry,
+        SEQUENCE_HALF_SPACE, SYNACK_RESEND_INTERNAL, UTP_HEADER, calc_pipe_expiry,
     },
     delay::DelayTracker,
     message::UtpMessage,
@@ -299,11 +299,13 @@ macro_rules! send_data {
             $segment_iter_item.on_sent($self.env.now(), &$self.socket.stats);
             on_packet_sent!($self, $header);
 
-            if $segment_iter_item.seq_nr() > $self.last_sent_seq_nr {
+            if $segment_iter_item.seq_nr().is_after($self.last_sent_seq_nr) {
                 $self.last_sent_seq_nr = $segment_iter_item.seq_nr();
                 $self.seq_nr = $segment_iter_item.seq_nr() + 1;
             }
-            $self.highest_sent_seq_nr = $self.highest_sent_seq_nr.max($self.last_sent_seq_nr);
+            if $self.last_sent_seq_nr.is_after($self.highest_sent_seq_nr) {
+                $self.highest_sent_seq_nr = $self.last_sent_seq_nr;
+            }
 
             // Data sent: start the timer if it is not running.
             $self.timers.retransmit.arm(
@@ -520,8 +522,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .user_tx_segments
                 .iter_mut_for_sending(None)
                 .take(sack_depth + 1)
-                .skip_while(|seg| seg.seq_nr() <= high_rxt)
-                .take_while(|seg| seg.seq_nr() <= recovery_point)
+                .skip_while(|seg| seg.seq_nr().is_at_or_before(high_rxt))
+                .take_while(|seg| seg.seq_nr().is_at_or_before(recovery_point))
                 .filter(|s| !s.is_delivered());
 
             let mut cwnd = rec.cwnd();
@@ -795,7 +797,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         };
 
         // Only send fin after all the outstanding data was sent.
-        if seq_nr - self.last_sent_seq_nr != 1 {
+        if seq_nr != self.last_sent_seq_nr + 1 {
             return Ok(false);
         }
 
@@ -811,7 +813,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 "data sent",
             );
             self.last_sent_seq_nr = seq_nr;
-            self.highest_sent_seq_nr = self.highest_sent_seq_nr.max(seq_nr);
+            if seq_nr.is_after(self.highest_sent_seq_nr) {
+                self.highest_sent_seq_nr = seq_nr;
+            }
             return Ok(true);
         }
         Ok(false)
@@ -884,7 +888,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.timers.retransmit.turn_off("MTU probe is not real RTO");
                 self.rto_retransmissions = 0;
 
-                if self.last_sent_seq_nr > rewind_to {
+                if self.last_sent_seq_nr.is_after(rewind_to) {
                     self.last_sent_seq_nr = rewind_to;
                 }
                 self.segment_sizes.on_probe_failed(payload_size);
@@ -936,7 +940,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             let is_mtu_probe = payload_size > min_ss as usize;
 
             if !self.user_tx_segments.enqueue(payload_size, is_mtu_probe) {
-                return Err(Error::BugCantEnqueue);
+                break;
             }
             remaining -= payload_size;
             remote_window_remaining -= payload_size;
@@ -1115,23 +1119,26 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         let previously_seen_remote_fin = self.state.is_remote_fin_or_later();
 
-        // An ACK of a packet we never sent is a third party's: ignored,
-        // a reset among them.
-        if hdr.htype != Syn && hdr.ack_nr > self.highest_sent_seq_nr {
-            trace!(%self.highest_sent_seq_nr, "dropping packet, it acks what we never sent");
-            self.socket.stats.invalid_packets.increment(1);
-            return Ok(Default::default());
-        }
-        if hdr.htype != Syn && hdr.ack_nr < self.user_tx_segments.acked_seq_nr() - 3 {
-            trace!(acked_seq_nr = %self.user_tx_segments.acked_seq_nr(), "dropping packet, its ack is too old");
+        // Anchor the admitted interval to its oldest duplicate ACK. Neither
+        // a future ACK nor an ambiguous half-space value belongs to it.
+        let oldest_ack = self.user_tx_segments.acked_seq_nr() - 3;
+        let ack_span = self.highest_sent_seq_nr.forward_distance_from(oldest_ack);
+        if hdr.htype != Syn
+            && (ack_span >= SEQUENCE_HALF_SPACE
+                || hdr.ack_nr.forward_distance_from(oldest_ack) > ack_span)
+        {
+            trace!("dropping packet, its ack is outside the sent interval");
             self.socket.stats.invalid_packets.increment(1);
             return Ok(Default::default());
         }
 
         let max_packets_reorder =
             crate::stream_rx::reorder_capacity(self.socket_opts.vsock_rx_bufsize).get();
+        let receive_delta = hdr
+            .seq_nr
+            .signed_offset_from(self.last_consumed_remote_seq_nr);
         if self.state != SynReceived
-            && hdr.seq_nr - self.last_consumed_remote_seq_nr > max_packets_reorder as isize
+            && receive_delta.is_none_or(|offset| offset > max_packets_reorder as isize)
         {
             trace!("dropping packet, its sequence is past the receive reorder window");
             self.socket.stats.redundant_packets.increment(1);
@@ -1214,7 +1221,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 trace!("state: fin-wait-1 -> fin-wait-2");
                 self.restart_remote_inactivity_timer();
                 self.state = FinWait2;
-                if hdr.htype == State && hdr.seq_nr - self.last_consumed_remote_seq_nr == 1 {
+                if hdr.htype == State && hdr.seq_nr == self.last_consumed_remote_seq_nr + 1 {
                     // some clients sends back FIN + ACK as STATE with seq_nr + 1. This is proably one of them.
                     trace!("treating ST_STATE as FIN");
                     self.state = Closed;
@@ -1234,7 +1241,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.state = Closed;
             }
 
-            (LastAck { remote_fin, .. }, _) if hdr.seq_nr > remote_fin => {
+            (LastAck { remote_fin, .. }, _) if hdr.seq_nr.is_after(remote_fin) => {
                 if hdr.htype == Data {
                     trace!(hdr=%hdr.short_repr(), ?remote_fin, "received higher seq nr than remote FIN, dropping packet");
                     self.socket.stats.invalid_packets.increment(1);
@@ -1307,6 +1314,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         );
         self.last_remote_window = msg.header.wnd_size;
 
+        self.congestion_controller
+            .advance_loss_gate(self.user_tx_segments.acked_seq_nr());
         self.recovery.on_ack(
             &msg.header,
             &result.on_ack_result,
@@ -1321,7 +1330,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             },
         );
 
-        let offset = msg.header.seq_nr - (self.last_consumed_remote_seq_nr + 1);
+        let Some(receive_delta) = receive_delta else {
+            return Ok(result);
+        };
+        let offset = receive_delta - 1;
 
         match msg.header.get_type() {
             Data => {
@@ -1458,7 +1470,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn ack_to_transmit(&self) -> bool {
-        self.last_consumed_remote_seq_nr > self.last_sent_ack_nr
+        self.last_consumed_remote_seq_nr
+            .is_after(self.last_sent_ack_nr)
     }
 
     fn restart_remote_inactivity_timer(&mut self) {

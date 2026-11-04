@@ -503,7 +503,10 @@ impl UserRx {
 // Packets held out of order: one per 1100 bytes of the receive buffer,
 // never fewer than 16. One further out is dropped.
 pub(crate) fn reorder_capacity(max_rx_bytes: NonZeroUsize) -> NonZeroUsize {
-    NonZeroUsize::new((max_rx_bytes.get() / 1100).max(16)).unwrap_or(NonZeroUsize::MIN)
+    NonZeroUsize::new(
+        (max_rx_bytes.get() / 1100).clamp(16, crate::constants::SEQUENCE_HALF_SPACE as usize - 1),
+    )
+    .unwrap_or(NonZeroUsize::MIN)
 }
 
 pub struct OutOfOrderQueue {

@@ -198,7 +198,7 @@ impl Ledbat {
     // Losses come in bursts: one cut per window of packets, and no more
     // than one per cut timer.
     pub fn on_enter_recovery(&mut self, now: Instant, lost: SeqNr, next_seq_nr: SeqNr) {
-        if self.loss_gate.is_some_and(|gate| lost <= gate) {
+        if self.loss_gate.is_some_and(|gate| !lost.is_after(gate)) {
             return;
         }
         if self.next_cut.is_some_and(|next| now <= next) {
@@ -207,6 +207,14 @@ impl Ledbat {
         self.next_cut = Some(now + self.params.cwnd_reduce_timer);
         self.loss_gate = Some(next_seq_nr);
         self.cut();
+    }
+
+    pub fn advance_loss_gate(&mut self, acknowledged: SeqNr) {
+        if let Some(gate) = &mut self.loss_gate
+            && acknowledged.is_after(*gate)
+        {
+            *gate = acknowledged;
+        }
     }
 
     pub fn set_remote_window(&mut self, win: usize) {
@@ -413,5 +421,18 @@ mod tests {
         let before = l.window();
         l.on_enter_recovery(now + Duration::from_secs(1), 18.into(), 30.into());
         assert_eq!(l.window(), before);
+    }
+
+    #[test]
+    fn acknowledged_progress_keeps_the_loss_gate_in_the_live_sequence_range() {
+        let mut l = grown();
+        let now = Instant::now();
+        l.on_enter_recovery(now, 65000.into(), 65500.into());
+        let window = l.window();
+        for acknowledged in [1000, 30000, 60000] {
+            l.advance_loss_gate(acknowledged.into());
+        }
+        l.on_enter_recovery(now + Duration::from_secs(1), 60001.into(), 61000.into());
+        assert_eq!(l.window(), window / 2);
     }
 }

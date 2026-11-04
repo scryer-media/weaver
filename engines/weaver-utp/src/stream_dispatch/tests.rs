@@ -18,6 +18,7 @@ mod packet_validation;
 mod probe_payload;
 mod retransmit_timer;
 mod rtte;
+mod sequence_wrap;
 mod shutdown;
 mod stream_api;
 mod timeouts;

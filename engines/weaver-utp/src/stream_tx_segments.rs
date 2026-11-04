@@ -28,7 +28,7 @@ use tokio::time::Instant;
 use tracing::trace;
 
 use crate::{
-    constants::calc_pipe_expiry,
+    constants::{MAX_RESERVED_DATA_PACKETS, calc_pipe_expiry},
     raw::UtpHeader,
     seq_nr::SeqNr,
     stats::{Counter, UtpStats},
@@ -329,6 +329,9 @@ impl Segments {
     /// Returns if the segment was enqueued or not.
     #[must_use]
     pub fn enqueue(&mut self, payload_len: usize, is_mtu_probe: bool) -> bool {
+        if self.segments.len() >= MAX_RESERVED_DATA_PACKETS {
+            return false;
+        }
         self.segments.push_back(Segment {
             payload_size: payload_len,
             payload_offset_absolute: self.offset,
@@ -403,8 +406,11 @@ impl Segments {
 
         let mut new_rtt: Option<Duration> = None;
 
-        let offset = ack_header.ack_nr - self.snd_una;
-        if offset >= 0 {
+        if let Some(offset) = ack_header
+            .ack_nr
+            .signed_offset_from(self.snd_una)
+            .filter(|offset| *offset >= 0)
+        {
             let drain_count = (offset as usize + 1).min(self.segments.len());
             for segment in self.segments.drain(0..drain_count) {
                 segment.update_rtt(now, &mut new_rtt);
@@ -418,12 +424,12 @@ impl Segments {
 
         // If TX start matches with header ACK and it's a selective ACK, mark all segments delivered.
         match (self.first_seq_nr(), ack_header.extensions.selective_ack) {
-            (Some(first_seq_nr), Some(sack)) if first_seq_nr > ack_header.ack_nr => {
+            (Some(first_seq_nr), Some(sack)) if first_seq_nr.is_after(ack_header.ack_nr) => {
                 self.sack_depth = sack.len();
                 self.last_sack_empty = sack.as_bitslice().not_any();
 
-                let sack_start = ack_header.ack_nr + 2;
-                let sack_start_offset = sack_start - first_seq_nr;
+                let sack_start_offset =
+                    2 - first_seq_nr.forward_distance_from(ack_header.ack_nr) as isize;
 
                 let mut process_sack = |segment: &mut Segment, is_sacked: bool| {
                     if !segment.is_delivered && is_sacked && segment.send_count() > 0 {
@@ -486,7 +492,9 @@ impl Segments {
         // On RTO, we rewind back last_sent_seq_nr, however we don't reset the "sent" status
         // of packets. So instead of using "is_sent", just iterate up to last_sent_seq_nr, and pretend we
         // never sent them.
-        let take = (last_sent_seq_nr - self.snd_una + 1).max(0) as usize;
+        let take = last_sent_seq_nr
+            .signed_offset_from(self.snd_una)
+            .map_or(0, |offset| (offset + 1).max(0) as usize);
         self.segments
             .iter()
             .take(take)
@@ -507,7 +515,9 @@ impl Segments {
         let mut delivered_segs = 0;
         let mut recalc_timer = None;
 
-        let take = (high_data - self.snd_una).max(0) as usize;
+        let take = high_data
+            .signed_offset_from(self.snd_una)
+            .map_or(0, |offset| offset.max(0) as usize);
 
         // After this we don't consider the packet being in the network.
         // rtt/2 might be a bit too aggressive.
@@ -530,7 +540,7 @@ impl Segments {
 
             segment.has_sacks_after_it = delivered_segs > 0 || self.last_sack_empty;
 
-            if seq_nr <= high_rxt {
+            if seq_nr.is_at_or_before(high_rxt) {
                 pipe += segment.payload_size;
             }
 
@@ -568,7 +578,9 @@ impl Segments {
         start: Option<SeqNr>,
     ) -> impl Iterator<Item = SegmentForSending<'_>> {
         let offset = match start {
-            Some(start) => (start - self.snd_una).max(0) as usize,
+            Some(start) => start
+                .signed_offset_from(self.snd_una)
+                .map_or(self.segments.len(), |offset| offset.max(0) as usize),
             None => 0,
         };
         let removed_abs = self.removed_offset;
@@ -602,7 +614,7 @@ mod tests {
     use crate::raw::{UtpHeader, selective_ack::SelectiveAck};
     use crate::stats::UtpStats;
 
-    use super::Segments;
+    use super::{Segments, SeqNr};
 
     fn make_segments(start_seq_nr: u16, count: u16) -> Segments {
         let mut ftx = Segments::new(start_seq_nr.into());
@@ -622,6 +634,41 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn reservation_pressure_counts_unsent_packets_and_delivered_holes() {
+        use crate::constants::MAX_RESERVED_DATA_PACKETS;
+
+        let first = SeqNr(65500);
+        let mut segments = Segments::new(first);
+        for _ in 0..MAX_RESERVED_DATA_PACKETS {
+            assert!(segments.enqueue(1, false));
+        }
+        assert!(!segments.enqueue(1, false));
+        let now = Instant::now();
+        let stats = UtpStats::default();
+        for mut item in segments.iter_mut_for_sending(None) {
+            item.on_sent(now, &stats);
+        }
+        let ack = make_sack_header((first - 1).0, [0, 1]);
+        let result = segments.remove_up_to_ack(now, &ack);
+        assert_eq!(result.newly_sacked_segment_count, 2);
+        assert_eq!(segments.total_len_packets(), MAX_RESERVED_DATA_PACKETS);
+        assert!(!segments.enqueue(1, false));
+
+        let result = segments.remove_up_to_ack(
+            now,
+            &UtpHeader {
+                ack_nr: first,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.acked_segments_count, 3);
+        for _ in 0..3 {
+            assert!(segments.enqueue(1, false));
+        }
+        assert!(!segments.enqueue(1, false));
     }
 
     #[test]
