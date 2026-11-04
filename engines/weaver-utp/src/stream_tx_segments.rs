@@ -331,7 +331,11 @@ impl Segments {
     pub fn pop_mtu_probe(&mut self, seq_nr: SeqNr) -> bool {
         let last_segment_seq_nr = self.snd_una + self.segments.len() as u16 - 1;
         match self.segments.pop_back() {
-            Some(s) if last_segment_seq_nr == seq_nr && s.is_mtu_probe && !s.is_delivered => true,
+            Some(s) if last_segment_seq_nr == seq_nr && s.is_mtu_probe && !s.is_delivered => {
+                self.len_bytes -= s.payload_size;
+                self.offset = s.payload_offset_absolute;
+                true
+            }
             Some(s) => {
                 self.segments.push_back(s);
                 false
@@ -353,6 +357,8 @@ impl Segments {
                     PopExpiredProbe::Empty
                 }
                 (true, true) if s.retransmit_count() >= max_probe_retransmissions => {
+                    self.len_bytes -= s.payload_size;
+                    self.offset = s.payload_offset_absolute;
                     PopExpiredProbe::Expired {
                         payload_size: s.payload_size,
                         rewind_to: self.snd_una + self.segments.len() as u16 - 1,
