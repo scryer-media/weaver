@@ -149,15 +149,28 @@ impl Walk<'_, '_> {
                         true => self.batch(&archive, index, password.is_some()),
                         false => 0,
                     };
+                    // Members that reach the last header read, whose end no
+                    // later header shows yet, wait for the next ones while
+                    // fewer would decode beside each other than the threads
+                    // allow and reading on waits for nothing: the rest of a
+                    // volume whose bytes are all in, or the next volume once
+                    // its bytes are. A member that runs on into the next
+                    // volume then decodes beside those that follow.
+                    let reads_on = match more {
+                        true => self.input.settled(volume),
+                        false => self.input.settled(volume + 1),
+                    };
+                    if step.get() > 1
+                        && batch < step.get()
+                        && index + batch + 1 == archive.len()
+                        && reads_on
+                    {
+                        break;
+                    }
                     if batch > 1 {
                         self.side_by_side(&archive, index..index + batch, password)?;
                         index += batch;
                         continue;
-                    }
-                    // The last header read waits for the next ones while
-                    // its volume has more, so it can decode beside them.
-                    if step.get() > 1 && more && index + 1 == archive.len() {
-                        break;
                     }
                     self.member(&mut archive, index, password.is_some())?;
                     index += 1;
@@ -171,14 +184,20 @@ impl Walk<'_, '_> {
             }
             volume += 1;
         }
+        // A last header left waiting for a volume the set turned out not to
+        // have decodes alone.
+        while index < archive.len() {
+            self.member(&mut archive, index, password.is_some())?;
+            index += 1;
+        }
         Ok(())
     }
 
     // How many members from `index` on can decode side by side: files whose
-    // data lies whole in one volume whose bytes are all in, so a worker on
-    // the lent pool never waits on a download, which a later header of the
-    // same volume shows is not continued in the next, whose length is known,
-    // and which fit in the memory the budget grants together. Each holds its
+    // data lies in volumes whose bytes are all in, so a worker on the lent
+    // pool never waits on a download, which a later header shows run on no
+    // further, whose length is known, and which fit in the memory the budget
+    // grants together. Each holds its
     // bytes, decoded whole before it is said, and its decoder's window, as
     // large as the dictionary its header names.
     fn batch(&self, archive: &RarArchive, index: usize, has_password: bool) -> usize {
@@ -189,16 +208,14 @@ impl Walk<'_, '_> {
             else {
                 break;
             };
-            let volume = info.volumes.first_volume;
-            let settled = u32::try_from(volume)
-                .ok()
-                .is_some_and(|volume| self.input.volumes.settled(VolumeIndex(volume)));
+            let span = info.volumes.first_volume..=info.volumes.last_volume;
+            let settled = span.clone().all(|volume| self.input.settled(volume));
             let plain = !(info.is_symlink
                 || info.is_hardlink
                 || info.is_file_copy
                 || info.is_directory
                 || (info.is_encrypted && !has_password));
-            let whole = info.volumes.last_volume == volume && after.volumes.first_volume == volume;
+            let whole = after.volumes.first_volume >= *span.end();
             let Some(length) = info.unpacked_size.filter(|_| plain && whole && settled) else {
                 break;
             };
@@ -609,6 +626,11 @@ impl Input {
                 Err(error)
             }
         }
+    }
+
+    // Whether the volume at `position` is in the set and no read of it waits.
+    fn settled(&self, position: usize) -> bool {
+        u32::try_from(position).is_ok_and(|position| self.volumes.settled(VolumeIndex(position)))
     }
 
     fn reader(&self, volume: VolumeIndex) -> Reader {

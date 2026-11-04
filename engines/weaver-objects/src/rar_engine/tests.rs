@@ -252,7 +252,12 @@ impl Volumes for Gate {
 
     fn len(&self, volume: VolumeIndex) -> Option<u64> {
         let state = self.state.lock().unwrap();
-        state.released[volume.0 as usize].then(|| self.volumes[volume.0 as usize].len() as u64)
+        let at = volume.0 as usize;
+        state
+            .released
+            .get(at)
+            .is_some_and(|released| *released)
+            .then(|| self.volumes[at].len() as u64)
     }
 
     // A released volume's bytes are all in.
@@ -1133,13 +1138,71 @@ fn the_files_of_a_set_that_is_not_solid_decode_side_by_side_and_are_said_in_orde
     assert_eq!(alone.sums, delivered);
     assert_eq!(beside.said, alone.said);
     assert_eq!(beside.sums, alone.sums);
-    // In each volume the first two files decoded side by side on the lent
-    // pool. The third waits for the header after it to show it ends in its
-    // volume, and that is the volume's end record, so it decodes alone.
+    // The first volume's files wait for the next volume's headers, whose
+    // bytes are all in, and five files decode in one spread, on no more
+    // workers than the four threads. The last waits for the header after
+    // it, and that is the set's end record, so it decodes alone.
     assert!(alone.spreads.is_empty(), "{:?}", alone.spreads);
-    assert_eq!(beside.spreads, vec![2, 2]);
+    assert_eq!(beside.spreads, vec![4]);
     // The workers decoded over the headers the walk parsed: none opened
     // the set again.
+    assert_eq!(beside.opens(), alone.opens());
+}
+
+// Four files over three volumes, the second and third running on from one
+// volume into the next.
+fn spanning_files() -> Vec<Vec<u8>> {
+    let body = |at: u8| -> Vec<u8> { (0..300u16).map(|byte| (byte as u8) ^ at).collect() };
+    let whole = |at: u8, flags: u64, part: &[u8]| {
+        let bytes = body(at);
+        rar5::file(
+            &format!("file{at}.bin"),
+            flags,
+            part,
+            bytes.len() as u64,
+            (flags & rar5::SPLIT_AFTER == 0).then(|| crc32(&bytes)),
+        )
+    };
+    let (one, two) = (body(1), body(2));
+    vec![
+        [
+            rar5::start(Some(0)),
+            whole(0, 0, &body(0)),
+            whole(1, rar5::SPLIT_AFTER, &one[..100]),
+            rar5::end(true),
+        ]
+        .concat(),
+        [
+            rar5::start(Some(1)),
+            whole(1, rar5::SPLIT_BEFORE, &one[100..]),
+            whole(2, rar5::SPLIT_AFTER, &two[..150]),
+            rar5::end(true),
+        ]
+        .concat(),
+        [
+            rar5::start(Some(2)),
+            whole(2, rar5::SPLIT_BEFORE, &two[150..]),
+            whole(3, 0, &body(3)),
+            rar5::end(false),
+        ]
+        .concat(),
+    ]
+}
+
+// Files that run on from one volume into the next decode side by side once
+// every volume they span is in, as a file whole in one volume does: the
+// walk reads the next volume's headers before it decides.
+#[test]
+fn files_spanning_volumes_whose_bytes_are_all_in_decode_side_by_side() {
+    let alone = on_threads(spanning_files(), 1);
+    let beside = on_threads(spanning_files(), 4);
+    assert!(alone.said.contains(&Said::Closed(3)), "{:?}", alone.said);
+    assert_eq!(beside.said, alone.said);
+    assert_eq!(beside.sums, alone.sums);
+    // The first three files decode in one spread. The last waits for the
+    // header after it, and that is the set's end record, so it decodes
+    // alone.
+    assert_eq!(beside.spreads, vec![3]);
     assert_eq!(beside.opens(), alone.opens());
 }
 
