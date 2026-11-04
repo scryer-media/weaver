@@ -870,8 +870,9 @@ async fn test_window_update_ack_after_read_with_waking() {
     );
 
     let connection_id = t.vsock.conn_id_send + 1;
+    let env = t.env.clone();
     let make_msg = |seq_nr, payload| {
-        make_msg(
+        let mut message = make_msg(
             UtpHeader {
                 htype: ST_DATA,
                 connection_id,
@@ -881,7 +882,9 @@ async fn test_window_update_ack_after_read_with_waking() {
                 ..Default::default()
             },
             payload,
-        )
+        );
+        message.received = env.now();
+        message
     };
 
     tokio::spawn(t.vsock);
@@ -890,7 +893,11 @@ async fn test_window_update_ack_after_read_with_waking() {
     t.tx.send(make_msg(1.into(), "aaaaa")).unwrap();
     t.tx.send(make_msg(2.into(), "bbbbb")).unwrap();
 
-    tokio::task::yield_now().await;
+    t.transport
+        .wait_for_sent(|header| {
+            header.htype == ST_STATE && header.ack_nr == 2.into() && header.wnd_size == 0
+        })
+        .await;
 
     // Ensure we send back 0 window
     let sent = t.transport.take_sent_utpmessages();
@@ -914,8 +921,12 @@ async fn test_window_update_ack_after_read_with_waking() {
         .await
         .unwrap();
 
-    // Reading should wake up the vsock. On yield, it should get polled.
-    tokio::task::yield_now().await;
+    // Reading wakes the stream; wait for this sequence's reopened window.
+    t.transport
+        .wait_for_sent(|header| {
+            header.htype == ST_STATE && header.ack_nr == 2.into() && header.wnd_size == 5
+        })
+        .await;
 
     // Should send window update ACK
     let sent = t.transport.take_sent_utpmessages();

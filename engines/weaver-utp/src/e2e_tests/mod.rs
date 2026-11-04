@@ -37,7 +37,7 @@ use crate::{
     traits::DefaultUtpEnvironment,
 };
 
-type Datagram = (SocketAddr, Vec<u8>);
+type Datagram = (Instant, SocketAddr, Vec<u8>);
 
 struct ForcedTimeout {
     dropped_seq_nr: Option<crate::seq_nr::SeqNr>,
@@ -52,6 +52,7 @@ pub(crate) struct LinkEnd {
     tx: UnboundedSender<Datagram>,
     rx: Mutex<UnboundedReceiver<Datagram>>,
     drop_every: u64,
+    one_way: Duration,
     sent: AtomicU64,
     pub(crate) lost: AtomicU64,
     // Pure ACKs and data packets this end sent.
@@ -75,6 +76,7 @@ pub(crate) fn link(
         tx,
         rx: Mutex::new(rx),
         drop_every,
+        one_way,
         sent: AtomicU64::new(0),
         lost: AtomicU64::new(0),
         acks: AtomicU64::new(0),
@@ -89,26 +91,16 @@ fn delayed(one_way: Duration) -> (UnboundedSender<Datagram>, UnboundedReceiver<D
     if one_way.is_zero() {
         return (tx, rx);
     }
-    let (held_tx, mut held_rx) = unbounded_channel::<(Instant, Datagram)>();
-    let (in_tx, in_rx) = unbounded_channel::<Datagram>();
-    // Stamped as it is sent: this task runs before the paused clock can move.
+    let (held_tx, mut held_rx) = unbounded_channel::<Datagram>();
     tokio::spawn(async move {
-        let mut in_rx = in_rx;
-        while let Some(datagram) = in_rx.recv().await {
-            if held_tx.send((Instant::now() + one_way, datagram)).is_err() {
-                return;
-            }
-        }
-    });
-    tokio::spawn(async move {
-        while let Some((at, datagram)) = held_rx.recv().await {
+        while let Some((at, from, data)) = held_rx.recv().await {
             tokio::time::sleep_until(at).await;
-            if tx.send(datagram).is_err() {
+            if tx.send((at, from, data)).is_err() {
                 return;
             }
         }
     });
-    (in_tx, rx)
+    (held_tx, rx)
 }
 
 impl LinkEnd {
@@ -154,7 +146,7 @@ impl LinkEnd {
             return Ok(buf.len());
         }
         self.tx
-            .send((self.addr, buf.to_vec()))
+            .send((Instant::now() + self.one_way, self.addr, buf.to_vec()))
             .map_err(|_| std::io::Error::other("link closed"))?;
         Ok(buf.len())
     }
@@ -162,7 +154,7 @@ impl LinkEnd {
 
 impl Transport for LinkEnd {
     async fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
-        let (from, data) = poll_fn(|cx| self.rx.lock().poll_recv(cx))
+        let (_at, from, data) = poll_fn(|cx| self.rx.lock().poll_recv(cx))
             .await
             .ok_or_else(|| std::io::Error::other("link closed"))?;
         buf[..data.len()].copy_from_slice(&data);
@@ -316,6 +308,22 @@ async fn one_socket_holds_more_than_128_streams() {
         client.stats().connection_successes.load(Ordering::Relaxed),
         STREAMS as u64
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn delivery_time_is_stamped_before_the_forwarder_runs() {
+    let one_way = Duration::from_millis(10);
+    let (sender, receiver) = link(ipv4(1), ipv4(2), 0, one_way);
+    let sent_at = Instant::now();
+    sender.send(b"packet").unwrap();
+    tokio::time::advance(Duration::from_millis(50)).await;
+
+    let (delivery_at, from, payload) = poll_fn(|cx| receiver.rx.lock().poll_recv(cx))
+        .await
+        .unwrap();
+    assert_eq!(delivery_at, sent_at + one_way);
+    assert_eq!(from, sender.addr);
+    assert_eq!(payload, b"packet");
 }
 
 #[tokio::test(start_paused = true)]

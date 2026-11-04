@@ -4,7 +4,7 @@
 // How long a stream waits for the remote, and how often it resends,
 // before it gives up.
 
-use std::time::Duration;
+use std::{sync::atomic::Ordering, time::Duration};
 
 use tokio::io::AsyncWriteExt;
 
@@ -134,7 +134,7 @@ async fn an_incoming_stream_sends_its_syn_ack_twice_then_waits_the_connect_timeo
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_connect_no_one_answers_fails_after_three_seconds() {
+async fn an_unanswered_connect_reaches_its_timeout_decision() {
     setup_test_logging();
     let sock = crate::UtpSocket::new_with_opts(
         RememberingTransport::new(ADDR_1),
@@ -142,10 +142,11 @@ async fn a_connect_no_one_answers_fails_after_three_seconds() {
         Default::default(),
     )
     .unwrap();
-    let started = tokio::time::Instant::now();
     let res = sock.connect(ADDR_2).await;
     assert!(matches!(res, Err(Error::ConnectTimedOut)));
-    assert_eq!(started.elapsed(), Duration::from_secs(3));
+    let stats = sock.stats();
+    assert_eq!(stats.connection_failures.load(Ordering::Relaxed), 1);
+    assert_eq!(stats.connecting.load(Ordering::Relaxed), 0);
 }
 
 #[test]

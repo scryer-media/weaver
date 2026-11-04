@@ -12,10 +12,13 @@ use std::{
 };
 
 use parking_lot::Mutex;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::sync::{
+    Notify,
+    mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+};
 use tracing::{Instrument, error_span};
 
-use crate::{PollSendToVectored, SocketOpts, Transport, message::UtpMessage};
+use crate::{PollSendToVectored, SocketOpts, Transport, message::UtpMessage, raw::UtpHeader};
 
 use super::{MockDispatcher, MockUtpSocket, env::MockUtpEnvironment};
 
@@ -165,6 +168,7 @@ struct RememberingTransportLocked {
 pub struct RememberingTransport {
     pub bind_addr: SocketAddr,
     locked: Arc<Mutex<RememberingTransportLocked>>,
+    sent: Arc<Notify>,
 }
 
 impl RememberingTransport {
@@ -172,6 +176,7 @@ impl RememberingTransport {
         Self {
             bind_addr,
             locked: Default::default(),
+            sent: Arc::default(),
         }
     }
 
@@ -190,13 +195,30 @@ impl RememberingTransport {
 
     pub fn send(&self, addr: SocketAddr, buf: &[u8]) -> std::io::Result<()> {
         let mut g = self.locked.lock();
-        if g.max_payload_len.is_some_and(|l| buf.len() > l) {
-            // NOTE: we STILL push the message so that we can detect it later.
-            g.messages.push((addr, buf.to_owned()));
-            return Err(std::io::Error::from_raw_os_error(libc::EMSGSIZE));
-        }
+        let too_large = g.max_payload_len.is_some_and(|l| buf.len() > l);
+        // A failed send is kept too, so tests can inspect the rejected packet.
         g.messages.push((addr, buf.to_owned()));
-        Ok(())
+        drop(g);
+        self.sent.notify_waiters();
+        if too_large {
+            Err(std::io::Error::from_raw_os_error(libc::EMSGSIZE))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub async fn wait_for_sent(&self, matches: impl Fn(&UtpHeader) -> bool) {
+        loop {
+            let sent = self.sent.notified();
+            tokio::pin!(sent);
+            sent.as_mut().enable();
+            if self.locked.lock().messages.iter().any(|(_, data)| {
+                UtpHeader::deserialize(data).is_some_and(|(header, _)| matches(&header))
+            }) {
+                return;
+            }
+            sent.await;
+        }
     }
 
     pub fn take_sent(&self) -> Vec<Msg> {
