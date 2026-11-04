@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
+// Modified by the Weaver authors, 2026-11-04.
 
 use tokio::time::Instant;
 use tracing::trace;
@@ -58,7 +59,7 @@ impl UtpMessage {
         let payload_size = buf.len() - hsize;
 
         match header.get_type() {
-            Type::ST_DATA => {
+            Type::Data => {
                 if payload_size == 0 {
                     trace!("ST_DATA packet with 0 payload, ignoring");
                     return None;

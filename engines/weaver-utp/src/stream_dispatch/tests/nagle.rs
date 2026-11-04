@@ -32,7 +32,7 @@ async fn test_nagle_algorithm() {
     // Allow sending by setting window size
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 0.into(),
             ack_nr: t.vsock.seq_nr - 1,
             wnd_size: 1024,
@@ -48,7 +48,7 @@ async fn test_nagle_algorithm() {
     // First small write should be sent immediately
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 101, ack_nr = 0, payload = "a")]
+        vec![cmphead!(Data, seq_nr = 101, ack_nr = 0, payload = "a")]
     );
 
     // Write another small chunk - should not be sent while first is unacked
@@ -69,7 +69,7 @@ async fn test_nagle_algorithm() {
     trace!("Acknowledge first packet");
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 0.into(),
             ack_nr: 101.into(),
             wnd_size: 1024,
@@ -85,7 +85,7 @@ async fn test_nagle_algorithm() {
     // After ACK, buffered data should be sent as one packet
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 102, ack_nr = 0, payload = "bc")],
+        vec![cmphead!(Data, seq_nr = 102, ack_nr = 0, payload = "bc")],
         "Buffered data should be coalesced"
     );
 
@@ -97,7 +97,7 @@ async fn test_nagle_algorithm() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 103, ack_nr = 0, payload = "d")],
+        vec![cmphead!(Data, seq_nr = 103, ack_nr = 0, payload = "d")],
     );
 
     // Next small write should also go immediately, even without ACK
@@ -105,6 +105,6 @@ async fn test_nagle_algorithm() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 104, ack_nr = 0, payload = "e")],
+        vec![cmphead!(Data, seq_nr = 104, ack_nr = 0, payload = "e")],
     );
 }

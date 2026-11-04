@@ -45,9 +45,12 @@ impl SelectiveAck {
         }
     }
 
-    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -85,7 +88,7 @@ mod tests {
 
     use crate::{
         message::UtpMessage,
-        raw::{Type::ST_DATA, selective_ack::SelectiveAck},
+        raw::{Type::Data, selective_ack::SelectiveAck},
         stream_rx::OutOfOrderQueue,
     };
 
@@ -96,7 +99,7 @@ mod tests {
     fn msg() -> UtpMessage {
         UtpMessage::new_test(
             crate::raw::UtpHeader {
-                htype: ST_DATA,
+                htype: Data,
                 ..Default::default()
             },
             b"a",

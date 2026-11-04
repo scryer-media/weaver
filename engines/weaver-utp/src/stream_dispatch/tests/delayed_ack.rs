@@ -28,7 +28,7 @@ async fn test_delayed_ack_sent_once() {
 
     t.send_msg(
         UtpHeader {
-            htype: ST_DATA,
+            htype: Data,
             seq_nr: 1.into(),
             ack_nr: t.vsock.seq_nr - 1,
             ..Default::default()
@@ -45,7 +45,7 @@ async fn test_delayed_ack_sent_once() {
     assert_eq!(&t.read_all_available().await.unwrap(), b"");
     // Assert an ACK was sent.
     let sent = t.take_sent();
-    assert_eq!(sent, vec![cmphead! {ST_STATE, ack_nr=1}]);
+    assert_eq!(sent, vec![cmphead! {State, ack_nr=1}]);
 
     // Assert nothing else is sent later.
     t.env.increment_now(Duration::from_secs(1));
@@ -58,12 +58,12 @@ async fn each_receive_drain_acknowledges_small_packets_once() {
     let mut t = make_test_vsock(Default::default(), false);
     t.send_data(1, t.vsock.seq_nr - 1, "a");
     t.poll_once_assert_pending().await;
-    assert_eq!(t.take_sent(), vec![cmphead!(ST_STATE, ack_nr = 1)]);
+    assert_eq!(t.take_sent(), vec![cmphead!(State, ack_nr = 1)]);
 
     t.send_data(2, t.vsock.seq_nr - 1, "b");
     t.send_data(3, t.vsock.seq_nr - 1, "c");
     t.poll_once_assert_pending().await;
-    assert_eq!(t.take_sent(), vec![cmphead!(ST_STATE, ack_nr = 3)]);
+    assert_eq!(t.take_sent(), vec![cmphead!(State, ack_nr = 3)]);
     assert_eq!(t.read_all_available().await.unwrap(), b"abc");
 
     t.poll_once_assert_pending().await;

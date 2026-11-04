@@ -35,7 +35,7 @@ async fn retransmit_timer_started() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 101, payload = "test")]
+        vec![cmphead!(Data, seq_nr = 101, payload = "test")]
     );
 
     assert!(matches!(t.vsock.timers.retransmit, Timer::Armed { .. }));
@@ -67,8 +67,8 @@ async fn retransmit_timer_idle_when_all_data_acked() {
     assert_eq!(
         t.take_sent(),
         vec![
-            cmphead!(ST_DATA, seq_nr = 101, payload = "te"),
-            cmphead!(ST_DATA, seq_nr = 102, payload = "st")
+            cmphead!(Data, seq_nr = 101, payload = "te"),
+            cmphead!(Data, seq_nr = 102, payload = "st")
         ]
     );
 
@@ -80,7 +80,7 @@ async fn retransmit_timer_idle_when_all_data_acked() {
     // Only 1 packet ACKed. Retransmit timer should reset.
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             wnd_size: 1024 * 1024,
             seq_nr: 0.into(),
             ack_nr: 101.into(),
@@ -103,7 +103,7 @@ async fn retransmit_timer_idle_when_all_data_acked() {
     t.env.increment_now(Duration::from_millis(100));
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             wnd_size: 1024 * 1024,
             seq_nr: 0.into(),
             ack_nr: 101.into(),
@@ -120,7 +120,7 @@ async fn retransmit_timer_idle_when_all_data_acked() {
     t.env.increment_now(Duration::from_millis(100));
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             wnd_size: 1024 * 1024,
             seq_nr: 0.into(),
             ack_nr: 102.into(),
@@ -154,7 +154,7 @@ async fn retransmit_timer_not_restarted_on_newly_sent_packets() {
 
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 101, payload = "te"),]
+        vec![cmphead!(Data, seq_nr = 101, payload = "te"),]
     );
 
     let timer_0 = t.vsock.timers.retransmit;
@@ -166,7 +166,7 @@ async fn retransmit_timer_not_restarted_on_newly_sent_packets() {
 
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 102, payload = "st"),]
+        vec![cmphead!(Data, seq_nr = 102, payload = "st"),]
     );
 
     let timer_1 = t.vsock.timers.retransmit;
@@ -195,10 +195,10 @@ async fn test_rto_not_stuck_in_congestion_control() {
     assert_eq!(
         t.take_sent(),
         vec![
-            cmphead!(ST_DATA, seq_nr = 101, payload = "hello"),
-            cmphead!(ST_DATA, seq_nr = 102, payload = "world"),
-            cmphead!(ST_DATA, seq_nr = 103, payload = "hello"),
-            cmphead!(ST_DATA, seq_nr = 104, payload = "world"),
+            cmphead!(Data, seq_nr = 101, payload = "hello"),
+            cmphead!(Data, seq_nr = 102, payload = "world"),
+            cmphead!(Data, seq_nr = 103, payload = "hello"),
+            cmphead!(Data, seq_nr = 104, payload = "world"),
         ]
     );
 
@@ -208,7 +208,7 @@ async fn test_rto_not_stuck_in_congestion_control() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 101, payload = "hello")]
+        vec![cmphead!(Data, seq_nr = 101, payload = "hello")]
     );
     assert_eq!(t.vsock.congestion_controller.window(), MSS);
     t.poll_once_assert_pending().await;
@@ -217,7 +217,7 @@ async fn test_rto_not_stuck_in_congestion_control() {
     // Its acknowledgement lets sending go on from the next.
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             wnd_size: 1024 * 1024,
             seq_nr: 0.into(),
             ack_nr: 101.into(),
@@ -228,11 +228,11 @@ async fn test_rto_not_stuck_in_congestion_control() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 102, payload = "world")]
+        vec![cmphead!(Data, seq_nr = 102, payload = "world")]
     );
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             wnd_size: 1024 * 1024,
             seq_nr: 0.into(),
             ack_nr: 104.into(),
@@ -264,7 +264,7 @@ async fn test_basic_retransmission_0() {
     // First transmission should happen
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = seq_nr, payload = "hello"),]
+        vec![cmphead!(Data, seq_nr = seq_nr, payload = "hello"),]
     );
 
     // Wait for retransmission timeout
@@ -274,7 +274,7 @@ async fn test_basic_retransmission_0() {
     // Should retransmit the same data
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = seq_nr, payload = "hello")]
+        vec![cmphead!(Data, seq_nr = seq_nr, payload = "hello")]
     );
 
     // Until time goes on, nothing should happen.
@@ -286,7 +286,7 @@ async fn test_basic_retransmission_0() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = seq_nr, payload = "hello")]
+        vec![cmphead!(Data, seq_nr = seq_nr, payload = "hello")]
     );
 }
 
@@ -303,7 +303,7 @@ async fn test_basic_retransmission_1() {
     // Allow sending by setting window size
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 0.into(),
             ack_nr: t.vsock.seq_nr - 1,
             wnd_size: 1024,
@@ -325,7 +325,7 @@ async fn test_basic_retransmission_1() {
     assert_eq!(
         t.take_sent(),
         vec![cmphead!(
-            ST_DATA,
+            Data,
             seq_nr = 101,
             ack_nr = 0,
             payload = "hello world"
@@ -344,7 +344,7 @@ async fn test_basic_retransmission_1() {
     assert_eq!(
         t.take_sent(),
         vec![cmphead!(
-            ST_DATA,
+            Data,
             seq_nr = 101,
             ack_nr = 0,
             payload = "hello world"
@@ -358,7 +358,7 @@ async fn test_basic_retransmission_1() {
     assert_eq!(
         t.take_sent(),
         vec![cmphead!(
-            ST_DATA,
+            Data,
             seq_nr = 101,
             ack_nr = 0,
             payload = "hello world"
@@ -369,7 +369,7 @@ async fn test_basic_retransmission_1() {
     // Now ACK the packet - should stop retransmissions
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 0.into(),
             ack_nr: 101.into(),
             wnd_size: 1024,
@@ -389,12 +389,7 @@ async fn test_basic_retransmission_1() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 102,
-            ack_nr = 0,
-            payload = "test"
-        )]
+        vec![cmphead!(Data, seq_nr = 102, ack_nr = 0, payload = "test")]
     );
 }
 
@@ -418,7 +413,7 @@ async fn test_rto_single_packet_retransmission_mss_sized() {
     // Allow sending by setting window size
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 1.into(),
             ack_nr: t.vsock.seq_nr - 1,
             wnd_size: 1024,
@@ -436,13 +431,13 @@ async fn test_rto_single_packet_retransmission_mss_sized() {
     assert_eq!(
         t.take_sent(),
         vec![
-            cmphead!(ST_DATA, seq_nr = 101, payload = "a"),
-            cmphead!(ST_DATA, seq_nr = 102, payload = "b"),
-            cmphead!(ST_DATA, seq_nr = 103, payload = "c"),
-            cmphead!(ST_DATA, seq_nr = 104, payload = "d"),
-            cmphead!(ST_DATA, seq_nr = 105, payload = "e"),
-            cmphead!(ST_DATA, seq_nr = 106, payload = "f"),
-            cmphead!(ST_DATA, seq_nr = 107, payload = "g"),
+            cmphead!(Data, seq_nr = 101, payload = "a"),
+            cmphead!(Data, seq_nr = 102, payload = "b"),
+            cmphead!(Data, seq_nr = 103, payload = "c"),
+            cmphead!(Data, seq_nr = 104, payload = "d"),
+            cmphead!(Data, seq_nr = 105, payload = "e"),
+            cmphead!(Data, seq_nr = 106, payload = "f"),
+            cmphead!(Data, seq_nr = 107, payload = "g"),
         ],
         "The initial window takes all seven"
     );
@@ -463,7 +458,7 @@ async fn test_rto_single_packet_retransmission_mss_sized() {
     // RTO should retransmit ONLY the first unacked packet
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 101, payload = "a")],
+        vec![cmphead!(Data, seq_nr = 101, payload = "a")],
         "After RTO, only the first unacked packet should be retransmitted"
     );
 
@@ -479,7 +474,7 @@ async fn test_rto_single_packet_retransmission_mss_sized() {
     // After ACK, we should resume sending from where we left off
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 1.into(),
             ack_nr: 101.into(),
             wnd_size: 1024,
@@ -496,14 +491,14 @@ async fn test_rto_single_packet_retransmission_mss_sized() {
     );
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 102, payload = "b")],
+        vec![cmphead!(Data, seq_nr = 102, payload = "b")],
         "After ACK for retransmitted packet, should continue sending"
     );
 
     // ACK the second packet
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 1.into(),
             ack_nr: 102.into(),
             wnd_size: 1024,
@@ -521,7 +516,7 @@ async fn test_rto_single_packet_retransmission_mss_sized() {
 
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 103, payload = "c")],
+        vec![cmphead!(Data, seq_nr = 103, payload = "c")],
         "After second ACK, should send next packet"
     );
 
@@ -532,7 +527,7 @@ async fn test_rto_single_packet_retransmission_mss_sized() {
     // Should retransmit only the first unacked packet
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 103, payload = "c")],
+        vec![cmphead!(Data, seq_nr = 103, payload = "c")],
         "After second RTO, only the first unacked packet should be retransmitted"
     );
 
@@ -558,7 +553,7 @@ async fn test_rto_single_packet_retransmission_smaller_than_mss() {
     // Allow sending by setting window size
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 1.into(),
             ack_nr: t.vsock.seq_nr - 1,
             wnd_size: 1024,
@@ -574,14 +569,14 @@ async fn test_rto_single_packet_retransmission_smaller_than_mss() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 101, payload = "a")]
+        vec![cmphead!(Data, seq_nr = 101, payload = "a")]
     );
 
     w.write_all(b"bcde").await.unwrap();
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 102, payload = "bcde")]
+        vec![cmphead!(Data, seq_nr = 102, payload = "bcde")]
     );
 
     // Trigger a timeout. Should retransmit only ONE packet and do nothing on second poll.
@@ -589,7 +584,7 @@ async fn test_rto_single_packet_retransmission_smaller_than_mss() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 101, payload = "a")]
+        vec![cmphead!(Data, seq_nr = 101, payload = "a")]
     );
     t.poll_once_assert_pending().await;
     t.assert_sent_empty();
@@ -622,14 +617,14 @@ async fn test_selective_ack_retransmission() {
     assert_eq!(
         t.take_sent(),
         vec![
-            cmphead!(ST_DATA, seq_nr = 101, ack_nr = 0, payload = "hello"),
-            cmphead!(ST_DATA, seq_nr = 102, ack_nr = 0, payload = "world")
+            cmphead!(Data, seq_nr = 101, ack_nr = 0, payload = "hello"),
+            cmphead!(Data, seq_nr = 102, ack_nr = 0, payload = "world")
         ]
     );
 
     // Send selective ACK indicating second packet was received but first wasn't
     let header = UtpHeader {
-        htype: ST_STATE,
+        htype: State,
         seq_nr: 1.into(),
         ack_nr: 100.into(), // ACK previous packet
         wnd_size: 1024,
@@ -650,18 +645,13 @@ async fn test_selective_ack_retransmission() {
     // Should only retransmit the first packet
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 101,
-            ack_nr = 0,
-            payload = "hello"
-        )]
+        vec![cmphead!(Data, seq_nr = 101, ack_nr = 0, payload = "hello")]
     );
 
     // Send normal ACK for first packet
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 1.into(),
             ack_nr: 101.into(),
             wnd_size: 1024,
@@ -697,7 +687,7 @@ async fn fin_retransmit() {
     }
 
     t.poll_once_assert_pending().await;
-    assert_eq!(t.take_sent(), vec![cmphead!(ST_FIN, seq_nr = 101)]);
+    assert_eq!(t.take_sent(), vec![cmphead!(Fin, seq_nr = 101)]);
     t.poll_once_assert_pending().await;
     t.assert_sent_empty();
 
@@ -705,7 +695,7 @@ async fn fin_retransmit() {
     let rto_0 = t.vsock.rtte.retransmission_timeout();
     t.env.increment_now(rto_0);
     t.poll_once_assert_pending().await;
-    assert_eq!(t.take_sent(), vec![cmphead!(ST_FIN, seq_nr = 101)]);
+    assert_eq!(t.take_sent(), vec![cmphead!(Fin, seq_nr = 101)]);
     t.poll_once_assert_pending().await;
     t.assert_sent_empty();
 
@@ -718,6 +708,6 @@ async fn fin_retransmit() {
     assert!(
         t.take_sent()
             .iter()
-            .all(|m| m.header.htype != ST_DATA && m.header.htype != ST_FIN)
+            .all(|m| m.header.htype != Data && m.header.htype != Fin)
     );
 }

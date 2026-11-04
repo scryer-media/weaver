@@ -36,12 +36,7 @@ async fn test_inactivity_timeout_0() {
     // Initial data should be sent
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 101,
-            ack_nr = 0,
-            payload = "hello"
-        )],
+        vec![cmphead!(Data, seq_nr = 101, ack_nr = 0, payload = "hello")],
     );
 
     // Wait just under timeout - connection should still be alive, but we
@@ -50,18 +45,13 @@ async fn test_inactivity_timeout_0() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 101,
-            ack_nr = 0,
-            payload = "hello"
-        )],
+        vec![cmphead!(Data, seq_nr = 101, ack_nr = 0, payload = "hello")],
     );
 
     // Remote sends ACK - should reset inactivity timer
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 0.into(),
             ack_nr: 101.into(),
             wnd_size: 1024,
@@ -92,12 +82,7 @@ async fn test_inactivity_timeout_0() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 102,
-            ack_nr = 0,
-            payload = "world"
-        )],
+        vec![cmphead!(Data, seq_nr = 102, ack_nr = 0, payload = "world")],
     );
 
     // Wait past timeout - connection should error out as nothing received.
@@ -134,7 +119,7 @@ async fn test_inactivity_timeout_initial_synack() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 101, ack_nr = 0)],
+        vec![cmphead!(State, seq_nr = 101, ack_nr = 0)],
         "Should send syn-ack"
     );
 
@@ -178,10 +163,7 @@ async fn test_inactivity_timeout_our_fin_acked() {
     drop(t.stream.take().unwrap());
 
     t.poll_once_assert_pending().await;
-    assert_eq!(
-        t.take_sent(),
-        vec![cmphead!(ST_FIN, seq_nr = 101, ack_nr = 0)],
-    );
+    assert_eq!(t.take_sent(), vec![cmphead!(Fin, seq_nr = 101, ack_nr = 0)],);
     assert_eq!(
         t.vsock.state,
         VirtualSocketState::FinWait1 {
@@ -191,7 +173,7 @@ async fn test_inactivity_timeout_our_fin_acked() {
 
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             ack_nr: 101.into(),
             ..Default::default()
         },
@@ -227,10 +209,7 @@ async fn test_inactivity_timeout_our_fin_unacked() {
     drop(t.stream.take().unwrap());
 
     t.poll_once_assert_pending().await;
-    assert_eq!(
-        t.take_sent(),
-        vec![cmphead!(ST_FIN, seq_nr = 101, ack_nr = 0)],
-    );
+    assert_eq!(t.take_sent(), vec![cmphead!(Fin, seq_nr = 101, ack_nr = 0)],);
     assert_eq!(
         t.vsock.state,
         VirtualSocketState::FinWait1 {

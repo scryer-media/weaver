@@ -15,35 +15,34 @@ const EXT_SELECTIVE_ACK: u8 = 1;
 const EXT_CLOSE_REASON: u8 = 3;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[allow(non_camel_case_types)]
 pub enum Type {
-    ST_DATA = 0,
-    ST_FIN = 1,
+    Data = 0,
+    Fin = 1,
     #[default]
-    ST_STATE = 2,
-    ST_RESET = 3,
-    ST_SYN = 4,
+    State = 2,
+    Reset = 3,
+    Syn = 4,
 }
 
 impl Type {
     fn from_number(num: u8) -> Option<Type> {
         match num {
-            0 => Some(Type::ST_DATA),
-            1 => Some(Type::ST_FIN),
-            2 => Some(Type::ST_STATE),
-            3 => Some(Type::ST_RESET),
-            4 => Some(Type::ST_SYN),
+            0 => Some(Type::Data),
+            1 => Some(Type::Fin),
+            2 => Some(Type::State),
+            3 => Some(Type::Reset),
+            4 => Some(Type::Syn),
             _ => None,
         }
     }
 
     fn to_number(self) -> u8 {
         match self {
-            Type::ST_DATA => 0,
-            Type::ST_FIN => 1,
-            Type::ST_STATE => 2,
-            Type::ST_RESET => 3,
-            Type::ST_SYN => 4,
+            Type::Data => 0,
+            Type::Fin => 1,
+            Type::State => 2,
+            Type::Reset => 3,
+            Type::Syn => 4,
         }
     }
 }
@@ -114,29 +113,29 @@ impl UtpHeader {
         let mut next_ext_pos = NEXT_EXT_IDX;
         let mut offset = 20;
 
-        macro_rules! add_ext {
-            ($id:expr, $payload:expr) => {
-                let payload = $payload;
-                if buffer.len() >= offset + 2 + payload.len() {
-                    buffer[next_ext_pos] = $id;
-                    buffer[offset] = NO_NEXT_EXT;
-                    buffer[offset + 1] = payload.len() as u8;
-                    buffer[offset + 2..offset + 2 + payload.len()].copy_from_slice(payload);
-
-                    #[allow(unused)]
-                    {
-                        next_ext_pos = offset;
-                    }
-                    offset += 2 + payload.len();
-                }
-            };
-        }
-
-        if let Some(sack) = self.extensions.selective_ack {
-            add_ext!(EXT_SELECTIVE_ACK, sack.as_bytes());
-        }
-        if let Some(close_reason) = self.extensions.close_reason {
-            add_ext!(EXT_CLOSE_REASON, &close_reason.as_bytes());
+        let close_reason = self.extensions.close_reason.map(|reason| reason.as_bytes());
+        for (id, payload) in [
+            (
+                EXT_SELECTIVE_ACK,
+                self.extensions
+                    .selective_ack
+                    .as_ref()
+                    .map(|sack| sack.as_bytes()),
+            ),
+            (
+                EXT_CLOSE_REASON,
+                close_reason.as_ref().map(|reason| reason.as_slice()),
+            ),
+        ] {
+            let Some(payload) = payload else { continue };
+            if buffer.len() >= offset + 2 + payload.len() {
+                buffer[next_ext_pos] = id;
+                buffer[offset] = NO_NEXT_EXT;
+                buffer[offset + 1] = payload.len() as u8;
+                buffer[offset + 2..offset + 2 + payload.len()].copy_from_slice(payload);
+                next_ext_pos = offset;
+                offset += 2 + payload.len();
+            }
         }
 
         Ok(offset)
@@ -231,7 +230,7 @@ mod tests {
         assert_eq!(
             header,
             UtpHeader {
-                htype: Type::ST_FIN,
+                htype: Type::Fin,
                 connection_id: 30796.into(),
                 timestamp_microseconds: 2293274188,
                 timestamp_difference_microseconds: 1967430273,
@@ -260,7 +259,7 @@ mod tests {
             Extensions, ext_close_reason::LibTorrentCloseReason, selective_ack::SelectiveAck,
         };
         let header = UtpHeader {
-            htype: Type::ST_FIN,
+            htype: Type::Fin,
             extensions: Extensions {
                 selective_ack: SelectiveAck::new_test([1]),
                 close_reason: Some(LibTorrentCloseReason(0x0102)),

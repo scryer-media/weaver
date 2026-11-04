@@ -43,33 +43,15 @@ macro_rules! non_zero_const {
     };
 }
 
-#[allow(unused)]
-macro_rules! trace_dbg {
-    ($e:expr) => {{
-        let expr = $e;
-        trace!(?expr);
-        expr
-    }};
-}
-
-#[allow(unused)]
 macro_rules! trace_every_ms {
     ($dur:expr, $($rest:tt)*) => {
         log_every_ms!($dur, tracing::Level::TRACE, $($rest)*);
     };
 }
 
-#[allow(unused)]
 macro_rules! debug_every_ms {
     ($dur:expr, $($rest:tt)*) => {
         log_every_ms!($dur, tracing::Level::DEBUG, $($rest)*);
-    };
-}
-
-#[allow(unused)]
-macro_rules! warn_every_ms {
-    ($dur:expr, $($rest:tt)*) => {
-        log_every_ms!($dur, tracing::Level::WARN, $($rest)*);
     };
 }
 

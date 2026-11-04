@@ -29,7 +29,7 @@ fn patient() -> SocketOpts {
 fn open_window(t: &mut super::TestVsock) {
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 1.into(),
             ack_nr: 100.into(),
             wnd_size: 1024 * 1024,
@@ -64,7 +64,7 @@ async fn data_is_sent_three_times_then_the_stream_gives_up() {
         Err(Error::MaxRetransmissionsReached)
     ));
     assert!(
-        t.take_sent().iter().all(|m| m.header.htype != ST_DATA),
+        t.take_sent().iter().all(|m| m.header.htype != Data),
         "no fourth send"
     );
     let stats = t._socket.stats().snapshot();
@@ -143,7 +143,7 @@ async fn our_fin_is_sent_twice_then_the_stream_ends() {
 
     t.env.increment_now(t.vsock.rtte.retransmission_timeout());
     assert!(t.poll_once_assert_ready().await.is_err());
-    assert!(t.take_sent().iter().all(|m| m.header.htype != ST_FIN));
+    assert!(t.take_sent().iter().all(|m| m.header.htype != Fin));
 }
 
 #[tokio::test]
@@ -218,7 +218,7 @@ async fn an_idle_window_decays_by_a_third_per_timeout() {
         t.env.increment_now(Duration::from_millis(50));
         t.send_msg(
             UtpHeader {
-                htype: ST_STATE,
+                htype: State,
                 seq_nr: 1.into(),
                 ack_nr: last,
                 wnd_size: 1024 * 1024,

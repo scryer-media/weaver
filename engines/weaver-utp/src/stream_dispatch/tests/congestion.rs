@@ -36,7 +36,7 @@ async fn test_congestion_control_basics() {
     // Allow sending by setting large window
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 1.into(),
             ack_nr: 99.into(),
             wnd_size: remote_wnd, // Large window to not interfere with congestion control
@@ -85,7 +85,7 @@ async fn test_congestion_control_basics() {
     for seq_nr in &first_batch_seq_nrs {
         t.send_msg(
             UtpHeader {
-                htype: ST_STATE,
+                htype: State,
                 seq_nr: 1.into(),
                 ack_nr: *seq_nr,
                 wnd_size: remote_wnd,
@@ -119,7 +119,7 @@ async fn test_congestion_control_basics() {
     for _ in 0..4 {
         t.send_msg(
             UtpHeader {
-                htype: ST_STATE,
+                htype: State,
                 seq_nr: 0.into(),
                 ack_nr: lost_seq_nr,
                 wnd_size: remote_wnd,
@@ -179,7 +179,7 @@ async fn ledbat_grows_under_target_and_backs_off_over_it() {
     let remote_wnd = 1024 * 1024;
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 1.into(),
             ack_nr: 99.into(),
             wnd_size: remote_wnd,
@@ -207,7 +207,7 @@ async fn ledbat_grows_under_target_and_backs_off_over_it() {
         t.env.increment_now(Duration::from_millis(250));
         t.send_msg(
             UtpHeader {
-                htype: ST_STATE,
+                htype: State,
                 seq_nr: 1.into(),
                 ack_nr: last,
                 wnd_size: remote_wnd,
@@ -271,7 +271,7 @@ async fn the_next_new_packet_stays_inside_the_last_loss_gate() {
     assert_eq!(sent.len(), 6);
     assert_eq!(sent.last().unwrap().header.seq_nr, 106.into());
     let ack = |ack_nr| UtpHeader {
-        htype: ST_STATE,
+        htype: State,
         seq_nr: 1.into(),
         ack_nr,
         wnd_size: 1024 * 1024,

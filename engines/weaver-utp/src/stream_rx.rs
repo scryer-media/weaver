@@ -670,9 +670,9 @@ impl OutOfOrderQueue {
         }
 
         let msg = match msg.header.htype {
-            Type::ST_DATA if msg.payload().is_empty() => return Err(Error::ZeroPayloadStData),
-            Type::ST_DATA => OoqMessage::Payload(msg.data),
-            Type::ST_FIN => OoqMessage::Eof,
+            Type::Data if msg.payload().is_empty() => return Err(Error::ZeroPayloadStData),
+            Type::Data => OoqMessage::Payload(msg.data),
+            Type::Fin => OoqMessage::Eof,
             _ => return Err(Error::BugInvalidMessageExpectedStDataOrFin),
         };
 
@@ -725,7 +725,7 @@ mod tests {
     fn msg(seq_nr: u16, payload: &[u8]) -> UtpMessage {
         UtpMessage::new_test(
             crate::raw::UtpHeader {
-                htype: crate::raw::Type::ST_DATA,
+                htype: crate::raw::Type::Data,
                 seq_nr: seq_nr.into(),
                 ..Default::default()
             },

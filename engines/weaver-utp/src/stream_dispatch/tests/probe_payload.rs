@@ -49,7 +49,7 @@ async fn transfer_after_removing_a_probe(removal: Removal) {
     }
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 1.into(),
             ack_nr: first_seq_nr,
             wnd_size: 1024 * 1024,
@@ -79,7 +79,7 @@ async fn transfer_after_removing_a_probe(removal: Removal) {
         let sent = t.take_sent();
         let mut last_ack = None;
         for message in sent {
-            assert_eq!(message.header.htype, ST_DATA);
+            assert_eq!(message.header.htype, Data);
             if matches!(removal, Removal::TooLarge) && message.payload().len() > floor {
                 saw_rejected_probe = true;
                 continue;
@@ -93,7 +93,7 @@ async fn transfer_after_removing_a_probe(removal: Removal) {
         let ack_nr = last_ack.expect("unflushed payload must have replacement data to acknowledge");
         t.send_msg(
             UtpHeader {
-                htype: ST_STATE,
+                htype: State,
                 seq_nr: 1.into(),
                 ack_nr,
                 wnd_size: 1024 * 1024,

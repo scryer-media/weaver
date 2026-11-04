@@ -118,10 +118,10 @@ impl LinkEnd {
     fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
         let n = self.sent.fetch_add(1, Ordering::Relaxed) + 1;
         match buf.first().map(|b| b >> 4) {
-            Some(t) if t == crate::raw::Type::ST_STATE as u8 => {
+            Some(t) if t == crate::raw::Type::State as u8 => {
                 self.acks.fetch_add(1, Ordering::Relaxed);
             }
-            Some(t) if t == crate::raw::Type::ST_DATA as u8 => {
+            Some(t) if t == crate::raw::Type::Data as u8 => {
                 self.data.fetch_add(1, Ordering::Relaxed);
                 let mut forced = self.forced_timeout.lock();
                 if let Some(timeout) = forced.as_mut() {

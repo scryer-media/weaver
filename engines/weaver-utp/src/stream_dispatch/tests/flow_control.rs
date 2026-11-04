@@ -29,7 +29,7 @@ async fn test_flow_control() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 101, ack_nr = 0)]
+        vec![cmphead!(State, seq_nr = 101, ack_nr = 0)]
     ); // syn ack
 
     // Test assembly queue limit first
@@ -85,7 +85,7 @@ async fn test_sender_flow_control() {
     // Set initial remote window very small
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 0.into(),
             ack_nr: t.vsock.seq_nr - 1,
             wnd_size: 5, // Only allow 5 bytes
@@ -106,12 +106,7 @@ async fn test_sender_flow_control() {
     // Should only send up to window size
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 101,
-            ack_nr = 0,
-            payload = "hello"
-        )]
+        vec![cmphead!(Data, seq_nr = 101, ack_nr = 0, payload = "hello")]
     );
 
     // No more data should be sent until window updates
@@ -121,7 +116,7 @@ async fn test_sender_flow_control() {
     // ACK first packet but keep window small
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 0.into(),
             ack_nr: 101.into(),
             wnd_size: 4, // Reduce window further
@@ -137,7 +132,7 @@ async fn test_sender_flow_control() {
     // Remote increases window and ACKs
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 0.into(),
             ack_nr: 101.into(),
             wnd_size: 10, // Open window
@@ -150,12 +145,7 @@ async fn test_sender_flow_control() {
     // Should send remaining data
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 102,
-            ack_nr = 0,
-            payload = "world"
-        )]
+        vec![cmphead!(Data, seq_nr = 102, ack_nr = 0, payload = "world")]
     );
 }
 
@@ -167,7 +157,7 @@ async fn test_zero_window_handling() {
     // Set initial window to allow some data
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 0.into(),
             ack_nr: t.vsock.seq_nr - 1,
             wnd_size: 5,
@@ -188,18 +178,13 @@ async fn test_zero_window_handling() {
     // First chunk should be sent
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 101,
-            ack_nr = 0,
-            payload = "hello"
-        )]
+        vec![cmphead!(Data, seq_nr = 101, ack_nr = 0, payload = "hello")]
     );
 
     // ACK data but advertise zero window
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 0.into(),
             ack_nr: 101.into(),
             wnd_size: 0, // Zero window
@@ -215,7 +200,7 @@ async fn test_zero_window_handling() {
     // Remote sends window update
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 0.into(),
             ack_nr: 101.into(),
             wnd_size: 1024, // Open window
@@ -228,12 +213,7 @@ async fn test_zero_window_handling() {
     // Remaining data should now be sent
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 102,
-            ack_nr = 0,
-            payload = " world"
-        )]
+        vec![cmphead!(Data, seq_nr = 102, ack_nr = 0, payload = " world")]
     );
 }
 
@@ -258,7 +238,7 @@ async fn test_window_update_sent_when_window_less_than_mss() {
     assert!(!t.vsock.user_rx.is_flush_waker_registered());
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, ack_nr = 1, wnd_size = 5u32)]
+        vec![cmphead!(State, ack_nr = 1, wnd_size = 5u32)]
     );
 
     // Now the window should be less than MSS.
@@ -268,12 +248,7 @@ async fn test_window_update_sent_when_window_less_than_mss() {
 
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(
-            ST_STATE,
-            seq_nr = 101,
-            ack_nr = 2,
-            wnd_size = 0u32
-        )],
+        vec![cmphead!(State, seq_nr = 101, ack_nr = 2, wnd_size = 0u32)],
         "Should have sent an ACK with new window less than MSS"
     );
 
@@ -290,12 +265,7 @@ async fn test_window_update_sent_when_window_less_than_mss() {
     // Should send window update ACK
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(
-            ST_STATE,
-            seq_nr = 101,
-            ack_nr = 2,
-            wnd_size = 5u32
-        )],
+        vec![cmphead!(State, seq_nr = 101, ack_nr = 2, wnd_size = 5u32)],
         "Should have sent an ACK with updated window"
     );
 }
@@ -307,7 +277,7 @@ async fn test_sends_up_to_remote_window_only_single_msg() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, ack_nr = 0)],
+        vec![cmphead!(State, ack_nr = 0)],
         "intial SYN-ACK should be sent"
     );
     assert_eq!(t.vsock.last_remote_window, 0);
@@ -323,7 +293,7 @@ async fn test_sends_up_to_remote_window_only_single_msg() {
 
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 0.into(),
             ack_nr: 100.into(),
             wnd_size: 4,
@@ -335,12 +305,7 @@ async fn test_sends_up_to_remote_window_only_single_msg() {
 
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(
-            ST_DATA,
-            seq_nr = 101,
-            ack_nr = 0,
-            payload = "hell"
-        )]
+        vec![cmphead!(Data, seq_nr = 101, ack_nr = 0, payload = "hell")]
     );
 
     // Until window updates and/or we receive an ACK, we don't send anything
@@ -378,7 +343,7 @@ async fn test_sends_up_to_remote_window_only_multi_msg() {
 
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 1.into(),
             ack_nr: 100.into(),
             // This is enough to send "hello" in 3 messages
@@ -391,9 +356,9 @@ async fn test_sends_up_to_remote_window_only_multi_msg() {
     assert_eq!(
         t.take_sent(),
         vec![
-            cmphead!(ST_DATA, seq_nr = 101, payload = "he"),
-            cmphead!(ST_DATA, seq_nr = 102, payload = "ll"),
-            cmphead!(ST_DATA, seq_nr = 103, payload = "o")
+            cmphead!(Data, seq_nr = 101, payload = "he"),
+            cmphead!(Data, seq_nr = 102, payload = "ll"),
+            cmphead!(Data, seq_nr = 103, payload = "o")
         ]
     );
 

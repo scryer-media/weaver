@@ -25,7 +25,7 @@ async fn test_st_reset_error_propagation() {
     // Send a RESET packet
     t.send_msg(
         UtpHeader {
-            htype: ST_RESET,
+            htype: Reset,
             seq_nr: 1.into(),
             // Our SYN's: a reset acks only what we sent.
             ack_nr: t.vsock.seq_nr - 1,
@@ -58,7 +58,7 @@ async fn test_repeated_eof_read() {
     let (mut r, _w) = t.stream.take().unwrap().split();
     t.send_msg(
         UtpHeader {
-            htype: ST_FIN,
+            htype: Fin,
             seq_nr: 1.into(),
             ack_nr: 100.into(),
             ..Default::default()
@@ -79,7 +79,7 @@ async fn test_repeated_eof_read_2() {
     let (mut r, _w) = t.stream.take().unwrap().split();
     t.send_msg(
         UtpHeader {
-            htype: ST_DATA,
+            htype: Data,
             seq_nr: 1.into(),
             ack_nr: 100.into(),
             ..Default::default()
@@ -88,7 +88,7 @@ async fn test_repeated_eof_read_2() {
     );
     t.send_msg(
         UtpHeader {
-            htype: ST_FIN,
+            htype: Fin,
             seq_nr: 2.into(),
             ack_nr: 100.into(),
             ..Default::default()
@@ -115,7 +115,7 @@ async fn test_flush_works() {
     // Allow sending by setting window size
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 0.into(),
             ack_nr: t.vsock.seq_nr - 1,
             wnd_size: 1024,
@@ -143,7 +143,7 @@ async fn test_flush_works() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 101, payload = "hello")],
+        vec![cmphead!(Data, seq_nr = 101, payload = "hello")],
     );
 
     // Ensure flush is still blocked until the data is ACKed.
@@ -157,7 +157,7 @@ async fn test_flush_works() {
     // Acknowledge the data
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 0.into(),
             ack_nr: 101.into(),
             ..Default::default()

@@ -25,7 +25,7 @@ use crate::{
 // The largest payload a new outgoing stream on `t`'s socket probes for.
 fn new_streams_max_ss(t: &super::TestVsock) -> u16 {
     let remote_ack = UtpHeader {
-        htype: ST_STATE,
+        htype: State,
         seq_nr: 1.into(),
         ack_nr: 100.into(),
         wnd_size: 1024 * 1024,
@@ -91,7 +91,7 @@ async fn no_packet_outgrows_a_1280_byte_tunnel() {
         }
         t.send_msg(
             UtpHeader {
-                htype: ST_STATE,
+                htype: State,
                 seq_nr: 1.into(),
                 ack_nr: ack_nr.into(),
                 wnd_size: 1024 * 1024,
@@ -142,7 +142,7 @@ async fn a_stream_that_dies_on_a_probe_lowers_the_ceiling() {
 
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 1.into(),
             ack_nr: 101.into(),
             wnd_size: 1024 * 1024,

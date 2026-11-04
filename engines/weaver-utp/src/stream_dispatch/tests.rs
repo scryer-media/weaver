@@ -69,7 +69,7 @@ impl TestVsock {
 
     fn send_data(&mut self, seq_nr: impl Into<SeqNr>, ack_nr: impl Into<SeqNr>, payload: &str) {
         let header = UtpHeader {
-            htype: ST_DATA,
+            htype: Data,
             connection_id: self.vsock.conn_id_send + 1,
             timestamp_microseconds: self.vsock.timestamp_microseconds(),
             timestamp_difference_microseconds: 0,
@@ -175,13 +175,13 @@ fn make_test_vsock(opts: SocketOpts, is_incoming: bool) -> TestVsock {
 fn test_stream_args(env: &MockUtpEnvironment, is_incoming: bool) -> StreamArgs {
     if is_incoming {
         let remote_syn = UtpHeader {
-            htype: ST_SYN,
+            htype: Syn,
             ..Default::default()
         };
         StreamArgs::new_incoming(101.into(), &remote_syn)
     } else {
         let remote_ack = UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 1.into(),
             ack_nr: 100.into(),
             wnd_size: 1024 * 1024,

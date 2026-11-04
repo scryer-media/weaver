@@ -435,7 +435,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             ControlRequest::ConnectRequest(addr, token, sender) => {
                 let conn_id = self.get_next_free_conn_id(addr);
                 let header = UtpHeader {
-                    htype: Type::ST_SYN,
+                    htype: Type::Syn,
                     connection_id: conn_id,
                     timestamp_microseconds: (self.env.now() - self.socket.created).as_micros()
                         as u32,
@@ -576,7 +576,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     async fn try_send_rst(&self, syn: Syn) {
         let mut buf: [u8; UTP_HEADER as usize] = [0; UTP_HEADER as usize];
         let packet = UtpHeader {
-            htype: Type::ST_RESET,
+            htype: Type::Reset,
             connection_id: syn.header.connection_id,
             seq_nr: 0.into(),
             ack_nr: syn.header.seq_nr,
@@ -653,10 +653,10 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         trace!(?key, "no matching live streams");
 
         match message.header.get_type() {
-            Type::ST_STATE => {
+            Type::State => {
                 self.on_maybe_connect_ack(addr, message)?;
             }
-            Type::ST_SYN => {
+            Type::Syn => {
                 self.on_syn(addr, message).await?;
             }
             _ => {
@@ -993,7 +993,7 @@ mod tests {
         let syn = |id: u16| {
             UtpMessage::new_test(
                 UtpHeader {
-                    htype: Type::ST_SYN,
+                    htype: Type::Syn,
                     connection_id: id.into(),
                     ..Default::default()
                 },
@@ -1047,7 +1047,7 @@ mod tests {
         let syn = |id: u16| {
             UtpMessage::new_test(
                 UtpHeader {
-                    htype: Type::ST_SYN,
+                    htype: Type::Syn,
                     connection_id: id.into(),
                     ..Default::default()
                 },
@@ -1114,7 +1114,7 @@ mod tests {
                     ADDR_2,
                     UtpMessage::new_test(
                         UtpHeader {
-                            htype: Type::ST_SYN,
+                            htype: Type::Syn,
                             connection_id: id.into(),
                             seq_nr: id.into(),
                             ..Default::default()
@@ -1130,7 +1130,7 @@ mod tests {
         assert_eq!(stats.syn_flood_dropped, 0);
         let sent = transport.take_sent_utpmessages();
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].header.htype, Type::ST_RESET);
+        assert_eq!(sent[0].header.htype, Type::Reset);
         assert_eq!(
             sent[0].header.ack_nr,
             (super::ACCEPT_QUEUE_MAX_SYNS as u16).into()

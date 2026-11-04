@@ -393,12 +393,6 @@ impl Segments {
         }
     }
 
-    #[allow(unused)]
-    pub fn stats(&self) -> impl std::fmt::Debug {
-        // this is for debugging only
-        format!("headers: {}", self.segments.len())
-    }
-
     // Returns number of removed headers, and their comibined payload size.
     pub fn remove_up_to_ack(&mut self, now: Instant, ack_header: &UtpHeader) -> OnAckResult {
         let mut removed = 0;

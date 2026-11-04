@@ -31,7 +31,7 @@ async fn test_rtte_set_and_updated() {
     // Allow sending by setting window size
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 1.into(),
             ack_nr: 100.into(),
             wnd_size: 1024,
@@ -46,11 +46,11 @@ async fn test_rtte_set_and_updated() {
     assert_eq!(
         t.take_sent(),
         vec![
-            cmphead!(ST_DATA, seq_nr = 101, payload = "a"),
-            cmphead!(ST_DATA, seq_nr = 102, payload = "b"),
-            cmphead!(ST_DATA, seq_nr = 103, payload = "c"),
-            cmphead!(ST_DATA, seq_nr = 104, payload = "d"),
-            cmphead!(ST_DATA, seq_nr = 105, payload = "e"),
+            cmphead!(Data, seq_nr = 101, payload = "a"),
+            cmphead!(Data, seq_nr = 102, payload = "b"),
+            cmphead!(Data, seq_nr = 103, payload = "c"),
+            cmphead!(Data, seq_nr = 104, payload = "d"),
+            cmphead!(Data, seq_nr = 105, payload = "e"),
         ]
     );
 
@@ -58,7 +58,7 @@ async fn test_rtte_set_and_updated() {
     t.env.increment_now(Duration::from_secs(1));
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 1.into(),
             ack_nr: 101.into(),
             // No need to send anything so set rwnd to 0.
@@ -78,7 +78,7 @@ async fn test_rtte_set_and_updated() {
     t.env.increment_now(Duration::from_secs(2));
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 1.into(),
             ack_nr: 102.into(),
             // No need to send anything so set rwnd to 0.
@@ -118,7 +118,7 @@ async fn confirmation_without_an_rtt_sample_uses_the_configured_floor() {
     let initial_rtt = t.vsock.rtte.roundtrip_time();
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 1.into(),
             ack_nr: 100.into(),
             wnd_size: 1024 * 1024,

@@ -21,7 +21,7 @@ async fn the_reported_gap_is_taken_on_arrival() {
     let arrival = t.vsock.timestamp_microseconds();
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             connection_id: t.vsock.conn_id_send + 1,
             timestamp_microseconds: 1_000,
             seq_nr: 1.into(),
@@ -40,7 +40,7 @@ async fn the_reported_gap_is_taken_on_arrival() {
 
     let sent = t.take_sent();
     assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].header.get_type(), ST_DATA);
+    assert_eq!(sent[0].header.get_type(), Data);
     assert_eq!(
         sent[0].header.timestamp_difference_microseconds,
         arrival.wrapping_sub(1_000)
@@ -53,7 +53,7 @@ async fn processing_delay_does_not_enter_the_reported_gap() {
     let arrival = (t.env.now() - t.vsock.socket_created).as_micros() as u32;
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             connection_id: t.vsock.conn_id_send + 1,
             timestamp_microseconds: 1_000,
             seq_nr: 1.into(),

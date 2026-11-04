@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 //! The session's connection budget: how many peer connections may be open at
 //! once, and how many outgoing connects may begin each second. The listener

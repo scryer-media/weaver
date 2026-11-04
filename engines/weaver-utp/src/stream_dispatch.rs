@@ -261,7 +261,7 @@ macro_rules! send_data {
     ($self:expr, $cx:expr, $header:expr, $segment_iter_item:expr) => {{
         // A closure so that we can use "?" inside the block.
         let mut tmp_closure = || {
-            $header.set_type(Type::ST_DATA);
+            $header.set_type(Type::Data);
             $header.seq_nr = $segment_iter_item.seq_nr();
             $header.timestamp_microseconds =
                 ($self.env.now() - $self.socket_created).as_micros() as u32;
@@ -800,7 +800,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         let mut fin = self.outgoing_header();
-        fin.set_type(Type::ST_FIN);
+        fin.set_type(Type::Fin);
         fin.seq_nr = seq_nr;
         if self.send_control_packet(cx, &fin)? {
             self.fin_sends += 1;
@@ -982,7 +982,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         if error.is_some() && !self.state.is_local_fin_or_later() {
             let mut fin = self.outgoing_header();
-            fin.set_type(Type::ST_FIN);
+            fin.set_type(Type::Fin);
             fin.seq_nr = self.seq_nr;
             self.seq_nr += 1;
             if let Err(e) = self.send_control_packet(cx, &fin) {
@@ -1117,12 +1117,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         // An ACK of a packet we never sent is a third party's: ignored,
         // a reset among them.
-        if hdr.htype != ST_SYN && hdr.ack_nr > self.highest_sent_seq_nr {
+        if hdr.htype != Syn && hdr.ack_nr > self.highest_sent_seq_nr {
             trace!(%self.highest_sent_seq_nr, "dropping packet, it acks what we never sent");
             self.socket.stats.invalid_packets.increment(1);
             return Ok(Default::default());
         }
-        if hdr.htype != ST_SYN && hdr.ack_nr < self.user_tx_segments.acked_seq_nr() - 3 {
+        if hdr.htype != Syn && hdr.ack_nr < self.user_tx_segments.acked_seq_nr() - 3 {
             trace!(acked_seq_nr = %self.user_tx_segments.acked_seq_nr(), "dropping packet, its ack is too old");
             self.socket.stats.invalid_packets.increment(1);
             return Ok(Default::default());
@@ -1130,15 +1130,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         match (self.state, hdr.get_type()) {
             // From real world packets: if ST_RESET acks our FIN, it's ok
-            (LastAck { our_fin, .. }, ST_RESET) if hdr.ack_nr == our_fin => {
+            (LastAck { our_fin, .. }, Reset) if hdr.ack_nr == our_fin => {
                 self.state = Closed;
                 return Ok(Default::default());
             }
-            (_, ST_RESET) => {
+            (_, Reset) => {
                 self.state = Closed;
                 return Err(Error::StResetReceived);
             }
-            (_, ST_SYN) => {
+            (_, Syn) => {
                 trace!("unexpected ST_SYN, ignoring");
                 self.socket.stats.invalid_packets.increment(1);
                 return Ok(Default::default());
@@ -1147,7 +1147,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 return Err(Error::BugRecvInClosed);
             }
             (SynReceived, _) => return Err(Error::BugUnexpectedPacketInSynReceived),
-            (SynAckSent { .. }, ST_DATA | ST_STATE) => {
+            (SynAckSent { .. }, Data | State) => {
                 if hdr.ack_nr != self.seq_nr - 1 {
                     trace!("dropping packet, we expected a different ack_nr");
                     self.socket.stats.invalid_packets.increment(1);
@@ -1158,15 +1158,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.restart_remote_inactivity_timer();
                 self.state = Established;
             }
-            (SynAckSent { .. }, ST_FIN) => {
+            (SynAckSent { .. }, Fin) => {
                 trace!("state: syn-ack-sent -> closed");
                 self.state = Closed;
             }
 
-            (Established, ST_DATA | ST_STATE) => {}
+            (Established, Data | State) => {}
 
             // Fin received in an expected state, but its sequence number is wrong
-            (Established | FinWait1 { .. } | FinWait2, ST_FIN)
+            (Established | FinWait1 { .. } | FinWait2, Fin)
                 if hdr.seq_nr != self.last_consumed_remote_seq_nr + 1 =>
             {
                 trace!(
@@ -1178,7 +1178,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 return Ok(Default::default());
             }
 
-            (Established, ST_FIN) => {
+            (Established, Fin) => {
                 trace!("state: established -> last-ack");
                 let our_fin = self.seq_nr;
                 self.seq_nr += 1;
@@ -1188,11 +1188,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
 
-            (FinWait1 { our_fin }, ST_FIN) if hdr.ack_nr == our_fin => {
+            (FinWait1 { our_fin }, Fin) if hdr.ack_nr == our_fin => {
                 trace!("state: fin-wait-1 -> closed");
                 self.state = Closed;
             }
-            (FinWait1 { our_fin }, ST_FIN) => {
+            (FinWait1 { our_fin }, Fin) => {
                 trace!("state: fin-wait-1 -> last-ack");
                 self.state = LastAck {
                     our_fin,
@@ -1200,23 +1200,23 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
 
-            (FinWait1 { our_fin }, ST_DATA | ST_STATE) if hdr.ack_nr == our_fin => {
+            (FinWait1 { our_fin }, Data | State) if hdr.ack_nr == our_fin => {
                 trace!("state: fin-wait-1 -> fin-wait-2");
                 self.restart_remote_inactivity_timer();
                 self.state = FinWait2;
-                if hdr.htype == ST_STATE && hdr.seq_nr - self.last_consumed_remote_seq_nr == 1 {
+                if hdr.htype == State && hdr.seq_nr - self.last_consumed_remote_seq_nr == 1 {
                     // some clients sends back FIN + ACK as STATE with seq_nr + 1. This is proably one of them.
                     trace!("treating ST_STATE as FIN");
                     self.state = Closed;
                 }
             }
-            (FinWait1 { .. }, ST_DATA | ST_STATE) => {}
-            (FinWait2, ST_FIN) => {
+            (FinWait1 { .. }, Data | State) => {}
+            (FinWait2, Fin) => {
                 trace!("state: fin-wait-2 -> closed");
                 self.restart_remote_inactivity_timer();
                 self.state = Closed;
             }
-            (FinWait2, ST_DATA | ST_STATE) => {}
+            (FinWait2, Data | State) => {}
 
             (LastAck { our_fin, .. }, _) if hdr.ack_nr == our_fin => {
                 trace!("state: last-ack -> closed");
@@ -1225,7 +1225,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
 
             (LastAck { remote_fin, .. }, _) if hdr.seq_nr > remote_fin => {
-                if hdr.htype == ST_DATA {
+                if hdr.htype == Data {
                     trace!(hdr=%hdr.short_repr(), ?remote_fin, "received higher seq nr than remote FIN, dropping packet");
                     self.socket.stats.invalid_packets.increment(1);
                     return Ok(Default::default());
@@ -1301,18 +1301,20 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             &msg.header,
             &result.on_ack_result,
             &mut self.user_tx_segments,
-            self.last_sent_seq_nr,
-            self.highest_sent_seq_nr + 1,
             &mut self.congestion_controller,
-            self.this_poll.now,
-            self.rtte.roundtrip_time(),
-            &self.socket.stats,
+            crate::recovery::AckContext {
+                last_sent_seq_nr: self.last_sent_seq_nr,
+                next_seq_nr: self.highest_sent_seq_nr + 1,
+                now: self.this_poll.now,
+                rtt: self.rtte.roundtrip_time(),
+                stats: &self.socket.stats,
+            },
         );
 
         let offset = msg.header.seq_nr - (self.last_consumed_remote_seq_nr + 1);
 
         match msg.header.get_type() {
-            ST_DATA => {
+            Data => {
                 if offset < 0 {
                     trace!(
                         %self.last_consumed_remote_seq_nr,
@@ -1392,9 +1394,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     self.send_ack(cx)?;
                 }
             }
-            ST_STATE => {}
-            ST_RESET => return Err(Error::StResetReceived),
-            ST_FIN => {
+            State => {}
+            Reset => return Err(Error::StResetReceived),
+            Fin => {
                 if let Some(close_reason) = msg.header.extensions.close_reason {
                     debug!("remote closed with {close_reason:?}");
                 }
@@ -1407,7 +1409,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     self.user_tx.mark_vsock_closed();
                 }
             }
-            ST_SYN => {
+            Syn => {
                 trace!("ignoring unexpected ST_SYN packet: {:?}", msg.header);
             }
         }

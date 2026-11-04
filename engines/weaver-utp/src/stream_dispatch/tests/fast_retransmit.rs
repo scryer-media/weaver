@@ -29,7 +29,7 @@ async fn test_fast_retransmit() {
     t.vsock.rtte.force_timeout(Duration::from_secs(10));
 
     let mut ack = UtpHeader {
-        htype: ST_STATE,
+        htype: State,
         seq_nr: 0.into(),
         ack_nr: 99.into(),
         wnd_size: 1024,
@@ -51,8 +51,8 @@ async fn test_fast_retransmit() {
     assert_eq!(
         t.take_sent(),
         vec![
-            cmphead!(ST_DATA, seq_nr = 101, payload = "hello"),
-            cmphead!(ST_DATA, seq_nr = 102, payload = "world")
+            cmphead!(Data, seq_nr = 101, payload = "hello"),
+            cmphead!(Data, seq_nr = 102, payload = "world")
         ]
     );
 
@@ -79,7 +79,7 @@ async fn test_fast_retransmit() {
 
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, seq_nr = 102, payload = "world")],
+        vec![cmphead!(Data, seq_nr = 102, payload = "world")],
         "Should have retransmitted second packet"
     );
 }
@@ -101,7 +101,7 @@ async fn test_duplicate_ack_counted_only_on_st_state() {
     // Allow sending by setting window size
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 0.into(),
             ack_nr: 99.into(),
             wnd_size: 1024,
@@ -123,15 +123,15 @@ async fn test_duplicate_ack_counted_only_on_st_state() {
     assert_eq!(
         t.take_sent(),
         vec![
-            cmphead!(ST_DATA, seq_nr = 101, ack_nr = 0, payload = "hello"),
-            cmphead!(ST_DATA, seq_nr = 102, ack_nr = 0, payload = "world")
+            cmphead!(Data, seq_nr = 101, ack_nr = 0, payload = "hello"),
+            cmphead!(Data, seq_nr = 102, ack_nr = 0, payload = "world")
         ]
     );
     assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 2);
 
     // Send three duplicate ACKs using different packet types
     let mut header = UtpHeader {
-        htype: ST_STATE,
+        htype: State,
         seq_nr: 0.into(),
         ack_nr: 101.into(),
         wnd_size: 1024,
@@ -144,14 +144,14 @@ async fn test_duplicate_ack_counted_only_on_st_state() {
     assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
 
     // Change to ST_DATA with same ACK - shouldn't count as duplicate
-    header.htype = ST_DATA;
+    header.htype = Data;
     header.seq_nr += 1;
     t.send_msg(header, "a");
     t.poll_once_assert_pending().await;
     assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 103, ack_nr = 1)]
+        vec![cmphead!(State, seq_nr = 103, ack_nr = 1)]
     );
 
     // Another ST_DATA - shouldn't count
@@ -161,11 +161,11 @@ async fn test_duplicate_ack_counted_only_on_st_state() {
     assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 103, ack_nr = 2)]
+        vec![cmphead!(State, seq_nr = 103, ack_nr = 2)]
     );
 
     // ST_FIN with same ACK - shouldn't count
-    header.htype = ST_FIN;
+    header.htype = Fin;
     header.seq_nr += 1;
     t.send_msg(header, "");
 
@@ -175,12 +175,12 @@ async fn test_duplicate_ack_counted_only_on_st_state() {
     assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_FIN, seq_nr = 103, ack_nr = 3)],
+        vec![cmphead!(Fin, seq_nr = 103, ack_nr = 3)],
         "Should have ACKed the FIN and sent back another FIN"
     );
 
     // Now send three ST_STATE duplicates
-    header.htype = ST_STATE;
+    header.htype = State;
     t.send_msg(header, "");
     t.send_msg(header, "");
     t.send_msg(header, "");
@@ -191,9 +191,9 @@ async fn test_duplicate_ack_counted_only_on_st_state() {
     assert_eq!(
         t.take_sent(),
         vec![
-            cmphead!(ST_DATA, seq_nr = 102, ack_nr = 3, payload = "world"),
+            cmphead!(Data, seq_nr = 102, ack_nr = 3, payload = "world"),
             // Re-send the FIN.
-            cmphead!(ST_FIN, seq_nr = 103, ack_nr = 3)
+            cmphead!(Fin, seq_nr = 103, ack_nr = 3)
         ],
         "Should have triggered fast retransmit"
     );

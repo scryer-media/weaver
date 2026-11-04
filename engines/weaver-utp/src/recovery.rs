@@ -19,6 +19,14 @@ use crate::{
     stream_tx_segments::{OnAckResult, Pipe, Segments},
 };
 
+pub struct AckContext<'a> {
+    pub last_sent_seq_nr: SeqNr,
+    pub next_seq_nr: SeqNr,
+    pub now: Instant,
+    pub rtt: Duration,
+    pub stats: &'a UtpStats,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Recovering {
     recovery_point: SeqNr,
@@ -125,9 +133,7 @@ fn count_non_sack_duplicates(
 
     match *last_ack {
         Some(last)
-            if header.htype == Type::ST_STATE
-                && last.ack_nr == header.ack_nr
-                && !is_window_update =>
+            if header.htype == Type::State && last.ack_nr == header.ack_nr && !is_window_update =>
         {
             stats.duplicate_acks_received.increment(1);
             let dup_acks = prev_dup_acks.saturating_add(1);
@@ -160,14 +166,6 @@ impl Recovery {
         }
     }
 
-    #[allow(unused)]
-    pub fn cwnd(&self) -> Option<usize> {
-        match &self.phase {
-            RecoveryPhase::Recovering(rec) => Some(rec.cwnd),
-            _ => None,
-        }
-    }
-
     pub fn remaining_cwnd(&self, last_remote_window: u32) -> Option<usize> {
         match &self.phase {
             RecoveryPhase::Recovering(rec) => Some(
@@ -190,19 +188,21 @@ impl Recovery {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn on_ack(
         &mut self,
         header: &UtpHeader,
         on_ack_result: &OnAckResult,
         tx_segs: &mut Segments,
-        last_sent_seq_nr: SeqNr,
-        next_seq_nr: SeqNr,
         congestion_controller: &mut Ledbat,
-        now: Instant,
-        rtt: Duration,
-        stats: &UtpStats,
+        context: AckContext<'_>,
     ) {
+        let AckContext {
+            last_sent_seq_nr,
+            next_seq_nr,
+            now,
+            rtt,
+            stats,
+        } = context;
         self.receiver_supports_sack |= header.extensions.selective_ack.is_some();
 
         match &mut self.phase {
@@ -328,19 +328,21 @@ mod tests {
         for _ in 0..4 {
             recovery.on_ack(
                 &UtpHeader {
-                    htype: Type::ST_STATE,
+                    htype: Type::State,
                     ack_nr: 9.into(),
                     wnd_size: 1 << 20,
                     ..Default::default()
                 },
                 &OnAckResult::default(),
                 &mut segs,
-                14.into(),
-                15.into(),
                 &mut cc,
-                Instant::now(),
-                Duration::from_millis(50),
-                &stats,
+                super::AckContext {
+                    last_sent_seq_nr: 14.into(),
+                    next_seq_nr: 15.into(),
+                    now: Instant::now(),
+                    rtt: Duration::from_millis(50),
+                    stats: &stats,
+                },
             );
         }
         (before, cc.window(), recovery.is_recovering())

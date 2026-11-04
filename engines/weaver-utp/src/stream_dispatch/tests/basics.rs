@@ -26,7 +26,7 @@ async fn test_doesnt_send_until_window_updated() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 101, ack_nr = 0)],
+        vec![cmphead!(State, seq_nr = 101, ack_nr = 0)],
         "intial SYN-ACK should be sent"
     );
     assert_eq!(t.vsock.last_remote_window, 0);
@@ -42,7 +42,7 @@ async fn test_doesnt_send_until_window_updated() {
 
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 0.into(),
             ack_nr: 100.into(),
             wnd_size: 1024,
@@ -54,7 +54,7 @@ async fn test_doesnt_send_until_window_updated() {
 
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_DATA, ack_nr = 0, payload = "hello")]
+        vec![cmphead!(Data, ack_nr = 0, payload = "hello")]
     );
 }
 
@@ -66,7 +66,7 @@ async fn test_out_of_order_delivery() {
     // First allow sending by setting window size
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 0.into(),
             ack_nr: 100.into(),
             wnd_size: 1024,
@@ -83,7 +83,7 @@ async fn test_out_of_order_delivery() {
     // Send seq 2 first
     t.send_msg(
         UtpHeader {
-            htype: ST_DATA,
+            htype: Data,
             seq_nr: 2.into(),
             ack_nr: 100.into(),
             ..Default::default()
@@ -98,13 +98,13 @@ async fn test_out_of_order_delivery() {
     // We should send an immediate ACK due to out-of-order delivery
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 101, ack_nr = 0)]
+        vec![cmphead!(State, seq_nr = 101, ack_nr = 0)]
     );
 
     // Send seq 3
     t.send_msg(
         UtpHeader {
-            htype: ST_DATA,
+            htype: Data,
             seq_nr: 3.into(),
             ack_nr: t.vsock.seq_nr - 1,
             ..Default::default()
@@ -119,13 +119,13 @@ async fn test_out_of_order_delivery() {
     // Another immediate ACK due to out-of-order
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 101, ack_nr = 0)]
+        vec![cmphead!(State, seq_nr = 101, ack_nr = 0)]
     );
 
     // Finally send seq 1
     t.send_msg(
         UtpHeader {
-            htype: ST_DATA,
+            htype: Data,
             seq_nr: 1.into(),
             ack_nr: t.vsock.seq_nr - 1,
             ..Default::default()
@@ -140,7 +140,7 @@ async fn test_out_of_order_delivery() {
     // And a final ACK for the in-order delivery
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 101, ack_nr = 3)]
+        vec![cmphead!(State, seq_nr = 101, ack_nr = 3)]
     );
 }
 
@@ -171,7 +171,7 @@ async fn test_data_integrity_manual_packets() {
     // Send data in chunks
     let chunks = test_data.chunks(CHUNK_SIZE);
     let mut header = UtpHeader {
-        htype: ST_DATA,
+        htype: Data,
         seq_nr: 0.into(),
         ack_nr: t.vsock.seq_nr - 1,
         wnd_size: 64 * 1024,
@@ -219,7 +219,7 @@ async fn test_sequence_numbers_incoming() {
         StreamArgs::new_incoming(
             31420.into(),
             &UtpHeader {
-                htype: ST_SYN,
+                htype: Syn,
                 seq_nr: 15089.into(),
                 ack_nr: 0.into(),
                 ..Default::default()
@@ -230,13 +230,13 @@ async fn test_sequence_numbers_incoming() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 31420, ack_nr = 15089)]
+        vec![cmphead!(State, seq_nr = 31420, ack_nr = 15089)]
     );
     t.send_data(15090, 31419, "hello");
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 31420, ack_nr = 15090)]
+        vec![cmphead!(State, seq_nr = 31420, ack_nr = 15090)]
     );
 
     let (_r, mut w) = t.stream.take().unwrap().split();
@@ -245,7 +245,7 @@ async fn test_sequence_numbers_incoming() {
     assert_eq!(
         t.take_sent(),
         vec![cmphead!(
-            ST_DATA,
+            Data,
             seq_nr = 31420,
             ack_nr = 15090,
             payload = "hello"
@@ -258,7 +258,7 @@ async fn test_sequence_numbers_incoming() {
     assert_eq!(
         t.take_sent(),
         vec![cmphead!(
-            ST_DATA,
+            Data,
             seq_nr = 31421,
             ack_nr = 15090,
             payload = "world"
@@ -275,7 +275,7 @@ async fn test_sequence_numbers_outgoing() {
         Default::default(),
         StreamArgs::new_outgoing(
             &UtpHeader {
-                htype: ST_STATE,
+                htype: State,
                 seq_nr: 31420.into(),
                 ack_nr: 15089.into(),
                 wnd_size: 1024 * 1024,
@@ -293,7 +293,7 @@ async fn test_sequence_numbers_outgoing() {
     assert_eq!(
         t.take_sent(),
         vec![cmphead!(
-            ST_DATA,
+            Data,
             seq_nr = 15090,
             ack_nr = 31419,
             payload = "hello"
@@ -301,7 +301,7 @@ async fn test_sequence_numbers_outgoing() {
     );
     t.send_msg(
         UtpHeader {
-            htype: ST_STATE,
+            htype: State,
             seq_nr: 31420.into(),
             ack_nr: 15090.into(),
             wnd_size: 1024 * 1024,
@@ -314,6 +314,6 @@ async fn test_sequence_numbers_outgoing() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(ST_STATE, seq_nr = 15091, ack_nr = 31421)]
+        vec![cmphead!(State, seq_nr = 15091, ack_nr = 31421)]
     )
 }
