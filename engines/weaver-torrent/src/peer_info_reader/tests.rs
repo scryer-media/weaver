@@ -83,8 +83,9 @@ impl SocketFactory for Dialed {
         _addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
         Box::pin(async {
-            let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-            Ok(Arc::new(socket) as Arc<dyn DatagramSocket>)
+            crate::test_support::sockets()
+                .bind_udp((std::net::Ipv4Addr::LOCALHOST, 0).into())
+                .await
         })
     }
 }
@@ -126,8 +127,9 @@ impl SocketFactory for WatchedDials {
         _addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
         Box::pin(async {
-            let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-            Ok(Arc::new(socket) as Arc<dyn DatagramSocket>)
+            crate::test_support::sockets()
+                .bind_udp((std::net::Ipv4Addr::LOCALHOST, 0).into())
+                .await
         })
     }
 }
@@ -183,8 +185,7 @@ pub(super) async fn connector() -> (
     let (tx, rx) = mpsc::unbounded_channel();
     let connector = StreamConnector::new(StreamConnectorArgs {
         enable_tcp: true,
-        socket_factory: Some(Arc::new(Dialed(tx))),
-        ..Default::default()
+        ..StreamConnectorArgs::over(Arc::new(Dialed(tx)))
     })
     .await
     .unwrap();
@@ -575,9 +576,8 @@ async fn a_plaintext_only_peer_sends_the_metadata_over_the_next_connection_at_on
     let (tx, mut dials) = mpsc::unbounded_channel();
     let connector = StreamConnector::new(StreamConnectorArgs {
         enable_tcp: true,
-        socket_factory: Some(Arc::new(Dialed(tx))),
         encryption: EncryptionPolicy::Prefer,
-        ..Default::default()
+        ..StreamConnectorArgs::over(Arc::new(Dialed(tx)))
     })
     .await
     .unwrap();

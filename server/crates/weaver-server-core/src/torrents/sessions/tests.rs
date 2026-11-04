@@ -176,9 +176,13 @@ impl Routes for FakeRoutes {
         Ok(OpenLeg {
             kind: plan.kind.clone(),
             shape: plan.kind.shape(None),
-            factory: Some(factory),
+            factory,
             names: Arc::new(weaver_torrent::network::NoNames),
-            http: tracker_client(&LegKind::System, None)?,
+            http: tracker_client(
+                &LegKind::System,
+                crate::torrents::net::system_dialer(),
+                None,
+            )?,
             leg,
         })
     }
@@ -1481,9 +1485,14 @@ fn leg(kind: LegKind) -> OpenLeg {
     OpenLeg {
         shape: kind.shape(None),
         kind,
-        factory: None,
+        factory: Arc::new(weaver_torrent::network::KernelSockets::new(None).unwrap()),
         names: Arc::new(weaver_torrent::network::NoNames),
-        http: tracker_client(&LegKind::System, None).unwrap(),
+        http: tracker_client(
+            &LegKind::System,
+            crate::torrents::net::system_dialer(),
+            None,
+        )
+        .unwrap(),
         leg: None,
     }
 }
@@ -2235,6 +2244,81 @@ async fn a_session_sends_stopped_only_while_its_leg_stands_and_its_route_is_up()
     network.shutdown().await;
 }
 
+// The sockets a leg's factory opened, counted, opened by that factory.
+struct Counted {
+    sockets: Arc<dyn SocketFactory>,
+    listened: AtomicUsize,
+    bound: AtomicUsize,
+}
+
+impl SocketFactory for Counted {
+    fn connect_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<(BoxAsyncReadVectored, BoxAsyncWrite)>> {
+        self.sockets.connect_tcp(addr)
+    }
+
+    fn listen_tcp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
+        self.listened.fetch_add(1, Ordering::SeqCst);
+        self.sockets.listen_tcp(addr)
+    }
+
+    fn bind_udp<'a>(
+        &'a self,
+        addr: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        self.bound.fetch_add(1, Ordering::SeqCst);
+        self.sockets.bind_udp(addr)
+    }
+}
+
+// A session on a leg of the host's own sockets, the System leg or one bound
+// to an interface, opens its listener, its DHT socket and its UDP trackers'
+// socket through its leg's factory, as a session on every other leg does:
+// the engine opens no socket of its own.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_own_socket_legs_session_opens_its_sockets_through_the_leg() {
+    use crate::torrents::net::{LOOPBACK_DEVICE, system_dialer};
+
+    let torrent = TorrentConfig {
+        upnp: false,
+        dht_bootstrap_nodes: String::new(),
+        peer_protocol: crate::settings::TorrentPeerProtocol::Tcp,
+        ..TorrentConfig::default()
+    };
+    for kind in [LegKind::System, LegKind::Interface(LOOPBACK_DEVICE.into())] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut leg = OpenLeg::on(kind.clone(), system_dialer(), None, None).unwrap();
+        let counted = Arc::new(Counted {
+            sockets: Arc::clone(&leg.factory),
+            listened: AtomicUsize::new(0),
+            bound: AtomicUsize::new(0),
+        });
+        leg.factory = counted.clone();
+        let options = session_options(
+            &leg,
+            0,
+            dir.path(),
+            8,
+            &torrent,
+            IpFilter::default(),
+            &IDENTITY.identity(),
+        );
+        assert!(options.dht.is_some(), "{kind:?}");
+        let session = Session::new_with_opts(dir.path().join("output"), options)
+            .await
+            .unwrap();
+        // One listener; one socket for the DHT, one for the UDP trackers.
+        assert_eq!(counted.listened.load(Ordering::SeqCst), 1, "{kind:?}");
+        assert_eq!(counted.bound.load(Ordering::SeqCst), 2, "{kind:?}");
+        session.stop().await;
+    }
+}
+
 // A session on the host's own sockets looks its names up as every other leg
 // does, through its leg's dialer: the lookup lands in the resolution record
 // of the task that asked, made by the host's DNS.
@@ -2252,7 +2336,6 @@ async fn a_system_leg_session_looks_names_up_on_the_record() {
     let plan = routes.plan(TorrentScope::Default).unwrap();
     assert_eq!(plan.kind, LegKind::System);
     let leg = routes.open(&plan, 8).await.unwrap();
-    assert!(leg.factory.is_none());
     let options = session_options(
         &leg,
         0,

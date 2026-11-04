@@ -89,6 +89,15 @@ impl Dialer for Carried {
             carried: self,
         }))
     }
+    fn bind_local_udp(
+        &self,
+        local: std::net::SocketAddr,
+    ) -> Option<std::io::Result<std::net::UdpSocket>> {
+        self.stage.bind_local_udp(local)
+    }
+    fn source_toward(&self, to: std::net::SocketAddr) -> Option<std::io::Result<std::net::IpAddr>> {
+        self.stage.source_toward(to)
+    }
     fn budget(&self) -> Duration {
         self.stage.budget()
     }
@@ -318,8 +327,8 @@ mod tests {
     use std::net::{IpAddr, SocketAddr};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use weaver_torrent::HttpTarget;
     use weaver_torrent::network::{Resolved, Resolver};
+    use weaver_torrent::{ClientShape, HttpTarget};
     use weaver_tunnel::pipe::DialedStream;
     use weaver_tunnel::resolution::record::{Recording, ResolvedBy};
 
@@ -431,13 +440,16 @@ mod tests {
             Resolved::Addresses(found) => found.iter().map(SocketAddr::ip).collect(),
             Resolved::AtExit => Vec::new(),
         };
-        let client = tracker_client(&LegKind::Ladder, Some(bridge.clone()))
+        let client = tracker_client(&LegKind::Ladder, leg.clone(), Some(bridge.clone()))
             .unwrap()
-            .client(Some(HttpTarget {
-                host: "tracker.test",
-                port,
-                addrs: &addrs,
-            }))
+            .client(
+                Some(HttpTarget {
+                    host: "tracker.test",
+                    port,
+                    addrs: &addrs,
+                }),
+                &ClientShape::FETCH,
+            )
             .unwrap();
         let response = client
             .get(format!("http://tracker.test:{port}/announce"))

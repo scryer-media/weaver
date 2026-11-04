@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, debug_span, trace, warn};
 use url::Url;
 
+use crate::core::net::{ClientShape, HttpClients};
 use crate::route_interface::RouteInterface;
 
 /// What a mapping forwards (libtorrent `portmap_protocol`).
@@ -566,14 +567,14 @@ impl UpnpPortForwarder {
         mappings: Vec<PortMapRequest>,
         opts: Option<UpnpPortForwarderOptions>,
         interface: Result<RouteInterface, String>,
+        clients: &dyn HttpClients,
     ) -> anyhow::Result<Self> {
         if mappings.is_empty() {
             bail!("empty ports")
         }
         // The gateway is on the local network: never reach it through a proxy.
-        let client = Client::builder()
-            .no_proxy()
-            .build()
+        let client = clients
+            .client(None, &ClientShape::GATEWAY)
             .context("error building the UPnP HTTP client")?;
         Ok(Self {
             mappings,
@@ -1004,6 +1005,7 @@ pub(crate) mod tests {
         xml_element_text,
     };
     use crate::route_interface::RouteInterface;
+    use crate::test_support::Loopback;
 
     /// The loopback interface, as the route's interface.
     fn loopback() -> RouteInterface {
@@ -1266,6 +1268,7 @@ pub(crate) mod tests {
             mappings,
             Some(UpnpPortForwarderOptions::default()),
             Ok(loopback()),
+            &Loopback::default(),
         )
         .unwrap();
         let (found, found_rx) = unbounded_channel();
@@ -1480,6 +1483,7 @@ pub(crate) mod tests {
                 ..Default::default()
             }),
             Ok(loopback()),
+            &Loopback::default(),
         )
         .unwrap();
         let (found, found_rx) = unbounded_channel();
@@ -1809,7 +1813,9 @@ pub(crate) mod tests {
             ip: std::net::Ipv4Addr::new(10, 44, 0, 2),
             point_to_point: true,
         };
-        let forwarder = UpnpPortForwarder::new(tcp_and_udp(6881), None, Ok(tunnel)).unwrap();
+        let forwarder =
+            UpnpPortForwarder::new(tcp_and_udp(6881), None, Ok(tunnel), &Loopback::default())
+                .unwrap();
         let cancel = CancellationToken::new();
         let (events_tx, mut events) = unbounded_channel();
         let task = tokio::spawn(forwarder.run(cancel.clone(), events_tx));
@@ -1841,7 +1847,13 @@ pub(crate) mod tests {
             Arc::new(|_: &SoapCall| ok("")),
         )
         .await;
-        let forwarder = UpnpPortForwarder::new(tcp_and_udp(6881), None, Ok(loopback())).unwrap();
+        let forwarder = UpnpPortForwarder::new(
+            tcp_and_udp(6881),
+            None,
+            Ok(loopback()),
+            &Loopback::default(),
+        )
+        .unwrap();
         let found = UpnpDiscoverResponse {
             received_from: "127.0.0.1:1900".parse().unwrap(),
             location,
@@ -1875,7 +1887,13 @@ pub(crate) mod tests {
                 (status, body + &" ".repeat(pad))
             })
         };
-        let forwarder = UpnpPortForwarder::new(tcp_and_udp(6881), None, Ok(loopback())).unwrap();
+        let forwarder = UpnpPortForwarder::new(
+            tcp_and_udp(6881),
+            None,
+            Ok(loopback()),
+            &Loopback::default(),
+        )
+        .unwrap();
         let open = |location| {
             let found = UpnpDiscoverResponse {
                 received_from: "127.0.0.1:1900".parse().unwrap(),

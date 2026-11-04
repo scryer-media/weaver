@@ -26,7 +26,7 @@ use crate::clone_to_owned::CloneToOwned;
 use crate::core::{
     hash_id::InfoHashes,
     magnet::Magnet,
-    net::{HttpClients, NamedBy, NoNames, Resolver},
+    net::{ClientShape, HttpClients, NamedBy, NoClients, NoNames, Resolver},
     spawn_utils::spawn_with_cancel,
     torrent_metainfo::{TorrentMetaV1Owned, ValidatedTorrentMetaV1Info, WebSeed, WebSeedKind},
     v2_tree::torrent_name,
@@ -255,8 +255,7 @@ fn dht_peers(
 /// `session_impl::remap_ports` maps a socket only once it is open).
 fn listening_protocols(listen: &crate::listen::ListenResult) -> Vec<PortmapProtocol> {
     [
-        (listen.tcp_socket.is_some() || listen.custom_tcp_socket.is_some())
-            .then_some(PortmapProtocol::Tcp),
+        listen.tcp_socket.is_some().then_some(PortmapProtocol::Tcp),
         listen.utp_socket.is_some().then_some(PortmapProtocol::Udp),
     ]
     .into_iter()
@@ -284,9 +283,9 @@ pub struct Session {
     pub(crate) external_ips: Arc<ExternalIps>,
     dht: Option<Dht>,
     pub(crate) connector: Arc<StreamConnector>,
-    pub(crate) reqwest_client: reqwest::Client,
-    // Builds the clients web seeds are asked through, each held to the
-    // address its request was checked at.
+    // The clients every request is asked through: metainfo and the allow
+    // list by their URL, trackers and web seeds each held to the address
+    // its request was checked at.
     pub(crate) http_clients: Arc<dyn HttpClients>,
     // Resolves web seeds' host names, so their addresses are known before
     // they are asked: the session's resolver.
@@ -353,10 +352,12 @@ fn is_bare_info_hash(s: &str) -> bool {
 }
 
 async fn torrent_from_url(
-    reqwest_client: &reqwest::Client,
+    clients: &dyn HttpClients,
     url: &str,
 ) -> anyhow::Result<ParsedTorrentFile> {
-    let response = reqwest_client
+    let response = clients
+        .client(None, &ClientShape::FETCH)
+        .context("error building HTTP(S) client")?
         .get(url)
         .send()
         .await
@@ -829,8 +830,7 @@ pub struct DhtSessionConfig {
     /// The DHT listen port. Priority: this explicit port -> persisted port
     /// (when persistence is enabled) -> random. The bind IP is derived from
     /// `SessionOptions::ipv4_only` (`0.0.0.0` if true, `[::]` otherwise).
-    /// Use `SessionOptions::bind_device_name` to scope the bind to a specific
-    /// network interface.
+    /// The socket is bound through `SessionOptions::socket_factory`.
     pub port: Option<u16>,
     /// Persistence behavior. If None, persistence is disabled.
     pub persistence: Option<DhtPersistenceConfig>,
@@ -933,7 +933,8 @@ pub struct SessionOptions {
     /// Defaults to DHT enabled with persistence.
     pub dht: Option<DhtSessionConfig>,
 
-    /// What network device to bind to for DHT, BT-UDP, BT-TCP, trackers and LSD.
+    /// The network device LSD binds to, and port mapping maps on. The
+    /// session's other sockets are `socket_factory`'s.
     /// On OSX will use IP(V6)_BOUND_IF, on Linux will use SO_BINDTODEVICE.
     pub bind_device_name: Option<String>,
 
@@ -1039,9 +1040,11 @@ pub struct SessionOptions {
     /// Force IPv4 only.
     pub ipv4_only: bool,
 
-    /// Create peer sockets with this factory instead of binding kernel
-    /// sockets. See [`SocketFactory`] for what it covers.
-    pub socket_factory: Option<Arc<dyn SocketFactory>>,
+    /// Every socket the session opens toward the internet: its peers' TCP
+    /// dials and listeners, its uTP socket, its DHT socket, and its UDP
+    /// trackers' socket. See [`SocketFactory`] for what it covers;
+    /// [`KernelSockets`](crate::network::KernelSockets) opens the kernel's.
+    pub socket_factory: Arc<dyn SocketFactory>,
 
     /// The resolver for every name the session looks up: DHT bootstrap
     /// nodes, UDP and HTTP trackers, and web seeds, whose addresses are
@@ -1049,12 +1052,13 @@ pub struct SessionOptions {
     /// ([`NoNames`]).
     pub resolver: Option<Arc<dyn Resolver>>,
 
-    /// Build the HTTP clients with this instead of the session's own builder.
-    /// Its client for no target downloads torrents and the block and allow
-    /// lists; a tracker or a web seed is asked through a client for the
-    /// addresses the session checked its host at. When set,
-    /// `bind_device_name` and the identity's User-Agent do not apply to HTTP
-    /// requests; configure them on the clients.
+    /// The HTTP clients the session asks through: it builds none itself.
+    /// Their client for no target downloads torrents and the allow list; a
+    /// tracker or a web seed is asked through a client for the addresses
+    /// the session checked its host at; a port mapper asks the gateway
+    /// through their gateway client and socket. `bind_device_name` and the
+    /// identity's User-Agent do not apply to them; configure them on the
+    /// clients. A session given none makes no HTTP request ([`NoClients`]).
     ///
     /// The client for no target does its own DNS lookups:
     /// [`SessionOptions::resolver`] does not apply to it. If those lookups must be routed too, build it
@@ -1079,8 +1083,10 @@ pub struct SessionOptions {
     pub trackers_changed: Option<Arc<Notify>>,
 }
 
-impl Default for SessionOptions {
-    fn default() -> Self {
+impl SessionOptions {
+    /// The default options of a session whose sockets `socket_factory`
+    /// opens.
+    pub fn new(socket_factory: Arc<dyn SocketFactory>) -> Self {
         Self {
             dht: Some(DhtSessionConfig::default()),
             bind_device_name: None,
@@ -1111,7 +1117,7 @@ impl Default for SessionOptions {
             lsd_socket: None,
             disable_pex: false,
             ipv4_only: false,
-            socket_factory: None,
+            socket_factory,
             resolver: None,
             http_client: None,
             encryption: crate::mse::EncryptionPolicy::Disabled,
@@ -1399,14 +1405,6 @@ struct PeerRequest<'a> {
 }
 
 impl Session {
-    /// Create a new session with default options.
-    /// The passed in folder will be used as a default unless overridden per torrent.
-    /// It will run a DHT server/client, a TCP listener and .
-    #[inline(never)]
-    pub fn new(default_output_folder: PathBuf) -> BoxFuture<'static, anyhow::Result<Arc<Self>>> {
-        Self::new_with_opts(default_output_folder, SessionOptions::default())
-    }
-
     pub fn cancellation_token(&self) -> &CancellationToken {
         &self.cancellation_token
     }
@@ -1441,6 +1439,9 @@ impl Session {
                 None => None,
             };
 
+            // The sockets the DHT and the UDP trackers bind.
+            let datagram_sockets = Arc::clone(&opts.socket_factory);
+
             let listen_result = if let Some(mut listen_opts) = opts.listen.take() {
                 // uTP drops a SYN once its streams pass twice the limit.
                 let connections_limit = match &opts.shared_limits {
@@ -1456,8 +1457,8 @@ impl Session {
                         .start(
                             opts.root_span.as_ref().and_then(|s| s.id()),
                             swarm.child_token(),
-                            bind_device.as_ref(),
-                            opts.socket_factory.as_ref(),
+                            &opts.socket_factory,
+                            connections_limit,
                         )
                         .await
                         .context(crate::listen::ListenFailed)?,
@@ -1467,17 +1468,14 @@ impl Session {
             };
 
             let dht = if let Some(dht_config) = opts.dht.take() {
-                // With a socket factory the DHT runs over a datagram socket the
-                // factory binds; the factory decides the real address.
-                let dht_socket = match opts.socket_factory.as_ref() {
-                    Some(factory) => Some(
-                        factory
-                            .bind_udp(dht_listen_addr(dht_config.port, None, opts.ipv4_only))
-                            .await
-                            .context("error binding DHT socket through socket factory")?,
-                    ),
-                    None => None,
-                };
+                // The DHT runs over a datagram socket the factory binds; the
+                // factory decides the real address.
+                let dht_socket = Some(
+                    datagram_sockets
+                        .bind_udp(dht_listen_addr(dht_config.port, None, opts.ipv4_only))
+                        .await
+                        .context("error binding DHT socket through socket factory")?,
+                );
                 let dht = if let Some(persistence_config) = dht_config.persistence {
                     PersistentDht::create_from_config(
                         persistence_config,
@@ -1486,8 +1484,8 @@ impl Session {
                         DhtConfig {
                             bootstrap_addrs: dht_config.bootstrap_addrs,
                             cancellation_token: Some(swarm.clone()),
-                            bind_device: bind_device.as_ref(),
                             socket: dht_socket,
+                            sockets: Some(datagram_sockets.clone()),
                             resolver: Some(resolver.clone()),
                             node_id_prefix: dht_node_id_prefix,
                             client_version: dht_client_version,
@@ -1502,9 +1500,9 @@ impl Session {
                     DhtBuilder::with_config(DhtConfig {
                         bootstrap_addrs: dht_config.bootstrap_addrs,
                         cancellation_token: Some(swarm.child_token()),
-                        bind_device: bind_device.as_ref(),
                         listen_addr: Some(listen_addr),
                         socket: dht_socket,
+                        sockets: Some(datagram_sockets.clone()),
                         resolver: Some(resolver.clone()),
                         node_id_prefix: dht_node_id_prefix,
                         client_version: dht_client_version,
@@ -1566,31 +1564,15 @@ impl Session {
                 .await
                 .context("error initializing session persistence store")?;
 
-            let http_clients: Arc<dyn HttpClients> = match opts.http_client.take() {
-                Some(clients) => clients,
-                None => {
-                    let user_agent = identity.user_agent.clone();
-                    let bind_device = opts.bind_device_name.clone();
-                    Arc::new(move || {
-                        #[allow(unused_mut)]
-                        let mut builder = reqwest::Client::builder().user_agent(&user_agent);
-                        #[cfg(not(windows))]
-                        if let Some(bd) = bind_device.as_ref() {
-                            builder = builder.interface(bd);
-                        }
-                        builder
-                    })
-                }
-            };
-            let reqwest_client = http_clients
-                .client(None)
-                .context("error building HTTP(S) client")?;
+            let http_clients: Arc<dyn HttpClients> = opts
+                .http_client
+                .take()
+                .unwrap_or_else(|| Arc::new(NoClients::over(Arc::clone(&opts.socket_factory))));
 
             let stream_connector = Arc::new(
                 StreamConnector::new(StreamConnectorArgs {
                     enable_tcp: opts.connect.as_ref().map(|c| c.enable_tcp).unwrap_or(true),
                     utp_socket: listen_result.as_ref().and_then(|l| l.utp_socket.clone()),
-                    bind_device: bind_device.clone(),
                     ipv4_only: opts.ipv4_only,
                     socket_factory: opts.socket_factory.clone(),
                     encryption: opts.encryption,
@@ -1601,7 +1583,7 @@ impl Session {
 
             let allowlist = if let Some(allowlist_url) = opts.allowlist_url {
                 info!(url = allowlist_url, "loading p2p allowlist");
-                let al = IpRanges::load_from_url(&reqwest_client, &allowlist_url)
+                let al = IpRanges::load_from_url(&*http_clients, &allowlist_url)
                     .await
                     .with_context(|| format!("error reading allowlist from {allowlist_url}"))?;
                 info!(len = al.len(), "loaded allowlist");
@@ -1610,24 +1592,17 @@ impl Session {
                 None
             };
 
-            let udp_tracker_client = match opts.socket_factory.as_ref() {
-                Some(factory) => {
-                    let addr: SocketAddr = if opts.ipv4_only {
-                        (Ipv4Addr::UNSPECIFIED, 0).into()
-                    } else {
-                        (Ipv6Addr::UNSPECIFIED, 0).into()
-                    };
-                    let socket = factory
-                        .bind_udp(addr)
-                        .await
-                        .context("error binding UDP tracker socket through socket factory")?;
-                    UdpTrackerClient::new_with_socket(token.clone(), socket, Some(resolver.clone()))
-                }
-                None => {
-                    UdpTrackerClient::new(token.clone(), bind_device.as_ref(), resolver.clone())
-                        .await
-                        .context("error creating UDP tracker client")?
-                }
+            let udp_tracker_client = {
+                let addr: SocketAddr = if opts.ipv4_only {
+                    (Ipv4Addr::UNSPECIFIED, 0).into()
+                } else {
+                    (Ipv6Addr::UNSPECIFIED, 0).into()
+                };
+                let socket = datagram_sockets
+                    .bind_udp(addr)
+                    .await
+                    .context("error binding the UDP tracker socket")?;
+                UdpTrackerClient::new_with_socket(token.clone(), socket, Some(resolver.clone()))
             };
 
             let lsd = {
@@ -1684,7 +1659,6 @@ impl Session {
                     .as_ref()
                     .is_some_and(|l| l.utp_socket.is_some()),
                 default_storage_factory: opts.default_storage_factory,
-                reqwest_client,
                 http_clients,
                 resolver,
                 connector: stream_connector,
@@ -1730,12 +1704,11 @@ impl Session {
                 let protocols = listening_protocols(&listen);
                 let max = listen.max_pending_incoming_handshake_checks;
                 let forwarded = listen
-                    .custom_tcp_socket
+                    .tcp_socket
                     .as_ref()
                     .and_then(|listener| listener.port_mappings());
                 let plain = crate::listen::Listening {
                     tcp_socket: listen.tcp_socket.take(),
-                    custom_tcp_socket: listen.custom_tcp_socket.take(),
                     utp_socket: listen.utp_socket.take(),
                     addr: listen.addr,
                 };
@@ -2001,17 +1974,6 @@ impl Session {
                 },
             );
         }
-        if let Some(tcp) = listening.custom_tcp_socket {
-            let this = self.clone();
-            self.spawn_on_swarm(
-                debug_span!(parent: self.rs(), "tcp_listen", ?addr, tls),
-                "tcp_listen",
-                async move {
-                    this.task_listener(tcp, tls, max_pending_incoming_handshake_checks)
-                        .await
-                },
-            );
-        }
         if let Some(utp) = listening.utp_socket {
             let this = self.clone();
             self.spawn_on_swarm(
@@ -2105,7 +2067,8 @@ impl Session {
         forward: Option<PortMapEvents>,
     ) {
         let interface =
-            crate::route_interface::route_interface(bind_device_name).map_err(|e| format!("{e:#}"));
+            crate::route_interface::route_interface(bind_device_name, self.http_clients.as_ref())
+                .map_err(|e| format!("{e:#}"));
         info!(
             ?requests,
             ?interface,
@@ -2116,7 +2079,12 @@ impl Session {
             description: self.identity.user_agent.clone(),
             ..Default::default()
         };
-        match UpnpPortForwarder::new(requests.clone(), Some(upnp_opts), interface.clone()) {
+        match UpnpPortForwarder::new(
+            requests.clone(),
+            Some(upnp_opts),
+            interface.clone(),
+            self.http_clients.as_ref(),
+        ) {
             Ok(upnp) => self.spawn_port_mapper(
                 "upnp_forward",
                 upnp.run(self.cancellation_token.clone(), events_tx.clone()),
@@ -2126,7 +2094,7 @@ impl Session {
         let route = interface.and_then(|i| GatewayRoute::of(&i).map_err(|e| format!("{e:#}")));
         self.spawn_port_mapper(
             "natpmp_forward",
-            NatPmpMapper::new(route, requests, None)
+            NatPmpMapper::new(route, requests, None, self.http_clients.clone())
                 .run(self.cancellation_token.clone(), events_tx),
         );
         self.follow_port_mappings(events, forward);
@@ -2584,7 +2552,7 @@ impl Session {
                         AddTorrent::Url(url)
                             if url.starts_with("http://") || url.starts_with("https://") =>
                         {
-                            torrent_from_url(&self.reqwest_client, &url).await?
+                            torrent_from_url(self.http_clients.as_ref(), &url).await?
                         }
                         AddTorrent::Url(url) => {
                             bail!(
@@ -3970,10 +3938,10 @@ mod tests {
         // A node run by hand on 127.0.0.1 answers ping, find_node and
         // get_peers, giving a token, and reports each announce_peer port.
         use crate::bencode::{BencodeValue, ByteBufOwned, dyn_from_bytes};
+        use crate::core::net::DatagramSocket;
         use crate::dht::{DhtConfig, DhtState, Id20};
         use futures::StreamExt;
         use std::net::Ipv4Addr;
-        use tokio::net::UdpSocket;
 
         const NODE_ID: [u8; 20] = [0x42; 20];
 
@@ -3992,7 +3960,7 @@ mod tests {
 
         // The port of the next announce_peer the node hears, answering
         // every query before it.
-        async fn next_announced(node: &UdpSocket) -> i64 {
+        async fn next_announced(node: &Arc<dyn DatagramSocket>) -> i64 {
             let mut buf = [0u8; 2048];
             loop {
                 let (len, from) = node.recv_from(&mut buf).await.unwrap();
@@ -4017,10 +3985,11 @@ mod tests {
             }
         }
 
-        let node = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
-        let node_addr = node.local_addr().unwrap();
+        let node = crate::test_support::loopback_udp().await;
+        let node_addr = node.bind_addr();
         let dht = DhtState::with_config(DhtConfig {
             listen_addr: Some((Ipv4Addr::LOCALHOST, 0).into()),
+            sockets: Some(crate::test_support::socket_factory()),
             bootstrap_addrs: Some(vec![node_addr.to_string()]),
             ..Default::default()
         })
@@ -4071,12 +4040,95 @@ mod tests {
                 listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
                 ..Default::default()
             }
-            .start(None, token.clone(), None, None)
+            .start(
+                None,
+                token.clone(),
+                &crate::test_support::socket_factory(),
+                super::DEFAULT_CONNECTIONS_LIMIT,
+            )
             .await
             .unwrap();
             assert_eq!(listening_protocols(&listen), expected, "{mode:?}");
             token.cancel();
         }
+    }
+
+    /// Kernel sockets that note each receive buffer a uTP socket asks for.
+    struct NotingAsks {
+        kernel: Arc<dyn crate::network::SocketFactory>,
+        asked: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl crate::network::SocketFactory for NotingAsks {
+        fn connect_tcp<'a>(
+            &'a self,
+            addr: std::net::SocketAddr,
+        ) -> crate::network::BoxFuture<
+            'a,
+            std::io::Result<(
+                crate::network::BoxAsyncReadVectored,
+                crate::network::BoxAsyncWrite,
+            )>,
+        > {
+            self.kernel.connect_tcp(addr)
+        }
+
+        fn listen_tcp<'a>(
+            &'a self,
+            addr: std::net::SocketAddr,
+        ) -> crate::network::BoxFuture<'a, std::io::Result<Box<dyn crate::network::StreamListener>>>
+        {
+            self.kernel.listen_tcp(addr)
+        }
+
+        fn bind_udp<'a>(
+            &'a self,
+            addr: std::net::SocketAddr,
+        ) -> crate::network::BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>>
+        {
+            self.kernel.bind_udp(addr)
+        }
+
+        fn bind_utp<'a>(
+            &'a self,
+            addr: std::net::SocketAddr,
+            receive_buffer: usize,
+        ) -> crate::network::BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>>
+        {
+            self.asked.lock().unwrap().push(receive_buffer);
+            self.kernel.bind_utp(addr, receive_buffer)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sessions_utp_socket_asks_for_a_window_per_connection() {
+        let dir = TempDir::new().unwrap();
+        let sockets = Arc::new(NotingAsks {
+            kernel: crate::test_support::socket_factory(),
+            asked: Default::default(),
+        });
+        let _session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                listen: Some(crate::ListenerOptions {
+                    mode: crate::ListenerMode::TcpAndUtp,
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    ..Default::default()
+                }),
+                connections_limit: 7,
+                ..SessionOptions::new(sockets.clone())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *sockets.asked.lock().unwrap(),
+            [7 * crate::udp_options::STREAM_WINDOW]
+        );
     }
 
     /// A one-piece torrent whose announce-list is `[[a1, a2], [b1]]`.
@@ -4186,7 +4238,7 @@ mod tests {
                 dht: None,
                 disable_local_service_discovery: true,
                 trackers: HashSet::from([url("http://session.test/announce")]),
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await
@@ -4268,7 +4320,7 @@ mod tests {
                 dht: None,
                 disable_local_service_discovery: false,
                 lsd_socket: Some(Box::new(RecordingSocket(sent_tx))),
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await
@@ -4441,7 +4493,7 @@ mod tests {
                 }),
                 connections_limit,
                 connections_slack,
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await
@@ -4519,7 +4571,7 @@ mod tests {
                 persistence: None,
                 disable_trackers: true,
                 disable_local_service_discovery: true,
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await
@@ -4625,7 +4677,7 @@ mod tests {
                 persistence: None,
                 disable_trackers: true,
                 disable_local_service_discovery: true,
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await
@@ -4722,7 +4774,7 @@ mod tests {
                 persistence: None,
                 disable_trackers: true,
                 disable_local_service_discovery: true,
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await
@@ -4799,10 +4851,16 @@ mod tests {
         session: &Session,
         info_hash: super::Id20,
         offer_v2: bool,
-    ) -> (tokio::net::TcpStream, Vec<u8>) {
+    ) -> (
+        (
+            crate::type_aliases::BoxAsyncReadVectored,
+            crate::type_aliases::BoxAsyncWrite,
+        ),
+        Vec<u8>,
+    ) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let mut stream = tokio::net::TcpStream::connect(session.listen_addr().unwrap())
+        let (mut read, mut write) = crate::test_support::tcp(session.listen_addr().unwrap())
             .await
             .unwrap();
         let mut handshake = [0u8; 68];
@@ -4811,10 +4869,10 @@ mod tests {
             .serialize_unchecked_len(&mut handshake);
         // A refused connection may be closed before or while this is written,
         // and reset after: either way nothing comes back.
-        let _ = stream.write_all(&handshake[..len]).await;
+        let _ = write.write_all(&handshake[..len]).await;
         let mut answer = Vec::new();
-        let _ = (&mut stream).take(68).read_to_end(&mut answer).await;
-        (stream, answer)
+        let _ = (&mut read).take(68).read_to_end(&mut answer).await;
+        ((read, write), answer)
     }
 
     // Whether a 68-byte handshake answer offers v2.
@@ -4882,7 +4940,7 @@ mod tests {
                         listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
                         ..Default::default()
                     }),
-                    ..Default::default()
+                    ..crate::test_support::session_options()
                 },
             )
             .await
@@ -5092,8 +5150,8 @@ mod tests {
                     listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
                     ..Default::default()
                 }),
-                socket_factory: Some(factory),
-                ..Default::default()
+                socket_factory: factory,
+                ..crate::test_support::session_options()
             },
         )
         .await
@@ -5164,7 +5222,7 @@ mod tests {
                         disable_local_service_discovery: true,
                         listen: None,
                         shared_limits: Some(shared),
-                        ..Default::default()
+                        ..crate::test_support::session_options()
                     },
                 )
                 .await
@@ -5328,7 +5386,7 @@ mod tests {
                 }),
                 // A test greets the seed from this host more than once.
                 allow_multiple_connections_per_ip: true,
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await
@@ -5475,7 +5533,7 @@ mod tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let torrent = v2_torrent(true);
         let (_dir, session, handle) = seeding_v2(&torrent).await;
-        let (mut stream, answer) =
+        let ((mut read, mut write), answer) =
             greet_with(&session, handle.info_hashes().v1.unwrap(), false).await;
         assert_eq!(answered_hash(&answer), handle.info_hashes().v1);
 
@@ -5491,11 +5549,11 @@ mod tests {
             });
         let mut frame = [0u8; 53];
         let len = request.serialize(&mut frame, &Default::default).unwrap();
-        stream.write_all(&frame[..len]).await.unwrap();
+        write.write_all(&frame[..len]).await.unwrap();
 
         // The session closes the connection: the read ends.
         let mut rest = Vec::new();
-        let _ = stream.read_to_end(&mut rest).await;
+        let _ = read.read_to_end(&mut rest).await;
 
         session.stop().await;
     }
@@ -5592,7 +5650,7 @@ mod tests {
                             ..Default::default()
                         }),
                     }),
-                    ..Default::default()
+                    ..crate::test_support::session_options()
                 },
             )
             .await
@@ -5641,7 +5699,7 @@ mod tests {
         let session = Session::new_with_opts(
             dir.path().into(),
             SessionOptions {
-                socket_factory: Some(Arc::new(Dialed(tx))),
+                socket_factory: Arc::new(Dialed(tx)),
                 encryption: EncryptionPolicy::Prefer,
                 connect: Some(super::ConnectionOptions {
                     enable_tcp: true,
@@ -5930,7 +5988,7 @@ mod tests {
                         .unwrap()
                         .to_string(),
                 ),
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await;
@@ -5960,7 +6018,7 @@ mod tests {
             &dir,
             SessionOptions {
                 ipv4_only: true,
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await;
@@ -5983,7 +6041,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_running_session_judges_incoming_connections_by_its_filter_as_it_changes() {
         let dir = TempDir::with_prefix("incoming_refiltered").unwrap();
-        let session = quiet_session(&dir, SessionOptions::default()).await;
+        let session = quiet_session(&dir, crate::test_support::session_options()).await;
         assert_eq!(check_once(&session, "10.0.0.1:6881"), None);
         assert_eq!(check_once(&session, "10.0.0.2:80"), None);
 
@@ -6019,7 +6077,7 @@ mod tests {
             &dir,
             SessionOptions {
                 ipv4_only: true,
-                ..Default::default()
+                ..crate::test_support::session_options()
             },
         )
         .await;

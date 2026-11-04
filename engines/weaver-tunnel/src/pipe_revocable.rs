@@ -126,6 +126,23 @@ impl Dialer for Revocable {
         }
         Arc::clone(&self.inner).inbound()
     }
+    // The leg's own datagram socket, while it is not revoked.
+    fn bind_local_udp(
+        &self,
+        local: std::net::SocketAddr,
+    ) -> Option<std::io::Result<std::net::UdpSocket>> {
+        if self.is_revoked() {
+            return Some(Err(std::io::Error::other("the leg was revoked")));
+        }
+        self.inner.bind_local_udp(local)
+    }
+    // Where the leg leaves toward `to`, while it is not revoked.
+    fn source_toward(&self, to: std::net::SocketAddr) -> Option<std::io::Result<std::net::IpAddr>> {
+        if self.is_revoked() {
+            return Some(Err(std::io::Error::other("the leg was revoked")));
+        }
+        self.inner.source_toward(to)
+    }
     fn budget(&self) -> Duration {
         self.inner.budget()
     }

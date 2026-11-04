@@ -22,6 +22,7 @@ use std::{
     io::{self, IoSlice},
     net::{IpAddr, SocketAddr},
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -211,47 +212,180 @@ pub struct HttpTarget<'a> {
     pub addrs: &'a [IpAddr],
 }
 
-/// Builds the session's HTTP clients.
-pub trait HttpClients: Send + Sync + 'static {
-    /// With no target, the builder of the client for requests it resolves
-    /// and redirects itself: HTTP trackers, metainfo, the block and allow
-    /// lists. With a target, of a client that reaches `target.host` at
-    /// `target.addrs` and nowhere else, and follows no redirect; through a
-    /// proxy that is handed the name, the proxy reaches it. An SSL torrent's
-    /// announces add its TLS identity to it.
-    fn builder(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::ClientBuilder>;
+/// What a session asks a client for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClientUse {
+    /// Metainfo, the block and allow lists, and web seeds. With no target
+    /// the client resolves and follows redirects itself; held to a target
+    /// it follows none. It keeps connections open between requests.
+    Fetch,
+    /// Tracker requests. The client keeps no connection open after a
+    /// request, so each announce dials and closes as one from a client
+    /// built for it alone does; `title_case` writes each word of a header
+    /// name capitalised, as libtorrent writes them.
+    Tracker { title_case: bool },
+    /// A port mapper's requests to the gateway on the local network: never
+    /// through a proxy.
+    Gateway,
+}
 
-    /// The client [`Self::builder`] gives.
-    fn client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
-        Ok(self.builder(target)?.build()?)
+/// The TLS identity an SSL torrent's announces present, and the CA they
+/// trust beside the system roots.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct ClientTls {
+    /// The identity's certificate chain and private key, PEM.
+    pub identity: Arc<[u8]>,
+    /// The torrent's CA, DER.
+    pub ca: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for ClientTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ClientTls")
     }
+}
 
-    /// As [`Self::client`], writing each word of a header name capitalised,
-    /// as libtorrent writes them.
-    fn title_case_client(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::Client> {
-        Ok(self.builder(target)?.http1_title_case_headers().build()?)
-    }
+/// A client's shape: what it is for, the TLS identity it presents, and the
+/// torrent it carries requests for.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ClientShape {
+    pub used_for: ClientUse,
+    pub tls: Option<ClientTls>,
+    /// The info-hash of the one torrent whose requests the client carries,
+    /// when it carries one torrent's alone: a web seed's. Clients for two
+    /// torrents never share a connection.
+    pub torrent: Option<crate::core::hash_id::Id20>,
+}
 
-    /// The client for one tracker request to `target`: as [`Self::client`],
-    /// or [`Self::title_case_client`] when `title_case`. A session may hand
-    /// the same client to every announce to a target, so long as it keeps
-    /// no connection open after a request, as a client used once does not.
-    fn tracker_client(
-        &self,
-        target: HttpTarget<'_>,
-        title_case: bool,
-    ) -> anyhow::Result<reqwest::Client> {
-        if title_case {
-            self.title_case_client(Some(target))
-        } else {
-            self.client(Some(target))
+impl ClientShape {
+    /// A client for metainfo, lists and web seeds.
+    pub const FETCH: Self = Self::of(ClientUse::Fetch);
+    /// A client for the gateway a port mapper asks.
+    pub const GATEWAY: Self = Self::of(ClientUse::Gateway);
+
+    pub const fn of(used_for: ClientUse) -> Self {
+        Self {
+            used_for,
+            tls: None,
+            torrent: None,
         }
     }
+
+    /// This shape, for the requests of the torrent `info_hash` alone.
+    pub fn for_torrent(self, info_hash: crate::core::hash_id::Id20) -> Self {
+        Self {
+            torrent: Some(info_hash),
+            ..self
+        }
+    }
+
+    /// `builder` given this shape, for the embedder to build the client
+    /// it hands back from.
+    pub fn apply(&self, builder: reqwest::ClientBuilder) -> anyhow::Result<reqwest::ClientBuilder> {
+        let builder = match self.used_for {
+            ClientUse::Fetch | ClientUse::Gateway => builder,
+            ClientUse::Tracker { title_case } => {
+                let builder = builder.pool_max_idle_per_host(0);
+                if title_case {
+                    builder.http1_title_case_headers()
+                } else {
+                    builder
+                }
+            }
+        };
+        Ok(match &self.tls {
+            None => builder,
+            Some(tls) => builder
+                .identity(reqwest::Identity::from_pem(&tls.identity)?)
+                .add_root_certificate(reqwest::Certificate::from_der(&tls.ca)?),
+        })
+    }
+}
+
+/// The session's HTTP clients, and the socket its port mapper asks the
+/// gateway over. The embedder builds each: the session never does.
+pub trait HttpClients: Send + Sync + 'static {
+    /// The client of `shape` for `target`, finished. With no target, one
+    /// that resolves names and follows redirects itself: metainfo, the
+    /// block and allow lists. With a target, one that reaches
+    /// `target.host` at `target.addrs` and nowhere else, and follows no
+    /// redirect; through a proxy that is handed the name, the proxy
+    /// reaches it. The embedder builds one for each target and shape, and
+    /// hands that one back each time it is asked again.
+    fn client(
+        &self,
+        target: Option<HttpTarget<'_>>,
+        shape: &ClientShape,
+    ) -> anyhow::Result<reqwest::Client>;
 
     /// Where a request from these clients to `to` leaves. Clients that do
     /// not say are a proxy's: the proxy picks how it reaches `to`.
     fn egress(&self, _to: SocketAddr) -> Egress {
         Egress::Proxied
+    }
+
+    /// A datagram socket bound at `local`, the address a port mapper asks
+    /// the gateway from, on the network the gateway is reached on.
+    fn gateway_socket<'a>(
+        &'a self,
+        local: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        Box::pin(async move {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("no socket to ask the gateway from {local}"),
+            ))
+        })
+    }
+}
+
+/// The clients of a session given none: it makes no HTTP request, so it
+/// fetches nothing by URL and announces to no HTTP tracker. Where its
+/// traffic leaves, and the socket its port mapper asks the gateway from,
+/// are its sockets' to say.
+#[derive(Clone)]
+pub struct NoClients {
+    sockets: Arc<dyn crate::network::SocketFactory>,
+}
+
+impl NoClients {
+    /// The clients of a session whose sockets come from `sockets`.
+    pub fn over(sockets: Arc<dyn crate::network::SocketFactory>) -> Self {
+        Self { sockets }
+    }
+}
+
+impl std::fmt::Debug for NoClients {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NoClients").finish_non_exhaustive()
+    }
+}
+
+impl HttpClients for NoClients {
+    fn client(
+        &self,
+        _target: Option<HttpTarget<'_>>,
+        _shape: &ClientShape,
+    ) -> anyhow::Result<reqwest::Client> {
+        anyhow::bail!("the session was given no HTTP clients")
+    }
+
+    fn egress(&self, to: SocketAddr) -> Egress {
+        match self.sockets.source_toward(to) {
+            Some(Ok(ip)) => Egress::From(ip),
+            Some(Err(error)) => {
+                tracing::debug!(%to, %error, "the sockets have no route toward the address");
+                Egress::NoRoute
+            }
+            None => Egress::Proxied,
+        }
+    }
+
+    fn gateway_socket<'a>(
+        &'a self,
+        local: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        self.sockets.gateway_socket(local)
     }
 }
 
@@ -265,86 +399,6 @@ pub enum Egress {
     From(IpAddr),
     /// The host has no route to it.
     NoRoute,
-}
-
-/// Where the host sends from to reach `to`, from a socket bound to the
-/// interface named `device` and to `from` where given: a UDP socket
-/// connected to `to`, which sends nothing and fails when no route reaches
-/// it.
-pub fn route_to(to: SocketAddr, from: Option<IpAddr>, device: Option<&str>) -> Egress {
-    let route = || -> Option<IpAddr> {
-        let socket =
-            socket2::Socket::new(socket2::Domain::for_address(to), socket2::Type::DGRAM, None)
-                .ok()?;
-        if let Some(device) = device {
-            librqbit_dualstack_sockets::BindDevice::new_from_name(device)
-                .ok()?
-                .bind_sref(&socket, to.is_ipv6())
-                .ok()?;
-        }
-        if let Some(from) = from {
-            socket.bind(&SocketAddr::new(from, 0).into()).ok()?;
-        }
-        socket.connect(&to.into()).ok()?;
-        Some(socket.local_addr().ok()?.as_socket()?.ip())
-    };
-    route().map_or(Egress::NoRoute, Egress::From)
-}
-
-/// The clients a builder makes, each held to its target.
-impl<F> HttpClients for F
-where
-    F: Fn() -> reqwest::ClientBuilder + Send + Sync + 'static,
-{
-    fn builder(&self, target: Option<HttpTarget<'_>>) -> anyhow::Result<reqwest::ClientBuilder> {
-        Ok(for_target(self(), target))
-    }
-
-    fn egress(&self, to: SocketAddr) -> Egress {
-        route_to(to, None, None)
-    }
-}
-
-/// `builder` held to `target`: it follows no redirect, and dials the
-/// target's host at the target's addresses only.
-pub fn for_target(
-    builder: reqwest::ClientBuilder,
-    target: Option<HttpTarget<'_>>,
-) -> reqwest::ClientBuilder {
-    let Some(target) = target else {
-        return builder;
-    };
-    let builder = builder.redirect(reqwest::redirect::Policy::none());
-    // An address in the URL is dialed as it is.
-    if target.host.parse::<IpAddr>().is_ok() {
-        return builder;
-    }
-    let addrs: Vec<SocketAddr> = target
-        .addrs
-        .iter()
-        .map(|ip| SocketAddr::new(*ip, target.port))
-        .collect();
-    builder.resolve_to_addrs(target.host, &addrs)
-}
-
-#[cfg(test)]
-mod route_tests {
-    use super::{Egress, route_to};
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-    // Loopback is reached from loopback, by the host's own route or held to
-    // it; a socket held to an IPv4 address has no route to an IPv6 one.
-    #[test]
-    fn a_route_leaves_from_the_address_it_is_held_to() {
-        let loopback = IpAddr::from(Ipv4Addr::LOCALHOST);
-        let to = SocketAddr::new(loopback, 9);
-        assert_eq!(route_to(to, None, None), Egress::From(loopback));
-        assert_eq!(route_to(to, Some(loopback), None), Egress::From(loopback));
-        assert_eq!(
-            route_to("[::1]:9".parse().unwrap(), Some(loopback), None),
-            Egress::NoRoute
-        );
-    }
 }
 
 #[cfg(all(test, feature = "e2e-local-trackers"))]

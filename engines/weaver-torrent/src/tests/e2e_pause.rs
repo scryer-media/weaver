@@ -83,7 +83,7 @@ impl Tracker {
 impl Drop for Tracker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        let _ = TcpStream::connect(self.addr);
+        crate::test_support::knock(self.addr);
     }
 }
 
@@ -160,7 +160,7 @@ async fn test_a_paused_torrent_asks_nothing_of_its_tracker_or_peers() -> anyhow:
     let session = Session::new_with_opts(
         out.path().into(),
         SessionOptions {
-            socket_factory: Some(Arc::new(Dialed(tx))),
+            socket_factory: Arc::new(Dialed(tx)),
             connect: Some(ConnectionOptions {
                 enable_tcp: true,
                 peer_opts: None,
@@ -242,7 +242,7 @@ async fn test_a_resumed_torrent_dials_the_peer_it_let_go_at_once() -> anyhow::Re
     let session = Session::new_with_opts(
         out.path().into(),
         SessionOptions {
-            socket_factory: Some(Arc::new(Dialed(tx))),
+            socket_factory: Arc::new(Dialed(tx)),
             connect: Some(ConnectionOptions {
                 enable_tcp: true,
                 peer_opts: None,
@@ -308,7 +308,7 @@ async fn test_a_pause_reports_the_block_it_cut_in_the_stopped_announce() -> anyh
     let session = Session::new_with_opts(
         out.path().into(),
         SessionOptions {
-            socket_factory: Some(Arc::new(WatchedDials(tx))),
+            socket_factory: Arc::new(WatchedDials(tx)),
             connect: Some(ConnectionOptions {
                 enable_tcp: true,
                 peer_opts: None,

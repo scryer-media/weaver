@@ -181,6 +181,12 @@ impl SocketEgress {
 
     // Bind a datagram socket for a tunnel peer of the supplied address family.
     pub fn bind_udp(&self, peer: SocketAddr) -> io::Result<UdpSocket> {
+        let socket = self.udp_socket(peer)?;
+        socket.set_nonblocking(true)?;
+        Ok(socket.into())
+    }
+
+    fn udp_socket(&self, peer: SocketAddr) -> io::Result<Socket> {
         let socket = self.socket(peer, Type::DGRAM, Protocol::UDP)?;
         if !matches!(self, Self::SourceAddress(_)) {
             let unspecified = if peer.is_ipv4() {
@@ -190,6 +196,46 @@ impl SocketEgress {
             };
             socket.bind(&SocketAddr::new(unspecified, 0).into())?;
         }
+        Ok(socket)
+    }
+
+    // The address a datagram to `to` leaves this egress from: a socket bound
+    // as the egress binds, connected to `to`, which sends nothing and fails
+    // when no route reaches it.
+    pub(crate) fn source_toward(&self, to: SocketAddr) -> io::Result<IpAddr> {
+        let socket = UdpSocket::from(self.udp_socket(to)?);
+        socket.connect(to)?;
+        Ok(socket.local_addr()?.ip())
+    }
+
+    // Bind a datagram socket a direct leg's consumer sends from itself, on
+    // `local`'s port: at the source address this egress pins, else at
+    // `local`'s address, on the egress's device when it names one.
+    pub(crate) fn bind_udp_at(&self, local: SocketAddr) -> io::Result<UdpSocket> {
+        let local = match self {
+            Self::SourceAddress(source) => SocketAddr::new(*source, local.port()),
+            _ => local,
+        };
+        let socket = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
+        if local.is_ipv6() && local.ip().is_unspecified() {
+            match self {
+                // On a device the unspecified IPv6 address keeps to IPv6 on
+                // every host, as one socket cannot be held to the device for
+                // both families everywhere; IPv4 is a socket of its own.
+                Self::Interface(_) => socket.set_only_v6(true)?,
+                // Elsewhere it takes IPv4 as well, whatever the host's
+                // default, unless the host keeps the socket to IPv6.
+                _ => {
+                    if let Err(error) = socket.set_only_v6(false) {
+                        tracing::debug!(%local, %error, "the host keeps the socket to IPv6 alone");
+                    }
+                }
+            }
+        }
+        if let Self::Interface(name) = self {
+            bind_interface(&socket, name, local.is_ipv6())?;
+        }
+        socket.bind(&local.into())?;
         socket.set_nonblocking(true)?;
         Ok(socket.into())
     }
@@ -200,6 +246,73 @@ mod connect_tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    // Loopback is reached from loopback, by the host's own route or from a
+    // pinned source address; a socket held to an IPv4 address has no route
+    // to an IPv6 one.
+    #[test]
+    fn a_route_leaves_from_the_address_its_egress_pins() {
+        let loopback = IpAddr::from(Ipv4Addr::LOCALHOST);
+        let to = SocketAddr::new(loopback, 9);
+        assert_eq!(SocketEgress::System.source_toward(to).unwrap(), loopback);
+        let pinned = SocketEgress::SourceAddress(loopback);
+        assert_eq!(pinned.source_toward(to).unwrap(), loopback);
+        assert!(pinned.source_toward("[::1]:9".parse().unwrap()).is_err());
+    }
+
+    // A socket bound at the unspecified IPv6 address takes IPv4 as well.
+    #[test]
+    fn an_unspecified_v6_socket_is_dual_stack() {
+        let socket = SocketEgress::System
+            .bind_udp_at("[::]:0".parse().unwrap())
+            .unwrap();
+        assert!(!socket2::SockRef::from(&socket).only_v6().unwrap());
+    }
+
+    // A socket on an interface at the unspecified IPv6 address keeps to
+    // IPv6, held to the device.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_unspecified_v6_socket_on_an_interface_keeps_to_ipv6() {
+        let device = if cfg!(target_os = "linux") {
+            "lo"
+        } else {
+            "lo0"
+        };
+        let socket =
+            match SocketEgress::Interface(device.into()).bind_udp_at("[::]:0".parse().unwrap()) {
+                Ok(socket) => socket,
+                // Binding to a device needs a privilege some Linux hosts withhold.
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+                Err(error) => panic!("{error}"),
+            };
+        let socket = socket2::SockRef::from(&socket);
+        assert!(socket.only_v6().unwrap());
+        #[cfg(target_os = "macos")]
+        {
+            let name = std::ffi::CString::new(device).unwrap();
+            // SAFETY: CString supplies the NUL-terminated name required by libc.
+            let index = std::num::NonZeroU32::new(unsafe { libc::if_nametoindex(name.as_ptr()) });
+            assert_eq!(socket.device_index_v6().unwrap(), index);
+        }
+        #[cfg(target_os = "linux")]
+        assert_eq!(socket.device().unwrap().as_deref(), Some(device.as_bytes()));
+    }
+
+    // A local socket binds where it is asked, or at the pinned source
+    // address on the port asked for.
+    #[test]
+    fn a_local_socket_binds_at_the_pinned_source() {
+        let loopback = IpAddr::from(Ipv4Addr::LOCALHOST);
+        let socket = SocketEgress::System
+            .bind_udp_at(SocketAddr::new(loopback, 0))
+            .unwrap();
+        assert_eq!(socket.local_addr().unwrap().ip(), loopback);
+        let socket = SocketEgress::SourceAddress(loopback)
+            .bind_udp_at(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0))
+            .unwrap();
+        assert_eq!(socket.local_addr().unwrap().ip(), loopback);
+    }
 
     #[test]
     fn connected_hangup_preserves_the_peers_last_reply() {

@@ -9,10 +9,10 @@
 
 use crate::core::net::{DatagramSocket, Resolver};
 use crate::core::spawn_utils::spawn_with_cancel;
+use crate::network::SocketFactory;
 use anyhow::Context;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use librqbit_dualstack_sockets::BindDevice;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::{BufReader, BufWriter};
@@ -106,23 +106,23 @@ impl PersistentDht {
         ipv4_only: bool,
         bootstrap_addrs: Option<Vec<String>>,
         cancellation_token: Option<CancellationToken>,
-        bind_device: Option<&'a BindDevice>,
+        sockets: Arc<dyn SocketFactory>,
     ) -> BoxFuture<'a, anyhow::Result<Dht>> {
-        Self::create_with_socket(
+        Self::create_from_config(
             persistence_config,
             port,
             ipv4_only,
-            bootstrap_addrs,
-            cancellation_token,
-            bind_device,
-            None,
-            None,
+            DhtConfig {
+                bootstrap_addrs,
+                cancellation_token,
+                sockets: Some(sockets),
+                ..Default::default()
+            },
         )
     }
 
-    /// Like [`PersistentDht::create`], but when `socket` is set the DHT sends
-    /// and receives through it instead of binding a kernel UDP socket. In that
-    /// case `port`, `ipv4_only`, `bind_device` and any persisted port are
+    /// Like [`PersistentDht::create`], but the DHT sends and receives
+    /// through `socket`, so `port`, `ipv4_only` and any persisted port are
     /// ignored.
     ///
     /// Bootstrap hostnames are looked up through `resolver`; with none, only
@@ -135,8 +135,7 @@ impl PersistentDht {
         ipv4_only: bool,
         bootstrap_addrs: Option<Vec<String>>,
         cancellation_token: Option<CancellationToken>,
-        bind_device: Option<&'a BindDevice>,
-        socket: Option<Arc<dyn DatagramSocket>>,
+        socket: Arc<dyn DatagramSocket>,
         resolver: Option<Arc<dyn Resolver>>,
     ) -> BoxFuture<'a, anyhow::Result<Dht>> {
         Self::create_from_config(
@@ -146,8 +145,7 @@ impl PersistentDht {
             DhtConfig {
                 bootstrap_addrs,
                 cancellation_token,
-                bind_device,
-                socket,
+                socket: Some(socket),
                 resolver,
                 ..Default::default()
             },
@@ -164,7 +162,7 @@ impl PersistentDht {
         persistence_config: DhtPersistenceConfig,
         port: Option<u16>,
         ipv4_only: bool,
-        config: DhtConfig<'a>,
+        config: DhtConfig,
     ) -> BoxFuture<'a, anyhow::Result<Dht>> {
         async move {
             let config_filename = persistence_config.config_filename;

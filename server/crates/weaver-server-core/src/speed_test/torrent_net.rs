@@ -173,6 +173,14 @@ impl SocketFactory for ProbeSockets {
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
         self.inner.bind_udp(addr)
     }
+
+    fn bind_utp<'a>(
+        &'a self,
+        addr: SocketAddr,
+        receive_buffer: usize,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        self.inner.bind_utp(addr, receive_buffer)
+    }
 }
 
 // The leg's listener, every peer it takes in counted.

@@ -73,7 +73,7 @@ weaver-model = { path = "../../shared/crates/weaver-model", default-features = f
 weaver-utp = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = ["Win32", "Win32_System", "Win32_System_IO", "Win32_System_Ioctl"] }
+windows = { workspace = true, features = ["Win32", "Win32_System", "Win32_System_IO", "Win32_System_Ioctl", "Win32_Networking_WinSock"] }
 
 [dev-dependencies]
 # The e2e tests lift the open-file limit.
@@ -85,3 +85,5 @@ tempfile = { workspace = true }
 # tests advance it past a deadline instead of waiting for one.
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
+# The routing layer's HTTP clients, for tests that make requests.
+weaver-tunnel = { path = "../weaver-tunnel", features = ["test-support"] }

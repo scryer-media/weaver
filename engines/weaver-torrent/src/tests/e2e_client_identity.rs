@@ -66,9 +66,7 @@ async fn test_a_web_seed_is_asked_as_the_client_the_torrent_names_itself_as() ->
         let session = Session::new_with_opts(
             out.path().into(),
             SessionOptions {
-                http_client: Some(std::sync::Arc::new(|| {
-                    reqwest::Client::builder().no_proxy()
-                })),
+                http_client: Some(crate::test_support::loopback()),
                 ..isolated_session_opts(false)
             },
         )

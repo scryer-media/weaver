@@ -437,10 +437,9 @@ mod tests {
             .unwrap();
         let port = listener.local_addr().unwrap().port();
         let writer = async move {
-            let mut w = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+            let (_r, mut w) = crate::test_support::tcp((Ipv4Addr::LOCALHOST, port))
                 .await
                 .unwrap();
-            w.set_nodelay(true).unwrap();
             for c in chunks {
                 w.write_all(&c).await.unwrap();
                 w.flush().await.unwrap();
@@ -492,10 +491,9 @@ mod tests {
             .await
             .unwrap();
         let port = reader.local_addr().unwrap().port();
-        let mut writer = tokio::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        let mut writer = crate::test_support::tcp((Ipv4Addr::LOCALHOST, port))
             .await
             .unwrap()
-            .into_split()
             .1;
 
         const ITERATIONS: u32 = 4096;

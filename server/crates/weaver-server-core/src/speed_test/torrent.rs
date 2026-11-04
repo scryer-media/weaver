@@ -435,7 +435,7 @@ impl Joined {
         // A route's session's options; only its sockets are watched, and its
         // mappers' reports kept.
         let options = SessionOptions {
-            socket_factory: Some(Arc::new(ProbeSockets::new(path.leg.sockets()?, watched))),
+            socket_factory: Arc::new(ProbeSockets::new(Arc::clone(&path.leg.factory), watched)),
             port_map_events: Some(events),
             ..path.session_options(dir.path())?
         };

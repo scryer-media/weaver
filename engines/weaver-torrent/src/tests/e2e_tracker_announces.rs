@@ -102,9 +102,7 @@ fn answer_with_peer(peer: SocketAddr) -> anyhow::Result<Vec<u8>> {
 pub(crate) fn tracker_session_opts() -> anyhow::Result<SessionOptions> {
     Ok(SessionOptions {
         disable_trackers: false,
-        http_client: Some(std::sync::Arc::new(|| {
-            reqwest::Client::builder().no_proxy()
-        })),
+        http_client: Some(crate::test_support::loopback()),
         ..isolated_session_opts(false)
     })
 }
@@ -303,13 +301,7 @@ impl crate::network::SocketFactory for Forwarding {
             crate::network::BoxAsyncWrite,
         )>,
     > {
-        Box::pin(async move {
-            let (read, write) = TcpStream::connect(addr).await?.into_split();
-            Ok((
-                Box::new(read) as crate::network::BoxAsyncReadVectored,
-                Box::new(write) as crate::network::BoxAsyncWrite,
-            ))
-        })
+        Box::pin(async move { crate::test_support::tcp(addr).await })
     }
 
     fn listen_tcp<'a>(
@@ -336,8 +328,8 @@ impl crate::network::SocketFactory for Forwarding {
         std::io::Result<std::sync::Arc<dyn crate::network::DatagramSocket>>,
     > {
         Box::pin(async {
-            let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-            Ok(std::sync::Arc::new(socket) as std::sync::Arc<dyn crate::network::DatagramSocket>)
+            let socket = crate::test_support::loopback_udp().await;
+            Ok(socket)
         })
     }
 }
@@ -370,9 +362,7 @@ async fn test_a_listener_whose_transport_forwards_a_port_announces_it() -> anyho
             announce_port: Some(CONFIGURED),
             ..Default::default()
         }),
-        socket_factory: Some(std::sync::Arc::new(Forwarding(std::sync::Mutex::new(
-            Some(received),
-        )))),
+        socket_factory: std::sync::Arc::new(Forwarding(std::sync::Mutex::new(Some(received)))),
         ..tracker_session_opts()?
     };
     let t = TestTorrent::new("test_forwarded_port", 2048, 1024).await?;
@@ -479,7 +469,7 @@ async fn test_an_announce_names_no_address_on_a_socket_factory_bound_to_a_source
             listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
             ..Default::default()
         }),
-        socket_factory: Some(factory),
+        socket_factory: factory,
         ..tracker_session_opts()?
     })
     .await?;
@@ -704,9 +694,7 @@ async fn test_tracker_announces_follow_the_live_run() -> anyhow::Result<()> {
         out.path().into(),
         SessionOptions {
             disable_trackers: false,
-            http_client: Some(std::sync::Arc::new(|| {
-                reqwest::Client::builder().no_proxy()
-            })),
+            http_client: Some(crate::test_support::loopback()),
             ..isolated_session_opts(false)
         },
     )
@@ -1182,10 +1170,12 @@ async fn test_a_magnets_run_starts_from_the_peers_its_fetchs_tracker_gave() -> a
 /// A session that announces to trackers and runs a DHT whose one bootstrap
 /// node is `node`, a loopback socket the test holds: whatever the DHT sends
 /// lands there and nowhere else.
-fn discovery_session_opts(node: &tokio::net::UdpSocket) -> anyhow::Result<SessionOptions> {
+fn discovery_session_opts<S: crate::network::DatagramSocket + ?Sized>(
+    node: &std::sync::Arc<S>,
+) -> anyhow::Result<SessionOptions> {
     Ok(SessionOptions {
         dht: Some(crate::DhtSessionConfig {
-            bootstrap_addrs: Some(vec![node.local_addr()?.to_string()]),
+            bootstrap_addrs: Some(vec![node.bind_addr().to_string()]),
             port: None,
             persistence: None,
         }),
@@ -1196,8 +1186,8 @@ fn discovery_session_opts(node: &tokio::net::UdpSocket) -> anyhow::Result<Sessio
 
 /// The DHT's next get_peers for `info_hash` to `node`, answering nothing
 /// else. Returns the request's transaction id and where it came from.
-async fn next_get_peers(
-    node: &tokio::net::UdpSocket,
+async fn next_get_peers<S: crate::network::DatagramSocket + ?Sized>(
+    node: &std::sync::Arc<S>,
     info_hash: crate::core::hash_id::Id20,
 ) -> anyhow::Result<(crate::bencode::ByteBufOwned, SocketAddr)> {
     use crate::dht::bprotocol::{MessageKind, deserialize_message};
@@ -1216,7 +1206,10 @@ async fn next_get_peers(
 }
 
 /// Whether the DHT has sent `node` a get_peers for `info_hash` by now.
-fn asked_for_peers(node: &tokio::net::UdpSocket, info_hash: crate::core::hash_id::Id20) -> bool {
+fn asked_for_peers(
+    node: &crate::network::KernelUdp,
+    info_hash: crate::core::hash_id::Id20,
+) -> bool {
     use crate::dht::bprotocol::{MessageKind, deserialize_message};
     let mut buf = [0u8; 2048];
     while let Ok((len, _)) = node.try_recv_from(&mut buf) {
@@ -1278,7 +1271,7 @@ async fn test_a_fetch_whose_tracker_names_a_peer_never_asks_the_dht() -> anyhow:
     let (_seeder, seeder_addr) = t.seed().await?;
     let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let url = format!("http://{}/announce", tracker.local_addr()?);
-    let node = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let node = crate::test_support::loopback_kernel_udp();
     let out = TempDir::with_prefix("test_fetch_tracker_peer_out")?;
     let session = Session::new_with_opts(out.path().into(), discovery_session_opts(&node)?).await?;
 
@@ -1305,7 +1298,7 @@ async fn test_a_fetch_whose_tracker_fails_goes_on_to_the_dht() -> anyhow::Result
     let t = TestTorrent::new("test_fetch_tracker_fails", 4096, 1024).await?;
     let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let url = format!("http://{}/announce", tracker.local_addr()?);
-    let node = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let node = crate::test_support::loopback_udp().await;
     let out = TempDir::with_prefix("test_fetch_tracker_fails_out")?;
     let session = Session::new_with_opts(out.path().into(), discovery_session_opts(&node)?).await?;
 
@@ -1359,7 +1352,7 @@ async fn test_a_fetch_whose_tracker_names_only_a_peer_without_extensions_goes_on
     let peer_addr = peer.local_addr()?;
     let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let url = format!("http://{}/announce", tracker.local_addr()?);
-    let node = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let node = crate::test_support::loopback_kernel_udp();
     let out = TempDir::with_prefix("test_fetch_tracker_peer_unable_out")?;
     let session = Session::new_with_opts(out.path().into(), discovery_session_opts(&node)?).await?;
 
@@ -1392,7 +1385,7 @@ async fn test_a_fetch_without_discovery_whose_tracker_fails_waits() -> anyhow::R
     let t = TestTorrent::new("test_fetch_tracker_fails_waits", 4096, 1024).await?;
     let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let url = format!("http://{}/announce", tracker.local_addr()?);
-    let node = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let node = crate::test_support::loopback_kernel_udp();
     let out = TempDir::with_prefix("test_fetch_tracker_fails_waits_out")?;
     let session = Session::new_with_opts(out.path().into(), discovery_session_opts(&node)?).await?;
 
@@ -1414,7 +1407,7 @@ async fn test_a_fetch_without_discovery_whose_tracker_fails_waits() -> anyhow::R
 async fn test_a_fetch_with_no_tracker_and_no_discovery_waits() -> anyhow::Result<()> {
     setup_test_logging();
     let t = TestTorrent::new("test_fetch_no_tracker_waits", 4096, 1024).await?;
-    let node = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let node = crate::test_support::loopback_kernel_udp();
     let out = TempDir::with_prefix("test_fetch_no_tracker_waits_out")?;
     let session = Session::new_with_opts(out.path().into(), discovery_session_opts(&node)?).await?;
 
@@ -1505,7 +1498,7 @@ async fn test_a_private_torrent_found_on_the_dht_takes_peers_from_its_trackers_a
     let (server, seeder_addr) = serve_metadata(&t.torrent).await?;
     let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let url = format!("http://{}/announce", tracker.local_addr()?);
-    let node = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let node = crate::test_support::loopback_udp().await;
     let out = TempDir::with_prefix("test_fetch_private_after_dht_out")?;
     let session = Session::new_with_opts(out.path().into(), discovery_session_opts(&node)?).await?;
 

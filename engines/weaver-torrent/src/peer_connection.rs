@@ -937,9 +937,8 @@ mod tests {
         let (tx, dialed) = mpsc::unbounded_channel();
         let connector = StreamConnector::new(StreamConnectorArgs {
             enable_tcp: true,
-            socket_factory: Some(Arc::new(Dialed(tx))),
             encryption,
-            ..Default::default()
+            ..StreamConnectorArgs::over(Arc::new(Dialed(tx)))
         })
         .await
         .unwrap();
@@ -1017,9 +1016,8 @@ mod tests {
     async fn a_connect_unanswered_is_given_up_at_the_connect_timeout() {
         let connector = StreamConnector::new(StreamConnectorArgs {
             enable_tcp: true,
-            socket_factory: Some(Arc::new(Unanswered)),
             encryption: EncryptionPolicy::Disabled,
-            ..Default::default()
+            ..StreamConnectorArgs::over(Arc::new(Unanswered))
         })
         .await
         .unwrap();

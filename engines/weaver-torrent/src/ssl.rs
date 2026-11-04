@@ -134,7 +134,8 @@ fn provider() -> CryptoProvider {
 struct Tls {
     client: Arc<ClientConfig>,
     server: Arc<ServerConfig>,
-    identity: SslIdentity,
+    // What the torrent's HTTPS announces present and trust.
+    announces: crate::ClientTls,
 }
 
 /// What makes a torrent an SSL torrent: its CA, the names it answers to in
@@ -242,7 +243,10 @@ impl SslTorrent {
         Ok(Tls {
             client: Arc::new(client),
             server: Arc::new(server),
-            identity,
+            announces: crate::ClientTls {
+                identity: identity.to_pem().into(),
+                ca: self.ca.to_vec().into(),
+            },
         })
     }
 
@@ -265,15 +269,13 @@ impl SslTorrent {
         Ok(halves(stream))
     }
 
-    /// `builder` for the torrent's HTTPS announces: it presents our
-    /// identity, and takes a tracker under the torrent's CA as well as one
+    /// What the torrent's HTTPS announces present and trust: our identity,
+    /// and the torrent's CA, so a tracker under it is taken as well as one
     /// under the system roots.
-    pub fn http(&self, builder: reqwest::ClientBuilder) -> anyhow::Result<reqwest::ClientBuilder> {
+    pub fn client_tls(&self) -> anyhow::Result<crate::ClientTls> {
         let tls = self.tls.load();
         let tls = tls.as_ref().context("the SSL torrent has no identity")?;
-        Ok(builder
-            .identity(reqwest::Identity::from_pem(&tls.identity.to_pem())?)
-            .add_root_certificate(reqwest::Certificate::from_der(&self.ca)?))
+        Ok(tls.announces.clone())
     }
 }
 
@@ -599,19 +601,25 @@ impl AsyncWrite for Joined {
     }
 }
 
-/// The HTTP clients of an SSL torrent's announces: the session's, with the
-/// torrent's TLS identity and CA added, read as each client is built.
+/// The HTTP clients of an SSL torrent's announces: the session's, in the
+/// shape that presents the torrent's TLS identity and trusts its CA, read
+/// as each client is asked for.
 pub(crate) struct SslHttpClients {
     pub inner: Arc<dyn crate::HttpClients>,
     pub ssl: Arc<SslTorrent>,
 }
 
 impl crate::HttpClients for SslHttpClients {
-    fn builder(
+    fn client(
         &self,
         target: Option<crate::HttpTarget<'_>>,
-    ) -> anyhow::Result<reqwest::ClientBuilder> {
-        self.ssl.http(self.inner.builder(target)?)
+        shape: &crate::ClientShape,
+    ) -> anyhow::Result<reqwest::Client> {
+        let shape = crate::ClientShape {
+            tls: Some(self.ssl.client_tls()?),
+            ..shape.clone()
+        };
+        self.inner.client(target, &shape)
     }
 
     fn egress(&self, to: std::net::SocketAddr) -> crate::Egress {

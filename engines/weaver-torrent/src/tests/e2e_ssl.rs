@@ -283,7 +283,7 @@ async fn tls_handshake(
 ) -> anyhow::Result<Vec<u8>> {
     let ssl = SslTorrent::new(ca_pem.as_bytes(), t.info_hashes, &t.name)?;
     ssl.set_identity(Some(identity))?;
-    let (r, w) = halves(TcpStream::connect(addr).await?);
+    let (r, w) = crate::test_support::tcp(addr).await?;
     let (mut r, mut w) = match ssl.connect(r, w).await {
         Ok(halves) => halves,
         Err(_) => return Ok(Vec::new()),
@@ -443,7 +443,7 @@ async fn test_ssl_peers_refuse_a_certificate_issued_to_another_torrent() -> anyh
         .context("impostor has no SSL listener")?;
     let ssl = SslTorrent::new(ca.pem.as_bytes(), t.info_hashes, &t.name)?;
     ssl.set_identity(Some(ca.peer("peer", &t)?))?;
-    let (r, w) = halves(TcpStream::connect(impostor_addr).await?);
+    let (r, w) = crate::test_support::tcp(impostor_addr).await?;
     let err = ssl
         .connect(r, w)
         .await
@@ -475,14 +475,14 @@ async fn test_ssl_torrent_refuses_plain_connections() -> anyhow::Result<()> {
     let ssl_addr = seeder
         .ssl_listen_addr()
         .context("seeder has no SSL listener")?;
-    let (mut r, mut w) = halves(TcpStream::connect(ssl_addr).await?);
+    let (mut r, mut w) = crate::test_support::tcp(ssl_addr).await?;
     w.write_all(&handshake(t.info_hash())).await?;
     let got = read_until_closed(&mut r).await;
     assert!(got.first() != Some(&19), "{got:?}");
 
     // A plain handshake for the torrent on the plain listener: refused.
     let plain_addr = seeder.listen_addr().context("seeder is not listening")?;
-    let (mut r, mut w) = halves(TcpStream::connect(plain_addr).await?);
+    let (mut r, mut w) = crate::test_support::tcp(plain_addr).await?;
     w.write_all(&handshake(t.info_hash())).await?;
     let got = read_until_closed(&mut r).await;
     assert!(got.first() != Some(&19), "{got:?}");
@@ -533,7 +533,7 @@ async fn test_ssl_torrent_https_tracker_sees_identity_and_ssl_port() -> anyhow::
         out.path().into(),
         SessionOptions {
             disable_trackers: false,
-            http_client: Some(Arc::new(|| reqwest::Client::builder().no_proxy())),
+            http_client: Some(crate::test_support::loopback()),
             ..opts
         },
     )
