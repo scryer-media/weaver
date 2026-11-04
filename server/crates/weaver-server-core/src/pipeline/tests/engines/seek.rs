@@ -729,7 +729,7 @@ async fn restart(
     let working_dir = pipeline.jobs[&JOB].working_dir.clone();
     match stop {
         Stop::Drained => pipeline.drain().await,
-        Stop::Crashed => {}
+        Stop::Crashed => pipeline.flush_graph_checkpoint(JOB),
     }
     let db = pipeline.db.clone();
     retire_pipeline_database(pipeline).await;

@@ -73,12 +73,13 @@ impl Drop for Unremovable {
 
 // The job's rows as they stand once every queued write has committed.
 async fn rows(pipeline: &Pipeline) -> GraphCheckpoint {
+    pipeline.flush_graph_checkpoint(JOB);
     pipeline.db.flush_write_queue().await.unwrap();
     pipeline
         .db
         .load_graph_checkpoint(JOB)
         .unwrap()
-        .expect("every step leaves a checkpoint")
+        .expect("the forced checkpoint committed")
 }
 
 // The database goes back to `rows`, as when every write after them was
