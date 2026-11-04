@@ -113,7 +113,7 @@ fn exclusive_rename_native(src: &std::ffi::CStr, dst: &std::ffi::CStr) -> io::Re
 // The move then takes the next rung down, as systemd's does: link(2) and
 // unlink(2), exclusive on every mount with hard links; where links are
 // refused too, a check of the target and then rename(2). Every rung refuses
-// a target that exists.
+// a target that exists, unless it is the source's own inode.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rename_exclusive_with(src: &Path, dst: &Path, exclusive: ExclusiveRename) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
@@ -132,14 +132,30 @@ fn rename_exclusive_with(src: &Path, dst: &Path, exclusive: ExclusiveRename) -> 
                 let _ = std::fs::remove_file(dst);
             });
         }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return finish_or_refuse(src, dst);
+        }
         Err(error) if refused(&error, &[libc::EPERM, libc::EXDEV]) => {}
         Err(error) => return Err(error),
     }
     match std::fs::symlink_metadata(dst) {
-        Ok(_) => Err(io::Error::from_raw_os_error(libc::EEXIST)),
+        Ok(_) => finish_or_refuse(src, dst),
         Err(error) if error.kind() == io::ErrorKind::NotFound => std::fs::rename(src, dst),
         Err(error) => Err(error),
     }
+}
+
+// The target exists. A file whose target is its own inode is a link and
+// unlink cut off between the two: the move finishes by unlinking the
+// source. Any other target is refused.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn finish_or_refuse(src: &Path, dst: &Path) -> io::Result<()> {
+    let source = std::fs::symlink_metadata(src)?;
+    let target = std::fs::symlink_metadata(dst)?;
+    if !source.is_dir() && (source.dev(), source.ino()) == (target.dev(), target.ino()) {
+        return std::fs::remove_file(src);
+    }
+    Err(io::Error::from_raw_os_error(libc::EEXIST))
 }
 
 // The call is not supported here, as opposed to failed.
@@ -673,6 +689,37 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(src.join("inside.bin")).unwrap(), b"inside");
         assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_file_already_linked_at_both_names_finishes_its_move() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("graph-waiting-0-3");
+        let dst = temp.path().join("movie.mkv");
+        std::fs::write(&src, b"source").unwrap();
+        std::fs::hard_link(&src, &dst).unwrap();
+
+        rename_exclusive_with(&src, &dst, refuse::<{ libc::EINVAL }>).unwrap();
+
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"source");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_different_file_with_the_same_bytes_is_still_refused() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src.bin");
+        let dst = temp.path().join("dst.bin");
+        std::fs::write(&src, b"same").unwrap();
+        std::fs::write(&dst, b"same").unwrap();
+
+        let error = rename_exclusive_with(&src, &dst, refuse::<{ libc::EINVAL }>).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&src).unwrap(), b"same");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"same");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
