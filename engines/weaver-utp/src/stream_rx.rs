@@ -502,7 +502,7 @@ impl UserRx {
 
 // Packets held out of order: one per 1100 bytes of the receive buffer,
 // never fewer than 16. One further out is dropped.
-fn reorder_capacity(max_rx_bytes: NonZeroUsize) -> NonZeroUsize {
+pub(crate) fn reorder_capacity(max_rx_bytes: NonZeroUsize) -> NonZeroUsize {
     NonZeroUsize::new((max_rx_bytes.get() / 1100).max(16)).unwrap_or(NonZeroUsize::MIN)
 }
 

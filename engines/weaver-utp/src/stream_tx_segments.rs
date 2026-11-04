@@ -426,7 +426,7 @@ impl Segments {
                 let sack_start_offset = sack_start - first_seq_nr;
 
                 let mut process_sack = |segment: &mut Segment, is_sacked: bool| {
-                    if !segment.is_delivered && is_sacked {
+                    if !segment.is_delivered && is_sacked && segment.send_count() > 0 {
                         segment.is_delivered = true;
                         segment.update_rtt(now, &mut new_rtt);
                         max_acked_payload_size = max_acked_payload_size.max(segment.payload_size);
@@ -628,6 +628,13 @@ mod tests {
     fn test_remove_up_to_ack() {
         // Test Case 1: Basic setup with 4 packets starting from sequence number 3
         let now = Instant::now();
+        let make_segments = |start, count| {
+            let mut segments = make_segments(start, count);
+            for mut item in segments.iter_mut_for_sending(None) {
+                item.on_sent(now, &UtpStats::default());
+            }
+            segments
+        };
         let ftx = make_segments(3, 4);
         assert_eq!(ftx.total_len_bytes(), 4);
         assert_eq!(ftx.total_len_packets(), 4);

@@ -1128,6 +1128,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             return Ok(Default::default());
         }
 
+        let max_packets_reorder =
+            crate::stream_rx::reorder_capacity(self.socket_opts.vsock_rx_bufsize).get();
+        if self.state != SynReceived
+            && hdr.seq_nr - self.last_consumed_remote_seq_nr > max_packets_reorder as isize
+        {
+            trace!("dropping packet, its sequence is past the receive reorder window");
+            self.socket.stats.redundant_packets.increment(1);
+            return Ok(Default::default());
+        }
+
         match (self.state, hdr.get_type()) {
             // From real world packets: if ST_RESET acks our FIN, it's ok
             (LastAck { our_fin, .. }, Reset) if hdr.ack_nr == our_fin => {

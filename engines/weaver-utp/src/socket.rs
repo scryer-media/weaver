@@ -248,6 +248,7 @@ type ConnectToken = u64;
 struct Connecting {
     token: ConnectToken,
     start: Instant,
+    connection_id: SeqNr,
     seq_nr: SeqNr,
     requester: ConnectRequest,
 }
@@ -276,10 +277,11 @@ impl ConnectingPerAddr {
         false
     }
 
-    fn pop(&mut self, s: SeqNr) -> Option<Connecting> {
+    fn pop(&mut self, connection_id: SeqNr, seq_nr: SeqNr) -> Option<Connecting> {
         for slot in self.slots.iter_mut() {
             if let Some(c) = slot
-                && c.seq_nr == s
+                && c.connection_id == connection_id
+                && c.seq_nr == seq_nr
             {
                 self.len -= 1;
                 return slot.take();
@@ -468,6 +470,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 }
                 let c = Connecting {
                     token,
+                    connection_id: header.connection_id,
                     seq_nr: header.seq_nr,
                     requester: sender,
                     start: self.env.now(),
@@ -508,7 +511,10 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             }
         };
 
-        let conn = if let Some(conn) = occ.get_mut().pop(msg.header.ack_nr) {
+        let conn = if let Some(conn) = occ
+            .get_mut()
+            .pop(msg.header.connection_id, msg.header.ack_nr)
+        {
             if occ.get_mut().is_empty() {
                 occ.remove();
             }
@@ -516,7 +522,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         } else {
             debug!(
                 ?msg,
-                "dropping packet. we are connecting to this addr, but ack_nr doens't match"
+                "dropping packet, connection ID or SYN acknowledgement does not match"
             );
             self.socket.stats.invalid_packets.increment(1);
             return Ok(());
@@ -967,6 +973,181 @@ mod tests {
     use tracing::{Instrument, debug_span, info};
 
     use crate::test_util::{MockUtpStream, setup_test_logging, transport::MockInterface};
+
+    struct RepeatedSynSequence(crate::test_util::env::MockUtpEnvironment);
+
+    impl crate::traits::UtpEnvironment for RepeatedSynSequence {
+        fn now(&self) -> tokio::time::Instant {
+            crate::traits::UtpEnvironment::now(&self.0)
+        }
+
+        fn copy(&self) -> Self {
+            Self(self.0.clone())
+        }
+
+        fn random_u16(&self) -> u16 {
+            100
+        }
+    }
+
+    async fn unexpected_handshake_state_is_ignored(
+        remote: SocketAddr,
+        connection_id_offset: u16,
+        syn_ack_offset: u16,
+    ) {
+        use super::{ControlRequest, RequestWithSpan};
+        use crate::{
+            UtpSocket,
+            message::UtpMessage,
+            raw::{Type, UtpHeader},
+            test_util::{ADDR_1, ADDR_2, env::MockUtpEnvironment, transport::RememberingTransport},
+        };
+
+        let transport = RememberingTransport::new(ADDR_1);
+        let (_socket, mut dispatcher) = UtpSocket::new_with_opts_and_dispatcher(
+            transport.clone(),
+            RepeatedSynSequence(MockUtpEnvironment::new()),
+            Default::default(),
+        )
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        dispatcher
+            .on_control(ControlRequest::ConnectRequest(
+                ADDR_2,
+                0,
+                RequestWithSpan::new(tx),
+            ))
+            .await;
+        let sent = transport.take_sent_utpmessages();
+        assert_eq!(sent.len(), 1);
+        let syn = &sent[0].header;
+        assert_eq!(syn.htype, Type::Syn);
+        let response = UtpHeader {
+            htype: Type::State,
+            connection_id: syn.connection_id,
+            seq_nr: 1.into(),
+            ack_nr: syn.seq_nr,
+            wnd_size: 1024,
+            ..Default::default()
+        };
+        dispatcher
+            .on_recv(
+                remote,
+                UtpMessage::new_test(
+                    UtpHeader {
+                        connection_id: response.connection_id + connection_id_offset,
+                        ack_nr: response.ack_nr + syn_ack_offset,
+                        ..response
+                    },
+                    b"",
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(dispatcher.streams.is_empty());
+
+        dispatcher
+            .on_recv(ADDR_2, UtpMessage::new_test(response, b""))
+            .await
+            .unwrap();
+        let _stream = rx.try_recv().unwrap().unwrap();
+        assert!(
+            dispatcher
+                .streams
+                .contains_key(&(ADDR_2, syn.connection_id.0))
+        );
+        assert!(dispatcher.connecting.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_state_handshake_requires_the_requested_endpoint() {
+        unexpected_handshake_state_is_ignored(SocketAddr::from((Ipv4Addr::LOCALHOST, 3)), 0, 0)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_state_handshake_requires_the_requested_connection_id() {
+        unexpected_handshake_state_is_ignored(crate::test_util::ADDR_2, 1, 0).await;
+    }
+
+    #[tokio::test]
+    async fn a_state_handshake_requires_the_sent_syn_sequence() {
+        unexpected_handshake_state_is_ignored(crate::test_util::ADDR_2, 0, 1).await;
+    }
+
+    #[tokio::test]
+    async fn equal_syn_sequences_complete_only_the_matching_connection_id() {
+        use super::{ControlRequest, RequestWithSpan};
+        use crate::{
+            UtpSocket,
+            message::UtpMessage,
+            raw::{Type, UtpHeader},
+            test_util::{ADDR_1, ADDR_2, env::MockUtpEnvironment, transport::RememberingTransport},
+        };
+
+        let transport = RememberingTransport::new(ADDR_1);
+        let (_socket, mut dispatcher) = UtpSocket::new_with_opts_and_dispatcher(
+            transport.clone(),
+            RepeatedSynSequence(MockUtpEnvironment::new()),
+            Default::default(),
+        )
+        .unwrap();
+        let (first_tx, mut first_rx) = tokio::sync::oneshot::channel();
+        let (second_tx, mut second_rx) = tokio::sync::oneshot::channel();
+        for (token, tx) in [(0, first_tx), (1, second_tx)] {
+            dispatcher
+                .on_control(ControlRequest::ConnectRequest(
+                    ADDR_2,
+                    token,
+                    RequestWithSpan::new(tx),
+                ))
+                .await;
+        }
+        let syns = transport.take_sent_utpmessages();
+        assert_eq!(syns.len(), 2);
+        assert!(syns.iter().all(|packet| packet.header.htype == Type::Syn));
+        assert_eq!(syns[0].header.seq_nr, syns[1].header.seq_nr);
+        assert_ne!(syns[0].header.connection_id, syns[1].header.connection_id);
+        let response = |index: usize| {
+            UtpMessage::new_test(
+                UtpHeader {
+                    htype: Type::State,
+                    connection_id: syns[index].header.connection_id,
+                    seq_nr: 1.into(),
+                    ack_nr: syns[index].header.seq_nr,
+                    wnd_size: 1024,
+                    ..Default::default()
+                },
+                b"",
+            )
+        };
+
+        dispatcher.on_recv(ADDR_2, response(1)).await.unwrap();
+        let _second_stream = second_rx.try_recv().unwrap().unwrap();
+        assert!(matches!(
+            first_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(
+            dispatcher
+                .streams
+                .contains_key(&(ADDR_2, syns[1].header.connection_id.0))
+        );
+        assert!(
+            !dispatcher
+                .streams
+                .contains_key(&(ADDR_2, syns[0].header.connection_id.0))
+        );
+
+        dispatcher.on_recv(ADDR_2, response(0)).await.unwrap();
+        let _first_stream = first_rx.try_recv().unwrap().unwrap();
+        assert_eq!(dispatcher.streams.len(), 2);
+        assert!(dispatcher.connecting.is_empty());
+    }
 
     #[tokio::test]
     async fn stream_routing_distinguishes_endpoints_and_all_raw_connection_ids() {

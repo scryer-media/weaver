@@ -14,6 +14,7 @@ mod inactivity_timeout;
 mod mtu_ceiling;
 mod mtu_probing;
 mod nagle;
+mod packet_validation;
 mod probe_payload;
 mod retransmit_timer;
 mod rtte;
