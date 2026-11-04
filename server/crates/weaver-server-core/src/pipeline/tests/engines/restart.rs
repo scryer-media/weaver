@@ -2075,14 +2075,18 @@ async fn a_job_with_no_password_candidates_stored_is_restored_from_its_checkpoin
 
 // A job whose work crashed the daemon on its last run is not restored into
 // the same crash: it comes back paused naming it, holding nothing, its
-// checkpoint as it was. Its marker stays, so a second restart without a
-// resume parks it again and never reaches its restore: a checkpoint read
-// that would fail there leaves no mark on it. A resume takes the marker,
-// replays the checkpoint and the job finishes.
+// checkpoint as it was, and the graph restore that would replay the crash
+// is never entered. Its marker stays, so a second restart without a resume
+// parks it again and never reaches its restore: a checkpoint read that
+// would fail there leaves no mark on it. A resume takes the marker, replays
+// the checkpoint and the job finishes.
 #[tokio::test]
 async fn a_job_that_crashed_the_daemon_stays_parked_across_restarts_until_resumed() {
+    use crate::pipeline::graph::restore::RESTORES;
     use crate::runtime::panic_trap::{Trap, boot_marks};
+    use std::sync::atomic::Ordering::Relaxed;
     let mut job = reopened().await;
+    let restores = RESTORES.load(Relaxed);
     let data = tempfile::tempdir().unwrap();
     let marker = Trap::new(data.path(), "test")
         .write(Some(JOB), "inverted byte range 20..10", None)
@@ -2093,6 +2097,7 @@ async fn a_job_that_crashed_the_daemon_stays_parked_across_restarts_until_resume
         .park_crashed_jobs(boot_marks(data.path(), |id| id == JOB));
     job.restore().await;
     job.is_parked_for_its_crash().await;
+    assert_eq!(RESTORES.load(Relaxed), restores);
     assert_eq!(
         job.pipeline.db.load_graph_checkpoint(JOB).unwrap(),
         checkpoint
@@ -2115,6 +2120,7 @@ async fn a_job_that_crashed_the_daemon_stays_parked_across_restarts_until_resume
         .unwrap();
     change_checkpoint(&job.pipeline, COLUMN_BACK).await;
     job.is_parked_for_its_crash().await;
+    assert_eq!(RESTORES.load(Relaxed), restores);
     assert_eq!(
         job.pipeline.db.load_graph_checkpoint(JOB).unwrap(),
         checkpoint
@@ -2122,6 +2128,9 @@ async fn a_job_that_crashed_the_daemon_stays_parked_across_restarts_until_resume
     assert!(marker.exists());
 
     job.resumes_from_its_checkpoint().await;
+    // The resume is what reaches the restore: once as the job is installed
+    // again, once as it is built when next reached.
+    assert!(RESTORES.load(Relaxed) > restores);
     assert!(!marker.exists());
 }
 
