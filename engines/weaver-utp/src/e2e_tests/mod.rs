@@ -383,6 +383,12 @@ async fn e2e_echo_ipv6() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn e2e_echo_ipv6_to_ipv4_mapped_peer() {
+    let mapped_peer = SocketAddr::from((Ipv4Addr::LOCALHOST.to_ipv6_mapped(), 1));
+    test_one_echo(mapped_peer, ipv6(2), 0).await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn e2e_echo_loss_5_pct() {
     test_one_echo(ipv4(1), ipv4(2), 20).await;
 }
