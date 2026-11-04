@@ -74,40 +74,40 @@ async fn a_zstd_stream_cut_short_fails() {
     cut_short("lantern.mkv.zst", zstd(&prose())).await;
 }
 
-// A tarred stream cut short: the stream never reaches its checked end, but
-// its one entry unpacked whole before the cut, and that entry is a usable
-// file, so the job ends Partial with it delivered.
+// A tarred stream cut short fails the job, whatever entry the tar yielded
+// before the cut: a cut cannot be told from corruption, so that entry is
+// unverified and not a usable file. SABnzbd fails it too
+// (sabnzbd/newsunpack.py:1160-1162).
 async fn tarred_cut_short(name: &str, compress: fn(&[u8]) -> Vec<u8>) {
     let mut bytes = compress(&tar(&[("lantern.mkv", prose())]));
     bytes.truncate(bytes.len() - 8);
     let graph = run(&Scenario::new(vec![Post::plain(name, bytes)])).await;
-    assert_eq!(
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{name}: {:?} {:?} {:?}",
         graph.status,
-        Some(JobStatus::Partial),
-        "{name}: {:?} {:?}",
         graph.failure,
         graph.files.keys().collect::<Vec<_>>()
     );
-    let entry = graph.files.get(&delivered("lantern.mkv"));
     assert!(
-        entry.is_some_and(|bytes| *bytes == prose()),
-        "{name}: the whole entry delivered, {:?}",
+        !graph.files.contains_key(&delivered("lantern.mkv")),
+        "{name}: the unverified entry is not delivered, {:?}",
         graph.files.keys().collect::<Vec<_>>()
     );
 }
 
 #[tokio::test]
-async fn a_gzipped_tar_cut_short_delivers_its_whole_entry_as_partial() {
+async fn a_gzipped_tar_cut_short_fails() {
     tarred_cut_short("lantern.tar.gz", gzip).await;
 }
 
 #[tokio::test]
-async fn a_bzipped_tar_cut_short_delivers_its_whole_entry_as_partial() {
+async fn a_bzipped_tar_cut_short_fails() {
     tarred_cut_short("lantern.tar.bz2", bzip2).await;
 }
 
 #[tokio::test]
-async fn an_xzipped_tar_cut_short_delivers_its_whole_entry_as_partial() {
+async fn an_xzipped_tar_cut_short_fails() {
     tarred_cut_short("lantern.tar.xz", xz).await;
 }
 
