@@ -1,0 +1,24 @@
+{
+  "slug": "zip-store-encrypted-descriptor",
+  "title": "zip-store-encrypted-descriptor.2026.TEST",
+  "description": "A stored encrypted member with known local sizes and a data descriptor; the password verifier is the DOS-time high byte.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "password": "e2e-test-password",
+  "segment_size": 768000,
+  "expectedOutputBLAKE3": {
+    "feature.mkv": "8d3de71a518f9bfb6a290d350c2cf1b3cab0a56ad2249d60216ab0ee1b95c2a3"
+  },
+  "exactOutputFiles": true,
+  "runtimeAssertions": {
+    "archiveModes": [
+      {
+        "archive": "archive.zip",
+        "requireKind": "zip",
+        "forbidKinds": [
+          "zip_engine"
+        ]
+      }
+    ]
+  }
+}

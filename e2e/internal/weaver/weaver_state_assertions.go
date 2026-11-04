@@ -389,6 +389,11 @@ func applyTerminalStateCheckSweeping(dbPath string, jobID int, slug string, stat
 			return "RETAINED_OUTPUT_ERROR", retainedErr.Error()
 		}
 	}
+	if err == nil && scenario.RuntimeAssertions != nil && len(scenario.RuntimeAssertions.ArchiveModes) > 0 {
+		if modeErr := assertArchiveModesScenario(jobID, scenario.RuntimeAssertions.ArchiveModes); modeErr != nil {
+			return "ARCHIVE_MODE_ASSERTION_ERROR", modeErr.Error()
+		}
+	}
 	if scenario.deliveredOn(status) {
 		if err == nil && len(scenario.RequiredJobEvents) > 0 {
 			if err := assertRequiredJobEvents(dbPath, jobID, scenario.RequiredJobEvents); err != nil {

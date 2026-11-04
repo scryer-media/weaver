@@ -233,7 +233,7 @@ pub(crate) fn directory(bytes: &[u8], entries: u64) -> Option<Vec<Central>> {
     (out.len() as u64 == entries).then_some(out)
 }
 
-fn central(bytes: &[u8], at: usize) -> Option<(Central, usize)> {
+pub(crate) fn central(bytes: &[u8], at: usize) -> Option<(Central, usize)> {
     (u32_at(bytes, at)? == CENTRAL).then_some(())?;
     let made_by = *bytes.get(at + 5)?;
     let flags = u16_at(bytes, at + 8)?;

@@ -86,18 +86,26 @@ struct Walk<'s, 'a> {
 
 impl Walk<'_, '_> {
     fn all(&mut self, image: Image, password: Option<&str>) -> Result<(), Option<Emit>> {
-        let mut archive = image
+        let archive = image
             .archive()
             .map_err(|error| Some(verdict::zip(&error)))?;
-        for index in 0..archive.len() {
-            // An entry whose local header says another name, size or method
-            // than the directory is two files at once: the one the directory
-            // lists and the one a header walk finds. Neither is the member.
-            let options = ZipReadOptions::new()
-                .password(password.map(str::as_bytes))
-                .enforce_header_consistency(true);
-            let mut file = archive
-                .by_index_with_options(index, options)
+        let directory = archive.metadata();
+        if directory.has_duplicate_names() {
+            return Err(Some(Emit::Refuse(weaver_graph::Why::InvalidArchive)));
+        }
+        let mut image = archive.into_inner();
+        for index in 0..directory.len() {
+            let entry = directory
+                .entry(index)
+                .map_err(|error| Some(verdict::zip(&error)))?;
+            image
+                .check_header(&entry)
+                .map_err(|error| Some(verdict::zip(&error)))?;
+            // The directory bounds the read and the decoded output. A stale
+            // local size does not discard a member whose CRC still checks.
+            let options = ZipReadOptions::new().password(password.map(str::as_bytes));
+            let mut file = entry
+                .with_reader(&mut image, options)
                 .map_err(|error| Some(verdict::zip(&error)))?;
             let name = file
                 .name()
