@@ -5,9 +5,11 @@ package weaver
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -107,6 +109,90 @@ func TestOldHarnessImagesRetireBeyondTheNewestPerFamily(t *testing.T) {
 	}
 	if got := selectRetiredHarnessImages(images, 3); len(got) != 0 {
 		t.Fatalf("keeping three retires nothing here, got %v", got)
+	}
+}
+
+func TestImageRetirementKeepsRunningAndStoppedContainersImagesByID(t *testing.T) {
+	for _, prefix := range []string{"", "sha256:"} {
+		t.Run("container-image-prefix-"+prefix, func(t *testing.T) {
+			var removed []string
+			command := func(args ...string) ([]byte, error) {
+				switch strings.Join(args, " ") {
+				case "images --no-trunc --format json":
+					return []byte(`[
+{"ID":"sha256:running","Names":["localhost/weaver-e2e-weaver:running"],"Created":1},
+{"ID":"stopped","Names":["localhost/weaver-e2e-weaver:stopped","localhost/weaver-e2e-weaver:alias"],"Created":2},
+{"ID":"unused","Names":["localhost/weaver-e2e-weaver:unused"],"Created":3},
+{"ID":"newest","Names":["localhost/weaver-e2e-weaver:newest"],"Created":4}]`), nil
+				case "ps -a -q --no-trunc":
+					return []byte("running-container\nstopped-container\n"), nil
+				case "container inspect running-container stopped-container":
+					return json.Marshal([]map[string]any{
+						{"Image": prefix + "running", "State": map[string]string{"Status": "running"}},
+						{"Image": prefix + "stopped", "State": map[string]string{"Status": "exited"}},
+					})
+				default:
+					if len(args) == 2 && args[0] == "rmi" {
+						removed = append(removed, args[1])
+						return nil, nil
+					}
+					t.Fatalf("unexpected engine command: %v", args)
+					return nil, nil
+				}
+			}
+			if err := retireHarnessImagesUsing(1, command); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(removed, []string{"localhost/weaver-e2e-weaver:unused"}) {
+				t.Fatalf("removed %v; container references, aliases and newest image must stay", removed)
+			}
+		})
+	}
+}
+
+func TestImageRetirementKeepsUsageRacesButReportsOtherEngineFailures(t *testing.T) {
+	for _, test := range []struct {
+		name, failCommand, output string
+		wantError                 bool
+		wantRemovals              int
+	}{
+		{"podman-external-container", "rmi", "image is in use by a container", false, 1},
+		{"docker-stopped-container", "rmi", "conflict: image is being used by stopped container example", false, 1},
+		{"remove-error", "rmi", "permission denied", true, 1},
+		{"listing-error", "ps", "cannot connect to engine", true, 0},
+		{"inspection-error", "container", "cannot inspect container", true, 0},
+		{"incomplete-inventory", "", "[]", true, 0},
+		{"missing-image-id", "", "[{}]", true, 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			removals := 0
+			command := func(args ...string) ([]byte, error) {
+				if args[0] == "rmi" {
+					removals++
+					if len(args) != 2 {
+						t.Fatalf("removal must name one tag without force: %v", args)
+					}
+				}
+				if args[0] == test.failCommand {
+					return []byte(test.output), errors.New("engine refused command")
+				}
+				switch args[0] {
+				case "images":
+					return []byte(`[{"ID":"old","Names":["localhost/weaver-e2e-weaver:old"],"Created":1},{"ID":"new","Names":["localhost/weaver-e2e-weaver:new"],"Created":2}]`), nil
+				case "ps":
+					if test.failCommand != "rmi" {
+						return []byte("container\n"), nil
+					}
+				case "container":
+					return []byte(test.output), nil
+				}
+				return nil, nil
+			}
+			err := retireHarnessImagesUsing(1, command)
+			if (err != nil) != test.wantError || removals != test.wantRemovals {
+				t.Fatalf("error=%v, removals=%d; want error=%t, removals=%d", err, removals, test.wantError, test.wantRemovals)
+			}
+		})
 	}
 }
 

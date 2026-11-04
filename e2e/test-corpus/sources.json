@@ -13756,8 +13756,8 @@
     },
     {
       "path": "testdata/yenc-lie-overlap-par2/copper.mesa.s01e02.mkv",
-      "size": 0,
-      "blake3": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 4608000,
+      "blake3": "2cd91c2ac8b6c6974e74d44f4fc90d104e337e37c00aac330c6c908c618f1818",
       "format": "mkv",
       "source": {
         "kind": "generated",
@@ -13770,8 +13770,8 @@
     },
     {
       "path": "testdata/yenc-lie-overlap-par2/copper.mesa.s01e02.mkv.par2",
-      "size": 0,
-      "blake3": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 544,
+      "blake3": "c35eff836320c039a38f6222e2d341300557952c3ef7a2f4004c20f8a26cf8cf",
       "format": "par2",
       "source": {
         "kind": "generated",
@@ -13784,8 +13784,8 @@
     },
     {
       "path": "testdata/yenc-lie-overlap-par2/copper.mesa.s01e02.mkv.vol0+3.par2",
-      "size": 0,
-      "blake3": "0000000000000000000000000000000000000000000000000000000000000000",
+      "size": 2305184,
+      "blake3": "a262027b19aeb0636be8a221e967a8f46d8a71d7004477c24408923c039a6970",
       "format": "par2",
       "source": {
         "kind": "generated",

@@ -389,6 +389,7 @@ func engineCreated(object map[string]json.RawMessage) time.Time {
 }
 
 type harnessImage struct {
+	ID      string
 	Ref     string
 	Group   string
 	Created time.Time
@@ -448,10 +449,20 @@ func harnessImageKeep() int {
 }
 
 // retireHarnessImages untags old fingerprint-tagged images one tag at a
-// time. A tag a container still uses is refused by the engine and stays.
-// Never an image prune: that takes tagged images too.
+// time, keeping images referenced by running or stopped containers. The
+// engine also protects references acquired after the inventory was read.
 func retireHarnessImages() error {
-	output, err := containerengine.Command("images", "--format", "json").Output()
+	return retireHarnessImagesUsing(harnessImageKeep(), func(args ...string) ([]byte, error) {
+		command := containerengine.Command(args...)
+		if args[0] == "rmi" {
+			return command.CombinedOutput()
+		}
+		return command.Output()
+	})
+}
+
+func retireHarnessImagesUsing(keep int, command func(...string) ([]byte, error)) error {
+	output, err := command("images", "--no-trunc", "--format", "json")
 	if err != nil {
 		return err
 	}
@@ -459,13 +470,65 @@ func retireHarnessImages() error {
 	if err != nil {
 		return err
 	}
+	retired := selectRetiredHarnessImages(images, keep)
+	if len(retired) == 0 {
+		return nil
+	}
+	output, err = command("ps", "-a", "-q", "--no-trunc")
+	if err != nil {
+		return fmt.Errorf("list containers before image retirement: %w", err)
+	}
+	used := map[string]bool{}
+	containers := strings.Fields(string(output))
+	for len(containers) > 0 {
+		count := min(128, len(containers))
+		output, err = command(append([]string{"container", "inspect"}, containers[:count]...)...)
+		if err != nil {
+			return fmt.Errorf("inspect containers before image retirement: %w", err)
+		}
+		objects, err := engineJSONObjects(output)
+		if err != nil {
+			return fmt.Errorf("read container images: %w", err)
+		}
+		if len(objects) != count {
+			return fmt.Errorf("container image inventory returned %d of %d containers", len(objects), count)
+		}
+		for _, object := range objects {
+			id := engineString(object, "Image", "ImageID", "ImageId")
+			if id == "" {
+				return errors.New("container image inventory has no image ID")
+			}
+			used[strings.TrimPrefix(id, "sha256:")] = true
+		}
+		containers = containers[count:]
+	}
+	ids := map[string]string{}
+	for _, image := range images {
+		ids[image.Ref] = image.ID
+	}
 	var errs []error
-	for _, ref := range selectRetiredHarnessImages(images, harnessImageKeep()) {
-		if output, err := containerengine.Command("rmi", ref).CombinedOutput(); err != nil {
+	for _, ref := range retired {
+		if ids[ref] == "" {
+			errs = append(errs, fmt.Errorf("image %s has no immutable ID; keeping it", ref))
+			continue
+		}
+		if used[ids[ref]] {
+			continue
+		}
+		if output, err := command("rmi", ref); err != nil && !imageRetirementInUse(output) {
 			errs = append(errs, fmt.Errorf("untag %s: %w: %s", ref, err, strings.TrimSpace(string(output))))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// Podman can also retain external build containers absent from `ps`, and
+// another run can acquire an image after the inventory. Those refusals keep
+// the image; unrelated engine errors still reach the caller.
+func imageRetirementInUse(output []byte) bool {
+	text := strings.ToLower(string(output))
+	return strings.Contains(text, "image is in use by a container") ||
+		strings.Contains(text, "image is being used by")
 }
 
 func parseHarnessImages(output []byte) ([]harnessImage, error) {
@@ -476,6 +539,7 @@ func parseHarnessImages(output []byte) ([]harnessImage, error) {
 	var images []harnessImage
 	for _, object := range objects {
 		created := engineCreated(object)
+		id := strings.TrimPrefix(engineString(object, "Id", "ID", "id"), "sha256:")
 		var refs []string
 		if raw, ok := object["Names"]; ok {
 			_ = json.Unmarshal(raw, &refs)
@@ -488,7 +552,7 @@ func parseHarnessImages(output []byte) ([]harnessImage, error) {
 		}
 		for _, ref := range refs {
 			if group := harnessImageGroup(ref); group != "" {
-				images = append(images, harnessImage{Ref: ref, Group: group, Created: created})
+				images = append(images, harnessImage{ID: id, Ref: ref, Group: group, Created: created})
 			}
 		}
 	}
