@@ -25,6 +25,8 @@ pub(crate) mod window;
 #[cfg(test)]
 pub(super) mod tests;
 
+use std::collections::BTreeSet;
+
 use weaver_graph::{ByteRange, NodeId, Pull, Purpose, Seek, Segment, VolumeIndex, Weight, When};
 
 use self::intake::{Checksums, Decoded};
@@ -138,6 +140,7 @@ impl ArticleRoot {
             }
         }
         let drawn = self.window.draw(queued);
+        let mut applied = BTreeSet::new();
         let answers = asks
             .iter()
             .map(|ask| {
@@ -149,11 +152,22 @@ impl ArticleRoot {
                         self.window.rank(ask.seek.volume).map(Class::Window)
                     }
                 };
+                if let Some(Class::Window(rank)) = class {
+                    applied.insert((
+                        ask.seek.volume,
+                        ask.seek.range.start,
+                        ask.seek.range.end,
+                        rank,
+                    ));
+                }
                 self.map.seek(ask.seek.volume, ask.seek.range, class)
             })
             .collect();
         // Bids no seek of this round carried still move their articles.
         for (bid, rank) in drawn {
+            if applied.contains(&(bid.volume, bid.range.start, bid.range.end, rank)) {
+                continue;
+            }
             self.map
                 .seek(bid.volume, bid.range, Some(Class::Window(rank)));
         }
