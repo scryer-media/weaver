@@ -274,6 +274,7 @@ fn entry(facts: EntryFacts) -> Entry {
         },
         hash_key: None,
         trial: None,
+        condemned_on: Coverage::new(),
         out: Arc::new(Out {
             coverage: facts.coverage,
             closed: facts.closed,

@@ -18,7 +18,7 @@ use unrar_rs::{
     ArchiveFormat, IneligibilityReason, MalformedReason, MemberEligibility, RarVolumeFacts,
     StoredLayoutBuilder, StoredMember,
 };
-use weaver_graph::{ByteRange, Emit, Handed, MemberId, RecoveryKind, VolumeIndex, Why};
+use weaver_graph::{ByteRange, Coverage, Emit, Handed, MemberId, RecoveryKind, VolumeIndex, Why};
 
 use super::{Entry, Lock, Piece, RarStore, Volume, claim};
 use crate::runs::CrcRuns;
@@ -311,6 +311,7 @@ impl RarStore {
             complete: dir,
             hash_key: None,
             trial: None,
+            condemned_on: Coverage::new(),
             out: Arc::default(),
             plain_runs: CrcRuns::default(),
             parts: Default::default(),
