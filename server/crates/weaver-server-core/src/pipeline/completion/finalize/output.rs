@@ -355,6 +355,57 @@ where
     }
 }
 
+// Moves one entry of the delivered set into the destination. On a resumed
+// move the working directory is authoritative: an entry still present there
+// had not finished moving, so whatever already stands at its destination is
+// an interrupted copy and gives way to it. A destination entry whose source
+// is gone moved whole before the restart, and nothing here reaches it.
+fn move_delivered_entry(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    source_bytes: u64,
+    phase_counters: Arc<PhaseCounters>,
+    resumed: bool,
+) -> Result<(), (std::io::Error, std::io::Error)> {
+    let interrupted = resumed
+        && std::fs::symlink_metadata(dst).is_ok()
+        && !runtime_fs::paths_equivalent_for_placement(src, dst);
+    if !interrupted {
+        return move_path_with_safe_rename_or_copy_fallback(src, dst, source_bytes, phase_counters);
+    }
+    let not_cleared = |error: std::io::Error| {
+        (
+            error,
+            std::io::Error::other("the interrupted copy at the destination was not cleared"),
+        )
+    };
+    let src_metadata = std::fs::symlink_metadata(src).map_err(not_cleared)?;
+    let dst_metadata = std::fs::symlink_metadata(dst).map_err(not_cleared)?;
+    let real_dir =
+        |metadata: &std::fs::Metadata| metadata.is_dir() && !metadata_is_link_or_reparse(metadata);
+    if real_dir(&src_metadata) && real_dir(&dst_metadata) {
+        // A directory copied part way: what already left it stands in the
+        // destination, and each entry still in it follows the same rule.
+        for entry in std::fs::read_dir(src).map_err(not_cleared)? {
+            let entry = entry.map_err(not_cleared)?;
+            move_delivered_entry(
+                &entry.path(),
+                &dst.join(entry.file_name()),
+                0,
+                Arc::clone(&phase_counters),
+                true,
+            )?;
+        }
+        return std::fs::remove_dir(src).map_err(not_cleared);
+    }
+    if real_dir(&dst_metadata) {
+        std::fs::remove_dir_all(dst).map_err(not_cleared)?;
+    } else {
+        std::fs::remove_file(dst).map_err(not_cleared)?;
+    }
+    move_path_with_safe_rename_or_copy_fallback(src, dst, source_bytes, phase_counters)
+}
+
 async fn validate_script_move_destination(
     db: crate::Database,
     context: crate::post_processing::runner::JobExecutionContext,
@@ -587,12 +638,7 @@ async fn run_move_to_claimed_destination(
             let dst_fb = dst.clone();
             let counters = Arc::clone(&phase_counters);
             match tokio::task::spawn_blocking(move || {
-                move_path_with_safe_rename_or_copy_fallback(
-                    &src_fb,
-                    &dst_fb,
-                    source_bytes,
-                    counters,
-                )
+                move_delivered_entry(&src_fb, &dst_fb, source_bytes, counters, resumed)
             })
             .await
             {
@@ -630,7 +676,7 @@ async fn run_move_to_claimed_destination(
             }
             let src = entry.path();
             let dst = dest.join(&file_name);
-            if dst.exists() && !runtime_fs::paths_equivalent_for_placement(&src, &dst) {
+            if !resumed && dst.exists() && !runtime_fs::paths_equivalent_for_placement(&src, &dst) {
                 continue;
             }
             let source_bytes = validation.root_entry_bytes.get(&src).copied().unwrap_or(0);
@@ -638,12 +684,7 @@ async fn run_move_to_claimed_destination(
             let dst_fb = dst.clone();
             let counters = Arc::clone(&phase_counters);
             match tokio::task::spawn_blocking(move || {
-                move_path_with_safe_rename_or_copy_fallback(
-                    &src_fb,
-                    &dst_fb,
-                    source_bytes,
-                    counters,
-                )
+                move_delivered_entry(&src_fb, &dst_fb, source_bytes, counters, resumed)
             })
             .await
             {

@@ -219,6 +219,58 @@ async fn restart_mid_move_finishes_into_the_same_destination() {
     );
 }
 
+// A restart part way through copying one file: the destination holds a
+// truncated copy while the whole source is still in the working directory.
+// The resumed move takes the source over the half copy.
+#[tokio::test]
+async fn restart_mid_copy_replaces_the_truncated_entry_with_its_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp).await;
+    let job_id = JobId(10304);
+    let job_name = "Slate Harbour Truncated";
+    let payload = b"delivered payload, whole".to_vec();
+    let destination = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(job_name));
+    // The copy of the first file stops part way, its source untouched,
+    // and the move goes no further, as the restart would have stopped it.
+    let half_copy = destination.join("payload.bin");
+    let truncated = payload[..9].to_vec();
+    *crate::pipeline::completion::finalize::BEFORE_FIRST_MOVE
+        .lock()
+        .unwrap() = Some(Box::new(move |_| {
+        std::fs::write(&half_copy, &truncated).unwrap();
+    }));
+    let (working_dir, done) =
+        move_without_hearing_it(&mut pipeline, job_id, job_name, &payload).await;
+    assert!(done.result.is_err());
+    assert_eq!(
+        std::fs::read(working_dir.join("payload.bin")).unwrap(),
+        payload
+    );
+    assert_eq!(
+        std::fs::read(destination.join("payload.bin")).unwrap(),
+        &payload[..9]
+    );
+    retire_pipeline_database(pipeline).await;
+
+    let mut restored = restart_and_restore(&temp, &intermediate_dir, job_id).await;
+    assert!(restored.inflight_moves.contains(&job_id));
+    settle_inflight_moves(&mut restored).await;
+    finished_once(&mut restored, job_id, &complete_dir).await;
+    assert!(!working_dir.exists());
+    assert_eq!(
+        tokio::fs::read(destination.join("payload.bin"))
+            .await
+            .unwrap(),
+        payload
+    );
+    assert_eq!(
+        tokio::fs::read(destination.join("sidecar.nfo"))
+            .await
+            .unwrap(),
+        b"sidecar"
+    );
+}
+
 // The turn that hears a final move finish reads nothing from the database,
 // however long the queue: the script settings that decide the terminal pass
 // are read off the actor and come back as an event.
