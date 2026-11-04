@@ -101,6 +101,20 @@ pub(in crate::pipeline) fn par2_volumes(
     par2_volumes_sliced(base, files, ARTICLE as u64, blocks, volumes)
 }
 
+// An index and the volumes par2cmdline writes for `blocks` recovery blocks
+// when told no volume count: sizes doubling from one, the last taking the
+// rest, so 53 blocks are `vol00+01`, `vol01+02`, `vol03+04`, `vol07+08`,
+// `vol15+16` and `vol31+22`. The index first, the volumes in block order,
+// sliced at `slice` bytes.
+pub(in crate::pipeline::tests) fn par2_doubling(
+    base: &str,
+    files: &[(&str, &[u8])],
+    slice: u64,
+    blocks: u32,
+) -> Vec<Post> {
+    par2_created(base, files, slice, blocks, None)
+}
+
 // The same, sliced at `slice` bytes rather than ARTICLE.
 pub(in crate::pipeline::tests) fn par2_volumes_sliced(
     base: &str,
@@ -108,6 +122,18 @@ pub(in crate::pipeline::tests) fn par2_volumes_sliced(
     slice: u64,
     blocks: u32,
     volumes: u32,
+) -> Vec<Post> {
+    par2_created(base, files, slice, blocks, Some(volumes))
+}
+
+// The set the creator writes, in `volumes` volumes or, with none, in the
+// doubling sizes it picks itself.
+fn par2_created(
+    base: &str,
+    files: &[(&str, &[u8])],
+    slice: u64,
+    blocks: u32,
+    volumes: Option<u32>,
 ) -> Vec<Post> {
     use par2_rs::create::{BlockSizing, Par2Creator, Par2CreatorOptions, RecoveryAmount};
 
@@ -130,7 +156,7 @@ pub(in crate::pipeline::tests) fn par2_volumes_sliced(
     );
     options.block_sizing = BlockSizing::Bytes(slice);
     options.recovery_amount = RecoveryAmount::Count(blocks);
-    options.volume_count = Some(volumes);
+    options.volume_count = volumes;
     let creator = Par2Creator::new(options);
     let created = creator.create(&creator.plan().unwrap()).unwrap();
     let mut posts: Vec<Post> = created
@@ -523,6 +549,10 @@ pub(in crate::pipeline::tests) struct Scenario {
     // Every batch the download queue hands out is served as workers fetching
     // these posts at once: one article of each in turn, in this order.
     pub(in crate::pipeline::tests) together: Vec<u32>,
+    // Once the queue hands out an article of one of these posts, every
+    // article it holds of them arrives at once, last first, as the fetches
+    // of many workers land out of order.
+    pub(in crate::pipeline::tests) reversed: Vec<u32>,
     // A restarted run serves these articles first, in this order, each once
     // the queue holds it.
     pub(in crate::pipeline::tests) first: Vec<(u32, u32)>,
@@ -557,6 +587,7 @@ impl Scenario {
             article: ARTICLE,
             backwards: false,
             together: Vec::new(),
+            reversed: Vec::new(),
             first: Vec::new(),
             uuencoded: false,
             leased: false,
@@ -630,6 +661,13 @@ impl Scenario {
     // order, then the second of each, and so on.
     pub(in crate::pipeline::tests) fn together(mut self, posts: &[u32]) -> Self {
         self.together = posts.to_vec();
+        self
+    }
+
+    // Whatever the queue holds of `posts` arrives at once, last first, from
+    // the first time it hands one of them out.
+    pub(in crate::pipeline::tests) fn reversed(mut self, posts: &[u32]) -> Self {
+        self.reversed = posts.to_vec();
         self
     }
 
@@ -1236,6 +1274,21 @@ fn handed_out(
         if !all {
             break;
         }
+    }
+    let reversed = |work: &DownloadWork| {
+        scenario
+            .reversed
+            .contains(&work.segment_id.file_id.file_index)
+    };
+    if !all && batch.first().is_some_and(reversed) {
+        batch.extend(queue.extract_matching(reversed));
+        batch.sort_by_key(|work| {
+            std::cmp::Reverse((
+                work.segment_id.segment_number,
+                work.segment_id.file_id.file_index,
+            ))
+        });
+        return Some((batch, None));
     }
     if scenario.together.is_empty() {
         batch.reverse();
