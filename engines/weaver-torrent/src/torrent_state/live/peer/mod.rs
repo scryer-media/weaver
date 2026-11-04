@@ -87,11 +87,6 @@ pub(crate) const SEND_BUFFER_LOW_WATERMARK: u64 = 128 * 1024;
 const SEND_BUFFER_WATERMARK: u64 = 4 * 1024 * 1024;
 const SEND_BUFFER_WATERMARK_FACTOR: u64 = 100;
 
-// What a peer's uTP stream holds received and not yet read, and so the most
-// its window offers: libtorrent's per-stream receive capacity. It is a cap,
-// not an allocation; a reader that keeps up holds next to nothing.
-pub(crate) const UTP_RECEIVE_BUFFER: usize = 1024 * 1024;
-
 // libtorrent `settings_pack::request_queue_time`: the requests outstanding to
 // a peer cover this long of its delivery.
 const REQUEST_QUEUE_TIME: Duration = Duration::from_secs(3);

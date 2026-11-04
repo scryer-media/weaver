@@ -13,11 +13,7 @@ pub const IPV6_HEADER: u16 = 40;
 pub const UDP_HEADER: u16 = 8;
 pub const UTP_HEADER: u16 = 20;
 
-/// Socket read buffer. Serves several purposes:
-/// - temporary storage before the data is read back to the user's application
-/// - reassembling out of order packets
-/// - advertising recv window to the other side (sender). The sender will not send more data than this and might thus stall.
-///   Ideal value for throughput should be BDP (bandwidth delay product).
+/// Default per-stream receive capacity, in bytes.
 pub const RX_BUF_SIZE_PER_VSOCK_DEFAULT: NonZeroUsize = non_zero_const!(1024 * 1024);
 
 /// How many unACKed bytes the socket can store without blocking writer.

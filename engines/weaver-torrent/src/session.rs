@@ -3815,16 +3815,10 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
     }
 }
 
-// What the session sets on its uTP socket where the caller left it unset:
-// the connection limit SYNs are capped by, and each stream's receive buffer
-// at the per-peer size.
+// The initial uTP connection limit when the caller left it unset.
 fn session_utp_opts(utp: &mut weaver_utp::SocketOpts, connections_limit: usize) {
     if utp.connections_limit.is_none() {
         utp.connections_limit = std::num::NonZeroUsize::new(connections_limit);
-    }
-    if utp.vsock_rx_bufsize_bytes.is_none() {
-        utp.vsock_rx_bufsize_bytes =
-            std::num::NonZeroUsize::new(crate::torrent_state::live::peer::UTP_RECEIVE_BUFFER);
     }
 }
 
@@ -6331,21 +6325,10 @@ mod tests {
     }
 
     #[test]
-    fn the_session_sizes_each_utp_streams_receive_buffer_and_caps_syns() {
+    fn the_session_caps_utp_syns_without_setting_a_receive_buffer() {
         let mut utp = weaver_utp::SocketOpts::default();
         super::session_utp_opts(&mut utp, 200);
-        assert_eq!(
-            utp.vsock_rx_bufsize_bytes.map(|n| n.get()),
-            Some(crate::torrent_state::live::peer::UTP_RECEIVE_BUFFER)
-        );
+        assert!(utp.vsock_rx_bufsize_bytes.is_none());
         assert_eq!(utp.connections_limit.map(|n| n.get()), Some(200));
-
-        // What the caller set stands.
-        let mut utp = weaver_utp::SocketOpts {
-            vsock_rx_bufsize_bytes: std::num::NonZeroUsize::new(4096),
-            ..Default::default()
-        };
-        super::session_utp_opts(&mut utp, 200);
-        assert_eq!(utp.vsock_rx_bufsize_bytes.map(|n| n.get()), Some(4096));
     }
 }
