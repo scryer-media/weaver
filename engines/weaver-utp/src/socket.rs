@@ -4,7 +4,7 @@
 // Modified by the Weaver authors, 2026-11-03.
 
 use std::{
-    collections::{VecDeque, hash_map::Entry},
+    collections::{BTreeMap, VecDeque, btree_map::Entry},
     io::IoSlice,
     net::SocketAddr,
     num::NonZeroUsize,
@@ -22,7 +22,6 @@ use crate::{
     stats::{Counter, UtpStats},
 };
 use parking_lot::Mutex;
-use rustc_hash::FxHashMap;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -48,7 +47,7 @@ use tokio::sync::{
 };
 use tracing::{debug, debug_span, trace, warn};
 
-type ConnectionId = SeqNr;
+type ConnectionId = u16;
 
 // When we get incoming packets this connection id is used to pick the stream.
 type StreamRecvKey = (SocketAddr, ConnectionId);
@@ -350,8 +349,8 @@ pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
 
     accept_queue: AcceptQueue<T, E>,
 
-    pub(crate) streams: FxHashMap<StreamRecvKey, UnboundedSender<UtpMessage>>,
-    connecting: FxHashMap<SocketAddr, ConnectingPerAddr>,
+    pub(crate) streams: BTreeMap<StreamRecvKey, UnboundedSender<UtpMessage>>,
+    connecting: BTreeMap<SocketAddr, ConnectingPerAddr>,
     control_rx: UnboundedReceiver<ControlRequest>,
     next_connection_id: SeqNr,
 }
@@ -423,7 +422,10 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     }
 
     fn get_next_free_conn_id(&mut self, addr: SocketAddr) -> SeqNr {
-        while self.streams.contains_key(&(addr, self.next_connection_id)) {
+        while self
+            .streams
+            .contains_key(&(addr, self.next_connection_id.0))
+        {
             self.next_connection_id += 2;
         }
         self.next_connection_id
@@ -525,7 +527,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let args = StreamArgs::new_outgoing(&msg.header, conn.start, now)
             .with_parent_span(conn.requester.created_span.clone());
 
-        let recv_key = (addr, msg.header.connection_id);
+        let recv_key = (addr, msg.header.connection_id.0);
         if self.streams.insert(recv_key, tx).is_some() {
             warn!(key=?recv_key, "bug: a stream already existed with key. It should have been checked beforehand.");
         }
@@ -546,7 +548,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         syn: Syn,
         accept: Acceptor<T, E>,
     ) -> MatchSynWithAccept<T, E> {
-        let recv_key = (syn.remote, syn.header.connection_id + 1);
+        let recv_key = (syn.remote, (syn.header.connection_id + 1).0);
         if self.streams.contains_key(&recv_key) {
             debug!(?recv_key, "SYN clashes with an existing stream, ignoring");
             self.socket.stats.invalid_packets.increment(1);
@@ -597,7 +599,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             .filter(|syn| {
                 !self
                     .streams
-                    .contains_key(&(syn.remote, syn.header.connection_id + 1))
+                    .contains_key(&(syn.remote, (syn.header.connection_id + 1).0))
             })
             .count();
         let registered = self.streams.len().saturating_add(pending);
@@ -637,7 +639,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     }
 
     async fn on_recv(&mut self, addr: SocketAddr, message: UtpMessage) -> crate::Result<()> {
-        let key = (addr, message.header.connection_id);
+        let key = (addr, message.header.connection_id.0);
 
         if let Some(tx) = self.streams.get(&key) {
             if tx.send(message).is_err() {
@@ -749,8 +751,8 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         });
 
         let dispatcher = Dispatcher {
-            streams: FxHashMap::default(),
-            connecting: FxHashMap::default(),
+            streams: BTreeMap::default(),
+            connecting: BTreeMap::default(),
             next_connection_id: env.random_u16().into(),
             control_rx,
             socket: sock.clone(),
@@ -966,6 +968,126 @@ mod tests {
 
     use crate::test_util::{MockUtpStream, setup_test_logging, transport::MockInterface};
 
+    #[tokio::test]
+    async fn stream_routing_distinguishes_endpoints_and_all_raw_connection_ids() {
+        use super::ControlRequest;
+        use crate::{
+            UtpSocket,
+            message::UtpMessage,
+            raw::{Type, UtpHeader},
+            test_util::{ADDR_1, ADDR_2, env::MockUtpEnvironment, transport::RememberingTransport},
+        };
+
+        let (_socket, mut dispatcher) = UtpSocket::new_with_opts_and_dispatcher(
+            RememberingTransport::new(ADDR_1),
+            MockUtpEnvironment::new(),
+            Default::default(),
+        )
+        .unwrap();
+        let other = SocketAddr::from((Ipv4Addr::LOCALHOST, 3));
+        let keys = [
+            (ADDR_2, 0u16),
+            (ADDR_2, 1),
+            (ADDR_2, 32767),
+            (ADDR_2, 32768),
+            (ADDR_2, 32769),
+            (ADDR_2, 65534),
+            (ADDR_2, 65535),
+            (other, 0),
+            (other, 32768),
+            (other, 65535),
+        ];
+        let mut receivers = Vec::new();
+        for key in keys {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            assert!(dispatcher.streams.insert(key, tx).is_none());
+            receivers.push(rx);
+        }
+        let packet = |id: u16, payload: &[u8]| {
+            UtpMessage::new_test(
+                UtpHeader {
+                    htype: Type::Data,
+                    connection_id: id.into(),
+                    ..Default::default()
+                },
+                payload,
+            )
+        };
+        for (index, (remote, id)) in keys.into_iter().enumerate() {
+            let payload = [index as u8];
+            dispatcher
+                .on_recv(remote, packet(id, &payload))
+                .await
+                .unwrap();
+            assert_eq!(receivers[index].try_recv().unwrap().payload(), payload);
+            assert!(receivers.iter_mut().all(|rx| rx.try_recv().is_err()));
+        }
+
+        dispatcher
+            .on_control(ControlRequest::Shutdown((ADDR_2, 32768)))
+            .await;
+        assert_eq!(dispatcher.streams.len(), keys.len() - 1);
+        dispatcher
+            .on_recv(ADDR_2, packet(32768, b"removed"))
+            .await
+            .unwrap();
+        assert!(receivers.iter_mut().all(|rx| rx.try_recv().is_err()));
+        dispatcher
+            .on_recv(other, packet(32768, b"still routed"))
+            .await
+            .unwrap();
+        assert_eq!(receivers[8].try_recv().unwrap().payload(), b"still routed");
+
+        dispatcher.next_connection_id = 65534.into();
+        assert_eq!(dispatcher.get_next_free_conn_id(ADDR_2), 2.into());
+        dispatcher
+            .on_control(ControlRequest::Shutdown((ADDR_2, 0)))
+            .await;
+        dispatcher.next_connection_id = 65534.into();
+        assert_eq!(dispatcher.get_next_free_conn_id(ADDR_2), 0.into());
+        assert!(dispatcher.streams.contains_key(&(other, 0)));
+    }
+
+    #[tokio::test]
+    async fn a_wrapped_incoming_id_is_registered_and_removed_on_stream_drop() {
+        use super::{MatchSynWithAccept, RequestWithSpan, Syn};
+        use crate::{
+            UtpSocket,
+            raw::{Type, UtpHeader},
+            test_util::{ADDR_1, ADDR_2, env::MockUtpEnvironment, transport::RememberingTransport},
+        };
+        let (_socket, mut dispatcher) = UtpSocket::new_with_opts_and_dispatcher(
+            RememberingTransport::new(ADDR_1),
+            MockUtpEnvironment::new(),
+            Default::default(),
+        )
+        .unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        assert!(matches!(
+            dispatcher.match_syn_with_accept(
+                Syn {
+                    remote: ADDR_2,
+                    header: UtpHeader {
+                        htype: Type::Syn,
+                        connection_id: u16::MAX.into(),
+                        ..Default::default()
+                    },
+                },
+                RequestWithSpan::new(tx),
+            ),
+            MatchSynWithAccept::Matched
+        ));
+        let starter = rx.await.unwrap();
+        assert!(dispatcher.streams.contains_key(&(ADDR_2, 0)));
+        drop(starter);
+        let shutdown = dispatcher.control_rx.recv().await.unwrap();
+        assert!(
+            matches!(shutdown, super::ControlRequest::Shutdown((remote, 0)) if remote == ADDR_2)
+        );
+        dispatcher.on_control(shutdown).await;
+        assert!(dispatcher.streams.is_empty());
+    }
+
     // A SYN while more than twice the connections limit of streams are
     // open is dropped unanswered; at twice the limit it is still taken up.
     #[tokio::test]
@@ -1003,7 +1125,7 @@ mod tests {
         let mut open = Vec::new();
         for id in 0..2u16 {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            dispatcher.streams.insert((ADDR_2, (1000 + id).into()), tx);
+            dispatcher.streams.insert((ADDR_2, 1000 + id), tx);
             open.push(rx);
         }
 
@@ -1011,7 +1133,7 @@ mod tests {
         assert_eq!(dispatcher.accept_queue.syns.len(), 1, "taken up");
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        dispatcher.streams.insert((ADDR_2, 2000.into()), tx);
+        dispatcher.streams.insert((ADDR_2, 2000), tx);
         open.push(rx);
         dispatcher.on_recv(ADDR_2, syn(3)).await.unwrap();
         assert_eq!(dispatcher.accept_queue.syns.len(), 1, "dropped");

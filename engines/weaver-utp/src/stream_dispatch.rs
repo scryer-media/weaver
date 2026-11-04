@@ -1883,7 +1883,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             },
             parent_span,
             drop_guard: DropGuardSendBeforeDeath::new(
-                ControlRequest::Shutdown((remote, conn_id_recv)),
+                ControlRequest::Shutdown((remote, conn_id_recv.0)),
                 &socket.control_requests,
             ),
             user_rx,
