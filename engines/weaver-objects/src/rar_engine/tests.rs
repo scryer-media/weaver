@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use std::collections::BTreeMap;
 use std::io;
 use std::num::NonZeroUsize;
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
-use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
@@ -1516,7 +1516,11 @@ fn overlapping(flip: Option<u8>) -> Vec<Vec<u8>> {
 
 // A run over `volumes` on `threads` of `pool`, the first volume in when it
 // starts, and the rest once the run waits on the second.
-fn arriving_on(volumes: Vec<Vec<u8>>, threads: usize, pool: Arc<dyn weaver_graph::Pool>) -> Vec<Emit> {
+fn arriving_on(
+    volumes: Vec<Vec<u8>>,
+    threads: usize,
+    pool: Arc<dyn weaver_graph::Pool>,
+) -> Vec<Emit> {
     let mut released = vec![false; volumes.len()];
     released[0] = true;
     let count = volumes.len() as u32;
@@ -1549,7 +1553,11 @@ fn arriving_on(volumes: Vec<Vec<u8>>, threads: usize, pool: Arc<dyn weaver_graph
 
 fn arriving(volumes: Vec<Vec<u8>>, threads: usize) -> OnThreads {
     let lent = Arc::new(Lent::default());
-    let emits = arriving_on(volumes, threads, Arc::clone(&lent) as Arc<dyn weaver_graph::Pool>);
+    let emits = arriving_on(
+        volumes,
+        threads,
+        Arc::clone(&lent) as Arc<dyn weaver_graph::Pool>,
+    );
     OnThreads {
         said: said(&emits),
         sums: checksums(&emits),
@@ -1830,9 +1838,11 @@ fn writer_sets() -> Vec<(String, Vec<Vec<u8>>)> {
             )
         })
         .collect();
+    // How a layout sets the writer's options.
+    type Shape = fn(&mut Options);
     let mut sets = Vec::new();
     for version in [Version::Rar4, Version::Rar5] {
-        let shapes: [(&str, fn(&mut Options)); 8] = [
+        let shapes: [(&str, Shape); 8] = [
             ("one", |_| {}),
             ("split", |options| options.split = Some(6_000)),
             ("encrypted", |options| options.password = Some(PASSWORD)),
@@ -1930,4 +1940,3 @@ fn brief(said: &[Said]) -> Vec<String> {
         })
         .collect()
 }
-

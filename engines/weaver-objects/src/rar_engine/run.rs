@@ -434,7 +434,12 @@ impl Walk<'_, '_> {
     ) -> Result<usize, Stop> {
         let member = self.announce(info)?;
         let decode_limits = limits(&self.budget);
-        let mut own = copy(archive.export_headers(), password, &self.kdf, &decode_limits);
+        let mut own = copy(
+            archive.export_headers(),
+            password,
+            &self.kdf,
+            &decode_limits,
+        );
         let beside = Beside::default();
         let mut next = index + 1;
         let mut inline = None;
@@ -692,7 +697,9 @@ fn decode(own: &mut RarArchive, at: usize, input: &Input) -> Decoded {
         .member_info(at)
         .and_then(|info| info.unpacked_size)
         .unwrap_or(0);
-    let first = own.member_info(at).map_or(0, |info| info.volumes.first_volume);
+    let first = own
+        .member_info(at)
+        .map_or(0, |info| info.volumes.first_volume);
     let mut bytes = Vec::with_capacity(usize::try_from(length).unwrap_or_default());
     let reach = Reach::new(input, first);
     let ended = own
