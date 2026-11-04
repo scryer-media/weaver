@@ -19,6 +19,8 @@ pub struct UtpStats {
     pub inactivity_timeouts: AtomicU64,
     pub immediate_acks: AtomicU64,
     pub delayed_acks: AtomicU64,
+    /// Largest per-stream congestion window observed on this socket, in bytes.
+    pub max_congestion_window_bytes: AtomicU64,
     pub live_virtual_sockets: AtomicU64,
     pub out_of_order_packets: AtomicU64,
     pub data_retransmissions: AtomicU64,

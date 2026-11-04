@@ -7,8 +7,14 @@
 mod tests;
 
 use std::{
-    future::Future, io::IoSlice, net::SocketAddr, num::NonZeroUsize, pin::Pin, sync::Arc,
-    task::Poll, time::Duration,
+    future::Future,
+    io::IoSlice,
+    net::SocketAddr,
+    num::NonZeroUsize,
+    pin::Pin,
+    sync::{Arc, atomic::Ordering},
+    task::Poll,
+    time::Duration,
 };
 
 use tokio::{
@@ -1257,6 +1263,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 segment: self.segment_sizes.probe_size().into(),
             });
         }
+        self.socket.stats.max_congestion_window_bytes.fetch_max(
+            self.congestion_controller.cwnd_bytes() as u64,
+            Ordering::Relaxed,
+        );
         self.last_remote_window = msg.header.wnd_size;
 
         self.recovery.on_ack(
@@ -1772,6 +1782,10 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             congestion_controller: {
                 let mut ctrl = Ledbat::new(ss.mss() as usize, socket.opts().ledbat);
                 ctrl.set_remote_window(remote_window as usize);
+                socket
+                    .stats
+                    .max_congestion_window_bytes
+                    .fetch_max(ctrl.cwnd_bytes() as u64, Ordering::Relaxed);
                 ctrl
             },
 

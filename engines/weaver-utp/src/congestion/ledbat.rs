@@ -87,7 +87,7 @@ impl Ledbat {
         ledbat
     }
 
-    fn cwnd_bytes(&self) -> usize {
+    pub(crate) fn cwnd_bytes(&self) -> usize {
         (self.cwnd >> FRAC) as usize
     }
 

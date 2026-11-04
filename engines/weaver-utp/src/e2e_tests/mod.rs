@@ -319,6 +319,60 @@ async fn one_socket_holds_more_than_128_streams() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn the_sender_window_grows_on_a_delayed_link() {
+    const TOTAL: usize = 2 << 20;
+    let token = tokio_util::sync::CancellationToken::new();
+    let (server, client) = sockets(
+        ipv4(1),
+        ipv4(2),
+        0,
+        Duration::from_millis(10),
+        SocketOpts {
+            cancellation_token: token.clone(),
+            ..Default::default()
+        },
+    );
+    let serve = async {
+        let (mut reader, writer) = server.accept().await.unwrap().split();
+        let mut buf = vec![0u8; 1 << 16];
+        let mut received = 0;
+        while received < TOTAL {
+            let n = reader.read(&mut buf).await.unwrap();
+            assert!(n > 0);
+            assert!(buf[..n].iter().all(|byte| *byte == 7));
+            received += n;
+        }
+        assert_eq!(received, TOTAL);
+        (reader, writer)
+    };
+    let dial = async {
+        let (reader, mut writer) = client.connect(ipv4(1)).await.unwrap().split();
+        assert_eq!(
+            client
+                .stats()
+                .max_congestion_window_bytes
+                .load(Ordering::Relaxed),
+            1500
+        );
+        let chunk = vec![7u8; 1 << 16];
+        for _ in 0..TOTAL / chunk.len() {
+            writer.write_all(&chunk).await.unwrap();
+        }
+        writer.flush().await.unwrap();
+        (reader, writer)
+    };
+    let (_server_halves, _client_halves) = tokio::join!(serve, dial);
+    assert!(
+        client
+            .stats()
+            .max_congestion_window_bytes
+            .load(Ordering::Relaxed)
+            > 1500
+    );
+    token.cancel();
+}
+
+#[tokio::test(start_paused = true)]
 async fn e2e_echo_ipv4() {
     test_one_echo(ipv4(1), ipv4(2), 0).await;
 }
