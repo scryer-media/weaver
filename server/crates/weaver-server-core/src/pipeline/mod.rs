@@ -1448,6 +1448,9 @@ pub struct Pipeline {
     pub(super) pending_completion_checks: VecDeque<JobId>,
     // Presence gates every attempt to resume a partially restored job.
     pub(crate) blocked_restores: HashMap<JobId, crate::jobs::handle::RestoreJobRequest>,
+    // The jobs whose work crashed the daemon on its last run, each parked
+    // paused as it installs instead of being restored into the same panic.
+    pub(crate) crash_marks: crate::runtime::panic_trap::CrashMarks,
     // Channels for pipeline stage results.
     pub(super) download_done_tx: mpsc::Sender<DownloadResult>,
     pub(super) download_done_rx: mpsc::Receiver<DownloadResult>,

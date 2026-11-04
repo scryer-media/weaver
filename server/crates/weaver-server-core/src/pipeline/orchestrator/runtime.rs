@@ -333,6 +333,7 @@ impl Pipeline {
             pending_decode: VecDeque::new(),
             pending_completion_checks: VecDeque::new(),
             blocked_restores: HashMap::new(),
+            crash_marks: Default::default(),
             download_done_tx,
             download_done_rx,
             download_refill_tx,

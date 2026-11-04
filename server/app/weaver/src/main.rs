@@ -468,6 +468,9 @@ async fn async_main() {
         drop(log_file_guard.take());
         std::process::exit(1);
     }
+    // From here a panic leaves its marker in the data folder, which the
+    // next start reads before it restores any job.
+    weaver_server_core::runtime::panic_trap::arm(&data_dir, env!("CARGO_PKG_VERSION"));
     let canonical_data_dir = match std::fs::canonicalize(&data_dir) {
         Ok(path) => path,
         Err(error) => {
@@ -591,15 +594,13 @@ fn install_e2e_network_time_scale() {
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let payload = info
-            .payload()
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("<non-string panic payload>");
+        use weaver_server_core::runtime::panic_trap;
+        let payload = panic_trap::payload_text(info.payload());
+        let job = panic_trap::current_job().map(|job| job.0);
 
         if let Some(location) = info.location() {
             error!(
+                job.id = job,
                 panic.message = payload,
                 panic.file = location.file(),
                 panic.line = location.line(),
@@ -607,7 +608,15 @@ fn install_panic_hook() {
                 "unexpected panic"
             );
         } else {
-            error!(panic.message = payload, "unexpected panic");
+            error!(job.id = job, panic.message = payload, "unexpected panic");
+        }
+
+        // The marker the next start parks the job by. The abort that
+        // follows is unchanged: this only leaves word of it behind.
+        if let Some(trap) = panic_trap::armed()
+            && let Err(error) = trap.record(info)
+        {
+            error!(%error, "the crash marker could not be written");
         }
 
         default_hook(info);

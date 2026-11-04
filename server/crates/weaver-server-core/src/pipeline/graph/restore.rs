@@ -177,6 +177,8 @@ impl RestoreSeat {
         job_id: JobId,
         files: Vec<RootFile>,
     ) -> Result<GraphRestore, GraphRestoreError> {
+        // A restore replays the job's own facts: a panic in it is the job's.
+        let _job = crate::runtime::panic_trap::JobScope::enter(job_id);
         let loaded = self.db.load_graph_checkpoint(job_id);
         loaded
             .map_err(GraphRestoreError::from)

@@ -17,6 +17,12 @@ use crate::jobs::working_dir::{claim_working_dir, stamp_working_dir};
 use crate::pipeline::Pipeline;
 use crate::{DownloadQueue, DownloadWork, RestoreJobRequest};
 
+// What a job's queue entry says while a restore that could not go through
+// holds it paused.
+fn restore_blocked(error: impl std::fmt::Display) -> String {
+    format!("Checkpoint could not be restored: {error}")
+}
+
 impl Pipeline {
     async fn restore_has_open_download_finalization(&self, job_id: JobId) -> bool {
         let events = match self
@@ -823,12 +829,22 @@ impl Pipeline {
                 Err(error) => {
                     self.install_blocked_restore(
                         request,
-                        format!("its file state could not be read: {error}"),
+                        restore_blocked(format!("its file state could not be read: {error}")),
                     )
                     .await;
                     return Ok(());
                 }
             }
+        }
+        // A job whose work crashed the daemon on its last run would restore
+        // into the same panic: it is parked paused before any of it is
+        // restored, its checkpoint left as it is for a resume to replay. Its
+        // marker goes once the pause is stored, so a resume restores it.
+        if let Some(mark) = self.crash_marks.take(request.job_id) {
+            if self.install_blocked_restore(request, mark.reason()).await {
+                mark.consume();
+            }
+            return Ok(());
         }
         let root = self.intermediate_dir.clone();
         let path = request.working_dir.clone();
@@ -846,7 +862,8 @@ impl Pipeline {
                     Err(error) => error.to_string(),
                     Ok(Ok(_)) => unreachable!(),
                 };
-                self.install_blocked_restore(request, error).await;
+                self.install_blocked_restore(request, restore_blocked(error))
+                    .await;
                 return Ok(());
             }
         }
@@ -871,7 +888,7 @@ impl Pipeline {
                 }
             }
             Err(error) => {
-                self.install_blocked_restore(original, error.to_string())
+                self.install_blocked_restore(original, restore_blocked(error))
                     .await;
             }
         }
@@ -879,7 +896,20 @@ impl Pipeline {
         Ok(())
     }
 
-    async fn install_blocked_restore(&mut self, request: RestoreJobRequest, error: String) {
+    // The jobs that crashed the daemon on its last run, read at start before
+    // any job is restored: each is parked paused as it installs.
+    pub fn park_crashed_jobs(&mut self, marks: crate::runtime::panic_trap::CrashMarks) {
+        self.crash_marks = marks;
+    }
+
+    // Installs the job paused, holding nothing, with `reason` shown as its
+    // error until a resume restores it. Returns whether the pause was stored,
+    // so a restart keeps it.
+    async fn install_blocked_restore(
+        &mut self,
+        request: RestoreJobRequest,
+        reason: String,
+    ) -> bool {
         let job_id = request.job_id;
         let server_attribution = self
             .db_blocking(move |db| db.load_active_server_attribution(job_id))
@@ -918,7 +948,7 @@ impl Pipeline {
             paused_resume_status: request.paused_resume_status.clone(),
             paused_resume_download_state: request.paused_resume_download_state,
             paused_resume_post_state: request.paused_resume_post_state,
-            failure_error: Some(format!("Checkpoint could not be restored: {error}")),
+            failure_error: Some(reason),
             working_dir: request.working_dir.clone(),
             downloaded_bytes: 0,
             restored_download_floor_bytes: 0,
@@ -951,9 +981,10 @@ impl Pipeline {
         self.blocked_restores.insert(job_id, request);
         self.remove_pending_completion_check(job_id);
         self.update_queue_metrics();
+        tracing::warn!(job_id = job_id.0, reason = %message, "placement recovery blocked; job retained paused");
         // Await this write: the next startup must retain the pause even if
         // filesystem recovery succeeds by then.
-        if let Err(persist_error) = self
+        let stored = self
             .db_blocking(move |db| {
                 db.set_active_job_runtime(
                     job_id,
@@ -969,11 +1000,11 @@ impl Pipeline {
                     resume_post,
                 )
             })
-            .await
-        {
+            .await;
+        if let Err(persist_error) = &stored {
             tracing::error!(job_id = job_id.0, %persist_error, "failed to persist blocked restore pause");
         }
-        tracing::warn!(job_id = job_id.0, %error, "placement recovery blocked; job retained paused");
+        stored.is_ok()
     }
 
     pub(crate) async fn resume_restored_job(

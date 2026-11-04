@@ -2013,6 +2013,71 @@ async fn a_job_with_no_password_candidates_stored_is_restored_from_its_checkpoin
     job.restores_from_its_checkpoint().await;
 }
 
+// A job whose work crashed the daemon on its last run is not restored into
+// the same crash: it comes back paused naming it, holding nothing, its
+// checkpoint as it was and its marker gone. A resume replays the checkpoint
+// and the job finishes.
+#[tokio::test]
+async fn a_job_that_crashed_the_daemon_comes_back_paused_and_resumes_from_its_checkpoint() {
+    use crate::runtime::panic_trap::{Trap, boot_marks};
+    let mut job = reopened().await;
+    let data = tempfile::tempdir().unwrap();
+    let marker = Trap::new(data.path(), "test")
+        .write(Some(JOB), "inverted byte range 20..10", None)
+        .unwrap();
+    let checkpoint = job.pipeline.db.load_graph_checkpoint(JOB).unwrap();
+    assert!(checkpoint.is_some());
+    job.pipeline
+        .park_crashed_jobs(boot_marks(data.path(), |id| id == JOB));
+
+    job.restore().await;
+    let pipeline = &mut job.pipeline;
+    assert!(pipeline.blocked_restores.contains_key(&JOB));
+    assert!(!pipeline.graph_jobs.contains_key(&JOB));
+    let info = pipeline
+        .list_jobs()
+        .into_iter()
+        .find(|job| job.job_id == JOB)
+        .expect("a parked job stays in the queue");
+    assert_eq!(info.status, JobStatus::Paused);
+    assert_eq!(
+        info.error.as_deref(),
+        Some("crashed the daemon: inverted byte range 20..10")
+    );
+    assert!(pipeline.jobs[&JOB].articles.active().is_none());
+    pipeline.dispatch_downloads();
+    assert_eq!(pipeline.active_downloads, 0);
+    pipeline.db.flush_write_queue().await.unwrap();
+    let row = pipeline
+        .db
+        .load_active_jobs()
+        .unwrap()
+        .remove(&JOB)
+        .unwrap();
+    assert_eq!(row.status, "paused");
+    assert_eq!(pipeline.db.load_graph_checkpoint(JOB).unwrap(), checkpoint);
+    assert!(!marker.exists());
+
+    job.resumes_from_its_checkpoint().await;
+}
+
+// Another job's crash marker leaves this job's restore alone: it is
+// restored from its checkpoint, and the marker waits for its own job.
+#[tokio::test]
+async fn another_jobs_crash_marker_leaves_the_restore_alone() {
+    use crate::runtime::panic_trap::{Trap, boot_marks};
+    let mut job = reopened().await;
+    let other = crate::JobId(JOB.0 + 1);
+    let data = tempfile::tempdir().unwrap();
+    let marker = Trap::new(data.path(), "test")
+        .write(Some(other), "not this job", None)
+        .unwrap();
+    job.pipeline
+        .park_crashed_jobs(boot_marks(data.path(), |id| id == other));
+    job.restores_from_its_checkpoint().await;
+    assert!(marker.exists());
+}
+
 // A job restarted with `away` making a read of what its restore needs fail,
 // then `back` making it read again.
 async fn held_until_it_reads(away: &'static str, back: &'static str) {

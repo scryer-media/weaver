@@ -62,9 +62,16 @@ pub(crate) struct Grant {
 
 impl Grant {
     // `work`, inside the pool when there is one.
+    // The pool's thread works for the job this one does.
     pub(crate) fn install<R: Send>(&self, work: impl FnOnce() -> R + Send) -> R {
         match &self.pool {
-            Some(pool) => pool.install(work),
+            Some(pool) => {
+                let job = crate::runtime::panic_trap::current_job();
+                pool.install(move || {
+                    let _job = crate::runtime::panic_trap::JobScope::carry(job);
+                    work()
+                })
+            }
             None => work(),
         }
     }
@@ -109,10 +116,15 @@ impl Grant {
 struct Lent(Arc<rayon::ThreadPool>);
 
 impl Pool for Lent {
+    // Each worker works for the job the run does.
     fn spread(&self, workers: usize, work: &(dyn Fn() + Sync)) {
+        let job = crate::runtime::panic_trap::current_job();
         self.0.in_place_scope(|scope| {
             for _ in 0..workers {
-                scope.spawn(|_| work());
+                scope.spawn(move |_| {
+                    let _job = crate::runtime::panic_trap::JobScope::carry(job);
+                    work()
+                });
             }
         });
     }
