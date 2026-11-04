@@ -359,34 +359,48 @@ async fn a_hex_named_member_bound_by_its_prefix_is_renamed_and_its_file_moves() 
     decode_all(&mut pipeline, job_id, &posts, 0).await;
     let hex = working_dir.join(&posts[0].name);
     assert_eq!(member_file(&pipeline, job_id, 0), Some(hex.clone()));
+    pipeline.db.flush_write_queue().await.unwrap();
+    hear_graph_mail(&mut pipeline, job_id).await;
+
+    // Hold the writer before the index can name the member. The repair can
+    // return, but the checkpoint that permits its file to move cannot commit.
+    let (release, held) = std::sync::mpsc::channel();
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    pipeline
+        .db
+        .try_queue_write("hold_member_rename_checkpoint", move |_| {
+            let _ = entered.send(());
+            let _ = held.recv();
+            Ok(())
+        })
+        .unwrap();
+    waiting.await.unwrap();
     decode_all(&mut pipeline, job_id, &posts, 1).await;
     // The volume still to come is the set's own from the post, so with the
     // payload in, the set rules as its index is founded, before it is read;
-    // the bind that names the member follows once that run is heard. The
-    // file moves once the checkpoint that records its name has committed.
-    // That commit runs beside the repair and may be heard with it, so what
-    // stands then is read against what the database holds.
+    // the bind that names the member follows once that run is heard.
     hear_repair(&mut pipeline, job_id).await;
-    if pipeline.graph_jobs[&job_id].moves_waiting() {
-        assert!(hex.exists());
-    } else {
-        let stored = pipeline.db.load_graph_checkpoint(job_id).unwrap().unwrap();
-        let root = stored
-            .nodes
-            .iter()
-            .find(|node| node.parent.is_none())
-            .unwrap()
-            .node;
-        assert!(
-            stored
-                .members
-                .iter()
-                .any(|row| row.node == root && row.member == 0 && row.name == "lantern.bin")
-        );
-        assert!(!hex.exists());
-    }
+    assert!(pipeline.graph_jobs[&job_id].moves_waiting());
+    assert_eq!(member_file(&pipeline, job_id, 0), Some(hex.clone()));
+    assert_eq!(read(&hex), data);
+    assert!(!working_dir.join("lantern.bin").exists());
+
+    release.send(()).unwrap();
     hear_graph_mail(&mut pipeline, job_id).await;
     assert!(!pipeline.graph_jobs[&job_id].moves_waiting());
+    let stored = pipeline.db.load_graph_checkpoint(job_id).unwrap().unwrap();
+    let root = stored
+        .nodes
+        .iter()
+        .find(|node| node.parent.is_none())
+        .unwrap()
+        .node;
+    assert!(
+        stored
+            .members
+            .iter()
+            .any(|row| row.node == root && row.member == 0 && row.name == "lantern.bin")
+    );
 
     let member = pipeline.graph_jobs[&job_id]
         .namespace()
