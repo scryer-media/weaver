@@ -600,7 +600,7 @@ fn install_panic_hook() {
 
         if let Some(location) = info.location() {
             error!(
-                job.id = job,
+                job_id = job,
                 panic.message = payload,
                 panic.file = location.file(),
                 panic.line = location.line(),
@@ -608,7 +608,7 @@ fn install_panic_hook() {
                 "unexpected panic"
             );
         } else {
-            error!(job.id = job, panic.message = payload, "unexpected panic");
+            error!(job_id = job, panic.message = payload, "unexpected panic");
         }
 
         // The marker the next start parks the job by. The abort that

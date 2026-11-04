@@ -23,9 +23,11 @@
 //     was raised, the build and the time;
 //   - the next start reads the markers before any job is restored. A marked
 //     job is installed paused with the reason, its checkpoint untouched, and
-//     its marker goes once the pause is stored. A resume replays the job as
-//     usual; should it panic again, it is parked again. The worst is one
-//     crash per resume, never a loop.
+//     nothing of it restored. Its marker stays until the job is resumed or
+//     deleted, so every start before then parks it again without walking
+//     into its restore. A resume removes the marker first and replays the
+//     job as usual; should it panic again, a fresh marker parks it again.
+//     The worst is one crash per resume, never a loop.
 //
 // Paused, not failed: a panic is a fault in Weaver, and says nothing about
 // the post.
@@ -105,6 +107,24 @@ pub async fn in_job<F: Future>(job: JobId, future: F) -> F::Output {
         future.as_mut().poll(cx)
     })
     .await
+}
+
+// `work`, to run on another thread working for the job this one works for
+// now: work handed to a blocking thread or a pool keeps its job's name.
+pub fn carried<R>(work: impl FnOnce() -> R) -> impl FnOnce() -> R {
+    let job = current_job();
+    move || {
+        let _job = JobScope::carry(job);
+        work()
+    }
+}
+
+// `tokio::task::spawn_blocking`, the blocking thread working for the job
+// this one works for now.
+pub fn spawn_blocking<R: Send + 'static>(
+    work: impl FnOnce() -> R + Send + 'static,
+) -> tokio::task::JoinHandle<R> {
+    tokio::task::spawn_blocking(carried(work))
 }
 
 // A panic's payload as text, as the standard hook renders it.
@@ -286,13 +306,18 @@ pub fn read_marks(data_dir: &Path) -> Vec<Mark> {
     marks
 }
 
-// The markers of jobs that crashed the daemon on its last run and are about
-// to be restored, each waiting for its job's install to park it.
+// The markers of jobs that crashed the daemon and are queued: each parks its
+// job at every install until a resume takes it.
 #[derive(Debug, Default)]
 pub struct CrashMarks(HashMap<JobId, Mark>);
 
 impl CrashMarks {
-    // The marker of `job`, taken: the install that takes it parks the job.
+    // The marker of `job`, if it crashed the daemon: its install parks it.
+    pub fn get(&self, job: JobId) -> Option<&Mark> {
+        self.0.get(&job)
+    }
+
+    // The marker of `job`, taken: the resume that takes it removes it.
     pub fn take(&mut self, job: JobId) -> Option<Mark> {
         self.0.remove(&job)
     }
@@ -335,7 +360,7 @@ pub fn boot_marks(data_dir: &Path, restores: impl Fn(JobId) -> bool) -> CrashMar
                     panic.location = mark.location.as_deref(),
                     panic.version = mark.version.as_deref(),
                     panic.time = mark.time.as_deref(),
-                    "a job crashed the daemon on its last run; it is restored paused"
+                    "a job crashed the daemon; it stays paused until resumed"
                 );
                 waiting.insert(job, mark);
             }
@@ -401,6 +426,18 @@ mod tests {
         tx.send(()).unwrap();
         assert_eq!(work.await.unwrap(), (Some(JobId(5)), Some(JobId(5))));
         assert_eq!(current_job(), None);
+    }
+
+    // A blocking thread handed work inside a job's work names that job while
+    // it runs it; one handed work outside any job names none.
+    #[tokio::test]
+    async fn a_blocking_thread_works_for_the_job_that_handed_it_work() {
+        let inside = in_job(JobId(8), async {
+            spawn_blocking(current_job).await.unwrap()
+        })
+        .await;
+        assert_eq!(inside, Some(JobId(8)));
+        assert_eq!(spawn_blocking(current_job).await.unwrap(), None);
     }
 
     #[test]

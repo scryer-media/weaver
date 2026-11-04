@@ -65,13 +65,7 @@ impl Grant {
     // The pool's thread works for the job this one does.
     pub(crate) fn install<R: Send>(&self, work: impl FnOnce() -> R + Send) -> R {
         match &self.pool {
-            Some(pool) => {
-                let job = crate::runtime::panic_trap::current_job();
-                pool.install(move || {
-                    let _job = crate::runtime::panic_trap::JobScope::carry(job);
-                    work()
-                })
-            }
+            Some(pool) => pool.install(crate::runtime::panic_trap::carried(work)),
             None => work(),
         }
     }

@@ -836,14 +836,16 @@ impl Pipeline {
                 }
             }
         }
-        // A job whose work crashed the daemon on its last run would restore
-        // into the same panic: it is parked paused before any of it is
-        // restored, its checkpoint left as it is for a resume to replay. Its
-        // marker goes once the pause is stored, so a resume restores it.
-        if let Some(mark) = self.crash_marks.take(request.job_id) {
-            if self.install_blocked_restore(request, mark.reason()).await {
-                mark.consume();
-            }
+        // A job whose work crashed the daemon would restore into the same
+        // panic: it is parked paused before any of it is restored, its
+        // checkpoint left as it is. Its marker stays until a resume takes it,
+        // so every start before then parks it again.
+        if let Some(reason) = self
+            .crash_marks
+            .get(request.job_id)
+            .map(|mark| mark.reason())
+        {
+            self.install_blocked_restore(request, reason).await;
             return Ok(());
         }
         let root = self.intermediate_dir.clone();
@@ -903,13 +905,8 @@ impl Pipeline {
     }
 
     // Installs the job paused, holding nothing, with `reason` shown as its
-    // error until a resume restores it. Returns whether the pause was stored,
-    // so a restart keeps it.
-    async fn install_blocked_restore(
-        &mut self,
-        request: RestoreJobRequest,
-        reason: String,
-    ) -> bool {
+    // error until a resume restores it.
+    async fn install_blocked_restore(&mut self, request: RestoreJobRequest, reason: String) {
         let job_id = request.job_id;
         let server_attribution = self
             .db_blocking(move |db| db.load_active_server_attribution(job_id))
@@ -1004,7 +1001,6 @@ impl Pipeline {
         if let Err(persist_error) = &stored {
             tracing::error!(job_id = job_id.0, %persist_error, "failed to persist blocked restore pause");
         }
-        stored.is_ok()
     }
 
     pub(crate) async fn resume_restored_job(
@@ -1012,6 +1008,12 @@ impl Pipeline {
         job_id: JobId,
     ) -> Result<(), crate::SchedulerError> {
         if let Some(mut request) = self.blocked_restores.get(&job_id).cloned() {
+            // A resume is the go-ahead to replay a job that crashed the
+            // daemon. Its marker goes before the replay, so a panic during it
+            // leaves a fresh one.
+            if let Some(mark) = self.crash_marks.take(job_id) {
+                mark.consume();
+            }
             let recovered = self
                 .db_blocking(move |db| db.load_active_job(job_id))
                 .await

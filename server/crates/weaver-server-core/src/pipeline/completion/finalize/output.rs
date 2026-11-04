@@ -370,7 +370,7 @@ async fn validate_script_move_destination(
         )));
     }
     let path = expected.to_path_buf();
-    let validated = tokio::task::spawn_blocking(move || {
+    let validated = crate::runtime::panic_trap::spawn_blocking(move || {
         crate::post_processing::effects::validate_directory(&db, &context, &path)
     })
     .await
@@ -428,7 +428,7 @@ async fn run_move_to_claimed_destination(
 ) -> Result<MoveToCompleteResult, MoveToCompleteFailure> {
     let policy = match policy_source {
         DeliveryPolicySource::Persisted(database) => {
-            tokio::task::spawn_blocking(move || database.post_processing_settings())
+            crate::runtime::panic_trap::spawn_blocking(move || database.post_processing_settings())
                 .await
                 .map_err(|error| {
                     MoveToCompleteFailure::Operational(format!(
@@ -449,7 +449,7 @@ async fn run_move_to_claimed_destination(
         let working_dir = working_dir.clone();
         let staging_dir = staging_dir.clone();
         let policy = Arc::clone(&policy);
-        tokio::task::spawn_blocking(move || {
+        crate::runtime::panic_trap::spawn_blocking(move || {
             validate_delivery_sources(&working_dir, staging_dir.as_deref(), &policy)
         })
         .await
@@ -527,7 +527,7 @@ async fn run_move_to_claimed_destination(
             let src_fb = src.clone();
             let dst_fb = dst.clone();
             let counters = Arc::clone(&phase_counters);
-            match tokio::task::spawn_blocking(move || {
+            match crate::runtime::panic_trap::spawn_blocking(move || {
                 move_path_with_safe_rename_or_copy_fallback(
                     &src_fb,
                     &dst_fb,
@@ -578,7 +578,7 @@ async fn run_move_to_claimed_destination(
             let src_fb = src.clone();
             let dst_fb = dst.clone();
             let counters = Arc::clone(&phase_counters);
-            match tokio::task::spawn_blocking(move || {
+            match crate::runtime::panic_trap::spawn_blocking(move || {
                 move_path_with_safe_rename_or_copy_fallback(
                     &src_fb,
                     &dst_fb,
@@ -637,8 +637,10 @@ async fn run_move_to_claimed_destination(
     // The delivered tree is the user's Weaver runs as, with the modes its
     // umask gives, whatever the archives it came out of said.
     let delivered = dest.clone();
-    match tokio::task::spawn_blocking(move || runtime_fs::normalize_extracted_tree(&delivered))
-        .await
+    match crate::runtime::panic_trap::spawn_blocking(move || {
+        runtime_fs::normalize_extracted_tree(&delivered)
+    })
+    .await
     {
         Ok(Ok(())) => {}
         Ok(Err(error)) => {
@@ -656,7 +658,11 @@ async fn run_move_to_claimed_destination(
     }
 
     let output_dir = dest.clone();
-    match tokio::task::spawn_blocking(move || mark_weaver_owned_output_dir(&output_dir)).await {
+    match crate::runtime::panic_trap::spawn_blocking(move || {
+        mark_weaver_owned_output_dir(&output_dir)
+    })
+    .await
+    {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!(
             job_id = job_id.0,
@@ -1117,10 +1123,12 @@ impl Pipeline {
             dest = %dest.display(),
             "starting final move"
         );
-        tokio::spawn(async move {
+        // The move is the job's work, and so is every blocking thread it
+        // hands work to.
+        tokio::spawn(crate::runtime::panic_trap::in_job(job_id, async move {
             if let Some(hook) = hold {
                 // The hook sleeps its thread, so it is given one of its own.
-                let _ = tokio::task::spawn_blocking(move || {
+                let _ = crate::runtime::panic_trap::spawn_blocking(move || {
                     crate::e2e_failpoint::maybe_delay(hook);
                 })
                 .await;
@@ -1165,7 +1173,7 @@ impl Pipeline {
                     result,
                 })
                 .await;
-        });
+        }));
         Ok(())
     }
 
