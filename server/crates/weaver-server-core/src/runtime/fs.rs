@@ -29,40 +29,16 @@ pub(crate) struct DirectoryFingerprint {
     file_index: u64,
 }
 
-// Atomic for both directories and files; never replaces an existing target.
+// Moves a directory or a file and never replaces an existing target. Atomic
+// wherever the mount takes the exclusive rename; see `rename_exclusive_with`
+// for the mounts that refuse it.
 pub(crate) fn rename_path_exclusive(src: &Path, dst: &Path) -> io::Result<()> {
     if src == dst {
         return Ok(());
     }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
-        use std::os::unix::ffi::OsStrExt;
-        let path = |path: &Path| {
-            std::ffi::CString::new(path.as_os_str().as_bytes())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
-        };
-        let src = path(src)?;
-        let dst = path(dst)?;
-        // The raw syscall rather than the libc wrapper: musl's static libc has
-        // no renameat2 symbol, so the portable release binary cannot link it.
-        #[cfg(target_os = "linux")]
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_renameat2,
-                libc::AT_FDCWD,
-                src.as_ptr(),
-                libc::AT_FDCWD,
-                dst.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        };
-        #[cfg(target_os = "macos")]
-        let result = unsafe { libc::renamex_np(src.as_ptr(), dst.as_ptr(), libc::RENAME_EXCL) };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+        rename_exclusive_with(src, dst, exclusive_rename_native)
     }
     #[cfg(windows)]
     {
@@ -101,6 +77,84 @@ pub(crate) fn rename_path_exclusive(src: &Path, dst: &Path) -> io::Result<()> {
             "atomic exclusive file moves are unsupported on this platform",
         ))
     }
+}
+
+// The one call that both moves and refuses an existing target, atomically.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+type ExclusiveRename = fn(&std::ffi::CStr, &std::ffi::CStr) -> io::Result<()>;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn exclusive_rename_native(src: &std::ffi::CStr, dst: &std::ffi::CStr) -> io::Result<()> {
+    // The raw syscall rather than the libc wrapper: musl's static libc has
+    // no renameat2 symbol, so the portable release binary cannot link it.
+    #[cfg(target_os = "linux")]
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            src.as_ptr(),
+            libc::AT_FDCWD,
+            dst.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(target_os = "macos")]
+    let result = unsafe { libc::renamex_np(src.as_ptr(), dst.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+// A mount that cannot refuse an existing target in the rename itself (NFS,
+// CIFS, 9p, virtiofs, FUSE without the flag) answers the flag with one of
+// these, as systemd's rename_noreplace() reads them (src/basic/fs-util.c).
+// The move then takes the next rung down, as systemd's does: link(2) and
+// unlink(2), exclusive on every mount with hard links; where links are
+// refused too, a check of the target and then rename(2). Every rung refuses
+// a target that exists.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn rename_exclusive_with(src: &Path, dst: &Path, exclusive: ExclusiveRename) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = |path: &Path| {
+        std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
+    };
+    match exclusive(&path(src)?, &path(dst)?) {
+        Err(error) if refused(&error, &[]) => {}
+        moved => return moved,
+    }
+    // A directory has no hard links: link(2) answers it EPERM.
+    match std::fs::hard_link(src, dst) {
+        Ok(()) => {
+            return std::fs::remove_file(src).inspect_err(|_| {
+                let _ = std::fs::remove_file(dst);
+            });
+        }
+        Err(error) if refused(&error, &[libc::EPERM, libc::EXDEV]) => {}
+        Err(error) => return Err(error),
+    }
+    match std::fs::symlink_metadata(dst) {
+        Ok(_) => Err(io::Error::from_raw_os_error(libc::EEXIST)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => std::fs::rename(src, dst),
+        Err(error) => Err(error),
+    }
+}
+
+// The call is not supported here, as opposed to failed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn refused(error: &io::Error, also: &[i32]) -> bool {
+    const UNSUPPORTED: [i32; 5] = [
+        libc::EINVAL,
+        libc::ENOSYS,
+        libc::ENOTTY,
+        libc::EOPNOTSUPP,
+        libc::ENOTSUP,
+    ];
+    error
+        .raw_os_error()
+        .is_some_and(|code| UNSUPPORTED.contains(&code) || also.contains(&code))
 }
 
 pub(crate) fn paths_equivalent_for_placement(left: &Path, right: &Path) -> bool {
@@ -550,6 +604,114 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(std::fs::read(&dst).unwrap(), b"existing");
+    }
+
+    // The exclusive call as a mount that refuses it answers.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn refuse<const ERRNO: i32>(_: &std::ffi::CStr, _: &std::ffi::CStr) -> io::Result<()> {
+        Err(io::Error::from_raw_os_error(ERRNO))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_refused_exclusive_rename_still_moves_a_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("graph-waiting-0-3");
+        let dst = temp.path().join("movie.mkv");
+        std::fs::write(&src, b"source").unwrap();
+
+        rename_exclusive_with(&src, &dst, refuse::<{ libc::EINVAL }>).unwrap();
+
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"source");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_refused_exclusive_rename_still_moves_a_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("old");
+        let dst = temp.path().join("new");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("inside.bin"), b"inside").unwrap();
+
+        rename_exclusive_with(&src, &dst, refuse::<{ libc::EINVAL }>).unwrap();
+
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(dst.join("inside.bin")).unwrap(), b"inside");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_refused_exclusive_rename_never_replaces_an_existing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src.bin");
+        let dst = temp.path().join("dst.bin");
+        std::fs::write(&src, b"source").unwrap();
+        std::fs::write(&dst, b"dest").unwrap();
+
+        let error = rename_exclusive_with(&src, &dst, refuse::<{ libc::EINVAL }>).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&src).unwrap(), b"source");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"dest");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_refused_exclusive_rename_never_replaces_an_existing_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("old");
+        let dst = temp.path().join("new");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("inside.bin"), b"inside").unwrap();
+        // Empty, so a plain rename(2) would replace it.
+        std::fs::create_dir(&dst).unwrap();
+
+        let error = rename_exclusive_with(&src, &dst, refuse::<{ libc::EINVAL }>).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(src.join("inside.bin")).unwrap(), b"inside");
+        assert_eq!(std::fs::read_dir(&dst).unwrap().count(), 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_unimplemented_exclusive_rename_falls_back_as_a_refused_one_does() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src.bin");
+        let dst = temp.path().join("dst.bin");
+        std::fs::write(&src, b"source").unwrap();
+
+        rename_exclusive_with(&src, &dst, refuse::<{ libc::ENOSYS }>).unwrap();
+
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"source");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn any_other_exclusive_rename_error_is_returned_unchanged() {
+        let failures: [ExclusiveRename; 3] = [
+            refuse::<{ libc::EACCES }>,
+            refuse::<{ libc::ENOENT }>,
+            refuse::<{ libc::EXDEV }>,
+        ];
+        for (failure, errno) in failures
+            .into_iter()
+            .zip([libc::EACCES, libc::ENOENT, libc::EXDEV])
+        {
+            let temp = tempfile::tempdir().unwrap();
+            let src = temp.path().join("src.bin");
+            let dst = temp.path().join("dst.bin");
+            std::fs::write(&src, b"source").unwrap();
+
+            let error = rename_exclusive_with(&src, &dst, failure).unwrap_err();
+
+            assert_eq!(error.raw_os_error(), Some(errno));
+            assert_eq!(std::fs::read(&src).unwrap(), b"source");
+            assert!(!dst.exists());
+        }
     }
 
     #[cfg(unix)]
