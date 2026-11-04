@@ -1818,7 +1818,15 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
             lane.set_body_activity(head_context.body_activity.clone());
             lane.set_checkpoint_plan(head_context.checkpoint_plan.clone());
         }
-        let Some((trace, meta)) = lane.ring_read_next() else {
+        // The head response is decoded as it is read: a panic decoding it
+        // is its job's.
+        let read = {
+            let _job = inflight
+                .front()
+                .map(|(_, head)| crate::runtime::panic_trap::JobScope::enter(head.job_id));
+            lane.ring_read_next()
+        };
+        let Some((trace, meta)) = read else {
             break (LaneParkReason::Error, false);
         };
         let Some((work, work_context)) = inflight.pop_front() else {

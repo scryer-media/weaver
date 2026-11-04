@@ -145,6 +145,7 @@ impl Pipeline {
                 source_server_idx,
                 exclude_servers,
             } => {
+                let _job = crate::runtime::panic_trap::JobScope::enter(segment_id.file_id.job_id);
                 self.handle_decode_failure(segment_id, &error, &exclude_servers, source_server_idx);
             }
         }
@@ -469,7 +470,14 @@ impl Pipeline {
         }
     }
 
+    // Every decoded article enters its job here, so a panic placing it is
+    // the job's.
     async fn handle_decode_success_inner(&mut self, result: DecodeResult, source: SegmentSource) {
+        let job_id = result.segment_id.file_id.job_id;
+        crate::runtime::panic_trap::in_job(job_id, self.place_decoded(result, source)).await;
+    }
+
+    async fn place_decoded(&mut self, result: DecodeResult, source: SegmentSource) {
         let _profile_scope = crate::runtime::perf_probe::scope("download.handle_decode_success");
         let DecodeResult {
             segment_id,

@@ -172,6 +172,7 @@ impl Lender for Lending<'_> {
         let grant = loans.hardware.grant();
         let shutdown = loans.hardware.shutdown().clone();
         tokio::task::spawn_blocking(move || {
+            let _job = crate::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
             tracing::info!(
                 job_id = scope,
                 node = set.0,
@@ -215,6 +216,7 @@ impl Lending<'_> {
         let mail = loans.mail.clone();
         let shutdown = loans.hardware.shutdown().clone();
         tokio::task::spawn_blocking(move || {
+            let _job = crate::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
             let checked = check.run(&shutdown);
             let _ = mail.blocking_send(Said {
                 scope,
@@ -241,6 +243,7 @@ impl Lending<'_> {
         let mail = loans.mail.clone();
         let shutdown = loans.hardware.shutdown().clone();
         tokio::task::spawn_blocking(move || {
+            let _job = crate::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
             let replayed = replay.run(&shutdown);
             if let Err(error) = mail.blocking_send(Said {
                 scope,

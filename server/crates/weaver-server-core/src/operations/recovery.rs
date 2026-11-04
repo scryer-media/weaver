@@ -22,6 +22,9 @@ pub struct RecoveredServerState {
     pub initial_history: Vec<JobInfo>,
     pub to_restore: Vec<RestoreCandidate>,
     pub initial_global_paused: bool,
+    // The jobs that crashed the daemon on its last run, each parked paused
+    // as it installs.
+    pub crashed: crate::runtime::panic_trap::CrashMarks,
     // What recovery leaves until the server answers; `spawn` runs it once.
     pub after_boot: AfterBoot,
 }
@@ -278,6 +281,12 @@ pub async fn recover_server_state(
     // a job waiting its turn lets them go again. A read that fails stops the
     // start, as the read of every row did; only a missing or unreadable NZB
     // archives the job.
+    // A job's work that panicked would panic again as the job is restored,
+    // so the markers the panic left are read before any job is.
+    let restoring: HashSet<crate::jobs::ids::JobId> =
+        in_progress.iter().map(|(job_id, _)| *job_id).collect();
+    let crashed = crate::runtime::panic_trap::boot_marks(data_dir, |job| restoring.contains(&job));
+
     let parsed = in_progress
         .par_iter()
         .map(|(job_id, recovered)| read_stored_files(db, *job_id, recovered))
@@ -441,6 +450,7 @@ pub async fn recover_server_state(
         initial_history,
         to_restore,
         initial_global_paused,
+        crashed,
         after_boot: AfterBoot {
             db: db.clone(),
             below: crate::jobs::ids::JobId(next_job_id),
@@ -634,6 +644,39 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    // A start reads the crash markers before it restores a job: one for a
+    // job it restores waits for that job's install, one for a job that is
+    // gone and one outside any job are logged and removed.
+    #[tokio::test]
+    async fn recovery_keeps_only_the_crash_markers_of_jobs_it_restores() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let nzb_path = temp.path().join("job-1.nzb");
+        db.create_active_job(&sample_active_job(1, nzb_path, temp.path().join("job-1")))
+            .unwrap();
+        let trap = crate::runtime::panic_trap::Trap::new(temp.path(), "test");
+        let restored = trap.write(Some(JobId(1)), "in its work", None).unwrap();
+        let gone = trap.write(Some(JobId(9)), "long gone", None).unwrap();
+        let daemon = trap.write(None, "outside", None).unwrap();
+
+        let mut recovered =
+            recover_server_state(&db, temp.path(), &temp.path().join("intermediate"))
+                .await
+                .unwrap();
+
+        assert_eq!(recovered.to_restore.len(), 1);
+        assert!(restored.exists());
+        assert!(!gone.exists());
+        assert!(!daemon.exists());
+        assert!(recovered.crashed.take(JobId(9)).is_none());
+        let mark = recovered
+            .crashed
+            .take(JobId(1))
+            .expect("the restored job's marker waits");
+        assert_eq!(mark.reason(), "crashed the daemon: in its work");
+        assert!(recovered.crashed.is_empty());
     }
 
     #[tokio::test]

@@ -197,6 +197,7 @@ pub(crate) async fn run(
     let to_restore = recovered_state.to_restore;
     let initial_global_paused = recovered_state.initial_global_paused;
     let after_boot = recovered_state.after_boot;
+    let crashed = recovered_state.crashed;
 
     // Publish recovered history to shared state so the API has data immediately.
     shared_state.load_history(initial_history.clone());
@@ -280,6 +281,7 @@ pub(crate) async fn run(
         startup_disk_work.clone(),
     )
     .await?;
+    pipeline.park_crashed_jobs(crashed);
 
     // Queue every recovered row before HTTP or intake can observe readiness.
     // Installing the tickets remains asynchronous on the pipeline.
