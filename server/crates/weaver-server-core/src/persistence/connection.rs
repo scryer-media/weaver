@@ -1234,6 +1234,8 @@ impl JobHistoryCache {
 // SQL-backed persistent store for config, servers, and job history.
 #[derive(Clone)]
 pub struct Database {
+    #[cfg(test)]
+    pub(crate) graph_checkpoint_writes: Arc<AtomicUsize>,
     pub(crate) rss_schedule_cache: Arc<crate::rss::ScheduleCache>,
     pub(crate) script_runtime: Arc<crate::post_processing::events::ScriptRuntime>,
     target: DatabaseTarget,
@@ -1280,6 +1282,8 @@ impl Database {
         let (writer_tx, writer_rx) = mpsc::channel(SQLITE_WRITE_QUEUE_CAPACITY);
         let db = Self {
             rss_schedule_cache: Arc::new(crate::rss::ScheduleCache::default()),
+            #[cfg(test)]
+            graph_checkpoint_writes: Arc::default(),
             script_runtime: Arc::new(crate::post_processing::events::ScriptRuntime::default()),
             target,
             sql_services,
@@ -1311,6 +1315,8 @@ impl Database {
         let (writer_tx, writer_rx) = mpsc::channel(SQLITE_WRITE_QUEUE_CAPACITY);
         let db = Self {
             target,
+            #[cfg(test)]
+            graph_checkpoint_writes: Arc::default(),
             sql_services,
             sql_worker,
             writer_tx,
@@ -1531,6 +1537,8 @@ impl Database {
         let (detached_tx, _detached_rx) = mpsc::channel(1);
         Database {
             target: self.target.clone(),
+            #[cfg(test)]
+            graph_checkpoint_writes: self.graph_checkpoint_writes.clone(),
             sql_services: self.sql_services.clone(),
             sql_worker: self.sql_worker.clone(),
             writer_tx: detached_tx,

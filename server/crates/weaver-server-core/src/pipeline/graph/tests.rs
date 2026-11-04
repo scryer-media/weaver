@@ -348,8 +348,14 @@ async fn a_lost_article_under_a_par2_set_is_repaired_through_the_tree() {
     retire_pipeline_database(pipeline).await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_hex_named_member_bound_by_its_prefix_is_renamed_and_its_file_moves() {
+    let clock = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let now = tokio::time::Instant::now();
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_005);
     let data = payload(3 * ARTICLE, 6);
@@ -360,6 +366,13 @@ async fn a_hex_named_member_bound_by_its_prefix_is_renamed_and_its_file_moves() 
     let hex = working_dir.join(&posts[0].name);
     assert_eq!(member_file(&pipeline, job_id, 0), Some(hex.clone()));
     pipeline.db.flush_write_queue().await.unwrap();
+    assert_eq!(
+        pipeline
+            .db
+            .graph_checkpoint_writes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
     hear_graph_mail(&mut pipeline, job_id).await;
 
     // Hold the writer before the index can name the member. The repair can
@@ -411,7 +424,9 @@ async fn a_hex_named_member_bound_by_its_prefix_is_renamed_and_its_file_moves() 
     assert_eq!(member_file(&pipeline, job_id, 0), Some(moved.clone()));
     assert_eq!(read(&moved), data);
     assert!(!hex.exists());
+    assert_eq!(tokio::time::Instant::now(), now);
     retire_pipeline_database(pipeline).await;
+    clock.abort();
 }
 
 #[tokio::test]

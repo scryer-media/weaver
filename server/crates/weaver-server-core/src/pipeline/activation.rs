@@ -400,7 +400,12 @@ impl Pipeline {
         let pending = graph.pending().clone();
         if !pending.control().cancelled()
             && pending
-                .await_commit(pending.stamp(), job_id.0, &self.graph_runs.written())
+                .await_commit(
+                    pending.stamp(),
+                    job_id.0,
+                    &self.graph_runs.written(),
+                    &self.db,
+                )
                 .is_none()
         {
             graph.owe_mail(pending.stamp());
