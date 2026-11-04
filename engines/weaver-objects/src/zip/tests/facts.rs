@@ -2,8 +2,28 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::super::Zip;
-use super::{archive, spanned};
+use super::{Entry, archive, payload, spanned, stored, write};
 use crate::testing::replay::{Step, frames, restores_alike};
+
+#[test]
+fn a_zip64_restores_its_retained_tail_and_sealed_grid_before_more_data_arrives() {
+    let contents = payload(1, 130_000);
+    let bytes = write(&[Entry::File(
+        "alpha.bin",
+        &contents,
+        stored().large_file(true),
+    )]);
+    let tail = bytes.len() - 65_557;
+    let mut steps = vec![
+        Step::Bound(0, "alpha.zip"),
+        Step::Sized(0, bytes.len() as u64),
+        Step::Bytes(0, tail as u64, &bytes[tail..]),
+    ];
+    steps.extend(frames(0, &bytes, 4096));
+    steps.push(Step::Closed(0));
+    let (facts, _, _) = restores_alike(Box::new(Zip::new()), &steps, 4, &[]);
+    assert!(!facts.parts.is_empty(), "the member grid is sealed apart");
+}
 
 #[test]
 fn a_zip_restored_before_its_directory_arrives_goes_on_as_the_live_one() {
