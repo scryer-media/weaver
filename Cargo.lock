@@ -6560,6 +6560,7 @@ dependencies = [
  "libc",
  "parking_lot",
  "rand 0.10.3",
+ "rustc-hash",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
