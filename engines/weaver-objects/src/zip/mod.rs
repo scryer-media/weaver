@@ -509,12 +509,15 @@ impl Object for Zip {
                 self.map
                     .as_ref()
                     .filter(|map| {
-                        map.entries.iter().any(|entry| {
-                            entry
-                                .cipher
-                                .as_ref()
-                                .is_some_and(|cipher| cipher.open.is_none())
-                        })
+                        map.entries
+                            .iter()
+                            .filter(|entry| entry.member.is_some())
+                            .any(|entry| {
+                                entry
+                                    .cipher
+                                    .as_ref()
+                                    .is_some_and(|cipher| cipher.open.is_none())
+                            })
                     })
                     .map(|_| Why::Encrypted)
             })

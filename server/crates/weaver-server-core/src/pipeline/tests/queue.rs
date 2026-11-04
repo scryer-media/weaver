@@ -309,6 +309,7 @@ async fn redownload_clears_the_committed_feed_verdict(cancel: bool) {
     add(&handle, id).await;
     pipeline.apply_queue_intents().await;
     activate_job(&mut pipeline, id).await;
+    pipeline.flush_graph_checkpoint(id);
     pipeline.db.flush_write_queue().await.unwrap();
     let mut verdict = crate::jobs::feed_verdict::FeedVerdict::new("fixture feed refusal".into());
     verdict.abandoned_files.insert(0);
@@ -351,6 +352,7 @@ async fn redownload_clears_the_committed_feed_verdict(cancel: bool) {
     handle.redownload_job(id).await.unwrap();
     pipeline.apply_queue_intents().await;
     activate_job(&mut pipeline, id).await;
+    pipeline.flush_graph_checkpoint(id);
     pipeline.db.flush_write_queue().await.unwrap();
     assert!(!pipeline.post_probes.verdicts.contains_key(&id));
     assert!(!pipeline.post_probes.dead.contains_key(&id));

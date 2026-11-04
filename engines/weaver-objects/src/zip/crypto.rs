@@ -331,6 +331,19 @@ impl Cipher {
         false
     }
 
+    fn replace_header(&mut self, header: [u8; HEADER as usize]) {
+        self.header = Some(header);
+        self.proven = false;
+        self.proof.clear();
+        self.restored = false;
+        self.replay = false;
+        self.pending.clear();
+        self.retry = false;
+        self.announce = true;
+        self.open = None;
+        self.rejected.clear();
+    }
+
     pub(super) fn unposted(&mut self, from: u64) {
         if self.replay && from == 0 {
             self.announce = true;
@@ -432,18 +445,40 @@ impl super::Zip {
                 continue;
             };
             let header = ByteRange::new(data - HEADER, data);
-            if cipher.header.is_none() {
-                self.kept.want(header);
-                if !self.kept.verified(header) {
-                    if self.kept.read(header).is_some() {
-                        self.say_damaged(header, out);
-                    }
-                    continue;
+            self.kept.want(header);
+            if !self.kept.verified(header) {
+                if self.kept.read(header).is_some() {
+                    self.say_damaged(header, out);
                 }
-                cipher.header = self
-                    .kept
-                    .read(header)
-                    .and_then(|bytes| bytes.try_into().ok());
+                continue;
+            }
+            let Some(header) = self
+                .kept
+                .read(header)
+                .and_then(|bytes| bytes.try_into().ok())
+            else {
+                continue;
+            };
+            if cipher.header.is_some_and(|previous| previous != header) {
+                if self.members[member.0 as usize]
+                    .coverage
+                    .overlapping(ByteRange::new(0, entry.length))
+                    .next()
+                    .is_some()
+                {
+                    // The old keys still reproduce the ciphertext already
+                    // posted as plaintext. The engine reads it through them
+                    // before opening the repaired header, after a restore too.
+                    if !cipher.unlock(&self.candidates, Provenance::Fresh) {
+                        locked = true;
+                        continue;
+                    }
+                    self.map = Some(map);
+                    return self.give_up(Emit::NeedsEngine(weaver_graph::Why::Unmapped), out);
+                }
+                cipher.replace_header(header);
+            } else {
+                cipher.header = Some(header);
             }
             let was_open = cipher.open.is_some();
             if !cipher.unlock(&self.candidates, Provenance::Fresh) {

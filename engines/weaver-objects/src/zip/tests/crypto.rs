@@ -697,3 +697,161 @@ fn an_inverse_frontier_is_bound_to_the_candidate_that_produced_it() {
         assert!(output == archive[range.start as usize..range.end as usize]);
     }
 }
+
+#[test]
+fn a_repaired_zipcrypto_header_rechecks_rejected_passwords() {
+    let plain = payload(103, 200_003);
+    let archive = encrypted(&plain);
+    let header = records::local_len(&archive).unwrap();
+    let data = header + 12;
+    let mut broken = archive[..data as usize].to_vec();
+    broken[data as usize - 1] ^= 1;
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, PASSWORD);
+    owner.deliver_as(0, ByteRange::new(0, data), Provenance::Fresh, Some(&broken));
+    assert!(owner.said.contains(&Emit::NeedsPassword));
+    owner.deliver_as(0, ByteRange::new(header, data), Provenance::Repaired, None);
+    owner.deliver(0, ByteRange::new(data, archive.len() as u64));
+    owner.close(0);
+    assert!(owner.member("alpha.bin").bytes == plain, "{:?}", owner.said);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+}
+
+#[test]
+fn an_ignored_encrypted_symlink_leaves_the_archive_complete() {
+    let plain = payload(104, 1000);
+    let options = stored()
+        .with_deprecated_encryption(PASSWORD.as_bytes())
+        .unwrap();
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer.start_file("feature.mkv", stored()).unwrap();
+    writer.write_all(&plain).unwrap();
+    writer.add_symlink("link", "feature.mkv", options).unwrap();
+    let archive = writer.finish().unwrap().into_inner();
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.whole(4096);
+    assert!(owner.member("feature.mkv").closed);
+    assert_eq!(owner.member("feature.mkv").bytes, plain);
+    let mut out = Vec::new();
+    owner
+        .object
+        .quiet(&crate::testing::Quiet(Vec::new()), &mut out);
+    assert!(out.is_empty(), "{out:?}");
+    assert!(!owner.said.contains(&Emit::NeedsPassword));
+    assert!(owner.posted(0) == Some(archive));
+}
+
+fn repaired_header_preserves_posted_ciphertext(restore: bool) {
+    use zeroize::Zeroizing;
+    let plain = payload(105, 200_003);
+    let archive = encrypted(&plain);
+    let header = records::local_len(&archive).unwrap() as usize;
+    let data = header + 12;
+    let mut broken = archive[..data].to_vec();
+    broken[header] ^= 1;
+    // A damaged header can pass its one-byte password check while giving
+    // the payload different keys. Those keys must still seal its plaintext.
+    let header_record = records::local(&archive).unwrap();
+    let check = (0..=u8::MAX)
+        .find(|&check| {
+            broken[data - 1] = check;
+            let mut cipher = super::super::crypto::Cipher::new(&header_record);
+            cipher.header = Some(broken[header..data].try_into().unwrap());
+            cipher.unlock(&[Zeroizing::new(PASSWORD.to_owned())], Provenance::Fresh)
+        })
+        .unwrap();
+    broken[data - 1] = check;
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, PASSWORD);
+    owner.deliver_as(
+        0,
+        ByteRange::new(0, data as u64),
+        Provenance::Fresh,
+        Some(&broken),
+    );
+    let prefix = ByteRange::new(data as u64, data as u64 + 4096);
+    owner.deliver(0, prefix);
+    assert!(owner.member("alpha.bin").bytes != plain[..4096]);
+    assert!(
+        owner
+            .member("alpha.bin")
+            .coverage
+            .covered(ByteRange::new(0, 4096))
+    );
+    if restore {
+        let saved = rmp_serde::to_vec(&owner.object).unwrap();
+        owner.object = rmp_serde::from_slice(&saved).unwrap();
+        // Repair can arrive before passwords are reoffered after restore.
+        owner.deliver_as(
+            0,
+            ByteRange::new(header as u64, data as u64),
+            Provenance::Repaired,
+            None,
+        );
+        assert!(!owner.said.contains(&Emit::NeedsEngine(Why::Unmapped)));
+        offer(&mut owner, PASSWORD);
+    } else {
+        owner.deliver_as(
+            0,
+            ByteRange::new(header as u64, data as u64),
+            Provenance::Repaired,
+            None,
+        );
+    }
+    assert!(owner.said.contains(&Emit::NeedsEngine(Why::Unmapped)));
+    let mut posted = Vec::new();
+    assert!(owner.read_posted(VolumeIndex(0), prefix, &mut posted));
+    assert!(posted == archive[prefix.start as usize..prefix.end as usize]);
+    let mut posted = Vec::new();
+    assert!(owner.read_posted(VolumeIndex(0), ByteRange::new(0, prefix.end), &mut posted));
+    assert!(posted == archive[..prefix.end as usize]);
+}
+
+#[test]
+fn a_repaired_zipcrypto_header_preserves_the_ciphertext_for_the_engine() {
+    repaired_header_preserves_posted_ciphertext(false);
+}
+
+#[test]
+fn a_repaired_zipcrypto_header_after_restore_preserves_the_ciphertext_for_the_engine() {
+    repaired_header_preserves_posted_ciphertext(true);
+}
+
+#[test]
+fn a_restored_ignored_cipher_does_not_require_a_password() {
+    let plain = payload(106, 1000);
+    let options = stored()
+        .with_deprecated_encryption(PASSWORD.as_bytes())
+        .unwrap();
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer.start_file("feature.mkv", stored()).unwrap();
+    writer.write_all(&plain).unwrap();
+    writer.add_symlink("link", "feature.mkv", options).unwrap();
+    let archive = writer.finish().unwrap().into_inner();
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.whole(4096);
+    // Earlier snapshots kept a cipher even for an entry with no member.
+    let ignored = owner
+        .object
+        .map
+        .as_mut()
+        .unwrap()
+        .entries
+        .iter_mut()
+        .find(|entry| entry.member.is_none())
+        .unwrap();
+    ignored.cipher = Some(super::super::crypto::Cipher::new(
+        &records::local(&archive).unwrap(),
+    ));
+    let saved = rmp_serde::to_vec(&owner.object).unwrap();
+    owner.object = rmp_serde::from_slice(&saved).unwrap();
+    let mut out = Vec::new();
+    owner
+        .object
+        .quiet(&crate::testing::Quiet(Vec::new()), &mut out);
+    assert!(out.is_empty(), "{out:?}");
+    assert!(owner.member("feature.mkv").closed);
+}

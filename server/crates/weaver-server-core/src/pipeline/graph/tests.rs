@@ -1542,6 +1542,7 @@ async fn a_restart_parks_the_volume_again_from_the_objects_wants() {
         for ordinal in after_head(&posts, 2) {
             assert_parked(&pipeline, job_id, 2, ordinal);
         }
+        pipeline.flush_graph_checkpoint(job_id);
         pipeline.db.flush_write_queue().await.unwrap();
         retire_pipeline_database(pipeline).await;
         working_dir

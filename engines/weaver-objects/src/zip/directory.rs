@@ -223,6 +223,7 @@ impl Zip {
             }
             let header = &centrals[index].header;
             let said = Said::of(header);
+            let streams = member.is_some() && (length > 0 || header.encrypted());
             map.entries.push(Entry {
                 header: headers[index],
                 member,
@@ -232,10 +233,8 @@ impl Zip {
                 crc: header.crc,
                 crc_known: true,
                 data: None,
-                cipher: header
-                    .encrypted()
-                    .then(|| super::crypto::Cipher::new(header)),
-                streams: length > 0 || header.encrypted(),
+                cipher: (streams && header.encrypted()).then(|| super::crypto::Cipher::new(header)),
+                streams,
                 expected: Some(header.clone()),
             });
         }
