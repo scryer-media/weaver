@@ -52,8 +52,8 @@ export function LimitControl({
 
 /**
  * How the global download limit is shared: usenet's percentage, torrents the
- * rest, or no split. Without a download limit there is nothing to share, so
- * the control is held as it stands and says why; the split it holds is kept.
+ * rest, or no split. Without a download limit the split stays editable and
+ * says what it needs; its shares take effect once a download limit is set.
  */
 export function SplitControl({
   value,

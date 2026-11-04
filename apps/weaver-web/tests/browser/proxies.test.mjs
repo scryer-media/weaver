@@ -586,6 +586,7 @@ test("a proxy is tested through a route drafted for it, which cannot use the pro
       },
       subject: { proxy: 3 },
       target: null,
+      torrent: false,
     });
     await shot(page, "test-via-proxy");
 
@@ -666,6 +667,7 @@ test("a pool is tested member by member through a route drafted for it, and carr
       route: { failover: "REDISTRIBUTE", legs: [{ egressId: 0, weight: 100, path: { direct: true } }] },
       subject: { pool: 1 },
       target: null,
+      torrent: false,
     });
     await shot(page, "test-via-pool");
 

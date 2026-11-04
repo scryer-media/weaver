@@ -272,10 +272,20 @@ const screen = query.has("routes")
  * With `?downloading` a job is downloading, so a run asks before it pauses downloads; otherwise the queue is idle.
  * With `?gauge` the header gauge reads a rate, as it can just after a Usenet run.
  */
+const activeJobs = Number(query.has("downloading"));
+const queue: NextData["queue"] = {
+  summary: { totalItems: activeJobs, queuedItems: 0, activeItems: activeJobs, pausedItems: 0 },
+  stateCounts: activeJobs ? [{ state: "DOWNLOADING", count: activeJobs }] : [],
+  categories: [],
+  totalCount: activeJobs,
+  isLoading: false,
+  error: null,
+  refresh: () => {},
+};
 const live = {
   isPaused: false,
   speed: query.has("gauge") ? 12 * 1024 * 1024 : 0,
-  queue: { jobs: query.has("downloading") ? [{ id: 7, status: "DOWNLOADING" }] : [] } as unknown as NextData["queue"],
+  queue,
 } as NextData;
 const shell = { search: "", actionsRef: { current: null }, setFlags: () => {}, controlsHost: document.getElementById("controls") };
 createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t, uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter initialEntries={[query.has("routes") ? "/settings/networking/routes" : "/settings/networking/speed?consumer=server:1"]}><SettingsShellProvider {...shell}><NextDataContext.Provider value={live}><main className="mx-auto flex max-w-[1400px] flex-col p-8">{screen}</main></NextDataContext.Provider></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);

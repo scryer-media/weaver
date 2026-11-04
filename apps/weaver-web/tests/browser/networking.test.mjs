@@ -148,7 +148,7 @@ test("flow displays route evidence, opens editors, and edits weights without los
  assert.ok(snakePaths.some(d=>Math.abs(d[2]-carrierMiddle)<0.01),"a snake starts at the carrying member");
  await chain.hover();
  await fadedEndpoints.filter({hasText:"News primary"}).waitFor({state:"attached"});
- assert.deepEqual(await fadedLegs.evaluateAll(legs=>legs.map(leg=>leg.getAttribute("aria-label"))),["Edit the route for Default outbound, leg 1","Edit the route for News primary, leg 2","Edit the route for News backup, leg 1","Edit the route for News archive, leg 1","Edit the route for News primary, leg 1","Edit the route for News primary, leg 3"]);
+ assert.deepEqual(await fadedLegs.evaluateAll(legs=>legs.map(leg=>leg.getAttribute("aria-label"))),["Edit the route for Default outbound, leg 1","Edit the route for News backup, leg 1","Edit the route for News archive, leg 1","Edit the route for News primary, leg 2","Edit the route for News primary, leg 1","Edit the route for News primary, leg 3"]);
  assert.equal(await chain.getAttribute("opacity"),null);
  assert.equal(await fadedSnakes.count(),0);
  assert.ok(await snakes.count()>0);
@@ -164,7 +164,7 @@ test("flow displays route evidence, opens editors, and edits weights without los
  if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT.replace(/\.png$/,"-focus-chain.png"),fullPage:true});
  await diagram.locator("a[href='/settings/networking/egress']").filter({hasText:"WAN Fiber"}).hover();
  await fadedEndpoints.filter({hasText:"Feed mirror"}).waitFor({state:"attached"});
- assert.deepEqual(await fadedLegs.evaluateAll(legs=>legs.map(leg=>leg.getAttribute("aria-label"))),["Edit the route for Default outbound, leg 1","Edit the route for Feed mirror, leg 1","Edit the route for News primary, leg 2","Edit the route for News backup, leg 1","Edit the route for News archive, leg 1","Edit the route for News primary, leg 3"]);
+ assert.deepEqual(await fadedLegs.evaluateAll(legs=>legs.map(leg=>leg.getAttribute("aria-label"))),["Edit the route for Default outbound, leg 1","Edit the route for News backup, leg 1","Edit the route for News archive, leg 1","Edit the route for Feed mirror, leg 1","Edit the route for News primary, leg 2","Edit the route for News primary, leg 3"]);
  assert.ok(await snakes.count()>0);
  assert.equal(await fadedSnakes.count(),0);
  assert.equal(await ribbons.count(),await snakes.count());
@@ -336,7 +336,7 @@ test("an egress is tested alone and a pool member by member, each through a rout
  assert.deepEqual(await paths(1),[["WAN Fiber",[]]]);
  await rows.first().getByText("8.4 ms · source 192.0.2.10:40000",{exact:true}).waitFor();
  await rows.first().getByText("Connected.",{exact:true}).waitFor();
- assert.deepEqual((await tests()).at(-1),{route:{failover:"REDISTRIBUTE",legs:[{egressId:1,weight:100,path:{direct:true}}]},subject:null,target:{host:"news.fixture.invalid",port:563}});
+ assert.deepEqual((await tests()).at(-1),{route:{failover:"REDISTRIBUTE",legs:[{egressId:1,weight:100,path:{direct:true}}]},subject:null,target:{host:"news.fixture.invalid",port:563},torrent:false});
  if(process.env.NETWORKING_SCREENSHOT)await page.screenshot({path:process.env.NETWORKING_SCREENSHOT.replace(/\.png$/,"-test-egress.png")});
  await button(dialog,"Close").click();
  await dialog.waitFor({state:"detached"});

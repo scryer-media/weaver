@@ -92,7 +92,7 @@ test("the global limits sit above the egress table, one per direction, and save 
   await page.close();
 });
 
-test("the split shares the download limit between usenet and torrents, and needs one", async () => {
+test("the split shares the download limit and stays editable without one", async () => {
   const { page, errors } = await open("egress");
   const status = page.locator("#status");
   const limits = page.getByRole("region", { name: "Limits", exact: true });
@@ -115,17 +115,35 @@ test("the split shares the download limit between usenet and torrents, and needs
   await limits.getByText("Usenet ↓ 20.0 MiB/s · Torrents ↓ 5.0 MiB/s", { exact: true }).waitFor();
   if (shot("split")) await limits.screenshot({ path: shot("split") });
 
-  // Without a download limit the split is kept, held as it stands, and says what it needs.
+  // Without a download limit the saved share stays editable and says what it needs.
   await limits.getByRole("switch", { name: "Download limit", exact: true }).click();
   await limits.getByText("Needs a global download limit", { exact: true }).waitFor();
-  assert.equal(await split.isDisabled(), true);
-  assert.equal(await usenet.isDisabled(), true);
+  assert.equal(await split.isDisabled(), false);
+  assert.equal(await usenet.isDisabled(), false);
+  assert.equal(await usenet.inputValue(), "80");
+  await usenet.fill("70");
+  await usenet.press("Tab");
+  await limits.getByText("Torrents 30%", { exact: true }).waitFor();
   await page.evaluate(() => window.egressQuotaFixture.actions.current.save());
   await status.filter({ hasText: /^clean Saved$/ }).waitFor();
   await limits.getByText("Usenet ↓", { exact: false }).waitFor({ state: "detached" });
+
+  // The split can be lifted and restored without setting a download limit.
+  await split.click();
+  await usenet.waitFor({ state: "detached" });
+  await status.filter({ hasText: /^dirty/ }).waitFor();
+  await page.evaluate(() => window.egressQuotaFixture.actions.current.save());
+  await status.filter({ hasText: /^clean Saved$/ }).waitFor();
+  await split.click();
+  await limits.getByText("Torrents 30%", { exact: true }).waitFor();
+  await status.filter({ hasText: /^dirty/ }).waitFor();
+  await page.evaluate(() => window.egressQuotaFixture.actions.current.save());
+  await status.filter({ hasText: /^clean Saved$/ }).waitFor();
   assert.deepEqual((await sent(page)).filter((entry) => entry.name === "SetBandwidth").map((entry) => entry.variables), [
     { input: { downloadBps: 25 * MIB, uploadBps: null, split: { usenetPct: 80 } } },
-    { input: { downloadBps: null, uploadBps: null, split: { usenetPct: 80 } } },
+    { input: { downloadBps: null, uploadBps: null, split: { usenetPct: 70 } } },
+    { input: { downloadBps: null, uploadBps: null, split: null } },
+    { input: { downloadBps: null, uploadBps: null, split: { usenetPct: 70 } } },
   ]);
   if (shot("split-needs-limit")) await limits.screenshot({ path: shot("split-needs-limit") });
   assert.equal(errors.length, 0, errors.join("\n"));
