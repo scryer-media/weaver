@@ -74,40 +74,40 @@ async fn a_zstd_stream_cut_short_fails() {
     cut_short("lantern.mkv.zst", zstd(&prose())).await;
 }
 
-// A tarred stream cut short: the stream never reaches its checked end, so
-// whatever entry the tar yields before the cut, the job does not complete.
-// Whether a whole entry ahead of the cut makes it Partial (a damaged tar
-// that delivered a member) or the stream's damage fails it is open; SABnzbd
-// fails a tar it cannot read through (sabnzbd/newsunpack.py:1160-1162), so
-// the assertion is that it is never Complete.
+// A tarred stream cut short fails the job, whatever entry the tar yielded
+// before the cut: a cut cannot be told from corruption, so that entry is
+// unverified and not a usable file. SABnzbd fails it too
+// (sabnzbd/newsunpack.py:1160-1162).
 async fn tarred_cut_short(name: &str, compress: fn(&[u8]) -> Vec<u8>) {
     let mut bytes = compress(&tar(&[("lantern.mkv", prose())]));
     bytes.truncate(bytes.len() - 8);
     let graph = run(&Scenario::new(vec![Post::plain(name, bytes)])).await;
     assert!(
-        matches!(
-            graph.status,
-            Some(JobStatus::Failed { .. } | JobStatus::Partial)
-        ),
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
         "{name}: {:?} {:?} {:?}",
         graph.status,
         graph.failure,
         graph.files.keys().collect::<Vec<_>>()
     );
+    assert!(
+        !graph.files.contains_key(&delivered("lantern.mkv")),
+        "{name}: the unverified entry is not delivered, {:?}",
+        graph.files.keys().collect::<Vec<_>>()
+    );
 }
 
 #[tokio::test]
-async fn a_gzipped_tar_cut_short_never_completes() {
+async fn a_gzipped_tar_cut_short_fails() {
     tarred_cut_short("lantern.tar.gz", gzip).await;
 }
 
 #[tokio::test]
-async fn a_bzipped_tar_cut_short_never_completes() {
+async fn a_bzipped_tar_cut_short_fails() {
     tarred_cut_short("lantern.tar.bz2", bzip2).await;
 }
 
 #[tokio::test]
-async fn an_xzipped_tar_cut_short_never_completes() {
+async fn an_xzipped_tar_cut_short_fails() {
     tarred_cut_short("lantern.tar.xz", xz).await;
 }
 
