@@ -1446,6 +1446,65 @@ mod tests {
         assert_eq!(post.repaired(), post.written);
     }
 
+    // A seal that chains on from a garbled article chains on from the cipher
+    // that arrived, which is what the plaintext after it came out of: the
+    // slices either side read back as they arrived, through one frontier in
+    // order as through a fresh one each, and the good slice after the
+    // garbled one stays good and is never rewritten. A set without slice
+    // checksums sweeps the same volume whole and rebuilds it.
+    #[test]
+    fn a_good_slice_after_a_garbled_one_reads_back_as_it_arrived() {
+        use encrypted::{ARTICLE, Fault, Post, SLICE};
+        // Article 20 spans 240,000..252,000, the end of slice 14 and the
+        // start of slice 15; its garbled byte sits at 246,000, in slice 15.
+        let garbled = Fault::Garbled {
+            volume: 2,
+            article: 20,
+        };
+        let mut post = Post::new(&[garbled], 4, true);
+        let member = post.members[2];
+        let arrived = post.access.store.members[&member].clone();
+        for slice in 13..17u64 {
+            let range = ByteRange::at(slice * SLICE, SLICE);
+            let mut chained = Vec::new();
+            assert!(post.access.read(member, range, &mut chained));
+            assert_eq!(
+                chained,
+                arrived[range.start as usize..range.end as usize],
+                "{slice}"
+            );
+        }
+        let (validity, _) = verified(&mut post, usize::MAX);
+        let (_, valid) = validity.iter().find(|(of, _)| *of == member).unwrap();
+        let garbled_slice = (20 * ARTICLE + ARTICLE / 2) / SLICE;
+        for slice in 0..valid.len() as u64 {
+            assert_eq!(valid[slice as usize], slice != garbled_slice, "{slice}");
+        }
+        let (outcome, _) = post.repair(None);
+        assert!(
+            matches!(outcome, RepairOutcome::Repaired { .. }),
+            "{outcome:?}"
+        );
+        for (into, offset, bytes) in &post.access.writes {
+            if *into == member {
+                let written = offset / SLICE..(offset + bytes.len() as u64).div_ceil(SLICE);
+                assert!(
+                    written.clone().all(|slice| slice == garbled_slice),
+                    "{written:?}"
+                );
+            }
+        }
+        assert_eq!(post.repaired(), post.written);
+
+        let mut whole = Post::new(&[garbled], 40, false);
+        let (outcome, _) = whole.repair(None);
+        assert!(
+            matches!(outcome, RepairOutcome::Repaired { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(whole.repaired(), whole.written);
+    }
+
     // One flipped byte vetoes the volume's slices, so the verification
     // reads it back whole: what it proves good is the repair's input, and
     // nothing of the volume is sealed twice.
