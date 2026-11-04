@@ -17,10 +17,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::{
-    sync::mpsc::UnboundedReceiver,
-    time::{Instant, Sleep},
-};
+use tokio::time::{Instant, Sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{Level, debug, debug_span, event, trace, trace_span};
 
@@ -32,7 +29,7 @@ use crate::{
         SEQUENCE_HALF_SPACE, SYNACK_RESEND_INTERNAL, UTP_HEADER, calc_pipe_expiry,
     },
     delay::DelayTracker,
-    message::UtpMessage,
+    ingress::{Event as IngressEvent, Receiver as IngressReceiver},
     mtu::{SegmentSizes, SegmentSizesConfig, packet_mtu},
     raw::{Type, UtpHeader},
     recovery::Recovery,
@@ -191,7 +188,7 @@ struct VirtualSocket<T, Env> {
 
     // Incoming queue. The main UDP socket writes here, and we need to consume these
     // as fast as possible.
-    rx: UnboundedReceiver<UtpMessage>,
+    rx: IngressReceiver,
     user_rx: UserRx,
 
     // The user ppayload that we haven't yet segmented into uTP messages.
@@ -1002,10 +999,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn process_all_incoming_messages(
         &mut self,
         cx: &mut std::task::Context<'_>,
+        remaining: &mut usize,
     ) -> crate::Result<()> {
         let mut result = ProcessIncomingMessageResult::default();
 
-        while let Poll::Ready(msg) = self.rx.poll_recv(cx) {
+        while *remaining > 0 {
+            let Poll::Ready(msg) = self.rx.poll_recv(cx) else {
+                break;
+            };
+            *remaining -= 1;
             let msg = match msg {
                 Some(msg) => msg,
                 None => {
@@ -1100,8 +1102,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn process_incoming_message(
         &mut self,
         cx: &mut std::task::Context<'_>,
-        msg: UtpMessage,
+        event: IngressEvent,
     ) -> crate::Result<ProcessIncomingMessageResult> {
+        let payload_dropped = event.payload_dropped;
+        let msg = event.message;
         let span = trace_span!("msg",
             seq_nr=%msg.header.seq_nr,
             ack_nr=%msg.header.ack_nr,
@@ -1329,6 +1333,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 stats: &self.socket.stats,
             },
         );
+
+        if payload_dropped {
+            self.force_immediate_ack("inbox payload refused");
+            return Ok(result);
+        }
 
         let Some(receive_delta) = receive_delta else {
             return Ok(result);
@@ -1563,6 +1572,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn poll(&mut self, cx: &mut std::task::Context<'_>) -> Poll<crate::Result<()>> {
+        const INGRESS_BATCH: usize = 64;
+        let mut ingress_remaining = INGRESS_BATCH;
+
         macro_rules! bail_if_err {
             ($e:expr) => {
                 match $e {
@@ -1595,6 +1607,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         // Restart can be set by functions within.
         while self.this_poll.restart {
+            if ingress_remaining == 0 {
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
             self.this_poll.transport_pending = false;
             self.this_poll.now = self.env.now();
             self.this_poll.restart = false;
@@ -1609,7 +1625,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
 
             // Read incoming stream.
-            pending_if_cannot_send!(self.process_all_incoming_messages(cx));
+            pending_if_cannot_send!(self.process_all_incoming_messages(cx, &mut ingress_remaining));
 
             // Flow control: flush as many in-order messages to user RX as possible.
             bail_if_err!(self.user_rx.flush(cx).map(|_| ()));
@@ -1674,6 +1690,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
 
+            if ingress_remaining == 0 {
+                cx.waker().wake_by_ref();
+            }
             return Poll::Pending;
         }
 
@@ -1788,7 +1807,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
     pub fn new(
         socket: &Arc<UtpSocket<T, E>>,
         remote: SocketAddr,
-        rx: UnboundedReceiver<UtpMessage>,
+        rx: IngressReceiver,
         args: StreamArgs,
     ) -> UtpStreamStarter<T, E> {
         let StreamArgs {

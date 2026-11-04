@@ -462,6 +462,16 @@ impl UserRx {
         msg: UtpMessage,
         offset: usize,
     ) -> crate::Result<AssemblerAddRemoveResult> {
+        let remaining = self
+            .shared
+            .locked
+            .lock()
+            .queue
+            .window()
+            .saturating_sub(self.ooq.stored_bytes());
+        if msg.payload().len() > remaining {
+            return Ok(AssemblerAddRemoveResult::Unavailable(msg));
+        }
         match self.ooq.add_remove(msg, offset)? {
             res @ AssemblerAddRemoveResult::Consumed {
                 sequence_numbers, ..
@@ -808,8 +818,8 @@ mod tests {
     #[tokio::test]
     async fn test_asm_channel_full_asm_empty() {
         setup_test_logging();
-        let (mut user_rx, _read) = user_rx(1);
-        let msg = msg(0, b"a");
+        let (mut user_rx, mut read) = user_rx(1);
+        let msg = msg(0, b"b");
 
         // fill RX
         user_rx.enqueue_test(UserRxMessage::Payload(b"a".to_vec()));
@@ -818,26 +828,42 @@ mod tests {
 
         assert_eq!(
             user_rx.add_remove_test(msg.clone(), 0).await.unwrap(),
+            AssemblerAddRemoveResult::Unavailable(msg.clone())
+        );
+        assert_eq!(user_rx.ooq.stored_packets(), 0);
+        assert_eq!(user_rx.ooq.stored_bytes(), 0);
+        assert!(user_rx.selective_ack().is_none());
+        let mut bytes = [0; 1];
+        read.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"a");
+        assert_eq!(
+            user_rx.add_remove_test(msg, 0).await.unwrap(),
             AssemblerAddRemoveResult::Consumed {
                 sequence_numbers: 1,
                 bytes: 1
             }
         );
-        assert_eq!(user_rx.ooq.stored_packets(), 1);
-        assert_eq!(user_rx.ooq.stored_bytes(), 1);
-        assert_eq!(user_rx.ooq.filled_front(), 1);
+        poll_fn(|cx| {
+            assert_eq!(user_rx.flush(cx).unwrap(), 1);
+            Poll::Ready(())
+        })
+        .await;
+        read.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"b");
+        assert_eq!(user_rx.ooq.stored_bytes() + user_rx.len_test(), 0);
     }
 
     #[tokio::test]
-    async fn test_asm_channel_full_asm_not_empty() {
-        let (mut user_rx, _read) = user_rx(1);
-        let msg = msg(0, b"a");
+    async fn test_asm_combined_capacity_full_with_out_of_order_data() {
+        let (mut user_rx, mut read) = user_rx(3);
+        let out_of_order = msg(1, b"c");
+        let missing = msg(0, b"b");
 
         // fill RX
-        user_rx.enqueue_test(UserRxMessage::Payload(msg.data.clone()));
+        user_rx.enqueue_test(UserRxMessage::Payload(b"aa".to_vec()));
 
         assert_eq!(
-            user_rx.add_remove_test(msg.clone(), 1).await.unwrap(),
+            user_rx.add_remove_test(out_of_order, 1).await.unwrap(),
             AssemblerAddRemoveResult::Consumed {
                 sequence_numbers: 0,
                 bytes: 0
@@ -847,9 +873,22 @@ mod tests {
         assert_eq!(user_rx.ooq.stored_packets(), 1);
         assert_eq!(user_rx.ooq.stored_bytes(), 1);
         assert_eq!(user_rx.ooq.filled_front(), 0);
+        assert_eq!(user_rx.ooq.stored_bytes() + user_rx.len_test(), 3);
+        assert!(user_rx.selective_ack().is_some());
 
         assert_eq!(
-            user_rx.add_remove_test(msg.clone(), 0).await.unwrap(),
+            user_rx.add_remove_test(missing.clone(), 0).await.unwrap(),
+            AssemblerAddRemoveResult::Unavailable(missing.clone())
+        );
+        assert_eq!(user_rx.ooq.stored_packets(), 1);
+        assert_eq!(user_rx.ooq.filled_front(), 0);
+        assert_eq!(user_rx.ooq.stored_bytes() + user_rx.len_test(), 3);
+        let mut bytes = [0; 2];
+        read.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"aa");
+
+        assert_eq!(
+            user_rx.add_remove_test(missing, 0).await.unwrap(),
             AssemblerAddRemoveResult::Consumed {
                 sequence_numbers: 2,
                 bytes: 2
@@ -858,6 +897,15 @@ mod tests {
         assert_eq!(user_rx.ooq.stored_packets(), 2);
         assert_eq!(user_rx.ooq.stored_bytes(), 2);
         assert_eq!(user_rx.ooq.filled_front(), 2);
+        assert_eq!(user_rx.ooq.stored_bytes() + user_rx.len_test(), 2);
+        poll_fn(|cx| {
+            assert_eq!(user_rx.flush(cx).unwrap(), 2);
+            Poll::Ready(())
+        })
+        .await;
+        read.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"bc");
+        assert_eq!(user_rx.ooq.stored_bytes() + user_rx.len_test(), 0);
     }
 
     #[tokio::test]

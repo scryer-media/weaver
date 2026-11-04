@@ -351,7 +351,7 @@ pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
 
     accept_queue: AcceptQueue<T, E>,
 
-    pub(crate) streams: BTreeMap<StreamRecvKey, UnboundedSender<UtpMessage>>,
+    pub(crate) streams: BTreeMap<StreamRecvKey, crate::ingress::Sender>,
     connecting: BTreeMap<SocketAddr, ConnectingPerAddr>,
     control_rx: UnboundedReceiver<ControlRequest>,
     next_connection_id: SeqNr,
@@ -529,7 +529,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         };
 
         let now = self.env.now();
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = crate::ingress::channel(self.socket.opts.vsock_rx_bufsize);
         let args = StreamArgs::new_outgoing(&msg.header, conn.start, now)
             .with_parent_span(conn.requester.created_span.clone());
 
@@ -563,7 +563,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
 
         let args = StreamArgs::new_incoming(self.env.random_u16().into(), &syn.header)
             .with_parent_span(accept.created_span.clone());
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = crate::ingress::channel(self.socket.opts.vsock_rx_bufsize);
 
         let starter = UtpStreamStarter::new(&self.socket, syn.remote, rx, args);
 
@@ -1180,7 +1180,7 @@ mod tests {
         ];
         let mut receivers = Vec::new();
         for key in keys {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, rx) = crate::ingress::channel(dispatcher.socket.opts.vsock_rx_bufsize);
             assert!(dispatcher.streams.insert(key, tx).is_none());
             receivers.push(rx);
         }
@@ -1200,7 +1200,10 @@ mod tests {
                 .on_recv(remote, packet(id, &payload))
                 .await
                 .unwrap();
-            assert_eq!(receivers[index].try_recv().unwrap().payload(), payload);
+            assert_eq!(
+                receivers[index].try_recv().unwrap().message.payload(),
+                payload
+            );
             assert!(receivers.iter_mut().all(|rx| rx.try_recv().is_err()));
         }
 
@@ -1217,7 +1220,10 @@ mod tests {
             .on_recv(other, packet(32768, b"still routed"))
             .await
             .unwrap();
-        assert_eq!(receivers[8].try_recv().unwrap().payload(), b"still routed");
+        assert_eq!(
+            receivers[8].try_recv().unwrap().message.payload(),
+            b"still routed"
+        );
 
         dispatcher.next_connection_id = 65534.into();
         assert_eq!(dispatcher.get_next_free_conn_id(ADDR_2), 2.into());
@@ -1305,7 +1311,7 @@ mod tests {
         };
         let mut open = Vec::new();
         for id in 0..2u16 {
-            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (tx, rx) = crate::ingress::channel(socket.opts.vsock_rx_bufsize);
             dispatcher.streams.insert((ADDR_2, 1000 + id), tx);
             open.push(rx);
         }
@@ -1313,7 +1319,7 @@ mod tests {
         dispatcher.on_recv(ADDR_2, syn(1)).await.unwrap();
         assert_eq!(dispatcher.accept_queue.syns.len(), 1, "taken up");
 
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = crate::ingress::channel(socket.opts.vsock_rx_bufsize);
         dispatcher.streams.insert((ADDR_2, 2000), tx);
         open.push(rx);
         dispatcher.on_recv(ADDR_2, syn(3)).await.unwrap();

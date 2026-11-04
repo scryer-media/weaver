@@ -12,6 +12,7 @@ mod delay;
 #[cfg(test)]
 mod e2e_tests;
 mod error;
+mod ingress;
 mod message;
 pub mod mtu;
 pub mod raw;

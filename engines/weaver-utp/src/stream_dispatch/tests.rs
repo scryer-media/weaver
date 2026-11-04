@@ -11,6 +11,7 @@ mod fast_retransmit;
 mod flow_control;
 mod guards;
 mod inactivity_timeout;
+mod ingress_limits;
 mod mtu_ceiling;
 mod mtu_probing;
 mod nagle;
@@ -31,7 +32,6 @@ use std::{
 };
 
 use futures::FutureExt;
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use crate::{
     SocketOpts, UtpSocket, UtpStream,
@@ -59,7 +59,7 @@ struct TestVsock {
     _socket: Arc<UtpSocket<RememberingTransport, MockUtpEnvironment>>,
     vsock: VirtualSocket<RememberingTransport, MockUtpEnvironment>,
     stream: Option<UtpStream>,
-    tx: UnboundedSender<UtpMessage>,
+    tx: crate::ingress::Sender,
 }
 
 impl TestVsock {
@@ -106,7 +106,15 @@ impl TestVsock {
             if self.vsock.rx.is_empty() {
                 return Poll::Ready(());
             }
-            self.vsock.poll_unpin(cx).map(|r| r.unwrap())
+            if let Poll::Ready(result) = self.vsock.poll_unpin(cx) {
+                result.unwrap();
+                return Poll::Ready(());
+            }
+            if self.vsock.rx.is_empty() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
         })
         .await
     }
@@ -152,7 +160,7 @@ fn make_test_vsock_on(
     env: MockUtpEnvironment,
 ) -> TestVsock {
     let socket = UtpSocket::new_with_opts(transport.clone(), env.clone(), opts).unwrap();
-    let (tx, rx) = unbounded_channel();
+    let (tx, rx) = crate::ingress::channel(socket.opts().vsock_rx_bufsize);
 
     let UtpStreamStarter { stream, vsock, .. } = UtpStreamStarter::new(&socket, ADDR_2, rx, args);
 

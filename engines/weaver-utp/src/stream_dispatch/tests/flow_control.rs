@@ -299,7 +299,7 @@ async fn test_sends_up_to_remote_window_only_single_msg() {
             wnd_size: 4,
             ..Default::default()
         },
-        "hello",
+        "",
     );
     t.poll_once_assert_pending().await;
 
@@ -350,7 +350,7 @@ async fn test_sends_up_to_remote_window_only_multi_msg() {
             wnd_size: 5,
             ..Default::default()
         },
-        "hello",
+        "",
     );
     t.poll_once_assert_pending().await;
     assert_eq!(

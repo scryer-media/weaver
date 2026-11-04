@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use tokio::{io::AsyncWriteExt, sync::mpsc::unbounded_channel};
+use tokio::io::AsyncWriteExt;
 
 use crate::{
     Error, SocketOpts,
@@ -31,7 +31,7 @@ fn new_streams_max_ss(t: &super::TestVsock) -> u16 {
         wnd_size: 1024 * 1024,
         ..Default::default()
     };
-    let (_tx, rx) = unbounded_channel();
+    let (_tx, rx) = crate::ingress::channel(t._socket.opts().vsock_rx_bufsize);
     let args = StreamArgs::new_outgoing(&remote_ack, t.env.now(), t.env.now());
     let starter = UtpStreamStarter::new(&t._socket, ADDR_2, rx, args);
     let max_ss = starter.vsock.segment_sizes.max_ss();
