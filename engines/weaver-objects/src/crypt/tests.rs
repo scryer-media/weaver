@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use std::collections::BTreeSet;
+
 use super::*;
 use crate::testing::payload;
 
@@ -122,6 +124,79 @@ fn bytes_in_any_order_decipher_once_their_seed_is_in() {
     // What is left: the final block, which seals the padding, and each block
     // an arrival started inside.
     assert_eq!(stream.kept(), kept.len());
+}
+
+// Frames of a stream cut where article boundaries fall, off the block grid.
+fn frames(len: usize, frame: usize) -> Vec<ByteRange> {
+    (0..len)
+        .step_by(frame)
+        .map(|start| ByteRange::new(start as u64, (start + frame).min(len) as u64))
+        .collect()
+}
+
+// Frames arriving last first: each frame's blocks decipher from its own
+// first whole block in one call, and the block after it, which waited for
+// it, in one more. What waits is a frame's edge, never its body.
+#[test]
+fn frames_arriving_backwards_decipher_in_two_calls_each_and_stage_only_edges() {
+    let (plain, cipher) = posted(64 * 1024 + 5);
+    let mut stream = cbc(&plain, &cipher);
+    let mut out = Out::default();
+    for range in frames(cipher.len(), 4099).into_iter().rev() {
+        let bytes = &cipher[range.start as usize..range.end as usize];
+        let came = out.deliver(&mut stream, range.start, bytes, Provenance::Fresh);
+        assert!(
+            !came.is_empty() && came.len() <= 2,
+            "{range}: {}",
+            came.len()
+        );
+        assert!(stream.staged_runs() <= 1, "{range}");
+    }
+    assert_eq!(out.bytes, plain);
+    assert_eq!(stream.staged_runs(), 0);
+}
+
+// Kept, the staged blocks are the map of each block by its offset, as they
+// always were, whatever runs hold them, and they come back as they went.
+#[test]
+fn staged_blocks_are_kept_as_a_map_by_offset() {
+    let (plain, cipher) = posted(200);
+    let mut stream = cbc(&plain, &cipher);
+    let mut out = Out::default();
+    out.deliver(&mut stream, 5, &cipher[5..100], Provenance::Fresh);
+    out.deliver(&mut stream, 120, &cipher[120..], Provenance::Fresh);
+    let staged = &stream.chain.staged;
+    let map: BTreeMap<u64, Block> = staged.iter().map(|(at, block)| (at, *block)).collect();
+    assert_eq!(
+        map.keys().copied().collect::<Vec<_>>(),
+        vec![0, 16, 96, 112, 128]
+    );
+    let kept = rmp_serde::to_vec(staged).unwrap();
+    assert_eq!(kept, rmp_serde::to_vec(&map).unwrap());
+    let back: Staged = rmp_serde::from_slice(&kept).unwrap();
+    assert!(back.iter().eq(staged.iter()));
+}
+
+// In order, each arrival deciphers in one call, and what is kept is a seed
+// per arrival and per stride, never one per block.
+#[test]
+fn arrivals_in_order_decipher_in_one_call_each_and_keep_only_seeds() {
+    let (plain, cipher) = two_strides();
+    let mut stream = cbc(&plain, &cipher);
+    let mut out = Out::default();
+    let strides = cipher.len() / STRIDE as usize;
+    for (index, range) in frames(cipher.len(), 768_013).into_iter().enumerate() {
+        let bytes = &cipher[range.start as usize..range.end as usize];
+        let came = out.deliver(&mut stream, range.start, bytes, Provenance::Fresh);
+        assert_eq!(came.len(), 1, "{range}");
+        assert!(
+            stream.kept() <= index + strides + 2,
+            "{range}: {}",
+            stream.kept()
+        );
+        assert!(stream.staged_runs() <= 1, "{range}");
+    }
+    assert_eq!(out.bytes, plain);
 }
 
 // A span un-said from inside a block, as its owner un-says it: from the
