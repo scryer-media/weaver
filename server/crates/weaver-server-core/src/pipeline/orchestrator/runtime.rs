@@ -475,23 +475,31 @@ impl Pipeline {
         Ok(pipeline)
     }
 
-    pub(crate) async fn db_blocking<F, R>(&self, f: F) -> R
+    #[track_caller]
+    pub(crate) fn db_blocking<F, R>(&self, f: F) -> impl std::future::Future<Output = R> + use<F, R>
     where
         F: FnOnce(&crate::Database) -> R + Send + 'static,
         R: Send + 'static,
     {
+        #[cfg(test)]
+        actor_db::count(std::panic::Location::caller());
         let db = self.db.clone();
-        let started = Instant::now();
-        let result = tokio::task::spawn_blocking(move || {
-            let task_started = Instant::now();
-            let result = f(&db);
-            crate::runtime::perf_probe::record("pipeline.db_blocking.task", task_started.elapsed());
+        async move {
+            let started = Instant::now();
+            let result = tokio::task::spawn_blocking(move || {
+                let task_started = Instant::now();
+                let result = f(&db);
+                crate::runtime::perf_probe::record(
+                    "pipeline.db_blocking.task",
+                    task_started.elapsed(),
+                );
+                result
+            })
+            .await
+            .expect("db task panicked");
+            crate::runtime::perf_probe::record("pipeline.db_blocking.await", started.elapsed());
             result
-        })
-        .await
-        .expect("db task panicked");
-        crate::runtime::perf_probe::record("pipeline.db_blocking.await", started.elapsed());
-        result
+        }
     }
 
     pub(crate) fn db_fire_and_forget<F>(&self, f: F)
@@ -1900,4 +1908,30 @@ pub(crate) fn timestamp_secs() -> u64 {
 
 pub(crate) fn is_terminal_status(status: &JobStatus) -> bool {
     status.finished()
+}
+
+// Counts the database calls the actor awaits, by call site, so a test can
+// pin which turns make none.
+#[cfg(test)]
+pub(crate) mod actor_db {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    static CALLS: Mutex<BTreeMap<(&'static str, u32), u64>> = Mutex::new(BTreeMap::new());
+
+    pub(crate) fn count(caller: &'static std::panic::Location<'static>) {
+        *CALLS
+            .lock()
+            .expect("actor db counter poisoned")
+            .entry((caller.file(), caller.line()))
+            .or_default() += 1;
+    }
+
+    pub(crate) fn total() -> u64 {
+        CALLS
+            .lock()
+            .expect("actor db counter poisoned")
+            .values()
+            .sum()
+    }
 }

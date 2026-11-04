@@ -378,13 +378,9 @@ impl Pipeline {
                 || globals.paused
                 || globals.scheduled_pause
                 || globals.speed_test_paused;
-            let job_stopped = inner
-                .jobs
-                .iter()
-                .find(|row| row.id == job_id)
-                .is_none_or(|row| {
-                    row.intents.cancelled.is_some() || row.intents.paused == Some(true)
-                });
+            let job_stopped = inner.job(job_id).is_none_or(|row| {
+                row.intents.cancelled.is_some() || row.intents.paused == Some(true)
+            });
             !stopping && !job_stopped
         })
     }

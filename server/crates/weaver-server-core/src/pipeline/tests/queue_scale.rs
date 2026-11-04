@@ -839,3 +839,78 @@ async fn a_speed_test_on_a_paused_queue_publishes_its_bytes_then_parks() {
     handle.shutdown().await.unwrap();
     runner.await.unwrap();
 }
+
+// On a long queue, the turn that hears a download result and the turn that
+// refills a lane visit no queue row and ask the database nothing: neither
+// grows with the queue.
+#[tokio::test]
+async fn a_result_turn_and_a_refill_turn_walk_no_row_and_ask_no_database_on_a_long_queue() {
+    use crate::persistence::connection::actor_thread;
+    use crate::pipeline::orchestrator::actor_db;
+    const LONG: u64 = 2_500;
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    handle
+        .set_max_concurrent_nzbs(std::num::NonZeroU32::new(14).unwrap())
+        .await
+        .unwrap();
+    for id in 1..=LONG {
+        enqueue(&mut pipeline, id).await;
+    }
+    settle_window(&mut pipeline).await;
+    assert_eq!(pipeline.nzb_admitted.len(), 14);
+    let job_id = *pipeline.nzb_admitted.iter().min().unwrap();
+    activate_job(&mut pipeline, job_id).await;
+    let work = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
+    let segment_id = work.segment_id;
+    pipeline.hold_test_lane_works(vec![work], false);
+
+    let walks = row_walks();
+    let awaited = actor_db::total();
+    let called = actor_thread::total();
+    let (response_tx, _response_rx) = tokio::sync::oneshot::channel();
+    actor_thread::OnActor(Box::pin(async {
+        pipeline
+            .handle_download_done(DownloadResult {
+                lane_id: 0,
+                job_id,
+                runtime_generation: 0,
+                segment_id,
+                data: Err(DownloadError::Fetch(
+                    DownloadFailure::from_lane_acquire_failure(Some(
+                        &weaver_nntp::NntpError::ConnectionClosed,
+                    )),
+                )),
+                attempts: Vec::new(),
+                lane_observation: None,
+                source_server_idx: None,
+                origin: DownloadResultOrigin::NormalPrimary,
+                retry_count: 0,
+                exclude_servers: Vec::new(),
+                release_connection_slot: true,
+            })
+            .await;
+        pipeline.handle_download_lane_refill_request(DownloadLaneRefillRequest {
+            lane_id: 0,
+            runtime_generation: 0,
+            server_idx: 0,
+            supports_pipelining: false,
+            current_mode: DownloadLaneMode::Sequential,
+            response_tx,
+        });
+    }))
+    .await;
+    assert_eq!(row_walks(), walks);
+    assert_eq!(actor_db::total(), awaited);
+    assert_eq!(actor_thread::total(), called);
+}

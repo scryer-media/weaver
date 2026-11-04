@@ -18,7 +18,7 @@ pub(super) use control::RESTORE_BATCH;
 pub(crate) use runtime::is_terminal_status;
 pub(super) use runtime::timestamp_secs;
 #[cfg(test)]
-pub(super) use runtime::{DECODES_HEARD_RESTORING, PERIODIC_TICKS};
+pub(super) use runtime::{DECODES_HEARD_RESTORING, PERIODIC_TICKS, actor_db};
 #[cfg(test)]
 pub(super) use runtime::{compute_decode_backlog_budget_bytes, compute_write_backlog_budget_bytes};
 #[cfg(test)]
