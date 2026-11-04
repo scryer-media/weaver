@@ -6,7 +6,7 @@ mod facts;
 mod owner;
 mod recovery_contracts;
 mod settle;
-mod writer;
+pub(crate) mod writer;
 
 use std::io::Cursor;
 use std::num::NonZeroUsize;

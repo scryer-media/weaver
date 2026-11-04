@@ -5,6 +5,7 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
@@ -1708,3 +1709,225 @@ fn a_run_stopped_while_files_decode_beside_it_joins_them_and_the_next_says_all()
     let alone = on_threads(overlapping(None), 1);
     assert_eq!(arriving(overlapping(None), 4).said, alone.said);
 }
+
+// How a set's volumes come in while a run reads them.
+#[derive(Clone, Copy, Debug)]
+enum Arrival {
+    // All in before the run starts.
+    Whole,
+    // Each as the run first reads it, with as many after it as the
+    // download is ahead.
+    Ahead(u32),
+}
+
+// Volumes that come in as the run first reads them.
+struct Dripping {
+    gate: Arc<Gate>,
+    ahead: u32,
+}
+
+impl Volumes for Dripping {
+    fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>> {
+        self.gate.next(after)
+    }
+
+    fn len(&self, volume: VolumeIndex) -> Option<u64> {
+        self.gate.len(volume)
+    }
+
+    fn settled(&self, volume: VolumeIndex) -> bool {
+        self.gate.settled(volume)
+    }
+
+    fn read_at(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
+        if !self.gate.settled(volume) {
+            let last = (self.gate.volumes.len() as u32).saturating_sub(1);
+            for at in volume.0..=volume.0.saturating_add(self.ahead).min(last) {
+                self.gate.release(at);
+            }
+        }
+        self.gate.read_at(volume, offset, into)
+    }
+}
+
+fn arrived(
+    volumes: &[Vec<u8>],
+    password: Option<&str>,
+    arrival: Arrival,
+    threads: usize,
+) -> (Vec<Said>, Vec<(u32, u32)>) {
+    let volumes: Arc<dyn Volumes> = match arrival {
+        Arrival::Whole => Gate::whole(volumes.to_vec()),
+        Arrival::Ahead(ahead) => Arc::new(Dripping {
+            gate: Gate::new(volumes.to_vec(), &vec![false; volumes.len()]),
+            ahead,
+        }),
+    };
+    let mut emits = Vec::new();
+    let mut sink = |emit| {
+        emits.push(emit);
+        true
+    };
+    let lent = Arc::new(Lent::default());
+    let mut engine = RarEngine::new();
+    if let Some(password) = password {
+        engine.offer_password(password, &mut Vec::new());
+    }
+    engine.start().run(
+        volumes,
+        &mut sink,
+        weaver_graph::Budget {
+            memory_bytes: None,
+            threads,
+            pool: Some(lent as Arc<dyn weaver_graph::Pool>),
+        },
+    );
+    (said(&emits), checksums(&emits))
+}
+
+// The RAR sets of the test corpus small enough for the default suite, each
+// with its volumes in order.
+fn fixture_sets() -> Vec<(String, Vec<Vec<u8>>)> {
+    let root = format!(
+        "{}/../../server/crates/weaver-server-core/tests/fixtures",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mut sets: BTreeMap<String, Vec<(String, Vec<u8>)>> = BTreeMap::new();
+    for dir in ["extraction_profiles", "rar4", "rar5"] {
+        for entry in std::fs::read_dir(format!("{root}/{dir}")).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !name.ends_with(".rar") || std::fs::metadata(&path).unwrap().len() > 1 << 20 {
+                continue;
+            }
+            let set = match name.rsplit_once(".part") {
+                Some((set, _)) => set.to_owned(),
+                None => name.trim_end_matches(".rar").to_owned(),
+            };
+            sets.entry(format!("{dir}/{set}"))
+                .or_default()
+                .push((name, std::fs::read(&path).unwrap()));
+        }
+    }
+    sets.into_iter()
+        .map(|(set, mut volumes)| {
+            volumes.sort();
+            (set, volumes.into_iter().map(|(_, bytes)| bytes).collect())
+        })
+        .collect()
+}
+
+// The direct store's writer layouts: stored files over one volume and many,
+// enciphered files and headers, solid, and a file whose header names a
+// method its bytes were not made with.
+fn writer_sets() -> Vec<(String, Vec<Vec<u8>>)> {
+    use crate::rar_store::tests::writer::{Item, Options, Version, write};
+    let items: Vec<Item> = (0..6u64)
+        .map(|at| {
+            Item::File(
+                ["a.bin", "b.bin", "c.bin", "d.bin", "e.bin", "f.bin"][at as usize],
+                crate::testing::payload(at + 1, 700 + 2_900 * at as usize),
+            )
+        })
+        .collect();
+    let mut sets = Vec::new();
+    for version in [Version::Rar4, Version::Rar5] {
+        let shapes: [(&str, fn(&mut Options)); 8] = [
+            ("one", |_| {}),
+            ("split", |options| options.split = Some(6_000)),
+            ("encrypted", |options| options.password = Some(PASSWORD)),
+            ("split-encrypted", |options| {
+                options.split = Some(6_000);
+                options.password = Some(PASSWORD);
+            }),
+            ("split-headers", |options| {
+                options.split = Some(6_000);
+                options.password = Some(PASSWORD);
+                options.encrypt_headers = true;
+            }),
+            ("split-solid", |options| {
+                options.split = Some(6_000);
+                options.solid = true;
+            }),
+            ("split-compressed", |options| {
+                options.split = Some(6_000);
+                options.compressed = Some(3);
+            }),
+            ("split-recovery", |options| {
+                options.split = Some(6_000);
+                options.recovery = true;
+            }),
+        ];
+        for (shape, made) in shapes {
+            let mut options = Options::new(version);
+            made(&mut options);
+            sets.push((format!("{version:?}-{shape}"), write(&items, &options)));
+        }
+    }
+    sets
+}
+
+const PASSWORD: &str = "testpass123";
+
+// Every set the engine's tests read, from the corpus, the store's writer and
+// the layouts above, plus each multi-volume one with a byte of its last
+// volume posted wrong, is said alike by the walk on one thread and on many,
+// emit for emit and in order, whether its volumes are all in or come in as
+// it reads.
+#[test]
+fn the_walk_says_every_set_alike_on_one_thread_and_on_many() {
+    let mut sets = fixture_sets();
+    assert!(sets.len() >= 40, "{} sets", sets.len());
+    sets.extend(writer_sets());
+    sets.extend([
+        ("six".to_owned(), six_files(0)),
+        ("six-solid".to_owned(), six_files(rar5::SOLID)),
+        ("six-compressed".to_owned(), six_files_compressed()),
+        ("six-in-one".to_owned(), six_in_one()),
+        ("spanning".to_owned(), spanning_files()),
+        ("overlapping".to_owned(), overlapping(None)),
+        ("overlapping-first-wrong".to_owned(), overlapping(Some(0))),
+        ("overlapping-third-wrong".to_owned(), overlapping(Some(2))),
+    ]);
+    let damaged: Vec<(String, Vec<Vec<u8>>)> = sets
+        .iter()
+        .filter(|(_, volumes)| volumes.len() > 1)
+        .map(|(name, volumes)| {
+            let mut volumes = volumes.clone();
+            let last = volumes.last_mut().unwrap();
+            let middle = last.len() / 2;
+            last[middle] ^= 0x10;
+            (format!("{name}-damaged"), volumes)
+        })
+        .collect();
+    sets.extend(damaged);
+    for (name, volumes) in &sets {
+        for password in [None, Some(PASSWORD)] {
+            for arrival in [Arrival::Whole, Arrival::Ahead(0), Arrival::Ahead(2)] {
+                let alone = arrived(volumes, password, arrival, 1);
+                for threads in [2, 4] {
+                    let beside = arrived(volumes, password, arrival, threads);
+                    assert!(
+                        beside == alone,
+                        "{name} {password:?} {arrival:?} on {threads} threads: {:?} {:?} alone {:?} {:?}",
+                        brief(&beside.0),
+                        beside.1,
+                        brief(&alone.0),
+                        alone.1
+                    );
+                }
+            }
+        }
+    }
+}
+
+// What a run said, with each member's bytes as their length and checksum.
+fn brief(said: &[Said]) -> Vec<String> {
+    said.iter()
+        .map(|said| match said {
+            Said::Bytes(id, bytes) => format!("Bytes({id}, {} {:08x})", bytes.len(), crc32(bytes)),
+            other => format!("{other:?}"),
+        })
+        .collect()
+}
+
