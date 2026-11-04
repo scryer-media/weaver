@@ -70,6 +70,7 @@ mod accounting;
 mod binding_order;
 mod caps;
 mod checkpoint_cost;
+mod classic_rar_crypt;
 mod classic_sfv;
 mod classic_streams;
 mod classic_zip64;
