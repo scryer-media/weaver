@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::io;
+use std::num::NonZeroUsize;
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
@@ -1315,4 +1316,123 @@ fn a_file_that_fails_beside_others_ends_the_run_as_it_would_alone() {
         .collect();
     assert_eq!(beside.iter().collect::<Vec<_>>(), unfailed);
     assert!(!spreads.is_empty());
+}
+
+// The gate's volumes as unrar-rs reads them, each read waiting for its
+// volume's bytes as a run's does.
+struct Gated(Arc<Gate>);
+
+struct GatedReader {
+    gate: Arc<Gate>,
+    volume: VolumeIndex,
+    position: u64,
+}
+
+impl io::Read for GatedReader {
+    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+        let read = self.gate.read_at(self.volume, self.position, into)?;
+        self.position += read as u64;
+        Ok(read)
+    }
+}
+
+impl io::Seek for GatedReader {
+    fn seek(&mut self, from: io::SeekFrom) -> io::Result<u64> {
+        self.position = match from {
+            io::SeekFrom::Start(offset) => offset,
+            io::SeekFrom::Current(by) => self.position.checked_add_signed(by).unwrap(),
+            io::SeekFrom::End(by) => (self.gate.volumes[self.volume.0 as usize].len() as u64)
+                .checked_add_signed(by)
+                .unwrap(),
+        };
+        Ok(self.position)
+    }
+}
+
+impl unrar_rs::VolumeProvider for Gated {
+    fn get_volume(
+        &self,
+        index: usize,
+    ) -> Result<Box<dyn unrar_rs::ReadSeek>, unrar_rs::VolumeProviderError> {
+        Ok(Box::new(GatedReader {
+            gate: Arc::clone(&self.0),
+            volume: VolumeIndex(index as u32),
+            position: 0,
+        }))
+    }
+}
+
+// An archive made from the headers of a prefix read only as far as a
+// member's first part decodes that member whole: its continuations are
+// found as decoding reaches the volumes that hold them, though none was
+// parsed when the copy was made and none of those volumes was in yet.
+#[test]
+fn a_copy_of_the_headers_decodes_a_member_whose_continuations_it_never_parsed() {
+    let rar5_four: Vec<Vec<u8>> = (1..=4)
+        .map(|part| {
+            std::fs::read(format!(
+                "{}/../../server/crates/weaver-server-core/tests/fixtures/extraction_profiles/rar5_lz_four.part0{part}.rar",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap()
+        })
+        .collect();
+    let rar4_four: Vec<Vec<u8>> = SPLIT_LZ.iter().map(|volume| volume.to_vec()).collect();
+    for volumes in [rar4_four, rar5_four] {
+        let count = volumes.len() as u32;
+        let whole = Gate::whole(volumes.clone());
+        let mut full = unrar_rs::RarArchive::open_prefix(
+            GatedReader {
+                gate: Arc::clone(&whole),
+                volume: VolumeIndex(0),
+                position: 0,
+            },
+            None,
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        let mut expected = Vec::new();
+        full.by_index_via(0, &Gated(Arc::clone(&whole)))
+            .and_then(|entry| entry.copy_to(&mut expected))
+            .unwrap();
+        assert!(!expected.is_empty());
+
+        let mut released = vec![false; volumes.len()];
+        released[0] = true;
+        let gate = Gate::new(volumes, &released);
+        let prefix = unrar_rs::RarArchive::open_prefix(
+            GatedReader {
+                gate: Arc::clone(&gate),
+                volume: VolumeIndex(0),
+                position: 0,
+            },
+            None,
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        let first = prefix.member_info(0).unwrap();
+        assert_eq!(
+            (first.volumes.first_volume, first.volumes.last_volume),
+            (0, 0),
+            "the copy knows the member's first part only"
+        );
+        let mut copy = unrar_rs::RarArchive::from_cached_headers_with_password_and_shared_kdf_cache(
+            prefix.export_headers(),
+            None,
+            Arc::new(KdfCache::new()),
+        );
+        copy.set_verify(true);
+        let provider = Gated(Arc::clone(&gate));
+        let decoding = thread::spawn(move || {
+            let mut out = Vec::new();
+            copy.by_index_via(0, &provider)
+                .and_then(|entry| entry.copy_to(&mut out))
+                .map(|_| out)
+        });
+        for volume in 1..count {
+            gate.wait_for_reader(volume);
+            gate.release(volume);
+        }
+        assert_eq!(decoding.join().unwrap().unwrap(), expected);
+    }
 }
