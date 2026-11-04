@@ -70,6 +70,7 @@ mod accounting;
 mod binding_order;
 mod caps;
 mod checkpoint_cost;
+mod classic_zip64;
 mod dead_posts;
 mod deep;
 mod delivery;
