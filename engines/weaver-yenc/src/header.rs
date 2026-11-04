@@ -85,6 +85,7 @@ pub fn parse_ybegin_line(line: &[u8]) -> Result<YencMetadata, YencError> {
         total: tolerant_u64(fields.total).0.map(saturating_u32),
         begin: None,
         end: None,
+        end_below_begin: None,
         defects,
     })
 }
@@ -110,11 +111,16 @@ pub fn apply_ypart_line(line: &[u8], metadata: &mut YencMetadata) -> Result<(), 
         metadata.defects.invalid_ypart_begin = true;
         metadata.begin = None;
         metadata.end = None;
+        metadata.end_below_begin = None;
         return Ok(());
     };
     // Only begin determines placement. A stale end cannot invalidate useful
     // bytes, and must never enter unchecked length or allocation arithmetic.
-    let end = tolerant_u64(fields.end).0.filter(|end| *end >= begin);
+    // An end below begin is kept aside: once the body has decoded, its
+    // length says whether the pair was only written the wrong way round.
+    let written_end = tolerant_u64(fields.end).0;
+    let end = written_end.filter(|end| *end >= begin);
+    metadata.end_below_begin = written_end.filter(|end| *end < begin);
     metadata.defects.invalid_ypart_end = end.is_none();
     if !metadata.defects.missing_size
         && !metadata.defects.invalid_size
