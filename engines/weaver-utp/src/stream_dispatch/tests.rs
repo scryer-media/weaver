@@ -61,7 +61,9 @@ struct TestVsock {
 
 impl TestVsock {
     fn send_msg(&mut self, header: UtpHeader, payload: &str) {
-        self.tx.send(make_msg(header, payload)).unwrap()
+        let mut message = make_msg(header, payload);
+        message.received = self.env.now();
+        self.tx.send(message).unwrap()
     }
 
     fn send_data(&mut self, seq_nr: impl Into<SeqNr>, ack_nr: impl Into<SeqNr>, payload: &str) {

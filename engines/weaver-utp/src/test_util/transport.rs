@@ -206,7 +206,7 @@ impl RememberingTransport {
     pub fn take_sent_utpmessages(&self) -> Vec<UtpMessage> {
         let sent = self.take_sent();
         sent.into_iter()
-            .map(|(_, msg)| UtpMessage::deserialize(&msg).unwrap())
+            .map(|(_, msg)| UtpMessage::deserialize(&msg, tokio::time::Instant::now()).unwrap())
             .collect()
     }
 }

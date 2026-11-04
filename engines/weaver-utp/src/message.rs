@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
 
+use tokio::time::Instant;
 use tracing::trace;
 
 use crate::{
@@ -9,11 +10,21 @@ use crate::{
     raw::{Type, UtpHeader},
 };
 
-#[derive(Default, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct UtpMessage {
     pub header: UtpHeader,
     pub data: Payload,
+    pub(crate) received: Instant,
 }
+
+// Arrival time is local metadata, not part of the packet's identity.
+impl PartialEq for UtpMessage {
+    fn eq(&self, other: &Self) -> bool {
+        self.header == other.header && self.data == other.data
+    }
+}
+
+impl Eq for UtpMessage {}
 
 impl std::fmt::Debug for UtpMessage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -37,10 +48,11 @@ impl UtpMessage {
         UtpMessage {
             header,
             data: payload.to_owned(),
+            received: Instant::now(),
         }
     }
 
-    pub fn deserialize(buf: &[u8]) -> Option<Self> {
+    pub fn deserialize(buf: &[u8], received: Instant) -> Option<Self> {
         let (header, hsize) = UtpHeader::deserialize(buf)?;
 
         let payload_size = buf.len() - hsize;
@@ -63,6 +75,7 @@ impl UtpMessage {
         Some(Self {
             header,
             data: buf[hsize..].to_owned(),
+            received,
         })
     }
 

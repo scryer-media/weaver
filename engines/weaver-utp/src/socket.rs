@@ -30,8 +30,9 @@ use crate::{UtpStream, spawn_utils::spawn_with_cancel};
 use crate::{
     congestion::ledbat::LedbatParams,
     constants::{
-        DEFAULT_CONNECT_TIMEOUT, DEFAULT_FIN_RESENDS, DEFAULT_MIN_TIMEOUT, DEFAULT_NUM_RESENDS, DEFAULT_REMOTE_INACTIVITY_TIMEOUT,
-        DEFAULT_SYN_RESENDS, IPV4_HEADER, RX_BUF_SIZE_PER_VSOCK_DEFAULT, UDP_HEADER, UTP_HEADER,
+        DEFAULT_CONNECT_TIMEOUT, DEFAULT_FIN_RESENDS, DEFAULT_MIN_TIMEOUT, DEFAULT_NUM_RESENDS,
+        DEFAULT_REMOTE_INACTIVITY_TIMEOUT, DEFAULT_SYN_RESENDS, IPV4_HEADER,
+        RX_BUF_SIZE_PER_VSOCK_DEFAULT, UDP_HEADER, UTP_HEADER,
     },
     message::UtpMessage,
     mtu::{MtuCeiling, floor_mtu},
@@ -372,8 +373,9 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 self.on_control(control).await;
             },
             recv = self.socket.transport.recv_from(read_buf) => {
+                let received = self.env.now();
                 let (len, addr) = recv.map_err(Error::Recv)?;
-                let message = match UtpMessage::deserialize(&read_buf[..len]) {
+                let message = match UtpMessage::deserialize(&read_buf[..len], received) {
                     Some(msg) => msg,
                     None => {
                         trace!(len, ?addr, "error deserializing and validating UTP message");

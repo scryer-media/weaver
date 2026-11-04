@@ -1231,8 +1231,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.congestion_controller
             .set_remote_window(msg.header.wnd_size as usize);
         let sampled = self.delay.on_packet(
-            self.this_poll.now,
-            self.timestamp_microseconds(),
+            msg.received,
+            (msg.received - self.socket_created).as_micros() as u32,
             msg.header.timestamp_microseconds,
             msg.header.timestamp_difference_microseconds,
         );
