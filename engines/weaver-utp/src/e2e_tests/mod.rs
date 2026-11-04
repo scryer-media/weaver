@@ -24,7 +24,10 @@ use anyhow::Context as _;
 use parking_lot::Mutex;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    sync::{
+        mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+        oneshot,
+    },
     try_join,
 };
 use tracing::{Instrument, error_span};
@@ -35,6 +38,11 @@ use crate::{
 };
 
 type Datagram = (SocketAddr, Vec<u8>);
+
+struct ForcedTimeout {
+    dropped_seq_nr: Option<crate::seq_nr::SeqNr>,
+    retransmitted: oneshot::Sender<()>,
+}
 
 // One end of a two-ended in-memory link. With `drop_every` set, every
 // n-th datagram this end sends is lost, past the first few so the
@@ -49,6 +57,7 @@ pub(crate) struct LinkEnd {
     // Pure ACKs and data packets this end sent.
     pub(crate) acks: AtomicU64,
     pub(crate) data: AtomicU64,
+    forced_timeout: Mutex<Option<ForcedTimeout>>,
 }
 
 // With `one_way` set, each direction holds every datagram that long on the
@@ -70,6 +79,7 @@ pub(crate) fn link(
         lost: AtomicU64::new(0),
         acks: AtomicU64::new(0),
         data: AtomicU64::new(0),
+        forced_timeout: Mutex::new(None),
     };
     (end(a, b_tx, a_rx), end(b, a_tx, b_rx))
 }
@@ -102,6 +112,17 @@ fn delayed(one_way: Duration) -> (UnboundedSender<Datagram>, UnboundedReceiver<D
 }
 
 impl LinkEnd {
+    // Lose the next data segment until its retransmission, then reopen the link.
+    fn force_timeout(&self) -> oneshot::Receiver<()> {
+        let (retransmitted, observed) = oneshot::channel();
+        let previous = self.forced_timeout.lock().replace(ForcedTimeout {
+            dropped_seq_nr: None,
+            retransmitted,
+        });
+        assert!(previous.is_none());
+        observed
+    }
+
     fn send(&self, buf: &[u8]) -> std::io::Result<usize> {
         let n = self.sent.fetch_add(1, Ordering::Relaxed) + 1;
         match buf.first().map(|b| b >> 4) {
@@ -110,6 +131,21 @@ impl LinkEnd {
             }
             Some(t) if t == crate::raw::Type::ST_DATA as u8 => {
                 self.data.fetch_add(1, Ordering::Relaxed);
+                let mut forced = self.forced_timeout.lock();
+                if let Some(timeout) = forced.as_mut() {
+                    let (header, _) = crate::raw::UtpHeader::deserialize(buf).unwrap();
+                    match timeout.dropped_seq_nr {
+                        None => {
+                            timeout.dropped_seq_nr = Some(header.seq_nr);
+                            self.lost.fetch_add(1, Ordering::Relaxed);
+                            return Ok(buf.len());
+                        }
+                        Some(seq_nr) => {
+                            assert_eq!(header.seq_nr, seq_nr);
+                            forced.take().unwrap().retransmitted.send(()).unwrap();
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -302,45 +338,152 @@ async fn e2e_echo_loss_20_pct() {
     test_one_echo(ipv4(1), ipv4(2), 5).await;
 }
 
-// 256 MiB one way over a clean link of 10 ms each way: the pure ACKs the
-// receiver sends and the paused clock's time the transfer takes.
-#[tokio::test(start_paused = true)]
-#[ignore = "bench: moves 256 MiB"]
-async fn ack_bench() {
-    const TOTAL: usize = 256 << 20;
+#[derive(Clone, Copy)]
+enum AckBenchScenario {
+    Warm,
+    ColdStart,
+    AfterTimeout,
+}
+
+impl AckBenchScenario {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Warm => "warm",
+            Self::ColdStart => "cold_start",
+            Self::AfterTimeout => "after_timeout",
+        }
+    }
+
+    fn total(self) -> usize {
+        match self {
+            Self::Warm => 256 << 20,
+            Self::ColdStart | Self::AfterTimeout => 256 << 10,
+        }
+    }
+}
+
+struct AckBenchCounters {
+    acks: u64,
+    data: u64,
+    immediate: u64,
+    delayed: u64,
+}
+
+impl AckBenchCounters {
+    fn read(server: &LinkSocket, client: &LinkSocket) -> Self {
+        Self {
+            acks: server.transport.acks.load(Ordering::Relaxed),
+            data: client.transport.data.load(Ordering::Relaxed),
+            immediate: server.stats().immediate_acks.load(Ordering::Relaxed),
+            delayed: server.stats().delayed_acks.load(Ordering::Relaxed),
+        }
+    }
+}
+
+async fn write_bench_payload(writer: &mut (impl AsyncWrite + Unpin), mut remaining: usize) {
+    let chunk = vec![7u8; 1 << 16];
+    while remaining > 0 {
+        let n = remaining.min(chunk.len());
+        writer.write_all(&chunk[..n]).await.unwrap();
+        remaining -= n;
+    }
+}
+
+async fn measure_ack_bench(scenario: AckBenchScenario, ack_per_drain: bool) {
+    let token = tokio_util::sync::CancellationToken::new();
     let (server, client) = sockets(
         ipv4(1),
         ipv4(2),
         0,
         Duration::from_millis(10),
-        SocketOpts::default(),
+        SocketOpts {
+            ack_per_drain,
+            cancellation_token: token.clone(),
+            ..Default::default()
+        },
     );
-    let started = tokio::time::Instant::now();
+    let total = scenario.total();
+    let initial_started = Instant::now();
+    let initial_counters = AckBenchCounters::read(&server, &client);
     let serve = async {
-        let (mut r, _w) = server.accept().await.unwrap().split();
+        let (mut reader, writer) = server.accept().await.unwrap().split();
         let mut buf = vec![0u8; 1 << 16];
         let mut got = 0;
-        while got < TOTAL {
-            let n = r.read(&mut buf).await.unwrap();
+        while got < total {
+            let n = reader.read(&mut buf).await.unwrap();
             assert!(n > 0);
+            assert!(buf[..n].iter().all(|byte| *byte == 7));
             got += n;
         }
+        assert_eq!(got, total);
+        (reader, writer)
     };
     let dial = async {
-        let (_r, mut w) = client.connect(ipv4(1)).await.unwrap().split();
-        let chunk = vec![7u8; 1 << 16];
-        for _ in 0..TOTAL / chunk.len() {
-            w.write_all(&chunk).await.unwrap();
-        }
-        w.flush().await.unwrap();
+        let (reader, mut writer) = client.connect(ipv4(1)).await.unwrap().split();
+        let (started, counters, remaining) = if matches!(scenario, AckBenchScenario::AfterTimeout) {
+            let prefix = total / 2;
+            write_bench_payload(&mut writer, prefix).await;
+            writer.flush().await.unwrap();
+            assert_eq!(client.stats().rto_timeouts_count.load(Ordering::Relaxed), 0);
+
+            // No other segment is outstanding or queued: only the timer can
+            // retransmit this byte. Start measuring while its ACK is in flight.
+            let retransmitted = client.transport.force_timeout();
+            writer.write_all(&[7]).await.unwrap();
+            retransmitted.await.unwrap();
+            assert_eq!(client.stats().rto_timeouts_count.load(Ordering::Relaxed), 1);
+            assert_eq!(client.transport.lost.load(Ordering::Relaxed), 1);
+            (
+                Instant::now(),
+                AckBenchCounters::read(&server, &client),
+                total - prefix - 1,
+            )
+        } else {
+            (initial_started, initial_counters, total)
+        };
+        write_bench_payload(&mut writer, remaining).await;
+        writer.flush().await.unwrap();
+        ((reader, writer), started, counters)
     };
-    tokio::join!(serve, dial);
-    let elapsed = started.elapsed();
-    let data = client.transport.data.load(Ordering::Relaxed);
-    println!(
-        "BENCH utp acks: {} pure ACKs for {data} data packets ({} immediate, {} delayed), {elapsed:?} on the paused clock",
-        server.transport.acks.load(Ordering::Relaxed),
-        server.stats().immediate_acks.load(Ordering::Relaxed),
-        server.stats().delayed_acks.load(Ordering::Relaxed),
+    let (_server_halves, (_client_halves, started, before)) = tokio::join!(serve, dial);
+    let duration = Instant::now().duration_since(started);
+    let after = AckBenchCounters::read(&server, &client);
+    let timeouts = client.stats().rto_timeouts_count.load(Ordering::Relaxed);
+    assert_eq!(
+        timeouts,
+        u64::from(matches!(scenario, AckBenchScenario::AfterTimeout))
     );
+    let mode = if ack_per_drain { "drain" } else { "current" };
+    println!(
+        "BENCH utp {} {mode}: {} pure ACKs for {} data packets ({} immediate, {} delayed), {duration:?} on the paused clock, {timeouts} RTOs",
+        scenario.label(),
+        after.acks - before.acks,
+        after.data - before.data,
+        after.immediate - before.immediate,
+        after.delayed - before.delayed,
+    );
+    token.cancel();
+}
+
+async fn compare_ack_bench(scenario: AckBenchScenario) {
+    measure_ack_bench(scenario, false).await;
+    measure_ack_bench(scenario, true).await;
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "bench: moves 256 MiB for each ACK policy"]
+async fn ack_bench() {
+    compare_ack_bench(AckBenchScenario::Warm).await;
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "bench: moves 256 KiB for each ACK policy"]
+async fn ack_bench_cold_start() {
+    compare_ack_bench(AckBenchScenario::ColdStart).await;
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "bench: forces one data timeout for each ACK policy"]
+async fn ack_bench_after_timeout() {
+    compare_ack_bench(AckBenchScenario::AfterTimeout).await;
 }

@@ -1061,6 +1061,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             );
         }
 
+        #[cfg(test)]
+        if self.socket_opts.ack_per_drain
+            && !self.this_poll.transport_pending
+            && self.ack_to_transmit()
+        {
+            self.force_immediate_ack("receive queue drained");
+        }
+
         Ok(())
     }
 

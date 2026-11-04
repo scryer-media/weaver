@@ -123,6 +123,9 @@ pub struct SocketOpts {
     /// MTU probing can handle a bit of packet loss. If it's 0, we would mark RTO'ed probes as failed
     /// sooner and thus perf would be better.
     pub mtu_probe_max_retransmissions: Option<usize>,
+
+    #[cfg(test)]
+    pub(crate) ack_per_drain: bool,
 }
 
 impl SocketOpts {
@@ -173,6 +176,8 @@ impl SocketOpts {
                 .map(|limit| limit.get().saturating_mul(2)),
             wait_for_last_ack: !self.dont_wait_for_lastack,
             mtu_probe_max_retransmissions: self.mtu_probe_max_retransmissions.unwrap_or(1),
+            #[cfg(test)]
+            ack_per_drain: self.ack_per_drain,
         })
     }
 }
@@ -198,6 +203,9 @@ pub(crate) struct ValidatedSocketOpts {
     pub wait_for_last_ack: bool,
 
     pub mtu_probe_max_retransmissions: usize,
+
+    #[cfg(test)]
+    pub ack_per_drain: bool,
 }
 
 pub(crate) struct RequestWithSpan<V> {
