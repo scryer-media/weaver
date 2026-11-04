@@ -392,15 +392,12 @@ async fn validate_script_move_destination(
 // lane that closed before running it, fails the move before any file has
 // left the working directory, and the still-empty claim is given back.
 async fn moving_row_committed(
-    durable: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+    durable: tokio::sync::oneshot::Receiver<Result<(), String>>,
     dest: &std::path::Path,
 ) -> Result<(), MoveToCompleteFailure> {
-    let outcome = match durable {
-        Some(committed) => committed
-            .await
-            .unwrap_or_else(|_| Err("the database writer closed before it ran".into())),
-        None => Err("the write could not be queued".into()),
-    };
+    let outcome = durable
+        .await
+        .unwrap_or_else(|_| Err("the database writer closed before it ran".into()));
     if let Err(error) = outcome {
         let _ = tokio::fs::remove_dir(dest).await;
         return Err(MoveToCompleteFailure::Operational(format!(
@@ -414,6 +411,33 @@ async fn moving_row_committed(
 #[cfg(test)]
 pub(crate) static BEFORE_FIRST_MOVE: std::sync::Mutex<Option<Box<dyn FnOnce(JobId) + Send>>> =
     std::sync::Mutex::new(None);
+
+// Where a final move delivers: a directory it claimed empty, or the one
+// the moving row of a job interrupted by a restart names, which already
+// holds what moved before the restart.
+enum MoveInto {
+    Claimed(PathBuf),
+    Resumed(PathBuf),
+}
+
+// What a final move's task is given.
+struct FinalMove {
+    job_id: JobId,
+    working_dir: PathBuf,
+    staging_dir: Option<PathBuf>,
+    dest: PathBuf,
+    // Answers once the moving row has committed. A resumed move has none:
+    // its row was already moving when it was read.
+    durable: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+    script_validation: Option<(
+        crate::Database,
+        crate::post_processing::runner::JobExecutionContext,
+    )>,
+    hold: Option<&'static str>,
+    phase_counters: Arc<PhaseCounters>,
+    naming: Option<DeliveryNamingPlan>,
+    policy_source: DeliveryPolicySource,
+}
 
 async fn run_move_to_complete(
     job_id: JobId,
@@ -429,7 +453,7 @@ async fn run_move_to_complete(
         job_id,
         working_dir,
         staging_dir,
-        dest,
+        MoveInto::Claimed(dest),
         phase_counters,
         naming,
         policy_source,
@@ -448,11 +472,15 @@ async fn run_move_to_claimed_destination(
     job_id: JobId,
     working_dir: PathBuf,
     staging_dir: Option<PathBuf>,
-    dest: PathBuf,
+    dest: MoveInto,
     phase_counters: Arc<PhaseCounters>,
     naming: Option<DeliveryNamingPlan>,
     policy_source: DeliveryPolicySource,
 ) -> Result<MoveToCompleteResult, MoveToCompleteFailure> {
+    let (dest, resumed) = match dest {
+        MoveInto::Claimed(dest) => (dest, false),
+        MoveInto::Resumed(dest) => (dest, true),
+    };
     let policy = match policy_source {
         DeliveryPolicySource::Persisted(database) => {
             tokio::task::spawn_blocking(move || database.post_processing_settings())
@@ -509,9 +537,10 @@ async fn run_move_to_claimed_destination(
             dest.display()
         ))
     })?;
-    if existing_entries
-        .next_entry()
-        .await
+    if !resumed
+        && existing_entries
+            .next_entry()
+            .await
         .map_err(|error| {
             MoveToCompleteFailure::Operational(format!(
                 "could not inspect claimed complete directory {}: {error}",
@@ -1136,20 +1165,166 @@ impl Pipeline {
         // moving before the first file moves (sabnzbd/postproc.py:517);
         // NZBGet writes the post stage into its queue file
         // (daemon/queue/DiskState.cpp:552).
-        let durable =
-            self.transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"));
+        let durable = self
+            .transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"))
+            .unwrap_or_else(|| {
+                let (failed, durable) = tokio::sync::oneshot::channel();
+                let _ = failed.send(Err("the write could not be queued".into()));
+                durable
+            });
         self.inflight_moves.insert(job_id);
 
         self.emit_job_event(PipelineEvent::MoveToCompleteStarted { job_id });
         self.report_job(job_id);
 
         let naming = self.delivery_naming_plan(job_id, &job_name).await;
-        let policy_source = DeliveryPolicySource::Persisted(self.db.clone());
+        self.spawn_final_move(FinalMove {
+            job_id,
+            working_dir,
+            staging_dir,
+            dest,
+            durable: Some(durable),
+            script_validation,
+            hold,
+            phase_counters,
+            naming,
+            policy_source: DeliveryPolicySource::Persisted(self.db.clone()),
+        });
+        Ok(())
+    }
 
+    // A job restored from a moving row goes on with its move: what is still
+    // in its working directory moves into the destination the row names. A
+    // working directory that is gone with the destination in place means
+    // the move finished, and the job goes on to its terminal pass.
+    pub(crate) async fn resume_restored_move(&mut self, job_id: JobId) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let recorded = state.working_dir.clone();
+        let staging_dir = state.staging_dir.clone();
+        let job_name = state.spec.name.clone();
+        let folder_name = crate::ingest::completed_folder_name(&state.spec.name, &state.spec.metadata);
+        let category = state.spec.category.clone();
+        let root = self.intermediate_dir.clone();
+        let source = match tokio::task::spawn_blocking(move || {
+            crate::jobs::working_dir::find_job_working_dir(&root, job_id)
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|found| found)
+        {
+            Ok(source) => source,
+            Err(error) => {
+                self.fail_job(
+                    job_id,
+                    format!("could not find what is left to move after a restart: {error}"),
+                );
+                return;
+            }
+        };
+        // A row that names its working directory, not a destination, was
+        // written before the destination was recorded; the move claims one.
+        let dest = if recorded.starts_with(&self.intermediate_dir) {
+            match self
+                .claim_complete_destination(job_id, &folder_name, category.as_deref())
+                .await
+            {
+                Ok(dest) => dest,
+                Err(error) => {
+                    self.fail_job(job_id, error);
+                    return;
+                }
+            }
+        } else {
+            recorded
+        };
+        let delivered = tokio::fs::symlink_metadata(&dest)
+            .await
+            .is_ok_and(|metadata| metadata.is_dir());
+        let Some(working_dir) = source else {
+            if delivered {
+                if let Some(state) = self.jobs.get_mut(&job_id) {
+                    state.working_dir = dest;
+                    state.staging_dir = None;
+                }
+                info!(job_id = job_id.0, "final move had finished before the restart");
+                self.start_terminal_post_processing(job_id);
+            } else {
+                self.fail_job(
+                    job_id,
+                    format!(
+                        "neither the working directory nor the destination {} survived the restart",
+                        dest.display()
+                    ),
+                );
+            }
+            return;
+        };
+        if !delivered {
+            self.fail_job(
+                job_id,
+                format!(
+                    "the destination {} of an interrupted move is gone",
+                    dest.display()
+                ),
+            );
+            return;
+        }
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state.working_dir = working_dir.clone();
+        }
+        self.shared_state.queue.write(|inner| {
+            let Some(row) = inner.job_mut(job_id) else {
+                return crate::pipeline::queue::Change::unchanged(());
+            };
+            row.report.moving = true;
+            crate::pipeline::queue::Change::changed(())
+        });
+        let phase_counters = self.phase_begin(job_id, JobPhase::Moving, None);
+        self.reserved_complete_destinations
+            .insert(job_id, dest.clone());
+        self.inflight_moves.insert(job_id);
+        self.emit_job_event(PipelineEvent::MoveToCompleteStarted { job_id });
+        self.report_job(job_id);
+        info!(
+            job_id = job_id.0,
+            dest = %dest.display(),
+            "resuming final move after a restart"
+        );
+        let naming = self.delivery_naming_plan(job_id, &job_name).await;
+        self.spawn_final_move(FinalMove {
+            job_id,
+            working_dir,
+            staging_dir,
+            dest,
+            durable: None,
+            script_validation: None,
+            hold: None,
+            phase_counters,
+            naming,
+            policy_source: DeliveryPolicySource::Persisted(self.db.clone()),
+        });
+    }
+
+    fn spawn_final_move(&self, final_move: FinalMove) {
+        let FinalMove {
+            job_id,
+            working_dir,
+            staging_dir,
+            dest,
+            durable,
+            script_validation,
+            hold,
+            phase_counters,
+            naming,
+            policy_source,
+        } = final_move;
         let move_done_tx = self.move_done_tx.clone();
         debug!(
             job_id = job_id.0,
             dest = %dest.display(),
+            resumed = durable.is_none(),
             "starting final move"
         );
         tokio::spawn(async move {
@@ -1162,7 +1337,13 @@ impl Pipeline {
             }
             let move_started = Instant::now();
             let result = async {
-                moving_row_committed(durable, &dest).await?;
+                let into = match durable {
+                    Some(durable) => {
+                        moving_row_committed(durable, &dest).await?;
+                        MoveInto::Claimed(dest.clone())
+                    }
+                    None => MoveInto::Resumed(dest.clone()),
+                };
                 #[cfg(test)]
                 {
                     let hook = BEFORE_FIRST_MOVE.lock().unwrap().take();
@@ -1173,16 +1354,32 @@ impl Pipeline {
                 if let Some((db, context)) = script_validation {
                     validate_script_move_destination(db, context, &dest).await?;
                 }
-                run_move_to_complete(
-                    job_id,
-                    working_dir,
-                    staging_dir,
-                    dest.clone(),
-                    phase_counters,
-                    naming,
-                    policy_source,
-                )
-                .await
+                match into {
+                    MoveInto::Claimed(dest) => {
+                        run_move_to_complete(
+                            job_id,
+                            working_dir,
+                            staging_dir,
+                            dest,
+                            phase_counters,
+                            naming,
+                            policy_source,
+                        )
+                        .await
+                    }
+                    resumed => {
+                        run_move_to_claimed_destination(
+                            job_id,
+                            working_dir,
+                            staging_dir,
+                            resumed,
+                            phase_counters,
+                            naming,
+                            policy_source,
+                        )
+                        .await
+                    }
+                }
             }
             .await;
             match &result {
@@ -1209,7 +1406,6 @@ impl Pipeline {
                 })
                 .await;
         });
-        Ok(())
     }
 
     pub(crate) async fn handle_move_to_complete_done(&mut self, done: MoveToCompleteDone) {

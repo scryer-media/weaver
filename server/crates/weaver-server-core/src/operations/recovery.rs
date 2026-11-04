@@ -203,6 +203,18 @@ pub async fn recover_server_state(
         .filter(|recovered| recovered.output_dir.starts_with(intermediate_dir))
         .map(|recovered| recovered.output_dir.clone())
         .collect();
+    // A moving job's row names its destination; the working directory it
+    // is still moving out of is its own all the same.
+    for (job_id, _) in active_jobs
+        .iter()
+        .filter(|(_, recovered)| recovered.status == "moving")
+    {
+        if let Some(working_dir) =
+            crate::jobs::working_dir::find_job_working_dir(intermediate_dir, *job_id)?
+        {
+            referenced_intermediate_dirs.insert(working_dir);
+        }
+    }
 
     // Split recovered jobs into finished (history) vs in-progress (to restore).
     let mut initial_history = Vec::new();
