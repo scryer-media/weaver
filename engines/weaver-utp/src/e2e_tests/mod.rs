@@ -6,6 +6,8 @@
 // Two sockets joined by an in-memory link, run on tokio's paused clock: a
 // connect, an accept and a counter echoed both ways, clean and with loss.
 
+mod bottleneck;
+
 use std::{
     future::poll_fn,
     io::IoSlice,
