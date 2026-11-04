@@ -264,6 +264,7 @@ async fn final_move_applies_pending_delivery_fields_without_an_actor_turn() {
     let done = pipeline.move_done_rx.recv().await.unwrap();
     assert_eq!(done.job_id, id);
     pipeline.handle_move_to_complete_done(done).await;
+    settle_script_admissions(&mut pipeline).await;
     assert_eq!(
         tokio::fs::read(destination.join("payload.bin"))
             .await
@@ -307,6 +308,7 @@ async fn post_processing_resume_applies_pending_category_before_a_deferred_move(
     let done = pipeline.move_done_rx.recv().await.unwrap();
     assert_eq!(done.job_id, id);
     pipeline.handle_move_to_complete_done(done).await;
+    settle_script_admissions(&mut pipeline).await;
     assert_eq!(
         tokio::fs::read(destination.join("payload.bin"))
             .await
@@ -615,6 +617,7 @@ async fn restart_between_final_move_and_first_script_resumes_scripts_on_delivere
 
     install_recording_script(&mut restored, &temp).await;
     restored.restore_job(request).await.unwrap();
+    settle_script_admissions(&mut restored).await;
 
     // Nothing of completion runs again: no move is in flight and the job is
     // waiting on its scripts, pointed at the delivered output.
@@ -738,6 +741,7 @@ async fn restart_part_way_through_a_failed_jobs_scripts_resumes_them_with_its_fa
     pipeline.jobs.get_mut(&job_id).unwrap().status = JobStatus::Moving;
     pipeline.fail_job(job_id, "could not move the output".to_string());
     settle_failed_releases(&mut pipeline).await;
+    settle_script_admissions(&mut pipeline).await;
     assert_eq!(
         pipeline.jobs[&job_id].status,
         JobStatus::QueuedPostProcessing
@@ -819,6 +823,7 @@ async fn restart_part_way_through_a_failed_jobs_scripts_resumes_them_with_its_fa
 
     install_scripts(&mut restored, &temp, &list).await;
     restored.restore_job(request).await.unwrap();
+    settle_script_admissions(&mut restored).await;
     let kept = restored
         .db
         .job_post_processing_facts(job_id.0)

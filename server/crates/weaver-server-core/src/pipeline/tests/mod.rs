@@ -1823,6 +1823,7 @@ async fn settle_inflight_moves(pipeline: &mut Pipeline) {
             .await
             .expect("move channel should stay open");
         pipeline.handle_move_to_complete_done(done).await;
+        settle_script_admissions(pipeline).await;
         pipeline.pump_decode_queue();
         while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
             pipeline.check_job_completion(queued_job).await;
@@ -1832,11 +1833,31 @@ async fn settle_inflight_moves(pipeline: &mut Pipeline) {
 
     while let Ok(done) = pipeline.move_done_rx.try_recv() {
         pipeline.handle_move_to_complete_done(done).await;
+        settle_script_admissions(pipeline).await;
         pipeline.pump_decode_queue();
         while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
             pipeline.check_job_completion(queued_job).await;
             pipeline.pump_decode_queue();
         }
+    }
+    settle_script_admissions(pipeline).await;
+}
+
+// Hands the actor the script settings each terminal pass read off it. A
+// pass still waiting on them holds the job and has no cancellation handle
+// yet; one that launched its scripts has.
+pub(in crate::pipeline) async fn settle_script_admissions(pipeline: &mut Pipeline) {
+    while pipeline.inflight_terminal_post_processing.iter().any(|id| {
+        !pipeline
+            .terminal_post_processing_cancellations
+            .contains_key(id)
+    }) {
+        let event = pipeline
+            .terminal_post_processing_done_rx
+            .recv()
+            .await
+            .expect("terminal post-processing channel should stay open");
+        pipeline.handle_terminal_post_processing_event(event).await;
     }
 }
 

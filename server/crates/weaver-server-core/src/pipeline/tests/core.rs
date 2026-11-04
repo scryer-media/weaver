@@ -611,6 +611,7 @@ async fn move_to_complete_uses_unique_destination_for_duplicate_job_names() {
     let dest = done.dest.clone();
     assert!(done.result.is_ok());
     pipeline.handle_move_to_complete_done(done).await;
+    settle_script_admissions(&mut pipeline).await;
     let expected_dest = complete_dir.join(format!(
         "{}.#{}",
         crate::jobs::working_dir::sanitize_dirname(job_name),

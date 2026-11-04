@@ -80,6 +80,8 @@ impl DatabaseRuntimeWorker {
         T: Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + Send + 'static,
     {
+        #[cfg(test)]
+        blocking_call_probe::note(caller);
         match self {
             Self::Sqlite { writer, .. } => writer.block_on(caller, future),
             Self::Postgres(worker) => worker.block_on(future),
@@ -96,6 +98,8 @@ impl DatabaseRuntimeWorker {
         Build: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + 'static,
     {
+        #[cfg(test)]
+        blocking_call_probe::note(caller);
         match self {
             Self::Sqlite { writer, .. } => writer.block_on_local(caller, build),
             Self::Postgres(_) => Err(StateError::Database(
@@ -114,6 +118,8 @@ impl DatabaseRuntimeWorker {
         T: Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + Send + 'static,
     {
+        #[cfg(test)]
+        blocking_call_probe::note(caller);
         match self {
             Self::Sqlite { reads, .. } => reads.block_on(caller, future),
             Self::Postgres(worker) => worker.block_on(future),
@@ -130,6 +136,8 @@ impl DatabaseRuntimeWorker {
         Build: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + 'static,
     {
+        #[cfg(test)]
+        blocking_call_probe::note(caller);
         match self {
             Self::Sqlite { writer, .. } => writer.block_on_local(caller, build),
             Self::Postgres(worker) => worker.block_on_local(build),
@@ -2222,3 +2230,33 @@ pub(crate) static JOB_WRITE_WAITS: std::sync::atomic::AtomicU64 =
 
 #[cfg(test)]
 mod tests;
+
+// Every blocking database call made on the thread that armed it, by the
+// caller's location: a test proves an actor turn reads nothing by arming the
+// probe on the actor's thread, running the turn, and taking the list.
+#[cfg(test)]
+pub(crate) mod blocking_call_probe {
+    use std::cell::RefCell;
+    use std::panic::Location;
+
+    thread_local! {
+        static CALLS: RefCell<Option<Vec<&'static Location<'static>>>> =
+            const { RefCell::new(None) };
+    }
+
+    pub(crate) fn arm() {
+        CALLS.with(|calls| *calls.borrow_mut() = Some(Vec::new()));
+    }
+
+    pub(crate) fn take() -> Vec<&'static Location<'static>> {
+        CALLS.with(|calls| calls.borrow_mut().take().unwrap_or_default())
+    }
+
+    pub(super) fn note(caller: &'static Location<'static>) {
+        CALLS.with(|calls| {
+            if let Some(calls) = calls.borrow_mut().as_mut() {
+                calls.push(caller);
+            }
+        });
+    }
+}

@@ -407,9 +407,12 @@ async fn moving_row_committed(
     Ok(())
 }
 
+#[cfg(test)]
+pub(crate) type MoveHook = Box<dyn FnOnce(JobId) + Send>;
+
 // Runs once the moving row has committed and before any file moves.
 #[cfg(test)]
-pub(crate) static BEFORE_FIRST_MOVE: std::sync::Mutex<Option<Box<dyn FnOnce(JobId) + Send>>> =
+pub(crate) static BEFORE_FIRST_MOVE: std::sync::Mutex<Option<MoveHook>> =
     std::sync::Mutex::new(None);
 
 // Where a final move delivers: a directory it claimed empty, or the one
@@ -541,13 +544,13 @@ async fn run_move_to_claimed_destination(
         && existing_entries
             .next_entry()
             .await
-        .map_err(|error| {
-            MoveToCompleteFailure::Operational(format!(
-                "could not inspect claimed complete directory {}: {error}",
-                dest.display()
-            ))
-        })?
-        .is_some()
+            .map_err(|error| {
+                MoveToCompleteFailure::Operational(format!(
+                    "could not inspect claimed complete directory {}: {error}",
+                    dest.display()
+                ))
+            })?
+            .is_some()
     {
         return Err(MoveToCompleteFailure::Security(format!(
             "claimed complete directory was populated before publication: {}",
@@ -1204,7 +1207,8 @@ impl Pipeline {
         let recorded = state.working_dir.clone();
         let staging_dir = state.staging_dir.clone();
         let job_name = state.spec.name.clone();
-        let folder_name = crate::ingest::completed_folder_name(&state.spec.name, &state.spec.metadata);
+        let folder_name =
+            crate::ingest::completed_folder_name(&state.spec.name, &state.spec.metadata);
         let category = state.spec.category.clone();
         let root = self.intermediate_dir.clone();
         let source = match tokio::task::spawn_blocking(move || {
@@ -1248,7 +1252,10 @@ impl Pipeline {
                     state.working_dir = dest;
                     state.staging_dir = None;
                 }
-                info!(job_id = job_id.0, "final move had finished before the restart");
+                info!(
+                    job_id = job_id.0,
+                    "final move had finished before the restart"
+                );
                 self.start_terminal_post_processing(job_id);
             } else {
                 self.fail_job(
@@ -1478,6 +1485,10 @@ impl Pipeline {
 
     // Resolve and run the job's script list, telling the scripts `facts`
     // about how the download ended.
+    //
+    // The script settings are read off the actor and the answer comes back
+    // as an event: the job is held by its terminal pass from here, so the
+    // queue window, slot admission and a rename all leave it alone meanwhile.
     fn start_terminal_post_processing_with_facts(
         &mut self,
         job_id: JobId,
@@ -1487,19 +1498,69 @@ impl Pipeline {
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
+        if !self.inflight_terminal_post_processing.insert(job_id) {
+            return;
+        }
         let category = state.spec.category.clone();
-        let admission = match self
-            .terminal_post_processing_executor
-            .admit_job_scripts(category.as_deref())
-        {
+        let executor = self.terminal_post_processing_executor.clone();
+        let db = self.db.clone();
+        let done_tx = self.terminal_post_processing_done_tx.clone();
+        tokio::spawn(async move {
+            let read = tokio::task::spawn_blocking(move || {
+                let admission = executor.admit_job_scripts(category.as_deref());
+                let queue_events_may_hold = match &admission {
+                    Ok(Some(admission)) => {
+                        !admission.has_enabled_entries() && queue_events_may_hold_job(&db, job_id)
+                    }
+                    _ => false,
+                };
+                (admission, queue_events_may_hold)
+            })
+            .await;
+            let (admission, queue_events_may_hold) = read.unwrap_or_else(|error| {
+                (
+                    Err(crate::StateError::Database(format!(
+                        "the script settings read did not finish: {error}"
+                    ))),
+                    false,
+                )
+            });
+            let _ = done_tx
+                .send(TerminalPostProcessingEvent::ScriptsAdmitted(
+                    TerminalScriptsAdmitted {
+                        job_id,
+                        facts,
+                        primary_failure,
+                        admission,
+                        queue_events_may_hold,
+                    },
+                ))
+                .await;
+        });
+    }
+
+    // Run the scripts the settings admitted, or finish the job when none
+    // can be involved.
+    pub(in crate::pipeline) fn handle_terminal_scripts_admitted(
+        &mut self,
+        admitted: TerminalScriptsAdmitted,
+    ) {
+        let TerminalScriptsAdmitted {
+            job_id,
+            facts,
+            primary_failure,
+            admission,
+            queue_events_may_hold,
+        } = admitted;
+        self.inflight_terminal_post_processing.remove(&job_id);
+        // A cancellation archived the job while its settings were read.
+        if !self.jobs.contains_key(&job_id) {
+            return;
+        }
+        let admission = match admission {
             Ok(Some(admission)) => admission,
             Ok(None) => {
-                match primary_failure {
-                    Some(failure) => {
-                        self.finalize_failed_job_after_terminal_post_processing(job_id, failure);
-                    }
-                    None => self.complete_job_after_terminal_post_processing(job_id),
-                }
+                self.finish_without_terminal_scripts(job_id, primary_failure);
                 return;
             }
             Err(error) => {
@@ -1508,12 +1569,7 @@ impl Pipeline {
                     error = %error,
                     "could not admit post-processing scripts; skipping scripts"
                 );
-                match primary_failure {
-                    Some(failure) => {
-                        self.finalize_failed_job_after_terminal_post_processing(job_id, failure);
-                    }
-                    None => self.complete_job_after_terminal_post_processing(job_id),
-                }
+                self.finish_without_terminal_scripts(job_id, primary_failure);
                 return;
             }
         };
@@ -1521,18 +1577,11 @@ impl Pipeline {
         // events of its own queued or running; the terminal pass waits for
         // those before the job leaves the queue, so it is skipped only when
         // no queue script can be involved.
-        if !admission.has_enabled_entries() && !self.queue_events_may_hold_job(job_id) {
-            match primary_failure {
-                Some(failure) => {
-                    self.finalize_failed_job_after_terminal_post_processing(job_id, failure);
-                }
-                None => self.complete_job_after_terminal_post_processing(job_id),
-            }
+        if !admission.has_enabled_entries() && !queue_events_may_hold {
+            self.finish_without_terminal_scripts(job_id, primary_failure);
             return;
         }
-        if !self.inflight_terminal_post_processing.insert(job_id) {
-            return;
-        }
+        self.inflight_terminal_post_processing.insert(job_id);
         // Low-frequency: at most one terminal post-processing pass per job.
         self.note_stage_started(
             job_id,
@@ -1541,15 +1590,13 @@ impl Pipeline {
         self.launch_terminal_post_processing_run(job_id, admission, facts, primary_failure, None);
     }
 
-    // Whether a queue script could have an event of this job queued or
-    // running. The hint is worked out afresh when a settings or instance save
-    // dropped it, so an unknown hint never sends a job without queue scripts
-    // through the terminal pass.
-    fn queue_events_may_hold_job(&self, job_id: JobId) -> bool {
-        if let Err(error) = crate::post_processing::events::refresh_admission_hint(&self.db) {
-            warn!(job_id = job_id.0, %error, "could not read the queue script settings");
+    fn finish_without_terminal_scripts(&mut self, job_id: JobId, primary_failure: Option<String>) {
+        match primary_failure {
+            Some(failure) => {
+                self.finalize_failed_job_after_terminal_post_processing(job_id, failure);
+            }
+            None => self.complete_job_after_terminal_post_processing(job_id),
         }
-        self.db.queue_barrier_possible(job_id.0)
     }
 
     // What the scripts of a pass beginning now are told about how the job's
@@ -2084,6 +2131,17 @@ impl Pipeline {
         self.record_job_history(job_id, Some(PipelineEvent::JobCompleted { job_id }));
         self.report_job(job_id);
     }
+}
+
+// Whether a queue script could have an event of this job queued or running.
+// The hint is worked out afresh when a settings or instance save dropped it,
+// so an unknown hint never sends a job without queue scripts through the
+// terminal pass.
+fn queue_events_may_hold_job(db: &crate::Database, job_id: JobId) -> bool {
+    if let Err(error) = crate::post_processing::events::refresh_admission_hint(db) {
+        warn!(job_id = job_id.0, %error, "could not read the queue script settings");
+    }
+    db.queue_barrier_possible(job_id.0)
 }
 
 #[cfg(test)]

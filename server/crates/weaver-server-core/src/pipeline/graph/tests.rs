@@ -1112,6 +1112,7 @@ async fn a_delivery_with_a_damaged_member_settles_to_partial() {
     assert!(pipeline.inflight_moves.contains(&job_id));
     let done = pipeline.move_done_rx.recv().await.unwrap();
     pipeline.handle_move_to_complete_done(done).await;
+    crate::pipeline::tests::settle_script_admissions(&mut pipeline).await;
     while !matches!(
         events.recv().await.expect("pipeline event channel closed"),
         PipelineEvent::JobCompleted { job_id: completed } if completed == job_id

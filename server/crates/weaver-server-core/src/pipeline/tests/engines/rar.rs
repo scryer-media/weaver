@@ -366,6 +366,7 @@ fn a_graph_job_held_after_its_repair_holds_no_other_job() {
         let done = pipeline.move_done_rx.recv().await.expect("a move reports");
         assert_eq!(done.job_id, OTHER, "the held job's move is still held");
         pipeline.handle_move_to_complete_done(done).await;
+        crate::pipeline::tests::settle_script_admissions(&mut pipeline).await;
         assert_eq!(
             job_status_for_assert(&pipeline, OTHER),
             Some(JobStatus::Complete)

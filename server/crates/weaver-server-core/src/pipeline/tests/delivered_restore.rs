@@ -3,7 +3,6 @@
 
 use super::*;
 
-
 // The moving row, naming the destination, commits before the first file
 // leaves the working directory: a restart at any point of the move finds the
 // delivery instead of a job still downloading.
@@ -39,6 +38,7 @@ async fn moving_row_commits_before_the_first_file_moves() {
     assert_eq!(output_dir, destination);
     assert!(payload_unmoved);
     pipeline.handle_move_to_complete_done(done).await;
+    settle_script_admissions(&mut pipeline).await;
     assert_eq!(
         tokio::fs::read(destination.join("payload.bin"))
             .await
@@ -119,10 +119,12 @@ async fn restart_and_restore(
     // Every article is in hand: nothing is queued to fetch and no graph
     // is restored from a checkpoint. A job with nothing left to move may
     // already have finished.
-    assert!(restored.jobs.get(&job_id).is_none_or(|state| matches!(
-        state.articles,
-        crate::jobs::model::JobArticles::Queued(_)
-    )));
+    assert!(
+        restored.jobs.get(&job_id).is_none_or(|state| matches!(
+            state.articles,
+            crate::jobs::model::JobArticles::Queued(_)
+        ))
+    );
     assert!(!restored.graph_jobs.contains_key(&job_id));
     restored
 }
@@ -215,4 +217,52 @@ async fn restart_mid_move_finishes_into_the_same_destination() {
             .unwrap(),
         b"sidecar"
     );
+}
+
+// The turn that hears a final move finish reads nothing from the database,
+// however long the queue: the script settings that decide the terminal pass
+// are read off the actor and come back as an event.
+#[tokio::test]
+async fn move_done_turn_reads_no_database_with_a_long_queue() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, complete_dir) = new_direct_pipeline(&temp).await;
+    for id in 1..=2_000u64 {
+        let spec = segmented_job_spec(&format!("Queued NZB {id}"), "payload.bin", &[512; 4]);
+        let nzb_zstd = nzb_zstd_for(&spec);
+        pipeline
+            .add_job(
+                JobId(id),
+                spec,
+                PathBuf::from(format!("queued-{id}.nzb")),
+                nzb_zstd,
+                crate::jobs::AddJobOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+    let job_id = JobId(10304);
+    let (_, done) = move_without_hearing_it(&mut pipeline, job_id, "long queue", b"payload").await;
+    assert!(done.result.is_ok());
+    assert_eq!(
+        pipeline.shared_state.queue.read(|inner| inner.jobs.len()),
+        2_001
+    );
+
+    crate::persistence::connection::blocking_call_probe::arm();
+    pipeline.handle_move_to_complete_done(done).await;
+    let calls = crate::persistence::connection::blocking_call_probe::take();
+    assert!(
+        calls.is_empty(),
+        "the move-done turn read the database at {calls:?}"
+    );
+
+    settle_script_admissions(&mut pipeline).await;
+    let finished = pipeline
+        .finished_jobs()
+        .await
+        .into_iter()
+        .find(|job| job.job_id == job_id)
+        .expect("the job finishes");
+    assert_eq!(finished.status, JobStatus::Complete);
+    assert!(complete_dir.join("long queue").join("payload.bin").exists());
 }
