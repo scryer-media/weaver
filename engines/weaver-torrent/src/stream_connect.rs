@@ -384,7 +384,7 @@ impl StreamConnector {
         tokio::pin!(utp_connect);
 
         let mut tcp_err: Option<Option<librqbit_dualstack_sockets::Error>> = None;
-        let mut utp_err: Option<Option<librqbit_utp::Error>> = None;
+        let mut utp_err: Option<Option<weaver_utp::Error>> = None;
 
         // wait until all fail, or one succeeds.
         loop {
@@ -435,10 +435,20 @@ impl StreamConnector {
 mod tests {
     use std::net::Ipv4Addr;
 
-    use librqbit_utp::UtpSocketUdp;
-
     use super::*;
     use crate::peer_info_reader::tests::Dialed;
+
+    async fn loopback_utp() -> UtpSocket {
+        crate::listen::bind_utp(
+            crate::test_support::socket_factory().as_ref(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Default::default(),
+            crate::udp_options::STREAM_WINDOW,
+            None,
+        )
+        .await
+        .unwrap()
+    }
 
     /// A connector that may use TCP, and uTP when `utp` holds.
     async fn connector(utp: bool) -> StreamConnector {
@@ -450,6 +460,7 @@ mod tests {
                     (Ipv4Addr::LOCALHOST, 0).into(),
                     Default::default(),
                     crate::udp_options::STREAM_WINDOW,
+                    None,
                 )
                 .await
                 .unwrap(),
@@ -477,9 +488,7 @@ mod tests {
     #[tokio::test]
     async fn a_utp_only_connection_dials_utp_and_never_tcp() {
         let connector = connector(true).await;
-        let theirs = UtpSocketUdp::new_udp((Ipv4Addr::LOCALHOST, 0).into())
-            .await
-            .unwrap();
+        let theirs = loopback_utp().await;
         let (accepted, connected) = tokio::join!(
             theirs.accept(),
             connector.connect(theirs.bind_addr(), Transports::Utp)

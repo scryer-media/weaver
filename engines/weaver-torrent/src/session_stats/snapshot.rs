@@ -6,6 +6,7 @@
 // Weaver authors from 2026-10-20 onward.
 
 use serde::Serialize;
+pub use weaver_utp::UtpStatsSnapshot;
 
 use crate::{
     session_stats::SessionCountersSnapshot,
@@ -23,6 +24,8 @@ pub struct SessionStatsSnapshot {
     pub peers: AggregatePeerStats,
     pub uptime_seconds: u64,
     pub connections: ConnectStatsSnapshot,
+    #[serde(with = "SerializedUtpStatsSnapshot")]
+    pub utp: UtpStatsSnapshot,
 }
 
 impl From<(&SessionStats, ConnectStatsSnapshot)> for SessionStatsSnapshot {
@@ -34,6 +37,21 @@ impl From<(&SessionStats, ConnectStatsSnapshot)> for SessionStatsSnapshot {
             peers: s.peers.snapshot(),
             uptime_seconds: s.startup_time.elapsed().as_secs(),
             connections: c,
+            utp: Default::default(),
         }
     }
+}
+
+#[derive(Serialize)]
+#[serde(remote = "weaver_utp::UtpStatsSnapshot")]
+struct SerializedUtpStatsSnapshot {
+    delay_samples_above_target: u64,
+    delay_samples_below_target: u64,
+    packets_lost: u64,
+    timeouts: u64,
+    invalid_packets: u64,
+    redundant_packets: u64,
+    syn_flood_dropped: u64,
+    syn_rst: u64,
+    max_congestion_window_bytes: u64,
 }

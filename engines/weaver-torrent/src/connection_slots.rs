@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 //! The session's connection budget: how many peer connections may be open at
 //! once, and how many outgoing connects may begin each second. The listener
@@ -17,12 +18,13 @@
 use std::{
     num::NonZeroU32,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicU32, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
+use crate::network::{UtpSocket, UtpSocketInner};
 use parking_lot::Mutex as SyncMutex;
 
 use tokio::{
@@ -63,6 +65,7 @@ pub(crate) struct ConnectionSlots {
 struct Cap {
     limit: usize,
     owed: usize,
+    utp_sockets: Vec<Weak<UtpSocketInner>>,
 }
 
 // The one-second window connects are counted in, and how many it has left,
@@ -121,7 +124,11 @@ impl ConnectionSlots {
     pub(crate) fn new(limit: usize, slack: usize, speed: NonZeroU32) -> Self {
         let limit = limit.min(Semaphore::MAX_PERMITS);
         Self {
-            cap: Arc::new(SyncMutex::new(Cap { limit, owed: 0 })),
+            cap: Arc::new(SyncMutex::new(Cap {
+                limit,
+                owed: 0,
+                utp_sockets: Vec::new(),
+            })),
             open: Arc::new(Semaphore::new(limit)),
             slack: Arc::new(Semaphore::new(slack.min(Semaphore::MAX_PERMITS))),
             connects: Mutex::new(ConnectWindow {
@@ -150,6 +157,22 @@ impl ConnectionSlots {
             cap.owed += fewer - self.open.forget_permits(fewer);
         }
         cap.limit = limit;
+        cap.utp_sockets.retain(|socket| {
+            let Some(socket) = socket.upgrade() else {
+                return false;
+            };
+            socket.set_connections_limit(limit);
+            true
+        });
+    }
+
+    // Registration and updates share the cap lock so a new listener cannot
+    // miss a limit change while its session is being created.
+    pub(crate) fn register_utp(&self, socket: &UtpSocket) {
+        let mut cap = self.cap.lock();
+        socket.0.set_connections_limit(cap.limit);
+        cap.utp_sockets.retain(|socket| socket.strong_count() > 0);
+        cap.utp_sockets.push(Arc::downgrade(&socket.0));
     }
 
     /// Begin at most `speed` outgoing connects each second from the next
@@ -259,6 +282,8 @@ impl ConnectionSlots {
 
 #[cfg(test)]
 mod tests {
+    mod startup;
+
     use std::{num::NonZeroU32, sync::Arc};
 
     use futures::poll;

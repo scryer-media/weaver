@@ -408,6 +408,15 @@ impl DatagramSocket for Carried {
         })
     }
 
+    // The tunnel's MTU: a larger packet is lost inside it.
+    fn link_mtu(&self) -> Option<u16> {
+        self.socket.link_mtu()
+    }
+
+    fn dont_fragment(&self) -> bool {
+        true
+    }
+
     // Only uTP polls a send, and a ladder leg runs no uTP.
     fn poll_send_to(
         &self,
@@ -1070,7 +1079,7 @@ mod tests {
             self.0.local_addr().ok()
         }
         fn link_mtu(&self) -> Option<u16> {
-            None
+            Some(1280)
         }
         fn is_closed(&self) -> bool {
             false
@@ -1132,6 +1141,16 @@ mod tests {
         Arc::new(Carrying(Arc::default()))
     }
 
+    #[tokio::test]
+    async fn a_tunnel_datagram_socket_reports_that_packets_cannot_fragment() {
+        let sockets = LegSockets::new(carrying(), &LegKind::Ladder);
+        let udp = sockets
+            .bind_udp(SocketAddr::from(([0, 0, 0, 0], 0)))
+            .await
+            .unwrap();
+        assert!(udp.dont_fragment());
+    }
+
     // A ladder leg whose tunnel carries datagrams: the session's UDP binds
     // inside the tunnel, and its names resolve there.
     #[tokio::test]
@@ -1142,6 +1161,8 @@ mod tests {
         let udp = sockets.bind_udp(asked).await.unwrap();
         assert_eq!(*tunnel.bound.lock().unwrap(), [asked]);
         assert_eq!(udp.bind_addr().ip(), IpAddr::from([127, 0, 0, 1]));
+        assert_eq!(udp.link_mtu(), Some(1280), "the tunnel's MTU");
+        assert!(udp.dont_fragment());
 
         let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let sent = udp

@@ -1711,18 +1711,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dontfrag"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c117949f5a8b25ba471b4dfea927a07a2f8730c585532a2eb4294e18f5155397"
-dependencies = [
- "cfg-if",
- "libc",
- "tokio",
- "windows-sys 0.52.0",
-]
-
-[[package]]
 name = "dotenvy"
 version = "0.15.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3004,28 +2992,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "librqbit-utp"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f3bfdc73944bc76cab24d5690a98816770040a654c449edf5ff2b9ba22626aa"
-dependencies = [
- "bitvec",
- "dontfrag",
- "lazy_static",
- "libc",
- "librqbit-dualstack-sockets",
- "parking_lot",
- "rand 0.9.5",
- "ringbuf",
- "rustc-hash",
- "socket2",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
 name = "libsqlite3-sys"
 version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3857,15 +3823,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
-name = "portable-atomic-util"
-version = "0.2.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "10ab3eb7f3becc3a1cbc4f2c6f20267996cfc1a6467a873763411b136a122715"
-dependencies = [
- "portable-atomic",
-]
-
-[[package]]
 name = "potential_utf"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4264,17 +4221,6 @@ dependencies = [
  "libc",
  "untrusted 0.9.0",
  "windows-sys 0.52.0",
-]
-
-[[package]]
-name = "ringbuf"
-version = "0.4.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe47b720588c8702e34b5979cb3271a8b1842c7cb6f57408efa70c779363488c"
-dependencies = [
- "crossbeam-utils",
- "portable-atomic",
- "portable-atomic-util",
 ]
 
 [[package]]
@@ -6544,7 +6490,6 @@ dependencies = [
  "httparse",
  "indexmap",
  "librqbit-dualstack-sockets",
- "librqbit-utp",
  "memchr",
  "memmap2",
  "mime_guess",
@@ -6576,6 +6521,7 @@ dependencies = [
  "walkdir",
  "weaver-model",
  "weaver-tunnel",
+ "weaver-utp",
  "windows",
  "x509-parser",
 ]
@@ -6602,6 +6548,23 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "weaver-utp"
+version = "0.16.5"
+dependencies = [
+ "anyhow",
+ "bitvec",
+ "futures",
+ "libc",
+ "parking_lot",
+ "rand 0.10.3",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

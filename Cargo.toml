@@ -12,6 +12,7 @@ members = [
     "engines/weaver-graph",
     "engines/weaver-objects",
     "engines/weaver-torrent",
+    "engines/weaver-utp",
 ]
 exclude = ["fuzz"]
 resolver = "2"
@@ -59,6 +60,7 @@ crossbeam-queue = { version = "0.3", default-features = false, features = ["std"
 bitvec = { version = "1.1", default-features = false, features = ["std"] }
 # The torrent session.
 weaver-torrent = { path = "engines/weaver-torrent" }
+weaver-utp = { path = "engines/weaver-utp" }
 anyhow = "1"
 arc-swap = "1.9"
 arrayvec = "0.7"
@@ -79,7 +81,6 @@ governor = "0.10"
 httparse = "1"
 indexmap = "2"
 librqbit-dualstack-sockets = "0.7"
-librqbit-utp = "0.7"
 network-interface = "2"
 nix = "0.31"
 parking_lot = "0.12"

@@ -66,13 +66,13 @@ impl AsyncReadVectored for tokio::net::tcp::OwnedReadHalf {
     }
 }
 
-impl AsyncReadVectored for librqbit_utp::UtpStreamReadHalf {
+impl AsyncReadVectored for weaver_utp::UtpStreamReadHalf {
     fn poll_read_vectored(
         self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         vec: &mut [IoSliceMut<'_>],
     ) -> Poll<std::io::Result<usize>> {
-        librqbit_utp::UtpStreamReadHalf::poll_read_vectored(self, cx, vec)
+        weaver_utp::UtpStreamReadHalf::poll_read_vectored(self, cx, vec)
     }
 }
 

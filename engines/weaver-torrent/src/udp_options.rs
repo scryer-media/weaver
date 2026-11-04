@@ -98,7 +98,6 @@ pub(crate) fn set_dont_fragment(socket: &tokio::net::UdpSocket, family: Family) 
 }
 
 /// Whether `socket`'s datagrams of `family` are never fragmented.
-#[cfg(test)]
 pub(crate) fn dont_fragment(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
     sys::get(socket, family)
 }
@@ -132,7 +131,6 @@ mod sys {
         super::unix::set_int(socket.as_raw_fd(), level, name, value)
     }
 
-    #[cfg(test)]
     pub(super) fn get(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
         let (level, name, value) = option(family);
         Ok(super::unix::get_int(socket.as_raw_fd(), level, name)? == value)
@@ -160,7 +158,6 @@ mod sys {
         super::unix::set_int(socket.as_raw_fd(), level, name, 1)
     }
 
-    #[cfg(test)]
     pub(super) fn get(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
         let (level, name) = option(family);
         Ok(super::unix::get_int(socket.as_raw_fd(), level, name)? != 0)
@@ -206,7 +203,6 @@ mod sys {
         if done == 0 { Ok(()) } else { Err(last_error()) }
     }
 
-    #[cfg(test)]
     pub(super) fn get(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
         let (level, name) = option(family);
         let mut value = [0u8; 4];
@@ -249,7 +245,6 @@ mod sys {
         ))
     }
 
-    #[cfg(test)]
     pub(super) fn get(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
         set(socket, family).map(|()| false)
     }
@@ -288,7 +283,6 @@ mod unix {
         libc::socklen_t::try_from(mem::size_of::<libc::c_int>()).map_err(io::Error::other)
     }
 
-    #[cfg(test)]
     pub(super) fn get_int(
         fd: RawFd,
         level: libc::c_int,
@@ -324,6 +318,35 @@ mod tests {
             Family::V6 => socket2::Domain::IPV6,
         };
         socket2::Socket::new(domain, socket2::Type::DGRAM, None).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_factory_reports_whether_its_datagrams_may_fragment() {
+        use crate::network::SocketFactory;
+
+        let factory = crate::test_support::sockets();
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let utp = factory.bind_utp(addr, super::STREAM_WINDOW).await.unwrap();
+        assert!(utp.dont_fragment());
+        let udp = factory.bind_udp(addr).await.unwrap();
+        assert!(!udp.dont_fragment());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dualstack_socket_requires_df_confirmation_for_both_families() {
+        let socket = crate::test_support::sockets()
+            .bind_kernel_utp((Ipv6Addr::UNSPECIFIED, 0).into(), super::STREAM_WINDOW)
+            .unwrap();
+        assert!(!socket2::SockRef::from(socket.socket()).only_v6().unwrap());
+        assert!(dont_fragment(socket.socket(), Family::V6).unwrap());
+        // An unavailable IPv4 option leaves that family's behavior unconfirmed.
+        assert!(!matches!(
+            dont_fragment(socket.socket(), Family::V4),
+            Ok(true)
+        ));
+        assert!(!socket.dont_fragment());
     }
 
     #[tokio::test]

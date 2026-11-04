@@ -1,0 +1,133 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+// Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
+// Modified by the Weaver authors, 2026-11-03.
+
+use std::time::Duration;
+
+use crate::raw::{Type::*, UtpHeader};
+use tokio::io::AsyncWriteExt;
+
+use crate::{
+    SocketOpts,
+    stream_dispatch::tests::{calc_mtu_for_mss, make_test_vsock},
+    test_util::setup_test_logging,
+};
+
+#[tokio::test]
+async fn test_rtte_set_and_updated() {
+    setup_test_logging();
+    let mut t = make_test_vsock(
+        SocketOpts {
+            link_mtu: Some(calc_mtu_for_mss(1)),
+            ..Default::default()
+        },
+        false,
+    );
+
+    // This gets set by test framework.
+    assert_eq!(t.vsock.rtte.roundtrip_time(), Duration::from_secs(1));
+
+    // Allow sending by setting window size
+    t.send_msg(
+        UtpHeader {
+            htype: State,
+            seq_nr: 1.into(),
+            ack_nr: 100.into(),
+            wnd_size: 1024,
+            ..Default::default()
+        },
+        "",
+    );
+
+    let (_r, mut w) = t.stream.take().unwrap().split();
+    w.write_all(b"abcde").await.unwrap();
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![
+            cmphead!(Data, seq_nr = 101, payload = "a"),
+            cmphead!(Data, seq_nr = 102, payload = "b"),
+            cmphead!(Data, seq_nr = 103, payload = "c"),
+            cmphead!(Data, seq_nr = 104, payload = "d"),
+            cmphead!(Data, seq_nr = 105, payload = "e"),
+        ]
+    );
+
+    // ACK first packet.
+    t.env.increment_now(Duration::from_secs(1));
+    t.send_msg(
+        UtpHeader {
+            htype: State,
+            seq_nr: 1.into(),
+            ack_nr: 101.into(),
+            // No need to send anything so set rwnd to 0.
+            wnd_size: 0,
+            ..Default::default()
+        },
+        "",
+    );
+
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
+
+    // No RTT variation, keep the same.
+    assert_eq!(t.vsock.rtte.roundtrip_time(), Duration::from_secs(1));
+
+    // ACK second packet, but increase RTT.
+    t.env.increment_now(Duration::from_secs(2));
+    t.send_msg(
+        UtpHeader {
+            htype: State,
+            seq_nr: 1.into(),
+            ack_nr: 102.into(),
+            // No need to send anything so set rwnd to 0.
+            wnd_size: 0,
+            ..Default::default()
+        },
+        "",
+    );
+
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
+
+    // RTT should increase, but be lower than the new value.
+    assert!(
+        t.vsock.rtte.roundtrip_time() > Duration::from_secs(1)
+            && t.vsock.rtte.roundtrip_time() < Duration::from_secs(2)
+    );
+}
+
+#[tokio::test]
+async fn confirmation_without_an_rtt_sample_uses_the_configured_floor() {
+    let floor = Duration::from_millis(800);
+    let mut t = make_test_vsock(
+        SocketOpts {
+            min_timeout: Some(floor),
+            ..Default::default()
+        },
+        true,
+    );
+    assert!(!t.vsock.confirmed);
+    assert_eq!(
+        t.vsock.rtte.retransmission_timeout(),
+        Duration::from_secs(3)
+    );
+    t.poll_once_assert_pending().await;
+    t.take_sent();
+    let initial_rtt = t.vsock.rtte.roundtrip_time();
+    t.send_msg(
+        UtpHeader {
+            htype: State,
+            seq_nr: 1.into(),
+            ack_nr: 100.into(),
+            wnd_size: 1024 * 1024,
+            ..Default::default()
+        },
+        "",
+    );
+    t.poll_once_assert_pending().await;
+    assert!(t.vsock.confirmed);
+    assert_eq!(t.vsock.rtte.roundtrip_time(), initial_rtt);
+    assert_eq!(t.vsock.rtte.retransmission_timeout(), floor);
+}

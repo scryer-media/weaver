@@ -603,6 +603,18 @@ metric_families! {
     TORRENT_SESSION_BLOCKED = ("weaver_torrent_session_blocked_connections_total", Counter,
         ["route", "direction"],
         "Peer connections the session's address filter refused since it opened, by direction.");
+    TORRENT_UTP_DELAY_ABOVE = ("weaver_torrent_utp_delay_samples_above_target_total", Counter,
+        ["route"], "uTP delay samples at or above the congestion target since the session opened.");
+    TORRENT_UTP_DELAY_BELOW = ("weaver_torrent_utp_delay_samples_below_target_total", Counter,
+        ["route"], "uTP delay samples below the congestion target since the session opened.");
+    TORRENT_UTP_PACKETS_LOST = ("weaver_torrent_utp_packets_lost_total", Counter,
+        ["route"], "Non-probe uTP loss indications passed to congestion handling before loss gating.");
+    TORRENT_UTP_TIMEOUTS = ("weaver_torrent_utp_timeouts_total", Counter,
+        ["route"], "uTP retransmission timeout decisions for outstanding packets, including MTU probes.");
+    TORRENT_UTP_INVALID_PACKETS = ("weaver_torrent_utp_invalid_packets_total", Counter,
+        ["route"], "uTP packets rejected by parsing or validation since the session opened.");
+    TORRENT_UTP_REDUNDANT_PACKETS = ("weaver_torrent_utp_redundant_packets_total", Counter,
+        ["route"], "Already acknowledged uTP data packets received since the session opened.");
     TORRENT_SESSION_PEERS = ("weaver_torrent_session_peers", Gauge, ["route", "state"],
         "Peers of every torrent on the session, by state.");
     TORRENT_SESSION_CONNECT_ATTEMPTS = ("weaver_torrent_session_connect_attempts_total", Counter,

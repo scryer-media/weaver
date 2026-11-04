@@ -14,13 +14,13 @@ pub enum Error {
     #[error("error connecting over TCP: {0:#}")]
     TcpConnect(#[source] librqbit_dualstack_sockets::Error),
     #[error("error connecting over uTP: {0:#}")]
-    UtpConnect(#[source] librqbit_utp::Error),
+    UtpConnect(#[source] weaver_utp::Error),
     #[error("can't connect, all connection methods disabled")]
     ConnectDisabled,
     #[error("error connecting: TCP={tcp:#} uTP={utp:#}")]
     Connect {
         tcp: librqbit_dualstack_sockets::Error,
-        utp: librqbit_utp::Error,
+        utp: weaver_utp::Error,
     },
     #[error("uTP disabled")]
     UtpDisabled,

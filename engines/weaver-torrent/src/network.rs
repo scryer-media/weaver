@@ -22,8 +22,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use librqbit_dualstack_sockets::PollSendToVectored;
-use librqbit_utp::{Transport, UtpSocketUdp, UtpStream};
+use weaver_utp::{DefaultUtpEnvironment, PollSendToVectored, Transport, UtpStream};
 
 pub use crate::core::net::{BoxFuture, DatagramSocket, NoNames, Resolved, Resolver};
 pub use crate::type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite};
@@ -188,37 +187,33 @@ impl Transport for DatagramTransport {
     fn bind_addr(&self) -> SocketAddr {
         self.0.bind_addr()
     }
-}
 
-// librqbit-utp does not export its default environment type by name, so it
-// is recovered from the `UtpSocketUdp` alias.
-pub(crate) trait UtpSocketEnv {
-    type Env;
-}
+    fn link_mtu(&self) -> Option<u16> {
+        self.0.link_mtu()
+    }
 
-impl<T, E> UtpSocketEnv for librqbit_utp::UtpSocket<T, E> {
-    type Env = E;
+    fn dont_fragment(&self) -> bool {
+        self.0.dont_fragment()
+    }
 }
-
-type DefaultUtpEnvironment = <UtpSocketUdp as UtpSocketEnv>::Env;
 
 /// The session's uTP socket, over a datagram socket from its
 /// [`SocketFactory`].
 #[derive(Clone, Debug)]
-pub(crate) struct UtpSocket(
-    pub(crate) Arc<librqbit_utp::UtpSocket<DatagramTransport, DefaultUtpEnvironment>>,
-);
+pub(crate) struct UtpSocket(pub(crate) Arc<UtpSocketInner>);
+
+pub(crate) type UtpSocketInner = weaver_utp::UtpSocket<DatagramTransport, DefaultUtpEnvironment>;
 
 impl UtpSocket {
     pub(crate) fn bind_addr(&self) -> SocketAddr {
         self.0.bind_addr()
     }
 
-    pub(crate) async fn accept(&self) -> librqbit_utp::Result<UtpStream> {
+    pub(crate) async fn accept(&self) -> weaver_utp::Result<UtpStream> {
         self.0.accept().await
     }
 
-    pub(crate) async fn connect(&self, remote: SocketAddr) -> librqbit_utp::Result<UtpStream> {
+    pub(crate) async fn connect(&self, remote: SocketAddr) -> weaver_utp::Result<UtpStream> {
         self.0.connect(remote).await
     }
 }
@@ -266,7 +261,9 @@ impl KernelSockets {
     fn kernel_udp_as(&self, addr: SocketAddr, paired: bool) -> io::Result<KernelUdp> {
         let socket = librqbit_dualstack_sockets::UdpSocket::bind_udp(addr, self.bind_opts(paired))
             .map_err(bind_error)?;
-        Ok(KernelUdp(socket))
+        let mut socket = KernelUdp(socket, false);
+        socket.cache_dont_fragment();
+        Ok(socket)
     }
 
     // The datagram sockets at `addr`, each set for uTP with a receive buffer
@@ -276,9 +273,10 @@ impl KernelSockets {
         addr: SocketAddr,
         utp: Option<usize>,
     ) -> io::Result<Arc<dyn DatagramSocket>> {
-        let set = |socket: KernelUdp, at: SocketAddr| {
+        let set = |mut socket: KernelUdp, at: SocketAddr| {
             if let Some(receive_buffer) = utp {
                 crate::udp_options::set_for_utp(socket.0.socket(), at, receive_buffer);
+                socket.cache_dont_fragment();
             }
             socket
         };
@@ -479,6 +477,10 @@ impl PairedUdp {
 }
 
 impl DatagramSocket for PairedUdp {
+    fn dont_fragment(&self) -> bool {
+        self.v6.dont_fragment() && self.v4.dont_fragment()
+    }
+
     fn bind_addr(&self) -> SocketAddr {
         self.v6.bind_addr()
     }
@@ -532,7 +534,24 @@ impl DatagramSocket for PairedUdp {
     }
 }
 
-pub(crate) struct KernelUdp(librqbit_dualstack_sockets::UdpSocket);
+pub(crate) struct KernelUdp(librqbit_dualstack_sockets::UdpSocket, bool);
+
+impl KernelUdp {
+    fn cache_dont_fragment(&mut self) {
+        let family = if self.0.bind_addr().is_ipv4() {
+            crate::udp_options::Family::V4
+        } else {
+            crate::udp_options::Family::V6
+        };
+        self.1 = crate::udp_options::dont_fragment(self.0.socket(), family).unwrap_or(false)
+            && (!self.0.is_dualstack()
+                || crate::udp_options::dont_fragment(
+                    self.0.socket(),
+                    crate::udp_options::Family::V4,
+                )
+                .unwrap_or(false));
+    }
+}
 
 /// Set a kernel datagram socket bound at `requested` for uTP to run over it,
 /// as [`SocketFactory::bind_utp`] asks: its datagrams never fragmented, and
@@ -559,8 +578,9 @@ impl KernelSockets {
         addr: SocketAddr,
         receive_buffer: usize,
     ) -> io::Result<Arc<KernelUdp>> {
-        let socket = self.kernel_udp(addr)?;
+        let mut socket = self.kernel_udp(addr)?;
         crate::udp_options::set_for_utp(socket.0.socket(), addr, receive_buffer);
+        socket.cache_dont_fragment();
         Ok(Arc::new(socket))
     }
 }
@@ -579,6 +599,10 @@ impl KernelUdp {
 }
 
 impl DatagramSocket for KernelUdp {
+    fn dont_fragment(&self) -> bool {
+        self.1
+    }
+
     fn bind_addr(&self) -> SocketAddr {
         self.0.bind_addr()
     }

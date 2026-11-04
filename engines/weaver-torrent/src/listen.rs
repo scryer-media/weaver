@@ -84,7 +84,7 @@ pub struct ListenerOptions {
     pub mode: ListenerMode,
     pub listen_addr: SocketAddr,
     pub enable_upnp_port_forwarding: bool,
-    pub utp_opts: Option<librqbit_utp::SocketOpts>,
+    pub utp_opts: Option<weaver_utp::SocketOpts>,
     pub announce_port: Option<u16>,
     pub ipv4_only: bool,
     pub max_pending_incoming_handshake_checks: usize,
@@ -119,9 +119,9 @@ impl ListenerOptions {
         parent_span: Option<tracing::Id>,
         cancellation_token: CancellationToken,
         socket_factory: &Arc<dyn SocketFactory>,
-        connections_limit: usize,
+        connection_slots: &crate::connection_slots::ConnectionSlots,
     ) -> anyhow::Result<ListenResult> {
-        let receive_buffer = crate::udp_options::receive_buffer_for(connections_limit);
+        let receive_buffer = crate::udp_options::receive_buffer_for(connection_slots.limit());
         let mut utp_opts = self.utp_opts.take().unwrap_or_default();
         utp_opts.cancellation_token = cancellation_token.clone();
         utp_opts.parent_span = parent_span;
@@ -145,6 +145,7 @@ impl ListenerOptions {
             receive_buffer,
             socket_factory,
             true,
+            connection_slots,
         )
         .await?;
         let listen_addr = bound.addr;
@@ -159,6 +160,7 @@ impl ListenerOptions {
                     receive_buffer,
                     socket_factory,
                     false,
+                    connection_slots,
                 )
                 .await
                 .context("error starting the SSL listener")?,
@@ -195,10 +197,11 @@ impl ListenerOptions {
 async fn bind(
     mode: ListenerMode,
     mut listen_addr: SocketAddr,
-    utp_opts: librqbit_utp::SocketOpts,
+    utp_opts: weaver_utp::SocketOpts,
     receive_buffer: usize,
     factory: &Arc<dyn SocketFactory>,
     peers: bool,
+    connection_slots: &crate::connection_slots::ConnectionSlots,
 ) -> anyhow::Result<Listening> {
     let tcp_socket = if mode.tcp_enabled() {
         let listening = if peers {
@@ -218,7 +221,15 @@ async fn bind(
     };
 
     let utp_socket = if mode.utp_enabled() {
-        match bind_utp(factory.as_ref(), listen_addr, utp_opts, receive_buffer).await {
+        match bind_utp(
+            factory.as_ref(),
+            listen_addr,
+            utp_opts,
+            receive_buffer,
+            Some(connection_slots),
+        )
+        .await
+        {
             Ok(sock) => {
                 listen_addr = sock.bind_addr();
                 info!(
@@ -250,17 +261,23 @@ async fn bind(
 pub(crate) async fn bind_utp(
     factory: &dyn SocketFactory,
     listen_addr: SocketAddr,
-    utp_opts: librqbit_utp::SocketOpts,
+    utp_opts: weaver_utp::SocketOpts,
     receive_buffer: usize,
+    connection_slots: Option<&crate::connection_slots::ConnectionSlots>,
 ) -> anyhow::Result<UtpSocket> {
     let transport = factory
         .bind_utp(listen_addr, receive_buffer)
         .await
         .context("error binding UDP socket")?;
-    let sock = librqbit_utp::UtpSocket::new_with_opts(
+    let sock = weaver_utp::UtpSocket::new_with_opts_and_init(
         DatagramTransport(transport),
         Default::default(),
         utp_opts,
+        |socket| {
+            if let Some(slots) = connection_slots {
+                slots.register_utp(&UtpSocket(Arc::clone(socket)));
+            }
+        },
     )?;
     Ok(UtpSocket(sock))
 }
