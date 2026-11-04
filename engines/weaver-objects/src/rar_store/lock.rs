@@ -315,6 +315,7 @@ impl RarStore {
             };
             let parts = entry.pieces.iter().map(|piece| piece.volume).collect();
             let said = std::mem::take(&mut entry.out);
+            entry.condemned_on = said.coverage.clone();
             self.condemned.insert(
                 id,
                 Condemned {
@@ -330,6 +331,27 @@ impl RarStore {
                 volume: piece.volume,
                 range: piece.data,
             }));
+        }
+        self.stale = true;
+    }
+
+    // A repair rewrote bytes a candidate was condemned over as they were
+    // posted: a key on trial cannot tell a wrong key from wrong bytes, so
+    // the checksum may have failed on the bytes. Every candidate is tried
+    // again on the bytes as they now stand, and every locked file reads its
+    // parts again under the one that keys it. A wrong one is condemned again
+    // by the same checksum, over bytes the repair left as they now stand.
+    pub(super) fn acquit(&mut self, out: &mut Vec<Emit>) {
+        for candidate in &mut self.candidates {
+            candidate.files_wrong = false;
+        }
+        for entry in &self.entries {
+            if matches!(entry.lock, Lock::Locked) {
+                out.extend(entry.pieces.iter().map(|piece| Emit::Again {
+                    volume: piece.volume,
+                    range: piece.data,
+                }));
+            }
         }
         self.stale = true;
     }

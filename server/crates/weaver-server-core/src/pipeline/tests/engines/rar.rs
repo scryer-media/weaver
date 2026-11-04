@@ -833,6 +833,65 @@ async fn an_encrypted_rar4_set_delivers() {
     assert_fetched_once(&graph);
 }
 
+// The `par2-light` post of a RAR4 set with encrypted data and plain
+// headers: five stored volumes, the PAR2 set made over them before bytes
+// in the third were flipped, so the post carries them wrong with checksums
+// that pass. Returns the posts and the member.
+fn rar4_posted_with_flipped_bytes() -> (Vec<Post>, Vec<u8>) {
+    let body = payload(40 * ARTICLE, 51);
+    let volumes = encrypted_rar4_store_set(MEMBER, &body, 5, SECRET, Some([7; 8]));
+    let mut posts = with_par2(volumes);
+    let third = &mut posts[2].bytes;
+    let at = third.len() / 2;
+    for byte in &mut third[at..at + 16] {
+        *byte ^= 0x5a;
+    }
+    (posts, body)
+}
+
+// The password comes with the job, as an NZB's meta carries it. The
+// member's checksum fails on the posted bytes until the set repairs them;
+// that failure is damage, not a wrong password, and the member opens with
+// the password once they are repaired.
+#[tokio::test]
+async fn an_encrypted_rar4_set_posted_with_flipped_bytes_is_repaired_and_opens_with_its_password() {
+    let (posts, body) = rar4_posted_with_flipped_bytes();
+    let graph = run(&Scenario::new(posts).password(SECRET)).await;
+    assert_member(&graph, &body);
+    assert!(
+        matches!(
+            graph.graph().outcomes.as_slice(),
+            [Some(RepairOutcome::Repaired { .. })]
+        ),
+        "{:?}",
+        graph.graph().outcomes
+    );
+}
+
+// The same post with a wrong password: tried again on the repaired bytes,
+// it fails the member's checksum there too, and the job fails for the
+// password.
+#[tokio::test]
+async fn an_encrypted_rar4_set_posted_with_flipped_bytes_and_a_wrong_password_fails_for_the_password()
+ {
+    let (posts, _) = rar4_posted_with_flipped_bytes();
+    let graph = run(&Scenario::new(posts).password("quill-ember-wrong")).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Password));
+    assert!(
+        matches!(
+            graph.graph().outcomes.as_slice(),
+            [Some(RepairOutcome::Repaired { .. })]
+        ),
+        "{:?}",
+        graph.graph().outcomes
+    );
+}
+
 // One damaged article of cipher text: the graph repairs it through the
 // posted bytes the store rebuilds, and asks for nothing again. Every
 // volume ends complete,

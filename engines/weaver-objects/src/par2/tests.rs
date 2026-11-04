@@ -2300,3 +2300,23 @@ fn execution_error_reports_its_operation_and_original_cause() {
         "{diagnostic:?}"
     );
 }
+
+// A volume past the hold whose articles land last first, as the fetches of
+// many workers do, the first article after all the rest: what arrived past
+// the hold is read again from the volume once the front reaches it, so
+// every block it carries is walked and counted before it is closed.
+#[test]
+fn a_volume_that_arrives_past_the_hold_is_walked_to_its_end() {
+    const MIB: u64 = 1024 * 1024;
+    let data = payload(3, 12 * MIB as usize);
+    let files = par2_set("big", &[("payload.bin", &data)], MIB, 12, 1);
+    let mut job = Job::new(Par2::new(OWN), OWN);
+    for (name, bytes) in &files {
+        job.volume(name, bytes, 750 * 1024, true);
+    }
+    assert!(
+        files[1].1.len() > 8 * MIB as usize,
+        "the volume runs past the hold"
+    );
+    assert_eq!(reachable(&job.object), 12);
+}

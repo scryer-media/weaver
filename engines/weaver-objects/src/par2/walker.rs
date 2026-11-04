@@ -9,7 +9,10 @@
 // after its magic. A recovery packet is mostly payload, so it is hashed as it
 // passes and only its exponent kept; the payload stays in the volume's file
 // and is read back when a repair spends it. Bytes that arrive ahead of the
-// front are held until the front reaches them, within a bound.
+// front are held until the front reaches them, within a bound. Bytes past
+// the bound are not held but noted, and when the front reaches them the walk
+// asks for them again from the volume's file: a volume is walked to its end
+// whatever order its articles came in, so every block it carries is counted.
 //
 // What the walk has read past it has read as it was then. A range whose
 // bytes come again is walked again: from its start, when the front stands
@@ -41,8 +44,8 @@ const FILE_DESC_BODY_CAP: u64 = 56 + 100_000;
 const IFSC_BODY_CAP: u64 = 16 + 32_768 * 20;
 const CREATOR_BODY_CAP: u64 = 100_000;
 const UNICODE_FILENAME_BODY_CAP: u64 = 16 + 2 * 100_000;
-// Bytes ahead of the front a volume may hold. Past it, deliveries are not
-// walked; the payloads are still on disk and a repair reads them back.
+// Bytes ahead of the front a volume may hold. Past it, deliveries wait in
+// the volume's file until the front reaches them, and are read from there.
 const HOLD_CAP: usize = 8 * 1024 * 1024;
 
 // What the walker found at one place in the volume.
@@ -129,6 +132,9 @@ pub(super) struct Walker {
     // apart, each walked again by a walk of its own that ends where the
     // range does.
     again: Vec<(ByteRange, Walker)>,
+    // Ranges that arrived past the hold, in offset order and apart: in the
+    // volume's file, not yet walked.
+    unheld: Vec<ByteRange>,
 }
 
 impl Walker {
@@ -238,13 +244,36 @@ impl Walker {
         let skip = self.next.saturating_sub(offset) as usize;
         let start = offset.max(self.next);
         let bytes = &bytes[skip..];
-        // Bytes at the front are walked whatever is held: they are what
-        // lets the held bytes drain. Only bytes that go on hold count.
-        if start > self.next && self.held_bytes + bytes.len() > HOLD_CAP {
+        // Bytes that reach the front are walked whatever is held: they are
+        // what lets the held bytes drain. Only bytes that go on hold count.
+        if start > self.reach() && self.held_bytes + bytes.len() > HOLD_CAP {
+            self.unheld.push(ByteRange::at(start, bytes.len() as u64));
+            self.unheld = joined(std::mem::take(&mut self.unheld));
             return;
         }
         self.hold(start, bytes);
         self.walk(found);
+    }
+
+    // Where the bytes in hand at the front run out.
+    fn reach(&self) -> u64 {
+        self.next + self.held.get(&self.next).map_or(0, Vec::len) as u64
+    }
+
+    // Where the bytes in hand run out at the front and a range that arrived
+    // past the hold begins, that range is read again from the volume: it
+    // comes to the front, where nothing holds it back.
+    fn read_unheld(&mut self, found: &mut Vec<Found>) {
+        let reach = self.reach();
+        let Some(at) = self
+            .unheld
+            .iter()
+            .position(|range| range.start <= reach && range.end > reach)
+        else {
+            return;
+        };
+        let range = ByteRange::new(reach, self.unheld.remove(at).end);
+        found.push(Found::Again(range));
     }
 
     pub(super) fn lose(&mut self, range: ByteRange, found: &mut Vec<Found>) {
@@ -274,6 +303,11 @@ impl Walker {
             .lost
             .iter()
             .flat_map(|lost| minus(*lost, range))
+            .collect();
+        self.unheld = self
+            .unheld
+            .iter()
+            .flat_map(|unheld| minus(*unheld, range))
             .collect();
         self.unhold(range);
         for (bound, walk) in &mut self.again {
@@ -361,6 +395,14 @@ impl Walker {
     // Merge bytes into the islands; new bytes win where they overlap.
     fn hold(&mut self, start: u64, bytes: &[u8]) {
         let end = start + bytes.len() as u64;
+        if !self.unheld.is_empty() {
+            let held = ByteRange::new(start, end);
+            self.unheld = self
+                .unheld
+                .iter()
+                .flat_map(|unheld| minus(*unheld, held))
+                .collect();
+        }
         let touching: Vec<u64> = self
             .held
             .range(..=end)
@@ -393,6 +435,7 @@ impl Walker {
     // a lost range the front has reached.
     fn walk(&mut self, found: &mut Vec<Found>) {
         while self.step(found) || self.cross_loss() {}
+        self.read_unheld(found);
     }
 
     // Where the held bytes run out and a lost range begins, the front skips
@@ -524,6 +567,21 @@ impl Walker {
             }
         }
     }
+}
+
+// The ranges in offset order, those that touch made one.
+fn joined(mut ranges: Vec<ByteRange>) -> Vec<ByteRange> {
+    ranges.sort_by_key(|range| range.start);
+    let mut out: Vec<ByteRange> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match out.last_mut() {
+            Some(last) if range.start <= last.end => {
+                *last = ByteRange::new(last.start, last.end.max(range.end));
+            }
+            _ => out.push(range),
+        }
+    }
+    out
 }
 
 fn body_cap(packet_type: PacketType) -> Option<u64> {
