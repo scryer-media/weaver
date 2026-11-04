@@ -1658,7 +1658,15 @@ mod tests {
         for (limit, bounded) in [(MIB as usize, true), (usize::MAX, false)] {
             let (mut job, member) = fixture(&files, &data);
             job.store.holes.clear();
-            let index = job.object.sets.values().next().unwrap().usable().unwrap().clone();
+            let index = job
+                .object
+                .sets
+                .values()
+                .next()
+                .unwrap()
+                .usable()
+                .unwrap()
+                .clone();
             let file = index.recovery_file_ids[0];
             let mut access = Ranges {
                 store: job.store,
