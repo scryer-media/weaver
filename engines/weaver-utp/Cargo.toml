@@ -12,6 +12,7 @@ bitvec = { workspace = true }
 libc = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }
+rustc-hash = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

@@ -22,7 +22,7 @@ use crate::{
     stats::{Counter, UtpStats},
 };
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -350,8 +350,8 @@ pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
 
     accept_queue: AcceptQueue<T, E>,
 
-    pub(crate) streams: HashMap<StreamRecvKey, UnboundedSender<UtpMessage>>,
-    connecting: HashMap<SocketAddr, ConnectingPerAddr>,
+    pub(crate) streams: FxHashMap<StreamRecvKey, UnboundedSender<UtpMessage>>,
+    connecting: FxHashMap<SocketAddr, ConnectingPerAddr>,
     control_rx: UnboundedReceiver<ControlRequest>,
     next_connection_id: SeqNr,
 }
@@ -749,8 +749,8 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         });
 
         let dispatcher = Dispatcher {
-            streams: Default::default(),
-            connecting: Default::default(),
+            streams: FxHashMap::default(),
+            connecting: FxHashMap::default(),
             next_connection_id: env.random_u16().into(),
             control_rx,
             socket: sock.clone(),
