@@ -472,7 +472,7 @@ async fn test_fin_sent_when_reader_dead_first() {
     // Remote sends some data - it should accumulate in OOQ, but be ACKed.
     t.send_data(1, t.vsock.seq_nr - 1, "ignored data");
     t.poll_once_assert_pending().await;
-    t.assert_sent_empty();
+    assert_eq!(t.take_sent(), vec![cmphead!(ST_STATE, ack_nr = 1)]);
 
     // Now drop the writer
     drop(writer);

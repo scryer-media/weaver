@@ -397,7 +397,7 @@ async fn measure_ack_bench(scenario: AckBenchScenario, ack_per_drain: bool) {
         0,
         Duration::from_millis(10),
         SocketOpts {
-            ack_per_drain,
+            benchmark_delayed_acks: !ack_per_drain,
             cancellation_token: token.clone(),
             ..Default::default()
         },

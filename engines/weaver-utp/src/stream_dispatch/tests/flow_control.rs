@@ -9,7 +9,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::{
     SocketOpts,
-    message::UtpMessage,
     raw::{Type::*, UtpHeader},
     stream_dispatch::tests::{calc_mtu_for_mss, make_test_vsock},
     test_util::setup_test_logging,
@@ -257,7 +256,10 @@ async fn test_window_update_sent_when_window_less_than_mss() {
     t.poll_once_assert_pending().await;
     // We shouldn't have registered the flush waker yet.
     assert!(!t.vsock.user_rx.is_flush_waker_registered());
-    assert_eq!(t.take_sent(), Vec::<UtpMessage>::new());
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_STATE, ack_nr = 1, wnd_size = 5u32)]
+    );
 
     // Now the window should be less than MSS.
     t.send_data(2, t.vsock.seq_nr - 1, "b");

@@ -125,7 +125,7 @@ pub struct SocketOpts {
     pub mtu_probe_max_retransmissions: Option<usize>,
 
     #[cfg(test)]
-    pub(crate) ack_per_drain: bool,
+    pub(crate) benchmark_delayed_acks: bool,
 }
 
 impl SocketOpts {
@@ -177,7 +177,7 @@ impl SocketOpts {
             wait_for_last_ack: !self.dont_wait_for_lastack,
             mtu_probe_max_retransmissions: self.mtu_probe_max_retransmissions.unwrap_or(1),
             #[cfg(test)]
-            ack_per_drain: self.ack_per_drain,
+            benchmark_delayed_acks: self.benchmark_delayed_acks,
         })
     }
 }
@@ -205,7 +205,7 @@ pub(crate) struct ValidatedSocketOpts {
     pub mtu_probe_max_retransmissions: usize,
 
     #[cfg(test)]
-    pub ack_per_drain: bool,
+    pub benchmark_delayed_acks: bool,
 }
 
 pub(crate) struct RequestWithSpan<V> {

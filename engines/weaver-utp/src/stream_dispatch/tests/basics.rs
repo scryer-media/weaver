@@ -10,7 +10,6 @@ use tracing::trace;
 
 use crate::{
     SocketOpts,
-    constants::ACK_DELAY,
     raw::{Type::*, UtpHeader},
     stream_dispatch::{
         StreamArgs,
@@ -235,9 +234,6 @@ async fn test_sequence_numbers_incoming() {
     );
     t.send_data(15090, 31419, "hello");
     t.poll_once_assert_pending().await;
-    t.assert_sent_empty();
-    t.env.increment_now(ACK_DELAY);
-    t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
         vec![cmphead!(ST_STATE, seq_nr = 31420, ack_nr = 15090)]
@@ -315,9 +311,6 @@ async fn test_sequence_numbers_outgoing() {
     );
     t.send_data(31420, 15090, "hello");
     t.send_data(31421, 15090, "world");
-    t.poll_once_assert_pending().await;
-    t.assert_sent_empty();
-    t.env.increment_now(ACK_DELAY);
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),

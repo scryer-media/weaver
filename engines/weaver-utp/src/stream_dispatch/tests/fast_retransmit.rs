@@ -149,12 +149,20 @@ async fn test_duplicate_ack_counted_only_on_st_state() {
     t.send_msg(header, "a");
     t.poll_once_assert_pending().await;
     assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_STATE, seq_nr = 103, ack_nr = 1)]
+    );
 
     // Another ST_DATA - shouldn't count
     header.seq_nr += 1;
     t.send_msg(header, "b");
     t.poll_once_assert_pending().await;
     assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(ST_STATE, seq_nr = 103, ack_nr = 2)]
+    );
 
     // ST_FIN with same ACK - shouldn't count
     header.htype = ST_FIN;
