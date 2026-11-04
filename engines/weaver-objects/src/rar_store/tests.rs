@@ -1111,6 +1111,35 @@ fn two_stores_with_one_password_and_salt_derive_once() {
     }
 }
 
+// A later volume's first two articles trade places: the second's bytes stand
+// at the volume's front, and the first's, with the volume's signature, sit
+// in a range that was lost. Nothing of a lost range is read, whatever bytes
+// a copy left there, so no member header is taken from it and no member is
+// said to run past the volume's end.
+#[test]
+fn a_lost_range_is_never_read_for_headers() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &split(version));
+        let real = volumes[1].clone();
+        let length = real.len() as u64;
+        let mut owner = Owner::named(store(), volumes);
+        for volume in [0, 2] {
+            owner.frames(volume, 1000);
+            owner.close(volume);
+        }
+        let front = ByteRange::new(0, 768);
+        let lost = ByteRange::new(768, 1536);
+        owner.deliver_as(1, front, Provenance::Fresh, Some(&real[768..1536]));
+        owner.deliver_as(1, lost, Provenance::Lost, Some(&real[..768]));
+        owner.deliver(1, ByteRange::new(lost.end, length));
+        owner.close(1);
+        let past = owner.said.iter().any(|emit| {
+            matches!(emit, Emit::Damaged { volume: VolumeIndex(1), range } if range.end > length)
+        });
+        assert!(!past, "{version:?} {:?}", owner.said);
+    }
+}
+
 #[test]
 fn a_damaged_file_header_waits_for_repair() {
     for version in [Version::Rar5, Version::Rar4] {

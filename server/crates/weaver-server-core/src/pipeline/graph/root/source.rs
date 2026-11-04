@@ -703,6 +703,22 @@ impl ArticleMap {
         }
     }
 
+    // The volume's articles in hand intact, each at the range it was placed
+    // at: the placements a later article's own range is checked against.
+    pub(crate) fn placed_intact(
+        &self,
+        volume: VolumeIndex,
+    ) -> impl Iterator<Item = (u32, ByteRange)> + '_ {
+        self.volumes
+            .get(volume.0 as usize)
+            .into_iter()
+            .flat_map(|found| found.articles.iter())
+            .filter_map(|article| match article.state {
+                State::Arrived(Some(range)) if article.intact => Some((article.ordinal, range)),
+                _ => None,
+            })
+    }
+
     // Whether this run holds an intact copy of the article that no seek has
     // sent back for: that copy stands, and a further one brings nothing.
     pub(crate) fn holds_intact(&self, volume: VolumeIndex, ordinal: u32) -> bool {

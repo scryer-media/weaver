@@ -636,6 +636,15 @@ impl GraphJob {
         }
     }
 
+    // The volume's articles the root holds intact, at the ranges they were
+    // placed at.
+    pub(crate) fn placed_intact(
+        &self,
+        volume: VolumeIndex,
+    ) -> impl Iterator<Item = (u32, weaver_graph::ByteRange)> + '_ {
+        self.root.map.placed_intact(volume)
+    }
+
     // Whether the root holds the article or has ruled it lost.
     pub(crate) fn article_settled(&self, volume: VolumeIndex, ordinal: u32) -> bool {
         self.root.map.article_settled(volume, ordinal)
