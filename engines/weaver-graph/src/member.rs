@@ -16,7 +16,7 @@ use crate::evidence::Algorithm;
 use crate::marks::Marked;
 use crate::object::{Kind, ObjectId};
 use crate::recovery::Recovery;
-use crate::sniff::{Sniff, signed, sniff};
+use crate::sniff::{Sniff, signed, sniff_among};
 use crate::volume::ByteRange;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -62,11 +62,12 @@ pub struct Member {
 
 impl Member {
     // What the member is, as founding asks it: by its name and its front,
-    // except that the kind whose reading of it was refuted is no answer,
-    // and then its bytes alone say. The one question every path asks that
-    // decides who owns a member.
-    pub fn said(&self, front: &[u8]) -> Sniff {
-        match sniff(&self.name, front, self.length) {
+    // among the members of its namespace, except that the kind whose
+    // reading of it was refuted is no answer, and then its bytes alone say.
+    // The one question every path asks that decides who owns a member.
+    pub fn said(&self, front: &[u8], namespace: &Namespace) -> Sniff {
+        let beside = namespace.members().map(|member| member.name.as_str());
+        match sniff_among(&self.name, front, self.length, beside) {
             Sniff::Object(kind) if Some(kind) == self.refuted => signed(front, self.length),
             said => said,
         }
