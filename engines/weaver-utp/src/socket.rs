@@ -17,7 +17,7 @@ use std::{
 };
 
 use crate::{
-    Error,
+    DatagramSend, Error,
     constants::{TX_BUF_SIZE_PER_VSOCK_INITIAL_DEFAULT, TX_BUF_SIZE_PER_VSOCK_MAX_DEFAULT},
     stats::{Counter, UtpStats},
 };
@@ -29,6 +29,8 @@ use crate::{UtpStream, runtime::Runtime, spawn_utils::task_with_cancel};
 
 #[cfg(test)]
 mod lifecycle_tests;
+#[cfg(test)]
+mod send_handle_tests;
 use crate::{
     congestion::ledbat::LedbatParams,
     constants::{
@@ -998,11 +1000,16 @@ impl<T: Transport, Env: UtpEnvironment> SocketState<T, Env> {
     pub(crate) fn try_poll_send_to(
         &self,
         transport: &T,
+        sender: Option<&mut (dyn DatagramSend + 'static)>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
         addr: SocketAddr,
     ) -> std::io::Result<bool> {
-        match transport.poll_send_to(cx, buf, addr) {
+        let sent = match sender {
+            Some(sender) => sender.poll_send_to(cx, buf, addr),
+            None => transport.poll_send_to(cx, buf, addr),
+        };
+        match sent {
             Poll::Ready(Ok(sz)) => {
                 if sz != buf.len() {
                     warn!(
@@ -1033,12 +1040,17 @@ impl<T: Transport, Env: UtpEnvironment> SocketState<T, Env> {
     pub(crate) fn try_poll_send_to_vectored(
         &self,
         transport: &T,
+        sender: Option<&mut (dyn DatagramSend + 'static)>,
         cx: &mut std::task::Context<'_>,
         bufs: &[IoSlice<'_>],
         addr: SocketAddr,
         total_len: usize,
     ) -> std::io::Result<bool> {
-        match transport.poll_send_to_vectored(cx, bufs, addr) {
+        let sent = match sender {
+            Some(sender) => sender.poll_send_to_vectored(cx, bufs, addr),
+            None => transport.poll_send_to_vectored(cx, bufs, addr),
+        };
+        match sent {
             Poll::Ready(Ok(sz)) => {
                 if sz != total_len {
                     warn!(

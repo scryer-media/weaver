@@ -40,6 +40,8 @@ pub use stats::{UtpStats, UtpStatsSnapshot};
 pub use stream::UtpStream;
 pub use stream_rx::UtpStreamReadHalf;
 pub use stream_tx::UtpStreamWriteHalf;
-pub use traits::{DefaultUtpEnvironment, PollSendToVectored, Transport, UtpEnvironment};
+pub use traits::{
+    DatagramSend, DefaultUtpEnvironment, PollSendToVectored, Transport, UtpEnvironment,
+};
 
 type Payload = Vec<u8>;

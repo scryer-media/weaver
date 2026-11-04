@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Level, debug, debug_span, event, trace, trace_span};
 
 use crate::{
-    Error,
+    DatagramSend, Error,
     congestion::{DelaySample, ledbat::Ledbat},
     constants::{
         ACK_DELAY, IMMEDIATE_ACK_EVERY_RMSS, RECOVERY_TRACING_LOG_LEVEL, RTTE_TRACING_LOG_LEVEL,
@@ -135,6 +135,7 @@ struct VirtualSocket<T, Env> {
     state: VirtualSocketState,
     socket: Arc<SocketState<T, Env>>,
     transport: Option<Arc<T>>,
+    sender: Option<Box<dyn DatagramSend>>,
     socket_created: Instant,
     socket_opts: ValidatedSocketOpts,
 
@@ -286,6 +287,7 @@ macro_rules! send_data {
                     .socket
                     .try_poll_send_to_vectored(
                         $self.transport.as_deref().ok_or(Error::DispatcherDead)?,
+                        $self.sender.as_deref_mut(),
                         $cx,
                         &bufs,
                         $self.remote,
@@ -771,6 +773,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             .socket
             .try_poll_send_to(
                 self.transport.as_deref().ok_or(Error::DispatcherDead)?,
+                self.sender.as_deref_mut(),
                 cx,
                 &self.this_poll.tmp_buf[..len],
                 self.remote,
@@ -1817,6 +1820,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             .upgrade()
             .ok_or(Error::DispatcherDead)?;
         runtime.register(move |transport| {
+            vsock.sender = transport.sender();
             vsock.transport = Some(transport);
             task_with_cancel(span, cancellation_token, vsock.run_forever())
         })?;
@@ -1968,6 +1972,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
 
             socket: socket.clone(),
             transport: None,
+            sender: None,
             recovery: Recovery::default(),
         };
 

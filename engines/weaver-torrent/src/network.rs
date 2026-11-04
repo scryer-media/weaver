@@ -24,7 +24,7 @@ use std::{
 
 use weaver_utp::{DefaultUtpEnvironment, PollSendToVectored, Transport, UtpStream};
 
-pub use crate::core::net::{BoxFuture, DatagramSocket, NoNames, Resolved, Resolver};
+pub use crate::core::net::{BoxFuture, DatagramSend, DatagramSocket, NoNames, Resolved, Resolver};
 pub use crate::type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite};
 pub use crate::vectored_traits::{
     AsyncReadToVectoredCompat, AsyncReadVectored, AsyncReadVectoredIntoCompat,
@@ -160,6 +160,10 @@ impl PollSendToVectored for DatagramTransport {
 }
 
 impl Transport for DatagramTransport {
+    fn sender(&self) -> Option<Box<dyn DatagramSend>> {
+        self.0.sender()
+    }
+
     fn shutdown(&self) -> impl Future<Output = io::Result<()>> + Send {
         self.0.shutdown()
     }
