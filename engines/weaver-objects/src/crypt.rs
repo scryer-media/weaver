@@ -188,6 +188,18 @@ fn count(staged: usize, deciphered: usize) {
     });
 }
 
+// Plaintext bytes a seal enciphered again, for the tests that count it.
+#[cfg(test)]
+thread_local! {
+    static SEALED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+// The bytes sealed since the last look.
+#[cfg(test)]
+pub(crate) fn sealed() -> u64 {
+    SEALED.with(|sealed| sealed.replace(0))
+}
+
 // What of a cipher stream's plaintext its owner has placed. The owner's
 // record is the one ledger of what came out: the cipher reads it and keeps
 // none of its own, so a cipher opened again over a restored record knows
@@ -624,12 +636,29 @@ impl Cbc {
         plain: &mut dyn FnMut(ByteRange, &mut Vec<u8>) -> bool,
         into: &mut Vec<u8>,
     ) -> bool {
+        self.seal_on(&Frontier::default(), placed, padding, range, plain, into)
+    }
+
+    // The same, chained on from where the last seal through `frontier`
+    // ended when that is nearer than every seed the chain keeps: a sweep
+    // of ranges in order enciphers each byte once.
+    pub fn seal_on(
+        &self,
+        frontier: &Frontier,
+        placed: &dyn Placed,
+        padding: &Padding,
+        range: ByteRange,
+        plain: &mut dyn FnMut(ByteRange, &mut Vec<u8>) -> bool,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        if range.is_empty() {
+            return true;
+        }
         let seen = self.chain.seen(placed, padding);
-        range.is_empty()
-            || self
-                .chain
-                .seal(&self.key, &seen, range, plain, into)
-                .is_some()
+        let reached = (self.chain)
+            .seal(&self.key, &seen, range, frontier.get(), plain, into)
+            .map(|reached| frontier.set(reached));
+        reached.is_some()
     }
 }
 
@@ -884,7 +913,14 @@ impl Chain {
             }
             let mut cipher = Vec::new();
             if self
-                .seal(key, seen, ByteRange::new(start, end), plain, &mut cipher)
+                .seal(
+                    key,
+                    seen,
+                    ByteRange::new(start, end),
+                    None,
+                    plain,
+                    &mut cipher,
+                )
                 .is_some()
             {
                 for (block, at) in cipher
@@ -1115,25 +1151,38 @@ impl Chain {
         }
     }
 
+    // The posted cipher of `range`, chained from the nearest seed: a kept
+    // checkpoint, or `reached`, where a seal of this cipher last left off,
+    // when that is nearer. Gives back where this one leaves off: the start
+    // of its last block and the cipher before it, when both are known.
     fn seal(
         &self,
         key: &MemberCipherKey,
         seen: &Seen<'_>,
         range: ByteRange,
+        reached: Option<Reached>,
         plain: &mut dyn FnMut(ByteRange, &mut Vec<u8>) -> bool,
         into: &mut Vec<u8>,
-    ) -> Option<()> {
+    ) -> Option<Option<Reached>> {
         if range.end > self.cipher_len {
             return None;
         }
         let block_start = block_floor(range.start);
         let block_end = block_ceil(range.end);
-        let (seeded, seed) = self.seed(block_start);
+        let (seeded, seed) = match (self.seed(block_start), reached) {
+            (kept, Some(reached)) if kept.0 < reached.0 && reached.0 <= block_start => reached,
+            (kept, _) => kept,
+        };
         // A staged block is posted as it came, whatever is before it: the
         // walk starts at the last one at or below the range when it is past
         // the seed, and the gap behind it is never enciphered again.
         let mut cursor = self.staged.last_in(seeded, block_start).unwrap_or(seeded);
         let mut preceding = Some(seed);
+        // The posted cipher before the last block walked: the next seal
+        // chains on from the start of that block, so one that starts in it,
+        // as the next slice of a volume does when the cipher stream is not
+        // aligned to the slices, still chains on.
+        let mut trail = None;
         let mut posted: Vec<u8> = Vec::with_capacity((block_end - block_start) as usize);
         while cursor < block_end {
             if let Some(block) = self.staged.get(cursor) {
@@ -1143,6 +1192,7 @@ impl Chain {
                     block.holds(wanted.shift(-(cursor as i64))).then_some(())?;
                     posted.extend_from_slice(&block.cipher);
                 }
+                trail = preceding;
                 preceding = block.full().then_some(block.cipher);
                 cursor += BLOCK;
                 continue;
@@ -1166,6 +1216,12 @@ impl Chain {
                 buffer.extend_from_slice(seen.padding.tail_plain.get(..take)?);
             }
             key.encrypt_range(&preceding?, &mut buffer).ok()?;
+            #[cfg(test)]
+            SEALED.with(|sealed| sealed.set(sealed.get() + buffer.len() as u64));
+            trail = match buffer.len().checked_sub(2 * BLOCK as usize) {
+                Some(at) => buffer[at..].first_chunk::<16>().copied(),
+                None => preceding,
+            };
             preceding = buffer.last_chunk::<16>().copied();
             if cursor >= block_start {
                 posted.extend_from_slice(&buffer);
@@ -1174,7 +1230,40 @@ impl Chain {
         }
         let from = (range.start - block_start) as usize;
         into.extend_from_slice(&posted[from..from + range.len() as usize]);
-        Some(())
+        Some(
+            preceding
+                .and(trail)
+                .map(|cipher| (block_end - BLOCK, cipher)),
+        )
+    }
+}
+
+// An offset in the cipher stream and the posted cipher of the block that
+// ends there: what a seal chains on from.
+type Reached = (u64, [u8; 16]);
+
+// Where the last seal through it ended, for the next to chain on from. It
+// holds posted cipher and nothing else, so one that is stale or shared costs
+// at most a seed, never a wrong byte: a seal takes it only when it is at or
+// below where its range starts and nearer than every kept checkpoint. It
+// belongs with one standing of the cipher and the plaintext that came out of
+// it, and goes when they do.
+#[derive(Default)]
+pub struct Frontier(std::sync::Mutex<Option<Reached>>);
+
+impl Frontier {
+    fn get(&self) -> Option<Reached> {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set(&self, reached: Option<Reached>) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = reached;
     }
 }
 
