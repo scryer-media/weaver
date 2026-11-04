@@ -9,7 +9,7 @@ use std::{
     net::SocketAddr,
     num::NonZeroUsize,
     sync::{
-        Arc,
+        Arc, Weak,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     task::Poll,
@@ -25,7 +25,10 @@ use parking_lot::Mutex;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::{UtpStream, spawn_utils::spawn_with_cancel};
+use crate::{UtpStream, runtime::Runtime, spawn_utils::task_with_cancel};
+
+#[cfg(test)]
+mod lifecycle_tests;
 use crate::{
     congestion::ledbat::LedbatParams,
     constants::{
@@ -347,7 +350,8 @@ impl<T, E> AcceptQueue<T, E> {
 
 pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
     env: E,
-    socket: Arc<UtpSocket<T, E>>,
+    socket: Arc<SocketState<T, E>>,
+    transport: Option<Arc<T>>,
 
     accept_queue: AcceptQueue<T, E>,
 
@@ -381,7 +385,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 let control = control_request.unwrap();
                 self.on_control(control).await;
             },
-            recv = self.socket.transport.recv_from(read_buf) => {
+            recv = self.transport.as_deref().ok_or(Error::DispatcherDead)?.recv_from(read_buf) => {
                 let received = self.env.now();
                 let (len, addr) = recv.map_err(Error::Recv)?;
                 let message = match UtpMessage::deserialize(&read_buf[..len], received) {
@@ -451,7 +455,11 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 };
                 let mut buf = [0u8; UTP_HEADER as usize];
                 header.serialize(&mut buf).unwrap();
-                match self.socket.transport.send_to(&buf, addr).await {
+                let Some(transport) = self.transport.as_deref() else {
+                    let _ = sender.tx.send(Err(Error::DispatcherDead));
+                    return;
+                };
+                match transport.send_to(&buf, addr).await {
                     Ok(len) if len == buf.len() => {}
                     Ok(len) => {
                         // Never seen this happen yet, so can be warn.
@@ -538,8 +546,8 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             warn!(key=?recv_key, "bug: a stream already existed with key. It should have been checked beforehand.");
         }
 
-        let stream = UtpStreamStarter::new(&self.socket, addr, rx, args).start();
-        if conn.requester.tx.send(Ok(stream)).is_ok() {
+        let stream = UtpStreamStarter::new_shared(&self.socket, addr, rx, args).start();
+        if conn.requester.tx.send(stream).is_ok() {
             trace!(?recv_key, "created stream and passed to connector");
         } else {
             debug!(?recv_key, "connecting receiver is dead. dropping");
@@ -565,7 +573,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             .with_parent_span(accept.created_span.clone());
         let (tx, rx) = crate::ingress::channel(self.socket.opts.vsock_rx_bufsize);
 
-        let starter = UtpStreamStarter::new(&self.socket, syn.remote, rx, args);
+        let starter = UtpStreamStarter::new_shared(&self.socket, syn.remote, rx, args);
 
         self.streams.insert(recv_key, tx);
         match accept.tx.send(starter) {
@@ -590,8 +598,9 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             ack_nr: syn.header.seq_nr,
             ..Default::default()
         };
-        if let Ok(len) = packet.serialize(&mut buf[..])
-            && let Err(e) = self.socket.transport.send_to(&buf[..len], syn.remote).await
+        if let Some(transport) = self.transport.as_deref()
+            && let Ok(len) = packet.serialize(&mut buf[..])
+            && let Err(e) = transport.send_to(&buf[..len], syn.remote).await
         {
             debug!(remote=?syn.remote, "error sending ST_RESET: {e:#}");
         }
@@ -675,9 +684,19 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     }
 }
 
-pub struct UtpSocket<T, E> {
-    // The underlying transport, usually UDP.
-    pub(crate) transport: T,
+pub struct UtpSocket<T: Transport, E> {
+    pub(crate) state: Arc<SocketState<T, E>>,
+    runtime: Arc<Runtime<T>>,
+}
+
+impl<T: Transport, E> Drop for UtpSocket<T, E> {
+    fn drop(&mut self) {
+        self.runtime.request_shutdown();
+    }
+}
+
+pub(crate) struct SocketState<T, E> {
+    pub(crate) runtime: Weak<Runtime<T>>,
     // When was the socket created. All the uTP "timestamp_microsends" are relative to it.
     pub(crate) created: Instant,
     pub(crate) control_requests: UnboundedSender<ControlRequest>,
@@ -686,6 +705,8 @@ pub struct UtpSocket<T, E> {
     pub(crate) env: E,
 
     local_addr: SocketAddr,
+    link_mtu: Option<u16>,
+    dont_fragment: bool,
     opts: ValidatedSocketOpts,
     connections_limit: AtomicUsize,
 
@@ -699,7 +720,7 @@ pub struct UtpSocket<T, E> {
 impl<T: Transport, E: UtpEnvironment> std::fmt::Debug for UtpSocket<T, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UtpSocket")
-            .field("addr", &self.local_addr)
+            .field("addr", &self.state.local_addr)
             .finish_non_exhaustive()
     }
 }
@@ -717,51 +738,97 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         initialize: impl FnOnce(&Arc<Self>),
     ) -> crate::Result<Arc<Self>> {
         let parent_span = opts.parent_span.clone();
-        let (sock, dispatcher) = Self::new_with_opts_and_dispatcher(transport, env, opts)?;
+        let (sock, mut dispatcher) = Self::build(transport, env, opts)?;
         initialize(&sock);
-        let span = debug_span!(parent: parent_span, "utp_socket", addr=?sock.transport.bind_addr());
-        spawn_with_cancel(
-            span,
-            sock.cancellation_token.clone(),
-            dispatcher.run_forever(),
-        );
+        let span = debug_span!(parent: parent_span, "utp_socket", addr=?sock.bind_addr());
+        let cancellation = sock.state.cancellation_token.clone();
+        let runtime = Arc::downgrade(&sock.runtime);
+        if sock
+            .runtime
+            .register(move |transport| {
+                dispatcher.transport = Some(transport);
+                task_with_cancel(span, cancellation, async move {
+                    let on_drop = runtime.clone();
+                    let _shutdown = FnDropGuard::new(move || {
+                        if let Some(runtime) = on_drop.upgrade() {
+                            runtime.request_shutdown();
+                        }
+                    });
+                    let result = dispatcher.run_forever().await;
+                    if let Some(runtime) = runtime.upgrade() {
+                        if let Err(error) = &result {
+                            runtime.request_shutdown_with_error(std::io::Error::other(
+                                error.to_string(),
+                            ));
+                        } else {
+                            runtime.request_shutdown();
+                        }
+                    }
+                    result
+                })
+            })
+            .is_err()
+        {
+            sock.runtime.request_shutdown();
+        }
         Ok(sock)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_opts_and_dispatcher(
         transport: T,
         env: Env,
         opts: SocketOpts,
     ) -> crate::Result<(Arc<Self>, Dispatcher<T, Env>)> {
+        let (socket, mut dispatcher) = Self::build(transport, env, opts)?;
+        dispatcher.transport = socket.runtime.transport();
+        Ok((socket, dispatcher))
+    }
+
+    fn build(
+        transport: T,
+        env: Env,
+        opts: SocketOpts,
+    ) -> crate::Result<(Arc<Self>, Dispatcher<T, Env>)> {
         let validated_opts = opts.validate()?;
-        let sock = transport;
-        let local_addr = sock.bind_addr();
+        let local_addr = transport.bind_addr();
+        let link_mtu = transport.link_mtu();
+        let dont_fragment = transport.dont_fragment();
+        let transport = Arc::new(transport);
+        let runtime = Runtime::new(transport, &opts.cancellation_token);
 
         let (accept_tx, accept_rx) = mpsc::channel(ACCEPT_QUEUE_MAX_ACCEPTORS);
         let (control_tx, control_rx) = unbounded_channel();
 
-        let sock = Arc::new(Self {
-            transport: sock,
+        let state = Arc::new(SocketState {
+            runtime: Arc::downgrade(&runtime),
             created: env.now(),
             control_requests: control_tx,
             local_addr,
+            link_mtu,
+            dont_fragment,
             opts: validated_opts,
             connections_limit: AtomicUsize::new(
                 opts.connections_limit.map_or(usize::MAX, NonZeroUsize::get),
             ),
             env: env.copy(),
             accept_requests: accept_tx,
-            cancellation_token: opts.cancellation_token.clone(),
+            cancellation_token: runtime.cancellation().clone(),
             stats: UtpStats::default(),
             mtu_ceiling: Default::default(),
         });
 
+        let sock = Arc::new(Self {
+            state: state.clone(),
+            runtime,
+        });
         let dispatcher = Dispatcher {
             streams: BTreeMap::default(),
             connecting: BTreeMap::default(),
             next_connection_id: env.random_u16().into(),
             control_rx,
-            socket: sock.clone(),
+            socket: state,
+            transport: None,
             env,
             accept_queue: AcceptQueue {
                 syns: Default::default(),
@@ -773,18 +840,75 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         Ok((sock, dispatcher))
     }
 
+    /// Stop every stream and dispatcher, join transport work, and release
+    /// the owned transport. Repeated callers share the same result.
+    pub async fn shutdown(&self) -> std::io::Result<()> {
+        self.runtime.shutdown().await
+    }
+
+    pub fn bind_addr(&self) -> SocketAddr {
+        self.state.local_addr
+    }
+
+    /// Whether this socket's transport sends with don't-fragment set.
+    pub fn dont_fragment(&self) -> bool {
+        self.state.dont_fragment
+    }
+
+    /// Change incoming SYN admission without evicting established streams.
+    /// Zero stays zero; `usize::MAX` leaves no finite bound.
+    pub fn set_connections_limit(&self, limit: usize) {
+        self.state.connections_limit.store(limit, Ordering::Relaxed);
+    }
+
+    /// The effective connection limit; `None` means no finite bound.
+    pub fn connections_limit(&self) -> Option<usize> {
+        let limit = self.state.connections_limit.load(Ordering::Relaxed);
+        (limit != usize::MAX).then_some(limit)
+    }
+
+    /// Counters remain readable after shutdown.
+    pub fn stats(&self) -> &UtpStats {
+        &self.state.stats
+    }
+
+    pub async fn accept(self: &Arc<Self>) -> crate::Result<UtpStream> {
+        self.state.accept().await
+    }
+
+    pub async fn connect(self: &Arc<Self>, remote: SocketAddr) -> crate::Result<UtpStream> {
+        self.state.connect(remote).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn opts(&self) -> &ValidatedSocketOpts {
+        self.state.opts()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn restrict_mtu(&self, mtu: u16) {
+        self.state.restrict_mtu(mtu);
+    }
+}
+
+impl<T: Transport, Env: UtpEnvironment> SocketState<T, Env> {
     // The link MTU a new stream probes up to: the link's, no larger than
     // the transport's path carries, and no higher than the streams that
     // died on large packets allow. Where datagrams may be fragmented, a
     // probe too large would arrive split rather than lost, so no stream
     // probes past the floor.
     pub(crate) fn probe_link_mtu(&self, is_ipv4: bool) -> u16 {
+        let (link_mtu, dont_fragment) = self
+            .runtime
+            .upgrade()
+            .and_then(|runtime| runtime.metadata())
+            .unwrap_or((self.link_mtu, self.dont_fragment));
         let mtu = self
             .opts
             .link_mtu
-            .min(self.transport.link_mtu().unwrap_or(u16::MAX))
+            .min(link_mtu.unwrap_or(u16::MAX))
             .min(self.mtu_ceiling.lock().get());
-        if self.transport.dont_fragment() {
+        if dont_fragment {
             mtu
         } else {
             mtu.min(floor_mtu(is_ipv4))
@@ -797,35 +921,8 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         self.mtu_ceiling.lock().restrict(mtu);
     }
 
-    /// Whether the transport sends with don't-fragment set.
-    pub fn dont_fragment(&self) -> bool {
-        self.transport.dont_fragment()
-    }
-
     pub(crate) fn opts(&self) -> &ValidatedSocketOpts {
         &self.opts
-    }
-
-    pub fn bind_addr(&self) -> SocketAddr {
-        self.local_addr
-    }
-
-    /// Change the connection limit used for incoming SYN admission.
-    /// A zero limit stays zero; `usize::MAX` leaves no finite bound.
-    pub fn set_connections_limit(&self, limit: usize) {
-        self.connections_limit.store(limit, Ordering::Relaxed);
-    }
-
-    /// The effective connection limit; `None` means no finite bound.
-    /// Unset options and `usize::MAX` both have that meaning.
-    pub fn connections_limit(&self) -> Option<usize> {
-        let limit = self.connections_limit.load(Ordering::Relaxed);
-        (limit != usize::MAX).then_some(limit)
-    }
-
-    /// The socket's counters.
-    pub fn stats(&self) -> &UtpStats {
-        &self.stats
     }
 
     pub async fn accept(self: &Arc<Self>) -> crate::Result<UtpStream> {
@@ -834,22 +931,26 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         self.stats.accepting.increment(1);
         let _accepting_guard = FnDropGuard::new(|| self.stats.accepting.decrement(1));
 
-        self.accept_requests
-            .send(RequestWithSpan::new(tx))
-            .await
-            .ok()
-            .ok_or(Error::DispatcherDead)?;
-
-        let stream = rx.await.ok().ok_or(Error::DispatcherDead)?;
-
+        tokio::select! {
+            biased;
+            _ = self.cancellation_token.cancelled() => return Err(Error::DispatcherDead),
+            sent = self.accept_requests.send(RequestWithSpan::new(tx)) => sent.map_err(|_| Error::DispatcherDead)?,
+        }
+        let stream = tokio::select! {
+            biased;
+            _ = self.cancellation_token.cancelled() => return Err(Error::DispatcherDead),
+            received = rx => received.map_err(|_| Error::DispatcherDead)?,
+        };
+        let stream = stream.start()?;
         self.stats.accepts.increment(1);
-
-        let stream = stream.start();
         trace!("accepted");
         Ok(stream)
     }
 
     pub async fn connect(self: &Arc<Self>, remote: SocketAddr) -> crate::Result<UtpStream> {
+        if self.cancellation_token.is_cancelled() {
+            return Err(Error::DispatcherDead);
+        }
         let (tx, rx) = oneshot::channel();
         let token = NEXT_CONNECT_TOKEN.fetch_add(1, Ordering::Relaxed);
         self.stats.connection_attempts.increment(1);
@@ -877,11 +978,13 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             &self.control_requests,
         );
 
-        let stream_or_err = tokio::time::timeout(self.opts.connect_timeout, rx)
-            .await
-            .map_err(|_| Error::ConnectTimedOut)?
-            .ok()
-            .ok_or(Error::DispatcherDead)?;
+        let stream_or_err = tokio::select! {
+            biased;
+            _ = self.cancellation_token.cancelled() => return Err(Error::DispatcherDead),
+            received = tokio::time::timeout(self.opts.connect_timeout, rx) => received
+                .map_err(|_| Error::ConnectTimedOut)?
+                .map_err(|_| Error::DispatcherDead)?,
+        };
         send_drop_guard.disarm();
         if stream_or_err.is_ok() {
             fail_guard.disarm();
@@ -894,11 +997,12 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
     /// Returns true if saw Poll::Pending
     pub(crate) fn try_poll_send_to(
         &self,
+        transport: &T,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
         addr: SocketAddr,
     ) -> std::io::Result<bool> {
-        match self.transport.poll_send_to(cx, buf, addr) {
+        match transport.poll_send_to(cx, buf, addr) {
             Poll::Ready(Ok(sz)) => {
                 if sz != buf.len() {
                     warn!(
@@ -928,12 +1032,13 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
 
     pub(crate) fn try_poll_send_to_vectored(
         &self,
+        transport: &T,
         cx: &mut std::task::Context<'_>,
         bufs: &[IoSlice<'_>],
         addr: SocketAddr,
         total_len: usize,
     ) -> std::io::Result<bool> {
-        match self.transport.poll_send_to_vectored(cx, bufs, addr) {
+        match transport.poll_send_to_vectored(cx, bufs, addr) {
             Poll::Ready(Ok(sz)) => {
                 if sz != total_len {
                     warn!(
@@ -1311,7 +1416,7 @@ mod tests {
         };
         let mut open = Vec::new();
         for id in 0..2u16 {
-            let (tx, rx) = crate::ingress::channel(socket.opts.vsock_rx_bufsize);
+            let (tx, rx) = crate::ingress::channel(socket.opts().vsock_rx_bufsize);
             dispatcher.streams.insert((ADDR_2, 1000 + id), tx);
             open.push(rx);
         }
@@ -1319,7 +1424,7 @@ mod tests {
         dispatcher.on_recv(ADDR_2, syn(1)).await.unwrap();
         assert_eq!(dispatcher.accept_queue.syns.len(), 1, "taken up");
 
-        let (tx, rx) = crate::ingress::channel(socket.opts.vsock_rx_bufsize);
+        let (tx, rx) = crate::ingress::channel(socket.opts().vsock_rx_bufsize);
         dispatcher.streams.insert((ADDR_2, 2000), tx);
         open.push(rx);
         dispatcher.on_recv(ADDR_2, syn(3)).await.unwrap();

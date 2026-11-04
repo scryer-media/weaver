@@ -162,7 +162,10 @@ fn make_test_vsock_on(
     let socket = UtpSocket::new_with_opts(transport.clone(), env.clone(), opts).unwrap();
     let (tx, rx) = crate::ingress::channel(socket.opts().vsock_rx_bufsize);
 
-    let UtpStreamStarter { stream, vsock, .. } = UtpStreamStarter::new(&socket, ADDR_2, rx, args);
+    let UtpStreamStarter {
+        stream, mut vsock, ..
+    } = UtpStreamStarter::new(&socket, ADDR_2, rx, args);
+    vsock.transport = socket.state.runtime.upgrade().unwrap().transport();
 
     TestVsock {
         transport,

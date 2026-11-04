@@ -197,6 +197,10 @@ impl PollSendToVectored for LinkEnd {
 
 pub(crate) type LinkSocket = Arc<UtpSocket<LinkEnd, DefaultUtpEnvironment>>;
 
+fn link_transport(socket: &LinkSocket) -> Arc<LinkEnd> {
+    socket.state.runtime.upgrade().unwrap().transport().unwrap()
+}
+
 pub(crate) fn sockets(
     a: SocketAddr,
     b: SocketAddr,
@@ -263,7 +267,7 @@ async fn test_one_echo(server_addr: SocketAddr, client_addr: SocketAddr, drop_ev
         1
     );
     if drop_every > 0 {
-        assert!(server.transport.lost.load(Ordering::Relaxed) > 0);
+        assert!(link_transport(&server).lost.load(Ordering::Relaxed) > 0);
         assert!(
             server.stats().data_retransmissions.load(Ordering::Relaxed)
                 + client.stats().data_retransmissions.load(Ordering::Relaxed)
@@ -446,8 +450,8 @@ struct AckBenchCounters {
 impl AckBenchCounters {
     fn read(server: &LinkSocket, client: &LinkSocket) -> Self {
         Self {
-            acks: server.transport.acks.load(Ordering::Relaxed),
-            data: client.transport.data.load(Ordering::Relaxed),
+            acks: link_transport(server).acks.load(Ordering::Relaxed),
+            data: link_transport(client).data.load(Ordering::Relaxed),
             immediate: server.stats().immediate_acks.load(Ordering::Relaxed),
             delayed: server.stats().delayed_acks.load(Ordering::Relaxed),
         }
@@ -502,12 +506,12 @@ async fn measure_ack_bench(scenario: AckBenchScenario, ack_per_drain: bool) {
 
             // No other segment is outstanding or queued: only the timer can
             // retransmit this byte. Start measuring while its ACK is in flight.
-            let retransmitted = client.transport.force_timeout();
+            let retransmitted = link_transport(&client).force_timeout();
             writer.write_all(&[7]).await.unwrap();
             retransmitted.await.unwrap();
             assert_eq!(client.stats().rto_timeouts_count.load(Ordering::Relaxed), 1);
             assert_eq!(client.stats().snapshot().timeouts, 1);
-            assert_eq!(client.transport.lost.load(Ordering::Relaxed), 1);
+            assert_eq!(link_transport(&client).lost.load(Ordering::Relaxed), 1);
             (
                 Instant::now(),
                 AckBenchCounters::read(&server, &client),

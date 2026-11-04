@@ -55,6 +55,7 @@ const LIFTED: &[(&str, usize)] = &[
     ("engines/weaver-nntp/tests/proxy_routing.rs", 1),
     ("engines/weaver-nntp/tests/socket_budget.rs", 1),
     ("engines/weaver-nntp/tests/wireguard_throughput.rs", 1),
+    ("engines/weaver-torrent/src/tests/e2e_session_stop.rs", 1),
     ("engines/weaver-tunnel/src/egress.rs", 2),
     ("engines/weaver-tunnel/src/lib.rs", 2),
     ("engines/weaver-tunnel/src/pipe.rs", 5),

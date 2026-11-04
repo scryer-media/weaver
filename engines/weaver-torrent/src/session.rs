@@ -2323,6 +2323,11 @@ impl Session {
         self.swarm.cancel();
         self.swarm_tasks.close();
         self.swarm_tasks.wait().await;
+        for socket in &self.utp_sockets {
+            if let Err(error) = socket.shutdown().await {
+                debug!(%error, "error shutting down uTP socket");
+            }
+        }
         let torrents = self
             .db
             .read()

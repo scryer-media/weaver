@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Level, debug, debug_span, event, trace, trace_span};
 
 use crate::{
-    Error, UtpSocket,
+    Error,
     congestion::{DelaySample, ledbat::Ledbat},
     constants::{
         ACK_DELAY, IMMEDIATE_ACK_EVERY_RMSS, RECOVERY_TRACING_LOG_LEVEL, RTTE_TRACING_LOG_LEVEL,
@@ -35,8 +35,8 @@ use crate::{
     recovery::Recovery,
     rtte::RttEstimator,
     seq_nr::SeqNr,
-    socket::{ControlRequest, ValidatedSocketOpts},
-    spawn_utils::spawn_with_cancel,
+    socket::{ControlRequest, SocketState, ValidatedSocketOpts},
+    spawn_utils::task_with_cancel,
     stats::Counter,
     stream::UtpStream,
     stream_rx::{AssemblerAddRemoveResult, UserRx},
@@ -133,7 +133,8 @@ impl VirtualSocketState {
 // An equivalent of a TCP socket for uTP.
 struct VirtualSocket<T, Env> {
     state: VirtualSocketState,
-    socket: Arc<UtpSocket<T, Env>>,
+    socket: Arc<SocketState<T, Env>>,
+    transport: Option<Arc<T>>,
     socket_created: Instant,
     socket_opts: ValidatedSocketOpts,
 
@@ -283,7 +284,13 @@ macro_rules! send_data {
                 ];
                 $self.this_poll.transport_pending = $self
                     .socket
-                    .try_poll_send_to_vectored($cx, &bufs, $self.remote, hlen + plen)
+                    .try_poll_send_to_vectored(
+                        $self.transport.as_deref().ok_or(Error::DispatcherDead)?,
+                        $cx,
+                        &bufs,
+                        $self.remote,
+                        hlen + plen,
+                    )
                     .map_err(Error::Send)?;
             }
 
@@ -379,7 +386,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 // delivered leaves later streams probing no higher.
                 let mss = usize::from(self.segment_sizes.mss());
                 let is_ipv4 = self.remote.is_ipv4();
-                let restrict = |socket: &UtpSocket<T, Env>, payload: usize| {
+                let restrict = |socket: &SocketState<T, Env>, payload: usize| {
                     if payload > mss {
                         socket.restrict_mtu(packet_mtu(payload, is_ipv4));
                     }
@@ -762,7 +769,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         self.this_poll.transport_pending = self
             .socket
-            .try_poll_send_to(cx, &self.this_poll.tmp_buf[..len], self.remote)
+            .try_poll_send_to(
+                self.transport.as_deref().ok_or(Error::DispatcherDead)?,
+                cx,
+                &self.this_poll.tmp_buf[..len],
+                self.remote,
+            )
             .map_err(Error::Send)?;
 
         let sent = !self.this_poll.transport_pending;
@@ -1790,26 +1802,43 @@ pub(crate) struct UtpStreamStarter<T, E> {
 }
 
 impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
-    pub fn start(self) -> UtpStream {
+    pub fn start(self) -> crate::Result<UtpStream> {
         let Self {
             stream,
-            vsock,
+            mut vsock,
             cancellation_token,
         } = self;
 
         let parent = vsock.parent_span.as_ref().and_then(|s| s.id());
         let span = debug_span!(parent: parent, "utp_stream", remote=?vsock.remote);
-        spawn_with_cancel(span, cancellation_token, vsock.run_forever());
-        stream
+        let runtime = vsock
+            .socket
+            .runtime
+            .upgrade()
+            .ok_or(Error::DispatcherDead)?;
+        runtime.register(move |transport| {
+            vsock.transport = Some(transport);
+            task_with_cancel(span, cancellation_token, vsock.run_forever())
+        })?;
+        Ok(stream)
     }
 
-    // Exposed for tests.
+    #[cfg(test)]
     pub fn new(
-        socket: &Arc<UtpSocket<T, E>>,
+        socket: &Arc<crate::UtpSocket<T, E>>,
         remote: SocketAddr,
         rx: IngressReceiver,
         args: StreamArgs,
     ) -> UtpStreamStarter<T, E> {
+        Self::new_shared(&socket.state, remote, rx, args)
+    }
+
+    pub(crate) fn new_shared(
+        socket: &Arc<SocketState<T, E>>,
+        remote: SocketAddr,
+        rx: IngressReceiver,
+        args: StreamArgs,
+    ) -> Self {
         let StreamArgs {
             conn_id_recv,
             conn_id_send,
@@ -1938,6 +1967,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             },
 
             socket: socket.clone(),
+            transport: None,
             recovery: Recovery::default(),
         };
 

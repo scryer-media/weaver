@@ -25,6 +25,11 @@ pub trait PollSendToVectored {
 /// The datagram transport a socket runs over. The crate never binds one
 /// itself.
 pub trait Transport: PollSendToVectored + Send + Sync + Unpin + 'static {
+    /// Stop and join work owned by this transport after its streams stop.
+    fn shutdown(&self) -> impl Future<Output = std::io::Result<()>> + Send {
+        async { Ok(()) }
+    }
+
     fn recv_from<'a>(
         &'a self,
         buf: &'a mut [u8],

@@ -35,6 +35,11 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + Sync + 'a>>;
 ///
 /// Used for DHT, UDP trackers and the uTP peer transport.
 pub trait DatagramSocket: Send + Sync + 'static {
+    /// Stop and join work owned by this dedicated socket before release.
+    fn shutdown(&self) -> BoxFuture<'_, io::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// The local address the socket is bound to.
     fn bind_addr(&self) -> SocketAddr;
 

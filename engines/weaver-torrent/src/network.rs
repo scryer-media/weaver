@@ -160,6 +160,10 @@ impl PollSendToVectored for DatagramTransport {
 }
 
 impl Transport for DatagramTransport {
+    fn shutdown(&self) -> impl Future<Output = io::Result<()>> + Send {
+        self.0.shutdown()
+    }
+
     fn recv_from<'a>(
         &'a self,
         buf: &'a mut [u8],
@@ -205,6 +209,10 @@ pub(crate) struct UtpSocket(pub(crate) Arc<UtpSocketInner>);
 pub(crate) type UtpSocketInner = weaver_utp::UtpSocket<DatagramTransport, DefaultUtpEnvironment>;
 
 impl UtpSocket {
+    pub(crate) async fn shutdown(&self) -> io::Result<()> {
+        self.0.shutdown().await
+    }
+
     pub(crate) fn bind_addr(&self) -> SocketAddr {
         self.0.bind_addr()
     }
