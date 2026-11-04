@@ -94,7 +94,7 @@ pub(super) async fn rename_obfuscated_members(
 ) -> Vec<FileRename> {
     let files = {
         let root = root.to_path_buf();
-        match tokio::task::spawn_blocking(move || {
+        match crate::runtime::panic_trap::spawn_blocking(move || {
             let files = scan_delivery(&root);
             let extensions: Vec<_> = files
                 .iter()
@@ -181,7 +181,9 @@ pub(super) async fn rename_obfuscated_members(
     }
 
     let root = root.to_path_buf();
-    match tokio::task::spawn_blocking(move || apply_renames(job_id, &root, renames)).await {
+    match crate::runtime::panic_trap::spawn_blocking(move || apply_renames(job_id, &root, renames))
+        .await
+    {
         Ok(renamed) => renamed,
         Err(error) => {
             warn!(
@@ -450,7 +452,7 @@ async fn fetch_srrdb_release_on(
     // parser. The body is never buffered in full, and decoded bytes are counted
     // as they arrive so compression cannot bypass the response ceiling.
     let (body_tx, body_rx) = tokio::sync::mpsc::channel(2);
-    let parse_task = tokio::task::spawn_blocking(move || {
+    let parse_task = crate::runtime::panic_trap::spawn_blocking(move || {
         parse_srrdb_release_reader(SrrdbBodyReader::new(body_rx))
     });
     let mut received_bytes = 0usize;

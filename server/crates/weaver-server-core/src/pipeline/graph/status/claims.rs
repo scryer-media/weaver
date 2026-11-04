@@ -439,11 +439,12 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
     // A leaf whose name and front say an object of some kind reads it: a
     // container that no object opened, so no file of the delivery.
     fn unopened(&self, node: NodeId, member: &Member) -> bool {
-        let front = self
-            .tree
-            .namespace(node)
-            .map_or(&[][..], |namespace| namespace.first_bytes(member.id));
-        matches!(member.said(front), Sniff::Object(_))
+        self.tree.namespace(node).is_some_and(|namespace| {
+            matches!(
+                member.said(namespace.first_bytes(member.id), namespace),
+                Sniff::Object(_)
+            )
+        })
     }
 
     // Some volume of `node` is short and a failed repair covers it.

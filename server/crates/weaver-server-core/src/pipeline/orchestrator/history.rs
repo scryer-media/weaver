@@ -100,8 +100,9 @@ impl Pipeline {
         // A graph job's short delivery names the stage that left it short,
         // and a repair that could not rebuild a member says why.
         let graph_shortfall = matches!(state.status, JobStatus::Partial)
-            .then(|| self.graph_shortfall(job_id))
-            .flatten();
+            .then(|| self.delivered_verdict(job_id))
+            .flatten()
+            .map(|verdict| (verdict.shortfall_stage, verdict.shortfall_message));
         let shortfall = graph_shortfall
             .as_ref()
             .map(|(stage, _)| *stage)

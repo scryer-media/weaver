@@ -359,34 +359,48 @@ async fn a_hex_named_member_bound_by_its_prefix_is_renamed_and_its_file_moves() 
     decode_all(&mut pipeline, job_id, &posts, 0).await;
     let hex = working_dir.join(&posts[0].name);
     assert_eq!(member_file(&pipeline, job_id, 0), Some(hex.clone()));
+    pipeline.db.flush_write_queue().await.unwrap();
+    hear_graph_mail(&mut pipeline, job_id).await;
+
+    // Hold the writer before the index can name the member. The repair can
+    // return, but the checkpoint that permits its file to move cannot commit.
+    let (release, held) = std::sync::mpsc::channel();
+    let (entered, waiting) = tokio::sync::oneshot::channel();
+    pipeline
+        .db
+        .try_queue_write("hold_member_rename_checkpoint", move |_| {
+            let _ = entered.send(());
+            let _ = held.recv();
+            Ok(())
+        })
+        .unwrap();
+    waiting.await.unwrap();
     decode_all(&mut pipeline, job_id, &posts, 1).await;
     // The volume still to come is the set's own from the post, so with the
     // payload in, the set rules as its index is founded, before it is read;
-    // the bind that names the member follows once that run is heard. The
-    // file moves once the checkpoint that records its name has committed.
-    // That commit runs beside the repair and may be heard with it, so what
-    // stands then is read against what the database holds.
+    // the bind that names the member follows once that run is heard.
     hear_repair(&mut pipeline, job_id).await;
-    if pipeline.graph_jobs[&job_id].moves_waiting() {
-        assert!(hex.exists());
-    } else {
-        let stored = pipeline.db.load_graph_checkpoint(job_id).unwrap().unwrap();
-        let root = stored
-            .nodes
-            .iter()
-            .find(|node| node.parent.is_none())
-            .unwrap()
-            .node;
-        assert!(
-            stored
-                .members
-                .iter()
-                .any(|row| row.node == root && row.member == 0 && row.name == "lantern.bin")
-        );
-        assert!(!hex.exists());
-    }
+    assert!(pipeline.graph_jobs[&job_id].moves_waiting());
+    assert_eq!(member_file(&pipeline, job_id, 0), Some(hex.clone()));
+    assert_eq!(read(&hex), data);
+    assert!(!working_dir.join("lantern.bin").exists());
+
+    release.send(()).unwrap();
     hear_graph_mail(&mut pipeline, job_id).await;
     assert!(!pipeline.graph_jobs[&job_id].moves_waiting());
+    let stored = pipeline.db.load_graph_checkpoint(job_id).unwrap().unwrap();
+    let root = stored
+        .nodes
+        .iter()
+        .find(|node| node.parent.is_none())
+        .unwrap()
+        .node;
+    assert!(
+        stored
+            .members
+            .iter()
+            .any(|row| row.node == root && row.member == 0 && row.name == "lantern.bin")
+    );
 
     let member = pipeline.graph_jobs[&job_id]
         .namespace()
@@ -1112,6 +1126,7 @@ async fn a_delivery_with_a_damaged_member_settles_to_partial() {
     assert!(pipeline.inflight_moves.contains(&job_id));
     let done = pipeline.move_done_rx.recv().await.unwrap();
     pipeline.handle_move_to_complete_done(done).await;
+    crate::pipeline::tests::settle_script_admissions(&mut pipeline).await;
     while !matches!(
         events.recv().await.expect("pipeline event channel closed"),
         PipelineEvent::JobCompleted { job_id: completed } if completed == job_id
@@ -1132,6 +1147,68 @@ async fn a_delivery_with_a_damaged_member_settles_to_partial() {
         Some(HistoryFailureKind::Unpack)
     );
     retire_pipeline_database(pipeline).await;
+}
+
+// The same Partial delivery, restarted once its final move finished and
+// before the terminal pass ran: no graph comes back, and the job still ends
+// Partial, for the same reason, from what its moving row kept.
+#[tokio::test]
+async fn a_partial_delivery_restarted_after_its_move_stays_partial() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_019);
+    let bodies = [payload(2 * ARTICLE + 9, 11), payload(ARTICLE - 3, 12)];
+    let mut posts: Vec<Post> = bodies
+        .iter()
+        .enumerate()
+        .map(|(index, body)| echo_volume(index as u32, body))
+        .collect();
+    posts.push(Post::plain("lantern.dat", payload(2 * ARTICLE, 13)));
+    let (mut pipeline, _) = graph_job(&temp_dir, job_id, &posts).await;
+    echo_engines(&mut pipeline, job_id, 2);
+    decode(&mut pipeline, job_id, &posts, 2, 0, true).await;
+    decode(&mut pipeline, job_id, &posts, 2, 1, false).await;
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    decode_all(&mut pipeline, job_id, &posts, 1).await;
+    drain_runs(&mut pipeline, job_id).await;
+    assert_eq!(
+        pipeline.graph_terminal_status(job_id),
+        Some(JobStatus::Partial)
+    );
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
+    state.status = JobStatus::Downloading;
+    state.refresh_runtime_lanes_from_status();
+    pipeline.check_job_completion(job_id).await;
+    assert!(pipeline.inflight_moves.contains(&job_id));
+    // The move finishes; weaver stops before it hears so.
+    let done = pipeline.move_done_rx.recv().await.unwrap();
+    assert!(done.result.is_ok());
+    let intermediate_dir = pipeline.intermediate_dir.clone();
+    retire_pipeline_database(pipeline).await;
+
+    let mut restored = crate::pipeline::tests::delivered_restore::restart_and_restore(
+        &temp_dir,
+        &intermediate_dir,
+        job_id,
+    )
+    .await;
+    crate::pipeline::tests::settle_script_admissions(&mut restored).await;
+    let finished = restored
+        .finished_jobs()
+        .await
+        .into_iter()
+        .find(|job| job.job_id == job_id)
+        .expect("the job finishes");
+    assert_eq!(finished.status, JobStatus::Partial);
+    let row = restored.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert_eq!((row.status.as_str(), row.error_message), ("partial", None));
+    let states = restored.db.nzbget_history_states(&[job_id.0]).unwrap();
+    assert_eq!(
+        states[&job_id.0].failure_kind,
+        Some(HistoryFailureKind::Unpack)
+    );
+    retire_pipeline_database(restored).await;
 }
 
 // A plain file arrives damaged beside the recovery the post carried for

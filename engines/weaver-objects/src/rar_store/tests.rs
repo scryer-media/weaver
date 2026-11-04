@@ -979,6 +979,109 @@ fn a_wrong_rar4_key_on_unverified_bytes_is_damage_until_repaired() {
     posted_whole(&owner);
 }
 
+// Where a single RAR4 volume's bytes go: each range in volume order, with
+// whether it is a file's data.
+fn rar4_data(volumes: &[Vec<u8>]) -> Vec<(ByteRange, bool)> {
+    let whole = ByteRange::new(0, volumes[0].len() as u64);
+    let mut walked = Owner::named(store(), volumes.to_vec());
+    walked.offer(PASSWORD);
+    walked.deliver(0, whole);
+    let mut placements = Vec::new();
+    walked.object.locate(VolumeIndex(0), whole, &mut placements);
+    let mut at = 0;
+    let mut data = Vec::new();
+    for placement in &placements {
+        let range = ByteRange::at(at, placement.len());
+        data.push((range, matches!(placement, Placement::Member { .. })));
+        at = range.end;
+    }
+    data
+}
+
+// A RAR4 volume posted with a byte of the first file's data wrong, its
+// checksums passing as a post made after the recovery set was: the file's
+// own checksum fails on bytes as they were posted, condemning the one
+// candidate on trial, until a repair rewrites them. Returns the owner and
+// the range the repair rewrites.
+fn rar4_posted_wrong(secret: &str) -> (Owner, ByteRange) {
+    let volumes = write(&items(), &encrypted(Version::Rar4, false));
+    let data = rar4_data(&volumes);
+    let (wrong, _) = *data.iter().find(|(_, member)| *member).expect("file data");
+    let mut posted = volumes[0][wrong.start as usize..wrong.end as usize].to_vec();
+    posted[0] ^= 0x5a;
+    let mut owner = Owner::named(store(), volumes);
+    owner.offer(secret);
+    for (range, _) in &data {
+        let bytes = (*range == wrong).then_some(posted.as_slice());
+        owner.deliver_as(0, *range, Provenance::Fresh, bytes);
+    }
+    owner.close(0);
+    assert!(
+        owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Again { .. })),
+        "condemned: {:?}",
+        owner.said
+    );
+    assert!(owner.members.values().all(|got| !got.closed));
+    (owner, wrong)
+}
+
+// The one candidate was condemned over bytes posted wrong. Once a repair
+// rewrites them and the job is quiet, it is tried again on them, and opens
+// every file.
+#[test]
+fn a_rar4_key_condemned_over_bytes_posted_wrong_opens_them_once_repaired() {
+    let (mut owner, wrong) = rar4_posted_wrong(PASSWORD);
+    owner.deliver_as(0, wrong, Provenance::Repaired, None);
+    // The tree hands held bytes back to a store that places them anew.
+    owner.quiet();
+    owner.settle();
+    assert!(
+        !owner.said.contains(&Emit::Refuse(Why::Encrypted)),
+        "{:?}",
+        owner.said
+    );
+    owner.said.retain(|emit| {
+        !matches!(
+            emit,
+            Emit::NeedsPassword | Emit::Again { .. } | Emit::Damaged { .. }
+        )
+    });
+    no_trouble(&owner);
+    streamed(&owner);
+}
+
+// A wrong candidate condemned over bytes posted wrong is tried again once
+// they are repaired, condemned again by the same checksum, and the set
+// needs a password.
+#[test]
+fn a_wrong_rar4_key_condemned_over_bytes_posted_wrong_is_condemned_again_once_repaired() {
+    let (mut owner, wrong) = rar4_posted_wrong("not-the-passphrase");
+    owner.deliver_as(0, wrong, Provenance::Repaired, None);
+    owner.said.clear();
+    owner.quiet();
+    owner.settle();
+    assert!(
+        owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Again { .. })),
+        "tried again: {:?}",
+        owner.said
+    );
+    assert!(!owner.said.contains(&Emit::Refuse(Why::Encrypted)));
+    assert!(owner.members.values().all(|got| !got.closed));
+    owner.said.clear();
+    owner.quiet();
+    assert!(
+        owner.said.contains(&Emit::Refuse(Why::Encrypted)),
+        "{:?}",
+        owner.said
+    );
+}
+
 #[test]
 fn every_rar4_candidate_wrong_on_verified_bytes_needs_a_password() {
     let volumes = write(&items(), &encrypted(Version::Rar4, false));
@@ -1108,6 +1211,35 @@ fn two_stores_with_one_password_and_salt_derive_once() {
         }
         assert!(counts[0].1 > 0, "{version:?} {headers}");
         assert_eq!(counts[0], counts[1], "{version:?} {headers}");
+    }
+}
+
+// A later volume's first two articles trade places: the second's bytes stand
+// at the volume's front, and the first's, with the volume's signature, sit
+// in a range that was lost. Nothing of a lost range is read, whatever bytes
+// a copy left there, so no member header is taken from it and no member is
+// said to run past the volume's end.
+#[test]
+fn a_lost_range_is_never_read_for_headers() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &split(version));
+        let real = volumes[1].clone();
+        let length = real.len() as u64;
+        let mut owner = Owner::named(store(), volumes);
+        for volume in [0, 2] {
+            owner.frames(volume, 1000);
+            owner.close(volume);
+        }
+        let front = ByteRange::new(0, 768);
+        let lost = ByteRange::new(768, 1536);
+        owner.deliver_as(1, front, Provenance::Fresh, Some(&real[768..1536]));
+        owner.deliver_as(1, lost, Provenance::Lost, Some(&real[..768]));
+        owner.deliver(1, ByteRange::new(lost.end, length));
+        owner.close(1);
+        let past = owner.said.iter().any(|emit| {
+            matches!(emit, Emit::Damaged { volume: VolumeIndex(1), range } if range.end > length)
+        });
+        assert!(!past, "{version:?} {:?}", owner.said);
     }
 }
 

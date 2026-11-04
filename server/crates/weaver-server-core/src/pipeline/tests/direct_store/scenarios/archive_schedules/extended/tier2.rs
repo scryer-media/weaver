@@ -19,6 +19,7 @@ use std::ops::Range;
 mod breadth;
 mod damage;
 mod fixtures;
+mod headers;
 mod par2_realism;
 mod par3_breadth;
 mod post;
@@ -297,16 +298,25 @@ fn tier2_sizing() {
     let par2 = par2_realism::family().total();
     let par3 = par3_breadth::family().total();
     let uu = uu::family().total();
+    let headers = headers::family().total() + headers::field::family().total();
     let breadth = breadth::totals();
     assert_eq!(damage, damage::TOTAL, "damage");
     assert_eq!(par2, par2_realism::TOTAL, "PAR2 realism");
     assert_eq!(par3, par3_breadth::TOTAL, "PAR3 breadth");
     assert_eq!(uu, uu::TOTAL, "uuencode");
-    let total = damage + par2 + par3 + uu + breadth.iter().map(|(_, count)| count).sum::<usize>();
-    eprintln!("damage={damage} par2={par2} par3={par3} uu={uu} {breadth:?} total={total}");
+    assert_eq!(headers, headers::TOTAL, "headers");
+    let total =
+        damage + par2 + par3 + uu + headers + breadth.iter().map(|(_, count)| count).sum::<usize>();
+    eprintln!(
+        "damage={damage} par2={par2} par3={par3} uu={uu} headers={headers} {breadth:?} total={total}"
+    );
     assert_eq!(total, TOTAL);
 }
 
 // Tier two's scenarios across every family.
-const TOTAL: usize =
-    damage::TOTAL + par2_realism::TOTAL + par3_breadth::TOTAL + uu::TOTAL + breadth::TOTAL;
+const TOTAL: usize = damage::TOTAL
+    + par2_realism::TOTAL
+    + par3_breadth::TOTAL
+    + uu::TOTAL
+    + headers::TOTAL
+    + breadth::TOTAL;

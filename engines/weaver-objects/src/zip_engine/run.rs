@@ -23,6 +23,12 @@ pub(super) struct Run {
     password: Option<String>,
 }
 
+// Bytes a member's output gathers before the sink hears them. The zip
+// library's readers hand back a few kilobytes at a time; each piece the sink
+// hears costs a message, a write and the bookkeeping behind both, so pieces
+// are gathered into a quarter megabyte first, at the cost of one copy.
+pub(super) const EMIT_BYTES: usize = 256 * 1024;
+
 impl Run {
     pub(super) fn new(password: Option<String>) -> Self {
         Self { password }
@@ -122,13 +128,16 @@ impl Walk<'_, '_> {
                     crc32: file.crc32(),
                 })?;
             }
-            let mut out = Out {
+            let out = Out {
                 sink: &mut *self.sink,
                 member,
                 offset: 0,
                 stopped: false,
             };
-            let copied = io::copy(&mut file, &mut out);
+            let mut out = io::BufWriter::with_capacity(EMIT_BYTES, out);
+            let copied = io::copy(&mut file, &mut out).and_then(|_| out.flush());
+            // What is still gathered when the copy failed is not said.
+            let (out, _) = out.into_parts();
             if out.stopped {
                 return Err(None);
             }

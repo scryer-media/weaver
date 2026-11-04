@@ -569,9 +569,12 @@ func ensureRestartFixturesSeeded(slugs []string) error {
 }
 
 func ensureRestartInfrastructure() {
-	log.Println("starting restart-suite infrastructure with fresh NNTP build...")
-	if err := ensureNNTPHealthBinary(); err != nil {
-		log.Fatalf("build NNTP healthcheck for restart suite: %v", err)
+	log.Println("starting restart-suite infrastructure...")
+	// Every service started here is pull_policy: never on an image these
+	// ensure calls prepare, or a digest-pinned registry image, so the up
+	// below never builds.
+	if err := ensureLocalWeaverNNTPImage(); err != nil {
+		log.Fatalf("prepare NNTP fixture image for restart suite: %v", err)
 	}
 	if err := ensureNyuuImageBuilt(); err != nil {
 		log.Fatalf("build nyuu image for restart suite: %v", err)
@@ -580,10 +583,10 @@ func ensureRestartInfrastructure() {
 	if weaverUsesPostgresDatastore() {
 		services = append(services, "weaver-postgres")
 	}
-	args := append(dockerComposeArgs("up", "-d", "--build", "--quiet-pull"), services...)
+	args := append(dockerComposeArgs("up", "-d", "--quiet-pull"), services...)
 	cmd := containerengine.Command(args...)
 	cmd.Dir = e2eDir()
-	if err := runExternalCommand(cmd, "docker compose up --build for restart suite"); err != nil {
+	if err := runExternalCommand(cmd, "docker compose up for restart suite"); err != nil {
 		log.Fatalf("start restart-suite infrastructure: %v", err)
 	}
 	if err := refreshRuntimePortEnvFromRunningStack(); err != nil {
@@ -3182,9 +3185,31 @@ func runVerificationReconcilesStaleExtractingRuntime(ctx *restartCaseContext) (r
 	), nil
 }
 
-// runDirectStorePar2AliasClaimantCompletesAfterRestart kills the process as
-// the job enters verification, with one connection so the late-sorted,
-// extensionless PAR2 index arrives after every archive volume. The restart
+// The worker hold leaves the actor and database writer running. Verification
+// alone is not a durability barrier: wait for this job's committed coverage and
+// recorded backing files before killing it.
+func waitForAliasCheckpoint(ctx *restartCaseContext, jobID int, hook string, segments []nzbSegmentRef, ranges map[string]decodedRange) error {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := managedWeaverExit(ctx.weaver); err != nil {
+			return err
+		}
+		if logHasDelayHook(ctx.caseLogPath, hook) {
+			evidence, err := readCheckpointEvidence(caseDBPath(ctx), jobID)
+			if err != nil {
+				return fmt.Errorf("read held PAR2 alias checkpoint: %w", err)
+			}
+			if len(directDurableArticles(segments, ranges, evidence)) > 0 {
+				return nil
+			}
+		}
+		<-ticker.C
+	}
+}
+
+// runDirectStorePar2AliasClaimantCompletesAfterRestart holds the verification
+// worker while the graph checkpoint commits, then kills the process. The restart
 // resumes from the graph checkpoint: it fetches none of the articles the
 // checkpoint held whole, names the volumes from what is on disk, and
 // completes with the expected output.
@@ -3198,18 +3223,19 @@ func runDirectStorePar2AliasClaimantCompletesAfterRestart(ctx *restartCaseContex
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := ctx.startWeaverWithConnections("status.enter_verifying", 1); err != nil {
+	const hook = "repair.task_start"
+	if err := ctx.startWeaverWithOptions("", 1, "WEAVER_E2E_HOLD="+hook); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug(slug)
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := ctx.waitForCrash(5*time.Minute, jobID); err != nil {
+	if err := waitForAliasCheckpoint(ctx, jobID, hook, segments, ranges); err != nil {
 		return restartCaseResult{}, err
 	}
-	if !logContains(ctx.caseLogPath, "status.enter_verifying") {
-		return restartCaseResult{}, fmt.Errorf("expected verifying failpoint evidence in log before PAR2 alias restart")
+	if err := ctx.killWeaverForRestart(); err != nil {
+		return restartCaseResult{}, err
 	}
 
 	dbPath := filepath.Join(ctx.CaseDir, "weaver.db")

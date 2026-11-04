@@ -94,6 +94,10 @@ pub(crate) struct GraphRestore {
 // What a graph job's restore takes from the pipeline, gathered on the
 // pipeline thread so the restore itself, every read back included, runs off
 // it.
+// How many restores were entered, for the tests that show one was not.
+#[cfg(test)]
+pub(crate) static RESTORES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub(crate) struct RestoreSeat {
     db: crate::Database,
     working_dir: PathBuf,
@@ -131,21 +135,6 @@ impl Pipeline {
             spec_password,
         }
     }
-
-    // Rebuild a graph job from its checkpoint before its queues are built.
-    // The reads back happen off the pipeline thread.
-    pub(crate) async fn restore_graph_job(
-        &self,
-        job_id: JobId,
-        spec: &JobSpec,
-        working_dir: &Path,
-    ) -> Result<GraphRestore, GraphRestoreError> {
-        let seat = self.graph_restore_seat(spec.password.clone(), working_dir);
-        let files = root_files(spec);
-        tokio::task::spawn_blocking(move || seat.restore(job_id, files))
-            .await
-            .map_err(|error| GraphRestoreError::Join(error.to_string()))?
-    }
 }
 
 // The root's files as the job's spec lists them, article by article.
@@ -164,6 +153,14 @@ pub(crate) fn root_files(spec: &JobSpec) -> Vec<RootFile> {
 }
 
 impl RestoreSeat {
+    // The seat for one job: its password, and its working directory as its
+    // install found it.
+    pub(crate) fn for_job(mut self, spec_password: Option<String>, working_dir: &Path) -> Self {
+        self.spec_password = spec_password;
+        self.working_dir = working_dir.to_path_buf();
+        self
+    }
+
     pub(crate) fn working_dir(&self) -> &Path {
         &self.working_dir
     }
@@ -171,12 +168,17 @@ impl RestoreSeat {
     // Read the job's checkpoint back and rebuild the job from it. A
     // checkpoint this build does not restore is none: the job starts afresh
     // and fetches every article, and its first checkpoint replaces the old
-    // rows whole. Blocks: called off the pipeline thread.
+    // rows whole. Blocks: called off the pipeline thread. A job whose work
+    // crashed the daemon never reaches here: its install is given no seat.
     pub(crate) fn restore(
         self,
         job_id: JobId,
         files: Vec<RootFile>,
     ) -> Result<GraphRestore, GraphRestoreError> {
+        #[cfg(test)]
+        RESTORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // A restore replays the job's own facts: a panic in it is the job's.
+        let _job = crate::runtime::panic_trap::JobScope::enter(job_id);
         let loaded = self.db.load_graph_checkpoint(job_id);
         loaded
             .map_err(GraphRestoreError::from)

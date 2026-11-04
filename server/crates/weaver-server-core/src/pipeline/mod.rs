@@ -7,6 +7,7 @@ pub(crate) use completion::finalize::{ActiveRuntimeValues, StoredRuntimeValues};
 pub mod archive;
 mod capacity;
 mod completion;
+mod db_reply;
 mod decode;
 pub mod diagnostics;
 pub mod download;
@@ -21,6 +22,7 @@ mod post_health;
 mod progress;
 pub mod queue;
 mod queue_window;
+pub(crate) use queue_window::waits_its_turn;
 mod server_attribution;
 mod support_facts;
 #[cfg(any(test, feature = "test-support"))]
@@ -514,6 +516,11 @@ pub(super) struct DownloadLaneObservation {
     // Whether byte pressure was clear when the batch was leased. Samples
     // taken under pressure say nothing about the depth under test.
     pub(super) pressure_clear: bool,
+    // The lane held a full rung of articles, in flight and queued behind,
+    // when this response was read. A response read with less waited on the
+    // lane's next lease, so its time says how late the work came as well as
+    // how fast the server is.
+    pub(super) fed: bool,
     pub(super) batch_complete: bool,
     pub(super) batch_clean: bool,
     pub(super) unresolved_count: u64,
@@ -802,12 +809,28 @@ pub(super) struct MoveToCompleteDone {
 }
 
 pub(super) enum TerminalPostProcessingEvent {
+    ScriptsAdmitted(TerminalScriptsAdmitted),
     QueueAdmitted(JobId),
     QueueDone(JobId, Result<(), crate::StateError>),
     AddedScriptsDone(JobId, Result<(), crate::StateError>),
     Started(JobId),
     Done(TerminalPostProcessingDone),
     CancelJobsDone(orchestrator::CancelJobsDone),
+}
+
+// What the script settings said when a job's terminal pass began: read off
+// the actor, so the turn that hears a move finish reads no setting itself.
+pub(super) struct TerminalScriptsAdmitted {
+    pub(super) job_id: JobId,
+    pub(super) facts: crate::post_processing::model::PostProcessingFacts,
+    pub(super) primary_failure: Option<String>,
+    pub(super) admission: Result<
+        Option<crate::post_processing::executor::PostProcessingJobAdmission>,
+        crate::StateError,
+    >,
+    // Whether a queue script could have an event of the job queued or
+    // running, asked only when the admission runs no script of its own.
+    pub(super) queue_events_may_hold: bool,
 }
 
 pub(super) struct TerminalPostProcessingDone {
@@ -1298,6 +1321,12 @@ pub struct Pipeline {
     pub(crate) nzb_seen: HashSet<JobId>,
     pub(crate) nzb_pause_releases: HashSet<JobId>,
     pub(crate) nzb_reprocess_pending: HashSet<JobId>,
+    // The slots whose take or release is out on the writer, not yet
+    // committed. Both count as held.
+    pub(crate) nzb_admitting: HashSet<JobId>,
+    pub(crate) nzb_releasing: HashSet<JobId>,
+    // The jobs whose install reads are out.
+    pub(crate) installing: HashSet<JobId>,
     // What the last walk over every queue row saw, and whether it left
     // anything for the next turn to look at again.
     pub(crate) queue_walk_mark: Option<nzb_admission::QueueWalkMark>,
@@ -1448,6 +1477,12 @@ pub struct Pipeline {
     pub(super) pending_completion_checks: VecDeque<JobId>,
     // Presence gates every attempt to resume a partially restored job.
     pub(crate) blocked_restores: HashMap<JobId, crate::jobs::handle::RestoreJobRequest>,
+    // The jobs whose work crashed the daemon on its last run, each parked
+    // paused as it installs instead of being restored into the same panic.
+    pub(crate) crash_marks: crate::runtime::panic_trap::CrashMarks,
+    // Jobs installed mid-move, whose move resumes once their install batch
+    // is in place.
+    pub(crate) moves_to_resume: Vec<JobId>,
     // Channels for pipeline stage results.
     pub(super) download_done_tx: mpsc::Sender<DownloadResult>,
     pub(super) download_done_rx: mpsc::Receiver<DownloadResult>,
@@ -1496,6 +1531,9 @@ pub struct Pipeline {
     pub(super) nntp_handoff_drained_rx: mpsc::Receiver<u64>,
     // Channel for background final-move results.
     pub(super) job_activated_tx: mpsc::Sender<activation::JobActivated>,
+    // Where the database answers the turn: see [`db_reply`].
+    pub(super) db_reply_tx: mpsc::UnboundedSender<db_reply::DbReply>,
+    pub(super) db_reply_rx: mpsc::UnboundedReceiver<db_reply::DbReply>,
     pub(super) job_activated_rx: mpsc::Receiver<activation::JobActivated>,
     pub(super) move_done_tx: mpsc::Sender<MoveToCompleteDone>,
     pub(super) move_done_rx: mpsc::Receiver<MoveToCompleteDone>,

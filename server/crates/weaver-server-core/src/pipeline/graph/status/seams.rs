@@ -625,13 +625,26 @@ impl Pipeline {
         &self,
         job_id: JobId,
     ) -> Option<(PipelineFailureStage, Option<String>)> {
+        self.graph_delivered_verdict(job_id)
+            .map(|verdict| (verdict.shortfall_stage, verdict.shortfall_message))
+    }
+
+    // What a graph job's delivery came to, as its row keeps it from the
+    // moment the final move begins. `None` once the job has gone.
+    pub(in crate::pipeline) fn graph_delivered_verdict(
+        &self,
+        job_id: JobId,
+    ) -> Option<crate::post_processing::model::DeliveredVerdict> {
         let (delivery, failure) = self.graph_ruling(job_id)?;
-        Some((
-            delivery.shortfall_stage(failure.as_ref()),
-            failure
+        Some(crate::post_processing::model::DeliveredVerdict {
+            partial: delivery.status(failure.as_ref()) == JobStatus::Partial,
+            shortfall_stage: delivery.shortfall_stage(failure.as_ref()),
+            shortfall_message: failure
                 .map(|failure| failure.message)
                 .or_else(|| delivery.withheld_error()),
-        ))
+            recovery_verified: self.graph_recovery_verified(job_id),
+            unpacked: self.graph_unpacked(job_id),
+        })
     }
 
     // The status a graph job with nothing left to wait for ends in. `None`

@@ -165,6 +165,7 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
     let mut current_file: Option<FileBuilder> = None;
     let mut total_segments = 0usize;
     let mut total_declared_bytes = 0u64;
+    let mut malformed = MalformedSegmentTally::default();
 
     // Parser state
     let mut in_head = false;
@@ -354,12 +355,7 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                             if let Some(reason) = seg.skip_reason(&message_id) {
                                 f.notes.malformed_segments =
                                     f.notes.malformed_segments.saturating_add(1);
-                                tracing::warn!(
-                                    subject = %f.subject,
-                                    message_id = %message_id,
-                                    reason,
-                                    "skipping malformed NZB segment"
-                                );
+                                malformed.note(&f.subject, &message_id, reason);
                             } else {
                                 let number = seg.number.expect("validated segment number");
                                 let bytes = seg.bytes.expect("validated segment byte count");
@@ -480,6 +476,7 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
 
         buf.clear();
     }
+    malformed.report();
 
     if files.is_empty() {
         return Err(NzbError::EmptyNzb);
@@ -703,6 +700,39 @@ impl DuplicateSegmentTally {
             duplicate_message_ids = self.message_ids,
             first_duplicate_message_id = %self.first.as_deref().unwrap_or_default(),
             "skipped duplicate NZB segments"
+        );
+    }
+}
+
+// The malformed segments skipped while one document was read, reported once
+// when it ends. A post whose segments all carry `bytes="0"` would otherwise
+// write a line per segment, and bury everything else the log had to say.
+#[derive(Debug, Default)]
+struct MalformedSegmentTally {
+    count: u64,
+    first: Option<(String, String, String)>,
+}
+
+impl MalformedSegmentTally {
+    fn note(&mut self, subject: &str, message_id: &str, reason: &str) {
+        self.count = self.count.saturating_add(1);
+        if self.first.is_none() {
+            self.first = Some((subject.to_owned(), message_id.to_owned(), reason.to_owned()));
+        }
+    }
+
+    // Emit the one warning this document's malformed segments are worth, if
+    // any, naming the first of them.
+    fn report(&self) {
+        let Some((subject, message_id, reason)) = &self.first else {
+            return;
+        };
+        tracing::warn!(
+            malformed_segments = self.count,
+            first_subject = %subject,
+            first_message_id = %message_id,
+            first_reason = %reason,
+            "skipping malformed NZB segments"
         );
     }
 }
@@ -1134,6 +1164,89 @@ mod tests {
         assert_eq!(nzb.files[0].segments[0].number, 6);
         assert_eq!(nzb.files[0].segments[0].bytes, 42);
         assert_eq!(nzb.files[0].segments[0].message_id(), "valid");
+    }
+
+    // Counts the warning events whose message starts with `prefix`, keeping
+    // the `malformed_segments` field of each.
+    struct WarningCounter {
+        prefix: &'static str,
+        counts: std::sync::Arc<std::sync::Mutex<Vec<Option<u64>>>>,
+    }
+
+    impl tracing::Subscriber for WarningCounter {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            #[derive(Default)]
+            struct Fields {
+                message: String,
+                malformed_segments: Option<u64>,
+            }
+            impl tracing::field::Visit for Fields {
+                fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                    if field.name() == "malformed_segments" {
+                        self.malformed_segments = Some(value);
+                    }
+                }
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.message = format!("{value:?}");
+                    }
+                }
+            }
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut fields = Fields::default();
+            event.record(&mut fields);
+            if fields.message.starts_with(self.prefix) {
+                self.counts.lock().unwrap().push(fields.malformed_segments);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    // A post whose segments carry `bytes="0"` is one warning with a count,
+    // not a line per segment.
+    #[test]
+    fn malformed_segments_are_one_warning_per_document() {
+        let xml = br#"<?xml version="1.0"?>
+<nzb>
+  <file poster="p" date="0" subject="first">
+    <groups><group>g</group></groups>
+    <segments>
+      <segment bytes="0" number="1">zero-one</segment>
+      <segment bytes="0" number="2">zero-two</segment>
+      <segment bytes="42" number="3">valid-one</segment>
+    </segments>
+  </file>
+  <file poster="p" date="0" subject="second">
+    <groups><group>g</group></groups>
+    <segments>
+      <segment bytes="0" number="1">zero-three</segment>
+      <segment bytes="42" number="2">valid-two</segment>
+    </segments>
+  </file>
+</nzb>"#;
+        let counts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = WarningCounter {
+            prefix: "skipping malformed NZB segment",
+            counts: counts.clone(),
+        };
+        let nzb = tracing::subscriber::with_default(subscriber, || parse_nzb(xml).unwrap());
+        assert_eq!(nzb.files.len(), 2);
+        assert_eq!(*counts.lock().unwrap(), [Some(3)]);
     }
 
     // A part listed again under another ID is one segment holding both IDs in

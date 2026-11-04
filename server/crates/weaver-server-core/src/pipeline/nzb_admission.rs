@@ -125,7 +125,7 @@ impl Pipeline {
     // walk over every row, which finds new candidates, retires forgotten ids
     // and restates each row's slot, runs when `walk` asks for it or a slot
     // was released this turn. Returns whether it walked.
-    pub(crate) async fn reconcile_nzb_admission(&mut self, walk: bool) -> bool {
+    pub(crate) fn reconcile_nzb_admission(&mut self, walk: bool) -> bool {
         // A crash between accepting pause and draining work must not turn
         // the interrupted pause into an automatic resume.
         if !self.nzb_pause_releases.is_empty() {
@@ -173,7 +173,9 @@ impl Pipeline {
                 let replaced = !self.jobs.contains_key(id) && row.is_some_and(|(_, intake)| intake);
                 let paused =
                     self.nzb_pause_releases.contains(id) && row.is_some_and(|(paused, _)| paused);
-                (gone || replaced || paused) && !self.nzb_work_in_flight(*id)
+                (gone || replaced || paused)
+                    && !self.nzb_releasing.contains(id)
+                    && !self.nzb_work_in_flight(*id)
             })
             .map(|(id, row)| {
                 (
@@ -186,18 +188,14 @@ impl Pipeline {
         for (id, replaced) in releases {
             // A replacement's old record has already been durably archived.
             // Its new record starts unowned and must acquire independently.
-            if !replaced
-                && let Err(error) = self
-                    .db_blocking(move |db| db.set_nzb_admitted(id, false))
-                    .await
-            {
-                error!(job_id = id.0, %error, "failed to release NZB admission");
-                self.queue_walk_due = true;
-                continue;
+            // Any other slot is let go once its release commits: it counts as
+            // held until then.
+            if replaced {
+                self.slot_written(id, false, true);
+                released = true;
+            } else {
+                self.queue_slot_write(id, false);
             }
-            self.nzb_admitted.remove(&id);
-            self.nzb_pause_releases.remove(&id);
-            released = true;
         }
         if !walk && !released {
             return false;
@@ -251,6 +249,7 @@ impl Pipeline {
                     && !row.paused
                     && !row.cancelled_or_retiring
                     && !self.nzb_admitted.contains(&row.id)
+                    && !self.nzb_admitting.contains(&row.id)
             })
             .map(|row| (row.priority, row.position, row.id))
             .collect();
@@ -279,7 +278,7 @@ impl Pipeline {
             // the next job rather than using the pass's earlier snapshot.
             let allowed = self.shared_state.queue.read(|inner| {
                 let globals = &inner.globals;
-                self.nzb_admitted.len()
+                self.nzb_admitted.len() + self.nzb_admitting.len()
                     < globals
                         .max_concurrent_nzbs
                         .unwrap_or(crate::settings::model::DEFAULT_MAX_CONCURRENT_NZBS)
@@ -292,28 +291,11 @@ impl Pipeline {
             if propagating.contains(&id) {
                 continue;
             }
-            if let Err(error) = self
-                .db_blocking(move |db| db.set_nzb_admitted(id, true))
-                .await
-            {
-                error!(job_id = id.0, %error, "failed to acquire NZB admission");
-                self.queue_walk_due = true;
-                continue;
-            }
-            self.nzb_admitted.insert(id);
-            // A job restored without a slot queued its engine runs; release
-            // them now that it holds one.
-            self.resume_graph_work(id);
-            self.download_dispatch_wake = true;
+            self.queue_slot_write(id, true);
         }
         self.shared_state.queue.write(|inner| {
             let mut changed = false;
             for row in &mut inner.jobs {
-                let admitted = self.nzb_admitted.contains(&row.id);
-                if row.report.nzb_admitted != admitted {
-                    row.report.nzb_admitted = admitted;
-                    changed = true;
-                }
                 if propagating.contains(&row.id) {
                     row.report.job.download_state = crate::DownloadState::Queued;
                     row.report.propagation_until_epoch_ms = self
@@ -322,14 +304,7 @@ impl Pipeline {
                         .map(|(_, epoch)| *epoch as f64);
                     changed = true;
                 }
-                let reason = self.stored_wait_reason(row);
-                if row.report.job.download_wait_reason.as_deref() != reason {
-                    row.report.job.download_wait_reason = reason.map(str::to_owned);
-                    if reason == Some(NZB_SLOT_WAIT_REASON) {
-                        row.report.job.download_state = crate::DownloadState::Queued;
-                    }
-                    changed = true;
-                }
+                changed |= self.restate_slot(row);
             }
             if changed {
                 Change::changed(())
@@ -378,6 +353,95 @@ impl Pipeline {
                     .is_some_and(|state| state.run_state != crate::RunState::Paused)
                 || (self.window_parked(row.id)
                     && row.report.job.run_state != crate::RunState::Paused))
+    }
+
+    // A slot is taken or let go durably before the actor acts on it: the
+    // write goes on the job's lane, behind every write the job queued
+    // before, and the slot counts as held while it is out. Its answer comes
+    // back as a [`DbReply::Slot`].
+    fn queue_slot_write(&mut self, id: JobId, admitted: bool) {
+        let replies = self.db_reply_tx.clone();
+        let queued = self
+            .db
+            .try_queue_job_write(id, "set_nzb_admitted", move |db| {
+                let written = db.set_nzb_admitted(id, admitted);
+                let _ = replies.send(crate::pipeline::db_reply::DbReply::Slot {
+                    job_id: id,
+                    admitted,
+                    committed: written.is_ok(),
+                });
+                written
+            });
+        match queued {
+            Ok(()) if admitted => {
+                self.nzb_admitting.insert(id);
+            }
+            Ok(()) => {
+                self.nzb_releasing.insert(id);
+            }
+            Err(error) => {
+                error!(job_id = id.0, admitted, %error, "failed to queue the NZB slot write");
+                self.queue_walk_due = true;
+            }
+        }
+    }
+
+    // A slot's write came back. One that committed is acted on; one that
+    // did not leaves the slot as it was, for the next walk to try again.
+    pub(crate) fn slot_written(&mut self, id: JobId, admitted: bool, committed: bool) {
+        if admitted {
+            self.nzb_admitting.remove(&id);
+        } else {
+            self.nzb_releasing.remove(&id);
+        }
+        if !committed {
+            error!(
+                job_id = id.0,
+                admitted, "failed to write the NZB slot; the next walk tries again"
+            );
+            self.queue_walk_due = true;
+            return;
+        }
+        if admitted {
+            self.nzb_admitted.insert(id);
+            // A job restored without a slot queued its engine runs; release
+            // them now that it holds one.
+            self.resume_graph_work(id);
+            self.download_dispatch_wake = true;
+        } else {
+            self.nzb_admitted.remove(&id);
+            self.nzb_pause_releases.remove(&id);
+        }
+        // A slot that moved is walked to: the holder is installed wherever
+        // it stands, and a slot let go is free for the next candidate.
+        self.queue_walk_due = true;
+        self.shared_state.queue.write(|inner| {
+            if inner.job_mut(id).is_some_and(|row| self.restate_slot(row)) {
+                Change::changed(())
+            } else {
+                Change::unchanged(())
+            }
+        });
+    }
+
+    // States on the row whether its job holds a slot, and the wait that
+    // follows from it. Returns whether the row changed.
+    fn restate_slot(&self, row: &mut crate::pipeline::queue::JobRow) -> bool {
+        let mut changed = false;
+        let admitted = self.nzb_admitted.contains(&row.id);
+        if row.report.nzb_admitted != admitted {
+            row.report.nzb_admitted = admitted;
+            changed = true;
+        }
+        let reason = self.stored_wait_reason(row);
+        if row.report.job.download_wait_reason.as_deref() != reason {
+            row.report.job.download_wait_reason = reason.map(str::to_owned);
+            if reason == Some(NZB_SLOT_WAIT_REASON) {
+                row.report.job.download_state = crate::DownloadState::Queued;
+            }
+            changed = true;
+        }
+        changed
     }
 
     pub(crate) fn nzb_work_in_flight(&self, id: JobId) -> bool {

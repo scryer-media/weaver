@@ -31,7 +31,7 @@ use std::sync::Arc;
 use unrar_rs::{ArchiveFormat, EncryptedStore, StoredLayoutBuilder};
 use weaver_graph::{
     ByteRange, Claim, Coverage, Delivery, Emit, Extent, Kind, Located, MemberId, Object, Placement,
-    Posting, Pull, Seek, Standing, VolumeIndex, Weight, Why,
+    Posting, Provenance, Pull, Seek, Standing, VolumeIndex, Weight, Why,
 };
 use zeroize::Zeroizing;
 
@@ -197,6 +197,11 @@ struct Entry {
     // The candidate that keyed the file when nothing proved it: on trial,
     // a whole-file checksum that fails on verified bytes condemns it.
     trial: Option<usize>,
+    // What the file's bytes were when a checksum condemned the candidate on
+    // trial over them, by offset: bytes a repair rewrites since were
+    // posted wrong, and the checksum that condemned it may have failed on
+    // them and not on a wrong key.
+    condemned_on: Coverage,
     out: Arc<Out>,
     // The plaintext's runs for the whole-file CRC, and every part's packed
     // runs, by piece, for its own.
@@ -231,6 +236,14 @@ impl Entry {
     // which checks the CRC32 it is stated.
     fn judges_its_checksum(&self) -> bool {
         self.uses_mac
+    }
+
+    // Whether a repair rewriting `stream` rewrites bytes a candidate was
+    // condemned over as they were posted.
+    fn rewrites_condemned(&self, stream: ByteRange) -> bool {
+        self.condemned_on
+            .overlapping(stream)
+            .any(|run| run.provenance != Provenance::Repaired)
     }
 }
 
@@ -285,6 +298,9 @@ pub struct RarStore {
     asked: bool,
     // The candidate on trial a checksum condemned during this delivery.
     wrong_key: Option<usize>,
+    // A repair rewrote bytes of a file no candidate keys that a candidate
+    // was condemned over as they were posted, since the job was last quiet.
+    rewritten: bool,
     // Files a condemned candidate keyed, with the cipher and record they
     // stood under, until every part of them has been posted again: their
     // bytes read back as they were posted.
@@ -327,6 +343,7 @@ impl RarStore {
             headers_open: None,
             asked: false,
             wrong_key: None,
+            rewritten: false,
             condemned: BTreeMap::new(),
             damage_said: HashSet::new(),
             recovery_said: BTreeSet::new(),
@@ -751,8 +768,16 @@ impl Object for RarStore {
     // Nothing more will arrive. A set whose first volume never came has
     // lost its first bytes: no header says what any volume after it holds.
     // Otherwise a member still damaged, a password still asked for, or a
-    // member named and never placed leaves the set unread.
+    // member named and never placed leaves the set unread. A repair that
+    // rewrote bytes a candidate was condemned over first has every candidate
+    // tried again on them, once the repair is done: nothing reads them again
+    // while it still writes.
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
+        if std::mem::take(&mut self.rewritten) {
+            self.acquit(out);
+            self.settle(None, out);
+            return;
+        }
         let first = self.volumes.get(&VolumeIndex(0));
         let why = match first.is_none_or(|found| found.name.is_none()) {
             true => Some(Why::FirstBytesLost),

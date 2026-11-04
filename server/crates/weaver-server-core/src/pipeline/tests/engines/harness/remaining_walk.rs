@@ -37,6 +37,8 @@ struct Walk {
     twice: Vec<(u32, u32)>,
     // Every article asked for, counting each time.
     asked: usize,
+    // Every article asked for, by file.
+    requested: BTreeSet<(u32, u32)>,
     // The paused job's remaining and wanted before and after the restart.
     across_restart: Option<((u64, u64), (u64, u64))>,
 }
@@ -201,6 +203,7 @@ async fn walk(scenario: &Scenario, pause: Option<Pause>) -> Walk {
     let status = job_status_for_assert(&pipeline, JOB);
     retire_pipeline_database(pipeline).await;
     let asked = requests.values().sum();
+    let requested = requests.keys().copied().collect();
     let twice = requests
         .into_iter()
         .filter(|(_, asked)| *asked > 1)
@@ -212,6 +215,7 @@ async fn walk(scenario: &Scenario, pause: Option<Pause>) -> Walk {
         status,
         twice,
         asked,
+        requested,
         across_restart,
     }
 }
@@ -352,6 +356,7 @@ async fn a_clean_rar_set_raises_remaining_only_by_recovery_it_asks_for() {
     let bytes: Vec<&[u8]> = volumes.iter().map(|(_, bytes)| bytes.as_slice()).collect();
     let revs = rar5_revs("silver.horizon", &bytes, 1);
     let mut posts = rar_posts(volumes);
+    let rev_files = posts.len() as u32..(posts.len() + revs.len()) as u32;
     posts.extend(revs);
     let scenario = Scenario::new(posts);
     let walk = walk(&scenario, None).await;
@@ -362,6 +367,18 @@ async fn a_clean_rar_set_raises_remaining_only_by_recovery_it_asks_for() {
     assert!(
         rises.is_empty(),
         "remaining rose with nothing lost: {rises:?}"
+    );
+    // Nothing is lost, so a recovery volume is read no further than the
+    // first article, which holds its whole header: none of its parity.
+    let parity: Vec<(u32, u32)> = walk
+        .requested
+        .iter()
+        .copied()
+        .filter(|&(file, article)| rev_files.contains(&file) && article > 0)
+        .collect();
+    assert!(
+        parity.is_empty(),
+        "a clean set fetched .rev parity articles {parity:?}"
     );
 }
 

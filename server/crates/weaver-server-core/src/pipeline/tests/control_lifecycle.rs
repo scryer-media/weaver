@@ -494,6 +494,7 @@ async fn pause_refused_after_downloads_drain_clears_the_intent_and_releases_the_
         assert_eq!(done.job_id, id);
         assert!(done.result.is_ok());
         pipeline.handle_move_to_complete_done(done).await;
+        settle_script_admissions(&mut pipeline).await;
         let terminal = loop {
             match events.recv().await.unwrap() {
                 event @ (PipelineEvent::JobCompleted { job_id }

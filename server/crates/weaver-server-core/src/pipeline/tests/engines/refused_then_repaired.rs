@@ -49,7 +49,7 @@ fn posts() -> Vec<Post> {
 }
 
 fn articles_of(scenario: &Scenario, file: usize) -> u32 {
-    scenario.posts[file].bytes.len().div_ceil(scenario.article) as u32
+    scenario.posts[file].articles(scenario.article).count() as u32
 }
 
 fn articles(post: &Post) -> u32 {
@@ -233,7 +233,7 @@ pub(super) async fn serve_posts(
 ) {
     for file in files {
         let post = &scenario.posts[file as usize];
-        for ordinal in 0..post.bytes.len().div_ceil(scenario.article) as u32 {
+        for ordinal in 0..post.articles(scenario.article).count() as u32 {
             serve_queued(pipeline, scenario, (file, ordinal)).await;
             pump_pipeline_runtime_queues(pipeline).await;
         }

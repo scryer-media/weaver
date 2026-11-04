@@ -21,7 +21,7 @@ use weaver_graph::{
 };
 
 use super::{Entry, Lock, Out, RarStore, Volume};
-use crate::crypt::{BLOCK, Cbc};
+use crate::crypt::{BLOCK, Cbc, Frontier};
 
 fn push(out: &mut Vec<Placement>, placement: Placement) {
     if placement.is_empty() {
@@ -530,6 +530,7 @@ impl RarStore {
                         member: MemberId(id as u32),
                         cbc: Arc::clone(cbc),
                         out: Arc::clone(out),
+                        frontier: Frontier::default(),
                     });
                 }
             }
@@ -547,6 +548,9 @@ struct Sealed {
     member: MemberId,
     cbc: Arc<Cbc>,
     out: Arc<Out>,
+    // Where the last seal of this part ended, so reads of it in order
+    // encipher each byte once.
+    frontier: Frontier,
 }
 
 // The store's posted bytes, apart from the store: a plain stretch is read
@@ -590,10 +594,14 @@ impl Posting for Posted {
                 )
             };
             let said = &sealed.out;
-            if !sealed
-                .cbc
-                .seal(&said.coverage, &said.padding, stream, &mut plain, into)
-            {
+            if !sealed.cbc.seal_on(
+                &sealed.frontier,
+                &said.coverage,
+                &said.padding,
+                stream,
+                &mut plain,
+                into,
+            ) {
                 return false;
             }
             cursor = part.end;

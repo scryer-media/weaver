@@ -861,3 +861,38 @@ fn a_run_says_each_files_header_checksum_and_none_for_a_directory() {
         vec![(1, crc(NOTES)), (2, crc(&second()))]
     );
 }
+
+// A deflated member reaches the sink in pieces of a quarter megabyte, not
+// in the few kilobytes the zip library's readers hand back at a time.
+#[test]
+fn a_deflated_member_is_said_in_quarter_megabyte_pieces() {
+    let data = payload(17, 4 * super::run::EMIT_BYTES + 5);
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    writer.start_file("movie.mkv", deflated).unwrap();
+    writer.write_all(&data).unwrap();
+    let archive = writer.finish().unwrap().into_inner();
+    let mut emits = Vec::new();
+    let mut sink = |emit| {
+        emits.push(emit);
+        true
+    };
+    ZipEngine::new().start().run(
+        Gate::whole(vec![archive]),
+        &mut sink,
+        weaver_graph::Budget::default(),
+    );
+    let pieces = emits
+        .iter()
+        .filter(|emit| matches!(emit, Emit::Bytes { .. }))
+        .count();
+    assert_eq!(pieces, data.len().div_ceil(super::run::EMIT_BYTES));
+    assert_eq!(
+        said(&emits),
+        vec![
+            Said::Member(0, "movie.mkv".into(), Some(data.len() as u64)),
+            Said::Bytes(0, data),
+            Said::Closed(0),
+        ]
+    );
+}

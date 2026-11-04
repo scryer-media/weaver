@@ -21,7 +21,7 @@ use super::header::SIGNATURE;
 use super::map::Map;
 use super::record::FolderPlaced;
 use super::{ENVELOPE, FILE, Lock, Out, SevenZipStore};
-use crate::crypt::{BLOCK, Cbc, Padding, block_floor};
+use crate::crypt::{BLOCK, Cbc, Frontier, Padding, block_floor};
 
 // A piece of the container: the envelope and held bytes in container
 // coordinates, a member's at its own offsets.
@@ -289,6 +289,7 @@ impl SevenZipStore {
                     pack: folder.pack.start,
                     cbc: Arc::clone(cbc),
                     padding: Arc::clone(padding),
+                    frontier: Frontier::default(),
                 });
             }
         }
@@ -309,6 +310,9 @@ struct Sealed {
     pack: u64,
     cbc: Arc<Cbc>,
     padding: Arc<Padding>,
+    // Where the last seal of this part ended, so reads of it in order
+    // encipher each byte once.
+    frontier: Frontier,
 }
 
 // The store's posted bytes, apart from the store: a plain stretch is read
@@ -355,10 +359,14 @@ impl Posting for Posted {
                 members: &self.members,
             };
             let local = part.shift(-(sealed.pack as i64));
-            if !sealed
-                .cbc
-                .seal(&placed, &sealed.padding, local, &mut plain, into)
-            {
+            if !sealed.cbc.seal_on(
+                &sealed.frontier,
+                &placed,
+                &sealed.padding,
+                local,
+                &mut plain,
+                into,
+            ) {
                 return false;
             }
             cursor = part.end;

@@ -62,6 +62,13 @@ impl RarStore {
                 slice.fill(Algorithm::Crc32);
             }
             self.check_part(id, piece, (part, stream), &slice, provenance, read, out);
+            // A repair rewrote bytes of a file no candidate keys, bytes a
+            // candidate was condemned over as they were posted: the checksum
+            // may have failed on them, wrong, and not under a wrong key.
+            let entry = &self.entries[id];
+            self.rewritten |= provenance == Provenance::Repaired
+                && matches!(entry.lock, Lock::Locked)
+                && entry.rewrites_condemned(stream);
             let entry = &mut self.entries[id];
             let judges = entry.judges_its_checksum();
             let mut plains = Vec::new();

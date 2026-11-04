@@ -229,6 +229,12 @@ impl Owner {
             match placement {
                 Placement::Held { range } => {
                     assert_eq!(range.start, at, "held pieces are in volume order");
+                    // Held bytes stand at their offsets, as the tree keeps
+                    // them in the volume's file: a later copy replaces what
+                    // it covers.
+                    self.held.retain(|(was, held, ..)| {
+                        *was != volume || held.start < range.start || held.end > range.end
+                    });
                     self.held.push((volume, *range, provenance, piece.to_vec()));
                 }
                 Placement::Envelope { envelope, range } => {

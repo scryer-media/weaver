@@ -306,6 +306,7 @@ async fn manual_pause_waits_for_work_and_resume_during_drain_keeps_ownership() {
     pipeline.apply_queue_intents().await;
     pipeline.apply_queue_intents().await;
     assert_eq!(pipeline.nzb_admitted, HashSet::from([JobId(1)]));
+    pipeline.db.flush_write_queue().await.unwrap();
     assert!(
         pipeline
             .db
@@ -316,6 +317,7 @@ async fn manual_pause_waits_for_work_and_resume_during_drain_keeps_ownership() {
     handle.resume_job(JobId(1)).await.unwrap();
     pipeline.apply_queue_intents().await;
     assert!(!pipeline.nzb_pause_releases.contains(&JobId(1)));
+    pipeline.db.flush_write_queue().await.unwrap();
     assert!(
         !pipeline
             .db

@@ -973,10 +973,16 @@ fn open_applies_sqlite_file_pragmas() {
     let db = Database::open(&temp.path().join("weaver.db")).unwrap();
 
     let cache_size = fetch_i64(&db, "PRAGMA cache_size", vec![]);
-    assert_eq!(cache_size, -16000);
+    assert_eq!(cache_size, -65536);
 
     let mmap_size = fetch_i64(&db, "PRAGMA mmap_size", vec![]);
     assert_eq!(mmap_size, 16 * 1024 * 1024);
+
+    let wal_autocheckpoint = fetch_i64(&db, "PRAGMA wal_autocheckpoint", vec![]);
+    assert_eq!(wal_autocheckpoint, 4000);
+
+    let journal_size_limit = fetch_i64(&db, "PRAGMA journal_size_limit", vec![]);
+    assert_eq!(journal_size_limit, 64 * 1024 * 1024);
 }
 
 #[test]
@@ -1281,6 +1287,7 @@ fn lane_write(
             label: "lane_probe",
             lane,
             op: Box::new(op),
+            committed: None,
         },
     }
 }

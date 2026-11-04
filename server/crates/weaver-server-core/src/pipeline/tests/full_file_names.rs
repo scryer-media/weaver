@@ -37,6 +37,7 @@ async fn a_delivery_rename_reaches_the_finished_job_with_its_full_name() {
     let done = pipeline.move_done_rx.recv().await.unwrap();
     let dest = done.dest.clone();
     pipeline.handle_move_to_complete_done(done).await;
+    settle_script_admissions(&mut pipeline).await;
 
     assert!(dest.join("Silver Horizon_ Part 2.mkv").is_file());
     let finished = pipeline

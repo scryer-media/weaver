@@ -1719,7 +1719,7 @@ impl Tree {
                     record.name.clone(),
                     record.length,
                     front.to_vec(),
-                    record.said(front),
+                    record.said(front, namespace),
                 )
             })
         }) else {
@@ -2309,10 +2309,13 @@ impl Tree {
             return;
         };
         let front = namespace.first_bytes(member).to_vec();
-        let Some((name, length, said)) = namespace
-            .get(member)
-            .map(|record| (record.name.clone(), record.length, record.said(&front)))
-        else {
+        let Some((name, length, said)) = namespace.get(member).map(|record| {
+            (
+                record.name.clone(),
+                record.length,
+                record.said(&front, namespace),
+            )
+        }) else {
             return;
         };
         let Sniff::Object(kind) = said else {
@@ -2361,11 +2364,13 @@ impl Tree {
         let Some(mut members) = self.nodes.members_mut(node) else {
             return;
         };
-        let Some((name, length, said)) = members
-            .namespace
-            .get(member)
-            .map(|record| (record.name.clone(), record.length, record.said(prefix)))
-        else {
+        let Some((name, length, said)) = members.namespace.get(member).map(|record| {
+            (
+                record.name.clone(),
+                record.length,
+                record.said(prefix, members.namespace),
+            )
+        }) else {
             return;
         };
         match said {

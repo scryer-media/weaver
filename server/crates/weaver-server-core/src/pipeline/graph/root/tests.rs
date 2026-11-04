@@ -2264,3 +2264,79 @@ async fn a_declared_length_a_mebibyte_long_closes_at_the_real_length() {
     assert!(furthest <= 2 * 66_400, "the file reached {furthest} bytes");
     assert_whole(&job, &dir, &bodies);
 }
+
+// A first part posted with its `=ypart begin=` and `end=` exchanged lies at
+// the start of its file on the live path, and in a root restored from a
+// checkpoint: taken before the part arrived, the refetched part lands
+// where the live one did; taken after, the restored root knows the same
+// place and keeps the copy that stood.
+#[test]
+fn an_exchanged_first_part_lands_at_the_same_place_after_a_restore() {
+    use super::facts::{Encoded, Parts, decode};
+    let files = [file("plain.bin", &[100, 100, 100])];
+    let body: Vec<u8> = (0..90u8).collect();
+    let exchanged = || {
+        let mut article = Vec::new();
+        weaver_yenc::encode_part(&body, &mut article, 128, "plain.bin", 1, 3, 90, 1, 270).unwrap();
+        let mut out = vec![0u8; article.len()];
+        let result = weaver_yenc::decode_nntp(&article, &mut out).unwrap();
+        out.truncate(result.bytes_written);
+        assert_eq!(result.crc_status, weaver_yenc::CrcVerification::Verified);
+        super::seams::decoded(
+            SegmentId {
+                file_id: crate::jobs::ids::NzbFileId {
+                    job_id: JobId(1),
+                    file_index: 0,
+                },
+                segment_number: 0,
+            },
+            result.metadata.article_file_offset(),
+            crate::pipeline::DecodedChunk::from(out),
+            true,
+            true,
+            result.metadata.size,
+            result.metadata.end,
+            result.segments,
+        )
+    };
+    let restarted = |root: &ArticleRoot| {
+        let encoding = root.encode(&mut Encoded::default(), 9, 0, None, Vec::new());
+        let Parts::All(parts) = encoding.parts else {
+            panic!("a fresh encoding is whole");
+        };
+        let facts = decode(encoding.version, &encoding.bytes, &parts).unwrap();
+        ArticleRoot::restore(&files, &facts).unwrap()
+    };
+
+    let mut live = ArticleRoot::new(&files);
+    let arrival = live.receive(exchanged()).expect("the first copy stands");
+    assert_eq!(arrival.offset, 0);
+    assert_eq!(arrival.bytes.len(), 90);
+    assert!(live.map.known_in(0, 0).contains(&(1, 90)));
+    assert_eq!(
+        kept_checksums(&live, ByteRange::new(0, 270)),
+        vec![checksum(0, 90, par2_rs::checksum::crc32(&body), true)]
+    );
+
+    // Restored before the part arrived: the refetched part lands as live.
+    let mut before = restarted(&ArticleRoot::new(&files));
+    let arrival = before.receive(exchanged()).expect("the first copy stands");
+    assert_eq!(arrival.offset, 0);
+    assert_eq!(before.map.known_in(0, 0), live.map.known_in(0, 0));
+    assert_eq!(
+        kept_checksums(&before, ByteRange::new(0, 270)),
+        kept_checksums(&live, ByteRange::new(0, 270))
+    );
+
+    // Restored after it arrived: the same place, and the part stands.
+    let mut after = restarted(&live);
+    assert_eq!(after.map.known_in(0, 0), live.map.known_in(0, 0));
+    assert_eq!(
+        kept_checksums(&after, ByteRange::new(0, 270)),
+        kept_checksums(&live, ByteRange::new(0, 270))
+    );
+    assert!(
+        after.receive(exchanged()).is_none(),
+        "the restored copy stands"
+    );
+}

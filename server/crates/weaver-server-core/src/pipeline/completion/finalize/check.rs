@@ -192,6 +192,10 @@ impl Pipeline {
     // it (the repair and extraction slots the graph asks for, and the final
     // move).
     pub(crate) async fn check_job_completion(&mut self, job_id: JobId) {
+        crate::runtime::panic_trap::in_job(job_id, self.weigh_job_completion(job_id)).await;
+    }
+
+    async fn weigh_job_completion(&mut self, job_id: JobId) {
         if !self.nzb_admitted.contains(&job_id) {
             return;
         }
