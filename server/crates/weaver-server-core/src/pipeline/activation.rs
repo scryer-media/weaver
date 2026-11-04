@@ -173,7 +173,24 @@ impl Pipeline {
         };
         let mut held = Self::held_parts(&self.uu_files, &self.unanchored_parked, job_id);
         held.extend(held_parts.iter().map(HeldPart::segment_id));
-        let (assembly, download_queue) = Self::build_job_assembly(job_id, &state.spec, skip, &held);
+        let (mut assembly, download_queue) =
+            Self::build_job_assembly(job_id, &state.spec, skip, &held);
+        // A graph root brought back holds the articles it placed. Each one's
+        // placement is recorded again, so an article that arrives now is
+        // checked against its neighbours exactly as it would have been
+        // before the job left the pipeline.
+        if let Some(graph) = &graph {
+            for file in assembly.files_mut() {
+                let volume = weaver_graph::VolumeIndex(file.file_id().file_index);
+                for (ordinal, range) in graph.placed_intact(volume) {
+                    if file.has_segment(ordinal)
+                        && let Ok(len) = u32::try_from(range.end - range.start)
+                    {
+                        file.record_placement(ordinal, range.start, len);
+                    }
+                }
+            }
+        }
         state.articles = JobArticles::Active(Box::new(ActiveArticles {
             assembly,
             download_queue,
