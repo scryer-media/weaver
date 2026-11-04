@@ -241,6 +241,7 @@ impl Recovery {
 
                 // A lost probe was too large, which says nothing of congestion.
                 if !tx_segs.first_is_mtu_probe() {
+                    stats.packets_lost.increment(1);
                     congestion_controller.on_enter_recovery(now, high_ack + 1, last_sent_seq_nr);
                 }
 

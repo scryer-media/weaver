@@ -371,6 +371,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             let seg = self.user_tx_segments.iter_mut_for_sending(None).next();
             if let Some(mut seg) = seg {
+                if self.timers.retransmit.report_expiry() {
+                    self.socket.stats.timeouts.increment(1);
+                }
                 // A stream that dies on a packet larger than any it saw
                 // delivered leaves later streams probing no higher.
                 let mss = usize::from(self.segment_sizes.mss());
@@ -435,6 +438,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 // There's no data to send. Maybe we need to resend FIN? Check.
                 match self.state.our_fin_if_unacked() {
                     Some(our_fin_seq_nr) if self.last_sent_seq_nr == our_fin_seq_nr => {
+                        if self.timers.retransmit.report_expiry() {
+                            self.socket.stats.timeouts.increment(1);
+                        }
                         let timeouts = self.rtte.timeouts() as usize + 1;
                         if timeouts > self.socket_opts.num_resends
                             || self.fin_sends >= self.socket_opts.fin_resends
@@ -864,6 +870,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 payload_size,
             } => {
                 debug!(payload_size, ?self.last_sent_seq_nr, ?rewind_to, "MTU probe expired");
+                if self.timers.retransmit.report_expiry() {
+                    self.socket.stats.timeouts.increment(1);
+                }
                 // In case the retransmit timer expired, this is not "real" expiry, but expiry due to us sending
                 // too large segment. So ignore the retransmit timer, pretend it didn't fire.
                 self.timers.retransmit.turn_off("MTU probe is not real RTO");
@@ -1104,10 +1113,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         // a reset among them.
         if hdr.htype != ST_SYN && hdr.ack_nr > self.highest_sent_seq_nr {
             trace!(%self.highest_sent_seq_nr, "dropping packet, it acks what we never sent");
+            self.socket.stats.invalid_packets.increment(1);
             return Ok(Default::default());
         }
         if hdr.htype != ST_SYN && hdr.ack_nr < self.user_tx_segments.acked_seq_nr() - 3 {
             trace!(acked_seq_nr = %self.user_tx_segments.acked_seq_nr(), "dropping packet, its ack is too old");
+            self.socket.stats.invalid_packets.increment(1);
             return Ok(Default::default());
         }
 
@@ -1123,6 +1134,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
             (_, ST_SYN) => {
                 trace!("unexpected ST_SYN, ignoring");
+                self.socket.stats.invalid_packets.increment(1);
                 return Ok(Default::default());
             }
             (Closed, _) => {
@@ -1132,6 +1144,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             (SynAckSent { .. }, ST_DATA | ST_STATE) => {
                 if hdr.ack_nr != self.seq_nr - 1 {
                     trace!("dropping packet, we expected a different ack_nr");
+                    self.socket.stats.invalid_packets.increment(1);
                     return Ok(Default::default());
                 }
 
@@ -1155,6 +1168,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     "dropping FIN, expected seq_nr to be {}",
                     self.last_consumed_remote_seq_nr + 1
                 );
+                self.socket.stats.invalid_packets.increment(1);
                 return Ok(Default::default());
             }
 
@@ -1207,6 +1221,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             (LastAck { remote_fin, .. }, _) if hdr.seq_nr > remote_fin => {
                 if hdr.htype == ST_DATA {
                     trace!(hdr=%hdr.short_repr(), ?remote_fin, "received higher seq nr than remote FIN, dropping packet");
+                    self.socket.stats.invalid_packets.increment(1);
                     return Ok(Default::default());
                 } else {
                     // We COULD drop this packet, but turns out it happens very often in the wild.
@@ -1257,15 +1272,18 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let acked_bytes =
             result.on_ack_result.acked_bytes + result.on_ack_result.newly_sacked_byte_count;
         if sampled.is_some() && acked_bytes > 0 && in_flight_before > 0 {
-            self.congestion_controller.on_delay_sample(DelaySample {
-                delay: self.delay.controller_delay(result.on_ack_result.new_rtt),
-                acked_bytes,
-                in_flight_before,
-                in_flight_after: self
-                    .user_tx_segments
-                    .calc_flight_size(self.last_sent_seq_nr),
-                segment: self.segment_sizes.probe_size().into(),
-            });
+            self.congestion_controller.on_delay_sample(
+                DelaySample {
+                    delay: self.delay.controller_delay(result.on_ack_result.new_rtt),
+                    acked_bytes,
+                    in_flight_before,
+                    in_flight_after: self
+                        .user_tx_segments
+                        .calc_flight_size(self.last_sent_seq_nr),
+                    segment: self.segment_sizes.probe_size().into(),
+                },
+                &self.socket.stats,
+            );
         }
         self.socket.stats.max_congestion_window_bytes.fetch_max(
             self.congestion_controller.cwnd_bytes() as u64,
@@ -1294,6 +1312,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         "ignoring message, we already processed it. There might be packet loss, resending ACK."
                     );
                     self.force_immediate_ack("duplicate ST_DATA");
+                    self.socket.stats.redundant_packets.increment(1);
                     self.socket
                         .stats
                         .incoming_already_acked_data_packets
@@ -1895,6 +1914,7 @@ enum Timer<const NAME: u8> {
     Idle,
     Armed {
         expires_at: Instant,
+        expiry_reported: bool,
     },
 }
 
@@ -1913,7 +1933,16 @@ impl<const NAME: u8> Timer<NAME> {
     fn expired(&self, now: Instant) -> bool {
         match self {
             Timer::Idle => false,
-            Timer::Armed { expires_at } => *expires_at <= now,
+            Timer::Armed { expires_at, .. } => *expires_at <= now,
+        }
+    }
+
+    fn report_expiry(&mut self) -> bool {
+        match self {
+            Timer::Armed {
+                expiry_reported, ..
+            } => !std::mem::replace(expiry_reported, true),
+            Timer::Idle => false,
         }
     }
 
@@ -1938,7 +1967,10 @@ impl<const NAME: u8> Timer<NAME> {
     }
 
     fn set(&mut self, expires_at: Instant) {
-        *self = Timer::Armed { expires_at }
+        *self = Timer::Armed {
+            expires_at,
+            expiry_reported: false,
+        }
     }
 
     fn arm(&mut self, now: Instant, delay: Duration, restart: bool, reason: &'static str) {
@@ -1947,15 +1979,20 @@ impl<const NAME: u8> Timer<NAME> {
                 trace!(?delay, reason, "arming {} timer", self.name());
                 Timer::Armed {
                     expires_at: now + delay,
+                    expiry_reported: false,
                 }
             }
             Timer::Armed { .. } if restart => {
                 trace!(?delay, reason, "arming {} timer", self.name());
                 Timer::Armed {
                     expires_at: now + delay,
+                    expiry_reported: false,
                 }
             }
-            Timer::Armed { expires_at, .. } => {
+            Timer::Armed {
+                expires_at,
+                expiry_reported,
+            } => {
                 let new_expires = now + delay;
                 if new_expires < expires_at {
                     trace!(
@@ -1967,6 +2004,7 @@ impl<const NAME: u8> Timer<NAME> {
                 }
                 Timer::Armed {
                     expires_at: expires_at.min(new_expires),
+                    expiry_reported: expiry_reported && new_expires >= expires_at,
                 }
             }
         };

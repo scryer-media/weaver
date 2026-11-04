@@ -14,6 +14,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub use weaver_torrent::session_stats::snapshot::UtpStatsSnapshot;
 use weaver_torrent::{FetchPhase, Session};
 
 use crate::jobs::JobId;
@@ -375,6 +376,7 @@ pub struct SessionSeries {
     pub sent_protocol_bytes: u64,
     pub blocked_incoming: u64,
     pub blocked_outgoing: u64,
+    pub utp: UtpStatsSnapshot,
     /// Its peers across every torrent, by state.
     pub peers: Vec<(&'static str, u32)>,
     /// Outgoing connections by transport and address family: attempted,
@@ -420,6 +422,7 @@ impl SessionSeries {
             sent_protocol_bytes: stats.counters.uploaded_protocol_bytes,
             blocked_incoming: stats.counters.blocked_incoming,
             blocked_outgoing: stats.counters.blocked_outgoing,
+            utp: stats.utp,
             peers: SESSION_PEER_STATES
                 .into_iter()
                 .zip([

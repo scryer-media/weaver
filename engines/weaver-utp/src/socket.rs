@@ -386,6 +386,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 let message = match UtpMessage::deserialize(&read_buf[..len], received) {
                     Some(msg) => msg,
                     None => {
+                        self.socket.stats.invalid_packets.increment(1);
                         trace!(len, ?addr, "error deserializing and validating UTP message");
                         return Ok(())
                     }
@@ -515,6 +516,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 ?msg,
                 "dropping packet. we are connecting to this addr, but ack_nr doens't match"
             );
+            self.socket.stats.invalid_packets.increment(1);
             return Ok(());
         };
 
@@ -547,6 +549,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let recv_key = (syn.remote, syn.header.connection_id + 1);
         if self.streams.contains_key(&recv_key) {
             debug!(?recv_key, "SYN clashes with an existing stream, ignoring");
+            self.socket.stats.invalid_packets.increment(1);
             return MatchSynWithAccept::SynInvalid(accept);
         }
 
@@ -594,7 +597,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 streams = self.streams.len(),
                 "dropping SYN, too many streams"
             );
-            self.socket.stats.cant_accept_syn.increment(1);
+            self.socket.stats.syn_flood_dropped.increment(1);
             return Ok(());
         }
         let mut syn = Syn {
@@ -615,7 +618,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             None => Ok(()),
             Some(syn) => {
                 debug!("dropping SYN, no more space to cache them and no acceptors available");
-                self.socket.stats.cant_accept_syn.increment(1);
+                self.socket.stats.syn_rst.increment(1);
                 self.try_send_rst(syn).await;
                 Ok(())
             }
@@ -976,11 +979,57 @@ mod tests {
         assert_eq!(
             socket
                 .stats()
-                .cant_accept_syn
+                .syn_flood_dropped
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
         );
         assert!(transport.take_sent_utpmessages().is_empty(), "unanswered");
+        assert_eq!(socket.stats().snapshot().syn_rst, 0);
+    }
+
+    #[tokio::test]
+    async fn a_full_syn_queue_counts_its_reset_separately() {
+        use crate::{
+            SocketOpts, UtpSocket,
+            message::UtpMessage,
+            raw::{Type, UtpHeader},
+            test_util::{ADDR_1, ADDR_2, env::MockUtpEnvironment, transport::RememberingTransport},
+        };
+
+        let transport = RememberingTransport::new(ADDR_1);
+        let (socket, mut dispatcher) = UtpSocket::new_with_opts_and_dispatcher(
+            transport.clone(),
+            MockUtpEnvironment::new(),
+            SocketOpts::default(),
+        )
+        .unwrap();
+        for id in 0..=super::ACCEPT_QUEUE_MAX_SYNS as u16 {
+            dispatcher
+                .on_recv(
+                    ADDR_2,
+                    UtpMessage::new_test(
+                        UtpHeader {
+                            htype: Type::ST_SYN,
+                            connection_id: id.into(),
+                            seq_nr: id.into(),
+                            ..Default::default()
+                        },
+                        b"",
+                    ),
+                )
+                .await
+                .unwrap();
+        }
+        let stats = socket.stats().snapshot();
+        assert_eq!(stats.syn_rst, 1);
+        assert_eq!(stats.syn_flood_dropped, 0);
+        let sent = transport.take_sent_utpmessages();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].header.htype, Type::ST_RESET);
+        assert_eq!(
+            sent[0].header.ack_nr,
+            (super::ACCEPT_QUEUE_MAX_SYNS as u16).into()
+        );
     }
 
     #[tokio::test]

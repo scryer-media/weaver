@@ -28,6 +28,66 @@ fn p(mtu: u16) -> String {
 }
 
 #[tokio::test]
+async fn abandoning_a_probe_counts_its_last_timeout_without_backoff() {
+    for retries in [0, 1] {
+        let mut t = make_test_vsock(
+            SocketOpts {
+                mtu_probe_max_retransmissions: Some(retries),
+                disable_nagle: true,
+                ..Default::default()
+            },
+            false,
+        );
+        let floor = usize::from(t.vsock.segment_sizes.mss());
+        let probe = usize::from(t.vsock.segment_sizes.probe_size());
+        t.stream
+            .as_mut()
+            .unwrap()
+            .write_all(&vec![7; floor + probe])
+            .await
+            .unwrap();
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].payload().len(), floor);
+        t.send_msg(
+            UtpHeader {
+                htype: ST_STATE,
+                seq_nr: 1.into(),
+                ack_nr: sent[0].header.seq_nr,
+                wnd_size: 1024 * 1024,
+                ..Default::default()
+            },
+            "",
+        );
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].payload().len(), probe);
+        let window = t.vsock.congestion_controller.window();
+
+        for expiry in 1..=retries + 1 {
+            t.env.increment_now(t.vsock.rtte.retransmission_timeout());
+            t.poll_once_assert_pending().await;
+            assert_eq!(t._socket.stats().snapshot().timeouts, expiry as u64);
+            let sent = t.take_sent();
+            assert!(!sent.is_empty());
+            if expiry <= retries {
+                assert_eq!(sent.len(), 1);
+                assert_eq!(sent[0].payload().len(), probe);
+            } else {
+                assert!(sent.iter().all(|message| message.payload().len() < probe));
+            }
+            assert_eq!(t.vsock.rtte.timeouts(), 0);
+            assert_eq!(t.vsock.congestion_controller.window(), window);
+        }
+        t.poll_once_assert_pending().await;
+        assert_eq!(t._socket.stats().snapshot().timeouts, (retries + 1) as u64);
+        assert_eq!(t._socket.stats().snapshot().packets_lost, 0);
+    }
+}
+
+#[tokio::test]
 async fn test_mtu_probing() {
     setup_test_logging();
 
@@ -45,9 +105,7 @@ async fn test_mtu_probing() {
     let (_r, mut w) = t.stream.take().unwrap().split();
 
     // Force congestion controller to have a very high window so that it doesn't interfere.
-    t.vsock
-        .congestion_controller
-        .set_window(1024 * 1024);
+    t.vsock.congestion_controller.set_window(1024 * 1024);
 
     #[derive(Debug)]
     enum TestCommand {
@@ -203,9 +261,7 @@ async fn probe_retry_if_emsgsize() {
         .set_probe_expiry_cooldown_max_packets(2);
 
     // Force congestion controller to have a very high window so that it doesn't interfere.
-    t.vsock
-        .congestion_controller
-        .set_window(1024 * 1024);
+    t.vsock.congestion_controller.set_window(1024 * 1024);
 
     let (_r, mut w) = t.stream.take().unwrap().split();
     w.write_all(make_payload(30000).as_bytes()).await.unwrap();

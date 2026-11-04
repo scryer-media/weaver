@@ -1487,7 +1487,7 @@ fn sample_speed_tests() -> weaver_server_core::speed_test::SpeedTestMetricsSnaps
 fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMetrics {
     use weaver_server_core::torrents::metrics::{
         FetchOutcome, Published, SeedingGoal, SeedingSeries, SessionSeries, TorrentEvent,
-        TorrentMetrics, TorrentSeries, TrackerSeries,
+        TorrentMetrics, TorrentSeries, TrackerSeries, UtpStatsSnapshot,
     };
     use weaver_server_core::torrents::service::TorrentPieces;
     use weaver_server_core::torrents::{FetchPhase, TorrentState, TrackerStatus};
@@ -1591,6 +1591,15 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
         sent_protocol_bytes: 900,
         blocked_incoming: 2,
         blocked_outgoing: 5,
+        utp: UtpStatsSnapshot {
+            delay_samples_above_target: 11,
+            delay_samples_below_target: 12,
+            packets_lost: 13,
+            timeouts: 14,
+            invalid_packets: 15,
+            redundant_packets: 16,
+            ..Default::default()
+        },
         peers: vec![
             ("established", 6),
             ("connecting", 5),

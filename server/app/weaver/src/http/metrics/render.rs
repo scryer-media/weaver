@@ -2733,6 +2733,33 @@ fn render_torrent_sessions(out: &mut Encoder, routes: &[SessionSeries]) {
             session.blocked_outgoing,
         );
     }
+    for (family, counter) in [
+        (
+            &f::TORRENT_UTP_DELAY_ABOVE,
+            (|s: &SessionSeries| s.utp.delay_samples_above_target) as fn(&SessionSeries) -> u64,
+        ),
+        (&f::TORRENT_UTP_DELAY_BELOW, |s: &SessionSeries| {
+            s.utp.delay_samples_below_target
+        }),
+        (&f::TORRENT_UTP_PACKETS_LOST, |s: &SessionSeries| {
+            s.utp.packets_lost
+        }),
+        (&f::TORRENT_UTP_TIMEOUTS, |s: &SessionSeries| s.utp.timeouts),
+        (&f::TORRENT_UTP_INVALID_PACKETS, |s: &SessionSeries| {
+            s.utp.invalid_packets
+        }),
+        (&f::TORRENT_UTP_REDUNDANT_PACKETS, |s: &SessionSeries| {
+            s.utp.redundant_packets
+        }),
+    ] {
+        for session in sessions() {
+            out.sample(
+                family,
+                &[("route", session.route.as_str())],
+                counter(session),
+            );
+        }
+    }
     for session in sessions() {
         for (state, count) in &session.peers {
             out.sample(

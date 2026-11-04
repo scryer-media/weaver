@@ -67,6 +67,40 @@ async fn data_is_sent_three_times_then_the_stream_gives_up() {
         t.take_sent().iter().all(|m| m.header.htype != ST_DATA),
         "no fourth send"
     );
+    let stats = t._socket.stats().snapshot();
+    assert_eq!(stats.timeouts, 3);
+    assert_eq!(stats.packets_lost, 0);
+}
+
+#[tokio::test]
+async fn an_rto_is_counted_once_while_transport_sends_stay_pending() {
+    let mut t = make_test_vsock(patient(), false);
+    open_window(&mut t);
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(b"hello")
+        .await
+        .unwrap();
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.take_sent().len(), 1);
+
+    t.transport.set_poll_send_pending(true);
+    t.env.increment_now(t.vsock.rtte.retransmission_timeout());
+    t.poll_once_assert_pending().await;
+    assert_eq!(t._socket.stats().snapshot().timeouts, 1);
+    t.poll_once_assert_pending().await;
+    assert_eq!(t._socket.stats().snapshot().timeouts, 1);
+    t.assert_sent_empty();
+
+    t.transport.set_poll_send_pending(false);
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.take_sent().len(), 1);
+    assert_eq!(t._socket.stats().snapshot().timeouts, 1);
+    t.env.increment_now(t.vsock.rtte.retransmission_timeout());
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.take_sent().len(), 1);
+    assert_eq!(t._socket.stats().snapshot().timeouts, 2);
 }
 
 #[tokio::test]

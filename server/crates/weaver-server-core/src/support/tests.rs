@@ -810,6 +810,7 @@ fn published_metrics() -> crate::torrents::metrics::TorrentMetrics {
                 sent_protocol_bytes: 80,
                 blocked_incoming: 1,
                 blocked_outgoing: 0,
+                utp: Default::default(),
                 peers: vec![("established", 3), ("connecting", 2)],
                 connects: vec![("tcp", "v4", [5, 3, 2])],
                 dht: None,

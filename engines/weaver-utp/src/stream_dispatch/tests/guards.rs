@@ -46,6 +46,7 @@ async fn hello_in_flight() -> super::TestVsock {
 async fn an_ack_of_a_packet_never_sent_is_ignored() {
     setup_test_logging();
     let mut t = hello_in_flight().await;
+    assert_eq!(t._socket.stats().snapshot().invalid_packets, 0);
     t.send_msg(
         UtpHeader {
             htype: ST_STATE,
@@ -57,6 +58,7 @@ async fn an_ack_of_a_packet_never_sent_is_ignored() {
         "",
     );
     t.poll_once_assert_pending().await;
+    assert_eq!(t._socket.stats().snapshot().invalid_packets, 1);
 
     t.env.increment_now(t.vsock.rtte.retransmission_timeout());
     t.poll_once_assert_pending().await;

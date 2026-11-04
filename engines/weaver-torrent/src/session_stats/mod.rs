@@ -94,6 +94,11 @@ impl Session {
     }
 
     pub fn stats_snapshot(&self) -> SessionStatsSnapshot {
-        SessionStatsSnapshot::from((&*self.stats, self.connector.stats().snapshot()))
+        let mut snapshot =
+            SessionStatsSnapshot::from((&*self.stats, self.connector.stats().snapshot()));
+        for socket in &self.utp_sockets {
+            snapshot.utp += socket.0.stats().snapshot();
+        }
+        snapshot
     }
 }

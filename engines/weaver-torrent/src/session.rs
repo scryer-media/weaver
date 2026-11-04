@@ -283,6 +283,7 @@ pub struct Session {
     pub(crate) external_ips: Arc<ExternalIps>,
     dht: Option<Dht>,
     pub(crate) connector: Arc<StreamConnector>,
+    pub(crate) utp_sockets: Vec<crate::network::UtpSocket>,
     // The clients every request is asked through: metainfo and the allow
     // list by their URL, trackers and web seeds each held to the address
     // its request was checked at.
@@ -1655,6 +1656,16 @@ impl Session {
                     .and_then(|l| l.ssl.as_ref())
                     .map(|ssl| ssl.addr),
                 external_ips,
+                utp_sockets: listen_result
+                    .iter()
+                    .flat_map(|listen| {
+                        listen
+                            .utp_socket
+                            .iter()
+                            .chain(listen.ssl.iter().filter_map(|ssl| ssl.utp_socket.as_ref()))
+                    })
+                    .cloned()
+                    .collect(),
                 utp: listen_result
                     .as_ref()
                     .is_some_and(|l| l.utp_socket.is_some()),
@@ -4129,6 +4140,47 @@ mod tests {
             *sockets.asked.lock().unwrap(),
             [7 * crate::udp_options::STREAM_WINDOW]
         );
+    }
+
+    #[tokio::test]
+    async fn a_session_reports_utp_stats_from_plain_and_ssl_listeners() {
+        use std::sync::atomic::Ordering;
+
+        let dir = TempDir::new().unwrap();
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                listen: Some(crate::ListenerOptions {
+                    mode: crate::ListenerMode::UtpOnly,
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    ssl_listen_port: Some(0),
+                    ..Default::default()
+                }),
+                ..crate::test_support::session_options()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(session.utp_sockets.len(), 2);
+        for (index, socket) in session.utp_sockets.iter().enumerate() {
+            let value = index as u64 + 1;
+            let stats = socket.0.stats();
+            stats.packets_lost.fetch_add(value, Ordering::Relaxed);
+            stats
+                .max_congestion_window_bytes
+                .store(1500 * value, Ordering::Relaxed);
+        }
+        let stats = session.stats_snapshot();
+        assert_eq!(stats.utp.packets_lost, 3);
+        assert_eq!(stats.utp.max_congestion_window_bytes, 3000);
+        let serialized = serde_json::to_value(stats).unwrap();
+        assert_eq!(serialized["utp"]["packets_lost"], 3);
+        assert_eq!(serialized["utp"]["max_congestion_window_bytes"], 3000);
+        session.stop().await;
     }
 
     /// A one-piece torrent whose announce-list is `[[a1, a2], [b1]]`.

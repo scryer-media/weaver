@@ -11,7 +11,10 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::DelaySample;
-use crate::seq_nr::SeqNr;
+use crate::{
+    seq_nr::SeqNr,
+    stats::{Counter, UtpStats},
+};
 
 const FRAC: u32 = 16;
 // The window a stream starts with: one Ethernet frame.
@@ -135,12 +138,17 @@ impl Ledbat {
         self.floor();
     }
 
-    pub fn on_delay_sample(&mut self, sample: DelaySample) {
+    pub fn on_delay_sample(&mut self, sample: DelaySample, stats: &UtpStats) {
         if sample.acked_bytes == 0 || sample.in_flight_before == 0 {
             return;
         }
         let target = (self.params.target_delay.as_micros() as i64).max(1);
         let delay = sample.delay.as_micros() as i64;
+        if delay >= target {
+            stats.delay_samples_above_target.increment(1);
+        } else {
+            stats.delay_samples_below_target.increment(1);
+        }
         let acked = sample.acked_bytes as i64;
 
         let saturated = (sample.in_flight_after + sample.acked_bytes + sample.segment.max(self.mss))
@@ -229,11 +237,23 @@ mod tests {
     }
 
     #[test]
+    fn delay_sample_counters_follow_the_target() {
+        let mut l = ledbat();
+        let stats = UtpStats::default();
+        for delay_ms in [20, 100, 200] {
+            l.on_delay_sample(sample(delay_ms, MSS, l.window()), &stats);
+        }
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.delay_samples_below_target, 1);
+        assert_eq!(snapshot.delay_samples_above_target, 2);
+    }
+
+    #[test]
     fn slow_start_grows_by_what_was_acknowledged() {
         let mut l = ledbat();
         let start = l.window();
         // Just under the target the linear gain is a few bytes.
-        l.on_delay_sample(sample(99, MSS, start));
+        l.on_delay_sample(sample(99, MSS, start), &UtpStats::default());
         assert_eq!(l.window(), start + MSS);
         assert!(l.is_slow_start());
     }
@@ -243,10 +263,10 @@ mod tests {
         let mut l = ledbat();
         for _ in 0..8 {
             let w = l.window();
-            l.on_delay_sample(sample(10, MSS, w));
+            l.on_delay_sample(sample(10, MSS, w), &UtpStats::default());
         }
         let before = l.window();
-        l.on_delay_sample(sample(100, MSS, before));
+        l.on_delay_sample(sample(100, MSS, before), &UtpStats::default());
         assert!(!l.is_slow_start());
         assert_eq!(l.ssthresh, before / 2);
         // At the target the linear gain is nothing.
@@ -258,10 +278,10 @@ mod tests {
         let mut l = ledbat();
         for _ in 0..8 {
             let w = l.window();
-            l.on_delay_sample(sample(10, MSS, w));
+            l.on_delay_sample(sample(10, MSS, w), &UtpStats::default());
         }
         let before = l.window();
-        l.on_delay_sample(sample(200, MSS, before));
+        l.on_delay_sample(sample(200, MSS, before), &UtpStats::default());
         // window_factor = 1000/before, delay_factor = -1, gain 3000.
         let expected = before as i64 - 3000 * MSS as i64 / before as i64;
         assert!(
@@ -275,13 +295,13 @@ mod tests {
         let mut l = ledbat();
         for _ in 0..8 {
             let w = l.window();
-            l.on_delay_sample(sample(10, MSS, w));
+            l.on_delay_sample(sample(10, MSS, w), &UtpStats::default());
         }
         let before = l.window();
         // Little in flight: the window is not what limits the sender.
-        l.on_delay_sample(sample(10, MSS, 2 * MSS));
+        l.on_delay_sample(sample(10, MSS, 2 * MSS), &UtpStats::default());
         assert_eq!(l.window(), before);
-        l.on_delay_sample(sample(300, MSS, 2 * MSS));
+        l.on_delay_sample(sample(300, MSS, 2 * MSS), &UtpStats::default());
         assert_eq!(l.window(), before);
     }
 
@@ -290,7 +310,7 @@ mod tests {
         let mut l = ledbat();
         for _ in 0..50 {
             let w = l.window();
-            l.on_delay_sample(sample(5_000, w, w));
+            l.on_delay_sample(sample(5_000, w, w), &UtpStats::default());
         }
         assert_eq!(l.window(), MSS);
     }
@@ -300,7 +320,7 @@ mod tests {
         let mut l = ledbat();
         for _ in 0..8 {
             let w = l.window();
-            l.on_delay_sample(sample(10, MSS, w));
+            l.on_delay_sample(sample(10, MSS, w), &UtpStats::default());
         }
         let before = l.window();
         l.on_enter_recovery(Instant::now(), 10.into(), 20.into());
@@ -314,7 +334,7 @@ mod tests {
         let mut l = ledbat();
         for _ in 0..8 {
             let w = l.window();
-            l.on_delay_sample(sample(10, MSS, w));
+            l.on_delay_sample(sample(10, MSS, w), &UtpStats::default());
         }
         l.on_enter_recovery(Instant::now(), 10.into(), 20.into());
         l.on_retransmission_timeout(Instant::now(), 20.into());
@@ -323,7 +343,7 @@ mod tests {
         let threshold = l.ssthresh;
         while l.is_slow_start() {
             let w = l.window();
-            l.on_delay_sample(sample(10, MSS, w));
+            l.on_delay_sample(sample(10, MSS, w), &UtpStats::default());
         }
         assert!(l.window() <= threshold + MSS);
     }
@@ -333,7 +353,7 @@ mod tests {
         let mut l = ledbat();
         for _ in 0..8 {
             let w = l.window();
-            l.on_delay_sample(sample(10, MSS, w));
+            l.on_delay_sample(sample(10, MSS, w), &UtpStats::default());
         }
         l.on_enter_recovery(Instant::now(), 10.into(), 20.into());
         let before = l.window();
@@ -350,7 +370,7 @@ mod tests {
         let mut l = ledbat();
         for _ in 0..8 {
             let w = l.window();
-            l.on_delay_sample(sample(10, MSS, w));
+            l.on_delay_sample(sample(10, MSS, w), &UtpStats::default());
         }
         l
     }
@@ -388,7 +408,7 @@ mod tests {
         l.on_retransmission_timeout(now, 20.into());
         for _ in 0..8 {
             let w = l.window();
-            l.on_delay_sample(sample(10, MSS, w));
+            l.on_delay_sample(sample(10, MSS, w), &UtpStats::default());
         }
         let before = l.window();
         l.on_enter_recovery(now + Duration::from_secs(1), 18.into(), 30.into());

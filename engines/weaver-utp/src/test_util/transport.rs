@@ -162,6 +162,7 @@ struct RememberingTransportLocked {
     max_payload_len: Option<usize>,
     link_mtu: Option<u16>,
     fragments: bool,
+    poll_send_pending: bool,
 }
 
 #[derive(Clone)]
@@ -178,6 +179,11 @@ impl RememberingTransport {
             locked: Default::default(),
             sent: Arc::default(),
         }
+    }
+
+    // Tests that poll the stream themselves control when sends become writable.
+    pub fn set_poll_send_pending(&self, pending: bool) {
+        self.locked.lock().poll_send_pending = pending;
     }
 
     pub fn set_link_mtu(&self, mtu: u16) {
@@ -252,6 +258,9 @@ impl Transport for RememberingTransport {
         buf: &[u8],
         target: SocketAddr,
     ) -> Poll<std::io::Result<usize>> {
+        if self.locked.lock().poll_send_pending {
+            return Poll::Pending;
+        }
         self.send(target, buf)?;
         Poll::Ready(Ok(buf.len()))
     }
@@ -276,6 +285,9 @@ impl PollSendToVectored for RememberingTransport {
         bufs: &[std::io::IoSlice<'_>],
         target: SocketAddr,
     ) -> Poll<std::io::Result<usize>> {
+        if self.locked.lock().poll_send_pending {
+            return Poll::Pending;
+        }
         let mut buf = Vec::new();
         bufs.iter().for_each(|b| buf.extend_from_slice(b.as_ref()));
         self.send(target, &buf)?;

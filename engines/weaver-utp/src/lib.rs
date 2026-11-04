@@ -34,7 +34,7 @@ mod utils;
 pub use congestion::ledbat::LedbatParams;
 pub use error::{Error, Result};
 pub use socket::{SocketOpts, UtpSocket};
-pub use stats::UtpStats;
+pub use stats::{UtpStats, UtpStatsSnapshot};
 pub use stream::UtpStream;
 pub use stream_rx::UtpStreamReadHalf;
 pub use stream_tx::UtpStreamWriteHalf;

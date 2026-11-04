@@ -326,14 +326,13 @@ async fn delivery_time_is_stamped_before_the_forwarder_runs() {
     assert_eq!(payload, b"packet");
 }
 
-#[tokio::test(start_paused = true)]
-async fn the_sender_window_grows_on_a_delayed_link() {
+async fn delayed_transfer(drop_every: u64) -> crate::UtpStatsSnapshot {
     const TOTAL: usize = 2 << 20;
     let token = tokio_util::sync::CancellationToken::new();
     let (server, client) = sockets(
         ipv4(1),
         ipv4(2),
-        0,
+        drop_every,
         Duration::from_millis(10),
         SocketOpts {
             cancellation_token: token.clone(),
@@ -370,14 +369,21 @@ async fn the_sender_window_grows_on_a_delayed_link() {
         (reader, writer)
     };
     let (_server_halves, _client_halves) = tokio::join!(serve, dial);
-    assert!(
-        client
-            .stats()
-            .max_congestion_window_bytes
-            .load(Ordering::Relaxed)
-            > 1500
-    );
+    let stats = client.stats().snapshot();
     token.cancel();
+    stats
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_sender_window_grows_on_a_delayed_link() {
+    assert!(delayed_transfer(0).await.max_congestion_window_bytes > 1500);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lossy_transfer_reports_packet_loss() {
+    let stats = delayed_transfer(20).await;
+    assert!(stats.packets_lost > 0);
+    assert!(stats.delay_samples_below_target > 0);
 }
 
 #[tokio::test(start_paused = true)]
@@ -500,6 +506,7 @@ async fn measure_ack_bench(scenario: AckBenchScenario, ack_per_drain: bool) {
             writer.write_all(&[7]).await.unwrap();
             retransmitted.await.unwrap();
             assert_eq!(client.stats().rto_timeouts_count.load(Ordering::Relaxed), 1);
+            assert_eq!(client.stats().snapshot().timeouts, 1);
             assert_eq!(client.transport.lost.load(Ordering::Relaxed), 1);
             (
                 Instant::now(),
