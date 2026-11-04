@@ -17,6 +17,7 @@ struct Piece {
     // The range's bytes from its start, as far as the last byte that
     // arrived: a wanted range holds only what reached it, however long it
     // is declared to be.
+    #[serde(serialize_with = "serialize_bytes")]
     bytes: Vec<u8>,
     coverage: Coverage,
 }
@@ -28,6 +29,12 @@ pub(crate) struct Kept {
     // Bumped whenever a range is wanted, so a delivery absorbed before its
     // range was wanted is absorbed again.
     generation: u64,
+}
+
+// MessagePack reads both its byte strings and the earlier integer arrays
+// into Vec<u8>, so the reader and the owning facts' versions stay as they are.
+fn serialize_bytes<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_bytes(bytes)
 }
 
 impl Piece {
@@ -276,6 +283,120 @@ impl Kept {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The reader and writer before retained bytes were encoded as byte strings.
+    #[derive(Serialize, Deserialize)]
+    struct ArrayPiece {
+        range: ByteRange,
+        bytes: Vec<u8>,
+        coverage: Coverage,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct ArrayKept {
+        pieces: BTreeMap<u64, ArrayPiece>,
+        generation: u64,
+    }
+
+    fn arrays(kept: &Kept) -> ArrayKept {
+        ArrayKept {
+            pieces: kept
+                .pieces
+                .iter()
+                .map(|(start, piece)| {
+                    (
+                        *start,
+                        ArrayPiece {
+                            range: piece.range,
+                            bytes: piece.bytes.clone(),
+                            coverage: piece.coverage.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            generation: kept.generation,
+        }
+    }
+
+    #[test]
+    fn retained_bytes_encode_as_messagepack_binary_at_every_length_width() {
+        for (length, header) in [
+            (0, vec![0xc4, 0]),
+            (4, vec![0xc4, 4]),
+            (256, vec![0xc5, 1, 0]),
+            (65_557, vec![0xc6, 0, 1, 0, 21]),
+        ] {
+            let piece = Piece {
+                range: ByteRange::at(10, length),
+                bytes: (0..length).map(|index| index as u8).collect(),
+                coverage: Coverage::new(),
+            };
+            let encoded = rmp_serde::to_vec(&piece).unwrap();
+            // A Piece is a three-field array; its range precedes the byte string.
+            assert_eq!(encoded[0], 0x93);
+            let at = 1 + rmp_serde::to_vec(&piece.range).unwrap().len();
+            assert_eq!(&encoded[at..at + header.len()], header);
+            assert_eq!(
+                &encoded[at + header.len()..at + header.len() + length as usize],
+                piece.bytes
+            );
+        }
+    }
+
+    #[test]
+    fn retained_bytes_restore_both_array_and_binary_snapshots_and_the_old_reader_reads_binary() {
+        let mut kept = Kept::default();
+        kept.want(ByteRange::new(10, 30));
+        kept.absorb(
+            ByteRange::new(10, 14),
+            &[0, 127, 128, 255],
+            Provenance::Fresh,
+        );
+        kept.absorb(
+            ByteRange::new(20, 24),
+            &[255, 128, 127, 0],
+            Provenance::Repaired,
+        );
+        kept.want(ByteRange::new(100, 200));
+        kept.want(ByteRange::new(300, 400));
+        kept.absorb(ByteRange::new(300, 304), &[255; 4], Provenance::Fresh);
+        let old = rmp_serde::to_vec(&arrays(&kept)).unwrap();
+        let new = rmp_serde::to_vec(&kept).unwrap();
+        assert_ne!(old, new);
+
+        for encoded in [&old, &new] {
+            let restored: Kept = rmp_serde::from_slice(encoded).unwrap();
+            assert!(restored.sound());
+            assert_eq!(rmp_serde::to_vec(&arrays(&restored)).unwrap(), old);
+            assert_eq!(restored.runs(), kept.runs());
+            let from_reader: Kept = rmp_serde::from_read(std::io::Cursor::new(encoded)).unwrap();
+            assert_eq!(rmp_serde::to_vec(&from_reader).unwrap(), new);
+        }
+
+        // The unchanged Vec<u8> reader also accepts MessagePack's binary form.
+        let older: ArrayKept = rmp_serde::from_slice(&new).unwrap();
+        assert_eq!(rmp_serde::to_vec(&older).unwrap(), old);
+        let older: ArrayKept = rmp_serde::from_read(std::io::Cursor::new(&new)).unwrap();
+        assert_eq!(rmp_serde::to_vec(&older).unwrap(), old);
+    }
+
+    #[test]
+    fn a_zip_tail_keeps_one_encoded_byte_per_retained_byte() {
+        let mut kept = Kept::default();
+        for (start, length) in [(0, 64), (1_000_000, 65_557)] {
+            let range = ByteRange::at(start, length);
+            kept.want(range);
+            let bytes: Vec<_> = (0..length).map(|index| index as u8).collect();
+            kept.absorb(range, &bytes, Provenance::Fresh);
+        }
+        let encoded = rmp_serde::to_vec(&kept).unwrap();
+        let old = rmp_serde::to_vec(&arrays(&kept)).unwrap();
+        assert_eq!(kept.len(), 65_621);
+        assert!(encoded.len() < 65_621 + 128);
+        assert!(old.len() > encoded.len() + 32_000);
+        let restored: Kept = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(restored.runs(), kept.runs());
+    }
 
     #[test]
     fn only_wanted_bytes_are_kept_and_a_later_want_keeps_what_was_kept() {
