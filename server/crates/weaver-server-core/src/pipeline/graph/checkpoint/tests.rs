@@ -1124,6 +1124,71 @@ async fn the_oldest_small_step_writes_once_when_its_age_is_due() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn age_and_force_share_one_write_behind_an_in_flight_checkpoint() {
+    let _clock = ClockHeld::new();
+    for age_first in [false, true] {
+        let (db, id) = checkpoint_database();
+        let (mut job, _dir) = long_post(1);
+        let pending = Pending::default();
+        let (mail, mut heard) = tokio::sync::mpsc::unbounded_channel();
+        pending.put(&job, Vec::new());
+        // Hold the first immutable payload after take, before its SQL and
+        // acknowledgement, without blocking the runtime that drives the timer.
+        let (first, first_stamp) = pending.take();
+        let first = first.unwrap();
+        let writer = pending.clone();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        db.try_queue_write("held_graph_checkpoint", move |db| {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+            let whole = first.whole;
+            db.save_graph_checkpoint(id, Arc::new(first))?;
+            writer.committed(first_stamp, whole);
+            Ok(())
+        })
+        .unwrap();
+        waiting.await.unwrap();
+
+        for ordinal in 1..4 {
+            intake(&mut job, ordinal);
+            pending.put(&job, Vec::new());
+            pending.queue(&db, id, &mail, false);
+        }
+        let stamp = pending.stamp();
+        // Keep the timer handle so taking the queued delta cannot cancel
+        // the age callback whose ordering this test controls.
+        let timer = pending.slot().timer.take().unwrap();
+        if age_first {
+            tokio::time::advance(super::CHECKPOINT_AGE).await;
+            timer.await.unwrap();
+            assert_eq!(pending.await_commit(stamp, id.0, &mail, &db), None);
+        } else {
+            assert_eq!(pending.await_commit(stamp, id.0, &mail, &db), None);
+            tokio::time::advance(super::CHECKPOINT_AGE).await;
+            timer.await.unwrap();
+        }
+        assert_eq!(writes(&db), 0);
+        assert!(heard.try_recv().is_err());
+        release.send(()).unwrap();
+        let said = heard.recv().await.unwrap();
+        assert_eq!(said.generation, stamp);
+        assert!(
+            matches!(said.heard, super::Heard::Written { stamp: Some(written), .. } if written == stamp)
+        );
+        db.flush_write_queue().await.unwrap();
+        assert_eq!(writes(&db), 2, "age_first={age_first}");
+        assert!(heard.try_recv().is_err());
+        let fresh = Pending::default();
+        fresh.put(&job, Vec::new());
+        assert_eq!(
+            snapshot(&db.load_graph_checkpoint(id).unwrap().unwrap()).unwrap(),
+            snapshot(&held(&fresh.take().0.unwrap())).unwrap()
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn awaiting_a_stamp_forces_its_write_without_advancing_time() {
     let _clock = ClockHeld::new();
     let (db, id) = checkpoint_database();
