@@ -1172,9 +1172,9 @@ const (
 	// the other phases share the rest, so the default runs the gate beside
 	// three other suites.
 	defaultFullPhaseJobs = 4
-	// A full run's release gate shares the engine with the other phases, so
-	// it runs narrower than a standalone gate unless the operator sets a width.
-	fullRunReleaseGateJobs = 6
+	// Playwright flows have their own concurrency within the gate's suite
+	// slot, unless the operator explicitly sets a width.
+	fullRunReleaseGateJobs = 10
 )
 
 // fullPhaseJobs is how many suites of a full run execute at once, set with
