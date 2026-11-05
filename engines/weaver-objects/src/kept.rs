@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use weaver_graph::{ByteRange, Coverage, Provenance};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Piece {
     range: ByteRange,
     // The range's bytes from its start, as far as the last byte that
@@ -22,7 +22,7 @@ struct Piece {
     coverage: Coverage,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Kept {
     // Disjoint, keyed by start.
     pieces: BTreeMap<u64, Piece>,

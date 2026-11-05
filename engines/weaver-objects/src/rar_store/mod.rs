@@ -69,6 +69,9 @@ pub(crate) struct Volume {
     // What the volume's front stated when it was bound, before any of its
     // bytes reached the walk: what places a sibling beside it meanwhile.
     front: Option<unrar_rs::RarVolumeFacts>,
+    // Cleared at touch, before a walk, and when a damaged delivery wants
+    // more header bytes. Payload-only arrivals reuse the encoded metadata.
+    facts: std::sync::Mutex<Option<weaver_graph::Sealed<facts::VolumeFacts>>>,
 }
 
 impl Volume {
@@ -81,7 +84,15 @@ impl Volume {
             kept: Kept::default(),
             walk: Walk::default(),
             front: None,
+            facts: std::sync::Mutex::new(None),
         }
+    }
+
+    fn invalidate_facts(&mut self) {
+        *self
+            .facts
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner()) = None;
     }
 
     // What the volume's headers have stated so far: what its walk read once
@@ -372,6 +383,9 @@ impl RarStore {
     // Something the walk or the layout reads of a volume changed, or the
     // volume came or went: look at it again.
     fn touch(&mut self, volume: VolumeIndex) {
+        if let Some(found) = self.volumes.get_mut(&volume) {
+            found.invalidate_facts();
+        }
         self.dirty.insert(volume);
     }
 
@@ -501,6 +515,9 @@ impl RarStore {
                 counts.walked.insert(volume.0);
             });
             let before = found.walk.reach().unwrap_or(0);
+            // Password changes can schedule a walk without touching the
+            // volume. The walk can change parsed facts or wanted ranges.
+            found.invalidate_facts();
             let step = found.walk.step(
                 &mut found.kept,
                 found.length,
@@ -707,7 +724,11 @@ impl Object for RarStore {
             if delivery.provenance.is_damaged() && !found.closed {
                 let hole = found.walk.hole(&found.kept, false);
                 if range.contains(hole) {
+                    let wanted = found.kept.generation();
                     found.kept.want(ByteRange::new(hole, range.end));
+                    if found.kept.generation() != wanted {
+                        found.invalidate_facts();
+                    }
                 }
             }
             if found.kept.generation() == generation {
