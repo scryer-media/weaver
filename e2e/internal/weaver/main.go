@@ -319,6 +319,14 @@ func Run(args []string, programName string) {
 	startHarnessRun(args[0])
 
 	switch args[0] {
+	case "filesystem":
+		cleanup := mustActivateContainerEngine()
+		err := cmdFilesystem()
+		cleanup()
+		if err != nil {
+			log.Fatal(err)
+		}
+		return
 	case "doctor":
 		if err := cmdDoctor(os.Stdout); err != nil {
 			os.Exit(1)
@@ -429,7 +437,8 @@ Commands:
   verify                STAT articles in NNTP server, search indexer
   status                Check health of all e2e services
   scenarios             List all available test scenarios
-  full                  Seed fixtures, then run functional, chaos, Docker restart, and managed restart phases
+  full                  Run all required functional, chaos, restart, product-behavior, and filesystem gates
+  filesystem            Run storage and delivery regressions on Unraid-style and portable FUSE mounts
   full real-usenet      Opt-in real-provider downloads; private/real-network holds .env, eight WG configs, and the SAB test NZB
   release-gate [flow]   Run the independent Weaver product-behavior release gate
   release-console [run] Serve the latest or selected Weaver release-gate artifacts

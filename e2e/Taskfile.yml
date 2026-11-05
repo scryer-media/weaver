@@ -190,8 +190,9 @@ tasks:
   filesystem:
     desc: Test storage and delivery on isolated Unraid-style and portable FUSE mounts
     dir: "{{.TASKFILE_DIR}}"
+    deps: [build]
     cmds:
-      - sh services/filesystem/test.sh
+      - "{{.E2E_BIN}} filesystem"
 
   pgo:
     desc: Run representative managed-Weaver flows and collect LLVM raw profiles
