@@ -7,6 +7,7 @@
 // connect, an accept and a counter echoed both ways, clean and with loss.
 
 mod bottleneck;
+mod small_window;
 
 use std::{
     future::poll_fn,

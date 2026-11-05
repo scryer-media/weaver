@@ -356,12 +356,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn rx_window(&self) -> u32 {
-        let wnd = self.user_rx.remaining_rx_window() as u32;
-        let rmss = self.segment_sizes.mss() as usize;
-        if (wnd as usize) < rmss {
-            return 0;
-        }
-        wnd - (wnd % rmss as u32)
+        self.user_rx
+            .remaining_rx_window()
+            .try_into()
+            .unwrap_or(u32::MAX)
     }
 
     fn send_tx_queue(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<()> {
@@ -1284,7 +1282,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let result = ProcessIncomingMessageResult {
             on_ack_result: self
                 .user_tx_segments
-                .remove_up_to_ack(self.this_poll.now, &msg.header),
+                .remove_up_to_ack(msg.received, &msg.header),
         };
         self.segment_sizes
             .on_payload_delivered(result.on_ack_result.max_acked_payload_size);
@@ -1468,7 +1466,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
         // if we need to send a window update, also send immediately.
         // In case the reader was fully flow controlled.
-        // NOTE: relies on rx_window being clamped by mss
         let current = self.rx_window();
         let changed = (current == 0) ^ (self.last_sent_window == 0);
         if changed {
@@ -1728,6 +1725,7 @@ pub struct StreamArgs {
     conn_id_recv: SeqNr,
     conn_id_send: SeqNr,
     last_remote_timestamp: u32,
+    last_remote_received: Instant,
 
     seq_nr: SeqNr,
     last_sent_seq_nr: SeqNr,
@@ -1752,6 +1750,7 @@ impl StreamArgs {
             conn_id_recv: conn_id,
             conn_id_send: conn_id + 1,
             last_remote_timestamp: remote_ack.timestamp_microseconds,
+            last_remote_received: ack_received_ts,
             remote_window: remote_ack.wnd_size,
 
             // The next ST_DATA must be +1 from initial SYN.
@@ -1763,7 +1762,7 @@ impl StreamArgs {
             last_sent_ack_nr: remote_ack.seq_nr - 1,
             last_consumed_remote_seq_nr: remote_ack.seq_nr - 1,
 
-            rtt: Some(ack_received_ts - syn_sent_ts),
+            rtt: ack_received_ts.checked_duration_since(syn_sent_ts),
 
             state: VirtualSocketState::Established,
 
@@ -1771,11 +1770,12 @@ impl StreamArgs {
         }
     }
 
-    pub fn new_incoming(next_seq_nr: SeqNr, remote_syn: &UtpHeader) -> Self {
+    pub fn new_incoming(next_seq_nr: SeqNr, remote_syn: &UtpHeader, received: Instant) -> Self {
         Self {
             conn_id_recv: remote_syn.connection_id + 1,
             conn_id_send: remote_syn.connection_id,
             last_remote_timestamp: remote_syn.timestamp_microseconds,
+            last_remote_received: received,
             remote_window: 0, // remote_syn.wnd_size should be 0 anyway. We can't send anything first.
 
             seq_nr: next_seq_nr,
@@ -1847,6 +1847,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             conn_id_recv,
             conn_id_send,
             last_remote_timestamp,
+            last_remote_received,
             seq_nr,
             last_sent_seq_nr,
             last_consumed_remote_seq_nr,
@@ -1876,7 +1877,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
         // The gap on the packet that opened the stream, taken as it arrived.
         let reply_us = match last_remote_timestamp {
             0 => 0,
-            sent => ((now - socket.created).as_micros() as u32).wrapping_sub(sent),
+            sent => ((last_remote_received - socket.created).as_micros() as u32).wrapping_sub(sent),
         };
 
         let cancellation_token = socket.cancellation_token.child_token();
@@ -1907,7 +1908,10 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 syn_ack_resend: Timer::default(),
                 remote_inactivity_timer: {
                     let mut timer = Timer::default();
-                    if rtt.is_none() {
+                    if matches!(
+                        state,
+                        VirtualSocketState::SynReceived | VirtualSocketState::SynAckSent { .. }
+                    ) {
                         timer.arm(
                             now,
                             socket.opts().remote_inactivity_timeout,
@@ -1918,7 +1922,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                     timer
                 },
             },
-            delay: DelayTracker::new(now, reply_us),
+            delay: DelayTracker::new(last_remote_received, reply_us),
             last_remote_window: remote_window,
             seq_nr,
             last_sent_seq_nr,

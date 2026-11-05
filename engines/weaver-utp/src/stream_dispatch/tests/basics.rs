@@ -241,6 +241,7 @@ async fn test_sequence_numbers_incoming() {
 
     setup_test_logging();
 
+    let env = MockUtpEnvironment::new();
     let mut t = make_test_vsock_args(
         Default::default(),
         StreamArgs::new_incoming(
@@ -251,8 +252,9 @@ async fn test_sequence_numbers_incoming() {
                 ack_nr: 0.into(),
                 ..Default::default()
             },
+            env.now(),
         ),
-        Default::default(),
+        env,
     );
     t.poll_once_assert_pending().await;
     assert_eq!(

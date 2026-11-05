@@ -3,6 +3,7 @@
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
 // Modified by the Weaver authors, 2026-11-03.
 
+mod arrival_time;
 mod basics;
 mod congestion;
 mod delay;
@@ -21,6 +22,7 @@ mod retransmit_timer;
 mod rtte;
 mod sequence_wrap;
 mod shutdown;
+mod small_window;
 mod stream_api;
 mod timeouts;
 
@@ -191,7 +193,7 @@ fn test_stream_args(env: &MockUtpEnvironment, is_incoming: bool) -> StreamArgs {
             htype: Syn,
             ..Default::default()
         };
-        StreamArgs::new_incoming(101.into(), &remote_syn)
+        StreamArgs::new_incoming(101.into(), &remote_syn, env.now())
     } else {
         let remote_ack = UtpHeader {
             htype: State,

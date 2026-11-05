@@ -28,6 +28,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{UtpStream, runtime::Runtime, spawn_utils::task_with_cancel};
 
 #[cfg(test)]
+mod arrival_time_tests;
+#[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
 mod mapped_endpoint_tests;
@@ -318,6 +320,7 @@ const ACCEPT_QUEUE_MAX_SYNS: usize = 32;
 struct Syn {
     remote: SocketAddr,
     header: UtpHeader,
+    received: Instant,
 }
 
 enum MatchSynWithAccept<T, E> {
@@ -560,9 +563,8 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             return Ok(());
         };
 
-        let now = self.env.now();
         let (tx, rx) = crate::ingress::channel(self.socket.opts.vsock_rx_bufsize);
-        let args = StreamArgs::new_outgoing(&msg.header, conn.start, now)
+        let args = StreamArgs::new_outgoing(&msg.header, conn.start, msg.received)
             .with_parent_span(conn.requester.created_span.clone());
 
         let recv_key = (addr, msg.header.connection_id.0);
@@ -593,8 +595,9 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             return MatchSynWithAccept::SynInvalid(accept);
         }
 
-        let args = StreamArgs::new_incoming(self.env.random_u16().into(), &syn.header)
-            .with_parent_span(accept.created_span.clone());
+        let args =
+            StreamArgs::new_incoming(self.env.random_u16().into(), &syn.header, syn.received)
+                .with_parent_span(accept.created_span.clone());
         let (tx, rx) = crate::ingress::channel(self.socket.opts.vsock_rx_bufsize);
 
         let starter = UtpStreamStarter::new_shared(&self.socket, syn.remote, rx, args);
@@ -655,6 +658,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let mut syn = Syn {
             remote,
             header: msg.header,
+            received: msg.received,
         };
         while let Some(acceptor) = self.accept_queue.try_next_acceptor() {
             match self.match_syn_with_accept(syn, acceptor) {
@@ -1395,6 +1399,7 @@ mod tests {
             dispatcher.match_syn_with_accept(
                 Syn {
                     remote: ADDR_2,
+                    received: _socket.state.created,
                     header: UtpHeader {
                         htype: Type::Syn,
                         connection_id: u16::MAX.into(),

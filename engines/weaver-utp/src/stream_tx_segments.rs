@@ -69,7 +69,7 @@ impl Segment {
             // This should not happen.
             SentStatus::NotSent | SentStatus::Retransmitted { .. } => {}
             SentStatus::SentTime(sent_ts) => {
-                *rtt = rtt_min(*rtt, Some(now - sent_ts));
+                *rtt = rtt_min(*rtt, now.checked_duration_since(sent_ts));
             }
         }
     }
