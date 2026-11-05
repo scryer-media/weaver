@@ -544,7 +544,7 @@ impl Leaf {
         self.revision += 1;
         self.written.clear();
         self.change(0, u64::MAX);
-        if self.file.is_none() && !self.path.exists() {
+        if self.file.is_none() && !self.path.try_exists().map_err(LeafError::io(&self.path))? {
             return Ok(());
         }
         let file = self.open(None)?;
@@ -592,6 +592,9 @@ impl Leaf {
         self.file = None;
         if self.directory {
             return remove_directory(&self.path);
+        }
+        if !self.on_disk {
+            return Ok(());
         }
         match std::fs::remove_file(&self.path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(LeafError::Io {
@@ -761,6 +764,27 @@ mod tests {
         );
         assert!(!dir.path().join("destination.bin").exists());
         assert_eq!(leaf.name(), "destination.bin");
+    }
+
+    #[test]
+    fn removing_an_unwritten_leaf_preserves_another_owners_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let leaf = Leaf::at(dir.path(), "source.bin");
+        std::fs::write(leaf.path(), b"another owner").unwrap();
+        leaf.remove().unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("source.bin")).unwrap(),
+            b"another owner"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn truncation_propagates_inspection_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("loop", dir.path().join("loop")).unwrap();
+        let mut leaf = Leaf::at(dir.path(), "loop");
+        assert!(leaf.truncate().is_err());
     }
 
     #[test]

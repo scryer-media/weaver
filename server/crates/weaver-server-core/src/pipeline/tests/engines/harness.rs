@@ -137,7 +137,13 @@ fn par2_created(
 ) -> Vec<Post> {
     use par2_rs::create::{BlockSizing, Par2Creator, Par2CreatorOptions, RecoveryAmount};
 
-    let source = tempfile::tempdir().unwrap();
+    // Fixture generation uses hard links when publishing parity files.
+    // Filesystem lanes can keep that oracle on local storage while TMPDIR
+    // puts every job file on the capability-limited mount under test.
+    let source = match std::env::var_os("WEAVER_TEST_FIXTURE_DIR") {
+        Some(dir) => tempfile::tempdir_in(dir).unwrap(),
+        None => tempfile::tempdir().unwrap(),
+    };
     let inputs = files
         .iter()
         .map(|(name, bytes)| {
