@@ -23,6 +23,7 @@ use std::{
 };
 
 use weaver_utp::{DefaultUtpEnvironment, PollSendToVectored, Transport, UtpStream};
+pub use weaver_utp::{is_message_size_error, message_size_error};
 
 pub use crate::core::net::{BoxFuture, DatagramSend, DatagramSocket, NoNames, Resolved, Resolver};
 pub use crate::type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite};

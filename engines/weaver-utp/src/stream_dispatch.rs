@@ -674,7 +674,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     break;
                 }
                 // If we couldn't send due to message size, we need to tweak MTU if possible and then retry.
-                Err(Error::Send(source)) if source.raw_os_error() == Some(libc::EMSGSIZE) => {
+                Err(Error::Send(source)) if crate::is_message_size_error(&source) => {
                     let seq_nr = item.seq_nr();
                     let size = item.payload_size();
                     debug!(

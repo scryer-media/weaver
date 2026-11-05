@@ -31,6 +31,7 @@ mod stream_tx_segments;
 #[cfg(test)]
 mod test_util;
 mod traits;
+mod udp_error;
 mod utils;
 
 pub use congestion::ledbat::LedbatParams;
@@ -43,5 +44,6 @@ pub use stream_tx::UtpStreamWriteHalf;
 pub use traits::{
     DatagramSend, DefaultUtpEnvironment, PollSendToVectored, Transport, UtpEnvironment,
 };
+pub use udp_error::{is_message_size_error, message_size_error};
 
 type Payload = Vec<u8>;

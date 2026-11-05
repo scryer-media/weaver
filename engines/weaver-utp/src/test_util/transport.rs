@@ -192,7 +192,7 @@ impl RememberingTransport {
         drop(g);
         self.sent.notify_waiters();
         if too_large {
-            Err(std::io::Error::from_raw_os_error(libc::EMSGSIZE))
+            Err(crate::message_size_error())
         } else {
             Ok(())
         }

@@ -408,7 +408,7 @@ impl Network {
 
     fn send(&self, source: SocketAddr, target: SocketAddr, data: &[u8]) -> io::Result<usize> {
         if data.len() + NETWORK_HEADERS > PATH_MTU {
-            return Err(io::Error::from_raw_os_error(libc::EMSGSIZE));
+            return Err(crate::message_size_error());
         }
         let wakes = {
             let mut model = self.model.lock();

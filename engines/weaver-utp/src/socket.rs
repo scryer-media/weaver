@@ -31,6 +31,8 @@ use crate::{UtpStream, runtime::Runtime, spawn_utils::task_with_cancel};
 mod lifecycle_tests;
 #[cfg(test)]
 mod send_handle_tests;
+#[cfg(test)]
+mod udp_error_tests;
 use crate::{
     congestion::ledbat::LedbatParams,
     constants::{
@@ -366,11 +368,22 @@ pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
 impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     pub(crate) async fn run_forever(mut self) -> crate::Result<()> {
         let mut read_buf = [0u8; 16384];
+        let mut completions = 0;
 
         loop {
+            if self.socket.cancellation_token.is_cancelled() {
+                return Ok(());
+            }
             if let Err(e) = self.run_once(&mut read_buf).await {
                 warn!("error running dispatcher: {e:#}");
                 return Err(e);
+            }
+            completions += 1;
+            if completions == 64 {
+                // A transport may repeatedly complete without yielding, for
+                // errors or packets alike. Give cancellation and peers a turn.
+                tokio::task::yield_now().await;
+                completions = 0;
             }
         }
     }
@@ -389,7 +402,14 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             },
             recv = self.transport.as_deref().ok_or(Error::DispatcherDead)?.recv_from(read_buf) => {
                 let received = self.env.now();
-                let (len, addr) = recv.map_err(Error::Recv)?;
+                let (len, addr) = match recv {
+                    Ok(received) => received,
+                    Err(error) if crate::udp_error::is_recoverable_receive_error(&error) => {
+                        trace!(%error, "recoverable datagram receive error");
+                        return Ok(());
+                    }
+                    Err(error) => return Err(Error::Recv(error)),
+                };
                 let message = match UtpMessage::deserialize(&read_buf[..len], received) {
                     Some(msg) => msg,
                     None => {

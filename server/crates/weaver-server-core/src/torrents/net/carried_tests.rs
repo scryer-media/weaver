@@ -182,7 +182,7 @@ async fn carried_utp_mtu_rejection_accounts_for_each_ip_family_before_acceptance
         else {
             panic!("the oversized packet was accepted")
         };
-        assert_eq!(error.raw_os_error(), Some(libc::EMSGSIZE));
+        assert!(weaver_torrent::network::is_message_size_error(&error));
         assert_eq!(
             carried
                 .sends
@@ -209,7 +209,7 @@ async fn carried_utp_deferred_size_error_is_a_sticky_terminal_socket_fault() {
     observed.recv().await.unwrap();
     accepted(&carried, b"queued", target);
     results
-        .send(Err(io::Error::from_raw_os_error(libc::EMSGSIZE)))
+        .send(Err(weaver_torrent::network::message_size_error()))
         .unwrap();
     let receive_error = carried.recv_from(&mut [0; 1]).await.unwrap_err();
     assert_eq!(receive_error.kind(), io::ErrorKind::BrokenPipe);

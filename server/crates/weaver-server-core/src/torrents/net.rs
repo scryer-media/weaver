@@ -711,7 +711,7 @@ impl CarriedSender {
         let result = if pending.stopped {
             Poll::Ready(Err(CarriedSends::error(&pending)))
         } else if len > limit {
-            Poll::Ready(Err(io::Error::from_raw_os_error(libc::EMSGSIZE)))
+            Poll::Ready(Err(weaver_torrent::network::message_size_error()))
         } else if pending.count >= CARRIED_SEND_PACKETS || pending.bytes + len > CARRIED_SEND_BYTES
         {
             pending.waiters.insert(self.key(), cx.waker().clone());
