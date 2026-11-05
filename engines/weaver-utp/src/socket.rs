@@ -554,7 +554,8 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         }
     }
     pub(crate) async fn run_forever(mut self) -> crate::Result<()> {
-        let mut read_buf = [0u8; 16384];
+        // Normal UDP datagrams carry at most u16::MAX - 8 payload bytes.
+        let mut read_buf = [0u8; u16::MAX as usize];
         let mut completions = 0;
 
         loop {
@@ -605,6 +606,11 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                     }
                     Err(error) => return Err(Error::Recv(error)),
                 };
+                if len >= read_buf.len() {
+                    self.socket.stats.invalid_packets.increment(1);
+                    trace!(len, ?addr, "dropping datagram at receive buffer limit");
+                    return Ok(());
+                }
                 let message = match UtpMessage::deserialize(&read_buf[..len], received) {
                     Some(msg) => msg,
                     None => {

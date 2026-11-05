@@ -193,6 +193,45 @@ async fn recoverable_receive_errors_leave_the_socket_available_for_a_valid_syn()
 }
 
 #[tokio::test(start_paused = true)]
+async fn maximum_udp_datagram_does_not_truncate_or_kill_the_dispatcher() {
+    let mut syn = vec![0; 20];
+    UtpHeader {
+        htype: Type::Syn,
+        connection_id: 101.into(),
+        seq_nr: 1.into(),
+        ..Default::default()
+    }
+    .serialize(&mut syn)
+    .unwrap();
+    let largest_udp_payload = vec![0xff; u16::MAX as usize - 8];
+    let mut ambiguous_payload = vec![0xaa; u16::MAX as usize];
+    UtpHeader {
+        htype: Type::Data,
+        connection_id: 102.into(),
+        seq_nr: 2.into(),
+        ..Default::default()
+    }
+    .serialize(&mut ambiguous_payload)
+    .unwrap();
+    let (socket, mut observed) = socket(
+        vec![
+            Reply::Packet(largest_udp_payload),
+            Reply::Packet(ambiguous_payload),
+            Reply::Packet(syn),
+        ],
+        None,
+        false,
+    );
+
+    let stream = socket.accept().await.unwrap();
+    assert_eq!(socket.stats().invalid_packets.load(Ordering::Relaxed), 2);
+    assert!(observed.control.received.load(Ordering::Relaxed) >= 3);
+    socket.shutdown().await.unwrap();
+    assert!(observed.dropped.try_recv().is_ok());
+    drop(stream);
+}
+
+#[tokio::test(start_paused = true)]
 async fn continuously_ready_errors_and_packets_yield_so_shutdown_can_join() {
     for alternate in [false, true] {
         let (socket, mut observed) = socket(Vec::new(), Some(alternate), false);
