@@ -30,24 +30,86 @@ where
     }
     let mut output = OpenOptions::new().create_new(true).write(true).open(dst)?;
 
-    let mut copied = 0u64;
-    let mut buf = vec![0u8; COPY_BUFFER_BYTES];
-    loop {
-        let read = input.read(&mut buf)?;
-        if read == 0 {
-            break;
+    let result = (|| {
+        let mut copied = 0u64;
+        let mut buf = vec![0u8; COPY_BUFFER_BYTES];
+        loop {
+            let read = input.read(&mut buf)?;
+            if read == 0 {
+                break;
+            }
+            output.write_all(&buf[..read])?;
+            copied += read as u64;
+            on_copied(read as u64);
         }
-        output.write_all(&buf[..read])?;
-        copied += read as u64;
-        on_copied(read as u64);
+        output.flush()?;
+        super::fs::apply_metadata_change(
+            dst,
+            "copied mode",
+            output.set_permissions(metadata.permissions()),
+        )?;
+        drop_open_file_cache(&input, src, 0, copied);
+        drop_open_file_cache(&output, dst, 0, copied);
+        Ok(copied)
+    })();
+    if result.is_err() {
+        discard_created_file(output, dst);
     }
-    output.flush()?;
-    fs::set_permissions(dst, metadata.permissions())?;
+    result
+}
 
-    drop_open_file_cache(&input, src, 0, copied);
-    drop_open_file_cache(&output, dst, 0, copied);
+// Cleanup belongs to the operation that exclusively created the file.
+// Closing before unlink also avoids NFS silly-renames. If a mount cannot
+// identify the entry, retain the partial copy rather than delete a stranger.
+pub(crate) fn discard_created_file(file: File, path: &Path) {
+    let expected = file_identity(&file).ok().filter(|(_, inode)| *inode != 0);
+    drop(file);
+    if expected.is_some() && path_identity(path).ok() == expected {
+        let _ = fs::remove_file(path);
+    }
+}
 
-    Ok(copied)
+#[cfg(unix)]
+fn file_identity(file: &File) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
+#[cfg(unix)]
+fn path_identity(path: &Path) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).map(|metadata| (metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+fn file_identity(file: &File) -> io::Result<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let info = unsafe { info.assume_init() };
+    Ok((
+        u64::from(info.dwVolumeSerialNumber),
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
+
+#[cfg(not(unix))]
+fn path_identity(path: &Path) -> io::Result<(u64, u64)> {
+    file_identity(&File::open(path)?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_identity(_file: &File) -> io::Result<(u64, u64)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "file identity unavailable",
+    ))
 }
 
 #[allow(dead_code)]
