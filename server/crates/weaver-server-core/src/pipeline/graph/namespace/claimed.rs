@@ -35,12 +35,12 @@ impl NamespaceWriter {
         // with the file's error, a file gone with it included. Each chunk
         // goes by the coverage and the file as they are then: routing a
         // run can name the member and settle its length, which moves and
-        // trims the file and the coverage behind it. A range held as damage
-        // may never have arrived at all: the file ends before it, and what
-        // lies past the end is not read. The file goes to the owner the
-        // member has now: a run that has that owner give the member up hands
-        // it on, and the hand-off carries the whole file to whatever holds
-        // the member next, so this replay is done. A folded posting's runs
+        // trims the file and the coverage behind it. A loss records no bytes,
+        // even when a sparse file extends across it: only runs that arrived
+        // go down. Damage past the file's end is not read. The file goes to
+        // the owner the member has now: if a route changes that owner, the
+        // hand-off carries the whole file to whatever holds the member next,
+        // so this replay is done. A folded posting's runs
         // are `said`, its record from before it folded, which no route
         // moves.
         if !self
@@ -76,6 +76,10 @@ impl NamespaceWriter {
                         .copied()
                 })
         {
+            if !run.provenance.arrived() {
+                at = run.range.end;
+                continue;
+            }
             let leaf = self
                 .files
                 .get(&node)

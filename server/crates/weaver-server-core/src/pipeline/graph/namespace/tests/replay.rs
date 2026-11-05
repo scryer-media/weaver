@@ -4,6 +4,130 @@
 use super::*;
 use std::sync::atomic::Ordering;
 
+const REPAIRED_FRONT: &[u8] = &{
+    let mut bytes = [0x71; FIRST_BYTES];
+    let mut at = 0;
+    while at < SIGNATURE.len() {
+        bytes[at] = SIGNATURE[at];
+        at += 1;
+    }
+    bytes
+};
+const REPLAY_BODY: &[u8] = b"abcdefghijklmnopqrst";
+
+fn repaired_header_claim(provenance: Provenance) -> (Job, MemberId, Vec<(ByteRange, Provenance)>) {
+    let repaired = REPAIRED_FRONT.len() as u64;
+    let mut job = Job::new(PLENTY).with_set(Some(Fix {
+        name: "archive.rar",
+        read: ByteRange::new(0, REPAIRED_FRONT.len() as u64 + 25),
+        fix: (0, REPAIRED_FRONT),
+    }));
+    job.par.lock().unwrap().proof = Some(ByteRange::new(0, repaired));
+    job.inner = repaired - HEADER + 25;
+    let member = job.member("archive.rar", Some(HEADER + job.inner));
+    job.send(member, 0, b"broken!", Provenance::Damaged);
+    job.send(member, repaired + 20, b"tail!", Provenance::Fresh);
+    let mut effects = Vec::new();
+    job.tree.damage(
+        NodeId::ROOT,
+        VolumeIndex(member.0),
+        ByteRange::new(HEADER, repaired + 20),
+        &mut effects,
+    );
+    let mut build = job.build();
+    job.writer
+        .apply_all(&mut job.tree, &mut build, &Source, effects, &mut job.out)
+        .unwrap();
+    assert_eq!(job.file("archive.rar").len() as u64, repaired + 25);
+    if provenance.arrived() {
+        job.send(member, repaired, REPLAY_BODY, provenance);
+    }
+
+    STORE_DELIVERIES.with_borrow_mut(|seen| *seen = Some(Vec::new()));
+    let due = job.tree.recovery_nodes(NodeId::ROOT);
+    assert_eq!(job.repair(&mut build, NodeId::ROOT, &due).len(), 1);
+    let deliveries = STORE_DELIVERIES.with_borrow_mut(Option::take).unwrap();
+    assert!(job.tree.child_of(NodeId::ROOT, member).is_some());
+    (job, member, deliveries)
+}
+
+#[test]
+fn a_repaired_header_claim_replays_arrived_ranges_around_sparse_loss() {
+    let (mut job, member, deliveries) = repaired_header_claim(Provenance::Lost);
+    let start = REPAIRED_FRONT.len() as u64;
+    let lost = ByteRange::new(start, start + 20);
+    assert!(
+        deliveries
+            .iter()
+            .all(|(range, _)| range.intersect(lost).is_none()),
+        "a sparse hole is not ciphertext: {deliveries:?}",
+    );
+    assert!(deliveries.contains(&(ByteRange::new(start + 20, start + 25), Provenance::Fresh)));
+    assert_eq!(
+        job.root()
+            .get(member)
+            .unwrap()
+            .coverage
+            .overlapping(lost)
+            .next()
+            .unwrap()
+            .provenance,
+        Provenance::Lost
+    );
+
+    job.send(member, start + 5, &REPLAY_BODY[5..10], Provenance::Repaired);
+    let remaining: Vec<_> = job
+        .root()
+        .get(member)
+        .unwrap()
+        .coverage
+        .overlapping(lost)
+        .map(|run| (run.range, run.provenance))
+        .collect();
+    assert_eq!(
+        remaining,
+        [
+            (ByteRange::new(start, start + 5), Provenance::Lost),
+            (ByteRange::new(start + 5, start + 10), Provenance::Repaired),
+            (ByteRange::new(start + 10, start + 20), Provenance::Lost),
+        ]
+    );
+    job.send(member, start, REPLAY_BODY, Provenance::Repaired);
+    let expected = [&REPAIRED_FRONT[HEADER as usize..], REPLAY_BODY, b"tail!"].concat();
+    assert_eq!(
+        blake3::hash(&job.file("inner.bin")),
+        blake3::hash(&expected)
+    );
+}
+
+#[test]
+fn a_repaired_header_claim_preserves_arrived_corrupt_bytes_and_their_provenance() {
+    for provenance in [Provenance::Damaged, Provenance::Refuted] {
+        let (job, member, deliveries) = repaired_header_claim(provenance);
+        let start = REPAIRED_FRONT.len() as u64;
+        assert!(
+            deliveries.contains(&(ByteRange::new(start, start + 20), provenance)),
+            "{deliveries:?}"
+        );
+        let expected = [&REPAIRED_FRONT[HEADER as usize..], REPLAY_BODY, b"tail!"].concat();
+        assert_eq!(job.file("inner.bin"), expected);
+        let (node, _) = job.tree.child_of(NodeId::ROOT, member).unwrap();
+        assert_eq!(
+            job.tree
+                .namespace(node)
+                .unwrap()
+                .get(MemberId(0))
+                .unwrap()
+                .coverage
+                .overlapping(ByteRange::new(start - HEADER, start + 20 - HEADER))
+                .next()
+                .unwrap()
+                .provenance,
+            provenance
+        );
+    }
+}
+
 fn staged_job() -> (Job, MemberId, NodeId, Vec<u8>) {
     let mut job = Job::new(PLENTY);
     let payload = vec![0x71; (2 * READ_BACK + 13) as usize];

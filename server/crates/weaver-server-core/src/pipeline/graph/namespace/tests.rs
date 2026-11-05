@@ -25,6 +25,7 @@ mod windows;
 thread_local! {
     // How many members a pass over the holds asked what is held of them.
     pub(super) static RELEASE_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static STORE_DELIVERIES: std::cell::RefCell<Option<Vec<(ByteRange, Provenance)>>> = const { std::cell::RefCell::new(None) };
 }
 
 const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";
@@ -53,6 +54,11 @@ impl Object for Store {
         _: &mut dyn FnMut(&weaver_graph::Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
     ) {
+        STORE_DELIVERIES.with_borrow_mut(|seen| {
+            if let Some(seen) = seen {
+                seen.push((delivery.range(), delivery.provenance));
+            }
+        });
         if delivery.bytes.windows(7).any(|window| window == b"RETRACT") {
             out.push(Emit::Retract(MemberId(0)));
             return;
@@ -294,6 +300,7 @@ impl Segments for Source {
 #[derive(Default)]
 struct Seen {
     report_error: bool,
+    proof: Option<ByteRange>,
     fed: Vec<Segment>,
     read: Option<Vec<u8>>,
     volume: Option<Vec<u8>>,
@@ -427,6 +434,14 @@ impl Recovery for Par {
 
     fn outcome(&self) -> Option<RepairOutcome> {
         self.last
+    }
+
+    fn proves(&self, _: MemberId, length: u64) -> ByteRange {
+        self.seen
+            .lock()
+            .unwrap()
+            .proof
+            .unwrap_or(ByteRange::new(0, length))
     }
 }
 
