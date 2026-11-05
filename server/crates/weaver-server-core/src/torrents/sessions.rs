@@ -486,10 +486,10 @@ pub(crate) const fn encryption_policy(
 
 /// How a session on a leg of `shape` takes and reaches peers: the
 /// transports `torrent` asks for that the leg carries, and whether it listens
-/// at all. uTP rides the listener's socket, so a session that does not
-/// listen, or whose leg carries no uTP, has none; one left with neither
-/// fails to build, and its route holds closed.
-fn transports(torrent: &TorrentConfig, shape: Shape) -> (Option<ListenerMode>, bool) {
+/// at all. Outgoing uTP uses the leg's datagram route even when it has no
+/// incoming listener. A session left with neither outgoing transport fails
+/// to build, and its route holds closed.
+fn transports(torrent: &TorrentConfig, shape: Shape) -> (Option<ListenerMode>, bool, bool) {
     let protocol = torrent.peer_protocol;
     let utp = protocol.utp() && shape.utp;
     let mode = match (protocol.tcp(), utp) {
@@ -498,7 +498,7 @@ fn transports(torrent: &TorrentConfig, shape: Shape) -> (Option<ListenerMode>, b
         (true, false) => Some(ListenerMode::TcpOnly),
         (false, false) => None,
     };
-    (mode.filter(|_| shape.listen), protocol.tcp())
+    (mode.filter(|_| shape.listen), protocol.tcp(), utp)
 }
 
 /// The limits `torrent` holds a session to, no limit as libtorrent counts
@@ -544,7 +544,7 @@ pub fn session_options(
 ) -> SessionOptions {
     let shape = leg.shape;
     let listen_ip = leg.kind.listen_ip().unwrap_or_else(|| unspecified(binds));
-    let (mode, enable_tcp) = transports(torrent, shape);
+    let (mode, enable_tcp, enable_utp) = transports(torrent, shape);
     let limits = session_limits(torrent);
     let mut options = SessionOptions {
         dht: shape.dht.then(|| DhtSessionConfig {
@@ -571,6 +571,7 @@ pub fn session_options(
         // factory, never by a proxy URL of the session's.
         connect: Some(ConnectionOptions {
             enable_tcp,
+            enable_utp: Some(enable_utp),
             peer_opts: Some(PeerConnectionOptions {
                 read_write_timeout: Some(PEER_TIMEOUT),
                 ..PeerConnectionOptions::default()

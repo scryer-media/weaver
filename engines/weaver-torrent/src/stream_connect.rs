@@ -73,6 +73,10 @@ pub(crate) enum Transports {
 pub struct ConnectionOptions {
     // TCP outgoing connections are enabled by default
     pub enable_tcp: bool,
+    /// `None` uses an existing listening uTP socket. `Some(true)` also
+    /// binds an outgoing socket through the session's factory when needed;
+    /// `Some(false)` disables outgoing uTP without changing its listener.
+    pub enable_utp: Option<bool>,
     pub peer_opts: Option<PeerConnectionOptions>,
 }
 
@@ -80,6 +84,7 @@ impl Default for ConnectionOptions {
     fn default() -> Self {
         Self {
             enable_tcp: true,
+            enable_utp: None,
             peer_opts: None,
         }
     }

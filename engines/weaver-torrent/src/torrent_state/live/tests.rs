@@ -5143,6 +5143,7 @@ async fn dialing_with(
         socket_factory: Arc::new(DialedTcp(crate::peer_info_reader::tests::Dialed(tx))),
         connect: Some(crate::stream_connect::ConnectionOptions {
             enable_tcp: true,
+            enable_utp: None,
             peer_opts: Some(peer_opts),
         }),
         ..isolated_session_opts(false)
