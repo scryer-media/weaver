@@ -127,6 +127,30 @@ fn a_read_over_damaged_bytes_nothing_will_repair_fails_as_lost() {
     assert!(volumes.lost());
 }
 
+// A volume is settled for a run only once no read of it waits or fails:
+// closed, and every byte of it in, fresh or repaired. A closed volume whose
+// damage nothing will repair is not, though no more bytes will come for it,
+// for a read over the damage fails; once repaired, it is.
+#[test]
+fn a_volume_is_settled_once_closed_and_every_byte_of_it_is_verified() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut envelopes, shelf) = shelved(dir.path());
+    envelopes
+        .keep(NODE, 0, 0, b"front", Provenance::Fresh)
+        .unwrap();
+    envelopes
+        .keep(NODE, 0, 5, b"-xnd-back", Provenance::Damaged)
+        .unwrap();
+    let volumes = reader(&shelf);
+    assert!(!volumes.settled(FIRST), "open");
+    close(&shelf, 0, 14, true);
+    assert!(!volumes.settled(FIRST), "damaged");
+    envelopes
+        .keep(NODE, 0, 5, b"-and-back", Provenance::Repaired)
+        .unwrap();
+    assert!(volumes.settled(FIRST));
+}
+
 #[test]
 fn a_read_ends_short_where_a_closed_volume_ends() {
     let dir = tempfile::tempdir().unwrap();

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use std::collections::BTreeMap;
 use std::io;
+use std::num::NonZeroUsize;
 use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
@@ -969,10 +971,11 @@ impl Volumes for Counted {
 }
 
 // A pool that lends threads of its own, recording how many each spread
-// asked for.
+// asked for, and how many each spread beside the run's thread started.
 #[derive(Default)]
 struct Lent {
     spreads: Mutex<Vec<usize>>,
+    besides: Mutex<Vec<usize>>,
 }
 
 impl weaver_graph::Pool for Lent {
@@ -984,6 +987,17 @@ impl weaver_graph::Pool for Lent {
             }
         });
     }
+
+    fn spread_beside(&self, work: &(dyn Fn() + Sync), caller: &mut dyn FnMut(&dyn Fn())) {
+        let started = std::sync::atomic::AtomicUsize::new(0);
+        thread::scope(|scope| {
+            caller(&|| {
+                started.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                scope.spawn(work);
+            });
+        });
+        self.besides.lock().unwrap().push(started.into_inner());
+    }
 }
 
 // What a run on `threads` of a lent pool said.
@@ -994,6 +1008,8 @@ struct OnThreads {
     reads: Vec<(u32, u64)>,
     // The threads each spread asked of the pool.
     spreads: Vec<usize>,
+    // The workers each spread beside the run's thread started.
+    besides: Vec<usize>,
 }
 
 impl OnThreads {
@@ -1081,11 +1097,13 @@ fn on_budget(volumes: Vec<Vec<u8>>, memory_bytes: Option<u64>, threads: usize) -
     );
     let reads = std::mem::take(&mut *counted.reads.lock().unwrap());
     let spreads = std::mem::take(&mut *lent.spreads.lock().unwrap());
+    let besides = std::mem::take(&mut *lent.besides.lock().unwrap());
     OnThreads {
         said: said(&emits),
         sums: checksums(&emits),
         reads,
         spreads,
+        besides,
     }
 }
 
@@ -1306,15 +1324,621 @@ fn a_file_that_fails_beside_others_ends_the_run_as_it_would_alone() {
     );
     assert!(alone.contains(&Said::Closed(0)));
     assert!(!alone.contains(&Said::Member(2, "file2.bin".into(), Some(274))));
-    // Alone, the failing file's bytes stream out before its checksum fails;
-    // beside others it is decoded whole first, so none are said. Either way
-    // the file is retracted.
-    let unfailed: Vec<&Said> = alone
-        .iter()
-        .filter(|said| !matches!(said, Said::Bytes(1, _)))
-        .collect();
-    assert_eq!(beside.iter().collect::<Vec<_>>(), unfailed);
+    // Beside others the failing file is decoded whole first, and then said
+    // as it streamed out alone: its bytes, as far as its decode came, before
+    // its checksum fails and it is retracted.
+    assert_eq!(beside, alone);
     assert!(!spreads.is_empty());
+}
+
+// The gate's volumes as unrar-rs reads them, each read waiting for its
+// volume's bytes as a run's does.
+struct Gated(Arc<Gate>);
+
+struct GatedReader {
+    gate: Arc<Gate>,
+    volume: VolumeIndex,
+    position: u64,
+}
+
+impl io::Read for GatedReader {
+    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+        let read = self.gate.read_at(self.volume, self.position, into)?;
+        self.position += read as u64;
+        Ok(read)
+    }
+}
+
+impl io::Seek for GatedReader {
+    fn seek(&mut self, from: io::SeekFrom) -> io::Result<u64> {
+        self.position = match from {
+            io::SeekFrom::Start(offset) => offset,
+            io::SeekFrom::Current(by) => self.position.checked_add_signed(by).unwrap(),
+            io::SeekFrom::End(by) => (self.gate.volumes[self.volume.0 as usize].len() as u64)
+                .checked_add_signed(by)
+                .unwrap(),
+        };
+        Ok(self.position)
+    }
+}
+
+impl unrar_rs::VolumeProvider for Gated {
+    fn get_volume(
+        &self,
+        index: usize,
+    ) -> Result<Box<dyn unrar_rs::ReadSeek>, unrar_rs::VolumeProviderError> {
+        Ok(Box::new(GatedReader {
+            gate: Arc::clone(&self.0),
+            volume: VolumeIndex(index as u32),
+            position: 0,
+        }))
+    }
+}
+
+// An archive made from the headers of a prefix read only as far as a
+// member's first part decodes that member whole: its continuations are
+// found as decoding reaches the volumes that hold them, though none was
+// parsed when the copy was made and none of those volumes was in yet.
+#[test]
+fn a_copy_of_the_headers_decodes_a_member_whose_continuations_it_never_parsed() {
+    let rar5_four: Vec<Vec<u8>> = (1..=4)
+        .map(|part| {
+            std::fs::read(format!(
+                "{}/../../server/crates/weaver-server-core/tests/fixtures/extraction_profiles/rar5_lz_four.part0{part}.rar",
+                env!("CARGO_MANIFEST_DIR")
+            ))
+            .unwrap()
+        })
+        .collect();
+    let rar4_four: Vec<Vec<u8>> = SPLIT_LZ.iter().map(|volume| volume.to_vec()).collect();
+    for volumes in [rar4_four, rar5_four] {
+        let count = volumes.len() as u32;
+        let whole = Gate::whole(volumes.clone());
+        let mut full = unrar_rs::RarArchive::open_prefix(
+            GatedReader {
+                gate: Arc::clone(&whole),
+                volume: VolumeIndex(0),
+                position: 0,
+            },
+            None,
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        let mut expected = Vec::new();
+        full.by_index_via(0, &Gated(Arc::clone(&whole)))
+            .and_then(|entry| entry.copy_to(&mut expected))
+            .unwrap();
+        assert!(!expected.is_empty());
+
+        let mut released = vec![false; volumes.len()];
+        released[0] = true;
+        let gate = Gate::new(volumes, &released);
+        let prefix = unrar_rs::RarArchive::open_prefix(
+            GatedReader {
+                gate: Arc::clone(&gate),
+                volume: VolumeIndex(0),
+                position: 0,
+            },
+            None,
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        let first = prefix.member_info(0).unwrap();
+        assert_eq!(
+            (first.volumes.first_volume, first.volumes.last_volume),
+            (0, 0),
+            "the copy knows the member's first part only"
+        );
+        let mut copy = unrar_rs::RarArchive::from_cached_headers_with_password_and_shared_kdf_cache(
+            prefix.export_headers(),
+            None,
+            Arc::new(KdfCache::new()),
+        );
+        copy.set_verify(true);
+        let provider = Gated(Arc::clone(&gate));
+        let decoding = thread::spawn(move || {
+            let mut out = Vec::new();
+            copy.by_index_via(0, &provider)
+                .and_then(|entry| entry.copy_to(&mut out))
+                .map(|_| out)
+        });
+        for volume in 1..count {
+            gate.wait_for_reader(volume);
+            gate.release(volume);
+        }
+        assert_eq!(decoding.join().unwrap().unwrap(), expected);
+    }
+}
+
+// A file posted over three volumes, then three files whole in the last;
+// `flip` names a file one byte of whose last part is posted wrong.
+fn overlapping(flip: Option<u8>) -> Vec<Vec<u8>> {
+    let body = |at: u8, length: usize| -> Vec<u8> {
+        (0..length)
+            .map(|byte| (byte as u8).wrapping_mul(3) ^ at)
+            .collect()
+    };
+    let posted = |at: u8, bytes: &[u8]| -> Vec<u8> {
+        let mut posted = bytes.to_vec();
+        if flip == Some(at) {
+            posted[5] ^= 0x20;
+        }
+        posted
+    };
+    let whole = |at: u8| {
+        let bytes = body(at, 400 + usize::from(at) * 50);
+        rar5::file(
+            &format!("file{at}.bin"),
+            0,
+            &posted(at, &bytes),
+            bytes.len() as u64,
+            Some(crc32(&bytes)),
+        )
+    };
+    let first = body(0, 3000);
+    let length = first.len() as u64;
+    vec![
+        [
+            rar5::start(Some(0)),
+            rar5::file("file0.bin", rar5::SPLIT_AFTER, &first[..1000], length, None),
+            rar5::end(true),
+        ]
+        .concat(),
+        [
+            rar5::start(Some(1)),
+            rar5::file(
+                "file0.bin",
+                rar5::SPLIT_BEFORE | rar5::SPLIT_AFTER,
+                &first[1000..2000],
+                length,
+                None,
+            ),
+            rar5::end(true),
+        ]
+        .concat(),
+        [
+            rar5::start(Some(2)),
+            rar5::file(
+                "file0.bin",
+                rar5::SPLIT_BEFORE,
+                &posted(0, &first[2000..]),
+                length,
+                Some(crc32(&first)),
+            ),
+            whole(1),
+            whole(2),
+            whole(3),
+            rar5::end(false),
+        ]
+        .concat(),
+    ]
+}
+
+// A run over `volumes` on `threads` of `pool`, the first volume in when it
+// starts, and the rest once the run waits on the second.
+fn arriving_on(
+    volumes: Vec<Vec<u8>>,
+    threads: usize,
+    pool: Arc<dyn weaver_graph::Pool>,
+) -> Vec<Emit> {
+    let mut released = vec![false; volumes.len()];
+    released[0] = true;
+    let count = volumes.len() as u32;
+    let gate = Gate::new(volumes, &released);
+    thread::scope(|scope| {
+        let run = scope.spawn(|| {
+            let mut emits = Vec::new();
+            let mut sink = |emit| {
+                emits.push(emit);
+                true
+            };
+            RarEngine::new().start().run(
+                Arc::clone(&gate) as Arc<dyn Volumes>,
+                &mut sink,
+                weaver_graph::Budget {
+                    memory_bytes: None,
+                    threads,
+                    pool: Some(pool),
+                },
+            );
+            emits
+        });
+        gate.wait_for_reader(1);
+        for volume in 1..count {
+            gate.release(volume);
+        }
+        run.join().unwrap()
+    })
+}
+
+fn arriving(volumes: Vec<Vec<u8>>, threads: usize) -> OnThreads {
+    let lent = Arc::new(Lent::default());
+    let emits = arriving_on(
+        volumes,
+        threads,
+        Arc::clone(&lent) as Arc<dyn weaver_graph::Pool>,
+    );
+    OnThreads {
+        said: said(&emits),
+        sums: checksums(&emits),
+        reads: Vec::new(),
+        spreads: std::mem::take(&mut *lent.spreads.lock().unwrap()),
+        besides: std::mem::take(&mut *lent.besides.lock().unwrap()),
+    }
+}
+
+// A file decoding on the run's thread while the last of its volumes come in
+// holds back none of the files after it: once their bytes are in, they
+// decode beside it, and every file is said as if one by one.
+#[test]
+fn files_after_one_still_decoding_decode_beside_it_and_are_said_in_order() {
+    let alone = arriving(overlapping(None), 1);
+    let beside = arriving(overlapping(None), 4);
+    assert!(alone.said.contains(&Said::Closed(3)), "{:?}", alone.said);
+    assert_eq!(beside.said, alone.said);
+    assert_eq!(beside.sums, alone.sums);
+    assert!(alone.besides.is_empty(), "{:?}", alone.besides);
+    // The second and third files decode beside the first. The last waits
+    // for the header after it, the set's end record, so it decodes alone.
+    assert_eq!(beside.besides, vec![2, 0]);
+    assert!(beside.spreads.is_empty(), "{:?}", beside.spreads);
+}
+
+// A file that fails beside one still decoding fails the run only once that
+// one closes, and as it would have failed alone.
+#[test]
+fn a_file_that_fails_beside_one_still_decoding_fails_the_run_after_it_closes() {
+    let alone = arriving(overlapping(Some(2)), 1);
+    let beside = arriving(overlapping(Some(2)), 4);
+    assert!(alone.said.contains(&Said::Closed(1)), "{:?}", alone.said);
+    assert!(alone.said.contains(&Said::Retract(2)), "{:?}", alone.said);
+    assert_eq!(beside.said, alone.said);
+    assert_eq!(beside.besides, vec![2]);
+}
+
+// The file on the run's thread fails: the files decoded beside it are never
+// said, as the walk would never have reached them.
+#[test]
+fn files_decoded_beside_one_that_fails_are_never_said() {
+    let alone = arriving(overlapping(Some(0)), 1);
+    let beside = arriving(overlapping(Some(0)), 4);
+    assert!(alone.said.contains(&Said::Retract(0)), "{:?}", alone.said);
+    assert!(
+        !alone
+            .said
+            .iter()
+            .any(|said| matches!(said, Said::Member(1.., _, _))),
+        "{:?}",
+        alone.said
+    );
+    assert_eq!(beside.said, alone.said);
+    assert_eq!(beside.besides, vec![2]);
+}
+
+// A pool whose workers beside the run's thread wait to be let go, so a test
+// can stop the run while they are out.
+#[derive(Default)]
+struct Held {
+    state: Mutex<(usize, bool, usize)>,
+    changed: Condvar,
+}
+
+impl Held {
+    fn started(&self) -> usize {
+        self.state.lock().unwrap().0
+    }
+
+    fn wait_started(&self) {
+        let mut state = self.state.lock().unwrap();
+        while state.0 == 0 {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn let_go(&self) {
+        self.state.lock().unwrap().1 = true;
+        self.changed.notify_all();
+    }
+
+    fn returned(&self) -> usize {
+        self.state.lock().unwrap().2
+    }
+}
+
+impl weaver_graph::Pool for Held {
+    fn spread(&self, workers: usize, work: &(dyn Fn() + Sync)) {
+        thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(work);
+            }
+        });
+    }
+
+    fn spread_beside(&self, work: &(dyn Fn() + Sync), caller: &mut dyn FnMut(&dyn Fn())) {
+        thread::scope(|scope| {
+            caller(&|| {
+                self.state.lock().unwrap().0 += 1;
+                self.changed.notify_all();
+                scope.spawn(|| {
+                    let mut state = self.state.lock().unwrap();
+                    while !state.1 {
+                        state = self.changed.wait(state).unwrap();
+                    }
+                    drop(state);
+                    work();
+                    self.state.lock().unwrap().2 += 1;
+                });
+            });
+        });
+    }
+}
+
+// The owner stops a run while files decode beside it: the run returns only
+// once every worker has, nothing it says after is heard, and the next run
+// says the set from its first file.
+#[test]
+fn a_run_stopped_while_files_decode_beside_it_joins_them_and_the_next_says_all() {
+    let held = Arc::new(Held::default());
+    let mut released = vec![false; 3];
+    released[0] = true;
+    let gate = Gate::new(overlapping(None), &released);
+    let after = std::sync::atomic::AtomicUsize::new(0);
+    let returned = thread::scope(|scope| {
+        let run = scope.spawn(|| {
+            let mut stopped = false;
+            let mut sink = |_emit| {
+                if stopped {
+                    after.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return false;
+                }
+                stopped = held.started() > 0;
+                !stopped
+            };
+            RarEngine::new().start().run(
+                Arc::clone(&gate) as Arc<dyn Volumes>,
+                &mut sink,
+                weaver_graph::Budget {
+                    memory_bytes: None,
+                    threads: 4,
+                    pool: Some(Arc::clone(&held) as Arc<dyn weaver_graph::Pool>),
+                },
+            );
+            held.returned()
+        });
+        gate.wait_for_reader(1);
+        gate.release(1);
+        gate.release(2);
+        held.wait_started();
+        held.let_go();
+        run.join().unwrap()
+    });
+    assert_eq!(returned, held.started());
+    assert_eq!(after.load(std::sync::atomic::Ordering::Relaxed), 0);
+    let alone = on_threads(overlapping(None), 1);
+    assert_eq!(arriving(overlapping(None), 4).said, alone.said);
+}
+
+// How a set's volumes come in while a run reads them.
+#[derive(Clone, Copy, Debug)]
+enum Arrival {
+    // All in before the run starts.
+    Whole,
+    // Each as the run first reads it, with as many after it as the
+    // download is ahead.
+    Ahead(u32),
+}
+
+// Volumes that come in as the run first reads them.
+struct Dripping {
+    gate: Arc<Gate>,
+    ahead: u32,
+}
+
+impl Volumes for Dripping {
+    fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>> {
+        self.gate.next(after)
+    }
+
+    fn len(&self, volume: VolumeIndex) -> Option<u64> {
+        self.gate.len(volume)
+    }
+
+    fn settled(&self, volume: VolumeIndex) -> bool {
+        self.gate.settled(volume)
+    }
+
+    fn read_at(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
+        if !self.gate.settled(volume) {
+            let last = (self.gate.volumes.len() as u32).saturating_sub(1);
+            for at in volume.0..=volume.0.saturating_add(self.ahead).min(last) {
+                self.gate.release(at);
+            }
+        }
+        self.gate.read_at(volume, offset, into)
+    }
+}
+
+fn arrived(
+    volumes: &[Vec<u8>],
+    password: Option<&str>,
+    arrival: Arrival,
+    threads: usize,
+) -> (Vec<Said>, Vec<(u32, u32)>) {
+    let volumes: Arc<dyn Volumes> = match arrival {
+        Arrival::Whole => Gate::whole(volumes.to_vec()),
+        Arrival::Ahead(ahead) => Arc::new(Dripping {
+            gate: Gate::new(volumes.to_vec(), &vec![false; volumes.len()]),
+            ahead,
+        }),
+    };
+    let mut emits = Vec::new();
+    let mut sink = |emit| {
+        emits.push(emit);
+        true
+    };
+    let lent = Arc::new(Lent::default());
+    let mut engine = RarEngine::new();
+    if let Some(password) = password {
+        engine.offer_password(password, &mut Vec::new());
+    }
+    engine.start().run(
+        volumes,
+        &mut sink,
+        weaver_graph::Budget {
+            memory_bytes: None,
+            threads,
+            pool: Some(lent as Arc<dyn weaver_graph::Pool>),
+        },
+    );
+    (said(&emits), checksums(&emits))
+}
+
+// The RAR sets of the test corpus small enough for the default suite, each
+// with its volumes in order.
+fn fixture_sets() -> Vec<(String, Vec<Vec<u8>>)> {
+    let root = format!(
+        "{}/../../server/crates/weaver-server-core/tests/fixtures",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mut sets: BTreeMap<String, Vec<(String, Vec<u8>)>> = BTreeMap::new();
+    for dir in ["extraction_profiles", "rar4", "rar5"] {
+        for entry in std::fs::read_dir(format!("{root}/{dir}")).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if !name.ends_with(".rar") || std::fs::metadata(&path).unwrap().len() > 1 << 20 {
+                continue;
+            }
+            let set = match name.rsplit_once(".part") {
+                Some((set, _)) => set.to_owned(),
+                None => name.trim_end_matches(".rar").to_owned(),
+            };
+            sets.entry(format!("{dir}/{set}"))
+                .or_default()
+                .push((name, std::fs::read(&path).unwrap()));
+        }
+    }
+    sets.into_iter()
+        .map(|(set, mut volumes)| {
+            volumes.sort();
+            (set, volumes.into_iter().map(|(_, bytes)| bytes).collect())
+        })
+        .collect()
+}
+
+// The direct store's writer layouts: stored files over one volume and many,
+// enciphered files and headers, solid, and a file whose header names a
+// method its bytes were not made with.
+fn writer_sets() -> Vec<(String, Vec<Vec<u8>>)> {
+    use crate::rar_store::tests::writer::{Item, Options, Version, write};
+    let items: Vec<Item> = (0..6u64)
+        .map(|at| {
+            Item::File(
+                ["a.bin", "b.bin", "c.bin", "d.bin", "e.bin", "f.bin"][at as usize],
+                crate::testing::payload(at + 1, 700 + 2_900 * at as usize),
+            )
+        })
+        .collect();
+    // How a layout sets the writer's options.
+    type Shape = fn(&mut Options);
+    let mut sets = Vec::new();
+    for version in [Version::Rar4, Version::Rar5] {
+        let shapes: [(&str, Shape); 8] = [
+            ("one", |_| {}),
+            ("split", |options| options.split = Some(6_000)),
+            ("encrypted", |options| options.password = Some(PASSWORD)),
+            ("split-encrypted", |options| {
+                options.split = Some(6_000);
+                options.password = Some(PASSWORD);
+            }),
+            ("split-headers", |options| {
+                options.split = Some(6_000);
+                options.password = Some(PASSWORD);
+                options.encrypt_headers = true;
+            }),
+            ("split-solid", |options| {
+                options.split = Some(6_000);
+                options.solid = true;
+            }),
+            ("split-compressed", |options| {
+                options.split = Some(6_000);
+                options.compressed = Some(3);
+            }),
+            ("split-recovery", |options| {
+                options.split = Some(6_000);
+                options.recovery = true;
+            }),
+        ];
+        for (shape, made) in shapes {
+            let mut options = Options::new(version);
+            made(&mut options);
+            sets.push((format!("{version:?}-{shape}"), write(&items, &options)));
+        }
+    }
+    sets
+}
+
+const PASSWORD: &str = "testpass123";
+
+// Every set the engine's tests read, from the corpus, the store's writer and
+// the layouts above, plus each multi-volume one with a byte of its last
+// volume posted wrong, is said alike by the walk on one thread and on many,
+// emit for emit and in order, whether its volumes are all in or come in as
+// it reads.
+#[test]
+fn the_walk_says_every_set_alike_on_one_thread_and_on_many() {
+    let mut sets = fixture_sets();
+    assert!(sets.len() >= 40, "{} sets", sets.len());
+    sets.extend(writer_sets());
+    sets.extend([
+        ("six".to_owned(), six_files(0)),
+        ("six-solid".to_owned(), six_files(rar5::SOLID)),
+        ("six-compressed".to_owned(), six_files_compressed()),
+        ("six-in-one".to_owned(), six_in_one()),
+        ("spanning".to_owned(), spanning_files()),
+        ("overlapping".to_owned(), overlapping(None)),
+        ("overlapping-first-wrong".to_owned(), overlapping(Some(0))),
+        ("overlapping-third-wrong".to_owned(), overlapping(Some(2))),
+    ]);
+    let damaged: Vec<(String, Vec<Vec<u8>>)> = sets
+        .iter()
+        .filter(|(_, volumes)| volumes.len() > 1)
+        .map(|(name, volumes)| {
+            let mut volumes = volumes.clone();
+            let last = volumes.last_mut().unwrap();
+            let middle = last.len() / 2;
+            last[middle] ^= 0x10;
+            (format!("{name}-damaged"), volumes)
+        })
+        .collect();
+    sets.extend(damaged);
+    for (name, volumes) in &sets {
+        for password in [None, Some(PASSWORD)] {
+            for arrival in [Arrival::Whole, Arrival::Ahead(0), Arrival::Ahead(2)] {
+                let alone = arrived(volumes, password, arrival, 1);
+                for threads in [2, 4] {
+                    let beside = arrived(volumes, password, arrival, threads);
+                    assert!(
+                        beside == alone,
+                        "{name} {password:?} {arrival:?} on {threads} threads: {:?} {:?} alone {:?} {:?}",
+                        brief(&beside.0),
+                        beside.1,
+                        brief(&alone.0),
+                        alone.1
+                    );
+                }
+            }
+        }
+    }
+}
+
+// What a run said, with each member's bytes as their length and checksum.
+fn brief(said: &[Said]) -> Vec<String> {
+    said.iter()
+        .map(|said| match said {
+            Said::Bytes(id, bytes) => format!("Bytes({id}, {} {:08x})", bytes.len(), crc32(bytes)),
+            other => format!("{other:?}"),
+        })
+        .collect()
 }
 
 // A compressed member reaches the sink in pieces of at least a megabyte, its

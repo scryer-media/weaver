@@ -106,7 +106,7 @@ impl Grant {
 }
 
 // The pool as a run borrows it: the run's thread waits while the work runs
-// on the pool's threads.
+// on the pool's threads, or goes on with its own beside it.
 struct Lent(Arc<rayon::ThreadPool>);
 
 impl Pool for Lent {
@@ -120,6 +120,18 @@ impl Pool for Lent {
                     work()
                 });
             }
+        });
+    }
+
+    fn spread_beside(&self, work: &(dyn Fn() + Sync), caller: &mut dyn FnMut(&dyn Fn())) {
+        let job = crate::runtime::panic_trap::current_job();
+        self.0.in_place_scope(|scope| {
+            caller(&|| {
+                scope.spawn(move |_| {
+                    let _job = crate::runtime::panic_trap::JobScope::carry(job);
+                    work()
+                });
+            });
         });
     }
 }

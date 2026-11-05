@@ -11,8 +11,11 @@
 // the files of a volume whose bytes are all in are decoded side by side on
 // the pool the budget lends, as many at once as it grants threads and as
 // much as it grants memory, and said in archive order as if one by one.
+// While a member decodes on the run's thread, waiting on bytes still to
+// come, the walk reads on the headers of the volumes already in and the
+// files there decode beside it, said once it closes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -27,9 +30,14 @@ use weaver_graph::{
     Budget, ByteRange, Emit, Extraction, MemberId, Provenance, Sink, VolumeIndex, Volumes, Why,
 };
 
-// One member's slot when members decode side by side: empty until its
-// worker is done, then its bytes or the error that stopped it.
-type Decoded = Mutex<Option<Result<Vec<u8>, RarError>>>;
+// A member decoded whole beside others: the bytes it came to, the furthest
+// volume its decode opened, and, if it failed, why and whether a read of its
+// volumes failed.
+struct Decoded {
+    bytes: Vec<u8>,
+    last: usize,
+    ended: Option<(RarError, bool)>,
+}
 
 // The smallest piece of a member the sink hears, its last aside, and the
 // largest of a member decoded whole. A streamed decoder writes a few hundred
@@ -99,7 +107,9 @@ enum Stop {
 struct Open {
     member: MemberId,
     encrypted: bool,
-    // The volumes the member's data spans.
+    // The volumes the member's data spans: from the one its header is in to
+    // the furthest its decode opened, which is as far as the decode found
+    // it, whatever headers the walk had read when it began.
     first: usize,
     last: usize,
 }
@@ -133,206 +143,159 @@ impl Walk<'_, '_> {
         // decoding picks inline or batched work from what it measures.
         archive.set_decode_mode(unrar_rs::DecodeMode::Adaptive);
         archive.set_verify(true);
-        let side_by_side = self.budget.threads() > 1 && !archive.is_solid();
+        let spreads = self.spreads(&archive);
+        let mut cursor = Cursor::new(0, first, &self.input, &self.budget, spreads);
         let mut index = 0;
-        let mut volume = 0;
-        while let Some(at) = self.input.index(volume).map_err(|_| Stop::Silent)? {
-            self.reading = volume;
-            // A closed volume's headers are read as many ahead as members
-            // can decode at once; a growing one's one at a time, so the walk
-            // never waits on a header for a member it could decode now.
-            let step = match side_by_side && self.input.volumes.len(at).is_some() {
-                true => NonZeroUsize::new(self.budget.threads()).unwrap_or(NonZeroUsize::MIN),
-                false => NonZeroUsize::MIN,
-            };
-            let mut headers = step;
-            loop {
-                let found = archive
-                    .extend_volume_prefix(volume, Box::new(self.input.reader(at)), headers)
-                    .map_err(|error| self.fail(error))?;
-                let more = found == headers.get();
-                while index < archive.len() {
-                    let batch = match side_by_side {
-                        true => self.batch(&archive, index, password.is_some()),
-                        false => 0,
-                    };
-                    // Members that reach the last header read, whose end no
-                    // later header shows yet, wait for the next ones while
-                    // fewer would decode beside each other than the threads
-                    // allow and reading on waits for nothing: the rest of a
-                    // volume whose bytes are all in, or the next volume once
-                    // its bytes are. A member that runs on into the next
-                    // volume then decodes beside those that follow.
-                    let reads_on = match more {
-                        true => self.input.settled(volume),
-                        false => self.input.settled(volume + 1),
-                    };
-                    if step.get() > 1
-                        && batch < step.get()
-                        && index + batch + 1 == archive.len()
-                        && reads_on
-                    {
-                        break;
-                    }
-                    if batch > 1 {
-                        self.side_by_side(&archive, index..index + batch, password)?;
-                        index += batch;
-                        continue;
-                    }
-                    self.member(&mut archive, index, password.is_some())?;
-                    index += 1;
-                }
-                if !more {
+        loop {
+            let wanted = cursor
+                .headers
+                .checked_add(cursor.step.get())
+                .and_then(NonZeroUsize::new)
+                .ok_or(Stop::Say(vec![Emit::Refuse(Why::Unsupported)]))?;
+            self.reading = cursor.volume;
+            cursor
+                .read(&mut archive, &self.input, wanted)
+                .map_err(|error| self.fail(error))?;
+            while index < archive.len() {
+                let batch = match spreads {
+                    true => self.batch(&archive, index, password.is_some()),
+                    false => 0,
+                };
+                // Members that reach the last header read, whose end no
+                // later header shows yet, wait for the next ones while
+                // fewer would decode beside each other than the threads
+                // allow and reading on waits for nothing: the rest of a
+                // volume whose bytes are all in, or the next volume once
+                // its bytes are. A member that runs on into the next
+                // volume then decodes beside those that follow.
+                let reads_on = match cursor.finished {
+                    false => self.input.settled(cursor.volume),
+                    true => self.input.settled(cursor.volume + 1),
+                };
+                if cursor.step.get() > 1
+                    && batch < cursor.step.get()
+                    && index + batch + 1 == archive.len()
+                    && reads_on
+                {
                     break;
                 }
-                headers = headers
-                    .checked_add(step.get())
-                    .ok_or(Stop::Say(vec![Emit::Refuse(Why::Unsupported)]))?;
+                if batch > 1 {
+                    self.side_by_side(&archive, index..index + batch, password)?;
+                    index += batch;
+                    continue;
+                }
+                index += self.member(&mut archive, index, &mut cursor, password)?;
             }
-            volume += 1;
+            if !cursor.finished {
+                continue;
+            }
+            let volume = cursor.volume + 1;
+            let Some(at) = self.input.index(volume).map_err(|_| Stop::Silent)? else {
+                break;
+            };
+            cursor = Cursor::new(volume, at, &self.input, &self.budget, spreads);
         }
         // A last header left waiting for a volume the set turned out not to
         // have decodes alone.
         while index < archive.len() {
-            self.member(&mut archive, index, password.is_some())?;
-            index += 1;
+            index += self.member(&mut archive, index, &mut cursor, password)?;
         }
         Ok(())
     }
 
-    // How many members from `index` on can decode side by side: files whose
-    // data lies in volumes whose bytes are all in, so a worker on the lent
-    // pool never waits on a download, which a later header shows run on no
-    // further, whose length is known, and which fit in the memory the budget
-    // grants together. Each holds its
-    // bytes, decoded whole before it is said, and its decoder's window, as
-    // large as the dictionary its header names.
+    // Whether members may decode beside each other: those of a set that is
+    // not solid, on more than the run's own thread.
+    fn spreads(&self, archive: &RarArchive) -> bool {
+        self.budget.threads() > 1 && !archive.is_solid()
+    }
+
+    // How many members from `index` on may decode side by side.
     fn batch(&self, archive: &RarArchive, index: usize, has_password: bool) -> usize {
-        let mut held = 0u64;
-        let mut count = 0;
-        for at in index..archive.len() {
-            let (Some(info), Some(after)) = (archive.member_info(at), archive.member_info(at + 1))
-            else {
-                break;
-            };
-            let span = info.volumes.first_volume..=info.volumes.last_volume;
-            let settled = span.clone().all(|volume| self.input.settled(volume));
-            let plain = !(info.is_symlink
-                || info.is_hardlink
-                || info.is_file_copy
-                || info.is_directory
-                || (info.is_encrypted && !has_password));
-            let whole = after.volumes.first_volume >= *span.end();
-            let Some(length) = info.unpacked_size.filter(|_| plain && whole && settled) else {
-                break;
-            };
-            let window = match info.compression.method {
-                CompressionMethod::Store => 0,
-                _ => info.compression.dict_size,
-            };
-            match held
-                .checked_add(length)
-                .and_then(|held| held.checked_add(window))
-            {
-                Some(total)
-                    if self
-                        .budget
-                        .memory_bytes
-                        .is_none_or(|memory| total <= memory) =>
-                {
-                    held = total
-                }
-                _ => break,
-            }
-            count += 1;
-        }
-        count
+        let mut held = 0;
+        (index..archive.len())
+            .map_while(|at| {
+                held = may_start(archive, &self.input, &self.budget, at, held, has_password)?;
+                Some(())
+            })
+            .count()
     }
 
     // Decode the members of `batch` on as many of the lent pool's threads
     // as the budget grants, each worker over an archive of its own made from
     // the headers the walk parsed, and say them in archive order once each
-    // is whole. A member that fails is said as far as its announcement and
-    // fails the run as it would decoding alone; the members after it are
-    // not said.
+    // is whole.
     fn side_by_side(
         &mut self,
         archive: &RarArchive,
         batch: std::ops::Range<usize>,
         password: Option<&str>,
     ) -> Result<(), Stop> {
-        let lengths: Vec<u64> = batch
-            .clone()
-            .map(|at| {
-                archive
-                    .member_info(at)
-                    .and_then(|info| info.unpacked_size)
-                    .unwrap_or(0)
-            })
-            .collect();
-        let decoded: Vec<Decoded> = (0..lengths.len()).map(|_| Mutex::new(None)).collect();
-        let workers = self.budget.threads().min(lengths.len());
+        let slots: Vec<Mutex<Option<Decoded>>> = batch.clone().map(|_| Mutex::new(None)).collect();
+        let workers = self.budget.threads().min(slots.len());
         // The walk's headers, read once, one copy for each worker.
         let headers: Mutex<Vec<CachedArchiveHeaders>> =
             Mutex::new((0..workers).map(|_| archive.export_headers()).collect());
         let taken = AtomicUsize::new(0);
         let halted = AtomicBool::new(false);
-        let (input, kdf, start) = (&self.input, &self.kdf, batch.start);
+        let (volumes, kdf, start) = (&self.input.volumes, &self.kdf, batch.start);
         let decode_limits = limits(&self.budget);
         let work = || {
             let Some(headers) = headers.lock().unwrap_or_else(PoisonError::into_inner).pop() else {
                 return;
             };
-            let mut own = RarArchive::from_cached_headers_with_password_and_shared_kdf_cache(
-                headers,
-                password.map(str::to_owned),
-                Arc::clone(kdf),
-            );
-            own.set_limits(decode_limits.clone());
-            own.set_decode_mode(unrar_rs::DecodeMode::Adaptive);
-            own.set_verify(true);
+            let mut own = copy(headers, password, kdf, &decode_limits);
+            let input = Input::beside(volumes);
             // Members are taken in archive order, so every one not taken
             // follows one that failed.
             while !halted.load(Ordering::Acquire) {
                 let at = taken.fetch_add(1, Ordering::AcqRel);
-                let Some(&length) = lengths.get(at) else {
+                let Some(slot) = slots.get(at) else {
                     break;
                 };
-                let mut out = Vec::with_capacity(usize::try_from(length).unwrap_or_default());
-                let result = own
-                    .by_index_via(start + at, input)
-                    .and_then(|entry| entry.copy_to(&mut out))
-                    .map(|_| out);
-                if result.is_err() {
+                let decoded = decode(&mut own, start + at, &input);
+                if decoded.ended.is_some() {
                     halted.store(true, Ordering::Release);
                 }
-                *decoded[at].lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
+                *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(decoded);
             }
         };
         self.budget.pool().spread(workers, &work);
-        let decoded = decoded
-            .into_iter()
-            .map(|slot| slot.into_inner().unwrap_or_else(PoisonError::into_inner));
-        for (at, result) in batch.zip(decoded) {
-            let Some(info) = archive.member_info(at) else {
-                return Err(self.fail(RarError::MemberIndexOutOfRange {
-                    index: at,
-                    len: archive.len(),
-                }));
-            };
-            let member = self.announce(&info)?;
-            match result {
-                Some(Ok(bytes)) => {
-                    self.deliver(member, bytes)?;
-                    self.open = None;
-                    self.checksum_of(archive, at, member)?;
-                    self.say(Emit::MemberClosed(member))?;
-                }
-                Some(Err(error)) => return Err(self.fail(error)),
+        for (at, slot) in batch.zip(slots) {
+            match slot.into_inner().unwrap_or_else(PoisonError::into_inner) {
+                Some(decoded) => self.say_decoded(archive, at, decoded)?,
                 None => unreachable!("a member not taken follows one that failed"),
             }
         }
         Ok(())
+    }
+
+    // A member decoded beside others, said as it would have been decoding
+    // alone: its bytes as far as its decode came, then its close, or the
+    // failure that ended it.
+    fn say_decoded(
+        &mut self,
+        archive: &RarArchive,
+        at: usize,
+        decoded: Decoded,
+    ) -> Result<(), Stop> {
+        let Some(info) = archive.member_info(at) else {
+            return Err(self.fail(RarError::MemberIndexOutOfRange {
+                index: at,
+                len: archive.len(),
+            }));
+        };
+        let member = self.announce(&info)?;
+        self.deliver(member, decoded.bytes)?;
+        if let Some((error, read_failed)) = decoded.ended {
+            // Decoding alone, the walk would have read what failed itself.
+            if read_failed {
+                self.input.failed.store(true, Ordering::Release);
+            }
+            return Err(self.failed_through(decoded.last, error));
+        }
+        self.open = None;
+        self.checksum_of(archive, at, member)?;
+        self.say(Emit::MemberClosed(member))
     }
 
     // A file member's announcement, leaving it open. It states no checksum:
@@ -350,7 +313,7 @@ impl Walk<'_, '_> {
             member,
             encrypted: info.is_encrypted,
             first: info.volumes.first_volume,
-            last: info.volumes.last_volume,
+            last: info.volumes.first_volume,
         });
         Ok(member)
     }
@@ -392,12 +355,16 @@ impl Walk<'_, '_> {
         Ok(())
     }
 
+    // Decode member `index` on the run's thread, straight into the sink, and
+    // say how many members were said: with threads to spare, members after
+    // it decode beside it and are said after it.
     fn member(
         &mut self,
         archive: &mut RarArchive,
         index: usize,
-        has_password: bool,
-    ) -> Result<(), Stop> {
+        cursor: &mut Cursor,
+        password: Option<&str>,
+    ) -> Result<usize, Stop> {
         let Some(info) = archive.member_info(index) else {
             return Err(self.fail(RarError::MemberIndexOutOfRange {
                 index,
@@ -407,7 +374,7 @@ impl Walk<'_, '_> {
         // A link is not a file body, so it is no member and the files around
         // it stand.
         if info.is_symlink || info.is_hardlink || info.is_file_copy {
-            return Ok(());
+            return Ok(1);
         }
         // A directory is a member with nothing in it, named with a trailing
         // slash as the store names it.
@@ -423,10 +390,13 @@ impl Walk<'_, '_> {
                 name,
                 length: Some(0),
             })?;
-            return self.say(Emit::MemberClosed(member));
+            return self.say(Emit::MemberClosed(member)).map(|()| 1);
         }
-        if info.is_encrypted && !has_password {
+        if info.is_encrypted && password.is_none() {
             return Err(Stop::Say(vec![Emit::NeedsPassword]));
+        }
+        if self.spreads(archive) {
+            return self.alongside(archive, index, &info, cursor, password);
         }
         let member = self.announce(&info)?;
         let mut out = Out {
@@ -435,10 +405,13 @@ impl Walk<'_, '_> {
             offset: 0,
             gathered: Vec::new(),
             stopped: false,
+            between: &mut || {},
         };
+        let reach = Reach::new(&self.input, info.volumes.first_volume);
         let decoded = archive
-            .by_index_via(index, &self.input)
+            .by_index_via(index, &reach)
             .and_then(|entry| entry.copy_to(&mut out));
+        let last = reach.last();
         // What is gathered is said whether or not the decode went on to
         // fail, as each write was before it was gathered.
         let decoded = out.flush().map_err(RarError::from).and(decoded);
@@ -446,11 +419,123 @@ impl Walk<'_, '_> {
             Ok(_) => {
                 self.open = None;
                 self.checksum_of(archive, index, member)?;
-                self.say(Emit::MemberClosed(member))
+                self.say(Emit::MemberClosed(member)).map(|()| 1)
             }
             Err(_) if out.stopped => Err(Stop::Silent),
-            Err(error) => Err(self.fail(error)),
+            Err(error) => Err(self.failed_through(last, error)),
         }
+    }
+
+    // Decode member `index` on the run's thread over a copy of the walk's
+    // headers, so the walk's own archive is free to read on. Between one
+    // write and the next the walk reads the headers of the volumes whose
+    // bytes are all in, and hands each member after it that may start to a
+    // worker beside it, on as many threads as the budget grants beyond the
+    // run's own. They are said once it closes, in archive order, as if
+    // decoded one by one; if it fails, they are not said, as the walk would
+    // not have reached them.
+    fn alongside(
+        &mut self,
+        archive: &mut RarArchive,
+        index: usize,
+        info: &unrar_rs::MemberInfo,
+        cursor: &mut Cursor,
+        password: Option<&str>,
+    ) -> Result<usize, Stop> {
+        let member = self.announce(info)?;
+        let decode_limits = limits(&self.budget);
+        let mut own = copy(
+            archive.export_headers(),
+            password,
+            &self.kdf,
+            &decode_limits,
+        );
+        let beside = Beside::default();
+        let mut next = index + 1;
+        let mut inline = None;
+        let mut stopped = false;
+        let mut last = info.volumes.first_volume;
+        {
+            let Walk {
+                input,
+                sink,
+                budget,
+                kdf,
+                ..
+            } = &mut *self;
+            let (input, budget) = (&*input, &*budget);
+            let lend = budget.threads() - 1;
+            let work = || {
+                beside.work(&input.volumes, kdf, password, &decode_limits);
+            };
+            // The decoder's window is held while the member decodes; its
+            // bytes are said as they come.
+            let mut held = window(info);
+            let mut ahead = Some(Input::beside(&input.volumes));
+            budget.pool().spread_beside(&work, &mut |more| {
+                let mut between = || {
+                    if let Some(view) = &ahead
+                        && !look_ahead(archive, view, budget, cursor)
+                    {
+                        ahead = None;
+                    }
+                    while beside.running.load(Ordering::Acquire) < lend {
+                        let Some(total) =
+                            may_start(archive, input, budget, next, held, password.is_some())
+                        else {
+                            break;
+                        };
+                        beside.hand_over(next, archive.export_headers());
+                        held = total;
+                        next += 1;
+                        more();
+                    }
+                };
+                between();
+                let mut out = Out {
+                    sink: &mut **sink,
+                    member,
+                    offset: 0,
+                    gathered: Vec::new(),
+                    stopped: false,
+                    between: &mut between,
+                };
+                let reach = Reach::new(input, last);
+                let decoded = own
+                    .by_index_via(index, &reach)
+                    .and_then(|entry| entry.copy_to(&mut out));
+                last = reach.last();
+                let decoded = out.flush().map_err(RarError::from).and(decoded);
+                stopped = out.stopped;
+                match decoded.is_ok() {
+                    // Members handed over and not yet taken, on a pool that
+                    // lends no thread beside its caller, decode here.
+                    true => while beside.work(&input.volumes, kdf, password, &decode_limits) {},
+                    false => beside.halted.store(true, Ordering::Release),
+                }
+                inline = Some(decoded);
+            });
+        }
+        match inline {
+            Some(Ok(_)) => {}
+            Some(Err(_)) if stopped => return Err(Stop::Silent),
+            Some(Err(error)) => return Err(self.failed_through(last, error)),
+            None => unreachable!("a pool runs its caller"),
+        }
+        self.open = None;
+        self.checksum_of(&own, index, member)?;
+        self.say(Emit::MemberClosed(member))?;
+        let mut decoded = beside
+            .decoded
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner);
+        for at in index + 1..next {
+            match decoded.remove(&at) {
+                Some(decoded) => self.say_decoded(archive, at, decoded)?,
+                None => unreachable!("a member a halt dropped follows one that failed"),
+            }
+        }
+        Ok(next - index)
     }
 
     fn say(&mut self, emit: Emit) -> Result<(), Stop> {
@@ -459,6 +544,15 @@ impl Walk<'_, '_> {
         } else {
             Err(Stop::Silent)
         }
+    }
+
+    // The open member failed, its decode having opened volumes as far as
+    // `last`.
+    fn failed_through(&mut self, last: usize, error: RarError) -> Stop {
+        if let Some(open) = &mut self.open {
+            open.last = last;
+        }
+        self.fail(error)
     }
 
     fn fail(&self, error: RarError) -> Stop {
@@ -471,6 +565,246 @@ impl Walk<'_, '_> {
             .as_ref()
             .map_or((self.reading, self.reading), |open| (open.first, open.last));
         Stop::Say(verdict(&error, encrypted, first..=last, &self.input))
+    }
+}
+
+// Where the walk's reading of headers stands: the volume read, how many
+// file headers each read of it asks for, how many it has read, and whether
+// those are all.
+struct Cursor {
+    volume: usize,
+    at: VolumeIndex,
+    // A closed volume's headers are read as many ahead as members can
+    // decode at once; a growing one's one at a time, so the walk never
+    // waits on a header for a member it could decode now.
+    step: NonZeroUsize,
+    headers: usize,
+    finished: bool,
+}
+
+impl Cursor {
+    fn new(volume: usize, at: VolumeIndex, input: &Input, budget: &Budget, spreads: bool) -> Self {
+        let step = match spreads && input.volumes.len(at).is_some() {
+            true => NonZeroUsize::new(budget.threads()).unwrap_or(NonZeroUsize::MIN),
+            false => NonZeroUsize::MIN,
+        };
+        Self {
+            volume,
+            at,
+            step,
+            headers: 0,
+            finished: false,
+        }
+    }
+
+    // Read the volume's headers on, as far as `wanted` of them.
+    fn read(
+        &mut self,
+        archive: &mut RarArchive,
+        input: &Input,
+        wanted: NonZeroUsize,
+    ) -> Result<(), RarError> {
+        let found =
+            archive.extend_volume_prefix(self.volume, Box::new(input.reader(self.at)), wanted)?;
+        self.headers = found;
+        self.finished = found < wanted.get();
+        Ok(())
+    }
+}
+
+// Whether member `at` may decode beside others with `held` already held,
+// and what is held once it does: a file, of plain bytes or with the
+// password its bytes need, whose data lies in volumes whose bytes are all
+// in, so a worker on the lent pool never waits on a download, which a later
+// header shows runs on no further, whose length is known, and which fits in
+// the memory the budget grants beside what is held. It holds its bytes,
+// decoded whole before it is said, and its decoder's window.
+fn may_start(
+    archive: &RarArchive,
+    input: &Input,
+    budget: &Budget,
+    at: usize,
+    held: u64,
+    has_password: bool,
+) -> Option<u64> {
+    let (info, after) = (archive.member_info(at)?, archive.member_info(at + 1)?);
+    let span = info.volumes.first_volume..=info.volumes.last_volume;
+    let plain = !(info.is_symlink
+        || info.is_hardlink
+        || info.is_file_copy
+        || info.is_directory
+        || (info.is_encrypted && !has_password));
+    let whole = after.volumes.first_volume >= *span.end();
+    let settled = span.clone().all(|volume| input.settled(volume));
+    let length = info.unpacked_size.filter(|_| plain && whole && settled)?;
+    let total = held.checked_add(length)?.checked_add(window(&info))?;
+    budget
+        .memory_bytes
+        .is_none_or(|memory| total <= memory)
+        .then_some(total)
+}
+
+// The window a member's decoder holds: as large as the dictionary its
+// header names, none for stored bytes.
+fn window(info: &unrar_rs::MemberInfo) -> u64 {
+    match info.compression.method {
+        CompressionMethod::Store => 0,
+        _ => info.compression.dict_size,
+    }
+}
+
+// Read on every header of the volumes from the cursor on whose bytes are
+// all in, while a member decodes on the run's thread: such reads never
+// wait. Says whether to go on: a read that fails ends it, and the walk
+// meets that failure again when it reads there itself.
+fn look_ahead(
+    archive: &mut RarArchive,
+    input: &Input,
+    budget: &Budget,
+    cursor: &mut Cursor,
+) -> bool {
+    loop {
+        if !cursor.finished {
+            if !input.settled(cursor.volume) {
+                return true;
+            }
+            if cursor.read(archive, input, NonZeroUsize::MAX).is_err() {
+                return false;
+            }
+            continue;
+        }
+        let volume = cursor.volume + 1;
+        if !input.settled(volume) {
+            return true;
+        }
+        let Ok(Some(at)) = input.index(volume) else {
+            return false;
+        };
+        *cursor = Cursor::new(volume, at, input, budget, true);
+    }
+}
+
+// An archive of its own over the walk's headers, for a member decoded
+// apart from the walk's archive.
+fn copy(
+    headers: CachedArchiveHeaders,
+    password: Option<&str>,
+    kdf: &Arc<KdfCache>,
+    decode_limits: &unrar_rs::Limits,
+) -> RarArchive {
+    let mut own = RarArchive::from_cached_headers_with_password_and_shared_kdf_cache(
+        headers,
+        password.map(str::to_owned),
+        Arc::clone(kdf),
+    );
+    own.set_limits(decode_limits.clone());
+    own.set_decode_mode(unrar_rs::DecodeMode::Adaptive);
+    own.set_verify(true);
+    own
+}
+
+// Member `at` of `own` decoded whole through `input`.
+fn decode(own: &mut RarArchive, at: usize, input: &Input) -> Decoded {
+    let length = own
+        .member_info(at)
+        .and_then(|info| info.unpacked_size)
+        .unwrap_or(0);
+    let first = own
+        .member_info(at)
+        .map_or(0, |info| info.volumes.first_volume);
+    let mut bytes = Vec::with_capacity(usize::try_from(length).unwrap_or_default());
+    let reach = Reach::new(input, first);
+    let ended = own
+        .by_index_via(at, &reach)
+        .and_then(|entry| entry.copy_to(&mut bytes))
+        .err()
+        .map(|error| (error, input.failed.load(Ordering::Acquire)));
+    Decoded {
+        bytes,
+        last: reach.last(),
+        ended,
+    }
+}
+
+// One member's decode through the run's input, keeping the furthest volume
+// it opened.
+struct Reach<'i> {
+    input: &'i Input,
+    last: AtomicUsize,
+}
+
+impl<'i> Reach<'i> {
+    fn new(input: &'i Input, first: usize) -> Self {
+        Self {
+            input,
+            last: AtomicUsize::new(first),
+        }
+    }
+
+    fn last(&self) -> usize {
+        self.last.load(Ordering::Relaxed)
+    }
+}
+
+impl VolumeProvider for Reach<'_> {
+    fn get_volume(&self, index: usize) -> Result<Box<dyn ReadSeek>, VolumeProviderError> {
+        self.last.fetch_max(index, Ordering::Relaxed);
+        self.input.get_volume(index)
+    }
+}
+
+// The members decoding beside the one on the run's thread. Each is handed
+// over with a copy of the walk's headers, and each start of the work takes
+// one, in archive order, so every member a halt drops follows one that
+// failed.
+#[derive(Default)]
+struct Beside {
+    handed: Mutex<VecDeque<(usize, CachedArchiveHeaders)>>,
+    decoded: Mutex<BTreeMap<usize, Decoded>>,
+    // Members handed over and not yet decoded.
+    running: AtomicUsize,
+    halted: AtomicBool,
+}
+
+impl Beside {
+    fn hand_over(&self, at: usize, headers: CachedArchiveHeaders) {
+        self.running.fetch_add(1, Ordering::AcqRel);
+        self.handed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back((at, headers));
+    }
+
+    // Decode the next member handed over, through a failure view of its
+    // own. Says whether there was one.
+    fn work(
+        &self,
+        volumes: &Arc<dyn Volumes>,
+        kdf: &Arc<KdfCache>,
+        password: Option<&str>,
+        decode_limits: &unrar_rs::Limits,
+    ) -> bool {
+        let taken = self
+            .handed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front();
+        let Some((at, headers)) = taken else {
+            return false;
+        };
+        if !self.halted.load(Ordering::Acquire) {
+            let mut own = copy(headers, password, kdf, decode_limits);
+            let decoded = decode(&mut own, at, &Input::beside(volumes));
+            if decoded.ended.is_some() {
+                self.halted.store(true, Ordering::Release);
+            }
+            self.decoded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(at, decoded);
+        }
+        self.running.fetch_sub(1, Ordering::AcqRel);
+        true
     }
 }
 
@@ -619,6 +953,17 @@ struct Input {
 }
 
 impl Input {
+    // The same volumes with a failure of their own to remember, for work
+    // beside the walk: a read it fails tells the walk nothing until the walk
+    // reaches the member, in archive order.
+    fn beside(volumes: &Arc<dyn Volumes>) -> Self {
+        Self {
+            volumes: Arc::clone(volumes),
+            failed: Arc::new(AtomicBool::new(false)),
+            reached: Mutex::default(),
+        }
+    }
+
     // The volume unrar-rs numbers `position`: bound volume `position`, for
     // a RAR set's volumes are numbered by their names. A position short of
     // the last bound volume with nothing bound there is still that volume:
@@ -735,15 +1080,17 @@ struct Stopped;
 // `EMIT_BYTES`, the member's last aside. A write that size or larger with
 // nothing gathered goes to the sink as it is; anything smaller gathers until
 // the pieces reach it. Either way each byte is copied once.
-struct Out<'s, 'a> {
+struct Out<'s, 'a, 'b> {
     sink: &'s mut Sink<'a>,
     member: MemberId,
     offset: u64,
     gathered: Vec<u8>,
     stopped: bool,
+    // What the walk does between one write and the next.
+    between: &'b mut dyn FnMut(),
 }
 
-impl Out<'_, '_> {
+impl Out<'_, '_, '_> {
     fn say(&mut self, bytes: Bytes) -> io::Result<()> {
         let length = bytes.len() as u64;
         let heard = (self.sink)(Emit::Bytes {
@@ -761,19 +1108,20 @@ impl Out<'_, '_> {
     }
 }
 
-impl Write for Out<'_, '_> {
+impl Write for Out<'_, '_, '_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if bytes.is_empty() {
             return Ok(0);
         }
         if self.gathered.is_empty() && bytes.len() >= EMIT_BYTES {
             self.say(Bytes::copy_from_slice(bytes))?;
-            return Ok(bytes.len());
+        } else {
+            self.gathered.extend_from_slice(bytes);
+            if self.gathered.len() >= EMIT_BYTES {
+                self.flush()?;
+            }
         }
-        self.gathered.extend_from_slice(bytes);
-        if self.gathered.len() >= EMIT_BYTES {
-            self.flush()?;
-        }
+        (self.between)();
         Ok(bytes.len())
     }
 

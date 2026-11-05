@@ -214,12 +214,13 @@ impl Volumes for RunVolumes {
         Some(length)
     }
 
+    // A volume with bytes nothing will bring is not settled: a read of them
+    // fails, and work on the pool reads only what is all in.
     fn settled(&self, volume: VolumeIndex) -> bool {
         let state = self.shelf.lock();
         state.kept.get(&volume.0).is_some_and(|kept| {
-            kept.closed.is_some_and(|length| {
-                kept.settled || kept.coverage.verified(ByteRange::new(0, length))
-            })
+            kept.closed
+                .is_some_and(|length| kept.coverage.verified(ByteRange::new(0, length)))
         })
     }
 
