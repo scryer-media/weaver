@@ -72,6 +72,9 @@ impl Pipeline {
         self.phase_progress.insert(key, runtime);
         if holds_live {
             self.post_download_phases += 1;
+            // A worker moves bytes while this turn awaits its other work.
+            // Its independent sampler must wake before the turn ends.
+            self.shared_state.queue.set_driving(true);
         }
         // Stage timing rides the phase lifecycle, which is per job per phase —
         // a handful of events over a job's whole life, never a per-segment
