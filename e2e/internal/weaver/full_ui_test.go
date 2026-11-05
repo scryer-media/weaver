@@ -1052,11 +1052,11 @@ func TestFullPhaseSlotsRunTheGateBesideThreeSuites(t *testing.T) {
 	}
 }
 
-func TestFullRunNarrowsTheReleaseGateUnlessTheOperatorSetsAWidth(t *testing.T) {
+func TestFullRunSetsTenReleaseFlowsUnlessTheOperatorSetsAWidth(t *testing.T) {
 	phase := &fullPhaseContext{Name: "Release Gate", Command: "release-gate", RunDir: t.TempDir()}
 
 	t.Setenv("E2E_WEAVER_RELEASE_GATE_JOBS", "")
-	if got, want := phase.env()["E2E_WEAVER_RELEASE_GATE_JOBS"], strconv.Itoa(fullRunReleaseGateJobs); got != want {
+	if got, want := phase.env()["E2E_WEAVER_RELEASE_GATE_JOBS"], "10"; got != want {
 		t.Fatalf("release-gate jobs = %q, want %q", got, want)
 	}
 
