@@ -3289,16 +3289,8 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
-        if let Some(lent) = self
-            .nodes
-            .get_mut(&node)
-            .and_then(|found| found.lent.as_mut())
-        {
-            let arrived = Arrived {
-                bytes: arrived.bytes.clone(),
-                ..*arrived
-            };
-            return lent.wait(Waiting::Delivered { arrived, length });
+        if self.nodes.queue_lent_delivery(node, arrived, length) {
+            return;
         }
         let delivery = arrived.delivery();
         let mut emits = std::mem::take(&mut self.emits);
@@ -3306,12 +3298,10 @@ impl Tree {
         // The object is out of its node while it takes the delivery, so its
         // reads can walk the tree below it. A retired object hears nothing:
         // its word was its last.
-        if let Some(mut object) = self
-            .nodes
-            .get_mut(&node)
-            .filter(|found| !found.retired)
-            .and_then(|found| found.object.take())
+        if self.nodes.get(&node).is_some_and(|found| !found.retired)
+            && let Some(mut object) = self.nodes.object_out(node)
         {
+            self.nodes.mark_own(node);
             if let Some(length) = length {
                 object.sized(delivery.volume, length, &mut emits);
             }
@@ -3320,9 +3310,7 @@ impl Tree {
                 reader.read(tree, node, volume, placement, into)
             };
             object.deliver(delivery, &mut read, &mut emits);
-            if let Some(found) = self.nodes.get_mut(&node) {
-                found.object = Some(object);
-            }
+            self.nodes.object_in(node, object);
         }
         self.apply(node, &mut emits, builder, effects);
         self.emits = emits;

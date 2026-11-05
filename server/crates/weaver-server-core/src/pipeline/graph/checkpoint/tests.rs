@@ -254,6 +254,139 @@ fn encoding(facts: &RootFacts) -> Encoding {
     )
 }
 
+// The borrowed full-snapshot encoder, independent of incremental owned conversions.
+pub(super) fn borrowed_node_rows(
+    node: &NodeRecord,
+    files: impl Fn(MemberId) -> FileState,
+    password: Option<i64>,
+) -> GraphCheckpoint {
+    let id = i64::from(node.node.0);
+    let mut out = GraphCheckpoint::default();
+    if let (Some(kind), Some(facts)) = (node.kind, &node.facts) {
+        let volumes: Vec<(u32, u32)> = node
+            .volumes
+            .iter()
+            .map(|(volume, member)| (volume.0, member.0))
+            .collect();
+        out.nodes.push(super::NodeRow {
+            node: id,
+            parent: node.parent.map(|parent| i64::from(parent.0)),
+            parent_member: node.volumes.first().map(|(_, member)| i64::from(member.0)),
+            volumes: rmp_serde::to_vec(&volumes).ok(),
+            window: node
+                .window
+                .map(|window| (window.start as i64, window.end as i64)),
+            kind: kind.to_string(),
+            state: super::state_name(node.state).to_owned(),
+            reason: node.reason.map(|why| super::why_name(why).to_owned()),
+            facts_version: i64::from(facts.version),
+            facts: facts.bytes.clone(),
+            winning_password: password,
+        });
+        out.parts.extend(facts.parts.iter().map(|part| PartRow {
+            node: id,
+            part: part.key as i64,
+            bytes: Arc::clone(&part.bytes),
+        }));
+    }
+    out.crypt
+        .extend(node.crypt.iter().map(|crypt| super::CryptRow {
+            node: id,
+            member: i64::from(crypt.member.0),
+            run_start: crypt.run_start,
+            seed: crypt.seed.to_vec(),
+        }));
+    out.members.extend(node.members.iter().map(|member| {
+        let state = files(member.member);
+        super::MemberRow {
+            node: id,
+            member: i64::from(member.member.0),
+            name: member.name.clone(),
+            output_name: member.output_name.clone(),
+            crc32: member.crc32.map(i64::from),
+            length: member.length.map(|length| length as i64),
+            closed: member.closed,
+            bound: member.bound_to.map(|object| i64::from(object.0)),
+            owner: member.owner.map(super::pair),
+            given_up: member.given_up.map(super::pair),
+            buried: member.buried,
+            undecided: member.undecided,
+            has_file: state.has_file,
+            on_disk: state.on_disk,
+            refused: state.refused.map(|why| super::why_name(why).to_owned()),
+            copy_of: member.copy_of.map(|into| i64::from(into.0)),
+            refuted_kind: member.refuted.map(|kind| kind.to_string()),
+        }
+    }));
+    out.coverage
+        .extend(node.coverage.iter().map(|run| super::CoverageRow {
+            node: id,
+            member: i64::from(run.member.0),
+            start: run.start as i64,
+            end: run.end as i64,
+            provenance: super::provenance_name(run.provenance).to_owned(),
+            verified: false,
+        }));
+    out.members.sort_by_key(Row::key);
+    out.coverage.sort_by_key(Row::key);
+    out.crypt.sort_by_key(Row::key);
+    out.parts.sort_by_key(Row::key);
+    out
+}
+
+#[test]
+fn owned_record_conversions_match_the_borrowed_full_snapshot_encoder() {
+    let mut taken = full();
+    taken.tree.nodes[0].members[0].output_name = "renamed.bin".to_string();
+    taken.tree.nodes[0].members[1].output_name.clear();
+    taken.files.insert(
+        (NodeId::ROOT, MemberId(0)),
+        FileState {
+            has_file: true,
+            on_disk: Some("staged.bin".to_string()),
+            refused: None,
+        },
+    );
+    taken
+        .files
+        .insert((NodeId::ROOT, MemberId(1)), FileState::default());
+    for node in &mut taken.tree.nodes {
+        if let Some(facts) = &mut node.facts {
+            facts.parts.push(Part {
+                key: u64::MAX,
+                bytes: Arc::from([8, 9].as_slice()),
+            });
+        }
+    }
+    for node in &taken.tree.nodes {
+        let password = taken.passwords.get(&node.node).map(|index| *index as i64);
+        let state = |member| {
+            taken
+                .files
+                .get(&(node.node, member))
+                .cloned()
+                .unwrap_or_default()
+        };
+        let expected = borrowed_node_rows(node, state, password);
+        let mut actual = super::own_rows(node.clone(), password);
+        for member in node.members.clone() {
+            let coverage = node
+                .coverage
+                .iter()
+                .filter(|run| run.member == member.member)
+                .cloned()
+                .collect();
+            let files = state(member.member);
+            let rows = super::member_rows(i64::from(node.node.0), member, coverage, files);
+            actual.members.extend(rows.members);
+            actual.coverage.extend(rows.coverage);
+        }
+        actual.members.sort_by_key(Row::key);
+        actual.coverage.sort_by_key(Row::key);
+        assert_eq!(actual, expected, "node {:?}", node.node);
+    }
+}
+
 // Every row of the snapshot, each table in key order.
 fn rows(taken: &Snapshot) -> GraphCheckpoint {
     let encoding = encoding(&taken.root);
@@ -291,7 +424,7 @@ fn rows(taken: &Snapshot) -> GraphCheckpoint {
         out.holds.extend(hold_rows(node.node, &holds));
     }
     out.parts
-        .extend(part_rows(i64::from(NodeId::ROOT.0), &parts));
+        .extend(part_rows(i64::from(NodeId::ROOT.0), parts));
     out.nodes.sort_by_key(Row::key);
     out.members.sort_by_key(Row::key);
     out.coverage.sort_by_key(Row::key);
@@ -715,6 +848,105 @@ fn a_pending_writes_what_the_database_does_not_hold() {
     let delta = restored.take().0.unwrap();
     assert_eq!(delta.rows(), 1, "{delta:?}");
     assert_eq!(root_parts(&delta), BTreeMap::from([(stale.part, None)]));
+}
+
+#[test]
+fn touched_flags_merge_every_combination_without_losing_other_sources() {
+    let flags = |bits| super::Touched {
+        own: bits & 1 != 0,
+        members: bits & 2 != 0,
+        files: bits & 4 != 0,
+        kept: bits & 8 != 0,
+    };
+    for first in 0..16 {
+        for second in 0..16 {
+            let mut merged = flags(first);
+            merged.merge(flags(second));
+            assert_eq!(merged, flags(first | second));
+        }
+    }
+}
+
+#[test]
+fn the_touched_visitor_keeps_sources_separate_until_the_caller_merges_them() {
+    let (job, _dir, _) = fifty_members();
+    let now = job.generations();
+    let collect = |at| {
+        let mut all: BTreeMap<NodeId, super::Touched> = BTreeMap::new();
+        job.visit_touched_since(at, |node, touched| {
+            all.entry(node).or_default().merge(touched);
+        });
+        all
+    };
+    assert!(collect(now).is_empty());
+    let tree = collect(super::Generations { tree: 0, ..now });
+    assert!(!tree.is_empty());
+    assert!(tree.values().all(|flags| !flags.files && !flags.kept));
+    let files = collect(super::Generations { files: 0, ..now });
+    assert!(!files.is_empty());
+    assert!(files.values().all(|flags| *flags
+        == super::Touched {
+            files: true,
+            ..super::Touched::default()
+        }));
+    let both = collect(super::Generations {
+        tree: 0,
+        files: 0,
+        ..now
+    });
+    assert!(both[&NodeId::ROOT].members && both[&NodeId::ROOT].files);
+}
+
+#[test]
+fn the_first_capture_deletes_restored_node_and_member_ids_no_tree_can_have() {
+    let (job, _dir) = long_post(20);
+    let fresh = Pending::default();
+    assert!(fresh.put(&job, Vec::new()));
+    let mut rows = held(&fresh.take().0.unwrap());
+    let root = i64::from(NodeId::ROOT.0);
+    let member = rows.members[0].clone();
+    let coverage = rows.coverage[0].clone();
+    let node = rows.nodes[0].clone();
+    let invalid = [-1, i64::from(u32::MAX) + 1];
+    for id in invalid {
+        rows.nodes.push(super::NodeRow {
+            node: id,
+            ..node.clone()
+        });
+        rows.members.push(super::MemberRow {
+            node: id,
+            ..member.clone()
+        });
+        rows.coverage.push(super::CoverageRow {
+            node: id,
+            ..coverage.clone()
+        });
+        rows.members.push(super::MemberRow {
+            member: id,
+            ..member.clone()
+        });
+        rows.coverage.push(super::CoverageRow {
+            member: id,
+            ..coverage.clone()
+        });
+    }
+    let pending = Pending::default();
+    pending.written(rows);
+    assert!(pending.put(&job, Vec::new()));
+    let delta = pending.take().0.unwrap();
+    assert_eq!(delta.rows(), 10, "{delta:?}");
+    for id in invalid {
+        assert_eq!(delta.nodes.get(&id), Some(&None));
+        assert_eq!(delta.members.get(&(id, member.member)), Some(&None));
+        assert_eq!(
+            delta.coverage.get(&(id, coverage.member, coverage.start)),
+            Some(&None)
+        );
+        assert_eq!(delta.members.get(&(root, id)), Some(&None));
+        assert_eq!(delta.coverage.get(&(root, id, coverage.start)), Some(&None));
+    }
+    assert!(!pending.put(&job, Vec::new()));
+    assert!(pending.take().0.is_none());
 }
 
 #[test]

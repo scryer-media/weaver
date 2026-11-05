@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use super::*;
 use crate::deliver::Posted;
+use crate::facts::{Durable, Facts};
 use crate::recovery::{MemberAccess, RepairOutcome};
 use crate::{Segment, SliceVerdict};
 
@@ -20,7 +21,17 @@ enum Heard {
     // What it was handed, when it is a candidate.
     Handed(Option<String>),
     Sized(u64),
-    Bytes(u64, Vec<u8>),
+    Bytes(u64, Vec<u8>, Provenance),
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ReaderFacts {
+    sized: usize,
+    delivered: usize,
+}
+
+impl Durable for ReaderFacts {
+    const VERSION: u16 = 1;
 }
 
 // A pretend recovery object that reads its range by what it was handed.
@@ -38,13 +49,33 @@ impl Object for Reader {
     fn kind(&self) -> Kind {
         Kind::Par2
     }
+    fn facts(&self) -> Facts {
+        let heard = self.0.lock().expect("log");
+        Facts::of(
+            Kind::Par2,
+            &ReaderFacts {
+                sized: heard
+                    .iter()
+                    .filter(|event| matches!(event, Heard::Sized(_)))
+                    .count(),
+                delivered: heard
+                    .iter()
+                    .filter(|event| matches!(event, Heard::Bytes(..)))
+                    .count(),
+            },
+        )
+    }
     fn deliver(
         &mut self,
         delivery: Delivery<'_>,
         _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         _: &mut Vec<Emit>,
     ) {
-        self.hear(Heard::Bytes(delivery.offset, delivery.bytes.to_vec()));
+        self.hear(Heard::Bytes(
+            delivery.offset,
+            delivery.bytes.to_vec(),
+            delivery.provenance,
+        ));
     }
     fn sized(&mut self, _: VolumeIndex, length: u64, _: &mut Vec<Emit>) {
         self.hear(Heard::Sized(length));
@@ -117,6 +148,136 @@ fn candidate(secret: &str) -> Handed {
     Handed::new(secret.to_string())
 }
 
+fn reader_window() -> (Tree, NodeId, Log) {
+    let (mut tree, first, _, _) = bound_tree();
+    let log = Log::default();
+    let window = tree
+        .attach_window(
+            NodeId::ROOT,
+            (first, WINDOW),
+            (Kind::Par2, &candidate("candidate")),
+            Vec::new(),
+            &mut Reading(Arc::clone(&log)),
+            &mut Vec::new(),
+        )
+        .expect("a window is built");
+    heard(&log);
+    (tree, window, log)
+}
+
+#[test]
+fn a_delivery_marks_opaque_facts_once_without_marking_its_members() {
+    for length in [None, Some(31)] {
+        let (mut tree, window, log) = reader_window();
+        let before = tree.own_record(window).unwrap().facts.unwrap();
+        let at = tree.generation();
+        let arrived = Arrived {
+            volume: VolumeIndex(0),
+            offset: 2,
+            bytes: Bytes::from_static(b"body").into(),
+            provenance: Provenance::Fresh,
+        };
+        let mut effects = Vec::new();
+        tree.deliver_to_object(window, &arrived, length, &mut Reading(log), &mut effects);
+
+        assert!(effects.is_empty(), "the object emits nothing");
+        assert_eq!(tree.generation(), at + 1);
+        assert_eq!(
+            tree.marked_since(at).collect::<Vec<_>>(),
+            vec![Mark::Node(window)]
+        );
+        let after = tree.own_record(window).unwrap().facts.unwrap();
+        assert_ne!(before, after);
+        assert_eq!(
+            after.read::<ReaderFacts>(Kind::Par2).unwrap(),
+            ReaderFacts {
+                sized: usize::from(length.is_some()),
+                delivered: 1,
+            }
+        );
+    }
+}
+
+#[test]
+fn a_delivery_with_no_live_object_marks_nothing() {
+    for absent in 0..3 {
+        let (mut tree, window, log) = reader_window();
+        match absent {
+            0 => {
+                tree.nodes.remove(&window);
+            }
+            1 => {
+                tree.nodes.object_out(window);
+            }
+            _ => tree.nodes.get_mut(&window).unwrap().retired = true,
+        }
+        let at = tree.generation();
+        let arrived = Arrived {
+            volume: VolumeIndex(0),
+            offset: 2,
+            bytes: Bytes::from_static(b"body").into(),
+            provenance: Provenance::Fresh,
+        };
+        tree.deliver_to_object(
+            window,
+            &arrived,
+            Some(31),
+            &mut Reading(Arc::clone(&log)),
+            &mut Vec::new(),
+        );
+        assert_eq!(tree.generation(), at, "case {absent}");
+        assert!(heard(&log).is_empty(), "case {absent}");
+    }
+}
+
+#[test]
+fn a_retired_lent_object_keeps_deliveries_in_order_without_marking_facts() {
+    let (mut tree, window, log) = reader_window();
+    let object = tree.lend(window).expect("the window lends");
+    tree.nodes.get_mut(&window).unwrap().retired = true;
+    let before = tree.own_record(window).unwrap();
+    let at = tree.generation();
+    for (offset, bytes, provenance, length) in [
+        (2, b"first".as_slice(), Provenance::Repaired, 21),
+        (7, b"next".as_slice(), Provenance::Damaged, 22),
+    ] {
+        let arrived = Arrived {
+            volume: VolumeIndex(0),
+            offset,
+            bytes: Bytes::copy_from_slice(bytes).into(),
+            provenance,
+        };
+        tree.deliver_to_object(
+            window,
+            &arrived,
+            Some(length),
+            &mut Reading(Arc::clone(&log)),
+            &mut Vec::new(),
+        );
+    }
+    assert_eq!(tree.generation(), at);
+    assert_eq!(tree.own_record(window).unwrap(), before);
+    assert!(heard(&log).is_empty());
+
+    tree.nodes.get_mut(&window).unwrap().retired = false;
+    tree.take_back(
+        window,
+        object,
+        &mut Reading(Arc::clone(&log)),
+        &mut Vec::new(),
+    );
+    assert_eq!(
+        heard(&log),
+        vec![
+            Heard::Handed(Some("candidate".to_string())),
+            Heard::Sized(21),
+            Heard::Bytes(2, b"first".to_vec(), Provenance::Repaired),
+            Heard::Sized(22),
+            Heard::Bytes(7, b"next".to_vec(), Provenance::Damaged),
+        ]
+    );
+}
+
 // The window is lent; meanwhile bytes reach it and its owner hands it a
 // second candidate. What comes back is a fresh object, as one rebuilt from
 // its facts is: it is handed the last candidate before the bytes that
@@ -176,7 +337,7 @@ fn an_object_taken_back_in_a_lent_windows_place_is_handed_the_last_candidate_fir
         vec![
             Heard::Handed(Some("second-candidate".to_string())),
             Heard::Sized(20),
-            Heard::Bytes(2, vec![7u8; 4]),
+            Heard::Bytes(2, vec![7u8; 4], Provenance::Fresh),
         ]
     );
 }
