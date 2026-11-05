@@ -425,6 +425,7 @@ func TestFullPhaseContextsIncludeContainerAndManagedRestarts(t *testing.T) {
 		{name: "Restart SQLite", command: "restart-all", datastore: "sqlite"},
 		{name: "Restart Postgres", command: "restart-all", datastore: "postgres"},
 		{name: "Product Behavior Gate", command: "release-gate", datastore: "sqlite", skipSeed: true},
+		{name: "Filesystem Gate", command: "filesystem", datastore: "sqlite", skipSeed: true},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("expected %d phases, got %d: %#v", len(want), len(got), got)
