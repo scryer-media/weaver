@@ -8,6 +8,7 @@ use std::sync::Arc;
 // so the OS scheduler prefers download/decode threads when CPU
 // is contended.
 pub fn build_postprocess_pool(thread_count: usize) -> Arc<rayon::ThreadPool> {
+    let _affinity = super::affinity::PostprocessAffinity::enter();
     Arc::new(
         rayon::ThreadPoolBuilder::new()
             .num_threads(thread_count)

@@ -422,6 +422,7 @@ impl Runs {
             heard,
         };
         tokio::task::spawn_blocking(move || {
+            let _affinity = crate::runtime::affinity::PostprocessAffinity::enter();
             let _job = crate::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
             // Said as the run returns, and as a run that panics unwinds, so
             // a run always ends: its slot, its memory and a stopped job's
