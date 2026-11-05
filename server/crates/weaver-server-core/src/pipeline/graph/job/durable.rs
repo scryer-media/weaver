@@ -8,7 +8,9 @@
 // are read on their own, so a checkpoint reads only what the tree, the
 // writer, its envelopes or an offer marked since the generations it read at.
 
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 use weaver_graph::holds::ScratchHold;
 use weaver_graph::tree::Mark;
@@ -33,24 +35,57 @@ impl GraphJob {
     // What the tree, the writer, its envelopes or an offer changed of each
     // node since `at`: with `at` the generations nothing was read at, every
     // node the job ever had.
-    pub(crate) fn touched_since(&self, at: Generations) -> BTreeMap<NodeId, Touched> {
-        let mut out: BTreeMap<NodeId, Touched> = BTreeMap::new();
+    pub(in crate::pipeline::graph) fn visit_touched_since(
+        &self,
+        at: Generations,
+        mut visit: impl FnMut(NodeId, Touched),
+    ) {
         for mark in self.tree.marked_since(at.tree) {
-            match mark {
-                Mark::Node(node) => out.entry(node).or_default().own = true,
-                Mark::Members(node) => out.entry(node).or_default().members = true,
-            }
+            let (node, touched) = match mark {
+                Mark::Node(node) => (
+                    node,
+                    Touched {
+                        own: true,
+                        ..Touched::default()
+                    },
+                ),
+                Mark::Members(node) => (
+                    node,
+                    Touched {
+                        members: true,
+                        ..Touched::default()
+                    },
+                ),
+            };
+            visit(node, touched);
         }
         for node in self.writer.files_changed_since(at.files) {
-            out.entry(node).or_default().files = true;
+            visit(
+                node,
+                Touched {
+                    files: true,
+                    ..Touched::default()
+                },
+            );
         }
         for node in self.writer.kept_changed_since(at.kept) {
-            out.entry(node).or_default().kept = true;
+            visit(
+                node,
+                Touched {
+                    kept: true,
+                    ..Touched::default()
+                },
+            );
         }
         for node in self.passwords.changed_since(at.offered) {
-            out.entry(node).or_default().own = true;
+            visit(
+                node,
+                Touched {
+                    own: true,
+                    ..Touched::default()
+                },
+            );
         }
-        out
     }
 
     // The node's own record, its members left out, and the candidate it
@@ -164,5 +199,86 @@ impl GraphJob {
     // run does not fetch again: what the facts encoded now spare a restore.
     pub(crate) fn settled_bytes(&self) -> u64 {
         self.root.map.settled_bytes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::graph::job::passwords::Passwords;
+    use crate::pipeline::graph::root::tests::{file, job_with};
+
+    #[test]
+    fn kept_and_offered_sources_visit_their_own_flags_at_their_own_generations() {
+        let (mut job, _dir, _) = job_with(&[file("member.bin", &[64])], Vec::new());
+        let before = job.generations();
+        job.writer
+            .restore_kept(&KeptRecord {
+                node: NodeId::ROOT,
+                envelope: 7,
+                runs: Vec::new(),
+                closed: None,
+                settled: false,
+                file: None,
+            })
+            .unwrap();
+        job.passwords = Passwords::new(vec!["candidate".to_string()]);
+        assert_eq!(job.passwords.resume_at(NodeId::ROOT, 0), Some("candidate"));
+        let now = job.generations();
+        let collect = |at| {
+            let mut visited = Vec::new();
+            job.visit_touched_since(at, |node, flags| visited.push((node, flags)));
+            visited
+        };
+        assert!(collect(now).is_empty());
+        assert_eq!(
+            collect(Generations {
+                kept: before.kept,
+                ..now
+            }),
+            vec![(
+                NodeId::ROOT,
+                Touched {
+                    kept: true,
+                    ..Touched::default()
+                },
+            )]
+        );
+        assert_eq!(
+            collect(Generations {
+                offered: before.offered,
+                ..now
+            }),
+            vec![(
+                NodeId::ROOT,
+                Touched {
+                    own: true,
+                    ..Touched::default()
+                },
+            )]
+        );
+        assert_eq!(
+            collect(Generations {
+                kept: before.kept,
+                offered: before.offered,
+                ..now
+            }),
+            vec![
+                (
+                    NodeId::ROOT,
+                    Touched {
+                        kept: true,
+                        ..Touched::default()
+                    }
+                ),
+                (
+                    NodeId::ROOT,
+                    Touched {
+                        own: true,
+                        ..Touched::default()
+                    }
+                ),
+            ]
+        );
     }
 }

@@ -28,7 +28,7 @@
 // key, the objects' facts carry key tuples and salts but never a key, and a
 // node's password is the index of its candidate, never the candidate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -118,6 +118,13 @@ impl Touched {
         files: true,
         kept: true,
     };
+
+    fn merge(&mut self, other: Self) {
+        self.own |= other.own;
+        self.members |= other.members;
+        self.files |= other.files;
+        self.kept |= other.kept;
+    }
 }
 
 // What the writer holds of one member.
@@ -277,7 +284,7 @@ impl HeldNode {
             let now = node
                 .and_then(|node| job.own_record(node))
                 .map_or_else(GraphCheckpoint::default, |(record, password)| {
-                    own_rows(&record, password.map(|index| index as i64))
+                    own_rows(record, password.map(|index| index as i64))
                 });
             delta.compare(&self.own, &now);
             self.own = now;
@@ -333,13 +340,28 @@ impl HeldNode {
             let now = job
                 .member(node, member)
                 .map_or_else(GraphCheckpoint::default, |(record, coverage, state)| {
-                    member_rows(id, &record, &coverage, state)
+                    member_rows(id, record, coverage, state)
                 });
-            let was = self.members.remove(&key).unwrap_or_default();
-            *dirty_bytes = dirty_bytes.saturating_add(added_coverage(&was.coverage, &now.coverage));
-            delta.compare(&was, &now);
-            if now != GraphCheckpoint::default() {
-                self.members.insert(key, now);
+            let mut compare = |was: &GraphCheckpoint| {
+                *dirty_bytes =
+                    dirty_bytes.saturating_add(added_coverage(&was.coverage, &now.coverage));
+                delta.compare(was, &now);
+            };
+            match self.members.entry(key) {
+                Entry::Occupied(mut entry) => {
+                    compare(entry.get());
+                    if now == GraphCheckpoint::default() {
+                        entry.remove();
+                    } else {
+                        entry.insert(now);
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    compare(&GraphCheckpoint::default());
+                    if now != GraphCheckpoint::default() {
+                        entry.insert(now);
+                    }
+                }
             }
         }
     }
@@ -458,11 +480,10 @@ impl Pending {
             held.root = Some(root);
         }
         let whole = held.read.is_none();
-        let mut touched: BTreeMap<i64, Touched> = job
-            .touched_since(held.read.unwrap_or_default())
-            .into_iter()
-            .map(|(node, touched)| (i64::from(node.0), touched))
-            .collect();
+        let mut touched: BTreeMap<i64, Touched> = BTreeMap::new();
+        job.visit_touched_since(held.read.unwrap_or_default(), |node, changed| {
+            touched.entry(i64::from(node.0)).or_default().merge(changed);
+        });
         if whole {
             // Rows a restore read: every node and every member is read again.
             touched.extend(held.nodes.keys().map(|node| (*node, Touched::ALL)));
@@ -472,15 +493,28 @@ impl Pending {
         }
         held.read = Some(job.generations());
         for (key, touched) in touched {
-            let mut entry = held.nodes.remove(&key).unwrap_or_default();
-            if whole {
-                entry.members_at = None;
-            }
             // An id no tree could have names a node the job does not have.
             let node = u32::try_from(key).ok().map(NodeId);
-            entry.step(job, node, touched, &mut delta, &mut slot.dirty_bytes);
-            if !entry.is_empty() {
-                held.nodes.insert(key, entry);
+            let mut step = |entry: &mut HeldNode| {
+                if whole {
+                    entry.members_at = None;
+                }
+                entry.step(job, node, touched, &mut delta, &mut slot.dirty_bytes);
+            };
+            match held.nodes.entry(key) {
+                Entry::Occupied(mut entry) => {
+                    step(entry.get_mut());
+                    if entry.get().is_empty() {
+                        entry.remove();
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    let mut now = HeldNode::default();
+                    step(&mut now);
+                    if !now.is_empty() {
+                        entry.insert(now);
+                    }
+                }
             }
         }
         #[cfg(test)]
@@ -1019,12 +1053,12 @@ fn root_parts(held: &mut BTreeMap<i64, Arc<[u8]>>, parts: Parts) -> Changes<Part
     out
 }
 
-fn part_rows(node: i64, parts: &[Part]) -> impl Iterator<Item = PartRow> + '_ {
-    parts.iter().map(move |part| PartRow {
+fn part_rows(node: i64, parts: Vec<Part>) -> impl Iterator<Item = PartRow> {
+    parts.into_iter().map(move |part| PartRow {
         node,
         // The key's bits, as the column's integer.
         part: part.key as i64,
-        bytes: Arc::clone(&part.bytes),
+        bytes: part.bytes,
     })
 }
 
@@ -1066,12 +1100,10 @@ fn job_rows(job: &GraphJob, node: NodeId) -> GraphCheckpoint {
 // nothing a step reads again shows here.
 #[cfg(test)]
 fn audit(job: &GraphJob, held: &Held) {
-    let nodes: std::collections::BTreeSet<i64> = job
-        .touched_since(Generations::default())
-        .into_keys()
-        .map(|node| i64::from(node.0))
-        .chain(held.nodes.keys().copied())
-        .collect();
+    let mut nodes: std::collections::BTreeSet<i64> = held.nodes.keys().copied().collect();
+    job.visit_touched_since(Generations::default(), |node, _| {
+        nodes.insert(i64::from(node.0));
+    });
     for key in nodes {
         let whole = u32::try_from(key)
             .map(NodeId)
@@ -1107,19 +1139,20 @@ fn hold_rows(node: NodeId, holds: &[ScratchHold]) -> Vec<HoldRow> {
 // A node's own rows, each table in key order: its own row and facts parts
 // when it holds an object, and its seeds. `password` is the candidate the
 // node was offered last.
-fn own_rows(node: &NodeRecord, password: Option<i64>) -> GraphCheckpoint {
+fn own_rows(node: NodeRecord, password: Option<i64>) -> GraphCheckpoint {
     let mut out = GraphCheckpoint::default();
     let id = i64::from(node.node.0);
-    if let (Some(kind), Some(facts)) = (node.kind, &node.facts) {
+    if let (Some(kind), Some(facts)) = (node.kind, node.facts) {
+        let parent_member = node.volumes.first().map(|(_, member)| i64::from(member.0));
         let volumes: Vec<(u32, u32)> = node
             .volumes
-            .iter()
+            .into_iter()
             .map(|(volume, member)| (volume.0, member.0))
             .collect();
         out.nodes.push(NodeRow {
             node: id,
             parent: node.parent.map(|parent| i64::from(parent.0)),
-            parent_member: node.volumes.first().map(|(_, member)| i64::from(member.0)),
+            parent_member,
             volumes: rmp_serde::to_vec(&volumes).ok(),
             window: node
                 .window
@@ -1128,17 +1161,18 @@ fn own_rows(node: &NodeRecord, password: Option<i64>) -> GraphCheckpoint {
             state: state_name(node.state).to_owned(),
             reason: node.reason.map(|why| why_name(why).to_owned()),
             facts_version: i64::from(facts.version),
-            facts: facts.bytes.clone(),
+            facts: facts.bytes,
             winning_password: password,
         });
-        out.parts.extend(part_rows(id, &facts.parts));
+        out.parts.extend(part_rows(id, facts.parts));
     }
-    out.crypt.extend(node.crypt.iter().map(|crypt| CryptRow {
-        node: id,
-        member: i64::from(crypt.member.0),
-        run_start: crypt.run_start,
-        seed: crypt.seed.to_vec(),
-    }));
+    out.crypt
+        .extend(node.crypt.into_iter().map(|crypt| CryptRow {
+            node: id,
+            member: i64::from(crypt.member.0),
+            run_start: crypt.run_start,
+            seed: crypt.seed.to_vec(),
+        }));
     out.crypt.sort_by_key(Row::key);
     out.parts.sort_by_key(Row::key);
     out
@@ -1148,27 +1182,30 @@ fn own_rows(node: &NodeRecord, password: Option<i64>) -> GraphCheckpoint {
 // what the writer holds of it.
 fn member_rows(
     node: i64,
-    member: &MemberRecord,
-    coverage: &[CoverageRecord],
+    member: MemberRecord,
+    coverage: Vec<CoverageRecord>,
     state: FileState,
 ) -> GraphCheckpoint {
     #[cfg(test)]
     MEMBER_ROWS_BUILT.with(|built| built.set(built.get() + 1));
     let mut out = GraphCheckpoint {
         members: vec![member_row(node, member, state)],
-        coverage: coverage.iter().map(|run| coverage_row(node, run)).collect(),
+        coverage: coverage
+            .into_iter()
+            .map(|run| coverage_row(node, &run))
+            .collect(),
         ..GraphCheckpoint::default()
     };
     out.coverage.sort_by_key(Row::key);
     out
 }
 
-fn member_row(node: i64, member: &MemberRecord, state: FileState) -> MemberRow {
+fn member_row(node: i64, member: MemberRecord, state: FileState) -> MemberRow {
     MemberRow {
         node,
         member: i64::from(member.member.0),
-        name: member.name.clone(),
-        output_name: member.output_name.clone(),
+        name: member.name,
+        output_name: member.output_name,
         crc32: member.crc32.map(i64::from),
         length: member.length.map(|length| length as i64),
         closed: member.closed,
@@ -1205,18 +1242,7 @@ fn node_rows(
     files: impl Fn(MemberId) -> FileState,
     password: Option<i64>,
 ) -> GraphCheckpoint {
-    let mut out = own_rows(node, password);
-    let id = i64::from(node.node.0);
-    out.members.extend(
-        node.members
-            .iter()
-            .map(|member| member_row(id, member, files(member.member))),
-    );
-    out.coverage
-        .extend(node.coverage.iter().map(|run| coverage_row(id, run)));
-    out.members.sort_by_key(Row::key);
-    out.coverage.sort_by_key(Row::key);
-    out
+    tests::borrowed_node_rows(node, files, password)
 }
 
 // The kept envelopes' rows, in key order.
