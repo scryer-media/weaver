@@ -150,6 +150,14 @@ fn rename_exclusive_with_link(
         Err(error) => return Err(error),
     }
     let source = std::fs::symlink_metadata(src)?;
+    // Some mounts reject the operation before checking whether the target
+    // exists. Resolve aliases and interrupted links before trying a copy;
+    // the copy itself still creates exclusively against a later collision.
+    match std::fs::symlink_metadata(dst) {
+        Ok(_) => return finish_or_refuse(src, dst),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     if source.is_file() {
         return copy_file_no_overwrite_then_remove_source(src, dst);
     }
@@ -162,11 +170,7 @@ fn rename_exclusive_with_link(
             "unsupported move source",
         ));
     }
-    match std::fs::symlink_metadata(dst) {
-        Ok(_) => finish_or_refuse(src, dst),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => std::fs::rename(src, dst),
-        Err(error) => Err(error),
-    }
+    std::fs::rename(src, dst)
 }
 
 // The target exists. A file whose target is its own inode is a link and
@@ -633,6 +637,20 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(std::fs::read(&src).unwrap(), b"second");
         assert_eq!(std::fs::read(&dst).unwrap(), b"source");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_mount_without_links_recognizes_an_alias_before_copying() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let src = dir.path().join("source.bin");
+        let dst = parent.join("../source.bin");
+        std::fs::write(&src, b"source").unwrap();
+        let no_links = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        rename_exclusive_with_link(&src, &dst, refuse::<{ libc::EINVAL }>, no_links).unwrap();
+        assert_eq!(std::fs::read(&src).unwrap(), b"source");
     }
 
     #[test]
