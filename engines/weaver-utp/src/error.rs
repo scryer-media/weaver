@@ -8,6 +8,12 @@ pub enum Error {
     #[error("error sending SYN: {0}")]
     ErrorSendingSyn(std::io::Error),
 
+    #[error("all connection IDs for this endpoint and parity are reserved")]
+    ConnectionIdsExhausted,
+
+    #[error("too many pending connections to this endpoint")]
+    TooManyPendingConnections,
+
     #[error("task cancelled")]
     TaskCancelled,
 

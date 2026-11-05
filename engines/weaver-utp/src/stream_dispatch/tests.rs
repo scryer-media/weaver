@@ -3,21 +3,27 @@
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
 // Modified by the Weaver authors, 2026-11-03.
 
+mod arrival_time;
 mod basics;
 mod congestion;
 mod delay;
 mod delayed_ack;
 mod fast_retransmit;
+mod fin_half_close;
 mod flow_control;
 mod guards;
 mod inactivity_timeout;
+mod ingress_limits;
 mod mtu_ceiling;
 mod mtu_probing;
 mod nagle;
+mod packet_validation;
 mod probe_payload;
 mod retransmit_timer;
 mod rtte;
+mod sequence_wrap;
 mod shutdown;
+mod small_window;
 mod stream_api;
 mod timeouts;
 
@@ -29,7 +35,6 @@ use std::{
 };
 
 use futures::FutureExt;
-use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use crate::{
     SocketOpts, UtpSocket, UtpStream,
@@ -57,7 +62,7 @@ struct TestVsock {
     _socket: Arc<UtpSocket<RememberingTransport, MockUtpEnvironment>>,
     vsock: VirtualSocket<RememberingTransport, MockUtpEnvironment>,
     stream: Option<UtpStream>,
-    tx: UnboundedSender<UtpMessage>,
+    tx: crate::ingress::Sender,
 }
 
 impl TestVsock {
@@ -104,7 +109,15 @@ impl TestVsock {
             if self.vsock.rx.is_empty() {
                 return Poll::Ready(());
             }
-            self.vsock.poll_unpin(cx).map(|r| r.unwrap())
+            if let Poll::Ready(result) = self.vsock.poll_unpin(cx) {
+                result.unwrap();
+                return Poll::Ready(());
+            }
+            if self.vsock.rx.is_empty() {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
         })
         .await
     }
@@ -150,9 +163,12 @@ fn make_test_vsock_on(
     env: MockUtpEnvironment,
 ) -> TestVsock {
     let socket = UtpSocket::new_with_opts(transport.clone(), env.clone(), opts).unwrap();
-    let (tx, rx) = unbounded_channel();
+    let (tx, rx) = crate::ingress::channel(socket.opts().vsock_rx_bufsize);
 
-    let UtpStreamStarter { stream, vsock, .. } = UtpStreamStarter::new(&socket, ADDR_2, rx, args);
+    let UtpStreamStarter {
+        stream, mut vsock, ..
+    } = UtpStreamStarter::new(&socket, ADDR_2, rx, args);
+    vsock.transport = socket.state.runtime.upgrade().unwrap().transport();
 
     TestVsock {
         transport,
@@ -178,7 +194,7 @@ fn test_stream_args(env: &MockUtpEnvironment, is_incoming: bool) -> StreamArgs {
             htype: Syn,
             ..Default::default()
         };
-        StreamArgs::new_incoming(101.into(), &remote_syn)
+        StreamArgs::new_incoming(101.into(), &remote_syn, env.now())
     } else {
         let remote_ack = UtpHeader {
             htype: State,

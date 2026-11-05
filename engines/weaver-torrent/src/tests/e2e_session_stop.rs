@@ -206,6 +206,112 @@ async fn test_stop_returns_once_the_dht_socket_is_gone() -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn utp_session() -> anyhow::Result<(TempDir, Arc<Session>)> {
+    let dir = TempDir::new()?;
+    let session = Session::new_with_opts(
+        dir.path().into(),
+        SessionOptions {
+            dht: None,
+            persistence: None,
+            disable_trackers: true,
+            disable_local_service_discovery: true,
+            listen: Some(ListenerOptions {
+                mode: ListenerMode::UtpOnly,
+                listen_addr: (Ipv4Addr::LOCALHOST, 0).into(),
+                ssl_listen_port: Some(0),
+                ..Default::default()
+            }),
+            ..crate::test_support::session_options()
+        },
+    )
+    .await?;
+    Ok((dir, session))
+}
+
+#[tokio::test]
+async fn a_stopped_session_releases_plain_and_ssl_utp_ports_with_stats_handles_alive()
+-> anyhow::Result<()> {
+    let (_dir, session) = utp_session().await?;
+    let addresses = [
+        session
+            .listen_addr()
+            .context("plain uTP listener is missing")?,
+        session
+            .ssl_listen_addr()
+            .context("SSL uTP listener is missing")?,
+    ];
+    let sockets: Vec<_> = session
+        .utp_sockets
+        .iter()
+        .map(|socket| socket.0.clone())
+        .collect();
+    assert_eq!(sockets.len(), 2);
+    session.stop().await;
+
+    let mut rebound = Vec::new();
+    let mut held = Vec::new();
+    for address in addresses {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "exclusive loopback rebind proves release; the kernel factory enables address reuse"
+        )]
+        let binding = tokio::net::UdpSocket::bind(address).await;
+        match binding {
+            Ok(socket) => rebound.push(socket),
+            Err(error) => held.push((address, error)),
+        }
+    }
+    for (socket, address) in sockets.iter().zip(addresses) {
+        let _snapshot = socket.stats().snapshot();
+        assert_eq!(socket.bind_addr(), address);
+    }
+    assert!(
+        held.is_empty(),
+        "stop returned with uTP ports still held: {held:?}"
+    );
+    assert_eq!(rebound.len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_session_stop_completes_pending_utp_accept_and_connect() -> anyhow::Result<()> {
+    use futures::FutureExt;
+
+    let (_dir, session) = utp_session().await?;
+    let socket = session
+        .utp_sockets
+        .first()
+        .context("uTP socket is missing")?
+        .0
+        .clone();
+    let unanswered = crate::test_support::loopback_udp().await;
+    let accept = socket.accept();
+    let connect = socket.connect(unanswered.bind_addr());
+    tokio::pin!(accept, connect);
+    assert!(accept.as_mut().now_or_never().is_none());
+    assert!(connect.as_mut().now_or_never().is_none());
+
+    session.stop().await;
+
+    let closed = |result| {
+        matches!(
+            result,
+            Some(Err(
+                weaver_utp::Error::DispatcherDead | weaver_utp::Error::TaskCancelled
+            ))
+        )
+    };
+    assert!(
+        closed(accept.as_mut().now_or_never()),
+        "accept remained pending after stop"
+    );
+    assert!(
+        closed(connect.as_mut().now_or_never()),
+        "connect remained pending after stop"
+    );
+    Ok(())
+}
+
 /// A session with a loopback listener and DHT, both watched, running one
 /// torrent that has announced `started` to a loopback tracker, and that
 /// tracker.

@@ -8,19 +8,19 @@
 //! UDP trackers) and whether it can listen are the dialer's to say: a ladder
 //! leg listens inside its tunnel when it ends in a WireGuard hop.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
-use std::io::{self, IoSliceMut};
+use std::io::{self, IoSlice, IoSliceMut};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use tokio::io::{AsyncRead, ReadBuf};
 use weaver_torrent::network::{
     AsyncReadVectored, AsyncReadVectoredIntoCompat, BoxAsyncReadVectored, BoxAsyncWrite, BoxFuture,
-    DatagramSocket, Resolved, Resolver,
+    DatagramSend, DatagramSocket, Resolved, Resolver,
 };
 use weaver_torrent::upnp::{PortMapReceiver, PortMapped, PortmapProtocol, PortmapTransport};
 use weaver_torrent::{
@@ -101,7 +101,7 @@ impl LegKind {
                     dht: datagrams,
                     upnp: false,
                     listen: dialer.is_some_and(|dialer| Arc::clone(dialer).inbound().is_some()),
-                    utp: false,
+                    utp: datagrams,
                     datagrams,
                 }
             }
@@ -135,8 +135,7 @@ pub struct Shape {
     pub upnp: bool,
     /// Incoming peer connections.
     pub listen: bool,
-    /// uTP beside TCP on the listener's port. A tunnel's datagram socket
-    /// cannot be polled for a send, which uTP needs.
+    /// uTP on the leg's datagram route.
     pub utp: bool,
     /// UDP of any kind: UDP trackers, uTP and DHT.
     pub datagrams: bool,
@@ -299,10 +298,7 @@ impl LegSockets {
         };
         shared(async move {
             let socket = carrier.bind(addr).await.map_err(io::Error::other)?;
-            Ok(Arc::new(Carried {
-                bind_addr: socket.local_addr().unwrap_or(addr),
-                socket,
-            }) as Arc<dyn DatagramSocket>)
+            Ok(Arc::new(Carried::new(socket, addr, utp.is_some())) as Arc<dyn DatagramSocket>)
         })
     }
 }
@@ -381,8 +377,172 @@ impl SocketFactory for LegSockets {
 
 // A socket in the leg's tunnel, as the session's datagram socket.
 struct Carried {
-    socket: Arc<dyn TunnelSocket>,
+    socket: Mutex<Option<Arc<dyn TunnelSocket>>>,
     bind_addr: SocketAddr,
+    link_mtu: Option<u16>,
+    sends: Option<Arc<CarriedSends>>,
+    worker: Mutex<CarriedWorker>,
+}
+
+struct CarriedWorker {
+    task: Option<tokio::task::JoinHandle<()>>,
+    completion: Option<tokio::sync::watch::Receiver<Option<Result<(), String>>>>,
+}
+
+const CARRIED_SEND_PACKETS: usize = 256;
+const CARRIED_SEND_BYTES: usize = 256 * 1024;
+
+struct CarriedPacket {
+    bytes: Vec<u8>,
+    target: SocketAddr,
+}
+
+#[derive(Default)]
+struct CarriedPending {
+    packets: VecDeque<CarriedPacket>,
+    // Includes the packet currently owned by the worker.
+    count: usize,
+    bytes: usize,
+    waiters: HashMap<usize, Waker>,
+    stopped: bool,
+    fault: Option<String>,
+}
+
+struct CarriedSends {
+    pending: Mutex<CarriedPending>,
+    ready: tokio::sync::Notify,
+    terminal: tokio::sync::watch::Sender<bool>,
+}
+
+impl CarriedSends {
+    fn error(pending: &CarriedPending) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            pending
+                .fault
+                .clone()
+                .unwrap_or_else(|| "the tunnel datagram socket stopped".into()),
+        )
+    }
+
+    fn stop(&self, fault: Option<String>) {
+        let waiters = {
+            let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+            pending.stopped = true;
+            if pending.fault.is_none() {
+                pending.fault = fault;
+            }
+            pending.packets.clear();
+            pending.bytes = 0;
+            pending.count = 0;
+            std::mem::take(&mut pending.waiters)
+        };
+        self.terminal.send_replace(true);
+        self.ready.notify_one();
+        for waiter in waiters.into_values() {
+            waiter.wake();
+        }
+    }
+
+    async fn run(self: Arc<Self>, socket: Arc<dyn TunnelSocket>) {
+        loop {
+            let ready = self.ready.notified();
+            tokio::pin!(ready);
+            ready.as_mut().enable();
+            let packet = {
+                let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+                if pending.stopped {
+                    return;
+                }
+                pending.packets.pop_front()
+            };
+            let Some(packet) = packet else {
+                ready.await;
+                continue;
+            };
+            if let Err(error) = socket.send_to(&packet.bytes, packet.target).await {
+                // A deferred error belongs to the accepted packet, not to a
+                // later MTU probe. End this socket instead of misattributing it.
+                self.stop(Some(format!("the tunnel datagram send failed: {error}")));
+                return;
+            }
+            let waiters = {
+                let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+                if pending.stopped {
+                    return;
+                }
+                pending.count -= 1;
+                pending.bytes -= packet.bytes.len();
+                std::mem::take(&mut pending.waiters)
+            };
+            for waiter in waiters.into_values() {
+                waiter.wake();
+            }
+        }
+    }
+}
+
+impl Carried {
+    fn new(socket: Arc<dyn TunnelSocket>, requested: SocketAddr, utp: bool) -> Self {
+        let sends = utp.then(|| {
+            Arc::new(CarriedSends {
+                pending: Mutex::new(CarriedPending::default()),
+                ready: tokio::sync::Notify::new(),
+                terminal: tokio::sync::watch::channel(false).0,
+            })
+        });
+        let worker = sends
+            .as_ref()
+            .map(|sends| tokio::spawn(Arc::clone(sends).run(Arc::clone(&socket))));
+        Self {
+            bind_addr: socket.local_addr().unwrap_or(requested),
+            link_mtu: socket.link_mtu(),
+            socket: Mutex::new(Some(socket)),
+            sends,
+            worker: Mutex::new(CarriedWorker {
+                task: worker,
+                completion: None,
+            }),
+        }
+    }
+
+    fn socket(&self) -> io::Result<Arc<dyn TunnelSocket>> {
+        self.socket
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "the tunnel datagram socket stopped",
+                )
+            })
+    }
+
+    fn stop(&self) {
+        if let Some(sends) = &self.sends {
+            sends.stop(None);
+        }
+        self.socket
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(worker) = self
+            .worker
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .task
+            .as_ref()
+        {
+            worker.abort();
+        }
+    }
+}
+
+impl Drop for Carried {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 impl DatagramSocket for Carried {
@@ -394,7 +554,23 @@ impl DatagramSocket for Carried {
         &'a self,
         buf: &'a mut [u8],
     ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
-        shared(self.socket.recv_from(buf))
+        shared(async move {
+            let socket = self.socket()?;
+            let Some(sends) = &self.sends else {
+                return socket.recv_from(buf).await;
+            };
+            let mut terminal = sends.terminal.subscribe();
+            let stopped = *terminal.borrow_and_update();
+            if !stopped {
+                tokio::select! {
+                    result = socket.recv_from(buf) => return result,
+                    _ = terminal.changed() => {}
+                }
+            }
+            Err(CarriedSends::error(
+                &sends.pending.lock().unwrap_or_else(PoisonError::into_inner),
+            ))
+        })
     }
 
     fn send_to<'a>(
@@ -403,31 +579,193 @@ impl DatagramSocket for Carried {
         target: SocketAddr,
     ) -> BoxFuture<'a, io::Result<usize>> {
         shared(async move {
-            self.socket.send_to(buf, target).await?;
+            if let Some(mut sender) = self.send_handle() {
+                return std::future::poll_fn(|cx| sender.poll_send_to(cx, buf, target)).await;
+            }
+            self.socket()?.send_to(buf, target).await?;
             Ok(buf.len())
         })
     }
 
     // The tunnel's MTU: a larger packet is lost inside it.
     fn link_mtu(&self) -> Option<u16> {
-        self.socket.link_mtu()
+        self.link_mtu
     }
 
     fn dont_fragment(&self) -> bool {
         true
     }
 
-    // Only uTP polls a send, and a ladder leg runs no uTP.
+    fn sender(&self) -> Option<Box<dyn DatagramSend>> {
+        self.send_handle()
+            .map(|sender| Box::new(sender) as Box<dyn DatagramSend>)
+    }
+
+    // Backpressure requires a caller-owned registration, so raw polling
+    // cannot safely wait for queue capacity.
     fn poll_send_to(
         &self,
-        _cx: &mut std::task::Context<'_>,
+        _cx: &mut Context<'_>,
         _buf: &[u8],
         _target: SocketAddr,
     ) -> std::task::Poll<io::Result<usize>> {
-        std::task::Poll::Ready(Err(io::Error::new(
+        Poll::Ready(Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "a tunnel's datagrams carry no uTP",
+            "tunnel datagram polling requires an owned sender",
         )))
+    }
+
+    fn poll_send_to_vectored(
+        &self,
+        cx: &mut Context<'_>,
+        _bufs: &[IoSlice<'_>],
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        self.poll_send_to(cx, &[], target)
+    }
+
+    fn shutdown(&self) -> BoxFuture<'_, io::Result<()>> {
+        self.shutdown_worker()
+    }
+}
+
+impl Carried {
+    fn send_handle(&self) -> Option<CarriedSender> {
+        self.sends.as_ref().map(|sends| CarriedSender {
+            sends: Arc::clone(sends),
+            link_mtu: self.link_mtu,
+            registration: Arc::new(()),
+        })
+    }
+
+    fn shutdown_worker(&self) -> BoxFuture<'_, io::Result<()>> {
+        self.stop();
+        let mut completion = {
+            let mut worker = self.worker.lock().unwrap_or_else(PoisonError::into_inner);
+            if worker.completion.is_none() {
+                let (completed, completion) = tokio::sync::watch::channel(None);
+                if let Some(task) = worker.task.take() {
+                    // The coordinator owns the join independently of callers.
+                    // Canceling a caller drops only its watch subscription.
+                    tokio::spawn(async move {
+                        let result = match task.await {
+                            Ok(()) => Ok(()),
+                            Err(error) if error.is_cancelled() => Ok(()),
+                            Err(error) => Err(error.to_string()),
+                        };
+                        completed.send_replace(Some(result));
+                    });
+                } else {
+                    completed.send_replace(Some(Ok(())));
+                }
+                worker.completion = Some(completion);
+            }
+            worker
+                .completion
+                .as_ref()
+                .expect("shutdown completion initialized")
+                .clone()
+        };
+        shared(async move {
+            loop {
+                let result = completion.borrow_and_update().clone();
+                if let Some(result) = result {
+                    return result.map_err(io::Error::other);
+                }
+                completion.changed().await.map_err(|_| {
+                    io::Error::other("the tunnel datagram shutdown coordinator stopped")
+                })?;
+            }
+        })
+    }
+}
+
+struct CarriedSender {
+    sends: Arc<CarriedSends>,
+    link_mtu: Option<u16>,
+    registration: Arc<()>,
+}
+
+impl CarriedSender {
+    fn key(&self) -> usize {
+        Arc::as_ptr(&self.registration) as usize
+    }
+
+    fn poll_enqueue(
+        &mut self,
+        cx: &mut Context<'_>,
+        len: usize,
+        target: SocketAddr,
+        copy: impl FnOnce() -> Vec<u8>,
+    ) -> Poll<io::Result<usize>> {
+        let mut pending = self
+            .sends
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let previous = pending.waiters.remove(&self.key());
+        let headers = if target.is_ipv4() { 28 } else { 48 };
+        let limit = self.link_mtu.map_or(65535 - headers, |mtu| {
+            usize::from(mtu).saturating_sub(headers)
+        });
+        let result = if pending.stopped {
+            Poll::Ready(Err(CarriedSends::error(&pending)))
+        } else if len > limit {
+            Poll::Ready(Err(weaver_torrent::network::message_size_error()))
+        } else if pending.count >= CARRIED_SEND_PACKETS || pending.bytes + len > CARRIED_SEND_BYTES
+        {
+            pending.waiters.insert(self.key(), cx.waker().clone());
+            Poll::Pending
+        } else {
+            pending.packets.push_back(CarriedPacket {
+                bytes: copy(),
+                target,
+            });
+            pending.count += 1;
+            pending.bytes += len;
+            Poll::Ready(Ok(len))
+        };
+        drop(pending);
+        drop(previous);
+        if result.is_ready() {
+            self.sends.ready.notify_one();
+        }
+        result
+    }
+}
+
+impl Drop for CarriedSender {
+    fn drop(&mut self) {
+        let waiter = self
+            .sends
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .waiters
+            .remove(&self.key());
+        drop(waiter);
+    }
+}
+
+impl DatagramSend for CarriedSender {
+    // Success means local acceptance. The worker alone sends the bounded
+    // FIFO, so async handshakes and polled data retain their packet order.
+    fn poll_send_to_vectored(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        let len = bufs
+            .iter()
+            .fold(0usize, |len, buf| len.saturating_add(buf.len()));
+        self.poll_enqueue(cx, len, target, || {
+            let mut joined = Vec::with_capacity(len);
+            for buf in bufs {
+                joined.extend_from_slice(buf);
+            }
+            joined
+        })
     }
 }
 
@@ -891,6 +1229,10 @@ fn bound_to(_: reqwest::ClientBuilder, _: &str) -> Result<reqwest::ClientBuilder
 }
 
 #[cfg(test)]
+#[path = "net/carried_tests.rs"]
+mod carried_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::proxies::Rung;
@@ -1139,6 +1481,46 @@ mod tests {
 
     fn carrying() -> Arc<dyn Dialer> {
         Arc::new(Carrying(Arc::default()))
+    }
+
+    #[test]
+    fn ladder_utp_requires_a_datagram_carrier_even_without_incoming_connections() {
+        let carried = LegKind::Ladder.shape(Some(&carrying()));
+        assert!(carried.utp && carried.datagrams && !carried.listen);
+        let stream_only = LegKind::Ladder.shape(Some(&loopback_egress()));
+        assert!(!stream_only.utp && !stream_only.datagrams);
+        assert!(!LegKind::Ladder.shape(None).utp);
+    }
+
+    #[tokio::test]
+    async fn bind_utp_on_a_non_listening_ladder_uses_only_its_carrier() {
+        let tunnel = Arc::new(Tunnel::default());
+        let sockets = LegSockets::new(Arc::new(Carrying(tunnel.clone())), &LegKind::Ladder);
+        let asked = SocketAddr::from(([0, 0, 0, 0], 6881));
+        let udp = sockets.bind_utp(asked, 1024).await.unwrap();
+        assert_eq!(*tunnel.bound.lock().unwrap(), [asked]);
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = peer.local_addr().unwrap();
+        let mut sender = udp.sender().unwrap();
+        assert_eq!(
+            std::future::poll_fn(|cx| sender.poll_send_to(cx, b"utp", target))
+                .await
+                .unwrap(),
+            3
+        );
+        let mut bytes = [0; 3];
+        let (len, from) = peer.recv_from(&mut bytes).await.unwrap();
+        assert_eq!((&bytes[..len], from), (&b"utp"[..], udp.bind_addr()));
+        udp.shutdown().await.unwrap();
+
+        let blocked = LegSockets::new(loopback_egress(), &LegKind::Ladder)
+            .bind_utp(asked, 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            blocked.send_to(b"utp", target).await.unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
     }
 
     #[tokio::test]
@@ -1445,7 +1827,7 @@ mod tests {
         )));
 
         let shape = LegKind::Ladder.shape(Some(&leg));
-        assert!(shape.listen && !shape.utp);
+        assert!(shape.listen && shape.utp);
 
         let sockets = LegSockets::new(leg, &LegKind::Ladder);
         let listener = sockets

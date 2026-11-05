@@ -1473,6 +1473,54 @@ impl Session {
                 None
             };
 
+            let enable_utp = opts.connect.as_ref().and_then(|connect| connect.enable_utp);
+            let listening_utp = listen_result
+                .as_ref()
+                .and_then(|listen| listen.utp_socket.clone());
+            let new_outgoing_utp = if enable_utp == Some(true) && listening_utp.is_none() {
+                let mut utp_opts = weaver_utp::SocketOpts {
+                    cancellation_token: swarm.child_token(),
+                    parent_span: opts.root_span.as_ref().and_then(|span| span.id()),
+                    dont_wait_for_lastack: true,
+                    ..Default::default()
+                };
+                session_utp_opts(&mut utp_opts, connection_slots.limit());
+                let address = if opts.ipv4_only {
+                    SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+                } else {
+                    SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+                };
+                Some(
+                    crate::listen::bind_utp(
+                        opts.socket_factory.as_ref(),
+                        address,
+                        utp_opts,
+                        crate::udp_options::receive_buffer_for(connection_slots.limit()),
+                        Some(&connection_slots),
+                    )
+                    .await
+                    .context("error binding outgoing uTP socket through socket factory")?,
+                )
+            } else {
+                None
+            };
+            let outgoing_utp = if enable_utp == Some(false) {
+                None
+            } else {
+                listening_utp.or_else(|| new_outgoing_utp.clone())
+            };
+            let utp_sockets = listen_result
+                .iter()
+                .flat_map(|listen| {
+                    listen
+                        .utp_socket
+                        .iter()
+                        .chain(listen.ssl.iter().filter_map(|ssl| ssl.utp_socket.as_ref()))
+                })
+                .chain(new_outgoing_utp.iter())
+                .cloned()
+                .collect();
+
             let dht = if let Some(dht_config) = opts.dht.take() {
                 // The DHT runs over a datagram socket the factory binds; the
                 // factory decides the real address.
@@ -1578,7 +1626,7 @@ impl Session {
             let stream_connector = Arc::new(
                 StreamConnector::new(StreamConnectorArgs {
                     enable_tcp: opts.connect.as_ref().map(|c| c.enable_tcp).unwrap_or(true),
-                    utp_socket: listen_result.as_ref().and_then(|l| l.utp_socket.clone()),
+                    utp_socket: outgoing_utp,
                     ipv4_only: opts.ipv4_only,
                     socket_factory: opts.socket_factory.clone(),
                     encryption: opts.encryption,
@@ -1661,16 +1709,7 @@ impl Session {
                     .and_then(|l| l.ssl.as_ref())
                     .map(|ssl| ssl.addr),
                 external_ips,
-                utp_sockets: listen_result
-                    .iter()
-                    .flat_map(|listen| {
-                        listen
-                            .utp_socket
-                            .iter()
-                            .chain(listen.ssl.iter().filter_map(|ssl| ssl.utp_socket.as_ref()))
-                    })
-                    .cloned()
-                    .collect(),
+                utp_sockets,
                 utp: listen_result
                     .as_ref()
                     .is_some_and(|l| l.utp_socket.is_some()),
@@ -2323,6 +2362,11 @@ impl Session {
         self.swarm.cancel();
         self.swarm_tasks.close();
         self.swarm_tasks.wait().await;
+        for socket in &self.utp_sockets {
+            if let Err(error) = socket.shutdown().await {
+                debug!(%error, "error shutting down uTP socket");
+            }
+        }
         let torrents = self
             .db
             .read()
@@ -3201,6 +3245,7 @@ impl Session {
 
     // `may_reach`, the IP filter applied only when `filtered`.
     fn may_reach_under(&self, ip: IpAddr, filtered: bool) -> Result<(), Unreachable> {
+        let ip = crate::network::canonical_ip_addr(ip);
         if self.ipv4_only && ip.is_ipv6() {
             return Err(Unreachable::Family);
         }
@@ -5781,6 +5826,7 @@ mod tests {
                     encryption,
                     connect: Some(super::ConnectionOptions {
                         enable_tcp: true,
+                        enable_utp: None,
                         peer_opts: Some(PeerConnectionOptions {
                             read_write_timeout: Some(std::time::Duration::from_secs(120)),
                             ..Default::default()
@@ -5839,6 +5885,7 @@ mod tests {
                 encryption: EncryptionPolicy::Prefer,
                 connect: Some(super::ConnectionOptions {
                     enable_tcp: true,
+                    enable_utp: None,
                     peer_opts: None,
                 }),
                 ..isolated_session_opts(false)

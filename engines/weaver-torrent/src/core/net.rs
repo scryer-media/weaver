@@ -30,11 +30,24 @@ use std::{
 /// transport abstraction this trait is adapted to.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + Sync + 'a>>;
 
+pub use weaver_utp::DatagramSend;
+
 /// An unconnected, message-oriented socket: the shape of a UDP socket, without
 /// requiring it to be one.
 ///
 /// Used for DHT, UDP trackers and the uTP peer transport.
 pub trait DatagramSocket: Send + Sync + 'static {
+    /// An owned send readiness registration for one flow, when needed.
+    /// `None` keeps polling this socket directly.
+    fn sender(&self) -> Option<Box<dyn DatagramSend>> {
+        None
+    }
+
+    /// Stop and join work owned by this dedicated socket before release.
+    fn shutdown(&self) -> BoxFuture<'_, io::Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// The local address the socket is bound to.
     fn bind_addr(&self) -> SocketAddr;
 

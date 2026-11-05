@@ -23,8 +23,11 @@ use std::{
 };
 
 use weaver_utp::{DefaultUtpEnvironment, PollSendToVectored, Transport, UtpStream};
+pub use weaver_utp::{
+    canonical_ip_addr, canonical_socket_addr, is_message_size_error, message_size_error,
+};
 
-pub use crate::core::net::{BoxFuture, DatagramSocket, NoNames, Resolved, Resolver};
+pub use crate::core::net::{BoxFuture, DatagramSend, DatagramSocket, NoNames, Resolved, Resolver};
 pub use crate::type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite};
 pub use crate::vectored_traits::{
     AsyncReadToVectoredCompat, AsyncReadVectored, AsyncReadVectoredIntoCompat,
@@ -160,6 +163,14 @@ impl PollSendToVectored for DatagramTransport {
 }
 
 impl Transport for DatagramTransport {
+    fn sender(&self) -> Option<Box<dyn DatagramSend>> {
+        self.0.sender()
+    }
+
+    fn shutdown(&self) -> impl Future<Output = io::Result<()>> + Send {
+        self.0.shutdown()
+    }
+
     fn recv_from<'a>(
         &'a self,
         buf: &'a mut [u8],
@@ -205,6 +216,10 @@ pub(crate) struct UtpSocket(pub(crate) Arc<UtpSocketInner>);
 pub(crate) type UtpSocketInner = weaver_utp::UtpSocket<DatagramTransport, DefaultUtpEnvironment>;
 
 impl UtpSocket {
+    pub(crate) async fn shutdown(&self) -> io::Result<()> {
+        self.0.shutdown().await
+    }
+
     pub(crate) fn bind_addr(&self) -> SocketAddr {
         self.0.bind_addr()
     }
@@ -664,6 +679,9 @@ impl DatagramSocket for KernelUdp {
         }
     }
 }
+
+#[cfg(test)]
+mod mapped_endpoint_tests;
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {

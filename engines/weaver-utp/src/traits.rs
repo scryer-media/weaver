@@ -22,9 +22,40 @@ pub trait PollSendToVectored {
     ) -> Poll<std::io::Result<usize>>;
 }
 
+/// A stream's send readiness registration. Dropping it releases that
+/// stream's registration, including a waiter left by a pending poll.
+pub trait DatagramSend: Send + Sync + Unpin {
+    fn poll_send_to_vectored(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+        target: SocketAddr,
+    ) -> Poll<std::io::Result<usize>>;
+
+    fn poll_send_to(
+        &mut self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        target: SocketAddr,
+    ) -> Poll<std::io::Result<usize>> {
+        self.poll_send_to_vectored(cx, &[IoSlice::new(buf)], target)
+    }
+}
+
 /// The datagram transport a socket runs over. The crate never binds one
 /// itself.
 pub trait Transport: PollSendToVectored + Send + Sync + Unpin + 'static {
+    /// Create an owned send registration for a started stream. `None`
+    /// keeps polling this transport directly.
+    fn sender(&self) -> Option<Box<dyn DatagramSend>> {
+        None
+    }
+
+    /// Stop and join work owned by this transport after its streams stop.
+    fn shutdown(&self) -> impl Future<Output = std::io::Result<()>> + Send {
+        async { Ok(()) }
+    }
+
     fn recv_from<'a>(
         &'a self,
         buf: &'a mut [u8],

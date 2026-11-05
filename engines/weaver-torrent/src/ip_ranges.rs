@@ -58,6 +58,9 @@ pub struct IpRanges {
     // as IpAddr is 17 bytes, Ipv4Addr is only 4 bytes (the majority of ranges).
     v4: SortedRanges<Ipv4Addr>,
     v6: SortedRanges<Ipv6Addr>,
+    // Keep explicit mapped ranges separate before broader IPv6 ranges merge.
+    // Their IPv6 exclusive endpoints can represent the end past IPv4's maximum.
+    mapped_v4: SortedRanges<Ipv6Addr>,
 }
 
 impl Default for IpRanges {
@@ -65,6 +68,7 @@ impl Default for IpRanges {
         Self {
             v4: sorted_ranges(empty()),
             v6: sorted_ranges(empty()),
+            mapped_v4: sorted_ranges(empty()),
         }
     }
 }
@@ -74,9 +78,16 @@ impl IpRanges {
         v4_ranges: impl IntoIterator<Item = Range<Ipv4Addr>>,
         v6_ranges: impl IntoIterator<Item = Range<Ipv6Addr>>,
     ) -> Self {
+        let mapped_end = Ipv4Addr::BROADCAST.to_ipv6_mapped().to_bits() + 1;
+        let (mapped, v6): (Vec<_>, Vec<_>) = v6_ranges.into_iter().partition(|range| {
+            range.start.to_ipv4_mapped().is_some()
+                && range.end.to_bits() <= mapped_end
+                && range.start < range.end
+        });
         Self {
             v4: sorted_ranges(v4_ranges.into_iter()),
-            v6: sorted_ranges(v6_ranges.into_iter()),
+            v6: sorted_ranges(v6.into_iter()),
+            mapped_v4: sorted_ranges(mapped.into_iter()),
         }
     }
 
@@ -88,6 +99,7 @@ impl IpRanges {
         for list in lists {
             v4.extend(list.v4.ranges.iter().cloned());
             v6.extend(list.v6.ranges.iter().cloned());
+            v6.extend(list.mapped_v4.ranges.iter().cloned());
         }
         Self::new(v4, v6)
     }
@@ -106,7 +118,7 @@ impl IpRanges {
     }
 
     pub fn len(&self) -> usize {
-        self.v4.len + self.v6.len
+        self.v4.len + self.v6.len + self.mapped_v4.len
     }
 
     pub fn is_empty(&self) -> bool {
@@ -199,8 +211,8 @@ impl IpRanges {
     }
 
     pub fn has(&self, ip: IpAddr) -> bool {
-        match ip {
-            IpAddr::V4(a) => self.v4.contains(&a),
+        match crate::network::canonical_ip_addr(ip) {
+            IpAddr::V4(a) => self.v4.contains(&a) || self.mapped_v4.contains(&a.to_ipv6_mapped()),
             IpAddr::V6(a) => self.v6.contains(&a),
         }
     }
@@ -243,6 +255,9 @@ fn inclusive(start: IpAddr, end: IpAddr) -> Option<IpRange> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod mapped_ranges_tests;
 
 #[cfg(test)]
 mod tests {

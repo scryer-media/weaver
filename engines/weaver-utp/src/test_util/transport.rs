@@ -11,16 +11,14 @@ use std::{
     task::Poll,
 };
 
+use crate::{PollSendToVectored, SocketOpts, Transport, message::UtpMessage, raw::UtpHeader};
 use parking_lot::Mutex;
 use tokio::sync::{
     Notify,
     mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
 };
-use tracing::{Instrument, error_span};
 
-use crate::{PollSendToVectored, SocketOpts, Transport, message::UtpMessage, raw::UtpHeader};
-
-use super::{MockDispatcher, MockUtpSocket, env::MockUtpEnvironment};
+use super::{MockUtpSocket, env::MockUtpEnvironment};
 
 type Msg = (SocketAddr, Vec<u8>);
 
@@ -37,34 +35,21 @@ impl MockInterface {
         })
     }
 
-    pub fn create_socket_with_dispatcher(
-        self: &Arc<Self>,
-        bind_addr: SocketAddr,
-    ) -> (Arc<MockUtpSocket>, MockDispatcher) {
+    pub fn create_socket(self: &Arc<Self>, bind_addr: SocketAddr) -> Arc<MockUtpSocket> {
+        MockUtpSocket::new_with_opts(
+            self.transport(bind_addr),
+            self.env.clone(),
+            SocketOpts::default(),
+        )
+        .unwrap()
+    }
+
+    fn transport(self: &Arc<Self>, bind_addr: SocketAddr) -> MockUtpTransport {
         let (tx, rx) = unbounded_channel();
-        let transport = MockUtpTransport::new(bind_addr, rx, self.clone());
-        let env = self.env.clone();
-
-        let opts = SocketOpts {
-            ..Default::default()
-        };
-
-        let socket = MockUtpSocket::new_with_opts_and_dispatcher(transport, env, opts).unwrap();
-
         if self.sockets.lock().insert(bind_addr, tx).is_some() {
             panic!("socket with {} already existed", bind_addr)
         }
-        socket
-    }
-
-    pub fn create_socket(self: &Arc<Self>, bind_addr: SocketAddr) -> Arc<MockUtpSocket> {
-        let (sock, dispatcher) = self.create_socket_with_dispatcher(bind_addr);
-        tokio::spawn(
-            dispatcher
-                .run_forever()
-                .instrument(error_span!("sock", ?bind_addr)),
-        );
-        sock
+        MockUtpTransport::new(bind_addr, rx, self.clone())
     }
 }
 
@@ -207,7 +192,7 @@ impl RememberingTransport {
         drop(g);
         self.sent.notify_waiters();
         if too_large {
-            Err(std::io::Error::from_raw_os_error(libc::EMSGSIZE))
+            Err(crate::message_size_error())
         } else {
             Ok(())
         }

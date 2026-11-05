@@ -8,7 +8,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use env::MockUtpEnvironment;
 use transport::MockUtpTransport;
 
-use crate::{UtpSocket, UtpStream, socket::Dispatcher};
+use crate::{UtpSocket, UtpStream};
 
 pub mod cmphead;
 pub mod env;
@@ -16,7 +16,6 @@ pub mod transport;
 
 pub type MockUtpSocket = UtpSocket<MockUtpTransport, MockUtpEnvironment>;
 pub type MockUtpStream = UtpStream;
-pub type MockDispatcher = Dispatcher<MockUtpTransport, MockUtpEnvironment>;
 
 // Logs to the test's output at the level RUST_LOG names, none when unset.
 pub fn setup_test_logging() {

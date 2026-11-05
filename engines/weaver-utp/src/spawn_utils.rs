@@ -7,13 +7,12 @@ use tracing::{Instrument, debug, trace};
 
 use crate::Error;
 
-/// Spawns a future with tracing instrumentation.
-#[track_caller]
-pub fn spawn(
+/// Wrap a registered task with tracing instrumentation.
+pub(crate) fn task(
     span: tracing::Span,
     fut: impl std::future::Future<Output = crate::Result<()>> + Send + 'static,
-) -> tokio::task::JoinHandle<()> {
-    let fut = async move {
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    async move {
         trace!("started");
         tokio::pin!(fut);
         let mut trace_interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -42,22 +41,18 @@ pub fn spawn(
             }
         }
     }
-    .instrument(span);
-    tokio::task::spawn(fut)
+    .instrument(span)
 }
 
-#[track_caller]
-pub fn spawn_with_cancel(
+pub(crate) fn task_with_cancel(
     span: tracing::Span,
     cancellation_token: CancellationToken,
     fut: impl std::future::Future<Output = crate::Result<()>> + Send + 'static,
-) -> tokio::task::JoinHandle<()> {
-    spawn(span, async move {
+) -> impl std::future::Future<Output = ()> + Send + 'static {
+    task(span, async move {
         tokio::select! {
-            _ = cancellation_token.cancelled() => {
-                Err(Error::TaskCancelled)
-            },
-            r = fut => r
+            _ = cancellation_token.cancelled() => Err(Error::TaskCancelled),
+            result = fut => result,
         }
     })
 }

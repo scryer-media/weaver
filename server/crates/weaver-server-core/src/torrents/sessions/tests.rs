@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+mod outgoing_utp;
+
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
@@ -1401,39 +1403,38 @@ fn the_peer_protocol_picks_the_transports_the_leg_carries() {
             IpFilter::default(),
             &IDENTITY.identity(),
         );
+        let connect = options.connect.unwrap();
         (
             options.listen.map(|listen| listen.mode),
-            options.connect.unwrap().enable_tcp,
+            connect.enable_tcp,
+            connect.enable_utp,
         )
     };
     let system = leg(LegKind::System);
     assert!(matches!(
         built(&system, TorrentPeerProtocol::Tcp),
-        (Some(ListenerMode::TcpOnly), true)
+        (Some(ListenerMode::TcpOnly), true, Some(false))
     ));
     assert!(matches!(
         built(&system, TorrentPeerProtocol::Utp),
-        (Some(ListenerMode::UtpOnly), false)
+        (Some(ListenerMode::UtpOnly), false, Some(true))
     ));
     assert!(matches!(
         built(&system, TorrentPeerProtocol::Both),
-        (Some(ListenerMode::TcpAndUtp), true)
+        (Some(ListenerMode::TcpAndUtp), true, Some(true))
     ));
-    // A leg that does not listen has no uTP to offer, whether its tunnel
-    // carries datagrams or not: it dials over TCP when that is asked for,
-    // and otherwise has no way to reach a peer.
+    // Incoming policy is independent of the transports a leg dials over.
     let mut datagrams = leg(LegKind::Ladder);
     datagrams.shape.datagrams = true;
+    datagrams.shape.utp = true;
     for ladder in [&tunnel, &datagrams] {
         assert!(!ladder.shape.listen);
-        assert!(matches!(
-            built(ladder, TorrentPeerProtocol::Both),
-            (None, true)
-        ));
-        assert!(matches!(
-            built(ladder, TorrentPeerProtocol::Utp),
-            (None, false)
-        ));
+        let (listen, tcp, utp) = built(ladder, TorrentPeerProtocol::Both);
+        assert!(listen.is_none() && tcp);
+        assert_eq!(utp, Some(ladder.shape.utp));
+        let (listen, tcp, utp) = built(ladder, TorrentPeerProtocol::Utp);
+        assert!(listen.is_none() && !tcp);
+        assert_eq!(utp, Some(ladder.shape.utp));
     }
 }
 

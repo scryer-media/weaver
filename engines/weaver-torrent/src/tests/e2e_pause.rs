@@ -163,6 +163,7 @@ async fn test_a_paused_torrent_asks_nothing_of_its_tracker_or_peers() -> anyhow:
             socket_factory: Arc::new(Dialed(tx)),
             connect: Some(ConnectionOptions {
                 enable_tcp: true,
+                enable_utp: None,
                 peer_opts: None,
             }),
             ..tracker_session_opts()?
@@ -245,6 +246,7 @@ async fn test_a_resumed_torrent_dials_the_peer_it_let_go_at_once() -> anyhow::Re
             socket_factory: Arc::new(Dialed(tx)),
             connect: Some(ConnectionOptions {
                 enable_tcp: true,
+                enable_utp: None,
                 peer_opts: None,
             }),
             ..tracker_session_opts()?
@@ -311,6 +313,7 @@ async fn test_a_pause_reports_the_block_it_cut_in_the_stopped_announce() -> anyh
             socket_factory: Arc::new(WatchedDials(tx)),
             connect: Some(ConnectionOptions {
                 enable_tcp: true,
+                enable_utp: None,
                 peer_opts: None,
             }),
             ..tracker_session_opts()?

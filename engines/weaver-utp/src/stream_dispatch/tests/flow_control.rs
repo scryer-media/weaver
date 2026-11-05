@@ -218,7 +218,7 @@ async fn test_zero_window_handling() {
 }
 
 #[tokio::test]
-async fn test_window_update_sent_when_window_less_than_mss() {
+async fn test_exact_receive_window_closes_only_when_full_and_reopens_after_read() {
     setup_test_logging();
 
     // Configure socket with small but non-zero receive buffer
@@ -231,7 +231,7 @@ async fn test_window_update_sent_when_window_less_than_mss() {
 
     let mut t = make_test_vsock(opts, false);
 
-    // Fill buffer to just under MSS to get a small window
+    // Half the buffer remains after one full-sized packet.
     t.send_data(1, t.vsock.seq_nr - 1, "aaaaa");
     t.poll_once_assert_pending().await;
     // We shouldn't have registered the flush waker yet.
@@ -248,11 +248,19 @@ async fn test_window_update_sent_when_window_less_than_mss() {
 
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(State, seq_nr = 101, ack_nr = 2, wnd_size = 0u32)],
-        "Should have sent an ACK with new window less than MSS"
+        vec![cmphead!(State, seq_nr = 101, ack_nr = 2, wnd_size = 4u32)],
+        "the remaining bytes stay available below MSS"
     );
 
-    // Read some data to free up more than MSS worth of buffer space
+    // Close the window only after its last four bytes are filled.
+    t.send_data(3, t.vsock.seq_nr - 1, "cccc");
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(State, seq_nr = 101, ack_nr = 3, wnd_size = 0u32)]
+    );
+
+    // Reading a packet reopens exactly its five bytes.
     let mut buf = vec![0u8; MSS];
     t.stream
         .as_mut()
@@ -260,14 +268,19 @@ async fn test_window_update_sent_when_window_less_than_mss() {
         .read_exact(&mut buf)
         .await
         .unwrap();
+    assert_eq!(&buf, b"aaaaa");
     t.poll_once_assert_pending().await;
 
     // Should send window update ACK
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(State, seq_nr = 101, ack_nr = 2, wnd_size = 5u32)],
+        vec![cmphead!(State, seq_nr = 101, ack_nr = 3, wnd_size = 5u32)],
         "Should have sent an ACK with updated window"
     );
+    assert_eq!(t.read_all_available().await.unwrap(), b"bcccc");
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.vsock.outgoing_header().wnd_size, 10);
+    t.assert_sent_empty();
 }
 
 #[tokio::test]
@@ -299,7 +312,7 @@ async fn test_sends_up_to_remote_window_only_single_msg() {
             wnd_size: 4,
             ..Default::default()
         },
-        "hello",
+        "",
     );
     t.poll_once_assert_pending().await;
 
@@ -350,7 +363,7 @@ async fn test_sends_up_to_remote_window_only_multi_msg() {
             wnd_size: 5,
             ..Default::default()
         },
-        "hello",
+        "",
     );
     t.poll_once_assert_pending().await;
     assert_eq!(

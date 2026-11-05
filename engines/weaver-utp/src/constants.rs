@@ -35,8 +35,9 @@ pub const IMMEDIATE_ACK_EVERY_RMSS: usize = 2;
 
 pub const SYNACK_RESEND_INTERNAL: Duration = Duration::from_millis(200);
 
-// u16 SeqNrs wrap around. If they are too far apart, this is used to detect if they wrapped or not.
-pub const WRAP_TOLERANCE: u16 = 1024;
+pub const SEQUENCE_HALF_SPACE: u16 = 1 << 15;
+// Leave space for FIN and the three acknowledged packets the ACK guard admits.
+pub const MAX_RESERVED_DATA_PACKETS: usize = SEQUENCE_HALF_SPACE as usize - 5;
 
 pub const RTTE_TRACING_LOG_LEVEL: Level = Level::TRACE;
 pub const RECOVERY_TRACING_LOG_LEVEL: Level = Level::TRACE;

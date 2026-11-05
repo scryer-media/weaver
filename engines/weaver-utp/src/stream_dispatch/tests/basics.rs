@@ -48,7 +48,7 @@ async fn test_doesnt_send_until_window_updated() {
             wnd_size: 1024,
             ..Default::default()
         },
-        "hello",
+        "",
     );
     t.poll_once_assert_pending().await;
 
@@ -187,8 +187,35 @@ async fn test_data_integrity_manual_packets() {
     t.process_all_available_incoming().await;
     assert!(t.vsock.user_rx.assembler_empty());
 
-    // Read all data
-    let received_data = t.read_all_available().await.unwrap();
+    let acknowledgements = t.take_sent();
+    let acknowledged = acknowledgements.last().unwrap().header.ack_nr;
+    assert_eq!(acknowledged, t.vsock.last_consumed_remote_seq_nr);
+    let acknowledged_packets = usize::from(*acknowledged);
+    assert!(acknowledged_packets > 0);
+    assert!(acknowledged_packets < DATA_SIZE.get() / CHUNK_SIZE);
+
+    // The flood exceeded the inbox packet budget. Retransmit exactly the
+    // unacknowledged tail after reading the accepted prefix.
+    let mut received_data = t.read_all_available().await.unwrap();
+    assert_eq!(
+        received_data,
+        test_data[..acknowledged_packets * CHUNK_SIZE]
+    );
+    for (index, chunk) in test_data
+        .chunks(CHUNK_SIZE)
+        .enumerate()
+        .skip(acknowledged_packets)
+    {
+        header.seq_nr = ((index + 1) as u16).into();
+        t.send_msg(header, std::str::from_utf8(chunk).unwrap());
+    }
+    t.process_all_available_incoming().await;
+    assert!(t.vsock.user_rx.assembler_empty());
+    assert_eq!(
+        usize::from(*t.vsock.last_consumed_remote_seq_nr),
+        DATA_SIZE.get() / CHUNK_SIZE
+    );
+    received_data.extend(t.read_all_available().await.unwrap());
     assert_eq!(t.vsock.user_rx.len_test(), 0);
 
     // Verify data integrity
@@ -214,6 +241,7 @@ async fn test_sequence_numbers_incoming() {
 
     setup_test_logging();
 
+    let env = MockUtpEnvironment::new();
     let mut t = make_test_vsock_args(
         Default::default(),
         StreamArgs::new_incoming(
@@ -224,8 +252,9 @@ async fn test_sequence_numbers_incoming() {
                 ack_nr: 0.into(),
                 ..Default::default()
             },
+            env.now(),
         ),
-        Default::default(),
+        env,
     );
     t.poll_once_assert_pending().await;
     assert_eq!(

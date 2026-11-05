@@ -4,6 +4,9 @@
 //! peer, calling the handler as the connection would, and reads what the
 //! handler queues for the wire.
 
+mod mapped_endpoint_tests;
+mod mapped_filter_tests;
+
 use std::{
     collections::BTreeSet,
     future::Future,
@@ -5143,6 +5146,7 @@ async fn dialing_with(
         socket_factory: Arc::new(DialedTcp(crate::peer_info_reader::tests::Dialed(tx))),
         connect: Some(crate::stream_connect::ConnectionOptions {
             enable_tcp: true,
+            enable_utp: None,
             peer_opts: Some(peer_opts),
         }),
         ..isolated_session_opts(false)

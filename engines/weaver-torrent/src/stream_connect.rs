@@ -73,6 +73,10 @@ pub(crate) enum Transports {
 pub struct ConnectionOptions {
     // TCP outgoing connections are enabled by default
     pub enable_tcp: bool,
+    /// `None` uses an existing listening uTP socket. `Some(true)` also
+    /// binds an outgoing socket through the session's factory when needed;
+    /// `Some(false)` disables outgoing uTP without changing its listener.
+    pub enable_utp: Option<bool>,
     pub peer_opts: Option<PeerConnectionOptions>,
 }
 
@@ -80,6 +84,7 @@ impl Default for ConnectionOptions {
     fn default() -> Self {
         Self {
             enable_tcp: true,
+            enable_utp: None,
             peer_opts: None,
         }
     }
@@ -321,6 +326,7 @@ impl StreamConnector {
         addr: SocketAddr,
         transports: Transports,
     ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
+        let addr = crate::network::canonical_socket_addr(addr);
         if addr.port() == 0 {
             return Err(Error::Anyhow(anyhow::anyhow!(
                 "invalid peer address (port 0): {}",
@@ -430,6 +436,9 @@ impl StreamConnector {
         }
     }
 }
+
+#[cfg(test)]
+mod mapped_endpoint_tests;
 
 #[cfg(test)]
 mod tests {
