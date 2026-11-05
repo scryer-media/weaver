@@ -992,6 +992,8 @@ impl ArticleMap {
         range: ByteRange,
         class: Option<Class>,
     ) -> Pull {
+        #[cfg(test)]
+        super::tests::SEEK_CALLS.with(|calls| calls.set(calls.get() + 1));
         let parks = class == Some(Class::Parked);
         let Some(found) = self.volumes.get_mut(volume.0 as usize) else {
             return if parks { Pull::Moved(0) } else { Pull::Lost };

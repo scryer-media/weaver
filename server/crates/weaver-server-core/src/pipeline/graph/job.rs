@@ -593,10 +593,13 @@ impl GraphJob {
         self.tree.spends(NodeId::ROOT, member)
     }
 
-    // Seam for status: the files that hold the bytes of every root member
-    // the job spends, its own file or what the object that consumed it kept
-    // of it. Once the job delivers they are not part of the release.
-    pub(crate) fn spent_files(&self) -> Vec<PathBuf> {
+    // Hand storage to completion. The graph only classifies what was
+    // consumed; its adapter releases every handle before returning paths
+    // completion may remove. A logical volume close is not an OS close.
+    pub(crate) fn release_delivery_files(&mut self) -> Result<Vec<PathBuf>, &'static str> {
+        if self.work_pending() || self.runs.live() || self.moves_waiting() {
+            return Err("graph storage is still in use before delivery");
+        }
         let mut files: Vec<PathBuf> = self
             .writer
             .files(NodeId::ROOT)
@@ -609,7 +612,10 @@ impl GraphJob {
                 .then(|| self.writer.kept_file(child, volume))
                 .flatten()
         }));
-        files
+        self.writer.release_handles();
+        files.sort();
+        files.dedup();
+        Ok(files)
     }
 
     // Articles the queues do not hold were fetched by an earlier run.

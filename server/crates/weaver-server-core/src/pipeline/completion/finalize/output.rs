@@ -254,19 +254,11 @@ fn move_path_with_copy_fallback(
     }
 
     let parent_fingerprint = runtime_fs::prepare_destination_parent(dst)?;
-    match file_cache::copy_large_file_with_progress(src, dst, |copied| {
+    file_cache::copy_large_file_with_progress(src, dst, |copied| {
         phase_counters
             .completed_bytes
             .fetch_add(copied, Ordering::Relaxed);
-    }) {
-        Ok(_) => {}
-        Err(error) => {
-            if error.kind() != std::io::ErrorKind::AlreadyExists {
-                cleanup_copy_destination_if_parent_matches(dst, &parent_fingerprint);
-            }
-            return Err(error);
-        }
-    }
+    })?;
     if !runtime_fs::destination_parent_matches(dst, &parent_fingerprint)? {
         return Err(std::io::Error::other(format!(
             "destination parent changed during copy: {}",
@@ -275,15 +267,6 @@ fn move_path_with_copy_fallback(
     }
     std::fs::remove_file(src)?;
     Ok(())
-}
-
-fn cleanup_copy_destination_if_parent_matches(
-    dst: &std::path::Path,
-    parent_fingerprint: &runtime_fs::DirectoryFingerprint,
-) {
-    if runtime_fs::destination_parent_matches(dst, parent_fingerprint).unwrap_or(false) {
-        let _ = std::fs::remove_file(dst);
-    }
 }
 
 fn rename_path_for_publication(
@@ -1148,6 +1131,30 @@ impl Pipeline {
         // this delivery. Read them after claiming the move boundary and before
         // copying its category, name and naming metadata.
         self.apply_pending_job_update(job_id);
+
+        // The storage adapter relinquishes every handle before completion
+        // removes consumed inputs or publishes outputs. Unlinking an open
+        // file creates a visible .nfs entry on NFS and can fail on Windows.
+        // Paused jobs never reach this ownership boundary.
+        let spent = self
+            .graph_jobs
+            .get_mut(&job_id)
+            .map(|graph| graph.release_delivery_files())
+            .transpose()
+            .map_err(str::to_owned)?
+            .unwrap_or_default();
+        for path in spent {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!(
+                        "could not remove consumed input {} before delivery: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
 
         let (working_dir, staging_dir, job_name, folder_name, category) = {
             let Some(state) = self.jobs.get(&job_id) else {

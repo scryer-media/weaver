@@ -425,7 +425,8 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
             article: None,
         });
     let restored = snapshot(&rows).unwrap();
-    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts);
+    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts)
+        .unwrap();
     fn files(root: &std::path::Path, at: &std::path::Path, into: &mut Vec<String>) {
         for entry in std::fs::read_dir(root.join(at)).unwrap() {
             let entry = entry.unwrap();
@@ -458,7 +459,8 @@ fn a_restore_sweeps_inside_a_directory_its_checkpoint_names() {
     std::fs::write(dir.path().join("folder/deeper/late.bin"), b"bytes").unwrap();
     let rows = rows(&taken);
     let restored = snapshot(&rows).unwrap();
-    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts);
+    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts)
+        .unwrap();
     assert!(dir.path().join("folder").is_dir());
     assert!(!dir.path().join("folder/obsolete.txt").exists());
     assert!(!dir.path().join("folder/deeper").exists());
@@ -491,7 +493,8 @@ fn a_restore_keeps_a_named_file_whose_directory_differs_in_case() {
     );
     let rows = rows(&taken);
     let restored = snapshot(&rows).unwrap();
-    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts);
+    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts)
+        .unwrap();
     assert!(dir.path().join("Folder").is_dir());
     assert!(
         dir.path().join("Folder/b.bin").exists(),
@@ -517,10 +520,12 @@ fn a_restore_keeps_a_file_that_moved_before_its_checkpoint_said_so() {
             dir.path(),
             "set.par2",
             Some(waiting.as_str())
-        ),
+        )
+        .unwrap(),
         "set.par2"
     );
-    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts);
+    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts)
+        .unwrap();
     assert!(dir.path().join("set.par2").exists());
     assert!(!dir.path().join(&waiting).exists());
 
@@ -531,8 +536,40 @@ fn a_restore_keeps_a_file_that_moved_before_its_checkpoint_said_so() {
             dir.path(),
             "set.par2",
             Some(waiting.as_str())
-        ),
+        )
+        .unwrap(),
         waiting
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_restore_inspection_error_stops_cleanup_before_any_file_is_removed() {
+    use weaver_graph::names::INTERNAL_DIR;
+    let dir = tempfile::tempdir().unwrap();
+    let taken = full();
+    std::os::unix::fs::symlink(INTERNAL_DIR, dir.path().join(INTERNAL_DIR)).unwrap();
+    std::fs::write(dir.path().join("set.par2"), b"destination").unwrap();
+    std::fs::write(
+        dir.path().join("unclaimed.bin"),
+        b"preserve until inspected",
+    )
+    .unwrap();
+
+    assert!(crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &taken, &[]).is_err());
+    assert_eq!(
+        std::fs::read(dir.path().join("set.par2")).unwrap(),
+        b"destination"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("unclaimed.bin")).unwrap(),
+        b"preserve until inspected"
+    );
+    assert!(
+        std::fs::symlink_metadata(dir.path().join(INTERNAL_DIR))
+            .unwrap()
+            .file_type()
+            .is_symlink()
     );
 }
 
@@ -999,4 +1036,309 @@ fn a_restored_member_that_closed_before_its_front_said_is_decided() {
     let (restored, _mail) = restored(&read, &files, dir.path());
     assert!(!restored.job.tree().is_undecided(NodeId::ROOT, member));
     assert!(!restored.job.tree().deciding(NodeId::ROOT));
+}
+
+// Keep the paused clock under the test's control while SQLite works on its
+// own thread. An idle runtime would otherwise advance to the next timer.
+struct ClockHeld(tokio::task::JoinHandle<()>);
+
+impl ClockHeld {
+    fn new() -> Self {
+        Self(tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        }))
+    }
+}
+
+impl Drop for ClockHeld {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn checkpoint_database() -> (crate::Database, crate::jobs::ids::JobId) {
+    let db = crate::Database::open_in_memory().unwrap();
+    let job = crate::jobs::ids::JobId(4282);
+    db.create_active_job(&crate::ActiveJob {
+        job_id: job,
+        nzb_hash: [0xA6; 32],
+        nzb_path: "checkpoint.nzb".into(),
+        nzb_zstd: crate::ingest::compress_nzb_bytes(
+            br#"<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"/>"#,
+        )
+        .unwrap(),
+        output_dir: "checkpoint".into(),
+        created_at: 1_700_000_000,
+        category: None,
+        metadata: Vec::new(),
+        status: "queued",
+        download_state: "queued",
+        post_state: "idle",
+        run_state: "active",
+        paused_resume_status: None,
+        paused_resume_download_state: None,
+        paused_resume_post_state: None,
+        password_override: None,
+        supplied_password_candidates: Vec::new(),
+    })
+    .unwrap();
+    (db, job)
+}
+
+fn writes(db: &crate::Database) -> usize {
+    db.graph_checkpoint_writes
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[tokio::test(start_paused = true)]
+async fn small_steps_share_one_transaction_and_restore_every_members_bytes() {
+    let _clock = ClockHeld::new();
+    let (db, id) = checkpoint_database();
+    let (mut job, dir, files) = fifty_members();
+    let pending = Pending::default();
+    let (mail, _heard) = tokio::sync::mpsc::unbounded_channel();
+    let now = tokio::time::Instant::now();
+    for volume in 0..50 {
+        arrive(&mut job, volume, 1);
+        pending.put(&job, Vec::new());
+        pending.queue(&db, id, &mail, false);
+        db.flush_write_queue().await.unwrap();
+    }
+    assert_eq!(
+        writes(&db),
+        0,
+        "an idle database does not flush small steps"
+    );
+    assert_eq!(tokio::time::Instant::now(), now);
+    pending.queue(&db, id, &mail, true);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 1);
+    let read = snapshot(&db.load_graph_checkpoint(id).unwrap().unwrap()).unwrap();
+    let (restored, _mail) = restored(&read, &files, dir.path());
+    let fresh = Pending::default();
+    fresh.put(&job, Vec::new());
+    assert_eq!(read, snapshot(&held(&fresh.take().0.unwrap())).unwrap());
+    for volume in 0..50 {
+        let member = MemberId(root_member(&job, volume) as u32);
+        assert_eq!(
+            restored.job.writer().file_state(NodeId::ROOT, member),
+            job.writer().file_state(NodeId::ROOT, member)
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(format!("member{volume:02}.bin"))).unwrap(),
+            vec![volume as u8; 128]
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_oldest_small_step_writes_once_when_its_age_is_due() {
+    let _clock = ClockHeld::new();
+    let (db, id) = checkpoint_database();
+    let (mut job, _dir) = long_post(1);
+    let pending = Pending::default();
+    let (mail, _heard) = tokio::sync::mpsc::unbounded_channel();
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, false);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 0);
+    tokio::time::advance(std::time::Duration::from_secs(4)).await;
+    intake(&mut job, 1);
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, false);
+    let timer = pending.slot().timer.take().unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    timer.await.unwrap();
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 1);
+    let committed = pending.slot().committed;
+    assert_eq!(committed, pending.stamp());
+    pending.queue(&db, id, &mail, false);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn age_and_force_share_one_write_behind_an_in_flight_checkpoint() {
+    let _clock = ClockHeld::new();
+    for age_first in [false, true] {
+        let (db, id) = checkpoint_database();
+        let (mut job, _dir) = long_post(1);
+        let pending = Pending::default();
+        let (mail, mut heard) = tokio::sync::mpsc::unbounded_channel();
+        pending.put(&job, Vec::new());
+        // Hold the first immutable payload after take, before its SQL and
+        // acknowledgement, without blocking the runtime that drives the timer.
+        let (first, first_stamp) = pending.take();
+        let first = first.unwrap();
+        let writer = pending.clone();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        db.try_queue_write("held_graph_checkpoint", move |db| {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+            let whole = first.whole;
+            db.save_graph_checkpoint(id, Arc::new(first))?;
+            writer.committed(first_stamp, whole);
+            Ok(())
+        })
+        .unwrap();
+        waiting.await.unwrap();
+
+        for ordinal in 1..4 {
+            intake(&mut job, ordinal);
+            pending.put(&job, Vec::new());
+            pending.queue(&db, id, &mail, false);
+        }
+        let stamp = pending.stamp();
+        // Keep the timer handle so taking the queued delta cannot cancel
+        // the age callback whose ordering this test controls.
+        let timer = pending.slot().timer.take().unwrap();
+        if age_first {
+            tokio::time::advance(super::CHECKPOINT_AGE).await;
+            timer.await.unwrap();
+            assert_eq!(pending.await_commit(stamp, id.0, &mail, &db), None);
+        } else {
+            assert_eq!(pending.await_commit(stamp, id.0, &mail, &db), None);
+            tokio::time::advance(super::CHECKPOINT_AGE).await;
+            timer.await.unwrap();
+        }
+        assert_eq!(writes(&db), 0);
+        assert!(heard.try_recv().is_err());
+        release.send(()).unwrap();
+        let said = heard.recv().await.unwrap();
+        assert_eq!(said.generation, stamp);
+        assert!(
+            matches!(said.heard, super::Heard::Written { stamp: Some(written), .. } if written == stamp)
+        );
+        db.flush_write_queue().await.unwrap();
+        assert_eq!(writes(&db), 2, "age_first={age_first}");
+        assert!(heard.try_recv().is_err());
+        let fresh = Pending::default();
+        fresh.put(&job, Vec::new());
+        assert_eq!(
+            snapshot(&db.load_graph_checkpoint(id).unwrap().unwrap()).unwrap(),
+            snapshot(&held(&fresh.take().0.unwrap())).unwrap()
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn awaiting_a_stamp_forces_its_write_without_advancing_time() {
+    let _clock = ClockHeld::new();
+    let (db, id) = checkpoint_database();
+    let (job, _dir) = long_post(1);
+    let pending = Pending::default();
+    let (mail, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, false);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 0);
+    let now = tokio::time::Instant::now();
+    let stamp = pending.stamp();
+    assert_eq!(pending.await_commit(stamp, id.0, &mail, &db), None);
+    let said = heard.recv().await.unwrap();
+    assert!(
+        matches!(said.heard, super::Heard::Written { stamp: Some(written), .. } if written == stamp)
+    );
+    assert_eq!(writes(&db), 1);
+    assert_eq!(tokio::time::Instant::now(), now);
+}
+
+#[tokio::test(start_paused = true)]
+async fn dirty_bytes_at_the_barrier_force_a_write() {
+    let _clock = ClockHeld::new();
+    let (db, id) = checkpoint_database();
+    // The post declares one byte per article; each actually covers 64.
+    let (mut job, _dir, _) = job_with(&[file("member00.bin", &[1, 1])], Vec::new());
+    arrive(&mut job, 0, 0);
+    let pending = Pending::default();
+    let (mail, _heard) = tokio::sync::mpsc::unbounded_channel();
+    pending.put(&job, Vec::new());
+    pending.slot().dirty_bytes = super::CHECKPOINT_BYTES - 64;
+    pending.queue(&db, id, &mail, false);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 0);
+    arrive(&mut job, 0, 1);
+    pending.put(&job, Vec::new());
+    assert_eq!(pending.slot().dirty_bytes, super::CHECKPOINT_BYTES);
+    pending.queue(&db, id, &mail, false);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 1);
+    assert_eq!(pending.slot().dirty_bytes, 0);
+}
+
+#[test]
+fn dirty_coverage_counts_new_ranges_without_recounting_splits_or_provenance() {
+    let rows = |ranges: &[(i64, i64)]| -> Vec<super::CoverageRow> {
+        ranges
+            .iter()
+            .map(|&(start, end)| super::CoverageRow {
+                node: 7,
+                member: 3,
+                start,
+                end,
+                provenance: "fresh".into(),
+                verified: false,
+            })
+            .collect()
+    };
+    let before = rows(&[(10, 20), (30, 40)]);
+    for (ranges, expected) in [
+        (vec![(0, 50)], 30),
+        (vec![(10, 15), (15, 20), (30, 40)], 0),
+        (vec![(0, 5), (12, 18), (35, 45), (50, 60)], 20),
+        (vec![(0, 10), (20, 30), (40, 50)], 30),
+        (vec![], 0),
+    ] {
+        let mut after = rows(&ranges);
+        for row in &mut after {
+            row.provenance = "repaired".into();
+            row.verified = true;
+        }
+        assert_eq!(
+            super::added_coverage(&before, &after),
+            expected,
+            "{ranges:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dropped_writer_leaves_only_committed_coverage_to_restore() {
+    let _clock = ClockHeld::new();
+    let (db, id) = checkpoint_database();
+    let (mut job, dir, files) = fifty_members();
+    let pending = Pending::default();
+    let (mail, _heard) = tokio::sync::mpsc::unbounded_channel();
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, true);
+    db.flush_write_queue().await.unwrap();
+    let committed = db.load_graph_checkpoint(id).unwrap().unwrap();
+    arrive(&mut job, 7, 1);
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, false);
+    let timer = pending.slot().timer.as_ref().unwrap().abort_handle();
+    drop(pending);
+    tokio::time::advance(super::CHECKPOINT_AGE).await;
+    while !timer.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 1);
+    let read = db.load_graph_checkpoint(id).unwrap().unwrap();
+    assert_eq!(read, committed);
+    let (restored, _mail) = restored(&snapshot(&read).unwrap(), &files, dir.path());
+    assert!(
+        restored
+            .job
+            .tree()
+            .record(NodeId::ROOT)
+            .unwrap()
+            .coverage
+            .iter()
+            .all(|coverage| coverage.end == 64)
+    );
 }

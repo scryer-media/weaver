@@ -5996,7 +5996,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.16.7"
+version = "0.16.9"
 dependencies = [
  "aho-corasick",
  "application-updater",
@@ -6058,7 +6058,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-graph"
-version = "0.16.7"
+version = "0.16.9"
 dependencies = [
  "bytes",
  "crc-turbo",
@@ -6071,14 +6071,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.16.7"
+version = "0.16.9"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.16.7"
+version = "0.16.9"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6107,7 +6107,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.16.7"
+version = "0.16.9"
 dependencies = [
  "blake3",
  "html-escape 0.3.0",
@@ -6121,7 +6121,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-objects"
-version = "0.16.7"
+version = "0.16.9"
 dependencies = [
  "aws-lc-rs",
  "brotli",
@@ -6146,7 +6146,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.16.7"
+version = "0.16.9"
 dependencies = [
  "async-graphql",
  "async-stream",
@@ -6177,7 +6177,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.16.7"
+version = "0.16.9"
 dependencies = [
  "aes-gcm",
  "application-updater",
@@ -6254,7 +6254,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-tunnel"
-version = "0.16.7"
+version = "0.16.9"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6277,7 +6277,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.16.7"
+version = "0.16.9"
 dependencies = [
  "cc",
  "crc-turbo",

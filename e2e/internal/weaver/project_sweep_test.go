@@ -18,7 +18,7 @@ func TestSweepTakesOnlyDeadOwnersProjectsInEngineOrder(t *testing.T) {
 	now := time.Date(2026, 11, 3, 15, 0, 0, 0, time.UTC)
 	recent := now.Add(-time.Hour)
 	old := now.Add(-48 * time.Hour)
-	ourDir := "/home/example/src/weaver/e2e"
+	ourDir := "/workspace/weaver/e2e"
 	resources := []engineResource{
 		// Claimed, owner alive: kept.
 		{Kind: engineContainer, Name: "c-alive", Project: "weaver-e2e-1-alive", Created: old},

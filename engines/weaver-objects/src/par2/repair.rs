@@ -490,7 +490,14 @@ fn whole_file_matches(
         return None;
     }
     let slice = index.slice_size.max(1);
-    let chunk = (CHUNK / slice).max(1) * slice;
+    // A slice the store cannot hold is not kept, so the sweep need not read
+    // whole slices: it reads a bounded chunk at a time and keeps nothing.
+    let keeping = slice <= kept.limit as u64;
+    let chunk = if keeping {
+        (CHUNK / slice).max(1) * slice
+    } else {
+        CHUNK
+    };
     let mut hasher = FileHashState::new();
     let mut buffer = Vec::new();
     let mut at = 0;
@@ -504,8 +511,10 @@ fn whole_file_matches(
             return None;
         }
         hasher.update(&buffer);
-        for (step, piece) in buffer.chunks(slice as usize).enumerate() {
-            kept.keep(file, at / slice + step as u64, piece.to_vec());
+        if keeping {
+            for (step, piece) in buffer.chunks(slice as usize).enumerate() {
+                kept.keep(file, at / slice + step as u64, piece.to_vec());
+            }
         }
         at = end;
     }
@@ -1608,6 +1617,75 @@ mod tests {
         );
         assert_eq!(bounded.repaired(), bounded.written);
         assert!(some > all, "bounded sealed {some}, unbounded {all}");
+    }
+
+    // A slice the repair's store cannot hold is not kept, so the whole-file
+    // sweep reads it in bounded chunks instead of whole: a set's declared
+    // slice size never sizes a read past the sweep's own chunk. A slice the
+    // store holds is read whole and kept.
+    #[test]
+    fn a_slice_past_the_memory_limit_is_swept_in_bounded_reads_and_not_kept() {
+        const MIB: u64 = 1 << 20;
+        struct Ranges {
+            store: Store,
+            reads: Vec<ByteRange>,
+        }
+        impl MemberAccess for Ranges {
+            fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
+                self.reads.push(range);
+                self.store.read(member, range, into)
+            }
+            fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
+                self.store.write_repaired(member, offset, bytes);
+            }
+            fn length(&self, member: MemberId) -> Option<u64> {
+                self.store.length(member)
+            }
+            fn arrived(&self, member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {
+                self.store.arrived(member, range, out);
+            }
+            fn read_volume(
+                &mut self,
+                volume: VolumeIndex,
+                range: ByteRange,
+                into: &mut Vec<u8>,
+            ) -> bool {
+                self.store.read_volume(volume, range, into)
+            }
+        }
+        let data = payload(95, (2 * MIB + MIB / 2) as usize);
+        let files = par2_set("set", &[("payload.bin", &data)], 2 * MIB, 1, 1);
+        for (limit, bounded) in [(MIB as usize, true), (usize::MAX, false)] {
+            let (mut job, member) = fixture(&files, &data);
+            job.store.holes.clear();
+            let index = job
+                .object
+                .sets
+                .values()
+                .next()
+                .unwrap()
+                .usable()
+                .unwrap()
+                .clone();
+            let file = index.recovery_file_ids[0];
+            let mut access = Ranges {
+                store: job.store,
+                reads: Vec::new(),
+            };
+            let mut kept = Kept::new(limit);
+            let whole = whole_file_matches(&index, file, member, &mut access, &mut kept);
+            assert_eq!(whole, Some(true));
+            let read: u64 = access.reads.iter().map(ByteRange::len).sum();
+            assert_eq!(read, data.len() as u64, "{:?}", access.reads);
+            let largest = access.reads.iter().map(ByteRange::len).max().unwrap();
+            if bounded {
+                assert_eq!(largest, MIB, "{:?}", access.reads);
+                assert!(kept.slices.is_empty());
+            } else {
+                assert_eq!(largest, 2 * MIB, "{:?}", access.reads);
+                assert_eq!(kept.slices.len(), 2);
+            }
+        }
     }
 
     // A set without slice checksums proves a volume by hashing it whole:

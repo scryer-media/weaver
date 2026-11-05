@@ -32,9 +32,11 @@ pub(super) struct Entry {
     pub(super) checksum: Option<u32>,
     pub(super) length: u64,
     pub(super) crc: u32,
+    pub(super) crc_known: bool,
     // Where the data starts in the container, once the local header says,
     // for an entry whose bytes stream into its member.
     pub(super) data: Option<u64>,
+    pub(super) cipher: Option<super::crypto::Cipher>,
     pub(super) streams: bool,
     // What the record read first says of the entry, until the other says
     // the same: the directory's, until the local header is read, or the
@@ -75,6 +77,7 @@ pub(super) struct Map {
     // The entries were held against the directory: built from it, or
     // walked and then found in it.
     pub(super) checked: bool,
+    pub(super) descriptor: Option<super::walk::Descriptor>,
 }
 
 impl Map {

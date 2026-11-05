@@ -44,6 +44,8 @@ pub(crate) enum GraphRestoreError {
     Checkpoint(#[from] CheckpointError),
     #[error("graph job could not be rebuilt from its checkpoint: {0}")]
     Rebuild(#[from] RestoreFailure),
+    #[error("graph job storage could not be inspected: {0}")]
+    Storage(#[from] super::leaf::LeafError),
     #[error("graph job restore stopped: {0}")]
     Join(String),
 }
@@ -94,6 +96,10 @@ pub(crate) struct GraphRestore {
 // What a graph job's restore takes from the pipeline, gathered on the
 // pipeline thread so the restore itself, every read back included, runs off
 // it.
+// How many restores were entered, for the tests that show one was not.
+#[cfg(test)]
+pub(crate) static RESTORES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub(crate) struct RestoreSeat {
     db: crate::Database,
     working_dir: PathBuf,
@@ -164,12 +170,15 @@ impl RestoreSeat {
     // Read the job's checkpoint back and rebuild the job from it. A
     // checkpoint this build does not restore is none: the job starts afresh
     // and fetches every article, and its first checkpoint replaces the old
-    // rows whole. Blocks: called off the pipeline thread.
+    // rows whole. Blocks: called off the pipeline thread. A job whose work
+    // crashed the daemon never reaches here: its install is given no seat.
     pub(crate) fn restore(
         self,
         job_id: JobId,
         files: Vec<RootFile>,
     ) -> Result<GraphRestore, GraphRestoreError> {
+        #[cfg(test)]
+        RESTORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // A restore replays the job's own facts: a panic in it is the job's.
         let _job = crate::runtime::panic_trap::JobScope::enter(job_id);
         let loaded = self.db.load_graph_checkpoint(job_id);
@@ -197,7 +206,7 @@ impl RestoreSeat {
         rows: crate::jobs::graph_checkpoint::GraphCheckpoint,
     ) -> Result<GraphRestore, GraphRestoreError> {
         let snapshot = checkpoint::snapshot(&rows)?;
-        sweep_unnamed(&self.working_dir, &snapshot, &rows.held_parts);
+        sweep_unnamed(&self.working_dir, &snapshot, &rows.held_parts)?;
         let held = held_parts_from_rows(job_id, &self.working_dir, &rows.held_parts);
         let storage = Storage {
             passwords: restore_passwords(&self.db, job_id, self.spec_password.as_deref())?,
@@ -261,7 +270,7 @@ pub(super) fn sweep_unnamed(
     working_dir: &Path,
     snapshot: &checkpoint::Snapshot,
     held_parts: &[crate::jobs::graph_checkpoint::HeldPartRow],
-) {
+) -> Result<(), super::leaf::LeafError> {
     let members = snapshot.tree.nodes.iter().flat_map(|node| {
         node.members.iter().filter_map(|record| {
             let state = snapshot.files.get(&(node.node, record.member))?;
@@ -271,7 +280,7 @@ pub(super) fn sweep_unnamed(
                     &record.output_name,
                     state.on_disk.as_deref(),
                 )
-                .to_owned()
+                .map(str::to_owned)
             })
         })
     });
@@ -288,7 +297,11 @@ pub(super) fn sweep_unnamed(
     // Each name as the path it takes on disk, the key the name ledger and
     // the writer compare names by: a directory "Folder/" and a file
     // "folder/b.bin" lie in one directory where the disk folds case.
+    // Resolve every recorded move before deleting anything. An inspection
+    // error must never make a still-owned source look like an orphan.
+    let members = members.collect::<Result<Vec<_>, _>>()?;
     let named: HashSet<String> = members
+        .into_iter()
         .chain(envelopes)
         .chain(holds)
         .chain(spooled)
@@ -301,6 +314,7 @@ pub(super) fn sweep_unnamed(
         within.extend(name.match_indices('/').map(|(at, _)| name[..at].to_owned()));
     }
     sweep_within(working_dir, Path::new(""), &named, &within);
+    Ok(())
 }
 
 fn sweep_within(dir: &Path, at: &Path, named: &HashSet<String>, within: &HashSet<String>) {

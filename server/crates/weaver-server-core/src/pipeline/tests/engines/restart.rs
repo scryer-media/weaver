@@ -320,6 +320,9 @@ async fn restart_heard(
     in_memory: &mut BTreeSet<(u32, u32)>,
     inspect: Inspect<'_>,
 ) -> (Pipeline, tokio::sync::broadcast::Receiver<PipelineEvent>) {
+    // These restarts exercise a committed step. The coalescing tests cover
+    // the coverage a crash loses before the writer's barrier is due.
+    pipeline.flush_graph_checkpoint(JOB);
     in_memory.extend(pipeline.graph_jobs[&JOB].in_memory());
     let working_dir = pipeline.jobs[&JOB].working_dir.clone();
     let db = pipeline.db.clone();
@@ -333,7 +336,7 @@ async fn restart_heard(
         .db
         .load_graph_checkpoint(JOB)
         .unwrap()
-        .expect("every step leaves a checkpoint");
+        .expect("the forced checkpoint committed");
     inspect(&rows);
     pipeline
         .restore_job(crate::RestoreJobRequest {
@@ -1656,6 +1659,7 @@ async fn served_four(
         );
         serve(&mut pipeline, scenario, article).await;
     }
+    pipeline.flush_graph_checkpoint(JOB);
     pipeline.db.flush_write_queue().await.unwrap();
     (pipeline, working_dir)
 }
@@ -2029,6 +2033,7 @@ async fn a_fresh_jobs_first_checkpoint_replaces_every_stale_row() {
         work.segment_id.segment_number,
     );
     serve(&mut pipeline, &scenario, article).await;
+    pipeline.flush_graph_checkpoint(JOB);
     pipeline.db.flush_write_queue().await.unwrap();
     // One article is covered, and the root is at this build's version.
     assert_eq!(covered(&pipeline).values().sum::<i64>(), ARTICLE as i64);
@@ -2075,14 +2080,18 @@ async fn a_job_with_no_password_candidates_stored_is_restored_from_its_checkpoin
 
 // A job whose work crashed the daemon on its last run is not restored into
 // the same crash: it comes back paused naming it, holding nothing, its
-// checkpoint as it was. Its marker stays, so a second restart without a
-// resume parks it again and never reaches its restore: a checkpoint read
-// that would fail there leaves no mark on it. A resume takes the marker,
-// replays the checkpoint and the job finishes.
+// checkpoint as it was, and the graph restore that would replay the crash
+// is never entered. Its marker stays, so a second restart without a resume
+// parks it again and never reaches its restore: a checkpoint read that
+// would fail there leaves no mark on it. A resume takes the marker, replays
+// the checkpoint and the job finishes.
 #[tokio::test]
 async fn a_job_that_crashed_the_daemon_stays_parked_across_restarts_until_resumed() {
+    use crate::pipeline::graph::restore::RESTORES;
     use crate::runtime::panic_trap::{Trap, boot_marks};
+    use std::sync::atomic::Ordering::Relaxed;
     let mut job = reopened().await;
+    let restores = RESTORES.load(Relaxed);
     let data = tempfile::tempdir().unwrap();
     let marker = Trap::new(data.path(), "test")
         .write(Some(JOB), "inverted byte range 20..10", None)
@@ -2093,6 +2102,7 @@ async fn a_job_that_crashed_the_daemon_stays_parked_across_restarts_until_resume
         .park_crashed_jobs(boot_marks(data.path(), |id| id == JOB));
     job.restore().await;
     job.is_parked_for_its_crash().await;
+    assert_eq!(RESTORES.load(Relaxed), restores);
     assert_eq!(
         job.pipeline.db.load_graph_checkpoint(JOB).unwrap(),
         checkpoint
@@ -2115,6 +2125,7 @@ async fn a_job_that_crashed_the_daemon_stays_parked_across_restarts_until_resume
         .unwrap();
     change_checkpoint(&job.pipeline, COLUMN_BACK).await;
     job.is_parked_for_its_crash().await;
+    assert_eq!(RESTORES.load(Relaxed), restores);
     assert_eq!(
         job.pipeline.db.load_graph_checkpoint(JOB).unwrap(),
         checkpoint
@@ -2122,6 +2133,9 @@ async fn a_job_that_crashed_the_daemon_stays_parked_across_restarts_until_resume
     assert!(marker.exists());
 
     job.resumes_from_its_checkpoint().await;
+    // The resume is what reaches the restore: once as the job is installed
+    // again, once as it is built when next reached.
+    assert!(RESTORES.load(Relaxed) > restores);
     assert!(!marker.exists());
 }
 
@@ -2172,6 +2186,7 @@ async fn a_restart_restores_a_running_job_with_its_articles_and_a_queued_job_wit
             );
             serve(&mut pipeline, &scenario, article).await;
         }
+        pipeline.flush_graph_checkpoint(JOB);
         pipeline.db.flush_write_queue().await.unwrap();
         retire_pipeline_database(pipeline).await;
         working_dir
@@ -2672,6 +2687,7 @@ async fn a_job_restored_under_paused_post_processing_starts_no_run_until_resume(
         !awaits_mail(&pipeline),
         "a run started under the pause before the restart"
     );
+    pipeline.flush_graph_checkpoint(JOB);
     let working_dir = pipeline.jobs[&JOB].working_dir.clone();
     let db = pipeline.db.clone();
     retire_pipeline_database(pipeline).await;

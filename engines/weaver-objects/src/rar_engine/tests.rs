@@ -1940,3 +1940,47 @@ fn brief(said: &[Said]) -> Vec<String> {
         })
         .collect()
 }
+
+// A compressed member reaches the sink in pieces of at least a megabyte, its
+// last aside, not in the tails the decoder writes beside each window it
+// flushes.
+#[test]
+fn a_compressed_member_is_said_in_megabyte_pieces() {
+    for archive in [
+        include_bytes!(
+            "../../../../server/crates/weaver-server-core/tests/fixtures/rar4/rar4_solid.rar"
+        )
+        .as_slice(),
+        include_bytes!(
+            "../../../../server/crates/weaver-server-core/tests/fixtures/rar5/rar5_solid.rar"
+        )
+        .as_slice(),
+    ] {
+        let mut emits = Vec::new();
+        let mut sink = |emit| {
+            emits.push(emit);
+            true
+        };
+        RarEngine::new().start().run(
+            Gate::whole(vec![archive.to_vec()]),
+            &mut sink,
+            weaver_graph::Budget::default(),
+        );
+        let mut pieces: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for emit in &emits {
+            if let Emit::Bytes { member, bytes, .. } = emit {
+                pieces.entry(member.0).or_default().push(bytes.len());
+            }
+        }
+        assert!(pieces.values().any(|lengths| lengths.len() > 1));
+        for lengths in pieces.values() {
+            let (_, before_last) = lengths.split_last().unwrap();
+            assert!(
+                before_last
+                    .iter()
+                    .all(|length| *length >= super::run::EMIT_BYTES),
+                "{lengths:?}"
+            );
+        }
+    }
+}

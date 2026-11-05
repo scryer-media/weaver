@@ -15,7 +15,14 @@
 // Each checkpoint is written as what it changed of the one before: a step
 // costs the database the rows it changed, not the job's. One writer per job:
 // a change waiting for the database takes in the next one rather than
-// queueing behind it, so a slow database costs writes, never order.
+// queueing behind it, so a slow database costs writes, never order. Changes
+// wait for 256 MiB of dirty coverage or five seconds, whichever
+// comes first. A crash loses at most that last five seconds or 256 MiB of
+// coverage while the database keeps up; a restore refetches it, as 0.16.5's
+// direct-store barrier did. Database stalls can extend that window. Delaying
+// a change does not make it claim unwritten bytes: each step wrote its bytes
+// before it was taken. Moves wait for the recorded name to commit, and a
+// graceful stop forces the last change into the database queue.
 //
 // Nothing secret is in any of it. The tree records carry no password and no
 // key, the objects' facts carry key tuples and salts but never a key, and a
@@ -23,7 +30,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tracing::{debug, warn};
 use weaver_graph::holds::ScratchHold;
@@ -49,6 +56,9 @@ use crate::pipeline::Pipeline;
 // The root row's kind: the root is the article object, not one the builder
 // makes.
 const ROOT_KIND: &str = "root";
+
+const CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
+const CHECKPOINT_AGE: Duration = Duration::from_secs(5);
 
 // A job's checkpoint, as a restore reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -134,7 +144,29 @@ pub(crate) enum CheckpointError {
 // A job's checkpoints on their way to the database: the rows the database
 // holds once what is queued is written, and the change queued for it.
 #[derive(Clone, Default)]
-pub(crate) struct Pending(Arc<Mutex<Slot>>);
+pub(crate) struct Pending(Arc<Writer>);
+
+#[derive(Default)]
+struct Writer {
+    slot: Mutex<Slot>,
+    // An age wake and a forced write must finish queueing in order, so a
+    // caller can put its database barrier after the forced write returns.
+    dispatch: Mutex<()>,
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        if let Some(timer) = self
+            .slot
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .timer
+            .take()
+        {
+            timer.abort();
+        }
+    }
+}
 
 #[derive(Default)]
 struct Slot {
@@ -149,8 +181,12 @@ struct Slot {
     // of the job is not known, so the next change is the whole job.
     held: Option<Held>,
     feed_verdict: Option<crate::jobs::feed_verdict::FeedVerdict>,
-    // The change a queued write takes: `Some` exactly while one is queued.
+    // The change waiting for its barrier or for a queued write to take it.
     queued: Option<Delta>,
+    oldest: Option<tokio::time::Instant>,
+    dirty_bytes: u64,
+    enqueued: bool,
+    timer: Option<tokio::task::JoinHandle<()>>,
     tally: Tally,
     // The stamp of the last checkpoint that changed anything. A write
     // takes the stamp with the change, and once it has committed every
@@ -228,7 +264,14 @@ impl HeldNode {
     // Bring the rows up to what the job has now of what `touched` says
     // changed, and put what changed into `delta`. `node` is `None` for an
     // id no tree could have, which names a node the job does not have.
-    fn step(&mut self, job: &GraphJob, node: Option<NodeId>, touched: Touched, delta: &mut Delta) {
+    fn step(
+        &mut self,
+        job: &GraphJob,
+        node: Option<NodeId>,
+        touched: Touched,
+        delta: &mut Delta,
+        dirty_bytes: &mut u64,
+    ) {
         let id = node.map(|node| i64::from(node.0));
         if touched.own {
             let now = node
@@ -293,6 +336,7 @@ impl HeldNode {
                     member_rows(id, &record, &coverage, state)
                 });
             let was = self.members.remove(&key).unwrap_or_default();
+            *dirty_bytes = dirty_bytes.saturating_add(added_coverage(&was.coverage, &now.coverage));
             delta.compare(&was, &now);
             if now != GraphCheckpoint::default() {
                 self.members.insert(key, now);
@@ -322,6 +366,33 @@ impl HeldNode {
     }
 }
 
+// Newly covered bytes of one member. Both lists are disjoint ranges in
+// offset order. A range that grows or splits counts only its new bytes;
+// changing its provenance does not count the same bytes again. Count every
+// member, so an extractor making progress without another article arriving
+// still reaches the byte barrier.
+fn added_coverage(before: &[CoverageRow], after: &[CoverageRow]) -> u64 {
+    let mut before = before.iter().peekable();
+    let mut bytes = 0_u64;
+    for row in after {
+        let mut at = row.start;
+        while let Some(old) = before.peek().filter(|old| old.start < row.end) {
+            if old.end <= at {
+                before.next();
+                continue;
+            }
+            bytes = bytes.saturating_add(old.start.saturating_sub(at).max(0) as u64);
+            at = old.end.min(row.end);
+            if old.end > row.end {
+                break;
+            }
+            before.next();
+        }
+        bytes = bytes.saturating_add(row.end.saturating_sub(at).max(0) as u64);
+    }
+    bytes
+}
+
 // How many members' rows the checkpoints taken on this thread built.
 #[cfg(test)]
 thread_local! {
@@ -349,7 +420,7 @@ impl Pending {
     }
 
     fn slot(&self) -> std::sync::MutexGuard<'_, Slot> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.0.slot.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     // Queue what this checkpoint changes, the job's spooled held parts
@@ -407,7 +478,7 @@ impl Pending {
             }
             // An id no tree could have names a node the job does not have.
             let node = u32::try_from(key).ok().map(NodeId);
-            entry.step(job, node, touched, &mut delta);
+            entry.step(job, node, touched, &mut delta, &mut slot.dirty_bytes);
             if !entry.is_empty() {
                 held.nodes.insert(key, entry);
             }
@@ -447,6 +518,7 @@ impl Pending {
             return false;
         }
         slot.asked += 1;
+        slot.oldest.get_or_insert_with(tokio::time::Instant::now);
         match &mut slot.queued {
             Some(queued) => {
                 queued.absorb(delta);
@@ -464,6 +536,12 @@ impl Pending {
     // write commits.
     pub(super) fn take(&self) -> (Option<Delta>, u64) {
         let mut slot = self.slot();
+        slot.oldest = None;
+        slot.dirty_bytes = 0;
+        slot.enqueued = false;
+        if let Some(timer) = slot.timer.take() {
+            timer.abort();
+        }
         (slot.queued.take(), slot.asked)
     }
 
@@ -480,6 +558,7 @@ impl Pending {
         stamp: u64,
         scope: u64,
         mail: &UnboundedSender<Said>,
+        db: &crate::Database,
     ) -> Option<u64> {
         let mut slot = self.slot();
         if !slot.lost && slot.committed >= stamp {
@@ -491,6 +570,8 @@ impl Pending {
             scope,
             mail: mail.clone(),
         });
+        drop(slot);
+        self.queue(db, JobId(scope), mail, true);
         None
     }
 
@@ -524,6 +605,12 @@ impl Pending {
         slot.control.cancel();
         slot.held = None;
         slot.queued = None;
+        slot.oldest = None;
+        slot.dirty_bytes = 0;
+        slot.enqueued = false;
+        if let Some(timer) = slot.timer.take() {
+            timer.abort();
+        }
         slot.lost = true;
         if let Some(owed) = slot.owed.take() {
             owed.send(None);
@@ -632,17 +719,14 @@ impl Pipeline {
         // a new full snapshot rather than revive that obsolete replay payload.
         pending.forget();
         pending.control().resume();
-        let queue = pending.put_with_feed(graph, held, self.post_probes.verdicts.get(&job_id));
+        pending.put_with_feed(graph, held, self.post_probes.verdicts.get(&job_id));
         let stamp = pending.stamp();
         graph.recorded(stamp);
         if pending
-            .await_commit(stamp, job_id.0, &self.graph_runs.written())
+            .await_commit(stamp, job_id.0, &self.graph_runs.written(), &self.db)
             .is_none()
         {
             graph.owe_mail(stamp);
-        }
-        if queue {
-            self.queue_graph_checkpoint(job_id, pending);
         }
     }
 
@@ -713,37 +797,87 @@ impl Pipeline {
             if pending.control().cancelled() {
                 return;
             }
-            let mut queue =
-                pending.put_with_feed(graph, held, self.post_probes.verdicts.get(&job_id));
+            pending.put_with_feed(graph, held, self.post_probes.verdicts.get(&job_id));
             graph.recorded(pending.stamp());
             let mut moved = false;
             if graph.awaits_commit() {
-                match pending.await_commit(graph.awaited(), job_id.0, &mail) {
+                match pending.await_commit(graph.awaited(), job_id.0, &mail, &self.db) {
                     Some(committed) => match graph.committed(committed) {
                         Ok(left) => moved = left,
                         // A file that could not move fails the job, as it
                         // does when the run mail says the commit.
                         Err(error) => return self.after_graph_result(job_id, Err(error.into())),
                     },
-                    None => queue |= graph.owe_mail(graph.awaited()),
+                    None => {
+                        graph.owe_mail(graph.awaited());
+                    }
                 }
             }
-            if queue {
-                self.queue_graph_checkpoint(job_id, pending);
-            }
+            pending.queue(&self.db, job_id, &mail, false);
             if !moved {
                 return;
             }
         }
     }
 
+    pub(in crate::pipeline) fn flush_graph_checkpoint(&self, job_id: JobId) {
+        if let Some(graph) = self.graph_jobs.get(&job_id) {
+            graph
+                .pending()
+                .queue(&self.db, job_id, &self.graph_runs.written(), true);
+        }
+    }
+}
+
+impl Pending {
     // Queue the write that takes the job's waiting change, if any, and says
     // what it committed. A write dropped before it runs has failed.
-    fn queue_graph_checkpoint(&self, job_id: JobId, pending: Pending) {
+    fn queue(
+        &self,
+        db: &crate::Database,
+        job_id: JobId,
+        mail: &UnboundedSender<Said>,
+        force: bool,
+    ) {
+        let _dispatch = self
+            .0
+            .dispatch
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut slot = self.slot();
+        let Some(oldest) = slot.oldest else {
+            return;
+        };
+        if slot.enqueued || slot.control.cancelled() {
+            return;
+        }
+        let due = force
+            || slot.dirty_bytes >= CHECKPOINT_BYTES
+            || oldest.elapsed() >= CHECKPOINT_AGE
+            || slot
+                .queued
+                .as_ref()
+                .is_some_and(|delta| delta.feed_verdict.is_some());
+        if !due {
+            if slot.timer.is_none() {
+                let pending = Arc::downgrade(&self.0);
+                let db = db.clone();
+                let mail = mail.clone();
+                slot.timer = Some(tokio::spawn(async move {
+                    tokio::time::sleep_until(oldest + CHECKPOINT_AGE).await;
+                    if let Some(pending) = pending.upgrade() {
+                        Pending(pending).queue(&db, job_id, &mail, false);
+                    }
+                }));
+            }
+            return;
+        }
+        slot.enqueued = true;
+        drop(slot);
+        let pending = self.clone();
         let unwritten = Unwritten(Some(pending.clone()));
-        let mail = self.graph_runs.written();
         let blocked_mail = mail.clone();
-        let queued = self.db.try_queue_graph_checkpoint(job_id, move || {
+        let queued = db.try_queue_graph_checkpoint(job_id, move || {
             let mut unwritten = unwritten;
             let writer = unwritten
                 .0

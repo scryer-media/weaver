@@ -321,18 +321,90 @@ fn a_repair_behind_what_the_run_read_stops_its_reads() {
 }
 
 #[test]
+fn releasing_envelope_handles_stops_old_readers_without_changing_bytes_or_facts() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut envelopes, shelf) = shelved(dir.path());
+    envelopes
+        .keep(NODE, 0, 0, b"front", Provenance::Fresh)
+        .unwrap();
+    close(&shelf, 0, 8, false);
+    let files = envelopes.open_files();
+    assert_eq!(files.len(), 1);
+    let superseded = reader(&shelf);
+    assert_eq!(read(&superseded, 0, 5).unwrap(), b"front");
+    shelf.restart();
+    let volumes = reader(&shelf);
+    assert_eq!(read(&volumes, 0, 5).unwrap(), b"front");
+    assert_eq!(superseded.open_files(), 1);
+    assert_eq!(volumes.open_files(), 1);
+    // Whether the thread has entered its wait yet or not, the handoff
+    // invalidates this generation and it must never reopen the file.
+    let waiting_volumes = Arc::clone(&volumes);
+    let waiting = std::thread::spawn(move || read(&waiting_volumes, 5, 3));
+    envelopes.release_handles();
+    assert!(envelopes.open_files().is_empty());
+    assert_eq!(superseded.open_files(), 0);
+    assert_eq!(volumes.open_files(), 0);
+    assert_eq!(
+        read(&volumes, 0, 5).unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert_eq!(volumes.open_files(), 0);
+    assert_eq!(
+        waiting.join().unwrap().unwrap_err().kind(),
+        std::io::ErrorKind::BrokenPipe
+    );
+    assert_eq!(std::fs::read(&files[0]).unwrap(), b"front");
+    let state = shelf.lock();
+    let kept = &state.kept[&0];
+    assert_eq!(kept.closed, Some(8));
+    assert_eq!(kept.coverage.bytes_covered(), 5);
+}
+
+#[test]
 fn forgetting_the_node_stops_a_waiting_read() {
     let dir = tempfile::tempdir().unwrap();
     let (mut envelopes, shelf) = shelved(dir.path());
     envelopes.keep(NODE, 0, 0, b"0", Provenance::Fresh).unwrap();
     let volumes = reader(&shelf);
-    let read = std::thread::spawn(move || read(&volumes, 0, 4));
+    assert_eq!(read(&volumes, 0, 1).unwrap(), b"0");
+    assert_eq!(volumes.open_files(), 1);
+    let waiting_volumes = Arc::clone(&volumes);
+    let read = std::thread::spawn(move || read(&waiting_volumes, 0, 4));
     let files = envelopes.forget(NODE);
+    assert_eq!(volumes.open_files(), 0);
     let error = read.join().unwrap().unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
     // The file stays for its owner to remove once no checkpoint names it.
     assert_eq!(files.len(), 1);
     assert!(files[0].path().exists());
+}
+
+#[test]
+fn dropping_storage_releases_handles_even_when_a_reader_keeps_the_shelf_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut envelopes, shelf) = shelved(dir.path());
+    envelopes
+        .keep(NODE, 0, 0, b"held", Provenance::Fresh)
+        .unwrap();
+    let volumes = reader(&shelf);
+    assert_eq!(read(&volumes, 0, 4).unwrap(), b"held");
+    assert_eq!(volumes.open_files(), 1);
+    let files = envelopes.open_files();
+    drop(envelopes);
+    assert_eq!(volumes.open_files(), 0);
+    assert_eq!(
+        read(&volumes, 0, 4).unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    // On NFS an unlinked open handle would leave a silly-rename entry.
+    std::fs::remove_file(&files[0]).unwrap();
+    assert_eq!(
+        std::fs::read_dir(files[0].parent().unwrap())
+            .unwrap()
+            .count(),
+        0
+    );
 }
 
 // A run that says nothing and returns.
