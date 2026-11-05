@@ -258,8 +258,11 @@ func requireFeedVerdictAbsence(proof checkpointEvidence, verdict restartFeedVerd
 		if row.FileIndex != index {
 			continue
 		}
-		if row.Length == nil || *row.Length != length || !row.Coverage.Covers(0, length) {
-			return fmt.Errorf("abandoned file does not cover its encoded lost bounds")
+		// The verdict refuses future dispatch, including work still in flight
+		// when it commits. Those articles may still be Waiting at the crash;
+		// full lost coverage is only known once they have all settled.
+		if row.Length != nil && *row.Length != length {
+			return fmt.Errorf("abandoned file has unexpected encoded lost bounds")
 		}
 		for _, run := range row.Coverage.Runs {
 			if run.Provenance != "lost" || run.End <= run.Start || run.End > length {

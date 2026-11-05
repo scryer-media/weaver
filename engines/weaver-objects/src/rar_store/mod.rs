@@ -22,7 +22,7 @@ mod record;
 mod walk;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, btree_map};
 use std::ops::Bound;

@@ -189,7 +189,11 @@ fn copy_cleanup_does_not_remove_replaced_parent_destination() {
         .unwrap();
     std::fs::write(&dst, b"copied payload").unwrap();
 
+    // Windows cannot rename a directory containing an open file. Reopen
+    // the original file after moving it to preserve the identity mismatch.
+    drop(created);
     std::fs::rename(&parent, &replaced_parent).unwrap();
+    let created = std::fs::File::open(replaced_parent.join("payload.bin")).unwrap();
     std::fs::create_dir(&parent).unwrap();
     std::fs::write(&dst, b"new occupant").unwrap();
 
