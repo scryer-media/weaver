@@ -912,8 +912,8 @@ fn a_member_closes_exactly_when_covered_at_its_length() {
         std::fs::metadata(job.dir.path().join("video.mkv"))
             .unwrap()
             .len(),
-        9,
-        "a known length is reserved on the first write"
+        3,
+        "unwritten declared bytes must not allocate space on a non-sparse mount"
     );
     job.send(member, 6, b"end", Provenance::Fresh);
     assert!(job.is_open(NodeId::ROOT, member));
@@ -1346,7 +1346,7 @@ fn a_committed_leaf_move_rejects_an_unowned_destination() {
 fn an_exclusive_leaf_move_preserves_case_only_renaming() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("BEACON.BIN"), b"owned").unwrap();
-    let mut leaf = Leaf::at(directory.path(), "BEACON.BIN");
+    let mut leaf = Leaf::found(directory.path(), "BEACON.BIN").unwrap();
     // The name ledger intentionally keeps an already-equivalent spelling.
     // Exercise the filesystem operation with an actual leaf move intent.
     leaf.intend("beacon.bin");
@@ -1378,7 +1378,7 @@ fn a_file_waits_off_a_name_another_file_still_sits_at() {
     let (first, second) = (MemberId(1), MemberId(2));
     for (member, name, bytes) in [(first, "x.bin", b"alpha"), (second, "y.bin", b"bravo")] {
         std::fs::write(job.dir.path().join(name), bytes).expect("file");
-        let leaf = Leaf::at(job.dir.path(), name);
+        let leaf = Leaf::found(job.dir.path(), name).unwrap();
         job.writer
             .files_mut(NodeId::ROOT)
             .leaves
@@ -1404,6 +1404,31 @@ fn a_file_waits_off_a_name_another_file_still_sits_at() {
     assert_eq!(job.file("y.bin"), b"alpha");
     assert_eq!(job.file("z.bin"), b"bravo");
     assert!(!job.dir.path().join("x.bin").exists());
+}
+
+#[test]
+fn delivery_releases_partial_and_retired_files_without_changing_their_bytes() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("partial.bin", Some(10));
+    job.send(member, 0, b"front", Provenance::Fresh);
+    let mut retired = Leaf::at(job.dir.path(), "retired.bin");
+    retired.write(0, b"old", None).unwrap();
+    job.writer.discard(retired).unwrap();
+    let mut scratch = Leaf::at(job.dir.path(), ".weaver-chunks/scratch");
+    scratch.write(0, b"held", None).unwrap();
+    job.writer.files_mut(NodeId::ROOT).scratch = Some(scratch);
+    assert_eq!(job.writer.open_files().len(), 3);
+    let partial = job.file("partial.bin");
+    job.writer.release_handles();
+    assert!(job.writer.open_files().is_empty());
+    assert_eq!(job.file("partial.bin"), partial);
+    assert_eq!(job.file("retired.bin"), b"old");
+    assert_eq!(job.file(".weaver-chunks/scratch"), b"held");
+    assert_eq!(job.root().get(member).unwrap().coverage.bytes_covered(), 5);
+    // Releasing the handle does not bypass the checkpoint that owns removal.
+    job.commit();
+    assert!(!job.dir.path().join("retired.bin").exists());
+    assert_eq!(job.file("partial.bin"), partial);
 }
 
 // Whether the member's file waits under the internal directory.
@@ -1471,7 +1496,7 @@ fn a_left_name_and_the_names_under_it_stay_shut_until_recorded() {
     job.writer
         .files_mut(NodeId::ROOT)
         .leaves
-        .insert(first, Leaf::at(job.dir.path(), "box"));
+        .insert(first, Leaf::found(job.dir.path(), "box").unwrap());
     job.writer.intend(NodeId::ROOT, first, "crate.bin");
     job.writer.recorded(1);
     assert!(job.writer.commit_moves(&mut job.tree, 1).expect("commit"));

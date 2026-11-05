@@ -315,6 +315,43 @@ impl NamespaceWriter {
         self.read_backs
     }
 
+    // Completion takes over the filesystem only after all storage owners
+    // give up their handles, including consumed volumes and partial files.
+    // Coverage and names stay available for the terminal report.
+    pub(crate) fn release_handles(&mut self) {
+        self.envelopes.release_handles();
+        let nodes: Vec<_> = self.files.keys().copied().collect();
+        for node in nodes {
+            let files = self.files.get_mut(&node).expect("listed namespace");
+            if let Some(scratch) = &mut files.scratch {
+                scratch.release_handle();
+            }
+            let members: Vec<_> = files.leaves.keys().copied().collect();
+            for member in members {
+                files
+                    .leaves
+                    .get_mut(&member)
+                    .expect("listed member")
+                    .release_handle();
+            }
+        }
+        for (leaf, _) in &mut self.leaving {
+            leaf.release_handle();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_files(&self) -> Vec<PathBuf> {
+        self.files
+            .values()
+            .flat_map(|files| files.leaves.values().chain(files.scratch.iter()))
+            .chain(self.leaving.iter().map(|(leaf, _)| leaf))
+            .filter(|leaf| leaf.is_open())
+            .map(|leaf| leaf.path().to_path_buf())
+            .chain(self.envelopes.open_files())
+            .collect()
+    }
+
     // Every member of the namespace with a file of its own, and its path.
     pub(crate) fn files(&self, node: NodeId) -> impl Iterator<Item = (MemberId, &Path)> + '_ {
         self.files

@@ -110,12 +110,23 @@ fn exclusive_rename_native(src: &std::ffi::CStr, dst: &std::ffi::CStr) -> io::Re
 // A mount that cannot refuse an existing target in the rename itself (NFS,
 // CIFS, 9p, virtiofs, FUSE without the flag) answers the flag with one of
 // these, as systemd's rename_noreplace() reads them (src/basic/fs-util.c).
-// The move then takes the next rung down, as systemd's does: link(2) and
-// unlink(2), exclusive on every mount with hard links; where links are
-// refused too, a check of the target and then rename(2). Every rung refuses
-// a target that exists, unless it is the source's own inode.
+// Files fall back to link/unlink, then an exclusively created copy when
+// links are unavailable. A check followed by plain rename could overwrite
+// a file created between the two. Directories retain their inode for the
+// working-directory ownership journal; plain rename cannot replace a file
+// or a nonempty directory with a directory.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn rename_exclusive_with(src: &Path, dst: &Path, exclusive: ExclusiveRename) -> io::Result<()> {
+    rename_exclusive_with_link(src, dst, exclusive, |src, dst| std::fs::hard_link(src, dst))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn rename_exclusive_with_link(
+    src: &Path,
+    dst: &Path,
+    exclusive: ExclusiveRename,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let path = |path: &Path| {
         std::ffi::CString::new(path.as_os_str().as_bytes())
@@ -126,7 +137,7 @@ fn rename_exclusive_with(src: &Path, dst: &Path, exclusive: ExclusiveRename) -> 
         moved => return moved,
     }
     // A directory has no hard links: link(2) answers it EPERM.
-    match std::fs::hard_link(src, dst) {
+    match link(src, dst) {
         Ok(()) => {
             return std::fs::remove_file(src).inspect_err(|_| {
                 let _ = std::fs::remove_file(dst);
@@ -137,6 +148,19 @@ fn rename_exclusive_with(src: &Path, dst: &Path, exclusive: ExclusiveRename) -> 
         }
         Err(error) if refused(&error, &[libc::EPERM, libc::EXDEV]) => {}
         Err(error) => return Err(error),
+    }
+    let source = std::fs::symlink_metadata(src)?;
+    if source.is_file() {
+        return copy_file_no_overwrite_then_remove_source(src, dst);
+    }
+    if source.file_type().is_symlink() {
+        return move_symlink_no_overwrite(src, dst);
+    }
+    if !source.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported move source",
+        ));
     }
     match std::fs::symlink_metadata(dst) {
         Ok(_) => finish_or_refuse(src, dst),
@@ -152,7 +176,39 @@ fn rename_exclusive_with(src: &Path, dst: &Path, exclusive: ExclusiveRename) -> 
 fn finish_or_refuse(src: &Path, dst: &Path) -> io::Result<()> {
     let source = std::fs::symlink_metadata(src)?;
     let target = std::fs::symlink_metadata(dst)?;
-    if !source.is_dir() && (source.dev(), source.ino()) == (target.dev(), target.ino()) {
+    if !source.is_dir()
+        && source.ino() != 0
+        && (source.dev(), source.ino()) == (target.dev(), target.ino())
+    {
+        let src_parent = src.parent().unwrap_or_else(|| Path::new("."));
+        let dst_parent = dst.parent().unwrap_or_else(|| Path::new("."));
+        let from = std::fs::metadata(src_parent)?;
+        let to = std::fs::metadata(dst_parent)?;
+        if (from.dev(), from.ino()) == (to.dev(), to.ino()) {
+            if src.file_name() == dst.file_name() {
+                return Ok(());
+            }
+            // Case-folding and Unicode-normalizing mounts can resolve two
+            // spellings to one entry. Only unlink a proven second link.
+            let mut links = 0;
+            let mut source_named = false;
+            let mut target_named = false;
+            for entry in std::fs::read_dir(src_parent)? {
+                let entry = entry?;
+                let metadata = std::fs::symlink_metadata(entry.path())?;
+                if (metadata.dev(), metadata.ino()) == (source.dev(), source.ino()) {
+                    links += 1;
+                    source_named |= Some(entry.file_name().as_os_str()) == src.file_name();
+                    target_named |= Some(entry.file_name().as_os_str()) == dst.file_name();
+                }
+            }
+            if links == 1 {
+                return Ok(());
+            }
+            if !source_named || !target_named {
+                return Err(io::Error::from_raw_os_error(libc::EEXIST));
+            }
+        }
         return std::fs::remove_file(src);
     }
     Err(io::Error::from_raw_os_error(libc::EEXIST))
@@ -219,15 +275,7 @@ pub(crate) fn rename_no_overwrite(src: &Path, dst: &Path) -> io::Result<()> {
 
 fn copy_file_no_overwrite_then_remove_source(src: &Path, dst: &Path) -> io::Result<()> {
     let parent_fingerprint = prepare_destination_parent(dst)?;
-    match file_cache::copy_large_file(src, dst) {
-        Ok(_) => {}
-        Err(error) => {
-            if error.kind() != io::ErrorKind::AlreadyExists {
-                cleanup_copy_destination_if_parent_matches(dst, &parent_fingerprint);
-            }
-            return Err(error);
-        }
-    }
+    file_cache::copy_large_file(src, dst)?;
     if !destination_parent_matches(dst, &parent_fingerprint)? {
         return Err(io::Error::other(format!(
             "destination parent changed during copy: {}",
@@ -235,15 +283,6 @@ fn copy_file_no_overwrite_then_remove_source(src: &Path, dst: &Path) -> io::Resu
         )));
     }
     std::fs::remove_file(src)
-}
-
-fn cleanup_copy_destination_if_parent_matches(
-    dst: &Path,
-    parent_fingerprint: &DirectoryFingerprint,
-) {
-    if destination_parent_matches(dst, parent_fingerprint).unwrap_or(false) {
-        let _ = std::fs::remove_file(dst);
-    }
 }
 
 fn move_symlink_no_overwrite(src: &Path, dst: &Path) -> io::Result<()> {
@@ -476,7 +515,7 @@ fn normalize_extracted_tree_unix(path: &Path, recursive: bool) -> io::Result<()>
                 if error.kind() == io::ErrorKind::NotFound {
                     return Ok(());
                 }
-                return Err(error);
+                apply_metadata_change(path, "ownership", Err(error))?;
             }
         }
 
@@ -491,7 +530,7 @@ fn normalize_extracted_tree_unix(path: &Path, recursive: bool) -> io::Result<()>
             if error.kind() == io::ErrorKind::NotFound {
                 return Ok(());
             }
-            return Err(error);
+            apply_metadata_change(path, "mode", Err(error))?;
         }
 
         if recursive && metadata.is_dir() {
@@ -522,6 +561,44 @@ fn normalize_extracted_tree_unix(path: &Path, recursive: bool) -> io::Result<()>
     )
 }
 
+// Remote and non-POSIX mounts may fix ownership and modes by mount policy.
+// Those optional attributes must not turn successfully written data into a
+// failed delivery. Other errors still fail, including missing files and I/O.
+pub(super) fn apply_metadata_change(
+    path: &Path,
+    operation: &str,
+    result: io::Result<()>,
+) -> io::Result<()> {
+    match result {
+        Err(error) if metadata_is_mount_managed(&error) => {
+            tracing::warn!(path = %path.display(), operation, %error, "filesystem retains its own file metadata");
+            Ok(())
+        }
+        result => result,
+    }
+}
+
+fn metadata_is_mount_managed(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::Unsupported | io::ErrorKind::PermissionDenied
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if error.raw_os_error().is_some_and(|code| {
+        [libc::ENOSYS, libc::ENOTSUP, libc::EOPNOTSUPP, libc::EROFS].contains(&code)
+    }) {
+        return true;
+    }
+    #[cfg(windows)]
+    if matches!(error.raw_os_error(), Some(1 | 50)) {
+        // ERROR_INVALID_FUNCTION / ERROR_NOT_SUPPORTED.
+        return true;
+    }
+    false
+}
+
 #[cfg(unix)]
 fn current_umask() -> u32 {
     static UMASK: OnceLock<u32> = OnceLock::new();
@@ -537,6 +614,79 @@ fn current_umask() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_mount_without_exclusive_rename_or_links_copies_without_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.bin");
+        let dst = dir.path().join("destination.bin");
+        std::fs::write(&src, b"source").unwrap();
+        let no_links = |_: &Path, _: &Path| Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        rename_exclusive_with_link(&src, &dst, refuse::<{ libc::EINVAL }>, no_links).unwrap();
+        assert_eq!(std::fs::read(&dst).unwrap(), b"source");
+        assert!(!src.exists());
+
+        std::fs::write(&src, b"second").unwrap();
+        let error = rename_exclusive_with_link(&src, &dst, refuse::<{ libc::EINVAL }>, no_links)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&src).unwrap(), b"second");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"source");
+    }
+
+    #[test]
+    fn a_copy_that_cannot_open_its_source_never_cleans_an_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("missing.bin");
+        let dst = dir.path().join("destination.bin");
+        std::fs::write(&dst, b"another owner").unwrap();
+        assert!(copy_file_no_overwrite_then_remove_source(&src, &dst).is_err());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"another owner");
+    }
+
+    #[test]
+    fn metadata_fallback_accepts_mount_policy_but_not_data_errors() {
+        let path = Path::new("payload.bin");
+        for kind in [io::ErrorKind::Unsupported, io::ErrorKind::PermissionDenied] {
+            apply_metadata_change(path, "mode", Err(io::Error::from(kind))).unwrap();
+        }
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::StorageFull,
+            io::ErrorKind::InvalidData,
+        ] {
+            let error =
+                apply_metadata_change(path, "mode", Err(io::Error::from(kind))).unwrap_err();
+            assert_eq!(error.kind(), kind);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_mount_metadata_refusals_do_not_turn_delivery_into_failure() {
+        for errno in [
+            libc::EPERM,
+            libc::EACCES,
+            libc::EOPNOTSUPP,
+            libc::ENOSYS,
+            libc::EROFS,
+        ] {
+            apply_metadata_change(
+                Path::new("payload.bin"),
+                "ownership",
+                Err(io::Error::from_raw_os_error(errno)),
+            )
+            .unwrap();
+        }
+        let error = apply_metadata_change(
+            Path::new("payload.bin"),
+            "ownership",
+            Err(io::Error::from_raw_os_error(libc::EIO)),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
 
     #[test]
     fn path_equivalence_matches_platform_case_rules() {
@@ -703,6 +853,22 @@ mod tests {
         rename_exclusive_with(&src, &dst, refuse::<{ libc::EINVAL }>).unwrap();
 
         assert!(!src.exists());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"source");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_fallback_move_through_an_alias_never_unlinks_its_only_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        std::fs::create_dir(&parent).unwrap();
+        let src = temp.path().join("source.bin");
+        let dst = parent.join("../source.bin");
+        std::fs::write(&src, b"source").unwrap();
+
+        rename_exclusive_with(&src, &dst, refuse::<{ libc::EINVAL }>).unwrap();
+
+        assert_eq!(std::fs::read(&src).unwrap(), b"source");
         assert_eq!(std::fs::read(&dst).unwrap(), b"source");
     }
 

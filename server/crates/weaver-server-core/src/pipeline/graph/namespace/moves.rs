@@ -51,16 +51,18 @@ pub(crate) fn restored_at<'a>(
     working_dir: &Path,
     output_name: &'a str,
     on_disk: Option<&'a str>,
-) -> &'a str {
-    match on_disk {
-        Some(sat)
-            if Leaf::path_at(working_dir, sat).exists()
-                || !Leaf::path_at(working_dir, output_name).exists() =>
-        {
-            sat
-        }
-        _ => output_name,
+) -> Result<&'a str, super::super::leaf::LeafError> {
+    let exists = |name: &str| {
+        let path = Leaf::path_at(working_dir, name);
+        path.try_exists()
+            .map_err(|source| super::super::leaf::LeafError::Io { path, source })
+    };
+    if let Some(sat) = on_disk
+        && (exists(sat)? || !exists(output_name)?)
+    {
+        return Ok(sat);
     }
+    Ok(output_name)
 }
 
 // How many files opened under a waiting name, and how many files moved on
@@ -355,15 +357,15 @@ impl NamespaceWriter {
         member: MemberId,
         output_name: &str,
         on_disk: Option<&str>,
-    ) -> Leaf {
-        let at = restored_at(&self.working_dir, output_name, on_disk);
-        let mut leaf = Leaf::found(&self.working_dir, at);
+    ) -> Result<Leaf, WriteError> {
+        let at = restored_at(&self.working_dir, output_name, on_disk)?;
+        let mut leaf = Leaf::found(&self.working_dir, at)?;
         let Some(sat) = on_disk else {
-            return leaf;
+            return Ok(leaf);
         };
         if at != sat {
             self.left.insert(key(sat), None);
-            return leaf;
+            return Ok(leaf);
         }
         leaf.intend(output_name);
         self.moves.push(Waiting {
@@ -371,7 +373,7 @@ impl NamespaceWriter {
             member,
             stamp: Some(0),
         });
-        leaf
+        Ok(leaf)
     }
 
     // Whether a file may enter `name`: no other member's file sits there or

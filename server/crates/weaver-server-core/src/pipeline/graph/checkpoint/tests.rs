@@ -425,7 +425,8 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
             article: None,
         });
     let restored = snapshot(&rows).unwrap();
-    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts);
+    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts)
+        .unwrap();
     fn files(root: &std::path::Path, at: &std::path::Path, into: &mut Vec<String>) {
         for entry in std::fs::read_dir(root.join(at)).unwrap() {
             let entry = entry.unwrap();
@@ -458,7 +459,8 @@ fn a_restore_sweeps_inside_a_directory_its_checkpoint_names() {
     std::fs::write(dir.path().join("folder/deeper/late.bin"), b"bytes").unwrap();
     let rows = rows(&taken);
     let restored = snapshot(&rows).unwrap();
-    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts);
+    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts)
+        .unwrap();
     assert!(dir.path().join("folder").is_dir());
     assert!(!dir.path().join("folder/obsolete.txt").exists());
     assert!(!dir.path().join("folder/deeper").exists());
@@ -491,7 +493,8 @@ fn a_restore_keeps_a_named_file_whose_directory_differs_in_case() {
     );
     let rows = rows(&taken);
     let restored = snapshot(&rows).unwrap();
-    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts);
+    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts)
+        .unwrap();
     assert!(dir.path().join("Folder").is_dir());
     assert!(
         dir.path().join("Folder/b.bin").exists(),
@@ -517,10 +520,12 @@ fn a_restore_keeps_a_file_that_moved_before_its_checkpoint_said_so() {
             dir.path(),
             "set.par2",
             Some(waiting.as_str())
-        ),
+        )
+        .unwrap(),
         "set.par2"
     );
-    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts);
+    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts)
+        .unwrap();
     assert!(dir.path().join("set.par2").exists());
     assert!(!dir.path().join(&waiting).exists());
 
@@ -531,8 +536,40 @@ fn a_restore_keeps_a_file_that_moved_before_its_checkpoint_said_so() {
             dir.path(),
             "set.par2",
             Some(waiting.as_str())
-        ),
+        )
+        .unwrap(),
         waiting
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_restore_inspection_error_stops_cleanup_before_any_file_is_removed() {
+    use weaver_graph::names::INTERNAL_DIR;
+    let dir = tempfile::tempdir().unwrap();
+    let taken = full();
+    std::os::unix::fs::symlink(INTERNAL_DIR, dir.path().join(INTERNAL_DIR)).unwrap();
+    std::fs::write(dir.path().join("set.par2"), b"destination").unwrap();
+    std::fs::write(
+        dir.path().join("unclaimed.bin"),
+        b"preserve until inspected",
+    )
+    .unwrap();
+
+    assert!(crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &taken, &[]).is_err());
+    assert_eq!(
+        std::fs::read(dir.path().join("set.par2")).unwrap(),
+        b"destination"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("unclaimed.bin")).unwrap(),
+        b"preserve until inspected"
+    );
+    assert!(
+        std::fs::symlink_metadata(dir.path().join(INTERNAL_DIR))
+            .unwrap()
+            .file_type()
+            .is_symlink()
     );
 }
 
