@@ -396,7 +396,7 @@ impl UserRx {
             flushed_packets += 1;
         }
 
-        if flushed_bytes > 0 {
+        if flushed_packets > 0 {
             let waker = self.shared.locked.lock().reader_waker.take();
             if let Some(w) = waker {
                 w.wake();

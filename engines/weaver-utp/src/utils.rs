@@ -5,8 +5,6 @@
 
 use std::task::Waker;
 
-use tokio::sync::mpsc::{UnboundedSender, WeakUnboundedSender};
-
 use crate::Error;
 
 pub fn update_optional_waker(waker: &mut Option<Waker>, cx: &std::task::Context<'_>) {
@@ -41,34 +39,6 @@ pub fn prepare_2_ioslices<'a>(
         .get(..second_len)
         .ok_or(Error::BugRequestedLengthExceedsBufferBounds)?;
     Ok([first, second])
-}
-
-pub(crate) struct DropGuardSendBeforeDeath<Msg> {
-    msg: Option<Msg>,
-    tx: WeakUnboundedSender<Msg>,
-}
-
-impl<Msg> DropGuardSendBeforeDeath<Msg> {
-    pub fn new(msg: Msg, tx: &UnboundedSender<Msg>) -> Self {
-        Self {
-            msg: Some(msg),
-            tx: tx.downgrade(),
-        }
-    }
-
-    pub fn disarm(&mut self) {
-        self.msg = None;
-    }
-}
-
-impl<Msg> Drop for DropGuardSendBeforeDeath<Msg> {
-    fn drop(&mut self) {
-        if let Some(msg) = self.msg.take()
-            && let Some(tx) = self.tx.upgrade()
-        {
-            let _ = tx.send(msg);
-        }
-    }
 }
 
 #[inline(always)]

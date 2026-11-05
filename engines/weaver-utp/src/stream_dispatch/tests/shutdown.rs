@@ -356,9 +356,34 @@ async fn test_finack_not_sent_until_all_data_consumed() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(Fin, seq_nr = 101, ack_nr = 3)],
+        vec![cmphead!(State, seq_nr = 101, ack_nr = 3)],
         "we should ACK the FIN"
     );
+    let mut received = Vec::new();
+    t.stream
+        .as_mut()
+        .unwrap()
+        .read_to_end(&mut received)
+        .await
+        .unwrap();
+    assert_eq!(received, b"aworld");
+    let (_reader, mut writer) = t.stream.take().unwrap().split();
+    let mut shutdown = Box::pin(writer.shutdown());
+    assert!(shutdown.as_mut().now_or_never().is_none());
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.take_sent(), vec![cmphead!(Fin, seq_nr = 101, ack_nr = 3)]);
+    t.send_msg(
+        UtpHeader {
+            htype: State,
+            seq_nr: 4.into(),
+            ack_nr: 101.into(),
+            wnd_size: 1024,
+            ..Default::default()
+        },
+        "",
+    );
+    t.poll_once_assert_ready().await.unwrap();
+    shutdown.await.unwrap();
 }
 
 #[tokio::test]
@@ -623,7 +648,7 @@ async fn test_fin_retransmission() {
 }
 
 #[tokio::test]
-async fn test_write_fails_after_remote_fin_received() {
+async fn test_remote_fin_keeps_writes_open_until_explicit_shutdown() {
     setup_test_logging();
     let mut t = make_test_vsock(Default::default(), false);
 
@@ -674,23 +699,23 @@ async fn test_write_fails_after_remote_fin_received() {
     );
     t.poll_once_assert_pending().await;
 
-    // We should ACK both the data and FIN as one message, and send FIN in return.
+    // Acknowledge the data and EOF while keeping our writer open.
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(Fin, seq_nr = 102, ack_nr = 2)],
-        "Should ACK both data and FIN and send FIN"
+        vec![cmphead!(State, seq_nr = 102, ack_nr = 2)],
+        "should ACK both data and FIN"
     );
 
-    // Try to write more data - should fail
-    let write_result = writer.write(b"more data").await;
-    assert!(
-        write_result.is_err(),
-        "Write should fail after receiving FIN"
-    );
-    let err = write_result.unwrap_err();
-    assert!(
-        err.to_string().contains("closed"),
-        "Error should indicate connection is closed: {err}"
+    writer.write_all(b"more data").await.unwrap();
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(
+            Data,
+            seq_nr = 102,
+            ack_nr = 2,
+            payload = "more data"
+        )]
     );
 
     trace!("reading data");
@@ -704,25 +729,44 @@ async fn test_write_fails_after_remote_fin_received() {
     let n = reader.read(&mut buf).await.unwrap();
     assert_eq!(n, 0, "Read should return EOF after FIN");
 
-    // We should wait for remote FIN
+    // Local writes remain independent of the received EOF.
     t.poll_once_assert_pending().await;
     t.assert_sent_empty();
 
-    // Remote ACKs our FIN
+    // Drain the continued write before explicitly closing our direction.
     t.send_msg(
         UtpHeader {
             htype: State,
-            seq_nr: 2.into(),
+            seq_nr: 3.into(),
             ack_nr: 102.into(),
             wnd_size: 1024,
             ..Default::default()
         },
         "",
     );
-
+    t.poll_once_assert_pending().await;
+    writer.flush().await.unwrap();
+    let mut shutdown = Box::pin(writer.shutdown());
+    assert!(shutdown.as_mut().now_or_never().is_none());
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.take_sent(), vec![cmphead!(Fin, seq_nr = 103, ack_nr = 2)]);
+    drop(shutdown);
+    let error = writer.write(b"after shutdown").await.unwrap_err();
+    assert!(error.to_string().contains("shutdown"));
+    t.send_msg(
+        UtpHeader {
+            htype: State,
+            seq_nr: 3.into(),
+            ack_nr: 103.into(),
+            wnd_size: 1024,
+            ..Default::default()
+        },
+        "",
+    );
     t.poll_once_assert_ready()
         .await
         .expect("connection should complete with Ok(())");
+    writer.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -787,13 +831,12 @@ async fn test_read_gets_eof_on_fin_real_world_packets() {
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(Fin, seq_nr = 39080, ack_nr = 43658)],
+        vec![cmphead!(State, seq_nr = 39080, ack_nr = 43658)],
         "we should ACK the FIN"
     );
     assert_eq!(
         t.vsock.state,
-        VirtualSocketState::LastAck {
-            our_fin: 39080.into(),
+        VirtualSocketState::CloseWait {
             remote_fin: 43658.into()
         }
     );
@@ -802,6 +845,21 @@ async fn test_read_gets_eof_on_fin_real_world_packets() {
         read.read(&mut [0u8; 1024]).await.unwrap(),
         0,
         "we should get EOF"
+    );
+
+    let mut shutdown = Box::pin(write.shutdown());
+    assert!(shutdown.as_mut().now_or_never().is_none());
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(Fin, seq_nr = 39080, ack_nr = 43658)]
+    );
+    assert_eq!(
+        t.vsock.state,
+        VirtualSocketState::LastAck {
+            our_fin: 39080.into(),
+            remote_fin: 43658.into(),
+        }
     );
 
     // Remote ACKs our FIN
@@ -818,6 +876,7 @@ async fn test_read_gets_eof_on_fin_real_world_packets() {
     t.poll_once_assert_ready().await.unwrap();
     t.assert_sent_empty();
     assert_eq!(t.vsock.state, VirtualSocketState::Closed);
+    shutdown.await.unwrap();
 }
 
 #[tokio::test]

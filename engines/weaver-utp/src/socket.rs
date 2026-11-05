@@ -5,12 +5,14 @@
 
 use std::{
     collections::{BTreeMap, VecDeque, btree_map::Entry},
+    future::{Future, poll_fn},
     io::IoSlice,
     net::SocketAddr,
     num::NonZeroUsize,
+    pin::Pin,
     sync::{
         Arc, Weak,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     task::Poll,
     time::Duration,
@@ -26,6 +28,12 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::{UtpStream, runtime::Runtime, spawn_utils::task_with_cancel};
+
+mod control;
+pub(crate) use control::RetirementGuard;
+use control::{ConnectAdmission, MAX_PENDING_CONNECTS, RetirementFlag, RetirementSignals};
+#[cfg(test)]
+mod control_integration_tests;
 
 #[cfg(test)]
 mod arrival_time_tests;
@@ -50,12 +58,9 @@ use crate::{
     seq_nr::SeqNr,
     stream_dispatch::{StreamArgs, UtpStreamStarter},
     traits::{Transport, UtpEnvironment},
-    utils::{DropGuardSendBeforeDeath, FnDropGuard},
+    utils::FnDropGuard,
 };
-use tokio::sync::{
-    mpsc::{self, UnboundedReceiver, UnboundedSender, unbounded_channel},
-    oneshot,
-};
+use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
 use tracing::{debug, debug_span, trace, warn};
 
 type ConnectionId = u16;
@@ -230,21 +235,18 @@ impl<V> RequestWithSpan<V> {
     }
 }
 
+#[cfg(test)]
 pub(crate) enum ControlRequest {
-    ConnectRequest(SocketAddr, ConnectToken, ConnectRequest),
-    ConnectDropped(SocketAddr, ConnectToken),
-
+    ConnectRequest(SocketAddr, u64, ConnectRequest),
     Shutdown(StreamRecvKey),
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for ControlRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ControlRequest::ConnectRequest(socket_addr, token, _) => {
                 write!(f, "ConnectRequest({socket_addr}, {token})")
-            }
-            ControlRequest::ConnectDropped(socket_addr, token) => {
-                write!(f, "ConnectDropped({socket_addr}, {token})")
             }
             ControlRequest::Shutdown(key) => {
                 write!(f, "Shutdown({key:?})")
@@ -253,14 +255,58 @@ impl std::fmt::Debug for ControlRequest {
     }
 }
 
-static NEXT_CONNECT_TOKEN: AtomicU64 = AtomicU64::new(0);
-type ConnectToken = u64;
+struct PendingConnectRequest {
+    remote: SocketAddr,
+    retired: Arc<RetirementFlag>,
+    permit: OwnedSemaphorePermit,
+    requester: ConnectRequest,
+}
+
+type ControlSend = Pin<Box<dyn Future<Output = std::io::Result<usize>> + Send + Sync>>;
+
+struct PendingSend {
+    future: Option<ControlSend>,
+    result: Option<std::io::Result<usize>>,
+}
+
+impl PendingSend {
+    fn new(future: ControlSend) -> Self {
+        Self {
+            future: Some(future),
+            result: None,
+        }
+    }
+    fn poll(&mut self, cx: &mut std::task::Context<'_>) -> bool {
+        if let Some(future) = &mut self.future {
+            match future.as_mut().poll(cx) {
+                Poll::Pending => return false,
+                Poll::Ready(result) => {
+                    self.result = Some(result);
+                    self.future.take();
+                }
+            }
+        }
+        true
+    }
+}
+
+enum SendCompletion {
+    Syn(SocketAddr, Arc<RetirementFlag>),
+    Response(usize),
+}
+
+enum SynSend {
+    Sending(PendingSend),
+    Accepted(Instant),
+}
 
 struct Connecting {
-    token: ConnectToken,
-    start: Instant,
     connection_id: SeqNr,
     seq_nr: SeqNr,
+    retired: Arc<RetirementFlag>,
+    permit: OwnedSemaphorePermit,
+    send: SynSend,
+    early_ack: Option<UtpMessage>,
     requester: ConnectRequest,
 }
 
@@ -301,10 +347,10 @@ impl ConnectingPerAddr {
         None
     }
 
-    fn pop_by_token(&mut self, token: ConnectToken) -> Option<Connecting> {
+    fn pop_by_flag(&mut self, flag: &Arc<RetirementFlag>) -> Option<Connecting> {
         for slot in self.slots.iter_mut() {
             if let Some(c) = slot
-                && c.token == token
+                && Arc::ptr_eq(&c.retired, flag)
             {
                 self.len -= 1;
                 return slot.take();
@@ -316,6 +362,12 @@ impl ConnectingPerAddr {
 
 const ACCEPT_QUEUE_MAX_ACCEPTORS: usize = 32;
 const ACCEPT_QUEUE_MAX_SYNS: usize = 32;
+const CONTROL_RESPONSES_MAX: usize = 32;
+
+pub(crate) struct RegisteredStream {
+    tx: crate::ingress::Sender,
+    retired: Arc<RetirementFlag>,
+}
 
 struct Syn {
     remote: SocketAddr,
@@ -364,13 +416,143 @@ pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
 
     accept_queue: AcceptQueue<T, E>,
 
-    pub(crate) streams: BTreeMap<StreamRecvKey, crate::ingress::Sender>,
+    pub(crate) streams: BTreeMap<StreamRecvKey, RegisteredStream>,
     connecting: BTreeMap<SocketAddr, ConnectingPerAddr>,
-    control_rx: UnboundedReceiver<ControlRequest>,
+    connect_rx: mpsc::Receiver<PendingConnectRequest>,
+    control_sends: Vec<PendingSend>,
     next_connection_id: SeqNr,
 }
 
+fn poll_control_sends(
+    connecting: &mut BTreeMap<SocketAddr, ConnectingPerAddr>,
+    responses: &mut [PendingSend],
+    cx: &mut std::task::Context<'_>,
+) -> Poll<SendCompletion> {
+    for (remote, pending) in connecting {
+        for connect in pending.slots.iter_mut().flatten() {
+            let ready = if connect.retired.is_retired() || connect.requester.tx.is_closed() {
+                true
+            } else {
+                match &mut connect.send {
+                    SynSend::Sending(send) => send.poll(cx),
+                    SynSend::Accepted(_) => false,
+                }
+            };
+            if ready {
+                return Poll::Ready(SendCompletion::Syn(*remote, Arc::clone(&connect.retired)));
+            }
+        }
+    }
+    for (index, response) in responses.iter_mut().enumerate() {
+        if response.poll(cx) {
+            return Poll::Ready(SendCompletion::Response(index));
+        }
+    }
+    Poll::Pending
+}
+
 impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
+    #[cfg(test)]
+    fn register_stream(
+        &mut self,
+        key: StreamRecvKey,
+        tx: crate::ingress::Sender,
+    ) -> Option<RegisteredStream> {
+        let (retired, mut guard) = self.socket.retirements.registration();
+        guard.disarm();
+        self.streams.insert(key, RegisteredStream { tx, retired })
+    }
+    fn finish_send(&mut self, completion: SendCompletion) -> crate::Result<()> {
+        match completion {
+            SendCompletion::Response(index) => {
+                if let Some(Err(error)) = self.control_sends.swap_remove(index).result {
+                    self.socket.stats.send_errors.increment(1);
+                    debug!(%error, "error sending ST_RESET");
+                }
+            }
+            SendCompletion::Syn(remote, flag) => {
+                let Some(mut entry) = self
+                    .connecting
+                    .get_mut(&remote)
+                    .and_then(|pending| pending.pop_by_flag(&flag))
+                else {
+                    return Ok(());
+                };
+                if self
+                    .connecting
+                    .get(&remote)
+                    .is_some_and(ConnectingPerAddr::is_empty)
+                {
+                    self.connecting.remove(&remote);
+                }
+                if entry.retired.is_retired() || entry.requester.tx.is_closed() {
+                    return Ok(());
+                }
+                let SynSend::Sending(mut send) = entry.send else {
+                    return Err(Error::BugUnreachable);
+                };
+                match send.result.take() {
+                    Some(Ok(len)) if len == UTP_HEADER as usize => {
+                        entry.send = SynSend::Accepted(self.env.now());
+                        if let Some(ack) = entry.early_ack.take() {
+                            self.promote_connect(remote, entry, ack)?;
+                        } else {
+                            assert!(self.connecting.entry(remote).or_default().insert(entry));
+                        }
+                    }
+                    result => {
+                        let error = match result {
+                            Some(Err(error)) => error,
+                            _ => std::io::Error::new(
+                                std::io::ErrorKind::WriteZero,
+                                "the SYN datagram was not fully accepted",
+                            ),
+                        };
+                        let _ = entry.requester.tx.send(Err(Error::ErrorSendingSyn(error)));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    async fn on_control(&mut self, control: ControlRequest) {
+        match control {
+            ControlRequest::Shutdown(key) => {
+                self.streams.remove(&key);
+            }
+            ControlRequest::ConnectRequest(remote, _token, requester) => {
+                let permit = self
+                    .socket
+                    .connect_admission
+                    .acquire(&self.socket.cancellation_token)
+                    .await
+                    .unwrap();
+                let (retired, mut guard) = self.socket.retirements.registration();
+                guard.disarm();
+                self.admit_connect(PendingConnectRequest {
+                    remote: canonical_socket_addr(remote),
+                    retired,
+                    permit,
+                    requester,
+                });
+                if self.connecting.values().any(|pending| {
+                    pending
+                        .slots
+                        .iter()
+                        .flatten()
+                        .any(|connect| matches!(connect.send, SynSend::Sending(_)))
+                }) {
+                    let completion = poll_fn(|cx| {
+                        poll_control_sends(&mut self.connecting, &mut self.control_sends, cx)
+                    })
+                    .await;
+                    self.finish_send(completion).unwrap();
+                }
+            }
+        }
+    }
     pub(crate) async fn run_forever(mut self) -> crate::Result<()> {
         let mut read_buf = [0u8; 16384];
         let mut completions = 0;
@@ -394,6 +576,11 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     }
 
     async fn run_once(&mut self, read_buf: &mut [u8]) -> crate::Result<()> {
+        let retirements = Arc::clone(&self.socket.retirements);
+        let retired = retirements.notifications().notified();
+        tokio::pin!(retired);
+        retired.as_mut().enable();
+        self.reap_retired();
         self.cleanup_accept_queue()?;
 
         tokio::select! {
@@ -401,9 +588,12 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 let accept = accept.unwrap();
                 self.accept_queue.next_available_acceptor = Some(accept);
             }
-            control_request = self.control_rx.recv() => {
-                let control = control_request.unwrap();
-                self.on_control(control).await;
+            request = self.connect_rx.recv() => {
+                if let Some(request) = request { self.admit_connect(request); }
+            },
+            _ = &mut retired => {},
+            completion = poll_fn(|cx| poll_control_sends(&mut self.connecting, &mut self.control_sends, cx)) => {
+                self.finish_send(completion)?;
             },
             recv = self.transport.as_deref().ok_or(Error::DispatcherDead)?.recv_from(read_buf) => {
                 let received = self.env.now();
@@ -454,84 +644,107 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         Ok(())
     }
 
-    fn get_next_free_conn_id(&mut self, addr: SocketAddr) -> SeqNr {
-        while self
-            .streams
-            .contains_key(&(addr, self.next_connection_id.0))
-        {
+    fn get_next_free_conn_id(&mut self, addr: SocketAddr) -> crate::Result<SeqNr> {
+        for _ in 0..32768 {
+            let candidate = self.next_connection_id;
             self.next_connection_id += 2;
+            if !self.key_reserved((addr, candidate.0)) {
+                return Ok(candidate);
+            }
         }
-        self.next_connection_id
+        Err(Error::ConnectionIdsExhausted)
     }
 
-    // This would only block if the socket TX is full. It will block the dispatcher but it's a resonable tradeoff.
-    async fn on_control(&mut self, msg: ControlRequest) {
-        match msg {
-            ControlRequest::ConnectRequest(addr, token, sender) => {
-                let conn_id = self.get_next_free_conn_id(addr);
-                let header = UtpHeader {
-                    htype: Type::Syn,
-                    connection_id: conn_id,
-                    timestamp_microseconds: (self.env.now() - self.socket.created).as_micros()
-                        as u32,
-                    timestamp_difference_microseconds: 0,
-                    wnd_size: 0,
-                    seq_nr: self.env.random_u16().into(),
-                    ack_nr: 0.into(),
-                    extensions: Default::default(),
-                };
-                let mut buf = [0u8; UTP_HEADER as usize];
-                header.serialize(&mut buf).unwrap();
-                let Some(transport) = self.transport.as_deref() else {
-                    let _ = sender.tx.send(Err(Error::DispatcherDead));
-                    return;
-                };
-                match transport.send_to(&buf, addr).await {
-                    Ok(len) if len == buf.len() => {}
-                    Ok(len) => {
-                        // Never seen this happen yet, so can be warn.
-                        warn!(
-                            len,
-                            expected_len = buf.len(),
-                            ?addr,
-                            "did not send full length, dropping"
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        let _ = sender.tx.send(Err(Error::ErrorSendingSyn(e)));
-                        return;
-                    }
-                }
-                let c = Connecting {
-                    token,
-                    connection_id: header.connection_id,
-                    seq_nr: header.seq_nr,
-                    requester: sender,
-                    start: self.env.now(),
-                };
-                if self.connecting.entry(addr).or_default().insert(c) {
-                    self.next_connection_id += 2;
-                } else {
-                    // This is super rare, can be warn.
-                    warn!("too many concurrent connectins to {addr}");
-                }
-            }
-            ControlRequest::ConnectDropped(addr, token) => {
-                match self.connecting.entry(addr) {
-                    Entry::Occupied(mut occ) => {
-                        if occ.get_mut().pop_by_token(token).is_some() && occ.get().is_empty() {
-                            occ.remove();
-                        }
-                    }
-                    Entry::Vacant(_) => {}
-                };
-            }
-            ControlRequest::Shutdown(key) => {
-                trace!(?key, "removing stream");
-                self.streams.remove(&key);
-            }
+    fn key_reserved(&self, key: StreamRecvKey) -> bool {
+        self.streams.contains_key(&key)
+            || self.connecting.get(&key.0).is_some_and(|pending| {
+                pending
+                    .slots
+                    .iter()
+                    .flatten()
+                    .any(|connect| connect.connection_id.0 == key.1)
+            })
+            || self
+                .accept_queue
+                .syns
+                .iter()
+                .any(|syn| syn.remote == key.0 && (syn.header.connection_id + 1).0 == key.1)
+    }
+
+    fn reap_retired(&mut self) {
+        if self.socket.retirements.take_dirty() {
+            self.streams
+                .retain(|_, stream| !stream.retired.is_retired());
         }
+        self.connecting.retain(|_, pending| {
+            for slot in &mut pending.slots {
+                if slot.as_ref().is_some_and(|connect| {
+                    connect.retired.is_retired() || connect.requester.tx.is_closed()
+                }) {
+                    slot.take();
+                    pending.len -= 1;
+                }
+            }
+            !pending.is_empty()
+        });
+    }
+
+    fn admit_connect(&mut self, request: PendingConnectRequest) {
+        self.reap_retired();
+        let PendingConnectRequest {
+            remote: addr,
+            retired,
+            permit,
+            requester: sender,
+        } = request;
+        if retired.is_retired()
+            || sender.tx.is_closed()
+            || self.socket.cancellation_token.is_cancelled()
+        {
+            return;
+        }
+        if self
+            .connecting
+            .get(&addr)
+            .is_some_and(|pending| pending.len == MAX_CONNECTING_PER_ADDR)
+        {
+            let _ = sender.tx.send(Err(Error::TooManyPendingConnections));
+            return;
+        }
+        let conn_id = match self.get_next_free_conn_id(addr) {
+            Ok(id) => id,
+            Err(error) => {
+                let _ = sender.tx.send(Err(error));
+                return;
+            }
+        };
+        let header = UtpHeader {
+            htype: Type::Syn,
+            connection_id: conn_id,
+            timestamp_microseconds: (self.env.now() - self.socket.created).as_micros() as u32,
+            timestamp_difference_microseconds: 0,
+            wnd_size: 0,
+            seq_nr: self.env.random_u16().into(),
+            ack_nr: 0.into(),
+            extensions: Default::default(),
+        };
+        let mut buf = [0u8; UTP_HEADER as usize];
+        header.serialize(&mut buf).unwrap();
+        let Some(transport) = self.transport.clone() else {
+            let _ = sender.tx.send(Err(Error::DispatcherDead));
+            return;
+        };
+        let send = Box::pin(async move { transport.send_to(&buf, addr).await });
+        let c = Connecting {
+            connection_id: header.connection_id,
+            seq_nr: header.seq_nr,
+            requester: sender,
+            retired,
+            permit,
+            send: SynSend::Sending(PendingSend::new(send)),
+            early_ack: None,
+        };
+        assert!(self.connecting.entry(addr).or_default().insert(c));
     }
 
     fn on_maybe_connect_ack(&mut self, addr: SocketAddr, msg: UtpMessage) -> crate::Result<()> {
@@ -546,6 +759,15 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             }
         };
 
+        if let Some(connect) = occ.get_mut().slots.iter_mut().flatten().find(|connect| {
+            connect.connection_id == msg.header.connection_id && connect.seq_nr == msg.header.ack_nr
+        }) && matches!(connect.send, SynSend::Sending(_))
+        {
+            if connect.early_ack.is_none() {
+                connect.early_ack = Some(msg);
+            }
+            return Ok(());
+        }
         let conn = if let Some(conn) = occ
             .get_mut()
             .pop(msg.header.connection_id, msg.header.ack_nr)
@@ -563,16 +785,33 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             return Ok(());
         };
 
-        let (tx, rx) = crate::ingress::channel(self.socket.opts.vsock_rx_bufsize);
-        let args = StreamArgs::new_outgoing(&msg.header, conn.start, msg.received)
-            .with_parent_span(conn.requester.created_span.clone());
+        self.promote_connect(addr, conn, msg)
+    }
 
-        let recv_key = (addr, msg.header.connection_id.0);
-        if self.streams.insert(recv_key, tx).is_some() {
-            warn!(key=?recv_key, "bug: a stream already existed with key. It should have been checked beforehand.");
+    fn promote_connect(
+        &mut self,
+        addr: SocketAddr,
+        conn: Connecting,
+        msg: UtpMessage,
+    ) -> crate::Result<()> {
+        let SynSend::Accepted(start) = conn.send else {
+            return Err(Error::BugUnreachable);
+        };
+        if conn.retired.is_retired() || conn.requester.tx.is_closed() {
+            return Ok(());
         }
-
-        let stream = UtpStreamStarter::new_shared(&self.socket, addr, rx, args).start();
+        let recv_key = (addr, msg.header.connection_id.0);
+        if self.streams.contains_key(&recv_key) {
+            return Err(Error::BugUnreachable);
+        }
+        let (retired, guard) = self.socket.retirements.registration();
+        let (tx, rx) = crate::ingress::channel(self.socket.opts.vsock_rx_bufsize);
+        let args = StreamArgs::new_outgoing(&msg.header, start, msg.received)
+            .with_parent_span(conn.requester.created_span.clone());
+        self.streams
+            .insert(recv_key, RegisteredStream { tx, retired });
+        let stream = UtpStreamStarter::new_registered(&self.socket, addr, rx, args, guard).start();
+        drop(conn.permit);
         if conn.requester.tx.send(stream).is_ok() {
             trace!(?recv_key, "created stream and passed to connector");
         } else {
@@ -589,7 +828,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         accept: Acceptor<T, E>,
     ) -> MatchSynWithAccept<T, E> {
         let recv_key = (syn.remote, (syn.header.connection_id + 1).0);
-        if self.streams.contains_key(&recv_key) {
+        if self.key_reserved(recv_key) {
             debug!(?recv_key, "SYN clashes with an existing stream, ignoring");
             self.socket.stats.invalid_packets.increment(1);
             return MatchSynWithAccept::SynInvalid(accept);
@@ -600,9 +839,11 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 .with_parent_span(accept.created_span.clone());
         let (tx, rx) = crate::ingress::channel(self.socket.opts.vsock_rx_bufsize);
 
-        let starter = UtpStreamStarter::new_shared(&self.socket, syn.remote, rx, args);
+        let (retired, guard) = self.socket.retirements.registration();
+        let starter = UtpStreamStarter::new_registered(&self.socket, syn.remote, rx, args, guard);
 
-        self.streams.insert(recv_key, tx);
+        self.streams
+            .insert(recv_key, RegisteredStream { tx, retired });
         match accept.tx.send(starter) {
             Ok(()) => {
                 trace!("created stream and passed to acceptor");
@@ -616,7 +857,12 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         }
     }
 
-    async fn try_send_rst(&self, syn: Syn) {
+    fn try_send_rst(&mut self, syn: Syn) {
+        if self.control_sends.len() == CONTROL_RESPONSES_MAX {
+            self.socket.stats.syn_flood_dropped.increment(1);
+            trace!("dropping best-effort ST_RESET, response queue is full");
+            return;
+        }
         let mut buf: [u8; UTP_HEADER as usize] = [0; UTP_HEADER as usize];
         let packet = UtpHeader {
             htype: Type::Reset,
@@ -625,15 +871,22 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             ack_nr: syn.header.seq_nr,
             ..Default::default()
         };
-        if let Some(transport) = self.transport.as_deref()
+        if let Some(transport) = self.transport.clone()
             && let Ok(len) = packet.serialize(&mut buf[..])
-            && let Err(e) = transport.send_to(&buf[..len], syn.remote).await
         {
-            debug!(remote=?syn.remote, "error sending ST_RESET: {e:#}");
+            self.control_sends
+                .push(PendingSend::new(Box::pin(async move {
+                    transport.send_to(&buf[..len], syn.remote).await
+                })));
         }
     }
 
     async fn on_syn(&mut self, remote: SocketAddr, msg: UtpMessage) -> crate::Result<()> {
+        let future_key = (remote, (msg.header.connection_id + 1).0);
+        if self.key_reserved(future_key) {
+            self.socket.stats.invalid_packets.increment(1);
+            return Ok(());
+        }
         let pending = self
             .accept_queue
             .syns
@@ -675,7 +928,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             Some(syn) => {
                 debug!("dropping SYN, no more space to cache them and no acceptors available");
                 self.socket.stats.syn_rst.increment(1);
-                self.try_send_rst(syn).await;
+                self.try_send_rst(syn);
                 Ok(())
             }
         }
@@ -685,8 +938,8 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let addr = canonical_socket_addr(addr);
         let key = (addr, message.header.connection_id.0);
 
-        if let Some(tx) = self.streams.get(&key) {
-            if tx.send(message).is_err() {
+        if let Some(stream) = self.streams.get(&key) {
+            if stream.tx.send(message).is_err() {
                 trace!(
                     ?key,
                     "stream dead, but wasn't cleaned up yet, this is probably a race"
@@ -728,7 +981,9 @@ pub(crate) struct SocketState<T, E> {
     pub(crate) runtime: Weak<Runtime<T>>,
     // When was the socket created. All the uTP "timestamp_microsends" are relative to it.
     pub(crate) created: Instant,
-    pub(crate) control_requests: UnboundedSender<ControlRequest>,
+    connect_requests: mpsc::Sender<PendingConnectRequest>,
+    connect_admission: ConnectAdmission,
+    pub(crate) retirements: Arc<RetirementSignals>,
     accept_requests: mpsc::Sender<Acceptor<T, E>>,
 
     pub(crate) env: E,
@@ -827,12 +1082,14 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         let runtime = Runtime::new(transport, &opts.cancellation_token);
 
         let (accept_tx, accept_rx) = mpsc::channel(ACCEPT_QUEUE_MAX_ACCEPTORS);
-        let (control_tx, control_rx) = unbounded_channel();
+        let (connect_tx, connect_rx) = mpsc::channel(MAX_PENDING_CONNECTS);
 
         let state = Arc::new(SocketState {
             runtime: Arc::downgrade(&runtime),
             created: env.now(),
-            control_requests: control_tx,
+            connect_requests: connect_tx,
+            connect_admission: ConnectAdmission::default(),
+            retirements: Arc::default(),
             local_addr,
             link_mtu,
             dont_fragment,
@@ -855,7 +1112,8 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             streams: BTreeMap::default(),
             connecting: BTreeMap::default(),
             next_connection_id: env.random_u16().into(),
-            control_rx,
+            connect_rx,
+            control_sends: Vec::new(),
             socket: state,
             transport: None,
             env,
@@ -981,8 +1239,6 @@ impl<T: Transport, Env: UtpEnvironment> SocketState<T, Env> {
             return Err(Error::DispatcherDead);
         }
         let remote = canonical_socket_addr(remote);
-        let (tx, rx) = oneshot::channel();
-        let token = NEXT_CONNECT_TOKEN.fetch_add(1, Ordering::Relaxed);
         self.stats.connection_attempts.increment(1);
         self.stats.connecting.increment(1);
 
@@ -994,28 +1250,34 @@ impl<T: Transport, Env: UtpEnvironment> SocketState<T, Env> {
             self.stats.connecting.decrement(1);
         });
 
-        self.control_requests
-            .send(ControlRequest::ConnectRequest(
-                remote,
-                token,
-                RequestWithSpan::new(tx),
-            ))
-            .ok()
-            .ok_or(Error::DispatcherDead)?;
-
-        let mut send_drop_guard = DropGuardSendBeforeDeath::new(
-            ControlRequest::ConnectDropped(remote, token),
-            &self.control_requests,
-        );
-
-        let stream_or_err = tokio::select! {
-            biased;
-            _ = self.cancellation_token.cancelled() => return Err(Error::DispatcherDead),
-            received = tokio::time::timeout(self.opts.connect_timeout, rx) => received
-                .map_err(|_| Error::ConnectTimedOut)?
-                .map_err(|_| Error::DispatcherDead)?,
-        };
-        send_drop_guard.disarm();
+        let stream_or_err = tokio::time::timeout(self.opts.connect_timeout, async {
+            let permit = self
+                .connect_admission
+                .acquire(&self.cancellation_token)
+                .await?;
+            if self.cancellation_token.is_cancelled() {
+                return Err(Error::DispatcherDead);
+            }
+            let (tx, rx) = oneshot::channel();
+            let (retired, mut guard) = self.retirements.registration();
+            self.connect_requests
+                .try_send(PendingConnectRequest {
+                    remote,
+                    retired,
+                    permit,
+                    requester: RequestWithSpan::new(tx),
+                })
+                .map_err(|_| Error::DispatcherDead)?;
+            let result = tokio::select! {
+                biased;
+                _ = self.cancellation_token.cancelled() => return Err(Error::DispatcherDead),
+                result = rx => result.map_err(|_| Error::DispatcherDead)?,
+            };
+            guard.disarm();
+            result
+        })
+        .await
+        .map_err(|_| Error::ConnectTimedOut)?;
         if stream_or_err.is_ok() {
             fail_guard.disarm();
             self.stats.connection_successes.increment(1);
@@ -1326,7 +1588,7 @@ mod tests {
         let mut receivers = Vec::new();
         for key in keys {
             let (tx, rx) = crate::ingress::channel(dispatcher.socket.opts.vsock_rx_bufsize);
-            assert!(dispatcher.streams.insert(key, tx).is_none());
+            assert!(dispatcher.register_stream(key, tx).is_none());
             receivers.push(rx);
         }
         let packet = |id: u16, payload: &[u8]| {
@@ -1371,12 +1633,12 @@ mod tests {
         );
 
         dispatcher.next_connection_id = 65534.into();
-        assert_eq!(dispatcher.get_next_free_conn_id(ADDR_2), 2.into());
+        assert_eq!(dispatcher.get_next_free_conn_id(ADDR_2).unwrap(), 2.into());
         dispatcher
             .on_control(ControlRequest::Shutdown((ADDR_2, 0)))
             .await;
         dispatcher.next_connection_id = 65534.into();
-        assert_eq!(dispatcher.get_next_free_conn_id(ADDR_2), 0.into());
+        assert_eq!(dispatcher.get_next_free_conn_id(ADDR_2).unwrap(), 0.into());
         assert!(dispatcher.streams.contains_key(&(other, 0)));
     }
 
@@ -1413,11 +1675,8 @@ mod tests {
         let starter = rx.await.unwrap();
         assert!(dispatcher.streams.contains_key(&(ADDR_2, 0)));
         drop(starter);
-        let shutdown = dispatcher.control_rx.recv().await.unwrap();
-        assert!(
-            matches!(shutdown, super::ControlRequest::Shutdown((remote, 0)) if remote == ADDR_2)
-        );
-        dispatcher.on_control(shutdown).await;
+        assert!(dispatcher.streams[&(ADDR_2, 0)].retired.is_retired());
+        dispatcher.reap_retired();
         assert!(dispatcher.streams.is_empty());
     }
 
@@ -1458,7 +1717,7 @@ mod tests {
         let mut open = Vec::new();
         for id in 0..2u16 {
             let (tx, rx) = crate::ingress::channel(socket.opts().vsock_rx_bufsize);
-            dispatcher.streams.insert((ADDR_2, 1000 + id), tx);
+            dispatcher.register_stream((ADDR_2, 1000 + id), tx);
             open.push(rx);
         }
 
@@ -1466,7 +1725,7 @@ mod tests {
         assert_eq!(dispatcher.accept_queue.syns.len(), 1, "taken up");
 
         let (tx, rx) = crate::ingress::channel(socket.opts().vsock_rx_bufsize);
-        dispatcher.streams.insert((ADDR_2, 2000), tx);
+        dispatcher.register_stream((ADDR_2, 2000), tx);
         open.push(rx);
         dispatcher.on_recv(ADDR_2, syn(3)).await.unwrap();
         assert_eq!(dispatcher.accept_queue.syns.len(), 1, "dropped");
@@ -1583,6 +1842,15 @@ mod tests {
         let stats = socket.stats().snapshot();
         assert_eq!(stats.syn_rst, 1);
         assert_eq!(stats.syn_flood_dropped, 0);
+        let completion = std::future::poll_fn(|cx| {
+            super::poll_control_sends(
+                &mut dispatcher.connecting,
+                &mut dispatcher.control_sends,
+                cx,
+            )
+        })
+        .await;
+        dispatcher.finish_send(completion).unwrap();
         let sent = transport.take_sent_utpmessages();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].header.htype, Type::Reset);

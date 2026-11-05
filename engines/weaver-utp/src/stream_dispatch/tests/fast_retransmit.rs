@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use futures::FutureExt;
 use tokio::io::AsyncWriteExt;
 use tracing::trace;
 
@@ -175,8 +176,8 @@ async fn test_duplicate_ack_counted_only_on_st_state() {
     assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 1);
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(Fin, seq_nr = 103, ack_nr = 3)],
-        "Should have ACKed the FIN and sent back another FIN"
+        vec![cmphead!(State, seq_nr = 103, ack_nr = 3)],
+        "remote FIN is acknowledged without closing our writer"
     );
 
     // Now send three ST_STATE duplicates
@@ -190,11 +191,22 @@ async fn test_duplicate_ack_counted_only_on_st_state() {
     // Now we should see duplicate ACKs counted and fast retransmit triggered
     assert_eq!(
         t.take_sent(),
-        vec![
-            cmphead!(Data, seq_nr = 102, ack_nr = 3, payload = "world"),
-            // Re-send the FIN.
-            cmphead!(Fin, seq_nr = 103, ack_nr = 3)
-        ],
+        vec![cmphead!(Data, seq_nr = 102, ack_nr = 3, payload = "world")],
         "Should have triggered fast retransmit"
     );
+    header.seq_nr = 4.into();
+    header.ack_nr = 102.into();
+    t.send_msg(header, "");
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
+    let (_reader, mut writer) = t.stream.take().unwrap().split();
+    writer.flush().await.unwrap();
+    let mut shutdown = Box::pin(writer.shutdown());
+    assert!(shutdown.as_mut().now_or_never().is_none());
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.take_sent(), vec![cmphead!(Fin, seq_nr = 103, ack_nr = 3)]);
+    header.ack_nr = 103.into();
+    t.send_msg(header, "");
+    t.poll_once_assert_ready().await.unwrap();
+    shutdown.await.unwrap();
 }

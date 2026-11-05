@@ -21,7 +21,7 @@ async fn a_mapped_source_routes_to_the_existing_ipv4_stream() {
     let peer = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 6881));
     let mapped = SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped(), 6881));
     let (sender, mut received) = crate::ingress::channel(socket.opts().vsock_rx_bufsize);
-    dispatcher.streams.insert((peer, 7), sender);
+    dispatcher.register_stream((peer, 7), sender);
     dispatcher
         .on_recv(
             mapped,

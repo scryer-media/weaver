@@ -9,6 +9,7 @@ mod congestion;
 mod delay;
 mod delayed_ack;
 mod fast_retransmit;
+mod fin_half_close;
 mod flow_control;
 mod guards;
 mod inactivity_timeout;

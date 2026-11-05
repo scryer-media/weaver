@@ -43,13 +43,35 @@ async fn transfer(addresses: [SocketAddr; 2], window: usize) -> anyhow::Result<(
     let receive = async {
         let mut bytes = Vec::new();
         server_read.read_to_end(&mut bytes).await?;
-        anyhow::ensure!(bytes == payload, "payload changed");
+        anyhow::ensure!(
+            bytes == payload,
+            "payload changed: received {} bytes, expected {}; first difference {:?}",
+            bytes.len(),
+            payload.len(),
+            bytes
+                .iter()
+                .zip(&payload)
+                .position(|(actual, expected)| actual != expected)
+                .or_else(
+                    || (bytes.len() != payload.len()).then_some(bytes.len().min(payload.len()))
+                )
+        );
         Ok::<_, anyhow::Error>(())
     };
     let reply_received = async {
         let mut bytes = Vec::new();
         client_read.read_to_end(&mut bytes).await?;
-        anyhow::ensure!(bytes == reply, "reply changed");
+        anyhow::ensure!(
+            bytes == reply,
+            "reply changed: received {} bytes, expected {}; first difference {:?}",
+            bytes.len(),
+            reply.len(),
+            bytes
+                .iter()
+                .zip(&reply)
+                .position(|(actual, expected)| actual != expected)
+                .or_else(|| (bytes.len() != reply.len()).then_some(bytes.len().min(reply.len())))
+        );
         Ok::<_, anyhow::Error>(())
     };
     tokio::try_join!(send, reply_sent, receive, reply_received)?;

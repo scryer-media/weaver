@@ -191,6 +191,14 @@ async fn a_fin_ack_reset_must_also_pass_the_receive_reorder_guard() {
         "",
     );
     t.poll_once_assert_pending().await;
+    let ack = t.take_sent();
+    assert_eq!(ack.len(), 1);
+    assert_eq!(ack[0].header.htype, State);
+    assert_eq!(ack[0].header.ack_nr, 1.into());
+    let (_reader, mut writer) = t.stream.take().unwrap().split();
+    let mut shutdown = Box::pin(writer.shutdown());
+    assert!(shutdown.as_mut().now_or_never().is_none());
+    t.poll_once_assert_pending().await;
     let sent = t.take_sent();
     let fin = sent
         .iter()
@@ -214,4 +222,5 @@ async fn a_fin_ack_reset_must_also_pass_the_receive_reorder_guard() {
     );
     t.poll_once_assert_ready().await.unwrap();
     assert_eq!(t.vsock.state, VirtualSocketState::Closed);
+    shutdown.await.unwrap();
 }

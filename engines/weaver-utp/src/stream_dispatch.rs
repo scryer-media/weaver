@@ -35,7 +35,7 @@ use crate::{
     recovery::Recovery,
     rtte::RttEstimator,
     seq_nr::SeqNr,
-    socket::{ControlRequest, SocketState, ValidatedSocketOpts},
+    socket::{RetirementGuard, SocketState, ValidatedSocketOpts},
     spawn_utils::task_with_cancel,
     stats::Counter,
     stream::UtpStream,
@@ -43,7 +43,7 @@ use crate::{
     stream_tx::{UserTx, UtpStreamWriteHalf},
     stream_tx_segments::{OnAckResult, PopExpiredProbe, Segments},
     traits::{Transport, UtpEnvironment},
-    utils::{DropGuardSendBeforeDeath, update_optional_waker},
+    utils::update_optional_waker,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +52,9 @@ pub enum VirtualSocketState {
     SynAckSent { count: usize },
 
     Established,
+
+    // The remote sent EOF; our writer remains open.
+    CloseWait { remote_fin: SeqNr },
 
     // We sent FIN, not yet ACKed
     FinWait1 { our_fin: SeqNr },
@@ -81,6 +84,7 @@ impl VirtualSocketState {
             VirtualSocketState::SynReceived => "syn-received",
             VirtualSocketState::SynAckSent { .. } => "syn-ack-sent",
             VirtualSocketState::Established => "established",
+            VirtualSocketState::CloseWait { .. } => "close-wait",
             VirtualSocketState::FinWait1 { .. } => "fin-wait-1",
             VirtualSocketState::FinWait2 => "fin-wait-2",
             VirtualSocketState::LastAck { .. } => "last-ack",
@@ -96,6 +100,13 @@ impl VirtualSocketState {
                 trace!("state {} -> fin-wait-1", self.name());
                 *self = VirtualSocketState::FinWait1 { our_fin }
             }
+            VirtualSocketState::CloseWait { remote_fin } => {
+                trace!("state close-wait -> last-ack");
+                *self = VirtualSocketState::LastAck {
+                    our_fin,
+                    remote_fin,
+                }
+            }
             _ => return false,
         };
         true
@@ -106,7 +117,8 @@ impl VirtualSocketState {
         match self {
             VirtualSocketState::SynReceived
             | VirtualSocketState::SynAckSent { .. }
-            | VirtualSocketState::Established => false,
+            | VirtualSocketState::Established
+            | VirtualSocketState::CloseWait { .. } => false,
             VirtualSocketState::Closed
             | VirtualSocketState::FinWait1 { .. }
             | VirtualSocketState::FinWait2
@@ -125,7 +137,9 @@ impl VirtualSocketState {
     fn is_remote_fin_or_later(&self) -> bool {
         matches!(
             self,
-            VirtualSocketState::LastAck { .. } | VirtualSocketState::Closed
+            VirtualSocketState::CloseWait { .. }
+                | VirtualSocketState::LastAck { .. }
+                | VirtualSocketState::Closed
         )
     }
 }
@@ -210,7 +224,7 @@ struct VirtualSocket<T, Env> {
 
     env: Env,
 
-    drop_guard: DropGuardSendBeforeDeath<ControlRequest>,
+    drop_guard: RetirementGuard,
     parent_span: Option<tracing::Span>,
 }
 
@@ -874,8 +888,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             tx_len
         };
 
-        if self.state.is_remote_fin_or_later() {
-            trace!(?self.state, "there is still unsent data, but the remote closed, so not segmenting further");
+        if matches!(
+            self.state,
+            VirtualSocketState::LastAck { .. } | VirtualSocketState::Closed
+        ) {
+            trace!(?self.state, "both directions are closing, not segmenting further");
             return Ok(());
         }
 
@@ -1193,8 +1210,21 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.state = Established;
             }
             (SynAckSent { .. }, Fin) => {
-                trace!("state: syn-ack-sent -> closed");
-                self.state = Closed;
+                if hdr.ack_nr != self.seq_nr - 1
+                    || hdr.seq_nr != self.last_consumed_remote_seq_nr + 1
+                {
+                    trace!("dropping FIN, its handshake acknowledgement or sequence is invalid");
+                    self.socket.stats.invalid_packets.increment(1);
+                    return Ok(Default::default());
+                }
+                trace!("state: syn-ack-sent -> close-wait");
+                self.timers
+                    .syn_ack_resend
+                    .turn_off("handshake confirmed by FIN");
+                self.restart_remote_inactivity_timer();
+                self.state = CloseWait {
+                    remote_fin: hdr.seq_nr,
+                };
             }
 
             (Established, Data | State) => {}
@@ -1213,11 +1243,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
 
             (Established, Fin) => {
-                trace!("state: established -> last-ack");
-                let our_fin = self.seq_nr;
-                self.seq_nr += 1;
-                self.state = LastAck {
-                    our_fin,
+                trace!("state: established -> close-wait");
+                self.state = CloseWait {
                     remote_fin: hdr.seq_nr,
                 }
             }
@@ -1238,11 +1265,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 trace!("state: fin-wait-1 -> fin-wait-2");
                 self.restart_remote_inactivity_timer();
                 self.state = FinWait2;
-                if hdr.htype == State && hdr.seq_nr == self.last_consumed_remote_seq_nr + 1 {
-                    // some clients sends back FIN + ACK as STATE with seq_nr + 1. This is proably one of them.
-                    trace!("treating ST_STATE as FIN");
-                    self.state = Closed;
-                }
             }
             (FinWait1 { .. }, Data | State) => {}
             (FinWait2, Fin) => {
@@ -1258,7 +1280,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.state = Closed;
             }
 
-            (LastAck { remote_fin, .. }, _) if hdr.seq_nr.is_after(remote_fin) => {
+            (CloseWait { remote_fin } | LastAck { remote_fin, .. }, _)
+                if hdr.seq_nr.is_after(remote_fin) =>
+            {
                 if hdr.htype == Data {
                     trace!(hdr=%hdr.short_repr(), ?remote_fin, "received higher seq nr than remote FIN, dropping packet");
                     self.socket.stats.invalid_packets.increment(1);
@@ -1269,7 +1293,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
 
-            (LastAck { .. }, _) => {}
+            (CloseWait { .. } | LastAck { .. }, _) => {}
         }
 
         // A packet past every check: the remote is there.
@@ -1450,7 +1474,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 if !previously_seen_remote_fin && offset >= 0 {
                     self.last_consumed_remote_seq_nr = hdr.seq_nr;
                     self.user_rx.add_remove(cx, msg, offset as usize)?;
-                    self.user_tx.mark_vsock_closed();
                 }
             }
             Syn => {
@@ -1722,7 +1745,6 @@ impl<T, E> Drop for VirtualSocket<T, E> {
 
 // See field descriptions / meanings in struct VirtualSocket
 pub struct StreamArgs {
-    conn_id_recv: SeqNr,
     conn_id_send: SeqNr,
     last_remote_timestamp: u32,
     last_remote_received: Instant,
@@ -1747,7 +1769,6 @@ impl StreamArgs {
     ) -> Self {
         let conn_id = remote_ack.connection_id;
         Self {
-            conn_id_recv: conn_id,
             conn_id_send: conn_id + 1,
             last_remote_timestamp: remote_ack.timestamp_microseconds,
             last_remote_received: ack_received_ts,
@@ -1772,7 +1793,6 @@ impl StreamArgs {
 
     pub fn new_incoming(next_seq_nr: SeqNr, remote_syn: &UtpHeader, received: Instant) -> Self {
         Self {
-            conn_id_recv: remote_syn.connection_id + 1,
             conn_id_send: remote_syn.connection_id,
             last_remote_timestamp: remote_syn.timestamp_microseconds,
             last_remote_received: received,
@@ -1837,14 +1857,25 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
         Self::new_shared(&socket.state, remote, rx, args)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_shared(
         socket: &Arc<SocketState<T, E>>,
         remote: SocketAddr,
         rx: IngressReceiver,
         args: StreamArgs,
     ) -> Self {
+        let (_, guard) = socket.retirements.registration();
+        Self::new_registered(socket, remote, rx, args, guard)
+    }
+
+    pub(crate) fn new_registered(
+        socket: &Arc<SocketState<T, E>>,
+        remote: SocketAddr,
+        rx: IngressReceiver,
+        args: StreamArgs,
+        guard: RetirementGuard,
+    ) -> Self {
         let StreamArgs {
-            conn_id_recv,
             conn_id_send,
             last_remote_timestamp,
             last_remote_received,
@@ -1961,10 +1992,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 unsegmented_data: 0,
             },
             parent_span,
-            drop_guard: DropGuardSendBeforeDeath::new(
-                ControlRequest::Shutdown((remote, conn_id_recv.0)),
-                &socket.control_requests,
-            ),
+            drop_guard: guard,
             user_rx,
             last_sent_window: if matches!(state, VirtualSocketState::Established) {
                 // Pretend we sent the window so that it doesn't trigger a window update packet
