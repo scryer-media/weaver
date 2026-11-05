@@ -5,6 +5,7 @@
 
 #[macro_use]
 mod macros;
+mod addr;
 mod byte_ring;
 mod congestion;
 mod constants;
@@ -34,6 +35,7 @@ mod traits;
 mod udp_error;
 mod utils;
 
+pub use addr::{canonical_ip_addr, canonical_socket_addr};
 pub use congestion::ledbat::LedbatParams;
 pub use error::{Error, Result};
 pub use socket::{SocketOpts, UtpSocket};

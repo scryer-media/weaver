@@ -4,6 +4,9 @@
 //! peer, calling the handler as the connection would, and reads what the
 //! handler queues for the wire.
 
+mod mapped_endpoint_tests;
+mod mapped_filter_tests;
+
 use std::{
     collections::BTreeSet,
     future::Future,

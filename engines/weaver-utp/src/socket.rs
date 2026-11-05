@@ -17,7 +17,7 @@ use std::{
 };
 
 use crate::{
-    DatagramSend, Error,
+    DatagramSend, Error, canonical_socket_addr,
     constants::{TX_BUF_SIZE_PER_VSOCK_INITIAL_DEFAULT, TX_BUF_SIZE_PER_VSOCK_MAX_DEFAULT},
     stats::{Counter, UtpStats},
 };
@@ -29,6 +29,8 @@ use crate::{UtpStream, runtime::Runtime, spawn_utils::task_with_cancel};
 
 #[cfg(test)]
 mod lifecycle_tests;
+#[cfg(test)]
+mod mapped_endpoint_tests;
 #[cfg(test)]
 mod send_handle_tests;
 #[cfg(test)]
@@ -676,6 +678,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     }
 
     async fn on_recv(&mut self, addr: SocketAddr, message: UtpMessage) -> crate::Result<()> {
+        let addr = canonical_socket_addr(addr);
         let key = (addr, message.header.connection_id.0);
 
         if let Some(tx) = self.streams.get(&key) {
@@ -973,6 +976,7 @@ impl<T: Transport, Env: UtpEnvironment> SocketState<T, Env> {
         if self.cancellation_token.is_cancelled() {
             return Err(Error::DispatcherDead);
         }
+        let remote = canonical_socket_addr(remote);
         let (tx, rx) = oneshot::channel();
         let token = NEXT_CONNECT_TOKEN.fetch_add(1, Ordering::Relaxed);
         self.stats.connection_attempts.increment(1);

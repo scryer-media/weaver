@@ -326,6 +326,7 @@ impl StreamConnector {
         addr: SocketAddr,
         transports: Transports,
     ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
+        let addr = crate::network::canonical_socket_addr(addr);
         if addr.port() == 0 {
             return Err(Error::Anyhow(anyhow::anyhow!(
                 "invalid peer address (port 0): {}",
@@ -435,6 +436,9 @@ impl StreamConnector {
         }
     }
 }
+
+#[cfg(test)]
+mod mapped_endpoint_tests;
 
 #[cfg(test)]
 mod tests {

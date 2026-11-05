@@ -23,7 +23,9 @@ use std::{
 };
 
 use weaver_utp::{DefaultUtpEnvironment, PollSendToVectored, Transport, UtpStream};
-pub use weaver_utp::{is_message_size_error, message_size_error};
+pub use weaver_utp::{
+    canonical_ip_addr, canonical_socket_addr, is_message_size_error, message_size_error,
+};
 
 pub use crate::core::net::{BoxFuture, DatagramSend, DatagramSocket, NoNames, Resolved, Resolver};
 pub use crate::type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite};
@@ -677,6 +679,9 @@ impl DatagramSocket for KernelUdp {
         }
     }
 }
+
+#[cfg(test)]
+mod mapped_endpoint_tests;
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {

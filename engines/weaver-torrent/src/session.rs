@@ -3245,6 +3245,7 @@ impl Session {
 
     // `may_reach`, the IP filter applied only when `filtered`.
     fn may_reach_under(&self, ip: IpAddr, filtered: bool) -> Result<(), Unreachable> {
+        let ip = crate::network::canonical_ip_addr(ip);
         if self.ipv4_only && ip.is_ipv6() {
             return Err(Unreachable::Family);
         }
