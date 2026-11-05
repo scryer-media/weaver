@@ -2302,7 +2302,11 @@ func classifyRestartResult(profile restartProfile, pass bool, passSummary string
 }
 
 func runDownloadCompletedFileSurvivesRestart(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv); err != nil {
+	segments, err := nzbSegments("rar5-multi-member")
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	if err := ctx.startWeaverWithOptions("", 8, "WEAVER_E2E_HOLD=status.enter_extracting"); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug("rar5-multi-member")
@@ -2310,18 +2314,15 @@ func runDownloadCompletedFileSurvivesRestart(ctx *restartCaseContext) (restartCa
 		return restartCaseResult{}, err
 	}
 
-	// The restart point is the extracting-phase delay hook, not "the database
-	// has a row and the job is not terminal yet". The case asserts that nothing
-	// is refetched after the restart, which only holds once every article is
-	// already durable; and a bare "not terminal yet" predicate matches the
-	// instant the job is queued, so on a fixture this small the job can reach a
-	// terminal status while the pre-crash evidence is still being captured, and
-	// the case silently turns into a check of what survives in history. Parking
-	// the process inside the extraction delay pins both ends: downloads are
-	// complete and the job provably cannot terminalize before the kill. An
-	// archive's engine starts reading while its volumes still arrive, so the
-	// hook fires once every volume it reads is in, not at the engine's start.
-	if _, err := waitForDelayHookRestartPoint(ctx, []int{jobID}, "status.enter_extracting", 3*time.Minute); err != nil {
+	// Hold extraction until the crash, while the checkpoint writer continues.
+	// In-memory completion is not a durable checkpoint after write batching.
+	if err := ctx.pollJob("completed-download checkpoint", caseDBPath(ctx), jobID, func() (bool, error) {
+		if !logHasDelayHook(ctx.caseLogPath, "status.enter_extracting") {
+			return false, nil
+		}
+		rows, err := readJobFileCoverage(caseDBPath(ctx), jobID)
+		return completedDownloadCheckpoint(segments, rows), err
+	}); err != nil {
 		return restartCaseResult{}, fmt.Errorf("wait for completed-download restart point: %w", err)
 	}
 	if err := ctx.killWeaverForRestart(); err != nil {
