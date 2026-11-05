@@ -84,7 +84,7 @@ impl NameLedger {
     // them when it had one before, is pushed to `moved` in an order that
     // is safe to apply on disk: a member moves out of a name before the
     // member taking it moves in. Idempotent: asking again for the same
-    // name returns the one held.
+    // name, in any spelling of it, returns the one held.
     pub fn allocate(
         &mut self,
         holder: Holder,
@@ -94,7 +94,10 @@ impl NameLedger {
     ) -> String {
         let wanted = confined(wanted);
         let old = match self.entries.get(&holder) {
-            Some(entry) if entry.wanted.eq_ignore_ascii_case(&wanted) => {
+            Some(entry)
+                if key(&entry.wanted) == key(&wanted)
+                    && is_directory(&entry.wanted) == is_directory(&wanted) =>
+            {
                 return entry.name.clone();
             }
             Some(entry) => Some(entry.name.clone()),
@@ -263,6 +266,16 @@ impl NameLedger {
         if !self.taken.contains_key(&name) {
             self.leaving.insert(name, holder);
         }
+    }
+
+    // Whether the holder was given another name only while the one it wants
+    // is leaving: once that one is vacated the holder takes it, so the name
+    // it holds now is not the one it keeps.
+    pub fn held_off(&self, holder: Holder) -> bool {
+        self.entries.get(&holder).is_some_and(|entry| {
+            let wanted = key(&entry.wanted);
+            wanted != key(&entry.name) && self.leaving.contains_key(&wanted)
+        })
     }
 
     pub fn given(&self, holder: Holder) -> Option<&str> {
@@ -966,6 +979,18 @@ mod tests {
             vec![composed.to_owned(), "Cafe\u{301} (1).mkv".to_owned()]
         );
         assert_eq!(second.0, first.0);
+    }
+
+    // A name asked for again in another spelling of it is the same name:
+    // the holder keeps the one it holds and nothing moves.
+    #[test]
+    fn a_name_asked_for_again_in_another_spelling_moves_nothing() {
+        let mut ledger = NameLedger::new();
+        assert_eq!(root(&mut ledger, 1, "Caf\u{e9}.mkv"), "Caf\u{e9}.mkv");
+        assert_eq!(root(&mut ledger, 1, "Cafe\u{301}.mkv"), "Caf\u{e9}.mkv");
+        assert_eq!(root(&mut ledger, 1, "CAF\u{c9}.MKV"), "Caf\u{e9}.mkv");
+        assert_eq!(root(&mut ledger, 2, "harbour/"), "harbour/");
+        assert_eq!(root(&mut ledger, 2, "Harbour/"), "harbour/");
     }
 
     #[test]

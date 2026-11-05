@@ -62,7 +62,26 @@ impl Zip {
                         range,
                     },
                 ),
-                Piece::Member(member, range) => push(out, Placement::Member { member, range }),
+                Piece::Member(member, range) => {
+                    let entry = self.map.as_ref().and_then(|map| map.entry(member));
+                    let locked =
+                        entry
+                            .and_then(|entry| entry.cipher.as_ref())
+                            .is_some_and(|cipher| {
+                                cipher.open.as_ref().is_none_or(|open| {
+                                    (!open.checked || range.start > open.reaches())
+                                        && !self.members[member.0 as usize]
+                                            .coverage
+                                            .covered(ByteRange::new(0, range.end))
+                                })
+                            });
+                    if locked {
+                        let start = entry.and_then(|entry| entry.data).unwrap();
+                        self.held_or_kept(range.shift(start as i64), base, out);
+                    } else {
+                        push(out, Placement::Member { member, range });
+                    }
+                }
                 Piece::Unplaced(range) => self.held_or_kept(range, base, out),
             }
         }

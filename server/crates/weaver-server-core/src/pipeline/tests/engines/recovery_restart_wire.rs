@@ -232,6 +232,7 @@ async fn late_rar_index(lost_tail: bool) {
         &mut before
     ));
     assert_eq!(before, posts[1].1[..extent.end as usize]);
+    pipeline.flush_graph_checkpoint(JOB);
     retire_pipeline_database(pipeline).await;
     (pipeline, _, _) = new_direct_pipeline(&root).await;
     let checkpoint = pipeline
@@ -516,6 +517,7 @@ async fn solid_rar_after_nonfirst_half(encrypted: bool) {
     ));
     assert_eq!(before, posts[1].1[..extent.end as usize]);
     let working = pipeline.jobs[&JOB].working_dir.clone();
+    pipeline.flush_graph_checkpoint(JOB);
     retire_pipeline_database(pipeline).await;
     (pipeline, _, _) = new_direct_pipeline(&root).await;
     let checkpoint = pipeline

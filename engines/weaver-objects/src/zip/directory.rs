@@ -223,6 +223,7 @@ impl Zip {
             }
             let header = &centrals[index].header;
             let said = Said::of(header);
+            let streams = member.is_some() && (length > 0 || header.encrypted());
             map.entries.push(Entry {
                 header: headers[index],
                 member,
@@ -230,8 +231,10 @@ impl Zip {
                 checksum: said.checksum,
                 length,
                 crc: header.crc,
+                crc_known: true,
                 data: None,
-                streams: length > 0,
+                cipher: (streams && header.encrypted()).then(|| super::crypto::Cipher::new(header)),
+                streams,
                 expected: Some(header.clone()),
             });
         }
@@ -406,6 +409,7 @@ impl Zip {
                 name: entry.name.clone(),
                 length: entry.length,
                 checksum: entry.checksum,
+                encrypted: entry.cipher.is_some(),
             };
             say(member, said, &mut self.members[id], out);
         }
@@ -442,12 +446,14 @@ pub(super) struct Said {
     pub(super) name: String,
     pub(super) length: u64,
     pub(super) checksum: Option<u32>,
+    pub(super) encrypted: bool,
 }
 
 impl Said {
     pub(super) fn of(header: &records::Header) -> Self {
         let directory = header.shape == Shape::Directory;
         Self {
+            encrypted: header.encrypted(),
             name: records::member_name(header.name.clone(), header.shape),
             length: if directory { 0 } else { header.length },
             // The header's CRC32 is the member's own unless a key went
@@ -466,7 +472,7 @@ fn say(member: MemberId, said: Said, out_said: &mut Out, out: &mut Vec<Emit>) {
     if let Some(crc32) = said.checksum {
         out.push(Emit::Checksum { member, crc32 });
     }
-    if said.length == 0 {
+    if said.length == 0 && !said.encrypted {
         out_said.closed = true;
         out.push(Emit::MemberClosed(member));
     }
@@ -492,7 +498,12 @@ fn local(kept: &mut Kept, map: &Map, index: usize) -> Local {
     let Some(expected) = &entry.expected else {
         return Local::Waiting;
     };
-    let streams = entry.streams.then_some(entry.length);
+    let prefix = if entry.cipher.is_some() {
+        super::crypto::HEADER
+    } else {
+        0
+    };
+    let streams = entry.streams.then_some(entry.length + prefix);
     let (header, stretch_end) = (entry.header, map.stretch_end(index));
     let fixed = ByteRange::new(header, (header + LOCAL_LEN).min(stretch_end));
     let Some(bytes) = kept.read(fixed) else {
@@ -507,7 +518,7 @@ fn local(kept: &mut Kept, map: &Map, index: usize) -> Local {
     if data + streams.unwrap_or(0) > stretch_end {
         return Local::Unsupported;
     }
-    let range = ByteRange::new(header, data);
+    let range = ByteRange::new(header, data + prefix);
     kept.want(range);
     let Some(bytes) = kept.read(range) else {
         return Local::Waiting;
@@ -521,7 +532,7 @@ fn local(kept: &mut Kept, map: &Map, index: usize) -> Local {
     Local::Agreed {
         range,
         crc: crc32(bytes),
-        data: streams.map(|_| data),
+        data: streams.map(|_| data + prefix),
     }
 }
 
@@ -534,7 +545,11 @@ fn moved(old: &Map, new: &Map) -> Vec<usize> {
             let member = MemberId(id as u32);
             match (old.entry(member), new.entry(member)) {
                 (Some(was), Some(is)) => {
-                    was.name != is.name
+                    // Re-reading encrypted metadata must re-prove the
+                    // cipher header before any old plaintext stands.
+                    was.cipher.is_some()
+                        || is.cipher.is_some()
+                        || was.name != is.name
                         || was.length != is.length
                         || was.checksum != is.checksum
                         || was.crc != is.crc

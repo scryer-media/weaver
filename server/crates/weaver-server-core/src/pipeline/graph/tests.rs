@@ -260,6 +260,54 @@ async fn a_par2_set_beside_a_plain_file_adjudicates_it_clean_without_reading_bac
 }
 
 #[tokio::test]
+async fn completion_releases_consumed_storage_before_unlink_and_publication() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_030);
+    let data = payload(4 * ARTICLE, 4);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    decode_all(&mut pipeline, job_id, &posts, 1).await;
+    // A clean job still owns the sampled, otherwise parked recovery volume.
+    decode(&mut pipeline, job_id, &posts, 2, 0, true).await;
+    hear_repair(&mut pipeline, job_id).await;
+    assert_eq!(
+        pipeline.graph_jobs[&job_id].recovery_summary()[0].outcome,
+        Some(RepairOutcome::Clean)
+    );
+    let held = pipeline.graph_jobs[&job_id].writer().open_files();
+    assert!(!held.is_empty(), "exercise retained recovery handles");
+    assert!(held.iter().all(|path| path.exists()));
+
+    pipeline.shared_state.set_post_processing_paused(true);
+    pipeline.start_move_to_complete(job_id).await.unwrap();
+    assert_eq!(pipeline.graph_jobs[&job_id].writer().open_files(), held);
+    assert!(
+        held.iter().all(|path| path.exists()),
+        "pause preserves consumed inputs"
+    );
+
+    pipeline.shared_state.set_post_processing_paused(false);
+    pipeline.start_move_to_complete(job_id).await.unwrap();
+    // This checks the lifetime invariant even on a local filesystem that
+    // silently hides an unlinked open file instead of exposing .nfs entries.
+    assert!(
+        pipeline.graph_jobs[&job_id]
+            .writer()
+            .open_files()
+            .is_empty()
+    );
+    for post in &posts[1..] {
+        assert!(!working_dir.join(&post.name).exists());
+    }
+    let done = pipeline.move_done_rx.recv().await.unwrap();
+    assert!(done.result.is_ok(), "{:?}", done.result);
+    pipeline.handle_move_to_complete_done(done).await;
+    retire_pipeline_database(pipeline).await;
+}
+
+#[tokio::test]
 async fn a_lost_article_under_a_par2_set_is_repaired_through_the_tree() {
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_004);
@@ -348,8 +396,14 @@ async fn a_lost_article_under_a_par2_set_is_repaired_through_the_tree() {
     retire_pipeline_database(pipeline).await;
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_hex_named_member_bound_by_its_prefix_is_renamed_and_its_file_moves() {
+    let clock = tokio::spawn(async {
+        loop {
+            tokio::task::yield_now().await;
+        }
+    });
+    let now = tokio::time::Instant::now();
     let temp_dir = tempfile::tempdir().unwrap();
     let job_id = JobId(92_005);
     let data = payload(3 * ARTICLE, 6);
@@ -360,6 +414,13 @@ async fn a_hex_named_member_bound_by_its_prefix_is_renamed_and_its_file_moves() 
     let hex = working_dir.join(&posts[0].name);
     assert_eq!(member_file(&pipeline, job_id, 0), Some(hex.clone()));
     pipeline.db.flush_write_queue().await.unwrap();
+    assert_eq!(
+        pipeline
+            .db
+            .graph_checkpoint_writes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        0
+    );
     hear_graph_mail(&mut pipeline, job_id).await;
 
     // Hold the writer before the index can name the member. The repair can
@@ -411,7 +472,9 @@ async fn a_hex_named_member_bound_by_its_prefix_is_renamed_and_its_file_moves() 
     assert_eq!(member_file(&pipeline, job_id, 0), Some(moved.clone()));
     assert_eq!(read(&moved), data);
     assert!(!hex.exists());
+    assert_eq!(tokio::time::Instant::now(), now);
     retire_pipeline_database(pipeline).await;
+    clock.abort();
 }
 
 #[tokio::test]
@@ -1527,6 +1590,7 @@ async fn a_restart_parks_the_volume_again_from_the_objects_wants() {
         for ordinal in after_head(&posts, 2) {
             assert_parked(&pipeline, job_id, 2, ordinal);
         }
+        pipeline.flush_graph_checkpoint(job_id);
         pipeline.db.flush_write_queue().await.unwrap();
         retire_pipeline_database(pipeline).await;
         working_dir

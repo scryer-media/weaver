@@ -226,24 +226,35 @@ export interface JobDownloadTotals {
 function withDownloadBar(
   bars: JobPhaseProgressData[],
   download: JobDownloadTotals | null,
+  status: string,
 ): JobPhaseProgressData[] {
-  if (download === null || bars.length === 0 || bars.some((bar) => bar.phase === "DOWNLOADING")) {
-    return bars;
+  let stack = bars;
+  if (download !== null && bars.length > 0 && !bars.some((bar) => bar.phase === "DOWNLOADING")) {
+    const at = bars[0].updatedAtEpochMs;
+    stack = [
+      {
+        phase: "DOWNLOADING",
+        completedBytes: download.completedBytes,
+        totalBytes: download.totalBytes,
+        progressPercent: download.progressPercent,
+        rateBps: null,
+        estimatedRemainingMs: null,
+        startedAtEpochMs: at,
+        updatedAtEpochMs: at,
+      },
+      ...bars,
+    ];
   }
-  const at = bars[0].updatedAtEpochMs;
-  return [
-    {
-      phase: "DOWNLOADING",
-      completedBytes: download.completedBytes,
-      totalBytes: download.totalBytes,
-      progressPercent: download.progressPercent,
-      rateBps: null,
-      estimatedRemainingMs: null,
-      startedAtEpochMs: at,
-      updatedAtEpochMs: at,
-    },
-    ...bars,
-  ];
+  // Publishing the delivery means its download is done, even when recovery
+  // stayed parked. The byte counts keep saying what actually arrived.
+  const complete = (download?.progressPercent ?? 0) >= 100
+    || status === "MOVING" || status === "FINALIZING" || status === "POST_PROCESSING"
+    || status === "COMPLETE" || status === "COMPLETED";
+  return complete
+    ? stack.map((bar) => bar.phase === "DOWNLOADING"
+      ? { ...bar, progressPercent: 100, rateBps: null, estimatedRemainingMs: null }
+      : bar)
+    : stack;
 }
 
 export const NO_PROGRESS_STATE: JobProgressState = {
@@ -316,7 +327,7 @@ export function advanceJobProgress(
   return {
     phases: settled.clocks,
     status: label.clock,
-    bars: withDownloadBar(settled.bars, download),
+    bars: withDownloadBar(settled.bars, download, status),
     nextChangeAt: due.length === 0 ? null : Math.min(...due),
   };
 }

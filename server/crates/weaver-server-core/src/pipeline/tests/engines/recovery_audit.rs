@@ -543,6 +543,7 @@ async fn drive_stream(
     let mut reads = 0;
     for (step, &article) in articles.iter().enumerate() {
         if Some(step) == after {
+            pipeline.flush_graph_checkpoint(JOB);
             retire_pipeline_database(pipeline).await;
             (pipeline, _, _) = new_direct_pipeline(&root).await;
             scenario.prepare(&mut pipeline);

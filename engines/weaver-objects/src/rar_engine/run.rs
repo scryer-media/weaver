@@ -31,6 +31,13 @@ use weaver_graph::{
 // worker is done, then its bytes or the error that stopped it.
 type Decoded = Mutex<Option<Result<Vec<u8>, RarError>>>;
 
+// The smallest piece of a member the sink hears, its last aside, and the
+// largest of a member decoded whole. A streamed decoder writes a few hundred
+// kilobytes at a time, with a few hundred bytes beside each window it
+// flushes; each piece the sink hears costs a message, a write and the
+// bookkeeping behind both, so smaller writes gather into one first.
+pub(super) const EMIT_BYTES: usize = 1 << 20;
+
 pub(super) struct Run {
     password: Option<String>,
 }
@@ -370,11 +377,10 @@ impl Walk<'_, '_> {
 
     // A member decoded whole, said in pieces no larger than a decoder's.
     fn deliver(&mut self, member: MemberId, bytes: Vec<u8>) -> Result<(), Stop> {
-        const PIECE: usize = 1 << 20;
         let bytes = Bytes::from(bytes);
         let mut offset = 0;
         while offset < bytes.len() {
-            let end = bytes.len().min(offset + PIECE);
+            let end = bytes.len().min(offset + EMIT_BYTES);
             self.say(Emit::Bytes {
                 member,
                 offset: offset as u64,
@@ -427,11 +433,15 @@ impl Walk<'_, '_> {
             sink: &mut *self.sink,
             member,
             offset: 0,
+            gathered: Vec::new(),
             stopped: false,
         };
         let decoded = archive
             .by_index_via(index, &self.input)
             .and_then(|entry| entry.copy_to(&mut out));
+        // What is gathered is said whether or not the decode went on to
+        // fail, as each write was before it was gathered.
+        let decoded = out.flush().map_err(RarError::from).and(decoded);
         match decoded {
             Ok(_) => {
                 self.open = None;
@@ -721,12 +731,34 @@ impl Seek for Reader {
 #[error("the owner stopped the run")]
 struct Stopped;
 
-// The decoder's output, handed to the sink as it is written.
+// The decoder's output, handed to the sink in pieces of at least
+// `EMIT_BYTES`, the member's last aside. A write that size or larger with
+// nothing gathered goes to the sink as it is; anything smaller gathers until
+// the pieces reach it. Either way each byte is copied once.
 struct Out<'s, 'a> {
     sink: &'s mut Sink<'a>,
     member: MemberId,
     offset: u64,
+    gathered: Vec<u8>,
     stopped: bool,
+}
+
+impl Out<'_, '_> {
+    fn say(&mut self, bytes: Bytes) -> io::Result<()> {
+        let length = bytes.len() as u64;
+        let heard = (self.sink)(Emit::Bytes {
+            member: self.member,
+            offset: self.offset,
+            bytes: bytes.into(),
+            provenance: Provenance::Fresh,
+        });
+        if !heard {
+            self.stopped = true;
+            return Err(io::Error::other(Stopped));
+        }
+        self.offset += length;
+        Ok(())
+    }
 }
 
 impl Write for Out<'_, '_> {
@@ -734,21 +766,22 @@ impl Write for Out<'_, '_> {
         if bytes.is_empty() {
             return Ok(0);
         }
-        let heard = (self.sink)(Emit::Bytes {
-            member: self.member,
-            offset: self.offset,
-            bytes: Bytes::copy_from_slice(bytes).into(),
-            provenance: Provenance::Fresh,
-        });
-        if !heard {
-            self.stopped = true;
-            return Err(io::Error::other(Stopped));
+        if self.gathered.is_empty() && bytes.len() >= EMIT_BYTES {
+            self.say(Bytes::copy_from_slice(bytes))?;
+            return Ok(bytes.len());
         }
-        self.offset += bytes.len() as u64;
+        self.gathered.extend_from_slice(bytes);
+        if self.gathered.len() >= EMIT_BYTES {
+            self.flush()?;
+        }
         Ok(bytes.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+        if self.gathered.is_empty() || self.stopped {
+            return Ok(());
+        }
+        let gathered = std::mem::take(&mut self.gathered);
+        self.say(Bytes::from(gathered))
     }
 }

@@ -320,6 +320,9 @@ async fn restart_heard(
     in_memory: &mut BTreeSet<(u32, u32)>,
     inspect: Inspect<'_>,
 ) -> (Pipeline, tokio::sync::broadcast::Receiver<PipelineEvent>) {
+    // These restarts exercise a committed step. The coalescing tests cover
+    // the coverage a crash loses before the writer's barrier is due.
+    pipeline.flush_graph_checkpoint(JOB);
     in_memory.extend(pipeline.graph_jobs[&JOB].in_memory());
     let working_dir = pipeline.jobs[&JOB].working_dir.clone();
     let db = pipeline.db.clone();
@@ -333,7 +336,7 @@ async fn restart_heard(
         .db
         .load_graph_checkpoint(JOB)
         .unwrap()
-        .expect("every step leaves a checkpoint");
+        .expect("the forced checkpoint committed");
     inspect(&rows);
     pipeline
         .restore_job(crate::RestoreJobRequest {
@@ -1656,6 +1659,7 @@ async fn served_four(
         );
         serve(&mut pipeline, scenario, article).await;
     }
+    pipeline.flush_graph_checkpoint(JOB);
     pipeline.db.flush_write_queue().await.unwrap();
     (pipeline, working_dir)
 }
@@ -2029,6 +2033,7 @@ async fn a_fresh_jobs_first_checkpoint_replaces_every_stale_row() {
         work.segment_id.segment_number,
     );
     serve(&mut pipeline, &scenario, article).await;
+    pipeline.flush_graph_checkpoint(JOB);
     pipeline.db.flush_write_queue().await.unwrap();
     // One article is covered, and the root is at this build's version.
     assert_eq!(covered(&pipeline).values().sum::<i64>(), ARTICLE as i64);
@@ -2181,6 +2186,7 @@ async fn a_restart_restores_a_running_job_with_its_articles_and_a_queued_job_wit
             );
             serve(&mut pipeline, &scenario, article).await;
         }
+        pipeline.flush_graph_checkpoint(JOB);
         pipeline.db.flush_write_queue().await.unwrap();
         retire_pipeline_database(pipeline).await;
         working_dir
@@ -2681,6 +2687,7 @@ async fn a_job_restored_under_paused_post_processing_starts_no_run_until_resume(
         !awaits_mail(&pipeline),
         "a run started under the pause before the restart"
     );
+    pipeline.flush_graph_checkpoint(JOB);
     let working_dir = pipeline.jobs[&JOB].working_dir.clone();
     let db = pipeline.db.clone();
     retire_pipeline_database(pipeline).await;

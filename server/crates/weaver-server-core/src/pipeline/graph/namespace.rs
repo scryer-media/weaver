@@ -200,8 +200,9 @@ pub(crate) struct NamespaceWriter {
     // Members whose files wait to move to the names the ledger gave them,
     // in the order it gave them.
     moves: Vec<moves::Waiting>,
-    // The names files left, by the ledger's key, each with the checkpoint
-    // that records it left once one is taken.
+    // The names members left that the database may still give them, by the
+    // ledger's key, each with the checkpoint that records they left once
+    // one is taken.
     left: BTreeMap<String, Option<u64>>,
     // Every file that goes, each with the checkpoint that stops naming it
     // once one is taken. Until that checkpoint commits, the one the
@@ -312,6 +313,43 @@ impl NamespaceWriter {
     // bytes passed settles the rest without one.
     pub(crate) fn read_backs(&self) -> u64 {
         self.read_backs
+    }
+
+    // Completion takes over the filesystem only after all storage owners
+    // give up their handles, including consumed volumes and partial files.
+    // Coverage and names stay available for the terminal report.
+    pub(crate) fn release_handles(&mut self) {
+        self.envelopes.release_handles();
+        let nodes: Vec<_> = self.files.keys().copied().collect();
+        for node in nodes {
+            let files = self.files.get_mut(&node).expect("listed namespace");
+            if let Some(scratch) = &mut files.scratch {
+                scratch.release_handle();
+            }
+            let members: Vec<_> = files.leaves.keys().copied().collect();
+            for member in members {
+                files
+                    .leaves
+                    .get_mut(&member)
+                    .expect("listed member")
+                    .release_handle();
+            }
+        }
+        for (leaf, _) in &mut self.leaving {
+            leaf.release_handle();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_files(&self) -> Vec<PathBuf> {
+        self.files
+            .values()
+            .flat_map(|files| files.leaves.values().chain(files.scratch.iter()))
+            .chain(self.leaving.iter().map(|(leaf, _)| leaf))
+            .filter(|leaf| leaf.is_open())
+            .map(|leaf| leaf.path().to_path_buf())
+            .chain(self.envelopes.open_files())
+            .collect()
     }
 
     // Every member of the namespace with a file of its own, and its path.
@@ -447,7 +485,7 @@ impl NamespaceWriter {
         self.caps.admit_member(tree, node, member)?;
         if Leaf::is_directory(&output_name) {
             self.settle(tree, builder, segments, node, member, out)?;
-            self.leaf(node, member, &output_name)?.create_directory()?;
+            self.leaf(tree, node, member)?.create_directory()?;
         } else if length == Some(0) {
             return self.shut(tree, builder, segments, node, member, out);
         }
@@ -711,9 +749,15 @@ impl NamespaceWriter {
             };
             self.caps.admit_name(new)?;
             self.intend(*node, *member, new);
-            // A name no file of the member sits at is free once the ledger
-            // moved the member off it.
+            // A name no file of the member sits at is free in the ledger
+            // once it moved the member off it. The database may still give
+            // it the member, as its name or the one its file waits for, so
+            // no file enters it until the checkpoint saying otherwise has
+            // committed.
             if !self.sits_at(*node, *member, old) {
+                if !Leaf::is_directory(old) {
+                    self.left.insert(weaver_graph::names::key(old), None);
+                }
                 tree.vacated(old, &mut freed);
             }
         }
@@ -1607,7 +1651,7 @@ impl NamespaceWriter {
             .saturating_add(bytes.len() as u64)
             .max(record.length.unwrap_or(0));
         self.admit_file(tree, node, member, end)?;
-        let leaf = self.leaf(node, member, &record.output_name)?;
+        let leaf = self.leaf(tree, node, member)?;
         let started = std::time::Instant::now();
         // The leaf folds the digest the member's stated check needs, from
         // the evidence the bytes came with, hashing only bytes no level above
@@ -1665,9 +1709,8 @@ impl NamespaceWriter {
         if length > 0 && !written {
             return Ok(());
         }
-        let output_name = record.output_name.clone();
         self.admit_file(tree, node, member, length)?;
-        self.leaf(node, member, &output_name)?.close(length)?;
+        self.leaf(tree, node, member)?.close(length)?;
         Ok(())
     }
 
@@ -1877,18 +1920,25 @@ impl NamespaceWriter {
             .get_or_insert_with(node, || Files::new(namespace, Arc::clone(accountant)))
     }
 
+    // The member's file, opened where `new_leaf` says when it has none.
     fn leaf(
         &mut self,
+        tree: &Tree,
         node: NodeId,
         member: MemberId,
-        output_name: &str,
     ) -> Result<&mut Leaf, WriteError> {
         let opened = self
             .files
             .get(&node)
             .is_some_and(|files| files.leaves.contains_key(&member));
         if !opened {
-            let leaf = self.new_leaf(node, member, output_name);
+            let output_name = tree
+                .namespace(node)
+                .and_then(|namespace| namespace.get(member))
+                .map(|record| record.output_name.clone())
+                .ok_or(WriteError::UnknownMember { node, member })?;
+            let held_off = tree.held_off(node, member);
+            let leaf = self.new_leaf((node, member), &output_name, held_off);
             self.files_mut(node).leaves.insert(member, leaf);
         }
         Ok(self
@@ -2316,6 +2366,8 @@ pub(crate) use verification::{Verification, Verified};
 pub(crate) use loan::replay::{Replay, Replayed};
 pub(crate) use loan::{Loan, Returned};
 pub(crate) use moves::restored_at;
+#[cfg(test)]
+pub(crate) use moves::{TALLY, Tally};
 pub(crate) use recovery::{Coming, Lender, SetState};
 #[cfg(test)]
 mod tests;

@@ -107,7 +107,6 @@ pub(super) async fn settle(pipeline: &mut Pipeline, job_id: JobId, step: Step) {
             _ => {
                 pipeline.record_validated_archive_password(job_id);
                 pipeline.log_deliveries(job_id);
-                pipeline.remove_spent_members(job_id).await;
                 // A repair ruled before this delivery: the moment the e2e
                 // post-repair hook names, between the ruling and the move.
                 let hold = pipeline
@@ -230,25 +229,6 @@ impl Pipeline {
             }
         };
         self.transition_postprocessing_status(job_id, stalled, None);
-    }
-
-    // What the job spent is not part of the release and is removed once it
-    // delivers, before the move: recovery data, bound or named so, and the
-    // volumes an object consumed to make what it hands over, such as the
-    // pieces a join wrote out whole.
-    async fn remove_spent_members(&self, job_id: JobId) {
-        let Some(graph) = self.graph_jobs.get(&job_id) else {
-            return;
-        };
-        for path in graph.spent_files() {
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    warn!(file = %path.display(), error = %error, "could not remove a spent member");
-                }
-            }
-        }
     }
 
     // What the root's recovery objects can say of a graph job now, read

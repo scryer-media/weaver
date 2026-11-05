@@ -182,14 +182,18 @@ fn copy_cleanup_does_not_remove_replaced_parent_destination() {
     let replaced_parent = temp.path().join("dest-replaced");
     let dst = parent.join("payload.bin");
     std::fs::create_dir(&parent).unwrap();
-    let parent_fingerprint = crate::runtime::fs::prepare_destination_parent(&dst).unwrap();
+    let created = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&dst)
+        .unwrap();
     std::fs::write(&dst, b"copied payload").unwrap();
 
     std::fs::rename(&parent, &replaced_parent).unwrap();
     std::fs::create_dir(&parent).unwrap();
     std::fs::write(&dst, b"new occupant").unwrap();
 
-    cleanup_copy_destination_if_parent_matches(&dst, &parent_fingerprint);
+    file_cache::discard_created_file(created, &dst);
 
     assert_eq!(std::fs::read(&dst).unwrap(), b"new occupant");
     assert_eq!(

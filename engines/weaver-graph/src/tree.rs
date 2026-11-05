@@ -1931,6 +1931,12 @@ impl Tree {
         self.report_moves(moved, effects);
     }
 
+    // Whether the member holds its output name only while the name it wants
+    // is leaving, and moves to that one once it is vacated.
+    pub fn held_off(&self, node: NodeId, member: MemberId) -> bool {
+        self.names.held_off((node, member))
+    }
+
     // A restored member's file still sits at `name`, which it is moving off:
     // the ledger gives it to no other member until it has.
     pub fn leaving(&mut self, node: NodeId, member: MemberId, name: &str) {
