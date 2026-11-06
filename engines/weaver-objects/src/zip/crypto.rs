@@ -253,8 +253,8 @@ pub(super) struct Cipher {
     pub(super) header: Option<[u8; HEADER as usize]>,
     pub(super) proven: bool,
     proof: Vec<u8>,
-    #[serde(skip, default = "restored")]
-    restored: bool,
+    // Set by snapshots that replayed a whole restored member; nothing
+    // sets it now, an old one's replay still starts the member over.
     replay: bool,
     // A replacement waits until the old suffix has been read back through
     // its old cipher. Replayed bytes are overlaid with the replacement.
@@ -285,7 +285,6 @@ impl Cipher {
             header: None,
             proven: false,
             proof: Vec::new(),
-            restored: false,
             replay: false,
             pending: Vec::new(),
             retry: false,
@@ -363,7 +362,6 @@ impl Cipher {
         self.header = Some(header);
         self.proven = false;
         self.proof.clear();
-        self.restored = false;
         self.replay = false;
         self.pending.clear();
         self.retry = false;
@@ -388,10 +386,6 @@ impl Cipher {
             Arc::make_mut(open).forget(from);
         }
     }
-}
-
-fn restored() -> bool {
-    true
 }
 
 impl super::Zip {
@@ -531,20 +525,12 @@ impl super::Zip {
                 let said = self.members[member.0 as usize].coverage.runs().next();
                 Arc::make_mut(cipher.open.as_mut().unwrap()).checked = said.is_none();
             }
-            if !was_open && !cipher.proven {
+            // A repair that waited for its replay across a restore is
+            // replayed now the keys are back. Restored plaintext alone
+            // goes again only on a failed CRC's retry.
+            if !was_open && !cipher.pending.is_empty() {
                 again.push(ByteRange::at(data, entry.length));
             }
-            if cipher.restored
-                && !cipher.proven
-                && self.members[member.0 as usize]
-                    .coverage
-                    .overlapping(ByteRange::new(0, entry.length))
-                    .next()
-                    .is_some()
-            {
-                cipher.replay = true;
-            }
-            cipher.restored = false;
             if entry.length == 0 && entry.crc == 0 && !self.members[member.0 as usize].closed {
                 cipher.proven = true;
                 self.members[member.0 as usize].closed = true;
@@ -698,13 +684,20 @@ impl super::Zip {
             if open.checked {
                 break;
             }
-            let proof = ByteRange::new(0, cipher.proof.len() as u64);
+            // What of the proof's span is still said: none once a replay
+            // uncovered the front, and then there is nothing to prove.
+            let said = coverage
+                .overlapping(ByteRange::new(0, cipher.proof.len() as u64))
+                .next()
+                .filter(|run| run.range.start == 0)
+                .map_or(0, |run| run.range.end.min(cipher.proof.len() as u64));
+            let proof = ByteRange::new(0, said);
             let mut expected = Vec::new();
-            if !coverage.covered(proof) || !plain(proof, &mut expected) {
+            if said > 0 && !plain(proof, &mut expected) {
                 entry.cipher = Some(cipher);
                 return;
             }
-            if open.proves(&expected, &cipher.proof) {
+            if said == 0 || open.proves(&expected, &cipher.proof[..said as usize]) {
                 Arc::make_mut(cipher.open.as_mut().unwrap()).checked = true;
                 break;
             }

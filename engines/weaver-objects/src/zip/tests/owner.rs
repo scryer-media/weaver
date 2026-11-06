@@ -324,6 +324,15 @@ impl Owner {
         }
     }
 
+    // A restart: the store comes back from its facts, its sealed parts
+    // included, as the owner restores it.
+    pub fn restore(&mut self) {
+        let facts = self.object.facts();
+        self.object = facts
+            .read::<Zip>(weaver_graph::Kind::Zip)
+            .expect("the facts restore");
+    }
+
     pub fn held(&self) -> usize {
         self.held.len()
     }

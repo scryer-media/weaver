@@ -947,3 +947,31 @@ fn a_restore_no_offered_candidate_proves_starts_the_member_over() {
     assert!(owner.member("alpha.bin").closed);
     assert!(owner.posted(0) == Some(archive));
 }
+
+#[test]
+fn an_unproven_partial_restore_continues_without_replaying_the_member() {
+    let plain = payload(107, 300_007);
+    let archive = encrypted(&plain);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, 200_000));
+    owner.restore();
+    let before = owner.said.len();
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(200_000, archive.len() as u64));
+    owner.close(0);
+    // The proof reconstructs the keys from the plaintext in hand: nothing
+    // said before the restore is read back or said again.
+    assert!(
+        !owner.said[before..]
+            .iter()
+            .any(|emit| matches!(emit, Emit::Again { .. } | Emit::Retract(_))),
+        "{:?}",
+        &owner.said[before..]
+    );
+    assert_eq!(owner.replays, 0);
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+}
