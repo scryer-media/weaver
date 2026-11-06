@@ -1469,14 +1469,11 @@ impl NamespaceWriter {
         said: Option<&Coverage>,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
-        let held: Vec<ByteRange> = self
+        let held = self
             .files
             .get(&node)
-            .map(|files| files.holds.held_ranges(held_volume(member)))
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|hold| hold.intersect(range))
-            .collect();
+            .map(|files| files.holds.held_in(held_volume(member), range))
+            .unwrap_or_default();
         for hold in held {
             for piece in self.take_held(node, member, hold)? {
                 self.replay_piece(tree, builder, segments, (node, member), piece, said, out)?;
