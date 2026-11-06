@@ -114,13 +114,21 @@ impl SocketEgress {
     /// this egress holds. A group at port 0 takes the port the host
     /// chooses. Fails when neither family joins its group anywhere. Must be
     /// called within a Tokio runtime.
-    pub fn join_multicast(&self, v4: SocketAddrV4, v6: SocketAddrV6) -> io::Result<MulticastSocket> {
+    pub fn join_multicast(
+        &self,
+        v4: SocketAddrV4,
+        v6: SocketAddrV6,
+    ) -> io::Result<MulticastSocket> {
         let interfaces: Vec<_> = if_addrs::get_if_addrs()?
             .into_iter()
             .filter(|interface| self.holds(interface))
             .collect();
         let plan = plan(&interfaces);
-        let (out_v4, out_v6) = plan.out.iter().copied().partition(|out| matches!(out, Out::V4(_)));
+        let (out_v4, out_v6) = plan
+            .out
+            .iter()
+            .copied()
+            .partition(|out| matches!(out, Out::V4(_)));
         let joined_v4 = self.joined(v4.into(), out_v4, |socket| {
             plan.join_v4
                 .iter()
@@ -278,7 +286,9 @@ mod tests {
         let addr = match address.parse().unwrap() {
             IpAddr::V4(ip) => IfAddr::V4(if_addrs::Ifv4Addr {
                 ip,
-                netmask: Ipv4Addr::from_bits(u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0)),
+                netmask: Ipv4Addr::from_bits(
+                    u32::MAX.checked_shl(32 - u32::from(prefix)).unwrap_or(0),
+                ),
                 prefixlen: prefix,
                 broadcast: None,
             }),
@@ -372,7 +382,10 @@ mod tests {
         assert_eq!(held(SocketEgress::System).len(), host().len());
         assert_eq!(
             held(SocketEgress::Interface("eth1".into())),
-            ["203.0.113.5".parse::<IpAddr>().unwrap(), "2001:db8::5".parse().unwrap()]
+            [
+                "203.0.113.5".parse::<IpAddr>().unwrap(),
+                "2001:db8::5".parse().unwrap()
+            ]
         );
         assert_eq!(
             held(SocketEgress::SourceAddress("10.0.0.2".parse().unwrap())),
@@ -387,7 +400,12 @@ mod tests {
         let socket = SocketEgress::Interface("lo0".into())
             .join_multicast(
                 SocketAddrV4::new(Ipv4Addr::new(239, 192, 152, 143), 0),
-                SocketAddrV6::new(Ipv6Addr::new(0xff15, 0, 0, 0, 0, 0, 0xefc0, 0x988f), 0, 0, 0),
+                SocketAddrV6::new(
+                    Ipv6Addr::new(0xff15, 0, 0, 0, 0, 0, 0xefc0, 0x988f),
+                    0,
+                    0,
+                    0,
+                ),
             )
             .unwrap();
         let sent = format!("weaver multicast {}", std::process::id()).into_bytes();
