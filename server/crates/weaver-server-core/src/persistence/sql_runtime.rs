@@ -1296,7 +1296,11 @@ fn commit_outcome_unknown(op_name: &str, error: StateError) -> StateError {
 
 // An autocommit statement on the writer gate. A busy statement applied
 // nothing, so it is run again under the same rules as a gated transaction.
-async fn run_gated_sqlite<T, Op, Fut>(gate: &WriterGate, operation_name: &str, operation: Op) -> SqlResult<T>
+async fn run_gated_sqlite<T, Op, Fut>(
+    gate: &WriterGate,
+    operation_name: &str,
+    operation: Op,
+) -> SqlResult<T>
 where
     Op: FnMut() -> Fut,
     Fut: Future<Output = SqlResult<T>>,
@@ -1311,7 +1315,10 @@ where
 pub(crate) fn sql_writes(template: &str) -> bool {
     let mut rest = template.trim_start();
     while let Some(comment) = rest.strip_prefix("--") {
-        rest = comment.split_once('\n').map_or("", |(_, after)| after).trim_start();
+        rest = comment
+            .split_once('\n')
+            .map_or("", |(_, after)| after)
+            .trim_start();
     }
     let upper = rest.to_ascii_uppercase();
     let first = upper

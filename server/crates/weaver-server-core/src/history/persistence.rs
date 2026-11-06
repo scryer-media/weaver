@@ -297,8 +297,12 @@ impl Database {
     pub fn delete_all_integration_events(&self) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            SqlRuntime::execute(datastore.write_exec(), "DELETE FROM integration_events", &[])
-                .await?;
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                "DELETE FROM integration_events",
+                &[],
+            )
+            .await?;
             Ok(())
         })
     }
