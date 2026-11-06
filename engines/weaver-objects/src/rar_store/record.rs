@@ -44,6 +44,7 @@ impl RarStore {
                 if condemned.parts.is_empty() {
                     self.condemned.remove(&id);
                 }
+                self.moved();
             }
             // The layout cuts a member's runs at its parts, so one run lies
             // in one piece; a part the entry has not taken yet routes nothing.

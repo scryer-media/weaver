@@ -230,6 +230,10 @@ pub(crate) struct NamespaceWriter {
     #[cfg(test)]
     diagnostics: Vec<weaver_graph::recovery::RepairDiagnostic>,
     placements: Vec<Placement>,
+    // Each held volume's object, volume and placement number when a pass
+    // last asked where its holds go: while the object says the same number,
+    // it places them as it did then, and nothing of them goes down.
+    asked: BTreeMap<(NodeId, VolumeIndex), (NodeId, VolumeIndex, u64)>,
     // Where the time a member write takes on disk is published, when the
     // job runs in a pipeline.
     metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
@@ -286,6 +290,7 @@ impl NamespaceWriter {
             #[cfg(test)]
             diagnostics: Vec::new(),
             placements: Vec::new(),
+            asked: BTreeMap::new(),
             metrics: None,
         }
     }
@@ -897,7 +902,7 @@ impl NamespaceWriter {
                 .holds
                 .take(held_volume(arrival.member), arrival.range());
         }
-        let held: Vec<(u64, Bytes)> = placements
+        let held: Vec<(u64, Evidenced)> = placements
             .iter()
             .filter_map(|placement| match placement {
                 Placement::Held { range } => range.intersect(arrival.range()),
@@ -906,7 +911,6 @@ impl NamespaceWriter {
             .map(|piece| {
                 let bytes = arrival
                     .bytes
-                    .bytes()
                     .slice(index(piece.start - arrival.offset)..index(piece.end - arrival.offset));
                 (piece.start, bytes)
             })
@@ -941,7 +945,7 @@ impl NamespaceWriter {
         {
             return Ok(());
         }
-        let held = vec![(range.start, Bytes::from(bytes))];
+        let held = vec![(range.start, Bytes::from(bytes).into())];
         self.hold_for(tree, builder, child, (node, member), held, effects)
     }
 
@@ -955,7 +959,7 @@ impl NamespaceWriter {
         builder: &mut dyn Builder,
         child: NodeId,
         (node, member): (NodeId, MemberId),
-        held: Vec<(u64, Bytes)>,
+        held: Vec<(u64, Evidenced)>,
         effects: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let mut breached = Vec::new();
@@ -974,7 +978,7 @@ impl NamespaceWriter {
             effects,
         );
         for (offset, bytes) in breached {
-            self.write_file(tree, node, member, offset, &bytes.into())?;
+            self.write_file(tree, node, member, offset, &bytes)?;
         }
         Ok(())
     }
@@ -1507,7 +1511,7 @@ impl NamespaceWriter {
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let (node, member) = (arrival.node, arrival.member);
-        if self.keep_held(node, member, arrival.offset, arrival.bytes.bytes().clone())? {
+        if self.keep_held(node, member, arrival.offset, arrival.bytes.clone())? {
             if let Some(owner) = self.settle(tree, builder, segments, node, member, out)? {
                 let mut effects = Vec::new();
                 self.capture(tree, builder, owner, &arrival, &mut effects)?;
@@ -1532,7 +1536,7 @@ impl NamespaceWriter {
         node: NodeId,
         member: MemberId,
         offset: u64,
-        bytes: Bytes,
+        bytes: Evidenced,
     ) -> Result<bool, WriteError> {
         let free_disk = self.free_disk_bytes();
         let outcome =
@@ -1578,7 +1582,7 @@ impl NamespaceWriter {
         member: MemberId,
     ) -> Result<(), WriteError> {
         for (offset, bytes) in self.take_held(node, member, ALL)? {
-            self.write_file(tree, node, member, offset, &bytes.into())?;
+            self.write_file(tree, node, member, offset, &bytes)?;
         }
         Ok(())
     }
@@ -1625,7 +1629,7 @@ impl NamespaceWriter {
         builder: &mut dyn Builder,
         segments: &dyn Segments,
         (node, member): (NodeId, MemberId),
-        (offset, bytes): (u64, Bytes),
+        (offset, bytes): (u64, Evidenced),
         said: Option<&Coverage>,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
@@ -1650,10 +1654,10 @@ impl NamespaceWriter {
                 node,
                 member,
                 offset: piece.start,
-                bytes: bytes.slice(start..end).into(),
+                bytes: bytes.slice(start..end),
                 provenance,
             };
-            self.route_as_brought(tree, builder, segments, arrival, out)?;
+            self.route_held_as_brought(tree, builder, segments, arrival, out)?;
         }
         Ok(())
     }
@@ -1717,12 +1721,40 @@ impl NamespaceWriter {
                 let Some((child, volume)) = tree.child_of(parent, member) else {
                     continue;
                 };
-                let held = self
-                    .files
-                    .get(&parent)
-                    .map(|files| files.holds.held_ranges(held))
-                    .unwrap_or_default();
-                for range in held {
+                let ranges = |writer: &Self| {
+                    writer
+                        .files
+                        .get(&parent)
+                        .map(|files| files.holds.held_ranges(held))
+                        .unwrap_or_default()
+                };
+                // Asked already, of an object whose map has not moved since:
+                // every hold was held by that same map, at the last pass or
+                // as it came.
+                let placement = tree.placement(child);
+                let unmoved = placement.is_some()
+                    && self.asked.get(&(parent, held)).copied()
+                        == placement.map(|number| (child, volume, number));
+                if unmoved {
+                    #[cfg(test)]
+                    for range in &ranges(self) {
+                        placements.clear();
+                        tree.locate(child, volume, *range, &mut placements);
+                        assert!(
+                            placements
+                                .iter()
+                                .all(|placement| matches!(placement, Placement::Held { .. })),
+                            "a hold the unmoved map places: {range:?}"
+                        );
+                    }
+                    continue;
+                }
+                if let Some(number) = placement {
+                    self.asked.insert((parent, held), (child, volume, number));
+                }
+                for range in ranges(self) {
+                    #[cfg(test)]
+                    tests::RELEASE_LOCATED.with(|located| located.set(located.get() + 1));
                     placements.clear();
                     tree.locate(child, volume, range, &mut placements);
                     if placements
@@ -1745,7 +1777,7 @@ impl NamespaceWriter {
         node: NodeId,
         member: MemberId,
         range: ByteRange,
-    ) -> Result<Vec<(u64, Bytes)>, WriteError> {
+    ) -> Result<Vec<(u64, Evidenced)>, WriteError> {
         let Some(files) = self.files.get_mut(&node) else {
             return Ok(Vec::new());
         };
@@ -1760,7 +1792,7 @@ impl NamespaceWriter {
                     Bytes::from(buffer)
                 }
             };
-            held.push((piece.range.start, bytes));
+            held.push((piece.range.start, Evidenced::with(bytes, piece.evidence)));
         }
         Ok(held)
     }

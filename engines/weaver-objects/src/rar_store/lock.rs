@@ -306,6 +306,7 @@ impl RarStore {
     // been posted again.
     pub(super) fn condemn(&mut self, candidate: usize, out: &mut Vec<Emit>) {
         self.candidates[candidate].files_wrong = true;
+        self.moved();
         for (id, entry) in self.entries.iter_mut().enumerate() {
             if entry.trial != Some(candidate) {
                 continue;

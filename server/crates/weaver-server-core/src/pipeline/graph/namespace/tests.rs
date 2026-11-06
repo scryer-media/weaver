@@ -25,7 +25,12 @@ mod windows;
 thread_local! {
     // How many members a pass over the holds asked what is held of them.
     pub(super) static RELEASE_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // How many held ranges a pass asked their object to place.
+    pub(crate) static RELEASE_LOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static STORE_DELIVERIES: std::cell::RefCell<Option<Vec<(ByteRange, Provenance)>>> = const { std::cell::RefCell::new(None) };
+    // Each delivery the pretend 7z store heard, with the CRC32 its bytes
+    // came proven by, when every byte of them was.
+    static LATE_HEARD: std::cell::RefCell<Vec<(ByteRange, Option<u64>)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";
@@ -155,6 +160,20 @@ fn map_at() -> ByteRange {
 // no place and is held; once it has, the body is "inner.bin".
 struct Late {
     mapped: bool,
+    // Its placement numbers: this one while unmapped, the next once mapped.
+    number: u64,
+}
+
+static LATE_NUMBERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl Late {
+    fn new() -> Self {
+        let number = LATE_NUMBERS.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            mapped: false,
+            number,
+        }
+    }
 }
 
 impl Object for Late {
@@ -172,6 +191,12 @@ impl Object for Late {
         out: &mut Vec<Emit>,
     ) {
         let range = ByteRange::at(delivery.offset, delivery.bytes.len() as u64);
+        let crc32 = weaver_graph::Algorithm::Crc32;
+        let proven = delivery
+            .bytes
+            .proven(crc32)
+            .then(|| delivery.bytes.digest(crc32).value);
+        LATE_HEARD.with_borrow_mut(|heard| heard.push((range, proven)));
         if !self.mapped && range.intersect(map_at()) == Some(map_at()) {
             self.mapped = true;
             out.push(Emit::Member {
@@ -196,6 +221,10 @@ impl Object for Late {
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
     fn wants(&self, _: &mut Vec<Seek>) {}
     fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
+
+    fn placement(&self) -> Option<u64> {
+        Some(self.number + u64::from(self.mapped))
+    }
 
     fn locate(&self, _: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         if let Some(header) = range.intersect(ByteRange::new(0, body().start)) {
@@ -249,7 +278,7 @@ impl Builder for Build {
                 length: self.inner,
                 checksum_on_repair: self.checksum_on_repair,
             })),
-            Kind::SevenZipStore => Some(Box::new(Late { mapped: false })),
+            Kind::SevenZipStore => Some(Box::new(Late::new())),
             Kind::Xz => Some(Box::new(streams::Decoded::new(Arc::clone(&self.heard)))),
             Kind::Par2 => Some(Box::new(Par {
                 volume: None,
@@ -1091,6 +1120,43 @@ fn bytes_held_before_a_store_knows_its_map_reach_the_member_once_it_does() {
     assert_eq!(posted, whole);
 }
 
+// Held bytes go down again with the checksum the source took of them when
+// they came, whether they stayed in memory or were paged to scratch and
+// read back: the object below is handed them proven, as a first delivery
+// is, and hashes nothing of them again.
+#[test]
+fn held_bytes_go_down_again_with_the_source_s_checksums() {
+    for resident_limit in [u64::MAX, 2] {
+        let mut job = Job::new(HoldBudgets {
+            resident_limit,
+            ..PLENTY
+        });
+        let member = job.member("a.7z", Some(map_at().end));
+        let mut front = seven_z().to_vec();
+        front.extend_from_slice(b"hello");
+        job.send(member, 0, &front, Provenance::Fresh);
+        assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len());
+        let paged = job.accountant.usage().scratch;
+        assert_eq!(paged > 0, resident_limit == 2, "limit {resident_limit}");
+        LATE_HEARD.with_borrow_mut(Vec::clear);
+
+        job.send(member, map_at().start, MAP, Provenance::Fresh);
+
+        assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
+        assert_eq!(job.file("inner.bin"), b"hello");
+        let replayed: Vec<_> = LATE_HEARD
+            .with_borrow(Clone::clone)
+            .into_iter()
+            .filter(|(range, _)| *range == body())
+            .collect();
+        assert_eq!(
+            replayed,
+            vec![(body(), Some(u64::from(SOURCE_CRC)))],
+            "limit {resident_limit}: the held body comes back proven by the source"
+        );
+    }
+}
+
 // A pass over the holds asks only the volumes that hold bytes: of six
 // hundred members and two stores waiting on their maps, a delivery to a
 // plain member asks the two stores, and each map then releases its own.
@@ -1120,6 +1186,45 @@ fn a_pass_over_the_holds_asks_only_the_volumes_that_hold_bytes() {
     assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len());
     job.send(stores[1], map_at().start, MAP, Provenance::Fresh);
     assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
+}
+
+// A pass asks a store where its held bytes go only once the store's
+// placement number moved: deliveries that move nothing locate nothing, and
+// the map that moves it releases the body, written as it came.
+#[test]
+fn a_pass_locates_held_bytes_only_once_their_object_s_map_moved() {
+    let mut job = Job::new(PLENTY);
+    let plain: Vec<MemberId> = (0..20)
+        .map(|index| job.member(&format!("f{index}.bin"), Some(4)))
+        .collect();
+    let store = job.member("a.7z", Some(map_at().end));
+    let mut front = seven_z().to_vec();
+    front.extend_from_slice(b"hello");
+    job.send(store, 0, &front, Provenance::Fresh);
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len());
+    job.send(plain[0], 0, b"data", Provenance::Fresh);
+    RELEASE_ASKED.set(0);
+    RELEASE_LOCATED.set(0);
+
+    for member in &plain[1..] {
+        job.send(*member, 0, b"data", Provenance::Fresh);
+    }
+
+    assert_eq!(
+        RELEASE_ASKED.get(),
+        plain.len() - 1,
+        "each pass asks the store"
+    );
+    assert_eq!(RELEASE_LOCATED.get(), 0, "and locates nothing");
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len());
+    job.send(store, map_at().start, MAP, Provenance::Fresh);
+    assert_eq!(
+        RELEASE_LOCATED.get(),
+        1,
+        "the map moved it: the body is located"
+    );
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
+    assert_eq!(job.file("inner.bin"), b"hello");
 }
 
 // The ledger confines every name to the working dir: a name that would
@@ -2938,7 +3043,12 @@ fn unrelated_candidate_and_shared_scratch_activity_do_not_invalidate_repair_loan
             .run(weaver_graph::Budget::default(), &Default::default());
         assert!(
             !job.writer
-                .keep_held(NodeId::ROOT, other, 25000, Bytes::from_static(b"held"))
+                .keep_held(
+                    NodeId::ROOT,
+                    other,
+                    25000,
+                    Bytes::from_static(b"held").into()
+                )
                 .unwrap()
         );
         job.send(other, 20000, b"new", Provenance::Fresh);
@@ -2968,7 +3078,12 @@ fn replacement_of_a_borrowed_hold_invalidates_repair_loan() {
         let member = job.member("payload.bin", Some(8));
         assert!(
             !job.writer
-                .keep_held(NodeId::ROOT, member, 0, Bytes::from_static(b"original"))
+                .keep_held(
+                    NodeId::ROOT,
+                    member,
+                    0,
+                    Bytes::from_static(b"original").into()
+                )
                 .unwrap()
         );
         job.tree
@@ -2995,7 +3110,7 @@ fn replacement_of_a_borrowed_hold_invalidates_repair_loan() {
         assert!(!job.writer.moved_since(&job.tree, &returned));
         assert!(
             !job.writer
-                .keep_held(NodeId::ROOT, member, 2, Bytes::from_static(b"new"))
+                .keep_held(NodeId::ROOT, member, 2, Bytes::from_static(b"new").into())
                 .unwrap()
         );
         assert!(
@@ -3021,7 +3136,12 @@ fn a_returned_ruling_stands_on_the_ranges_it_read_and_only_those() {
         let arrive = |job: &mut Job, offset: u64, bytes: &'static [u8]| {
             assert!(
                 !job.writer
-                    .keep_held(NodeId::ROOT, member, offset, Bytes::from_static(bytes))
+                    .keep_held(
+                        NodeId::ROOT,
+                        member,
+                        offset,
+                        Bytes::from_static(bytes).into()
+                    )
                     .unwrap()
             );
             job.tree

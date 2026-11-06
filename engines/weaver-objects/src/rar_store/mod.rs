@@ -324,6 +324,18 @@ pub struct RarStore {
     stale: bool,
     // The object gave its set up; it says nothing more.
     gone: bool,
+    // Moved wherever anything `place` reads may change: a look at what
+    // changed, a volume touched, a condemned file's cipher taken or let go.
+    // Data that only passes through moves nothing.
+    placed: u64,
+}
+
+// Every store's placement numbers, so no two stores, a store restored in
+// place of another included, ever share one.
+static PLACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_placed() -> u64 {
+    PLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
 impl Default for RarStore {
@@ -361,7 +373,13 @@ impl RarStore {
             gaps_said: BTreeSet::new(),
             stale: false,
             gone: false,
+            placed: next_placed(),
         }
+    }
+
+    // Something `place` reads may have changed.
+    fn moved(&mut self) {
+        self.placed = next_placed();
     }
 
     // A volume newly held lies under no piece: a layout maps only volumes
@@ -387,6 +405,7 @@ impl RarStore {
             found.invalidate_facts();
         }
         self.dirty.insert(volume);
+        self.moved();
     }
 
     // File what a volume's walk says of the set, as it stands now: whether
@@ -474,6 +493,8 @@ impl RarStore {
         }
         let mut reached = BTreeMap::new();
         while !self.gone && (std::mem::take(&mut self.stale) | !self.dirty.is_empty()) {
+            // The walks, the layout and the keys change only here.
+            self.moved();
             let touched = std::mem::take(&mut self.dirty);
             self.walk(&touched, &mut reached, out);
             // The layout holds to every volume touched so far, those the
@@ -734,6 +755,8 @@ impl Object for RarStore {
             if found.kept.generation() == generation {
                 break;
             }
+            // A range wanted anew is the store's own now, not held.
+            self.moved();
         }
         self.route(
             volume,
@@ -844,6 +867,10 @@ impl Object for RarStore {
 
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         self.place(volume, range, out);
+    }
+
+    fn placement(&self) -> Option<u64> {
+        Some(self.placed)
     }
 
     fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {
