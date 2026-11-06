@@ -3529,6 +3529,12 @@ impl Session {
         self.utp
     }
 
+    /// Whether the session speaks uTP at all: it listens on uTP, or it
+    /// connects out over a uTP socket of its own.
+    pub fn uses_utp(&self) -> bool {
+        !self.utp_sockets.is_empty()
+    }
+
     /// Our address as the internet sees it, IPv4 first, of each family the
     /// vote has settled on.
     pub fn external_ips(&self) -> Vec<IpAddr> {

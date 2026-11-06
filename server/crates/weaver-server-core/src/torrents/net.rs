@@ -2269,6 +2269,7 @@ pub struct Exposure {
     pub inbound: bool,
     pub udp_trackers: bool,
     pub dht: bool,
+    /// The session speaks uTP: it listens on uTP or connects out over it.
     pub utp: bool,
 }
 
@@ -2294,7 +2295,7 @@ impl Exposure {
             inbound: announced_port != 0,
             udp_trackers: shape.datagrams,
             dht: shape.dht,
-            utp: session.listens_utp(),
+            utp: session.uses_utp(),
         }
     }
 }
