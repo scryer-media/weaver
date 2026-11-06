@@ -641,7 +641,7 @@ impl GraphJob {
     fn unarrive(&mut self, volume: VolumeIndex, ordinal: u32) -> Result<(), GraphError> {
         let range = self.root.map.arrived_range(volume, ordinal);
         let tail = match (range, self.tree.child_of(NodeId::ROOT, MemberId(volume.0))) {
-            (Some(range), Some((child, bound))) if self.tree.window(child).is_none() => Some(
+            (Some(range), Some((child, bound))) => Some(
                 self.writer
                     .read_tail(&mut self.tree, &mut *self.builder, child, &[(bound, range)])?,
             ),

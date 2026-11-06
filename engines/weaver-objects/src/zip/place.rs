@@ -92,7 +92,10 @@ impl Zip {
                             open.reaches().max(said)
                         })
                         .filter(|at| range.start < *at && *at < range.end);
-                    if let Some(at) = split {
+                    // A member piece is cut from the member's span, which
+                    // starts at its data.
+                    let data = entry.and_then(|entry| entry.data);
+                    if let (Some(at), Some(start)) = (split, data) {
                         push(
                             out,
                             Placement::Member {
@@ -100,7 +103,6 @@ impl Zip {
                                 range: ByteRange::new(range.start, at),
                             },
                         );
-                        let start = entry.and_then(|entry| entry.data).unwrap();
                         self.held_or_kept(
                             ByteRange::new(at, range.end).shift(start as i64),
                             base,
@@ -119,8 +121,7 @@ impl Zip {
                                             .covered(ByteRange::new(0, range.end))
                                 })
                             });
-                    if locked {
-                        let start = entry.and_then(|entry| entry.data).unwrap();
+                    if let (true, Some(start)) = (locked, data) {
                         self.held_or_kept(range.shift(start as i64), base, out);
                     } else {
                         push(out, Placement::Member { member, range });
