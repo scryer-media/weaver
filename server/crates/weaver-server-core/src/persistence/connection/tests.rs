@@ -979,7 +979,7 @@ fn open_applies_sqlite_file_pragmas() {
     assert_eq!(mmap_size, 16 * 1024 * 1024);
 
     let wal_autocheckpoint = fetch_i64(&db, "PRAGMA wal_autocheckpoint", vec![]);
-    assert_eq!(wal_autocheckpoint, 4000);
+    assert_eq!(wal_autocheckpoint, 0);
 
     let journal_size_limit = fetch_i64(&db, "PRAGMA journal_size_limit", vec![]);
     assert_eq!(journal_size_limit, 64 * 1024 * 1024);

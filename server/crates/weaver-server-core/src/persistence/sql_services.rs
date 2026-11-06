@@ -16,6 +16,7 @@ use crate::persistence::database_target::DatabaseTarget;
 use crate::persistence::postgres_migrations;
 use crate::persistence::sql_runtime::{SqlRuntime, StoreDatastore, db_err};
 use crate::persistence::sqlite_writer::{SqliteWriterGate, new_writer_gate};
+use crate::persistence::wal_checkpoint::{WAL_CHECKPOINT_FRAMES, WalCheckpointer};
 use crate::persistence::{StateError, postgres_migrations::MigrationStatus};
 use crate::schema_migrations::MigrationMode;
 
@@ -90,6 +91,9 @@ pub(crate) struct SqliteServices {
     pool: sqlx::SqlitePool,
     encryption_key: Arc<RwLock<Option<crate::persistence::encryption::EncryptionKey>>>,
     writer_gate: SqliteWriterGate,
+    // A file database's checkpoint task; the last handle to drop runs its
+    // shutdown checkpoint.
+    _checkpointer: Option<Arc<WalCheckpointer>>,
     // Migration ledger maximum as it stood when this handle opened the
     // database, captured before the migration run below could move it.
     // `None` for a database nothing had ever migrated.
@@ -118,10 +122,24 @@ impl SqliteServices {
         url: impl AsRef<str>,
         migration_mode: MigrationMode,
     ) -> Result<Self, StateError> {
-        let db_url = sqlite_url_with_create(url.as_ref());
+        Self::open_sqlite(url.as_ref(), migration_mode, WAL_CHECKPOINT_FRAMES).await
+    }
+
+    pub(crate) async fn open_sqlite(
+        url: &str,
+        migration_mode: MigrationMode,
+        wal_checkpoint_frames: u32,
+    ) -> Result<Self, StateError> {
+        let db_url = sqlite_url_with_create(url);
         let is_memory = db_url.contains(":memory:");
-        let pool_opts = sqlite_pool_options(is_memory);
         let connect_opts = sqlite_connect_options(&db_url, is_memory)?;
+        let wal = (!is_memory).then(|| WalCheckpointer::signal(wal_checkpoint_frames));
+        let pool_opts = match wal {
+            Some(wal) => sqlite_pool_options(is_memory).after_connect(move |connection, _| {
+                Box::pin(async move { wal.report_commits(connection).await })
+            }),
+            None => sqlite_pool_options(is_memory),
+        };
 
         // The run goes over one connection. A connection keeps the schema it
         // last read, and SQLite checks a dropped column against that copy, so
@@ -144,14 +162,19 @@ impl SqliteServices {
             None
         } else {
             Some(
+                // The run is alone at startup and has no checkpoint task
+                // yet, so it keeps SQLite's own autocheckpoint.
                 open(
-                    connect_opts.clone().pragma("auto_vacuum", "INCREMENTAL"),
+                    connect_opts
+                        .clone()
+                        .pragma("auto_vacuum", "INCREMENTAL")
+                        .pragma("wal_autocheckpoint", WAL_CHECKPOINT_FRAMES.to_string()),
                     SqlitePoolOptions::new().max_connections(1),
                 )
                 .await?,
             )
         };
-        let pool = open(connect_opts, pool_opts).await?;
+        let pool = open(connect_opts.clone(), pool_opts).await?;
         let runner = migration_pool.as_ref().unwrap_or(&pool);
 
         // Read before the run, because the run is what changes the answer.
@@ -164,12 +187,24 @@ impl SqliteServices {
         }
         migrated?;
 
+        let checkpointer = match wal {
+            Some(wal) => Some(Arc::new(WalCheckpointer::start(wal, connect_opts).await?)),
+            None => None,
+        };
         Ok(Self {
             pool,
             encryption_key: Arc::new(RwLock::new(None)),
-            writer_gate: new_writer_gate(),
+            writer_gate: new_writer_gate(wal),
+            _checkpointer: checkpointer,
             pre_migration_schema_version,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wal_signal(
+        &self,
+    ) -> Option<&'static crate::persistence::wal_checkpoint::WalSignal> {
+        self.writer_gate.wal()
     }
 
     pub(crate) fn pool(&self) -> &sqlx::SqlitePool {
@@ -395,7 +430,8 @@ pub(crate) fn sqlite_connect_options(
         connect_opts = connect_opts
             .journal_mode(SqliteJournalMode::Wal)
             .pragma("cache_size", "-65536")
-            .pragma("wal_autocheckpoint", "4000")
+            // Checkpoints run on their own task; see `wal_checkpoint`.
+            .pragma("wal_autocheckpoint", "0")
             .pragma("journal_size_limit", "67108864");
     }
     Ok(connect_opts)

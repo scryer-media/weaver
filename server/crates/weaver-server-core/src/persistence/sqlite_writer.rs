@@ -5,13 +5,17 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, MutexGuard};
 
+use crate::persistence::wal_checkpoint::WalSignal;
+
 // One per SQLite database: every write takes it, so writes wait their turn
 // here instead of in SQLite's busy handler.
 pub(crate) type SqliteWriterGate = Arc<WriterGate>;
 
-#[derive(Default)]
 pub(crate) struct WriterGate {
     lock: Mutex<()>,
+    // A file database's WAL: a write that takes the gate waits for the
+    // checkpoint a commit past the threshold asked for.
+    wal: Option<&'static WalSignal>,
     // How many callers wait for the gate, so a test can wait until a write
     // has parked here.
     #[cfg(test)]
@@ -22,7 +26,19 @@ impl WriterGate {
     pub(crate) async fn lock(&self) -> MutexGuard<'_, ()> {
         #[cfg(test)]
         let _waiting = Waiting::new(&self.waiting);
-        self.lock.lock().await
+        let guard = self.lock.lock().await;
+        // Checked once the gate is ours, so a write already queued on it
+        // cannot slip in after the commit that crossed the threshold. The
+        // checkpoint task never takes the gate, so this wait always ends.
+        if let Some(wal) = self.wal {
+            wal.caught_up().await;
+        }
+        guard
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wal(&self) -> Option<&'static WalSignal> {
+        self.wal
     }
 
     #[cfg(test)]
@@ -50,8 +66,13 @@ impl Drop for Waiting<'_> {
     }
 }
 
-pub(crate) fn new_writer_gate() -> SqliteWriterGate {
-    Arc::new(WriterGate::default())
+pub(crate) fn new_writer_gate(wal: Option<&'static WalSignal>) -> SqliteWriterGate {
+    Arc::new(WriterGate {
+        lock: Mutex::new(()),
+        wal,
+        #[cfg(test)]
+        waiting: tokio::sync::watch::channel(0).0,
+    })
 }
 
 #[cfg(test)]
