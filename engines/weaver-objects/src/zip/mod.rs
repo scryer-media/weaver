@@ -580,20 +580,8 @@ impl Object for Zip {
                     && let Some(part) = span.intersect(global)
                     && let Some(cipher) = &mut entry.cipher
                 {
-                    let (from, to) = (part.start - span.start, part.end - span.start);
-                    // Said after the range, as far as it was said on from
-                    // it: made under keys that came from the range.
-                    let mut covered = to;
-                    for run in self.members[member.0 as usize]
-                        .coverage
-                        .overlapping(ByteRange::new(to, entry.length.max(to)))
-                    {
-                        if run.range.start > covered {
-                            break;
-                        }
-                        covered = covered.max(run.range.end);
-                    }
-                    cipher.unposted(from, to, covered.min(entry.length));
+                    let from = part.start - span.start;
+                    cipher.unposted(from);
                     let said = &mut self.members[member.0 as usize];
                     said.coverage.erase(ByteRange::new(from, entry.length));
                     said.closed = false;
@@ -604,6 +592,36 @@ impl Object for Zip {
         crate::said::unposted(&placements, &mut self.members, |out| {
             (&mut out.coverage, &mut out.closed)
         });
+    }
+
+    // A cipher member's plaintext after the range was made under keys the
+    // range fed, so forgetting the range forgets it all, through the end of
+    // what the member has said.
+    fn uncovers(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<(VolumeIndex, ByteRange)>) {
+        out.push((volume, range));
+        let (Some(global), Some(map)) = (self.global(volume, range), &self.map) else {
+            return;
+        };
+        for entry in &map.entries {
+            let (Some(span), Some(member), Some(_)) = (entry.span(), entry.member, &entry.cipher)
+            else {
+                continue;
+            };
+            let Some(part) = span.intersect(global) else {
+                continue;
+            };
+            let after = ByteRange::new(part.end - span.start, entry.length);
+            let Some(end) = self.members[member.0 as usize]
+                .coverage
+                .overlapping(after)
+                .map(|run| run.range.end.min(entry.length))
+                .max()
+                .filter(|end| *end > after.start)
+            else {
+                continue;
+            };
+            self.to_volumes(ByteRange::new(part.end, span.start + end), out);
+        }
     }
 
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {

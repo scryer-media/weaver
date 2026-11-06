@@ -1068,8 +1068,9 @@ fn a_zipcrypto_repair_replays_only_from_the_repaired_byte() {
 }
 
 // A range in the middle of a closed member uncovered and said again: the
-// keys after it come from it, so the tail after it is read back under the
-// keys it was made with and said again, and the member closes whole.
+// keys after it come from it, so uncovering it uncovers the tail after it
+// through the member's end, which is read back under the keys it was made
+// with and said again with it, and the member closes whole.
 #[test]
 fn a_partial_uncover_of_a_closed_member_replays_its_tail() {
     let plain = payload(88, 300_007);
@@ -1081,30 +1082,25 @@ fn a_partial_uncover_of_a_closed_member_replays_its_tail() {
     offer(&mut owner, PASSWORD);
     owner.whole(4096);
     assert!(owner.member("alpha.bin").closed);
-    let before = owner.said.len();
+    assert_eq!(
+        owner.forgets(&[(VolumeIndex(0), window)], false),
+        vec![(VolumeIndex(0), ByteRange::new(window.start, end))]
+    );
+    let replays = owner.replays;
     owner.again(&[(VolumeIndex(0), window)]);
     owner.close(0);
-    let said = &owner.said[before..];
-    assert!(
-        said.contains(&Emit::Again {
-            volume: VolumeIndex(0),
-            range: ByteRange::new(window.end, end),
-        }),
-        "{said:?}"
-    );
+    assert!(owner.replays > replays);
     assert!(owner.object.members[0].closed);
     assert!(owner.member("alpha.bin").closed);
     assert!(owner.member("alpha.bin").bytes == plain);
     assert!(owner.posted(0) == Some(archive));
 }
 
-// An article sent back for another copy: what came first was not the
-// article, and the tail after it was decrypted under keys fed its wrong
-// plaintext. The right copy comes, and the tail, read back under the keys
-// it was made with, is said again right.
-#[test]
-fn a_sent_back_article_corrects_the_tail_after_it() {
-    let plain = payload(89, 300_007);
+// The ciphertext of `archive` with one article's bytes wrong, delivered
+// with the right copy still to come: the tail after it is decrypted under
+// keys fed the wrong plaintext.
+fn sent_back(seed: u64) -> (Vec<u8>, Vec<u8>, ByteRange, Owner) {
+    let plain = payload(seed, 300_007);
     let archive = encrypted(&plain);
     let start = records::local_len(&archive).unwrap() + 12;
     let window = ByteRange::at(start + 100_000, 4096);
@@ -1118,18 +1114,40 @@ fn a_sent_back_article_corrects_the_tail_after_it() {
     owner.deliver(0, ByteRange::new(0, window.start));
     owner.deliver_as(0, window, Provenance::Fresh, Some(&wrong));
     owner.deliver(0, ByteRange::new(window.end, archive.len() as u64));
-    // The tree forgets the window, as `send_back` uncovers it.
-    let mut placements = Vec::new();
-    owner.object.unposted(VolumeIndex(0), window);
-    owner.object.locate(VolumeIndex(0), window, &mut placements);
-    for placement in placements {
-        if let weaver_graph::Placement::Member { member, range } = placement
-            && let Some(got) = owner.members.get_mut(&member.0)
-        {
-            got.coverage.erase(range);
-            got.closed = false;
-        }
-    }
+    assert!(owner.member("alpha.bin").bytes != plain);
+    (plain, archive, window, owner)
+}
+
+// An article sent back for another copy: the tail after it, read back
+// under the keys it was made with before the article is uncovered, waits
+// for the right copy, and is said again right once it comes.
+#[test]
+fn a_sent_back_article_corrects_the_tail_after_it() {
+    let (plain, archive, window, mut owner) = sent_back(89);
+    let start = records::local_len(&archive).unwrap() + 12;
+    owner.send_back(VolumeIndex(0), window);
+    // The window and the tail after it are no longer said, and the tail
+    // waits, read back, for the keys the right copy makes.
+    let member = ByteRange::new(window.start - start, plain.len() as u64);
+    assert!(owner.member("alpha.bin").coverage.overlapping(member).next().is_none());
+    assert!(owner.object.members[0].coverage.overlapping(member).next().is_none());
+    assert!(!owner.member("alpha.bin").closed);
+    owner.deliver(0, window);
+    owner.close(0);
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+}
+
+// A restart between an article sent back and its other copy: what the
+// tail's uncover forgot is in the facts, so the copy that comes after the
+// restore says the tail again, and the member closes right.
+#[test]
+fn a_restart_before_a_sent_back_article_comes_again_keeps_the_tail() {
+    let (plain, archive, window, mut owner) = sent_back(90);
+    owner.send_back(VolumeIndex(0), window);
+    owner.restore();
+    offer(&mut owner, PASSWORD);
     owner.deliver(0, window);
     owner.close(0);
     assert!(owner.member("alpha.bin").bytes == plain);

@@ -401,10 +401,79 @@ impl Owner {
     }
 
     // Ranges asked for again, as the tree answers them: what of each was
-    // delivered is read back, every range while the store still stands as
-    // it said them all, every member they reached is open again, and the
-    // bytes come again as they came.
+    // delivered, and of what uncovering it forgets past it, is read back,
+    // every range while the store still stands as it said them all, every
+    // member they reached is open again, and the bytes come again as they
+    // came.
     pub(super) fn again(&mut self, ranges: &[(VolumeIndex, ByteRange)]) {
+        let read_back = self.read_delivered(&self.forgets(ranges, false));
+        for (volume, piece, _, _) in &read_back {
+            self.uncover(*volume, *piece);
+        }
+        for (volume, piece, provenance, bytes) in read_back {
+            self.replays += 1;
+            self.push(volume, piece, provenance, Some(&bytes));
+        }
+    }
+
+    // An article sent back for another copy, as the job sends it back: what
+    // uncovering it forgets past it is read back first, the article is
+    // uncovered and no longer delivered, and what was read back comes
+    // again. The other copy comes when the test delivers it.
+    pub(super) fn send_back(&mut self, volume: VolumeIndex, range: ByteRange) {
+        let tail = self.read_delivered(&self.forgets(&[(volume, range)], true));
+        self.uncover(volume, range);
+        if let Some(delivered) = self.delivered.get_mut(&volume.0) {
+            delivered.erase(range);
+        }
+        for (volume, piece, provenance, bytes) in tail {
+            self.replays += 1;
+            self.push(volume, piece, provenance, Some(&bytes));
+        }
+        self.settle();
+    }
+
+    // The ranges and what the store says uncovering them forgets with
+    // them, each byte once; only what lies past them when `beyond`.
+    pub(super) fn forgets(
+        &self,
+        ranges: &[(VolumeIndex, ByteRange)],
+        beyond: bool,
+    ) -> Vec<(VolumeIndex, ByteRange)> {
+        let mut by_volume: BTreeMap<VolumeIndex, Coverage> = BTreeMap::new();
+        for &(volume, range) in ranges {
+            let mut out = Vec::new();
+            self.object.uncovers(volume, range, &mut out);
+            for (volume, range) in out {
+                by_volume
+                    .entry(volume)
+                    .or_default()
+                    .write(range, Provenance::Fresh);
+            }
+        }
+        if beyond {
+            for &(volume, range) in ranges {
+                if let Some(coverage) = by_volume.get_mut(&volume) {
+                    coverage.erase(range);
+                }
+            }
+        }
+        by_volume
+            .into_iter()
+            .flat_map(|(volume, coverage)| {
+                coverage
+                    .runs()
+                    .map(|run| (volume, run.range))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    // What of the ranges was delivered, read back as posted.
+    fn read_delivered(
+        &self,
+        ranges: &[(VolumeIndex, ByteRange)],
+    ) -> Vec<(VolumeIndex, ByteRange, Provenance, Vec<u8>)> {
         let mut read_back = Vec::new();
         for &(volume, range) in ranges {
             let runs: Vec<(ByteRange, Provenance)> = self
@@ -424,22 +493,28 @@ impl Owner {
                 }
             }
         }
-        for (volume, piece, _, _) in &read_back {
-            let mut placements = Vec::new();
-            self.object.unposted(*volume, *piece);
-            self.object.locate(*volume, *piece, &mut placements);
-            for placement in placements {
-                if let Placement::Member { member, range } = placement
-                    && let Some(got) = self.members.get_mut(&member.0)
-                {
-                    got.coverage.erase(range);
-                    got.closed = false;
-                }
-            }
+        read_back
+    }
+
+    // A range uncovered, as the tree uncovers it: it and what the store
+    // says it forgets with it are unsaid where the store placed them before
+    // it forgets them, and every member they reached is open again.
+    pub(super) fn uncover(&mut self, volume: VolumeIndex, range: ByteRange) {
+        let forgets = self.forgets(&[(volume, range)], false);
+        let mut placements = Vec::new();
+        for &(volume, range) in &forgets {
+            self.object.locate(volume, range, &mut placements);
         }
-        for (volume, piece, provenance, bytes) in read_back {
-            self.replays += 1;
-            self.push(volume, piece, provenance, Some(&bytes));
+        for (volume, range) in forgets {
+            self.object.unposted(volume, range);
+        }
+        for placement in placements {
+            if let Placement::Member { member, range } = placement
+                && let Some(got) = self.members.get_mut(&member.0)
+            {
+                got.coverage.erase(range);
+                got.closed = false;
+            }
         }
     }
 

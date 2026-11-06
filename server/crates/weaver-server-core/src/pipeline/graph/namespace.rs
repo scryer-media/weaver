@@ -235,6 +235,24 @@ pub(crate) struct NamespaceWriter {
     metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
 }
 
+// A cipher's tail read back before the ranges that fed its keys are
+// uncovered: the node it is of, the read's serial, and its staged pieces
+// with each one's provenance.
+pub(crate) struct Tail {
+    node: NodeId,
+    serial: u64,
+    staged: loan::Repaired,
+    sources: Vec<Provenance>,
+}
+
+impl Tail {
+    // A tail not to be said: the step failed before it.
+    pub(crate) fn drop_read(self, tree: &mut Tree) {
+        tree.again_done();
+        let _ = self.staged.discard();
+    }
+}
+
 impl NamespaceWriter {
     pub(crate) fn new(
         scope: u64,
@@ -1265,6 +1283,66 @@ impl NamespaceWriter {
             self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
         }
         Ok(())
+    }
+
+    // What uncovering ranges of a node's volume forgets past them, a
+    // cipher's tail made under keys they fed, read back while those keys
+    // still stand and staged on disk, to be said again by `say_tail` once
+    // the ranges are uncovered.
+    pub(crate) fn read_tail(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        node: NodeId,
+        ranges: &[(VolumeIndex, ByteRange)],
+    ) -> Result<Tail, WriteError> {
+        let mut staged = loan::Repaired::again(&self.working_dir, node)?;
+        let mut sources = Vec::new();
+        let serial = tree.again_tail(node, ranges, &self.placing(builder), &mut |volume, posted| {
+            staged.write(MemberId(volume.0), posted.offset, &posted.bytes);
+            sources.push(posted.provenance);
+        });
+        if let Some(error) = staged.failed() {
+            tree.again_done();
+            let _ = staged.discard();
+            return Err(error.into());
+        }
+        Ok(Tail {
+            node,
+            serial,
+            staged,
+            sources,
+        })
+    }
+
+    // A tail `read_tail` staged, said again in the order it was read.
+    pub(crate) fn say_tail(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        tail: Tail,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let Tail {
+            node,
+            serial,
+            staged,
+            sources,
+        } = tail;
+        let said = self.again_staged(
+            tree,
+            builder,
+            segments,
+            (serial, node),
+            &staged,
+            sources,
+            out,
+        );
+        tree.again_done();
+        let removed = staged.discard();
+        said?;
+        Ok(removed?)
     }
 
     // A member its object gave back is a leaf, and its file is what the

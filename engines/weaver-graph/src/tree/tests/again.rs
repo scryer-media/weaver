@@ -17,6 +17,8 @@ type Log = Arc<Mutex<Vec<Heard>>>;
 enum Heard {
     Bytes(u64, Vec<u8>, Provenance),
     Unposted(ByteRange),
+    // Set in the log before the store is built: it forgets its tail.
+    Tail,
 }
 
 // A pretend store whose one member is its volume, each byte flipped so the
@@ -31,6 +33,9 @@ struct Trial {
     // second time, inside the replay of the first request.
     nest: bool,
     fronts: u32,
+    // Forgetting a range forgets everything given after it, as a cipher's
+    // keys after a range come from it.
+    tail: bool,
 }
 
 impl Trial {
@@ -42,6 +47,14 @@ impl Trial {
 impl Object for Trial {
     fn unposted(&mut self, _: VolumeIndex, range: ByteRange) {
         self.hear(Heard::Unposted(range));
+    }
+
+    fn uncovers(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<(VolumeIndex, ByteRange)>) {
+        out.push((volume, range));
+        let given = self.given.len() as u64;
+        if self.tail && range.end < given {
+            out.push((volume, ByteRange::new(range.end, given)));
+        }
     }
 
     fn kind(&self) -> Kind {
@@ -141,6 +154,7 @@ impl Builder for Trials {
                 asked: false,
                 nest: self.1,
                 fronts: 0,
+                tail: self.0.lock().expect("log").contains(&Heard::Tail),
             }) as Box<dyn Object>
         })
     }
@@ -438,4 +452,111 @@ fn a_replay_raised_inside_a_replay_is_said_once() {
         .count();
     // As it came, by the first request, and by the one raised inside it.
     assert_eq!(fronts, 3, "{heard:?}");
+}
+
+// A store whose bytes after a range come from it, bound below the root
+// with its front and a body delivered.
+fn tailed() -> (Tree, Trials, Log, MemberId, NodeId, Vec<u8>) {
+    let log = Log::default();
+    log.lock().expect("log").push(Heard::Tail);
+    let mut builder = Trials(Arc::clone(&log), false);
+    let mut tree = Tree::new();
+    let mut effects = Vec::new();
+    let show = tree.announce_root("show.rar", None, &mut effects);
+    let mut posted = SIGNATURE.to_vec();
+    posted.extend_from_slice(b"hello");
+    deliver(
+        &mut tree,
+        &mut builder,
+        show,
+        (0, &posted, Provenance::Fresh),
+        &mut effects,
+    );
+    let child = tree.child_of(NodeId::ROOT, show).expect("bound").0;
+    let body = b"the body after the front".to_vec();
+    deliver(
+        &mut tree,
+        &mut builder,
+        show,
+        (posted.len() as u64, &body, Provenance::Fresh),
+        &mut effects,
+    );
+    posted.extend_from_slice(&body);
+    log.lock().expect("log").clear();
+    (tree, builder, log, show, child, posted)
+}
+
+// An article uncovered at the root whose store's bytes after it come from
+// it: below, the store forgets the article and everything after it, and
+// its member is uncovered through its end, as the store forgot it.
+#[test]
+fn an_uncover_forgets_what_the_store_says_comes_from_it() {
+    let (mut tree, _, log, show, child, posted) = tailed();
+    let length = posted.len() as u64;
+    tree.uncover(NodeId::ROOT, VolumeIndex(show.0), ByteRange::new(5, 8));
+    let heard = log.lock().expect("log").clone();
+    assert_eq!(
+        heard,
+        vec![
+            Heard::Unposted(ByteRange::new(5, 8)),
+            Heard::Unposted(ByteRange::new(8, length)),
+        ]
+    );
+    let record = tree
+        .namespace(child)
+        .and_then(|namespace| namespace.get(MemberId(0)))
+        .expect("member");
+    assert!(record.coverage.covered(ByteRange::new(0, 5)));
+    assert!(record.coverage.overlapping(ByteRange::new(5, length)).next().is_none());
+    // The root holds what arrived of the volume apart from the article.
+    let root = tree
+        .namespace(NodeId::ROOT)
+        .and_then(|namespace| namespace.get(show))
+        .expect("volume");
+    assert!(root.coverage.covered(ByteRange::new(8, length)));
+}
+
+// Asked for a range again, a store whose bytes after it come from it has
+// them read back with it, and all of it uncovered.
+#[test]
+fn a_range_asked_for_again_reads_back_what_comes_from_it() {
+    let (mut tree, builder, _, _, child, posted) = tailed();
+    let length = posted.len() as u64;
+    let mut said = Vec::new();
+    tree.again_read(
+        child,
+        &[(VolumeIndex(0), ByteRange::new(5, 8))],
+        &builder,
+        &mut |_, posted| said.push((posted.offset, posted.bytes.to_vec())),
+    );
+    tree.again_done();
+    assert_eq!(said, vec![(5, posted[5..].to_vec())]);
+    let record = tree
+        .namespace(child)
+        .and_then(|namespace| namespace.get(MemberId(0)))
+        .expect("member");
+    assert!(record.coverage.overlapping(ByteRange::new(5, length)).next().is_none());
+}
+
+// Before a range is uncovered by bytes of the caller's own, the bytes after
+// it that come from it are read back alone, and nothing is uncovered yet.
+#[test]
+fn a_tail_is_read_back_before_its_range_is_uncovered() {
+    let (mut tree, builder, log, _, child, posted) = tailed();
+    let length = posted.len() as u64;
+    let mut said = Vec::new();
+    tree.again_tail(
+        child,
+        &[(VolumeIndex(0), ByteRange::new(5, 8))],
+        &builder,
+        &mut |_, posted| said.push((posted.offset, posted.bytes.to_vec())),
+    );
+    tree.again_done();
+    assert_eq!(said, vec![(8, posted[8..].to_vec())]);
+    assert!(log.lock().expect("log").is_empty());
+    let record = tree
+        .namespace(child)
+        .and_then(|namespace| namespace.get(MemberId(0)))
+        .expect("member");
+    assert!(record.coverage.covered(ByteRange::new(0, length)));
 }

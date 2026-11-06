@@ -627,19 +627,37 @@ impl GraphJob {
     // it where its neighbours showed it is not, so what came was never the
     // article's bytes. The root waits on it again, and the copy that comes
     // is taken as its first.
-    pub(crate) fn send_back(&mut self, volume: VolumeIndex, ordinal: u32) {
-        self.unarrive(volume, ordinal);
+    pub(crate) fn send_back(&mut self, volume: VolumeIndex, ordinal: u32) -> Result<(), GraphError> {
+        self.unarrive(volume, ordinal)
     }
 
     // The root waits on an arrived article again, and what its bytes
     // covered of their member is covered no more, so no member reads as its
-    // own bytes that may never have been.
-    fn unarrive(&mut self, volume: VolumeIndex, ordinal: u32) {
+    // own bytes that may never have been. What uncovering it forgets past
+    // it in the object bound to its volume, a cipher's tail made under keys
+    // it fed, is read back first, under those keys, and said again once it
+    // is uncovered: it waits there for the keys the article's next copy
+    // makes.
+    fn unarrive(&mut self, volume: VolumeIndex, ordinal: u32) -> Result<(), GraphError> {
         let range = self.root.map.arrived_range(volume, ordinal);
+        let tail = match (range, self.tree.child_of(NodeId::ROOT, MemberId(volume.0))) {
+            (Some(range), Some((child, bound))) if self.tree.window(child).is_none() => Some(
+                self.writer
+                    .read_tail(&mut self.tree, &mut *self.builder, child, &[(bound, range)])?,
+            ),
+            _ => None,
+        };
         self.root.map.unarrive(volume, ordinal);
         if let Some(range) = range {
             self.tree.uncover(NodeId::ROOT, volume, range);
         }
+        if let Some(tail) = tail {
+            let mut out = Vec::new();
+            self.writer
+                .say_tail(&mut self.tree, &mut *self.builder, &self.root, tail, &mut out)?;
+            self.heard(out)?;
+        }
+        Ok(())
     }
 
     // The volume's articles the root holds intact, at the ranges they were

@@ -35,31 +35,6 @@ const fn crc_table() -> [u32; 256] {
 }
 const CRC: [u32; 256] = crc_table();
 
-// Each table entry's top byte is its own, so the entry a CRC step took is
-// known from the step's result: the step runs backwards.
-const fn crc_top() -> [u8; 256] {
-    let mut top = [0; 256];
-    let mut i = 0;
-    while i < CRC.len() {
-        top[(CRC[i] >> 24) as usize] = i as u8;
-        i += 1;
-    }
-    top
-}
-const CRC_TOP: [u8; 256] = crc_top();
-
-// The key multiplier's inverse modulo 2^32.
-const fn multiplier_inverse() -> u32 {
-    let mut inverse: u32 = 134_775_813;
-    let mut round = 0;
-    while round < 5 {
-        inverse = inverse.wrapping_mul(2u32.wrapping_sub(134_775_813u32.wrapping_mul(inverse)));
-        round += 1;
-    }
-    inverse
-}
-const MULTIPLIER_INVERSE: u32 = multiplier_inverse();
-
 #[derive(Clone)]
 struct Keys(Zeroizing<[u32; 3]>);
 
@@ -91,21 +66,6 @@ impl Keys {
         let plain = byte ^ self.mask();
         self.update(plain);
         plain
-    }
-
-    // `update` run backwards: the keys before the plaintext byte that
-    // made these.
-    fn undo(&mut self, plain: u8) {
-        let back = |key: u32, byte: u8| {
-            let index = CRC_TOP[(key >> 24) as usize];
-            ((key ^ CRC[index as usize]) << 8) | u32::from(index ^ byte)
-        };
-        self.0[2] = back(self.0[2], (self.0[1] >> 24) as u8);
-        self.0[1] = self.0[1]
-            .wrapping_sub(1)
-            .wrapping_mul(MULTIPLIER_INVERSE)
-            .wrapping_sub(self.0[0] & 0xff);
-        self.0[0] = back(self.0[0], plain);
     }
 }
 
@@ -292,89 +252,6 @@ impl Open {
         true
     }
 
-    // As `seal`, for a tail whose keys came from bytes since uncovered:
-    // its state is walked forward from a checkpoint inside the tail, or
-    // backwards from the first after the range, never through anything
-    // before `floor`.
-    fn seal_tail(
-        &self,
-        floor: u64,
-        frontier: &mut Option<(usize, u64, State)>,
-        range: ByteRange,
-        coverage: &Coverage,
-        read: &mut dyn FnMut(ByteRange, &mut Vec<u8>) -> bool,
-        into: &mut Vec<u8>,
-    ) -> bool {
-        let mut read_covered = |range: ByteRange, into: &mut Vec<u8>| {
-            coverage.covered(range) && read(range, into) && into.len() as u64 == range.len()
-        };
-        let cached = frontier
-            .as_ref()
-            .filter(|(_, cached, _)| (floor..=range.start).contains(cached))
-            .map(|(_, at, state)| (*at, state.keys.clone()));
-        let inside = self
-            .checkpoints
-            .range(floor..=range.start)
-            .next_back()
-            .map(|(&at, state)| (at, state.keys.clone()));
-        let mut keys = match cached.into_iter().chain(inside).max_by_key(|(at, _)| *at) {
-            Some((mut at, mut keys)) => {
-                while at < range.start {
-                    let end = (at + STEP).min(range.start);
-                    let mut plain = Vec::new();
-                    if !read_covered(ByteRange::new(at, end), &mut plain) {
-                        return false;
-                    }
-                    for byte in plain {
-                        keys.update(byte);
-                    }
-                    at = end;
-                }
-                keys
-            }
-            None => {
-                let after = self
-                    .checkpoints
-                    .range(range.start..)
-                    .next()
-                    .map(|(&at, state)| (at, state.keys.clone()))
-                    .or_else(|| {
-                        (self.frontier.0 >= range.start)
-                            .then(|| (self.frontier.0, self.frontier.1.keys.clone()))
-                    });
-                let Some((at, mut keys)) = after else {
-                    return false;
-                };
-                let mut plain = Vec::new();
-                if !read_covered(ByteRange::new(range.start, at), &mut plain) {
-                    return false;
-                }
-                for &byte in plain.iter().rev() {
-                    keys.undo(byte);
-                }
-                keys
-            }
-        };
-        let mut plain = Vec::new();
-        if !read_covered(range, &mut plain) {
-            return false;
-        }
-        for byte in plain {
-            into.push(byte ^ keys.mask());
-            keys.update(byte);
-        }
-        *frontier = Some((
-            self.candidate,
-            range.end,
-            State {
-                keys,
-                provenance: Provenance::Fresh,
-                crc: 0,
-            },
-        ));
-        true
-    }
-
     pub(super) fn forget(&mut self, from: u64) {
         let retained = self
             .checkpoints
@@ -408,18 +285,6 @@ pub(super) struct Cipher {
     pub(super) open: Option<Arc<Open>>,
     #[serde(skip)]
     rejected: BTreeSet<usize>,
-    // Tails said under keys that came from bytes since uncovered: each is
-    // read back under the keys it was made with, `open` as it stood, and
-    // asked for again once the uncovered bytes are said again.
-    #[serde(skip)]
-    pub(super) stale: Vec<Stale>,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct Stale {
-    pub(super) tail: ByteRange,
-    open: Arc<Open>,
-    asked: bool,
 }
 
 impl Cipher {
@@ -446,7 +311,6 @@ impl Cipher {
             announce: false,
             open: None,
             rejected: BTreeSet::new(),
-            stale: Vec::new(),
         }
     }
 
@@ -530,35 +394,7 @@ impl Cipher {
         self.rejected.clear();
     }
 
-    // The member's bytes from `from` to `to` will be said again, and what
-    // it said after them, to `covered`, was made under keys that came from
-    // them.
-    pub(super) fn unposted(&mut self, from: u64, to: u64, covered: u64) {
-        // What of each earlier tail these bytes leave stands as it did.
-        self.stale = std::mem::take(&mut self.stale)
-            .into_iter()
-            .flat_map(|stale| {
-                let (start, end) = (stale.tail.start, stale.tail.end);
-                [(start, end.min(from)), (start.max(to), end)]
-                    .into_iter()
-                    .filter(|(start, end)| start < end)
-                    .map(move |(start, end)| Stale {
-                        tail: ByteRange::new(start, end),
-                        open: Arc::clone(&stale.open),
-                        asked: stale.asked && start == stale.tail.start,
-                    })
-            })
-            .collect();
-        if !self.retry
-            && to < covered
-            && let Some(open) = &self.open
-        {
-            self.stale.push(Stale {
-                tail: ByteRange::new(to, covered),
-                open: Arc::clone(open),
-                asked: false,
-            });
-        }
+    pub(super) fn unposted(&mut self, from: u64) {
         if self.replay && from == 0 {
             self.announce = true;
             self.replay = false;
@@ -602,25 +438,6 @@ impl super::Zip {
                 let Some(part) = span.intersect(global) else {
                     continue;
                 };
-                for stale in &entry.cipher.as_ref().unwrap().stale {
-                    let Some(part) = part.intersect(stale.tail.shift(span.start as i64)) else {
-                        continue;
-                    };
-                    let mut coverage = Coverage::new();
-                    coverage.write(stale.tail, Provenance::Fresh);
-                    sealed.push(Sealed {
-                        volume,
-                        part: part.shift(-(base as i64)),
-                        offset: part.start - span.start,
-                        member,
-                        coverage,
-                        open: Arc::clone(&stale.open),
-                        frontier: std::sync::Mutex::new(None),
-                        proof: Vec::new(),
-                        alternatives: Vec::new(),
-                        floor: Some(stale.tail.start),
-                    });
-                }
                 let coverage = &self.members[member.0 as usize].coverage;
                 for run in coverage.overlapping(part.shift(-(span.start as i64))) {
                     let Some(part) = part.intersect(run.range.shift(span.start as i64)) else {
@@ -652,7 +469,6 @@ impl super::Zip {
                                     })
                             })
                             .collect(),
-                        floor: None,
                     });
                 }
             }
@@ -1051,30 +867,8 @@ impl super::Zip {
                 rest
             })
             .collect();
-        // The bytes a stale tail's keys came from are said again: the tail
-        // is asked for again, read back under its old keys.
-        let reaches = cipher.open.as_ref().map_or(0, |open| open.reaches());
-        let data = entry.data.unwrap_or_default();
-        let tails: Vec<ByteRange> = cipher
-            .stale
-            .iter_mut()
-            .filter(|stale| !stale.asked && reaches >= stale.tail.start)
-            .map(|stale| {
-                stale.asked = true;
-                stale.tail.shift(data as i64)
-            })
-            .collect();
         entry.cipher = Some(cipher);
         self.record(member, offset, Evidenced::from(bytes), provenance, out);
-        let mut pieces = Vec::new();
-        for tail in tails {
-            self.to_volumes(tail, &mut pieces);
-        }
-        out.extend(
-            pieces
-                .into_iter()
-                .map(|(volume, range)| Emit::Again { volume, range }),
-        );
     }
 }
 
@@ -1088,8 +882,6 @@ struct Sealed {
     frontier: std::sync::Mutex<Option<(usize, u64, State)>>,
     proof: Vec<u8>,
     alternatives: Vec<Arc<Open>>,
-    // A stale tail's: where the tail starts, and nothing before it is read.
-    floor: Option<u64>,
 }
 
 pub(super) struct Posted {
@@ -1128,20 +920,6 @@ impl weaver_graph::Posting for Posted {
                     into,
                 )
             };
-            if let Some(floor) = sealed.floor {
-                if !sealed.open.seal_tail(
-                    floor,
-                    &mut sealed.frontier.lock().unwrap(),
-                    local,
-                    &sealed.coverage,
-                    &mut plain,
-                    into,
-                ) {
-                    return false;
-                }
-                cursor = part.end;
-                continue;
-            }
             let mut proof = Vec::new();
             let proof_range = ByteRange::new(0, sealed.proof.len() as u64);
             if !sealed.coverage.covered(proof_range) || !plain(proof_range, &mut proof) {

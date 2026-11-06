@@ -4095,7 +4095,7 @@ impl Tree {
         provenance: Provenance,
         effects: &mut Vec<Effect>,
     ) {
-        self.walk_down(pending, |tree, node, member, range, pending| {
+        self.walk_down(pending, false, |tree, node, member, range, pending| {
             tree.mark(node, member, (range, provenance), effects, pending);
         });
     }
@@ -4114,6 +4114,22 @@ impl Tree {
         self.forget_input(node, volume, range, true);
     }
 
+    // What uncovering this range of the node's volume uncovers, as its
+    // object says: the range, and a cipher's tail after it.
+    pub fn uncovers(
+        &self,
+        node: NodeId,
+        volume: VolumeIndex,
+        range: ByteRange,
+    ) -> Vec<(VolumeIndex, ByteRange)> {
+        let mut out = Vec::new();
+        match self.nodes.get(&node).and_then(|found| found.object.as_ref()) {
+            Some(object) => object.uncovers(volume, range, &mut out),
+            None => out.push((volume, range)),
+        }
+        out
+    }
+
     fn forget_input(
         &mut self,
         node: NodeId,
@@ -4121,15 +4137,9 @@ impl Tree {
         range: ByteRange,
         keep_repairs: bool,
     ) {
-        if let Some(object) = self
-            .nodes
-            .get_mut(&node)
-            .and_then(|found| found.object.as_mut())
-        {
-            object.unposted(volume, range);
-        }
         self.walk_down(
             vec![(node, volume, range)],
+            true,
             |tree, node, member, range, pending| {
                 if !keep_repairs {
                     tree.unsay(node, member, range, pending);
@@ -4198,84 +4208,160 @@ impl Tree {
         self.again_depth += 1;
         let serial = self.again_serial;
         let mut again: Vec<(VolumeIndex, ByteRange)> = Vec::new();
-        for &(volume, range) in ranges {
-            let Some((parent, member)) = self
-                .nodes
-                .get(&node)
-                .and_then(|found| found.binding.as_ref())
-                .and_then(|binding| Some((binding.parent, *binding.volumes.get(&volume)?)))
-            else {
-                continue;
-            };
-            let Some(within) = self.in_member(node, range) else {
-                continue;
-            };
-            let shift = within.start as i64 - range.start as i64;
-            let record = self
-                .namespace(parent)
-                .and_then(|namespace| namespace.get(member));
-            let runs: Vec<(ByteRange, Provenance)> = record
-                .map(|record| {
-                    record
-                        .coverage
-                        .overlapping(within)
-                        .filter(|run| run.provenance.arrived())
-                        .filter_map(|run| {
-                            let piece = run.range.intersect(within)?;
-                            (!piece.is_empty()).then(|| (piece.shift(-shift), run.provenance))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let Some(object) = self
-                .nodes
-                .get(&node)
-                .and_then(|found| found.object.as_ref())
-            else {
-                break;
-            };
-            let (tree, reader) = (&*self, builder);
-            let mut read = |placement: &Placement, into: &mut Vec<u8>| {
-                reader.read(tree, node, volume, placement, into)
-            };
-            // Bytes held as damage above may not all sit below: an object
-            // that placed them only after they came holds none of them.
-            // Only what sits below goes again, and a loss never does.
-            let pieces = runs.into_iter().flat_map(|(piece, provenance)| {
-                let sitting = if provenance.is_damaged() {
-                    tree.sitting(node, object.as_ref(), volume, piece)
-                } else {
-                    vec![piece]
-                };
-                sitting.into_iter().flat_map(move |piece| {
-                    (piece.start..piece.end)
-                        .step_by(AGAIN_PIECE as usize)
-                        .map(move |at| {
-                            let end = piece.end.min(at.saturating_add(AGAIN_PIECE));
-                            (ByteRange::new(at, end), provenance)
-                        })
-                })
-            });
-            for (piece, provenance) in pieces {
-                let mut bytes = Vec::new();
-                if object.posted(volume, piece, &mut read, &mut bytes) {
-                    again.push((volume, ByteRange::at(piece.start, bytes.len() as u64)));
-                    stage(
-                        volume,
-                        Posted {
-                            offset: piece.start,
-                            bytes: Evidenced::from(bytes),
-                            provenance,
-                        },
-                    );
-                }
-            }
+        for (volume, range) in self.forgets(node, ranges, false) {
+            self.read_back(node, volume, range, builder, stage, &mut again);
         }
         for (volume, piece) in again {
             self.uncover(node, volume, piece);
             self.agains.push((serial, node, volume, piece));
         }
         serial
+    }
+
+    // What uncovering these ranges forgets past them, a cipher's tail, read
+    // back as `again_read` reads, while the keys that made it still stand,
+    // and not uncovered: the caller uncovers the ranges, which uncovers the
+    // tail with them, says the ranges again with bytes of its own, then says
+    // each piece read here by `replay_again` under the serial returned, and
+    // `again_done` follows the last.
+    pub fn again_tail(
+        &mut self,
+        node: NodeId,
+        ranges: &[(VolumeIndex, ByteRange)],
+        builder: &dyn Builder,
+        stage: &mut dyn FnMut(VolumeIndex, Posted),
+    ) -> u64 {
+        self.again_serial += 1;
+        self.again_depth += 1;
+        let serial = self.again_serial;
+        let mut again: Vec<(VolumeIndex, ByteRange)> = Vec::new();
+        for (volume, range) in self.forgets(node, ranges, true) {
+            self.read_back(node, volume, range, builder, stage, &mut again);
+        }
+        for (volume, piece) in again {
+            self.agains.push((serial, node, volume, piece));
+        }
+        serial
+    }
+
+    // The ranges and what uncovering them forgets with them, each byte
+    // once, in order; only what lies past them when `beyond`.
+    fn forgets(
+        &self,
+        node: NodeId,
+        ranges: &[(VolumeIndex, ByteRange)],
+        beyond: bool,
+    ) -> Vec<(VolumeIndex, ByteRange)> {
+        let mut by_volume: BTreeMap<VolumeIndex, Coverage> = BTreeMap::new();
+        for &(volume, range) in ranges {
+            for (volume, range) in self.uncovers(node, volume, range) {
+                by_volume
+                    .entry(volume)
+                    .or_default()
+                    .write(range, Provenance::Fresh);
+            }
+        }
+        if beyond {
+            for &(volume, range) in ranges {
+                if let Some(coverage) = by_volume.get_mut(&volume) {
+                    coverage.erase(range);
+                }
+            }
+        }
+        by_volume
+            .into_iter()
+            .flat_map(|(volume, coverage)| {
+                coverage
+                    .runs()
+                    .map(|run| (volume, run.range))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    // What of this range of the node's volume arrived above, read back
+    // through the object in pieces of at most `AGAIN_PIECE` bytes, each
+    // handed to `stage` and noted in `again`.
+    fn read_back(
+        &self,
+        node: NodeId,
+        volume: VolumeIndex,
+        range: ByteRange,
+        builder: &dyn Builder,
+        stage: &mut dyn FnMut(VolumeIndex, Posted),
+        again: &mut Vec<(VolumeIndex, ByteRange)>,
+    ) {
+        let Some((parent, member)) = self
+            .nodes
+            .get(&node)
+            .and_then(|found| found.binding.as_ref())
+            .and_then(|binding| Some((binding.parent, *binding.volumes.get(&volume)?)))
+        else {
+            return;
+        };
+        let Some(within) = self.in_member(node, range) else {
+            return;
+        };
+        let shift = within.start as i64 - range.start as i64;
+        let record = self
+            .namespace(parent)
+            .and_then(|namespace| namespace.get(member));
+        let runs: Vec<(ByteRange, Provenance)> = record
+            .map(|record| {
+                record
+                    .coverage
+                    .overlapping(within)
+                    .filter(|run| run.provenance.arrived())
+                    .filter_map(|run| {
+                        let piece = run.range.intersect(within)?;
+                        (!piece.is_empty()).then(|| (piece.shift(-shift), run.provenance))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(object) = self
+            .nodes
+            .get(&node)
+            .and_then(|found| found.object.as_ref())
+        else {
+            return;
+        };
+        let (tree, reader) = (self, builder);
+        let mut read = |placement: &Placement, into: &mut Vec<u8>| {
+            reader.read(tree, node, volume, placement, into)
+        };
+        // Bytes held as damage above may not all sit below: an object
+        // that placed them only after they came holds none of them.
+        // Only what sits below goes again, and a loss never does.
+        let pieces = runs.into_iter().flat_map(|(piece, provenance)| {
+            let sitting = if provenance.is_damaged() {
+                tree.sitting(node, object.as_ref(), volume, piece)
+            } else {
+                vec![piece]
+            };
+            sitting.into_iter().flat_map(move |piece| {
+                (piece.start..piece.end)
+                    .step_by(AGAIN_PIECE as usize)
+                    .map(move |at| {
+                        let end = piece.end.min(at.saturating_add(AGAIN_PIECE));
+                        (ByteRange::new(at, end), provenance)
+                    })
+            })
+        });
+        for (piece, provenance) in pieces {
+            let mut bytes = Vec::new();
+            if object.posted(volume, piece, &mut read, &mut bytes) {
+                again.push((volume, ByteRange::at(piece.start, bytes.len() as u64)));
+                stage(
+                    volume,
+                    Posted {
+                        offset: piece.start,
+                        bytes: Evidenced::from(bytes),
+                        provenance,
+                    },
+                );
+            }
+        }
     }
 
     // One piece `again_read` under `serial` read back, said again as
@@ -4423,10 +4509,15 @@ impl Tree {
     }
 
     // Each member the ranges of the nodes' volumes landed in, by the node's
-    // object, handed to `each`, which pushes what goes on down.
+    // object, handed to `each`, which pushes what goes on down. When
+    // `forget`, each object forgets each range it is handed, and what it
+    // says forgetting it forgets with it, a cipher's tail, goes down too:
+    // where the bytes landed is read before the object forgets them, since
+    // forgetting moves where a cipher would place them now.
     fn walk_down(
         &mut self,
         mut pending: Vec<(NodeId, VolumeIndex, ByteRange)>,
+        forget: bool,
         mut each: impl FnMut(
             &mut Self,
             NodeId,
@@ -4444,9 +4535,26 @@ impl Tree {
                 each(self, at, MemberId(volume.0), range, &mut pending);
                 continue;
             };
+            let mut forgets = Vec::new();
+            match forget {
+                true => object.uncovers(volume, range, &mut forgets),
+                false => forgets.push((volume, range)),
+            }
             let mut placements = std::mem::take(&mut self.placements);
             placements.clear();
-            object.locate(volume, range, &mut placements);
+            for &(volume, range) in &forgets {
+                object.locate(volume, range, &mut placements);
+            }
+            if forget
+                && let Some(object) = self
+                    .nodes
+                    .get_mut(&at)
+                    .and_then(|found| found.object.as_mut())
+            {
+                for (volume, range) in forgets {
+                    object.unposted(volume, range);
+                }
+            }
             for placement in placements.drain(..) {
                 if let Placement::Member { member, range } = placement {
                     each(self, at, member, range, &mut pending);
@@ -4476,13 +4584,6 @@ impl Tree {
             return;
         };
         for range in lost {
-            if let Some(object) = self
-                .nodes
-                .get_mut(&child)
-                .and_then(|found| found.object.as_mut())
-            {
-                object.unposted(volume, range);
-            }
             pending.push((child, volume, range));
         }
     }

@@ -208,7 +208,7 @@ impl GraphJob {
         missing.extend(self.root.map.unseen());
         let mut refetched = Vec::with_capacity(missing.len());
         for (volume, ordinal) in missing {
-            self.unarrive(volume, ordinal);
+            self.unarrive(volume, ordinal)?;
             if let Some(found) = self
                 .tree
                 .namespace_mut(NodeId::ROOT)
