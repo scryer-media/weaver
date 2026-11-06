@@ -535,11 +535,12 @@ async fn test_wait_for_remote_fin_both_halves_dropped_quick_reply() {
         "",
     );
 
-    // Should send ACK for remote's FIN and complete
+    // Should send ACK for remote's FIN and complete. The ACK carries our
+    // FIN's seq_nr: a FIN does not advance it.
     let result = t.poll_once().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(State, seq_nr = 102, ack_nr = 1)],
+        vec![cmphead!(State, seq_nr = 101, ack_nr = 1)],
         "Should ACK remote FIN"
     );
     assert!(
@@ -959,5 +960,39 @@ async fn test_window_update_ack_after_read_with_waking() {
         sent,
         vec![cmphead!(State, seq_nr = 101, ack_nr = 2, wnd_size = 5u32)],
         "should have sent zero-window ACK"
+    );
+}
+
+#[tokio::test]
+async fn acks_after_our_fin_carry_the_fin_seq_nr() {
+    setup_test_logging();
+    let mut t = make_test_vsock(Default::default(), false);
+    let (_reader, mut writer) = t.stream.take().unwrap().split();
+    let mut shutdown = Box::pin(writer.shutdown());
+    assert!(shutdown.as_mut().now_or_never().is_none());
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.take_sent(), vec![cmphead!(Fin, seq_nr = 101, ack_nr = 0)]);
+
+    // The remote keeps sending after our FIN; an out of order packet is
+    // ACKed at once.
+    let mut header = UtpHeader {
+        htype: Data,
+        seq_nr: 2.into(),
+        ack_nr: 101.into(),
+        wnd_size: 1024,
+        ..Default::default()
+    };
+    t.send_msg(header, "world");
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(State, seq_nr = 101, ack_nr = 0)]
+    );
+    header.seq_nr = 1.into();
+    t.send_msg(header, "hello");
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(State, seq_nr = 101, ack_nr = 2)]
     );
 }
