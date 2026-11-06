@@ -576,7 +576,11 @@ impl Walk {
         );
         let moved = differs || self.ended != ended || self.more != more;
         let kept_blocks = match (&self.facts, read_on) {
-            (Some(was), true) => was.members.len().min(self.blocks.len()),
+            (Some(was), true) => was
+                .members
+                .len()
+                .min(self.blocks.len())
+                .min(facts.members.len()),
             _ => 0,
         };
         self.blocks.truncate(kept_blocks);
