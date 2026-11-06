@@ -29,8 +29,7 @@ impl SparseImage {
     pub(super) fn of(kept: &Kept, closed: bool) -> Self {
         Self {
             runs: kept
-                .runs()
-                .into_iter()
+                .runs_from(0)
                 .filter(|(_, _, provenance)| readable(*provenance, closed))
                 .map(|(range, bytes, _)| (range.start, Bytes::copy_from_slice(bytes)))
                 .collect(),

@@ -103,7 +103,7 @@ fn data_end(facts: &RarVolumeFacts) -> u64 {
 // The first byte at or after `from` the walk may not read.
 fn hole(kept: &Kept, from: u64, closed: bool) -> u64 {
     let mut at = from;
-    for (range, _, provenance) in kept.runs() {
+    for (range, _, provenance) in kept.runs_from(from) {
         if !readable(provenance, closed) || range.end <= at {
             continue;
         }
@@ -117,15 +117,14 @@ fn hole(kept: &Kept, from: u64, closed: bool) -> u64 {
 
 // Whether a byte past `from` arrived damaged.
 fn damaged_past(kept: &Kept, from: u64) -> bool {
-    kept.runs()
-        .into_iter()
+    kept.runs_from(from)
         .any(|(range, _, provenance)| provenance.is_damaged() && range.end > from)
 }
 
 // The damaged run a byte sits in.
 fn damaged_at(kept: &Kept, at: u64) -> Option<ByteRange> {
-    kept.runs()
-        .into_iter()
+    kept.runs_from(at)
+        .take_while(|(range, _, _)| range.start <= at)
         .find(|(range, _, provenance)| provenance.is_damaged() && range.contains(at))
         .map(|(range, _, _)| range)
 }
@@ -275,6 +274,28 @@ impl Walk {
     // Walk again over what is kept: the store steps only a volume something
     // the walk reads changed for.
     pub(super) fn step(
+        &mut self,
+        kept: &mut Kept,
+        length: Option<u64>,
+        password: Option<&str>,
+        kdf: &Arc<KdfCache>,
+        closed: bool,
+    ) -> Step {
+        #[cfg(test)]
+        let collected = crate::kept::collected::count();
+        let step = self.read(kept, length, password, kdf, closed);
+        // A walk looks only at the runs about the bytes it asks after: it
+        // never collects every run in hand.
+        #[cfg(test)]
+        assert_eq!(
+            crate::kept::collected::count(),
+            collected,
+            "a walk collected every run in hand"
+        );
+        step
+    }
+
+    fn read(
         &mut self,
         kept: &mut Kept,
         length: Option<u64>,
@@ -433,6 +454,93 @@ impl Walk {
         match end > from {
             true => ByteRange::new(from, end),
             false => ByteRange::new(0, hole(kept, 0, closed)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use weaver_graph::Provenance;
+
+    use super::*;
+
+    // A kept volume of many pieces, each with gaps and runs of every kind.
+    fn scattered() -> Kept {
+        let mut kept = Kept::default();
+        let kinds = [
+            Provenance::Fresh,
+            Provenance::Damaged,
+            Provenance::Repaired,
+            Provenance::Refuted,
+            Provenance::Lost,
+        ];
+        for piece in 0..40u64 {
+            let start = piece * 100;
+            kept.want(ByteRange::new(start, start + 60));
+            for run in 0..4u64 {
+                if (piece + run) % 3 == 2 {
+                    continue;
+                }
+                let at = start + run * 15;
+                let kind = kinds[((piece * 7 + run) % kinds.len() as u64) as usize];
+                kept.absorb(ByteRange::new(at, at + 10), &[piece as u8; 10], kind);
+            }
+        }
+        kept
+    }
+
+    fn hole_collected(kept: &Kept, from: u64, closed: bool) -> u64 {
+        let mut at = from;
+        for (range, _, provenance) in kept.runs() {
+            if !readable(provenance, closed) || range.end <= at {
+                continue;
+            }
+            if range.start > at {
+                break;
+            }
+            at = range.end;
+        }
+        at
+    }
+
+    fn damaged_past_collected(kept: &Kept, from: u64) -> bool {
+        kept.runs()
+            .into_iter()
+            .any(|(range, _, provenance)| provenance.is_damaged() && range.end > from)
+    }
+
+    fn damaged_at_collected(kept: &Kept, at: u64) -> Option<ByteRange> {
+        kept.runs()
+            .into_iter()
+            .find(|(range, _, provenance)| provenance.is_damaged() && range.contains(at))
+            .map(|(range, _, _)| range)
+    }
+
+    // Read from the runs about an offset, the walk's questions answer as
+    // they did over every run collected, at every offset, and collect none.
+    #[test]
+    fn walk_run_lookups_from_an_offset_answer_as_over_every_run() {
+        let kept = scattered();
+        assert!(kept.runs().len() > 80);
+        for at in 0..4_200 {
+            let collected = crate::kept::collected::count();
+            let found = (
+                hole(&kept, at, false),
+                hole(&kept, at, true),
+                damaged_past(&kept, at),
+                damaged_at(&kept, at),
+            );
+            assert_eq!(crate::kept::collected::count(), collected, "at {at}");
+            assert_eq!(
+                found,
+                (
+                    hole_collected(&kept, at, false),
+                    hole_collected(&kept, at, true),
+                    damaged_past_collected(&kept, at),
+                    damaged_at_collected(&kept, at),
+                ),
+                "at {at}"
+            );
         }
     }
 }

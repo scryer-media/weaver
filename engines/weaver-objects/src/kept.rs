@@ -37,6 +37,24 @@ fn serialize_bytes<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<
     serializer.serialize_bytes(bytes)
 }
 
+// How many times this thread collected every run in hand, for a test.
+#[cfg(test)]
+pub(crate) mod collected {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COLLECTED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump() {
+        COLLECTED.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(crate) fn count() -> usize {
+        COLLECTED.with(Cell::get)
+    }
+}
+
 impl Piece {
     // The part of the range its bytes reach.
     fn held(&self) -> ByteRange {
@@ -254,16 +272,31 @@ impl Kept {
 
     // Every run in hand, in order, with its bytes and how they arrived.
     pub(crate) fn runs(&self) -> Vec<(ByteRange, &[u8], Provenance)> {
-        self.pieces
-            .values()
-            .flat_map(|piece| {
-                piece.coverage.runs().map(move |run| {
-                    let at = (run.range.start - piece.range.start) as usize;
-                    let bytes = &piece.bytes[at..at + run.range.len() as usize];
-                    (run.range, bytes, run.provenance)
-                })
+        #[cfg(test)]
+        collected::bump();
+        self.runs_from(0).collect()
+    }
+
+    // The runs in hand, in order, from the piece holding `offset` on, or the
+    // last one before it: every run of a piece before that one ends at or
+    // before `offset`, since pieces are disjoint and each run lies inside
+    // its piece.
+    pub(crate) fn runs_from(
+        &self,
+        offset: u64,
+    ) -> impl Iterator<Item = (ByteRange, &[u8], Provenance)> {
+        let first = self
+            .pieces
+            .range(..=offset)
+            .next_back()
+            .map_or(0, |(start, _)| *start);
+        self.pieces.range(first..).flat_map(|(_, piece)| {
+            piece.coverage.runs().map(move |run| {
+                let at = (run.range.start - piece.range.start) as usize;
+                let bytes = &piece.bytes[at..at + run.range.len() as usize];
+                (run.range, bytes, run.provenance)
             })
-            .collect()
+        })
     }
 
     // Where the next byte in hand at or after `offset` is, if any.
