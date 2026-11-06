@@ -2976,22 +2976,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "librqbit-dualstack-sockets"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7189f1ff66ca75055137a38b062ba7df9691d071b7172e5090997c62eb4b4de"
-dependencies = [
- "backon",
- "futures",
- "libc",
- "network-interface",
- "socket2",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "libsqlite3-sys"
 version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6489,7 +6473,6 @@ dependencies = [
  "http",
  "httparse",
  "indexmap",
- "librqbit-dualstack-sockets",
  "memchr",
  "memmap2",
  "mime_guess",

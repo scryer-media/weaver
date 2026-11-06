@@ -102,7 +102,6 @@ use futures::{
     stream::{BoxStream, FuturesUnordered},
 };
 use http::StatusCode;
-use librqbit_dualstack_sockets::BindDevice;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
@@ -111,6 +110,7 @@ use tokio_util::{
     task::TaskTracker,
 };
 use tracing::{Instrument, debug, debug_span, error, info, trace, warn};
+use weaver_tunnel::egress::SocketEgress;
 
 pub(crate) mod external_ip;
 
@@ -1432,12 +1432,10 @@ impl Session {
             let resolver: Arc<dyn Resolver> =
                 opts.resolver.take().unwrap_or_else(|| Arc::new(NoNames));
 
-            let bind_device = match opts.bind_device_name.as_ref() {
-                Some(name) => Some(
-                    BindDevice::new_from_name(name)
-                        .with_context(|| format!("error creating bind device {name}"))?,
-                ),
-                None => None,
+            let lsd_egress = match opts.bind_device_name.as_ref() {
+                Some(name) => SocketEgress::existing_interface(name)
+                    .with_context(|| format!("error creating bind device {name}"))?,
+                None => SocketEgress::System,
             };
 
             // The sockets the DHT and the UDP trackers bind.
@@ -1676,7 +1674,7 @@ impl Session {
                 } else {
                     LocalServiceDiscovery::new(LocalServiceDiscoveryOptions {
                         cancel_token: swarm.clone(),
-                        bind_device: bind_device.as_ref(),
+                        egress: lsd_egress,
                         tasks: Some(swarm_tasks.clone()),
                         #[cfg(test)]
                         socket: opts.lsd_socket.take(),

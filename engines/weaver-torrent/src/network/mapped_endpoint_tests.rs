@@ -16,8 +16,8 @@ async fn a_mapped_peer_transfers_both_ways_through_a_same_port_datagram_pair() -
 {
     let factory = KernelSockets::new(None)?;
     let (v6, v4) = bind_pair(
-        (Ipv6Addr::UNSPECIFIED, 0).into(),
-        |address| factory.kernel_udp_as(address, true),
+        (Ipv6Addr::LOCALHOST, 0).into(),
+        |address| factory.kernel_udp(address),
         |socket| socket.bind_addr().port(),
     )?;
     assert_eq!(v6.bind_addr().port(), v4.bind_addr().port());

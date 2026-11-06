@@ -14,14 +14,9 @@ use std::{
     time::Duration,
 };
 
-use crate::{
-    core::{Id20, spawn_utils::spawn_with_cancel},
-    upnp::get_local_ip_relative_to,
-};
+use crate::core::{Id20, spawn_utils::spawn_with_cancel};
 use anyhow::Context;
 use futures::{Stream, future::BoxFuture};
-use librqbit_dualstack_sockets::{BindDevice, MulticastUdpSocket};
-use network_interface::NetworkInterface;
 use parking_lot::Mutex;
 use tokio::{
     sync::{
@@ -32,6 +27,7 @@ use tokio::{
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
 use tracing::{debug_span, trace};
+use weaver_tunnel::egress::{MulticastSocket, SocketEgress};
 
 const LSD_PORT: u16 = 6771;
 const LSD_IPV4: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::new(239, 192, 152, 143), LSD_PORT);
@@ -66,30 +62,28 @@ pub(crate) trait Socket: Send + Sync + 'static {
     fn send_everywhere<'a>(&'a self, msg: &'a (dyn Fn(bool) -> String + Sync))
     -> BoxFuture<'a, ()>;
 
-    /// The host's interfaces, whose networks are the local ones.
-    fn nics(&self) -> &[NetworkInterface];
+    /// Whether `source` is this host or on the network of one of its
+    /// interfaces.
+    fn is_local(&self, source: SocketAddr) -> bool;
 }
 
-impl Socket for MulticastUdpSocket {
+impl Socket for MulticastSocket {
     fn recv_from<'a>(
         &'a self,
         buf: &'a mut [u8],
     ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
-        Box::pin(MulticastUdpSocket::recv_from(self, buf))
+        Box::pin(MulticastSocket::recv_from(self, buf))
     }
 
     fn send_everywhere<'a>(
         &'a self,
         msg: &'a (dyn Fn(bool) -> String + Sync),
     ) -> BoxFuture<'a, ()> {
-        Box::pin(async move {
-            self.try_send_mcast_everywhere(&|mopts| Some(msg(mopts.mcast_addr().is_ipv6())))
-                .await
-        })
+        Box::pin(self.send_everywhere(|group| msg(group.is_ipv6()).into_bytes()))
     }
 
-    fn nics(&self) -> &[NetworkInterface] {
-        MulticastUdpSocket::nics(self)
+    fn is_local(&self, source: SocketAddr) -> bool {
+        MulticastSocket::is_local(self, source)
     }
 }
 
@@ -261,10 +255,11 @@ pub struct LocalServiceDiscovery {
 }
 
 #[derive(Default)]
-pub struct LocalServiceDiscoveryOptions<'a> {
+pub struct LocalServiceDiscoveryOptions {
     pub cancel_token: CancellationToken,
     pub cookie: Option<u32>,
-    pub bind_device: Option<&'a BindDevice>,
+    /// The interface the LSD joins its groups on, or every one.
+    pub egress: SocketEgress,
     /// Track the LSD's tasks in this tracker. They own the socket's use, so
     /// once the tracker is empty after cancellation, nothing is sent or
     /// received on it again.
@@ -275,7 +270,7 @@ pub struct LocalServiceDiscoveryOptions<'a> {
 }
 
 impl LocalServiceDiscovery {
-    pub async fn new(opts: LocalServiceDiscoveryOptions<'_>) -> anyhow::Result<Self> {
+    pub async fn new(opts: LocalServiceDiscoveryOptions) -> anyhow::Result<Self> {
         let tasks = opts.tasks.unwrap_or_default();
         #[cfg(test)]
         if let Some(socket) = opts.socket {
@@ -286,15 +281,10 @@ impl LocalServiceDiscovery {
                 tasks,
             ));
         }
-        let socket = MulticastUdpSocket::new(
-            (Ipv6Addr::UNSPECIFIED, LSD_PORT).into(),
-            LSD_IPV4,
-            LSD_IPV6,
-            None,
-            opts.bind_device,
-        )
-        .await
-        .context("error binding LSD socket")?;
+        let socket = opts
+            .egress
+            .join_multicast(LSD_IPV4, LSD_IPV6)
+            .context("error binding LSD socket")?;
         Ok(Self::with_socket(
             Box::new(socket),
             opts.cookie.unwrap_or_else(rand::random),
@@ -361,7 +351,7 @@ cookie: {cookie}\r
         let mut headers = [httparse::EMPTY_HEADER; 16];
 
         let (sz, addr) = self.inner.socket.recv_from(buf).await?;
-        if get_local_ip_relative_to(addr, self.inner.socket.nics()).is_err() {
+        if !self.inner.socket.is_local(addr) {
             trace!(?addr, "ignoring a packet from outside the local network");
             return Ok(());
         }
@@ -511,8 +501,8 @@ impl Socket for RecordingSocket {
         Box::pin(async {})
     }
 
-    fn nics(&self) -> &[NetworkInterface] {
-        &[]
+    fn is_local(&self, _: SocketAddr) -> bool {
+        false
     }
 }
 
@@ -552,8 +542,8 @@ impl Socket for ListeningSocket {
         Box::pin(async {})
     }
 
-    fn nics(&self) -> &[NetworkInterface] {
-        &[]
+    fn is_local(&self, _: SocketAddr) -> bool {
+        false
     }
 }
 
@@ -670,8 +660,8 @@ mod tests {
             Box::pin(async {})
         }
 
-        fn nics(&self) -> &[NetworkInterface] {
-            &self.nics
+        fn is_local(&self, source: SocketAddr) -> bool {
+            crate::upnp::get_local_ip_relative_to(source, &self.nics).is_ok()
         }
     }
 

@@ -22,6 +22,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use weaver_tunnel::egress::SocketEgress;
 use weaver_utp::{DefaultUtpEnvironment, PollSendToVectored, Transport, UtpStream};
 pub use weaver_utp::{
     canonical_ip_addr, canonical_socket_addr, is_message_size_error, message_size_error,
@@ -237,27 +238,18 @@ impl UtpSocket {
 /// bound, on one device or none. A caller that watches a session's sockets
 /// wraps this and hands the session the wrapper.
 pub struct KernelSockets {
-    bind_device: Option<librqbit_dualstack_sockets::BindDevice>,
+    egress: SocketEgress,
 }
 
 impl KernelSockets {
     /// The kernel sockets of a session bound to `bind_device_name`, or to
     /// none.
     pub fn new(bind_device_name: Option<&str>) -> anyhow::Result<Self> {
-        let bind_device = bind_device_name
-            .map(librqbit_dualstack_sockets::BindDevice::new_from_name)
-            .transpose()?;
-        Ok(Self { bind_device })
-    }
-
-    // A socket bound at the unspecified IPv6 address takes IPv4 as well,
-    // unless it is one of a pair.
-    fn bind_opts(&self, paired: bool) -> librqbit_dualstack_sockets::BindOpts<'_> {
-        librqbit_dualstack_sockets::BindOpts {
-            request_dualstack: !paired,
-            reuseport: false,
-            device: self.bind_device.as_ref(),
-        }
+        let egress = match bind_device_name {
+            Some(name) => SocketEgress::existing_interface(name)?,
+            None => SocketEgress::System,
+        };
+        Ok(Self { egress })
     }
 
     // Whether a bind at `addr` opens a socket for each family, IPv6 alone at
@@ -265,18 +257,23 @@ impl KernelSockets {
     // IPv6 address on a device, which one socket cannot hold to it for both
     // families on every host.
     fn paired(&self, addr: SocketAddr) -> bool {
-        self.bind_device.is_some() && addr.is_ipv6() && addr.ip().is_unspecified()
+        matches!(self.egress, SocketEgress::Interface(_))
+            && addr.is_ipv6()
+            && addr.ip().is_unspecified()
     }
 
-    /// A datagram socket at `addr`, at the kernel's defaults.
+    /// A datagram socket at `addr`, at the kernel's defaults. One at the
+    /// unspecified IPv6 address takes IPv4 as well, unless it is one of a
+    /// pair.
     fn kernel_udp(&self, addr: SocketAddr) -> io::Result<KernelUdp> {
-        self.kernel_udp_as(addr, false)
-    }
-
-    fn kernel_udp_as(&self, addr: SocketAddr, paired: bool) -> io::Result<KernelUdp> {
-        let socket = librqbit_dualstack_sockets::UdpSocket::bind_udp(addr, self.bind_opts(paired))
-            .map_err(bind_error)?;
-        let mut socket = KernelUdp(socket, false);
+        let (socket, dual_stack) = self.egress.bind_udp_reusing(addr)?;
+        let socket = tokio::net::UdpSocket::from_std(socket)?;
+        let mut socket = KernelUdp {
+            local: socket.local_addr()?,
+            socket,
+            dual_stack,
+            dont_fragment: false,
+        };
         socket.cache_dont_fragment();
         Ok(socket)
     }
@@ -290,7 +287,7 @@ impl KernelSockets {
     ) -> io::Result<Arc<dyn DatagramSocket>> {
         let set = |mut socket: KernelUdp, at: SocketAddr| {
             if let Some(receive_buffer) = utp {
-                crate::udp_options::set_for_utp(socket.0.socket(), at, receive_buffer);
+                crate::udp_options::set_for_utp(&socket.socket, at, receive_buffer);
                 socket.cache_dont_fragment();
             }
             socket
@@ -298,24 +295,12 @@ impl KernelSockets {
         if !self.paired(addr) {
             return Ok(Arc::new(set(self.kernel_udp(addr)?, addr)));
         }
-        let (v6, v4) = bind_pair(
-            addr,
-            |at| self.kernel_udp_as(at, true),
-            |socket| socket.0.bind_addr().port(),
-        )?;
-        let (v6_addr, v4_addr) = (v6.0.bind_addr(), v4.0.bind_addr());
+        let (v6, v4) = bind_pair(addr, |at| self.kernel_udp(at), |socket| socket.local.port())?;
+        let (v6_addr, v4_addr) = (v6.local, v4.local);
         Ok(Arc::new(PairedUdp {
             v6: set(v6, v6_addr),
             v4: set(v4, v4_addr),
         }))
-    }
-}
-
-// The io error a failed bind carries, so a port in use is told apart.
-fn bind_error(error: librqbit_dualstack_sockets::Error) -> io::Error {
-    match error {
-        librqbit_dualstack_sockets::Error::Bind(error) => error,
-        error => io::Error::other(error),
     }
 }
 
@@ -355,15 +340,11 @@ impl SocketFactory for KernelSockets {
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<(BoxAsyncReadVectored, BoxAsyncWrite)>> {
         Box::pin(async move {
-            let stream = librqbit_dualstack_sockets::tcp_connect(
-                addr,
-                librqbit_dualstack_sockets::ConnectOpts {
-                    source_port: None,
-                    bind_device: self.bind_device.as_ref(),
-                },
-            )
-            .await
-            .map_err(io::Error::other)?;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the kernel's own route dials from its device, or the host's"
+            )]
+            let stream = self.egress.connect(addr).await?;
             let (read, write) = stream.into_split();
             Ok((
                 Box::new(read) as BoxAsyncReadVectored,
@@ -377,20 +358,17 @@ impl SocketFactory for KernelSockets {
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
         Box::pin(async move {
-            let listen = |at, paired| {
-                librqbit_dualstack_sockets::TcpListener::bind_tcp(at, self.bind_opts(paired))
-                    .map_err(bind_error)
+            let listen = |at| -> io::Result<KernelListener> {
+                let listener = tokio::net::TcpListener::from_std(self.egress.listen_tcp(at)?)?;
+                Ok(KernelListener {
+                    local: listener.local_addr()?,
+                    listener,
+                })
             };
             if !self.paired(addr) {
-                return Ok(
-                    Box::new(KernelListener(listen(addr, false)?)) as Box<dyn StreamListener>
-                );
+                return Ok(Box::new(listen(addr)?) as Box<dyn StreamListener>);
             }
-            let (v6, v4) = bind_pair(
-                addr,
-                |at| listen(at, true),
-                |listener| listener.bind_addr().port(),
-            )?;
+            let (v6, v4) = bind_pair(addr, listen, |listener| listener.local.port())?;
             Ok(Box::new(PairedListener { v6, v4 }) as Box<dyn StreamListener>)
         })
     }
@@ -420,18 +398,30 @@ impl SocketFactory for KernelSockets {
     }
 }
 
-struct KernelListener(librqbit_dualstack_sockets::TcpListener);
+struct KernelListener {
+    listener: tokio::net::TcpListener,
+    local: SocketAddr,
+}
+
+impl KernelListener {
+    // The next peer, an IPv4 one on a socket that takes both families
+    // named by its IPv4 address.
+    async fn take(&self) -> io::Result<(tokio::net::TcpStream, SocketAddr)> {
+        let (stream, peer) = self.listener.accept().await?;
+        Ok((stream, canonical_socket_addr(peer)))
+    }
+}
 
 impl StreamListener for KernelListener {
     fn local_addr(&self) -> SocketAddr {
-        self.0.bind_addr()
+        self.local
     }
 
     fn accept<'a>(
         &'a self,
     ) -> BoxFuture<'a, io::Result<(SocketAddr, BoxAsyncReadVectored, BoxAsyncWrite)>> {
         Box::pin(async move {
-            let (stream, peer) = self.0.accept().await?;
+            let (stream, peer) = self.take().await?;
             let (read, write) = stream.into_split();
             Ok((
                 peer,
@@ -444,13 +434,13 @@ impl StreamListener for KernelListener {
 
 // A listener for each family on one port, taking a peer from either.
 struct PairedListener {
-    v6: librqbit_dualstack_sockets::TcpListener,
-    v4: librqbit_dualstack_sockets::TcpListener,
+    v6: KernelListener,
+    v4: KernelListener,
 }
 
 impl StreamListener for PairedListener {
     fn local_addr(&self) -> SocketAddr {
-        self.v6.bind_addr()
+        self.v6.local
     }
 
     fn accept<'a>(
@@ -458,8 +448,8 @@ impl StreamListener for PairedListener {
     ) -> BoxFuture<'a, io::Result<(SocketAddr, BoxAsyncReadVectored, BoxAsyncWrite)>> {
         Box::pin(async move {
             let (stream, peer) = tokio::select! {
-                accepted = self.v6.accept() => accepted?,
-                accepted = self.v4.accept() => accepted?,
+                accepted = self.v6.take() => accepted?,
+                accepted = self.v4.take() => accepted?,
             };
             let (read, write) = stream.into_split();
             Ok((
@@ -505,7 +495,7 @@ impl DatagramSocket for PairedUdp {
         buf: &'a mut [u8],
     ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
         Box::pin(async move {
-            let (v6, v4) = (self.v6.0.socket(), self.v4.0.socket());
+            let (v6, v4) = (&self.v6.socket, &self.v4.socket);
             loop {
                 let socket = tokio::select! {
                     ready = v6.readable() => { ready?; v6 }
@@ -549,22 +539,38 @@ impl DatagramSocket for PairedUdp {
     }
 }
 
-pub(crate) struct KernelUdp(librqbit_dualstack_sockets::UdpSocket, bool);
+/// A kernel datagram socket: the address it is bound at, whether it takes
+/// IPv4 as well as IPv6, and whether its datagrams are never fragmented.
+pub(crate) struct KernelUdp {
+    socket: tokio::net::UdpSocket,
+    local: SocketAddr,
+    dual_stack: bool,
+    dont_fragment: bool,
+}
 
 impl KernelUdp {
     fn cache_dont_fragment(&mut self) {
-        let family = if self.0.bind_addr().is_ipv4() {
+        let family = if self.local.is_ipv4() {
             crate::udp_options::Family::V4
         } else {
             crate::udp_options::Family::V6
         };
-        self.1 = crate::udp_options::dont_fragment(self.0.socket(), family).unwrap_or(false)
-            && (!self.0.is_dualstack()
-                || crate::udp_options::dont_fragment(
-                    self.0.socket(),
-                    crate::udp_options::Family::V4,
-                )
-                .unwrap_or(false));
+        self.dont_fragment = crate::udp_options::dont_fragment(&self.socket, family)
+            .unwrap_or(false)
+            && (!self.dual_stack
+                || crate::udp_options::dont_fragment(&self.socket, crate::udp_options::Family::V4)
+                    .unwrap_or(false));
+    }
+
+    // `target` as the socket names it: an IPv4 one by its IPv4-mapped IPv6
+    // address on a socket that takes both families.
+    fn toward(&self, target: SocketAddr) -> SocketAddr {
+        match target {
+            SocketAddr::V4(v4) if self.dual_stack => {
+                SocketAddr::V6(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0))
+            }
+            target => target,
+        }
     }
 }
 
@@ -594,7 +600,7 @@ impl KernelSockets {
         receive_buffer: usize,
     ) -> io::Result<Arc<KernelUdp>> {
         let mut socket = self.kernel_udp(addr)?;
-        crate::udp_options::set_for_utp(socket.0.socket(), addr, receive_buffer);
+        crate::udp_options::set_for_utp(&socket.socket, addr, receive_buffer);
         socket.cache_dont_fragment();
         Ok(Arc::new(socket))
     }
@@ -604,29 +610,34 @@ impl KernelSockets {
 impl KernelUdp {
     /// A datagram already waiting, without waiting for one.
     pub(crate) fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
-        self.0.socket().try_recv_from(buf)
+        self.socket.try_recv_from(buf)
     }
 
     /// The kernel socket itself.
     pub(crate) fn socket(&self) -> &tokio::net::UdpSocket {
-        self.0.socket()
+        &self.socket
     }
 }
 
 impl DatagramSocket for KernelUdp {
     fn dont_fragment(&self) -> bool {
-        self.1
+        self.dont_fragment
     }
 
     fn bind_addr(&self) -> SocketAddr {
-        self.0.bind_addr()
+        self.local
     }
 
+    // A datagram from an IPv4 peer is from its IPv4 address, whichever
+    // family's socket took it.
     fn recv_from<'a>(
         &'a self,
         buf: &'a mut [u8],
     ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
-        Box::pin(self.0.recv_from(buf))
+        Box::pin(async move {
+            let (len, from) = self.socket.recv_from(buf).await?;
+            Ok((len, canonical_socket_addr(from)))
+        })
     }
 
     fn send_to<'a>(
@@ -634,7 +645,7 @@ impl DatagramSocket for KernelUdp {
         buf: &'a [u8],
         target: SocketAddr,
     ) -> BoxFuture<'a, io::Result<usize>> {
-        Box::pin(self.0.send_to(buf, target))
+        Box::pin(self.socket.send_to(buf, self.toward(target)))
     }
 
     fn poll_send_to(
@@ -643,7 +654,7 @@ impl DatagramSocket for KernelUdp {
         buf: &[u8],
         target: SocketAddr,
     ) -> Poll<io::Result<usize>> {
-        self.0.poll_send_to(cx, buf, target)
+        self.socket.poll_send_to(cx, buf, self.toward(target))
     }
 
     // One datagram from every slice, in one system call, without joining
@@ -655,13 +666,8 @@ impl DatagramSocket for KernelUdp {
         bufs: &[IoSlice<'_>],
         target: SocketAddr,
     ) -> Poll<io::Result<usize>> {
-        let target = match target {
-            SocketAddr::V4(v4) if self.0.is_dualstack() => {
-                SocketAddr::V6(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0))
-            }
-            target => target,
-        };
-        let socket = self.0.socket();
+        let target = self.toward(target);
+        let socket = &self.socket;
         loop {
             std::task::ready!(socket.poll_send_ready(cx))?;
             match socket.try_io(tokio::io::Interest::WRITABLE, || {
@@ -703,13 +709,7 @@ mod tests {
 
     // Whether the host withholds holding a socket to a device.
     fn withheld(error: &io::Error) -> bool {
-        matches!(
-            error
-                .get_ref()
-                .and_then(|error| error.downcast_ref::<librqbit_dualstack_sockets::Error>()),
-            Some(librqbit_dualstack_sockets::Error::BindDeviceSetDeviceError(error))
-                if error.kind() == io::ErrorKind::PermissionDenied
-        )
+        error.kind() == io::ErrorKind::PermissionDenied
     }
 
     #[tokio::test]
