@@ -112,7 +112,7 @@ async fn carried_utp_acceptance_uses_the_carrier_fifo_for_async_and_polled_sends
 }
 
 #[tokio::test]
-async fn carried_utp_packet_bound_includes_the_active_send_and_wakes_every_flow() {
+async fn carried_utp_packet_bound_includes_the_active_send_and_wakes_the_oldest_flow() {
     let (socket, mut observed, results) = controlled(None);
     let carried = Carried::new(socket, ([0, 0, 0, 0], 0).into(), true);
     let target = ([198, 51, 100, 1], 7001).into();
@@ -121,15 +121,18 @@ async fn carried_utp_packet_bound_includes_the_active_send_and_wakes_every_flow(
     for _ in 1..CARRIED_SEND_PACKETS {
         accepted(&carried, b"a", target);
     }
-    let one = Arc::default();
-    let two = Arc::default();
+    let one = Arc::<Woken>::default();
+    let two = Arc::<Woken>::default();
+    let three = Arc::<Woken>::default();
     let mut one_sender = carried.send_handle().unwrap();
     let mut two_sender = carried.send_handle().unwrap();
+    let mut three_sender = carried.send_handle().unwrap();
     assert!(polled(&mut one_sender, b"b", target, &one).is_pending());
     assert!(polled(&mut two_sender, b"c", target, &two).is_pending());
-    let waker = Waker::from(Arc::clone(&two));
+    assert!(polled(&mut three_sender, b"d", target, &three).is_pending());
+    let waker = Waker::from(Arc::clone(&one));
     assert!(
-        two_sender
+        one_sender
             .poll_enqueue(&mut Context::from_waker(&waker), 1, target, || panic!(
                 "a full queue must not copy a packet"
             ))
@@ -140,11 +143,42 @@ async fn carried_utp_packet_bound_includes_the_active_send_and_wakes_every_flow(
     results.send(Ok(())).unwrap();
     observed.recv().await.unwrap();
     assert_eq!(one.0.load(Ordering::SeqCst), 1);
+    assert_eq!(two.0.load(Ordering::SeqCst), 0);
+    assert_eq!(three.0.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        polled(&mut one_sender, b"b", target, &one),
+        Poll::Ready(Ok(1))
+    ));
+    results.send(Ok(())).unwrap();
+    observed.recv().await.unwrap();
     assert_eq!(two.0.load(Ordering::SeqCst), 1);
-    accepted(&carried, b"b", target);
-    assert!(polled(&mut two_sender, b"c", target, &two).is_pending());
+    assert_eq!(three.0.load(Ordering::SeqCst), 0);
     carried.shutdown().await.unwrap();
-    assert!(two.0.load(Ordering::SeqCst) > 1);
+    assert_eq!(three.0.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn carried_utp_a_waiter_that_loses_its_room_registers_again() {
+    let (socket, mut observed, results) = controlled(None);
+    let carried = Carried::new(socket, ([0, 0, 0, 0], 0).into(), true);
+    let target = ([198, 51, 100, 1], 7001).into();
+    accepted(&carried, b"a", target);
+    observed.recv().await.unwrap();
+    for _ in 1..CARRIED_SEND_PACKETS {
+        accepted(&carried, b"a", target);
+    }
+    let waiter = Arc::<Woken>::default();
+    let mut sender = carried.send_handle().unwrap();
+    assert!(polled(&mut sender, b"b", target, &waiter).is_pending());
+    results.send(Ok(())).unwrap();
+    observed.recv().await.unwrap();
+    assert_eq!(waiter.0.load(Ordering::SeqCst), 1);
+    accepted(&carried, b"c", target);
+    assert!(polled(&mut sender, b"b", target, &waiter).is_pending());
+    results.send(Ok(())).unwrap();
+    observed.recv().await.unwrap();
+    assert_eq!(waiter.0.load(Ordering::SeqCst), 2);
+    carried.shutdown().await.unwrap();
 }
 
 #[tokio::test]

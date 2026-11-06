@@ -397,15 +397,44 @@ struct CarriedPacket {
     target: SocketAddr,
 }
 
+struct CarriedWaiter {
+    key: usize,
+    len: usize,
+    waker: Waker,
+}
+
 #[derive(Default)]
 struct CarriedPending {
     packets: VecDeque<CarriedPacket>,
     // Includes the packet currently owned by the worker.
     count: usize,
     bytes: usize,
-    waiters: HashMap<usize, Waker>,
+    // Oldest first.
+    waiters: VecDeque<CarriedWaiter>,
     stopped: bool,
     fault: Option<String>,
+}
+
+impl CarriedPending {
+    fn fits(&self, count: usize, bytes: usize) -> bool {
+        count < CARRIED_SEND_PACKETS && bytes <= CARRIED_SEND_BYTES
+    }
+
+    // The oldest waiters the free room admits. A waiter never overtakes an
+    // older one that does not fit yet; one that loses its room to another
+    // sender registers again.
+    fn admitted(&mut self) -> Vec<Waker> {
+        let (mut count, mut bytes) = (self.count, self.bytes);
+        let mut admitted = Vec::new();
+        while let Some(waiter) = self.waiters.front()
+            && self.fits(count, bytes + waiter.len)
+        {
+            count += 1;
+            bytes += waiter.len;
+            admitted.extend(self.waiters.pop_front().map(|waiter| waiter.waker));
+        }
+        admitted
+    }
 }
 
 // A send the carrier refuses for its destination alone, such as one in a
@@ -452,8 +481,8 @@ impl CarriedSends {
         };
         self.terminal.send_replace(true);
         self.ready.notify_one();
-        for waiter in waiters.into_values() {
-            waiter.wake();
+        for waiter in waiters {
+            waiter.waker.wake();
         }
     }
 
@@ -488,10 +517,10 @@ impl CarriedSends {
                 }
                 pending.count -= 1;
                 pending.bytes -= packet.bytes.len();
-                std::mem::take(&mut pending.waiters)
+                pending.admitted()
             };
-            for waiter in waiters.into_values() {
-                waiter.wake();
+            for waker in waiters {
+                waker.wake();
             }
         }
     }
@@ -718,7 +747,8 @@ impl CarriedSender {
             .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let previous = pending.waiters.remove(&self.key());
+        let queued = pending.waiters.iter().position(|waiter| waiter.key == self.key());
+        let previous = queued.and_then(|at| pending.waiters.remove(at));
         let headers = if target.is_ipv4() { 28 } else { 48 };
         let limit = self.link_mtu.map_or(65535 - headers, |mtu| {
             usize::from(mtu).saturating_sub(headers)
@@ -727,9 +757,17 @@ impl CarriedSender {
             Poll::Ready(Err(CarriedSends::error(&pending)))
         } else if len > limit {
             Poll::Ready(Err(weaver_torrent::network::message_size_error()))
-        } else if pending.count >= CARRIED_SEND_PACKETS || pending.bytes + len > CARRIED_SEND_BYTES
-        {
-            pending.waiters.insert(self.key(), cx.waker().clone());
+        } else if !pending.fits(pending.count, pending.bytes + len) {
+            // A waiter polled again keeps its place in line.
+            let at = queued.unwrap_or(pending.waiters.len());
+            pending.waiters.insert(
+                at,
+                CarriedWaiter {
+                    key: self.key(),
+                    len,
+                    waker: cx.waker().clone(),
+                },
+            );
             Poll::Pending
         } else {
             pending.packets.push_back(CarriedPacket {
@@ -751,13 +789,15 @@ impl CarriedSender {
 
 impl Drop for CarriedSender {
     fn drop(&mut self) {
-        let waiter = self
-            .sends
-            .pending
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .waiters
-            .remove(&self.key());
+        let waiter = {
+            let mut pending = self
+                .sends
+                .pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let queued = pending.waiters.iter().position(|waiter| waiter.key == self.key());
+            queued.and_then(|at| pending.waiters.remove(at))
+        };
         drop(waiter);
     }
 }
