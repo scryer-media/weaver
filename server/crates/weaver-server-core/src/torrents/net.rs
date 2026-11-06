@@ -747,7 +747,10 @@ impl CarriedSender {
             .pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let queued = pending.waiters.iter().position(|waiter| waiter.key == self.key());
+        let queued = pending
+            .waiters
+            .iter()
+            .position(|waiter| waiter.key == self.key());
         let previous = queued.and_then(|at| pending.waiters.remove(at));
         let headers = if target.is_ipv4() { 28 } else { 48 };
         let limit = self.link_mtu.map_or(65535 - headers, |mtu| {
@@ -795,7 +798,10 @@ impl Drop for CarriedSender {
                 .pending
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            let queued = pending.waiters.iter().position(|waiter| waiter.key == self.key());
+            let queued = pending
+                .waiters
+                .iter()
+                .position(|waiter| waiter.key == self.key());
             queued.and_then(|at| pending.waiters.remove(at))
         };
         drop(waiter);

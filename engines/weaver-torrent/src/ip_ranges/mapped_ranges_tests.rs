@@ -114,7 +114,15 @@ fn a_range_straddling_the_mapped_block_covers_its_mapped_share() {
     has_both(&upper, Ipv4Addr::new(255, 255, 254, 255), false);
     for list in [&lower, &upper] {
         let union = IpRanges::union([list]);
-        has_both(&union, Ipv4Addr::new(10, 0, 0, 1), list.has(Ipv4Addr::new(10, 0, 0, 1).into()));
-        has_both(&union, Ipv4Addr::BROADCAST, list.has(Ipv4Addr::BROADCAST.into()));
+        has_both(
+            &union,
+            Ipv4Addr::new(10, 0, 0, 1),
+            list.has(Ipv4Addr::new(10, 0, 0, 1).into()),
+        );
+        has_both(
+            &union,
+            Ipv4Addr::BROADCAST,
+            list.has(Ipv4Addr::BROADCAST.into()),
+        );
     }
 }

@@ -1474,7 +1474,10 @@ impl Session {
             };
 
             let enable_utp = opts.connect.as_ref().and_then(|connect| connect.enable_utp);
-            let enable_tcp = opts.connect.as_ref().is_none_or(|connect| connect.enable_tcp);
+            let enable_tcp = opts
+                .connect
+                .as_ref()
+                .is_none_or(|connect| connect.enable_tcp);
             let listening_utp = listen_result
                 .as_ref()
                 .and_then(|listen| listen.utp_socket.clone());

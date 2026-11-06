@@ -278,7 +278,10 @@ async fn carried_utp_deferred_target_error_fails_only_that_packet() {
         let refused = "[2001:db8::1]:7001".parse().unwrap();
         let other = ([198, 51, 100, 2], 7002).into();
         accepted(&carried, b"refused", refused);
-        assert_eq!(observed.recv().await.unwrap(), (b"refused".to_vec(), refused));
+        assert_eq!(
+            observed.recv().await.unwrap(),
+            (b"refused".to_vec(), refused)
+        );
         accepted(&carried, b"queued", other);
         results.send(Err(failure)).unwrap();
         assert_eq!(observed.recv().await.unwrap(), (b"queued".to_vec(), other));
