@@ -198,14 +198,25 @@ fn bounded_password_candidates<'a>(
 // Every `X-DNZB-Password` value on an indexer's NZB response, in the order
 // received. The header is repeatable and each occurrence is one password; a
 // value is never split on commas, because a password may contain one. Header
-// names are case-insensitive, which `HeaderMap` already guarantees.
+// names are case-insensitive, which `HeaderMap` already guarantees. A value
+// that only flags the archive as protected is dropped, never tried.
 pub fn dnzb_header_passwords(headers: &reqwest::header::HeaderMap) -> Vec<String> {
     headers
         .get_all("x-dnzb-password")
         .iter()
         .filter_map(|value| std::str::from_utf8(value.as_bytes()).ok())
+        .filter(|value| !is_password_protection_marker(value))
         .map(str::to_string)
         .collect()
+}
+
+// Some indexers put a protection flag such as `-1` in `X-DNZB-Password`
+// instead of a password. Indexer-sourced header values only.
+fn is_password_protection_marker(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "-1" | "0" | "1" | "true" | "false" | "yes" | "no" | "protected" | "passworded"
+    )
 }
 
 pub fn nzb_password_candidates(
@@ -373,5 +384,38 @@ mod tests {
         assert_eq!(ids.all(), ["only@example.invalid"]);
         assert_eq!(ids.in_use(), "only@example.invalid");
         assert!(!ids.has_next());
+    }
+
+    #[test]
+    fn protection_flags_are_markers_and_passwords_are_not() {
+        for marker in [
+            "-1",
+            "0",
+            "1",
+            "true",
+            "false",
+            "yes",
+            "no",
+            "protected",
+            "passworded",
+            " TRUE ",
+            "Protected",
+            "\tPASSWORDED\t",
+            " -1",
+            "No ",
+        ] {
+            assert!(is_password_protection_marker(marker), "{marker:?}");
+        }
+        for password in [
+            "-10",
+            "1abc",
+            "true-story",
+            "10",
+            "yess",
+            "",
+            "synthetic-key",
+        ] {
+            assert!(!is_password_protection_marker(password), "{password:?}");
+        }
     }
 }
