@@ -1636,3 +1636,75 @@ async fn a_step_that_reaches_the_byte_threshold_is_due_at_once() {
     pending.delivered(1);
     assert!(pending.stepped(id, &mail));
 }
+// A post of four files of two 64-byte articles each, nothing in yet.
+fn four_members() -> (GraphJob, tempfile::TempDir, Vec<RootFile>) {
+    let files: Vec<RootFile> = (0..4)
+        .map(|index| file(&format!("member{index:02}.bin"), &[64, 64]))
+        .collect();
+    let (job, dir, _) = job_with(&files, Vec::new());
+    (job, dir, files)
+}
+
+// What a crash costs a job: the articles on disk that no write queued for
+// the database names. Two are in when a checkpoint commits and two more
+// arrive whose change waits for its barrier; the job a restore makes from
+// the database has the first two only, and the job says the other two are
+// what a crash now would fetch again.
+#[tokio::test(start_paused = true)]
+async fn a_crash_costs_only_the_articles_since_the_committed_checkpoint() {
+    let _clock = ClockHeld::new();
+    let (db, id) = checkpoint_database();
+    let (mut job, dir, files) = four_members();
+    arrive(&mut job, 0, 0);
+    arrive(&mut job, 1, 0);
+    let pending = job.pending().clone();
+    let (mail, _heard) = tokio::sync::mpsc::unbounded_channel();
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, true);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 1);
+    assert_eq!(job.on_disk(), [(0, 0), (1, 0)].into_iter().collect());
+    assert_eq!(job.in_memory(), Vec::<(u32, u32)>::new());
+    arrive(&mut job, 2, 0);
+    arrive(&mut job, 3, 0);
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, false);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 1, "the change waits for its barrier");
+    assert_eq!(job.in_memory(), vec![(2, 0), (3, 0)]);
+    let read = snapshot(&db.load_graph_checkpoint(id).unwrap().unwrap()).unwrap();
+    let (restored, _mail) = restored(&read, &files, dir.path());
+    assert_eq!(
+        restored.job.on_disk(),
+        [(0, 0), (1, 0)].into_iter().collect()
+    );
+    assert_eq!(restored.job.in_memory(), Vec::<(u32, u32)>::new());
+}
+
+// A forced write takes every change: once it is queued a crash costs
+// nothing the job has on disk, before the write has run and after.
+#[tokio::test(start_paused = true)]
+async fn a_forced_write_leaves_a_crash_nothing_to_fetch_again() {
+    let _clock = ClockHeld::new();
+    let (db, id) = checkpoint_database();
+    let (mut job, dir, files) = four_members();
+    arrive(&mut job, 0, 0);
+    let pending = job.pending().clone();
+    let (mail, _heard) = tokio::sync::mpsc::unbounded_channel();
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, true);
+    db.flush_write_queue().await.unwrap();
+    arrive(&mut job, 1, 0);
+    arrive(&mut job, 2, 0);
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, false);
+    assert_eq!(job.in_memory(), vec![(1, 0), (2, 0)]);
+    pending.queue(&db, id, &mail, true);
+    assert_eq!(job.in_memory(), Vec::<(u32, u32)>::new());
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 2);
+    assert_eq!(job.in_memory(), Vec::<(u32, u32)>::new());
+    let read = snapshot(&db.load_graph_checkpoint(id).unwrap().unwrap()).unwrap();
+    let (restored, _mail) = restored(&read, &files, dir.path());
+    assert_eq!(restored.job.on_disk(), job.on_disk());
+}

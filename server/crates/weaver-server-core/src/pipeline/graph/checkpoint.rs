@@ -224,6 +224,19 @@ struct Slot {
     // Who to tell once a stamp has committed, or a write has failed, while
     // a member's file waits on it to move.
     owed: Option<Owed>,
+    #[cfg(test)]
+    named: Named,
+}
+
+// The articles on disk that a checkpoint names, as a restore after a crash
+// would find them: at the last checkpoint that changed anything, at the
+// last one a write took, and at the last one a write committed.
+#[cfg(test)]
+#[derive(Default)]
+struct Named {
+    put: std::collections::BTreeSet<(u32, u32)>,
+    taken: std::collections::BTreeSet<(u32, u32)>,
+    committed: std::collections::BTreeSet<(u32, u32)>,
 }
 
 // The word a move waits on, and where to send it.
@@ -574,6 +587,10 @@ impl Pending {
         if delta.is_empty() {
             return false;
         }
+        #[cfg(test)]
+        {
+            slot.named.put = job.on_disk();
+        }
         slot.asked += 1;
         slot.oldest
             .get_or_insert_with(|| since.unwrap_or_else(tokio::time::Instant::now));
@@ -600,7 +617,37 @@ impl Pending {
         if let Some(timer) = slot.timer.take() {
             timer.abort();
         }
+        #[cfg(test)]
+        {
+            slot.named.taken = slot.named.put.clone();
+        }
         (slot.queued.take(), slot.asked)
+    }
+
+    // The articles on disk the database names once the writes queued for
+    // it run, as a restore after a crash now finds them: a change queued
+    // with no write to take it dies with the process.
+    #[cfg(test)]
+    pub(crate) fn named(&self) -> std::collections::BTreeSet<(u32, u32)> {
+        let slot = self.slot();
+        if slot.enqueued {
+            slot.named.put.clone()
+        } else {
+            slot.named.taken.clone()
+        }
+    }
+
+    // The job came back from the database's rows, on disk as `job` stands
+    // now: every checkpoint so far names that.
+    #[cfg(test)]
+    pub(crate) fn restored(&self, job: &GraphJob) {
+        let on_disk = job.on_disk();
+        let mut slot = self.slot();
+        slot.named = Named {
+            put: on_disk.clone(),
+            taken: on_disk.clone(),
+            committed: on_disk,
+        };
     }
 
     // Whether a step ran that no checkpoint has read.
@@ -684,6 +731,10 @@ impl Pending {
         if slot.lost {
             return;
         }
+        #[cfg(test)]
+        {
+            slot.named.committed = slot.named.taken.clone();
+        }
         slot.committed = slot.committed.max(stamp);
         let committed = slot.committed;
         if slot
@@ -709,6 +760,10 @@ impl Pending {
         slot.enqueued = false;
         if let Some(timer) = slot.timer.take() {
             timer.abort();
+        }
+        #[cfg(test)]
+        {
+            slot.named.taken = slot.named.committed.clone();
         }
         slot.lost = true;
         if let Some(owed) = slot.owed.take() {
