@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, btree_map};
 use std::ops::Bound;
 use std::sync::Arc;
 
-use unrar_rs::{ArchiveFormat, EncryptedStore, StoredLayoutBuilder};
+use unrar_rs::{ArchiveFormat, EncryptedStore};
 use weaver_graph::{
     ByteRange, Claim, Coverage, Delivery, Emit, Extent, Kind, Located, MemberId, Object, Placement,
     Posting, Provenance, Pull, Seek, Standing, VolumeIndex, Weight, Why,
@@ -143,6 +143,11 @@ mod counts {
         pub(crate) walks: usize,
         pub(crate) layouts: usize,
         pub(crate) names: usize,
+        // Volumes the layout was asked to take, each with the stamp of the
+        // facts it was asked on, and how often it was not asked since its
+        // answer was known.
+        pub(crate) asked: Vec<(u32, u64)>,
+        pub(crate) known: usize,
     }
 
     thread_local! {
@@ -301,7 +306,7 @@ pub struct RarStore {
     formats: [BTreeSet<VolumeIndex>; 3],
     // The layout kept: extended past its tail as volumes are read, laid
     // afresh only where a volume it holds changed what it said.
-    layout: Option<StoredLayoutBuilder>,
+    layout: Option<layout::Laid>,
     entries: Vec<Entry>,
     candidates: Vec<Candidate>,
     // The candidate that opened the headers.

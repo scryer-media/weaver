@@ -16,6 +16,7 @@ use unrar_rs::{
     RarVolumeFactsWalk, RarVolumeHeaderEncryption,
 };
 use weaver_graph::{ByteRange, Emit, Why};
+use zeroize::Zeroizing;
 
 use super::image::{SparseImage, readable};
 use crate::kept::Kept;
@@ -59,6 +60,48 @@ pub(super) struct Walk {
     // Where the next walk reads on from: every header before it was read
     // whole from bytes that have not changed since.
     pub(super) cursor: RarVolumeFactsCursor,
+    // The password the cursor last stepped with: under another one it
+    // begins again at the signature on its own.
+    keyed: Keyed,
+    // Which facts these are: a number no facts any walk read had before,
+    // drawn each time they change, so a layout laid on them can tell
+    // they did not.
+    pub(super) stamp: u64,
+}
+
+static STAMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_stamp() -> u64 {
+    STAMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+// A password kept to compare with, never shown.
+#[derive(Default)]
+struct Keyed(Option<Zeroizing<String>>);
+
+impl std::fmt::Debug for Keyed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Keyed")
+    }
+}
+
+// Where each walk's image began on this thread, for a test: 0 for every
+// run in hand.
+#[cfg(test)]
+pub(super) mod imaged {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static IMAGED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn note(at: u64) {
+        IMAGED.with_borrow_mut(|imaged| imaged.push(at));
+    }
+
+    pub(crate) fn take() -> Vec<u64> {
+        IMAGED.with(RefCell::take)
+    }
 }
 
 // Where each walk began on this thread, for a test: 0 from the signature.
@@ -103,7 +146,7 @@ fn data_end(facts: &RarVolumeFacts) -> u64 {
 // The first byte at or after `from` the walk may not read.
 fn hole(kept: &Kept, from: u64, closed: bool) -> u64 {
     let mut at = from;
-    for (range, _, provenance) in kept.runs() {
+    for (range, _, provenance) in kept.runs_from(from) {
         if !readable(provenance, closed) || range.end <= at {
             continue;
         }
@@ -117,15 +160,14 @@ fn hole(kept: &Kept, from: u64, closed: bool) -> u64 {
 
 // Whether a byte past `from` arrived damaged.
 fn damaged_past(kept: &Kept, from: u64) -> bool {
-    kept.runs()
-        .into_iter()
+    kept.runs_from(from)
         .any(|(range, _, provenance)| provenance.is_damaged() && range.end > from)
 }
 
 // The damaged run a byte sits in.
 fn damaged_at(kept: &Kept, at: u64) -> Option<ByteRange> {
-    kept.runs()
-        .into_iter()
+    kept.runs_from(at)
+        .take_while(|(range, _, _)| range.start <= at)
         .find(|(range, _, provenance)| provenance.is_damaged() && range.contains(at))
         .map(|(range, _, _)| range)
 }
@@ -214,6 +256,12 @@ fn quick_open_cross_check(
 }
 
 impl Walk {
+    // Facts read before, as a checkpoint kept them.
+    pub(super) fn restore(&mut self, facts: Option<RarVolumeFacts>) {
+        self.facts = facts;
+        self.stamp = next_stamp();
+    }
+
     // How far the headers place bytes: nothing before any are read, every
     // byte once the volume has ended.
     pub(super) fn reach(&self) -> Option<u64> {
@@ -264,6 +312,41 @@ impl Walk {
         self.successor() == Some(false)
     }
 
+    // Where the next step reads on from under `password`, when it truly
+    // reads on: the cursor holds a resume, and it was keyed with this same
+    // password, since under another one it begins at the signature.
+    pub(super) fn resumes(&self, password: Option<&str>) -> Option<u64> {
+        let keyed = self.keyed.0.as_deref().map(String::as_str);
+        self.cursor.resumes_at().filter(|_| keyed == password)
+    }
+
+    // The first byte the next step can read. A step reading on reads nothing
+    // before its resume, so the runs ending at or before it need not be in
+    // its image. Every run is, from the signature, whenever
+    // (a) the cursor holds no resume (`resumes_at()` is None),
+    // (b) the password differs from the one the cursor last stepped with,
+    // (c) the headers read so far carry a Quick Open locator
+    //     (`has_locator` or `quick_open_offset`), whose records the step may
+    //     read wherever they lie, or
+    // (d) the volume is not known to be RAR5: a RAR4 step can read owner
+    //     records anywhere in the volume, and a RAR 1.4 one reads from the
+    //     signature every time.
+    pub(super) fn image_from(&self, password: Option<&str>) -> u64 {
+        let Some(at) = self.resumes(password) else {
+            return 0;
+        };
+        match &self.facts {
+            Some(facts)
+                if facts.archive_format() == ArchiveFormat::Rar5
+                    && !facts.has_locator
+                    && facts.quick_open_offset.is_none() =>
+            {
+                at
+            }
+            _ => 0,
+        }
+    }
+
     // A kept byte changed from `at` on: a walk that read on past it begins
     // again from the signature, and one short of it reads on.
     pub(super) fn changed_from(&mut self, at: u64) {
@@ -282,6 +365,28 @@ impl Walk {
         kdf: &Arc<KdfCache>,
         closed: bool,
     ) -> Step {
+        #[cfg(test)]
+        let collected = crate::kept::collected::count();
+        let step = self.read(kept, length, password, kdf, closed);
+        // A walk looks only at the runs about the bytes it asks after: it
+        // never collects every run in hand.
+        #[cfg(test)]
+        assert_eq!(
+            crate::kept::collected::count(),
+            collected,
+            "a walk collected every run in hand"
+        );
+        step
+    }
+
+    fn read(
+        &mut self,
+        kept: &mut Kept,
+        length: Option<u64>,
+        password: Option<&str>,
+        kdf: &Arc<KdfCache>,
+        closed: bool,
+    ) -> Step {
         let signature = ByteRange::new(0, length.map_or(SIGNATURE, |length| length.min(SIGNATURE)));
         kept.want(signature);
         if hole(kept, 0, closed) < signature.end {
@@ -289,8 +394,12 @@ impl Walk {
         }
         #[cfg(test)]
         began::note(self.cursor.resumes_at().unwrap_or(0));
-        let image = SparseImage::of(kept, closed);
+        let from = self.image_from(password);
+        #[cfg(test)]
+        imaged::note(from);
+        let image = SparseImage::past(kept, closed, from);
         let walked = self.cursor.step(image, password, Arc::clone(kdf));
+        self.keyed = Keyed(password.map(|password| Zeroizing::new(password.to_owned())));
         // A walk read on from the cursor reads what one from the signature
         // reads over the same bytes.
         #[cfg(test)]
@@ -382,7 +491,8 @@ impl Walk {
         // may be its own.
         let more =
             (walk.short_at.is_none() && !damaged_past(kept, reach)).then_some(facts.more_volumes);
-        let moved = self.facts.as_ref() != Some(&facts) || self.ended != ended || self.more != more;
+        let differs = self.facts.as_ref() != Some(&facts);
+        let moved = differs || self.ended != ended || self.more != more;
         self.blocks = facts
             .members
             .iter()
@@ -390,6 +500,9 @@ impl Walk {
                 data: ByteRange::at(member.data_offset, member.data_size),
             })
             .collect();
+        if differs {
+            self.stamp = next_stamp();
+        }
         self.facts = Some(facts);
         self.more = more;
         self.ended = ended;
@@ -433,6 +546,93 @@ impl Walk {
         match end > from {
             true => ByteRange::new(from, end),
             false => ByteRange::new(0, hole(kept, 0, closed)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use weaver_graph::Provenance;
+
+    use super::*;
+
+    // A kept volume of many pieces, each with gaps and runs of every kind.
+    fn scattered() -> Kept {
+        let mut kept = Kept::default();
+        let kinds = [
+            Provenance::Fresh,
+            Provenance::Damaged,
+            Provenance::Repaired,
+            Provenance::Refuted,
+            Provenance::Lost,
+        ];
+        for piece in 0..40u64 {
+            let start = piece * 100;
+            kept.want(ByteRange::new(start, start + 60));
+            for run in 0..4u64 {
+                if (piece + run) % 3 == 2 {
+                    continue;
+                }
+                let at = start + run * 15;
+                let kind = kinds[((piece * 7 + run) % kinds.len() as u64) as usize];
+                kept.absorb(ByteRange::new(at, at + 10), &[piece as u8; 10], kind);
+            }
+        }
+        kept
+    }
+
+    fn hole_collected(kept: &Kept, from: u64, closed: bool) -> u64 {
+        let mut at = from;
+        for (range, _, provenance) in kept.runs() {
+            if !readable(provenance, closed) || range.end <= at {
+                continue;
+            }
+            if range.start > at {
+                break;
+            }
+            at = range.end;
+        }
+        at
+    }
+
+    fn damaged_past_collected(kept: &Kept, from: u64) -> bool {
+        kept.runs()
+            .into_iter()
+            .any(|(range, _, provenance)| provenance.is_damaged() && range.end > from)
+    }
+
+    fn damaged_at_collected(kept: &Kept, at: u64) -> Option<ByteRange> {
+        kept.runs()
+            .into_iter()
+            .find(|(range, _, provenance)| provenance.is_damaged() && range.contains(at))
+            .map(|(range, _, _)| range)
+    }
+
+    // Read from the runs about an offset, the walk's questions answer as
+    // they did over every run collected, at every offset, and collect none.
+    #[test]
+    fn walk_run_lookups_from_an_offset_answer_as_over_every_run() {
+        let kept = scattered();
+        assert!(kept.runs().len() > 80);
+        for at in 0..4_200 {
+            let collected = crate::kept::collected::count();
+            let found = (
+                hole(&kept, at, false),
+                hole(&kept, at, true),
+                damaged_past(&kept, at),
+                damaged_at(&kept, at),
+            );
+            assert_eq!(crate::kept::collected::count(), collected, "at {at}");
+            assert_eq!(
+                found,
+                (
+                    hole_collected(&kept, at, false),
+                    hole_collected(&kept, at, true),
+                    damaged_past_collected(&kept, at),
+                    damaged_at_collected(&kept, at),
+                ),
+                "at {at}"
+            );
         }
     }
 }

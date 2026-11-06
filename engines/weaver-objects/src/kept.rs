@@ -37,6 +37,24 @@ fn serialize_bytes<S: serde::Serializer>(bytes: &[u8], serializer: S) -> Result<
     serializer.serialize_bytes(bytes)
 }
 
+// How many times this thread collected every run in hand, for a test.
+#[cfg(test)]
+pub(crate) mod collected {
+    use std::cell::Cell;
+
+    thread_local! {
+        static COLLECTED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn bump() {
+        COLLECTED.with(|count| count.set(count.get() + 1));
+    }
+
+    pub(crate) fn count() -> usize {
+        COLLECTED.with(Cell::get)
+    }
+}
+
 impl Piece {
     // The part of the range its bytes reach.
     fn held(&self) -> ByteRange {
@@ -102,12 +120,17 @@ impl Kept {
         if range.is_empty() {
             return;
         }
-        let touching: Vec<u64> = self
+        // Pieces are disjoint and keyed by start, so their ends rise with
+        // their starts: those touching the range are the last ones starting
+        // at or before its end, back to the first that ends before it.
+        let mut touching: Vec<u64> = self
             .pieces
-            .values()
-            .filter(|piece| piece.range.abuts(range))
-            .map(|piece| piece.range.start)
+            .range(..=range.end)
+            .rev()
+            .take_while(|(_, piece)| piece.range.end >= range.start)
+            .map(|(start, _)| *start)
             .collect();
+        touching.reverse();
         if let [start] = touching.as_slice()
             && self.pieces[start].range.covers(range)
         {
@@ -174,7 +197,14 @@ impl Kept {
         provenance: Provenance,
     ) -> Option<u64> {
         let mut changed: Option<u64> = None;
-        for piece in self.pieces.values_mut() {
+        // The pieces meeting the range: those starting before its end, back
+        // to the first that ends at or before its start.
+        for (_, piece) in self
+            .pieces
+            .range_mut(..range.end)
+            .rev()
+            .take_while(|(_, piece)| piece.range.end > range.start)
+        {
             let Some(overlap) = piece.range.intersect(range) else {
                 continue;
             };
@@ -254,16 +284,31 @@ impl Kept {
 
     // Every run in hand, in order, with its bytes and how they arrived.
     pub(crate) fn runs(&self) -> Vec<(ByteRange, &[u8], Provenance)> {
-        self.pieces
-            .values()
-            .flat_map(|piece| {
-                piece.coverage.runs().map(move |run| {
-                    let at = (run.range.start - piece.range.start) as usize;
-                    let bytes = &piece.bytes[at..at + run.range.len() as usize];
-                    (run.range, bytes, run.provenance)
-                })
+        #[cfg(test)]
+        collected::bump();
+        self.runs_from(0).collect()
+    }
+
+    // The runs in hand, in order, from the piece holding `offset` on, or the
+    // last one before it: every run of a piece before that one ends at or
+    // before `offset`, since pieces are disjoint and each run lies inside
+    // its piece.
+    pub(crate) fn runs_from(
+        &self,
+        offset: u64,
+    ) -> impl Iterator<Item = (ByteRange, &[u8], Provenance)> {
+        let first = self
+            .pieces
+            .range(..=offset)
+            .next_back()
+            .map_or(0, |(start, _)| *start);
+        self.pieces.range(first..).flat_map(|(_, piece)| {
+            piece.coverage.runs().map(move |run| {
+                let at = (run.range.start - piece.range.start) as usize;
+                let bytes = &piece.bytes[at..at + run.range.len() as usize];
+                (run.range, bytes, run.provenance)
             })
-            .collect()
+        })
     }
 
     // Where the next byte in hand at or after `offset` is, if any.
@@ -418,6 +463,122 @@ mod tests {
         assert!(old.len() > encoded.len() + 32_000);
         let restored: Kept = rmp_serde::from_slice(&encoded).unwrap();
         assert_eq!(restored.runs(), kept.runs());
+    }
+
+    // The scans over every piece the range lookups replaced.
+    fn want_linear(kept: &mut Kept, range: ByteRange) {
+        if range.is_empty() {
+            return;
+        }
+        let touching: Vec<u64> = kept
+            .pieces
+            .values()
+            .filter(|piece| piece.range.abuts(range))
+            .map(|piece| piece.range.start)
+            .collect();
+        if let [start] = touching.as_slice()
+            && kept.pieces[start].range.covers(range)
+        {
+            return;
+        }
+        let mut merged = range;
+        for start in &touching {
+            let piece = &kept.pieces[start];
+            merged = ByteRange::new(
+                merged.start.min(piece.range.start),
+                merged.end.max(piece.range.end),
+            );
+        }
+        let mut grown = Piece {
+            range: merged,
+            bytes: Vec::new(),
+            coverage: Coverage::new(),
+        };
+        for start in touching {
+            if let Some(piece) = kept.pieces.remove(&start) {
+                let at = (piece.range.start - merged.start) as usize;
+                reach(&mut grown.bytes, at, piece.bytes.len()).copy_from_slice(&piece.bytes);
+                for run in piece.coverage.runs() {
+                    grown.coverage.write(run.range, run.provenance);
+                }
+            }
+        }
+        kept.pieces.insert(merged.start, grown);
+        kept.generation += 1;
+    }
+
+    fn absorb_linear(
+        kept: &mut Kept,
+        range: ByteRange,
+        bytes: &[u8],
+        provenance: Provenance,
+    ) -> Option<u64> {
+        let mut changed: Option<u64> = None;
+        for piece in kept.pieces.values_mut() {
+            let Some(overlap) = piece.range.intersect(range) else {
+                continue;
+            };
+            let from = &bytes
+                [(overlap.start - range.start) as usize..(overlap.end - range.start) as usize];
+            let at = (overlap.start - piece.range.start) as usize;
+            let trusted = first_untrusted(&piece.coverage, overlap, provenance);
+            let into = reach(&mut piece.bytes, at, from.len());
+            let differs = into
+                .iter()
+                .zip(from)
+                .position(|(held, came)| held != came)
+                .map(|offset| overlap.start + offset as u64);
+            let Some(first) = [trusted, differs].into_iter().flatten().min() else {
+                continue;
+            };
+            into.copy_from_slice(from);
+            piece.coverage.write(overlap, provenance);
+            changed = Some(changed.map_or(first, |was| was.min(first)));
+        }
+        changed
+    }
+
+    // Wants and deliveries over many pieces, touching, overlapping, nested
+    // and apart, leave the same pieces, generations and absorb offsets as
+    // the scans over every piece did.
+    #[test]
+    fn range_lookups_keep_as_the_scans_over_every_piece_did() {
+        let kinds = [Provenance::Fresh, Provenance::Damaged, Provenance::Repaired];
+        let mut ranged = Kept::default();
+        let mut linear = Kept::default();
+        let mut seed = 0x2545_f491_u64;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        for step in 0..4_000 {
+            let start = next(100_000);
+            let wants = step % 3 == 0;
+            let len = 1 + match (wants, step % 7 == 0) {
+                (true, true) => next(600),
+                (true, false) => next(40),
+                (false, _) => next(3_000),
+            };
+            let range = ByteRange::new(start, start + len);
+            if wants {
+                ranged.want(range);
+                want_linear(&mut linear, range);
+                assert_eq!(ranged.generation(), linear.generation(), "step {step}");
+            } else {
+                let bytes: Vec<u8> = (0..len).map(|at| (next(4) + at) as u8).collect();
+                let kind = kinds[next(kinds.len() as u64) as usize];
+                assert_eq!(
+                    ranged.absorb(range, &bytes, kind),
+                    absorb_linear(&mut linear, range, &bytes, kind),
+                    "step {step}"
+                );
+            }
+            assert_eq!(ranged, linear, "step {step}");
+        }
+        assert!(ranged.pieces.len() > 100, "{}", ranged.pieces.len());
+        assert!(ranged.sound());
     }
 
     #[test]
