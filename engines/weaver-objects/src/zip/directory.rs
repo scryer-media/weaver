@@ -226,7 +226,10 @@ impl Zip {
             }
             let header = &centrals[index].header;
             let said = Said::of(header);
-            let streams = member.is_some() && (length > 0 || header.encrypted());
+            // A directory holds nothing to decrypt: its encryption
+            // header, if a writer gave it one, is the envelope's.
+            let encrypted = header.encrypted() && header.shape != Shape::Directory;
+            let streams = member.is_some() && (length > 0 || encrypted);
             map.entries.push(Entry {
                 header: headers[index],
                 member,
@@ -236,7 +239,7 @@ impl Zip {
                 crc: header.crc,
                 crc_known: true,
                 data: None,
-                cipher: (streams && header.encrypted()).then(|| super::crypto::Cipher::new(header)),
+                cipher: (streams && encrypted).then(|| super::crypto::Cipher::new(header)),
                 streams,
                 expected: Some(header.clone()),
             });
@@ -476,7 +479,8 @@ impl Said {
     pub(super) fn of(header: &records::Header) -> Self {
         let directory = header.shape == Shape::Directory;
         Self {
-            encrypted: header.encrypted(),
+            // A directory is never decrypted, whatever its flags say.
+            encrypted: header.encrypted() && !directory,
             name: records::member_name(header.name.clone(), header.shape),
             length: if directory { 0 } else { header.length },
             // The header's CRC32 is the member's own unless a key went

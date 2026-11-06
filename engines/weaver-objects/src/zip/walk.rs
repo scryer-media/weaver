@@ -88,8 +88,9 @@ impl Zip {
             let length = self.announce(member, &header, out);
             let data = cursor + len;
             let compressed = header.compressed;
-            let cipher = header
-                .encrypted()
+            // A directory holds nothing to decrypt: its encryption header,
+            // if a writer gave it one, is the envelope's.
+            let cipher = (header.encrypted() && header.shape != records::Shape::Directory)
                 .then(|| super::crypto::Cipher::new(&header));
             let prefix = if cipher.is_some() {
                 super::crypto::HEADER

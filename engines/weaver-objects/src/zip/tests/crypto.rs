@@ -686,6 +686,39 @@ fn a_zip64_field_widens_the_descriptor_whatever_the_sizes() {
     )));
 }
 
+// A directory entry flagged encrypted, its twelve-byte encryption header
+// for data: a directory holds no bytes to decrypt, so it closes with no
+// password asked for, and its header is the envelope's.
+fn encrypted_directory() -> Vec<u8> {
+    let mut archive = write(&[Entry::Dir("folder/")]);
+    let end = records::find_end(&archive).unwrap();
+    let central = end.offset as usize;
+    let data = records::local_len(&archive).unwrap() as usize;
+    archive[6..8].copy_from_slice(&1u16.to_le_bytes());
+    archive[18..22].copy_from_slice(&12u32.to_le_bytes());
+    archive[central + 8..central + 10].copy_from_slice(&1u16.to_le_bytes());
+    archive[central + 20..central + 24].copy_from_slice(&12u32.to_le_bytes());
+    archive[end.at as usize + 16..end.at as usize + 20]
+        .copy_from_slice(&(central as u32 + 12).to_le_bytes());
+    let header = super::super::crypto::encrypt_fixture(PASSWORD, b"");
+    assert_eq!(header.len(), 12);
+    archive.splice(data..data, header);
+    archive
+}
+
+#[test]
+fn an_encrypted_directory_entry_closes_without_a_password() {
+    for pull in [Pull::Moved(1), Pull::Unseekable] {
+        let archive = encrypted_directory();
+        let mut owner = Owner::single(Zip::new(), archive.clone());
+        owner.pull = pull;
+        owner.whole(4096);
+        assert!(owner.member("folder/").closed, "{pull:?}");
+        assert!(!owner.said.contains(&Emit::NeedsPassword), "{:?}", owner.said);
+        assert!(owner.posted(0) == Some(archive));
+    }
+}
+
 #[test]
 fn an_inverse_frontier_is_bound_to_the_candidate_that_produced_it() {
     use weaver_graph::{Coverage, Placement};
