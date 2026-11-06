@@ -526,3 +526,68 @@ fn a_stream_of_partial_blocks_is_refused() {
         Err(CryptError::Overlong { .. })
     ));
 }
+
+// A member's record of thousands of runs with gaps between them: what the
+// cipher asks of it, block by block, answers as a map of every byte does,
+// for blocks before the first run, in a gap, in a run, across a boundary
+// and past the last run.
+#[test]
+fn placed_agrees_with_a_byte_map_over_thousands_of_runs() {
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = |bound: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % bound
+    };
+    let kinds = [
+        Provenance::Fresh,
+        Provenance::Repaired,
+        Provenance::Damaged,
+        Provenance::Refuted,
+        Provenance::Lost,
+    ];
+    let mut coverage = Coverage::new();
+    let mut bytes: Vec<Option<Provenance>> = Vec::new();
+    let mut at = 5;
+    for _ in 0..4000 {
+        at += next(4);
+        let range = ByteRange::at(at, 1 + next(40));
+        let provenance = kinds[next(kinds.len() as u64) as usize];
+        bytes.resize(range.end as usize, None);
+        bytes[range.start as usize..range.end as usize].fill(Some(provenance));
+        coverage.write(range, provenance);
+        at = range.end;
+    }
+    assert!(
+        coverage.runs().count() > 2000,
+        "{}",
+        coverage.runs().count()
+    );
+    let byte = |offset: u64| bytes.get(offset as usize).copied().flatten();
+    let mut starts: Vec<u64> = (0..at + 3 * BLOCK).step_by(BLOCK as usize).collect();
+    starts.extend((0..at + 40).step_by(11));
+    for run in coverage.runs() {
+        for edge in [run.range.start, run.range.end] {
+            starts.extend([edge.saturating_sub(1), edge, edge + 1]);
+        }
+    }
+    for start in starts {
+        for len in [1, 2, BLOCK, 3 * BLOCK, 50] {
+            let range = ByteRange::at(start, len);
+            let all: Vec<Option<Provenance>> = (range.start..range.end).map(byte).collect();
+            let placed = all
+                .iter()
+                .copied()
+                .collect::<Option<Vec<Provenance>>>()
+                .map(|all| all.into_iter().fold(Provenance::Fresh, worse));
+            let first = (range.start..range.end).find(|offset| byte(*offset).is_some());
+            assert_eq!(coverage.placed(range), placed, "placed {range:?}");
+            assert_eq!(
+                coverage.first_placed(range),
+                first,
+                "first_placed {range:?}"
+            );
+        }
+    }
+}
