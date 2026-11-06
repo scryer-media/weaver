@@ -5,11 +5,14 @@
 
 use std::{
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket},
     time::Duration,
 };
 
 use socket2::{Domain, Protocol, Socket, TcpKeepalive, Type};
+
+mod multicast;
+pub use multicast::MulticastSocket;
 
 // Binding is exclusive: choosing a device leaves source selection to the kernel.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
@@ -212,11 +215,49 @@ impl SocketEgress {
     // `local`'s port: at the source address this egress pins, else at
     // `local`'s address, on the egress's device when it names one.
     pub(crate) fn bind_udp_at(&self, local: SocketAddr) -> io::Result<UdpSocket> {
+        let (socket, local, _) = self.local_socket(local, Type::DGRAM, Protocol::UDP)?;
+        socket.bind(&local.into())?;
+        socket.set_nonblocking(true)?;
+        Ok(socket.into())
+    }
+
+    /// A datagram socket bound as [`Self::bind_udp_at`] binds, on an address
+    /// a socket bound before it may have left in use, and whether it takes
+    /// IPv4 as well as IPv6.
+    pub fn bind_udp_reusing(&self, local: SocketAddr) -> io::Result<(UdpSocket, bool)> {
+        let (socket, local, dual_stack) = self.local_socket(local, Type::DGRAM, Protocol::UDP)?;
+        #[cfg(not(windows))]
+        socket.set_reuse_address(true)?;
+        socket.bind(&local.into())?;
+        socket.set_nonblocking(true)?;
+        Ok((socket.into(), dual_stack))
+    }
+
+    /// A stream listener bound as [`Self::bind_udp_at`] binds a datagram
+    /// socket, on an address a listener before it may have left in use.
+    pub fn listen_tcp(&self, local: SocketAddr) -> io::Result<TcpListener> {
+        let (socket, local, _) = self.local_socket(local, Type::STREAM, Protocol::TCP)?;
+        socket.set_reuse_address(true)?;
+        socket.bind(&local.into())?;
+        socket.listen(1024)?;
+        socket.set_nonblocking(true)?;
+        Ok(socket.into())
+    }
+
+    // An unbound socket for `local` as this egress binds it, the address it
+    // binds at, and whether it takes IPv4 as well as IPv6.
+    fn local_socket(
+        &self,
+        local: SocketAddr,
+        kind: Type,
+        protocol: Protocol,
+    ) -> io::Result<(Socket, SocketAddr, bool)> {
         let local = match self {
             Self::SourceAddress(source) => SocketAddr::new(*source, local.port()),
             _ => local,
         };
-        let socket = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
+        let socket = Socket::new(Domain::for_address(local), kind, Some(protocol))?;
+        let mut dual_stack = false;
         if local.is_ipv6() && local.ip().is_unspecified() {
             match self {
                 // On a device the unspecified IPv6 address keeps to IPv6 on
@@ -225,19 +266,24 @@ impl SocketEgress {
                 Self::Interface(_) => socket.set_only_v6(true)?,
                 // Elsewhere it takes IPv4 as well, whatever the host's
                 // default, unless the host keeps the socket to IPv6.
-                _ => {
-                    if let Err(error) = socket.set_only_v6(false) {
+                _ => match socket.set_only_v6(false) {
+                    Ok(()) => dual_stack = true,
+                    Err(error) => {
                         tracing::debug!(%local, %error, "the host keeps the socket to IPv6 alone");
                     }
-                }
+                },
             }
         }
         if let Self::Interface(name) = self {
             bind_interface(&socket, name, local.is_ipv6())?;
         }
-        socket.bind(&local.into())?;
-        socket.set_nonblocking(true)?;
-        Ok(socket.into())
+        Ok((socket, local, dual_stack))
+    }
+
+    /// The egress held to the interface called `name`, which must exist.
+    pub fn existing_interface(name: &str) -> io::Result<Self> {
+        interface_index(name)?;
+        Ok(Self::Interface(name.to_owned()))
     }
 }
 
@@ -312,6 +358,68 @@ mod connect_tests {
             .bind_udp_at(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0))
             .unwrap();
         assert_eq!(socket.local_addr().unwrap().ip(), loopback);
+    }
+
+    // A datagram socket on an address in use before takes IPv4 as well at
+    // the unspecified IPv6 address, and says so; at an IPv4 address it
+    // takes IPv4 alone.
+    #[test]
+    fn a_reusing_datagram_socket_says_whether_it_takes_both_families() {
+        let (socket, dual_stack) = SocketEgress::System
+            .bind_udp_reusing("[::]:0".parse().unwrap())
+            .unwrap();
+        assert!(dual_stack);
+        let socket = socket2::SockRef::from(&socket);
+        assert!(!socket.only_v6().unwrap());
+        #[cfg(not(windows))]
+        assert!(socket.reuse_address().unwrap());
+        let loopback = IpAddr::from(Ipv4Addr::LOCALHOST);
+        let (socket, dual_stack) = SocketEgress::System
+            .bind_udp_reusing(SocketAddr::new(loopback, 0))
+            .unwrap();
+        assert!(!dual_stack);
+        assert_eq!(socket.local_addr().unwrap().ip(), loopback);
+    }
+
+    // A listener at the unspecified IPv6 address takes an IPv4 peer.
+    #[test]
+    fn a_listener_at_the_unspecified_v6_address_takes_an_ipv4_peer() {
+        let listener = SocketEgress::System
+            .listen_tcp("[::]:0".parse().unwrap())
+            .unwrap();
+        assert!(socket2::SockRef::from(&listener).reuse_address().unwrap());
+        let port = listener.local_addr().unwrap().port();
+        let _peer = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        listener.set_nonblocking(false).unwrap();
+        let (_, from) = listener.accept().unwrap();
+        assert_eq!(from.ip().to_canonical(), IpAddr::from(Ipv4Addr::LOCALHOST));
+    }
+
+    // A listener on an interface at the unspecified IPv6 address keeps to
+    // IPv6; an egress held to an interface names one that exists.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_interface_listener_keeps_to_ipv6_on_an_existing_interface() {
+        let device = if cfg!(target_os = "linux") {
+            "lo"
+        } else {
+            "lo0"
+        };
+        assert_eq!(
+            SocketEgress::existing_interface("weaver-none0")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotFound
+        );
+        let egress = SocketEgress::existing_interface(device).unwrap();
+        assert_eq!(egress, SocketEgress::Interface(device.into()));
+        let listener = match egress.listen_tcp("[::]:0".parse().unwrap()) {
+            Ok(listener) => listener,
+            // Binding to a device needs a privilege some Linux hosts withhold.
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("{error}"),
+        };
+        assert!(socket2::SockRef::from(&listener).only_v6().unwrap());
     }
 
     #[test]
@@ -392,13 +500,7 @@ fn bind_interface(socket: &Socket, name: &str, ipv6: bool) -> io::Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
-        let name = std::ffi::CString::new(name)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid interface name"))?;
-        // SAFETY: CString supplies the NUL-terminated name required by libc.
-        let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
-        let index = std::num::NonZeroU32::new(index).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "egress interface does not exist")
-        })?;
+        let index = interface_index(name)?;
         if ipv6 {
             socket.bind_device_by_index_v6(Some(index))
         } else {
@@ -413,6 +515,25 @@ fn bind_interface(socket: &Socket, name: &str, ipv6: bool) -> io::Result<()> {
             "interface binding is not supported on this platform; use a source address",
         ))
     }
+}
+
+// The index of the interface called `name`.
+#[cfg(unix)]
+fn interface_index(name: &str) -> io::Result<std::num::NonZeroU32> {
+    let name = std::ffi::CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid interface name"))?;
+    // SAFETY: CString supplies the NUL-terminated name required by libc.
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    std::num::NonZeroU32::new(index)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "egress interface does not exist"))
+}
+
+#[cfg(not(unix))]
+fn interface_index(_name: &str) -> io::Result<std::num::NonZeroU32> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "interface binding is not supported on this platform; use a source address",
+    ))
 }
 
 // Address flags used both by health discovery and address-race family filtering.
