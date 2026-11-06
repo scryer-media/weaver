@@ -727,7 +727,11 @@ impl Object for SevenZipStore {
         // signature names the end header, the end header names its packs.
         loop {
             let generation = self.kept.generation();
-            if self.kept.absorb(range, bytes, delivery.provenance) {
+            if self
+                .kept
+                .absorb(range, bytes, delivery.provenance)
+                .is_some()
+            {
                 self.stale = true;
                 self.rebuild_if_changed(range);
             }

@@ -456,7 +456,11 @@ impl Object for Zip {
         // tail names the directory, the directory names the local headers.
         loop {
             let generation = self.kept.generation();
-            if self.kept.absorb(range, delivery.bytes, delivery.provenance) {
+            if self
+                .kept
+                .absorb(range, delivery.bytes, delivery.provenance)
+                .is_some()
+            {
                 self.stale = true;
                 self.rebuild_if_changed(range, out);
             }
