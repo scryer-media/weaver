@@ -180,6 +180,8 @@ pub struct LiveNetworkRoute {
 }
 
 type StagedPoolMembers = HashMap<(u32, u32), Vec<(u32, Arc<dyn Dialer>)>>;
+// The pools running now, by pool and egress.
+pub(super) type RunningPools = Arc<Mutex<HashMap<(u32, u32), Arc<PoolStage>>>>;
 
 pub struct NetworkRuntime {
     pub egress_controls: Arc<weaver_nntp::transfer::ServerTransferRegistry>,
@@ -197,7 +199,9 @@ pub struct NetworkRuntime {
     // saved profile shares the session already holding its WireGuard permit
     // instead of competing with it for the budget, and never shuts it down.
     borrowed_sessions: HashMap<String, Arc<dyn Dialer>>,
-    pools: Mutex<HashMap<(u32, u32), Arc<PoolStage>>>,
+    // Shared with the torrent legs that hold a pool member, which look a
+    // member up again in whichever pool on their egress still has it.
+    pools: RunningPools,
     routes: Mutex<HashMap<String, Arc<LiveNetworkRoute>>>,
     interfaces: Arc<InterfaceMonitor>,
     compiling: bool,
@@ -260,7 +264,7 @@ impl NetworkRuntime {
             configuration: RwLock::new(configuration),
             sessions: Mutex::new(HashMap::new()),
             borrowed_sessions: HashMap::new(),
-            pools: Mutex::new(HashMap::new()),
+            pools: Arc::default(),
             routes: Mutex::new(HashMap::new()),
             interfaces,
             compiling: false,
@@ -816,12 +820,27 @@ impl NetworkRuntime {
                         }
                         Rung::Pool { id } => {
                             let pool = config.pools.get(id).ok_or("proxy pool does not exist")?;
-                            pool_versions.push((pool.id, pool.enabled, pool.member_ids.clone()));
-                            for member in &pool.member_ids {
-                                versions.push((
-                                    *member,
-                                    config.profiles.get(member).map(|p| p.revision),
+                            // A torrent session holds one member through a
+                            // stage of its own, which the pool's stage lets
+                            // go when that member is edited or leaves: an
+                            // edit to the pool's members keeps a torrent's
+                            // leg, so it moves no other member's session.
+                            // Any other leg is rebuilt, which clears a block
+                            // its route laid on it.
+                            if matches!(consumer, Consumer::Torrent(_)) {
+                                pool_versions.push((pool.id, pool.enabled, Vec::new()));
+                            } else {
+                                pool_versions.push((
+                                    pool.id,
+                                    pool.enabled,
+                                    pool.member_ids.clone(),
                                 ));
+                                for member in &pool.member_ids {
+                                    versions.push((
+                                        *member,
+                                        config.profiles.get(member).map(|p| p.revision),
+                                    ));
+                                }
                             }
                             self.pool(config, *id, bottom.clone())?
                         }
@@ -983,7 +1002,9 @@ impl NetworkRuntime {
             configuration: RwLock::new(next.clone()),
             sessions: Mutex::new(self.sessions.lock().expect("network sessions").clone()),
             borrowed_sessions: HashMap::new(),
-            pools: Mutex::new(self.pools.lock().expect("network pools").clone()),
+            pools: Arc::new(Mutex::new(
+                self.pools.lock().expect("network pools").clone(),
+            )),
             routes: Mutex::new(HashMap::new()),
             interfaces: self.interfaces.clone(),
             compiling: true,
@@ -1072,7 +1093,7 @@ impl NetworkRuntime {
         *self.sessions.lock().expect("network sessions") =
             std::mem::take(staging.sessions.get_mut().expect("staged sessions"));
         *self.pools.lock().expect("network pools") =
-            std::mem::take(staging.pools.get_mut().expect("staged pools"));
+            std::mem::take(&mut *staging.pools.lock().expect("staged pools"));
         for (key, members) in std::mem::take(staging.pool_updates.get_mut().expect("staged pools"))
         {
             self.pools.lock().expect("network pools")[&key].set_members(members);

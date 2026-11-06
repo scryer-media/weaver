@@ -14,10 +14,15 @@ use weaver_tunnel::{
 /// A torrent session's leg: a leg of its consumer's live route. The stage
 /// belongs to the route, which revokes it when the leg changes; the bridge
 /// an HTTP client rides belongs to this leg, and stops with it. On a pool
-/// leg the session holds one member, and goes through no other.
+/// leg the session holds one member through a stage of its own, which the
+/// route's revoking leaves alone: the member is the proxy on the leg's
+/// egress, whichever route's pool placed it there, and the stage is revoked
+/// once no pool on that egress holds that proxy as it was.
 pub struct TorrentLeg {
     pub stage: Arc<Revocable>,
-    member: Option<Arc<dyn Dialer>>,
+    member: Option<Arc<PinnedMember>>,
+    // The route's stage the leg's connections count on.
+    counted: std::sync::Weak<Revocable>,
     route: Arc<super::weighted::Weighted>,
     handle: tokio::runtime::Handle,
     bridge: Mutex<Option<Arc<Bridge>>>,
@@ -27,7 +32,7 @@ impl TorrentLeg {
     pub fn dialer(&self) -> Arc<dyn Dialer> {
         Arc::new(Carried {
             stage: self.stage.clone(),
-            member: self.member.clone(),
+            counted: self.counted.clone(),
             route: self.route.clone(),
         })
     }
@@ -50,6 +55,46 @@ impl TorrentLeg {
         *bridge = Some(started.clone());
         Ok(started)
     }
+    /// Why the pool member the leg holds carries nothing now, when it does
+    /// not: no pool on its egress holds it as it was, which revokes the leg,
+    /// or it is blocked. None on a leg that holds no member.
+    pub fn member_down(&self) -> Option<String> {
+        let member = self.member.as_ref()?;
+        match held(&self.stage, member) {
+            Ok(pin) => pin.blocked(),
+            Err(gone) => Some(gone),
+        }
+    }
+    /// Resolves once the leg can carry nothing more: its stage revoked, with
+    /// why when its member went from under it.
+    pub fn gone(&self) -> impl std::future::Future<Output = Option<String>> + Send + 'static {
+        let stage = self.stage.clone();
+        let member = self.member.clone();
+        async move {
+            let Some(member) = member else {
+                stage.cancelled().await;
+                return None;
+            };
+            loop {
+                if stage.is_revoked() {
+                    return member.gone.get().cloned();
+                }
+                let pin = match held(&stage, &member) {
+                    Ok(pin) => pin,
+                    Err(gone) => return Some(gone),
+                };
+                tokio::select! {
+                    () = stage.cancelled() => {}
+                    () = pin.changed() => {}
+                }
+            }
+        }
+    }
+}
+// The member `member` holds now, or why it holds none, `stage` revoked once
+// it holds none.
+fn held(stage: &Revocable, member: &PinnedMember) -> Result<Arc<MemberPin>, String> {
+    member.current().inspect_err(|_| stage.revoke())
 }
 impl Drop for TorrentLeg {
     fn drop(&mut self) {
@@ -63,62 +108,127 @@ impl Drop for TorrentLeg {
         }
     }
 }
+// The pool member a session on a pool leg goes through: the one it was
+// placed on, or, once that member's pool lets it go, the same proxy through
+// the same session in another pool on the leg's egress. Once no pool there
+// holds it as it was, it is gone for good.
+struct PinnedMember {
+    pools: RunningPools,
+    egress_id: u32,
+    pin: Mutex<Arc<MemberPin>>,
+    gone: std::sync::OnceLock<String>,
+}
+impl PinnedMember {
+    fn pin(&self) -> Arc<MemberPin> {
+        self.pin
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+    // The member held now, moved to another pool on the egress when its own
+    // let it go; or why there is none.
+    fn current(&self) -> Result<Arc<MemberPin>, String> {
+        if let Some(gone) = self.gone.get() {
+            return Err(gone.clone());
+        }
+        let pin = self.pin();
+        let Some(stale) = pin.stale() else {
+            return Ok(pin);
+        };
+        let moved = self
+            .pools
+            .lock()
+            .expect("network pools")
+            .iter()
+            .filter(|((_, egress_id), _)| *egress_id == self.egress_id)
+            .find_map(|(_, pool)| pool.pin_same(&pin));
+        match moved {
+            Some(moved) => {
+                *self.pin.lock().unwrap_or_else(PoisonError::into_inner) = moved.clone();
+                Ok(moved)
+            }
+            None => Err(self.gone.get_or_init(|| stale).clone()),
+        }
+    }
+    fn dialing(&self) -> Result<Arc<MemberPin>, DialError> {
+        self.current().map_err(DialError::Skipped)
+    }
+}
+#[async_trait::async_trait]
+impl Dialer for PinnedMember {
+    async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
+        self.dialing()?.dial(target).await
+    }
+    async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
+        self.dialing()?.resolve(host).await
+    }
+    fn offers(&self) -> weaver_tunnel::pipe::Transports {
+        self.pin().offers()
+    }
+    fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
+        self.current().ok()?.datagrams()
+    }
+    fn inbound(self: Arc<Self>) -> Option<Arc<dyn Inbound>> {
+        self.current().ok()?.inbound()
+    }
+    fn bind_local_udp(
+        &self,
+        local: std::net::SocketAddr,
+    ) -> Option<std::io::Result<std::net::UdpSocket>> {
+        match self.current() {
+            Ok(pin) => pin.bind_local_udp(local),
+            Err(gone) => Some(Err(std::io::Error::other(gone))),
+        }
+    }
+    fn source_toward(&self, to: std::net::SocketAddr) -> Option<std::io::Result<std::net::IpAddr>> {
+        match self.current() {
+            Ok(pin) => pin.source_toward(to),
+            Err(gone) => Some(Err(std::io::Error::other(gone))),
+        }
+    }
+    fn budget(&self) -> Duration {
+        self.pin().budget()
+    }
+    fn describe(&self) -> String {
+        self.pin().describe()
+    }
+}
 // A session's connections on its leg of the route. The session keeps its
 // own peer limit, so they pass the route's allocation by, but the route
 // counts them, and their bytes, as those of the leg its stage is when each
 // is dialled: a reload that moves the stage to another position moves its
-// counts with it. On a pool leg each goes through the session's member, and
-// the leg's revocation still ends them.
+// counts with it. On a pool leg they go through the session's own stage and
+// count on the route's.
 struct Carried {
     stage: Arc<Revocable>,
-    member: Option<Arc<dyn Dialer>>,
+    counted: std::sync::Weak<Revocable>,
     route: Arc<super::weighted::Weighted>,
 }
 impl Carried {
-    // The member a pool leg's session holds, while the leg is not revoked.
-    fn member(&self) -> Result<Option<&Arc<dyn Dialer>>, std::io::Error> {
-        match &self.member {
-            Some(_) if self.stage.is_revoked() => Err(std::io::Error::other("the leg was revoked")),
-            member => Ok(member.as_ref()),
+    fn count(&self, dialed: &mut Dialed) {
+        if let Some(stage) = self.counted.upgrade() {
+            self.route.carry(&*stage, dialed);
         }
     }
 }
 #[async_trait::async_trait]
 impl Dialer for Carried {
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
-        let mut dialed = match &self.member {
-            Some(member) => self.stage.dial_using(member.as_ref(), target).await?,
-            None => self.stage.dial(target).await?,
-        };
-        self.route.carry(&*self.stage, &mut dialed);
+        let mut dialed = self.stage.dial(target).await?;
+        self.count(&mut dialed);
         Ok(dialed)
     }
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
-        match self
-            .member()
-            .map_err(|e| DialError::Skipped(e.to_string()))?
-        {
-            Some(member) => member.resolve(host).await,
-            None => self.stage.resolve(host).await,
-        }
+        self.stage.resolve(host).await
     }
     fn offers(&self) -> weaver_tunnel::pipe::Transports {
-        match &self.member {
-            Some(member) => member.offers(),
-            None => self.stage.offers(),
-        }
+        self.stage.offers()
     }
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
-        match self.member().ok()? {
-            Some(member) => Arc::clone(member).datagrams(),
-            None => Arc::clone(&self.stage).datagrams(),
-        }
+        Arc::clone(&self.stage).datagrams()
     }
     fn inbound(self: Arc<Self>) -> Option<Arc<dyn Inbound>> {
-        let inbound = match self.member().ok()? {
-            Some(member) => Arc::clone(member).inbound()?,
-            None => Arc::clone(&self.stage).inbound()?,
-        };
+        let inbound = Arc::clone(&self.stage).inbound()?;
         Some(Arc::new(CarriedInbound {
             inbound,
             carried: self,
@@ -128,30 +238,16 @@ impl Dialer for Carried {
         &self,
         local: std::net::SocketAddr,
     ) -> Option<std::io::Result<std::net::UdpSocket>> {
-        match self.member() {
-            Ok(Some(member)) => member.bind_local_udp(local),
-            Ok(None) => self.stage.bind_local_udp(local),
-            Err(error) => Some(Err(error)),
-        }
+        self.stage.bind_local_udp(local)
     }
     fn source_toward(&self, to: std::net::SocketAddr) -> Option<std::io::Result<std::net::IpAddr>> {
-        match self.member() {
-            Ok(Some(member)) => member.source_toward(to),
-            Ok(None) => self.stage.source_toward(to),
-            Err(error) => Some(Err(error)),
-        }
+        self.stage.source_toward(to)
     }
     fn budget(&self) -> Duration {
-        match &self.member {
-            Some(member) => member.budget(),
-            None => self.stage.budget(),
-        }
+        self.stage.budget()
     }
     fn describe(&self) -> String {
-        match &self.member {
-            Some(member) => member.describe(),
-            None => self.stage.describe(),
-        }
+        self.stage.describe()
     }
 }
 // Connections arriving on the leg, which the route counts as the session's
@@ -187,9 +283,7 @@ impl InboundListener for CarriedListener {
     }
     async fn accept(&self) -> Result<Dialed, TunnelError> {
         let mut accepted = self.listener.accept().await?;
-        self.carried
-            .route
-            .carry(&*self.carried.stage, &mut accepted);
+        self.carried.count(&mut accepted);
         Ok(accepted)
     }
 }
@@ -358,7 +452,9 @@ impl NetworkRuntime {
 
     /// The leg a torrent scope's session on pool member `member` runs on:
     /// the scope's live route's leg at `position`, whose one rung is a pool,
-    /// held to that member for the session's life.
+    /// held to that member for the session's life. The session outlives the
+    /// scope's route: another scope whose pool holds the same proxy on the
+    /// same egress runs on it too.
     pub fn torrent_member_leg(
         &self,
         scope: TorrentScope,
@@ -368,6 +464,28 @@ impl NetworkRuntime {
         timeout: Duration,
     ) -> Result<Arc<TorrentLeg>, String> {
         self.torrent_leg_on(scope, position, Some(member), peers, timeout)
+    }
+
+    /// Start a torrent scope's live route, and so its pool, when it is not
+    /// running yet: a scope that joins a member session another scope opened
+    /// opens no leg of its own, yet the session may live on in its pool once
+    /// the opener's route leaves the member. A running route is left as it is.
+    pub fn start_torrent_route(
+        &self,
+        scope: TorrentScope,
+        peers: u16,
+        timeout: Duration,
+    ) -> Result<(), String> {
+        let consumer = Consumer::Torrent(scope);
+        if self
+            .routes
+            .lock()
+            .expect("network routes")
+            .contains_key(&consumer.key())
+        {
+            return Ok(());
+        }
+        self.route(consumer, peers, timeout).map(drop)
     }
 
     fn torrent_leg_on(
@@ -384,8 +502,9 @@ impl NetworkRuntime {
             let leg = legs.get(position).ok_or("the route has no such leg")?;
             (leg.stage.clone(), leg.definition.clone())
         };
-        let member = match member {
-            None => None,
+        let counted = Arc::downgrade(&stage);
+        let (stage, member) = match member {
+            None => (stage, None),
             Some(member) => {
                 let pool = pool_of(&definition.path).ok_or("the leg has no pool")?;
                 let stage = self
@@ -395,16 +514,27 @@ impl NetworkRuntime {
                     .get(&(pool, definition.egress_id))
                     .cloned()
                     .ok_or_else(|| format!("pool {pool} is not running"))?;
-                Some(stage.pin_member(member).ok_or_else(|| {
+                let pin = stage.pin_member(member).ok_or_else(|| {
                     stage
                         .member_down(member)
                         .unwrap_or_else(|| format!("proxy {member} cannot be used in pool {pool}"))
-                })?)
+                })?;
+                let member = Arc::new(PinnedMember {
+                    pools: self.pools.clone(),
+                    egress_id: definition.egress_id,
+                    pin: Mutex::new(pin),
+                    gone: std::sync::OnceLock::new(),
+                });
+                (
+                    Arc::new(Revocable::new(member.clone() as Arc<dyn Dialer>)),
+                    Some(member),
+                )
             }
         };
         Ok(Arc::new(TorrentLeg {
             stage,
             member,
+            counted,
             route: route.weighted.clone(),
             handle: self.handle.clone(),
             bridge: Mutex::new(None),

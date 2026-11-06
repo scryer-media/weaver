@@ -766,14 +766,30 @@ impl PoolStage {
     // Member `id` alone, for a holder that keeps one exit for its whole
     // life: every dial goes through that member and none moves to another
     // when it fails. None while `id` is no member or is blocked.
-    pub fn pin_member(&self, id: u32) -> Option<Arc<dyn Dialer>> {
+    pub fn pin_member(&self, id: u32) -> Option<Arc<MemberPin>> {
+        self.pin_where(id, |_| true)
+    }
+    // The member `pin` holds, as this pool has it: the same proxy, dialled
+    // through the same session, and not blocked. A holder whose own pool let
+    // that member go keeps its exit through this one.
+    pub fn pin_same(&self, pin: &MemberPin) -> Option<Arc<MemberPin>> {
+        self.pin_where(pin.member.id, |member| {
+            Arc::ptr_eq(&member.dialer, &pin.member.dialer)
+        })
+    }
+    fn pin_where(&self, id: u32, like: impl Fn(&Member) -> bool) -> Option<Arc<MemberPin>> {
+        if self.state.stopped.load(Ordering::Acquire) {
+            return None;
+        }
         let member = self
             .state
             .members
             .read()
             .expect("pool members")
             .get(&id)
-            .filter(|member| member.status.lock().expect("pool member").blocked.is_none())
+            .filter(|member| {
+                like(member) && member.status.lock().expect("pool member").blocked.is_none()
+            })
             .cloned()?;
         member.pinned.fetch_add(1, Ordering::AcqRel);
         Some(Arc::new(MemberPin {
@@ -844,12 +860,48 @@ impl Dialer for MemberLease {
         format!("pool {} member {}", self.state.id, self.member.id)
     }
 }
-// One member held for a holder's whole life, as a torrent session holds its
-// exit: its connections and bytes count as the member's, as a lease's do,
-// and it dials, listens and sends datagrams through that member only.
-struct MemberPin {
+/// One member held for a holder's whole life, as a torrent session holds its
+/// exit: its connections and bytes count as the member's, as a lease's do,
+/// and it dials, listens and sends datagrams through that member only.
+pub struct MemberPin {
     member: Arc<Member>,
     state: Arc<PoolState>,
+}
+impl MemberPin {
+    /// Why the member held is no longer the pool's, when it is not: the pool
+    /// stopped, let the proxy go, or holds it as it is now after an edit.
+    pub fn stale(&self) -> Option<String> {
+        let (pool, id) = (self.state.id, self.member.id);
+        if self.state.stopped.load(Ordering::Acquire) {
+            return Some(format!("pool {pool} stopped"));
+        }
+        match self.state.members.read().expect("pool members").get(&id) {
+            None => Some(format!("proxy {id} is no longer a member of pool {pool}")),
+            Some(member) if !Arc::ptr_eq(member, &self.member) => {
+                Some(format!("proxy {id} changed in pool {pool}"))
+            }
+            Some(_) => None,
+        }
+    }
+    /// Why the member held carries nothing, when it is blocked.
+    pub fn blocked(&self) -> Option<String> {
+        self.member
+            .status
+            .lock()
+            .expect("pool member")
+            .blocked
+            .clone()
+    }
+    /// Resolves once the pool's members may have changed since this was
+    /// called, or at once when the member held is no longer the pool's.
+    pub async fn changed(&self) {
+        let notified = self.state.changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.stale().is_none() {
+            notified.await;
+        }
+    }
 }
 impl Drop for MemberPin {
     fn drop(&mut self) {

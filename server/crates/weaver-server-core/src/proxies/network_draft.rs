@@ -171,7 +171,7 @@ impl NetworkRuntime {
             ),
             sessions: Mutex::new(HashMap::new()),
             borrowed_sessions: self.sessions.lock().expect("network sessions").clone(),
-            pools: Mutex::new(HashMap::new()),
+            pools: Arc::default(),
             routes: Mutex::new(HashMap::new()),
             interfaces: self.interfaces.clone(),
             compiling: false,

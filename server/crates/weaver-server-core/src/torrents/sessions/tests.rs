@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 mod outgoing_utp;
+mod pool_members;
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -94,14 +95,10 @@ fn proxy_key(proxy: u32) -> RouteKey {
     RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &ladder(proxy))
 }
 
-// The session key of `member` of a scope routed through `pool`.
-pub(crate) fn pool_member_key(pool: u32, member: u32) -> RouteKey {
-    RouteKey::member(
-        SYSTEM_EGRESS_ID,
-        &EgressBinding::System,
-        &pool_ladder(pool),
-        member,
-    )
+// The session key of pool member `member` on the system egress, whichever
+// pool holds it.
+pub(crate) fn pool_member_key(member: u32) -> RouteKey {
+    RouteKey::member(SYSTEM_EGRESS_ID, &EgressBinding::System, member)
 }
 
 fn scope_name(scope: TorrentScope) -> String {
@@ -194,7 +191,7 @@ impl Routes for FakeRoutes {
                 members
                     .into_iter()
                     .map(|id| {
-                        let key = pool_member_key(pool, id);
+                        let key = pool_member_key(id);
                         MemberPlan {
                             id,
                             down: self.member_down(id, &key).map(RouteFailure::leg_down),
@@ -258,7 +255,16 @@ impl Routes for FakeRoutes {
         );
         let network = self.network.lock().unwrap().clone();
         let leg = network
-            .map(|network| network.torrent_leg(plan.scope, TORRENT_LEG, 8, Duration::from_secs(30)))
+            .map(|network| match plan.member {
+                Some(member) => network.torrent_member_leg(
+                    plan.scope,
+                    TORRENT_LEG,
+                    member,
+                    8,
+                    Duration::from_secs(30),
+                ),
+                None => network.torrent_leg(plan.scope, TORRENT_LEG, 8, Duration::from_secs(30)),
+            })
             .transpose()?;
         Ok(OpenLeg {
             kind: plan.kind.clone(),
@@ -272,6 +278,14 @@ impl Routes for FakeRoutes {
             )?,
             leg,
         })
+    }
+
+    fn join(&self, plan: &RoutePlan, _: usize) {
+        if let Some(network) = self.network.lock().unwrap().clone() {
+            network
+                .start_torrent_route(plan.scope, 8, Duration::from_secs(30))
+                .unwrap();
+        }
     }
 
     async fn fetch_blocklist(&self, url: &reqwest::Url) -> Result<IpRanges, String> {

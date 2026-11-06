@@ -1012,7 +1012,7 @@ async fn a_pool_route_plans_a_session_on_each_member() {
 
     let plan = routes.plan(TorrentScope::Default).unwrap();
     assert!(plan.down.is_none(), "{:?}", plan.down);
-    let key = |member| member_key(&proxies.network, SYSTEM_EGRESS_ID, &path, member);
+    let key = |member| member_key(&proxies.network, SYSTEM_EGRESS_ID, member);
     let members: Vec<_> = plan
         .members
         .iter()
@@ -9671,7 +9671,7 @@ async fn pins(service: &TorrentService, db: &Database, jobs: &[JobId]) -> Vec<Op
             let pin = torrent.record.pool_member;
             assert_eq!(db.get_torrent(*job_id).unwrap().unwrap().pool_member, pin);
             if let Some(member) = pin {
-                assert_eq!(torrent.route, Some(pool_member_key(POOL, member)));
+                assert_eq!(torrent.route, Some(pool_member_key(member)));
             }
             pin
         })
@@ -9706,7 +9706,7 @@ async fn torrents_on_a_pool_route_go_to_the_least_loaded_member() {
     let keys: BTreeSet<_> = running.keys().cloned().collect();
     assert_eq!(
         keys,
-        BTreeSet::from([pool_member_key(POOL, 1), pool_member_key(POOL, 2)])
+        BTreeSet::from([pool_member_key(1), pool_member_key(2)])
     );
     rig.service.stop().await;
 }
@@ -9800,6 +9800,111 @@ async fn a_failed_member_moves_only_its_torrents_and_its_return_moves_none() {
         let view = rig.service.torrent(job_id).await.unwrap();
         assert_eq!(view.route_reason, Some(TorrentRouteReason::LegDown));
     }
+    rig.service.stop().await;
+}
+
+// A member taken out of the pool moves its own torrents to the members left,
+// and no other torrent: the one on member 2 keeps its session, which takes
+// the moved ones in. The removed member's session, idle, closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_removed_from_the_pool_moves_only_its_torrents() {
+    let rig = rig(set_clock());
+    rig.routes.route_pool(TorrentScope::Default, POOL, &[1, 2]);
+    rig.service.open().await.unwrap();
+    let jobs = [
+        add_plain(&rig.service, "first", 1).await,
+        add_plain(&rig.service, "second", 2).await,
+        add_plain(&rig.service, "third", 3).await,
+    ];
+    assert_eq!(
+        pins(&rig.service, &rig.db, &jobs).await,
+        [Some(1), Some(2), Some(1)]
+    );
+    let kept = session_of(&rig.service, jobs[1]).await;
+    let removed = session_of(&rig.service, jobs[0]).await;
+
+    rig.routes.route_pool(TorrentScope::Default, POOL, &[2]);
+    rig.service.tick().await;
+    assert_eq!(
+        pins(&rig.service, &rig.db, &jobs).await,
+        [Some(2), Some(2), Some(2)]
+    );
+    for job_id in jobs {
+        assert!(Arc::ptr_eq(&session_of(&rig.service, job_id).await, &kept));
+    }
+    assert!(!kept.cancellation_token().is_cancelled());
+    removed.cancellation_token().cancelled().await;
+    rig.service.stop().await;
+}
+
+// Proxy 3 in the default scope's pool and in the category's: a torrent from
+// each pins to it and both run in one session, listed once for both scopes.
+// The default scope routed elsewhere, the category's torrent keeps that
+// session; the category routed elsewhere too, no torrent uses it and it
+// closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_proxy_in_two_pools_runs_one_session_for_both_scopes() {
+    let tv = TorrentScope::Category(1);
+    let rig = rig(set_clock());
+    rig.routes.route_pool(TorrentScope::Default, POOL, &[3]);
+    rig.routes.route_pool(tv, POOL + 1, &[3]);
+    rig.service.open().await.unwrap();
+    let default = add_plain(&rig.service, "default", 1).await;
+    let category = rig
+        .service
+        .add(AddRequest {
+            category: Some("tv".into()),
+            ..request(AddSource::Metainfo(plain("category", 2)))
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pins(&rig.service, &rig.db, &[default, category]).await,
+        [Some(3), Some(3)]
+    );
+    let shared = session_of(&rig.service, default).await;
+    assert!(Arc::ptr_eq(
+        &session_of(&rig.service, category).await,
+        &shared
+    ));
+    let listed = rig.service.routes().await;
+    let route = listed
+        .iter()
+        .find(|route| route.key == pool_member_key(3))
+        .unwrap();
+    let scopes: Vec<_> = route.scopes.iter().map(|(scope, _)| *scope).collect();
+    assert_eq!(scopes.len(), 2);
+    assert!(scopes.contains(&TorrentScope::Default) && scopes.contains(&tv));
+    assert!(route.session.is_some());
+
+    rig.routes.route(TorrentScope::Default, 5);
+    rig.service.tick().await;
+    assert_eq!(
+        pins(&rig.service, &rig.db, &[default, category]).await,
+        [None, Some(3)]
+    );
+    assert!(Arc::ptr_eq(
+        &session_of(&rig.service, category).await,
+        &shared
+    ));
+    assert!(!shared.cancellation_token().is_cancelled());
+
+    rig.routes.route(tv, 6);
+    rig.service.tick().await;
+    assert_eq!(
+        pins(&rig.service, &rig.db, &[default, category]).await,
+        [None, None]
+    );
+    shared.cancellation_token().cancelled().await;
+    assert!(
+        !rig.service
+            .inner
+            .sessions
+            .running()
+            .await
+            .contains_key(&pool_member_key(3))
+    );
     rig.service.stop().await;
 }
 

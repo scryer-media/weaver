@@ -143,10 +143,11 @@ impl RouteKey {
         Self(hex::encode(&Sha1::digest(&encoded)[..8]))
     }
 
-    /// The key of the session a pool route through `egress_id` and `path`
-    /// runs on `member`: each member's session is its own.
-    pub fn member(egress_id: u32, binding: &EgressBinding, path: &LegPath, member: u32) -> Self {
-        let encoded = serde_json::to_vec(&(egress_id, binding, path, member))
+    /// The key of the session a pool route through `egress_id` runs on its
+    /// member, proxy `member`: one proxy on one egress runs one session,
+    /// whichever pools and routes hold it.
+    pub fn member(egress_id: u32, binding: &EgressBinding, member: u32) -> Self {
+        let encoded = serde_json::to_vec(&("member", egress_id, binding, member))
             .expect("route legs always encode");
         Self(hex::encode(&Sha1::digest(&encoded)[..8]))
     }
@@ -208,17 +209,12 @@ pub fn leg_key(network: &NetworkRuntime, egress_id: u32, path: &LegPath) -> Rout
     }
 }
 
-/// The key of the session a pool route through `egress_id` and `path` runs
-/// on `member`.
-pub fn member_key(
-    network: &NetworkRuntime,
-    egress_id: u32,
-    path: &LegPath,
-    member: u32,
-) -> RouteKey {
+/// The key of the session a pool route through `egress_id` runs on proxy
+/// `member`.
+pub fn member_key(network: &NetworkRuntime, egress_id: u32, member: u32) -> RouteKey {
     match leg_egress(network, egress_id) {
-        Some(egress) => RouteKey::member(egress.id, &egress.binding, path, member),
-        None => RouteKey::member(egress_id, &EgressBinding::System, path, member),
+        Some(egress) => RouteKey::member(egress.id, &egress.binding, member),
+        None => RouteKey::member(egress_id, &EgressBinding::System, member),
     }
 }
 
@@ -385,6 +381,10 @@ pub trait Routes: Send + Sync {
     fn leg_down(&self, plan: &RoutePlan) -> Option<RouteFailure>;
     /// Open `plan`'s leg for a session of at most `peers` peers.
     async fn open(&self, plan: &RoutePlan, peers: usize) -> Result<OpenLeg, String>;
+    /// `plan`'s scope runs on a member session another scope opened: start
+    /// the scope's own route, so the session lives on in its pool after the
+    /// opener's route leaves the member.
+    fn join(&self, _plan: &RoutePlan, _peers: usize) {}
     /// The blocklist at `url`, which every route's session shares.
     async fn fetch_blocklist(&self, url: &reqwest::Url) -> Result<IpRanges, String>;
 }
@@ -439,7 +439,7 @@ impl Routes for NetworkRoutes {
                             .into_iter()
                             .map(|id| MemberPlan {
                                 id,
-                                key: member_key(self.network(), leg.egress_id, &leg.path, id),
+                                key: member_key(self.network(), leg.egress_id, id),
                                 down: unavailable.clone().or_else(|| {
                                     self.network()
                                         .pool_member_down(pool, egress_id, id)
@@ -478,15 +478,10 @@ impl Routes for NetworkRoutes {
         })
     }
 
+    // A pool member's session may be another scope's too: whether its
+    // member carries anything is its leg's to say, not one scope's pool.
     fn leg_down(&self, plan: &RoutePlan) -> Option<RouteFailure> {
-        leg_unavailable(self.network(), plan.egress_id).or_else(|| {
-            let member = plan.member?;
-            let route = plan.policy.route();
-            let pool = pool_of(&route.legs.first()?.path)?;
-            self.network()
-                .pool_member_down(pool, plan.egress_id, member)
-                .map(RouteFailure::leg_down)
-        })
+        leg_unavailable(self.network(), plan.egress_id)
     }
 
     async fn open(&self, plan: &RoutePlan, peers: usize) -> Result<OpenLeg, String> {
@@ -512,6 +507,20 @@ impl Routes for NetworkRoutes {
             _ => None,
         };
         OpenLeg::on(plan.kind.clone(), leg.dialer(), bridge, Some(leg))
+    }
+
+    fn join(&self, plan: &RoutePlan, peers: usize) {
+        let peers = u16::try_from(peers).unwrap_or(u16::MAX);
+        if let Err(error) = self
+            .network()
+            .start_torrent_route(plan.scope, peers, self.timeout)
+        {
+            tracing::debug!(
+                route = plan.key.as_str(),
+                error,
+                "a joining scope's route did not start"
+            );
+        }
     }
 
     // Fetched once for every route, so on Default outbound, which carries
@@ -798,11 +807,19 @@ impl Slot {
     }
 
     // Why the slot's session does not run, when it does not: it is held
-    // closed, or the leg it opened on has been revoked under it.
-    fn held(&self) -> Option<&RouteFailure> {
+    // closed, the leg it opened on has been revoked under it, or the pool
+    // member that leg holds went from under it or is blocked.
+    fn held(&self) -> Option<RouteFailure> {
         match self {
-            Self::Held { reason, .. } => Some(reason),
-            Self::Open { leg: Some(leg), .. } if leg.stage.is_revoked() => Some(&REVOKED),
+            Self::Held { reason, .. } => Some(reason.clone()),
+            Self::Open { leg: Some(leg), .. } => match leg.member_down() {
+                Some(reason) if leg.stage.is_revoked() => Some(RouteFailure::with_detail(
+                    TorrentRouteReason::LegRevoked,
+                    reason,
+                )),
+                Some(reason) => Some(RouteFailure::leg_down(reason)),
+                None => leg.stage.is_revoked().then_some(REVOKED),
+            },
             Self::Open { .. } => None,
         }
     }
@@ -937,23 +954,27 @@ impl Sessions {
         self.trackers_changed.notified().await;
     }
 
-    // Once `leg` is revoked under `session`, the session may send no more,
-    // and the follower wakes; unless the session stops first.
+    // Once `leg` is revoked under `session`, or the pool member it holds
+    // goes from under it, the session may send no more, and the follower
+    // wakes; unless the session stops first.
     fn watch(&self, key: &RouteKey, leg: &TorrentLeg, session: &Arc<Session>) {
-        let (key, stage) = (key.clone(), Arc::clone(&leg.stage));
+        let (key, gone) = (key.clone(), leg.gone());
         let stopped = session.cancellation_token().clone();
         let session = Arc::downgrade(session);
         let revoked = Arc::clone(&self.revoked);
         tokio::spawn(async move {
             tokio::select! {
-                () = stage.cancelled() => {
+                detail = gone => {
+                    let reason = detail.map_or(REVOKED, |detail| {
+                        RouteFailure::with_detail(TorrentRouteReason::LegRevoked, detail)
+                    });
                     tracing::info!(
                         route = key.as_str(),
-                        reason = ?REVOKED.reason,
+                        reason = %reason.message(),
                         "a route's leg was revoked under its open session"
                     );
                     if let Some(session) = session.upgrade() {
-                        withhold(&key, &session, &REVOKED);
+                        withhold(&key, &session, &reason);
                     }
                     revoked.notify_one();
                 }
@@ -1124,14 +1145,16 @@ impl Sessions {
         plan: &RoutePlan,
         opener: &Identity,
     ) -> Result<Arc<Session>, SessionError> {
-        if let Some(session) = self
+        let running = self
             .slots
             .lock()
             .await
             .get(&plan.key)
             .and_then(Slot::running)
-        {
-            return Ok(Arc::clone(session));
+            .cloned();
+        if let Some(session) = running {
+            self.joined(plan);
+            return Ok(session);
         }
         let port_slot = self.port_slot(&plan.key).await;
         let mut slots = self.slots.lock().await;
@@ -1139,6 +1162,7 @@ impl Sessions {
             return Err(SessionError::RouteDown(off));
         }
         if let Some(session) = slots.get(&plan.key).and_then(Slot::running) {
+            self.joined(plan);
             return Ok(Arc::clone(session));
         }
         if !slots.contains_key(&plan.key) && slots.len() >= MAX_SESSIONS {
@@ -1198,6 +1222,17 @@ impl Sessions {
                 );
                 Err(SessionError::Build(error))
             }
+        }
+    }
+
+    // A member session handed to `plan`'s scope, which may not be the scope
+    // that opened it: the scope's own route starts, if it has not, so the
+    // session outlives the opener's route while this scope's pool holds the
+    // member.
+    fn joined(&self, plan: &RoutePlan) {
+        if plan.member.is_some() {
+            self.routes
+                .join(plan, self.config().max_peers_total as usize);
         }
     }
 
@@ -1322,7 +1357,7 @@ impl Sessions {
     // was revoked under it, or is down or out of quota now.
     fn silenced(&self, slot: &Slot) -> Option<RouteFailure> {
         match slot {
-            Slot::Open { plan, .. } => slot.held().cloned().or_else(|| self.routes.leg_down(plan)),
+            Slot::Open { plan, .. } => slot.held().or_else(|| self.routes.leg_down(plan)),
             Slot::Held { reason, .. } => Some(reason.clone()),
         }
     }
@@ -1660,7 +1695,7 @@ fn view(key: &RouteKey, slot: &Slot) -> SessionView {
             mappings: Vec::new(),
             external: Vec::new(),
             exposure: None,
-            held: held.cloned(),
+            held,
         },
     }
 }

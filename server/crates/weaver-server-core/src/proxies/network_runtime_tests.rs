@@ -169,6 +169,65 @@ async fn profile_revision_rebuilds_pool_leg_after_trust_failure() {
     runtime.shutdown().await;
 }
 
+// A torrent scope's pool leg stands through edits to the pool's members: a
+// member added and another edited keep its stage, as each session holds its
+// member through a stage of its own. A server's leg on the same pool is
+// rebuilt by the same edits. The pool disabled takes the torrent leg down.
+#[tokio::test]
+async fn a_torrent_pool_leg_stands_through_member_edits_until_the_pool_is_disabled() {
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let timeout = Duration::from_secs(1);
+    let torrent = Consumer::Torrent(TorrentScope::Category(1));
+    let server = Consumer::Server(1);
+    let mut config = runtime.configuration.read().unwrap().clone();
+    config.profiles.insert(1, proxy());
+    config.profiles.insert(2, ProxyProfile { id: 2, ..proxy() });
+    config.pools.insert(
+        7,
+        ProxyPool {
+            id: 7,
+            name: "fixture".into(),
+            kind: ProxyKind::Socks5,
+            member_ids: vec![1],
+            enabled: true,
+        },
+    );
+    for consumer in [torrent, server] {
+        config.consumers.insert(consumer.key());
+        config.policies.insert(consumer.key(), pool_policy());
+    }
+    runtime.apply_configuration(config.clone()).unwrap();
+    let stage = |consumer| {
+        runtime
+            .route(consumer, 5, timeout)
+            .unwrap()
+            .legs
+            .read()
+            .unwrap()[0]
+            .stage
+            .clone()
+    };
+    let torrent_leg = stage(torrent);
+    let server_leg = stage(server);
+
+    config.pools.get_mut(&7).unwrap().member_ids = vec![1, 2];
+    config.profiles.get_mut(&1).unwrap().revision += 1;
+    runtime.apply_configuration(config.clone()).unwrap();
+    assert!(Arc::ptr_eq(&stage(torrent), &torrent_leg));
+    assert!(!torrent_leg.is_revoked());
+    assert!(!Arc::ptr_eq(&stage(server), &server_leg));
+    assert!(server_leg.is_revoked());
+
+    config.pools.get_mut(&7).unwrap().enabled = false;
+    runtime.apply_configuration(config).unwrap();
+    assert!(torrent_leg.is_revoked());
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn unused_session_is_kept_until_live_streams_allow_retirement() {
     struct Busy(std::sync::Arc<std::sync::atomic::AtomicBool>);
