@@ -1067,6 +1067,76 @@ fn a_zipcrypto_repair_replays_only_from_the_repaired_byte() {
     assert!(owner.posted(0) == Some(archive));
 }
 
+// A range in the middle of a closed member uncovered and said again: the
+// keys after it come from it, so the tail after it is read back under the
+// keys it was made with and said again, and the member closes whole.
+#[test]
+fn a_partial_uncover_of_a_closed_member_replays_its_tail() {
+    let plain = payload(88, 300_007);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let end = start + plain.len() as u64;
+    let window = ByteRange::at(start + 100_000, 4096);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    offer(&mut owner, PASSWORD);
+    owner.whole(4096);
+    assert!(owner.member("alpha.bin").closed);
+    let before = owner.said.len();
+    owner.again(&[(VolumeIndex(0), window)]);
+    owner.close(0);
+    let said = &owner.said[before..];
+    assert!(
+        said.contains(&Emit::Again {
+            volume: VolumeIndex(0),
+            range: ByteRange::new(window.end, end),
+        }),
+        "{said:?}"
+    );
+    assert!(owner.object.members[0].closed);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.posted(0) == Some(archive));
+}
+
+// An article sent back for another copy: what came first was not the
+// article, and the tail after it was decrypted under keys fed its wrong
+// plaintext. The right copy comes, and the tail, read back under the keys
+// it was made with, is said again right.
+#[test]
+fn a_sent_back_article_corrects_the_tail_after_it() {
+    let plain = payload(89, 300_007);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let window = ByteRange::at(start + 100_000, 4096);
+    let wrong: Vec<u8> = archive[window.start as usize..window.end as usize]
+        .iter()
+        .map(|byte| byte ^ 0x5a)
+        .collect();
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, window.start));
+    owner.deliver_as(0, window, Provenance::Fresh, Some(&wrong));
+    owner.deliver(0, ByteRange::new(window.end, archive.len() as u64));
+    // The tree forgets the window, as `send_back` uncovers it.
+    let mut placements = Vec::new();
+    owner.object.unposted(VolumeIndex(0), window);
+    owner.object.locate(VolumeIndex(0), window, &mut placements);
+    for placement in placements {
+        if let weaver_graph::Placement::Member { member, range } = placement
+            && let Some(got) = owner.members.get_mut(&member.0)
+        {
+            got.coverage.erase(range);
+            got.closed = false;
+        }
+    }
+    owner.deliver(0, window);
+    owner.close(0);
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+}
+
 // A repair in the member's last bytes lies inside the tail the end record
 // was searched for in, but in no record the directory read: the map stands,
 // and the repair replays from its byte once.

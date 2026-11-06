@@ -580,8 +580,20 @@ impl Object for Zip {
                     && let Some(part) = span.intersect(global)
                     && let Some(cipher) = &mut entry.cipher
                 {
-                    let from = part.start - span.start;
-                    cipher.unposted(from);
+                    let (from, to) = (part.start - span.start, part.end - span.start);
+                    // Said after the range, as far as it was said on from
+                    // it: made under keys that came from the range.
+                    let mut covered = to;
+                    for run in self.members[member.0 as usize]
+                        .coverage
+                        .overlapping(ByteRange::new(to, entry.length.max(to)))
+                    {
+                        if run.range.start > covered {
+                            break;
+                        }
+                        covered = covered.max(run.range.end);
+                    }
+                    cipher.unposted(from, to, covered.min(entry.length));
                     let said = &mut self.members[member.0 as usize];
                     said.coverage.erase(ByteRange::new(from, entry.length));
                     said.closed = false;

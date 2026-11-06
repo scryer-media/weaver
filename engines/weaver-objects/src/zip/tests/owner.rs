@@ -404,7 +404,7 @@ impl Owner {
     // delivered is read back, every range while the store still stands as
     // it said them all, every member they reached is open again, and the
     // bytes come again as they came.
-    fn again(&mut self, ranges: &[(VolumeIndex, ByteRange)]) {
+    pub(super) fn again(&mut self, ranges: &[(VolumeIndex, ByteRange)]) {
         let mut read_back = Vec::new();
         for &(volume, range) in ranges {
             let runs: Vec<(ByteRange, Provenance)> = self
