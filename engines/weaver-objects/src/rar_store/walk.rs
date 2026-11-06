@@ -112,6 +112,25 @@ pub(super) mod began {
     }
 }
 
+// What each comparison of facts read on from the cursor found on this
+// thread, for a test: whether they differ.
+#[cfg(test)]
+pub(super) mod read_on {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static READ_ON: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn note(differs: bool) {
+        READ_ON.with_borrow_mut(|read_on| read_on.push(differs));
+    }
+
+    pub(crate) fn take() -> Vec<bool> {
+        READ_ON.with(RefCell::take)
+    }
+}
+
 fn signature_len(facts: &RarVolumeFacts) -> u64 {
     match facts.archive_format() {
         ArchiveFormat::Rar5 => 8,
@@ -160,6 +179,51 @@ fn damaged_at(kept: &Kept, at: u64) -> Option<ByteRange> {
         .take_while(|(range, _, _)| range.start <= at)
         .find(|(range, _, provenance)| provenance.is_damaged() && range.contains(at))
         .map(|(range, _, _)| range)
+}
+
+// Whether facts a step read on from the cursor differ from the last step's.
+// The members and services that step read were read whole from bytes
+// unchanged since, so the cursor hands the same ones back first: only how
+// many there are and the volume's own fields can differ.
+fn read_on_differs(was: &RarVolumeFacts, now: &RarVolumeFacts) -> bool {
+    let RarVolumeFacts {
+        format,
+        volume_number,
+        more_volumes,
+        is_solid,
+        is_encrypted,
+        is_volume,
+        has_recovery_record,
+        is_locked,
+        has_authenticity_verification,
+        has_locator,
+        quick_open_offset,
+        headers_from_quick_open,
+        recovery_record_offset,
+        original_name,
+        original_name_raw,
+        original_creation_time_ns,
+        members,
+        services,
+    } = now;
+    *format != was.format
+        || *volume_number != was.volume_number
+        || *more_volumes != was.more_volumes
+        || *is_solid != was.is_solid
+        || *is_encrypted != was.is_encrypted
+        || *is_volume != was.is_volume
+        || *has_recovery_record != was.has_recovery_record
+        || *is_locked != was.is_locked
+        || *has_authenticity_verification != was.has_authenticity_verification
+        || *has_locator != was.has_locator
+        || *quick_open_offset != was.quick_open_offset
+        || *headers_from_quick_open != was.headers_from_quick_open
+        || *recovery_record_offset != was.recovery_record_offset
+        || *original_name != was.original_name
+        || *original_name_raw != was.original_name_raw
+        || *original_creation_time_ns != was.original_creation_time_ns
+        || members.len() != was.members.len()
+        || services.len() != was.services.len()
 }
 
 // A file header as a physical walk reads it, to hold a Quick Open cache to.
@@ -429,7 +493,7 @@ impl Walk {
                 }
             }
         }
-        self.accept(walk, kept, length, password, kdf, closed)
+        self.accept(walk, kept, length, password, kdf, closed, from > 0)
     }
 
     fn accept(
@@ -440,6 +504,7 @@ impl Walk {
         password: Option<&str>,
         kdf: &Arc<KdfCache>,
         closed: bool,
+        read_on: bool,
     ) -> Step {
         let facts = walk.facts;
         let reach = data_end(&facts);
@@ -475,14 +540,42 @@ impl Walk {
         // may be its own.
         let more =
             (walk.short_at.is_none() && !damaged_past(kept, reach)).then_some(facts.more_volumes);
-        let moved = self.facts.as_ref() != Some(&facts) || self.ended != ended || self.more != more;
-        self.blocks = facts
-            .members
-            .iter()
-            .map(|member| Block {
+        // A step that read on from the cursor kept every member and service
+        // the last one read, so only what it added and the volume's own
+        // fields can differ.
+        let differs = match (&self.facts, read_on) {
+            (Some(was), true) => {
+                let differs = read_on_differs(was, &facts);
+                #[cfg(test)]
+                read_on::note(differs);
+                differs
+            }
+            (was, _) => was.as_ref() != Some(&facts),
+        };
+        #[cfg(test)]
+        assert_eq!(
+            differs,
+            self.facts.as_ref() != Some(&facts),
+            "facts read on compare as whole ones"
+        );
+        let moved = differs || self.ended != ended || self.more != more;
+        let kept_blocks = match (&self.facts, read_on) {
+            (Some(was), true) => was.members.len().min(self.blocks.len()),
+            _ => 0,
+        };
+        self.blocks.truncate(kept_blocks);
+        self.blocks
+            .extend(facts.members[kept_blocks..].iter().map(|member| Block {
                 data: ByteRange::at(member.data_offset, member.data_size),
-            })
-            .collect();
+            }));
+        #[cfg(test)]
+        assert!(
+            self.blocks.iter().map(|block| block.data).eq(facts
+                .members
+                .iter()
+                .map(|member| ByteRange::at(member.data_offset, member.data_size))),
+            "blocks extended are blocks rebuilt"
+        );
         self.facts = Some(facts);
         self.more = more;
         self.ended = ended;
