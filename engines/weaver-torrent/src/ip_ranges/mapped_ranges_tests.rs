@@ -86,3 +86,35 @@ async fn the_mapped_range_upper_endpoint_does_not_wrap_to_ipv4_zero() {
     has_both(&parsed, Ipv4Addr::UNSPECIFIED, false);
     assert_eq!(parsed.len(), 1);
 }
+
+#[test]
+fn a_range_straddling_the_mapped_block_covers_its_mapped_share() {
+    let first = Ipv4Addr::UNSPECIFIED.to_ipv6_mapped().to_bits();
+    let after_last = Ipv4Addr::BROADCAST.to_ipv6_mapped().to_bits() + 1;
+    let below = Ipv6Addr::from_bits(first - 1);
+    let above = Ipv6Addr::from_bits(after_last);
+    let lower = IpRanges::new(
+        [],
+        std::iter::once(below..Ipv4Addr::new(10, 0, 0, 1).to_ipv6_mapped()),
+    );
+    assert!(lower.has(below.into()));
+    has_both(&lower, Ipv4Addr::UNSPECIFIED, true);
+    has_both(&lower, Ipv4Addr::new(10, 0, 0, 0), true);
+    has_both(&lower, Ipv4Addr::new(10, 0, 0, 1), false);
+    let upper = IpRanges::new(
+        [],
+        std::iter::once(
+            Ipv4Addr::new(255, 255, 255, 0).to_ipv6_mapped()..Ipv6Addr::from_bits(after_last + 1),
+        ),
+    );
+    assert!(upper.has(above.into()));
+    assert!(!upper.has(Ipv6Addr::from_bits(after_last + 1).into()));
+    has_both(&upper, Ipv4Addr::new(255, 255, 255, 0), true);
+    has_both(&upper, Ipv4Addr::BROADCAST, true);
+    has_both(&upper, Ipv4Addr::new(255, 255, 254, 255), false);
+    for list in [&lower, &upper] {
+        let union = IpRanges::union([list]);
+        has_both(&union, Ipv4Addr::new(10, 0, 0, 1), list.has(Ipv4Addr::new(10, 0, 0, 1).into()));
+        has_both(&union, Ipv4Addr::BROADCAST, list.has(Ipv4Addr::BROADCAST.into()));
+    }
+}
