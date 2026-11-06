@@ -23,6 +23,7 @@ const en: LocaleDictionary = {
   "applicationUpgrade.install": "Install v{{version}}",
   "applicationUpgrade.notEligible": "Weaver cannot update this installation in-app ({{reason}}).",
   "applicationUpgrade.failed": "The update to v{{version}} failed: {{error}}",
+  "applicationUpgrade.githubUnavailable": "GitHub is temporarily unavailable. Please try upgrading again later.",
   "applicationUpgrade.completed": "Updated to v{{version}}.",
   "applicationUpgrade.phase.checking": "Checking the release…",
   "applicationUpgrade.phase.downloading": "Downloading v{{version}}…",
