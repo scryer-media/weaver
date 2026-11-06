@@ -122,22 +122,28 @@ pub(crate) fn find_job_working_dir(root: &Path, job_id: JobId) -> std::io::Resul
     };
     for entry in entries {
         let path = entry?.path();
-        let Ok(dir) = open_working_directory(root, &path) else {
-            continue;
-        };
-        let Ok(stored) = read_working_marker(&dir) else {
-            continue;
-        };
-        if marker_job_id(&stored) == Some(job_id)
-            && !matches!(
-                match_marker(&dir, &path, &stored, job_id)?,
-                MarkerMatch::Mismatch
-            )
-        {
+        if is_job_working_dir(root, &path, job_id)? {
             return Ok(Some(path));
         }
     }
     Ok(None)
+}
+
+// Whether `path` is a working directory under `root` that carries this
+// job's ownership marker: the job's own working directory, by identity,
+// never by where it sits.
+pub(crate) fn is_job_working_dir(root: &Path, path: &Path, job_id: JobId) -> std::io::Result<bool> {
+    let Ok(dir) = open_working_directory(root, path) else {
+        return Ok(false);
+    };
+    let Ok(stored) = read_working_marker(&dir) else {
+        return Ok(false);
+    };
+    Ok(marker_job_id(&stored) == Some(job_id)
+        && !matches!(
+            match_marker(&dir, path, &stored, job_id)?,
+            MarkerMatch::Mismatch
+        ))
 }
 
 fn open_working_directory(root: &Path, path: &Path) -> std::io::Result<Dir> {
