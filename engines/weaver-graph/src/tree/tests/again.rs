@@ -27,6 +27,10 @@ struct Trial {
     log: Log,
     given: Vec<Option<u8>>,
     asked: bool,
+    // Asks for its first twenty bytes once more when its front comes the
+    // second time, inside the replay of the first request.
+    nest: bool,
+    fronts: u32,
 }
 
 impl Trial {
@@ -74,6 +78,15 @@ impl Object for Trial {
             bytes: delivery.bytes.iter().map(|byte| byte ^ 0x20).collect(),
             provenance: delivery.provenance,
         });
+        if self.nest && delivery.offset == 0 {
+            self.fronts += 1;
+            if self.fronts == 2 {
+                out.push(Emit::Again {
+                    volume: delivery.volume,
+                    range: ByteRange::new(0, 20),
+                });
+            }
+        }
         if !self.asked && delivery.bytes.windows(5).any(|window| window == b"CHECK") {
             self.asked = true;
             out.push(Emit::MemberClosed(MemberId(0)));
@@ -117,7 +130,7 @@ impl Object for Trial {
     }
 }
 
-struct Trials(Log);
+struct Trials(Log, bool);
 
 impl Builder for Trials {
     fn build(&mut self, kind: Kind, _: ObjectId) -> Option<Box<dyn Object>> {
@@ -126,6 +139,8 @@ impl Builder for Trials {
                 log: Arc::clone(&self.0),
                 given: Vec::new(),
                 asked: false,
+                nest: self.1,
+                fronts: 0,
             }) as Box<dyn Object>
         })
     }
@@ -176,7 +191,7 @@ fn answer(tree: &mut Tree, builder: &mut Trials, effects: &mut Vec<Effect>) {
 #[test]
 fn a_range_asked_for_again_is_delivered_again_as_it_was_posted() {
     let log = Log::default();
-    let mut builder = Trials(Arc::clone(&log));
+    let mut builder = Trials(Arc::clone(&log), false);
     let mut tree = Tree::new();
     let mut effects = Vec::new();
     let show = tree.announce_root("show.rar", None, &mut effects);
@@ -237,7 +252,7 @@ fn a_range_asked_for_again_is_delivered_again_as_it_was_posted() {
 #[test]
 fn a_loss_beside_damaged_bytes_is_never_said_again_as_bytes() {
     let log = Log::default();
-    let mut builder = Trials(Arc::clone(&log));
+    let mut builder = Trials(Arc::clone(&log), false);
     let mut tree = Tree::new();
     let mut effects = Vec::new();
     let show = tree.announce_root("show.rar", None, &mut effects);
@@ -309,7 +324,7 @@ fn a_loss_beside_damaged_bytes_is_never_said_again_as_bytes() {
 #[test]
 fn a_large_range_asked_for_again_is_read_back_in_bounded_pieces() {
     let log = Log::default();
-    let mut builder = Trials(Arc::clone(&log));
+    let mut builder = Trials(Arc::clone(&log), false);
     let mut tree = Tree::new();
     let mut effects = Vec::new();
     let show = tree.announce_root("show.rar", None, &mut effects);
@@ -354,4 +369,73 @@ fn a_large_range_asked_for_again_is_read_back_in_bounded_pieces() {
         .and_then(|namespace| namespace.get(MemberId(0)))
         .expect("member");
     assert!(record.coverage.runs().next().is_none());
+}
+
+// An owner that applies each replayed piece's effects before the next piece
+// goes, a request raised inside a replay answered at once, as the
+// namespace writer answers them.
+fn answer_at_once(tree: &mut Tree, builder: &mut Trials, effects: Vec<Effect>) {
+    for effect in effects {
+        let Effect::Again { node, ranges } = effect else {
+            continue;
+        };
+        let mut staged = Vec::new();
+        let serial = tree.again_read(node, &ranges, builder, &mut |volume, posted| {
+            staged.push((volume, posted));
+        });
+        for (volume, posted) in staged {
+            let mut raised = Vec::new();
+            tree.replay_again(serial, node, volume, posted, builder, &mut raised);
+            answer_at_once(tree, builder, raised);
+        }
+        tree.again_done();
+    }
+}
+
+// A request raised while an earlier one is being said again reads back and
+// says again what the earlier one has yet to say: the earlier one does not
+// say those bytes a second time.
+#[test]
+fn a_replay_raised_inside_a_replay_is_said_once() {
+    let log = Log::default();
+    let mut builder = Trials(Arc::clone(&log), true);
+    let mut tree = Tree::new();
+    let mut effects = Vec::new();
+    let show = tree.announce_root("show.rar", None, &mut effects);
+    let mut front = SIGNATURE.to_vec();
+    front.extend_from_slice(b"hello");
+    deliver(
+        &mut tree,
+        &mut builder,
+        show,
+        (0, &front, Provenance::Fresh),
+        &mut effects,
+    );
+    effects.clear();
+    tree.deliver(
+        NodeId::ROOT,
+        show,
+        Posted {
+            offset: 15,
+            bytes: Bytes::from_static(b"CHECK").into(),
+            provenance: Provenance::Fresh,
+        },
+        &mut builder,
+        &mut effects,
+    );
+    answer_at_once(&mut tree, &mut builder, effects);
+    let heard = log.lock().expect("log").clone();
+    let checks = heard
+        .iter()
+        .filter(|heard| matches!(heard, Heard::Bytes(15, _, _)))
+        .count();
+    // Once as it came, and once by the request raised inside the first
+    // one's replay, which read it back before the first one said it.
+    assert_eq!(checks, 2, "{heard:?}");
+    let fronts = heard
+        .iter()
+        .filter(|heard| matches!(heard, Heard::Bytes(0, _, _)))
+        .count();
+    // As it came, by the first request, and by the one raised inside it.
+    assert_eq!(fronts, 3, "{heard:?}");
 }

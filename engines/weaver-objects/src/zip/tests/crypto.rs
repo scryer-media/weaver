@@ -1067,6 +1067,46 @@ fn a_zipcrypto_repair_replays_only_from_the_repaired_byte() {
     assert!(owner.posted(0) == Some(archive));
 }
 
+// A repair in the member's last bytes lies inside the tail the end record
+// was searched for in, but in no record the directory read: the map stands,
+// and the repair replays from its byte once.
+#[test]
+fn a_repair_in_the_tail_search_window_keeps_the_map() {
+    let plain = payload(88, 300_007);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let end = start + plain.len() as u64;
+    let b = ByteRange::at(start + 250_000, 1);
+    assert!(b.start + records::TAIL > archive.len() as u64);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, b.start));
+    owner.deliver_as(0, b, Provenance::Damaged, Some(&[archive[b.start as usize] ^ 0x5a]));
+    owner.deliver(0, ByteRange::new(b.end, archive.len() as u64));
+    let first = owner.said.len();
+    owner.deliver_as(0, b, Provenance::Repaired, None);
+    let said = &owner.said[first..];
+    let agains: Vec<ByteRange> = said
+        .iter()
+        .filter_map(|emit| match emit {
+            Emit::Again { range, .. } => Some(*range),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(agains, vec![ByteRange::new(b.start, end)], "{said:?}");
+    assert!(
+        !said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Retract(_) | Emit::NeedsPassword)),
+        "{said:?}"
+    );
+    owner.close(0);
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+}
+
 // A second repair that comes before the first one's replay joins it: the
 // one replay from the earlier repair carries both.
 #[test]

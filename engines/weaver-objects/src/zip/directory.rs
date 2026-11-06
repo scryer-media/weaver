@@ -47,7 +47,10 @@ impl Zip {
         let mut end = found;
         // Where the records after the directory start.
         let mut after = at;
-        let mut read = vec![tail];
+        // The end record runs from its signature to the tail's end: only
+        // it stands under the map, not the rest of the window it was
+        // searched for in, which is the last member's bytes.
+        let mut read = vec![ByteRange::new(at, total)];
         if found.wide {
             let range = ByteRange::new(at.saturating_sub(LOCATOR_LEN), at);
             let Some(bytes) = self.need(range) else {
@@ -272,6 +275,15 @@ impl Zip {
                 let entry = &mut map.entries[index];
                 entry.expected = None;
                 entry.data = data;
+                if let (Some(cipher), Some(data)) = (&mut entry.cipher, data) {
+                    let header = ByteRange::new(data - super::crypto::HEADER, data);
+                    cipher.header = self
+                        .kept
+                        .verified(header)
+                        .then(|| self.kept.read(header))
+                        .flatten()
+                        .and_then(|bytes| bytes.try_into().ok());
+                }
                 self.basis.push((range, crc));
             }
         }
@@ -392,6 +404,17 @@ impl Zip {
         for &id in moved.iter().filter(|id| **id < old.members.len()) {
             out.push(Emit::Retract(MemberId(id as u32)));
             self.grid.forget(MemberId(id as u32));
+        }
+        // A member that stands keeps its keys, its proof and what waits for
+        // its replay: the header they were made under is the new map's.
+        let (mut old, mut new) = (old, new);
+        for id in (0..new.members.len().min(old.members.len()))
+            .filter(|id| moved.binary_search(id).is_err())
+        {
+            let (was, is) = (old.members[id], new.members[id]);
+            if new.entries[is].cipher.is_some() {
+                new.entries[is].cipher = old.entries[was].cipher.take();
+            }
         }
         let mut was = std::mem::take(&mut self.members);
         self.members = (0..new.members.len())
@@ -545,10 +568,11 @@ fn moved(old: &Map, new: &Map) -> Vec<usize> {
             let member = MemberId(id as u32);
             match (old.entry(member), new.entry(member)) {
                 (Some(was), Some(is)) => {
-                    // Re-reading encrypted metadata must re-prove the
-                    // cipher header before any old plaintext stands.
-                    was.cipher.is_some()
-                        || is.cipher.is_some()
+                    // An encrypted member stands only under the cipher
+                    // header its plaintext was made under.
+                    was.cipher.as_ref().map(|cipher| cipher.header)
+                        != is.cipher.as_ref().map(|cipher| cipher.header)
+                        || was.cipher.as_ref().is_some_and(|cipher| cipher.header.is_none())
                         || was.name != is.name
                         || was.length != is.length
                         || was.checksum != is.checksum

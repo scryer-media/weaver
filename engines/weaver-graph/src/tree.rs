@@ -411,6 +411,13 @@ pub struct Tree {
     emits: Vec<Emit>,
     extents: Vec<Extent>,
     placements: Vec<Placement>,
+    // What each `again_read` still being replayed read back, by its serial:
+    // a replay raised inside another says those bytes again itself, and
+    // the one outside it must not say them a second time. Kept only while
+    // some read is unfinished; never recorded.
+    agains: Vec<(u64, NodeId, VolumeIndex, ByteRange)>,
+    again_serial: u64,
+    again_depth: u32,
 }
 
 impl Default for Tree {
@@ -434,6 +441,9 @@ impl Tree {
             emits: Vec::new(),
             extents: Vec::new(),
             placements: Vec::new(),
+            agains: Vec::new(),
+            again_serial: 0,
+            again_depth: 0,
         }
     }
 
@@ -4157,12 +4167,13 @@ impl Tree {
         effects: &mut Vec<Effect>,
     ) {
         let mut again = Vec::new();
-        self.again_read(node, ranges, builder, &mut |volume, posted| {
+        let serial = self.again_read(node, ranges, builder, &mut |volume, posted| {
             again.push((volume, posted));
         });
         for (volume, posted) in again {
-            self.replay_piece(node, volume, posted, builder, effects);
+            self.replay_again(serial, node, volume, posted, builder, effects);
         }
+        self.again_done();
     }
 
     // What `again` delivers, read back a piece of at most `AGAIN_PIECE`
@@ -4173,14 +4184,19 @@ impl Tree {
     // owner stages them where it likes, on disk for a large member, and
     // never holds the whole range in memory. The owner applies each
     // piece's effects before the next piece goes, so a run the object
-    // could not place when it came never looks placed by a later one.
+    // could not place when it came never looks placed by a later one. Each
+    // piece goes by `replay_again` under the serial returned here, and
+    // `again_done` follows the last.
     pub fn again_read(
         &mut self,
         node: NodeId,
         ranges: &[(VolumeIndex, ByteRange)],
         builder: &dyn Builder,
         stage: &mut dyn FnMut(VolumeIndex, Posted),
-    ) {
+    ) -> u64 {
+        self.again_serial += 1;
+        self.again_depth += 1;
+        let serial = self.again_serial;
         let mut again: Vec<(VolumeIndex, ByteRange)> = Vec::new();
         for &(volume, range) in ranges {
             let Some((parent, member)) = self
@@ -4216,7 +4232,7 @@ impl Tree {
                 .get(&node)
                 .and_then(|found| found.object.as_ref())
             else {
-                return;
+                break;
             };
             let (tree, reader) = (&*self, builder);
             let mut read = |placement: &Placement, into: &mut Vec<u8>| {
@@ -4257,6 +4273,63 @@ impl Tree {
         }
         for (volume, piece) in again {
             self.uncover(node, volume, piece);
+            self.agains.push((serial, node, volume, piece));
+        }
+        serial
+    }
+
+    // One piece `again_read` under `serial` read back, said again as
+    // `replay_piece` says it, apart from what a read raised since, inside
+    // this one's replay, read back and said again already.
+    pub fn replay_again(
+        &mut self,
+        serial: u64,
+        node: NodeId,
+        volume: VolumeIndex,
+        posted: Posted,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let whole = ByteRange::at(posted.offset, posted.bytes.len() as u64);
+        let mut left = vec![whole];
+        for &(_, _, _, said) in self
+            .agains
+            .iter()
+            .filter(|(since, at, on, _)| *since > serial && *at == node && *on == volume)
+        {
+            left = left
+                .into_iter()
+                .flat_map(|part| {
+                    let before = (part.start, part.end.min(said.start));
+                    let after = (part.start.max(said.end), part.end);
+                    [before, after]
+                        .into_iter()
+                        .filter(|(start, end)| start < end)
+                        .map(|(start, end)| ByteRange::new(start, end))
+                })
+                .collect();
+        }
+        if left == [whole] {
+            return self.replay_piece(node, volume, posted, builder, effects);
+        }
+        for part in left {
+            let from = (part.start - whole.start) as usize;
+            let bytes = posted.bytes.slice(from..from + part.len() as usize);
+            let piece = Posted {
+                offset: part.start,
+                bytes,
+                provenance: posted.provenance,
+            };
+            self.replay_piece(node, volume, piece, builder, effects);
+        }
+    }
+
+    // The last piece of an `again_read` went: once no read is being said
+    // again, what they read back is forgotten.
+    pub fn again_done(&mut self) {
+        self.again_depth = self.again_depth.saturating_sub(1);
+        if self.again_depth == 0 {
+            self.agains.clear();
         }
     }
 

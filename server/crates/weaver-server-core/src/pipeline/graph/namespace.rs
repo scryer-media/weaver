@@ -1201,7 +1201,7 @@ impl NamespaceWriter {
             Effect::Again { node, ranges } => {
                 let mut staged = loan::Repaired::again(&self.working_dir, *node)?;
                 let mut sources = Vec::new();
-                tree.again_read(
+                let serial = tree.again_read(
                     *node,
                     ranges,
                     &self.placing(builder),
@@ -1212,8 +1212,17 @@ impl NamespaceWriter {
                 );
                 let replayed = match staged.failed() {
                     Some(error) => Err(WriteError::from(error)),
-                    None => self.again_staged(tree, builder, segments, *node, &staged, sources, out),
+                    None => self.again_staged(
+                        tree,
+                        builder,
+                        segments,
+                        (serial, *node),
+                        &staged,
+                        sources,
+                        out,
+                    ),
                 };
+                tree.again_done();
                 let removed = staged.discard();
                 replayed?;
                 removed?;
@@ -1231,7 +1240,7 @@ impl NamespaceWriter {
         tree: &mut Tree,
         builder: &mut dyn Builder,
         segments: &dyn Segments,
-        node: NodeId,
+        (serial, node): (u64, NodeId),
         staged: &loan::Repaired,
         sources: Vec<Provenance>,
         out: &mut Vec<Effect>,
@@ -1245,7 +1254,8 @@ impl NamespaceWriter {
                 provenance,
             };
             let mut effects = Vec::new();
-            tree.replay_piece(
+            tree.replay_again(
+                serial,
                 node,
                 VolumeIndex(volume.0),
                 posted,
