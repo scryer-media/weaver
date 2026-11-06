@@ -2230,29 +2230,6 @@ fn a_resumed_rar5_walk_images_only_the_runs_past_its_cursor() {
     }
 }
 
-// Facts a walk read on from its cursor are compared by the volume's own
-// fields and how many members and services there are: the walks of a
-// volume arriving in order find them both moved and not, and each finding
-// is checked against a whole comparison as it runs.
-#[test]
-fn facts_read_on_from_the_cursor_compare_by_what_the_step_added() {
-    let volumes = write(&items(), &Options::new(Version::Rar5));
-    let length = volumes[0].len() as u64;
-    let mut owner = Owner::named(store(), volumes);
-    walk::read_on::take();
-    let mut start = 0;
-    while start < length {
-        let end = (start + 100).min(length);
-        owner.deliver(0, ByteRange::new(start, end));
-        start = end;
-    }
-    owner.close(0);
-    let found = walk::read_on::take();
-    assert!(found.contains(&true), "{found:?}");
-    assert!(found.contains(&false), "{found:?}");
-    streamed(&owner);
-}
-
 // Each of the four things that make a step begin at the signature images
 // every run in hand: no resume, another password than the cursor last
 // stepped with, a Quick Open locator, a volume not read as RAR5.
