@@ -97,7 +97,7 @@ impl Database {
         let value = value.to_string();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "INSERT INTO settings (key, value) VALUES ({}, {})
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 &[SqlArg::Text(key), SqlArg::Text(value)],
@@ -112,7 +112,7 @@ impl Database {
         let key = key.to_string();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "DELETE FROM settings WHERE key = {}",
                 &[SqlArg::Text(key)],
             )
@@ -131,7 +131,7 @@ impl Database {
         let expected = expected.to_string();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "DELETE FROM settings WHERE key = {} AND value = {}",
                 &[SqlArg::Text(key), SqlArg::Text(expected)],
             )
@@ -145,7 +145,7 @@ impl Database {
         self.run_sql_blocking(async move {
             let next_job_id = next_job_id_floor_target(&datastore).await?;
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "INSERT INTO settings (key, value) VALUES ({}, {})
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 &[

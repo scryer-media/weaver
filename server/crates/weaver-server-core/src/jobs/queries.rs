@@ -99,7 +99,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE active_jobs SET root_phase = {} WHERE job_id = {}",
                 &[
                     SqlArg::Text(phase.to_string()),

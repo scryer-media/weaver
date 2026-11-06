@@ -75,7 +75,7 @@ impl Database {
         ];
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "INSERT INTO server_tls_diagnostics
                     (server_id, cipher_suite, honors_client_cipher_order,
                      probed_at_epoch_seconds)
@@ -95,7 +95,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "DELETE FROM server_tls_diagnostics WHERE server_id = {}",
                 &[SqlArg::I64(i64::from(server_id))],
             )

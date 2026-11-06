@@ -153,7 +153,7 @@ impl Database {
         let args = rss_rule_args(rule)?;
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "INSERT INTO rss_rules
                     (id, feed_id, sort_order, enabled, action, title_regex, item_categories,
                      min_size_bytes, max_size_bytes, category_override, metadata)
@@ -172,7 +172,7 @@ impl Database {
         args.push(id);
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE rss_rules
                     SET feed_id = {}, sort_order = {}, enabled = {}, action = {}, title_regex = {},
                         item_categories = {}, min_size_bytes = {}, max_size_bytes = {},
@@ -189,7 +189,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "DELETE FROM rss_rules WHERE id = {}",
                 &[SqlArg::I64(i64::from(id))],
             )
@@ -203,7 +203,7 @@ impl Database {
         let args = rss_seen_item_args(item);
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "INSERT INTO rss_seen_items
                     (feed_id, item_id, item_title, published_at, size_bytes, decision, seen_at,
                      job_id, item_url, error)
@@ -229,7 +229,7 @@ impl Database {
         let item_id = item_id.to_string();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "DELETE FROM rss_seen_items WHERE feed_id = {} AND item_id = {}",
                 &[SqlArg::I64(i64::from(feed_id)), SqlArg::Text(item_id)],
             )
@@ -244,14 +244,14 @@ impl Database {
             let changed = match feed_id {
                 Some(feed_id) => {
                     SqlRuntime::execute(
-                        datastore.read_exec(),
+                        datastore.write_exec(),
                         "DELETE FROM rss_seen_items WHERE feed_id = {}",
                         &[SqlArg::I64(i64::from(feed_id))],
                     )
                     .await?
                 }
                 None => {
-                    SqlRuntime::execute(datastore.read_exec(), "DELETE FROM rss_seen_items", &[])
+                    SqlRuntime::execute(datastore.write_exec(), "DELETE FROM rss_seen_items", &[])
                         .await?
                 }
             };
@@ -263,7 +263,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "DELETE FROM rss_seen_items WHERE seen_at < {}",
                 &[SqlArg::I64(cutoff_ts)],
             )
@@ -283,7 +283,7 @@ impl Database {
         let last_modified = last_modified.map(str::to_string);
         let result = self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE rss_feeds
                     SET last_polled_at = {}, last_success_at = {}, last_error = NULL,
                         consecutive_failures = 0, etag = {}, last_modified = {}
@@ -315,7 +315,7 @@ impl Database {
         let error = error.to_string();
         let result = self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE rss_feeds
                     SET last_polled_at = {},
                         last_error = {},

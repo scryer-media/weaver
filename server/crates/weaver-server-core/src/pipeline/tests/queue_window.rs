@@ -292,7 +292,7 @@ async fn an_unreadable_parked_job_is_cancelled_and_frees_its_slot() {
         .db
         .run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE active_jobs SET nzb_zstd = {} WHERE job_id = {}",
                 &[
                     SqlArg::Bytes(b"not an nzb".to_vec()),

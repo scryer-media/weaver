@@ -99,7 +99,7 @@ impl Database {
         let updated_at = Utc::now().timestamp();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "INSERT INTO server_download_usage
                     (server_id, lifetime_bytes, quota_baseline_bytes,
                      window_start_epoch_seconds, window_end_epoch_seconds,
