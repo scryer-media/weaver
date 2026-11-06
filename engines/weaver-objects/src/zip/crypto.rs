@@ -518,14 +518,14 @@ impl super::Zip {
                         offset: part.start - span.start,
                         member,
                         keys: Arc::clone(keys),
+                        reach: 0,
                     });
                 }
             }
         }
-        sealed.sort_by_key(|sealed| (sealed.volume, sealed.part.start));
-        // Ranges asked twice seal the same run once.
-        sealed.dedup_by_key(|sealed| (sealed.volume, sealed.part));
-        Posted { placed, sealed }
+        let mut posted = Posted { placed, sealed };
+        posted.order();
+        posted
     }
 
     pub(super) fn open_entries(&mut self, out: &mut Vec<weaver_graph::Emit>) {
@@ -926,6 +926,9 @@ pub(super) struct Sealed {
     offset: u64,
     member: weaver_graph::MemberId,
     pub(super) keys: Arc<MemberKeys>,
+    // The furthest any run of this volume at or before this one reaches:
+    // entries' spans may overlap, so `part.end` alone is not in order.
+    reach: u64,
 }
 
 // What every sealed run of one member reads through: its coverage, its
@@ -986,6 +989,41 @@ pub(super) struct Posted {
     pub(super) sealed: Vec<Sealed>,
 }
 
+impl Posted {
+    // Runs in volume order, each knowing how far the runs before it reach.
+    fn order(&mut self) {
+        let sealed = &mut self.sealed;
+        sealed.sort_by_key(|sealed| (sealed.volume, sealed.part.start, sealed.part.end));
+        sealed.dedup_by_key(|sealed| (sealed.volume, sealed.part));
+        let mut reach: Option<(weaver_graph::VolumeIndex, u64)> = None;
+        for sealed in sealed.iter_mut() {
+            let before = reach
+                .filter(|(volume, _)| *volume == sealed.volume)
+                .map_or(0, |(_, end)| end);
+            sealed.reach = before.max(sealed.part.end);
+            reach = Some((sealed.volume, sealed.reach));
+        }
+    }
+
+    // Seal again, as a run of its own, the part of the run at `index`
+    // that `part` names, as an entry whose span overlaps another's would.
+    #[cfg(test)]
+    pub(super) fn seal_within(&mut self, index: usize, part: ByteRange) {
+        let run = &self.sealed[index];
+        let part = run.part.intersect(part).expect("a part of the run");
+        let within = Sealed {
+            volume: run.volume,
+            part,
+            offset: run.offset + part.start - run.part.start,
+            member: run.member,
+            keys: Arc::clone(&run.keys),
+            reach: 0,
+        };
+        self.sealed.push(within);
+        self.order();
+    }
+}
+
 impl weaver_graph::Posting for Posted {
     fn posted(
         &self,
@@ -996,16 +1034,19 @@ impl weaver_graph::Posting for Posted {
     ) -> bool {
         use weaver_graph::Placement;
         let mut cursor = range.start;
-        // The runs are in volume order and apart: the first that reaches
-        // past the range's start is found, and the rest follow it.
+        // The runs are in volume order and their reach never falls: the
+        // first whose reach passes the range's start is found, and every
+        // run that meets the range is it or follows it.
         let first = self
             .sealed
-            .partition_point(|sealed| (sealed.volume, sealed.part.end) <= (volume, range.start));
+            .partition_point(|sealed| (sealed.volume, sealed.reach) <= (volume, range.start));
         for sealed in self.sealed[first..]
             .iter()
             .take_while(|sealed| sealed.volume == volume && sealed.part.start < range.end)
         {
-            let Some(part) = sealed.part.intersect(range) else {
+            // Bytes an earlier, overlapping run already read are not read
+            // twice.
+            let Some(part) = sealed.part.intersect(ByteRange::new(cursor, range.end)) else {
                 continue;
             };
             let keys = &sealed.keys;

@@ -1343,6 +1343,39 @@ fn a_posting_shares_one_members_keys_and_tries_no_other_candidate() {
     assert!(posting.sealed[0].keys.alternatives.get().is_none());
 }
 
+// Entries whose spans overlap seal overlapping runs of one volume: one
+// that starts earlier and reaches further than the run after it still
+// answers past that run's end, and bytes both runs hold are read once.
+#[test]
+fn an_earlier_run_reaching_past_an_overlapping_one_still_answers() {
+    let plain = payload(92, 200_003);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    offer(&mut owner, PASSWORD);
+    owner.whole(4096);
+    assert!(owner.member("alpha.bin").closed);
+    let whole = ByteRange::at(start, plain.len() as u64);
+    let mut posting = owner.object.posted_over(&[(VolumeIndex(0), whole)]);
+    assert_eq!(posting.sealed.len(), 1);
+    let inner = ByteRange::at(start + 1_000, 500);
+    posting.seal_within(0, inner);
+    assert_eq!(posting.sealed.len(), 2);
+    for range in [
+        ByteRange::at(start + 2_000, 300),
+        ByteRange::at(start + 120_000, 4096),
+        ByteRange::new(start + 900, start + 1_600),
+        ByteRange::new(start + 1_200, start + 1_400),
+    ] {
+        let mut bytes = Vec::new();
+        assert!(owner.read_through_posting(&posting, VolumeIndex(0), range, &mut bytes));
+        assert!(
+            bytes == archive[range.start as usize..range.end as usize],
+            "{range:?}"
+        );
+    }
+}
+
 // A repair in the member's last bytes lies inside the tail the end record
 // was searched for in, but in no record the directory read: the map stands,
 // and the repair replays from its byte once.
