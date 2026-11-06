@@ -1423,6 +1423,13 @@ impl Tree {
         Some(taken)
     }
 
+    // What the object at `node` says of its inverse map: while the number
+    // stands, `locate` answers as it did. `None` for the root, and for an
+    // object that keeps no such number.
+    pub fn placement(&self, node: NodeId) -> Option<u64> {
+        self.object(node).and_then(|object| object.placement())
+    }
+
     // The object a member is a volume of, and which volume; a posting of a
     // member is that member's.
     pub fn child_of(&self, node: NodeId, member: MemberId) -> Option<(NodeId, VolumeIndex)> {

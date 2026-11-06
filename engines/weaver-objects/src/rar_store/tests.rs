@@ -2037,3 +2037,114 @@ fn a_stored_split_file_handed_its_evidence_is_judged_without_hashing_its_data() 
         "{with:?}"
     );
 }
+
+// A namespace asks a store where its held bytes go only once the store's
+// placement number has moved since it last asked. Each kind of change that
+// places held bytes moves it: the walk reaching them, the layout linking
+// their volume from another, a password opening their file, a close reading
+// the header that names them, and a volume bound. The owner checks at every
+// pass that no hold is placed while the number stands, and notes each one
+// placed after a pass the number would have let skip.
+#[test]
+fn every_change_that_places_held_bytes_moves_the_placement_number() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let mut owner = Owner::named(store(), write(&items(), &Options::new(version)));
+        owner.backwards(0, 777);
+        owner.close(0);
+        streamed(&owner);
+        assert!(
+            owner.gated.contains(&("deliver", 0, VolumeIndex(0))),
+            "{version:?} walk: {:?}",
+            owner.gated
+        );
+
+        let mut owner = Owner::named(store(), write(&items(), &split(version)));
+        for volume in [2, 0, 1] {
+            owner.frames(volume, 1000);
+        }
+        for volume in [2, 0, 1] {
+            owner.close(volume);
+        }
+        streamed(&owner);
+        assert!(
+            owner.gated.contains(&("deliver", 1, VolumeIndex(2))),
+            "{version:?} layout: {:?}",
+            owner.gated
+        );
+
+        let mut owner = Owner::named(store(), write(&items(), &split_encrypted(version, false)));
+        for volume in [1, 2, 0] {
+            owner.backwards(volume, 1500);
+        }
+        owner.offer(PASSWORD);
+        for volume in 0..3 {
+            owner.close(volume);
+        }
+        owner.said.retain(|emit| *emit != Emit::NeedsPassword);
+        streamed(&owner);
+        assert!(
+            owner.gated.iter().any(|(doing, ..)| *doing == "password"),
+            "{version:?} password: {:?}",
+            owner.gated
+        );
+
+        let real = write(&items(), &Options::new(version)).remove(0);
+        let [(_, alpha), (_, beta), _] = &files()[..] else {
+            unreachable!("three files")
+        };
+        let alpha_end = (find(&real, &alpha[..64]) + alpha.len()) as u64;
+        let beta_at = find(&real, &beta[..64]) as u64;
+        let article = ByteRange::new(alpha_end - 100, beta_at + 100);
+        let length = real.len() as u64;
+        let mut owner = Owner::named(store(), vec![real]);
+        owner.deliver(0, ByteRange::new(0, article.start));
+        owner.deliver_as(0, article, Provenance::Damaged, None);
+        owner.deliver(0, ByteRange::new(article.end, length));
+        assert_eq!(owner.held(), 1, "{version:?}");
+        owner.close(0);
+        assert_eq!(owner.held(), 0, "{version:?}");
+        assert_eq!(owner.member("beta.bin").bytes, *beta, "{version:?}");
+        assert_eq!(
+            owner.gated,
+            [("close", 0, VolumeIndex(0))],
+            "{version:?} close"
+        );
+
+        // A volume bound or adopted changes what the store places of it:
+        // the number moves with it. The namespace hands a member's holds to
+        // its object as it binds it, past any pass.
+        let volumes = write(&items(), &split(version));
+        let mut owner = Owner::named(store(), volumes);
+        let number = owner.object.placement();
+        owner
+            .object
+            .bound(VolumeIndex(1), "alpha.part2.rar", &[], None);
+        assert_ne!(owner.object.placement(), number, "{version:?} bind");
+    }
+}
+
+// Bytes that only pass through, data past every header, move nothing: a
+// namespace holding bytes of the volume asks the store nothing more.
+#[test]
+fn data_that_only_passes_through_leaves_the_placement_number_standing() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &split(version));
+        let mut owner = Owner::named(store(), volumes);
+        owner.frames(0, 1000);
+        owner.close(0);
+        let first = find(&owner.volumes[2].1, &files()[1].1[3_000..3_064]) as u64;
+        owner.deliver(2, ByteRange::new(first, first + 100));
+        let number = owner.object.placement();
+        assert!(owner.held() > 0, "{version:?}");
+        for at in (first + 100..first + 1_000).step_by(100) {
+            owner.deliver(2, ByteRange::new(at, at + 100));
+            assert_eq!(owner.object.placement(), number, "{version:?} at {at}");
+        }
+        owner.frames(1, 1000);
+        owner.frames(2, 1000);
+        for volume in 1..3 {
+            owner.close(volume);
+        }
+        streamed(&owner);
+    }
+}

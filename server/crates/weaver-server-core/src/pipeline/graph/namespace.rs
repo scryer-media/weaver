@@ -230,6 +230,10 @@ pub(crate) struct NamespaceWriter {
     #[cfg(test)]
     diagnostics: Vec<weaver_graph::recovery::RepairDiagnostic>,
     placements: Vec<Placement>,
+    // Each held volume's object, volume and placement number when a pass
+    // last asked where its holds go: while the object says the same number,
+    // it places them as it did then, and nothing of them goes down.
+    asked: BTreeMap<(NodeId, VolumeIndex), (NodeId, VolumeIndex, u64)>,
     // Where the time a member write takes on disk is published, when the
     // job runs in a pipeline.
     metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
@@ -286,6 +290,7 @@ impl NamespaceWriter {
             #[cfg(test)]
             diagnostics: Vec::new(),
             placements: Vec::new(),
+            asked: BTreeMap::new(),
             metrics: None,
         }
     }
@@ -1716,12 +1721,40 @@ impl NamespaceWriter {
                 let Some((child, volume)) = tree.child_of(parent, member) else {
                     continue;
                 };
-                let held = self
-                    .files
-                    .get(&parent)
-                    .map(|files| files.holds.held_ranges(held))
-                    .unwrap_or_default();
-                for range in held {
+                let ranges = |writer: &Self| {
+                    writer
+                        .files
+                        .get(&parent)
+                        .map(|files| files.holds.held_ranges(held))
+                        .unwrap_or_default()
+                };
+                // Asked already, of an object whose map has not moved since:
+                // every hold was held by that same map, at the last pass or
+                // as it came.
+                let placement = tree.placement(child);
+                let unmoved = placement.is_some()
+                    && self.asked.get(&(parent, held)).copied()
+                        == placement.map(|number| (child, volume, number));
+                if unmoved {
+                    #[cfg(test)]
+                    for range in &ranges(self) {
+                        placements.clear();
+                        tree.locate(child, volume, *range, &mut placements);
+                        assert!(
+                            placements
+                                .iter()
+                                .all(|placement| matches!(placement, Placement::Held { .. })),
+                            "a hold the unmoved map places: {range:?}"
+                        );
+                    }
+                    continue;
+                }
+                if let Some(number) = placement {
+                    self.asked.insert((parent, held), (child, volume, number));
+                }
+                for range in ranges(self) {
+                    #[cfg(test)]
+                    tests::RELEASE_LOCATED.with(|located| located.set(located.get() + 1));
                     placements.clear();
                     tree.locate(child, volume, range, &mut placements);
                     if placements

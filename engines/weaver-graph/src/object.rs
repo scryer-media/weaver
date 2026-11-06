@@ -381,6 +381,14 @@ pub trait Object: Send + Sync {
     // contiguous run, in volume order, together covering the whole range.
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>);
 
+    // A number that changes whenever anything `locate` reads may have
+    // changed: while it stands, `locate` answers every range as it did.
+    // No two objects share one. `None` for an object that keeps no such
+    // number, which is asked every time.
+    fn placement(&self) -> Option<u64> {
+        None
+    }
+
     // The forward map: where does this range of my member lie in my volumes?
     // The extents go into `out`; the answer says whether they are all of the
     // range, the part placed so far, or whether the range can never be
