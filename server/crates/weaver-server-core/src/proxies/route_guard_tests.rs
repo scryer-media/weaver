@@ -83,7 +83,6 @@ const LIFTED: &[(&str, usize)] = &[
         "server/crates/weaver-server-core/src/proxies/routed_http.rs",
         2,
     ),
-    ("server/crates/weaver-server-core/src/proxies/runtime.rs", 2),
     ("server/crates/weaver-server-core/src/speed_test/http.rs", 1),
     // A leg's clients, one built for each target and shape and kept for
     // the leg.

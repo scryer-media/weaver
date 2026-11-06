@@ -207,7 +207,9 @@ pub(super) fn service(
     .unwrap();
     let runtime = ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
     if let Some(proxy) = &fixture.http3 {
-        runtime.install_http3_fixture(fixture.profile.id, proxy.provider());
+        runtime
+            .network
+            .install_fixture(fixture.profile.id, proxy.provider());
     }
     let mut security = RuntimeSecurityConfig::default();
     security.rss_allow_private_network = allow_private;
