@@ -717,6 +717,17 @@ impl super::Zip {
                 .next()
                 .filter(|run| run.range.start == 0)
                 .map_or(0, |run| run.range.end.min(cipher.proof.len() as u64));
+            // Plaintext said with none of it in the proof's span, a
+            // restore's whose front was uncovered, proves nothing of the
+            // candidate that made it, and keys derived through it once the
+            // front comes again would be this candidate's fed another's
+            // plaintext. It starts over, and this delivery goes to the
+            // member as it stands then.
+            if said == 0 && entry.data.is_some() && coverage.runs().next().is_some() {
+                entry.cipher = Some(cipher);
+                self.disown(member, out);
+                return self.decrypt_record(member, offset, bytes, provenance, read, out);
+            }
             let proof = ByteRange::new(0, said);
             let mut expected = Vec::new();
             if said > 0 && !plain(proof, &mut expected) {

@@ -948,6 +948,53 @@ fn a_restore_no_offered_candidate_proves_starts_the_member_over() {
     assert!(owner.posted(0) == Some(archive));
 }
 
+// A restored member whose plaintext does not reach its front, made under a
+// candidate since withdrawn: the front coming fresh under another proves
+// nothing of the rest, so no key is derived through that plaintext. The
+// member starts over and its ciphertext is fetched again.
+#[test]
+fn a_restore_without_its_front_never_derives_keys_through_unproven_plaintext() {
+    let plain = payload(61, 180_007);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let wrong = false_password(&archive);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, &wrong);
+    owner.deliver(0, ByteRange::new(0, 150_000));
+    // The restore holds what the false positive said past the front only.
+    owner.object.members[0]
+        .coverage
+        .erase(ByteRange::new(0, 50_000));
+    owner.restore();
+    let before = owner.said.len();
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, start + 50_000));
+    owner.deliver(0, ByteRange::new(150_000, archive.len() as u64));
+    owner.close(0);
+    let said = &owner.said[before..];
+    assert!(said.contains(&Emit::Retract(MemberId(0))), "{said:?}");
+    assert!(
+        said.iter().any(|emit| matches!(
+            emit,
+            Emit::Damaged { volume: VolumeIndex(0), range }
+                if range.start <= start + 50_000 && range.end >= 150_000
+        )),
+        "{said:?}"
+    );
+    assert!(!owner.member("alpha.bin").closed);
+    owner.deliver_as(
+        0,
+        ByteRange::new(start + 50_000, 150_000),
+        Provenance::Repaired,
+        None,
+    );
+    owner.close(0);
+    assert!(owner.member("alpha.bin").bytes == plain, "{:?}", owner.said);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+}
+
 #[test]
 fn an_unproven_partial_restore_continues_without_replaying_the_member() {
     let plain = payload(107, 300_007);
