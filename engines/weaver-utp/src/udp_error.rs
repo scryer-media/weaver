@@ -22,12 +22,12 @@ pub fn is_message_size_error(error: &io::Error) -> bool {
 fn windows_recoverable_receive_code(code: i32) -> bool {
     matches!(
         code,
-        // Winsock: host unreachable, bad address, connection reset/refused/
-        // aborted, network reset/unreachable, message too large.
-        10065 | 10014 | 10054 | 10061 | 10053 | 10052 | 10051 | 10040
-        // Win32: operation aborted, more data, host/port unreachable, retry,
-        // network unreachable, connection refused/aborted.
-            | 995 | 234 | 1232 | 1234 | 1237 | 1231 | 1225 | 1236
+        // Winsock: host unreachable, connection reset/refused/aborted,
+        // network reset/unreachable, message too large.
+        10065 | 10054 | 10061 | 10053 | 10052 | 10051 | 10040
+        // Win32: more data, host/port unreachable, retry, network
+        // unreachable, connection refused/aborted.
+            | 234 | 1232 | 1234 | 1237 | 1231 | 1225 | 1236
     )
 }
 
@@ -55,11 +55,9 @@ pub(crate) fn is_recoverable_receive_error(error: &io::Error) -> bool {
     {
         [
             libc::EHOSTUNREACH,
-            libc::EFAULT,
             libc::ECONNRESET,
             libc::ECONNREFUSED,
             libc::ECONNABORTED,
-            libc::ECANCELED,
             libc::ENETRESET,
             libc::ENETUNREACH,
             libc::EMSGSIZE,
@@ -122,12 +120,12 @@ mod tests {
     #[test]
     fn windows_socket_and_system_receive_codes_are_mapped_explicitly() {
         for code in [
-            10065, 10014, 10054, 10061, 10053, 10052, 10051, 10040, 995, 234, 1232, 1234, 1237,
-            1231, 1225, 1236,
+            10065, 10054, 10061, 10053, 10052, 10051, 10040, 234, 1232, 1234, 1237, 1231, 1225,
+            1236,
         ] {
             assert!(windows_recoverable_receive_code(code), "{code}");
         }
-        for code in [0, 5, 6, 109, 10038, 10050, 10057] {
+        for code in [0, 5, 6, 109, 995, 10014, 10038, 10050, 10057] {
             assert!(!windows_recoverable_receive_code(code), "{code}");
         }
     }
@@ -137,11 +135,9 @@ mod tests {
     fn unix_receive_codes_are_mapped_explicitly() {
         for code in [
             libc::EHOSTUNREACH,
-            libc::EFAULT,
             libc::ECONNRESET,
             libc::ECONNREFUSED,
             libc::ECONNABORTED,
-            libc::ECANCELED,
             libc::ENETRESET,
             libc::ENETUNREACH,
             libc::EMSGSIZE,
@@ -153,7 +149,14 @@ mod tests {
                 "{code}"
             );
         }
-        for code in [libc::EBADF, libc::EPIPE, libc::EACCES, libc::ENOTCONN] {
+        for code in [
+            libc::EBADF,
+            libc::EPIPE,
+            libc::EACCES,
+            libc::ENOTCONN,
+            libc::EFAULT,
+            libc::ECANCELED,
+        ] {
             assert!(
                 !is_recoverable_receive_error(&io::Error::from_raw_os_error(code)),
                 "{code}"
