@@ -66,6 +66,7 @@ fn validate_delivery_sources(
     working_dir: &Path,
     staging_dir: Option<&Path>,
     settings: &PostProcessingSettings,
+    left_behind: &HashSet<PathBuf>,
 ) -> Result<DeliverySourceValidation, String> {
     let mut validation = DeliverySourceValidation::default();
     let mut source_exists = false;
@@ -74,6 +75,7 @@ fn validate_delivery_sources(
             staging_dir,
             "staging",
             &[".weaver-chunks"],
+            &HashSet::new(),
             settings,
             &mut validation,
         )?;
@@ -87,6 +89,7 @@ fn validate_delivery_sources(
             ".weaver-staging",
             WORKING_DIR_MARKER,
         ],
+        left_behind,
         settings,
         &mut validation,
     )?;
@@ -99,6 +102,7 @@ fn scan_delivery_root(
     root: &Path,
     source_name: &str,
     ignored_entries: &[&str],
+    ignored_paths: &HashSet<PathBuf>,
     settings: &PostProcessingSettings,
     validation: &mut DeliverySourceValidation,
 ) -> Result<bool, String> {
@@ -136,6 +140,9 @@ fn scan_delivery_root(
             continue;
         }
         let entry_path = entry.path();
+        if ignored_paths.contains(&entry_path) {
+            continue;
+        }
         let entry_name = entry.file_name();
         let mut entry_bytes = 0u64;
         let mut stack = vec![(entry_path.clone(), PathBuf::from(&entry_name))];
@@ -449,6 +456,15 @@ pub(crate) type MoveHook = Box<dyn FnOnce(JobId) + Send>;
 pub(crate) static BEFORE_FIRST_MOVE: std::sync::Mutex<Option<MoveHook>> =
     std::sync::Mutex::new(None);
 
+#[cfg(test)]
+pub(crate) type SpentHook = Box<dyn FnOnce(&[PathBuf]) + Send>;
+
+// Runs with the consumed inputs once their handles are released and before
+// they are removed.
+#[cfg(test)]
+pub(crate) static BEFORE_SPENT_REMOVAL: std::sync::Mutex<Option<SpentHook>> =
+    std::sync::Mutex::new(None);
+
 // Where a final move delivers: a directory it claimed empty, or the one
 // the moving row of a job interrupted by a restart names, which already
 // holds what moved before the restart.
@@ -474,8 +490,11 @@ struct FinalMove {
     phase_counters: Arc<PhaseCounters>,
     naming: Option<DeliveryNamingPlan>,
     policy_source: DeliveryPolicySource,
+    // Consumed inputs whose removal failed: they stay where they are.
+    left_behind: HashSet<PathBuf>,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_move_to_complete(
     job_id: JobId,
     working_dir: PathBuf,
@@ -484,6 +503,7 @@ async fn run_move_to_complete(
     phase_counters: Arc<PhaseCounters>,
     naming: Option<DeliveryNamingPlan>,
     policy_source: DeliveryPolicySource,
+    left_behind: HashSet<PathBuf>,
 ) -> Result<MoveToCompleteResult, MoveToCompleteFailure> {
     let claimed_dest = dest.clone();
     let result = run_move_to_claimed_destination(
@@ -494,6 +514,7 @@ async fn run_move_to_complete(
         phase_counters,
         naming,
         policy_source,
+        left_behind,
     )
     .await;
     if result.is_err() {
@@ -505,6 +526,7 @@ async fn run_move_to_complete(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_move_to_claimed_destination(
     job_id: JobId,
     working_dir: PathBuf,
@@ -513,6 +535,9 @@ async fn run_move_to_claimed_destination(
     phase_counters: Arc<PhaseCounters>,
     naming: Option<DeliveryNamingPlan>,
     policy_source: DeliveryPolicySource,
+    // Consumed inputs that could not be removed: they stay in the working
+    // directory and are neither scanned nor moved.
+    left_behind: HashSet<PathBuf>,
 ) -> Result<MoveToCompleteResult, MoveToCompleteFailure> {
     let (dest, resumed) = match dest {
         MoveInto::Claimed(dest) => (dest, false),
@@ -541,8 +566,9 @@ async fn run_move_to_claimed_destination(
         let working_dir = working_dir.clone();
         let staging_dir = staging_dir.clone();
         let policy = Arc::clone(&policy);
+        let left_behind = left_behind.clone();
         crate::runtime::panic_trap::spawn_blocking(move || {
-            validate_delivery_sources(&working_dir, staging_dir.as_deref(), &policy)
+            validate_delivery_sources(&working_dir, staging_dir.as_deref(), &policy, &left_behind)
         })
         .await
         .map_err(|error| {
@@ -658,6 +684,9 @@ async fn run_move_to_claimed_destination(
                 continue;
             }
             let src = entry.path();
+            if left_behind.contains(&src) {
+                continue;
+            }
             let dst = dest.join(&file_name);
             if !resumed && dst.exists() && !runtime_fs::paths_equivalent_for_placement(&src, &dst) {
                 continue;
@@ -1143,15 +1172,31 @@ impl Pipeline {
             .transpose()
             .map_err(str::to_owned)?
             .unwrap_or_default();
+        #[cfg(test)]
+        {
+            let hook = BEFORE_SPENT_REMOVAL.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(&spent);
+            }
+        }
+        // A consumed input another process still holds open, or a share that
+        // refuses the unlink, is not part of the delivery and costs it
+        // nothing: it stays where it is, and the move leaves it there. No
+        // retry: the handles Weaver held are already closed, and an outside
+        // holder keeps its own for as long as it likes.
+        let mut left_behind = HashSet::new();
         for path in spent {
             match tokio::fs::remove_file(&path).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
-                    return Err(format!(
-                        "could not remove consumed input {} before delivery: {error}",
-                        path.display()
-                    ));
+                    warn!(
+                        job_id = job_id.0,
+                        path = %path.display(),
+                        error = %error,
+                        "could not remove a consumed input before delivery; it stays in the working directory"
+                    );
+                    left_behind.insert(path);
                 }
             }
         }
@@ -1246,6 +1291,7 @@ impl Pipeline {
             phase_counters,
             naming,
             policy_source: DeliveryPolicySource::Persisted(self.db.clone()),
+            left_behind,
         });
         Ok(())
     }
@@ -1365,6 +1411,7 @@ impl Pipeline {
             phase_counters,
             naming,
             policy_source: DeliveryPolicySource::Persisted(self.db.clone()),
+            left_behind: HashSet::new(),
         });
     }
 
@@ -1380,6 +1427,7 @@ impl Pipeline {
             phase_counters,
             naming,
             policy_source,
+            left_behind,
         } = final_move;
         let move_done_tx = self.move_done_tx.clone();
         debug!(
@@ -1427,6 +1475,7 @@ impl Pipeline {
                             phase_counters,
                             naming,
                             policy_source,
+                            left_behind,
                         )
                         .await
                     }
@@ -1439,6 +1488,7 @@ impl Pipeline {
                             phase_counters,
                             naming,
                             policy_source,
+                            left_behind,
                         )
                         .await
                     }
