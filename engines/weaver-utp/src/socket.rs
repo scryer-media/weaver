@@ -31,7 +31,7 @@ use crate::{UtpStream, runtime::Runtime, spawn_utils::task_with_cancel};
 
 mod control;
 pub(crate) use control::RetirementGuard;
-use control::{ConnectAdmission, MAX_PENDING_CONNECTS, RetirementFlag, RetirementSignals};
+use control::{ConnectAdmission, RetirementFlag, RetirementSignals, pending_connects};
 #[cfg(test)]
 mod control_integration_tests;
 
@@ -1088,13 +1088,14 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         let runtime = Runtime::new(transport, &opts.cancellation_token);
 
         let (accept_tx, accept_rx) = mpsc::channel(ACCEPT_QUEUE_MAX_ACCEPTORS);
-        let (connect_tx, connect_rx) = mpsc::channel(MAX_PENDING_CONNECTS);
+        let pending_connects = pending_connects(opts.connections_limit);
+        let (connect_tx, connect_rx) = mpsc::channel(pending_connects);
 
         let state = Arc::new(SocketState {
             runtime: Arc::downgrade(&runtime),
             created: env.now(),
             connect_requests: connect_tx,
-            connect_admission: ConnectAdmission::default(),
+            connect_admission: ConnectAdmission::new(pending_connects),
             retirements: Arc::default(),
             local_addr,
             link_mtu,
@@ -1256,24 +1257,26 @@ impl<T: Transport, Env: UtpEnvironment> SocketState<T, Env> {
             self.stats.connecting.decrement(1);
         });
 
+        // The timeout runs from the SYN request, not from the wait for
+        // admission.
+        let permit = self
+            .connect_admission
+            .acquire(&self.cancellation_token)
+            .await?;
+        if self.cancellation_token.is_cancelled() {
+            return Err(Error::DispatcherDead);
+        }
+        let (tx, rx) = oneshot::channel();
+        let (retired, mut guard) = self.retirements.registration();
+        self.connect_requests
+            .try_send(PendingConnectRequest {
+                remote,
+                retired,
+                permit,
+                requester: RequestWithSpan::new(tx),
+            })
+            .map_err(|_| Error::DispatcherDead)?;
         let stream_or_err = tokio::time::timeout(self.opts.connect_timeout, async {
-            let permit = self
-                .connect_admission
-                .acquire(&self.cancellation_token)
-                .await?;
-            if self.cancellation_token.is_cancelled() {
-                return Err(Error::DispatcherDead);
-            }
-            let (tx, rx) = oneshot::channel();
-            let (retired, mut guard) = self.retirements.registration();
-            self.connect_requests
-                .try_send(PendingConnectRequest {
-                    remote,
-                    retired,
-                    permit,
-                    requester: RequestWithSpan::new(tx),
-                })
-                .map_err(|_| Error::DispatcherDead)?;
             let result = tokio::select! {
                 biased;
                 _ = self.cancellation_token.cancelled() => return Err(Error::DispatcherDead),
