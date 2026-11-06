@@ -73,6 +73,21 @@ impl Keys {
 struct State {
     keys: Keys,
     provenance: Provenance,
+    // The CRC32 of the plaintext before this point, so a replay from it
+    // can say the prefix's checksum without reading the prefix back.
+    crc: u32,
+}
+
+impl State {
+    fn fold(&mut self, plain: &[u8]) {
+        if !plain.is_empty() {
+            self.crc = crate::grid::crc32_combine(
+                self.crc,
+                crate::grid::crc32(plain),
+                plain.len() as u64,
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -151,9 +166,10 @@ impl Open {
             if !read(range, &mut plain) || plain.len() as u64 != range.len() {
                 return None;
             }
-            for byte in plain {
+            for &byte in &plain {
                 state.keys.update(byte);
             }
+            state.fold(&plain);
             state.provenance = crate::crypt::worse(state.provenance, provenance);
             at = end;
             if at % STEP == 0 {
@@ -174,12 +190,16 @@ impl Open {
         let mut state = self.state(offset, coverage, read)?;
         state.provenance = crate::crypt::worse(state.provenance, provenance);
         let mut plain = Vec::with_capacity(cipher.len());
+        let mut folded = 0;
         for (at, &byte) in (offset..).zip(cipher) {
             plain.push(state.keys.decrypt(byte));
             if (at + 1) % STEP == 0 {
+                state.fold(&plain[folded..]);
+                folded = plain.len();
                 self.checkpoints.insert(at + 1, state.clone());
             }
         }
+        state.fold(&plain[folded..]);
         let end = offset + cipher.len() as u64;
         if end >= self.frontier.0 {
             self.frontier = (end, state.clone());
@@ -318,7 +338,11 @@ impl Cipher {
                 self.rejected.insert(candidate);
                 continue;
             }
-            let state = State { keys, provenance };
+            let state = State {
+                keys,
+                provenance,
+                crc: 0,
+            };
             self.open = Some(Arc::new(Open {
                 checkpoints: BTreeMap::from([(0, state.clone())]),
                 frontier: (0, state),
@@ -528,8 +552,10 @@ impl super::Zip {
             // A repair that waited for its replay across a restore is
             // replayed now the keys are back. Restored plaintext alone
             // goes again only on a failed CRC's retry.
-            if !was_open && !cipher.pending.is_empty() {
-                again.push(ByteRange::at(data, entry.length));
+            if !was_open
+                && let Some(from) = cipher.pending.iter().map(|(wanted, _, _)| wanted.start).min()
+            {
+                again.push(ByteRange::new(data + from, data + entry.length));
             }
             if entry.length == 0 && entry.crc == 0 && !self.members[member.0 as usize].closed {
                 cipher.proven = true;
@@ -726,7 +752,9 @@ impl super::Zip {
         }
         let mut input = bytes.to_vec();
         let range = ByteRange::at(offset, input.len() as u64);
-        let replaying = !cipher.pending.is_empty();
+        // Where the replay already asked for starts: a repair at or after
+        // it is replayed with it.
+        let replay_from = cipher.pending.iter().map(|(wanted, _, _)| wanted.start).min();
         let mut provenance = provenance;
         for (wanted, replacement, source) in &cipher.pending {
             if let Some(part) = wanted.intersect(range) {
@@ -737,7 +765,13 @@ impl super::Zip {
                 provenance = crate::crypt::worse(provenance, *source);
             }
         }
-        let trial = !replaying && coverage.covered(range);
+        // Bytes said already are tried on a copy of the keys: what they
+        // decrypt to replaces nothing until the suffix after them is
+        // replayed through the new feedback.
+        let trial = coverage.covered(range);
+        // The delivery's own provenance, not the chain's: a repair waits
+        // as what it is, whatever damage stood before it.
+        let source = provenance;
         let mut updated = if trial {
             Arc::new(Open::clone(open))
         } else {
@@ -752,13 +786,35 @@ impl super::Zip {
         };
         // Capture the old suffix before replacing its prefix. Every byte
         // after a changed ciphertext byte needs the new feedback state.
-        if !replaying && coverage.covered(range) {
+        // The prefix before the change cannot change: the replay starts
+        // at it, and runs to the member's end, as far as anything came.
+        if trial {
             let mut previous = Vec::new();
             if plain(range, &mut previous) && previous != bytes {
                 cipher.changed();
-                cipher.pending.push((range, input, provenance));
-                let again = ByteRange::at(entry.data.unwrap(), entry.length);
+                cipher.pending.push((range, input, source));
+                let data = entry.data.unwrap();
+                let again = ByteRange::new(data + range.start, data + entry.length);
                 entry.cipher = Some(cipher);
+                if replay_from.is_some_and(|from| from <= range.start) {
+                    return;
+                }
+                // The replay says everything from the change again; the
+                // prefix's checksum, from the keys' state at the change,
+                // stands for the bytes before it in the member's CRC.
+                if let Some(prefix) =
+                    Arc::make_mut(&mut updated).state(range.start, coverage, &mut plain)
+                {
+                    self.grid.offer(
+                        member,
+                        crate::grid::WHOLE,
+                        &weaver_graph::Segment {
+                            range: ByteRange::new(0, range.start),
+                            crc32: prefix.crc,
+                            verified: prefix.provenance.is_verified(),
+                        },
+                    );
+                }
                 let mut pieces = Vec::new();
                 self.to_volumes(again, &mut pieces);
                 out.extend(

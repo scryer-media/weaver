@@ -975,3 +975,109 @@ fn an_unproven_partial_restore_continues_without_replaying_the_member() {
     assert!(owner.member("alpha.bin").closed);
     assert!(owner.posted(0) == Some(archive));
 }
+
+// Two damaged bytes, each repaired in turn: each repair replays the member
+// from the repaired byte on, never from its front.
+#[test]
+fn a_zipcrypto_repair_replays_only_from_the_repaired_byte() {
+    let plain = payload(88, 300_007);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let end = start + plain.len() as u64;
+    let a = ByteRange::at(start + 20_000, 1);
+    let b = ByteRange::at(start + 200_000, 1);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, a.start));
+    owner.deliver_as(0, a, Provenance::Damaged, Some(&[archive[a.start as usize] ^ 0x5a]));
+    owner.deliver(0, ByteRange::new(a.end, b.start));
+    owner.deliver_as(0, b, Provenance::Damaged, Some(&[archive[b.start as usize] ^ 0x5a]));
+    owner.deliver(0, ByteRange::new(b.end, archive.len() as u64));
+    let agains = |said: &[Emit]| -> Vec<ByteRange> {
+        said.iter()
+            .filter_map(|emit| match emit {
+                Emit::Again { range, .. } => Some(*range),
+                _ => None,
+            })
+            .collect()
+    };
+    let first = owner.said.len();
+    owner.deliver_as(0, a, Provenance::Repaired, None);
+    assert_eq!(agains(&owner.said[first..]), vec![ByteRange::new(a.start, end)]);
+    let second = owner.said.len();
+    owner.deliver_as(0, b, Provenance::Repaired, None);
+    assert_eq!(agains(&owner.said[second..]), vec![ByteRange::new(b.start, end)]);
+    assert!(
+        !owner.said[first..]
+            .iter()
+            .any(|emit| matches!(emit, Emit::Retract(_) | Emit::NeedsPassword)),
+        "{:?}",
+        &owner.said[first..]
+    );
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+}
+
+// A second repair that comes before the first one's replay joins it: the
+// one replay from the earlier repair carries both.
+#[test]
+fn zipcrypto_repairs_before_their_replay_are_replayed_once() {
+    use weaver_graph::{Delivery, Evidenced, Placement};
+    let plain = payload(108, 300_007);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let a = ByteRange::at(start + 20_000, 1);
+    let b = ByteRange::at(start + 150_000, 1);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, a.start));
+    owner.deliver_as(0, a, Provenance::Damaged, Some(&[archive[a.start as usize] ^ 0x5a]));
+    owner.deliver(0, ByteRange::new(a.end, b.start));
+    owner.deliver_as(0, b, Provenance::Damaged, Some(&[archive[b.start as usize] ^ 0x5a]));
+    owner.deliver(0, ByteRange::new(b.end, archive.len() as u64));
+    let previous = owner.member("alpha.bin").bytes.clone();
+    let mut repair = |owner: &mut Owner, range: ByteRange| {
+        let mut out = Vec::new();
+        owner.object.deliver(
+            Delivery {
+                volume: VolumeIndex(0),
+                offset: range.start,
+                bytes: &Evidenced::from(archive[range.start as usize..range.end as usize].to_vec()),
+                provenance: Provenance::Repaired,
+            },
+            &mut |placement, into| {
+                if let Placement::Member { range, .. } = placement {
+                    into.extend_from_slice(&previous[range.start as usize..range.end as usize]);
+                    true
+                } else {
+                    false
+                }
+            },
+            &mut out,
+        );
+        owner
+            .delivered
+            .get_mut(&0)
+            .unwrap()
+            .write(range, Provenance::Repaired);
+        out
+    };
+    let first = repair(&mut owner, a);
+    let second = repair(&mut owner, b);
+    assert!(first.iter().any(|emit| matches!(emit, Emit::Again { .. })));
+    assert!(
+        !second.iter().any(|emit| matches!(emit, Emit::Again { .. })),
+        "{second:?}"
+    );
+    owner.apply(first);
+    owner.apply(second);
+    owner.close(0);
+    assert!(owner.member("alpha.bin").bytes == plain, "{:?}", owner.said);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+    let cipher = owner.object.map.as_ref().unwrap().entry(MemberId(0)).unwrap();
+    assert!(cipher.cipher.as_ref().unwrap().pending.is_empty());
+}
