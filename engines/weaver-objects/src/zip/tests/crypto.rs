@@ -651,6 +651,41 @@ fn a_small_zipcrypto_entry_can_use_a_zip64_data_descriptor() {
     )));
 }
 
+// A zip64 field in the local header makes the descriptor's sizes 8 bytes
+// each though neither size is saturated, as APPNOTE 4.3.9.2 has it.
+#[test]
+fn a_zip64_field_widens_the_descriptor_whatever_the_sizes() {
+    let plain = payload(103, 100_003);
+    let mut archive = encrypted_descriptor(&plain);
+    let local = records::local_len(&archive).unwrap() as usize;
+    let old_directory = records::find_end(&archive).unwrap().offset;
+    archive[28..30].copy_from_slice(&20u16.to_le_bytes());
+    let mut extra = vec![1, 0, 16, 0];
+    extra.extend((plain.len() as u64).to_le_bytes());
+    extra.extend((plain.len() as u64 + 12).to_le_bytes());
+    archive.splice(local..local, extra);
+    let descriptor = local + 20 + 12 + plain.len();
+    let mut wide = 0x0807_4b50u32.to_le_bytes().to_vec();
+    wide.extend(crate::grid::crc32(&plain).to_le_bytes());
+    wide.extend((plain.len() as u64 + 12).to_le_bytes());
+    wide.extend((plain.len() as u64).to_le_bytes());
+    archive.splice(descriptor..descriptor + 16, wide);
+    let end = records::find_end(&archive).unwrap();
+    archive[end.at as usize + 16..end.at as usize + 20]
+        .copy_from_slice(&(old_directory as u32 + 28).to_le_bytes());
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, PASSWORD);
+    owner.whole(4096);
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+    assert!(!owner.said.iter().any(|emit| matches!(
+        emit,
+        Emit::Damaged { .. } | Emit::NeedsEngine(_) | Emit::Refuse(_)
+    )));
+}
+
 #[test]
 fn an_inverse_frontier_is_bound_to_the_candidate_that_produced_it() {
     use weaver_graph::{Coverage, Placement};

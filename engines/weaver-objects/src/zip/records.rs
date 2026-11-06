@@ -338,6 +338,19 @@ pub(crate) fn local(bytes: &[u8]) -> Option<Header> {
     })
 }
 
+// Whether a whole local header carries a zip64 field. APPNOTE 4.3.9.2:
+// with one, the sizes in the data descriptor after the entry are 8 bytes
+// each, whatever the sizes are.
+pub(crate) fn local_zip64(bytes: &[u8]) -> bool {
+    let (Some(len), Some(name_len)) = (local_len(bytes), u16_at(bytes, 26)) else {
+        return false;
+    };
+    let extra_at = LOCAL_LEN as usize + name_len as usize;
+    bytes
+        .get(extra_at..len as usize)
+        .is_some_and(|extra| field(extra, ZIP64).is_some())
+}
+
 // Whether an entry's local header says what its directory entry says, as
 // the zip library compares them: an entry whose two headers disagree reads
 // as one file to a reader of the directory and as another to one that walks
