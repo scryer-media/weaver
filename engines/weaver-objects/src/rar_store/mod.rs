@@ -715,10 +715,11 @@ impl Object for RarStore {
         loop {
             let found = self.volume(volume);
             let generation = found.kept.generation();
-            if found
+            if let Some(at) = found
                 .kept
                 .absorb(range, delivery.bytes, delivery.provenance)
             {
+                found.walk.changed_from(at);
                 self.touch(volume);
             }
             self.settle(Some((volume, range)), out);

@@ -12,8 +12,8 @@
 use std::sync::Arc;
 
 use unrar_rs::{
-    ArchiveFormat, KdfCache, RarArchive, RarError, RarVolumeFacts, RarVolumeFactsWalk,
-    RarVolumeHeaderEncryption,
+    ArchiveFormat, KdfCache, RarArchive, RarError, RarVolumeFacts, RarVolumeFactsCursor,
+    RarVolumeFactsWalk, RarVolumeHeaderEncryption,
 };
 use weaver_graph::{ByteRange, Emit, Why};
 
@@ -56,6 +56,27 @@ pub(super) struct Walk {
     pub(super) ended: bool,
     pub(super) blocks: Vec<Block>,
     pub(super) locked: Option<RarVolumeHeaderEncryption>,
+    // Where the next walk reads on from: every header before it was read
+    // whole from bytes that have not changed since.
+    pub(super) cursor: RarVolumeFactsCursor,
+}
+
+// Where each walk began on this thread, for a test: 0 from the signature.
+#[cfg(test)]
+pub(super) mod began {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static BEGAN: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn note(at: u64) {
+        BEGAN.with_borrow_mut(|began| began.push(at));
+    }
+
+    pub(crate) fn take() -> Vec<u64> {
+        BEGAN.with(RefCell::take)
+    }
 }
 
 fn signature_len(facts: &RarVolumeFacts) -> u64 {
@@ -243,6 +264,14 @@ impl Walk {
         self.successor() == Some(false)
     }
 
+    // A kept byte changed from `at` on: a walk that read on past it begins
+    // again from the signature, and one short of it reads on.
+    pub(super) fn changed_from(&mut self, at: u64) {
+        if self.cursor.resumes_at().is_some_and(|resumes| at < resumes) {
+            self.cursor.restart();
+        }
+    }
+
     // Walk again over what is kept: the store steps only a volume something
     // the walk reads changed for.
     pub(super) fn step(
@@ -258,12 +287,26 @@ impl Walk {
         if hole(kept, 0, closed) < signature.end {
             return self.waiting(kept, closed, false);
         }
+        #[cfg(test)]
+        began::note(self.cursor.resumes_at().unwrap_or(0));
         let image = SparseImage::of(kept, closed);
-        let walk = match RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
-            image,
-            password,
-            Arc::clone(kdf),
-        ) {
+        let walked = self.cursor.step(image, password, Arc::clone(kdf));
+        // A walk read on from the cursor reads what one from the signature
+        // reads over the same bytes.
+        #[cfg(test)]
+        assert_eq!(
+            format!("{walked:?}"),
+            format!(
+                "{:?}",
+                RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
+                    SparseImage::of(kept, closed),
+                    password,
+                    Arc::clone(kdf),
+                )
+            ),
+            "a resumed walk reads as a fresh one"
+        );
+        let walk = match walked {
             Ok(walk) => walk,
             Err(RarError::EncryptedArchive) => {
                 let image = SparseImage::of(kept, closed);

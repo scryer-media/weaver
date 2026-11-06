@@ -44,6 +44,26 @@ impl Piece {
     }
 }
 
+// The first offset of `range` its coverage does not hold as `provenance`:
+// a byte it never had, or one it had with another.
+fn first_untrusted(coverage: &Coverage, range: ByteRange, provenance: Provenance) -> Option<u64> {
+    let mut at = range.start;
+    for run in coverage.overlapping(range) {
+        let start = run.range.start.max(range.start);
+        if start > at {
+            return Some(at);
+        }
+        if run.provenance != provenance {
+            return Some(start);
+        }
+        at = at.max(run.range.end);
+        if at >= range.end {
+            return None;
+        }
+    }
+    (at < range.end).then_some(at)
+}
+
 // A piece's bytes at `at..at + len`, grown to reach them.
 fn reach(bytes: &mut Vec<u8>, at: usize, len: usize) -> &mut [u8] {
     if bytes.len() < at + len {
@@ -144,15 +164,16 @@ impl Kept {
             .filter(move |piece| piece.range.intersect(range).is_some())
     }
 
-    // Keep what of a delivery lands in a wanted range. Whether anything kept
-    // changed, in its bytes or in how far they can be trusted.
+    // Keep what of a delivery lands in a wanted range. The first offset where
+    // anything kept changed, in its bytes or in how far they can be trusted;
+    // `None` when nothing did.
     pub(crate) fn absorb(
         &mut self,
         range: ByteRange,
         bytes: &[u8],
         provenance: Provenance,
-    ) -> bool {
-        let mut changed = false;
+    ) -> Option<u64> {
+        let mut changed: Option<u64> = None;
         for piece in self.pieces.values_mut() {
             let Some(overlap) = piece.range.intersect(range) else {
                 continue;
@@ -160,18 +181,19 @@ impl Kept {
             let from = &bytes
                 [(overlap.start - range.start) as usize..(overlap.end - range.start) as usize];
             let at = (overlap.start - piece.range.start) as usize;
+            let trusted = first_untrusted(&piece.coverage, overlap, provenance);
             let into = reach(&mut piece.bytes, at, from.len());
-            let same = piece.coverage.covered(overlap)
-                && piece
-                    .coverage
-                    .overlapping(overlap)
-                    .all(|run| run.provenance == provenance)
-                && *into == *from;
-            if !same {
-                into.copy_from_slice(from);
-                piece.coverage.write(overlap, provenance);
-                changed = true;
-            }
+            let differs = into
+                .iter()
+                .zip(from)
+                .position(|(held, came)| held != came)
+                .map(|offset| overlap.start + offset as u64);
+            let Some(first) = [trusted, differs].into_iter().flatten().min() else {
+                continue;
+            };
+            into.copy_from_slice(from);
+            piece.coverage.write(overlap, provenance);
+            changed = Some(changed.map_or(first, |was| was.min(first)));
         }
         changed
     }
@@ -402,15 +424,24 @@ mod tests {
     fn only_wanted_bytes_are_kept_and_a_later_want_keeps_what_was_kept() {
         let mut kept = Kept::default();
         kept.want(ByteRange::new(10, 20));
-        assert!(kept.absorb(ByteRange::new(0, 30), &[1; 30], Provenance::Fresh));
-        assert!(!kept.absorb(ByteRange::new(0, 30), &[1; 30], Provenance::Fresh));
+        assert_eq!(
+            kept.absorb(ByteRange::new(0, 30), &[1; 30], Provenance::Fresh),
+            Some(10)
+        );
+        assert_eq!(
+            kept.absorb(ByteRange::new(0, 30), &[1; 30], Provenance::Fresh),
+            None
+        );
         assert_eq!(kept.read(ByteRange::new(10, 20)), Some(&[1u8; 10][..]));
         kept.want(ByteRange::new(15, 40));
         assert_eq!(kept.read(ByteRange::new(10, 20)), Some(&[1u8; 10][..]));
         let mut missing = Vec::new();
         kept.missing(ByteRange::new(10, 40), &mut missing);
         assert_eq!(missing, vec![ByteRange::new(20, 40)]);
-        assert!(kept.absorb(ByteRange::new(12, 13), &[9], Provenance::Repaired));
+        assert_eq!(
+            kept.absorb(ByteRange::new(12, 13), &[9], Provenance::Repaired),
+            Some(12)
+        );
         assert!(kept.verified(ByteRange::new(10, 20)));
     }
 
@@ -420,7 +451,10 @@ mod tests {
         let declared = ByteRange::new(32, 1 << 62);
         kept.want(declared);
         assert_eq!(kept.from(32), &[] as &[u8]);
-        assert!(kept.absorb(ByteRange::new(0, 64), &[7; 64], Provenance::Fresh));
+        assert_eq!(
+            kept.absorb(ByteRange::new(0, 64), &[7; 64], Provenance::Fresh),
+            Some(32)
+        );
         assert_eq!(kept.read(ByteRange::new(32, 64)), Some(&[7u8; 32][..]));
         assert_eq!(kept.read(declared), None);
         kept.want(ByteRange::new(0, 40));
