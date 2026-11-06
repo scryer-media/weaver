@@ -89,7 +89,9 @@ async fn a_parsed_mapped_allowlist_admits_both_representations_and_refuses_other
     assert!(harness.peers.with_peer(refused, |_| ()).is_none());
     for peer in peers() {
         harness.add_peer(peer, PeerSourceFlag::Tracker);
-        assert!(harness.peers.with_peer(peer, |_| ()).is_some(), "{peer}");
+        let key = crate::network::canonical_socket_addr(peer);
+        assert!(harness.peers.with_peer(key, |_| ()).is_some(), "{peer}");
     }
+    assert_eq!(harness.peers.states.len(), 1);
     harness._session.stop().await;
 }

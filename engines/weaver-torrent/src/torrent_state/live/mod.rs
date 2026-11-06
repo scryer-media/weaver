@@ -1371,8 +1371,10 @@ impl TorrentStateLive {
         }
     }
 
-    /// `source` named `addr` (libtorrent `torrent::add_peer`).
+    /// `source` named `addr` (libtorrent `torrent::add_peer`). A mapped
+    /// address names its IPv4 peer, so one peer has one entry.
     pub(crate) fn add_peer(&self, addr: SocketAddr, source: PeerSourceFlag) {
+        let addr = crate::network::canonical_socket_addr(addr);
         if self.may_connect_to(addr) {
             self.peers.add_peer(addr, source);
         }
@@ -1381,6 +1383,7 @@ impl TorrentStateLive {
     /// A holepunch asks us to connect to `addr`: over uTP, so only when we
     /// speak it (libtorrent `bt_peer_connection::on_holepunch`, `connect`).
     fn holepunch(&self, addr: SocketAddr) {
+        let addr = crate::network::canonical_socket_addr(addr);
         if self.utp && self.may_connect_to(addr) {
             self.peers.holepunch(addr);
         }
