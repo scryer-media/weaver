@@ -904,6 +904,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bzip2-turbo"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f542fbec5f6cd891cb388b7e45670b56624a5e207ad507d830e64956aaf64a0"
+dependencies = [
+ "crc-turbo",
+]
+
+[[package]]
 name = "cap-fs-ext"
 version = "4.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4575,13 +4584,13 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.29.3"
+version = "0.29.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47e78cf4c24e122389175a1f0570faf86fce2c786fec113f4617e3ebf97b2789"
+checksum = "d874c46bb2ea4a1921628682fc80e3875dae43e13517172312781f8250e9a4db"
 dependencies = [
  "aws-lc-rs",
  "brotli",
- "bzip2",
+ "bzip2-turbo",
  "cap-std",
  "flate2",
  "getrandom 0.4.3",
