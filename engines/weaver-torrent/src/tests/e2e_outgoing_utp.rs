@@ -217,24 +217,41 @@ async fn legacy_and_disabled_outgoing_utp_do_not_bind_an_unsupported_factory() -
 }
 
 #[tokio::test]
-async fn explicit_outgoing_utp_bind_failure_is_not_hidden_by_tcp() -> anyhow::Result<()> {
-    for tcp in [false, true] {
-        let directory = TempDir::new()?;
-        let factory = Arc::new(Factory {
-            reject_utp: true,
-            ..Default::default()
-        });
-        let result = Session::new_with_opts(
-            directory.path().into(),
-            options(&factory, Some(true), false, tcp),
-        )
-        .await;
-        assert!(result.is_err());
-        assert_eq!(factory.utp_attempts.load(Ordering::Relaxed), 1);
-        assert_eq!(factory.tcp_attempts.load(Ordering::Relaxed), 0);
-        assert_eq!(factory.listeners.load(Ordering::Relaxed), 0);
-        assert!(factory.bound.lock().unwrap().is_empty());
-    }
+async fn explicit_outgoing_utp_bind_failure_fails_a_session_without_tcp() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
+    let factory = Arc::new(Factory {
+        reject_utp: true,
+        ..Default::default()
+    });
+    let result = Session::new_with_opts(
+        directory.path().into(),
+        options(&factory, Some(true), false, false),
+    )
+    .await;
+    assert!(result.is_err());
+    assert_eq!(factory.utp_attempts.load(Ordering::Relaxed), 1);
+    assert_eq!(factory.tcp_attempts.load(Ordering::Relaxed), 0);
+    assert_eq!(factory.listeners.load(Ordering::Relaxed), 0);
+    assert!(factory.bound.lock().unwrap().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_outgoing_utp_bind_failure_leaves_a_tcp_session_running() -> anyhow::Result<()> {
+    let directory = TempDir::new()?;
+    let factory = Arc::new(Factory {
+        reject_utp: true,
+        ..Default::default()
+    });
+    let session = Session::new_with_opts(
+        directory.path().into(),
+        options(&factory, Some(true), false, true),
+    )
+    .await?;
+    assert_eq!(factory.utp_attempts.load(Ordering::Relaxed), 1);
+    assert!(session.utp_sockets.is_empty());
+    assert!(factory.bound.lock().unwrap().is_empty());
+    session.stop().await;
     Ok(())
 }
 
