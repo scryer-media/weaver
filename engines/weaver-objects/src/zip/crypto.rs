@@ -580,7 +580,7 @@ impl super::Zip {
     pub(super) fn posted_over(&self, ranges: &[(weaver_graph::VolumeIndex, ByteRange)]) -> Posted {
         use weaver_graph::{Placement, Placements};
         let placed = Placements::take(ranges, |volume, range, out: &mut Vec<Placement>| {
-            self.place(volume, range, out)
+            self.place_as(volume, range, true, out)
         });
         let mut sealed = Vec::new();
         for &(volume, range) in ranges {

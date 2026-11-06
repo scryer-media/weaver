@@ -44,6 +44,19 @@ fn push(out: &mut Vec<Placement>, placement: Placement) {
 
 impl Zip {
     pub(super) fn place(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
+        self.place_as(volume, range, false, out);
+    }
+
+    // Where a range's bytes are, for a delivery or, `posting`, for reading
+    // back what was posted: there ciphertext past both the keys' frontier
+    // and the member's said front is held, wherever the range starts.
+    pub(super) fn place_as(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        posting: bool,
+        out: &mut Vec<Placement>,
+    ) {
         let Some(global) = self.global(volume, range) else {
             return push(out, Placement::Held { range });
         };
@@ -64,6 +77,37 @@ impl Zip {
                 ),
                 Piece::Member(member, range) => {
                     let entry = self.map.as_ref().and_then(|map| map.entry(member));
+                    // Split where what the keys reach, or the member said,
+                    // ends: only the part past it can be held.
+                    let split = posting
+                        .then(|| entry.and_then(|entry| entry.cipher.as_ref()?.open.as_ref()))
+                        .flatten()
+                        .map(|open| {
+                            let said = self.members[member.0 as usize]
+                                .coverage
+                                .runs()
+                                .next()
+                                .filter(|run| run.range.start == 0)
+                                .map_or(0, |run| run.range.end);
+                            open.reaches().max(said)
+                        })
+                        .filter(|at| range.start < *at && *at < range.end);
+                    if let Some(at) = split {
+                        push(
+                            out,
+                            Placement::Member {
+                                member,
+                                range: ByteRange::new(range.start, at),
+                            },
+                        );
+                        let start = entry.and_then(|entry| entry.data).unwrap();
+                        self.held_or_kept(
+                            ByteRange::new(at, range.end).shift(start as i64),
+                            base,
+                            out,
+                        );
+                        continue;
+                    }
                     let locked =
                         entry
                             .and_then(|entry| entry.cipher.as_ref())

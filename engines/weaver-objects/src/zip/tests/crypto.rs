@@ -1137,6 +1137,36 @@ fn a_sent_back_article_corrects_the_tail_after_it() {
     assert!(owner.posted(0) == Some(archive));
 }
 
+// Ciphertext held past a gap the keys wait at reads back through a posting
+// of the whole volume as through one of its own range.
+#[test]
+fn a_whole_volume_posting_reads_held_ciphertext_past_the_frontier() {
+    let plain = payload(88, 300_007);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let gap = ByteRange::at(start + 100_000, 4096);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, gap.start));
+    owner.deliver(0, ByteRange::new(gap.end, archive.len() as u64));
+    let after = ByteRange::at(gap.end + 10_000, 4096);
+    let expected = &archive[after.start as usize..after.end as usize];
+    let mut alone = Vec::new();
+    assert!(owner.read_posted(VolumeIndex(0), after, &mut alone));
+    assert!(alone == expected);
+    let whole = ByteRange::new(0, archive.len() as u64);
+    let posting = owner.object.posting(&[(VolumeIndex(0), whole)]);
+    let mut through = Vec::new();
+    assert!(owner.read_through_posting(posting.as_ref(), VolumeIndex(0), after, &mut through));
+    assert!(through == expected);
+    // A run from the front across the frontier into the held bytes.
+    let across = ByteRange::new(gap.start - 4096, gap.start);
+    let mut front = Vec::new();
+    assert!(owner.read_through_posting(posting.as_ref(), VolumeIndex(0), across, &mut front));
+    assert!(front == archive[across.start as usize..across.end as usize]);
+}
+
 // A repair in the member's last bytes lies inside the tail the end record
 // was searched for in, but in no record the directory read: the map stands,
 // and the repair replays from its byte once.

@@ -478,6 +478,42 @@ impl Owner {
         self.object.posted(volume, range, &mut read, into)
     }
 
+    // As `read_posted`, through a posting taken over other ranges, as the
+    // tree reads a whole volume's posting.
+    pub(super) fn read_through_posting(
+        &self,
+        posting: &dyn weaver_graph::Posting,
+        volume: VolumeIndex,
+        range: ByteRange,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        let mut read = |placement: &Placement, into: &mut Vec<u8>| -> bool {
+            match placement {
+                Placement::Member { member, range } => {
+                    let Some(got) = self.members.get(&member.0) else {
+                        return false;
+                    };
+                    if !got.coverage.covered(*range) {
+                        return false;
+                    }
+                    into.extend_from_slice(&got.bytes[range.start as usize..range.end as usize]);
+                    true
+                }
+                Placement::Envelope { envelope, range } => {
+                    match self.object.envelope(*envelope, *range) {
+                        Some(bytes) => {
+                            into.extend_from_slice(&bytes);
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                Placement::Held { range } => read_held(&self.held, volume, *range, into),
+            }
+        };
+        posting.posted(volume, range, &mut read, into)
+    }
+
     // A member by name.
     pub fn member(&self, name: &str) -> &Got {
         self.members
