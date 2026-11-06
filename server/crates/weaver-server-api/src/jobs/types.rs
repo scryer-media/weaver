@@ -310,10 +310,24 @@ pub struct QueueSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
+#[graphql(complex)]
 pub struct GlobalQueueState {
     pub is_paused: bool,
     pub speed_limit_bytes_per_sec: u64,
     pub download_block: DownloadBlock,
+}
+
+#[async_graphql::ComplexObject]
+impl GlobalQueueState {
+    /// When a timed pause resumes downloads on its own, in epoch milliseconds.
+    /// Null when no resume is scheduled.
+    async fn resume_at_epoch_ms(&self, ctx: &async_graphql::Context<'_>) -> Option<u64> {
+        let coordinator = ctx.data_opt::<crate::ScheduledResumeCoordinator>()?;
+        match coordinator.resume_at().await {
+            0 => None,
+            secs => Some(secs.saturating_mul(1000)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]

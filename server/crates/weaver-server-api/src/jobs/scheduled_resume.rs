@@ -116,6 +116,20 @@ impl ScheduledResumeCoordinator {
         self.set_paused(true).await
     }
 
+    // Pause now and resume at the deadline, under one lock so no other
+    // pause or resume lands between the two.
+    pub async fn pause_until(&self, resume_at_epoch_secs: u64) -> Result<(), ScheduledResumeError> {
+        let generation = {
+            let mut state = self.inner.state.lock().await;
+            state.invalidate();
+            self.inner.handle.pause_all().await?;
+            Self::write_setting(self.inner.db.clone(), resume_at_epoch_secs).await?;
+            state.arm(resume_at_epoch_secs)
+        };
+        self.spawn_timer(resume_at_epoch_secs, generation);
+        Ok(())
+    }
+
     pub async fn resume_all(&self) -> Result<(), ScheduledResumeError> {
         self.set_paused(false).await
     }

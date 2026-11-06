@@ -194,6 +194,54 @@ async fn is_paused_true_after_pause_all() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn timed_pause_all_resumes_after_the_duration() {
+    let h = TestHarness::new().await;
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let resp = h.execute("mutation { pauseAll(resumeAfterSecs: 1800) }").await;
+    assert_no_errors(&resp);
+    assert!(h.handle.is_globally_paused());
+
+    let resume_at = h.scheduled_resume.resume_at().await;
+    assert!(resume_at >= before + 1800);
+    assert_eq!(
+        h.db.get_setting("nzbget.scheduled_resume_at").unwrap(),
+        Some(resume_at.to_string())
+    );
+    let resp = h.execute("{ globalQueueState { resumeAtEpochMs } }").await;
+    assert_no_errors(&resp);
+    assert_eq!(
+        response_data(&resp)["globalQueueState"]["resumeAtEpochMs"].as_u64(),
+        Some(resume_at * 1000)
+    );
+
+    // The timer sleeps on the paused clock from whenever its task first runs,
+    // so the clock steps a second at a time until the queue is out of the
+    // pause rather than jumping once past a deadline it may not have set yet.
+    while h.handle.is_globally_paused() {
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    }
+    assert_eq!(h.scheduled_resume.resume_at().await, 0);
+    let resp = h.execute("{ globalQueueState { resumeAtEpochMs } }").await;
+    assert_no_errors(&resp);
+    assert!(response_data(&resp)["globalQueueState"]["resumeAtEpochMs"].is_null());
+}
+
+#[tokio::test]
+async fn timed_pause_all_rejects_out_of_range_durations() {
+    let h = TestHarness::new().await;
+    for secs in [0, 2_592_001] {
+        let resp = h
+            .execute(&format!("mutation {{ pauseAll(resumeAfterSecs: {secs}) }}"))
+            .await;
+        assert!(!resp.errors.is_empty(), "{secs} accepted");
+    }
+    assert!(!h.handle.is_globally_paused());
+}
+
+#[tokio::test(start_paused = true)]
 async fn graphql_global_pause_surfaces_cancel_scheduled_resume() {
     let h = TestHarness::new().await;
     let mutations = [

@@ -40,6 +40,9 @@ use weaver_server_core::{
     Database, FieldUpdate, JobUpdate, QueueMoveTarget, SchedulerError, SchedulerHandle,
 };
 
+/// Longest timed pause, matching NZBGet's `scheduleresume` bound.
+const MAX_RESUME_AFTER_SECS: u64 = 60 * 60 * 24 * 30;
+
 #[derive(Default)]
 pub(crate) struct JobsMutation;
 
@@ -739,11 +742,28 @@ impl JobsMutation {
         map_scheduler_result(handle.reorder_job(JobId(id), target).await)?;
         Ok(true)
     }
-    /// Pause all download dispatch globally.
+    /// Pause all download dispatch globally. With `resumeAfterSecs`, downloads
+    /// resume on their own after that many seconds (1 to 30 days).
     #[graphql(guard = "ControlGuard")]
-    async fn pause_all(&self, ctx: &Context<'_>) -> Result<bool> {
+    async fn pause_all(&self, ctx: &Context<'_>, resume_after_secs: Option<u64>) -> Result<bool> {
         let scheduled_resume = ctx.data::<ScheduledResumeCoordinator>()?;
-        map_scheduled_resume_result(scheduled_resume.pause_all().await)?;
+        let result = match resume_after_secs {
+            None => scheduled_resume.pause_all().await,
+            Some(secs) if (1..=MAX_RESUME_AFTER_SECS).contains(&secs) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                scheduled_resume.pause_until(now + secs).await
+            }
+            Some(_) => {
+                return Err(graphql_error(
+                    "INVALID_INPUT",
+                    "resumeAfterSecs must be between 1 and 2592000",
+                ));
+            }
+        };
+        map_scheduled_resume_result(result)?;
         Ok(true)
     }
     /// Resume all download dispatch globally.
