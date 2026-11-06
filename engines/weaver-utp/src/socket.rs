@@ -904,12 +904,9 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             })
             .count();
         let registered = self.streams.len().saturating_add(pending);
-        let limit = self
-            .socket
-            .connections_limit
-            .load(Ordering::Relaxed)
-            .saturating_mul(2);
-        if registered > limit {
+        let limit = self.socket.connections_limit.load(Ordering::Relaxed);
+        // A zero limit admits no stream at all.
+        if limit == 0 || registered > limit.saturating_mul(2) {
             trace!(streams = registered, "dropping SYN, too many streams");
             self.socket.stats.syn_flood_dropped.increment(1);
             return Ok(());
@@ -1813,6 +1810,38 @@ mod tests {
         dispatcher.on_recv(ADDR_2, syn(6)).await.unwrap();
         assert_eq!(dispatcher.accept_queue.syns.len(), 6);
         assert_eq!(socket.stats().snapshot().syn_flood_dropped, 3);
+    }
+
+    #[tokio::test]
+    async fn a_zero_connection_limit_admits_no_syn() {
+        use crate::{
+            SocketOpts, UtpSocket,
+            message::UtpMessage,
+            raw::{Type, UtpHeader},
+            test_util::{ADDR_1, ADDR_2, env::MockUtpEnvironment, transport::RememberingTransport},
+        };
+
+        let transport = RememberingTransport::new(ADDR_1);
+        let (socket, mut dispatcher) = UtpSocket::new_with_opts_and_dispatcher(
+            transport.clone(),
+            MockUtpEnvironment::new(),
+            SocketOpts::default(),
+        )
+        .unwrap();
+        socket.set_connections_limit(0);
+        let syn = UtpMessage::new_test(
+            UtpHeader {
+                htype: Type::Syn,
+                connection_id: 1.into(),
+                ..Default::default()
+            },
+            b"",
+        );
+        dispatcher.on_recv(ADDR_2, syn).await.unwrap();
+        assert!(dispatcher.accept_queue.syns.is_empty());
+        assert!(dispatcher.streams.is_empty());
+        assert_eq!(socket.stats().snapshot().syn_flood_dropped, 1);
+        assert!(transport.take_sent_utpmessages().is_empty(), "unanswered");
     }
 
     #[tokio::test]
