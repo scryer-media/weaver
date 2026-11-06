@@ -179,6 +179,7 @@ impl Pipeline {
         let result = graph.intake(decoded, &mut self.graph_status.repairs, limit);
         // A copy the root dropped committed nothing.
         if let Ok(true) = result {
+            graph.pending().delivered(committed);
             self.metrics
                 .bytes_committed
                 .fetch_add(committed, std::sync::atomic::Ordering::Relaxed);
@@ -324,6 +325,10 @@ impl Pipeline {
         } = &said.heard
         {
             self.pause_graph_checkpoint(job_id, control, *revision, error);
+            return;
+        }
+        if let Heard::CheckpointDue { control } = &said.heard {
+            self.graph_checkpoint_due(job_id, control);
             return;
         }
         if let Some(graph) = self.retiring_graph_jobs.get_mut(&job_id) {
@@ -486,7 +491,7 @@ impl Pipeline {
         self.wake_repair_waiters();
         self.after_graph_step(job_id);
         // The step's bytes are written: the checkpoint can say so.
-        self.checkpoint_graph_job(job_id);
+        self.step_graph_checkpoint(job_id);
     }
 
     // Lend the job's due repairs under the repair slots every graph job

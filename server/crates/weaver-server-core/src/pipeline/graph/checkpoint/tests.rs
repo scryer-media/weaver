@@ -1574,3 +1574,65 @@ async fn a_dropped_writer_leaves_only_committed_coverage_to_restore() {
             .all(|coverage| coverage.end == 64)
     );
 }
+
+// A job's steps between checkpoints take none: the write they join waits
+// on the first of them, and the run mail hears once it is due, not before.
+#[tokio::test(start_paused = true)]
+async fn steps_take_no_checkpoint_until_their_write_is_due() {
+    use crate::pipeline::graph::engine::Heard;
+    let _clock = ClockHeld::new();
+    let (db, id) = checkpoint_database();
+    let (mut job, _dir) = long_post(1);
+    let pending = Pending::default();
+    let (mail, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    assert!(
+        pending.stepped(id, &mail),
+        "the first checkpoint is due at once"
+    );
+    pending.put(&job, Vec::new());
+    let first = tokio::time::Instant::now();
+    for ordinal in 1..20 {
+        intake(&mut job, ordinal);
+        pending.delivered(1_000);
+        assert!(!pending.stepped(id, &mail));
+    }
+    assert_eq!(pending.tally().checkpoints, 1);
+    assert!(heard.try_recv().is_err());
+    tokio::time::advance(super::CHECKPOINT_AGE).await;
+    let said = heard.recv().await.unwrap();
+    assert!(
+        matches!(&said.heard, Heard::CheckpointDue { control } if control.same(&pending.control()))
+    );
+    assert_eq!(tokio::time::Instant::now(), first + super::CHECKPOINT_AGE);
+    assert!(pending.stepped(id, &mail));
+    pending.put(&job, Vec::new());
+    assert!(!pending.unread_steps());
+    pending.queue(&db, id, &mail, false);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 1, "one write takes every step");
+    assert_eq!(pending.tally().checkpoints, 2);
+    let read = snapshot(&db.load_graph_checkpoint(id).unwrap().unwrap()).unwrap();
+    let fresh = Pending::default();
+    fresh.put(&job, Vec::new());
+    assert_eq!(read, snapshot(&held(&fresh.take().0.unwrap())).unwrap());
+    assert!(heard.try_recv().is_err());
+}
+
+// A step whose bytes take the job's dirty bytes to the threshold is due at
+// once, with no wake.
+#[tokio::test(start_paused = true)]
+async fn a_step_that_reaches_the_byte_threshold_is_due_at_once() {
+    let _clock = ClockHeld::new();
+    let (mut job, _dir) = long_post(1);
+    let pending = Pending::default();
+    let (mail, _heard) = tokio::sync::mpsc::unbounded_channel();
+    let id = crate::jobs::ids::JobId(0);
+    pending.put(&job, Vec::new());
+    pending.take();
+    intake(&mut job, 1);
+    pending.delivered(super::CHECKPOINT_BYTES - 1);
+    assert!(!pending.stepped(id, &mail));
+    intake(&mut job, 2);
+    pending.delivered(1);
+    assert!(pending.stepped(id, &mail));
+}

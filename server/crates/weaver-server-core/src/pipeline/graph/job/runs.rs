@@ -43,7 +43,10 @@ impl GraphJob {
                     self.acknowledge_checkpoint(stamp.unwrap_or(said.generation));
                 }
             }
-            Heard::Emit(_) | Heard::Ended | Heard::CheckpointBlocked { .. } => {}
+            Heard::Emit(_)
+            | Heard::Ended
+            | Heard::CheckpointBlocked { .. }
+            | Heard::CheckpointDue { .. } => {}
         }
         Ok(())
     }
@@ -101,7 +104,7 @@ impl GraphJob {
                     Ok(())
                 };
             }
-            Heard::CheckpointBlocked { .. } => return Ok(()),
+            Heard::CheckpointBlocked { .. } | Heard::CheckpointDue { .. } => return Ok(()),
             _ if !self.runs.current(node, said.generation) => return Ok(()),
             Heard::Emit(emit) => {
                 // The tree is told the run is asking, as it is told how far

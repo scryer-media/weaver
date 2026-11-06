@@ -82,6 +82,12 @@ pub(crate) enum Heard {
         revision: u64,
         error: String,
     },
+    // The job's steps since its last checkpoint are old enough that the
+    // write they join is due: the job's actor takes the checkpoint.
+    // Addressed to the root, under no run's generation.
+    CheckpointDue {
+        control: crate::persistence::checkpoint_write::CheckpointControl,
+    },
 }
 
 // Where every graph job's runs speak, and where the database says a

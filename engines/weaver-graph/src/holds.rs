@@ -558,6 +558,22 @@ impl HoldLedger {
             .unwrap_or_default()
     }
 
+    // The held ranges of `volume` inside `range`, clipped to it, in offset
+    // order: the hold before its start, then those that start inside it.
+    pub fn held_in(&self, volume: VolumeIndex, range: ByteRange) -> Vec<ByteRange> {
+        let Some(holds) = self.volumes.get(&volume) else {
+            return Vec::new();
+        };
+        let start = holds
+            .range(..=range.start)
+            .next_back()
+            .map_or(range.start, |(&start, _)| start);
+        holds
+            .range(start..range.end.max(start))
+            .filter_map(|(_, hold)| hold.range.intersect(range))
+            .collect()
+    }
+
     // The first volume after `after` that holds anything, in volume order,
     // or the first of them when `after` is none.
     pub fn next_held_volume(&self, after: Option<VolumeIndex>) -> Option<VolumeIndex> {
@@ -824,6 +840,31 @@ mod tests {
                 scratch: 0,
                 namespaces: 0
             }
+        );
+    }
+
+    #[test]
+    fn held_in_is_every_held_range_clipped_to_the_range() {
+        let accountant = Arc::new(HoldsAccountant::new(budgets(100)));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        for offset in [10, 20, 30, 50] {
+            ledger.hold(VolumeIndex(0), offset, bytes(1, 10), PLENTY);
+        }
+        for start in 0..70 {
+            for end in start..70 {
+                let range = ByteRange::new(start, end);
+                let clipped: Vec<ByteRange> = ledger
+                    .held_ranges(VolumeIndex(0))
+                    .into_iter()
+                    .filter_map(|hold| hold.intersect(range))
+                    .collect();
+                assert_eq!(ledger.held_in(VolumeIndex(0), range), clipped);
+            }
+        }
+        assert!(
+            ledger
+                .held_in(VolumeIndex(1), ByteRange::new(0, 100))
+                .is_empty()
         );
     }
 

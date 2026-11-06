@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// What a graph job's checkpoints ask the database to write. A checkpoint is
-// taken after every step, so one that wrote the whole tree each time would
-// cost a job the square of its size; one that writes what its step changed
-// costs each step the same whatever the job's size.
+// What a graph job's checkpoints ask the database to write. A step takes a
+// checkpoint only when the write it joins is due, so the count of them
+// follows the job's bytes and age, not its steps; and one that writes what
+// changed since the last costs a job no more than its size.
 
 use super::harness::{ARTICLE, Post, Scenario, par2_set, payload, run};
 use crate::pipeline::graph::checkpoint::Tally;
@@ -28,17 +28,24 @@ async fn tally(articles: usize) -> Tally {
 async fn a_checkpoint_writes_what_its_step_changed() {
     let small = tally(20).await;
     let large = tally(80).await;
-    assert!(small.checkpoints >= 20, "a checkpoint per step: {small:?}");
-    assert!(large.checkpoints >= 80, "a checkpoint per step: {large:?}");
-    // Per checkpoint, a job four times the size writes no more than a step
-    // of the smaller one does, give or take what a step touches.
-    let per = |of: usize, tally: Tally| of as f64 / tally.checkpoints as f64;
-    assert!(
-        per(large.facts, large) <= 1.5 * per(small.facts, small),
-        "facts bytes per checkpoint grow with the job: {small:?} {large:?}"
+    // Neither job reaches the byte or age threshold of a write, so each
+    // takes the same checkpoints whatever its steps.
+    assert_eq!(
+        small.checkpoints, large.checkpoints,
+        "checkpoints follow the job's steps: {small:?} {large:?}"
     );
     assert!(
-        per(large.rows, large) <= 1.5 * per(small.rows, small),
-        "rows per checkpoint grow with the job: {small:?} {large:?}"
+        large.checkpoints < 20,
+        "a checkpoint per step: {small:?} {large:?}"
+    );
+    // A job four times the size writes no more than four times the rows
+    // and facts, give or take what a step touches.
+    assert!(
+        large.facts as f64 <= 6.0 * small.facts as f64,
+        "facts bytes grow faster than the job: {small:?} {large:?}"
+    );
+    assert!(
+        large.rows as f64 <= 6.0 * small.rows as f64,
+        "rows grow faster than the job: {small:?} {large:?}"
     );
 }

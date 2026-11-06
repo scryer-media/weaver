@@ -199,6 +199,11 @@ struct Volume {
     cuts: Vec<ByteRange>,
     // The chunks of the volume's facts each change touched.
     marks: Marks<Chunk>,
+    // Bumped by every change a seek's answer reads: an article's state or
+    // class, a boundary, the order the volume is placed in.
+    changes: u64,
+    // The seeks answered since the last change, and what each was told.
+    answered: Vec<(ByteRange, Option<Class>, Pull)>,
 }
 
 impl Volume {
@@ -236,6 +241,8 @@ impl Volume {
             cut: BTreeSet::new(),
             cuts: Vec::new(),
             marks: Marks::default(),
+            changes: 0,
+            answered: Vec::new(),
         }
     }
 
@@ -251,6 +258,7 @@ impl Volume {
         if was == state {
             return;
         }
+        self.changed();
         // Another copy, or none: what its tail lacked is asked again.
         self.cut.remove(&index);
         let size = self.encoded_at(index + 1) - self.encoded_at(index);
@@ -316,6 +324,7 @@ impl Volume {
         }
         article.class = class;
         let chunk = of_ordinal(article.ordinal);
+        self.changed();
         self.file_parkable(index);
         self.marks.mark(Chunk::Articles(chunk));
     }
@@ -357,6 +366,7 @@ impl Volume {
         let was = self.known.insert(boundary, offset);
         self.disorder += self.falls_around(boundary);
         if was != Some(offset) {
+            self.changed();
             self.marks.mark(Chunk::Known(of_boundary(boundary as u64)));
         }
     }
@@ -366,12 +376,27 @@ impl Volume {
         let was = self.known.remove(&boundary);
         self.disorder += self.falls_around(boundary);
         if was.is_some() {
+            self.changed();
             self.marks.mark(Chunk::Known(of_boundary(boundary as u64)));
         }
     }
 
     // The falling pairs among the known boundaries next to `boundary`'s
     // place: the two it makes when known, the one across it when not.
+    // A seek answered before this change may be told otherwise now.
+    fn changed(&mut self) {
+        self.changes += 1;
+        self.answered.clear();
+    }
+
+    // Place the volume in order only, from the front.
+    fn set_ordered_only(&mut self, ordered_only: bool) {
+        if self.ordered_only != ordered_only {
+            self.ordered_only = ordered_only;
+            self.changed();
+        }
+    }
+
     fn falls_around(&self, boundary: usize) -> usize {
         let below = self.known.range(..boundary).next_back().map(|(_, at)| *at);
         let above = self.known.range(boundary + 1..).next().map(|(_, at)| *at);
@@ -699,7 +724,7 @@ impl ArticleMap {
 
     pub(crate) fn set_ordered_only(&mut self, volume: VolumeIndex) {
         if let Some(found) = self.volumes.get_mut(volume.0 as usize) {
-            found.ordered_only = true;
+            found.set_ordered_only(true);
         }
     }
 
@@ -994,6 +1019,39 @@ impl ArticleMap {
     ) -> Pull {
         #[cfg(test)]
         super::tests::SEEK_CALLS.with(|calls| calls.set(calls.get() + 1));
+        // A seek asked again with nothing it reads changed since is told
+        // what it was, without mapping its range again: one that moved
+        // articles changed them, so only an answer that moved none stands.
+        if let Some(found) = self.volumes.get(volume.0 as usize)
+            && let Some(&(_, _, pull)) = found
+                .answered
+                .iter()
+                .find(|(asked, of, _)| *asked == range && *of == class)
+        {
+            #[cfg(test)]
+            {
+                let changes = found.changes;
+                assert_eq!(self.map_seek(volume, range, class), pull);
+                assert_eq!(self.volumes[volume.0 as usize].changes, changes);
+            }
+            return pull;
+        }
+        #[cfg(test)]
+        super::tests::SEEK_MAPPED.with(|calls| calls.set(calls.get() + 1));
+        let changes = self
+            .volumes
+            .get(volume.0 as usize)
+            .map(|found| found.changes);
+        let pull = self.map_seek(volume, range, class);
+        if let Some(found) = self.volumes.get_mut(volume.0 as usize)
+            && Some(found.changes) == changes
+        {
+            found.answered.push((range, class, pull));
+        }
+        pull
+    }
+
+    fn map_seek(&mut self, volume: VolumeIndex, range: ByteRange, class: Option<Class>) -> Pull {
         let parks = class == Some(Class::Parked);
         let Some(found) = self.volumes.get_mut(volume.0 as usize) else {
             return if parks { Pull::Moved(0) } else { Pull::Lost };

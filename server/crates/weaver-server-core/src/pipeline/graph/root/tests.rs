@@ -41,6 +41,7 @@ const ZIP_FRONT: &[u8] = b"PK\x03\x04";
 
 thread_local! {
     pub(super) static SEEK_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static SEEK_MAPPED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 // A stand-in for a format's object: it asks for what it was told to until
@@ -2402,4 +2403,44 @@ fn an_exchanged_first_part_lands_at_the_same_place_after_a_restore() {
         after.receive(exchanged()).is_none(),
         "the restored copy stands"
     );
+}
+
+// A seek asked again with nothing in its volume changed is told what it was
+// without mapping its range again: articles arriving in another volume
+// change nothing of it, and a loss in its own volume maps it once more.
+#[test]
+fn an_unchanged_seek_is_answered_without_mapping_its_range_again() {
+    let mut root = ArticleRoot::new(&[
+        file("first.bin", &[100, 100, 100]),
+        file("second.bin", &[100, 100, 100]),
+    ]);
+    let whole = ByteRange::new(0, 300);
+    let critical = Some(Class::Critical);
+    assert_eq!(
+        root.map.seek(VolumeIndex(0), whole, critical),
+        Pull::Moved(3)
+    );
+    assert_eq!(
+        root.map.seek(VolumeIndex(0), whole, critical),
+        Pull::Moved(0)
+    );
+    SEEK_MAPPED.with(|calls| calls.set(0));
+    for ordinal in 0..3 {
+        root.receive(decoded(
+            1,
+            ordinal,
+            u64::from(ordinal) * 100,
+            &[7; 100],
+            Some(300),
+        ));
+        assert_eq!(
+            root.map.seek(VolumeIndex(0), whole, critical),
+            Pull::Moved(0)
+        );
+    }
+    assert_eq!(SEEK_MAPPED.with(std::cell::Cell::get), 0);
+    root.map.lost(VolumeIndex(0), 1);
+    root.map.seek(VolumeIndex(0), whole, critical);
+    root.map.seek(VolumeIndex(0), whole, critical);
+    assert_eq!(SEEK_MAPPED.with(std::cell::Cell::get), 1);
 }

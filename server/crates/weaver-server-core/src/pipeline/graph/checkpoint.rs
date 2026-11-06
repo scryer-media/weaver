@@ -4,20 +4,23 @@
 // A graph job's checkpoint: the tree's records, the root's facts, which
 // members have files, the kept envelopes, the holds paged to scratch and
 // which candidate each node was offered last, as the rows the database
-// keeps. It is taken after every step that reached the tree, when the step's
-// bytes are written, so it only ever describes bytes on disk; holds in
+// keeps. It is taken when a write of it is due, after a step that reached
+// the tree has written its bytes, so it only ever describes bytes on disk;
+// holds in
 // memory are left out and fetched again. A graceful stop pages every hold it
 // can to scratch first, so its last checkpoint leaves out only what scratch
 // could not take. The pipeline's parts that arrived and wait to be placed
 // are taken with it the same way: those spooled to the job's working
 // directory, never those still in memory.
 //
-// Each checkpoint is written as what it changed of the one before: a step
-// costs the database the rows it changed, not the job's. One writer per job:
+// Each checkpoint is written as what it changed of the one before: it
+// costs the database the rows the steps since changed, not the job's. One writer per job:
 // a change waiting for the database takes in the next one rather than
 // queueing behind it, so a slow database costs writes, never order. Changes
 // wait for 256 MiB of dirty coverage or five seconds, whichever
-// comes first. A crash loses at most that last five seconds or 256 MiB of
+// comes first, and a step takes no checkpoint until then: the steps of
+// those five seconds are read once, when the write is due, or at once when
+// a move waits on a commit. A crash loses at most that last five seconds or 256 MiB of
 // coverage while the database keeps up; a restore refetches it, as 0.16.5's
 // direct-store barrier did. Database stalls can extend that window. Delaying
 // a change does not make it claim unwritten bytes: each step wrote its bytes
@@ -172,6 +175,15 @@ impl Drop for Writer {
         {
             timer.abort();
         }
+        if let Some(due) = self
+            .slot
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .due
+            .take()
+        {
+            due.abort();
+        }
     }
 }
 
@@ -194,6 +206,11 @@ struct Slot {
     dirty_bytes: u64,
     enqueued: bool,
     timer: Option<tokio::task::JoinHandle<()>>,
+    // When the first step since the last checkpoint ran, while none has
+    // been taken of it, and the wake that mails the job's actor to take
+    // one once it is due.
+    stepped: Option<tokio::time::Instant>,
+    due: Option<tokio::task::JoinHandle<()>>,
     tally: Tally,
     // The stamp of the last checkpoint that changed anything. A write
     // takes the stamp with the change, and once it has committed every
@@ -461,6 +478,12 @@ impl Pending {
     ) -> bool {
         let mut slot = self.slot();
         let slot = &mut *slot;
+        // The steps since the last checkpoint are in this one: their change
+        // is as old as the first of them.
+        let since = slot.stepped.take();
+        if let Some(due) = slot.due.take() {
+            due.abort();
+        }
         let mut delta = Delta {
             whole: slot.held.is_none(),
             ..Delta::default()
@@ -552,7 +575,8 @@ impl Pending {
             return false;
         }
         slot.asked += 1;
-        slot.oldest.get_or_insert_with(tokio::time::Instant::now);
+        slot.oldest
+            .get_or_insert_with(|| since.unwrap_or_else(tokio::time::Instant::now));
         match &mut slot.queued {
             Some(queued) => {
                 queued.absorb(delta);
@@ -577,6 +601,47 @@ impl Pending {
             timer.abort();
         }
         (slot.queued.take(), slot.asked)
+    }
+
+    // Whether a step ran that no checkpoint has read.
+    fn unread_steps(&self) -> bool {
+        self.slot().stepped.is_some()
+    }
+
+    // A step wrote `bytes` of the job's coverage.
+    pub(in crate::pipeline) fn delivered(&self, bytes: u64) {
+        let mut slot = self.slot();
+        slot.dirty_bytes = slot.dirty_bytes.saturating_add(bytes);
+    }
+
+    // A step reached the job: whether its checkpoint is due now, as the
+    // write it joins would be. The first checkpoint is, and so is one after
+    // the database's rows were lost. Otherwise the run mail hears once the
+    // first step not yet taken is CHECKPOINT_AGE old.
+    fn stepped(&self, job_id: JobId, mail: &UnboundedSender<Said>) -> bool {
+        let mut slot = self.slot();
+        let first = *slot.stepped.get_or_insert_with(tokio::time::Instant::now);
+        let due = slot.held.is_none()
+            || slot.dirty_bytes >= CHECKPOINT_BYTES
+            || first.elapsed() >= CHECKPOINT_AGE
+            || slot
+                .oldest
+                .is_some_and(|oldest| oldest.elapsed() >= CHECKPOINT_AGE);
+        if !due && slot.due.is_none() {
+            let mail = mail.clone();
+            let control = slot.control.clone();
+            slot.due = Some(tokio::spawn(async move {
+                tokio::time::sleep_until(first + CHECKPOINT_AGE).await;
+                // A pipeline that has gone takes no checkpoint.
+                let _ = mail.send(Said {
+                    scope: job_id.0,
+                    node: NodeId::ROOT,
+                    generation: 0,
+                    heard: Heard::CheckpointDue { control },
+                });
+            }));
+        }
+        due
     }
 
     // The stamp of the last checkpoint that changed anything.
@@ -854,7 +919,55 @@ impl Pipeline {
         }
     }
 
-    pub(in crate::pipeline) fn flush_graph_checkpoint(&self, job_id: JobId) {
+    // A step reached the job and wrote its bytes. Its checkpoint is taken
+    // once the write it joins is due, or at once while a move waits on a
+    // commit; until then nothing is read of the job.
+    pub(in crate::pipeline) fn step_graph_checkpoint(&mut self, job_id: JobId) {
+        let Some(graph) = self.graph_jobs.get(&job_id) else {
+            return;
+        };
+        let pending = graph.pending();
+        if pending.control().cancelled() {
+            return;
+        }
+        if graph.awaits_commit() || pending.stepped(job_id, &self.graph_runs.written()) {
+            self.checkpoint_graph_job(job_id);
+        }
+    }
+
+    // Take the checkpoint of the steps no checkpoint has read yet, if any.
+    pub(in crate::pipeline) fn take_stepped_graph_checkpoint(&mut self, job_id: JobId) {
+        if self
+            .graph_jobs
+            .get(&job_id)
+            .is_some_and(|graph| graph.pending().unread_steps())
+        {
+            self.checkpoint_graph_job(job_id);
+        }
+    }
+
+    // The wake a step armed: its checkpoint is due. One of a graph the job
+    // no longer has, or of a writer cancelled since, takes nothing.
+    pub(in crate::pipeline) fn graph_checkpoint_due(
+        &mut self,
+        job_id: JobId,
+        control: &CheckpointControl,
+    ) {
+        if self.job_failure_started(job_id)
+            || !self
+                .graph_jobs
+                .get(&job_id)
+                .is_some_and(|graph| graph.pending().control().same(control))
+        {
+            return;
+        }
+        self.checkpoint_graph_job(job_id);
+    }
+
+    // Queue the job's change for the database now, the steps not yet
+    // taken in it first.
+    pub(in crate::pipeline) fn flush_graph_checkpoint(&mut self, job_id: JobId) {
+        self.take_stepped_graph_checkpoint(job_id);
         if let Some(graph) = self.graph_jobs.get(&job_id) {
             graph
                 .pending()
