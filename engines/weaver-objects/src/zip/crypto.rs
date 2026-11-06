@@ -356,6 +356,23 @@ impl Cipher {
         }
     }
 
+    // The cipher as its header alone states it: nothing proven, opened,
+    // waiting or rejected.
+    fn bare(&self) -> Self {
+        Self {
+            check: self.check,
+            header: self.header,
+            proven: false,
+            proof: Vec::new(),
+            replay: false,
+            pending: Vec::new(),
+            retry: false,
+            announce: false,
+            open: None,
+            rejected: BTreeSet::new(),
+        }
+    }
+
     pub(super) fn unlock(
         &mut self,
         candidates: &[Zeroizing<String>],
@@ -461,6 +478,7 @@ impl super::Zip {
             self.place_as(volume, range, true, out)
         });
         let mut sealed = Vec::new();
+        let mut shared: BTreeMap<weaver_graph::MemberId, Arc<MemberKeys>> = BTreeMap::new();
         for &(volume, range) in ranges {
             let (Some(global), Some(map)) = (self.global(volume, range), &self.map) else {
                 continue;
@@ -485,37 +503,31 @@ impl super::Zip {
                     let Some(part) = part.intersect(run.range.shift(span.start as i64)) else {
                         continue;
                     };
+                    // One member's runs share its coverage, keys and proof.
+                    let keys = shared.entry(member).or_insert_with(|| {
+                        Arc::new(MemberKeys {
+                            coverage: coverage.clone(),
+                            open: Arc::clone(open),
+                            frontier: std::sync::Mutex::new(None),
+                            proof: cipher_proof(entry),
+                            bare: entry.cipher.as_ref().map(Cipher::bare),
+                            candidates: self.candidates.clone(),
+                            alternatives: std::sync::OnceLock::new(),
+                        })
+                    });
                     sealed.push(Sealed {
                         volume,
                         part: part.shift(-(base as i64)),
                         offset: part.start - span.start,
                         member,
-                        coverage: coverage.clone(),
-                        open: Arc::clone(open),
-                        frontier: std::sync::Mutex::new(None),
-                        proof: entry.cipher.as_ref().unwrap().proof.clone(),
-                        alternatives: self
-                            .candidates
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(candidate, secret)| {
-                                let mut cipher = entry.cipher.as_ref()?.clone();
-                                cipher.open = None;
-                                cipher.rejected.clear();
-                                cipher
-                                    .unlock(std::slice::from_ref(secret), Provenance::Fresh)
-                                    .then(|| {
-                                        let mut open = Open::clone(cipher.open.as_ref().unwrap());
-                                        open.candidate = candidate;
-                                        Arc::new(open)
-                                    })
-                            })
-                            .collect(),
+                        keys: Arc::clone(keys),
                     });
                 }
             }
         }
         sealed.sort_by_key(|sealed| (sealed.volume, sealed.part.start));
+        // Ranges asked twice seal the same run once.
+        sealed.dedup_by_key(|sealed| (sealed.volume, sealed.part));
         Posted { placed, sealed }
     }
 
@@ -903,21 +915,70 @@ impl super::Zip {
     }
 }
 
-struct Sealed {
+pub(super) struct Sealed {
     volume: weaver_graph::VolumeIndex,
     part: ByteRange,
     offset: u64,
     member: weaver_graph::MemberId,
+    pub(super) keys: Arc<MemberKeys>,
+}
+
+// What every sealed run of one member reads through: its coverage, its
+// keys, the proof they answer, and the other candidates' keys, made only
+// when the open ones do not prove the plaintext.
+pub(super) struct MemberKeys {
     coverage: Coverage,
     open: Arc<Open>,
     frontier: std::sync::Mutex<Option<(usize, u64, State)>>,
     proof: Vec<u8>,
-    alternatives: Vec<Arc<Open>>,
+    bare: Option<Cipher>,
+    candidates: Vec<Zeroizing<String>>,
+    pub(super) alternatives: std::sync::OnceLock<Vec<Arc<Open>>>,
+}
+
+fn cipher_proof(entry: &super::map::Entry) -> Vec<u8> {
+    entry
+        .cipher
+        .as_ref()
+        .map(|cipher| cipher.proof.clone())
+        .unwrap_or_default()
+}
+
+impl MemberKeys {
+    // The keys that prove `plain`, the member's front: the open ones, or
+    // the first other candidate's that does.
+    fn proving(&self, plain: &[u8]) -> Option<&Open> {
+        if self.open.proves(plain, &self.proof) {
+            return Some(&self.open);
+        }
+        self.alternatives
+            .get_or_init(|| {
+                let Some(bare) = &self.bare else {
+                    return Vec::new();
+                };
+                self.candidates
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(candidate, secret)| {
+                        let mut cipher = bare.clone();
+                        cipher
+                            .unlock(std::slice::from_ref(secret), Provenance::Fresh)
+                            .then_some(())?;
+                        let mut open = Open::clone(cipher.open.as_ref()?);
+                        open.candidate = candidate;
+                        Some(Arc::new(open))
+                    })
+                    .collect()
+            })
+            .iter()
+            .map(|open| &**open)
+            .find(|open| open.proves(plain, &self.proof))
+    }
 }
 
 pub(super) struct Posted {
     placed: weaver_graph::Placements,
-    sealed: Vec<Sealed>,
+    pub(super) sealed: Vec<Sealed>,
 }
 
 impl weaver_graph::Posting for Posted {
@@ -930,10 +991,19 @@ impl weaver_graph::Posting for Posted {
     ) -> bool {
         use weaver_graph::Placement;
         let mut cursor = range.start;
-        for sealed in self.sealed.iter().filter(|sealed| sealed.volume == volume) {
+        // The runs are in volume order and apart: the first that reaches
+        // past the range's start is found, and the rest follow it.
+        let first = self
+            .sealed
+            .partition_point(|sealed| (sealed.volume, sealed.part.end) <= (volume, range.start));
+        for sealed in self.sealed[first..]
+            .iter()
+            .take_while(|sealed| sealed.volume == volume && sealed.part.start < range.end)
+        {
             let Some(part) = sealed.part.intersect(range) else {
                 continue;
             };
+            let keys = &sealed.keys;
             if part.start > cursor
                 && !self
                     .placed
@@ -952,20 +1022,20 @@ impl weaver_graph::Posting for Posted {
                 )
             };
             let mut proof = Vec::new();
-            let proof_range = ByteRange::new(0, sealed.proof.len() as u64);
-            if !sealed.coverage.covered(proof_range) || !plain(proof_range, &mut proof) {
+            let proof_range = ByteRange::new(0, keys.proof.len() as u64);
+            if !keys.coverage.covered(proof_range) || !plain(proof_range, &mut proof) {
                 return false;
             }
-            let Some(open) = std::iter::once(&sealed.open)
-                .chain(&sealed.alternatives)
-                .find(|open| open.proves(&proof, &sealed.proof))
-            else {
+            let Some(open) = keys.proving(&proof) else {
+                return false;
+            };
+            let Ok(mut frontier) = keys.frontier.lock() else {
                 return false;
             };
             if !open.seal(
-                &mut sealed.frontier.lock().unwrap(),
+                &mut frontier,
                 local,
-                &sealed.coverage,
+                &keys.coverage,
                 &mut plain,
                 into,
             ) {

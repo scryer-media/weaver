@@ -1208,6 +1208,39 @@ fn a_covered_redelivery_tries_its_bytes_without_copying_the_keys() {
     assert!(owner.posted(0) == Some(archive));
 }
 
+// A posting over several runs of one member seals them all through one
+// share of its coverage and keys, and makes no other candidate's keys
+// while the open ones prove the member's front.
+#[test]
+fn a_posting_shares_one_members_keys_and_tries_no_other_candidate() {
+    let plain = payload(91, 300_007);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    offer(&mut owner, &false_password(&archive));
+    offer(&mut owner, PASSWORD);
+    owner.whole(4096);
+    assert!(owner.member("alpha.bin").closed);
+    let runs = [
+        ByteRange::at(start + 10_000, 4096),
+        ByteRange::at(start + 200_000, 4096),
+    ];
+    let posting = owner
+        .object
+        .posted_over(&runs.map(|range| (VolumeIndex(0), range)));
+    assert_eq!(posting.sealed.len(), 2);
+    assert!(std::sync::Arc::ptr_eq(
+        &posting.sealed[0].keys,
+        &posting.sealed[1].keys
+    ));
+    for range in runs.into_iter().rev() {
+        let mut bytes = Vec::new();
+        assert!(owner.read_through_posting(&posting, VolumeIndex(0), range, &mut bytes));
+        assert!(bytes == archive[range.start as usize..range.end as usize]);
+    }
+    assert!(posting.sealed[0].keys.alternatives.get().is_none());
+}
+
 // A repair in the member's last bytes lies inside the tail the end record
 // was searched for in, but in no record the directory read: the map stands,
 // and the repair replays from its byte once.
