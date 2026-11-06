@@ -906,3 +906,44 @@ fn a_verified_wrong_byte_keeps_the_only_passing_password_and_waits_for_repair() 
     assert!(out.is_empty(), "{out:?}");
     assert!(owner.posted(0) == Some(archive));
 }
+
+#[test]
+fn a_restore_no_offered_candidate_proves_starts_the_member_over() {
+    let plain = payload(94, 180_007);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let wrong = false_password(&archive);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, &wrong);
+    owner.deliver(0, ByteRange::new(0, 80_000));
+    owner.object = rmp_serde::from_slice(&rmp_serde::to_vec(&owner.object).unwrap()).unwrap();
+    let before = owner.said.len();
+    // Only the right password now: it does not reproduce what the false
+    // positive said, so nothing may be derived from that plaintext.
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(80_000, archive.len() as u64));
+    owner.close(0);
+    let said = &owner.said[before..];
+    assert!(said.contains(&Emit::Retract(MemberId(0))), "{said:?}");
+    assert!(said.contains(&Emit::NeedsPassword), "{said:?}");
+    assert!(
+        said.iter().any(|emit| matches!(
+            emit,
+            Emit::Damaged { volume: VolumeIndex(0), range }
+                if range.start <= start && range.end >= 80_000
+        )),
+        "{said:?}"
+    );
+    assert!(!owner.member("alpha.bin").closed);
+    assert!(
+        owner.member("alpha.bin").bytes.is_empty()
+            || owner.member("alpha.bin").bytes[..] == plain[..owner.member("alpha.bin").bytes.len()]
+    );
+    // The recovery brings the damaged ciphertext again.
+    owner.deliver_as(0, ByteRange::new(0, 80_000), Provenance::Repaired, None);
+    owner.close(0);
+    assert!(owner.member("alpha.bin").bytes == plain, "{:?}", owner.said);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+}

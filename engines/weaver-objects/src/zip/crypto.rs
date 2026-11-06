@@ -324,7 +324,7 @@ impl Cipher {
                 checkpoints: BTreeMap::from([(0, state.clone())]),
                 frontier: (0, state),
                 candidate,
-                checked: !self.proven,
+                checked: true,
             }));
             return true;
         }
@@ -513,7 +513,8 @@ impl super::Zip {
                 locked |= cipher.header.is_some();
                 continue;
             }
-            if cipher.announce {
+            let announced = cipher.announce;
+            if announced {
                 out.push(Emit::Retract(member));
                 out.push(Emit::Member {
                     member,
@@ -524,7 +525,13 @@ impl super::Zip {
                 self.grid.forget(member);
                 cipher.announce = false;
             }
-            if !was_open && (cipher.open.as_ref().unwrap().checked || !cipher.proven) {
+            // Plaintext said before the keys opened, a restore's, must be
+            // proved to be this candidate's before any key comes from it.
+            if !was_open || announced {
+                let said = self.members[member.0 as usize].coverage.runs().next();
+                Arc::make_mut(cipher.open.as_mut().unwrap()).checked = said.is_none();
+            }
+            if !was_open && !cipher.proven {
                 again.push(ByteRange::at(data, entry.length));
             }
             if cipher.restored
@@ -555,6 +562,54 @@ impl super::Zip {
             );
         }
         if locked && !self.asked {
+            self.asked = true;
+            out.push(Emit::NeedsPassword);
+        }
+    }
+
+    // No candidate offered reproduces the ciphertext of the plaintext a
+    // restored member holds: it cannot be read back, nor can keys be
+    // derived from it. The member starts over, the ranges that plaintext
+    // stood for are said damaged so the recovery brings their ciphertext
+    // again, and a password is asked for.
+    fn disown(&mut self, member: weaver_graph::MemberId, out: &mut Vec<weaver_graph::Emit>) {
+        use weaver_graph::Emit;
+        let Some(map) = &mut self.map else {
+            return;
+        };
+        let index = map.members[member.0 as usize];
+        let entry = &mut map.entries[index];
+        let (Some(data), Some(cipher)) = (entry.data, &mut entry.cipher) else {
+            return;
+        };
+        let stood: Vec<ByteRange> = self.members[member.0 as usize]
+            .coverage
+            .runs()
+            .map(|run| run.range.shift(data as i64))
+            .collect();
+        out.push(Emit::Retract(member));
+        out.push(Emit::Member {
+            member,
+            name: entry.name.clone(),
+            length: Some(entry.length),
+        });
+        self.members[member.0 as usize] = super::map::Out::default();
+        self.grid.forget(member);
+        cipher.announce = false;
+        cipher.proven = false;
+        cipher.changed();
+        // Nothing stands now for a candidate to prove against.
+        cipher.unlock(&self.candidates, Provenance::Fresh);
+        let mut pieces = Vec::new();
+        for range in stood {
+            self.to_volumes(range, &mut pieces);
+        }
+        out.extend(
+            pieces
+                .into_iter()
+                .map(|(volume, range)| Emit::Damaged { volume, range }),
+        );
+        if !self.asked {
             self.asked = true;
             out.push(Emit::NeedsPassword);
         }
@@ -636,6 +691,9 @@ impl super::Zip {
         let coverage = &self.members[member.0 as usize].coverage;
         let mut plain =
             |range, into: &mut Vec<u8>| read(&Placement::Member { member, range }, into);
+        // Plaintext already said was produced by some candidate: no key is
+        // derived from it until a candidate's keys reproduce the proof.
+        let mut disproved = false;
         while let Some(open) = &cipher.open {
             if open.checked {
                 break;
@@ -650,14 +708,19 @@ impl super::Zip {
                 Arc::make_mut(cipher.open.as_mut().unwrap()).checked = true;
                 break;
             }
+            disproved = true;
             cipher.rejected.insert(open.candidate);
             cipher.open = None;
             if !cipher.unlock(&self.candidates, Provenance::Fresh) {
                 break;
             }
+            Arc::make_mut(cipher.open.as_mut().unwrap()).checked = false;
         }
         let Some(open) = &cipher.open else {
             entry.cipher = Some(cipher);
+            if disproved {
+                return self.disown(member, out);
+            }
             if !self.asked {
                 self.asked = true;
                 out.push(Emit::NeedsPassword);
