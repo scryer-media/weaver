@@ -38,6 +38,11 @@ use nodes::Nodes;
 #[cfg(test)]
 pub(crate) use records::tests as record_tests;
 
+// The most bytes `Tree::again_read` reads back at once: an object asking
+// for a whole member again never has the member in memory, nor its
+// re-encoded twin beside it.
+pub const AGAIN_PIECE: u64 = 1 << 20;
+
 // What objects parsed of the members they gave back, by namespace and member.
 type Given = BTreeMap<(NodeId, MemberId), Carried>;
 
@@ -4151,23 +4156,32 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
-        for (volume, posted) in self.again_read(node, ranges, builder) {
+        let mut again = Vec::new();
+        self.again_read(node, ranges, builder, &mut |volume, posted| {
+            again.push((volume, posted));
+        });
+        for (volume, posted) in again {
             self.replay_piece(node, volume, posted, builder, effects);
         }
     }
 
-    // What `again` delivers, read back and uncovered, each run to go to the
-    // object by `replay_piece` as any delivery does: what it places nowhere
-    // yet, a file it cannot key, is the owner's to hold. The owner applies
-    // each run's effects before the next run goes, so a run the object
+    // What `again` delivers, read back a piece of at most `AGAIN_PIECE`
+    // bytes at a time and handed to `stage`, then uncovered, each piece to
+    // go to the object by `replay_piece` as any delivery does: what it
+    // places nowhere yet, a file it cannot key, is the owner's to hold.
+    // Every piece is read before any is uncovered or delivered, so the
+    // owner stages them where it likes, on disk for a large member, and
+    // never holds the whole range in memory. The owner applies each
+    // piece's effects before the next piece goes, so a run the object
     // could not place when it came never looks placed by a later one.
     pub fn again_read(
         &mut self,
         node: NodeId,
         ranges: &[(VolumeIndex, ByteRange)],
         builder: &dyn Builder,
-    ) -> Vec<(VolumeIndex, Posted)> {
-        let mut again = Vec::new();
+        stage: &mut dyn FnMut(VolumeIndex, Posted),
+    ) {
+        let mut again: Vec<(VolumeIndex, ByteRange)> = Vec::new();
         for &(volume, range) in ranges {
             let Some((parent, member)) = self
                 .nodes
@@ -4202,7 +4216,7 @@ impl Tree {
                 .get(&node)
                 .and_then(|found| found.object.as_ref())
             else {
-                return Vec::new();
+                return;
             };
             let (tree, reader) = (&*self, builder);
             let mut read = |placement: &Placement, into: &mut Vec<u8>| {
@@ -4217,27 +4231,33 @@ impl Tree {
                 } else {
                     vec![piece]
                 };
-                sitting.into_iter().map(move |piece| (piece, provenance))
+                sitting.into_iter().flat_map(move |piece| {
+                    (piece.start..piece.end)
+                        .step_by(AGAIN_PIECE as usize)
+                        .map(move |at| {
+                            let end = piece.end.min(at.saturating_add(AGAIN_PIECE));
+                            (ByteRange::new(at, end), provenance)
+                        })
+                })
             });
             for (piece, provenance) in pieces {
                 let mut bytes = Vec::new();
                 if object.posted(volume, piece, &mut read, &mut bytes) {
-                    again.push((
+                    again.push((volume, ByteRange::at(piece.start, bytes.len() as u64)));
+                    stage(
                         volume,
                         Posted {
                             offset: piece.start,
                             bytes: Evidenced::from(bytes),
                             provenance,
                         },
-                    ));
+                    );
                 }
             }
         }
-        for (volume, posted) in &again {
-            let piece = ByteRange::at(posted.offset, posted.bytes.len() as u64);
-            self.uncover(node, *volume, piece);
+        for (volume, piece) in again {
+            self.uncover(node, volume, piece);
         }
-        again
     }
 
     // The parts of a range of the node's volume whose bytes sit below it,

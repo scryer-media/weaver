@@ -287,11 +287,13 @@ fn a_loss_beside_damaged_bytes_is_never_said_again_as_bytes() {
             "{held:?}"
         );
     }
-    let again = tree.again_read(child, &[(VolumeIndex(0), ByteRange::new(0, 24))], &builder);
-    let said: Vec<(u64, Vec<u8>, Provenance)> = again
-        .into_iter()
-        .map(|(_, posted)| (posted.offset, posted.bytes.to_vec(), posted.provenance))
-        .collect();
+    let mut said: Vec<(u64, Vec<u8>, Provenance)> = Vec::new();
+    tree.again_read(
+        child,
+        &[(VolumeIndex(0), ByteRange::new(0, 24))],
+        &builder,
+        &mut |_, posted| said.push((posted.offset, posted.bytes.to_vec(), posted.provenance)),
+    );
     assert_eq!(
         said,
         vec![
@@ -299,4 +301,57 @@ fn a_loss_beside_damaged_bytes_is_never_said_again_as_bytes() {
             (15, b"CHECK".to_vec(), Provenance::Damaged),
         ]
     );
+}
+
+// A member asked for again whole is read back a piece at a time, none
+// longer than `AGAIN_PIECE`, each piece handed on before the next is read,
+// and all of it uncovered only once every piece is read.
+#[test]
+fn a_large_range_asked_for_again_is_read_back_in_bounded_pieces() {
+    let log = Log::default();
+    let mut builder = Trials(Arc::clone(&log));
+    let mut tree = Tree::new();
+    let mut effects = Vec::new();
+    let show = tree.announce_root("show.rar", None, &mut effects);
+    let mut front = SIGNATURE.to_vec();
+    front.extend_from_slice(b"hello");
+    deliver(
+        &mut tree,
+        &mut builder,
+        show,
+        (0, &front, Provenance::Fresh),
+        &mut effects,
+    );
+    let child = tree.child_of(NodeId::ROOT, show).expect("bound").0;
+    let body = vec![0x71; (2 * AGAIN_PIECE + 13) as usize];
+    deliver(
+        &mut tree,
+        &mut builder,
+        show,
+        (front.len() as u64, &body, Provenance::Fresh),
+        &mut effects,
+    );
+    let length = (front.len() + body.len()) as u64;
+    let mut pieces = Vec::new();
+    tree.again_read(
+        child,
+        &[(VolumeIndex(0), ByteRange::new(0, length))],
+        &builder,
+        &mut |_, posted| {
+            let piece = ByteRange::at(posted.offset, posted.bytes.len() as u64);
+            pieces.push(piece);
+        },
+    );
+    assert!(
+        pieces.iter().all(|piece| piece.len() <= AGAIN_PIECE),
+        "{pieces:?}"
+    );
+    assert_eq!(pieces.first().map(|piece| piece.start), Some(0));
+    assert!(pieces.windows(2).all(|pair| pair[0].end == pair[1].start));
+    assert_eq!(pieces.last().map(|piece| piece.end), Some(length));
+    let record = tree
+        .namespace(child)
+        .and_then(|namespace| namespace.get(MemberId(0)))
+        .expect("member");
+    assert!(record.coverage.runs().next().is_none());
 }

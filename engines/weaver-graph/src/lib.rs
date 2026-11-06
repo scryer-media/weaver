@@ -70,5 +70,5 @@ pub use sniff::{
     HEAD_VERDICT_BYTES, Sniff, VERDICT_BYTES, names_recovery, par2_index, signed, signs_a_head,
     sniff,
 };
-pub use tree::{Builder, Disclaim, Effect, NodeId, Tree};
+pub use tree::{AGAIN_PIECE, Builder, Disclaim, Effect, NodeId, Tree};
 pub use volume::{ByteRange, VolumeIndex};
