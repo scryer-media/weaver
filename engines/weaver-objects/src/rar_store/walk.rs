@@ -63,6 +63,16 @@ pub(super) struct Walk {
     // The password the cursor last stepped with: under another one it
     // begins again at the signature on its own.
     keyed: Keyed,
+    // Which facts these are: a number no facts any walk read had before,
+    // drawn each time they change, so a layout laid on them can tell
+    // they did not.
+    pub(super) stamp: u64,
+}
+
+static STAMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_stamp() -> u64 {
+    STAMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
 // A password kept to compare with, never shown.
@@ -310,6 +320,12 @@ fn quick_open_cross_check(
 }
 
 impl Walk {
+    // Facts read before, as a checkpoint kept them.
+    pub(super) fn restore(&mut self, facts: Option<RarVolumeFacts>) {
+        self.facts = facts;
+        self.stamp = next_stamp();
+    }
+
     // How far the headers place bytes: nothing before any are read, every
     // byte once the volume has ended.
     pub(super) fn reach(&self) -> Option<u64> {
@@ -576,6 +592,9 @@ impl Walk {
                 .map(|member| ByteRange::at(member.data_offset, member.data_size))),
             "blocks extended are blocks rebuilt"
         );
+        if differs {
+            self.stamp = next_stamp();
+        }
         self.facts = Some(facts);
         self.more = more;
         self.ended = ended;
