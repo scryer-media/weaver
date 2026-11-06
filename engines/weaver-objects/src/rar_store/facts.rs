@@ -313,7 +313,7 @@ pub(crate) fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
                 })
                 .collect()
         });
-        volume.walk.restore(found.headers);
+        volume.walk.facts = found.headers;
         volume.walk.ended = found.ended;
         volume.walk.locked = found.locked;
         store.volumes.insert(found.index, volume);
