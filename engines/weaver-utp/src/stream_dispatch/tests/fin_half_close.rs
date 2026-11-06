@@ -400,3 +400,32 @@ async fn a_fin_confirming_the_handshake_closes_only_the_incoming_direction() {
     test.poll_once_assert_ready().await.unwrap();
     shutdown.await.unwrap();
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_fin_with_payload_is_taken_as_a_fin_and_its_payload_ignored() {
+    let mut test = make_test_vsock(Default::default(), false);
+    let (mut reader, mut writer) = test.stream.take().unwrap().split();
+    test.send_msg(
+        UtpHeader {
+            htype: Type::Fin,
+            seq_nr: 1.into(),
+            ack_nr: 100.into(),
+            wnd_size: 1024,
+            ..Default::default()
+        },
+        "payload",
+    );
+    test.poll_once_assert_pending().await;
+    assert!(matches!(
+        test.vsock.state,
+        VirtualSocketState::CloseWait { remote_fin } if remote_fin.0 == 1
+    ));
+    let ack = test.take_sent();
+    assert_eq!(ack.len(), 1);
+    assert_eq!(ack[0].header.htype, Type::State);
+    assert_eq!(ack[0].header.ack_nr.0, 1);
+    let mut received = Vec::new();
+    reader.read_to_end(&mut received).await.unwrap();
+    assert!(received.is_empty());
+    writer.write_all(b"x").await.unwrap();
+}

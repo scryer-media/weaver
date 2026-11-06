@@ -167,7 +167,8 @@ struct VirtualSocket<T, Env> {
     // following cases:
     // 1. Initial SYN is sent.
     // 2. ST_DATA is sent
-    // 3. ST_FIN is sent.
+    // ST_FIN takes this seq_nr without advancing it, so every ST_STATE after
+    // our FIN carries the FIN's seq_nr.
     seq_nr: SeqNr,
 
     // How many consecutive RTO retransmissions happened.
@@ -1015,7 +1016,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             let mut fin = self.outgoing_header();
             fin.set_type(Type::Fin);
             fin.seq_nr = self.seq_nr;
-            self.seq_nr += 1;
             if let Err(e) = self.send_control_packet(cx, &fin) {
                 trace!("error sending FIN: {e:#}")
             }
@@ -1487,10 +1487,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if self.state.is_remote_fin_or_later() {
             return false;
         }
-        // if we need to send a window update, also send immediately.
-        // In case the reader was fully flow controlled.
+        // A remote sends only whole packets into the window we last
+        // advertised, so announce a window that closed, opened from zero, or
+        // grew by a packet since.
         let current = self.rx_window();
-        let changed = (current == 0) ^ (self.last_sent_window == 0);
+        let mss = u32::from(self.segment_sizes.mss());
+        let changed = (current == 0) ^ (self.last_sent_window == 0)
+            || current.saturating_sub(self.last_sent_window) >= mss;
         if changed {
             trace!(
                 self.last_sent_window,
@@ -1591,9 +1594,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
     fn transition_to_fin_wait_1(&mut self) {
         log_if_changed!(Level::DEBUG, "state", self, |s| s.state, |s| {
-            if s.state.transition_to_fin_wait_1(s.seq_nr) {
-                s.seq_nr += 1;
-            }
+            s.state.transition_to_fin_wait_1(s.seq_nr);
         });
     }
 

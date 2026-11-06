@@ -1474,6 +1474,10 @@ impl Session {
             };
 
             let enable_utp = opts.connect.as_ref().and_then(|connect| connect.enable_utp);
+            let enable_tcp = opts
+                .connect
+                .as_ref()
+                .is_none_or(|connect| connect.enable_tcp);
             let listening_utp = listen_result
                 .as_ref()
                 .and_then(|listen| listen.utp_socket.clone());
@@ -1490,17 +1494,24 @@ impl Session {
                 } else {
                     SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
                 };
-                Some(
-                    crate::listen::bind_utp(
-                        opts.socket_factory.as_ref(),
-                        address,
-                        utp_opts,
-                        crate::udp_options::receive_buffer_for(connection_slots.limit()),
-                        Some(&connection_slots),
-                    )
-                    .await
-                    .context("error binding outgoing uTP socket through socket factory")?,
+                match crate::listen::bind_utp(
+                    opts.socket_factory.as_ref(),
+                    address,
+                    utp_opts,
+                    crate::udp_options::receive_buffer_for(connection_slots.limit()),
+                    Some(&connection_slots),
                 )
+                .await
+                .context("error binding outgoing uTP socket through socket factory")
+                {
+                    Ok(socket) => Some(socket),
+                    // As with the listener, TCP still connects without uTP.
+                    Err(e) if enable_tcp => {
+                        error!("{e:#}");
+                        None
+                    }
+                    Err(e) => return Err(e),
+                }
             } else {
                 None
             };
@@ -1625,7 +1636,7 @@ impl Session {
 
             let stream_connector = Arc::new(
                 StreamConnector::new(StreamConnectorArgs {
-                    enable_tcp: opts.connect.as_ref().map(|c| c.enable_tcp).unwrap_or(true),
+                    enable_tcp,
                     utp_socket: outgoing_utp,
                     ipv4_only: opts.ipv4_only,
                     socket_factory: opts.socket_factory.clone(),
@@ -3519,6 +3530,12 @@ impl Session {
     /// Whether the session listens on uTP as well, on the listen address.
     pub fn listens_utp(&self) -> bool {
         self.utp
+    }
+
+    /// Whether the session speaks uTP at all: it listens on uTP, or it
+    /// connects out over a uTP socket of its own.
+    pub fn uses_utp(&self) -> bool {
+        !self.utp_sockets.is_empty()
     }
 
     /// Our address as the internet sees it, IPv4 first, of each family the

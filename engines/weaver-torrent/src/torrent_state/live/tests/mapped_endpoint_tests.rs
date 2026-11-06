@@ -39,6 +39,9 @@ async fn an_ipv4_blocked_peer_is_refused_in_both_address_representations_before_
 
     harness._session.set_ip_filter(IpFilter::default());
     harness.add_peer(mapped, PeerSourceFlag::Tracker);
-    assert!(harness.peers.with_peer(mapped, |_| ()).is_some());
+    harness.add_peer(ipv4, PeerSourceFlag::Dht);
+    assert!(harness.peers.with_peer(ipv4, |_| ()).is_some());
+    assert!(harness.peers.with_peer(mapped, |_| ()).is_none());
+    assert_eq!(harness.peers.states.len(), 1);
     harness._session.stop().await;
 }

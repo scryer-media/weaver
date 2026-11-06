@@ -78,12 +78,24 @@ impl IpRanges {
         v4_ranges: impl IntoIterator<Item = Range<Ipv4Addr>>,
         v6_ranges: impl IntoIterator<Item = Range<Ipv6Addr>>,
     ) -> Self {
-        let mapped_end = Ipv4Addr::BROADCAST.to_ipv6_mapped().to_bits() + 1;
-        let (mapped, v6): (Vec<_>, Vec<_>) = v6_ranges.into_iter().partition(|range| {
-            range.start.to_ipv4_mapped().is_some()
-                && range.end.to_bits() <= mapped_end
-                && range.start < range.end
-        });
+        let block = Ipv4Addr::UNSPECIFIED.to_ipv6_mapped().to_bits()
+            ..Ipv4Addr::BROADCAST.to_ipv6_mapped().to_bits() + 1;
+        let (mut mapped, mut v6) = (Vec::new(), Vec::new());
+        for range in v6_ranges {
+            let (start, end) = (range.start.to_bits(), range.end.to_bits());
+            // A range with an endpoint in the mapped block covers its share of
+            // the block; a broader IPv6 range does not reach IPv4 peers.
+            let reaches = start < end && (block.contains(&start) || block.contains(&(end - 1)));
+            if reaches {
+                mapped.push(
+                    Ipv6Addr::from_bits(start.max(block.start))
+                        ..Ipv6Addr::from_bits(end.min(block.end)),
+                );
+            }
+            if !reaches || start < block.start || end > block.end {
+                v6.push(range);
+            }
+        }
         Self {
             v4: sorted_ranges(v4_ranges.into_iter()),
             v6: sorted_ranges(v6.into_iter()),

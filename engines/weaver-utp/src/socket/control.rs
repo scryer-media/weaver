@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use std::num::NonZeroUsize;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -9,7 +10,16 @@ use std::sync::{
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+/// Pending connects on a socket with no finite connections limit.
 pub(super) const MAX_PENDING_CONNECTS: usize = 32;
+
+/// How many connects may be pending at once: as many as the socket admits
+/// streams, so a caller bounded by that limit never waits here.
+pub(super) fn pending_connects(connections_limit: Option<NonZeroUsize>) -> usize {
+    connections_limit.map_or(MAX_PENDING_CONNECTS, |limit| {
+        limit.get().min(Semaphore::MAX_PERMITS)
+    })
+}
 
 /// One permit follows a connect from its request queue through its handshake.
 /// Established streams do not retain a permit.
@@ -19,13 +29,17 @@ pub(super) struct ConnectAdmission {
 
 impl Default for ConnectAdmission {
     fn default() -> Self {
-        Self {
-            permits: Arc::new(Semaphore::new(MAX_PENDING_CONNECTS)),
-        }
+        Self::new(MAX_PENDING_CONNECTS)
     }
 }
 
 impl ConnectAdmission {
+    pub(super) fn new(permits: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(permits)),
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn available_permits(&self) -> usize {
         self.permits.available_permits()

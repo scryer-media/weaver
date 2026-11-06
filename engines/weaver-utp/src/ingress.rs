@@ -128,8 +128,10 @@ impl Sender {
                 }
             }
         } else {
+            // Only DATA delivers a payload; any other packet still acts on
+            // its header, a FIN with payload included.
             if !message.data.is_empty() {
-                return Ok(());
+                message.data = Vec::new();
             }
             (self.budget.reserve(0, false), false)
         };
@@ -277,6 +279,30 @@ mod tests {
         assert_eq!(rx.rx.try_recv().unwrap().message.header.htype, Type::State);
         assert_eq!(rx.rx.try_recv().unwrap().message.payload(), b"a");
         assert_eq!(tx.usage(), Usage::default());
+    }
+
+    #[test]
+    fn a_control_packet_with_payload_keeps_its_header_without_the_payload() {
+        let (tx, mut rx) = with_limits(Limits {
+            bytes: 4,
+            data_packets: 1,
+            control_packets: 2,
+        });
+        tx.send(message(Type::Fin, b"abc")).unwrap();
+        tx.send(message(Type::State, b"abc")).unwrap();
+        assert_eq!(
+            tx.usage(),
+            Usage {
+                control_packets: 2,
+                ..Default::default()
+            }
+        );
+        for kind in [Type::Fin, Type::State] {
+            let event = rx.rx.try_recv().unwrap();
+            assert_eq!(event.message.header.htype, kind);
+            assert!(event.message.payload().is_empty());
+            assert!(!event.payload_dropped);
+        }
     }
 
     #[test]

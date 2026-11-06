@@ -288,6 +288,8 @@ async fn a_non_listening_datagram_route_completes_a_utp_only_torrent_transfer() 
     assert_eq!(client.ssl_listen_addr(), None);
     assert_eq!(client.announce_port(), None);
     assert!(!client.listens_utp());
+    assert!(client.uses_utp());
+    assert!(crate::torrents::net::Exposure::of(&client, shape, None, &[]).utp);
     assert!(client.stats_snapshot().utp.max_congestion_window_bytes > 0);
     client.stop().await;
     assert!(

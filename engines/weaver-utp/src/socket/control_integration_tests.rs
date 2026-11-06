@@ -60,6 +60,10 @@ fn remote(port: u16) -> SocketAddr {
 }
 
 fn network() -> (ControlledSocket, Network) {
+    network_with(SocketOpts::default())
+}
+
+fn network_with(opts: SocketOpts) -> (ControlledSocket, Network) {
     let (incoming, received) = mpsc::unbounded_channel();
     let control = Arc::new(Controlled {
         incoming: Mutex::new(received),
@@ -76,7 +80,7 @@ fn network() -> (ControlledSocket, Network) {
     let socket = UtpSocket::new_with_opts(
         ControlledTransport(Arc::clone(&control)),
         DefaultUtpEnvironment {},
-        SocketOpts::default(),
+        opts,
     )
     .unwrap();
     (socket, Network { control, incoming })
@@ -371,6 +375,58 @@ async fn pending_connects_bound_admission_and_release_before_the_response_is_pol
     }
     // None of the first 32 response futures has been polled since enqueueing.
     drop(attempts);
+    drop(next);
+    socket.shutdown().await.unwrap();
+    assert_eq!(network.control.active_syn.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn pending_connects_scale_with_the_connections_limit() {
+    let (socket, network) = network_with(SocketOpts {
+        connections_limit: NonZeroUsize::new(40),
+        ..Default::default()
+    });
+    let mut attempts = Vec::new();
+    for index in 0..40 {
+        let mut attempt = Box::pin(socket.connect(remote(100 + index)));
+        assert!(attempt.as_mut().now_or_never().is_none());
+        attempts.push(attempt);
+    }
+    network.sent(Type::Syn, remote(139), 1).await;
+    assert_eq!(network.control.active_syn.load(Ordering::Relaxed), 40);
+    network.control.syn_completion.add_permits(40);
+    drop(attempts);
+    socket.shutdown().await.unwrap();
+    assert_eq!(network.control.active_syn.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_connect_waiting_for_admission_sends_its_syn_before_its_timeout_starts() {
+    let (socket, network) = network();
+    let mut attempts = Vec::new();
+    for index in 0..32 {
+        let mut attempt = Box::pin(socket.connect(remote(100 + index)));
+        assert!(attempt.as_mut().now_or_never().is_none());
+        attempts.push(attempt);
+    }
+    let mut next = Box::pin(socket.connect(remote(200)));
+    assert!(next.as_mut().now_or_never().is_none());
+    network.sent(Type::Syn, remote(131), 1).await;
+    network.control.syn_completion.add_permits(33);
+    // The admitted connects time out unanswered while the next one waits.
+    for attempt in attempts {
+        assert!(matches!(attempt.await, Err(Error::ConnectTimedOut)));
+    }
+    let advance = async {
+        let _ = next.as_mut().await;
+    };
+    let observed = async {
+        network.sent(Type::Syn, remote(200), 1).await;
+    };
+    tokio::select! {
+        _ = advance => panic!("the queued connect ended without a SYN"),
+        _ = observed => {}
+    }
     drop(next);
     socket.shutdown().await.unwrap();
     assert_eq!(network.control.active_syn.load(Ordering::Relaxed), 0);
