@@ -714,7 +714,11 @@ fn an_encrypted_directory_entry_closes_without_a_password() {
         owner.pull = pull;
         owner.whole(4096);
         assert!(owner.member("folder/").closed, "{pull:?}");
-        assert!(!owner.said.contains(&Emit::NeedsPassword), "{:?}", owner.said);
+        assert!(
+            !owner.said.contains(&Emit::NeedsPassword),
+            "{:?}",
+            owner.said
+        );
         assert!(owner.posted(0) == Some(archive));
     }
 }
@@ -1006,7 +1010,8 @@ fn a_restore_no_offered_candidate_proves_starts_the_member_over() {
     assert!(!owner.member("alpha.bin").closed);
     assert!(
         owner.member("alpha.bin").bytes.is_empty()
-            || owner.member("alpha.bin").bytes[..] == plain[..owner.member("alpha.bin").bytes.len()]
+            || owner.member("alpha.bin").bytes[..]
+                == plain[..owner.member("alpha.bin").bytes.len()]
     );
     // The recovery brings the damaged ciphertext again.
     owner.deliver_as(0, ByteRange::new(0, 80_000), Provenance::Repaired, None);
@@ -1105,9 +1110,19 @@ fn a_zipcrypto_repair_replays_only_from_the_repaired_byte() {
     owner.pull = Pull::Unseekable;
     offer(&mut owner, PASSWORD);
     owner.deliver(0, ByteRange::new(0, a.start));
-    owner.deliver_as(0, a, Provenance::Damaged, Some(&[archive[a.start as usize] ^ 0x5a]));
+    owner.deliver_as(
+        0,
+        a,
+        Provenance::Damaged,
+        Some(&[archive[a.start as usize] ^ 0x5a]),
+    );
     owner.deliver(0, ByteRange::new(a.end, b.start));
-    owner.deliver_as(0, b, Provenance::Damaged, Some(&[archive[b.start as usize] ^ 0x5a]));
+    owner.deliver_as(
+        0,
+        b,
+        Provenance::Damaged,
+        Some(&[archive[b.start as usize] ^ 0x5a]),
+    );
     owner.deliver(0, ByteRange::new(b.end, archive.len() as u64));
     let agains = |said: &[Emit]| -> Vec<ByteRange> {
         said.iter()
@@ -1119,10 +1134,16 @@ fn a_zipcrypto_repair_replays_only_from_the_repaired_byte() {
     };
     let first = owner.said.len();
     owner.deliver_as(0, a, Provenance::Repaired, None);
-    assert_eq!(agains(&owner.said[first..]), vec![ByteRange::new(a.start, end)]);
+    assert_eq!(
+        agains(&owner.said[first..]),
+        vec![ByteRange::new(a.start, end)]
+    );
     let second = owner.said.len();
     owner.deliver_as(0, b, Provenance::Repaired, None);
-    assert_eq!(agains(&owner.said[second..]), vec![ByteRange::new(b.start, end)]);
+    assert_eq!(
+        agains(&owner.said[second..]),
+        vec![ByteRange::new(b.start, end)]
+    );
     assert!(
         !owner.said[first..]
             .iter()
@@ -1197,8 +1218,21 @@ fn a_sent_back_article_corrects_the_tail_after_it() {
     // The window and the tail after it are no longer said, and the tail
     // waits, read back, for the keys the right copy makes.
     let member = ByteRange::new(window.start - start, plain.len() as u64);
-    assert!(owner.member("alpha.bin").coverage.overlapping(member).next().is_none());
-    assert!(owner.object.members[0].coverage.overlapping(member).next().is_none());
+    assert!(
+        owner
+            .member("alpha.bin")
+            .coverage
+            .overlapping(member)
+            .next()
+            .is_none()
+    );
+    assert!(
+        owner.object.members[0]
+            .coverage
+            .overlapping(member)
+            .next()
+            .is_none()
+    );
     assert!(!owner.member("alpha.bin").closed);
     owner.deliver(0, window);
     owner.close(0);
@@ -1324,7 +1358,12 @@ fn a_repair_in_the_tail_search_window_keeps_the_map() {
     owner.pull = Pull::Unseekable;
     offer(&mut owner, PASSWORD);
     owner.deliver(0, ByteRange::new(0, b.start));
-    owner.deliver_as(0, b, Provenance::Damaged, Some(&[archive[b.start as usize] ^ 0x5a]));
+    owner.deliver_as(
+        0,
+        b,
+        Provenance::Damaged,
+        Some(&[archive[b.start as usize] ^ 0x5a]),
+    );
     owner.deliver(0, ByteRange::new(b.end, archive.len() as u64));
     let first = owner.said.len();
     owner.deliver_as(0, b, Provenance::Repaired, None);
@@ -1363,12 +1402,22 @@ fn zipcrypto_repairs_before_their_replay_are_replayed_once() {
     owner.pull = Pull::Unseekable;
     offer(&mut owner, PASSWORD);
     owner.deliver(0, ByteRange::new(0, a.start));
-    owner.deliver_as(0, a, Provenance::Damaged, Some(&[archive[a.start as usize] ^ 0x5a]));
+    owner.deliver_as(
+        0,
+        a,
+        Provenance::Damaged,
+        Some(&[archive[a.start as usize] ^ 0x5a]),
+    );
     owner.deliver(0, ByteRange::new(a.end, b.start));
-    owner.deliver_as(0, b, Provenance::Damaged, Some(&[archive[b.start as usize] ^ 0x5a]));
+    owner.deliver_as(
+        0,
+        b,
+        Provenance::Damaged,
+        Some(&[archive[b.start as usize] ^ 0x5a]),
+    );
     owner.deliver(0, ByteRange::new(b.end, archive.len() as u64));
     let previous = owner.member("alpha.bin").bytes.clone();
-    let mut repair = |owner: &mut Owner, range: ByteRange| {
+    let repair = |owner: &mut Owner, range: ByteRange| {
         let mut out = Vec::new();
         owner.object.deliver(
             Delivery {
@@ -1407,6 +1456,12 @@ fn zipcrypto_repairs_before_their_replay_are_replayed_once() {
     assert!(owner.member("alpha.bin").bytes == plain, "{:?}", owner.said);
     assert!(owner.member("alpha.bin").closed);
     assert!(owner.posted(0) == Some(archive));
-    let cipher = owner.object.map.as_ref().unwrap().entry(MemberId(0)).unwrap();
+    let cipher = owner
+        .object
+        .map
+        .as_ref()
+        .unwrap()
+        .entry(MemberId(0))
+        .unwrap();
     assert!(cipher.cipher.as_ref().unwrap().pending.is_empty());
 }

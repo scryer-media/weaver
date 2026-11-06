@@ -81,11 +81,8 @@ struct State {
 impl State {
     fn fold(&mut self, plain: &[u8]) {
         if !plain.is_empty() {
-            self.crc = crate::grid::crc32_combine(
-                self.crc,
-                crate::grid::crc32(plain),
-                plain.len() as u64,
-            );
+            self.crc =
+                crate::grid::crc32_combine(self.crc, crate::grid::crc32(plain), plain.len() as u64);
         }
     }
 }
@@ -607,7 +604,11 @@ impl super::Zip {
             // replayed now the keys are back. Restored plaintext alone
             // goes again only on a failed CRC's retry.
             if !was_open
-                && let Some(from) = cipher.pending.iter().map(|(wanted, _, _)| wanted.start).min()
+                && let Some(from) = cipher
+                    .pending
+                    .iter()
+                    .map(|(wanted, _, _)| wanted.start)
+                    .min()
             {
                 again.push(ByteRange::new(data + from, data + entry.length));
             }
@@ -819,7 +820,11 @@ impl super::Zip {
         let range = ByteRange::at(offset, input.len() as u64);
         // Where the replay already asked for starts: a repair at or after
         // it is replayed with it.
-        let replay_from = cipher.pending.iter().map(|(wanted, _, _)| wanted.start).min();
+        let replay_from = cipher
+            .pending
+            .iter()
+            .map(|(wanted, _, _)| wanted.start)
+            .min();
         let mut provenance = provenance;
         for (wanted, replacement, source) in &cipher.pending {
             if let Some(part) = wanted.intersect(range) {
@@ -1032,13 +1037,7 @@ impl weaver_graph::Posting for Posted {
             let Ok(mut frontier) = keys.frontier.lock() else {
                 return false;
             };
-            if !open.seal(
-                &mut frontier,
-                local,
-                &keys.coverage,
-                &mut plain,
-                into,
-            ) {
+            if !open.seal(&mut frontier, local, &keys.coverage, &mut plain, into) {
                 return false;
             }
             cursor = part.end;

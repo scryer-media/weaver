@@ -627,7 +627,11 @@ impl GraphJob {
     // it where its neighbours showed it is not, so what came was never the
     // article's bytes. The root waits on it again, and the copy that comes
     // is taken as its first.
-    pub(crate) fn send_back(&mut self, volume: VolumeIndex, ordinal: u32) -> Result<(), GraphError> {
+    pub(crate) fn send_back(
+        &mut self,
+        volume: VolumeIndex,
+        ordinal: u32,
+    ) -> Result<(), GraphError> {
         self.unarrive(volume, ordinal)
     }
 
@@ -641,10 +645,12 @@ impl GraphJob {
     fn unarrive(&mut self, volume: VolumeIndex, ordinal: u32) -> Result<(), GraphError> {
         let range = self.root.map.arrived_range(volume, ordinal);
         let tail = match (range, self.tree.child_of(NodeId::ROOT, MemberId(volume.0))) {
-            (Some(range), Some((child, bound))) => Some(
-                self.writer
-                    .read_tail(&mut self.tree, &mut *self.builder, child, &[(bound, range)])?,
-            ),
+            (Some(range), Some((child, bound))) => Some(self.writer.read_tail(
+                &mut self.tree,
+                &mut *self.builder,
+                child,
+                &[(bound, range)],
+            )?),
             _ => None,
         };
         self.root.map.unarrive(volume, ordinal);
@@ -653,8 +659,13 @@ impl GraphJob {
         }
         if let Some(tail) = tail {
             let mut out = Vec::new();
-            self.writer
-                .say_tail(&mut self.tree, &mut *self.builder, &self.root, tail, &mut out)?;
+            self.writer.say_tail(
+                &mut self.tree,
+                &mut *self.builder,
+                &self.root,
+                tail,
+                &mut out,
+            )?;
             self.heard(out)?;
         }
         Ok(())

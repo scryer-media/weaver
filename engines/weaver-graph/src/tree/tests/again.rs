@@ -49,7 +49,12 @@ impl Object for Trial {
         self.hear(Heard::Unposted(range));
     }
 
-    fn uncovers(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<(VolumeIndex, ByteRange)>) {
+    fn uncovers(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        out: &mut Vec<(VolumeIndex, ByteRange)>,
+    ) {
         out.push((volume, range));
         let given = self.given.len() as u64;
         if self.tail && range.end < given {
@@ -507,7 +512,13 @@ fn an_uncover_forgets_what_the_store_says_comes_from_it() {
         .and_then(|namespace| namespace.get(MemberId(0)))
         .expect("member");
     assert!(record.coverage.covered(ByteRange::new(0, 5)));
-    assert!(record.coverage.overlapping(ByteRange::new(5, length)).next().is_none());
+    assert!(
+        record
+            .coverage
+            .overlapping(ByteRange::new(5, length))
+            .next()
+            .is_none()
+    );
     // The root holds what arrived of the volume apart from the article.
     let root = tree
         .namespace(NodeId::ROOT)
@@ -535,7 +546,13 @@ fn a_range_asked_for_again_reads_back_what_comes_from_it() {
         .namespace(child)
         .and_then(|namespace| namespace.get(MemberId(0)))
         .expect("member");
-    assert!(record.coverage.overlapping(ByteRange::new(5, length)).next().is_none());
+    assert!(
+        record
+            .coverage
+            .overlapping(ByteRange::new(5, length))
+            .next()
+            .is_none()
+    );
 }
 
 // Before a range is uncovered by bytes of the caller's own, the bytes after

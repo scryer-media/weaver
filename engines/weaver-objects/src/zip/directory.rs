@@ -576,7 +576,10 @@ fn moved(old: &Map, new: &Map) -> Vec<usize> {
                     // header its plaintext was made under.
                     was.cipher.as_ref().map(|cipher| cipher.header)
                         != is.cipher.as_ref().map(|cipher| cipher.header)
-                        || was.cipher.as_ref().is_some_and(|cipher| cipher.header.is_none())
+                        || was
+                            .cipher
+                            .as_ref()
+                            .is_some_and(|cipher| cipher.header.is_none())
                         || was.name != is.name
                         || was.length != is.length
                         || was.checksum != is.checksum

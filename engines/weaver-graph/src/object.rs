@@ -413,7 +413,12 @@ pub trait Object: Send + Sync {
     // and whatever I said that came from it and must be said again with
     // it, a cipher's plaintext after it, made under keys it fed. The tree
     // reads all of it back before it forgets any, and forgets all of it.
-    fn uncovers(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<(VolumeIndex, ByteRange)>) {
+    fn uncovers(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        out: &mut Vec<(VolumeIndex, ByteRange)>,
+    ) {
         out.push((volume, range));
     }
 

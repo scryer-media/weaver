@@ -597,7 +597,12 @@ impl Object for Zip {
     // A cipher member's plaintext after the range was made under keys the
     // range fed, so forgetting the range forgets it all, through the end of
     // what the member has said.
-    fn uncovers(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<(VolumeIndex, ByteRange)>) {
+    fn uncovers(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        out: &mut Vec<(VolumeIndex, ByteRange)>,
+    ) {
         out.push((volume, range));
         let (Some(global), Some(map)) = (self.global(volume, range), &self.map) else {
             return;

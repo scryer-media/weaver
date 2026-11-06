@@ -4123,7 +4123,11 @@ impl Tree {
         range: ByteRange,
     ) -> Vec<(VolumeIndex, ByteRange)> {
         let mut out = Vec::new();
-        match self.nodes.get(&node).and_then(|found| found.object.as_ref()) {
+        match self
+            .nodes
+            .get(&node)
+            .and_then(|found| found.object.as_ref())
+        {
             Some(object) => object.uncovers(volume, range, &mut out),
             None => out.push((volume, range)),
         }

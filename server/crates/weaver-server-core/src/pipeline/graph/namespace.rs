@@ -1298,10 +1298,15 @@ impl NamespaceWriter {
     ) -> Result<Tail, WriteError> {
         let mut staged = loan::Repaired::again(&self.working_dir, node)?;
         let mut sources = Vec::new();
-        let serial = tree.again_tail(node, ranges, &self.placing(builder), &mut |volume, posted| {
-            staged.write(MemberId(volume.0), posted.offset, &posted.bytes);
-            sources.push(posted.provenance);
-        });
+        let serial = tree.again_tail(
+            node,
+            ranges,
+            &self.placing(builder),
+            &mut |volume, posted| {
+                staged.write(MemberId(volume.0), posted.offset, &posted.bytes);
+                sources.push(posted.provenance);
+            },
+        );
         if let Some(error) = staged.failed() {
             tree.again_done();
             let _ = staged.discard();
