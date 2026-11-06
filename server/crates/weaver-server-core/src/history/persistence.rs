@@ -281,7 +281,7 @@ impl Database {
                             args.push(SqlArg::OptI64(event.item_id.map(|value| value as i64)));
                             args.push(SqlArg::Text(event.payload_json.clone()));
                         }
-                        SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
+                        SqlRuntime::execute(datastore.write_exec(), &sql, &args).await?;
                     }
                     crate::runtime::perf_probe::record_sql_op(
                         "postgres",
@@ -297,7 +297,7 @@ impl Database {
     pub fn delete_all_integration_events(&self) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            SqlRuntime::execute(datastore.read_exec(), "DELETE FROM integration_events", &[])
+            SqlRuntime::execute(datastore.write_exec(), "DELETE FROM integration_events", &[])
                 .await?;
             Ok(())
         })

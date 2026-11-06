@@ -456,7 +456,7 @@ fn insert_history_row_with_nzb_zstd(db: &Database, row: &crate::JobHistoryRow, n
     let nzb_zstd = nzb_zstd.to_vec();
     db.run_sql_blocking(async move {
         SqlRuntime::execute(
-            datastore.read_exec(),
+            datastore.write_exec(),
             "UPDATE job_history SET nzb_zstd = {} WHERE job_id = {}",
             &[SqlArg::Bytes(nzb_zstd), SqlArg::I64(job_id)],
         )

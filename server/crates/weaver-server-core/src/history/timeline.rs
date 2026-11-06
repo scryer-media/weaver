@@ -139,7 +139,7 @@ async fn insert_job_events_sql(
                     args.push(SqlArg::Text(event.message.clone()));
                     args.push(SqlArg::OptText(event.file_id.clone()));
                 }
-                SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
+                SqlRuntime::execute(datastore.write_exec(), &sql, &args).await?;
             }
             crate::runtime::perf_probe::record_sql_op(
                 "postgres",
@@ -167,7 +167,7 @@ impl Database {
         let file_id = file_id.map(str::to_string);
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "INSERT INTO job_events (job_id, timestamp, kind, message, file_id)
                  VALUES ({}, {}, {}, {}, {})",
                 &[
@@ -402,7 +402,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "DELETE FROM job_events WHERE job_id = {}",
                 &[SqlArg::I64(job_id as i64)],
             )
@@ -415,7 +415,7 @@ impl Database {
     pub fn delete_all_job_events(&self) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            SqlRuntime::execute(datastore.read_exec(), "DELETE FROM job_events", &[]).await?;
+            SqlRuntime::execute(datastore.write_exec(), "DELETE FROM job_events", &[]).await?;
             Ok(())
         })
     }

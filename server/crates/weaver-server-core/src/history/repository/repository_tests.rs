@@ -68,7 +68,7 @@ fn upsert_preserves_persisted_nzb_bytes_when_update_omits_them() {
     let expected_for_update = expected_nzb.clone();
     db.run_sql_blocking(async move {
         SqlRuntime::execute(
-            datastore.read_exec(),
+            datastore.write_exec(),
             "UPDATE job_history SET nzb_zstd = {} WHERE job_id = {}",
             &[SqlArg::Bytes(expected_for_update), SqlArg::I64(1)],
         )
@@ -257,7 +257,7 @@ fn batched_bundle_delete_clears_every_child_table_and_leaves_other_jobs() {
                     vec![SqlArg::I64(id)],
                 ),
             ] {
-                SqlRuntime::execute(datastore.read_exec(), template, &args).await?;
+                SqlRuntime::execute(datastore.write_exec(), template, &args).await?;
             }
             Ok(())
         })

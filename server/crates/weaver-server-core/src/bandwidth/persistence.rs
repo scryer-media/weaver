@@ -74,7 +74,7 @@ impl Database {
                         args.push(SqlArg::I64(payload_bytes as i64));
                     }
                     let result = SqlRuntime::execute(
-                        datastore.read_exec(),
+                        datastore.write_exec(),
                         &format!(
                             "INSERT INTO bandwidth_usage_minute_buckets (bucket_epoch_minute, metered, payload_bytes)
                              VALUES {placeholders}
@@ -103,7 +103,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "DELETE FROM bandwidth_usage_minute_buckets WHERE bucket_epoch_minute < {}",
                 &[SqlArg::I64(cutoff_bucket_epoch_minute)],
             )

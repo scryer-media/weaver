@@ -1187,7 +1187,7 @@ impl Database {
         let datastore = self.datastore();
         let result = self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE script_instances SET enabled = {}",
                 &[SqlArg::Bool(false)],
             )
@@ -1354,7 +1354,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "DELETE FROM feed_scripts WHERE feed_id = {}",
                 &[SqlArg::I64(i64::from(feed_id))],
             )

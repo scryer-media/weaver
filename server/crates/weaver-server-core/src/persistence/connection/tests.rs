@@ -40,7 +40,7 @@ fn fetch_text(db: &Database, sql: &'static str, args: Vec<SqlArg>) -> String {
 fn execute(db: &Database, sql: &'static str, args: Vec<SqlArg>) {
     let datastore = db.datastore();
     db.run_sql_blocking_read(async move {
-        SqlRuntime::execute(datastore.read_exec(), sql, &args).await?;
+        SqlRuntime::execute(datastore.write_exec(), sql, &args).await?;
         Ok(())
     })
     .unwrap()
