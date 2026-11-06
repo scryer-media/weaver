@@ -120,47 +120,20 @@ impl SqliteServices {
     ) -> Result<Self, StateError> {
         let db_url = sqlite_url_with_create(url.as_ref());
         let is_memory = db_url.contains(":memory:");
-        let pool_opts = if is_memory {
-            SqlitePoolOptions::new()
-                .max_connections(1)
-                .min_connections(1)
-                .idle_timeout(None)
-                .max_lifetime(None)
-        } else {
-            SqlitePoolOptions::new().max_connections(sqlite_max_connections_from_env())
-        };
-
-        let mut connect_opts: SqliteConnectOptions = db_url.parse().map_err(db_err)?;
-        connect_opts = connect_opts
-            .foreign_keys(true)
-            .busy_timeout(Duration::from_millis(10_000))
-            .pragma("auto_vacuum", "INCREMENTAL")
-            .pragma("synchronous", "NORMAL")
-            .pragma("mmap_size", "16777216")
-            .pragma("temp_store", "MEMORY")
-            .log_slow_statements(
-                LevelFilter::Warn,
-                Duration::from_millis(SLOW_STATEMENT_WARN_MS),
-            );
-        if is_memory {
-            connect_opts = connect_opts.pragma("cache_size", "-16000");
-        } else {
-            // A file database sits on whatever disk the user has, spinning ones
-            // included: a 64 MB page cache keeps the hot tables off the disk, a
-            // 16 MB WAL between checkpoints turns many small commits into fewer
-            // long writes, and the size limit truncates the WAL back after a
-            // checkpoint so one burst does not leave it large for good.
-            connect_opts = connect_opts
-                .journal_mode(SqliteJournalMode::Wal)
-                .pragma("cache_size", "-65536")
-                .pragma("wal_autocheckpoint", "4000")
-                .pragma("journal_size_limit", "67108864");
-        }
+        let pool_opts = sqlite_pool_options(is_memory);
+        let connect_opts = sqlite_connect_options(&db_url, is_memory)?;
 
         // The run goes over one connection. A connection keeps the schema it
         // last read, and SQLite checks a dropped column against that copy, so
         // a migration that drops a column an earlier step added on another
         // connection would read it as missing.
+        //
+        // auto_vacuum is set here and only here. Setting it writes page 1, so
+        // a connection that sets it takes SQLite's write lock while it opens:
+        // behind a long commit the open waits busy_timeout and fails, and a
+        // read on that connection fails with it. The setting lives in the
+        // database file, so the one migration connection, which opens first
+        // and creates the schema, sets it for every connection after it.
         let label = db_url.as_str();
         let open = move |options: SqliteConnectOptions, pool_opts: SqlitePoolOptions| async move {
             pool_opts.connect_with(options).await.map_err(|error| {
@@ -172,7 +145,7 @@ impl SqliteServices {
         } else {
             Some(
                 open(
-                    connect_opts.clone(),
+                    connect_opts.clone().pragma("auto_vacuum", "INCREMENTAL"),
                     SqlitePoolOptions::new().max_connections(1),
                 )
                 .await?,
@@ -390,6 +363,62 @@ pub(crate) fn sqlite_url_with_create(path: &str) -> String {
     format!("sqlite://{path}?mode=rwc")
 }
 
+// Nothing a file pool connection is opened with writes the database, so
+// opening one never needs SQLite's write lock.
+pub(crate) fn sqlite_connect_options(
+    db_url: &str,
+    is_memory: bool,
+) -> Result<SqliteConnectOptions, StateError> {
+    let mut connect_opts: SqliteConnectOptions = db_url.parse().map_err(db_err)?;
+    connect_opts = connect_opts
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_millis(10_000))
+        .pragma("synchronous", "NORMAL")
+        .pragma("mmap_size", "16777216")
+        .pragma("temp_store", "MEMORY")
+        .log_slow_statements(
+            LevelFilter::Warn,
+            Duration::from_millis(SLOW_STATEMENT_WARN_MS),
+        );
+    if is_memory {
+        // A memory database has its one connection for life and no
+        // migration connection, so that connection sets auto_vacuum.
+        connect_opts = connect_opts
+            .pragma("auto_vacuum", "INCREMENTAL")
+            .pragma("cache_size", "-16000");
+    } else {
+        // A file database sits on whatever disk the user has, spinning ones
+        // included: a 64 MB page cache keeps the hot tables off the disk, a
+        // 16 MB WAL between checkpoints turns many small commits into fewer
+        // long writes, and the size limit truncates the WAL back after a
+        // checkpoint so one burst does not leave it large for good.
+        connect_opts = connect_opts
+            .journal_mode(SqliteJournalMode::Wal)
+            .pragma("cache_size", "-65536")
+            .pragma("wal_autocheckpoint", "4000")
+            .pragma("journal_size_limit", "67108864");
+    }
+    Ok(connect_opts)
+}
+
+// A file pool opens every connection up front and keeps it for the life of
+// the process, so no request ever waits on an open: an open reads the
+// header and the schema, which on network storage is slow. Sixteen
+// connections cost sixteen file handles, and each page cache only grows as
+// it is used.
+pub(crate) fn sqlite_pool_options(is_memory: bool) -> SqlitePoolOptions {
+    let max_connections = if is_memory {
+        1
+    } else {
+        sqlite_max_connections_from_env()
+    };
+    SqlitePoolOptions::new()
+        .max_connections(max_connections)
+        .min_connections(max_connections)
+        .idle_timeout(None)
+        .max_lifetime(None)
+}
+
 pub(crate) fn sqlite_max_connections_from_env() -> u32 {
     std::env::var("WEAVER_SQLITE_MAX_CONNECTIONS")
         .ok()
@@ -505,5 +534,88 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cache_size, -16000);
+    }
+
+    async fn file_services(dir: &tempfile::TempDir) -> (SqliteServices, String) {
+        let path = dir.path().join("weaver.db");
+        let services = SqliteServices::new_path(&path, MigrationMode::Apply)
+            .await
+            .unwrap();
+        let url = sqlite_url_with_create(&path.to_string_lossy());
+        (services, url)
+    }
+
+    // A transaction holds SQLite's write lock, as a long gated commit does. A
+    // connection opened with the pool's options, given no busy wait at all,
+    // still opens and reads: nothing it runs on open takes the write lock.
+    // The same open that also sets auto_vacuum, as every pool connection did,
+    // fails busy at once, which is what the pin guards against.
+    #[tokio::test]
+    async fn a_pool_connection_opens_while_a_write_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let (services, url) = file_services(&dir).await;
+        sqlx::query("CREATE TABLE pin (v INTEGER)")
+            .execute(services.pool())
+            .await
+            .unwrap();
+
+        let mut holder = services.pool().acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO pin (v) VALUES (1)")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+
+        let no_wait = sqlite_connect_options(&url, false)
+            .unwrap()
+            .busy_timeout(Duration::ZERO);
+        let mut fresh = no_wait.connect().await.unwrap();
+        let (rows,): (i64,) = sqlx::query_as("SELECT count(*) FROM pin")
+            .fetch_one(&mut fresh)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+        fresh.close().await.unwrap();
+
+        let error = no_wait
+            .pragma("auto_vacuum", "INCREMENTAL")
+            .connect()
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .as_deref(),
+            Some("5"),
+            "{error}"
+        );
+
+        sqlx::query("COMMIT").execute(&mut *holder).await.unwrap();
+    }
+
+    // The migration connection sets auto_vacuum once and the file keeps it.
+    #[tokio::test]
+    async fn auto_vacuum_is_set_once_at_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let (services, _) = file_services(&dir).await;
+        let (mode,): (i64,) = sqlx::query_as("PRAGMA auto_vacuum")
+            .fetch_one(services.pool())
+            .await
+            .unwrap();
+        assert_eq!(mode, 2, "INCREMENTAL");
+    }
+
+    // A file pool opens every connection and never drops one, so no request
+    // pays for an open.
+    #[test]
+    fn a_file_pool_keeps_every_connection() {
+        let options = sqlite_pool_options(false);
+        assert_eq!(options.get_min_connections(), options.get_max_connections());
+        assert_eq!(options.get_idle_timeout(), None);
+        assert_eq!(options.get_max_lifetime(), None);
     }
 }
