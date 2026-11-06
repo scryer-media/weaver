@@ -1311,14 +1311,18 @@ impl Pipeline {
             crate::ingest::completed_folder_name(&state.spec.name, &state.spec.metadata);
         let category = state.spec.category.clone();
         let root = self.intermediate_dir.clone();
-        let source = match tokio::task::spawn_blocking(move || {
-            crate::jobs::working_dir::find_job_working_dir(&root, job_id)
+        let named = recorded.clone();
+        let found = tokio::task::spawn_blocking(move || {
+            let source = crate::jobs::working_dir::find_job_working_dir(&root, job_id)?;
+            let own = source.as_ref() == Some(&named)
+                || crate::jobs::working_dir::is_job_working_dir(&root, &named, job_id)?;
+            Ok::<_, std::io::Error>((source, own))
         })
         .await
         .map_err(std::io::Error::other)
-        .and_then(|found| found)
-        {
-            Ok(source) => source,
+        .and_then(|found| found);
+        let (source, names_working_dir) = match found {
+            Ok(found) => found,
             Err(error) => {
                 self.fail_job(
                     job_id,
@@ -1327,9 +1331,13 @@ impl Pipeline {
                 return;
             }
         };
-        // A row that names its working directory, not a destination, was
-        // written before the destination was recorded; the move claims one.
-        let dest = if recorded.starts_with(&self.intermediate_dir) {
+        // A row that names the job's own working directory, not a
+        // destination, was written before the destination was recorded; the
+        // move claims one. A destination is told from it by the job's
+        // ownership marker, never by where it sits: a complete directory may
+        // lie inside the intermediate one, and its destination is resumed
+        // into, not claimed again beside itself.
+        let dest = if names_working_dir {
             match self
                 .claim_complete_destination(job_id, &folder_name, category.as_deref())
                 .await
