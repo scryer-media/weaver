@@ -119,34 +119,114 @@ async fn failed_reload_keeps_routes_pools_and_configuration_together() {
     runtime.shutdown().await;
 }
 
-#[tokio::test]
-async fn profile_revision_rebuilds_pool_leg_after_trust_failure() {
-    let runtime = NetworkRuntime::new(
-        Database::open_in_memory().unwrap(),
-        tokio::runtime::Handle::current(),
-    )
-    .unwrap();
+// A configuration whose server 1 routes through pool 7, holding `members`.
+fn server_pool(runtime: &NetworkRuntime, members: Vec<u32>) -> Configuration {
     let mut config = runtime.configuration.read().unwrap().clone();
     config.consumers.insert(Consumer::Server(1).key());
-    config.profiles.insert(1, proxy());
+    for id in &members {
+        config
+            .profiles
+            .entry(*id)
+            .or_insert(ProxyProfile { id: *id, ..proxy() });
+    }
     config.pools.insert(
         7,
         ProxyPool {
             id: 7,
             name: "fixture".into(),
             kind: ProxyKind::Socks5,
-            member_ids: vec![1],
+            member_ids: members,
             enabled: true,
         },
     );
     config
         .policies
         .insert(Consumer::Server(1).key(), pool_policy());
-    runtime.apply_configuration(config.clone()).unwrap();
-    let route = runtime
+    config
+}
+
+fn server_route(runtime: &NetworkRuntime) -> Arc<LiveNetworkRoute> {
+    runtime
         .route(Consumer::Server(1), 5, Duration::from_secs(1))
-        .unwrap();
-    let old: Arc<dyn Dialer> = route.legs.read().unwrap()[0].stage.clone();
+        .unwrap()
+}
+
+fn first_stage(route: &LiveNetworkRoute) -> Arc<Revocable> {
+    route.legs.read().unwrap()[0].stage.clone()
+}
+
+fn running_pool(runtime: &NetworkRuntime) -> Arc<PoolStage> {
+    runtime.pools.lock().unwrap()[&(7, 0)].clone()
+}
+
+fn member_ids(pool: &PoolStage) -> Vec<u32> {
+    pool.snapshot().1.iter().map(|member| member.id).collect()
+}
+
+fn health(route: &LiveNetworkRoute) -> LegHealthState {
+    route.weighted.allocations()[0].health.clone()
+}
+
+// An SSH proxy whose host key no longer matches the pinned one: its session
+// never prepares, which blocks the pool member it backs.
+struct Mismatched;
+#[async_trait::async_trait]
+impl TunnelProvider for Mismatched {
+    async fn prepare(&self) -> Result<(), weaver_tunnel::TunnelError> {
+        Err(weaver_tunnel::TunnelError::HostKeyMismatch {
+            host: "ssh.invalid".into(),
+            port: 22,
+            expected: "SHA256:old".into(),
+            actual: "SHA256:new".into(),
+        })
+    }
+    async fn dial(
+        &self,
+        _: &str,
+        _: u16,
+    ) -> Result<Box<dyn weaver_tunnel::TunnelStream>, weaver_tunnel::TunnelError> {
+        self.prepare().await.map(|()| unreachable!())
+    }
+    fn describe(&self) -> String {
+        "mismatched".into()
+    }
+}
+
+fn mismatched_ssh(id: u32) -> ProxyProfile {
+    ProxyProfile {
+        id,
+        kind: ProxyKind::Ssh,
+        port: 22,
+        ..proxy()
+    }
+}
+
+// Dials the route once; every member of its pool blocks on the way.
+async fn dial_blocked(route: &LiveNetworkRoute) {
+    let dialed = route
+        .weighted
+        .dial(&Target {
+            host: "news.invalid".into(),
+            port: 119,
+            purpose: weaver_tunnel::pipe::Purpose::Probe,
+            addresses: Vec::new(),
+        })
+        .await;
+    assert!(matches!(dialed, Err(DialError::Fatal(_))));
+    assert!(matches!(health(route), LegHealthState::Blocked(_)));
+}
+
+#[tokio::test]
+async fn a_member_edit_lifts_a_pool_legs_block_and_keeps_its_stage() {
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let mut config = server_pool(&runtime, vec![1]);
+    runtime.apply_configuration(config.clone()).unwrap();
+    let route = server_route(&runtime);
+    let old: Arc<dyn Dialer> = first_stage(&route);
     route.weighted.report_external(
         0,
         &old,
@@ -154,27 +234,19 @@ async fn profile_revision_rebuilds_pool_leg_after_trust_failure() {
             "trust rejected".into(),
         ))),
     );
-    assert!(matches!(
-        route.weighted.allocations()[0].health,
-        LegHealthState::Blocked(_)
-    ));
+    assert!(matches!(health(&route), LegHealthState::Blocked(_)));
     config.profiles.get_mut(&1).unwrap().revision += 1;
     runtime.apply_configuration(config).unwrap();
-    assert!(matches!(
-        route.weighted.allocations()[0].health,
-        LegHealthState::Up
-    ));
-    let new: Arc<dyn Dialer> = route.legs.read().unwrap()[0].stage.clone();
-    assert!(!Arc::ptr_eq(&old, &new));
+    assert!(matches!(health(&route), LegHealthState::Up));
+    let new: Arc<dyn Dialer> = first_stage(&route);
+    assert!(Arc::ptr_eq(&old, &new));
     runtime.shutdown().await;
 }
 
-// A torrent scope's pool leg stands through edits to the pool's members: a
-// member added and another edited keep its stage, as each session holds its
-// member through a stage of its own. A server's leg on the same pool is
-// rebuilt by the same edits. The pool disabled takes the torrent leg down.
+// A pool edit keeps every leg on the pool, a torrent scope's and a server's
+// alike. The pool disabled takes both down.
 #[tokio::test]
-async fn a_torrent_pool_leg_stands_through_member_edits_until_the_pool_is_disabled() {
+async fn pool_legs_stand_through_member_edits_until_the_pool_is_disabled() {
     let runtime = NetworkRuntime::new(
         Database::open_in_memory().unwrap(),
         tokio::runtime::Handle::current(),
@@ -201,30 +273,216 @@ async fn a_torrent_pool_leg_stands_through_member_edits_until_the_pool_is_disabl
         config.policies.insert(consumer.key(), pool_policy());
     }
     runtime.apply_configuration(config.clone()).unwrap();
-    let stage = |consumer| {
-        runtime
-            .route(consumer, 5, timeout)
-            .unwrap()
-            .legs
-            .read()
-            .unwrap()[0]
-            .stage
-            .clone()
-    };
+    let stage = |consumer| first_stage(&runtime.route(consumer, 5, timeout).unwrap());
     let torrent_leg = stage(torrent);
     let server_leg = stage(server);
 
     config.pools.get_mut(&7).unwrap().member_ids = vec![1, 2];
     config.profiles.get_mut(&1).unwrap().revision += 1;
     runtime.apply_configuration(config.clone()).unwrap();
-    assert!(Arc::ptr_eq(&stage(torrent), &torrent_leg));
-    assert!(!torrent_leg.is_revoked());
-    assert!(!Arc::ptr_eq(&stage(server), &server_leg));
-    assert!(server_leg.is_revoked());
+    for (consumer, leg) in [(torrent, &torrent_leg), (server, &server_leg)] {
+        assert!(Arc::ptr_eq(&stage(consumer), leg));
+        assert!(!leg.is_revoked());
+    }
 
     config.pools.get_mut(&7).unwrap().enabled = false;
     runtime.apply_configuration(config).unwrap();
     assert!(torrent_leg.is_revoked());
+    assert!(server_leg.is_revoked());
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_member_added_to_a_server_pool_keeps_the_leg_and_every_member() {
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    runtime
+        .apply_configuration(server_pool(&runtime, vec![1]))
+        .unwrap();
+    let route = server_route(&runtime);
+    let stage = first_stage(&route);
+    let pool = running_pool(&runtime);
+    let first = pool.pin_member(1).unwrap();
+
+    runtime
+        .apply_configuration(server_pool(&runtime, vec![1, 2]))
+        .unwrap();
+    assert!(Arc::ptr_eq(&first_stage(&route), &stage));
+    assert!(!stage.is_revoked());
+    assert_eq!(member_ids(&pool), vec![1, 2]);
+    assert_eq!(first.stale(), None);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_member_removed_from_a_server_pool_is_recalled_alone() {
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    runtime
+        .apply_configuration(server_pool(&runtime, vec![1, 2, 3]))
+        .unwrap();
+    let route = server_route(&runtime);
+    let stage = first_stage(&route);
+    let pool = running_pool(&runtime);
+    let pins = [1, 2, 3].map(|id| pool.pin_member(id).unwrap());
+
+    runtime
+        .apply_configuration(server_pool(&runtime, vec![1, 3]))
+        .unwrap();
+    assert!(Arc::ptr_eq(&first_stage(&route), &stage));
+    assert!(!stage.is_revoked());
+    assert_eq!(member_ids(&pool), vec![1, 3]);
+    assert_eq!(pins[0].stale(), None);
+    assert_eq!(
+        pins[1].stale().as_deref(),
+        Some("proxy 2 is no longer a member of pool 7")
+    );
+    assert_eq!(pins[2].stale(), None);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_member_edited_in_a_server_pool_is_renewed_alone() {
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let mut config = server_pool(&runtime, vec![1, 2]);
+    runtime.apply_configuration(config.clone()).unwrap();
+    let route = server_route(&runtime);
+    let stage = first_stage(&route);
+    let pool = running_pool(&runtime);
+    let first = pool.pin_member(1).unwrap();
+    let second = pool.pin_member(2).unwrap();
+
+    config.profiles.get_mut(&2).unwrap().revision += 1;
+    runtime.apply_configuration(config).unwrap();
+    assert!(Arc::ptr_eq(&first_stage(&route), &stage));
+    assert!(!stage.is_revoked());
+    assert_eq!(first.stale(), None);
+    assert_eq!(second.stale().as_deref(), Some("proxy 2 changed in pool 7"));
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn reordering_a_server_pool_keeps_the_leg_and_moves_the_plan_order() {
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    runtime
+        .apply_configuration(server_pool(&runtime, vec![1, 2]))
+        .unwrap();
+    let route = server_route(&runtime);
+    let stage = first_stage(&route);
+    let pool = running_pool(&runtime);
+    let pins = [1, 2].map(|id| pool.pin_member(id).unwrap());
+    let order = |pool: &PoolStage| -> Vec<u32> {
+        pool.snapshot()
+            .0
+            .candidates
+            .iter()
+            .map(|candidate| candidate.candidate)
+            .collect()
+    };
+    assert_eq!(order(&pool), vec![1, 2]);
+
+    runtime
+        .apply_configuration(server_pool(&runtime, vec![2, 1]))
+        .unwrap();
+    assert!(Arc::ptr_eq(&first_stage(&route), &stage));
+    assert!(!stage.is_revoked());
+    assert_eq!(order(&pool), vec![2, 1]);
+    assert!(pins.iter().all(|pin| pin.stale().is_none()));
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_blocked_member_edited_brings_its_server_leg_back_up() {
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    runtime.install_fixture(1, Arc::new(Mismatched));
+    let mut config = server_pool(&runtime, vec![]);
+    config.profiles.insert(1, mismatched_ssh(1));
+    config.pools.get_mut(&7).unwrap().member_ids = vec![1];
+    runtime.apply_configuration(config.clone()).unwrap();
+    let route = server_route(&runtime);
+    let stage = first_stage(&route);
+    dial_blocked(&route).await;
+    assert!(running_pool(&runtime).all_blocked());
+
+    config.profiles.get_mut(&1).unwrap().revision += 1;
+    runtime.apply_configuration(config).unwrap();
+    assert!(matches!(health(&route), LegHealthState::Up));
+    assert!(Arc::ptr_eq(&first_stage(&route), &stage));
+    assert!(!stage.is_revoked());
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_server_pool_leg_stays_blocked_while_every_remaining_member_is() {
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    runtime.install_fixture(1, Arc::new(Mismatched));
+    runtime.install_fixture(2, Arc::new(Mismatched));
+    let mut config = server_pool(&runtime, vec![]);
+    config.profiles.insert(1, mismatched_ssh(1));
+    config.profiles.insert(2, mismatched_ssh(2));
+    config.pools.get_mut(&7).unwrap().member_ids = vec![1, 2];
+    runtime.apply_configuration(config.clone()).unwrap();
+    let route = server_route(&runtime);
+    let stage = first_stage(&route);
+    dial_blocked(&route).await;
+
+    config.pools.get_mut(&7).unwrap().member_ids = vec![1];
+    runtime.apply_configuration(config).unwrap();
+    assert_eq!(member_ids(&running_pool(&runtime)), vec![1]);
+    assert!(matches!(health(&route), LegHealthState::Blocked(_)));
+    assert!(Arc::ptr_eq(&first_stage(&route), &stage));
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_server_pool_leg_moved_to_another_egress_is_rebuilt() {
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let mut config = server_pool(&runtime, vec![1]);
+    config.egresses.insert(
+        2,
+        EgressInterface {
+            id: 2,
+            name: "second".into(),
+            quota: Default::default(),
+            ..metered_egress(0)
+        },
+    );
+    runtime.apply_configuration(config.clone()).unwrap();
+    let route = server_route(&runtime);
+    let stage = first_stage(&route);
+
+    let mut moved = pool_policy();
+    moved.legs[0].egress_id = 2;
+    config.policies.insert(Consumer::Server(1).key(), moved);
+    runtime.apply_configuration(config).unwrap();
+    assert!(!Arc::ptr_eq(&first_stage(&route), &stage));
+    assert!(stage.is_revoked());
     runtime.shutdown().await;
 }
 

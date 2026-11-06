@@ -820,28 +820,13 @@ impl NetworkRuntime {
                         }
                         Rung::Pool { id } => {
                             let pool = config.pools.get(id).ok_or("proxy pool does not exist")?;
-                            // A torrent session holds one member through a
-                            // stage of its own, which the pool's stage lets
-                            // go when that member is edited or leaves: an
-                            // edit to the pool's members keeps a torrent's
-                            // leg, so it moves no other member's session.
-                            // Any other leg is rebuilt, which clears a block
-                            // its route laid on it.
-                            if matches!(consumer, Consumer::Torrent(_)) {
-                                pool_versions.push((pool.id, pool.enabled, Vec::new()));
-                            } else {
-                                pool_versions.push((
-                                    pool.id,
-                                    pool.enabled,
-                                    pool.member_ids.clone(),
-                                ));
-                                for member in &pool.member_ids {
-                                    versions.push((
-                                        *member,
-                                        config.profiles.get(member).map(|p| p.revision),
-                                    ));
-                                }
-                            }
+                            // An edit to the pool's members reaches, through
+                            // the pool's stage, only the members it touches,
+                            // so it keeps the leg: every other member keeps
+                            // its sessions and connections, and a block the
+                            // leg holds is lifted on reload once a member is
+                            // unblocked.
+                            pool_versions.push((pool.id, pool.enabled));
                             self.pool(config, *id, bottom.clone())?
                         }
                         Rung::Chain { ids } => {
@@ -1094,9 +1079,16 @@ impl NetworkRuntime {
             std::mem::take(staging.sessions.get_mut().expect("staged sessions"));
         *self.pools.lock().expect("network pools") =
             std::mem::take(&mut *staging.pools.lock().expect("staged pools"));
+        // Pools whose members this reload changed.
+        let mut changed_pools = HashSet::new();
         for (key, members) in std::mem::take(staging.pool_updates.get_mut().expect("staged pools"))
         {
-            self.pools.lock().expect("network pools")[&key].set_members(members);
+            let pool = self.pools.lock().expect("network pools")[&key].clone();
+            let revision = pool.revision();
+            pool.set_members(members);
+            if pool.revision() != revision {
+                changed_pools.insert(key);
+            }
         }
         let snapshot = self.interfaces();
         let quota_blocked = self.quota_blocked_egresses();
@@ -1117,6 +1109,24 @@ impl NetworkRuntime {
                         &quota_blocked,
                     ),
                 );
+            }
+            // A pool leg is blocked only when every member of its pool was.
+            // A member edit kept the leg, so its block goes once the pool
+            // holds a member that is not blocked.
+            for (position, leg) in fresh.iter().enumerate() {
+                let unblocked = pool_keys(&leg.definition).any(|key| {
+                    changed_pools.contains(&key)
+                        && self
+                            .pools
+                            .lock()
+                            .expect("network pools")
+                            .get(&key)
+                            .is_some_and(|pool| !pool.all_blocked())
+                });
+                if unblocked {
+                    let stage: Arc<dyn Dialer> = leg.stage.clone();
+                    route.weighted.unblock(position, &stage);
+                }
             }
             retired.extend(old.iter().map(|leg| leg.stage.clone()));
             held.extend(fresh.iter().map(|leg| leg.stage.clone()));
@@ -1266,6 +1276,17 @@ fn shared_leg(routes: &[Arc<LiveNetworkRoute>], signature: &str) -> Option<LiveL
                 .find(|leg| leg.signature == signature)
                 .cloned()
         })
+}
+// The running pools `leg` dials through, by pool and egress.
+fn pool_keys(leg: &RouteLeg) -> impl Iterator<Item = (u32, u32)> + '_ {
+    let rungs = match &leg.path {
+        LegPath::Ladder { rungs, .. } => rungs.as_slice(),
+        LegPath::Direct => &[],
+    };
+    rungs.iter().filter_map(|rung| match rung {
+        Rung::Pool { id } => Some((*id, leg.egress_id)),
+        _ => None,
+    })
 }
 
 fn configure_egress_rates(

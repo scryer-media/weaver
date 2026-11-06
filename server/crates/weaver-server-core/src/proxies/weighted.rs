@@ -575,6 +575,21 @@ impl Weighted {
             self.shared.publish(&state);
         }
     }
+    // Lifts the block on leg `position` while `stage` still dials it, for a
+    // stage that has a path again without being rebuilt.
+    pub fn unblock(&self, position: usize, stage: &Arc<dyn Dialer>) {
+        let mut state = self.shared.state.lock().expect("leg allocation");
+        if self
+            .legs
+            .read()
+            .expect("route stages")
+            .get(position)
+            .is_some_and(|current| Arc::ptr_eq(current, stage))
+            && state.legs[position].blocked.take().is_some()
+        {
+            self.shared.publish(&state);
+        }
+    }
     pub fn update(&self, route: Route, legs: Vec<Arc<dyn Dialer>>, cap: u16) -> Result<(), String> {
         self.apply_update(Self::prepare_update(route, legs, cap)?);
         Ok(())

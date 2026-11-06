@@ -363,13 +363,15 @@ impl PoolState {
         }
         Ok(self.decorate(member.clone(), dialed))
     }
-    fn pool_error(&self, error: DialError) -> DialError {
+    fn all_blocked(&self) -> bool {
         let members = self.members.read().expect("pool members");
-        let all_blocked = !members.is_empty()
+        !members.is_empty()
             && members
                 .values()
-                .all(|member| member.status.lock().expect("pool member").blocked.is_some());
-        if all_blocked {
+                .all(|member| member.status.lock().expect("pool member").blocked.is_some())
+    }
+    fn pool_error(&self, error: DialError) -> DialError {
+        if self.all_blocked() {
             DialError::Fatal(weaver_tunnel::TunnelError::Engine(
                 "all pool members are blocked".into(),
             ))
@@ -675,6 +677,7 @@ impl PoolStage {
     }
     pub fn set_members(&self, next: Vec<(u32, Arc<dyn Dialer>)>) -> Vec<u32> {
         let mut members = self.state.members.write().expect("pool members");
+        let order: Vec<_> = next.iter().map(|(id, _)| *id).collect();
         if members.len() == next.len()
             && next.iter().all(|(id, stage)| {
                 members
@@ -682,6 +685,23 @@ impl PoolStage {
                     .is_some_and(|m| Arc::ptr_eq(&m.dialer, stage))
             })
         {
+            // The same members, perhaps in another order: only the order the
+            // plan tries its candidates in moves. A blocked member the plan
+            // already dropped stays out.
+            let mut plan = self.state.plan.lock().expect("pool plan");
+            let current: Vec<_> = plan
+                .snapshot()
+                .candidates
+                .into_iter()
+                .map(|candidate| candidate.candidate)
+                .collect();
+            let reordered: Vec<_> = order
+                .into_iter()
+                .filter(|id| current.contains(id))
+                .collect();
+            if reordered != current {
+                plan.set_candidates(reordered, Instant::now().into_std());
+            }
             return Vec::new();
         }
         for (id, member) in members.iter() {
@@ -697,7 +717,6 @@ impl PoolStage {
             .filter(|id| !next.iter().any(|(next, _)| next == *id))
             .copied()
             .collect();
-        let order: Vec<_> = next.iter().map(|(id, _)| *id).collect();
         let next = next
             .into_iter()
             .map(|(id, dialer)| {
@@ -742,6 +761,11 @@ impl PoolStage {
     }
     pub fn revision(&self) -> u64 {
         self.state.revision.load(Ordering::Acquire)
+    }
+    // Whether every member is blocked, which is when the pool reports a
+    // dial through it as fatal.
+    pub fn all_blocked(&self) -> bool {
+        self.state.all_blocked()
     }
     // Each lease keeps the same member for DNS validation and its HTTP fetch.
     pub fn lease_members(&self) -> Vec<(u32, Arc<dyn Dialer>)> {
