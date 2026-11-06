@@ -396,6 +396,7 @@ mod tests {
     // On loopback the IPv4 group hears its own datagram, from loopback.
     #[cfg(target_os = "macos")]
     #[tokio::test]
+    #[expect(clippy::disallowed_methods, reason = "a loopback fixture")]
     async fn a_group_hears_its_own_datagram_on_loopback() {
         let socket = SocketEgress::Interface("lo0".into())
             .join_multicast(

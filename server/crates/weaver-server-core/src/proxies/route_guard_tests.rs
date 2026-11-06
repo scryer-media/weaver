@@ -39,6 +39,9 @@ const BANNED: &[&str] = &[
     "weaver_tunnel::egress::SocketEgress::connect",
     "weaver_tunnel::egress::SocketEgress::connect_blocking",
     "weaver_tunnel::egress::SocketEgress::bind_udp",
+    "weaver_tunnel::egress::SocketEgress::bind_udp_reusing",
+    "weaver_tunnel::egress::SocketEgress::listen_tcp",
+    "weaver_tunnel::egress::SocketEgress::join_multicast",
     "weaver_nntp::route_dialer::AddressPlanned::new",
     "weaver_tunnel::pipe::Egress::new",
 ];
@@ -55,10 +58,14 @@ const LIFTED: &[(&str, usize)] = &[
     ("engines/weaver-nntp/tests/proxy_routing.rs", 1),
     ("engines/weaver-nntp/tests/socket_budget.rs", 1),
     ("engines/weaver-nntp/tests/wireguard_throughput.rs", 1),
-    // The kernel route's own dial, from its device or the host's.
-    ("engines/weaver-torrent/src/network.rs", 1),
+    // The LSD's groups, on the local network alone.
+    ("engines/weaver-torrent/src/lsd.rs", 1),
+    // The kernel route's own dial, datagram bind and listener, from its
+    // device or the host's.
+    ("engines/weaver-torrent/src/network.rs", 3),
     ("engines/weaver-torrent/src/tests/e2e_session_stop.rs", 1),
-    ("engines/weaver-tunnel/src/egress.rs", 2),
+    ("engines/weaver-tunnel/src/egress.rs", 5),
+    ("engines/weaver-tunnel/src/egress/multicast.rs", 1),
     ("engines/weaver-tunnel/src/lib.rs", 2),
     ("engines/weaver-tunnel/src/pipe.rs", 5),
     ("engines/weaver-tunnel/src/resolution.rs", 3),

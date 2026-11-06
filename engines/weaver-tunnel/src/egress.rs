@@ -364,6 +364,7 @@ mod connect_tests {
     // the unspecified IPv6 address, and says so; at an IPv4 address it
     // takes IPv4 alone.
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "a loopback fixture")]
     fn a_reusing_datagram_socket_says_whether_it_takes_both_families() {
         let (socket, dual_stack) = SocketEgress::System
             .bind_udp_reusing("[::]:0".parse().unwrap())
@@ -383,6 +384,7 @@ mod connect_tests {
 
     // A listener at the unspecified IPv6 address takes an IPv4 peer.
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "a loopback fixture")]
     fn a_listener_at_the_unspecified_v6_address_takes_an_ipv4_peer() {
         let listener = SocketEgress::System
             .listen_tcp("[::]:0".parse().unwrap())
@@ -399,6 +401,7 @@ mod connect_tests {
     // IPv6; an egress held to an interface names one that exists.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
+    #[expect(clippy::disallowed_methods, reason = "a loopback fixture")]
     fn an_interface_listener_keeps_to_ipv6_on_an_existing_interface() {
         let device = if cfg!(target_os = "linux") {
             "lo"

@@ -281,6 +281,10 @@ impl LocalServiceDiscovery {
                 tasks,
             ));
         }
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the LSD's groups are on the local network alone, never a route"
+        )]
         let socket = opts
             .egress
             .join_multicast(LSD_IPV4, LSD_IPV6)

@@ -266,6 +266,10 @@ impl KernelSockets {
     /// unspecified IPv6 address takes IPv4 as well, unless it is one of a
     /// pair.
     fn kernel_udp(&self, addr: SocketAddr) -> io::Result<KernelUdp> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the kernel's own route binds on its device, or the host's"
+        )]
         let (socket, dual_stack) = self.egress.bind_udp_reusing(addr)?;
         let socket = tokio::net::UdpSocket::from_std(socket)?;
         let mut socket = KernelUdp {
@@ -359,6 +363,10 @@ impl SocketFactory for KernelSockets {
     ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
         Box::pin(async move {
             let listen = |at| -> io::Result<KernelListener> {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the kernel's own route listens on its device, or the host's"
+                )]
                 let listener = tokio::net::TcpListener::from_std(self.egress.listen_tcp(at)?)?;
                 Ok(KernelListener {
                     local: listener.local_addr()?,
