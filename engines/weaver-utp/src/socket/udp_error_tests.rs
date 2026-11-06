@@ -17,7 +17,8 @@ use parking_lot::Mutex;
 use tokio::sync::{Semaphore, oneshot};
 
 use crate::{
-    PollSendToVectored, SocketOpts, Transport, UtpSocket,
+    Error, PollSendToVectored, SocketOpts, Transport, UtpSocket,
+    constants::CONSECUTIVE_RECEIVE_ERRORS_MAX,
     raw::{Type, UtpHeader},
     test_util::{ADDR_1, ADDR_2, env::MockUtpEnvironment},
 };
@@ -46,14 +47,11 @@ struct Observed {
     dropped: oneshot::Receiver<()>,
 }
 
-fn socket(
+fn transport(
     replies: Vec<Reply>,
     repeating: Option<bool>,
     gated: bool,
-) -> (
-    Arc<UtpSocket<ReceiveTransport, MockUtpEnvironment>>,
-    Observed,
-) {
+) -> (ReceiveTransport, Observed) {
     let (watermark_tx, watermark) = oneshot::channel();
     let (entered_tx, shutdown_entered) = oneshot::channel();
     let (dropped_tx, dropped) = oneshot::channel();
@@ -66,14 +64,8 @@ fn socket(
         dropped: Mutex::new(Some(dropped_tx)),
         shutdown_release: Semaphore::new(usize::from(!gated)),
     });
-    let socket = UtpSocket::new_with_opts(
-        ReceiveTransport(Arc::clone(&control)),
-        MockUtpEnvironment::new(),
-        SocketOpts::default(),
-    )
-    .unwrap();
     (
-        socket,
+        ReceiveTransport(Arc::clone(&control)),
         Observed {
             control,
             watermark,
@@ -81,6 +73,39 @@ fn socket(
             dropped,
         },
     )
+}
+
+fn socket(
+    replies: Vec<Reply>,
+    repeating: Option<bool>,
+    gated: bool,
+) -> (
+    Arc<UtpSocket<ReceiveTransport, MockUtpEnvironment>>,
+    Observed,
+) {
+    let (transport, observed) = transport(replies, repeating, gated);
+    let socket =
+        UtpSocket::new_with_opts(transport, MockUtpEnvironment::new(), SocketOpts::default())
+            .unwrap();
+    (socket, observed)
+}
+
+fn syn() -> Vec<u8> {
+    let mut syn = vec![0; 20];
+    UtpHeader {
+        htype: Type::Syn,
+        connection_id: 101.into(),
+        seq_nr: 1.into(),
+        wnd_size: 65535,
+        ..Default::default()
+    }
+    .serialize(&mut syn)
+    .unwrap();
+    syn
+}
+
+fn refused() -> Reply {
+    Reply::Error(io::Error::new(io::ErrorKind::ConnectionRefused, "datagram"))
 }
 
 impl Drop for ReceiveTransport {
@@ -233,16 +258,56 @@ async fn maximum_udp_datagram_does_not_truncate_or_kill_the_dispatcher() {
 
 #[tokio::test(start_paused = true)]
 async fn continuously_ready_errors_and_packets_yield_so_shutdown_can_join() {
-    for alternate in [false, true] {
-        let (socket, mut observed) = socket(Vec::new(), Some(alternate), false);
-        observed.watermark.await.unwrap();
-        socket.shutdown().await.unwrap();
-        assert!(observed.control.received.load(Ordering::Relaxed) >= 64);
-        if alternate {
-            assert!(socket.stats().invalid_packets.load(Ordering::Relaxed) > 0);
-        }
-        assert!(observed.dropped.try_recv().is_ok());
-    }
+    let (socket, mut observed) = socket(Vec::new(), Some(true), false);
+    observed.watermark.await.unwrap();
+    socket.shutdown().await.unwrap();
+    assert!(observed.control.received.load(Ordering::Relaxed) >= 64);
+    assert!(socket.stats().invalid_packets.load(Ordering::Relaxed) > 0);
+    assert!(observed.dropped.try_recv().is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_datagram_resets_the_run_of_recoverable_receive_errors() {
+    let run = CONSECUTIVE_RECEIVE_ERRORS_MAX - 1;
+    let mut replies: Vec<_> = (0..run).map(|_| refused()).collect();
+    replies.push(Reply::Packet(vec![0xff]));
+    replies.extend((0..run).map(|_| refused()));
+    replies.push(Reply::Packet(syn()));
+    let (socket, mut observed) = socket(replies, None, false);
+    let stream = socket.accept().await.unwrap();
+    assert_eq!(socket.stats().accepts.load(Ordering::Relaxed), 1);
+    assert_eq!(socket.stats().invalid_packets.load(Ordering::Relaxed), 1);
+    assert!(observed.control.received.load(Ordering::Relaxed) >= 2 * run + 2);
+    socket.shutdown().await.unwrap();
+    assert!(observed.dropped.try_recv().is_ok());
+    drop(stream);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unbroken_run_of_recoverable_receive_errors_ends_the_dispatcher() {
+    let mut replies: Vec<_> = (0..CONSECUTIVE_RECEIVE_ERRORS_MAX)
+        .map(|_| refused())
+        .collect();
+    replies.push(Reply::Packet(syn()));
+    let (transport, observed) = transport(replies, None, false);
+    let (_socket, dispatcher) = UtpSocket::new_with_opts_and_dispatcher(
+        transport,
+        MockUtpEnvironment::new(),
+        SocketOpts::default(),
+    )
+    .unwrap();
+    let result = dispatcher.run_forever().await;
+    assert!(
+        matches!(
+            &result,
+            Err(Error::Recv(error)) if error.kind() == io::ErrorKind::ConnectionRefused
+        ),
+        "{result:?}"
+    );
+    assert_eq!(
+        observed.control.received.load(Ordering::Relaxed),
+        CONSECUTIVE_RECEIVE_ERRORS_MAX
+    );
 }
 
 #[tokio::test(start_paused = true)]

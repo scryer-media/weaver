@@ -20,7 +20,10 @@ use std::{
 
 use crate::{
     DatagramSend, Error, canonical_socket_addr,
-    constants::{TX_BUF_SIZE_PER_VSOCK_INITIAL_DEFAULT, TX_BUF_SIZE_PER_VSOCK_MAX_DEFAULT},
+    constants::{
+        CONSECUTIVE_RECEIVE_ERRORS_MAX, TX_BUF_SIZE_PER_VSOCK_INITIAL_DEFAULT,
+        TX_BUF_SIZE_PER_VSOCK_MAX_DEFAULT,
+    },
     stats::{Counter, UtpStats},
 };
 use parking_lot::Mutex;
@@ -557,12 +560,13 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         // Normal UDP datagrams carry at most u16::MAX - 8 payload bytes.
         let mut read_buf = [0u8; u16::MAX as usize];
         let mut completions = 0;
+        let mut receive_errors = 0;
 
         loop {
             if self.socket.cancellation_token.is_cancelled() {
                 return Ok(());
             }
-            if let Err(e) = self.run_once(&mut read_buf).await {
+            if let Err(e) = self.run_once(&mut read_buf, &mut receive_errors).await {
                 warn!("error running dispatcher: {e:#}");
                 return Err(e);
             }
@@ -576,7 +580,11 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         }
     }
 
-    async fn run_once(&mut self, read_buf: &mut [u8]) -> crate::Result<()> {
+    async fn run_once(
+        &mut self,
+        read_buf: &mut [u8],
+        receive_errors: &mut usize,
+    ) -> crate::Result<()> {
         let retirements = Arc::clone(&self.socket.retirements);
         let retired = retirements.notifications().notified();
         tokio::pin!(retired);
@@ -599,8 +607,15 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             recv = self.transport.as_deref().ok_or(Error::DispatcherDead)?.recv_from(read_buf) => {
                 let received = self.env.now();
                 let (len, addr) = match recv {
-                    Ok(received) => received,
+                    Ok(received) => {
+                        *receive_errors = 0;
+                        received
+                    }
                     Err(error) if crate::udp_error::is_recoverable_receive_error(&error) => {
+                        *receive_errors += 1;
+                        if *receive_errors >= CONSECUTIVE_RECEIVE_ERRORS_MAX {
+                            return Err(Error::Recv(error));
+                        }
                         trace!(%error, "recoverable datagram receive error");
                         return Ok(());
                     }

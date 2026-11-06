@@ -35,6 +35,9 @@ pub const IMMEDIATE_ACK_EVERY_RMSS: usize = 2;
 
 pub const SYNACK_RESEND_INTERNAL: Duration = Duration::from_millis(200);
 
+/// A run of recoverable receive errors this long with no packet between means the socket is broken.
+pub const CONSECUTIVE_RECEIVE_ERRORS_MAX: usize = 64;
+
 pub const SEQUENCE_HALF_SPACE: u16 = 1 << 15;
 // Leave space for FIN and the three acknowledged packets the ACK guard admits.
 pub const MAX_RESERVED_DATA_PACKETS: usize = SEQUENCE_HALF_SPACE as usize - 5;
