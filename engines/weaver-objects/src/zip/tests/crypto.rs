@@ -1185,6 +1185,29 @@ fn a_whole_volume_posting_reads_held_ciphertext_past_the_frontier() {
     assert!(front == archive[across.start as usize..across.end as usize]);
 }
 
+// Bytes said already that come again the same are tried without a copy of
+// the member's keys and checkpoints, and kept in place.
+#[test]
+fn a_covered_redelivery_tries_its_bytes_without_copying_the_keys() {
+    let plain = payload(90, 300_007);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    offer(&mut owner, PASSWORD);
+    owner.whole(4096);
+    assert!(owner.member("alpha.bin").closed);
+    let keys = |owner: &Owner| {
+        let map = owner.object.map.as_ref().unwrap();
+        let cipher = map.entry(MemberId(0)).unwrap().cipher.as_ref().unwrap();
+        std::sync::Arc::as_ptr(cipher.open.as_ref().unwrap())
+    };
+    let before = keys(&owner);
+    owner.deliver(0, ByteRange::at(start + 150_000, 4096));
+    assert_eq!(keys(&owner), before);
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.posted(0) == Some(archive));
+}
+
 // A repair in the member's last bytes lies inside the tail the end record
 // was searched for in, but in no record the directory read: the map stands,
 // and the repair replays from its byte once.

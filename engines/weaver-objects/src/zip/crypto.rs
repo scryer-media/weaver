@@ -111,6 +111,15 @@ pub(super) fn encrypt_fixture_with_check(password: &str, plain: &[u8], check: u8
         .collect()
 }
 
+struct Decrypted {
+    end: u64,
+    plain: Vec<u8>,
+    // The state at the delivery's start, and every checkpoint after it.
+    before: State,
+    passed: Vec<(u64, State)>,
+    after: State,
+}
+
 #[derive(Clone)]
 pub(super) struct Open {
     checkpoints: BTreeMap<u64, State>,
@@ -147,11 +156,14 @@ impl Open {
         self.frontier.0
     }
 
-    fn state(
-        &mut self,
+    // The state at `offset`, walked from the last one kept before it, each
+    // checkpoint it passes handed to `passed`, none kept.
+    fn walk(
+        &self,
         offset: u64,
         coverage: &Coverage,
         read: &mut dyn FnMut(ByteRange, &mut Vec<u8>) -> bool,
+        passed: &mut Vec<(u64, State)>,
     ) -> Option<State> {
         let (&mut_at, initial) = self.checkpoints.range(..=offset).next_back()?;
         let (mut at, mut state) = (mut_at, initial.clone());
@@ -173,12 +185,14 @@ impl Open {
             state.provenance = crate::crypt::worse(state.provenance, provenance);
             at = end;
             if at % STEP == 0 {
-                self.checkpoints.insert(at, state.clone());
+                passed.push((at, state.clone()));
             }
         }
         Some(state)
     }
 
+    // A trial taken at once, as the tests decrypt.
+    #[cfg(test)]
     pub(super) fn decrypt(
         &mut self,
         offset: u64,
@@ -187,7 +201,23 @@ impl Open {
         coverage: &Coverage,
         read: &mut dyn FnMut(ByteRange, &mut Vec<u8>) -> bool,
     ) -> Option<(Vec<u8>, Provenance)> {
-        let mut state = self.state(offset, coverage, read)?;
+        let decrypted = self.trial(offset, cipher, provenance, coverage, read)?;
+        Some(self.keep(decrypted))
+    }
+
+    // What decrypting `cipher` at `offset` gives, the keys untouched: a
+    // trial of bytes said already costs no copy of every checkpoint.
+    fn trial(
+        &self,
+        offset: u64,
+        cipher: &[u8],
+        provenance: Provenance,
+        coverage: &Coverage,
+        read: &mut dyn FnMut(ByteRange, &mut Vec<u8>) -> bool,
+    ) -> Option<Decrypted> {
+        let mut passed = Vec::new();
+        let before = self.walk(offset, coverage, read, &mut passed)?;
+        let mut state = before.clone();
         state.provenance = crate::crypt::worse(state.provenance, provenance);
         let mut plain = Vec::with_capacity(cipher.len());
         let mut folded = 0;
@@ -196,15 +226,27 @@ impl Open {
             if (at + 1) % STEP == 0 {
                 state.fold(&plain[folded..]);
                 folded = plain.len();
-                self.checkpoints.insert(at + 1, state.clone());
+                passed.push((at + 1, state.clone()));
             }
         }
         state.fold(&plain[folded..]);
-        let end = offset + cipher.len() as u64;
-        if end >= self.frontier.0 {
-            self.frontier = (end, state.clone());
+        Some(Decrypted {
+            end: offset + cipher.len() as u64,
+            plain,
+            before,
+            passed,
+            after: state,
+        })
+    }
+
+    // A trial's result taken: its checkpoints kept and the frontier moved.
+    fn keep(&mut self, decrypted: Decrypted) -> (Vec<u8>, Provenance) {
+        self.checkpoints.extend(decrypted.passed);
+        let provenance = decrypted.after.provenance;
+        if decrypted.end >= self.frontier.0 {
+            self.frontier = (decrypted.end, decrypted.after);
         }
-        Some((plain, state.provenance))
+        (decrypted.plain, provenance)
     }
 
     fn seal(
@@ -761,7 +803,7 @@ impl super::Zip {
             entry.cipher = Some(cipher);
             return;
         }
-        let mut input = bytes.to_vec();
+        let mut input = std::borrow::Cow::Borrowed(&bytes[..]);
         let range = ByteRange::at(offset, input.len() as u64);
         // Where the replay already asked for starts: a repair at or after
         // it is replayed with it.
@@ -771,7 +813,7 @@ impl super::Zip {
             if let Some(part) = wanted.intersect(range) {
                 let from = (part.start - range.start) as usize;
                 let at = (part.start - wanted.start) as usize;
-                input[from..from + part.len() as usize]
+                input.to_mut()[from..from + part.len() as usize]
                     .copy_from_slice(&replacement[at..at + part.len() as usize]);
                 provenance = crate::crypt::worse(provenance, *source);
             }
@@ -783,15 +825,7 @@ impl super::Zip {
         // The delivery's own provenance, not the chain's: a repair waits
         // as what it is, whatever damage stood before it.
         let source = provenance;
-        let mut updated = if trial {
-            Arc::new(Open::clone(open))
-        } else {
-            cipher.open.take().unwrap()
-        };
-        let decoded =
-            Arc::make_mut(&mut updated).decrypt(offset, &input, provenance, coverage, &mut plain);
-        let Some((bytes, provenance)) = decoded else {
-            cipher.open = Some(updated);
+        let Some(decrypted) = open.trial(offset, &input, provenance, coverage, &mut plain) else {
             entry.cipher = Some(cipher);
             return;
         };
@@ -801,9 +835,9 @@ impl super::Zip {
         // at it, and runs to the member's end, as far as anything came.
         if trial {
             let mut previous = Vec::new();
-            if plain(range, &mut previous) && previous != bytes {
+            if plain(range, &mut previous) && previous != decrypted.plain {
                 cipher.changed();
-                cipher.pending.push((range, input, source));
+                cipher.pending.push((range, input.into_owned(), source));
                 let data = entry.data.unwrap();
                 let again = ByteRange::new(data + range.start, data + entry.length);
                 entry.cipher = Some(cipher);
@@ -813,19 +847,16 @@ impl super::Zip {
                 // The replay says everything from the change again; the
                 // prefix's checksum, from the keys' state at the change,
                 // stands for the bytes before it in the member's CRC.
-                if let Some(prefix) =
-                    Arc::make_mut(&mut updated).state(range.start, coverage, &mut plain)
-                {
-                    self.grid.offer(
-                        member,
-                        crate::grid::WHOLE,
-                        &weaver_graph::Segment {
-                            range: ByteRange::new(0, range.start),
-                            crc32: prefix.crc,
-                            verified: prefix.provenance.is_verified(),
-                        },
-                    );
-                }
+                let prefix = decrypted.before;
+                self.grid.offer(
+                    member,
+                    crate::grid::WHOLE,
+                    &weaver_graph::Segment {
+                        range: ByteRange::new(0, range.start),
+                        crc32: prefix.crc,
+                        verified: prefix.provenance.is_verified(),
+                    },
+                );
                 let mut pieces = Vec::new();
                 self.to_volumes(again, &mut pieces);
                 out.extend(
@@ -841,7 +872,7 @@ impl super::Zip {
             cipher.proof.resize(end.max(cipher.proof.len()), 0);
             cipher.proof[offset as usize..end].copy_from_slice(&input[..end - offset as usize]);
         }
-        cipher.open = Some(updated);
+        let (bytes, provenance) = Arc::make_mut(cipher.open.as_mut().unwrap()).keep(decrypted);
         // Keep only replacement pieces not consumed by this replay.
         cipher.pending = cipher
             .pending
