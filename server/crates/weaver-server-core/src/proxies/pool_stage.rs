@@ -88,6 +88,9 @@ struct Member {
     outcomes: Mutex<Vec<std::sync::Weak<weaver_tunnel::bridge::ConnectionOutcome>>>,
     read: AtomicU64,
     rate: Mutex<MemberRate>,
+    // Holders pinned to this member for their whole life: while one is, the
+    // member's session is never retired as idle.
+    pinned: AtomicU64,
 }
 impl Member {
     fn new(id: u32, dialer: Arc<dyn Dialer>) -> Arc<Self> {
@@ -110,6 +113,7 @@ impl Member {
             outcomes: Mutex::new(Vec::new()),
             read: AtomicU64::new(0),
             rate: Mutex::new(MemberRate::default()),
+            pinned: AtomicU64::new(0),
         })
     }
     fn status(&self, now: Instant) -> PoolMemberStatus {
@@ -192,6 +196,7 @@ impl Member {
         let retire = {
             let status = self.status.lock().expect("pool member");
             status.warmed
+                && self.pinned.load(Ordering::Acquire) == 0
                 && status.open == 0
                 && status.opening == 0
                 && self.idle_since.lock().expect("member idle").elapsed()
@@ -326,6 +331,37 @@ impl PoolState {
         // ever be measured against a throttled pin. Addresses are judged the
         // same way: only connects and setups count against them.
         dialed
+    }
+    // Whether `member` is still the pool's, as when it was leased.
+    fn current(&self, member: &Arc<Member>) -> Result<(), DialError> {
+        if self.stopped.load(Ordering::Acquire)
+            || !self
+                .members
+                .read()
+                .expect("pool members")
+                .get(&member.id)
+                .is_some_and(|m| Arc::ptr_eq(m, member))
+        {
+            return Err(DialError::Skipped("pool member changed".into()));
+        }
+        Ok(())
+    }
+    // A dial through `member` alone, its connection counted as the pool's.
+    async fn dial_member(
+        self: &Arc<Self>,
+        member: &Arc<Member>,
+        target: &Target,
+    ) -> Result<Dialed, DialError> {
+        let (dialed, elapsed) = member
+            .dial(target)
+            .await
+            .map_err(|error| self.pool_error(error))?;
+        if !self.record(member, |plan| {
+            plan.connected(member.id, elapsed, Instant::now().into_std())
+        }) {
+            return Err(DialError::Skipped("pool member changed".into()));
+        }
+        Ok(self.decorate(member.clone(), dialed))
     }
     fn pool_error(&self, error: DialError) -> DialError {
         let members = self.members.read().expect("pool members");
@@ -727,6 +763,36 @@ impl PoolStage {
             })
             .collect()
     }
+    // Member `id` alone, for a holder that keeps one exit for its whole
+    // life: every dial goes through that member and none moves to another
+    // when it fails. None while `id` is no member or is blocked.
+    pub fn pin_member(&self, id: u32) -> Option<Arc<dyn Dialer>> {
+        let member = self
+            .state
+            .members
+            .read()
+            .expect("pool members")
+            .get(&id)
+            .filter(|member| member.status.lock().expect("pool member").blocked.is_none())
+            .cloned()?;
+        member.pinned.fetch_add(1, Ordering::AcqRel);
+        Some(Arc::new(MemberPin {
+            member,
+            state: self.state.clone(),
+        }))
+    }
+    // Why member `id` carries nothing now, when it does not: it is no
+    // member, or it is blocked.
+    pub fn member_down(&self, id: u32) -> Option<String> {
+        let members = self.state.members.read().expect("pool members");
+        let Some(member) = members.get(&id) else {
+            return Some(format!(
+                "proxy {id} is no longer a member of pool {}",
+                self.state.id
+            ));
+        };
+        member.status.lock().expect("pool member").blocked.clone()
+    }
     pub fn lease_member(&self) -> Result<(u32, Arc<dyn Dialer>), DialError> {
         self.lease_members()
             .into_iter()
@@ -763,33 +829,61 @@ impl Dialer for MemberLease {
         });
     }
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
-        if self.state.stopped.load(Ordering::Acquire)
-            || !self
-                .state
-                .members
-                .read()
-                .expect("pool members")
-                .get(&self.member.id)
-                .is_some_and(|m| Arc::ptr_eq(m, &self.member))
-        {
-            return Err(DialError::Skipped("pool member changed".into()));
-        }
+        self.state.current(&self.member)?;
         self.reserve();
-        let (dialed, elapsed) = self
-            .member
-            .dial(target)
-            .await
-            .map_err(|error| self.state.pool_error(error))?;
-        if !self.state.record(&self.member, |plan| {
-            plan.connected(self.member.id, elapsed, Instant::now().into_std())
-        }) {
-            return Err(DialError::Skipped("pool member changed".into()));
-        }
-        Ok(self.state.decorate(self.member.clone(), dialed))
+        self.state.dial_member(&self.member, target).await
     }
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
         self.reserve();
         self.member.dialer.resolve(host).await
+    }
+    fn budget(&self) -> Duration {
+        self.member.dialer.budget()
+    }
+    fn describe(&self) -> String {
+        format!("pool {} member {}", self.state.id, self.member.id)
+    }
+}
+// One member held for a holder's whole life, as a torrent session holds its
+// exit: its connections and bytes count as the member's, as a lease's do,
+// and it dials, listens and sends datagrams through that member only.
+struct MemberPin {
+    member: Arc<Member>,
+    state: Arc<PoolState>,
+}
+impl Drop for MemberPin {
+    fn drop(&mut self) {
+        self.member.pinned.fetch_sub(1, Ordering::AcqRel);
+        *self.member.idle_since.lock().expect("member idle") = Instant::now();
+    }
+}
+#[async_trait::async_trait]
+impl Dialer for MemberPin {
+    async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
+        self.state.current(&self.member)?;
+        self.state.dial_member(&self.member, target).await
+    }
+    async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
+        self.state.current(&self.member)?;
+        self.member.dialer.resolve(host).await
+    }
+    fn offers(&self) -> weaver_tunnel::pipe::Transports {
+        self.member.dialer.offers()
+    }
+    fn datagrams(self: Arc<Self>) -> Option<Arc<dyn weaver_tunnel::endpoint::DatagramTransport>> {
+        Arc::clone(&self.member.dialer).datagrams()
+    }
+    fn inbound(self: Arc<Self>) -> Option<Arc<dyn weaver_tunnel::pipe::Inbound>> {
+        Arc::clone(&self.member.dialer).inbound()
+    }
+    fn bind_local_udp(
+        &self,
+        local: std::net::SocketAddr,
+    ) -> Option<std::io::Result<std::net::UdpSocket>> {
+        self.member.dialer.bind_local_udp(local)
+    }
+    fn source_toward(&self, to: std::net::SocketAddr) -> Option<std::io::Result<std::net::IpAddr>> {
+        self.member.dialer.source_toward(to)
     }
     fn budget(&self) -> Duration {
         self.member.dialer.budget()

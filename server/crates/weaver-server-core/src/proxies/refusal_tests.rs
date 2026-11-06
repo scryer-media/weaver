@@ -230,11 +230,6 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             "routing consumer no longer exists",
         ),
         (
-            R::TorrentRouteExit(super::TorrentRouteFault::Pool),
-            "TORRENT_ROUTE_POOL",
-            "a torrent route cannot use a pool",
-        ),
-        (
             R::TorrentRouteExit(super::TorrentRouteFault::Legs),
             "TORRENT_ROUTE_LEGS",
             "a torrent route has one leg",
@@ -545,17 +540,16 @@ fn slot(refusal: &R) -> usize {
         R::TestSubjectInRoute => 79,
         R::TestPathCount { .. } => 80,
         R::TestNeedsRoute => 81,
-        R::TorrentRouteExit(super::TorrentRouteFault::Pool) => 82,
-        R::BandwidthLimitTooLarge => 83,
-        R::BandwidthSplitRange => 84,
-        R::SpeedTestTorrentNeedsTorrentRoute => 85,
-        R::SpeedTestTorrentsOff => 86,
-        R::TorrentRouteExit(super::TorrentRouteFault::Legs) => 87,
-        R::TorrentRouteExit(super::TorrentRouteFault::DirectFallback) => 88,
-        R::TorrentRouteExit(super::TorrentRouteFault::Rungs) => 89,
+        R::BandwidthLimitTooLarge => 82,
+        R::BandwidthSplitRange => 83,
+        R::SpeedTestTorrentNeedsTorrentRoute => 84,
+        R::SpeedTestTorrentsOff => 85,
+        R::TorrentRouteExit(super::TorrentRouteFault::Legs) => 86,
+        R::TorrentRouteExit(super::TorrentRouteFault::DirectFallback) => 87,
+        R::TorrentRouteExit(super::TorrentRouteFault::Rungs) => 88,
     }
 }
-const SLOTS: usize = 90;
+const SLOTS: usize = 89;
 
 #[test]
 fn every_refusal_keeps_its_code_and_its_sentence() {

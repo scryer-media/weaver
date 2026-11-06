@@ -416,9 +416,10 @@ impl Consumer {
 
     // A torrent's peers and trackers see one address for the whole run: its
     // route is one leg with one exit. A direct leg is its egress; a ladder
-    // is one rung, a proxy or a chain ending at one proxy, and never falls
-    // back to the egress. With one leg there is nothing to fail over to, so
-    // the route's failover means nothing here.
+    // is one rung, a proxy, a chain ending at one proxy or a pool whose
+    // torrents each stay on one member, and never falls back to the egress.
+    // With one leg there is nothing to fail over to, so the route's failover
+    // means nothing here.
     pub fn validate_route(self, route: &super::Route) -> Result<(), super::NetworkRefusal> {
         use super::{NetworkRefusal, TorrentRouteFault};
         if !matches!(self, Self::Torrent(_)) {

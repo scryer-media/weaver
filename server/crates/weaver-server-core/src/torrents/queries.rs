@@ -16,7 +16,7 @@ pub(crate) const TORRENT_COLUMNS: &str = "job_id, infohash_v1, infohash_v2, name
      category_id, added_at_ms, state, forced, completed_at_ms, storage_dir, \
      policy_override, unpack, unpack_in_force, metadata, upload_limit, download_limit, \
      sequential, first_last_piece_first, save_path, content_layout, files_dir, seed_mode, move_to, \
-     queue_position";
+     queue_position, pool_member";
 
 fn corrupt(what: &str, value: impl std::fmt::Display) -> StateError {
     StateError::Database(format!("stored torrent {what} is not valid: {value}"))
@@ -100,6 +100,7 @@ pub(crate) fn torrent_from_row(row: &SqlRow) -> Result<TorrentRecord, StateError
         seed_mode: row.bool("seed_mode")?,
         move_to: row.opt_text("move_to")?,
         queue_position: row.i64("queue_position")?,
+        pool_member: opt_u32(row, "pool_member")?,
     })
 }
 

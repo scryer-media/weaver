@@ -161,6 +161,7 @@ fn torrent_args(torrent: &TorrentRecord) -> Result<Vec<SqlArg>, StateError> {
         SqlArg::Bool(torrent.seed_mode),
         SqlArg::OptText(torrent.move_to.clone()),
         SqlArg::I64(torrent.queue_position),
+        SqlArg::OptI64(torrent.pool_member.map(i64::from)),
     ])
 }
 
@@ -769,6 +770,19 @@ impl Database {
                 .transpose()?
                 .flatten())
         })
+    }
+
+    // The pool member the torrent is pinned to, or none.
+    pub fn set_torrent_pool_member(
+        &self,
+        job_id: JobId,
+        member: Option<u32>,
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptI64(member.map(i64::from)),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        self.set_torrent_column("pool_member", args)
     }
 
     // The torrent moved where it was to move once complete, or will not.

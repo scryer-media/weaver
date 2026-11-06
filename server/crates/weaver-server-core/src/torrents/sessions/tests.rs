@@ -49,13 +49,25 @@ fn ladder(proxy: u32) -> LegPath {
     }
 }
 
+fn pool_ladder(pool: u32) -> LegPath {
+    LegPath::Ladder {
+        rungs: vec![Rung::Pool { id: pool }],
+        direct_fallback: false,
+    }
+}
+
 // Routes whose legs are ladders that reach no one, unless a leg of another
 // kind is given. Each scope maps to a proxy id, so scopes with the same id
-// share a route; every leg can be set down, one proxy's out of quota, a leg
-// can refuse to open, or wait to open until the route answers.
+// share a route, or to a pool and its members; every leg can be set down,
+// one proxy's out of quota, one pool member down, a leg can refuse to open,
+// or wait to open until the route answers.
 #[derive(Default)]
 pub(crate) struct FakeRoutes {
     pub(crate) proxies: Mutex<BTreeMap<String, u32>>,
+    // The scopes routed through a pool: the pool, and its members in order.
+    pub(crate) pools: Mutex<BTreeMap<String, (u32, Vec<u32>)>>,
+    // The pool members that are down.
+    pub(crate) members_down: Mutex<BTreeSet<u32>>,
     pub(crate) down: Mutex<Option<String>>,
     // The routes whose legs are out of quota.
     pub(crate) spent: Mutex<BTreeSet<RouteKey>>,
@@ -82,16 +94,57 @@ fn proxy_key(proxy: u32) -> RouteKey {
     RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &ladder(proxy))
 }
 
+// The session key of `member` of a scope routed through `pool`.
+pub(crate) fn pool_member_key(pool: u32, member: u32) -> RouteKey {
+    RouteKey::member(
+        SYSTEM_EGRESS_ID,
+        &EgressBinding::System,
+        &pool_ladder(pool),
+        member,
+    )
+}
+
 fn scope_name(scope: TorrentScope) -> String {
     Consumer::Torrent(scope).key()
 }
 
 impl FakeRoutes {
     pub(crate) fn route(&self, scope: TorrentScope, proxy: u32) {
+        self.pools.lock().unwrap().remove(&scope_name(scope));
         self.proxies
             .lock()
             .unwrap()
             .insert(scope_name(scope), proxy);
+    }
+
+    // `scope` runs through `pool`, whose members are `members`.
+    pub(crate) fn route_pool(&self, scope: TorrentScope, pool: u32, members: &[u32]) {
+        self.proxies.lock().unwrap().remove(&scope_name(scope));
+        self.pools
+            .lock()
+            .unwrap()
+            .insert(scope_name(scope), (pool, members.to_vec()));
+    }
+
+    // Pool member `member` is down, or up again.
+    pub(crate) fn set_member_down(&self, member: u32, down: bool) {
+        let mut members = self.members_down.lock().unwrap();
+        if down {
+            members.insert(member);
+        } else {
+            members.remove(&member);
+        }
+    }
+
+    // Why pool member `member`, on `key`, carries nothing, when it does not.
+    fn member_down(&self, member: u32, key: &RouteKey) -> Option<String> {
+        self.key_down(key).or_else(|| {
+            self.members_down
+                .lock()
+                .unwrap()
+                .contains(&member)
+                .then(|| format!("proxy {member} failed"))
+        })
     }
 
     pub(crate) fn set_down(&self, reason: Option<&str>) {
@@ -126,6 +179,7 @@ impl FakeRoutes {
 #[async_trait::async_trait]
 impl Routes for FakeRoutes {
     fn plan(&self, scope: TorrentScope) -> Result<RoutePlan, String> {
+        let pool = self.pools.lock().unwrap().get(&scope_name(scope)).cloned();
         let proxy = self
             .proxies
             .lock()
@@ -133,7 +187,32 @@ impl Routes for FakeRoutes {
             .get(&scope_name(scope))
             .copied()
             .unwrap_or(0);
-        let key = proxy_key(proxy);
+        let (key, members) = match pool {
+            None => (proxy_key(proxy), Vec::new()),
+            Some((pool, members)) => (
+                RouteKey::of(SYSTEM_EGRESS_ID, &EgressBinding::System, &pool_ladder(pool)),
+                members
+                    .into_iter()
+                    .map(|id| {
+                        let key = pool_member_key(pool, id);
+                        MemberPlan {
+                            id,
+                            down: self.member_down(id, &key).map(RouteFailure::leg_down),
+                            key,
+                            names: Some(ResolvedBy::Proxy),
+                        }
+                    })
+                    .collect(),
+            ),
+        };
+        let down = if members.is_empty() {
+            self.key_down(&key)
+        } else {
+            members
+                .iter()
+                .all(|member| member.down.is_some())
+                .then(|| "every member is down".to_owned())
+        };
         let kind = self
             .leg
             .lock()
@@ -149,13 +228,19 @@ impl Routes for FakeRoutes {
                 _ => ResolvedBy::Host,
             }),
             kind,
-            down: self.key_down(&key).map(RouteFailure::leg_down),
+            down: down.map(RouteFailure::leg_down),
             key,
+            members,
+            member: None,
         })
     }
 
     fn leg_down(&self, plan: &RoutePlan) -> Option<RouteFailure> {
-        self.key_down(&plan.key).map(RouteFailure::leg_down)
+        match plan.member {
+            Some(member) => self.member_down(member, &plan.key),
+            None => self.key_down(&plan.key),
+        }
+        .map(RouteFailure::leg_down)
     }
 
     async fn open(&self, plan: &RoutePlan, peers: usize) -> Result<OpenLeg, String> {

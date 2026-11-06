@@ -28,7 +28,7 @@ mod draft;
 pub use draft::DraftNetworkRoute;
 #[path = "network_torrent.rs"]
 mod torrent;
-pub use torrent::{LegTenancy, LegTenant, SessionTraffic, TorrentLeg};
+pub use torrent::{LegTenancy, LegTenant, SessionTraffic, TorrentLeg, pool_of};
 #[path = "network_test_via.rs"]
 mod test_via;
 pub use test_via::{

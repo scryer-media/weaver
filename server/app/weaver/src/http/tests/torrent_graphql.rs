@@ -46,6 +46,8 @@ impl Routes for Offline {
             down: Some(
                 weaver_server_core::torrents::sessions::RouteFailure::leg_down("offline".into()),
             ),
+            members: Vec::new(),
+            member: None,
         })
     }
 

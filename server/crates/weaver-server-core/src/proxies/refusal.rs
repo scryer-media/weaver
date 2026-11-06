@@ -131,13 +131,13 @@ pub enum NetworkRefusal {
 }
 
 // What gives a torrent route more than one exit: a second leg, a fall back
-// to the host's own address, or a second rung that would be another exit.
+// to the host's own address, or a second rung that would be another exit. A
+// pool rung is one exit per torrent: each torrent stays on one member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TorrentRouteFault {
     Legs,
     DirectFallback,
     Rungs,
-    Pool,
 }
 
 impl TorrentRouteFault {
@@ -146,7 +146,6 @@ impl TorrentRouteFault {
             Self::Legs => "TORRENT_ROUTE_LEGS",
             Self::DirectFallback => "TORRENT_ROUTE_DIRECT_FALLBACK",
             Self::Rungs => "TORRENT_ROUTE_RUNGS",
-            Self::Pool => "TORRENT_ROUTE_POOL",
         }
     }
 
@@ -155,12 +154,11 @@ impl TorrentRouteFault {
             Self::Legs => "a torrent route has one leg",
             Self::DirectFallback => "a torrent route has no direct fallback",
             Self::Rungs => "a torrent route has one rung",
-            Self::Pool => "a torrent route cannot use a pool",
         }
     }
 
     pub fn validate(route: &super::Route) -> Result<(), Self> {
-        use super::{LegPath, Rung};
+        use super::LegPath;
         let [leg] = route.legs.as_slice() else {
             return Err(Self::Legs);
         };
@@ -171,9 +169,6 @@ impl TorrentRouteFault {
         else {
             return Ok(());
         };
-        if rungs.iter().any(|rung| matches!(rung, Rung::Pool { .. })) {
-            return Err(Self::Pool);
-        }
         if *direct_fallback {
             return Err(Self::DirectFallback);
         }

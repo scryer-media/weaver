@@ -15,7 +15,7 @@ use crate::settings::{SeedingAction, SeedingGoalMode};
 use crate::torrents::TrackerStatus;
 use crate::torrents::sessions::Routes;
 use crate::torrents::sessions::tests::{
-    FakeRoutes, env, loopback_proxy, on_network, save_again, unbound_leg,
+    FakeRoutes, env, loopback_proxy, on_network, pool_member_key, save_again, unbound_leg,
 };
 use crate::torrents::storage::PieceStorage;
 
@@ -942,10 +942,6 @@ async fn stored_route_faults_keep_their_typed_reason() {
             )],
             TorrentRouteFault::Rungs,
         ),
-        (
-            vec![ladder(vec![Rung::Pool { id: 1 }], false)],
-            TorrentRouteFault::Pool,
-        ),
     ] {
         let db = Database::open_in_memory().unwrap();
         let proxies =
@@ -965,6 +961,71 @@ async fn stored_route_faults_keep_their_typed_reason() {
         assert_eq!(failure.message(), fault.message());
         proxies.network.shutdown().await;
     }
+}
+
+// A route whose one rung is a pool plans a session on each enabled member,
+// each under its own key, and is up; placed, a torrent runs on the lowest
+// member, whose leg is up.
+#[tokio::test]
+async fn a_pool_route_plans_a_session_on_each_member() {
+    use crate::proxies::{ProxyKind, ProxyPool, Rung};
+    use crate::torrents::sessions::{NetworkRoutes, member_key};
+
+    let db = Database::open_in_memory().unwrap();
+    for id in 1..=3 {
+        db.save_proxy_profile(&crate::proxies::ProxyProfile {
+            id,
+            name: format!("exit-{id}"),
+            enabled: id != 3,
+            ..loopback_proxy(1080)
+        })
+        .unwrap();
+    }
+    let pool = db
+        .create_proxy_pool(&ProxyPool {
+            id: 0,
+            name: "Region".into(),
+            kind: ProxyKind::Socks5,
+            member_ids: vec![2, 3, 1],
+            enabled: true,
+        })
+        .unwrap();
+    let path = LegPath::Ladder {
+        rungs: vec![Rung::Pool { id: pool.id }],
+        direct_fallback: false,
+    };
+    db.save_proxy_routing_policy(
+        Consumer::Torrent(TorrentScope::Default),
+        &RoutingPolicy {
+            legs: vec![RouteLeg {
+                egress_id: SYSTEM_EGRESS_ID,
+                weight: 100,
+                path: path.clone(),
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let proxies =
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let routes = NetworkRoutes::new(db, Arc::clone(&proxies), Duration::from_secs(30));
+
+    let plan = routes.plan(TorrentScope::Default).unwrap();
+    assert!(plan.down.is_none(), "{:?}", plan.down);
+    let key = |member| member_key(&proxies.network, SYSTEM_EGRESS_ID, &path, member);
+    let members: Vec<_> = plan
+        .members
+        .iter()
+        .map(|member| (member.id, member.key.clone(), member.down.is_none()))
+        .collect();
+    assert_eq!(members, [(2, key(2), true), (1, key(1), true)]);
+    assert_ne!(key(1), key(2));
+    assert!(!plan.keys().any(|member| *member == plan.key));
+
+    let (placed, pin) = plan.place(None, |_| 0);
+    assert_eq!((pin, &placed.key), (Some(1), &key(1)));
+    assert!(routes.leg_down(&placed).is_none());
+    proxies.network.shutdown().await;
 }
 
 #[tokio::test]
@@ -5092,6 +5153,7 @@ fn unpack_comes_from_the_torrent_then_its_rule_then_its_category_then_the_defaul
         seed_mode: false,
         move_to: None,
         queue_position: 0,
+        pool_member: None,
     };
     let mut rules = [TrackerRule {
         archive_passwords: Default::default(),
@@ -5169,6 +5231,7 @@ fn chain() -> (TorrentRecord, TrackerRule, TorrentSettings) {
         seed_mode: false,
         move_to: None,
         queue_position: 0,
+        pool_member: None,
     };
     let rule = TrackerRule {
         id: 1,
@@ -9593,4 +9656,178 @@ async fn a_seed_mode_archive_with_a_bad_file_is_fetched_again_and_unpacks_whole(
     );
     rig.service.stop().await;
     seeding.stop().await;
+}
+
+// The pool the default scope routes through in the pool tests.
+const POOL: u32 = 7;
+
+// The pool member each of `jobs` is pinned to. Each pin is the one stored,
+// and its torrent's route is its member's session.
+async fn pins(service: &TorrentService, db: &Database, jobs: &[JobId]) -> Vec<Option<u32>> {
+    let live = service.inner.live.lock().await;
+    jobs.iter()
+        .map(|job_id| {
+            let torrent = &live[job_id];
+            let pin = torrent.record.pool_member;
+            assert_eq!(db.get_torrent(*job_id).unwrap().unwrap().pool_member, pin);
+            if let Some(member) = pin {
+                assert_eq!(torrent.route, Some(pool_member_key(POOL, member)));
+            }
+            pin
+        })
+        .collect()
+}
+
+async fn add_plain(service: &TorrentService, name: &str, seed: u8) -> JobId {
+    service
+        .add(request(AddSource::Metainfo(plain(name, seed))))
+        .await
+        .unwrap()
+}
+
+// Torrents on a pool route go to the member with the fewest, the lowest id
+// of those, whatever the pool's order: the first to 1, the second to 2, the
+// third to 1. Each member runs its own session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn torrents_on_a_pool_route_go_to_the_least_loaded_member() {
+    let rig = rig(set_clock());
+    rig.routes.route_pool(TorrentScope::Default, POOL, &[2, 1]);
+    rig.service.open().await.unwrap();
+
+    let first = add_plain(&rig.service, "first", 1).await;
+    let second = add_plain(&rig.service, "second", 2).await;
+    let third = add_plain(&rig.service, "third", 3).await;
+
+    assert_eq!(
+        pins(&rig.service, &rig.db, &[first, second, third]).await,
+        [Some(1), Some(2), Some(1)]
+    );
+    let running = rig.service.inner.sessions.running().await;
+    let keys: BTreeSet<_> = running.keys().cloned().collect();
+    assert_eq!(
+        keys,
+        BTreeSet::from([pool_member_key(POOL, 1), pool_member_key(POOL, 2)])
+    );
+    rig.service.stop().await;
+}
+
+// A torrent keeps its member while that member is up: another member come
+// up with no torrents on it draws none away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pinned_torrent_stays_on_its_member_when_another_comes_up_emptier() {
+    let rig = rig(set_clock());
+    rig.routes.route_pool(TorrentScope::Default, POOL, &[1, 2]);
+    rig.routes.set_member_down(2, true);
+    rig.service.open().await.unwrap();
+    let first = add_plain(&rig.service, "first", 1).await;
+    let second = add_plain(&rig.service, "second", 2).await;
+    assert_eq!(
+        pins(&rig.service, &rig.db, &[first, second]).await,
+        [Some(1), Some(1)]
+    );
+
+    rig.routes.set_member_down(2, false);
+    rig.service.follow_routes().await;
+
+    assert_eq!(
+        pins(&rig.service, &rig.db, &[first, second]).await,
+        [Some(1), Some(1)]
+    );
+    let live = rig.service.inner.live.lock().await;
+    assert!(live[&first].attached.is_some() && live[&second].attached.is_some());
+    drop(live);
+    rig.service.stop().await;
+}
+
+// A member that fails moves its own torrents to the members still up, and
+// no other torrent: the one on member 2 keeps its session. The failed member
+// back up draws none of them back. With every member down, each torrent
+// holds on its member for why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_member_moves_only_its_torrents_and_its_return_moves_none() {
+    use crate::torrents::sessions::TorrentRouteReason;
+
+    let rig = rig(set_clock());
+    rig.routes.route_pool(TorrentScope::Default, POOL, &[1, 2]);
+    rig.service.open().await.unwrap();
+    let jobs = [
+        add_plain(&rig.service, "first", 1).await,
+        add_plain(&rig.service, "second", 2).await,
+        add_plain(&rig.service, "third", 3).await,
+    ];
+    assert_eq!(
+        pins(&rig.service, &rig.db, &jobs).await,
+        [Some(1), Some(2), Some(1)]
+    );
+    let session = |live: &BTreeMap<JobId, Live>, job_id: JobId| {
+        Arc::clone(&live[&job_id].attached.as_ref().unwrap().session)
+    };
+    let kept = session(&*rig.service.inner.live.lock().await, jobs[1]);
+
+    rig.routes.set_member_down(1, true);
+    rig.service.follow_routes().await;
+    assert_eq!(
+        pins(&rig.service, &rig.db, &jobs).await,
+        [Some(2), Some(2), Some(2)]
+    );
+    let live = rig.service.inner.live.lock().await;
+    assert!(Arc::ptr_eq(&session(&live, jobs[1]), &kept));
+    assert!(Arc::ptr_eq(&session(&live, jobs[0]), &kept));
+    assert!(Arc::ptr_eq(&session(&live, jobs[2]), &kept));
+    drop(live);
+
+    rig.routes.set_member_down(1, false);
+    rig.service.follow_routes().await;
+    assert_eq!(
+        pins(&rig.service, &rig.db, &jobs).await,
+        [Some(2), Some(2), Some(2)]
+    );
+    let live = rig.service.inner.live.lock().await;
+    assert!(
+        jobs.iter()
+            .all(|job_id| Arc::ptr_eq(&session(&live, *job_id), &kept))
+    );
+    drop(live);
+
+    rig.routes.set_member_down(1, true);
+    rig.routes.set_member_down(2, true);
+    rig.service.follow_routes().await;
+    assert_eq!(
+        pins(&rig.service, &rig.db, &jobs).await,
+        [Some(2), Some(2), Some(2)]
+    );
+    for job_id in jobs {
+        let view = rig.service.torrent(job_id).await.unwrap();
+        assert_eq!(view.route_reason, Some(TorrentRouteReason::LegDown));
+    }
+    rig.service.stop().await;
+}
+
+// A torrent's member is stored: restarted, it runs on that member though
+// another is emptier and lower. Its route no longer through a pool, the pin
+// is cleared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pin_survives_a_restart_and_clears_when_the_route_leaves_the_pool() {
+    let rig = rig(set_clock());
+    rig.routes.route_pool(TorrentScope::Default, POOL, &[1, 2]);
+    rig.routes.set_member_down(1, true);
+    rig.service.open().await.unwrap();
+    let job_id = add_plain(&rig.service, "set", 1).await;
+    assert_eq!(pins(&rig.service, &rig.db, &[job_id]).await, [Some(2)]);
+    rig.service.stop().await;
+
+    rig.routes.set_member_down(1, false);
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    assert_eq!(pins(&again, &rig.db, &[job_id]).await, [Some(2)]);
+    assert!(again.inner.live.lock().await[&job_id].attached.is_some());
+
+    rig.routes.route(TorrentScope::Default, 5);
+    again.follow_routes().await;
+    assert_eq!(pins(&again, &rig.db, &[job_id]).await, [None]);
+    assert_eq!(
+        again.inner.live.lock().await[&job_id].route,
+        Some(rig.routes.plan(TorrentScope::Default).unwrap().key)
+    );
+    again.stop().await;
 }

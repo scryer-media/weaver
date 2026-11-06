@@ -211,7 +211,7 @@ test("a torrent route shows who resolves its names, and whether peers can reach 
 });
 
 test("every locale renders route reasons and reuses its route refusal wording", () => {
-  const faults = ["TORRENT_ROUTE_LEGS", "TORRENT_ROUTE_DIRECT_FALLBACK", "TORRENT_ROUTE_RUNGS", "TORRENT_ROUTE_POOL"] as const;
+  const faults = ["TORRENT_ROUTE_LEGS", "TORRENT_ROUTE_DIRECT_FALLBACK", "TORRENT_ROUTE_RUNGS"] as const;
   for (const [locale, dictionary] of Object.entries({ en: nextEn, de: nextDe, es: nextEs, fr: nextFr, it: nextIt, ja: nextJa, ko: nextKo, pt: nextPt, zh: nextZh })) {
     const translate = (key: string) => {
       const value = dictionary[key];

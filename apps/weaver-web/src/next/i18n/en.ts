@@ -1615,7 +1615,6 @@ export const nextEn: LocaleDictionary = {
   "next.refusal.EGRESS_QUOTA_SOFT_ABOVE_HARD": "The upload soft cap must not be above the hard cap.",
   "next.refusal.BANDWIDTH_LIMIT_TOO_LARGE": "The speed limit is too large.",
   "next.refusal.BANDWIDTH_SPLIT_RANGE": "A bandwidth split gives usenet 1% to 99%.",
-  "next.refusal.TORRENT_ROUTE_POOL": "A torrent route cannot use a pool.",
   "next.refusal.TORRENT_ROUTE_LEGS": "A torrent route has one leg.",
   "next.refusal.TORRENT_ROUTE_DIRECT_FALLBACK": "A torrent route cannot fall back to direct.",
   "next.refusal.TORRENT_ROUTE_RUNGS": "A torrent route has one rung.",

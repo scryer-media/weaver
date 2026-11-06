@@ -13,9 +13,11 @@ use weaver_tunnel::{
 
 /// A torrent session's leg: a leg of its consumer's live route. The stage
 /// belongs to the route, which revokes it when the leg changes; the bridge
-/// an HTTP client rides belongs to this leg, and stops with it.
+/// an HTTP client rides belongs to this leg, and stops with it. On a pool
+/// leg the session holds one member, and goes through no other.
 pub struct TorrentLeg {
     pub stage: Arc<Revocable>,
+    member: Option<Arc<dyn Dialer>>,
     route: Arc<super::weighted::Weighted>,
     handle: tokio::runtime::Handle,
     bridge: Mutex<Option<Arc<Bridge>>>,
@@ -25,6 +27,7 @@ impl TorrentLeg {
     pub fn dialer(&self) -> Arc<dyn Dialer> {
         Arc::new(Carried {
             stage: self.stage.clone(),
+            member: self.member.clone(),
             route: self.route.clone(),
         })
     }
@@ -64,26 +67,58 @@ impl Drop for TorrentLeg {
 // own peer limit, so they pass the route's allocation by, but the route
 // counts them, and their bytes, as those of the leg its stage is when each
 // is dialled: a reload that moves the stage to another position moves its
-// counts with it.
+// counts with it. On a pool leg each goes through the session's member, and
+// the leg's revocation still ends them.
 struct Carried {
     stage: Arc<Revocable>,
+    member: Option<Arc<dyn Dialer>>,
     route: Arc<super::weighted::Weighted>,
+}
+impl Carried {
+    // The member a pool leg's session holds, while the leg is not revoked.
+    fn member(&self) -> Result<Option<&Arc<dyn Dialer>>, std::io::Error> {
+        match &self.member {
+            Some(_) if self.stage.is_revoked() => Err(std::io::Error::other("the leg was revoked")),
+            member => Ok(member.as_ref()),
+        }
+    }
 }
 #[async_trait::async_trait]
 impl Dialer for Carried {
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
-        let mut dialed = self.stage.dial(target).await?;
+        let mut dialed = match &self.member {
+            Some(member) => self.stage.dial_using(member.as_ref(), target).await?,
+            None => self.stage.dial(target).await?,
+        };
         self.route.carry(&*self.stage, &mut dialed);
         Ok(dialed)
     }
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
-        self.stage.resolve(host).await
+        match self
+            .member()
+            .map_err(|e| DialError::Skipped(e.to_string()))?
+        {
+            Some(member) => member.resolve(host).await,
+            None => self.stage.resolve(host).await,
+        }
+    }
+    fn offers(&self) -> weaver_tunnel::pipe::Transports {
+        match &self.member {
+            Some(member) => member.offers(),
+            None => self.stage.offers(),
+        }
     }
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
-        Arc::clone(&self.stage).datagrams()
+        match self.member().ok()? {
+            Some(member) => Arc::clone(member).datagrams(),
+            None => Arc::clone(&self.stage).datagrams(),
+        }
     }
     fn inbound(self: Arc<Self>) -> Option<Arc<dyn Inbound>> {
-        let inbound = Arc::clone(&self.stage).inbound()?;
+        let inbound = match self.member().ok()? {
+            Some(member) => Arc::clone(member).inbound()?,
+            None => Arc::clone(&self.stage).inbound()?,
+        };
         Some(Arc::new(CarriedInbound {
             inbound,
             carried: self,
@@ -93,16 +128,30 @@ impl Dialer for Carried {
         &self,
         local: std::net::SocketAddr,
     ) -> Option<std::io::Result<std::net::UdpSocket>> {
-        self.stage.bind_local_udp(local)
+        match self.member() {
+            Ok(Some(member)) => member.bind_local_udp(local),
+            Ok(None) => self.stage.bind_local_udp(local),
+            Err(error) => Some(Err(error)),
+        }
     }
     fn source_toward(&self, to: std::net::SocketAddr) -> Option<std::io::Result<std::net::IpAddr>> {
-        self.stage.source_toward(to)
+        match self.member() {
+            Ok(Some(member)) => member.source_toward(to),
+            Ok(None) => self.stage.source_toward(to),
+            Err(error) => Some(Err(error)),
+        }
     }
     fn budget(&self) -> Duration {
-        self.stage.budget()
+        match &self.member {
+            Some(member) => member.budget(),
+            None => self.stage.budget(),
+        }
     }
     fn describe(&self) -> String {
-        self.stage.describe()
+        match &self.member {
+            Some(member) => member.describe(),
+            None => self.stage.describe(),
+        }
     }
 }
 // Connections arriving on the leg, which the route counts as the session's
@@ -304,21 +353,99 @@ impl NetworkRuntime {
         peers: u16,
         timeout: Duration,
     ) -> Result<Arc<TorrentLeg>, String> {
+        self.torrent_leg_on(scope, position, None, peers, timeout)
+    }
+
+    /// The leg a torrent scope's session on pool member `member` runs on:
+    /// the scope's live route's leg at `position`, whose one rung is a pool,
+    /// held to that member for the session's life.
+    pub fn torrent_member_leg(
+        &self,
+        scope: TorrentScope,
+        position: usize,
+        member: u32,
+        peers: u16,
+        timeout: Duration,
+    ) -> Result<Arc<TorrentLeg>, String> {
+        self.torrent_leg_on(scope, position, Some(member), peers, timeout)
+    }
+
+    fn torrent_leg_on(
+        &self,
+        scope: TorrentScope,
+        position: usize,
+        member: Option<u32>,
+        peers: u16,
+        timeout: Duration,
+    ) -> Result<Arc<TorrentLeg>, String> {
         let route = self.route(Consumer::Torrent(scope), peers, timeout)?;
-        let stage = route
-            .legs
-            .read()
-            .expect("network route legs")
-            .get(position)
-            .ok_or("the route has no such leg")?
-            .stage
-            .clone();
+        let (stage, definition) = {
+            let legs = route.legs.read().expect("network route legs");
+            let leg = legs.get(position).ok_or("the route has no such leg")?;
+            (leg.stage.clone(), leg.definition.clone())
+        };
+        let member = match member {
+            None => None,
+            Some(member) => {
+                let pool = pool_of(&definition.path).ok_or("the leg has no pool")?;
+                let stage = self
+                    .pools
+                    .lock()
+                    .expect("network pools")
+                    .get(&(pool, definition.egress_id))
+                    .cloned()
+                    .ok_or_else(|| format!("pool {pool} is not running"))?;
+                Some(stage.pin_member(member).ok_or_else(|| {
+                    stage
+                        .member_down(member)
+                        .unwrap_or_else(|| format!("proxy {member} cannot be used in pool {pool}"))
+                })?)
+            }
+        };
         Ok(Arc::new(TorrentLeg {
             stage,
+            member,
             route: route.weighted.clone(),
             handle: self.handle.clone(),
             bridge: Mutex::new(None),
         }))
+    }
+
+    /// The members of pool `pool` that may carry a session, in the pool's
+    /// order: none while the pool is disabled or gone, and no proxy that is
+    /// disabled, as the pool's own stage takes them.
+    pub fn pool_members(&self, pool: u32) -> Vec<u32> {
+        let config = self.configuration.read().expect("network configuration");
+        let Some(pool) = config.pools.get(&pool).filter(|pool| pool.enabled) else {
+            return Vec::new();
+        };
+        pool.member_ids
+            .iter()
+            .copied()
+            .filter(|id| config.profiles.get(id).is_some_and(|p| p.enabled))
+            .collect()
+    }
+
+    /// Why member `member` of pool `pool` on egress `egress_id` carries
+    /// nothing now, when it does not: it was dropped from the pool, or is
+    /// blocked. A pool no route has started yet holds every member up.
+    pub fn pool_member_down(&self, pool: u32, egress_id: u32, member: u32) -> Option<String> {
+        self.pools
+            .lock()
+            .expect("network pools")
+            .get(&(pool, egress_id))?
+            .member_down(member)
+    }
+}
+
+/// The pool a leg's one rung is, when it is one.
+pub fn pool_of(path: &LegPath) -> Option<u32> {
+    match path {
+        LegPath::Ladder { rungs, .. } => match rungs.as_slice() {
+            [Rung::Pool { id }] => Some(*id),
+            _ => None,
+        },
+        LegPath::Direct => None,
     }
 }
 

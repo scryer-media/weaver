@@ -216,6 +216,9 @@ pub struct TorrentRecord {
     // Where it stands in the download queue, the lowest first (libtorrent
     // `torrent::queue_position`). A seed keeps the place it had.
     pub queue_position: i64,
+    // The pool member its route's session runs it on, by proxy id, while
+    // its route has a pool: it stays there until that member fails.
+    pub pool_member: Option<u32>,
 }
 
 impl TorrentRecord {

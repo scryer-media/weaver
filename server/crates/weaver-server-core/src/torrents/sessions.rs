@@ -32,7 +32,7 @@ use crate::persistence::Database;
 use crate::proxies::{
     Consumer, EgressBinding, EgressHealth, EgressInterface, FetchOptions, LegPath, NetworkRuntime,
     ProxyRuntime, ResolvedBy, Route, RoutingPolicy, Rung, SYSTEM_EGRESS_ID, TorrentLeg,
-    TorrentScope, routed_fetch,
+    TorrentScope, pool_of, routed_fetch,
 };
 use crate::settings::{BlocklistSource, TorrentConfig, TorrentEncryption, TorrentLimit};
 use crate::torrents::identity::IDENTITY;
@@ -143,6 +143,14 @@ impl RouteKey {
         Self(hex::encode(&Sha1::digest(&encoded)[..8]))
     }
 
+    /// The key of the session a pool route through `egress_id` and `path`
+    /// runs on `member`: each member's session is its own.
+    pub fn member(egress_id: u32, binding: &EgressBinding, path: &LegPath, member: u32) -> Self {
+        let encoded = serde_json::to_vec(&(egress_id, binding, path, member))
+            .expect("route legs always encode");
+        Self(hex::encode(&Sha1::digest(&encoded)[..8]))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -177,8 +185,9 @@ pub fn leg_unavailable(network: &NetworkRuntime, egress_id: u32) -> Option<Route
 }
 
 /// Who resolves the names a session on `path` looks up: the host's DNS on a
-/// direct leg, the exit proxy's naming on a ladder, none on a pool exit or a
-/// proxy that is not configured.
+/// direct leg, the exit proxy's naming on a ladder, none on a pool exit, whose
+/// sessions each name through their own member, or a proxy that is not
+/// configured.
 pub fn names_on(network: &NetworkRuntime, path: &LegPath) -> Option<ResolvedBy> {
     let exit = match path {
         LegPath::Direct => return Some(ResolvedBy::Host),
@@ -196,6 +205,20 @@ pub fn leg_key(network: &NetworkRuntime, egress_id: u32, path: &LegPath) -> Rout
     match leg_egress(network, egress_id) {
         Some(egress) => RouteKey::of(egress.id, &egress.binding, path),
         None => RouteKey::of(egress_id, &EgressBinding::System, path),
+    }
+}
+
+/// The key of the session a pool route through `egress_id` and `path` runs
+/// on `member`.
+pub fn member_key(
+    network: &NetworkRuntime,
+    egress_id: u32,
+    path: &LegPath,
+    member: u32,
+) -> RouteKey {
+    match leg_egress(network, egress_id) {
+        Some(egress) => RouteKey::member(egress.id, &egress.binding, path, member),
+        None => RouteKey::member(egress_id, &EgressBinding::System, path, member),
     }
 }
 
@@ -217,7 +240,10 @@ pub fn unplanned_key(scope: TorrentScope) -> RouteKey {
 pub const TORRENT_LEG: usize = 0;
 
 /// A torrent scope's route as it stands: its one leg, and whether that leg is
-/// up. A route a torrent may not run on is down, for the refusal.
+/// up. A route a torrent may not run on is down, for the refusal. A route
+/// whose one rung is a pool runs a session on each member, and each torrent
+/// on one of them: the plan of the route lists its members, and the plan a
+/// torrent runs on is its member's.
 #[derive(Clone, Debug)]
 pub struct RoutePlan {
     pub scope: TorrentScope,
@@ -225,12 +251,84 @@ pub struct RoutePlan {
     pub egress_id: u32,
     pub kind: LegKind,
     pub key: RouteKey,
-    /// Why the leg is down, when it is.
+    /// Why the leg is down, when it is: on a pool route, while no member is
+    /// up.
     pub down: Option<RouteFailure>,
     /// Who resolves the names its sessions look up: the host's DNS on a
     /// direct leg, the exit proxy's naming on a ladder, none when the route
     /// names no proxy that is configured.
     pub names: Option<ResolvedBy>,
+    /// The members of its pool that may carry a session, in the pool's
+    /// order; none when its rung is no pool.
+    pub members: Vec<MemberPlan>,
+    /// The member this plan's session runs on, on a member's plan.
+    pub member: Option<u32>,
+}
+
+/// A pool member a route's torrents may run on: its own session's key, why
+/// it carries nothing now when it does not, and who resolves its names.
+#[derive(Clone, Debug)]
+pub struct MemberPlan {
+    pub id: u32,
+    pub key: RouteKey,
+    pub down: Option<RouteFailure>,
+    pub names: Option<ResolvedBy>,
+}
+
+impl RoutePlan {
+    /// The plan a torrent pinned to member `pinned` runs on, and the member
+    /// it is pinned to from here. A torrent stays on its member while that
+    /// member is up; one with none, or whose member failed while another is
+    /// up, goes to the up member with the fewest torrents by `load`, the
+    /// lowest id of those. Its member down with none other up, it holds on
+    /// its member. A route with no pool pins nothing.
+    pub fn place(
+        &self,
+        pinned: Option<u32>,
+        load: impl Fn(&RouteKey) -> usize,
+    ) -> (RoutePlan, Option<u32>) {
+        let pinned = pinned.and_then(|id| self.members.iter().find(|member| member.id == id));
+        let up = |member: &&MemberPlan| member.down.is_none();
+        let member = pinned.filter(up).or_else(|| {
+            self.members
+                .iter()
+                .filter(up)
+                .min_by_key(|member| (load(&member.key), member.id))
+                .or(pinned)
+        });
+        match member {
+            Some(member) => (self.on(member), Some(member.id)),
+            None => (self.clone(), None),
+        }
+    }
+
+    // The plan of `member`'s session.
+    fn on(&self, member: &MemberPlan) -> RoutePlan {
+        RoutePlan {
+            key: member.key.clone(),
+            down: member.down.clone(),
+            names: member.names,
+            member: Some(member.id),
+            ..self.clone()
+        }
+    }
+
+    /// Who resolves the names of a torrent pinned to member `pinned`: its
+    /// member's naming on a pool route, the route's otherwise.
+    pub fn names_for(&self, pinned: Option<u32>) -> Option<ResolvedBy> {
+        match pinned.and_then(|id| self.members.iter().find(|member| member.id == id)) {
+            Some(member) => member.names,
+            None => self.names,
+        }
+    }
+
+    /// The keys of every session the route runs: its members' on a pool
+    /// route, else its own.
+    pub fn keys(&self) -> impl Iterator<Item = &RouteKey> {
+        let own = self.members.is_empty().then_some(&self.key);
+        own.into_iter()
+            .chain(self.members.iter().map(|member| &member.key))
+    }
 }
 
 /// A leg made ready for a session.
@@ -323,29 +421,72 @@ impl Routes for NetworkRoutes {
         let route = policy.route();
         let leg = route.legs.first().ok_or("the route has no leg")?;
         let egress = leg_egress(self.network(), leg.egress_id);
+        let egress_id = egress.as_ref().map_or(leg.egress_id, |egress| egress.id);
+        let mut members = Vec::new();
         let (key, down) = match crate::proxies::TorrentRouteFault::validate(&route) {
             Err(fault) => (
                 refused_key(&route),
                 Some(TorrentRouteReason::RouteBroken(fault).into()),
             ),
-            Ok(()) => (
-                leg_key(self.network(), leg.egress_id, &leg.path),
-                leg_unavailable(self.network(), leg.egress_id),
-            ),
+            Ok(()) => {
+                let unavailable = leg_unavailable(self.network(), leg.egress_id);
+                let down = match pool_of(&leg.path) {
+                    None => unavailable,
+                    Some(pool) => {
+                        members = self
+                            .network()
+                            .pool_members(pool)
+                            .into_iter()
+                            .map(|id| MemberPlan {
+                                id,
+                                key: member_key(self.network(), leg.egress_id, &leg.path, id),
+                                down: unavailable.clone().or_else(|| {
+                                    self.network()
+                                        .pool_member_down(pool, egress_id, id)
+                                        .map(RouteFailure::leg_down)
+                                }),
+                                names: self.network().resolved_by(id),
+                            })
+                            .collect();
+                        // Down while no member is up: for the first member's
+                        // reason, or for the pool having none.
+                        members.iter().all(|member| member.down.is_some()).then(|| {
+                            members
+                                .first()
+                                .and_then(|member| member.down.clone())
+                                .unwrap_or_else(|| {
+                                    RouteFailure::leg_down(format!(
+                                        "pool {pool} has no member that is enabled"
+                                    ))
+                                })
+                        })
+                    }
+                };
+                (leg_key(self.network(), leg.egress_id, &leg.path), down)
+            }
         };
         Ok(RoutePlan {
             scope,
-            egress_id: egress.as_ref().map_or(leg.egress_id, |egress| egress.id),
+            egress_id,
             kind: leg_kind(self.network(), leg.egress_id, &leg.path),
             key,
             names: names_on(self.network(), &leg.path),
             policy,
             down,
+            members,
+            member: None,
         })
     }
 
     fn leg_down(&self, plan: &RoutePlan) -> Option<RouteFailure> {
-        leg_unavailable(self.network(), plan.egress_id)
+        leg_unavailable(self.network(), plan.egress_id).or_else(|| {
+            let member = plan.member?;
+            let route = plan.policy.route();
+            let pool = pool_of(&route.legs.first()?.path)?;
+            self.network()
+                .pool_member_down(pool, plan.egress_id, member)
+                .map(RouteFailure::leg_down)
+        })
     }
 
     async fn open(&self, plan: &RoutePlan, peers: usize) -> Result<OpenLeg, String> {
@@ -354,9 +495,18 @@ impl Routes for NetworkRoutes {
             return OpenLeg::on(plan.kind.clone(), egress, None, None);
         }
         let peers = u16::try_from(peers).unwrap_or(u16::MAX);
-        let leg = self
-            .network()
-            .torrent_leg(plan.scope, TORRENT_LEG, peers, self.timeout)?;
+        let leg = match plan.member {
+            Some(member) => self.network().torrent_member_leg(
+                plan.scope,
+                TORRENT_LEG,
+                member,
+                peers,
+                self.timeout,
+            )?,
+            None => self
+                .network()
+                .torrent_leg(plan.scope, TORRENT_LEG, peers, self.timeout)?,
+        };
         let bridge = match plan.kind {
             LegKind::Ladder => Some(leg.bridge()?),
             _ => None,

@@ -129,7 +129,6 @@ export function routeProblemText(t: Translate, problem: RouteProblem): string {
     case "proxyRepeated":
       return t("next.networking.problem.proxyRepeated");
     case "TORRENT_ROUTE_LEGS":
-    case "TORRENT_ROUTE_POOL":
     case "TORRENT_ROUTE_DIRECT_FALLBACK":
     case "TORRENT_ROUTE_RUNGS":
       return t(refusalKey(problem));

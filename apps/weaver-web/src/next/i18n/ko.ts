@@ -1607,7 +1607,6 @@ export const nextKo: LocaleDictionary = {
   "next.refusal.EGRESS_QUOTA_SOFT_ABOVE_HARD": "업로드 소프트 할당량은 하드 할당량보다 클 수 없습니다.",
   "next.refusal.BANDWIDTH_LIMIT_TOO_LARGE": "속도 제한이 너무 큽니다.",
   "next.refusal.BANDWIDTH_SPLIT_RANGE": "대역폭 배분은 유즈넷에 1%에서 99%를 줍니다.",
-  "next.refusal.TORRENT_ROUTE_POOL": "토렌트 경로에서는 풀을 사용할 수 없습니다.",
   "next.refusal.TORRENT_ROUTE_LEGS": "토렌트 경로의 레그는 하나입니다.",
   "next.refusal.TORRENT_ROUTE_DIRECT_FALLBACK": "토렌트 경로는 직접 연결로 대체할 수 없습니다.",
   "next.refusal.TORRENT_ROUTE_RUNGS": "토렌트 경로의 단계는 하나입니다.",

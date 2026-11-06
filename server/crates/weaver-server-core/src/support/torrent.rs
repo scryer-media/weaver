@@ -888,7 +888,6 @@ fn route_reason(reason: TorrentRouteReason) -> &'static str {
             TorrentRouteFault::Legs => "route_broken_legs",
             TorrentRouteFault::DirectFallback => "route_broken_direct_fallback",
             TorrentRouteFault::Rungs => "route_broken_rungs",
-            TorrentRouteFault::Pool => "route_broken_pool",
         },
         TorrentRouteReason::RoutePlanFailed => "route_plan_failed",
         TorrentRouteReason::LegOpenFailed => "leg_open_failed",

@@ -72,10 +72,9 @@ test("a torrent route is one leg with one exit",()=>{
   const proxy=(proxyId:number)=>({kind:"PROXY" as const,proxyId,poolId:null,chainIds:[]});
   const ladder=(rungs:Rung[],directFallback=false):NetworkRoute=>({failover:"HOLD",legs:[{egressId:0,weight:100,path:{kind:"LADDER",directFallback,rungs}}]});
   const direct:NetworkRoute={failover:"HOLD",legs:[directLeg()]};
-  const accepted=[direct,ladder([proxy(3)]),ladder([{kind:"CHAIN",proxyId:null,poolId:null,chainIds:[3,4]}])];
+  const accepted=[direct,ladder([proxy(3)]),ladder([{kind:"CHAIN",proxyId:null,poolId:null,chainIds:[3,4]}]),ladder([{kind:"POOL",proxyId:null,poolId:5,chainIds:[]}])];
   const refused:[NetworkRoute,string][]=[
     [{failover:"HOLD",legs:[{...directLeg(),weight:50},{...directLeg(),weight:50}]},"TORRENT_ROUTE_LEGS"],
-    [ladder([{kind:"POOL",proxyId:null,poolId:5,chainIds:[]}]),"TORRENT_ROUTE_POOL"],
     [ladder([proxy(3)],true),"TORRENT_ROUTE_DIRECT_FALLBACK"],
     [ladder([proxy(3),proxy(4)]),"TORRENT_ROUTE_RUNGS"],
   ];

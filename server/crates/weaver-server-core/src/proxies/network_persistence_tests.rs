@@ -622,8 +622,9 @@ fn a_wireguard_proxy_is_saved_on_only_one_path_per_egress() {
 }
 
 // A torrent route is one leg with one exit: a second leg, a fall back to the
-// egress, a second rung or a pool is refused; a direct leg on any egress, a
-// proxy or a chain is saved. A server takes any of them.
+// egress or a second rung is refused; a direct leg on any egress, a proxy, a
+// chain or a pool, whose torrents each stay on one member, is saved. A server
+// takes any of them.
 #[test]
 fn a_torrent_route_is_one_leg_with_one_exit() {
     let db = Database::open_in_memory().unwrap();
@@ -686,13 +687,6 @@ fn a_torrent_route_is_one_leg_with_one_exit() {
             )]),
             "TORRENT_ROUTE_RUNGS",
         ),
-        (
-            policy(vec![leg(
-                0,
-                ladder(vec![Rung::Pool { id: pool.id }], false),
-            )]),
-            "TORRENT_ROUTE_POOL",
-        ),
     ];
     let saved = [
         RoutingPolicy {
@@ -707,6 +701,10 @@ fn a_torrent_route_is_one_leg_with_one_exit() {
         policy(vec![leg(
             0,
             ladder(vec![Rung::Chain { ids: vec![1, 3] }], false),
+        )]),
+        policy(vec![leg(
+            0,
+            ladder(vec![Rung::Pool { id: pool.id }], false),
         )]),
     ];
     for consumer in [

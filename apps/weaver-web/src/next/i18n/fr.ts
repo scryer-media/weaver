@@ -1607,7 +1607,6 @@ export const nextFr: LocaleDictionary = {
   "next.refusal.EGRESS_QUOTA_SOFT_ABOVE_HARD": "Le quota d’envoi souple ne peut pas dépasser le quota strict.",
   "next.refusal.BANDWIDTH_LIMIT_TOO_LARGE": "La limite de vitesse est trop élevée.",
   "next.refusal.BANDWIDTH_SPLIT_RANGE": "Un partage de la bande passante donne à usenet de 1 % à 99 %.",
-  "next.refusal.TORRENT_ROUTE_POOL": "Une route torrent ne peut pas utiliser de pool.",
   "next.refusal.TORRENT_ROUTE_LEGS": "Une route torrent a une branche.",
   "next.refusal.TORRENT_ROUTE_DIRECT_FALLBACK": "Une route torrent ne peut pas se replier en direct.",
   "next.refusal.TORRENT_ROUTE_RUNGS": "Une route torrent a un échelon.",

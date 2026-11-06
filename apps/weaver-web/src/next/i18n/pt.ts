@@ -1607,7 +1607,6 @@ export const nextPt: LocaleDictionary = {
   "next.refusal.EGRESS_QUOTA_SOFT_ABOVE_HARD": "A cota de upload flexível não pode passar da rígida.",
   "next.refusal.BANDWIDTH_LIMIT_TOO_LARGE": "O limite de velocidade é grande demais.",
   "next.refusal.BANDWIDTH_SPLIT_RANGE": "Uma divisão da largura de banda dá à usenet de 1% a 99%.",
-  "next.refusal.TORRENT_ROUTE_POOL": "Uma rota de torrents não pode usar um pool.",
   "next.refusal.TORRENT_ROUTE_LEGS": "Uma rota de torrents tem um trecho.",
   "next.refusal.TORRENT_ROUTE_DIRECT_FALLBACK": "Uma rota de torrents não pode recorrer ao direto.",
   "next.refusal.TORRENT_ROUTE_RUNGS": "Uma rota de torrents tem um degrau.",

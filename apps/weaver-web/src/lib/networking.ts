@@ -64,18 +64,18 @@ export function routeInput(route: NetworkRoute) {
   })) };
 }
 /** What keeps a route off torrent traffic, by the daemon's own refusal code. */
-export type TorrentRouteFault = "TORRENT_ROUTE_LEGS" | "TORRENT_ROUTE_POOL" | "TORRENT_ROUTE_DIRECT_FALLBACK" | "TORRENT_ROUTE_RUNGS";
+export type TorrentRouteFault = "TORRENT_ROUTE_LEGS" | "TORRENT_ROUTE_DIRECT_FALLBACK" | "TORRENT_ROUTE_RUNGS";
 /**
  * Why a torrent may not run on a route, the daemon's rule and order: a
  * torrent's peers and trackers see one address, so its route is one leg with
- * one exit. A direct leg is its egress; a ladder is one rung, a proxy or a
- * chain ending at one proxy, never a pool and never falling back direct.
+ * one exit. A direct leg is its egress; a ladder is one rung, a proxy, a
+ * chain ending at one proxy or a pool whose torrents each stay on one member,
+ * never falling back direct.
  */
 export function torrentRouteFault(route: NetworkRoute): TorrentRouteFault | null {
   if (route.legs.length !== 1) return "TORRENT_ROUTE_LEGS";
   const path = route.legs[0]!.path;
   if (path.kind === "DIRECT") return null;
-  if (path.rungs.some(rung => rung.kind === "POOL")) return "TORRENT_ROUTE_POOL";
   if (path.directFallback) return "TORRENT_ROUTE_DIRECT_FALLBACK";
   if (path.rungs.length > 1) return "TORRENT_ROUTE_RUNGS";
   return null;

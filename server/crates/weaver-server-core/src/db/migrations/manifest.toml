@@ -1386,3 +1386,20 @@ kind = "sql"
 file = "migrations/0103_usage_daily/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 104
+description = "a torrent on a pool route keeps the member it is pinned to"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0104_torrent_pool_member/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0104_torrent_pool_member/postgres.sql"
+engine = "postgres"
+scope = "all"

@@ -1607,7 +1607,6 @@ export const nextJa: LocaleDictionary = {
   "next.refusal.EGRESS_QUOTA_SOFT_ABOVE_HARD": "アップロードのソフト上限はハード上限を超えられません。",
   "next.refusal.BANDWIDTH_LIMIT_TOO_LARGE": "速度制限が大きすぎます。",
   "next.refusal.BANDWIDTH_SPLIT_RANGE": "帯域の配分では Usenet に 1% から 99% を割り当てます。",
-  "next.refusal.TORRENT_ROUTE_POOL": "トレント経路ではプールを使えません。",
   "next.refusal.TORRENT_ROUTE_LEGS": "トレント経路のレッグは 1 つです。",
   "next.refusal.TORRENT_ROUTE_DIRECT_FALLBACK": "トレント経路は直接接続にフォールバックできません。",
   "next.refusal.TORRENT_ROUTE_RUNGS": "トレント経路の段は 1 つです。",

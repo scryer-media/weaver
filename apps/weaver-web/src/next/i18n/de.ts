@@ -1607,7 +1607,6 @@ export const nextDe: LocaleDictionary = {
   "next.refusal.EGRESS_QUOTA_SOFT_ABOVE_HARD": "Das weiche Upload-Kontingent darf nicht über dem harten liegen.",
   "next.refusal.BANDWIDTH_LIMIT_TOO_LARGE": "Das Geschwindigkeitslimit ist zu groß.",
   "next.refusal.BANDWIDTH_SPLIT_RANGE": "Eine Bandbreitenaufteilung gibt Usenet 1 % bis 99 %.",
-  "next.refusal.TORRENT_ROUTE_POOL": "Eine Torrent-Route kann keinen Pool nutzen.",
   "next.refusal.TORRENT_ROUTE_LEGS": "Eine Torrent-Route hat einen Strang.",
   "next.refusal.TORRENT_ROUTE_DIRECT_FALLBACK": "Eine Torrent-Route kann nicht auf direkt zurückfallen.",
   "next.refusal.TORRENT_ROUTE_RUNGS": "Eine Torrent-Route hat eine Stufe.",
