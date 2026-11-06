@@ -235,6 +235,24 @@ pub(crate) struct NamespaceWriter {
     metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
 }
 
+// A cipher's tail read back before the ranges that fed its keys are
+// uncovered: the node it is of, the read's serial, and its staged pieces
+// with each one's provenance.
+pub(crate) struct Tail {
+    node: NodeId,
+    serial: u64,
+    staged: loan::Repaired,
+    sources: Vec<Provenance>,
+}
+
+impl Tail {
+    // A tail not to be said: the step failed before it.
+    pub(crate) fn drop_read(self, tree: &mut Tree) {
+        tree.again_done();
+        let _ = self.staged.discard();
+    }
+}
+
 impl NamespaceWriter {
     pub(crate) fn new(
         scope: u64,
@@ -1196,23 +1214,140 @@ impl NamespaceWriter {
             // Every effect before it is applied, so what the object reads
             // back of its members is on disk. Each run's effects are
             // applied before the next run goes, as each delivery's are.
+            // What it reads back is staged on disk a piece at a time, and
+            // read from there a piece at a time as it is said again.
             Effect::Again { node, ranges } => {
-                let runs = tree.again_read(*node, ranges, &self.placing(builder));
-                for (volume, posted) in runs {
-                    let mut effects = Vec::new();
-                    tree.replay_piece(
-                        *node,
-                        volume,
-                        posted,
-                        &mut self.placing(builder),
-                        &mut effects,
-                    );
-                    self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
-                }
+                let mut staged = loan::Repaired::again(&self.working_dir, *node)?;
+                let mut sources = Vec::new();
+                let serial = tree.again_read(
+                    *node,
+                    ranges,
+                    &self.placing(builder),
+                    &mut |volume, posted| {
+                        staged.write(MemberId(volume.0), posted.offset, &posted.bytes);
+                        sources.push(posted.provenance);
+                    },
+                );
+                let replayed = match staged.failed() {
+                    Some(error) => Err(WriteError::from(error)),
+                    None => self.again_staged(
+                        tree,
+                        builder,
+                        segments,
+                        (serial, *node),
+                        &staged,
+                        sources,
+                        out,
+                    ),
+                };
+                tree.again_done();
+                let removed = staged.discard();
+                replayed?;
+                removed?;
             }
         }
         out.push(effect);
         Ok(())
+    }
+
+    // Each staged piece of an `Effect::Again`, said again in the order it
+    // was read, its effects applied before the next piece goes.
+    #[allow(clippy::too_many_arguments)]
+    fn again_staged(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        (serial, node): (u64, NodeId),
+        staged: &loan::Repaired,
+        sources: Vec<Provenance>,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        // One slice per staged piece: no piece is longer than a slice.
+        const _: () = assert!(weaver_graph::AGAIN_PIECE <= READ_BACK);
+        for ((volume, offset, bytes), provenance) in staged.slices().zip(sources) {
+            let posted = Posted {
+                offset,
+                bytes: bytes?.into(),
+                provenance,
+            };
+            let mut effects = Vec::new();
+            tree.replay_again(
+                serial,
+                node,
+                VolumeIndex(volume.0),
+                posted,
+                &mut self.placing(builder),
+                &mut effects,
+            );
+            self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
+        }
+        Ok(())
+    }
+
+    // What uncovering ranges of a node's volume forgets past them, a
+    // cipher's tail made under keys they fed, read back while those keys
+    // still stand and staged on disk, to be said again by `say_tail` once
+    // the ranges are uncovered.
+    pub(crate) fn read_tail(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        node: NodeId,
+        ranges: &[(VolumeIndex, ByteRange)],
+    ) -> Result<Tail, WriteError> {
+        let mut staged = loan::Repaired::again(&self.working_dir, node)?;
+        let mut sources = Vec::new();
+        let serial = tree.again_tail(
+            node,
+            ranges,
+            &self.placing(builder),
+            &mut |volume, posted| {
+                staged.write(MemberId(volume.0), posted.offset, &posted.bytes);
+                sources.push(posted.provenance);
+            },
+        );
+        if let Some(error) = staged.failed() {
+            tree.again_done();
+            let _ = staged.discard();
+            return Err(error.into());
+        }
+        Ok(Tail {
+            node,
+            serial,
+            staged,
+            sources,
+        })
+    }
+
+    // A tail `read_tail` staged, said again in the order it was read.
+    pub(crate) fn say_tail(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        tail: Tail,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let Tail {
+            node,
+            serial,
+            staged,
+            sources,
+        } = tail;
+        let said = self.again_staged(
+            tree,
+            builder,
+            segments,
+            (serial, node),
+            &staged,
+            sources,
+            out,
+        );
+        tree.again_done();
+        let removed = staged.discard();
+        said?;
+        Ok(removed?)
     }
 
     // A member its object gave back is a leaf, and its file is what the

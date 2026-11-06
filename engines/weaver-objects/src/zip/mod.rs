@@ -594,6 +594,41 @@ impl Object for Zip {
         });
     }
 
+    // A cipher member's plaintext after the range was made under keys the
+    // range fed, so forgetting the range forgets it all, through the end of
+    // what the member has said.
+    fn uncovers(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        out: &mut Vec<(VolumeIndex, ByteRange)>,
+    ) {
+        out.push((volume, range));
+        let (Some(global), Some(map)) = (self.global(volume, range), &self.map) else {
+            return;
+        };
+        for entry in &map.entries {
+            let (Some(span), Some(member), Some(_)) = (entry.span(), entry.member, &entry.cipher)
+            else {
+                continue;
+            };
+            let Some(part) = span.intersect(global) else {
+                continue;
+            };
+            let after = ByteRange::new(part.end - span.start, entry.length);
+            let Some(end) = self.members[member.0 as usize]
+                .coverage
+                .overlapping(after)
+                .map(|run| run.range.end.min(entry.length))
+                .max()
+                .filter(|end| *end > after.start)
+            else {
+                continue;
+            };
+            self.to_volumes(ByteRange::new(part.end, span.start + end), out);
+        }
+    }
+
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         self.place(volume, range, out);
     }
@@ -639,6 +674,7 @@ impl Object for Zip {
             .any(|candidate| candidate.as_str() == secret)
         {
             self.candidates.push(Zeroizing::new(secret.to_owned()));
+            self.retry_doubted(out);
         }
         self.open_entries(out);
     }

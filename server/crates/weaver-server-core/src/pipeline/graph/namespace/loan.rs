@@ -298,7 +298,32 @@ impl Repaired {
         })
     }
 
-    fn write(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
+    // What an object asked for again, read back and staged here until the
+    // tree has uncovered it all, so a whole member said again is never in
+    // memory at once. Each request gets its own file: one the replay
+    // raises while an earlier one is being said again is staged apart.
+    pub(crate) fn again(working_dir: &std::path::Path, node: NodeId) -> Result<Self, LeafError> {
+        let internal = working_dir.join(weaver_graph::names::INTERNAL_DIR);
+        std::fs::create_dir_all(&internal).map_err(|source| LeafError::Io {
+            path: internal.clone(),
+            source,
+        })?;
+        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let serial = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!(
+            "{}/graph-again-{}-{serial}.repaired",
+            weaver_graph::names::INTERNAL_DIR,
+            node.0,
+        );
+        Ok(Self {
+            runs: Vec::new(),
+            output: Leaf::at(working_dir, &name),
+            written: 0,
+            failed: None,
+        })
+    }
+
+    pub(crate) fn write(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
         if self.failed.is_some() {
             return;
         }
@@ -349,6 +374,15 @@ impl Repaired {
 
     // The output goes with the runs.
     pub(crate) fn remove(self) -> Result<(), LeafError> {
+        self.output.remove()
+    }
+
+    // As `remove`, for a staging nothing may have been written to: a
+    // request whose ranges read back nothing has no file.
+    pub(crate) fn discard(self) -> Result<(), LeafError> {
+        if !self.output.path().exists() {
+            return Ok(());
+        }
         self.output.remove()
     }
 }

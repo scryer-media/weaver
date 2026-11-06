@@ -289,7 +289,45 @@ impl NamespaceWriter {
             return Ok(replayed.remove()?);
         }
         // All input was captured before the first unposted callback can
-        // invalidate a cipher seed, placement or dependent member.
+        // invalidate a cipher seed, placement or dependent member. What
+        // uncovering it forgets past it, a cipher's tail made under keys it
+        // fed, is read back now, under those keys, and said again after it.
+        let window: Vec<(VolumeIndex, ByteRange)> = replayed
+            .bytes
+            .runs
+            .iter()
+            .map(|(volume, offset, range)| {
+                (VolumeIndex(volume.0), ByteRange::at(*offset, range.len()))
+            })
+            .collect();
+        let tail = self.read_tail(tree, builder, replayed.node, &window)?;
+        if let Err(error) = self.replay_window(tree, builder, segments, &mut replayed, out) {
+            tail.drop_read(tree);
+            return Err(error);
+        }
+        let mut applied = Vec::new();
+        let said = self.say_tail(tree, builder, segments, tail, &mut applied);
+        // The job answers password requests; payload effects have already
+        // reached disk.
+        out.extend(
+            applied
+                .into_iter()
+                .filter(|effect| matches!(effect, Effect::NeedsPassword { .. })),
+        );
+        said?;
+        Ok(replayed.remove()?)
+    }
+
+    // The window a replay staged, uncovered at every depth and said again
+    // with the staged bytes, each run's effects applied before the next.
+    fn replay_window(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        replayed: &mut Replayed,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
         for ((volume, offset, range), provenance) in
             replayed.bytes.runs.iter().zip(&replayed.provenance)
         {
@@ -331,6 +369,6 @@ impl NamespaceWriter {
                     .filter(|effect| matches!(effect, Effect::NeedsPassword { .. })),
             );
         }
-        Ok(replayed.remove()?)
+        Ok(())
     }
 }

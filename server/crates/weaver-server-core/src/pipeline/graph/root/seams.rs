@@ -208,11 +208,14 @@ impl Pipeline {
     // An article of a graph job the decoder withdrew, its placement refuted
     // by its neighbours, is sent back to the root for another copy.
     pub(in crate::pipeline) fn graph_article_sent_back(&mut self, segment_id: SegmentId) {
-        if let Some(graph) = self.graph_jobs.get_mut(&segment_id.file_id.job_id) {
-            graph.send_back(
+        let job_id = segment_id.file_id.job_id;
+        if let Some(graph) = self.graph_jobs.get_mut(&job_id)
+            && let Err(error) = graph.send_back(
                 VolumeIndex(segment_id.file_id.file_index),
                 segment_id.segment_number,
-            );
+            )
+        {
+            self.after_graph_result(job_id, Err(error));
         }
     }
 

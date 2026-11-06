@@ -409,6 +409,19 @@ pub trait Object: Send + Sync {
     // I said of them, so I say it again as they come.
     fn unposted(&mut self, volume: VolumeIndex, range: ByteRange);
 
+    // What forgetting this range of my volume forgets, in order: the range,
+    // and whatever I said that came from it and must be said again with
+    // it, a cipher's plaintext after it, made under keys it fed. The tree
+    // reads all of it back before it forgets any, and forgets all of it.
+    fn uncovers(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        out: &mut Vec<(VolumeIndex, ByteRange)>,
+    ) {
+        out.push((volume, range));
+    }
+
     // What `posted` answers for these ranges of my volumes, as I stand now,
     // owned and apart from me. An object that rebuilds its posted bytes
     // itself hands out what that rebuilding needs, shared rather than
