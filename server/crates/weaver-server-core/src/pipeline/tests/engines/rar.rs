@@ -123,6 +123,34 @@ async fn a_two_volume_rar5_set_delivers_its_members() {
     assert_fetched_once(&graph);
 }
 
+// Every batch served last article first: a volume's data comes before the
+// headers that place it and is held, then goes down again once they come,
+// with the checksums the source took of it. Nothing hashes it again: the
+// run hashes as many bytes as one whose articles come in order, and the
+// member is the same bytes. Held bytes that went down bare hashed nearly
+// six times as many bytes as the run in order.
+#[tokio::test]
+async fn held_store_bytes_are_hashed_no_more_than_bytes_placed_at_once() {
+    let body = body();
+    let set = single_member_store_set(MEMBER, &body, 4);
+    let hashed = weaver_graph::evidence::counting::hashed;
+
+    let before = hashed();
+    let in_order = run(&Scenario::new(posts(set.clone()))).await;
+    let placed = hashed() - before;
+    let before = hashed();
+    let backwards = run(&Scenario::new(posts(set)).backwards()).await;
+    let held = hashed() - before;
+
+    assert_member(&in_order, &body);
+    assert_member(&backwards, &body);
+    assert_fetched_once(&backwards);
+    assert_eq!(
+        held, placed,
+        "held bytes are hashed no more than placed ones"
+    );
+}
+
 #[tokio::test]
 async fn a_four_volume_rar5_set_delivers_its_member() {
     let body = body();

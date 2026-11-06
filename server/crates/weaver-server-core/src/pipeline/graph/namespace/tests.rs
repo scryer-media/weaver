@@ -26,6 +26,9 @@ thread_local! {
     // How many members a pass over the holds asked what is held of them.
     pub(super) static RELEASE_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static STORE_DELIVERIES: std::cell::RefCell<Option<Vec<(ByteRange, Provenance)>>> = const { std::cell::RefCell::new(None) };
+    // Each delivery the pretend 7z store heard, with the CRC32 its bytes
+    // came proven by, when every byte of them was.
+    static LATE_HEARD: std::cell::RefCell<Vec<(ByteRange, Option<u64>)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";
@@ -172,6 +175,12 @@ impl Object for Late {
         out: &mut Vec<Emit>,
     ) {
         let range = ByteRange::at(delivery.offset, delivery.bytes.len() as u64);
+        let crc32 = weaver_graph::Algorithm::Crc32;
+        let proven = delivery
+            .bytes
+            .proven(crc32)
+            .then(|| delivery.bytes.digest(crc32).value);
+        LATE_HEARD.with_borrow_mut(|heard| heard.push((range, proven)));
         if !self.mapped && range.intersect(map_at()) == Some(map_at()) {
             self.mapped = true;
             out.push(Emit::Member {
@@ -1089,6 +1098,43 @@ fn bytes_held_before_a_store_knows_its_map_reach_the_member_once_it_does() {
     let mut whole = front;
     whole.extend_from_slice(MAP);
     assert_eq!(posted, whole);
+}
+
+// Held bytes go down again with the checksum the source took of them when
+// they came, whether they stayed in memory or were paged to scratch and
+// read back: the object below is handed them proven, as a first delivery
+// is, and hashes nothing of them again.
+#[test]
+fn held_bytes_go_down_again_with_the_source_s_checksums() {
+    for resident_limit in [u64::MAX, 2] {
+        let mut job = Job::new(HoldBudgets {
+            resident_limit,
+            ..PLENTY
+        });
+        let member = job.member("a.7z", Some(map_at().end));
+        let mut front = seven_z().to_vec();
+        front.extend_from_slice(b"hello");
+        job.send(member, 0, &front, Provenance::Fresh);
+        assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len());
+        let paged = job.accountant.usage().scratch;
+        assert_eq!(paged > 0, resident_limit == 2, "limit {resident_limit}");
+        LATE_HEARD.with_borrow_mut(Vec::clear);
+
+        job.send(member, map_at().start, MAP, Provenance::Fresh);
+
+        assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
+        assert_eq!(job.file("inner.bin"), b"hello");
+        let replayed: Vec<_> = LATE_HEARD
+            .with_borrow(Clone::clone)
+            .into_iter()
+            .filter(|(range, _)| *range == body())
+            .collect();
+        assert_eq!(
+            replayed,
+            vec![(body(), Some(u64::from(SOURCE_CRC)))],
+            "limit {resident_limit}: the held body comes back proven by the source"
+        );
+    }
 }
 
 // A pass over the holds asks only the volumes that hold bytes: of six
@@ -2938,7 +2984,12 @@ fn unrelated_candidate_and_shared_scratch_activity_do_not_invalidate_repair_loan
             .run(weaver_graph::Budget::default(), &Default::default());
         assert!(
             !job.writer
-                .keep_held(NodeId::ROOT, other, 25000, Bytes::from_static(b"held"))
+                .keep_held(
+                    NodeId::ROOT,
+                    other,
+                    25000,
+                    Bytes::from_static(b"held").into()
+                )
                 .unwrap()
         );
         job.send(other, 20000, b"new", Provenance::Fresh);
@@ -2968,7 +3019,12 @@ fn replacement_of_a_borrowed_hold_invalidates_repair_loan() {
         let member = job.member("payload.bin", Some(8));
         assert!(
             !job.writer
-                .keep_held(NodeId::ROOT, member, 0, Bytes::from_static(b"original"))
+                .keep_held(
+                    NodeId::ROOT,
+                    member,
+                    0,
+                    Bytes::from_static(b"original").into()
+                )
                 .unwrap()
         );
         job.tree
@@ -2995,7 +3051,7 @@ fn replacement_of_a_borrowed_hold_invalidates_repair_loan() {
         assert!(!job.writer.moved_since(&job.tree, &returned));
         assert!(
             !job.writer
-                .keep_held(NodeId::ROOT, member, 2, Bytes::from_static(b"new"))
+                .keep_held(NodeId::ROOT, member, 2, Bytes::from_static(b"new").into())
                 .unwrap()
         );
         assert!(
@@ -3021,7 +3077,12 @@ fn a_returned_ruling_stands_on_the_ranges_it_read_and_only_those() {
         let arrive = |job: &mut Job, offset: u64, bytes: &'static [u8]| {
             assert!(
                 !job.writer
-                    .keep_held(NodeId::ROOT, member, offset, Bytes::from_static(bytes))
+                    .keep_held(
+                        NodeId::ROOT,
+                        member,
+                        offset,
+                        Bytes::from_static(bytes).into()
+                    )
                     .unwrap()
             );
             job.tree
