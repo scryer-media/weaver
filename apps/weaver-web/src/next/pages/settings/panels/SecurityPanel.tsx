@@ -819,9 +819,7 @@ function SecurityPanelBody({
     : {
         id: "loginEnabled",
         label: t("next.security.requireLogin"),
-        help: login?.enabled
-          ? t("next.security.requireLoginOnHelp")
-          : t("next.security.requireLoginOffHelp"),
+        help: login?.enabled ? undefined : t("next.security.requireLoginOffHelp"),
         keywords: "password admin authentication",
         control: {
           kind: "custom",
@@ -1048,7 +1046,6 @@ function SecurityPanelBody({
               {
                 id: "name",
                 label: t("next.security.name"),
-                help: t("next.security.keyNameHelp"),
                 control: {
                   kind: "text",
                   mono: false,

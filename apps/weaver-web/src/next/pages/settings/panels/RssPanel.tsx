@@ -474,7 +474,6 @@ export function RssPanel() {
       kind: "table",
       id: "feeds",
       title: t("next.rss.feeds"),
-      note: t("next.rss.feedsNote"),
       columns: "minmax(0, 1fr) minmax(0, 1.3fr) 110px minmax(0, 1fr) 64px",
       headers: [
         t("next.rss.name"),
@@ -721,7 +720,6 @@ export function RssPanel() {
         {
           id: "enabled",
           label: t("next.rss.enabled"),
-          help: t("next.rss.enabledHelp"),
           control: {
             kind: "toggle",
             value: feedForm.enabled && !feedForm.killSwitch,
@@ -858,7 +856,6 @@ export function RssPanel() {
     {
       id: "action",
       label: t("next.rss.action"),
-      help: t("next.rss.actionHelp"),
       control: {
         kind: "segmented",
         value: ruleForm.action,

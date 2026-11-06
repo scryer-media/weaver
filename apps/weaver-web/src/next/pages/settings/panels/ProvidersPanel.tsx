@@ -530,7 +530,6 @@ export function ProvidersPanel() {
             {
               id: "host",
               label: t("next.providers.host"),
-              help: t("next.providers.hostHelp"),
               control: {
                 kind: "text",
                 value: values.host,
@@ -551,8 +550,7 @@ export function ProvidersPanel() {
             },
             {
               id: "tls",
-              label: "TLS",
-              help: t("next.providers.tlsHelp"),
+              label: "SSL/TLS",
               control: {
                 kind: "toggle",
                 value: values.tls,
@@ -601,7 +599,6 @@ export function ProvidersPanel() {
             {
               id: "active",
               label: t("next.providers.enabled"),
-              help: t("next.providers.enabledHelp"),
               control: {
                 kind: "toggle",
                 value: values.active && !values.killSwitch,
@@ -634,7 +631,6 @@ export function ProvidersPanel() {
             {
               id: "retentionDays",
               label: t("next.providers.retention"),
-              help: t("next.providers.retentionHelp"),
               control: {
                 kind: "number",
                 value: values.retentionDays,
@@ -652,7 +648,6 @@ export function ProvidersPanel() {
             {
               id: "speedUnlimited",
               label: t("next.providers.unlimitedSpeed"),
-              help: t("next.providers.unlimitedSpeedHelp"),
               control: {
                 kind: "toggle",
                 value: values.speedUnlimited,
@@ -676,7 +671,6 @@ export function ProvidersPanel() {
                 ]),
             ...quotaFields(t, values.quota, (quota) => patch({ quota }), {
               label: t("next.providers.quota"),
-              help: t("next.providers.quotaHelp"),
               usedBytes: values.quotaUsedBytes,
             }),
           ],
@@ -714,7 +708,7 @@ export function ProvidersPanel() {
         title={editingId === "new" ? t("next.providers.add") : (editing?.host ?? t("next.providers.provider"))}
         note={
           editingId === "new"
-            ? t("next.providers.newNote")
+            ? undefined
             : t("next.providers.priorityNote", { priority: values?.priority ?? 0 })
         }
         width={620}

@@ -10,7 +10,6 @@ const en: LocaleDictionary = {
   "settings.networkOverview": "Overview",
   "settings.networkEgress": "Egress",
   "settings.networkRoutes": "Routes",
-  "settings.networkingDesc": "Egress interfaces, proxy pools and consumer routes",
   "settings.proxies": "Proxies",
 
   // Navigation

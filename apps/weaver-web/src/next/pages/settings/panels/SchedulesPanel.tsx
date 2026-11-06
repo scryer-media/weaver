@@ -276,7 +276,7 @@ export function SchedulesPanel() {
             ? t("next.schedules.add")
             : editing?.label || editing?.time || t("next.schedules.schedule")
         }
-        note={editingId === "new" ? t("next.schedules.newNote") : scheduleDaysLabel(t, editing?.days ?? [])}
+        note={editingId === "new" ? undefined : scheduleDaysLabel(t, editing?.days ?? [])}
         error={error}
         busy={busy}
         onSave={() => void save()}

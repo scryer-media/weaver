@@ -409,7 +409,6 @@ export function GeneralPanel() {
             {
               id: "maxRetries",
               label: t("next.general.retries"),
-              help: t("next.general.retriesHelp"),
               control: {
                 kind: "number",
                 value: values.maxRetries,
@@ -552,7 +551,6 @@ export function GeneralPanel() {
           kind: "section",
           id: "storage",
           title: t("next.general.storage"),
-          note: t("next.general.storageNote"),
           fields: [
             {
               id: "dataDir",

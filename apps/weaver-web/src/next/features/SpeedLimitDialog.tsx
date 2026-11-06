@@ -112,6 +112,8 @@ export function SpeedLimitControl() {
     <>
       <SecondaryButton
         icon="bandwidth"
+        // A limit in force reads as a warning: yellow outline, not a fill.
+        className={inForce > 0 ? "border-wv-warn text-wv-warn hover:border-wv-warn-hover" : undefined}
         title={bySchedule ? t("next.speedLimit.bySchedule") : t("next.speedLimit.buttonTitle")}
         onClick={openDialog}
       >

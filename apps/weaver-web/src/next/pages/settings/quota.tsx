@@ -133,7 +133,7 @@ export function quotaFields(
   t: Translate,
   draft: QuotaDraft,
   onChange: (next: QuotaDraft) => void,
-  options: { label: string; help: string; usedBytes?: number },
+  options: { label: string; help?: string; usedBytes?: number },
 ): FieldSpec[] {
   const patchQuota = (next: Partial<DownloadQuota>) => onChange({ ...draft, quota: { ...draft.quota, ...next } });
   const toggle: FieldSpec = {

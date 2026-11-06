@@ -132,7 +132,6 @@ export function SecretEditor({
       <RecordEditor
         open
         title={editing ? editing.name : t("next.secrets.add")}
-        note={editing ? t("next.secrets.editNote") : t("next.secrets.newNote")}
         error={error}
         busy={busy}
         onSave={() => checked(save)}

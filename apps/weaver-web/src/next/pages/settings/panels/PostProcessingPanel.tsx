@@ -253,7 +253,6 @@ export function ScriptConfigurationPanel() {
         {
           id: "terminationGraceSeconds",
           label: t("next.postProcessing.grace"),
-          help: t("next.postProcessing.graceHelp"),
           control: {
             kind: "number",
             value: values.terminationGraceSeconds,
