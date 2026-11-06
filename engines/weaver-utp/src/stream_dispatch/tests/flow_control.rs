@@ -279,7 +279,12 @@ async fn test_exact_receive_window_closes_only_when_full_and_reopens_after_read(
     );
     assert_eq!(t.read_all_available().await.unwrap(), b"bcccc");
     t.poll_once_assert_pending().await;
-    assert_eq!(t.vsock.outgoing_header().wnd_size, 10);
+    // Room for another full packet is announced too.
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(State, seq_nr = 101, ack_nr = 3, wnd_size = 10u32)]
+    );
+    t.poll_once_assert_pending().await;
     t.assert_sent_empty();
 }
 

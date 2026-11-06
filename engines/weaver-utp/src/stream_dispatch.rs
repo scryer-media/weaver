@@ -1487,10 +1487,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         if self.state.is_remote_fin_or_later() {
             return false;
         }
-        // if we need to send a window update, also send immediately.
-        // In case the reader was fully flow controlled.
+        // A remote sends only whole packets into the window we last
+        // advertised, so announce a window that closed, opened from zero, or
+        // grew by a packet since.
         let current = self.rx_window();
-        let changed = (current == 0) ^ (self.last_sent_window == 0);
+        let mss = u32::from(self.segment_sizes.mss());
+        let changed = (current == 0) ^ (self.last_sent_window == 0)
+            || current.saturating_sub(self.last_sent_window) >= mss;
         if changed {
             trace!(
                 self.last_sent_window,
