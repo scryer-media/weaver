@@ -12,14 +12,14 @@ use tokio::sync::AcquireError;
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("error connecting over TCP: {0:#}")]
-    TcpConnect(#[source] librqbit_dualstack_sockets::Error),
+    TcpConnect(#[source] std::io::Error),
     #[error("error connecting over uTP: {0:#}")]
     UtpConnect(#[source] weaver_utp::Error),
     #[error("can't connect, all connection methods disabled")]
     ConnectDisabled,
     #[error("error connecting: TCP={tcp:#} uTP={utp:#}")]
     Connect {
-        tcp: librqbit_dualstack_sockets::Error,
+        tcp: std::io::Error,
         utp: weaver_utp::Error,
     },
     #[error("uTP disabled")]

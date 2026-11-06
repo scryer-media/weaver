@@ -71,6 +71,7 @@ walkdir = { workspace = true }
 x509-parser = { version = "0.18", default-features = false }
 weaver-model = { path = "../../shared/crates/weaver-model", default-features = false }
 weaver-utp = { workspace = true }
+weaver-tunnel = { path = "../weaver-tunnel" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32", "Win32_System", "Win32_System_IO", "Win32_System_Ioctl", "Win32_Networking_WinSock"] }

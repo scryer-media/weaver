@@ -356,10 +356,9 @@ impl StreamConnector {
                     addr.is_ipv6(),
                     self.socket_factory.connect_tcp(addr),
                 )
-                .await
-                .map_err(librqbit_dualstack_sockets::Error::Connect)?;
+                .await?;
             debug!(?addr, "connected over TCP");
-            Ok::<_, librqbit_dualstack_sockets::Error>(Some(conn))
+            Ok::<_, std::io::Error>(Some(conn))
         };
 
         let tcp_failed_notify = tokio::sync::Notify::new();
@@ -390,7 +389,7 @@ impl StreamConnector {
         tokio::pin!(tcp_connect);
         tokio::pin!(utp_connect);
 
-        let mut tcp_err: Option<Option<librqbit_dualstack_sockets::Error>> = None;
+        let mut tcp_err: Option<Option<std::io::Error>> = None;
         let mut utp_err: Option<Option<weaver_utp::Error>> = None;
 
         // wait until all fail, or one succeeds.
