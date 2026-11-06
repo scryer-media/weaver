@@ -72,7 +72,7 @@ impl Drop for Unremovable {
 }
 
 // The job's rows as they stand once every queued write has committed.
-async fn rows(pipeline: &Pipeline) -> GraphCheckpoint {
+async fn rows(pipeline: &mut Pipeline) -> GraphCheckpoint {
     pipeline.flush_graph_checkpoint(JOB);
     pipeline.db.flush_write_queue().await.unwrap();
     pipeline
@@ -153,7 +153,7 @@ async fn run_stopping(scenario: &Scenario, stop: Stop) -> (Restarted, GraphCheck
             if !owed.remove(&article) && *asked > 1 {
                 from_disk.insert(article);
             }
-            let was = before(&pipeline, restored.as_ref()).await;
+            let was = before(&mut pipeline, restored.as_ref()).await;
             serve_work(&mut pipeline, scenario, &work).await;
             observe(&pipeline, &mut graph, &mut reads);
             if finished(&pipeline) {
@@ -195,7 +195,7 @@ async fn run_stopping(scenario: &Scenario, stop: Stop) -> (Restarted, GraphCheck
             .get(&JOB)
             .is_some_and(|job| job.awaits_mail())
         {
-            let was = before(&pipeline, restored.as_ref()).await;
+            let was = before(&mut pipeline, restored.as_ref()).await;
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
             pipeline.graph_run_said(said);
             observe(&pipeline, &mut graph, &mut reads);
@@ -255,7 +255,7 @@ async fn run_stopping(scenario: &Scenario, stop: Stop) -> (Restarted, GraphCheck
 
 // The rows before the step under way, while the job has not gone down.
 async fn before(
-    pipeline: &Pipeline,
+    pipeline: &mut Pipeline,
     restored: Option<&GraphCheckpoint>,
 ) -> Option<GraphCheckpoint> {
     match restored {
@@ -305,7 +305,7 @@ async fn go_down(
             *blocker = Some(Unremovable::at(working_dir.join(name)));
         }
         Stop::Moved(name) => {
-            let recorded = rows(&pipeline).await;
+            let recorded = rows(&mut pipeline).await;
             while !working_dir.join(name).exists() {
                 let said = pipeline
                     .graph_runs

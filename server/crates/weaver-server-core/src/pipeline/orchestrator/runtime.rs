@@ -1804,6 +1804,9 @@ impl Pipeline {
     fn checkpoint_graph_holds(&mut self) {
         let jobs: Vec<JobId> = self.graph_jobs.keys().copied().collect();
         for job_id in jobs {
+            // The steps no checkpoint has read yet are taken before the
+            // page-out, so a failed one leaves the checkpoint of every step.
+            self.take_stepped_graph_checkpoint(job_id);
             let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
                 continue;
             };
