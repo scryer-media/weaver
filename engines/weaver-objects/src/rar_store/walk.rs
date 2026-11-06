@@ -16,6 +16,7 @@ use unrar_rs::{
     RarVolumeFactsWalk, RarVolumeHeaderEncryption,
 };
 use weaver_graph::{ByteRange, Emit, Why};
+use zeroize::Zeroizing;
 
 use super::image::{SparseImage, readable};
 use crate::kept::Kept;
@@ -59,6 +60,38 @@ pub(super) struct Walk {
     // Where the next walk reads on from: every header before it was read
     // whole from bytes that have not changed since.
     pub(super) cursor: RarVolumeFactsCursor,
+    // The password the cursor last stepped with: under another one it
+    // begins again at the signature on its own.
+    keyed: Keyed,
+}
+
+// A password kept to compare with, never shown.
+#[derive(Default)]
+struct Keyed(Option<Zeroizing<String>>);
+
+impl std::fmt::Debug for Keyed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Keyed")
+    }
+}
+
+// Where each walk's image began on this thread, for a test: 0 for every
+// run in hand.
+#[cfg(test)]
+pub(super) mod imaged {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static IMAGED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn note(at: u64) {
+        IMAGED.with_borrow_mut(|imaged| imaged.push(at));
+    }
+
+    pub(crate) fn take() -> Vec<u64> {
+        IMAGED.with(RefCell::take)
+    }
 }
 
 // Where each walk began on this thread, for a test: 0 from the signature.
@@ -263,6 +296,41 @@ impl Walk {
         self.successor() == Some(false)
     }
 
+    // Where the next step reads on from under `password`, when it truly
+    // reads on: the cursor holds a resume, and it was keyed with this same
+    // password, since under another one it begins at the signature.
+    pub(super) fn resumes(&self, password: Option<&str>) -> Option<u64> {
+        let keyed = self.keyed.0.as_deref().map(String::as_str);
+        self.cursor.resumes_at().filter(|_| keyed == password)
+    }
+
+    // The first byte the next step can read. A step reading on reads nothing
+    // before its resume, so the runs ending at or before it need not be in
+    // its image. Every run is, from the signature, whenever
+    // (a) the cursor holds no resume (`resumes_at()` is None),
+    // (b) the password differs from the one the cursor last stepped with,
+    // (c) the headers read so far carry a Quick Open locator
+    //     (`has_locator` or `quick_open_offset`), whose records the step may
+    //     read wherever they lie, or
+    // (d) the volume is not known to be RAR5: a RAR4 step can read owner
+    //     records anywhere in the volume, and a RAR 1.4 one reads from the
+    //     signature every time.
+    pub(super) fn image_from(&self, password: Option<&str>) -> u64 {
+        let Some(at) = self.resumes(password) else {
+            return 0;
+        };
+        match &self.facts {
+            Some(facts)
+                if facts.archive_format() == ArchiveFormat::Rar5
+                    && !facts.has_locator
+                    && facts.quick_open_offset.is_none() =>
+            {
+                at
+            }
+            _ => 0,
+        }
+    }
+
     // A kept byte changed from `at` on: a walk that read on past it begins
     // again from the signature, and one short of it reads on.
     pub(super) fn changed_from(&mut self, at: u64) {
@@ -310,8 +378,12 @@ impl Walk {
         }
         #[cfg(test)]
         began::note(self.cursor.resumes_at().unwrap_or(0));
-        let image = SparseImage::of(kept, closed);
+        let from = self.image_from(password);
+        #[cfg(test)]
+        imaged::note(from);
+        let image = SparseImage::past(kept, closed, from);
         let walked = self.cursor.step(image, password, Arc::clone(kdf));
+        self.keyed = Keyed(password.map(|password| Zeroizing::new(password.to_owned())));
         // A walk read on from the cursor reads what one from the signature
         // reads over the same bytes.
         #[cfg(test)]

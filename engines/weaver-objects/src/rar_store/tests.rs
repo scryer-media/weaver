@@ -2194,6 +2194,105 @@ fn a_volume_arriving_in_order_is_walked_from_its_signature_once() {
     }
 }
 
+// A RAR5 walk reading on from its cursor is handed only the runs past it;
+// a RAR4 one every run in hand, each walk. Every walk is checked against
+// one from the signature over every run as it runs.
+#[test]
+fn a_resumed_rar5_walk_images_only_the_runs_past_its_cursor() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &Options::new(version));
+        let length = volumes[0].len() as u64;
+        let mut owner = Owner::named(store(), volumes);
+        walk::began::take();
+        walk::imaged::take();
+        let mut start = 0;
+        while start < length {
+            let end = (start + 500).min(length);
+            owner.deliver(0, ByteRange::new(start, end));
+            start = end;
+        }
+        owner.close(0);
+        let began = walk::began::take();
+        let imaged = walk::imaged::take();
+        assert_eq!(began.len(), imaged.len(), "{version:?}");
+        assert!(
+            began
+                .iter()
+                .zip(&imaged)
+                .all(|(began, imaged)| *imaged == 0 || imaged == began),
+            "{version:?} {began:?} {imaged:?}"
+        );
+        match version {
+            Version::Rar5 => assert!(imaged.iter().any(|at| *at > 0), "{imaged:?}"),
+            _ => assert!(imaged.iter().all(|at| *at == 0), "{imaged:?}"),
+        }
+        streamed(&owner);
+    }
+}
+
+// Each of the four things that make a step begin at the signature images
+// every run in hand: no resume, another password than the cursor last
+// stepped with, a Quick Open locator, a volume not read as RAR5.
+#[test]
+fn a_walk_images_every_run_unless_it_truly_reads_on_from_a_rar5_cursor() {
+    let volumes = write(&items(), &Options::new(Version::Rar5));
+    let mut owner = Owner::named(store(), volumes);
+    owner.frames(0, 500);
+    let walk = &mut owner.object.volumes.get_mut(&VolumeIndex(0)).unwrap().walk;
+    let resumes = walk.cursor.resumes_at().expect("a cursor");
+    assert!(resumes > 0);
+    assert_eq!(walk.image_from(None), resumes);
+    // (b) another password than the last step's
+    assert_eq!(walk.image_from(Some(PASSWORD)), 0);
+    // (c) a Quick Open locator, either way the headers state one
+    let facts = walk.facts.clone().unwrap();
+    walk.facts.as_mut().unwrap().has_locator = true;
+    assert_eq!(walk.image_from(None), 0);
+    walk.facts = Some(facts.clone());
+    walk.facts.as_mut().unwrap().quick_open_offset = Some(resumes + 1);
+    assert_eq!(walk.image_from(None), 0);
+    // (d) a volume read as RAR4, or not read at all
+    walk.facts = Some(facts.clone());
+    walk.facts.as_mut().unwrap().format = 4;
+    assert_eq!(walk.image_from(None), 0);
+    walk.facts = None;
+    assert_eq!(walk.image_from(None), 0);
+    walk.facts = Some(facts);
+    assert_eq!(walk.image_from(None), resumes);
+    // (a) no resume
+    walk.cursor.restart();
+    assert_eq!(walk.image_from(None), 0);
+}
+
+// Headers enciphered: the walks before the password stop at the
+// encryption header with a resume keyed with no password, and the first
+// walk under the password reads from the signature over every run.
+#[test]
+fn a_walk_under_a_new_password_images_every_run() {
+    let volumes = write(&items(), &encrypted(Version::Rar5, true));
+    let mut owner = Owner::named(store(), volumes);
+    owner.frames(0, 500);
+    assert!(cursor(&owner).0.is_some());
+    walk::began::take();
+    walk::imaged::take();
+    owner.offer(PASSWORD);
+    let began = walk::began::take();
+    let imaged = walk::imaged::take();
+    // The walk the offer schedules still steps with no password and reads
+    // on; the one the opened headers schedule steps under it, and its
+    // cursor's resume does not hold.
+    assert_eq!(began.first(), imaged.first(), "{began:?} {imaged:?}");
+    let keyed = began
+        .iter()
+        .zip(&imaged)
+        .position(|(began, imaged)| *began > 0 && *imaged == 0);
+    assert_eq!(keyed, Some(1), "{began:?} {imaged:?}");
+    owner.close(0);
+    owner.said.retain(|emit| *emit != Emit::NeedsPassword);
+    no_trouble(&owner);
+    streamed(&owner);
+}
+
 // A repair whose first changed byte lies before the cursor walks the volume
 // again from its signature: here wrong file headers, read once the volume
 // closed, are repaired, and the walk reads the set as a fresh one does, the
@@ -2222,8 +2321,10 @@ fn a_header_repaired_behind_the_cursor_walks_again_from_the_signature() {
             "{version:?}"
         );
         walk::began::take();
+        walk::imaged::take();
         owner.deliver_as(0, header, Provenance::Repaired, None);
         assert_eq!(walk::began::take().first(), Some(&0), "{version:?}");
+        assert_eq!(walk::imaged::take().first(), Some(&0), "{version:?}");
         let found = &owner.object.volumes[&VolumeIndex(0)];
         assert!(
             found.kept.verified(ByteRange::new(at, at + 9)),
