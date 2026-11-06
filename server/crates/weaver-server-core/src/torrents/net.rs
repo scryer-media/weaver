@@ -408,6 +408,19 @@ struct CarriedPending {
     fault: Option<String>,
 }
 
+// A send the carrier refuses for its destination alone, such as one in a
+// family the tunnel has no address in. That packet is lost; the socket and
+// every other destination keep going.
+fn fails_only_its_target(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::InvalidInput
+            | io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+    )
+}
+
 struct CarriedSends {
     pending: Mutex<CarriedPending>,
     ready: tokio::sync::Notify,
@@ -460,7 +473,9 @@ impl CarriedSends {
                 ready.await;
                 continue;
             };
-            if let Err(error) = socket.send_to(&packet.bytes, packet.target).await {
+            if let Err(error) = socket.send_to(&packet.bytes, packet.target).await
+                && !fails_only_its_target(&error)
+            {
                 // A deferred error belongs to the accepted packet, not to a
                 // later MTU probe. End this socket instead of misattributing it.
                 self.stop(Some(format!("the tunnel datagram send failed: {error}")));
