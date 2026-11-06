@@ -331,6 +331,34 @@ impl Cipher {
         false
     }
 
+    // Whether a candidate other than the open one, not rejected, passes the
+    // header's check byte: only then is a whole-member CRC failure over
+    // verified bytes a reason to give the open candidate up. Otherwise the
+    // bytes are what is wrong, and a repair is what puts them right.
+    pub(super) fn alternative(&self, candidates: &[Zeroizing<String>]) -> bool {
+        let (Some(header), Some(open)) = (self.header, &self.open) else {
+            return false;
+        };
+        candidates.iter().enumerate().any(|(candidate, password)| {
+            if candidate == open.candidate || self.rejected.contains(&candidate) {
+                return false;
+            }
+            let mut keys = Keys::new(password.as_bytes());
+            let mut last = 0;
+            for byte in header {
+                last = keys.decrypt(byte);
+            }
+            last == self.check
+        })
+    }
+
+    // The member's ciphertext changed: a candidate given up on the old
+    // bytes' CRC may be the right one for the new.
+    pub(super) fn changed(&mut self) {
+        self.retry = false;
+        self.rejected.clear();
+    }
+
     fn replace_header(&mut self, header: [u8; HEADER as usize]) {
         self.header = Some(header);
         self.proven = false;
@@ -671,6 +699,7 @@ impl super::Zip {
         if !replaying && coverage.covered(range) {
             let mut previous = Vec::new();
             if plain(range, &mut previous) && previous != bytes {
+                cipher.changed();
                 cipher.pending.push((range, input, provenance));
                 let again = ByteRange::at(entry.data.unwrap(), entry.length);
                 entry.cipher = Some(cipher);

@@ -855,3 +855,54 @@ fn a_restored_ignored_cipher_does_not_require_a_password() {
     assert!(out.is_empty(), "{out:?}");
     assert!(owner.member("feature.mkv").closed);
 }
+
+#[test]
+fn a_verified_wrong_byte_keeps_the_only_passing_password_and_waits_for_repair() {
+    let plain = payload(88, 300_007);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + 12;
+    let bad = ByteRange::at(start + 20_000, 1);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, bad.start));
+    // Bad as posted, with a good article checksum: verified but wrong.
+    owner.deliver_as(
+        0,
+        bad,
+        Provenance::Fresh,
+        Some(&[archive[bad.start as usize] ^ 0x5a]),
+    );
+    owner.deliver(0, ByteRange::new(bad.end, archive.len() as u64));
+    owner.close(0);
+    assert!(!owner.member("alpha.bin").closed);
+    assert!(
+        owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Damaged { .. })),
+        "{:?}",
+        owner.said
+    );
+    // The recovery set repairs the byte; the password is not offered again.
+    let before = owner.said.len();
+    owner.deliver_as(0, bad, Provenance::Repaired, None);
+    assert!(owner.member("alpha.bin").bytes == plain, "{:?}", owner.said);
+    assert!(owner.member("alpha.bin").closed, "{:?}", owner.said);
+    assert!(
+        !owner.said[before..].contains(&Emit::NeedsPassword),
+        "{:?}",
+        owner.said
+    );
+    assert!(
+        !owner.said.contains(&Emit::Retract(MemberId(0))),
+        "{:?}",
+        owner.said
+    );
+    let mut out = Vec::new();
+    owner
+        .object
+        .quiet(&crate::testing::Quiet(Vec::new()), &mut out);
+    assert!(out.is_empty(), "{out:?}");
+    assert!(owner.posted(0) == Some(archive));
+}

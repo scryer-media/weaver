@@ -639,6 +639,7 @@ impl Object for Zip {
             .any(|candidate| candidate.as_str() == secret)
         {
             self.candidates.push(Zeroizing::new(secret.to_owned()));
+            self.retry_doubted(out);
         }
         self.open_entries(out);
     }
