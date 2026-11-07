@@ -52,10 +52,7 @@ pub(crate) async fn clear_restart_artifacts(
             tokio::fs::remove_dir_all(working_dir).await?;
         }
     }
-    let staging = resources
-        .complete_dir
-        .join(".weaver-staging")
-        .join(id.0.to_string());
+    let staging = super::staging_dir_for(&resources.complete_dir, id);
     match tokio::fs::symlink_metadata(&staging).await {
         Ok(meta) if meta.file_type().is_symlink() => {
             return Err(SchedulerError::Conflict(

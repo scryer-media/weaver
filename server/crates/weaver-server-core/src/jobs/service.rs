@@ -385,6 +385,24 @@ impl Pipeline {
                 .await
                 .map_err(crate::SchedulerError::Io)?;
         }
+        let staging_dir = crate::pipeline::queue::delivery_staging_dir(
+            &resources.intermediate_dir,
+            &resources.complete_dir,
+            job_id,
+        );
+        if let Some(staging_dir) = staging_dir.clone() {
+            let complete_dir = resources.complete_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::pipeline::queue::make_staging_dir(&complete_dir, &staging_dir, job_id)
+            })
+            .await
+            .map_err(|error| {
+                crate::SchedulerError::Internal(format!(
+                    "staging directory worker panicked: {error}"
+                ))
+            })?
+            .map_err(crate::SchedulerError::Io)?;
+        }
         crate::runtime::perf_probe::record(
             "pipeline.add_job.working_dir_ready",
             stage_start.elapsed(),
@@ -506,6 +524,7 @@ impl Pipeline {
                 {
                     warn!(job_id = job_id.0, error = %cleanup_error, "failed to clean working directory after active job persistence failure");
                 }
+                remove_unadmitted_staging(job_id, staging_dir.as_deref()).await;
                 return Err(error.into());
             }
             Ok(false) => {
@@ -515,6 +534,7 @@ impl Pipeline {
                 {
                     warn!(job_id = job_id.0, error = %cleanup_error, "failed to clean superseded job working directory");
                 }
+                remove_unadmitted_staging(job_id, staging_dir.as_deref()).await;
                 return Err(crate::SchedulerError::SemanticSuperseded);
             }
             Ok(true) => {}
@@ -534,6 +554,7 @@ impl Pipeline {
             spec,
             options,
             working_dir,
+            staging_dir,
             nzb_hash,
             nzb_password_candidates,
             restart,
@@ -549,6 +570,7 @@ impl Pipeline {
             spec,
             options,
             working_dir,
+            staging_dir,
             nzb_hash,
             nzb_password_candidates,
             restart,
@@ -627,7 +649,7 @@ impl Pipeline {
             support_facts: Default::default(),
             detected_archives: HashMap::new(),
             file_identities,
-            staging_dir: None,
+            staging_dir,
             category_bytes: Some(category_bytes),
             nzb_password_candidates: nzb_password_candidates
                 .map(std::sync::OnceLock::from)
@@ -1855,3 +1877,17 @@ mod tests {
         );
     }
 }
+
+// The staging directory an admission made, gone with the admission that
+// failed: nothing was written to it.
+async fn remove_unadmitted_staging(job_id: JobId, staging_dir: Option<&std::path::Path>) {
+    let Some(staging_dir) = staging_dir else {
+        return;
+    };
+    if let Err(error) = tokio::fs::remove_dir_all(staging_dir).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(job_id = job_id.0, error = %error, "failed to clean staging directory after a failed admission");
+    }
+}
+

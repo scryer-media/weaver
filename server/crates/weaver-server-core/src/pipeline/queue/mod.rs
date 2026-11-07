@@ -15,7 +15,10 @@ mod counters;
 mod history;
 mod intents;
 pub mod paging;
-pub(crate) use admission::{AdmissionResources, PreparedAdd, RestartAdmission};
+pub(crate) use admission::{
+    AdmissionResources, PreparedAdd, RestartAdmission, delivery_staging_dir, make_staging_dir,
+    staging_dir_for,
+};
 #[cfg(test)]
 pub(crate) use counters::COUNTER_SAMPLES;
 pub(crate) use history::clear_restart_artifacts;
