@@ -12,7 +12,7 @@ use tempfile::TempDir;
 
 use crate::{
     AddTorrent, AddTorrentOptions, CreateTorrentOptions, FilePriority, IpFilter, IpRanges,
-    ManagedTorrent, Session, SessionOptions,
+    ManagedTorrent, PiecePriority, Session, SessionOptions,
     core::{
         spawn_utils::polls,
         torrent_metainfo::{WebSeed, WebSeedKind},
@@ -124,7 +124,7 @@ fn woken(before: &BTreeMap<String, u64>, after: &BTreeMap<String, u64>) -> BTree
 }
 
 // A thousand finished torrents with no peers, each with a web seed or not,
-// counted once whatever the adds started is past.
+// counted from the moment the last one finished.
 async fn idle_wakes(with_web_seed: bool) -> (Vec<u64>, BTreeMap<String, u64>) {
     let dir = TempDir::with_prefix("idle_wakes").unwrap();
     let session = session(dir.path()).await;
@@ -145,7 +145,6 @@ async fn idle_wakes(with_web_seed: bool) -> (Vec<u64>, BTreeMap<String, u64>) {
     for handle in &handles {
         handle.wait_until_completed().await.unwrap();
     }
-    tokio::time::sleep(Duration::from_secs(60)).await;
     let counted = count(SECONDS).await;
     drop(handles);
     session.stop().await;
@@ -170,10 +169,10 @@ async fn a_thousand_idle_finished_torrents_with_a_web_seed_wake_only_for_the_ses
     assert_eq!(by_task, the_sessions_timers());
 }
 
-// A finished torrent with a web seed runs no web seed tick; once it wants
-// a file it skipped, it ticks again each WEB_SEED_TICK.
-#[tokio::test(start_paused = true)]
-async fn a_finished_torrent_wanting_a_file_again_ticks_its_web_seeds_again() {
+// A finished torrent of two one-piece files with a web seed, the second
+// not on disk and skipped: as a file, or as a piece when `by_piece`. Its
+// web seed task has gone ten seconds without a wake.
+async fn finished_skipping_one(by_piece: bool) -> (TempDir, Arc<Session>, Arc<ManagedTorrent>) {
     let dir = TempDir::with_prefix("web_seed_wanting").unwrap();
     let content = dir.path().join("content");
     std::fs::create_dir(&content).unwrap();
@@ -187,26 +186,59 @@ async fn a_finished_torrent_wanting_a_file_again_ticks_its_web_seeds_again() {
         torrent,
         &content,
         AddTorrentOptions {
-            only_files: Some(vec![0]),
+            only_files: (!by_piece).then(|| vec![0]),
+            piece_priorities: by_piece.then(|| vec![(1, PiecePriority::Skip)]),
             web_seeds: vec![WebSeed::new(b"http://127.0.0.1:9/", WebSeedKind::Url, true)],
             ..Default::default()
         },
     )
     .await;
     handle.wait_until_completed().await.unwrap();
-
     let (_, finished) = count(10).await;
     assert_eq!(finished.get("web_seeds"), None, "{finished:?}");
+    (dir, session, handle)
+}
 
-    handle
-        .set_file_priorities(&[(1, FilePriority::Normal)])
-        .unwrap();
+// The web seed task ticks each WEB_SEED_TICK over the next ten seconds.
+async fn ticks_again(handle: &ManagedTorrent) {
     let (_, wanting) = count(10).await;
     assert!(
         wanting.get("web_seeds").is_some_and(|&n| n >= 10),
         "{wanting:?}"
     );
     assert_eq!(handle.web_seeds().len(), 1);
+}
+
+// A finished torrent with a web seed runs no web seed tick; once it wants
+// a file it skipped, it ticks again each WEB_SEED_TICK.
+#[tokio::test(start_paused = true)]
+async fn a_finished_torrent_wanting_a_file_again_ticks_its_web_seeds_again() {
+    let (_dir, session, handle) = finished_skipping_one(false).await;
+    handle
+        .set_file_priorities(&[(1, FilePriority::Normal)])
+        .unwrap();
+    ticks_again(&handle).await;
+    session.stop().await;
+}
+
+// The same once it wants a piece it skipped again.
+#[tokio::test(start_paused = true)]
+async fn a_finished_torrent_wanting_a_piece_again_ticks_its_web_seeds_again() {
+    let (_dir, session, handle) = finished_skipping_one(true).await;
+    handle
+        .set_piece_priorities(&[(1, PiecePriority::Normal)])
+        .unwrap();
+    ticks_again(&handle).await;
+    session.stop().await;
+}
+
+// The same while a stream reads the skipped file.
+#[tokio::test(start_paused = true)]
+async fn a_finished_torrent_streaming_a_skipped_file_ticks_its_web_seeds_again() {
+    let (_dir, session, handle) = finished_skipping_one(false).await;
+    let stream = handle.clone().stream(1).await.unwrap();
+    ticks_again(&handle).await;
+    drop(stream);
     session.stop().await;
 }
 
