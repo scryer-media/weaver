@@ -723,7 +723,7 @@ export interface PanelFlags {
   dirty: boolean;
   busy: boolean;
   /** Replaces the status bar's "All changes saved" — a result, or a failure. */
-  status: string | null;
+  status: ReactNode;
   /** Colour the status line as a failure rather than as progress. */
   failed: boolean;
 }
@@ -909,7 +909,7 @@ export function usePanelState({
 }: {
   dirty: boolean;
   busy?: boolean;
-  status?: string | null;
+  status?: ReactNode;
   failed?: boolean;
   save: () => void;
   revert: () => void;
@@ -953,7 +953,7 @@ export function usePanelState({
  * Revert have nothing to act on — but a sync report or a failed delete still
  * belongs in the status bar.
  */
-export function usePanelStatus(status: string | null, failed = false): void {
+export function usePanelStatus(status: ReactNode, failed = false): void {
   const { setFlags } = useShell();
   const active = useSettingsPanelActive();
 

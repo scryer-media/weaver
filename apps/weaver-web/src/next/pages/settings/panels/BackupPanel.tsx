@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useEffect, useEffectEvent, useRef, useState } from "react";
+import { useEffect, useEffectEvent, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQuery } from "urql";
 import { StoredBackups } from "./StoredBackups";
 import { createStoredBackup, useBackupAdminAction } from "./useBackupAdminAction";
@@ -14,7 +14,7 @@ import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { DangerButton, SecondaryButton } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { formatDate } from "../../../data/format";
-import { countLabel } from "../../../i18n/labels";
+import { aroundSlot } from "../../../i18n/labels";
 import { settingsIds, testIds } from "@/next/testids";
 import { PathField } from "../../../features/DirectoryBrowserDialog";
 import {
@@ -116,7 +116,7 @@ async function readStatus(t: Translate): Promise<Outcome<BackupStatus>> {
   }
 }
 
-/** Builds an archive and saves it; resolves to the note naming the file. */
+/** Builds an archive and saves it; resolves to the name it was saved under. */
 async function exportBackup(t: Translate, password: string): Promise<Outcome<string>> {
   try {
     const response = await fetch(endpoint("api/backup/export"), {
@@ -128,10 +128,35 @@ async function exportBackup(t: Translate, password: string): Promise<Outcome<str
       await throwJsonError(t, response);
     }
     const filename = await saveResponseAsDownload(response, `weaver_backup_${Date.now()}.enc`);
-    return { done: t("next.backup.savedFile", { name: filename }) };
+    return { done: filename };
   } catch (failure) {
     return { failure: message(failure) };
   }
+}
+
+/** The note naming a saved export, the file name set in its own element inside the phrase. */
+function savedNote(t: Translate, filename: string): ReactNode {
+  const [before, after] = aroundSlot(t, "next.backup.savedFile", "name");
+  return (
+    <>
+      {before}
+      <span data-testid={settingsIds.backupSavedFile}>{filename}</span>
+      {after}
+    </>
+  );
+}
+
+/** What a restore did, staged or applied, with its history count in its own element. */
+function restoreNote(t: Translate, staged: boolean, historyJobs: number): ReactNode {
+  const key = staged ? "next.backup.staged" : "next.backup.restored";
+  const [before, after] = aroundSlot(t, `${key}.${historyJobs === 1 ? "one" : "other"}`, "count");
+  return (
+    <span data-testid={settingsIds.backupRestoreOutcome(staged ? "staged" : "restored")}>
+      {before}
+      <span data-testid={settingsIds.backupRestoreHistoryJobs}>{historyJobs}</span>
+      {after}
+    </span>
+  );
 }
 
 /** Reads an archive's manifest; resolves to it, the remaps it asks for, and the note saying so. */
@@ -185,7 +210,7 @@ async function restoreBackup(
     inspected: InspectResult | null;
     remaps: Record<string, string>;
   },
-): Promise<Outcome<string>> {
+): Promise<Outcome<ReactNode>> {
   const { file, password, dataDir, intermediateDir, completeDir, inspected, remaps } = request;
   try {
     const form = new FormData();
@@ -222,11 +247,7 @@ async function restoreBackup(
         body: form,
       }),
     )) as RestoreReport;
-    return {
-      done: report.restart_required
-        ? countLabel(t, "next.backup.staged", report.history_jobs)
-        : countLabel(t, "next.backup.restored", report.history_jobs),
-    };
+    return { done: restoreNote(t, report.restart_required, report.history_jobs) };
   } catch (failure) {
     return { failure: message(failure) };
   }
@@ -238,7 +259,7 @@ export function BackupPanel() {
   const currentDataDir = data?.settings?.dataDir ?? "";
 
   const [status, setStatus] = useState<BackupStatus | null>(null);
-  const [note, setNote] = useState<string | null>(null);
+  const [note, setNote] = useState<ReactNode>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [backupGeneration, setBackupGeneration] = useState(0);
@@ -257,7 +278,11 @@ export function BackupPanel() {
   const [remaps, setRemaps] = useState<Record<string, string>>({});
   const [confirmRestore, setConfirmRestore] = useState(false);
 
-  usePanelStatus(error ?? createAction.error ?? note, error !== null || createAction.error !== null);
+  const errorLine = useMemo(
+    () => (error === null ? null : <span data-testid={settingsIds.backupError}>{error}</span>),
+    [error],
+  );
+  usePanelStatus(errorLine ?? createAction.error ?? note, error !== null || createAction.error !== null);
 
   useEffect(() => {
     setDataDir((current) => current || currentDataDir);
@@ -290,7 +315,7 @@ export function BackupPanel() {
     setNote(t("next.backup.building"));
     const saved = await exportBackup(t, password);
     if ("done" in saved) {
-      setNote(saved.done);
+      setNote(savedNote(t, saved.done));
       setBackupGeneration((value) => value + 1);
     } else {
       setNote(null);
