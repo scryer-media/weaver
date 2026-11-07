@@ -626,3 +626,70 @@ fn prepublication_scan_handles_deep_output_trees_iteratively() {
 
     assert_eq!(validation.total_bytes, 4);
 }
+
+// A job on two devices delivers from its staging directory first: the
+// staging directory's marker and chunk directory are its own and are never
+// published, and a directory both roots hold is joined.
+#[tokio::test]
+async fn final_move_publishes_the_staged_delivery_without_its_marker_and_joins_shared_directories()
+{
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    let staging = temp.path().join("staging");
+    let dest = temp.path().join("complete");
+    std::fs::create_dir_all(working.join("Sample")).unwrap();
+    std::fs::create_dir_all(staging.join("Sample")).unwrap();
+    std::fs::create_dir_all(staging.join(".weaver-chunks")).unwrap();
+    std::fs::create_dir(&dest).unwrap();
+    std::fs::write(staging.join(WORKING_DIR_MARKER), b"marker").unwrap();
+    std::fs::write(staging.join("movie.mkv"), b"movie").unwrap();
+    std::fs::write(staging.join("Sample/sample.mkv"), b"sample").unwrap();
+    std::fs::write(working.join("Sample/sample.srt"), b"subs").unwrap();
+
+    run_move_to_complete(
+        JobId(1),
+        working.clone(),
+        Some(staging.clone()),
+        dest.clone(),
+        Arc::new(PhaseCounters::default()),
+        None,
+        DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
+        HashSet::new(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(std::fs::read(dest.join("movie.mkv")).unwrap(), b"movie");
+    assert_eq!(std::fs::read(dest.join("Sample/sample.mkv")).unwrap(), b"sample");
+    assert_eq!(std::fs::read(dest.join("Sample/sample.srt")).unwrap(), b"subs");
+    assert!(!dest.join(WORKING_DIR_MARKER).exists());
+    assert!(!dest.join(".weaver-chunks").exists());
+    assert!(!staging.exists());
+}
+
+// A failed job keeps what it delivered in its working directory, so what its
+// staging directory holds goes back there, and the staging directory goes.
+#[test]
+fn a_failed_job_s_staged_delivery_returns_to_its_working_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let working = temp.path().join("working");
+    let staging = temp.path().join("staging");
+    std::fs::create_dir_all(working.join("Sample")).unwrap();
+    std::fs::create_dir_all(staging.join("Sample")).unwrap();
+    std::fs::write(working.join(WORKING_DIR_MARKER), b"working marker").unwrap();
+    std::fs::write(staging.join(WORKING_DIR_MARKER), b"staging marker").unwrap();
+    std::fs::write(staging.join("movie.mkv"), b"movie").unwrap();
+    std::fs::write(staging.join("Sample/sample.mkv"), b"sample").unwrap();
+    std::fs::write(working.join("Sample/sample.srt"), b"subs").unwrap();
+
+    return_staged_delivery(&staging, &working).unwrap();
+
+    assert_eq!(std::fs::read(working.join("movie.mkv")).unwrap(), b"movie");
+    assert_eq!(std::fs::read(working.join("Sample/sample.mkv")).unwrap(), b"sample");
+    assert_eq!(std::fs::read(working.join("Sample/sample.srt")).unwrap(), b"subs");
+    assert_eq!(
+        std::fs::read(working.join(WORKING_DIR_MARKER)).unwrap(),
+        b"working marker"
+    );
+    assert!(!staging.exists());
+}

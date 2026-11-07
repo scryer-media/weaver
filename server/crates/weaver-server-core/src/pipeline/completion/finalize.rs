@@ -12,6 +12,7 @@ pub(crate) mod check;
 pub(crate) mod claims;
 pub(crate) mod deobfuscate;
 mod output;
+pub(crate) use output::return_staged_delivery;
 #[cfg(test)]
 pub(in crate::pipeline) use output::member_crc32_by_path;
 #[cfg(test)]

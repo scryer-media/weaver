@@ -206,7 +206,7 @@ impl Pipeline {
         job_id: JobId,
         error: &str,
         preserve_staging: bool,
-    ) -> Option<PathBuf> {
+    ) -> Option<(PathBuf, Option<PathBuf>)> {
         let (staging_dir, working_dir, released) = if let Some(state) = self.jobs.get_mut(&job_id) {
             let released = state.post_state;
             state.queued_repair_at_epoch_ms = None;
@@ -233,7 +233,13 @@ impl Pipeline {
             self.metrics
                 .post_state_moved(released, crate::jobs::model::PostState::Failed);
         }
-        // Clean up staging directory if it was created.
+        // What the staging directory holds the job delivered: it goes back
+        // to the working directory as that is released. Kept for the
+        // scripts, or with no working directory to return to, it goes.
+        let (staging_dir, returned) = match (staging_dir, working_dir.is_some()) {
+            (Some(staging), true) => (None, Some(staging)),
+            (staging, _) => (staging, None),
+        };
         if let Some(staging) = staging_dir {
             tokio::spawn(async move {
                 if let Err(e) = tokio::fs::remove_dir_all(&staging).await
@@ -266,14 +272,19 @@ impl Pipeline {
         self.clear_job_phase_progress_runtime(job_id);
         self.clear_job_retention_excludes(job_id);
         self.clear_job_write_backlog(job_id);
-        working_dir
+        working_dir.map(|dir| (dir, returned))
     }
 
     // What the job leaves in its working directory is what it delivered:
     // the directory is released off the actor before the history records
     // it, so the record never lists the graph's internals.
-    fn finish_failed_job(&mut self, job_id: JobId, error: String, release: Option<PathBuf>) {
-        let Some(working_dir) = release else {
+    fn finish_failed_job(
+        &mut self,
+        job_id: JobId,
+        error: String,
+        release: Option<(PathBuf, Option<PathBuf>)>,
+    ) {
+        let Some((working_dir, staging)) = release else {
             self.record_failed_job(job_id, error);
             return;
         };
@@ -283,6 +294,9 @@ impl Pipeline {
         tokio::spawn(async move {
             let dir = working_dir.clone();
             let released = tokio::task::spawn_blocking(move || {
+                if let Some(staging) = staging {
+                    crate::pipeline::completion::finalize::return_staged_delivery(&staging, &dir)?;
+                }
                 crate::jobs::working_dir::release_failed_working_dir(&root, &dir, job_id)
             })
             .await;
@@ -315,3 +329,4 @@ impl Pipeline {
         self.report_job(job_id);
     }
 }
+

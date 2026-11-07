@@ -74,7 +74,7 @@ fn validate_delivery_sources(
         source_exists |= scan_delivery_root(
             staging_dir,
             "staging",
-            &[".weaver-chunks"],
+            &[".weaver-chunks", WORKING_DIR_MARKER],
             &HashSet::new(),
             settings,
             &mut validation,
@@ -350,6 +350,73 @@ where
 // had not finished moving, so whatever already stands at its destination is
 // an interrupted copy and gives way to it. A destination entry whose source
 // is gone moved whole before the restart, and nothing here reaches it.
+// A failed job keeps what it delivered in its working directory, as it
+// does on one device: what its staging directory holds goes back there,
+// joining the directories both hold, and the staging directory goes. The
+// marker and the chunk directory are the staging directory's own.
+pub(crate) fn return_staged_delivery(staging: &Path, working_dir: &Path) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(staging) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        result => result?,
+    };
+    let counters = Arc::new(PhaseCounters::default());
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == WORKING_DIR_MARKER || name == ".weaver-chunks" {
+            continue;
+        }
+        let (from, to) = (entry.path(), working_dir.join(&name));
+        let moved = if std::fs::symlink_metadata(&to).is_ok() {
+            merge_delivered_dir(&from, &to, Arc::clone(&counters)).map(|_| ())
+        } else {
+            let bytes = entry.metadata().map_or(0, |metadata| metadata.len());
+            move_path_with_safe_rename_or_copy_fallback(&from, &to, bytes, Arc::clone(&counters))
+        };
+        moved.map_err(|(_, fallback)| fallback)?;
+    }
+    std::fs::remove_dir_all(staging)
+}
+
+// Move what `src` holds into `dst` when both are real directories, entry by
+// entry, a directory both hold joined the same way. An entry whose name is
+// already taken in `dst` stays where it is. Whether they were directories
+// to join.
+fn merge_delivered_dir(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    phase_counters: Arc<PhaseCounters>,
+) -> Result<bool, (std::io::Error, std::io::Error)> {
+    let real_dir = |path: &std::path::Path| {
+        std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata_is_link_or_reparse(&metadata))
+    };
+    if !real_dir(src) || !real_dir(dst) {
+        return Ok(false);
+    }
+    let unread = |error: std::io::Error| {
+        (
+            error,
+            std::io::Error::other("the directory to join was not read"),
+        )
+    };
+    for entry in std::fs::read_dir(src).map_err(unread)? {
+        let entry = entry.map_err(unread)?;
+        let (from, to) = (entry.path(), dst.join(entry.file_name()));
+        if std::fs::symlink_metadata(&to).is_ok() {
+            merge_delivered_dir(&from, &to, Arc::clone(&phase_counters))?;
+            continue;
+        }
+        let bytes = std::fs::symlink_metadata(&from)
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .map_or(0, |metadata| metadata.len());
+        move_path_with_safe_rename_or_copy_fallback(&from, &to, bytes, Arc::clone(&phase_counters))?;
+    }
+    let _ = std::fs::remove_dir(src);
+    Ok(true)
+}
+
 fn move_delivered_entry(
     src: &std::path::Path,
     dst: &std::path::Path,
@@ -626,6 +693,9 @@ async fn run_move_to_claimed_destination(
     {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let file_name = entry.file_name();
+            if file_name == WORKING_DIR_MARKER {
+                continue;
+            }
             if file_name == ".weaver-chunks" {
                 let src = entry.path();
                 if let Err(error) = tokio::fs::remove_dir_all(&src).await
@@ -689,6 +759,31 @@ async fn run_move_to_claimed_destination(
             }
             let dst = dest.join(&file_name);
             if !resumed && dst.exists() && !runtime_fs::paths_equivalent_for_placement(&src, &dst) {
+                // A directory the staging directory delivered first, which
+                // the working directory also holds delivered files of: they
+                // join it, and a name the staging directory already filled
+                // keeps what it holds.
+                let counters = Arc::clone(&phase_counters);
+                let (src_fb, dst_fb) = (src.clone(), dst.clone());
+                match crate::runtime::panic_trap::spawn_blocking(move || {
+                    merge_delivered_dir(&src_fb, &dst_fb, counters)
+                })
+                .await
+                {
+                    Ok(Ok(true)) => moved += 1,
+                    Ok(Ok(false)) => {}
+                    Ok(Err((rename_err, copy_err))) => failures.push(format!(
+                        "{}: rename failed: {}; fallback failed: {}",
+                        file_name.to_string_lossy(),
+                        rename_err,
+                        copy_err
+                    )),
+                    Err(join_err) => failures.push(format!(
+                        "{}: move task failed: {}",
+                        file_name.to_string_lossy(),
+                        join_err
+                    )),
+                }
                 continue;
             }
             let source_bytes = validation.root_entry_bytes.get(&src).copied().unwrap_or(0);
