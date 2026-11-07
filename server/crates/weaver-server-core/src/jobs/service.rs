@@ -390,10 +390,15 @@ impl Pipeline {
             &resources.complete_dir,
             job_id,
         );
-        if let Some(staging_dir) = staging_dir.clone() {
+        let output_kind = {
             let complete_dir = resources.complete_dir.clone();
+            let staging = staging_dir.clone();
+            let output_root = staging.clone().unwrap_or_else(|| working_dir.clone());
             tokio::task::spawn_blocking(move || {
-                crate::pipeline::queue::make_staging_dir(&complete_dir, &staging_dir, job_id)
+                if let Some(staging) = &staging {
+                    crate::pipeline::queue::make_staging_dir(&complete_dir, staging, job_id)?;
+                }
+                Ok::<_, std::io::Error>(crate::runtime::storage_kind::storage_kind(&output_root))
             })
             .await
             .map_err(|error| {
@@ -401,8 +406,14 @@ impl Pipeline {
                     "staging directory worker panicked: {error}"
                 ))
             })?
-            .map_err(crate::SchedulerError::Io)?;
-        }
+            .map_err(crate::SchedulerError::Io)?
+        };
+        info!(
+            job_id = job_id.0,
+            storage = output_kind.as_str(),
+            split = staging_dir.is_some(),
+            "output storage"
+        );
         crate::runtime::perf_probe::record(
             "pipeline.add_job.working_dir_ready",
             stage_start.elapsed(),

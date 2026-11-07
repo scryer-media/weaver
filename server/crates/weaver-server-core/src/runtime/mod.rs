@@ -21,6 +21,7 @@ pub mod process_metrics;
 pub mod reload;
 pub mod resource_limits;
 pub mod restart;
+pub(crate) mod storage_kind;
 pub mod system_probe;
 pub mod system_profile;
 pub mod thread_release;
