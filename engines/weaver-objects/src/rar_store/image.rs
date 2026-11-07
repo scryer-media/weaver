@@ -27,11 +27,18 @@ pub(super) fn readable(provenance: Provenance, closed: bool) -> bool {
 impl SparseImage {
     // The runs a walk may trust, as `readable` says.
     pub(super) fn of(kept: &Kept, closed: bool) -> Self {
+        Self::past(kept, closed, 0)
+    }
+
+    // The runs a walk may trust that end past `from`: a walk reading on
+    // from there reads nothing before it.
+    pub(super) fn past(kept: &Kept, closed: bool, from: u64) -> Self {
         Self {
             runs: kept
-                .runs()
-                .into_iter()
-                .filter(|(_, _, provenance)| readable(*provenance, closed))
+                .runs_from(from)
+                .filter(|(range, _, provenance)| {
+                    (from == 0 || range.end > from) && readable(*provenance, closed)
+                })
                 .map(|(range, bytes, _)| (range.start, Bytes::copy_from_slice(bytes)))
                 .collect(),
             position: 0,

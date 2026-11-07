@@ -6,6 +6,8 @@ import path from "node:path";
 import type { Locator, Page } from "@playwright/test";
 import { expect, test } from "./helpers";
 import { expectHttpErrors } from "./support/http-errors";
+import { byTestIdPrefix, choose, saveSettings, tableRow } from "./support/settings-locators";
+import { settingsIds, testIds } from "./support/testids";
 import {
   makeRestoreTargetNonPristine,
   seedRestorableHistoryMetadata,
@@ -42,7 +44,12 @@ const serverPassword = "e2e-backup-server-password";
 
 const stage = process.env.E2E_WEAVER_BACKUP_STAGE ?? "";
 
-const signInButton = (page: Page) => page.getByRole("button", { name: "Sign in", exact: true });
+const field = testIds.field;
+const fixtureServer = "nntp";
+
+const signInButton = (page: Page) => page.getByTestId(settingsIds.loginSubmit);
+/** The settings report line, where each backup step says how it went. */
+const statusLine = (page: Page) => page.getByTestId(testIds.shellStatus);
 
 async function signIn(page: Page): Promise<void> {
   await page.locator("#username").fill(loginUsername);
@@ -57,40 +64,30 @@ async function signIn(page: Page): Promise<void> {
   await expect(signInButton(page)).toHaveCount(0);
 }
 
-/** A settings table row, found by the exact text of one of its cells. */
-function tableRow(page: Page, table: string, cellText: string): Locator {
-  return page
-    .getByRole("region", { name: table, exact: true })
-    .getByRole("button")
-    .filter({ has: page.getByText(cellText, { exact: true }) });
+/** A schedule row on the Downloads track. */
+function downloadsSchedule(page: Page, label: string): Locator {
+  return tableRow(page, "schedules", label, page.getByTestId(testIds.rowGroup("schedules", "DOWNLOADS")));
 }
 
 /** Choose a server folder through the directory dialog a path field opens. */
-async function chooseFolder(page: Page, field: Locator, dialogName: string, folder: string) {
-  await field.click();
-  const dialog = page.getByRole("dialog", { name: dialogName, exact: true });
+async function chooseFolder(page: Page, pathInput: Locator, folder: string) {
+  await pathInput.click();
+  const dialog = page.getByTestId(testIds.dialog("picker"));
   // The dialog opens on a listing of its own; typing before it lands would be
   // overwritten by it.
-  const useFolder = dialog.getByRole("button", { name: "Use this folder", exact: true });
+  const useFolder = dialog.getByTestId(testIds.pickerUse);
   await expect(useFolder).toBeEnabled();
-  await dialog.getByRole("textbox", { name: "Folder path", exact: true }).fill(folder);
-  await dialog.getByRole("button", { name: "Go", exact: true }).click();
+  await dialog.getByTestId(testIds.pickerPathInput).fill(folder);
+  await dialog.getByTestId(testIds.pickerGo).click();
   // It chooses the folder it is showing, so let the browse land first.
-  await expect(dialog.getByTitle(folder, { exact: true })).not.toHaveCount(0);
+  await expect(dialog.getByTestId(testIds.pickerPath)).toHaveAttribute("title", folder);
   await useFolder.click();
   await expect(dialog).toBeHidden();
-  await expect(field).toHaveValue(folder);
-}
-
-async function saveSettings(page: Page) {
-  await page.getByRole("button", { name: "Save changes", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Saved", exact: true })).toBeDisabled();
+  await expect(pathInput).toHaveValue(folder);
 }
 
 const restoreButton = (page: Page) =>
-  page
-    .getByRole("region", { name: "Restore", exact: true })
-    .getByRole("button", { name: "Restore from archive", exact: true });
+  page.getByTestId(testIds.section("restore")).getByTestId(settingsIds.backupRestore);
 
 test(`encrypted backup matrix stage: ${stage || "missing"}`, async ({ cleanPage: page, request }) => {
   const matrix = matrixFromEnvironment();
@@ -124,16 +121,17 @@ async function runSourceExport(
   await expectProductMarkers(page, matrix, true);
 
   await page.goto("/settings/backup");
-  const exportSection = page.getByRole("region", { name: "Backup", exact: true });
-  const exportPassword = exportSection.getByLabel("Password", { exact: true });
-  const exportPasswordConfirm = exportSection.getByLabel("Confirm password", { exact: true });
-  const downloadButton = page.getByRole("banner").getByRole("button", { name: "Download backup", exact: true });
+  const exportSection = page.getByTestId(testIds.section("export"));
+  const exportPassword = exportSection.getByTestId(field("password"));
+  const exportPasswordConfirm = exportSection.getByTestId(field("passwordConfirm"));
+  const downloadButton = page.getByTestId(settingsIds.backupDownload);
   await exportPassword.fill(backupPassphrase);
   await expect(exportPassword).toHaveAttribute("type", "password");
   await expect(exportPasswordConfirm).toHaveAttribute("type", "password");
 
   // A mismatched confirmation must block the export before any request fires.
-  const mismatch = exportSection.getByText("The two passwords do not match.", { exact: true });
+  // The confirmation's help line appears only to say the two differ.
+  const mismatch = exportSection.getByTestId(testIds.fieldHelp("passwordConfirm"));
   await exportPasswordConfirm.fill(`${backupPassphrase}-mismatch`);
   await expect(mismatch).toBeVisible();
   await expect(downloadButton).toBeDisabled();
@@ -145,7 +143,7 @@ async function runSourceExport(
   await downloadButton.click();
   const download = await downloadPromise;
   await download.saveAs(backupPath);
-  await expect(page.getByRole("contentinfo")).toContainText(/Saved weaver_backup_\S+\.enc/);
+  await expect(statusLine(page).getByTestId(settingsIds.backupSavedFile)).toHaveText(/^weaver_backup_\S+\.enc$/);
 
   const backup = fs.readFileSync(backupPath);
   expect(backup.length, "encrypted backup artifact is empty").toBeGreaterThan(0);
@@ -169,7 +167,8 @@ async function runTargetRestore(page: Page, expectedMatrix: BackupMatrixState) {
     status: 400,
   });
   await analyzeBackup(page, backupPath, "wrong-passphrase");
-  await expect(page.getByRole("contentinfo")).toContainText(/password|decrypt|invalid/i);
+  // The failure is the server's own message, read from the panel's error element.
+  await expect(statusLine(page).getByTestId(settingsIds.backupError)).toContainText(/password|decrypt|invalid/i);
   await expect(restoreButton(page)).toBeDisabled();
   await expectProductMarkers(page, matrix, false);
 
@@ -179,29 +178,27 @@ async function runTargetRestore(page: Page, expectedMatrix: BackupMatrixState) {
     status: 400,
   });
   await analyzeBackup(page, tamperedBackupPath, backupPassphrase);
-  await expect(page.getByRole("contentinfo")).toContainText(
+  await expect(statusLine(page).getByTestId(settingsIds.backupError)).toContainText(
     /corrupt|decrypt|integrity|invalid|password/i,
   );
   await expect(restoreButton(page)).toBeDisabled();
   await expectProductMarkers(page, matrix, false);
 
   await analyzeBackup(page, backupPath, backupPassphrase);
-  const preview = page.getByRole("region", { name: "What this archive holds", exact: true });
+  const preview = page.getByTestId(testIds.section("manifest"));
   await expect(preview).toBeVisible();
-  await expect(preview).toContainText(`Source database${matrix.sourceDatastore}`);
+  await expect(preview.getByTestId(settingsIds.backupSourceEngine)).toHaveText(matrix.sourceDatastore);
   await fillRequiredCategoryRemaps(page);
 
   await expect(restoreButton(page)).toBeEnabled();
   await restoreButton(page).click();
-  const confirmation = page.getByRole("dialog", { name: "Restore from archive", exact: true });
-  await confirmation.getByRole("button", { name: "Stage restore", exact: true }).click();
+  const confirmation = page.getByTestId(testIds.dialog("backup-restore"));
+  await confirmation.getByTestId(testIds.confirmAccept).click();
   await expect(confirmation).toBeHidden();
-  await expect(page.getByRole("contentinfo")).toContainText(
-    /Restore staged · \d+ downloads? in history · restart weaver to apply it/,
-  );
-  await expect(page.getByRole("region", { name: "Staged restore", exact: true })).toContainText(
-    "Waiting for a restart",
-  );
+  const staged = statusLine(page).getByTestId(settingsIds.backupRestoreOutcome("staged"));
+  await expect(staged.getByTestId(settingsIds.backupRestoreHistoryJobs)).toHaveText(/^\d+$/);
+  // The staged-restore section exists only while a restore waits for a restart.
+  await expect(page.getByTestId(testIds.section("pending"))).toBeVisible();
 
   // Restore is staged atomically: the live target remains unchanged until the
   // harness restarts Weaver for the target-verify stage.
@@ -232,9 +229,9 @@ async function runTargetVerify(page: Page, expectedMatrix: BackupMatrixState) {
   await expectProductMarkers(page, matrix, true);
   await page.goto("/settings/backup");
   await expect(page.getByRole("main")).toBeVisible();
-  await expect(page.getByRole("region", { name: "Staged restore", exact: true })).toHaveCount(0);
+  await expect(page.getByTestId(testIds.section("pending"))).toHaveCount(0);
   await expect(
-    page.getByRole("region", { name: "Backup", exact: true }).getByLabel("Password", { exact: true }),
+    page.getByTestId(testIds.section("export")).getByTestId(field("password")),
   ).toHaveAttribute("type", "password");
 }
 
@@ -249,8 +246,8 @@ async function runTargetBlocked(
   // Sanctioned setup only: a paused metadata probe makes the target
   // intentionally non-pristine without exercising article transfer.
   await page.goto("/");
-  await page.getByRole("banner").getByRole("button", { name: "Pause all", exact: true }).click();
-  await expect(page.getByRole("banner").getByRole("button", { name: "Resume all", exact: true })).toBeVisible();
+  await page.getByTestId(testIds.queuePauseAll).click();
+  await expect(page.getByTestId(testIds.queueResumeAll)).toBeVisible();
   const result = await makeRestoreTargetNonPristine(
     request,
     `weaver-restore-blocked-${matrix.sourceDatastore}-to-${matrix.targetDatastore}`,
@@ -259,8 +256,8 @@ async function runTargetBlocked(
 
   await expectProductMarkers(page, matrix, false);
   await analyzeBackup(page, backupPath, backupPassphrase);
-  await expect(page.getByRole("region", { name: "What this archive holds", exact: true })).toBeVisible();
-  await expect(page.getByRole("region", { name: "Restore", exact: true })).toContainText(
+  await expect(page.getByTestId(testIds.section("manifest"))).toBeVisible();
+  await expect(page.getByTestId(testIds.section("restore")).getByTestId(settingsIds.backupStatus)).toContainText(
     /no active jobs or job history/i,
   );
   await expect(restoreButton(page)).toBeDisabled();
@@ -273,95 +270,81 @@ async function createSourceMarkersThroughUI(
   matrix: BackupMatrixState,
 ) {
   await page.goto("/settings/networking/egress");
-  const ceiling = page.getByRole("spinbutton", { name: "Download ceiling", exact: true });
+  const ceiling = page.getByTestId(field("maxDownloadSpeed"));
   await ceiling.fill(downloadCeiling(matrix));
   await ceiling.press("Tab");
   await saveSettings(page);
 
   await page.goto("/settings/categories");
-  await page.getByRole("main").getByRole("button", { name: "Add category", exact: true }).click();
-  const categoryForm = page.getByRole("dialog", { name: "Add category", exact: true });
-  await categoryForm.getByRole("textbox", { name: "Name", exact: true }).fill(matrix.categoryName);
+  await page.getByTestId(testIds.tableAdd("categories")).click();
+  const categoryForm = page.getByTestId(testIds.dialog("category"));
+  await categoryForm.getByTestId(field("name")).fill(matrix.categoryName);
   fs.mkdirSync(
     path.join("/weaver-data", path.basename(matrix.categorySourcePath)),
     { recursive: true },
   );
-  await chooseFolder(
-    page,
-    categoryForm.getByRole("textbox", { name: "Destination", exact: true }),
-    "Destination",
-    matrix.categorySourcePath,
-  );
-  await categoryForm.getByRole("textbox", { name: "Also known as", exact: true }).fill(matrix.categoryPattern);
-  await categoryForm.getByRole("button", { name: "Save", exact: true }).click();
+  await chooseFolder(page, categoryForm.getByTestId(field("destDir")), matrix.categorySourcePath);
+  await categoryForm.getByTestId(field("aliases")).fill(matrix.categoryPattern);
+  await categoryForm.getByTestId(testIds.editorSave).click();
   await expect(categoryForm).toBeHidden();
   await expect(
-    tableRow(page, "Categories", matrix.categoryName).getByText(matrix.categoryPattern, { exact: true }),
+    tableRow(page, "categories", matrix.categoryName).getByText(matrix.categoryPattern, { exact: true }),
   ).toBeVisible();
 
   await page.goto("/settings/schedules");
-  await page.getByRole("main").getByRole("button", { name: "Add schedule", exact: true }).click();
-  const scheduleForm = page.getByRole("dialog", { name: "Add schedule", exact: true });
-  await scheduleForm.getByLabel("Time", { exact: true }).fill("03:15");
-  await scheduleForm.getByRole("textbox", { name: "Label", exact: true }).fill(matrix.scheduleName);
-  await scheduleForm.getByRole("switch", { name: "Enabled", exact: true }).click();
-  await scheduleForm.getByRole("button", { name: "Save", exact: true }).click();
+  await page.getByTestId(testIds.tableAdd("schedules")).click();
+  const scheduleForm = page.getByTestId(testIds.dialog("schedule"));
+  await scheduleForm.getByTestId(field("time")).fill("03:15");
+  await scheduleForm.getByTestId(field("label")).fill(matrix.scheduleName);
+  await scheduleForm.getByTestId(field("enabled")).click();
+  await scheduleForm.getByTestId(testIds.editorSave).click();
   await expect(scheduleForm).toBeHidden();
-  await expect(tableRow(page, "Downloads", matrix.scheduleName)).toBeVisible();
+  await expect(downloadsSchedule(page, matrix.scheduleName)).toBeVisible();
 
   await page.goto("/settings/servers");
-  await page.getByRole("main").getByRole("button", { name: "Add provider", exact: true }).click();
-  const serverForm = page.getByRole("dialog", { name: "Add provider", exact: true });
-  await serverForm.getByRole("textbox", { name: "Host", exact: true }).fill(matrix.serverHost);
-  const tls = serverForm.getByRole("switch", { name: "TLS", exact: true });
+  await page.getByTestId(testIds.tableAdd("servers")).click();
+  const serverForm = page.getByTestId(testIds.dialog("provider"));
+  await serverForm.getByTestId(field("host")).fill(matrix.serverHost);
+  const tls = serverForm.getByTestId(field("tls"));
   if (await tls.isChecked()) await tls.click();
-  await expect(serverForm.getByRole("spinbutton", { name: "Port", exact: true })).toHaveValue("119");
-  await serverForm.getByLabel("Username", { exact: true }).fill("e2e-user");
-  await serverForm.getByLabel("Password", { exact: true }).fill(serverPassword);
-  const connections = serverForm.getByRole("spinbutton", { name: "Connections", exact: true });
+  await expect(serverForm.getByTestId(field("port"))).toHaveValue("119");
+  await serverForm.getByTestId(field("username")).fill("e2e-user");
+  await serverForm.getByTestId(field("password")).fill(serverPassword);
+  const connections = serverForm.getByTestId(field("connections"));
   await connections.fill("1");
   await connections.press("Tab");
-  const serverEnabled = serverForm.getByRole("switch", { name: "Enabled", exact: true });
+  const serverEnabled = serverForm.getByTestId(field("active"));
   if (await serverEnabled.isChecked()) await serverEnabled.click();
-  await serverForm.getByRole("button", { name: "Save", exact: true }).click();
+  await serverForm.getByTestId(testIds.editorSave).click();
   await expect(serverForm).toBeHidden();
-  await expect(tableRow(page, "Servers", matrix.serverHost)).toBeVisible();
+  await expect(tableRow(page, "servers", matrix.serverHost)).toBeVisible();
 
   await page.goto("/settings/rss");
-  await page.getByRole("main").getByRole("button", { name: "Add feed", exact: true }).click();
-  const feedForm = page.getByRole("dialog", { name: "Add feed", exact: true });
-  await feedForm.getByRole("textbox", { name: "Name", exact: true }).fill(matrix.rssFeedName);
-  await feedForm.getByRole("textbox", { name: "URL", exact: true }).fill("http://127.0.0.1:1/e2e-backup.xml");
-  await feedForm.getByRole("button", { name: "Save", exact: true }).click();
+  await page.getByTestId(testIds.tableAdd("feeds")).click();
+  const feedForm = page.getByTestId(testIds.dialog("feed"));
+  await feedForm.getByTestId(field("name")).fill(matrix.rssFeedName);
+  await feedForm.getByTestId(field("url")).fill("http://127.0.0.1:1/e2e-backup.xml");
+  await feedForm.getByTestId(testIds.editorSave).click();
   await expect(feedForm).toBeHidden();
-  await expect(tableRow(page, "Feeds", matrix.rssFeedName)).toBeVisible();
-  await page
-    .getByRole("region", { name: "Rules", exact: true })
-    .getByRole("button", { name: "Add rule", exact: true })
-    .click();
-  const ruleForm = page.getByRole("dialog", { name: "Add rule", exact: true });
-  await ruleForm.getByRole("textbox", { name: "Title matches", exact: true }).fill(matrix.rssRuleTerm);
-  await ruleForm.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(tableRow(page, "feeds", matrix.rssFeedName)).toBeVisible();
+  await page.getByTestId(testIds.tableAdd("rules")).click();
+  const ruleForm = page.getByTestId(testIds.dialog("rss-rule"));
+  await ruleForm.getByTestId(field("titleRegex")).fill(matrix.rssRuleTerm);
+  await ruleForm.getByTestId(testIds.editorSave).click();
   await expect(ruleForm).toBeHidden();
-  await expect(tableRow(page, "Rules", matrix.rssRuleTerm).getByText("Accept", { exact: true })).toBeVisible();
+  await expect(
+    tableRow(page, "rules", matrix.rssRuleTerm).getByTestId(settingsIds.rssRuleAction("ACCEPT")),
+  ).toBeVisible();
 
   await page.goto("/settings/watch-folder");
-  const watchSection = page.getByRole("region", { name: "Watch folder", exact: true });
+  const watchSection = page.getByTestId(testIds.section("folder"));
   fs.mkdirSync(
     path.join("/weaver-data", path.basename(matrix.watchPath)),
     { recursive: true },
   );
-  await chooseFolder(
-    page,
-    watchSection.getByRole("textbox", { name: "Folder", exact: true }),
-    "Folder",
-    matrix.watchPath,
-  );
-  await watchSection
-    .getByRole("radiogroup", { name: "Watching", exact: true })
-    .getByRole("radio", { name: "Polling", exact: true })
-    .click();
-  const pollInterval = watchSection.getByRole("spinbutton", { name: "Poll interval", exact: true });
+  await chooseFolder(page, watchSection.getByTestId(field("path")), matrix.watchPath);
+  await watchSection.getByTestId(testIds.option(field("mode"), "polling")).click();
+  const pollInterval = watchSection.getByTestId(field("pollIntervalSecs"));
   await pollInterval.fill("45");
   await pollInterval.press("Tab");
   await saveSettings(page);
@@ -371,27 +354,23 @@ async function createSourceMarkersThroughUI(
   await expect(historyRow(page, matrix.historyName)).toBeVisible();
 
   await page.goto("/settings/security");
-  await page.getByRole("main").getByRole("button", { name: "Add API key", exact: true }).click();
-  const keyEditor = page.getByRole("dialog", { name: "New API key", exact: true });
-  await keyEditor.getByRole("textbox", { name: "Name", exact: true }).fill(matrix.apiKeyName);
-  await keyEditor.getByRole("button", { name: "Scope", exact: true }).click();
-  await page
-    .getByRole("menu", { name: "Scope", exact: true })
-    .getByRole("menuitemradio", { name: "Read only", exact: true })
-    .click();
-  await keyEditor.getByRole("button", { name: "Create key", exact: true }).click();
-  const createdDialog = page.getByRole("dialog", { name: "API key created", exact: true });
+  await page.getByTestId(testIds.tableAdd("keys")).click();
+  const keyEditor = page.getByTestId(testIds.dialog("key-new"));
+  await keyEditor.getByTestId(field("name")).fill(matrix.apiKeyName);
+  await choose(page, keyEditor, field("scope"), "READ");
+  await keyEditor.getByTestId(testIds.editorSave).click();
+  const createdDialog = page.getByTestId(testIds.dialog("key-created"));
   await expect(createdDialog).toContainText(matrix.apiKeyName);
-  await expect(createdDialog.getByRole("textbox", { name: "API key", exact: true })).not.toHaveValue("");
-  await createdDialog.getByRole("button", { name: "Done", exact: true }).click();
+  await expect(createdDialog.getByTestId(settingsIds.keyCreatedValue)).not.toHaveValue("");
+  await createdDialog.getByTestId(settingsIds.keyCreatedDone).click();
   await expect(createdDialog).toBeHidden();
   await expect(apiKey(page, matrix)).toBeVisible();
 
-  await page.getByRole("button", { name: "Set up a login", exact: true }).click();
-  const setup = page.getByRole("dialog", { name: "Set up a login", exact: true });
-  await setup.getByLabel("Username", { exact: true }).fill(loginUsername);
-  await setup.getByLabel("Password", { exact: true }).fill(loginPassword);
-  await setup.getByLabel("Repeat the password", { exact: true }).fill(loginPassword);
+  await page.getByTestId(settingsIds.loginSetup).click();
+  const setup = page.getByTestId(testIds.dialog("login-setup"));
+  await setup.getByTestId(field("username")).fill(loginUsername);
+  await setup.getByTestId(field("password")).fill(loginPassword);
+  await setup.getByTestId(field("confirm")).fill(loginPassword);
   // Enabling login mid-session 401s whichever polling queries are still in
   // flight before the client redirects to sign-in. At least one proves auth
   // is enforced; the exact number is scheduling noise.
@@ -402,7 +381,7 @@ async function createSourceMarkersThroughUI(
     count: 1,
     maxCount: 8,
   });
-  await setup.getByRole("button", { name: "Turn on login", exact: true }).click();
+  await setup.getByTestId(testIds.editorSave).click();
   await expect(signInButton(page)).toBeVisible();
   await page.goto("/");
   await expect(signInButton(page)).toBeVisible();
@@ -414,16 +393,11 @@ function downloadCeiling(matrix: BackupMatrixState): string {
 }
 
 function historyRow(page: Page, name: string): Locator {
-  return page
-    .getByRole("main")
-    .getByRole("button")
-    .filter({ has: page.getByText(name, { exact: true }) });
+  return byTestIdPrefix(page, testIds.historyRowPrefix).filter({ has: page.getByText(name, { exact: true }) });
 }
 
 function apiKey(page: Page, matrix: BackupMatrixState): Locator {
-  return page
-    .getByRole("region", { name: "API keys", exact: true })
-    .getByText(matrix.apiKeyName, { exact: true });
+  return page.getByTestId(testIds.section("keys")).getByText(matrix.apiKeyName, { exact: true });
 }
 
 async function expectProductMarkers(
@@ -432,7 +406,7 @@ async function expectProductMarkers(
   present: boolean,
 ) {
   await page.goto("/settings/networking/egress");
-  const ceiling = page.getByRole("spinbutton", { name: "Download ceiling", exact: true });
+  const ceiling = page.getByTestId(field("maxDownloadSpeed"));
   await expect(ceiling).toBeVisible();
   if (present) {
     await expect(ceiling).toHaveValue(downloadCeiling(matrix));
@@ -441,44 +415,45 @@ async function expectProductMarkers(
   }
 
   await page.goto("/settings/categories");
-  await expect(page.getByRole("region", { name: "Categories", exact: true })).toBeVisible();
-  const categoryRow = tableRow(page, "Categories", matrix.categoryName);
+  await expect(page.getByTestId(testIds.section("categories"))).toBeVisible();
+  const categoryRow = tableRow(page, "categories", matrix.categoryName);
   await expect(categoryRow).toHaveCount(present ? 1 : 0);
   if (present) await expect(categoryRow).toContainText(matrix.categoryPattern);
 
   await page.goto("/settings/schedules");
   // The list heads only the groups that hold a rule, so the list itself is what loads.
-  await expect(page.getByRole("region", { name: "Schedules", exact: true })).toBeVisible();
-  await expect(tableRow(page, "Downloads", matrix.scheduleName)).toHaveCount(present ? 1 : 0);
+  await expect(page.getByTestId(testIds.section("schedules"))).toBeVisible();
+  await expect(downloadsSchedule(page, matrix.scheduleName)).toHaveCount(present ? 1 : 0);
 
   await page.goto("/settings/servers");
-  await expect(tableRow(page, "Servers", "nntp")).toBeVisible();
-  const serverRow = tableRow(page, "Servers", matrix.serverHost);
+  await expect(tableRow(page, "servers", fixtureServer)).toBeVisible();
+  const serverRow = tableRow(page, "servers", matrix.serverHost);
   await expect(serverRow).toHaveCount(present ? 1 : 0);
   if (present) {
     await serverRow.click();
-    const serverForm = page.getByRole("dialog", { name: matrix.serverHost, exact: true });
-    const password = serverForm.getByLabel("Password", { exact: true });
+    const serverForm = page.getByTestId(testIds.dialog("provider"));
+    await expect(serverForm).toContainText(matrix.serverHost);
+    // The stored password never comes back: the field is empty and shows the mask.
+    const password = serverForm.getByTestId(field("password"));
     await expect(password).toHaveValue("");
     await expect(password).toHaveAttribute("placeholder", "••••••••");
-    await expect(serverForm.getByText("Leave blank to keep the stored password.", { exact: true })).toBeVisible();
-    await serverForm.getByRole("button", { name: "Cancel", exact: true }).click();
+    await serverForm.getByTestId(testIds.editorCancel).click();
     await expect(serverForm).toBeHidden();
   }
 
   await page.goto("/settings/rss");
-  await expect(page.getByRole("region", { name: "Feeds", exact: true })).toBeVisible();
-  await expect(tableRow(page, "Feeds", matrix.rssFeedName)).toHaveCount(present ? 1 : 0);
-  await expect(tableRow(page, "Rules", matrix.rssRuleTerm)).toHaveCount(present ? 1 : 0);
+  await expect(page.getByTestId(testIds.section("feeds"))).toBeVisible();
+  await expect(tableRow(page, "feeds", matrix.rssFeedName)).toHaveCount(present ? 1 : 0);
+  await expect(tableRow(page, "rules", matrix.rssRuleTerm)).toHaveCount(present ? 1 : 0);
 
   await page.goto("/settings/watch-folder");
-  const watchSection = page.getByRole("region", { name: "Watch folder", exact: true });
-  const watchPath = watchSection.getByRole("textbox", { name: "Folder", exact: true });
+  const watchSection = page.getByTestId(testIds.section("folder"));
+  const watchPath = watchSection.getByTestId(field("path"));
   await expect(watchPath).toBeVisible();
   if (present) {
     await expect(watchPath).toHaveValue(matrix.watchPath);
     await expect(
-      watchSection.getByRole("spinbutton", { name: "Poll interval", exact: true }),
+      watchSection.getByTestId(field("pollIntervalSecs")),
     ).toHaveValue("45");
   } else {
     await expect(watchPath).not.toHaveValue(matrix.watchPath);
@@ -489,34 +464,37 @@ async function expectProductMarkers(
   await expect(historyRow(page, matrix.historyName)).toHaveCount(present ? 1 : 0);
 
   await page.goto("/settings/security");
-  await expect(page.getByRole("region", { name: "API keys", exact: true })).toBeVisible();
+  await expect(page.getByTestId(testIds.section("keys"))).toBeVisible();
   await expect(apiKey(page, matrix)).toHaveCount(present ? 1 : 0);
 }
 
 async function analyzeBackup(page: Page, file: string, password: string) {
   await page.goto("/settings/backup");
-  const restoreSection = page.getByRole("region", { name: "Restore", exact: true });
+  const restoreSection = page.getByTestId(testIds.section("restore"));
   // Wait for the restore availability check before reading anything.
-  await expect(restoreSection.getByText("checking…", { exact: true })).toHaveCount(0);
+  await expect(restoreSection.getByTestId(settingsIds.backupStatus)).toBeVisible();
   const chooser = page.waitForEvent("filechooser");
-  await restoreSection.getByRole("button", { name: "Choose file", exact: true }).click();
+  await restoreSection.getByTestId(settingsIds.backupChooseFile).click();
   await (await chooser).setFiles(file);
-  await expect(restoreSection.getByText(path.basename(file), { exact: true })).toBeVisible();
-  const restorePassword = restoreSection.getByLabel("Password", { exact: true });
+  await expect(restoreSection.getByTestId(settingsIds.backupFileName)).toHaveText(path.basename(file));
+  const restorePassword = restoreSection.getByTestId(field("restorePassword"));
   await restorePassword.fill(password);
   await expect(restorePassword).toHaveAttribute("type", "password");
   const inspected = page.waitForResponse(
     (response) => new URL(response.url()).pathname.endsWith("/api/backup/inspect"),
   );
-  await restoreSection.getByRole("button", { name: "Read archive", exact: true }).click();
+  const readArchive = restoreSection.getByTestId(settingsIds.backupReadArchive);
+  await readArchive.click();
   await inspected;
-  await expect(page.getByRole("contentinfo")).not.toContainText("Reading the archive…");
+  // The panel is busy while it reads the archive; the button comes back once
+  // the read has settled and the report line says how it went.
+  await expect(readArchive).toBeEnabled();
 }
 
 async function fillRequiredCategoryRemaps(page: Page) {
-  const panel = page.getByRole("region", { name: "Category destinations", exact: true });
+  const panel = page.getByTestId(testIds.section("remaps"));
   await expect(panel).toBeVisible();
-  const remapInputs = panel.getByRole("textbox");
+  const remapInputs = panel.getByTestId(settingsIds.backupRemap);
   await expect(remapInputs).not.toHaveCount(0);
   const inputs = await remapInputs.all();
   for (const [index, input] of inputs.entries()) {
@@ -525,9 +503,7 @@ async function fillRequiredCategoryRemaps(page: Page) {
     const relativePath = `e2e-restored-category-${index + 1}`;
     const destination = `/data/${relativePath}`;
     fs.mkdirSync(path.join("/weaver-data", relativePath), { recursive: true });
-    const label = await input.getAttribute("aria-label");
-    expect(label, "a category destination field has no label").toBeTruthy();
-    await chooseFolder(page, input, label!, destination);
+    await chooseFolder(page, input, destination);
   }
 }
 

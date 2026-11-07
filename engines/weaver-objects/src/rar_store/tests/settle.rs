@@ -140,3 +140,31 @@ fn a_claim_parses_the_set_numbering_once() {
         assert_eq!(counts::take().names, VOLUMES, "{version:?}");
     }
 }
+
+// A layout is asked to take a volume again only on facts it was not asked
+// on before: once on the very facts it took a volume on, its answer is
+// known, and every such answer is the one it gives when asked.
+#[test]
+fn a_layout_is_asked_to_take_a_volume_only_on_facts_it_was_not_asked_on() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let (bytes, volumes) = fifty(version);
+        let mut owner = Owner::named(store(), volumes);
+        counts::take();
+        for volume in 0..VOLUMES {
+            owner.bind(volume);
+            owner.frames(volume, 64);
+            owner.close(volume);
+        }
+        let counted = counts::take();
+        let mut asked = counted.asked.clone();
+        asked.sort_unstable();
+        asked.dedup();
+        assert_eq!(asked.len(), counted.asked.len(), "{version:?} {counted:?}");
+        assert!(counted.known > 0, "{version:?} {counted:?}");
+        no_trouble(&owner);
+        let got = owner.member("alpha.bin");
+        assert!(got.closed);
+        assert_eq!(got.bytes, bytes);
+        posted_whole(&owner);
+    }
+}

@@ -9,6 +9,7 @@ import {
   UPDATE_SCRIPT_INSTANCE_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+import { testIds } from "@/next/testids";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
 import { CheckBox, SecondaryButton, TextField } from "../../../components/controls";
 import { Icon } from "../../../components/icons";
@@ -206,7 +207,6 @@ export function ScriptInstanceEditor({
     {
       id: "script",
       label: t("next.postProcessing.script"),
-      help: t("next.postProcessing.scriptHelp"),
       control: {
         kind: "select",
         value: form.script,
@@ -220,7 +220,6 @@ export function ScriptInstanceEditor({
     {
       id: "trigger",
       label: t("next.scriptRuns.trigger"),
-      help: t("next.postProcessing.triggerHelp"),
       control: {
         kind: "select",
         value: form.trigger,
@@ -236,7 +235,6 @@ export function ScriptInstanceEditor({
           {
             id: "queueEvent",
             label: t("next.postProcessing.queueEvent"),
-            help: t("next.postProcessing.queueEventHelp"),
             control: {
               kind: "select" as const,
               value: form.queueEvent,
@@ -309,7 +307,6 @@ export function ScriptInstanceEditor({
         {
           id: "runAtStartup",
           label: t("next.schedules.runAtStartup"),
-          help: t("next.postProcessing.runAtStartupHelp"),
           control: {
             kind: "toggle",
             value: schedule.startup,
@@ -601,7 +598,6 @@ export function ScriptInstanceEditor({
     {
       id: "enabled",
       label: t("next.postProcessing.enabled"),
-      help: t("next.postProcessing.enabledHelp"),
       control: {
         kind: "toggle",
         value: form.enabled,
@@ -649,7 +645,6 @@ export function ScriptInstanceEditor({
     {
       id: "inputs",
       title: t("next.postProcessing.inputs"),
-      note: t("next.postProcessing.inputsNote"),
       fields: form.inputs.map(inputField),
       body: inputsBody,
     },
@@ -667,12 +662,13 @@ export function ScriptInstanceEditor({
   return (
     <>
     <RecordEditor
+      testId={testIds.dialog("pp-job")}
       open
       title={editing ? editing.name : t("next.postProcessing.createInstance")}
       note={
         editing
           ? triggerTitle(t, editing.trigger, editing.queueEvent)
-          : t("next.postProcessing.createInstanceNote")
+          : undefined
       }
       width={640}
       sections={sections}

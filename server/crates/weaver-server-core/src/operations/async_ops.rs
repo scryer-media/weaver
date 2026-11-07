@@ -335,6 +335,10 @@ async fn insert_history_delete_operation_tx(
 // `NULL` for a freshly queued target. Rows bind 6 parameters each
 // (operation_id, target_kind, target_id, state, error_message, sort_order), so
 // chunks stay under the dialect bind budget.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: a batch on the transaction run_in_transaction opened under the gate; Postgres has no writer gate"
+)]
 async fn bulk_insert_history_delete_targets_tx(
     tx: &mut SqlTx<'_>,
     operation_id: u64,
@@ -822,7 +826,7 @@ impl Database {
                     SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
                 ];
                 args.extend(id_args(chunk));
-                SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
+                SqlRuntime::execute(datastore.write_exec(), &sql, &args).await?;
             }
             Ok(())
         })
@@ -837,7 +841,7 @@ impl Database {
         let error_message = error_message.to_string();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE async_operation_targets
                  SET state = 'failed',
                      error_message = {}
@@ -883,7 +887,7 @@ impl Database {
                 AsyncOperationState::Completed
             };
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE async_operations
                  SET state = {},
                      finished_at = {}

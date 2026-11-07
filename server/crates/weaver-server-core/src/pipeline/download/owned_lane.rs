@@ -1633,7 +1633,12 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         }
 
         // Top the ring back up to the depth in force.
-        while stop.is_none() && lane.ring_outstanding() < context.depth() {
+        // Behind a mid-batch 480 the lane drains its ring and logs in again
+        // before anything new goes out.
+        while stop.is_none()
+            && lane.ring_outstanding() < context.depth()
+            && !lane.holds_new_requests()
+        {
             if !lane.accepts_new_work() {
                 stop = Some(LaneStop::Quarantined);
                 break;
@@ -2210,7 +2215,7 @@ fn unresolved_result(
         segment_id: work.segment_id,
         runtime_generation,
         data: Err(DownloadError::Fetch(DownloadFailure::new(
-            DownloadFailureKind::EstablishedTransport,
+            DownloadFailureKind::Unanswered,
             message,
         ))),
         attempts: Vec::new(),
@@ -2540,6 +2545,37 @@ mod tests {
     // article instead of its last. Only the lane's closing event waits for an
     // acknowledgement, because that is what orders the results ahead of the
     // park message on the other channel.
+    // The articles abandoned behind a fault were never answered: they keep
+    // their retry budget and go back out on another connection.
+    #[test]
+    fn an_abandoned_article_is_unanswered() {
+        let result = unresolved_result(
+            tail_work(0, 2),
+            1,
+            0,
+            JobId(7),
+            0,
+            DownloadLaneMode::Sequential,
+            true,
+            None,
+            true,
+            3,
+            &[],
+            "lane pipeline faulted before this article's response",
+        );
+        let Err(DownloadError::Fetch(failure)) = &result.data else {
+            panic!("an abandoned article is a fetch failure");
+        };
+        assert_eq!(failure.kind, DownloadFailureKind::Unanswered);
+        assert!(failure.kind.preserves_article_retry_budget());
+        assert_eq!(result.retry_count, 2);
+        // The kind says nothing about the socket; the abandoned result
+        // carries the lane's own verdict that the connection was lost.
+        let observation = result.lane_observation.unwrap();
+        assert!(observation.connection_discarded);
+        assert!(!observation.batch_clean);
+    }
+
     #[tokio::test]
     async fn results_stream_one_article_at_a_time_and_only_the_last_waits() {
         let (event_tx, mut event_rx) = mpsc::channel(8);

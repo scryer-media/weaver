@@ -152,6 +152,8 @@ impl GraphJob {
         // What the restore closed again landed before the restart, and was
         // said then.
         job.notes.clear();
+        #[cfg(test)]
+        job.pending.restored(&job);
         Ok(Restored {
             settled: job.root.map.settled(),
             refetched,
@@ -208,7 +210,7 @@ impl GraphJob {
         missing.extend(self.root.map.unseen());
         let mut refetched = Vec::with_capacity(missing.len());
         for (volume, ordinal) in missing {
-            self.unarrive(volume, ordinal);
+            self.unarrive(volume, ordinal)?;
             if let Some(found) = self
                 .tree
                 .namespace_mut(NodeId::ROOT)
@@ -255,24 +257,19 @@ impl GraphJob {
             .collect()
     }
 
-    // The articles a restart now would fetch again: in hand but not on disk,
-    // or heard of before the root saw them.
+    // The articles a crash now would cost, so a restore fetches them again:
+    // in hand but not on disk, on disk but not in the checkpoint the
+    // database will hold once the writes already queued for it run, or
+    // heard of before the root saw them.
     #[cfg(test)]
     pub(crate) fn in_memory(&self) -> Vec<(u32, u32)> {
+        let named = self.pending.named();
         let mut out = Vec::new();
-        let mut bytes = Vec::new();
-        for index in 0..self.root.map.volume_count() {
-            let volume = VolumeIndex(index as u32);
-            for (ordinal, range) in self.root.map.arrived_ranges(volume) {
-                bytes.clear();
-                if !self
-                    .writer
-                    .read_posted(&self.tree, MemberId(volume.0), range, &mut bytes)
-                {
-                    out.push((volume.0, ordinal));
-                }
+        self.arrived(|article, on_disk| {
+            if !on_disk || !named.contains(&article) {
+                out.push(article);
             }
-        }
+        });
         out.extend(
             self.root
                 .map
@@ -281,6 +278,36 @@ impl GraphJob {
                 .map(|(volume, ordinal)| (volume.0, ordinal)),
         );
         out
+    }
+
+    // The articles the root has in hand whose bytes are on disk: what a
+    // checkpoint taken now names.
+    #[cfg(test)]
+    pub(crate) fn on_disk(&self) -> std::collections::BTreeSet<(u32, u32)> {
+        let mut out = std::collections::BTreeSet::new();
+        self.arrived(|article, on_disk| {
+            if on_disk {
+                out.insert(article);
+            }
+        });
+        out
+    }
+
+    // Each article the root has in hand, and whether its bytes read back
+    // from disk.
+    #[cfg(test)]
+    fn arrived(&self, mut each: impl FnMut((u32, u32), bool)) {
+        let mut bytes = Vec::new();
+        for index in 0..self.root.map.volume_count() {
+            let volume = VolumeIndex(index as u32);
+            for (ordinal, range) in self.root.map.arrived_ranges(volume) {
+                bytes.clear();
+                let on_disk =
+                    self.writer
+                        .read_posted(&self.tree, MemberId(volume.0), range, &mut bytes);
+                each((volume.0, ordinal), on_disk);
+            }
+        }
     }
 
     fn deliver_again(&mut self, read: ReadBack) -> Result<(), GraphError> {

@@ -1359,6 +1359,10 @@ impl Database {
         &self.target
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: a TRUNCATE checkpoint for backup, outside the gate by ruling, idle at the time"
+    )]
     pub(crate) fn checkpoint_sqlite(&self) -> Result<(), StateError> {
         let StoreDatastore::Sqlite { pool, .. } = self.datastore() else {
             return Ok(());
@@ -2124,7 +2128,7 @@ impl Database {
                     maybe_encrypt(Some(&key), &val).map_err(StateError::Database)?
                 {
                     SqlRuntime::execute(
-                        datastore.read_exec(),
+                        datastore.write_exec(),
                         "UPDATE servers SET password = {} WHERE id = {}",
                         &[SqlArg::Text(encrypted), SqlArg::I64(*id)],
                     )
@@ -2157,7 +2161,7 @@ impl Database {
                     maybe_encrypt(Some(&key), &val).map_err(StateError::Database)?
                 {
                     SqlRuntime::execute(
-                        datastore.read_exec(),
+                        datastore.write_exec(),
                         "UPDATE rss_feeds SET password = {} WHERE id = {}",
                         &[SqlArg::Text(encrypted), SqlArg::I64(*id)],
                     )
@@ -2190,7 +2194,7 @@ impl Database {
                     let encrypted = crate::persistence::encryption::encrypt_value(&key, &password)
                         .map_err(StateError::Database)?;
                     SqlRuntime::execute(
-                        datastore.read_exec(),
+                        datastore.write_exec(),
                         update,
                         &[
                             SqlArg::Text(encrypted),

@@ -944,6 +944,7 @@ export const LIVE_METRICS_QUERY = gql`
     globalState: globalQueueState {
       isPaused
       speedLimitBytesPerSec
+      resumeAtEpochMs
       downloadBlock {
         ...DownloadBlockFields
       }
@@ -1135,8 +1136,8 @@ export const ACCEPT_HISTORY_DELETE_MUTATION = gql`
 `;
 
 export const PAUSE_ALL_MUTATION = gql`
-  mutation PauseAll {
-    pauseAll
+  mutation PauseAll($resumeAfterSecs: Int) {
+    pauseAll(resumeAfterSecs: $resumeAfterSecs)
   }
 `;
 
@@ -1202,6 +1203,7 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
       globalState {
         isPaused
         speedLimitBytesPerSec
+        resumeAtEpochMs
         downloadBlock {
           ...DownloadBlockFields
         }

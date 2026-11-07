@@ -42,7 +42,7 @@ fn create_free_pages(db: &Database, rows: usize) {
     let datastore = db.datastore();
     db.run_sql_blocking(async move {
         SqlRuntime::execute(
-            datastore.read_exec(),
+            datastore.write_exec(),
             "CREATE TABLE IF NOT EXISTS maintenance_blob (
                 id INTEGER PRIMARY KEY,
                 body BLOB NOT NULL
@@ -66,7 +66,7 @@ fn create_free_pages(db: &Database, rows: usize) {
         })
         .await?;
 
-        SqlRuntime::execute(datastore.read_exec(), "DELETE FROM maintenance_blob", &[]).await?;
+        SqlRuntime::execute(datastore.write_exec(), "DELETE FROM maintenance_blob", &[]).await?;
         let _ = SqlRuntime::fetch_optional(
             datastore.read_exec(),
             "PRAGMA wal_checkpoint(TRUNCATE)",
@@ -81,7 +81,7 @@ fn create_free_pages(db: &Database, rows: usize) {
 fn execute_sql(db: &Database, sql: &'static str) {
     let datastore = db.datastore();
     db.run_sql_blocking(async move {
-        SqlRuntime::execute(datastore.read_exec(), sql, &[]).await?;
+        SqlRuntime::execute(datastore.write_exec(), sql, &[]).await?;
         Ok(())
     })
     .unwrap();

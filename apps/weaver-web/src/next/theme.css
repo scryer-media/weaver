@@ -80,6 +80,8 @@
   /* Semantic state. */
   --color-wv-info: #6aa9cf;
   --color-wv-warn: #d3a43e;
+  --color-wv-warn-hover: #e0b552;
+  --color-wv-on-warn: #241a06;
   --color-wv-orange: #eb8f1e;
   --color-wv-error: #e0745a;
   --color-wv-error-text: #e89b82;
@@ -248,6 +250,7 @@ html .wv-xscroll::-webkit-scrollbar {
  * leaves the control's edge and fades as it travels. It is an outline, so the
  * menus keep the system's only shadow. With reduced motion the ring holds
  * still a few pixels out, and keyboard focus swaps it for the focus ring.
+ * The ring is the accent unless the control sets `--wv-ping-color`.
  */
 html .wv-ping {
   outline: 2px solid transparent;
@@ -262,7 +265,7 @@ html .wv-ping:focus-visible {
 
 @keyframes wv-ping {
   from {
-    outline-color: var(--wv-accent);
+    outline-color: var(--wv-ping-color, var(--wv-accent));
     outline-offset: 0;
   }
   to {
@@ -274,7 +277,7 @@ html .wv-ping:focus-visible {
 @media (prefers-reduced-motion: reduce) {
   html .wv-ping {
     animation: none;
-    outline-color: var(--wv-accent);
+    outline-color: var(--wv-ping-color, var(--wv-accent));
     outline-offset: 3px;
   }
 }

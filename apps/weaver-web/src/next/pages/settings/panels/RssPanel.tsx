@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useMemo, useState } from "react";
+import { Fragment, useMemo, useState, type ReactNode } from "react";
 import { useMutation, useQuery } from "urql";
 import {
   ADD_RSS_FEED_MUTATION,
@@ -18,6 +18,7 @@ import {
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { blockedRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
 import { refusalMessage } from "@/lib/refusal";
+import { settingsIds, testIds } from "@/next/testids";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
@@ -27,7 +28,7 @@ import { RoutingState } from "../../../components/RoutingState";
 import { Cell } from "../../../components/rows";
 import { formatDate, formatSize } from "../../../data/format";
 import { WV } from "../../../data/palette";
-import { countLabel } from "../../../i18n/labels";
+import { aroundSlot, countLabel } from "../../../i18n/labels";
 import {
   PanelControls,
   SettingsBlocks,
@@ -255,19 +256,42 @@ function feedState(t: Translate, feed: RssFeed): { color: string; text: string }
   return { color: WV.accent, text: feed.lastSuccessAt ? formatDate(feed.lastSuccessAt) : t("next.rss.notPolled") };
 }
 
-function reportLine(t: Translate, report: SyncReport): string {
+/** One count of a report line, the number set in its own element inside the phrase. */
+function reportCount(
+  t: Translate,
+  key: string,
+  count: number,
+  id: Parameters<typeof settingsIds.rssReportCount>[0],
+): ReactNode {
+  const [before, after] = aroundSlot(t, `${key}.${count === 1 ? "one" : "other"}`, "count");
+  return (
+    <>
+      {before}
+      <span data-testid={settingsIds.rssReportCount(id)}>{count}</span>
+      {after}
+    </>
+  );
+}
+
+function reportLine(t: Translate, report: SyncReport): ReactNode {
   const parts = [
-    countLabel(t, "next.rss.feedsPolled", report.feedsPolled),
-    countLabel(t, "next.rss.itemsNew", report.itemsNew),
-    countLabel(t, "next.rss.itemsQueued", report.itemsSubmitted),
+    reportCount(t, "next.rss.feedsPolled", report.feedsPolled, "polled"),
+    reportCount(t, "next.rss.itemsNew", report.itemsNew, "new"),
+    reportCount(t, "next.rss.itemsQueued", report.itemsSubmitted, "queued"),
   ];
   if (report.itemsIgnored > 0) {
-    parts.push(countLabel(t, "next.rss.itemsIgnored", report.itemsIgnored));
+    parts.push(reportCount(t, "next.rss.itemsIgnored", report.itemsIgnored, "ignored"));
   }
-  if (report.errors.length > 0) {
-    parts.push(report.errors[0] ?? "");
+  const firstError = report.errors[0];
+  if (firstError) {
+    parts.push(<span data-testid={settingsIds.rssReportError}>{firstError}</span>);
   }
-  return parts.filter(Boolean).join(" · ");
+  return parts.map((part, index) => (
+    <Fragment key={index}>
+      {index > 0 ? " · " : null}
+      {part}
+    </Fragment>
+  ));
 }
 
 export function RssPanel() {
@@ -288,7 +312,7 @@ export function RssPanel() {
   const [ruleId, setRuleId] = useState<number | "new" | null>(null);
   const [ruleForm, setRuleForm] = useState<RuleForm>({ ...NEW_RULE, feedId: 0 });
   const [error, setError] = useState<string | null>(null);
-  const [status, setStatus] = useState<string | null>(null);
+  const [status, setStatus] = useState<ReactNode>(null);
   const [busy, setBusy] = useState(false);
   const [confirmFeed, setConfirmFeed] = useState<RssFeed | null>(null);
   const [confirmRule, setConfirmRule] = useState<RssRule | null>(null);
@@ -474,7 +498,6 @@ export function RssPanel() {
       kind: "table",
       id: "feeds",
       title: t("next.rss.feeds"),
-      note: t("next.rss.feedsNote"),
       columns: "minmax(0, 1fr) minmax(0, 1.3fr) 110px minmax(0, 1fr) 64px",
       headers: [
         t("next.rss.name"),
@@ -507,11 +530,16 @@ export function RssPanel() {
             <Cell key="interval" mono className="text-wv-secondary">
               {feed.pollIntervalSecs}s
             </Cell>,
-            <Cell key="state" mono className="text-wv-muted" title={state.text}>
+            <Cell key="state" mono className="text-wv-muted" title={state.text} testId={settingsIds.rssFeedState}>
               {state.text}
             </Cell>,
             <span key="sync" onClick={(event) => event.stopPropagation()}>
-              <SecondaryButton icon="refresh" className="h-7 px-2" onClick={() => void sync(feed)}>
+              <SecondaryButton
+                icon="refresh"
+                className="h-7 px-2"
+                onClick={() => void sync(feed)}
+                testId={settingsIds.rssFeedPoll}
+              >
                 {t("next.rss.poll")}
               </SecondaryButton>
             </span>,
@@ -552,6 +580,7 @@ export function RssPanel() {
           <Cell
             key="action"
             className={rule.action === "REJECT" ? "text-wv-error-text" : "text-wv-secondary"}
+            testId={settingsIds.rssRuleAction(rule.action)}
           >
             {rule.action === "REJECT" ? t("next.rss.reject") : t("next.rss.accept")}
           </Cell>,
@@ -589,7 +618,7 @@ export function RssPanel() {
       },
       footer:
         seenItems.length > 0 ? (
-          <SecondaryButton icon="remove" onClick={() => setConfirmSeen("all")}>
+          <SecondaryButton icon="remove" onClick={() => setConfirmSeen("all")} testId={settingsIds.rssSeenClear}>
             {t("next.rss.clearHistory")}
           </SecondaryButton>
         ) : undefined,
@@ -721,7 +750,6 @@ export function RssPanel() {
         {
           id: "enabled",
           label: t("next.rss.enabled"),
-          help: t("next.rss.enabledHelp"),
           control: {
             kind: "toggle",
             value: feedForm.enabled && !feedForm.killSwitch,
@@ -858,7 +886,6 @@ export function RssPanel() {
     {
       id: "action",
       label: t("next.rss.action"),
-      help: t("next.rss.actionHelp"),
       control: {
         kind: "segmented",
         value: ruleForm.action,
@@ -966,6 +993,7 @@ export function RssPanel() {
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
       <RecordEditor
+        testId={testIds.dialog("feed")}
         open={feedId !== null}
         title={feedId === "new" ? t("next.rss.addFeed") : (editingFeed?.name ?? t("next.rss.feed"))}
         note={
@@ -989,6 +1017,7 @@ export function RssPanel() {
       />
 
       <RecordEditor
+        testId={testIds.dialog("rss-rule")}
         open={ruleId !== null}
         title={ruleId === "new" ? t("next.rss.addRule") : t("next.rss.editRule")}
         note={feedNames.get(ruleForm.feedId) ?? undefined}
@@ -1006,6 +1035,7 @@ export function RssPanel() {
       />
 
       <ConfirmDialog
+        testId={testIds.dialog("feed-remove")}
         open={confirmFeed !== null}
         title={t("next.rss.removeFeed")}
         note={confirmFeed?.name}
@@ -1025,6 +1055,7 @@ export function RssPanel() {
       />
 
       <ConfirmDialog
+        testId={testIds.dialog("rss-rule-remove")}
         open={confirmRule !== null}
         title={t("next.rss.removeRule")}
         note={confirmRule ? (feedNames.get(confirmRule.feedId) ?? undefined) : undefined}
@@ -1044,6 +1075,7 @@ export function RssPanel() {
       />
 
       <ConfirmDialog
+        testId={testIds.dialog(confirmSeen === "all" ? "rss-seen-clear" : "rss-seen-forget")}
         open={confirmSeen !== null}
         title={confirmSeen === "all" ? t("next.rss.clearSeenTitle") : t("next.rss.forgetItemTitle")}
         note={

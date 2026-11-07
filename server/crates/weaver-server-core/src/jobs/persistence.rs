@@ -151,6 +151,10 @@ pub(crate) fn metadata_json(metadata: &[(String, String)]) -> Result<Option<Stri
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: a batch on the transaction run_in_transaction opened under the gate; Postgres has no writer gate"
+)]
 async fn bulk_upsert_file_identities_tx(
     tx: &mut SqlTx<'_>,
     job_id: JobId,
@@ -259,6 +263,10 @@ async fn bulk_upsert_file_identities_tx(
 // inside the caller's transaction: Postgres batches with `UPDATE ... FROM
 // (VALUES ...)`, SQLite issues per-row updates (local to the serialized
 // writer, so the extra statements are cheap).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: a batch on the transaction run_in_transaction opened under the gate; Postgres has no writer gate"
+)]
 async fn bulk_update_active_files_filenames_tx(
     tx: &mut SqlTx<'_>,
     job_id: JobId,
@@ -1071,7 +1079,7 @@ impl Database {
                 }
                 SqlEngine::Postgres => {
                     SqlRuntime::execute(
-                        datastore.read_exec(),
+                        datastore.write_exec(),
                         "UPDATE active_jobs
                          SET output_dir = COALESCE({}, output_dir),
                              post_processing_outcome = COALESCE({}, post_processing_outcome),
@@ -1167,7 +1175,7 @@ impl Database {
                 SqlEngine::Postgres => {
                     let started = std::time::Instant::now();
                     let result = SqlRuntime::execute(
-                        datastore.read_exec(),
+                        datastore.write_exec(),
                         "WITH active_file_complete_active AS (
                              SELECT 1
                              FROM active_jobs
@@ -1209,6 +1217,10 @@ impl Database {
     // single-file path (an absent `active_jobs` row inserts nothing). Postgres
     // runs one autocommit `FOR KEY SHARE`-guarded multi-row upsert per chunk;
     // SQLite guards once inside a transaction then bulk-upserts in chunks.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: a batch on the transaction run_in_transaction opened under the gate; Postgres has no writer gate"
+    )]
     pub fn complete_files(
         &self,
         job_id: JobId,
@@ -1283,7 +1295,7 @@ impl Database {
                                 md5.map(|_| provenance.as_sql().to_string()),
                             ));
                         }
-                        SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
+                        SqlRuntime::execute(datastore.write_exec(), &sql, &args).await?;
                     }
                     crate::runtime::perf_probe::record_sql_op(
                         "postgres",
@@ -1384,7 +1396,7 @@ impl Database {
                 SqlEngine::Postgres => {
                     let started = std::time::Instant::now();
                     let result = SqlRuntime::execute(
-                        datastore.read_exec(),
+                        datastore.write_exec(),
                         "WITH active_file_identity_parent AS (
                             SELECT 1 FROM active_jobs WHERE job_id = {} FOR KEY SHARE
                          ),
@@ -1573,7 +1585,7 @@ mod tests {
         let value = value.to_string();
         db.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE active_jobs SET password = {} WHERE job_id = {}",
                 &[SqlArg::Text(value), SqlArg::I64(id.0 as i64)],
             )

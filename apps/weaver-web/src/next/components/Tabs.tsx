@@ -3,6 +3,7 @@
 
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
+import { testIds } from "@/next/testids";
 
 export interface TabDefinition<T extends string> {
   id: T;
@@ -30,6 +31,7 @@ export function Tabs<T extends string>({
   right,
   center,
   className,
+  testId,
 }: {
   tabs: readonly TabDefinition<T>[];
   active: T;
@@ -37,6 +39,8 @@ export function Tabs<T extends string>({
   right?: ReactNode;
   center?: ReactNode;
   className?: string;
+  /** Names each tab `<testId>-tab-<id>` and its count `<testId>-count-<id>`. */
+  testId?: string;
 }) {
   return (
     <div
@@ -54,6 +58,7 @@ export function Tabs<T extends string>({
             <button
               key={tab.id}
               type="button"
+              data-testid={testId === undefined ? undefined : testIds.tab(testId, tab.id)}
               onClick={() => onSelect(tab.id)}
               aria-pressed={isActive}
               className={cn(
@@ -65,7 +70,10 @@ export function Tabs<T extends string>({
             >
               {tab.label}
               {tab.count === undefined ? null : (
-                <span className="ml-[6px] font-wv-mono text-[11.5px] font-normal text-wv-faint">
+                <span
+                  data-testid={testId === undefined ? undefined : testIds.tabCount(testId, tab.id)}
+                  className="ml-[6px] font-wv-mono text-[11.5px] font-normal text-wv-faint"
+                >
                   {tab.count}
                 </span>
               )}

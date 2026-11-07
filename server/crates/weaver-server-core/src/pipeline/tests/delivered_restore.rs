@@ -100,7 +100,18 @@ pub(in crate::pipeline) async fn restart_and_restore(
     intermediate_dir: &std::path::Path,
     job_id: JobId,
 ) -> Pipeline {
-    let (mut restored, _, _) = new_direct_pipeline(temp).await;
+    let (restored, _, _) = new_direct_pipeline(temp).await;
+    restore_into(restored, temp, intermediate_dir, job_id).await
+}
+
+// Restores the job into `restored`, opened on the same directories, as
+// startup does.
+async fn restore_into(
+    mut restored: Pipeline,
+    temp: &tempfile::TempDir,
+    intermediate_dir: &std::path::Path,
+    job_id: JobId,
+) -> Pipeline {
     let startup = crate::operations::recovery::recover_server_state(
         &restored.db,
         &temp.path().join("data"),
@@ -267,6 +278,149 @@ async fn restart_mid_copy_replaces_the_truncated_entry_with_its_source() {
         tokio::fs::read(destination.join("sidecar.nfo"))
             .await
             .unwrap(),
+        b"sidecar"
+    );
+}
+
+// A pipeline whose complete directory lies inside its intermediate one, as
+// an operator may configure it.
+async fn new_nested_pipeline(temp: &tempfile::TempDir) -> (Pipeline, PathBuf, PathBuf) {
+    let intermediate_dir = temp.path().join("intermediate");
+    new_direct_pipeline_at_roots(
+        temp.path().join("data"),
+        intermediate_dir.clone(),
+        intermediate_dir.join("complete"),
+        temp.path().join("weaver.db"),
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        0,
+        None,
+    )
+    .await
+}
+
+// Moves the first file into the destination and stops the move there, as a
+// restart part way through it would.
+fn stop_after_the_first_file(intermediate_dir: &std::path::Path, destination: &std::path::Path) {
+    let first_moved = destination.join("payload.bin");
+    let intermediate = intermediate_dir.to_path_buf();
+    *crate::pipeline::completion::finalize::BEFORE_FIRST_MOVE
+        .lock()
+        .unwrap() = Some(Box::new(move |job_id| {
+        let working_dir = crate::jobs::working_dir::find_job_working_dir(&intermediate, job_id)
+            .unwrap()
+            .unwrap();
+        std::fs::rename(working_dir.join("payload.bin"), &first_moved).unwrap();
+    }));
+}
+
+// The complete directory lies inside the intermediate one, so the moving
+// row's destination does too. A restart part way through the move resumes
+// into that one destination: the job is not split across it and a second,
+// suffixed folder beside it.
+#[tokio::test]
+async fn restart_mid_move_into_a_nested_complete_dir_keeps_one_destination() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, complete_dir) = new_nested_pipeline(&temp).await;
+    assert!(complete_dir.starts_with(&intermediate_dir));
+    let job_id = JobId(10305);
+    let job_name = "Slate Harbour Nested";
+    let payload = b"delivered payload".to_vec();
+    let destination = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(job_name));
+    stop_after_the_first_file(&intermediate_dir, &destination);
+    let (working_dir, done) =
+        move_without_hearing_it(&mut pipeline, job_id, job_name, &payload).await;
+    assert!(done.result.is_err());
+    assert!(working_dir.join("sidecar.nfo").exists());
+    assert!(destination.join("payload.bin").exists());
+    pipeline.db.flush_write_queue().await.unwrap();
+    let row = pipeline.db.load_active_job(job_id).unwrap().unwrap();
+    assert_eq!(row.output_dir, destination);
+    retire_pipeline_database(pipeline).await;
+
+    let (restored, _, _) = new_nested_pipeline(&temp).await;
+    let mut restored = restore_into(restored, &temp, &intermediate_dir, job_id).await;
+    assert!(restored.inflight_moves.contains(&job_id));
+    settle_inflight_moves(&mut restored).await;
+    finished_once(&mut restored, job_id, &complete_dir).await;
+    assert!(!working_dir.exists());
+    assert_eq!(
+        tokio::fs::read(destination.join("payload.bin"))
+            .await
+            .unwrap(),
+        payload
+    );
+    assert_eq!(
+        tokio::fs::read(destination.join("sidecar.nfo"))
+            .await
+            .unwrap(),
+        b"sidecar"
+    );
+}
+
+// A moving row that names the job's own working directory, not a
+// destination, as one written before the destination was recorded would:
+// the resumed move claims a destination and delivers everything into it.
+#[tokio::test]
+async fn restart_with_a_row_naming_the_working_dir_claims_the_destination() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp).await;
+    let job_id = JobId(10306);
+    let job_name = "Slate Harbour Unclaimed";
+    let payload = b"delivered payload".to_vec();
+    let destination = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(job_name));
+    stop_after_the_first_file(&intermediate_dir, &destination);
+    let (working_dir, done) =
+        move_without_hearing_it(&mut pipeline, job_id, job_name, &payload).await;
+    assert!(done.result.is_err());
+    // Nothing was delivered and no destination recorded: the first file is
+    // back in the working directory, and the row names that directory.
+    std::fs::rename(
+        destination.join("payload.bin"),
+        working_dir.join("payload.bin"),
+    )
+    .unwrap();
+    std::fs::remove_dir(&destination).unwrap();
+    pipeline.db.flush_write_queue().await.unwrap();
+    let db = pipeline.db.clone();
+    let named = working_dir.clone();
+    tokio::task::spawn_blocking(move || db.update_active_job_output_dir(job_id, &named))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pipeline
+            .db
+            .load_active_job(job_id)
+            .unwrap()
+            .unwrap()
+            .output_dir,
+        working_dir
+    );
+    retire_pipeline_database(pipeline).await;
+
+    let mut restored = restart_and_restore(&temp, &intermediate_dir, job_id).await;
+    assert!(restored.inflight_moves.contains(&job_id));
+    settle_inflight_moves(&mut restored).await;
+    finished_once(&mut restored, job_id, &complete_dir).await;
+    assert!(!working_dir.exists());
+    // The destination claimed now, the one folder under the complete
+    // directory, holds every file.
+    let claimed = std::fs::read_dir(&complete_dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    assert_eq!(
+        tokio::fs::read(claimed.join("payload.bin")).await.unwrap(),
+        payload
+    );
+    assert_eq!(
+        tokio::fs::read(claimed.join("sidecar.nfo")).await.unwrap(),
         b"sidecar"
     );
 }

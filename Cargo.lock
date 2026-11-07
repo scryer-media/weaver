@@ -904,6 +904,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bzip2-turbo"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f542fbec5f6cd891cb388b7e45670b56624a5e207ad507d830e64956aaf64a0"
+dependencies = [
+ "crc-turbo",
+]
+
+[[package]]
 name = "cap-fs-ext"
 version = "4.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4575,13 +4584,13 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.29.3"
+version = "0.29.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47e78cf4c24e122389175a1f0570faf86fce2c786fec113f4617e3ebf97b2789"
+checksum = "d874c46bb2ea4a1921628682fc80e3875dae43e13517172312781f8250e9a4db"
 dependencies = [
  "aws-lc-rs",
  "brotli",
- "bzip2",
+ "bzip2-turbo",
  "cap-std",
  "flate2",
  "getrandom 0.4.3",
@@ -5773,9 +5782,9 @@ dependencies = [
 
 [[package]]
 name = "unrar-rs"
-version = "0.15.1"
+version = "0.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a57e3e98ad891f5435f6f62cdfe42ba15c0fa8b8bd2a183b18a2ce174508a749"
+checksum = "b2208aebc13beba1e0b75f24d982f6e10053c7ba5df20436d988ece072899cdc"
 dependencies = [
  "aws-lc-rs",
  "blake2s_simd",
@@ -5996,7 +6005,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.16.10"
+version = "0.16.11"
 dependencies = [
  "aho-corasick",
  "application-updater",
@@ -6058,7 +6067,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-graph"
-version = "0.16.10"
+version = "0.16.11"
 dependencies = [
  "bytes",
  "crc-turbo",
@@ -6071,14 +6080,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.16.10"
+version = "0.16.11"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.16.10"
+version = "0.16.11"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6107,7 +6116,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.16.10"
+version = "0.16.11"
 dependencies = [
  "blake3",
  "html-escape 0.3.0",
@@ -6121,7 +6130,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-objects"
-version = "0.16.10"
+version = "0.16.11"
 dependencies = [
  "aws-lc-rs",
  "brotli",
@@ -6146,7 +6155,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.16.10"
+version = "0.16.11"
 dependencies = [
  "async-graphql",
  "async-stream",
@@ -6177,7 +6186,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.16.10"
+version = "0.16.11"
 dependencies = [
  "aes-gcm",
  "application-updater",
@@ -6254,7 +6263,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-tunnel"
-version = "0.16.10"
+version = "0.16.11"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6277,7 +6286,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.16.10"
+version = "0.16.11"
 dependencies = [
  "cc",
  "crc-turbo",

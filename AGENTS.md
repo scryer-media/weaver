@@ -53,3 +53,9 @@ A test must give the same result on a slow, loaded, or shared CI runner as on a 
 - Tie every wait to the specific item under test, using its ID, sequence number, or a watermark taken before the action. Earlier or unrelated activity must not be able to satisfy the wait.
 - Do not put deadlines or timeouts in tests, and never assert an upper bound on elapsed time. The test runner bounds every test instead: `.config/nextest.toml` flags a test after a minute and ends it after an hour, so a missed condition fails the run instead of hanging it. That limit is set far above any real run so a loaded runner cannot fail a test; it only catches a hang.
 - Never fix a flaky test by raising a timeout, adding a sleep, or adding a retry. Find and remove the race. If the product exposes nothing observable to wait on, report that gap instead of working around it.
+
+## Playwright e2e specs
+
+- Before writing or changing anything under `e2e/playwright-weaver` (a spec, a fixture, a support helper, or a locator), read `.agents/skills/e2e-playwright/SKILL.md` and follow it.
+- It is binding, not advice: durable ids instead of copy or CSS, waits tied to the item under test, no sleeps or timeouts, isolated fixtures, and assertions on product behavior. It restates the test determinism rules above for the browser.
+- The selector audit (`npm run audit:selector-quality`, part of `npm run audit`) enforces the locator rules. Fix the spec; never widen the audit to let a spec through.

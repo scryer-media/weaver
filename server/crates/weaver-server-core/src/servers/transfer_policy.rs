@@ -1113,7 +1113,7 @@ mod tests {
         let datastore = db.datastore();
         db.run_sql_blocking(async move {
             crate::persistence::sql_runtime::SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "DROP TABLE server_download_usage",
                 &[],
             )

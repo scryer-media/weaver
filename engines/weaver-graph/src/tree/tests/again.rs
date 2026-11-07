@@ -17,6 +17,8 @@ type Log = Arc<Mutex<Vec<Heard>>>;
 enum Heard {
     Bytes(u64, Vec<u8>, Provenance),
     Unposted(ByteRange),
+    // Set in the log before the store is built: it forgets its tail.
+    Tail,
 }
 
 // A pretend store whose one member is its volume, each byte flipped so the
@@ -27,6 +29,13 @@ struct Trial {
     log: Log,
     given: Vec<Option<u8>>,
     asked: bool,
+    // Asks for its first twenty bytes once more when its front comes the
+    // second time, inside the replay of the first request.
+    nest: bool,
+    fronts: u32,
+    // Forgetting a range forgets everything given after it, as a cipher's
+    // keys after a range come from it.
+    tail: bool,
 }
 
 impl Trial {
@@ -38,6 +47,19 @@ impl Trial {
 impl Object for Trial {
     fn unposted(&mut self, _: VolumeIndex, range: ByteRange) {
         self.hear(Heard::Unposted(range));
+    }
+
+    fn uncovers(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        out: &mut Vec<(VolumeIndex, ByteRange)>,
+    ) {
+        out.push((volume, range));
+        let given = self.given.len() as u64;
+        if self.tail && range.end < given {
+            out.push((volume, ByteRange::new(range.end, given)));
+        }
     }
 
     fn kind(&self) -> Kind {
@@ -74,6 +96,15 @@ impl Object for Trial {
             bytes: delivery.bytes.iter().map(|byte| byte ^ 0x20).collect(),
             provenance: delivery.provenance,
         });
+        if self.nest && delivery.offset == 0 {
+            self.fronts += 1;
+            if self.fronts == 2 {
+                out.push(Emit::Again {
+                    volume: delivery.volume,
+                    range: ByteRange::new(0, 20),
+                });
+            }
+        }
         if !self.asked && delivery.bytes.windows(5).any(|window| window == b"CHECK") {
             self.asked = true;
             out.push(Emit::MemberClosed(MemberId(0)));
@@ -117,7 +148,7 @@ impl Object for Trial {
     }
 }
 
-struct Trials(Log);
+struct Trials(Log, bool);
 
 impl Builder for Trials {
     fn build(&mut self, kind: Kind, _: ObjectId) -> Option<Box<dyn Object>> {
@@ -126,6 +157,9 @@ impl Builder for Trials {
                 log: Arc::clone(&self.0),
                 given: Vec::new(),
                 asked: false,
+                nest: self.1,
+                fronts: 0,
+                tail: self.0.lock().expect("log").contains(&Heard::Tail),
             }) as Box<dyn Object>
         })
     }
@@ -176,7 +210,7 @@ fn answer(tree: &mut Tree, builder: &mut Trials, effects: &mut Vec<Effect>) {
 #[test]
 fn a_range_asked_for_again_is_delivered_again_as_it_was_posted() {
     let log = Log::default();
-    let mut builder = Trials(Arc::clone(&log));
+    let mut builder = Trials(Arc::clone(&log), false);
     let mut tree = Tree::new();
     let mut effects = Vec::new();
     let show = tree.announce_root("show.rar", None, &mut effects);
@@ -237,7 +271,7 @@ fn a_range_asked_for_again_is_delivered_again_as_it_was_posted() {
 #[test]
 fn a_loss_beside_damaged_bytes_is_never_said_again_as_bytes() {
     let log = Log::default();
-    let mut builder = Trials(Arc::clone(&log));
+    let mut builder = Trials(Arc::clone(&log), false);
     let mut tree = Tree::new();
     let mut effects = Vec::new();
     let show = tree.announce_root("show.rar", None, &mut effects);
@@ -287,11 +321,13 @@ fn a_loss_beside_damaged_bytes_is_never_said_again_as_bytes() {
             "{held:?}"
         );
     }
-    let again = tree.again_read(child, &[(VolumeIndex(0), ByteRange::new(0, 24))], &builder);
-    let said: Vec<(u64, Vec<u8>, Provenance)> = again
-        .into_iter()
-        .map(|(_, posted)| (posted.offset, posted.bytes.to_vec(), posted.provenance))
-        .collect();
+    let mut said: Vec<(u64, Vec<u8>, Provenance)> = Vec::new();
+    tree.again_read(
+        child,
+        &[(VolumeIndex(0), ByteRange::new(0, 24))],
+        &builder,
+        &mut |_, posted| said.push((posted.offset, posted.bytes.to_vec(), posted.provenance)),
+    );
     assert_eq!(
         said,
         vec![
@@ -299,4 +335,245 @@ fn a_loss_beside_damaged_bytes_is_never_said_again_as_bytes() {
             (15, b"CHECK".to_vec(), Provenance::Damaged),
         ]
     );
+}
+
+// A member asked for again whole is read back a piece at a time, none
+// longer than `AGAIN_PIECE`, each piece handed on before the next is read,
+// and all of it uncovered only once every piece is read.
+#[test]
+fn a_large_range_asked_for_again_is_read_back_in_bounded_pieces() {
+    let log = Log::default();
+    let mut builder = Trials(Arc::clone(&log), false);
+    let mut tree = Tree::new();
+    let mut effects = Vec::new();
+    let show = tree.announce_root("show.rar", None, &mut effects);
+    let mut front = SIGNATURE.to_vec();
+    front.extend_from_slice(b"hello");
+    deliver(
+        &mut tree,
+        &mut builder,
+        show,
+        (0, &front, Provenance::Fresh),
+        &mut effects,
+    );
+    let child = tree.child_of(NodeId::ROOT, show).expect("bound").0;
+    let body = vec![0x71; (2 * AGAIN_PIECE + 13) as usize];
+    deliver(
+        &mut tree,
+        &mut builder,
+        show,
+        (front.len() as u64, &body, Provenance::Fresh),
+        &mut effects,
+    );
+    let length = (front.len() + body.len()) as u64;
+    let mut pieces = Vec::new();
+    tree.again_read(
+        child,
+        &[(VolumeIndex(0), ByteRange::new(0, length))],
+        &builder,
+        &mut |_, posted| {
+            let piece = ByteRange::at(posted.offset, posted.bytes.len() as u64);
+            pieces.push(piece);
+        },
+    );
+    assert!(
+        pieces.iter().all(|piece| piece.len() <= AGAIN_PIECE),
+        "{pieces:?}"
+    );
+    assert_eq!(pieces.first().map(|piece| piece.start), Some(0));
+    assert!(pieces.windows(2).all(|pair| pair[0].end == pair[1].start));
+    assert_eq!(pieces.last().map(|piece| piece.end), Some(length));
+    let record = tree
+        .namespace(child)
+        .and_then(|namespace| namespace.get(MemberId(0)))
+        .expect("member");
+    assert!(record.coverage.runs().next().is_none());
+}
+
+// An owner that applies each replayed piece's effects before the next piece
+// goes, a request raised inside a replay answered at once, as the
+// namespace writer answers them.
+fn answer_at_once(tree: &mut Tree, builder: &mut Trials, effects: Vec<Effect>) {
+    for effect in effects {
+        let Effect::Again { node, ranges } = effect else {
+            continue;
+        };
+        let mut staged = Vec::new();
+        let serial = tree.again_read(node, &ranges, builder, &mut |volume, posted| {
+            staged.push((volume, posted));
+        });
+        for (volume, posted) in staged {
+            let mut raised = Vec::new();
+            tree.replay_again(serial, node, volume, posted, builder, &mut raised);
+            answer_at_once(tree, builder, raised);
+        }
+        tree.again_done();
+    }
+}
+
+// A request raised while an earlier one is being said again reads back and
+// says again what the earlier one has yet to say: the earlier one does not
+// say those bytes a second time.
+#[test]
+fn a_replay_raised_inside_a_replay_is_said_once() {
+    let log = Log::default();
+    let mut builder = Trials(Arc::clone(&log), true);
+    let mut tree = Tree::new();
+    let mut effects = Vec::new();
+    let show = tree.announce_root("show.rar", None, &mut effects);
+    let mut front = SIGNATURE.to_vec();
+    front.extend_from_slice(b"hello");
+    deliver(
+        &mut tree,
+        &mut builder,
+        show,
+        (0, &front, Provenance::Fresh),
+        &mut effects,
+    );
+    effects.clear();
+    tree.deliver(
+        NodeId::ROOT,
+        show,
+        Posted {
+            offset: 15,
+            bytes: Bytes::from_static(b"CHECK").into(),
+            provenance: Provenance::Fresh,
+        },
+        &mut builder,
+        &mut effects,
+    );
+    answer_at_once(&mut tree, &mut builder, effects);
+    let heard = log.lock().expect("log").clone();
+    let checks = heard
+        .iter()
+        .filter(|heard| matches!(heard, Heard::Bytes(15, _, _)))
+        .count();
+    // Once as it came, and once by the request raised inside the first
+    // one's replay, which read it back before the first one said it.
+    assert_eq!(checks, 2, "{heard:?}");
+    let fronts = heard
+        .iter()
+        .filter(|heard| matches!(heard, Heard::Bytes(0, _, _)))
+        .count();
+    // As it came, by the first request, and by the one raised inside it.
+    assert_eq!(fronts, 3, "{heard:?}");
+}
+
+// A store whose bytes after a range come from it, bound below the root
+// with its front and a body delivered.
+fn tailed() -> (Tree, Trials, Log, MemberId, NodeId, Vec<u8>) {
+    let log = Log::default();
+    log.lock().expect("log").push(Heard::Tail);
+    let mut builder = Trials(Arc::clone(&log), false);
+    let mut tree = Tree::new();
+    let mut effects = Vec::new();
+    let show = tree.announce_root("show.rar", None, &mut effects);
+    let mut posted = SIGNATURE.to_vec();
+    posted.extend_from_slice(b"hello");
+    deliver(
+        &mut tree,
+        &mut builder,
+        show,
+        (0, &posted, Provenance::Fresh),
+        &mut effects,
+    );
+    let child = tree.child_of(NodeId::ROOT, show).expect("bound").0;
+    let body = b"the body after the front".to_vec();
+    deliver(
+        &mut tree,
+        &mut builder,
+        show,
+        (posted.len() as u64, &body, Provenance::Fresh),
+        &mut effects,
+    );
+    posted.extend_from_slice(&body);
+    log.lock().expect("log").clear();
+    (tree, builder, log, show, child, posted)
+}
+
+// An article uncovered at the root whose store's bytes after it come from
+// it: below, the store forgets the article and everything after it, and
+// its member is uncovered through its end, as the store forgot it.
+#[test]
+fn an_uncover_forgets_what_the_store_says_comes_from_it() {
+    let (mut tree, _, log, show, child, posted) = tailed();
+    let length = posted.len() as u64;
+    tree.uncover(NodeId::ROOT, VolumeIndex(show.0), ByteRange::new(5, 8));
+    let heard = log.lock().expect("log").clone();
+    assert_eq!(
+        heard,
+        vec![
+            Heard::Unposted(ByteRange::new(5, 8)),
+            Heard::Unposted(ByteRange::new(8, length)),
+        ]
+    );
+    let record = tree
+        .namespace(child)
+        .and_then(|namespace| namespace.get(MemberId(0)))
+        .expect("member");
+    assert!(record.coverage.covered(ByteRange::new(0, 5)));
+    assert!(
+        record
+            .coverage
+            .overlapping(ByteRange::new(5, length))
+            .next()
+            .is_none()
+    );
+    // The root holds what arrived of the volume apart from the article.
+    let root = tree
+        .namespace(NodeId::ROOT)
+        .and_then(|namespace| namespace.get(show))
+        .expect("volume");
+    assert!(root.coverage.covered(ByteRange::new(8, length)));
+}
+
+// Asked for a range again, a store whose bytes after it come from it has
+// them read back with it, and all of it uncovered.
+#[test]
+fn a_range_asked_for_again_reads_back_what_comes_from_it() {
+    let (mut tree, builder, _, _, child, posted) = tailed();
+    let length = posted.len() as u64;
+    let mut said = Vec::new();
+    tree.again_read(
+        child,
+        &[(VolumeIndex(0), ByteRange::new(5, 8))],
+        &builder,
+        &mut |_, posted| said.push((posted.offset, posted.bytes.to_vec())),
+    );
+    tree.again_done();
+    assert_eq!(said, vec![(5, posted[5..].to_vec())]);
+    let record = tree
+        .namespace(child)
+        .and_then(|namespace| namespace.get(MemberId(0)))
+        .expect("member");
+    assert!(
+        record
+            .coverage
+            .overlapping(ByteRange::new(5, length))
+            .next()
+            .is_none()
+    );
+}
+
+// Before a range is uncovered by bytes of the caller's own, the bytes after
+// it that come from it are read back alone, and nothing is uncovered yet.
+#[test]
+fn a_tail_is_read_back_before_its_range_is_uncovered() {
+    let (mut tree, builder, log, _, child, posted) = tailed();
+    let length = posted.len() as u64;
+    let mut said = Vec::new();
+    tree.again_tail(
+        child,
+        &[(VolumeIndex(0), ByteRange::new(5, 8))],
+        &builder,
+        &mut |_, posted| said.push((posted.offset, posted.bytes.to_vec())),
+    );
+    tree.again_done();
+    assert_eq!(said, vec![(8, posted[8..].to_vec())]);
+    assert!(log.lock().expect("log").is_empty());
+    let record = tree
+        .namespace(child)
+        .and_then(|namespace| namespace.get(MemberId(0)))
+        .expect("member");
+    assert!(record.coverage.covered(ByteRange::new(0, length)));
 }

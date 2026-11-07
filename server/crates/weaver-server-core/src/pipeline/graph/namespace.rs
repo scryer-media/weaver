@@ -230,9 +230,31 @@ pub(crate) struct NamespaceWriter {
     #[cfg(test)]
     diagnostics: Vec<weaver_graph::recovery::RepairDiagnostic>,
     placements: Vec<Placement>,
+    // Each held volume's object, volume and placement number when a pass
+    // last asked where its holds go: while the object says the same number,
+    // it places them as it did then, and nothing of them goes down.
+    asked: BTreeMap<(NodeId, VolumeIndex), (NodeId, VolumeIndex, u64)>,
     // Where the time a member write takes on disk is published, when the
     // job runs in a pipeline.
     metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
+}
+
+// A cipher's tail read back before the ranges that fed its keys are
+// uncovered: the node it is of, the read's serial, and its staged pieces
+// with each one's provenance.
+pub(crate) struct Tail {
+    node: NodeId,
+    serial: u64,
+    staged: loan::Repaired,
+    sources: Vec<Provenance>,
+}
+
+impl Tail {
+    // A tail not to be said: the step failed before it.
+    pub(crate) fn drop_read(self, tree: &mut Tree) {
+        tree.again_done();
+        let _ = self.staged.discard();
+    }
 }
 
 impl NamespaceWriter {
@@ -268,6 +290,7 @@ impl NamespaceWriter {
             #[cfg(test)]
             diagnostics: Vec::new(),
             placements: Vec::new(),
+            asked: BTreeMap::new(),
             metrics: None,
         }
     }
@@ -879,7 +902,7 @@ impl NamespaceWriter {
                 .holds
                 .take(held_volume(arrival.member), arrival.range());
         }
-        let held: Vec<(u64, Bytes)> = placements
+        let held: Vec<(u64, Evidenced)> = placements
             .iter()
             .filter_map(|placement| match placement {
                 Placement::Held { range } => range.intersect(arrival.range()),
@@ -888,7 +911,6 @@ impl NamespaceWriter {
             .map(|piece| {
                 let bytes = arrival
                     .bytes
-                    .bytes()
                     .slice(index(piece.start - arrival.offset)..index(piece.end - arrival.offset));
                 (piece.start, bytes)
             })
@@ -923,7 +945,7 @@ impl NamespaceWriter {
         {
             return Ok(());
         }
-        let held = vec![(range.start, Bytes::from(bytes))];
+        let held = vec![(range.start, Bytes::from(bytes).into())];
         self.hold_for(tree, builder, child, (node, member), held, effects)
     }
 
@@ -937,7 +959,7 @@ impl NamespaceWriter {
         builder: &mut dyn Builder,
         child: NodeId,
         (node, member): (NodeId, MemberId),
-        held: Vec<(u64, Bytes)>,
+        held: Vec<(u64, Evidenced)>,
         effects: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let mut breached = Vec::new();
@@ -956,7 +978,7 @@ impl NamespaceWriter {
             effects,
         );
         for (offset, bytes) in breached {
-            self.write_file(tree, node, member, offset, &bytes.into())?;
+            self.write_file(tree, node, member, offset, &bytes)?;
         }
         Ok(())
     }
@@ -1196,23 +1218,140 @@ impl NamespaceWriter {
             // Every effect before it is applied, so what the object reads
             // back of its members is on disk. Each run's effects are
             // applied before the next run goes, as each delivery's are.
+            // What it reads back is staged on disk a piece at a time, and
+            // read from there a piece at a time as it is said again.
             Effect::Again { node, ranges } => {
-                let runs = tree.again_read(*node, ranges, &self.placing(builder));
-                for (volume, posted) in runs {
-                    let mut effects = Vec::new();
-                    tree.replay_piece(
-                        *node,
-                        volume,
-                        posted,
-                        &mut self.placing(builder),
-                        &mut effects,
-                    );
-                    self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
-                }
+                let mut staged = loan::Repaired::again(&self.working_dir, *node)?;
+                let mut sources = Vec::new();
+                let serial = tree.again_read(
+                    *node,
+                    ranges,
+                    &self.placing(builder),
+                    &mut |volume, posted| {
+                        staged.write(MemberId(volume.0), posted.offset, &posted.bytes);
+                        sources.push(posted.provenance);
+                    },
+                );
+                let replayed = match staged.failed() {
+                    Some(error) => Err(WriteError::from(error)),
+                    None => self.again_staged(
+                        tree,
+                        builder,
+                        segments,
+                        (serial, *node),
+                        &staged,
+                        sources,
+                        out,
+                    ),
+                };
+                tree.again_done();
+                let removed = staged.discard();
+                replayed?;
+                removed?;
             }
         }
         out.push(effect);
         Ok(())
+    }
+
+    // Each staged piece of an `Effect::Again`, said again in the order it
+    // was read, its effects applied before the next piece goes.
+    #[allow(clippy::too_many_arguments)]
+    fn again_staged(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        (serial, node): (u64, NodeId),
+        staged: &loan::Repaired,
+        sources: Vec<Provenance>,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        // One slice per staged piece: no piece is longer than a slice.
+        const _: () = assert!(weaver_graph::AGAIN_PIECE <= READ_BACK);
+        for ((volume, offset, bytes), provenance) in staged.slices().zip(sources) {
+            let posted = Posted {
+                offset,
+                bytes: bytes?.into(),
+                provenance,
+            };
+            let mut effects = Vec::new();
+            tree.replay_again(
+                serial,
+                node,
+                VolumeIndex(volume.0),
+                posted,
+                &mut self.placing(builder),
+                &mut effects,
+            );
+            self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
+        }
+        Ok(())
+    }
+
+    // What uncovering ranges of a node's volume forgets past them, a
+    // cipher's tail made under keys they fed, read back while those keys
+    // still stand and staged on disk, to be said again by `say_tail` once
+    // the ranges are uncovered.
+    pub(crate) fn read_tail(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        node: NodeId,
+        ranges: &[(VolumeIndex, ByteRange)],
+    ) -> Result<Tail, WriteError> {
+        let mut staged = loan::Repaired::again(&self.working_dir, node)?;
+        let mut sources = Vec::new();
+        let serial = tree.again_tail(
+            node,
+            ranges,
+            &self.placing(builder),
+            &mut |volume, posted| {
+                staged.write(MemberId(volume.0), posted.offset, &posted.bytes);
+                sources.push(posted.provenance);
+            },
+        );
+        if let Some(error) = staged.failed() {
+            tree.again_done();
+            let _ = staged.discard();
+            return Err(error.into());
+        }
+        Ok(Tail {
+            node,
+            serial,
+            staged,
+            sources,
+        })
+    }
+
+    // A tail `read_tail` staged, said again in the order it was read.
+    pub(crate) fn say_tail(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        tail: Tail,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let Tail {
+            node,
+            serial,
+            staged,
+            sources,
+        } = tail;
+        let said = self.again_staged(
+            tree,
+            builder,
+            segments,
+            (serial, node),
+            &staged,
+            sources,
+            out,
+        );
+        tree.again_done();
+        let removed = staged.discard();
+        said?;
+        Ok(removed?)
     }
 
     // A member its object gave back is a leaf, and its file is what the
@@ -1372,7 +1511,7 @@ impl NamespaceWriter {
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let (node, member) = (arrival.node, arrival.member);
-        if self.keep_held(node, member, arrival.offset, arrival.bytes.bytes().clone())? {
+        if self.keep_held(node, member, arrival.offset, arrival.bytes.clone())? {
             if let Some(owner) = self.settle(tree, builder, segments, node, member, out)? {
                 let mut effects = Vec::new();
                 self.capture(tree, builder, owner, &arrival, &mut effects)?;
@@ -1397,7 +1536,7 @@ impl NamespaceWriter {
         node: NodeId,
         member: MemberId,
         offset: u64,
-        bytes: Bytes,
+        bytes: Evidenced,
     ) -> Result<bool, WriteError> {
         let free_disk = self.free_disk_bytes();
         let outcome =
@@ -1443,7 +1582,7 @@ impl NamespaceWriter {
         member: MemberId,
     ) -> Result<(), WriteError> {
         for (offset, bytes) in self.take_held(node, member, ALL)? {
-            self.write_file(tree, node, member, offset, &bytes.into())?;
+            self.write_file(tree, node, member, offset, &bytes)?;
         }
         Ok(())
     }
@@ -1469,14 +1608,11 @@ impl NamespaceWriter {
         said: Option<&Coverage>,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
-        let held: Vec<ByteRange> = self
+        let held = self
             .files
             .get(&node)
-            .map(|files| files.holds.held_ranges(held_volume(member)))
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|hold| hold.intersect(range))
-            .collect();
+            .map(|files| files.holds.held_in(held_volume(member), range))
+            .unwrap_or_default();
         for hold in held {
             for piece in self.take_held(node, member, hold)? {
                 self.replay_piece(tree, builder, segments, (node, member), piece, said, out)?;
@@ -1493,7 +1629,7 @@ impl NamespaceWriter {
         builder: &mut dyn Builder,
         segments: &dyn Segments,
         (node, member): (NodeId, MemberId),
-        (offset, bytes): (u64, Bytes),
+        (offset, bytes): (u64, Evidenced),
         said: Option<&Coverage>,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
@@ -1518,10 +1654,10 @@ impl NamespaceWriter {
                 node,
                 member,
                 offset: piece.start,
-                bytes: bytes.slice(start..end).into(),
+                bytes: bytes.slice(start..end),
                 provenance,
             };
-            self.route_as_brought(tree, builder, segments, arrival, out)?;
+            self.route_held_as_brought(tree, builder, segments, arrival, out)?;
         }
         Ok(())
     }
@@ -1585,12 +1721,40 @@ impl NamespaceWriter {
                 let Some((child, volume)) = tree.child_of(parent, member) else {
                     continue;
                 };
-                let held = self
-                    .files
-                    .get(&parent)
-                    .map(|files| files.holds.held_ranges(held))
-                    .unwrap_or_default();
-                for range in held {
+                let ranges = |writer: &Self| {
+                    writer
+                        .files
+                        .get(&parent)
+                        .map(|files| files.holds.held_ranges(held))
+                        .unwrap_or_default()
+                };
+                // Asked already, of an object whose map has not moved since:
+                // every hold was held by that same map, at the last pass or
+                // as it came.
+                let placement = tree.placement(child);
+                let unmoved = placement.is_some()
+                    && self.asked.get(&(parent, held)).copied()
+                        == placement.map(|number| (child, volume, number));
+                if unmoved {
+                    #[cfg(test)]
+                    for range in &ranges(self) {
+                        placements.clear();
+                        tree.locate(child, volume, *range, &mut placements);
+                        assert!(
+                            placements
+                                .iter()
+                                .all(|placement| matches!(placement, Placement::Held { .. })),
+                            "a hold the unmoved map places: {range:?}"
+                        );
+                    }
+                    continue;
+                }
+                if let Some(number) = placement {
+                    self.asked.insert((parent, held), (child, volume, number));
+                }
+                for range in ranges(self) {
+                    #[cfg(test)]
+                    tests::RELEASE_LOCATED.with(|located| located.set(located.get() + 1));
                     placements.clear();
                     tree.locate(child, volume, range, &mut placements);
                     if placements
@@ -1613,7 +1777,7 @@ impl NamespaceWriter {
         node: NodeId,
         member: MemberId,
         range: ByteRange,
-    ) -> Result<Vec<(u64, Bytes)>, WriteError> {
+    ) -> Result<Vec<(u64, Evidenced)>, WriteError> {
         let Some(files) = self.files.get_mut(&node) else {
             return Ok(Vec::new());
         };
@@ -1628,7 +1792,7 @@ impl NamespaceWriter {
                     Bytes::from(buffer)
                 }
             };
-            held.push((piece.range.start, bytes));
+            held.push((piece.range.start, Evidenced::with(bytes, piece.evidence)));
         }
         Ok(held)
     }

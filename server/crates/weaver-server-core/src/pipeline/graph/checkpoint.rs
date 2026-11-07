@@ -4,20 +4,23 @@
 // A graph job's checkpoint: the tree's records, the root's facts, which
 // members have files, the kept envelopes, the holds paged to scratch and
 // which candidate each node was offered last, as the rows the database
-// keeps. It is taken after every step that reached the tree, when the step's
-// bytes are written, so it only ever describes bytes on disk; holds in
+// keeps. It is taken when a write of it is due, after a step that reached
+// the tree has written its bytes, so it only ever describes bytes on disk;
+// holds in
 // memory are left out and fetched again. A graceful stop pages every hold it
 // can to scratch first, so its last checkpoint leaves out only what scratch
 // could not take. The pipeline's parts that arrived and wait to be placed
 // are taken with it the same way: those spooled to the job's working
 // directory, never those still in memory.
 //
-// Each checkpoint is written as what it changed of the one before: a step
-// costs the database the rows it changed, not the job's. One writer per job:
+// Each checkpoint is written as what it changed of the one before: it
+// costs the database the rows the steps since changed, not the job's. One writer per job:
 // a change waiting for the database takes in the next one rather than
 // queueing behind it, so a slow database costs writes, never order. Changes
 // wait for 256 MiB of dirty coverage or five seconds, whichever
-// comes first. A crash loses at most that last five seconds or 256 MiB of
+// comes first, and a step takes no checkpoint until then: the steps of
+// those five seconds are read once, when the write is due, or at once when
+// a move waits on a commit. A crash loses at most that last five seconds or 256 MiB of
 // coverage while the database keeps up; a restore refetches it, as 0.16.5's
 // direct-store barrier did. Database stalls can extend that window. Delaying
 // a change does not make it claim unwritten bytes: each step wrote its bytes
@@ -28,7 +31,7 @@
 // key, the objects' facts carry key tuples and salts but never a key, and a
 // node's password is the index of its candidate, never the candidate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -118,6 +121,13 @@ impl Touched {
         files: true,
         kept: true,
     };
+
+    fn merge(&mut self, other: Self) {
+        self.own |= other.own;
+        self.members |= other.members;
+        self.files |= other.files;
+        self.kept |= other.kept;
+    }
 }
 
 // What the writer holds of one member.
@@ -165,6 +175,15 @@ impl Drop for Writer {
         {
             timer.abort();
         }
+        if let Some(due) = self
+            .slot
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .due
+            .take()
+        {
+            due.abort();
+        }
     }
 }
 
@@ -187,6 +206,11 @@ struct Slot {
     dirty_bytes: u64,
     enqueued: bool,
     timer: Option<tokio::task::JoinHandle<()>>,
+    // When the first step since the last checkpoint ran, while none has
+    // been taken of it, and the wake that mails the job's actor to take
+    // one once it is due.
+    stepped: Option<tokio::time::Instant>,
+    due: Option<tokio::task::JoinHandle<()>>,
     tally: Tally,
     // The stamp of the last checkpoint that changed anything. A write
     // takes the stamp with the change, and once it has committed every
@@ -200,6 +224,19 @@ struct Slot {
     // Who to tell once a stamp has committed, or a write has failed, while
     // a member's file waits on it to move.
     owed: Option<Owed>,
+    #[cfg(test)]
+    named: Named,
+}
+
+// The articles on disk that a checkpoint names, as a restore after a crash
+// would find them: at the last checkpoint that changed anything, at the
+// last one a write took, and at the last one a write committed.
+#[cfg(test)]
+#[derive(Default)]
+struct Named {
+    put: std::collections::BTreeSet<(u32, u32)>,
+    taken: std::collections::BTreeSet<(u32, u32)>,
+    committed: std::collections::BTreeSet<(u32, u32)>,
 }
 
 // The word a move waits on, and where to send it.
@@ -277,7 +314,7 @@ impl HeldNode {
             let now = node
                 .and_then(|node| job.own_record(node))
                 .map_or_else(GraphCheckpoint::default, |(record, password)| {
-                    own_rows(&record, password.map(|index| index as i64))
+                    own_rows(record, password.map(|index| index as i64))
                 });
             delta.compare(&self.own, &now);
             self.own = now;
@@ -333,13 +370,28 @@ impl HeldNode {
             let now = job
                 .member(node, member)
                 .map_or_else(GraphCheckpoint::default, |(record, coverage, state)| {
-                    member_rows(id, &record, &coverage, state)
+                    member_rows(id, record, coverage, state)
                 });
-            let was = self.members.remove(&key).unwrap_or_default();
-            *dirty_bytes = dirty_bytes.saturating_add(added_coverage(&was.coverage, &now.coverage));
-            delta.compare(&was, &now);
-            if now != GraphCheckpoint::default() {
-                self.members.insert(key, now);
+            let mut compare = |was: &GraphCheckpoint| {
+                *dirty_bytes =
+                    dirty_bytes.saturating_add(added_coverage(&was.coverage, &now.coverage));
+                delta.compare(was, &now);
+            };
+            match self.members.entry(key) {
+                Entry::Occupied(mut entry) => {
+                    compare(entry.get());
+                    if now == GraphCheckpoint::default() {
+                        entry.remove();
+                    } else {
+                        entry.insert(now);
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    compare(&GraphCheckpoint::default());
+                    if now != GraphCheckpoint::default() {
+                        entry.insert(now);
+                    }
+                }
             }
         }
     }
@@ -439,6 +491,12 @@ impl Pending {
     ) -> bool {
         let mut slot = self.slot();
         let slot = &mut *slot;
+        // The steps since the last checkpoint are in this one: their change
+        // is as old as the first of them.
+        let since = slot.stepped.take();
+        if let Some(due) = slot.due.take() {
+            due.abort();
+        }
         let mut delta = Delta {
             whole: slot.held.is_none(),
             ..Delta::default()
@@ -458,11 +516,10 @@ impl Pending {
             held.root = Some(root);
         }
         let whole = held.read.is_none();
-        let mut touched: BTreeMap<i64, Touched> = job
-            .touched_since(held.read.unwrap_or_default())
-            .into_iter()
-            .map(|(node, touched)| (i64::from(node.0), touched))
-            .collect();
+        let mut touched: BTreeMap<i64, Touched> = BTreeMap::new();
+        job.visit_touched_since(held.read.unwrap_or_default(), |node, changed| {
+            touched.entry(i64::from(node.0)).or_default().merge(changed);
+        });
         if whole {
             // Rows a restore read: every node and every member is read again.
             touched.extend(held.nodes.keys().map(|node| (*node, Touched::ALL)));
@@ -472,15 +529,28 @@ impl Pending {
         }
         held.read = Some(job.generations());
         for (key, touched) in touched {
-            let mut entry = held.nodes.remove(&key).unwrap_or_default();
-            if whole {
-                entry.members_at = None;
-            }
             // An id no tree could have names a node the job does not have.
             let node = u32::try_from(key).ok().map(NodeId);
-            entry.step(job, node, touched, &mut delta, &mut slot.dirty_bytes);
-            if !entry.is_empty() {
-                held.nodes.insert(key, entry);
+            let mut step = |entry: &mut HeldNode| {
+                if whole {
+                    entry.members_at = None;
+                }
+                entry.step(job, node, touched, &mut delta, &mut slot.dirty_bytes);
+            };
+            match held.nodes.entry(key) {
+                Entry::Occupied(mut entry) => {
+                    step(entry.get_mut());
+                    if entry.get().is_empty() {
+                        entry.remove();
+                    }
+                }
+                Entry::Vacant(entry) => {
+                    let mut now = HeldNode::default();
+                    step(&mut now);
+                    if !now.is_empty() {
+                        entry.insert(now);
+                    }
+                }
             }
         }
         #[cfg(test)]
@@ -517,8 +587,13 @@ impl Pending {
         if delta.is_empty() {
             return false;
         }
+        #[cfg(test)]
+        {
+            slot.named.put = job.on_disk();
+        }
         slot.asked += 1;
-        slot.oldest.get_or_insert_with(tokio::time::Instant::now);
+        slot.oldest
+            .get_or_insert_with(|| since.unwrap_or_else(tokio::time::Instant::now));
         match &mut slot.queued {
             Some(queued) => {
                 queued.absorb(delta);
@@ -542,7 +617,78 @@ impl Pending {
         if let Some(timer) = slot.timer.take() {
             timer.abort();
         }
+        #[cfg(test)]
+        {
+            slot.named.taken = slot.named.put.clone();
+        }
         (slot.queued.take(), slot.asked)
+    }
+
+    // The articles on disk the database names once the writes queued for
+    // it run, as a restore after a crash now finds them: a change queued
+    // with no write to take it dies with the process.
+    #[cfg(test)]
+    pub(crate) fn named(&self) -> std::collections::BTreeSet<(u32, u32)> {
+        let slot = self.slot();
+        if slot.enqueued {
+            slot.named.put.clone()
+        } else {
+            slot.named.taken.clone()
+        }
+    }
+
+    // The job came back from the database's rows, on disk as `job` stands
+    // now: every checkpoint so far names that.
+    #[cfg(test)]
+    pub(crate) fn restored(&self, job: &GraphJob) {
+        let on_disk = job.on_disk();
+        let mut slot = self.slot();
+        slot.named = Named {
+            put: on_disk.clone(),
+            taken: on_disk.clone(),
+            committed: on_disk,
+        };
+    }
+
+    // Whether a step ran that no checkpoint has read.
+    fn unread_steps(&self) -> bool {
+        self.slot().stepped.is_some()
+    }
+
+    // A step wrote `bytes` of the job's coverage.
+    pub(in crate::pipeline) fn delivered(&self, bytes: u64) {
+        let mut slot = self.slot();
+        slot.dirty_bytes = slot.dirty_bytes.saturating_add(bytes);
+    }
+
+    // A step reached the job: whether its checkpoint is due now, as the
+    // write it joins would be. The first checkpoint is, and so is one after
+    // the database's rows were lost. Otherwise the run mail hears once the
+    // first step not yet taken is CHECKPOINT_AGE old.
+    fn stepped(&self, job_id: JobId, mail: &UnboundedSender<Said>) -> bool {
+        let mut slot = self.slot();
+        let first = *slot.stepped.get_or_insert_with(tokio::time::Instant::now);
+        let due = slot.held.is_none()
+            || slot.dirty_bytes >= CHECKPOINT_BYTES
+            || first.elapsed() >= CHECKPOINT_AGE
+            || slot
+                .oldest
+                .is_some_and(|oldest| oldest.elapsed() >= CHECKPOINT_AGE);
+        if !due && slot.due.is_none() {
+            let mail = mail.clone();
+            let control = slot.control.clone();
+            slot.due = Some(tokio::spawn(async move {
+                tokio::time::sleep_until(first + CHECKPOINT_AGE).await;
+                // A pipeline that has gone takes no checkpoint.
+                let _ = mail.send(Said {
+                    scope: job_id.0,
+                    node: NodeId::ROOT,
+                    generation: 0,
+                    heard: Heard::CheckpointDue { control },
+                });
+            }));
+        }
+        due
     }
 
     // The stamp of the last checkpoint that changed anything.
@@ -585,6 +731,10 @@ impl Pending {
         if slot.lost {
             return;
         }
+        #[cfg(test)]
+        {
+            slot.named.committed = slot.named.taken.clone();
+        }
         slot.committed = slot.committed.max(stamp);
         let committed = slot.committed;
         if slot
@@ -610,6 +760,10 @@ impl Pending {
         slot.enqueued = false;
         if let Some(timer) = slot.timer.take() {
             timer.abort();
+        }
+        #[cfg(test)]
+        {
+            slot.named.taken = slot.named.committed.clone();
         }
         slot.lost = true;
         if let Some(owed) = slot.owed.take() {
@@ -820,7 +974,55 @@ impl Pipeline {
         }
     }
 
-    pub(in crate::pipeline) fn flush_graph_checkpoint(&self, job_id: JobId) {
+    // A step reached the job and wrote its bytes. Its checkpoint is taken
+    // once the write it joins is due, or at once while a move waits on a
+    // commit; until then nothing is read of the job.
+    pub(in crate::pipeline) fn step_graph_checkpoint(&mut self, job_id: JobId) {
+        let Some(graph) = self.graph_jobs.get(&job_id) else {
+            return;
+        };
+        let pending = graph.pending();
+        if pending.control().cancelled() {
+            return;
+        }
+        if graph.awaits_commit() || pending.stepped(job_id, &self.graph_runs.written()) {
+            self.checkpoint_graph_job(job_id);
+        }
+    }
+
+    // Take the checkpoint of the steps no checkpoint has read yet, if any.
+    pub(in crate::pipeline) fn take_stepped_graph_checkpoint(&mut self, job_id: JobId) {
+        if self
+            .graph_jobs
+            .get(&job_id)
+            .is_some_and(|graph| graph.pending().unread_steps())
+        {
+            self.checkpoint_graph_job(job_id);
+        }
+    }
+
+    // The wake a step armed: its checkpoint is due. One of a graph the job
+    // no longer has, or of a writer cancelled since, takes nothing.
+    pub(in crate::pipeline) fn graph_checkpoint_due(
+        &mut self,
+        job_id: JobId,
+        control: &CheckpointControl,
+    ) {
+        if self.job_failure_started(job_id)
+            || !self
+                .graph_jobs
+                .get(&job_id)
+                .is_some_and(|graph| graph.pending().control().same(control))
+        {
+            return;
+        }
+        self.checkpoint_graph_job(job_id);
+    }
+
+    // Queue the job's change for the database now, the steps not yet
+    // taken in it first.
+    pub(in crate::pipeline) fn flush_graph_checkpoint(&mut self, job_id: JobId) {
+        self.take_stepped_graph_checkpoint(job_id);
         if let Some(graph) = self.graph_jobs.get(&job_id) {
             graph
                 .pending()
@@ -1019,12 +1221,12 @@ fn root_parts(held: &mut BTreeMap<i64, Arc<[u8]>>, parts: Parts) -> Changes<Part
     out
 }
 
-fn part_rows(node: i64, parts: &[Part]) -> impl Iterator<Item = PartRow> + '_ {
-    parts.iter().map(move |part| PartRow {
+fn part_rows(node: i64, parts: Vec<Part>) -> impl Iterator<Item = PartRow> {
+    parts.into_iter().map(move |part| PartRow {
         node,
         // The key's bits, as the column's integer.
         part: part.key as i64,
-        bytes: Arc::clone(&part.bytes),
+        bytes: part.bytes,
     })
 }
 
@@ -1066,12 +1268,10 @@ fn job_rows(job: &GraphJob, node: NodeId) -> GraphCheckpoint {
 // nothing a step reads again shows here.
 #[cfg(test)]
 fn audit(job: &GraphJob, held: &Held) {
-    let nodes: std::collections::BTreeSet<i64> = job
-        .touched_since(Generations::default())
-        .into_keys()
-        .map(|node| i64::from(node.0))
-        .chain(held.nodes.keys().copied())
-        .collect();
+    let mut nodes: std::collections::BTreeSet<i64> = held.nodes.keys().copied().collect();
+    job.visit_touched_since(Generations::default(), |node, _| {
+        nodes.insert(i64::from(node.0));
+    });
     for key in nodes {
         let whole = u32::try_from(key)
             .map(NodeId)
@@ -1107,19 +1307,20 @@ fn hold_rows(node: NodeId, holds: &[ScratchHold]) -> Vec<HoldRow> {
 // A node's own rows, each table in key order: its own row and facts parts
 // when it holds an object, and its seeds. `password` is the candidate the
 // node was offered last.
-fn own_rows(node: &NodeRecord, password: Option<i64>) -> GraphCheckpoint {
+fn own_rows(node: NodeRecord, password: Option<i64>) -> GraphCheckpoint {
     let mut out = GraphCheckpoint::default();
     let id = i64::from(node.node.0);
-    if let (Some(kind), Some(facts)) = (node.kind, &node.facts) {
+    if let (Some(kind), Some(facts)) = (node.kind, node.facts) {
+        let parent_member = node.volumes.first().map(|(_, member)| i64::from(member.0));
         let volumes: Vec<(u32, u32)> = node
             .volumes
-            .iter()
+            .into_iter()
             .map(|(volume, member)| (volume.0, member.0))
             .collect();
         out.nodes.push(NodeRow {
             node: id,
             parent: node.parent.map(|parent| i64::from(parent.0)),
-            parent_member: node.volumes.first().map(|(_, member)| i64::from(member.0)),
+            parent_member,
             volumes: rmp_serde::to_vec(&volumes).ok(),
             window: node
                 .window
@@ -1128,17 +1329,18 @@ fn own_rows(node: &NodeRecord, password: Option<i64>) -> GraphCheckpoint {
             state: state_name(node.state).to_owned(),
             reason: node.reason.map(|why| why_name(why).to_owned()),
             facts_version: i64::from(facts.version),
-            facts: facts.bytes.clone(),
+            facts: facts.bytes,
             winning_password: password,
         });
-        out.parts.extend(part_rows(id, &facts.parts));
+        out.parts.extend(part_rows(id, facts.parts));
     }
-    out.crypt.extend(node.crypt.iter().map(|crypt| CryptRow {
-        node: id,
-        member: i64::from(crypt.member.0),
-        run_start: crypt.run_start,
-        seed: crypt.seed.to_vec(),
-    }));
+    out.crypt
+        .extend(node.crypt.into_iter().map(|crypt| CryptRow {
+            node: id,
+            member: i64::from(crypt.member.0),
+            run_start: crypt.run_start,
+            seed: crypt.seed.to_vec(),
+        }));
     out.crypt.sort_by_key(Row::key);
     out.parts.sort_by_key(Row::key);
     out
@@ -1148,27 +1350,30 @@ fn own_rows(node: &NodeRecord, password: Option<i64>) -> GraphCheckpoint {
 // what the writer holds of it.
 fn member_rows(
     node: i64,
-    member: &MemberRecord,
-    coverage: &[CoverageRecord],
+    member: MemberRecord,
+    coverage: Vec<CoverageRecord>,
     state: FileState,
 ) -> GraphCheckpoint {
     #[cfg(test)]
     MEMBER_ROWS_BUILT.with(|built| built.set(built.get() + 1));
     let mut out = GraphCheckpoint {
         members: vec![member_row(node, member, state)],
-        coverage: coverage.iter().map(|run| coverage_row(node, run)).collect(),
+        coverage: coverage
+            .into_iter()
+            .map(|run| coverage_row(node, &run))
+            .collect(),
         ..GraphCheckpoint::default()
     };
     out.coverage.sort_by_key(Row::key);
     out
 }
 
-fn member_row(node: i64, member: &MemberRecord, state: FileState) -> MemberRow {
+fn member_row(node: i64, member: MemberRecord, state: FileState) -> MemberRow {
     MemberRow {
         node,
         member: i64::from(member.member.0),
-        name: member.name.clone(),
-        output_name: member.output_name.clone(),
+        name: member.name,
+        output_name: member.output_name,
         crc32: member.crc32.map(i64::from),
         length: member.length.map(|length| length as i64),
         closed: member.closed,
@@ -1205,18 +1410,7 @@ fn node_rows(
     files: impl Fn(MemberId) -> FileState,
     password: Option<i64>,
 ) -> GraphCheckpoint {
-    let mut out = own_rows(node, password);
-    let id = i64::from(node.node.0);
-    out.members.extend(
-        node.members
-            .iter()
-            .map(|member| member_row(id, member, files(member.member))),
-    );
-    out.coverage
-        .extend(node.coverage.iter().map(|run| coverage_row(id, run)));
-    out.members.sort_by_key(Row::key);
-    out.coverage.sort_by_key(Row::key);
-    out
+    tests::borrowed_node_rows(node, files, password)
 }
 
 // The kept envelopes' rows, in key order.

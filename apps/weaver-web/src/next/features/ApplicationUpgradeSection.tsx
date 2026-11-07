@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 import { useApplicationUpgrade, RunProgress } from "@/next/features/updates/use-application-upgrade";
+import { upgradeFailureKey } from "@/next/features/updates/application-upgrade";
 import { useTranslate } from "@/lib/context/translate-context";
 import { SectionHeader } from "../components/chrome";
 import { PrimaryButton } from "../components/controls";
@@ -43,7 +44,7 @@ export function ApplicationUpgradeSection() {
 
       {!status.activeRun && run?.status === "FAILED" ? (
         <div role="alert" className={`${row} text-wv-error`}>
-          {t("applicationUpgrade.failed", { version: run.targetVersion, error: run.error ?? "" })}
+          {t(upgradeFailureKey(run.error), { version: run.targetVersion, error: run.error ?? "" })}
         </div>
       ) : null}
 

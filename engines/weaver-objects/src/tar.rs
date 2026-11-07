@@ -377,7 +377,11 @@ impl Object for Tar {
         // the next header, an extension's data.
         loop {
             let generation = self.kept.generation();
-            if self.kept.absorb(range, delivery.bytes, delivery.provenance) {
+            if self
+                .kept
+                .absorb(range, delivery.bytes, delivery.provenance)
+                .is_some()
+            {
                 self.rewind_if_changed(range, out);
             }
             self.walk(out);

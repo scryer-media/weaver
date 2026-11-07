@@ -82,6 +82,12 @@ pub(crate) enum Heard {
         revision: u64,
         error: String,
     },
+    // The job's steps since its last checkpoint are old enough that the
+    // write they join is due: the job's actor takes the checkpoint.
+    // Addressed to the root, under no run's generation.
+    CheckpointDue {
+        control: crate::persistence::checkpoint_write::CheckpointControl,
+    },
 }
 
 // Where every graph job's runs speak, and where the database says a
@@ -422,6 +428,7 @@ impl Runs {
             heard,
         };
         tokio::task::spawn_blocking(move || {
+            let _affinity = crate::runtime::affinity::PostprocessAffinity::enter();
             let _job = crate::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
             // Said as the run returns, and as a run that panics unwinds, so
             // a run always ends: its slot, its memory and a stopped job's

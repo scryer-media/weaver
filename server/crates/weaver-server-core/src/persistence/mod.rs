@@ -13,6 +13,9 @@ pub mod setup;
 pub(crate) mod sql_runtime;
 pub(crate) mod sql_services;
 pub(crate) mod sqlite_writer;
+pub(crate) mod wal_checkpoint;
+#[cfg(test)]
+pub(crate) mod write_guard_tests;
 
 pub use connection::Database;
 pub(crate) use connection::DatabaseWriterExecutor;

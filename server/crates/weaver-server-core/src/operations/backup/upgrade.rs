@@ -132,6 +132,10 @@ async fn read_settings(
     Ok(Some(rows.into_iter().collect()))
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: upgrade markers written before the database opens and the gate exists"
+)]
 async fn write_marker(
     target: &DatabaseTarget,
     key: &str,

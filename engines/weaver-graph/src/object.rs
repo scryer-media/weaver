@@ -381,6 +381,14 @@ pub trait Object: Send + Sync {
     // contiguous run, in volume order, together covering the whole range.
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>);
 
+    // A number that changes whenever anything `locate` reads may have
+    // changed: while it stands, `locate` answers every range as it did.
+    // No two objects share one. `None` for an object that keeps no such
+    // number, which is asked every time.
+    fn placement(&self) -> Option<u64> {
+        None
+    }
+
     // The forward map: where does this range of my member lie in my volumes?
     // The extents go into `out`; the answer says whether they are all of the
     // range, the part placed so far, or whether the range can never be
@@ -408,6 +416,19 @@ pub trait Object: Send + Sync {
     // could not read them back, and they will be posted again. I forget what
     // I said of them, so I say it again as they come.
     fn unposted(&mut self, volume: VolumeIndex, range: ByteRange);
+
+    // What forgetting this range of my volume forgets, in order: the range,
+    // and whatever I said that came from it and must be said again with
+    // it, a cipher's plaintext after it, made under keys it fed. The tree
+    // reads all of it back before it forgets any, and forgets all of it.
+    fn uncovers(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        out: &mut Vec<(VolumeIndex, ByteRange)>,
+    ) {
+        out.push((volume, range));
+    }
 
     // What `posted` answers for these ranges of my volumes, as I stand now,
     // owned and apart from me. An object that rebuilds its posted bytes

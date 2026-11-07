@@ -9,6 +9,7 @@ import {
   TEST_SCRIPT_INSTANCE_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+import { settingsIds, testIds } from "@/next/testids";
 import { Dialog } from "../../../components/Dialog";
 import { ScriptStatusMark, TruncatedTag } from "../../../components/JobScriptResults";
 import { SectionHeader, Square } from "../../../components/chrome";
@@ -230,6 +231,7 @@ export function ScriptTestDialog({ instance, onClose }: { instance: ScriptInstan
 
   return (
     <Dialog
+      testId={testIds.dialog("pp-test")}
       open
       title={t("next.postProcessing.testTitle", { name: instance.name })}
       note={instance.script}
@@ -242,11 +244,11 @@ export function ScriptTestDialog({ instance, onClose }: { instance: ScriptInstan
               {t("next.postProcessing.cancelTest")}
             </SecondaryButton>
           ) : (
-            <SecondaryButton icon="test" disabled={starting} onClick={() => void start()}>
+            <SecondaryButton icon="test" disabled={starting} onClick={() => void start()} testId={settingsIds.ppTestAgain}>
               {t("next.postProcessing.testAgain")}
             </SecondaryButton>
           )}
-          <SecondaryButton onClick={onClose}>{t("next.networking.close")}</SecondaryButton>
+          <SecondaryButton onClick={onClose} testId={settingsIds.ppTestClose}>{t("next.networking.close")}</SecondaryButton>
         </>
       }
     >
@@ -288,7 +290,11 @@ export function ScriptTestDialog({ instance, onClose }: { instance: ScriptInstan
           </section>
 
           {run.arguments.length > 0 ? (
-            <section aria-label={t("next.postProcessing.testArguments")} className="flex flex-none flex-col">
+            <section
+              aria-label={t("next.postProcessing.testArguments")}
+              data-testid={settingsIds.ppTestArguments}
+              className="flex flex-none flex-col"
+            >
               <SectionHeader label={t("next.postProcessing.testArguments")} count={run.arguments.length} sticky={false} />
               {run.arguments.map((argument, index) => (
                 <div key={index} className={`${LINE} text-wv-fg`}>
@@ -298,7 +304,11 @@ export function ScriptTestDialog({ instance, onClose }: { instance: ScriptInstan
             </section>
           ) : null}
 
-          <section aria-label={t("next.postProcessing.testLog")} className="flex flex-none flex-col">
+          <section
+            aria-label={t("next.postProcessing.testLog")}
+            data-testid={settingsIds.ppTestLog}
+            className="flex flex-none flex-col"
+          >
             <SectionHeader label={t("next.postProcessing.testLog")} sticky={false} />
             <div className={`${BAND} flex flex-col gap-2`}>
               {run.log ? (

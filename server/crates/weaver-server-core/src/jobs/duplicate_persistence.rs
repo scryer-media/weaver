@@ -254,7 +254,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE duplicate_job_snapshots
                  SET lifecycle = {}, updated_at = {}
                  WHERE job_id = {}",
@@ -589,7 +589,7 @@ impl Database {
         let now = epoch_seconds();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE semantic_duplicate_candidates
                  SET candidate_state = {}, terminal_cause = {}, promotion_state = {},
                      promotion_claimed_at = NULL, updated_at = {}
@@ -616,7 +616,7 @@ impl Database {
         let now = epoch_seconds();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE semantic_duplicate_candidates
                  SET candidate_state = {}, terminal_cause = NULL, promotion_state = {},
                      promotion_claimed_at = NULL, updated_at = {}
@@ -1050,7 +1050,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "INSERT INTO duplicate_backfill_state
                     (backfill_key, cursor_job_id, completed_at, updated_at)
                  VALUES ({}, {}, {}, {})

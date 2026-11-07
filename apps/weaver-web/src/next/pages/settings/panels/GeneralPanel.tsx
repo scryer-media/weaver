@@ -36,6 +36,7 @@ import {
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { SecondaryButton, Select, TextArea } from "../../../components/controls";
 import { SettingsBlocks, usePanelStatus, type FieldSpec, type SettingsBlock } from "../framework";
+import { settingsIds, testIds } from "../../../testids";
 
 /**
  * General: everything the daemon keeps in `GeneralSettings`, plus the
@@ -409,7 +410,6 @@ export function GeneralPanel() {
             {
               id: "maxRetries",
               label: t("next.general.retries"),
-              help: t("next.general.retriesHelp"),
               control: {
                 kind: "number",
                 value: values.maxRetries,
@@ -491,6 +491,7 @@ export function GeneralPanel() {
                   <div className="flex items-start justify-end gap-2">
                     {editingPasswords ? (
                       <TextArea
+                        testId={settingsIds.archivePasswordList}
                         label={t("next.archivePasswords.list")}
                         value={values.archivePasswords}
                         rows={3}
@@ -501,12 +502,12 @@ export function GeneralPanel() {
                         onBlur={() => commitPasswords(values.archivePasswords)}
                       />
                     ) : (
-                      <SecondaryButton icon="password" onClick={() => setEditingPasswords(true)}>
+                      <SecondaryButton icon="password" onClick={() => setEditingPasswords(true)} testId={settingsIds.archivePasswordEdit}>
                         {t("next.archivePasswords.edit")}
                       </SecondaryButton>
                     )}
                     {hasPasswords ? (
-                      <SecondaryButton icon="remove" onClick={() => setConfirmClear(true)}>
+                      <SecondaryButton icon="remove" onClick={() => setConfirmClear(true)} testId={settingsIds.archivePasswordClear}>
                         {t("next.common.clear")}
                       </SecondaryButton>
                     ) : null}
@@ -552,7 +553,6 @@ export function GeneralPanel() {
           kind: "section",
           id: "storage",
           title: t("next.general.storage"),
-          note: t("next.general.storageNote"),
           fields: [
             {
               id: "dataDir",
@@ -631,6 +631,7 @@ export function GeneralPanel() {
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
       <ConfirmDialog
         open={confirmClear}
+        testId={testIds.dialog("archive-passwords-clear")}
         title={t("next.archivePasswords.clearTitle")}
         body={t("next.archivePasswords.clearBody")}
         confirmLabel={t("next.common.clear")}
@@ -676,6 +677,7 @@ function PerformanceProfile({ settings }: { settings: HardwareProfileSettings })
   return (
     <div className="flex min-w-0 flex-col items-end gap-2">
       <Select
+        testId={testIds.field("hardwareProfile")}
         label={t("next.performance.profile")}
         options={saved.options.map((option) => {
           const Icon = { EFFICIENT: Leaf, BALANCED: Scale, PERFORMANCE: Rocket }[option.profile];
@@ -690,7 +692,7 @@ function PerformanceProfile({ settings }: { settings: HardwareProfileSettings })
         disabled={state.fetching}
       />
       {saved.selected === null ? (
-        <p className="text-[11.5px] text-wv-dim">{t("next.performance.notConfirmed")}</p>
+        <p data-testid={settingsIds.profileUnconfirmed} className="text-[11.5px] text-wv-dim">{t("next.performance.notConfirmed")}</p>
       ) : null}
       {scheduledNotice ? <p className="text-[11.5px] text-wv-dim">{scheduledNotice}</p> : null}
       {error ? (

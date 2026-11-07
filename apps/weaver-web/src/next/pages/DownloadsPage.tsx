@@ -18,6 +18,7 @@ import {
   SYSTEM_INFO_QUERY,
 } from "@/graphql/queries";
 import { formatJobReleaseName, type JobData } from "@/lib/job-types";
+import { cn } from "@/lib/utils";
 import { formatEtaFromRemainingBytes, useStableEtaSpeed } from "@/lib/hooks/use-stable-queue-eta";
 import { useTranslate } from "@/lib/context/translate-context";
 import { statusToken } from "@/lib/status-tokens";
@@ -31,6 +32,7 @@ import { Pagination } from "../components/Pagination";
 import { StorageMounts, type StorageVolume } from "../components/storage";
 import { Tabs } from "../components/Tabs";
 import { useNextData } from "../data/next-data";
+import { testIds } from "../testids";
 import { sameElements, sameEntries, sameItems, shallowEqual, useSettled } from "../data/settled";
 import {
   batchTarget,
@@ -120,8 +122,118 @@ function sortJobs(
   );
 }
 
+const PAUSE_FOR_OPTIONS: { seconds: number; label: string }[] = [
+  { seconds: 30 * 60, label: "next.downloads.pauseFor30m" },
+  { seconds: 60 * 60, label: "next.downloads.pauseFor1h" },
+  { seconds: 2 * 60 * 60, label: "next.downloads.pauseFor2h" },
+  { seconds: 8 * 60 * 60, label: "next.downloads.pauseFor8h" },
+];
+
+/** Pause all, split with a menu of timed pauses that resume on their own. */
+function PauseAllControl({ paused, resumeAt }: { paused: boolean; resumeAt: number | null }) {
+  const t = useTranslate();
+  const [, pauseAll] = useMutation(PAUSE_ALL_MUTATION);
+  const [, resumeAll] = useMutation(RESUME_ALL_MUTATION);
+  const [open, setOpen] = useState(false);
+
+  if (paused && resumeAt !== null) {
+    return <TimedResumeButton resumeAt={resumeAt} onResume={() => void resumeAll({})} />;
+  }
+  if (paused) {
+    return (
+      <button type="button" data-testid={testIds.queueResumeAll} onClick={() => void resumeAll({})} className={PAUSED_BUTTON}>
+        <Icon name="resume" size={14} className="-ml-[2px] mr-[7px] flex-none" />
+        {t("next.downloads.resumeAll")}
+      </button>
+    );
+  }
+
+  return (
+    <div className="relative flex">
+      <SecondaryButton icon="pause" onClick={() => void pauseAll({})} testId={testIds.queuePauseAll}>
+        {t("next.downloads.pauseAll")}
+      </SecondaryButton>
+      <button
+        type="button"
+        data-wv-menu-trigger=""
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={t("next.downloads.pauseForMenu")}
+        onClick={() => setOpen((previous) => !previous)}
+        className="-ml-px flex h-[34px] cursor-pointer items-center border border-wv-control bg-wv-button px-[9px] text-wv-fg hover:border-wv-control-hover hover:bg-wv-button-hover"
+      >
+        <Icon name="dropdown" size={14} />
+      </button>
+      <Menu
+        open={open}
+        onDismiss={() => setOpen(false)}
+        label={t("next.downloads.pauseForMenu")}
+        className="top-[38px] right-0 w-[164px]"
+      >
+        {PAUSE_FOR_OPTIONS.map((option) => (
+          <MenuItem
+            key={option.seconds}
+            onSelect={() => {
+              setOpen(false);
+              void pauseAll({ resumeAfterSecs: option.seconds });
+            }}
+          >
+            {t(option.label)}
+          </MenuItem>
+        ))}
+      </Menu>
+    </div>
+  );
+}
+
+/** A paused queue's resume button: warning yellow, with the ping the update notice uses. */
+const PAUSED_BUTTON =
+  "wv-ping flex h-[34px] cursor-pointer items-center whitespace-nowrap bg-wv-warn px-[14px] text-[13px] font-medium text-wv-on-warn [--wv-ping-color:var(--color-wv-warn)] hover:bg-wv-warn-hover";
+
+/** Whole minutes left as HH:MM, rounded up so it never reads 00:00 while still paused. */
+function formatResumeCountdown(msLeft: number): string {
+  const minutes = Math.max(0, Math.ceil(msLeft / 60_000));
+  return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+}
+
+/**
+ * A timed pause: the countdown to the automatic resume, which reads
+ * "Resume now" while hovered or focused. Both labels share one grid cell so
+ * the button keeps its width when the text swaps.
+ */
+function TimedResumeButton({ resumeAt, onResume }: { resumeAt: number; onResume: () => void }) {
+  const t = useTranslate();
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const countdown = t("next.downloads.resumingIn", { time: formatResumeCountdown(resumeAt - now) });
+  const resumeNow = t("next.downloads.resumeNow");
+
+  return (
+    <button
+      type="button"
+      data-testid={testIds.queueResumeTimed}
+      onClick={onResume}
+      aria-label={`${resumeNow} (${countdown})`}
+      className={cn("group", PAUSED_BUTTON)}
+    >
+      <Icon name="resume" size={14} className="-ml-[2px] mr-[7px] flex-none" />
+      <span className="grid">
+        <span className="col-start-1 row-start-1 tabular-nums group-hover:invisible group-focus-visible:invisible">
+          {countdown}
+        </span>
+        <span className="invisible col-start-1 row-start-1 group-hover:visible group-focus-visible:visible">
+          {resumeNow}
+        </span>
+      </span>
+    </button>
+  );
+}
+
 export function DownloadsPage() {
-  const { queue, categories: configured, speed, isPaused, downloadBlock } = useNextData();
+  const { queue, categories: configured, speed, isPaused, resumeAt, downloadBlock } = useNextData();
   const { inForce: speedLimit } = useSpeedLimitInForce();
   const statusLabel = useStatusLabel();
   const t = useTranslate();
@@ -158,8 +270,6 @@ export function DownloadsPage() {
 
   const client = useClient();
 
-  const [, pauseAll] = useMutation(PAUSE_ALL_MUTATION);
-  const [, resumeAll] = useMutation(RESUME_ALL_MUTATION);
   const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation<{ cancelJob: boolean }>(CANCEL_JOB_MUTATION);
@@ -538,14 +648,7 @@ export function DownloadsPage() {
             onChange={(next) => reset(() => setQuery(next))}
             className="w-[132px] sm:w-[224px]"
           />
-          <SecondaryButton
-            icon={isPaused ? "resume" : "pause"}
-            onClick={() => {
-              void (isPaused ? resumeAll({}) : pauseAll({}));
-            }}
-          >
-            {isPaused ? t("next.downloads.resumeAll") : t("next.downloads.pauseAll")}
-          </SecondaryButton>
+          <PauseAllControl paused={isPaused} resumeAt={resumeAt} />
           <SpeedLimitControl />
           <PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>{t("next.addNzb.title")}</PrimaryButton>
         </>
@@ -712,6 +815,7 @@ export function DownloadsPage() {
           ) : queue.summary.totalItems === 0 && jobs.length === 0 ? (
             <EmptyState
               centered
+              testId={testIds.queueEmpty}
               title={t("next.downloads.emptyTitle")}
               body={t("next.downloads.emptyBody")}
               action={<PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>{t("next.addNzb.title")}</PrimaryButton>}

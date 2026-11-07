@@ -13,6 +13,7 @@ import { PrimaryButton, SecondaryButton, TextField } from "../../components/cont
 import { SettingsPanelScope, SettingsShellProvider, type PanelFlags } from "./framework";
 import { findPanel, panelSearchTitle, SETTINGS_PANELS, settingsRail, type PanelDefinition } from "./panels";
 import { SearchRegistry, searchOutcome } from "./search";
+import { settingsIds } from "@/next/testids";
 
 const PANEL_SLUGS = SETTINGS_PANELS.map((entry) => entry.slug);
 
@@ -137,8 +138,8 @@ export function SettingsPage() {
     <NextShell
       title={panel ? t(panel.label) : t("nav.settings")}
       titleTag={panel?.tag === "beta" ? <BetaTag /> : undefined}
-      note={panel ? t(panel.note) : undefined}
-      railMiddle={<PanelListBlock eyebrow={t("nav.settings")} items={railItems} />}
+      note={panel?.note ? t(panel.note) : undefined}
+      railMiddle={<PanelListBlock eyebrow={t("nav.settings")} items={railItems} testId={settingsIds.nav} />}
       statusRight={<span className={statusTone}>{statusRight}</span>}
       controls={
         <>
@@ -150,6 +151,7 @@ export function SettingsPage() {
             the title does.
           */}
           <TextField
+            testId={settingsIds.search}
             label={t("next.settings.search")}
             placeholder={t("next.settings.search")}
             mono={false}
@@ -165,6 +167,7 @@ export function SettingsPage() {
           <div ref={setControlsHost} className="flex items-center gap-[10px] empty:hidden" />
           <SecondaryButton
             icon="revert"
+            testId={settingsIds.revert}
             disabled={!flags.dirty || flags.busy}
             onClick={() => actionsRef.current?.revert()}
           >
@@ -172,6 +175,7 @@ export function SettingsPage() {
           </SecondaryButton>
           <PrimaryButton
             icon="save"
+            testId={flags.busy ? settingsIds.saving : flags.dirty ? settingsIds.save : settingsIds.saved}
             disabled={!flags.dirty || flags.busy}
             onClick={() => actionsRef.current?.save()}
           >

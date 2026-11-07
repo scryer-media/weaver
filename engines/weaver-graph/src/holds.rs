@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
 
+use crate::evidence::{Evidence, Evidenced};
 use crate::tree::NodeId;
 use crate::volume::{ByteRange, VolumeIndex};
 
@@ -309,12 +310,18 @@ pub struct HoldOutcome {
 pub struct Taken {
     pub range: ByteRange,
     pub location: Location,
+    // The evidence the bytes were held with, at offsets into them.
+    pub evidence: Vec<Evidence>,
 }
 
 #[derive(Clone, Debug)]
 struct Hold {
     range: ByteRange,
     location: Location,
+    // The evidence the bytes came with, at offsets into the hold. It stays
+    // here when the bytes page out, so bytes read back from scratch go on
+    // as proven as bytes that stayed in RAM.
+    evidence: Vec<Evidence>,
     // When it was held. A piece cut from a hold keeps its age, so a split
     // never makes old bytes look new.
     age: u64,
@@ -337,6 +344,24 @@ impl Hold {
                 len: piece.len(),
             },
         }
+    }
+
+    // The evidence of `piece`, which lies inside this hold, at offsets into
+    // it: every piece the cut leaves whole. One the cut goes through is
+    // dropped, in RAM as on scratch, where no bytes are in hand to derive
+    // its parts from, so where the bytes live never changes what they
+    // carry.
+    fn evidence_of(&self, piece: ByteRange) -> Vec<Evidence> {
+        let skip = piece.start - self.range.start;
+        let inside = ByteRange::at(skip, piece.len());
+        self.evidence
+            .iter()
+            .filter(|evidence| inside.covers(evidence.range))
+            .map(|evidence| Evidence {
+                range: evidence.range.shift(-(skip as i64)),
+                digest: evidence.digest,
+            })
+            .collect()
     }
 
     // The location of a piece this hold keeps after a cut. RAM is copied out
@@ -416,7 +441,8 @@ impl HoldLedger {
             .unwrap_or_default()
     }
 
-    // Hold `bytes` of `volume` at `offset`, replacing any hold they overlap.
+    // Hold `bytes` of `volume` at `offset`, replacing any hold they overlap,
+    // with the evidence they came with.
     //
     // RAM first. When RAM is short, this namespace's oldest resident holds
     // page out one at a time until the new bytes fit: the oldest have waited
@@ -428,9 +454,12 @@ impl HoldLedger {
         &mut self,
         volume: VolumeIndex,
         offset: u64,
-        bytes: Bytes,
+        bytes: impl Into<Evidenced>,
         free_disk: u64,
     ) -> HoldOutcome {
+        let bytes: Evidenced = bytes.into();
+        let evidence = bytes.evidence().to_vec();
+        let bytes = bytes.into_bytes();
         let accountant = Arc::clone(&self.accountant);
         let len = byte_len(&bytes);
         let range = ByteRange::at(offset, len);
@@ -449,7 +478,7 @@ impl HoldLedger {
         if len <= accountant.resident_room_if_paged(self.namespace) {
             loop {
                 if accountant.reserve_resident(self.namespace, len) == Reserve::Granted {
-                    self.insert(volume, range, Location::Ram(bytes));
+                    self.insert(volume, range, Location::Ram(bytes), evidence);
                     return HoldOutcome {
                         placed: Placed::Ram,
                         page_outs,
@@ -482,6 +511,7 @@ impl HoldLedger {
                         offset: scratch_offset,
                         len,
                     },
+                    evidence,
                 );
                 page_outs.push(PageOut {
                     volume,
@@ -528,6 +558,7 @@ impl HoldLedger {
                         Some(Taken {
                             range: inside,
                             location: hold.slice(inside),
+                            evidence: hold.evidence_of(inside),
                         })
                     })
                     .collect()
@@ -556,6 +587,22 @@ impl HoldLedger {
             .get(&volume)
             .map(|holds| holds.values().map(|hold| hold.range).collect())
             .unwrap_or_default()
+    }
+
+    // The held ranges of `volume` inside `range`, clipped to it, in offset
+    // order: the hold before its start, then those that start inside it.
+    pub fn held_in(&self, volume: VolumeIndex, range: ByteRange) -> Vec<ByteRange> {
+        let Some(holds) = self.volumes.get(&volume) else {
+            return Vec::new();
+        };
+        let start = holds
+            .range(..=range.start)
+            .next_back()
+            .map_or(range.start, |(&start, _)| start);
+        holds
+            .range(start..range.end.max(start))
+            .filter_map(|(_, hold)| hold.range.intersect(range))
+            .collect()
     }
 
     // The first volume after `after` that holds anything, in volume order,
@@ -638,6 +685,9 @@ impl HoldLedger {
                     offset: held.scratch_offset,
                     len,
                 },
+                // A checkpoint records where the bytes are, not what proved
+                // them: they come back bare.
+                Vec::new(),
             );
             self.scratch_end = self.scratch_end.max(held.scratch_offset + len);
         }
@@ -650,7 +700,13 @@ impl HoldLedger {
         offset
     }
 
-    fn insert(&mut self, volume: VolumeIndex, range: ByteRange, location: Location) {
+    fn insert(
+        &mut self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        location: Location,
+        evidence: Vec<Evidence>,
+    ) {
         let age = self.next_age;
         self.next_age += 1;
         self.place(
@@ -658,6 +714,7 @@ impl HoldLedger {
             Hold {
                 range,
                 location,
+                evidence,
                 age,
             },
         );
@@ -728,11 +785,13 @@ impl HoldLedger {
             for piece in [left, right] {
                 if !piece.is_empty() {
                     let location = hold.keep(piece);
+                    let evidence = hold.evidence_of(piece);
                     self.place(
                         volume,
                         Hold {
                             range: piece,
                             location,
+                            evidence,
                             age: hold.age,
                         },
                     );
@@ -741,6 +800,7 @@ impl HoldLedger {
             taken.push(Taken {
                 range: inside,
                 location: hold.slice(inside),
+                evidence: hold.evidence_of(inside),
             });
         }
         if self.scratch == 0 {
@@ -771,6 +831,7 @@ impl HoldLedger {
                     offset: scratch_offset,
                     len,
                 },
+                evidence: hold.evidence,
                 age: hold.age,
             },
         );
@@ -828,6 +889,31 @@ mod tests {
     }
 
     #[test]
+    fn held_in_is_every_held_range_clipped_to_the_range() {
+        let accountant = Arc::new(HoldsAccountant::new(budgets(100)));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        for offset in [10, 20, 30, 50] {
+            ledger.hold(VolumeIndex(0), offset, bytes(1, 10), PLENTY);
+        }
+        for start in 0..70 {
+            for end in start..70 {
+                let range = ByteRange::new(start, end);
+                let clipped: Vec<ByteRange> = ledger
+                    .held_ranges(VolumeIndex(0))
+                    .into_iter()
+                    .filter_map(|hold| hold.intersect(range))
+                    .collect();
+                assert_eq!(ledger.held_in(VolumeIndex(0), range), clipped);
+            }
+        }
+        assert!(
+            ledger
+                .held_in(VolumeIndex(1), ByteRange::new(0, 100))
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn peek_clips_an_overlapping_predecessor_and_preserves_gaps_and_accounting() {
         for resident in [0, 100] {
             let accountant = Arc::new(HoldsAccountant::new(budgets(resident)));
@@ -849,11 +935,13 @@ mod tests {
                 vec![
                     Taken {
                         range: ByteRange::new(18, 20),
-                        location: location(1, 8, 2)
+                        location: location(1, 8, 2),
+                        evidence: Vec::new(),
                     },
                     Taken {
                         range: ByteRange::new(30, 35),
-                        location: location(2, 10, 5)
+                        location: location(2, 10, 5),
+                        evidence: Vec::new(),
                     },
                 ]
             );
@@ -861,7 +949,8 @@ mod tests {
                 ledger.peek(VolumeIndex(0), ByteRange::new(45, 55)),
                 vec![Taken {
                     range: ByteRange::new(50, 55),
-                    location: location(3, 20, 5)
+                    location: location(3, 20, 5),
+                    evidence: Vec::new(),
                 },]
             );
             for range in [
@@ -888,6 +977,41 @@ mod tests {
         }
     }
 
+    // Bytes keep the evidence they were held with, whether they stay in RAM
+    // or page out, and a piece cut from a hold keeps the evidence it leaves
+    // whole and no other, in RAM as on scratch.
+    #[test]
+    fn held_bytes_keep_their_evidence_in_ram_and_on_scratch_alike() {
+        use crate::evidence::{Digest, Evidence, Evidenced};
+        let evidence = |start, end, crc| Evidence {
+            range: ByteRange::new(start, end),
+            digest: Digest::crc32(crc),
+        };
+        let mut seen = Vec::new();
+        for resident in [100, 0] {
+            let accountant = Arc::new(HoldsAccountant::new(budgets(resident)));
+            let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+            let held = Evidenced::with(
+                bytes(4, 10),
+                [evidence(0, 4, 1), evidence(4, 8, 2), evidence(8, 10, 3)],
+            );
+            ledger.hold(VolumeIndex(0), 20, held, PLENTY);
+            let peeked = ledger.peek(VolumeIndex(0), ByteRange::new(20, 30));
+            assert_eq!(
+                peeked[0].evidence,
+                vec![evidence(0, 4, 1), evidence(4, 8, 2), evidence(8, 10, 3)]
+            );
+            let taken = ledger.take(VolumeIndex(0), ByteRange::new(26, 30));
+            assert_eq!(taken[0].evidence, vec![evidence(2, 4, 3)]);
+            let rest = ledger.take(VolumeIndex(0), ByteRange::new(0, 100));
+            assert_eq!(rest[0].range, ByteRange::new(20, 26));
+            assert_eq!(rest[0].evidence, vec![evidence(0, 4, 1)]);
+            seen.push((taken[0].evidence.clone(), rest[0].evidence.clone()));
+            assert_idle(&accountant);
+        }
+        assert_eq!(seen[0], seen[1], "RAM and scratch carry the same evidence");
+    }
+
     #[test]
     fn a_hold_that_fits_stays_in_ram_and_a_take_returns_it_and_zeroes_the_accountant() {
         let accountant = Arc::new(HoldsAccountant::new(budgets(100)));
@@ -907,6 +1031,7 @@ mod tests {
             vec![Taken {
                 range: ByteRange::new(10, 15),
                 location: Location::Ram(bytes(7, 5)),
+                evidence: Vec::new(),
             }]
         );
         assert_eq!(ledger.total_held(), 0);
@@ -1079,6 +1204,7 @@ mod tests {
             vec![Taken {
                 range: ByteRange::new(104, 106),
                 location: Location::Scratch { offset: 4, len: 2 },
+                evidence: Vec::new(),
             }]
         );
         assert_eq!(accountant.usage().scratch, 8);

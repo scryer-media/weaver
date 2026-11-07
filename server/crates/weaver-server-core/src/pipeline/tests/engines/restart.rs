@@ -320,6 +320,7 @@ async fn restart_heard(
     in_memory: &mut BTreeSet<(u32, u32)>,
     inspect: Inspect<'_>,
 ) -> (Pipeline, tokio::sync::broadcast::Receiver<PipelineEvent>) {
+    let mut pipeline = pipeline;
     // These restarts exercise a committed step. The coalescing tests cover
     // the coverage a crash loses before the writer's barrier is due.
     pipeline.flush_graph_checkpoint(JOB);
@@ -877,7 +878,8 @@ async fn a_job_with_no_checkpoint_is_admitted_afresh_at_restore() {
 
 // A restored graph job's durable download floor is what its checkpoints
 // settle. The graph writes the job's files and its checkpoint is the barrier,
-// so the floor moves with every checkpoint the restored job takes; a floor
+// so the floor moves with every checkpoint the restored job takes and with
+// the barrier that takes its steps at once; a floor
 // read off the file coverage barrier never moves past the restored one, and
 // the restart lead gate holds the job to one article at a time with nothing
 // to flush.
@@ -902,7 +904,8 @@ async fn a_restored_graph_job_advances_its_durable_floor_with_its_checkpoints() 
     assert!(restored > 0, "the fixture restores with a durable floor");
     assert_eq!(pipeline.durable_download_floor_bytes_for_job(JOB), restored);
 
-    // Three more articles, each checkpointed by the step that took it.
+    // Three more articles. A step snapshots only when a write is due, so
+    // the floor holds at the restored one until the barrier takes them.
     let mut served = 0u64;
     for _ in 0..3 {
         let work = next_work(&mut pipeline, &scenario).expect("the post has articles to come");
@@ -913,6 +916,8 @@ async fn a_restored_graph_job_advances_its_durable_floor_with_its_checkpoints() 
         );
         serve(&mut pipeline, &scenario, article).await;
     }
+    assert_eq!(pipeline.durable_download_floor_bytes_for_job(JOB), restored);
+    pipeline.advance_durable_download_floor(JOB);
     let floor = pipeline.durable_download_floor_bytes_for_job(JOB);
     assert_eq!(
         floor,
@@ -1633,6 +1638,12 @@ async fn change_checkpoint(pipeline: &Pipeline, sql: &'static str) {
                     .matches("{}")
                     .map(|_| crate::persistence::sql_runtime::SqlArg::I64(JOB.0 as i64))
                     .collect();
+                // SQLite checks a RENAME COLUMN against the schema this
+                // connection last read, and another connection of the pool
+                // may have renamed it since. Reading the schema first brings
+                // the connection up to date.
+                tx.execute("SELECT count(*) FROM sqlite_schema", &[])
+                    .await?;
                 tx.execute(sql, &args).await?;
                 Ok(())
             })

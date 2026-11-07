@@ -280,9 +280,65 @@ impl QueueWalk {
     }
 }
 
+/// Lowercases and turns the release-name separators `.`, `_` and `-` into
+/// single spaces, so `The_Office-S02` and `the office s02` read alike.
+fn normalize_search_text(text: &str) -> String {
+    let lowered = text.to_lowercase();
+    lowered
+        .split(|c: char| c.is_whitespace() || matches!(c, '.' | '_' | '-'))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A queue search: words in any order, every one required, each a
+/// LIKE-style pattern where `%` or `*` stands for any run of characters.
+/// `office s02` and `s02 office` both find `The.Office.S02E01`, and
+/// `office%1080` finds it too.
+struct SearchQuery {
+    /// Each word split at its wildcards; the pieces must appear in order.
+    words: Vec<Vec<String>>,
+}
+
+impl SearchQuery {
+    fn parse(search: &str) -> Option<Self> {
+        let words: Vec<Vec<String>> = normalize_search_text(search)
+            .split(' ')
+            .map(|word| {
+                word.split(['%', '*'])
+                    .filter(|piece| !piece.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|pieces| !pieces.is_empty())
+            .collect();
+        (!words.is_empty()).then_some(Self { words })
+    }
+
+    /// Whether every word matches at least one of the texts, which must
+    /// already be normalised.
+    fn matches_all(&self, texts: &[&str]) -> bool {
+        self.words
+            .iter()
+            .all(|pieces| texts.iter().any(|text| like_contains(text, pieces)))
+    }
+}
+
+/// SQL `LIKE '%a%b%'`: the pieces appear in `text` in order.
+fn like_contains(text: &str, pieces: &[String]) -> bool {
+    let mut rest = text;
+    for piece in pieces {
+        match rest.find(piece.as_str()) {
+            Some(at) => rest = &rest[at + piece.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
 /// Which rows a page or a batch keeps. One predicate serves both.
 pub(crate) struct QueueSelection<'a> {
-    search: Option<String>,
+    search: Option<SearchQuery>,
     states: Option<&'a [QueueItemState]>,
     priorities: Option<&'a [QueuePriority]>,
     categories: Option<&'a [String]>,
@@ -320,10 +376,7 @@ impl<'a> QueueSelection<'a> {
         categories: Option<&'a Vec<String>>,
     ) -> Self {
         Self {
-            search: search
-                .map(str::trim)
-                .filter(|search| !search.is_empty())
-                .map(str::to_lowercase),
+            search: search.and_then(SearchQuery::parse),
             states: non_empty(states),
             priorities: non_empty(priorities),
             categories: non_empty(categories),
@@ -353,21 +406,29 @@ impl<'a> QueueSelection<'a> {
         {
             return false;
         }
-        let Some(search) = self.search.as_deref() else {
+        let Some(search) = self.search.as_ref() else {
             return true;
         };
         let Some((name, original_title)) = row.titles.as_ref() else {
             return false;
         };
-        if name.to_lowercase().contains(search) {
+        let plain_name = normalize_search_text(name);
+        if search.matches_all(&[plain_name.as_str()]) {
             return true;
         }
         let display_title =
             weaver_server_core::ingest::derive_release_name(Some(original_title), Some(name));
-        queue_page_display_name(original_title, name, &display_title)
-            .to_lowercase()
-            .contains(search)
-            || display_title.to_lowercase().contains(search)
+        let display_name = normalize_search_text(&queue_page_display_name(
+            original_title,
+            name,
+            &display_title,
+        ));
+        let display_title = normalize_search_text(&display_title);
+        search.matches_all(&[
+            plain_name.as_str(),
+            display_name.as_str(),
+            display_title.as_str(),
+        ])
     }
 
     // Categories: the stage state counts are taken after.
@@ -816,6 +877,41 @@ mod tests {
     use super::*;
     use weaver_server_core::{DownloadState, JobStatus, PipelineMetrics, PostState, RunState};
 
+    fn search_finds(search: &str, name: &str) -> bool {
+        let query = SearchQuery::parse(search).expect("a non-empty search");
+        query.matches_all(&[normalize_search_text(name).as_str()])
+    }
+
+    #[test]
+    fn search_words_match_in_any_order_across_separators() {
+        let name = "The_Office-S02E01.1080p.WEB-DL";
+        for search in [
+            "office s02",
+            "s02 office",
+            "OFFICE",
+            "office.s02",
+            "office web dl",
+            "web-dl",
+            "the_office",
+        ] {
+            assert!(search_finds(search, name), "{search} missed");
+        }
+        for search in ["offce", "office s03", "office 720p"] {
+            assert!(!search_finds(search, name), "{search} matched");
+        }
+    }
+
+    #[test]
+    fn search_wildcards_follow_like() {
+        let name = "The.Office.S02E01.1080p.WEB-DL";
+        for search in ["office%1080", "office*1080", "s0%e01", "%web%", "the%dl"] {
+            assert!(search_finds(search, name), "{search} missed");
+        }
+        // The pieces of a pattern must appear in order.
+        assert!(!search_finds("1080%office", name));
+        assert!(SearchQuery::parse(" % * . _ ").is_none());
+    }
+
     fn job(id: u64, status: JobStatus, category: Option<&str>, total_bytes: u64) -> JobInfo {
         let (download_state, run_state, post_state) = match status {
             JobStatus::Downloading => (
@@ -960,8 +1056,9 @@ mod tests {
         let walk = QueueWalk::read(&state, selection.needs(input.sort_field));
         let plan = PagePlan::plan(&walk, &input, ROWS);
 
-        // "show 0001" finds ids 10..=19 through the display name.
-        let searched: Vec<u64> = (10..=19).collect();
+        // Each word matches anywhere in the name, as LIKE '%0001%' does:
+        // "show 0001" finds Show.00001 and Show.00010..=00019.
+        let searched: Vec<u64> = std::iter::once(1).chain(10..=19).collect();
         let in_category: Vec<u64> = searched.iter().copied().filter(|id| id % 3 != 1).collect();
         let mut expected: Vec<u64> = in_category
             .iter()

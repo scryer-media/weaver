@@ -5,34 +5,27 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Locator, Page } from "@playwright/test";
 import { expect, test } from "./helpers";
+import { operationResponse } from "./support/graphql-operations";
 import { introspectHardwareProfile } from "./support/runtime-introspection";
+import { byTestIdPrefix, choose, saveSettings, tableRow } from "./support/settings-locators";
+import { settingsIds, testIds } from "./support/testids";
 
 const afterRestart = process.env.E2E_WEAVER_UI_STAGE === "after-restart";
 const persistedCategory = "e2e-product-category-persisted";
 const persistedSchedule = "e2e-off-peak-persisted";
 
-/** A settings table row, found by the exact text of one of its cells. */
-function tableRow(page: Page, table: string, cellText: string): Locator {
-  return page
-    .getByRole("region", { name: table, exact: true })
-    .getByRole("button")
-    .filter({ has: page.getByText(cellText, { exact: true }) });
-}
+const field = testIds.field;
+const systemEgress = "System";
+const fixtureServer = "nntp";
 
-/** Commit a panel's draft through the settings top bar and wait for it to land. */
-async function saveSettings(page: Page) {
-  await page.getByRole("button", { name: "Save changes", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Saved", exact: true })).toBeDisabled();
+/** A schedule row in the group of its track. */
+function scheduleRow(page: Page, track: string, label: string): Locator {
+  return tableRow(page, "schedules", label, page.getByTestId(testIds.rowGroup("schedules", track)));
 }
 
 /** A General field saves itself: do `action` and wait for its own mutation to answer without errors. */
 async function savedBy(page: Page, mutation: string, action: () => Promise<void>) {
-  const saved = page.waitForResponse(
-    (response) =>
-      new URL(response.url()).pathname.endsWith("/graphql")
-      && response.request().method() === "POST"
-      && response.request().postData()?.includes(`mutation ${mutation}`) === true,
-  );
+  const saved = operationResponse(page, mutation);
   await action();
   const response = await saved;
   expect(response.ok()).toBeTruthy();
@@ -40,33 +33,34 @@ async function savedBy(page: Page, mutation: string, action: () => Promise<void>
   expect(payload.errors ?? [], JSON.stringify(payload.errors ?? [])).toEqual([]);
 }
 
-async function confirmRemoval(page: Page, label: string) {
-  const confirm = page.getByRole("dialog", { name: label, exact: true });
-  await confirm.getByRole("button", { name: label, exact: true }).click();
+async function confirmRemoval(page: Page, dialogId: string) {
+  const confirm = page.getByTestId(testIds.dialog(dialogId));
+  await confirm.getByTestId(testIds.confirmAccept).click();
   await expect(confirm).toBeHidden();
 }
 
 /** Open the System egress's editor from the egress table. */
 async function openSystemEgress(page: Page): Promise<Locator> {
   await page.goto("/settings/networking/egress");
-  await tableRow(page, "Egress interfaces", "System").click();
-  const editor = page.getByRole("dialog", { name: "System", exact: true });
+  await tableRow(page, "egress", systemEgress).click();
+  const editor = page.getByTestId(testIds.dialog("egress"));
+  await expect(editor).toContainText(systemEgress);
   await expect(editor).toBeVisible();
   return editor;
 }
 
 test("general SRRDB lookup, bandwidth ceiling and an egress download quota persist", async ({ cleanPage: page }) => {
   await page.goto("/settings/general");
-  const srrdbLookup = page.getByRole("switch", { name: "SRRDB release lookup", exact: true });
+  const srrdbLookup = page.getByTestId(field("srrdb"));
   await expect(srrdbLookup).toBeVisible();
   if (afterRestart) {
     await expect(srrdbLookup).toBeChecked();
     await page.goto("/settings/networking/egress");
-    await expect(page.getByRole("spinbutton", { name: "Download ceiling", exact: true })).toHaveValue("8");
+    await expect(page.getByTestId(field("maxDownloadSpeed"))).toHaveValue("8");
     const editor = await openSystemEgress(page);
-    await expect(editor.getByRole("switch", { name: "Enforce a download quota", exact: true })).toBeChecked();
-    await expect(editor.getByRole("spinbutton", { name: "Reset day of month", exact: true })).toHaveValue("17");
-    await editor.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(editor.getByTestId(field("quotaEnabled"))).toBeChecked();
+    await expect(editor.getByTestId(field("quotaMonthDay"))).toHaveValue("17");
+    await editor.getByTestId(testIds.editorCancel).click();
     await expect(editor).toBeHidden();
     return;
   }
@@ -74,12 +68,12 @@ test("general SRRDB lookup, bandwidth ceiling and an egress download quota persi
   await expect(srrdbLookup).not.toBeChecked();
   // The switch saves as it changes; the top bar has nothing to save.
   await savedBy(page, "UpdateSettings", () => srrdbLookup.click());
-  await expect(page.getByRole("button", { name: "Saved", exact: true })).toBeDisabled();
+  await expect(page.getByTestId(settingsIds.saved)).toBeDisabled();
   await page.reload();
   await expect(srrdbLookup).toBeChecked();
 
   await page.goto("/settings/networking/egress");
-  const ceiling = page.getByRole("spinbutton", { name: "Download ceiling", exact: true });
+  const ceiling = page.getByTestId(field("maxDownloadSpeed"));
   await ceiling.fill("8");
   await ceiling.press("Tab");
   await saveSettings(page);
@@ -88,27 +82,23 @@ test("general SRRDB lookup, bandwidth ceiling and an egress download quota persi
 
   // The data cap is a download quota on an egress.
   let editor = await openSystemEgress(page);
-  await editor.getByRole("switch", { name: "Enforce a download quota", exact: true }).click();
-  await editor.getByRole("button", { name: "Quota window", exact: true }).click();
-  await page
-    .getByRole("menu", { name: "Quota window", exact: true })
-    .getByRole("menuitemradio", { name: "Monthly", exact: true })
-    .click();
-  await editor.getByRole("textbox", { name: "Allowance", exact: true }).fill("500");
-  const monthlyDay = editor.getByRole("spinbutton", { name: "Reset day of month", exact: true });
+  await editor.getByTestId(field("quotaEnabled")).click();
+  await choose(page, editor, field("quotaPeriod"), "MONTHLY");
+  await editor.getByTestId(field("quotaLimit")).fill("500");
+  const monthlyDay = editor.getByTestId(field("quotaMonthDay"));
   // The day of month clamps to the calendar instead of refusing the draft.
   await monthlyDay.fill("32");
   await monthlyDay.press("Tab");
   await expect(monthlyDay).toHaveValue("31");
   await monthlyDay.fill("17");
   await monthlyDay.press("Tab");
-  await editor.getByRole("button", { name: "Save egress", exact: true }).click();
+  await editor.getByTestId(testIds.editorSave).click();
   await expect(editor).toBeHidden();
   await page.reload();
   editor = await openSystemEgress(page);
-  await expect(editor.getByRole("switch", { name: "Enforce a download quota", exact: true })).toBeChecked();
-  await expect(editor.getByRole("spinbutton", { name: "Reset day of month", exact: true })).toHaveValue("17");
-  await editor.getByRole("button", { name: "Cancel", exact: true }).click();
+  await expect(editor.getByTestId(field("quotaEnabled"))).toBeChecked();
+  await expect(editor.getByTestId(field("quotaMonthDay"))).toHaveValue("17");
+  await editor.getByTestId(testIds.editorCancel).click();
   await expect(editor).toBeHidden();
 });
 
@@ -116,8 +106,8 @@ test("the unacceptable extension list saves under General downloads, normalized"
   test.skip(afterRestart, "the list is put back before restart");
   await page.goto("/settings/general");
   const extensions = page
-    .getByRole("region", { name: "Downloads", exact: true })
-    .getByRole("textbox", { name: "Unacceptable extensions", exact: true });
+    .getByTestId(testIds.section("downloads"))
+    .getByTestId(field("unacceptableExtensions"));
   await expect(extensions).toBeVisible();
   const original = await extensions.inputValue();
   try {
@@ -140,12 +130,12 @@ test("the unacceptable extension list saves under General downloads, normalized"
 
 test("archive passwords and the password file save, clear and persist without echoing the list", async ({ cleanPage: page }) => {
   await page.goto("/settings/general");
-  const section = page.getByRole("region", { name: "Archive passwords", exact: true });
-  const list = section.getByRole("textbox", { name: "Passwords (one per line)", exact: true });
-  const file = section.getByRole("textbox", { name: "Password file", exact: true });
-  const clear = section.getByRole("button", { name: "Clear", exact: true });
+  const section = page.getByTestId(testIds.section("archivePasswords"));
+  const list = section.getByTestId(settingsIds.archivePasswordList);
+  const file = section.getByTestId(field("archivePasswordFile"));
+  const clear = section.getByTestId(settingsIds.archivePasswordClear);
   // The list stays behind Edit passwords until asked for, so a shared screen never shows it.
-  const edit = section.getByRole("button", { name: "Edit passwords", exact: true });
+  const edit = section.getByTestId(settingsIds.archivePasswordEdit);
   const passwordFile = "/data/e2e-archive-passwords.txt";
   if (afterRestart) {
     // The daemon reports only that a list is stored; the list never comes back.
@@ -168,11 +158,11 @@ test("archive passwords and the password file save, clear and persist without ec
   await expect(clear).toBeVisible();
   // A file picked through Browse is stored as it is picked.
   await file.click();
-  const picker = page.getByRole("dialog", { name: "Password file", exact: true });
+  const picker = page.getByTestId(testIds.dialog("picker"));
   await expect(picker).toBeVisible();
-  await picker.getByRole("button", { name: "e2e-archive-passwords.txt", exact: true }).click();
+  await picker.getByTestId(testIds.pickerEntry("e2e-archive-passwords.txt")).click();
   await savedBy(page, "UpdateArchivePasswordSettings", () =>
-    picker.getByRole("button", { name: "Use this file", exact: true }).click(),
+    picker.getByTestId(testIds.pickerUse).click(),
   );
   await expect(picker).toBeHidden();
   await expect(file).toHaveValue(passwordFile);
@@ -185,9 +175,9 @@ test("archive passwords and the password file save, clear and persist without ec
 
   // Clearing asks first, then removes the stored list and keeps the file.
   await clear.click();
-  const confirm = page.getByRole("dialog", { name: "Clear stored passwords", exact: true });
+  const confirm = page.getByTestId(testIds.dialog("archive-passwords-clear"));
   await savedBy(page, "UpdateArchivePasswordSettings", () =>
-    confirm.getByRole("button", { name: "Clear", exact: true }).click(),
+    confirm.getByTestId(testIds.confirmAccept).click(),
   );
   await expect(confirm).toHaveCount(0);
   await expect(clear).toHaveCount(0);
@@ -205,217 +195,222 @@ test("archive passwords and the password file save, clear and persist without ec
 
 test("provider edits keep the stored password masked and a disabled provider can be added and removed", async ({ cleanPage: page }) => {
   await page.goto("/settings/servers");
-  const serverRow = tableRow(page, "Servers", "nntp");
-  const editor = page.getByRole("dialog", { name: "nntp", exact: true });
+  const serverRow = tableRow(page, "servers", fixtureServer);
+  const editor = page.getByTestId(testIds.dialog("provider"));
   const expectMaskedPassword = async () => {
-    const password = editor.getByLabel("Password", { exact: true });
+    await expect(editor).toContainText(fixtureServer);
+    // The stored password never comes back: the field is empty and shows the mask.
+    const password = editor.getByTestId(field("password"));
     await expect(password).toHaveValue("");
     await expect(password).toHaveAttribute("placeholder", "••••••••");
-    await expect(editor.getByText("Leave blank to keep the stored password.", { exact: true })).toBeVisible();
   };
+  const connectionsCell = serverRow.getByTestId(settingsIds.providerConnections);
   if (afterRestart) {
-    await expect(serverRow.getByText("5", { exact: true })).toBeVisible();
+    await expect(connectionsCell).toHaveText("5");
     await serverRow.click();
     await expectMaskedPassword();
-    await expect(editor.getByRole("spinbutton", { name: "Connections", exact: true })).toHaveValue("5");
-    await editor.getByRole("button", { name: "Cancel", exact: true }).click();
+    await expect(editor.getByTestId(field("connections"))).toHaveValue("5");
+    await editor.getByTestId(testIds.editorCancel).click();
     await expect(editor).toBeHidden();
     return;
   }
 
   await serverRow.click();
   await expectMaskedPassword();
-  const connections = editor.getByRole("spinbutton", { name: "Connections", exact: true });
+  const connections = editor.getByTestId(field("connections"));
   await connections.fill("5");
   await connections.press("Tab");
-  await editor.getByRole("button", { name: "Save", exact: true }).click();
+  await editor.getByTestId(testIds.editorSave).click();
   await expect(editor).toBeHidden();
-  await expect(serverRow.getByText("5", { exact: true })).toBeVisible();
+  await expect(connectionsCell).toHaveText("5");
   await page.reload();
-  await expect(serverRow.getByText("5", { exact: true })).toBeVisible();
+  await expect(connectionsCell).toHaveText("5");
 
-  await page.getByRole("main").getByRole("button", { name: "Add provider", exact: true }).click();
-  const addForm = page.getByRole("dialog", { name: "Add provider", exact: true });
-  await addForm.getByRole("textbox", { name: "Host", exact: true }).fill("e2e-ui.invalid");
-  await addForm.getByRole("switch", { name: "TLS", exact: true }).click();
-  await expect(addForm.getByRole("spinbutton", { name: "Port", exact: true })).toHaveValue("119");
-  const addConnections = addForm.getByRole("spinbutton", { name: "Connections", exact: true });
+  await page.getByTestId(testIds.tableAdd("servers")).click();
+  const addForm = page.getByTestId(testIds.dialog("provider"));
+  await addForm.getByTestId(field("host")).fill("e2e-ui.invalid");
+  await addForm.getByTestId(field("tls")).click();
+  await expect(addForm.getByTestId(field("port"))).toHaveValue("119");
+  const addConnections = addForm.getByTestId(field("connections"));
   await addConnections.fill("1");
   await addConnections.press("Tab");
-  const enabled = addForm.getByRole("switch", { name: "Enabled", exact: true });
+  const enabled = addForm.getByTestId(field("active"));
   await expect(enabled).toBeChecked();
   await enabled.click();
-  await addForm.getByRole("button", { name: "Save", exact: true }).click();
+  await addForm.getByTestId(testIds.editorSave).click();
   await expect(addForm).toBeHidden();
 
-  const temporaryRow = tableRow(page, "Servers", "e2e-ui.invalid");
-  await expect(temporaryRow.getByRole("switch", { name: "e2e-ui.invalid enabled", exact: true })).not.toBeChecked();
-  await expect(temporaryRow.getByText("Plain", { exact: true })).toBeVisible();
+  const temporaryRow = tableRow(page, "servers", "e2e-ui.invalid");
+  await expect(temporaryRow.getByTestId(settingsIds.providerEnabled)).not.toBeChecked();
+  await expect(temporaryRow.getByTestId(settingsIds.providerTransport("plain"))).toBeVisible();
   await temporaryRow.click();
-  await page
-    .getByRole("dialog", { name: "e2e-ui.invalid", exact: true })
-    .getByRole("button", { name: "Remove provider", exact: true })
-    .click();
-  await confirmRemoval(page, "Remove provider");
+  await page.getByTestId(testIds.dialog("provider")).getByTestId(testIds.editorDelete).click();
+  await confirmRemoval(page, "provider-remove");
   await expect(temporaryRow).toHaveCount(0);
 });
 
 test("category create, edit, persistence, and delete are browser-owned", async ({ cleanPage: page }) => {
   await page.goto("/settings/categories");
   const removeCategory = async (name: string) => {
-    await tableRow(page, "Categories", name).click();
-    await page
-      .getByRole("dialog", { name, exact: true })
-      .getByRole("button", { name: "Remove category", exact: true })
-      .click();
-    await confirmRemoval(page, "Remove category");
-    await expect(tableRow(page, "Categories", name)).toHaveCount(0);
+    await tableRow(page, "categories", name).click();
+    const editor = page.getByTestId(testIds.dialog("category"));
+    await expect(editor).toContainText(name);
+    await editor.getByTestId(testIds.editorDelete).click();
+    await confirmRemoval(page, "category-remove");
+    await expect(tableRow(page, "categories", name)).toHaveCount(0);
   };
+  const persistedAliases = "persisted-*";
   if (afterRestart) {
-    await expect(tableRow(page, "Categories", persistedCategory).getByText("persisted-*", { exact: true })).toBeVisible();
+    await expect(tableRow(page, "categories", persistedCategory).getByText(persistedAliases, { exact: true })).toBeVisible();
     await removeCategory(persistedCategory);
     return;
   }
 
   const addCategory = async (name: string, aliases: string) => {
-    await page.getByRole("main").getByRole("button", { name: "Add category", exact: true }).click();
-    const form = page.getByRole("dialog", { name: "Add category", exact: true });
-    await form.getByRole("textbox", { name: "Name", exact: true }).fill(name);
-    await form.getByRole("textbox", { name: "Also known as", exact: true }).fill(aliases);
-    await form.getByRole("button", { name: "Save", exact: true }).click();
+    await page.getByTestId(testIds.tableAdd("categories")).click();
+    const form = page.getByTestId(testIds.dialog("category"));
+    await form.getByTestId(field("name")).fill(name);
+    await form.getByTestId(field("aliases")).fill(aliases);
+    await form.getByTestId(testIds.editorSave).click();
     await expect(form).toBeHidden();
-    await expect(tableRow(page, "Categories", name).getByText(aliases, { exact: true })).toBeVisible();
+    await expect(tableRow(page, "categories", name).getByText(aliases, { exact: true })).toBeVisible();
   };
 
-  await addCategory("e2e-product-category", "e2e-product-*");
+  const category = "e2e-product-category";
+  const edited = "e2e-product-category-edited";
+  await addCategory(category, "e2e-product-*");
   await page.reload();
-  await expect(tableRow(page, "Categories", "e2e-product-category")).toBeVisible();
-  await tableRow(page, "Categories", "e2e-product-category").click();
-  const form = page.getByRole("dialog", { name: "e2e-product-category", exact: true });
-  await form.getByRole("textbox", { name: "Name", exact: true }).fill("e2e-product-category-edited");
-  await form.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(tableRow(page, "categories", category)).toBeVisible();
+  await tableRow(page, "categories", category).click();
+  const form = page.getByTestId(testIds.dialog("category"));
+  await expect(form).toContainText(category);
+  await form.getByTestId(field("name")).fill(edited);
+  await form.getByTestId(testIds.editorSave).click();
   await expect(form).toBeHidden();
-  await expect(tableRow(page, "Categories", "e2e-product-category-edited")).toBeVisible();
-  await expect(tableRow(page, "Categories", "e2e-product-category")).toHaveCount(0);
+  await expect(tableRow(page, "categories", edited)).toBeVisible();
+  await expect(tableRow(page, "categories", category)).toHaveCount(0);
 
-  await removeCategory("e2e-product-category-edited");
-  await addCategory(persistedCategory, "persisted-*");
+  await removeCategory(edited);
+  await addCategory(persistedCategory, persistedAliases);
 });
 
 test("schedule rules support create, toggle, edit, and delete", async ({ cleanPage: page }) => {
   await page.goto("/settings/schedules");
   // The list heads only the groups that hold a rule, so the list itself is what loads.
-  await expect(page.getByRole("region", { name: "Schedules", exact: true })).toBeVisible();
+  await expect(page.getByTestId(testIds.section("schedules"))).toBeVisible();
   const removeSchedule = async (label: string) => {
-    await tableRow(page, "Downloads", label).click();
-    await page
-      .getByRole("dialog", { name: label, exact: true })
-      .getByRole("button", { name: "Remove schedule", exact: true })
-      .click();
-    await confirmRemoval(page, "Remove schedule");
-    await expect(tableRow(page, "Downloads", label)).toHaveCount(0);
+    await scheduleRow(page, "DOWNLOADS", label).click();
+    const editor = page.getByTestId(testIds.dialog("schedule"));
+    await expect(editor).toContainText(label);
+    await editor.getByTestId(testIds.editorDelete).click();
+    await confirmRemoval(page, "schedule-remove");
+    await expect(scheduleRow(page, "DOWNLOADS", label)).toHaveCount(0);
   };
   if (afterRestart) {
-    const persistedRule = tableRow(page, "Downloads", persistedSchedule);
-    await expect(persistedRule.getByRole("switch", { name: "04:30 schedule enabled", exact: true })).not.toBeChecked();
+    const persistedRule = scheduleRow(page, "DOWNLOADS", persistedSchedule);
+    await expect(persistedRule).toContainText("04:30");
+    await expect(persistedRule.getByTestId(settingsIds.scheduleEnabled)).not.toBeChecked();
     await removeSchedule(persistedSchedule);
     return;
   }
 
   const addSchedule = async (time: string, label: string) => {
-    await page.getByRole("main").getByRole("button", { name: "Add schedule", exact: true }).click();
-    const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
-    await form.getByLabel("Time", { exact: true }).fill(time);
-    await form.getByRole("textbox", { name: "Label", exact: true }).fill(label);
-    await form.getByRole("switch", { name: "Enabled", exact: true }).click();
-    await form.getByRole("button", { name: "Save", exact: true }).click();
+    await page.getByTestId(testIds.tableAdd("schedules")).click();
+    const form = page.getByTestId(testIds.dialog("schedule"));
+    await form.getByTestId(field("time")).fill(time);
+    await form.getByTestId(field("label")).fill(label);
+    await form.getByTestId(field("enabled")).click();
+    await form.getByTestId(testIds.editorSave).click();
     await expect(form).toBeHidden();
-    return tableRow(page, "Downloads", label);
+    const row = scheduleRow(page, "DOWNLOADS", label);
+    await expect(row).toContainText(time);
+    return row;
   };
 
   let rule = await addSchedule("03:15", "e2e-off-peak");
-  let enabled = rule.getByRole("switch", { name: "03:15 schedule enabled", exact: true });
+  let enabled = rule.getByTestId(settingsIds.scheduleEnabled);
   await expect(enabled).not.toBeChecked();
   await page.reload();
   await expect(enabled).not.toBeChecked();
 
   await rule.click();
-  const form = page.getByRole("dialog", { name: "e2e-off-peak", exact: true });
-  await form.getByRole("textbox", { name: "Label", exact: true }).fill("e2e-off-peak-edited");
+  const form = page.getByTestId(testIds.dialog("schedule"));
+  await expect(form).toContainText("e2e-off-peak");
+  await form.getByTestId(field("label")).fill("e2e-off-peak-edited");
   // Exercise the editor toggle without publishing an enabled hold to this
   // shared instance, where either pause or resume affects other scenarios.
-  const draftEnabled = form.getByRole("switch", { name: "Enabled", exact: true });
+  const draftEnabled = form.getByTestId(field("enabled"));
   await draftEnabled.click();
   await expect(draftEnabled).toBeChecked();
   await draftEnabled.click();
   await expect(draftEnabled).not.toBeChecked();
-  await form.getByRole("button", { name: "Save", exact: true }).click();
+  await form.getByTestId(testIds.editorSave).click();
   await expect(form).toBeHidden();
-  rule = tableRow(page, "Downloads", "e2e-off-peak-edited");
+  rule = scheduleRow(page, "DOWNLOADS", "e2e-off-peak-edited");
   await expect(rule).toBeVisible();
-  enabled = rule.getByRole("switch", { name: "03:15 schedule enabled", exact: true });
+  await expect(rule).toContainText("03:15");
+  enabled = rule.getByTestId(settingsIds.scheduleEnabled);
   await expect(enabled).not.toBeChecked();
   await removeSchedule("e2e-off-peak-edited");
 
   rule = await addSchedule("04:30", persistedSchedule);
-  const persistedEnabled = rule.getByRole("switch", { name: "04:30 schedule enabled", exact: true });
+  const persistedEnabled = rule.getByTestId(settingsIds.scheduleEnabled);
   await expect(persistedEnabled).not.toBeChecked();
 });
 
 test("new schedule actions stay disabled and appear on their own tracks", async ({ cleanPage: page }) => {
   test.skip(afterRestart, "temporary rules are removed before restart");
   await page.goto("/settings/schedules");
+  // Each action, by its value, and the track its rules land on.
   const cases = [
-    ["Pause all intake", "Downloads"],
-    ["Pause post-processing", "Post-processing"],
-    ["Resume post-processing", "Post-processing"],
-    ["Set server availability", "Servers"],
-    ["Set quota metering", "Quota metering"],
-    ["Pause RSS", "RSS"],
-    ["Resume RSS", "RSS"],
-    ["Prune history", "One-shot actions"],
+    ["pause_all", "DOWNLOADS"],
+    ["pause_post_processing", "POST_PROCESSING"],
+    ["resume_post_processing", "POST_PROCESSING"],
+    ["set_server_active", "SERVER"],
+    ["set_quota_metering", "QUOTA"],
+    ["pause_rss", "RSS"],
+    ["resume_rss", "RSS"],
+    ["prune_history", "ONE_SHOT"],
   ];
   for (const [action, track] of cases) {
     const label = `e2e-disabled-${action}`;
-    await page.getByRole("main").getByRole("button", { name: "Add schedule", exact: true }).click();
-    const form = page.getByRole("dialog", { name: "Add schedule", exact: true });
-    await form.getByRole("textbox", { name: "Label", exact: true }).fill(label);
-    await form.getByRole("switch", { name: "Enabled", exact: true }).click();
-    await form.getByRole("button", { name: "Action", exact: true }).click();
-    await page.getByRole("menuitemradio", { name: action, exact: true }).click();
-    if (action === "Set server availability") {
-      await form.getByRole("button", { name: "Server", exact: true }).click();
-      await page.getByRole("menuitemradio", { name: "nntp", exact: true }).click();
+    await page.getByTestId(testIds.tableAdd("schedules")).click();
+    const form = page.getByTestId(testIds.dialog("schedule"));
+    await form.getByTestId(field("label")).fill(label);
+    await form.getByTestId(field("enabled")).click();
+    await choose(page, form, field("actionType"), action);
+    if (action === "set_server_active") {
+      await form.getByTestId(field("serverId")).click();
+      await byTestIdPrefix(page.getByTestId(testIds.menu(field("serverId"))), testIds.option(field("serverId"), ""))
+        .filter({ has: page.getByText(fixtureServer, { exact: true }) })
+        .click();
     }
-    if (action === "Prune history") await form.getByRole("switch", { name: "Completed", exact: true }).check();
-    await form.getByRole("button", { name: "Save", exact: true }).click();
+    if (action === "prune_history") await form.getByTestId(field("pruneCompleted")).check();
+    await form.getByTestId(testIds.editorSave).click();
     await expect(form).toBeHidden();
-    let row = tableRow(page, track, label);
+    let row = scheduleRow(page, track, label);
     await expect(row).toBeVisible();
-    await expect(row.getByRole("switch")).not.toBeChecked();
+    await expect(row.getByTestId(settingsIds.scheduleEnabled)).not.toBeChecked();
     await row.click();
-    const edit = page.getByRole("dialog", { name: label, exact: true });
-    await edit.getByRole("textbox", { name: "Label", exact: true }).fill(`${label}-edited`);
+    const edit = page.getByTestId(testIds.dialog("schedule"));
+    await expect(edit).toContainText(label);
+    await edit.getByTestId(field("label")).fill(`${label}-edited`);
     // Toggle only the draft, and save disabled so no hold reaches the shared instance.
-    await edit.getByRole("switch", { name: "Enabled", exact: true }).click();
-    await edit.getByRole("switch", { name: "Enabled", exact: true }).click();
-    await edit.getByRole("button", { name: "Save", exact: true }).click();
+    await edit.getByTestId(field("enabled")).click();
+    await edit.getByTestId(field("enabled")).click();
+    await edit.getByTestId(testIds.editorSave).click();
     await expect(edit).toBeHidden();
     await page.reload();
-    row = tableRow(page, track, `${label}-edited`);
-    await expect(row.getByRole("switch")).not.toBeChecked();
+    row = scheduleRow(page, track, `${label}-edited`);
+    await expect(row.getByTestId(settingsIds.scheduleEnabled)).not.toBeChecked();
     await row.click();
-    await page.getByRole("dialog", { name: `${label}-edited`, exact: true }).getByRole("button", { name: "Remove schedule", exact: true }).click();
-    await confirmRemoval(page, "Remove schedule");
+    const editedForm = page.getByTestId(testIds.dialog("schedule"));
+    await expect(editedForm).toContainText(`${label}-edited`);
+    await editedForm.getByTestId(testIds.editorDelete).click();
+    await confirmRemoval(page, "schedule-remove");
     await expect(row).toHaveCount(0);
   }
 });
-
-const profileNames: Record<string, string> = {
-  EFFICIENT: "Efficient",
-  BALANCED: "Balanced",
-  PERFORMANCE: "Performance",
-};
 
 test("the performance profile saves the moment one is picked and keeps it", async ({ cleanPage: page, request }) => {
   const offered = await introspectHardwareProfile(request);
@@ -425,46 +420,37 @@ test("the performance profile saves the moment one is picked and keeps it", asyn
   );
 
   await page.goto("/settings/general");
-  const recommendedName = profileNames[offered.recommended];
-  expect(recommendedName, `unknown profile ${offered.recommended}`).toBeTruthy();
-  const profile = page
-    .getByRole("region", { name: "Performance", exact: true })
-    .getByRole("button", { name: "Hardware profile", exact: true });
-  const unconfirmed = page.getByText("Running the recommended profile, not yet confirmed.", { exact: true });
+  const recommended = offered.recommended;
+  const profileId = field("hardwareProfile");
+  const profile = page.getByTestId(testIds.section("performance")).getByTestId(profileId);
+  const showsRecommended = profile.getByTestId(testIds.selected(profileId, recommended));
+  const unconfirmed = page.getByTestId(settingsIds.profileUnconfirmed);
   if (afterRestart) {
-    await expect(profile).toHaveText(recommendedName);
+    await expect(showsRecommended).toBeVisible();
     await expect(unconfirmed).toBeHidden();
     return;
   }
 
-  const saved = page.waitForResponse(
-    (response) =>
-      new URL(response.url()).pathname.endsWith("/graphql")
-      && response.request().method() === "POST"
-      && response.request().postData()?.includes("mutation SetHardwareProfile") === true,
-  );
+  const saved = operationResponse(page, "SetHardwareProfile");
   await profile.click();
-  await page
-    .getByRole("menu", { name: "Hardware profile", exact: true })
-    .getByRole("menuitemradio", { name: recommendedName, exact: true })
-    .click();
+  await page.getByTestId(testIds.menu(profileId)).getByTestId(testIds.option(profileId, recommended)).click();
   const response = await saved;
   expect(response.ok()).toBeTruthy();
   const payload = await response.json();
   expect(payload.errors ?? [], JSON.stringify(payload.errors ?? [])).toEqual([]);
-  await expect(profile).toHaveText(recommendedName);
+  await expect(showsRecommended).toBeVisible();
   await expect(unconfirmed).toBeHidden();
   await expect(page.getByRole("alert")).toBeHidden();
 
   await page.reload();
-  await expect(profile).toHaveText(recommendedName);
+  await expect(showsRecommended).toBeVisible();
   await expect(unconfirmed).toBeHidden();
 });
 
 test("settings navigation owns every coverage-ledger route", async ({ cleanPage: page }) => {
   await page.goto("/settings");
   await expect(page).toHaveURL(/\/settings\/general$/);
-  const navigation = page.getByRole("navigation", { name: "Settings", exact: true });
+  const navigation = page.getByTestId(settingsIds.nav);
   const ledger = JSON.parse(
     readFileSync(resolve(process.cwd(), "coverage-ledger.v1.json"), "utf8"),
   ) as { routes: Array<{ path: string }> };

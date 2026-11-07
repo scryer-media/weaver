@@ -7,6 +7,7 @@ import { Eyebrow } from "./chrome";
 import { Segmented } from "./controls";
 import { Icon, type IconName } from "./icons";
 import { formatCount } from "../data/format";
+import { testIds } from "@/next/testids";
 
 /**
  * The 44px bar under a paginated list: how many rows a page holds, which slice
@@ -54,12 +55,13 @@ export function Pagination({
       </Eyebrow>
       <Segmented
         size="compact"
+        testId={testIds.paginationPageSize}
         label={t("table.rowsPerPage")}
         value={String(pageSize)}
         options={pageSizes.map((size) => ({ value: String(size), label: String(size) }))}
         onChange={(next) => onPageSize(Number(next))}
       />
-      <span className="font-wv-mono text-[11.5px] whitespace-nowrap text-wv-muted">
+      <span data-testid={testIds.paginationRange} className="font-wv-mono text-[11.5px] whitespace-nowrap text-wv-muted">
         {total === 0
           ? t("next.pagination.empty")
           : t("next.pagination.range", {
@@ -70,7 +72,13 @@ export function Pagination({
       </span>
 
       <div className="ml-auto flex items-center gap-2">
-        <Step label={t("action.previous")} before="previous" disabled={pageIndex === 0} onClick={() => onPage(pageIndex - 1)} />
+        <Step
+          label={t("action.previous")}
+          before="previous"
+          disabled={pageIndex === 0}
+          onClick={() => onPage(pageIndex - 1)}
+          testId={testIds.paginationPrevious}
+        />
         <div className="flex items-center gap-1">
           {pages.map((page) => (
             <button
@@ -94,6 +102,7 @@ export function Pagination({
           after="next"
           disabled={pageIndex + 1 >= pageCount}
           onClick={() => onPage(pageIndex + 1)}
+          testId={testIds.paginationNext}
         />
       </div>
     </div>
@@ -106,16 +115,19 @@ function Step({
   after,
   disabled,
   onClick,
+  testId,
 }: {
   label: string;
   before?: IconName;
   after?: IconName;
   disabled: boolean;
   onClick: () => void;
+  testId: string;
 }) {
   return (
     <button
       type="button"
+      data-testid={testId}
       disabled={disabled}
       onClick={onClick}
       className={cn(

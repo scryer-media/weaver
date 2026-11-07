@@ -139,11 +139,13 @@ export function FormRow({
   help,
   children,
   htmlFor,
+  helpTestId,
 }: {
   label: ReactNode;
   help?: ReactNode;
   children: ReactNode;
   htmlFor?: string;
+  helpTestId?: string;
 }) {
   return (
     <div className="grid grid-cols-1 items-center gap-x-6 gap-y-3 border-b border-wv-hairline px-4 py-[14px] hover:bg-wv-cell-hover sm:grid-cols-[minmax(0,1fr)_minmax(268px,max-content)] sm:px-6">
@@ -155,7 +157,7 @@ export function FormRow({
           {label}
         </label>
         {help === undefined ? null : (
-          <div className="text-[12px] leading-[1.45] text-pretty text-wv-muted">{help}</div>
+          <div data-testid={helpTestId} className="text-[12px] leading-[1.45] text-pretty text-wv-muted">{help}</div>
         )}
       </div>
       <div className="flex min-w-0 items-center gap-3 sm:justify-end">
@@ -303,6 +305,7 @@ export function GridRow({
   title,
   className,
   children,
+  testId,
 }: {
   columns: Columns;
   gap?: number;
@@ -311,10 +314,12 @@ export function GridRow({
   title?: string;
   className?: string;
   children: ReactNode;
+  testId?: string;
 }) {
   const interactive = typeof onClick === "function";
   return (
     <div
+      data-testid={testId}
       {...(interactive
         ? {
             role: "button",
@@ -349,14 +354,17 @@ export function Cell({
   mono = false,
   className,
   title,
+  testId,
 }: {
   children: ReactNode;
   mono?: boolean;
   className?: string;
   title?: string;
+  testId?: string;
 }) {
   return (
     <div
+      data-testid={testId}
       title={title}
       className={cn(
         "min-w-0 truncate",

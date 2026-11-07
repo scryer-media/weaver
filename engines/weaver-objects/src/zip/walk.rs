@@ -88,8 +88,9 @@ impl Zip {
             let length = self.announce(member, &header, out);
             let data = cursor + len;
             let compressed = header.compressed;
-            let cipher = header
-                .encrypted()
+            // A directory holds nothing to decrypt: its encryption header,
+            // if a writer gave it one, is the envelope's.
+            let cipher = (header.encrypted() && header.shape != records::Shape::Directory)
                 .then(|| super::crypto::Cipher::new(&header));
             let prefix = if cipher.is_some() {
                 super::crypto::HEADER
@@ -122,8 +123,7 @@ impl Zip {
                     crc: header.crc,
                     compressed,
                     length,
-                    wide: records::u32_at(&bytes, 18) == Some(u32::MAX)
-                        || records::u32_at(&bytes, 22) == Some(u32::MAX),
+                    wide: records::local_zip64(&bytes),
                 });
             }
             // What follows the data, a directory entry's included, is the

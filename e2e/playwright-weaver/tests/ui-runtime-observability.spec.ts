@@ -5,8 +5,11 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import type { Page, WebSocketRoute } from "@playwright/test";
 import { expect, openNavigation, test, weaverRoute } from "./helpers";
+import { isOperation, operationResponse } from "./support/graphql-operations";
 import { introspectPublicMutationNames } from "./support/runtime-introspection";
+import { byTestIdPrefix, choose } from "./support/settings-locators";
 import { seedRuntimeHistory } from "./support/setup/runtime-history";
+import { runtimeIds, settingsIds, testIds } from "./support/testids";
 
 type CoverageEntry = {
   name?: string;
@@ -84,53 +87,43 @@ test("visible navigation routes are assigned to the Weaver coverage ledger", asy
 
 test("monitoring metrics and live logs expose real product state and controls", async ({ cleanPage: page }) => {
   await page.goto(weaverRoute("/monitoring"));
-  await expect(page.getByRole("heading", { name: "Monitoring", exact: true })).toBeVisible();
-  await expect(page.getByText("Pipeline", { exact: true })).toBeVisible();
-  await expect(page.getByText("Connections", { exact: true })).toBeVisible();
-  const main = page.getByRole("main");
-  await expect(main.getByText("Queue depths", { exact: true })).toBeVisible();
+  await expect(page.getByTestId(runtimeIds.monitoringPipeline)).toBeVisible();
+  await expect(page.getByTestId(runtimeIds.monitoringConnections)).toBeVisible();
+  await expect(page.getByTestId(runtimeIds.monitoringDepths)).toBeVisible();
   // The provider list reads live server health, so the configured provider
-  // shows up by host.
-  await expect(main.getByText("nntp", { exact: true })).toBeVisible();
+  // shows up by host: the fixture's host, not the app's copy.
+  const providerHost = "nntp";
+  await expect(page.getByTestId(runtimeIds.monitoringProviders).getByText(providerHost, { exact: true })).toBeVisible();
 
   await page.goto(weaverRoute("/logs"));
-  await expect(page.getByRole("heading", { name: "Logs", exact: true })).toBeVisible();
-  const following = page.getByText("following new lines", { exact: true });
+  const following = page.getByTestId(runtimeIds.logsTail("following"));
   await expect(following).toBeVisible();
-  await page.getByRole("banner").getByRole("button", { name: "Pause tail", exact: true }).click();
-  await expect(page.getByText("paused — scroll freely", { exact: true })).toBeVisible();
-  await page.getByRole("banner").getByRole("button", { name: "Resume tail", exact: true }).click();
+  await page.getByTestId(runtimeIds.logsPauseTail).click();
+  await expect(page.getByTestId(runtimeIds.logsTail("paused"))).toBeVisible();
+  await page.getByTestId(runtimeIds.logsResumeTail).click();
   await expect(following).toBeVisible();
 
   // The live log level: a preset applies at once, the field shows the
   // directives now in force, and Default hands back the startup filter.
-  const logLevel = page.getByRole("button", { name: "Log level", exact: true });
-  const directives = page.getByRole("textbox", { name: "Filter directives", exact: true });
-  await expect(logLevel).toContainText("Default");
+  const logLevel = page.getByTestId(runtimeIds.logsLevel);
+  const levelShown = (preset: string) => logLevel.getByTestId(testIds.selected(runtimeIds.logsLevel, preset));
+  const directives = page.getByTestId(runtimeIds.logsDirectives);
+  await expect(levelShown("default")).toBeVisible();
   const startupDirectives = await directives.inputValue();
-  await chooseLogLevel(page, "Download debug");
+  await chooseLogLevel(page, "download");
   await expect(directives).toHaveValue(
     "info,weaver_server_core::pipeline::download=debug,weaver_nntp=debug",
   );
-  await expect(logLevel).toContainText("Download debug");
-  await chooseLogLevel(page, "Default");
+  await expect(levelShown("download")).toBeVisible();
+  await chooseLogLevel(page, "default");
   await expect(directives).toHaveValue(startupDirectives);
-  await expect(logLevel).toContainText("Default");
+  await expect(levelShown("default")).toBeVisible();
 });
 
-/** Pick a log-level preset and wait for the server to apply it. */
+/** Pick a log-level preset, by its preset key, and wait for the server to apply it. */
 async function chooseLogLevel(page: Page, preset: string) {
-  const applied = page.waitForResponse(
-    (response) =>
-      new URL(response.url()).pathname.endsWith("/graphql")
-      && response.request().method() === "POST"
-      && response.request().postData()?.includes("mutation SetLogFilter") === true,
-  );
-  await page.getByRole("button", { name: "Log level", exact: true }).click();
-  await page
-    .getByRole("menu", { name: "Log level", exact: true })
-    .getByRole("menuitemradio", { name: preset, exact: true })
-    .click();
+  const applied = operationResponse(page, "SetLogFilter");
+  await choose(page, page, runtimeIds.logsLevel, preset);
   const response = await applied;
   expect(response.ok()).toBeTruthy();
   const payload = await response.json();
@@ -141,16 +134,15 @@ test("history pagination renders metadata-only seeded records", async ({ cleanPa
   const suffix = configuredBasePath.replaceAll("/", "-") || "root";
   const markers = await seedRuntimeHistory(request, `e2e-runtime-history-${suffix}`);
   await page.goto(weaverRoute("/history"));
-  const main = page.getByRole("main");
   const historyRow = (name: string) =>
-    main.getByRole("button").filter({ has: page.getByText(name, { exact: true }) });
+    byTestIdPrefix(page, testIds.historyRowPrefix).filter({ has: page.getByText(name, { exact: true }) });
   await expect(historyRow(markers.newest)).toBeVisible();
   await page
-    .getByRole("radiogroup", { name: "Rows per page", exact: true })
-    .getByRole("radio", { name: "25", exact: true })
+    .getByTestId(testIds.paginationPageSize)
+    .getByTestId(testIds.option(testIds.paginationPageSize, "25"))
     .click();
   await expect(historyRow(markers.oldest)).toHaveCount(0);
-  const next = page.getByRole("button", { name: "Next", exact: true });
+  const next = page.getByTestId(testIds.paginationNext);
   await expect(next).toBeEnabled();
   await next.click();
   await expect(historyRow(markers.oldest)).toBeVisible();
@@ -158,23 +150,16 @@ test("history pagination renders metadata-only seeded records", async ({ cleanPa
 
 test("subscription loss polls and reconnects without losing the visible application", async ({ cleanPage: page }) => {
   let blockReconnects = false;
-  let disconnected = false;
-  let pollingRequests = 0;
   let socketConnections = 0;
   let liveBrowserSocket: WebSocketRoute | undefined;
   let liveServerSocket: WebSocketRoute | undefined;
   let blockedReconnectSocket: WebSocketRoute | undefined;
-
-  page.on("request", (request) => {
-    if (
-      disconnected
-      && request.method() === "POST"
-      && request.url().includes("/graphql")
-      && /LiveMetrics/.test(request.postData() ?? "")
-    ) {
-      pollingRequests += 1;
-    }
+  // Settles when the client opens a live socket again after the interruption.
+  let reconnected!: () => void;
+  const reconnect = new Promise<void>((resolve) => {
+    reconnected = resolve;
   });
+
   await page.routeWebSocket(/\/graphql\/ws(?:\?|$)/, (socket) => {
     if (blockReconnects) {
       // Return so Playwright can still observe the HTTP polling fallback.
@@ -184,24 +169,27 @@ test("subscription loss polls and reconnects without losing the visible applicat
     liveBrowserSocket = socket;
     liveServerSocket = socket.connectToServer();
     socketConnections += 1;
+    if (socketConnections > 1) reconnected();
   });
 
   await page.goto(weaverRoute("/"));
   await expect(page.getByRole("main")).toBeVisible();
-  const status = page.getByRole("contentinfo");
-  await expect(status.getByText("Connected", { exact: true })).toBeVisible();
+  const status = page.getByTestId(testIds.shellConnection);
+  const connected = status.getByTestId(testIds.shellConnectionState("connected"));
+  await expect(connected).toBeVisible();
   await expect.poll(() => liveBrowserSocket).toBeTruthy();
   await expect.poll(() => liveServerSocket).toBeTruthy();
   expect(socketConnections).toBe(1);
 
   blockReconnects = true;
-  disconnected = true;
+  // The HTTP fallback polls live metrics by name once the socket is gone.
+  const polled = page.waitForRequest((request) => isOperation(request, "LiveMetrics"));
   try {
     await liveServerSocket!.close({ code: 1012, reason: "Weaver e2e subscription interruption" });
     await liveBrowserSocket!.close({ code: 1012, reason: "Weaver e2e subscription interruption" });
-    await expect(status.getByText(/^Reconnecting/)).toBeVisible();
-    await expect.poll(() => pollingRequests, { timeout: 20_000 }).toBeGreaterThan(0);
-    await expect(status.getByText("Reconnecting — polling", { exact: true })).toBeVisible();
+    await expect(status.getByTestId(/^shell-connection-(?:reconnecting|polling)$/)).toBeVisible();
+    await polled;
+    await expect(status.getByTestId(testIds.shellConnectionState("polling"))).toBeVisible();
     await expect(page.getByRole("main")).toBeVisible();
   } finally {
     blockReconnects = false;
@@ -210,14 +198,13 @@ test("subscription loss polls and reconnects without losing the visible applicat
       reason: "Weaver e2e reconnect interruption released",
     });
   }
-  await expect.poll(() => socketConnections, { timeout: 20_000 }).toBeGreaterThan(1);
-  await expect(status.getByText("Connected", { exact: true })).toBeVisible({ timeout: 30_000 });
+  await reconnect;
+  await expect(connected).toBeVisible();
   await expect(page.getByRole("main")).toBeVisible();
 });
 
 test("the NZB analyzer renders and downloads a redacted report without queueing", async ({ cleanPage: page }) => {
   await page.goto(weaverRoute("/tools/nzb-analyzer"));
-  await expect(page.getByRole("heading", { name: "NZB analyzer", exact: true })).toBeVisible();
   const sentinel = "e2e-analyzer-private";
   const nzb = `<?xml version="1.0" encoding="UTF-8"?>
     <nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
@@ -228,13 +215,13 @@ test("the NZB analyzer renders and downloads a redacted report without queueing"
       </file>
     </nzb>`;
   const chooser = page.waitForEvent("filechooser");
-  await page.getByRole("button", { name: "Drop an .nzb or .nzb.gz here, or click to choose one", exact: true }).click();
+  await page.getByTestId(runtimeIds.analyzerDrop).click();
   await (await chooser).setFiles({ name: "analysis-probe.nzb", mimeType: "application/x-nzb", buffer: Buffer.from(nzb) });
-  const report = page.getByRole("region", { name: "Report", exact: true });
+  const report = page.getByTestId(runtimeIds.analyzerReport);
   await expect(report).toContainText("fingerprint ");
   await expect(report).not.toContainText(sentinel);
   const downloadPromise = page.waitForEvent("download");
-  await page.getByRole("button", { name: "Download JSON", exact: true }).click();
+  await page.getByTestId(runtimeIds.analyzerDownloadJson).click();
   const download = await downloadPromise;
   const stream = await download.createReadStream();
   if (!stream) throw new Error("the analyzer did not retain its download");
@@ -246,52 +233,51 @@ test("the NZB analyzer renders and downloads a redacted report without queueing"
   expect(parsed.nzb.shape.file_count).toBe(1);
   expect(parsed.job).toBeNull();
   await page.goto(weaverRoute("/"));
-  await expect(page.getByRole("main")).toContainText("No active downloads");
+  await expect(page.getByTestId(testIds.queueEmpty)).toBeVisible();
 });
 
 test("stored backup storage, download and deletion are browser-owned", async ({ cleanPage: page }) => {
   await page.goto(weaverRoute("/settings/backup"));
-  const storage = page.getByRole("region", { name: "Backup storage", exact: true });
-  const path = storage.getByRole("textbox", { name: "Custom backup path", exact: true });
+  const storage = page.getByTestId(testIds.section("backupStorage"));
+  const path = storage.getByTestId(testIds.field("backupPath"));
   await expect(path).toBeVisible();
   const originalPath = await path.inputValue();
   const customPath = `/data/e2e-backups-${configuredBasePath.replaceAll("/", "-") || "root"}`;
   const savePath = async (value: string) => {
     // Focusing a path opens its picker; cancel it before typing a path directly.
     await path.click();
-    const picker = page.getByRole("dialog", { name: "Custom backup path", exact: true });
-    await picker.getByRole("button", { name: "Cancel", exact: true }).click();
+    const picker = page.getByTestId(testIds.dialog("picker"));
+    await picker.getByTestId(testIds.pickerCancel).click();
     await expect(picker).toBeHidden();
     await path.fill(value);
-    const saved = page.waitForResponse((response) =>
-      response.request().method() === "POST"
-      && response.request().postData()?.includes("mutation UpdateBackupSettings") === true,
-    );
-    await storage.getByRole("button", { name: "Save changes", exact: true }).click();
+    const saved = operationResponse(page, "UpdateBackupSettings");
+    await storage.getByTestId(settingsIds.backupStorageSave).click();
     expect((await saved).ok()).toBeTruthy();
     await page.reload();
     await expect(path).toHaveValue(value);
   };
   await savePath(customPath);
   try {
-    const stored = page.getByRole("region", { name: "Stored backups", exact: true });
-    await expect(stored.getByRole("button", { name: "Download", exact: true })).toHaveCount(0);
-    const backup = page.getByRole("region", { name: "Backup", exact: true });
-    await backup.getByLabel("Password", { exact: true }).fill("e2e-stored-backup-key");
-    await backup.getByLabel("Confirm password", { exact: true }).fill("e2e-stored-backup-key");
+    const stored = page.getByTestId(testIds.section("storedBackups"));
+    const downloads = stored.getByTestId(settingsIds.storedBackupDownload);
+    await expect(downloads).toHaveCount(0);
+    const backup = page.getByTestId(testIds.section("export"));
+    await backup.getByTestId(testIds.field("password")).fill("e2e-stored-backup-key");
+    await backup.getByTestId(testIds.field("passwordConfirm")).fill("e2e-stored-backup-key");
     const created = page.waitForResponse((response) =>
       new URL(response.url()).pathname.endsWith("/api/backup/create")
       && response.request().method() === "POST",
     );
-    await page.getByRole("button", { name: "Create without downloading", exact: true }).click();
+    await page.getByTestId(settingsIds.backupCreate).click();
     const response = await created;
     expect(response.status()).toBe(202);
     const info = await response.json() as { filename: string };
-    await expect(stored.getByTitle(info.filename, { exact: true })).toBeVisible();
-    const downloadButton = stored.getByRole("button", { name: "Download", exact: true });
+    const storedRow = stored.getByTestId(testIds.row("storedBackups", info.filename));
+    await expect(storedRow).toBeVisible();
+    const downloadButton = downloads;
     await expect(downloadButton).toHaveCount(1);
     await expect(downloadButton).toBeEnabled();
-    await expect(stored.getByText("Ready", { exact: true })).toBeVisible();
+    await expect(storedRow.getByTestId(settingsIds.storedBackupStatus("ready"))).toBeVisible();
     const downloadPromise = page.waitForEvent("download");
     await downloadButton.click();
     const download = await downloadPromise;
@@ -301,14 +287,14 @@ test("stored backup storage, download and deletion are browser-owned", async ({ 
     let bytes = 0;
     for await (const chunk of stream) bytes += chunk.length;
     expect(bytes).toBeGreaterThan(0);
-    await stored.getByRole("button", { name: "Delete backup", exact: true }).click();
-    const confirm = page.getByRole("dialog", { name: "Delete backup", exact: true });
+    await storedRow.getByTestId(settingsIds.storedBackupDelete).click();
+    const confirm = page.getByTestId(testIds.dialog("stored-backup-delete"));
     await expect(confirm).toContainText(info.filename);
-    await confirm.getByRole("button", { name: "Delete backup", exact: true }).click();
+    await confirm.getByTestId(testIds.confirmAccept).click();
     await expect(confirm).toBeHidden();
-    await expect(stored.getByTitle(info.filename, { exact: true })).toHaveCount(0);
+    await expect(storedRow).toHaveCount(0);
     await page.reload();
-    await expect(stored.getByRole("button", { name: "Download", exact: true })).toHaveCount(0);
+    await expect(downloads).toHaveCount(0);
   } finally {
     await savePath(originalPath);
   }

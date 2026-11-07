@@ -69,8 +69,8 @@ use self::extraction::{ExtractionLimits, ProcessMemoryBudget};
 // Maximum number of retries for a single segment before giving up.
 const MAX_SEGMENT_RETRIES: u32 = 3;
 // Consecutive established-transport failures of one segment before its retry
-// is held back past the server recovery backoff, so the next recovery probe
-// carries different work.
+// is held back past the server recovery backoff while its server is
+// quarantined, so the next recovery probe carries different work.
 const SEGMENT_TRANSPORT_STREAK_HOLD: u32 = 2;
 // Consecutive established-transport failures of one segment after which the
 // fault is the article's, provided other segments downloaded meanwhile.
@@ -542,6 +542,12 @@ pub(super) enum DownloadFailureKind {
     Unrequested,
     ConnectionEstablishment,
     EstablishedTransport,
+    // The article's response never came: the session expired at its status
+    // line, or the batch was abandoned ahead of it. Nothing about the article
+    // was seen, so it never costs the article. Whether it cost the connection
+    // is the lane's verdict, not this kind's: a lane that re-authenticated in
+    // place keeps its socket, and one that lost it says so.
+    Unanswered,
     Auth,
     ContentOrProtocol,
 }
@@ -556,6 +562,7 @@ impl DownloadFailureKind {
                 | Self::Unrequested
                 | Self::ConnectionEstablishment
                 | Self::EstablishedTransport
+                | Self::Unanswered
                 | Self::Auth
         )
     }
@@ -567,7 +574,9 @@ impl DownloadFailureKind {
             Self::LaneUnavailable => Some("no eligible NNTP server"),
             Self::Unrequested => Some("NNTP lane replaced"),
             Self::ConnectionEstablishment => Some("NNTP connection unavailable"),
-            Self::EstablishedTransport => Some("NNTP BODY transport unavailable"),
+            Self::EstablishedTransport | Self::Unanswered => {
+                Some("NNTP BODY transport unavailable")
+            }
             Self::Auth => Some("NNTP authentication blocked"),
             Self::ArticleNotFound | Self::ContentOrProtocol => None,
         }
@@ -631,6 +640,11 @@ impl DownloadFailure {
             // went out: nothing was requested, and nothing is known about the
             // article or the server.
             NntpError::WorkObsolete => Some(DownloadFailureKind::Unrequested),
+            // A session that expired part-way through a batch costs the
+            // connection, not the server and not the article: the 480 stood
+            // where the article's status line would have, so the article is
+            // re-asked on a freshly authenticated connection.
+            NntpError::SessionExpired => Some(DownloadFailureKind::Unanswered),
             NntpError::AuthenticationFailed
             | NntpError::AuthenticationRejected
             | NntpError::AuthenticationRequired
@@ -641,10 +655,6 @@ impl DownloadFailure {
             | NntpError::Timeout
             | NntpError::SoftTimeout(_)
             | NntpError::ConnectionClosed
-            // A session that expired part-way through a batch costs the
-            // connection, not the server: the articles are re-asked on a
-            // freshly authenticated one.
-            | NntpError::SessionExpired
             | NntpError::ServerDisconnectedMidBody
             | NntpError::TruncatedMultilineBody
             | NntpError::MalformedMultilineTerminator
@@ -735,6 +745,13 @@ impl DownloadError {
     // no BODY was ever issued, so they are clean for the same reason (they
     // still park the lane, just without discarding it).
     //
+    // `Unanswered` says nothing about the socket either. A 480 at the status
+    // line is one complete line; the blocking lane drains the replies behind
+    // it and re-authenticates in place, and when that fails, or the session
+    // had no credentials, or the batch was abandoned, the lane reports the
+    // connection discarded (`connection_discarded`, `ring_is_closed`) and that
+    // verdict drops it.
+    //
     // Decode failures stay dirty: the yEnc decoder can fail on a body the
     // transport never finished delivering.
     pub(super) fn leaves_connection_clean(&self) -> bool {
@@ -744,6 +761,7 @@ impl DownloadError {
                 DownloadFailureKind::ArticleNotFound
                     | DownloadFailureKind::ServerQuota
                     | DownloadFailureKind::Unrequested
+                    | DownloadFailureKind::Unanswered
             ),
             Self::Decode { .. } | Self::Local { .. } => false,
         }

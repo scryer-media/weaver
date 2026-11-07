@@ -132,7 +132,7 @@ impl Coverage {
             return true;
         }
         let mut cursor = range.start;
-        for run in self.runs.range(..range.end).map(|(_, run)| run) {
+        for run in self.from(range).map(|(_, run)| run) {
             if run.range.end <= cursor {
                 continue;
             }
@@ -204,15 +204,21 @@ impl Coverage {
     // The runs `range` reaches, found from the one at or before its start,
     // so a member's every arrival reads only the runs it lands on.
     pub fn overlapping(&self, range: ByteRange) -> impl Iterator<Item = &Run> {
+        self.from(range)
+            .map(|(_, run)| run)
+            .filter(move |run| run.range.intersect(range).is_some())
+    }
+
+    // The runs that start before `range` ends, from the one at or before its
+    // start: runs are disjoint and in offset order, so no earlier run can
+    // reach it, and a probe reads only the runs it spans.
+    fn from(&self, range: ByteRange) -> std::collections::btree_map::Range<'_, u64, Run> {
         let from = self
             .runs
             .range(..=range.start)
             .next_back()
             .map_or(range.start, |(start, _)| *start);
-        self.runs
-            .range(from..range.end.max(from))
-            .map(|(_, run)| run)
-            .filter(move |run| run.range.intersect(range).is_some())
+        self.runs.range(from..range.end.max(from))
     }
 
     // Record that `range` arrived with `provenance`, replacing any earlier
@@ -252,8 +258,7 @@ impl Coverage {
     // Remove `range` from every run it overlaps, keeping the parts outside it.
     fn cut(&mut self, range: ByteRange) {
         let touched: Vec<Run> = self
-            .runs
-            .range(..range.end)
+            .from(range)
             .map(|(_, run)| *run)
             .filter(|run| run.range.end > range.start)
             .collect();
@@ -1443,6 +1448,109 @@ mod tests {
                 (90, 100, Provenance::Fresh),
             ]
         );
+    }
+
+    // Thousands of disjoint runs with gaps between them, then overwrites
+    // and erases scattered over them, against a map of every byte: each
+    // probe reads only the runs it spans, and answers as the byte map does,
+    // whether it starts before the first run, in a gap, in a run, on a
+    // boundary, or past the last run.
+    #[test]
+    fn coverage_probes_agree_with_a_byte_map_over_thousands_of_runs() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |bound: u64| {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) % bound
+        };
+        let kinds = [
+            Provenance::Fresh,
+            Provenance::Repaired,
+            Provenance::Damaged,
+            Provenance::Refuted,
+            Provenance::Lost,
+        ];
+        let mut coverage = Coverage::new();
+        let mut bytes: Vec<Option<Provenance>> = Vec::new();
+        let put = |coverage: &mut Coverage,
+                   bytes: &mut Vec<Option<Provenance>>,
+                   range: ByteRange,
+                   provenance: Option<Provenance>| {
+            if bytes.len() < range.end as usize {
+                bytes.resize(range.end as usize, None);
+            }
+            bytes[range.start as usize..range.end as usize].fill(provenance);
+            match provenance {
+                Some(provenance) => coverage.write(range, provenance),
+                None => coverage.erase(range),
+            }
+        };
+        let mut at = 3;
+        for _ in 0..4000 {
+            at += next(4);
+            let range = ByteRange::at(at, 1 + next(8));
+            let provenance = kinds[next(kinds.len() as u64) as usize];
+            put(&mut coverage, &mut bytes, range, Some(provenance));
+            at = range.end;
+        }
+        let end = at;
+        for _ in 0..400 {
+            let range = ByteRange::at(next(end), 1 + next(24));
+            let provenance = match next(3) {
+                0 => None,
+                _ => Some(kinds[next(kinds.len() as u64) as usize]),
+            };
+            put(&mut coverage, &mut bytes, range, provenance);
+        }
+        assert!(
+            coverage.runs().count() > 2000,
+            "{}",
+            coverage.runs().count()
+        );
+        let mut previous: Option<Run> = None;
+        for run in coverage.runs() {
+            assert!(!run.range.is_empty());
+            if let Some(before) = previous {
+                assert!(before.range.end <= run.range.start);
+                assert!(before.range.end < run.range.start || before.provenance != run.provenance);
+            }
+            previous = Some(*run);
+        }
+        let byte = |offset: u64| bytes.get(offset as usize).copied().flatten();
+        let mut starts: Vec<u64> = (0..end + 40).step_by(7).collect();
+        for run in coverage.runs() {
+            for edge in [run.range.start, run.range.end] {
+                starts.extend([edge.saturating_sub(1), edge, edge + 1]);
+            }
+        }
+        starts.extend([0, 1, 2, 3, end, end + 1, end + 100]);
+        let mut probes = 0;
+        for start in starts {
+            for len in [0, 1, 2, 5, 16, 33, 120] {
+                let range = ByteRange::at(start, len);
+                let all = (range.start..range.end).map(byte);
+                let covered = all.clone().all(|byte| byte.is_some());
+                let verified = all
+                    .clone()
+                    .all(|byte| byte.is_some_and(Provenance::is_verified));
+                let damaged = all
+                    .clone()
+                    .any(|byte| byte.is_some_and(Provenance::is_damaged));
+                assert_eq!(coverage.covered(range), covered, "covered {range:?}");
+                assert_eq!(coverage.verified(range), verified, "verified {range:?}");
+                assert_eq!(coverage.damaged(range), damaged, "damaged {range:?}");
+                let reached: Vec<Run> = coverage.overlapping(range).copied().collect();
+                let naive: Vec<Run> = coverage
+                    .runs()
+                    .filter(|run| run.range.intersect(range).is_some())
+                    .copied()
+                    .collect();
+                assert_eq!(reached, naive, "overlapping {range:?}");
+                probes += 1;
+            }
+        }
+        assert!(probes > 10_000, "{probes}");
     }
 
     #[test]

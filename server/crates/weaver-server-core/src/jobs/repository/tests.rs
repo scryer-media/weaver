@@ -40,7 +40,7 @@ fn execute_sql(db: &Database, sql: impl Into<String>, args: Vec<SqlArg>) {
     let datastore = db.datastore();
     let sql = sql.into();
     db.run_sql_blocking_read(async move {
-        SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
+        SqlRuntime::execute(datastore.write_exec(), &sql, &args).await?;
         Ok(())
     })
     .unwrap()

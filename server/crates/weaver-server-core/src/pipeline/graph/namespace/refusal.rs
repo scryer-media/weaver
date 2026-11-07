@@ -22,7 +22,8 @@
 
 use bytes::Bytes;
 use weaver_graph::{
-    Builder, ByteRange, Coverage, Effect, MemberId, NodeId, Placement, Provenance, Tree,
+    Builder, ByteRange, Coverage, Digest, Effect, Evidence, Evidenced, MemberId, NodeId, Placement,
+    Provenance, Segment, Tree, VolumeIndex,
 };
 
 use super::{Arrival, NamespaceWriter, READ_BACK, Segments, Write, WriteError};
@@ -188,18 +189,56 @@ impl NamespaceWriter {
         arrival: Arrival,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        self.route_brought(tree, builder, segments, arrival, false, out)
+    }
+
+    // Held bytes going down again, as brought. They are the bytes the
+    // source posted there, in memory or read back from scratch alike, so
+    // the checksums the source took of them when they came are their
+    // evidence again, and no level below hashes them a second time.
+    pub(super) fn route_held_as_brought(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        arrival: Arrival,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        self.route_brought(tree, builder, segments, arrival, true, out)
+    }
+
+    fn route_brought(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        arrival: Arrival,
+        held: bool,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
         let range = arrival.range();
         let parts = tree.namespace(arrival.node).map_or_else(
             || vec![(range, arrival.member)],
             |namespace| namespace.brought(arrival.member, range),
         );
+        let mut found = Vec::new();
         for (part, posting) in parts {
             let from = super::index(part.start - range.start);
             let to = super::index(part.end - range.start);
+            let mut bytes = arrival.bytes.slice(from..to);
+            if held {
+                bytes = source_evidence(
+                    segments,
+                    (arrival.node, posting, part),
+                    arrival.provenance,
+                    bytes,
+                    &mut found,
+                );
+            }
             let piece = Arrival {
                 member: posting,
                 offset: part.start,
-                bytes: arrival.bytes.slice(from..to),
+                bytes,
                 ..arrival.clone()
             };
             self.route(tree, builder, segments, piece, out)?;
@@ -405,4 +444,40 @@ pub(super) fn outside(
             at = at.max(cut.map_or(range.end, |cut| cut.end));
             (!part.is_empty()).then_some(part)
         })
+}
+
+// The source's checksums of the bytes it posted at `part` of the posting,
+// as the evidence of `bytes`, which are those bytes held and given back.
+// Only the root's source keeps any: a namespace below it has none, and its
+// held bytes go down bare, as they did. Bytes a repair made are not the
+// source's, and take none. A checksum the part cuts through is left out:
+// nothing here has the rest of the bytes it was taken of, so those bytes
+// are hashed where they are needed, as before.
+fn source_evidence(
+    segments: &dyn Segments,
+    (node, posting, part): (NodeId, MemberId, ByteRange),
+    provenance: Provenance,
+    bytes: Evidenced,
+    found: &mut Vec<Segment>,
+) -> Evidenced {
+    let posted = matches!(
+        provenance,
+        Provenance::Fresh | Provenance::Damaged | Provenance::Refuted
+    );
+    if !posted || !bytes.evidence().is_empty() {
+        return bytes;
+    }
+    found.clear();
+    segments.segments_for(node, VolumeIndex(posting.0), part, found);
+    if found.is_empty() {
+        return bytes;
+    }
+    let evidence = found
+        .iter()
+        .filter(|segment| part.covers(segment.range))
+        .map(|segment| Evidence {
+            range: segment.range.shift(-(part.start as i64)),
+            digest: Digest::crc32(segment.crc32),
+        });
+    Evidenced::with(bytes.into_bytes(), evidence)
 }

@@ -25,6 +25,7 @@ import { RecordEditor, type EditorSection } from "../../../components/RecordEdit
 import { speedPage } from "../../../features/networking/data";
 import { SecondaryButton, Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
+import { settingsIds, testIds } from "../../../testids";
 import { WorkingOverlay } from "../../../components/WorkingOverlay";
 import { WV } from "../../../data/palette";
 import { formatHostnames, formatLatency } from "../../../data/format";
@@ -489,10 +490,10 @@ export function ProvidersPanel() {
             <span className="min-w-0 truncate font-wv-mono text-[12.5px]">{server.host}</span>
             <span className="flex-none font-wv-mono text-[11px] text-wv-faint">:{server.port}</span>
           </span>,
-          <Cell key="connections" mono>
+          <Cell key="connections" mono testId={settingsIds.providerConnections}>
             {server.connections}
           </Cell>,
-          <Cell key="transport" mono className="text-wv-secondary">
+          <Cell key="transport" mono className="text-wv-secondary" testId={settingsIds.providerTransport(server.tls ? "tls" : "plain")}>
             {transportLabel(t, server)}
           </Cell>,
           <Cell key="role">{roleLabel(t, server)}</Cell>,
@@ -502,6 +503,7 @@ export function ProvidersPanel() {
               checked={server.active}
               onChange={(next) => void setActive(server, next)}
               label={t("next.providers.enabledAria", { host: server.host })}
+              testId={settingsIds.providerEnabled}
             />
           </span>,
           <span key="actions" className="ml-auto flex gap-2" onClick={(event) => event.stopPropagation()}>
@@ -530,7 +532,6 @@ export function ProvidersPanel() {
             {
               id: "host",
               label: t("next.providers.host"),
-              help: t("next.providers.hostHelp"),
               control: {
                 kind: "text",
                 value: values.host,
@@ -551,8 +552,7 @@ export function ProvidersPanel() {
             },
             {
               id: "tls",
-              label: "TLS",
-              help: t("next.providers.tlsHelp"),
+              label: "SSL/TLS",
               control: {
                 kind: "toggle",
                 value: values.tls,
@@ -601,7 +601,6 @@ export function ProvidersPanel() {
             {
               id: "active",
               label: t("next.providers.enabled"),
-              help: t("next.providers.enabledHelp"),
               control: {
                 kind: "toggle",
                 value: values.active && !values.killSwitch,
@@ -634,7 +633,6 @@ export function ProvidersPanel() {
             {
               id: "retentionDays",
               label: t("next.providers.retention"),
-              help: t("next.providers.retentionHelp"),
               control: {
                 kind: "number",
                 value: values.retentionDays,
@@ -652,7 +650,6 @@ export function ProvidersPanel() {
             {
               id: "speedUnlimited",
               label: t("next.providers.unlimitedSpeed"),
-              help: t("next.providers.unlimitedSpeedHelp"),
               control: {
                 kind: "toggle",
                 value: values.speedUnlimited,
@@ -676,7 +673,6 @@ export function ProvidersPanel() {
                 ]),
             ...quotaFields(t, values.quota, (quota) => patch({ quota }), {
               label: t("next.providers.quota"),
-              help: t("next.providers.quotaHelp"),
               usedBytes: values.quotaUsedBytes,
             }),
           ],
@@ -711,10 +707,11 @@ export function ProvidersPanel() {
 
       <RecordEditor
         open={editingId !== null}
+        testId={testIds.dialog("provider")}
         title={editingId === "new" ? t("next.providers.add") : (editing?.host ?? t("next.providers.provider"))}
         note={
           editingId === "new"
-            ? t("next.providers.newNote")
+            ? undefined
             : t("next.providers.priorityNote", { priority: values?.priority ?? 0 })
         }
         width={620}
@@ -858,6 +855,7 @@ export function ProvidersPanel() {
 
       <ConfirmDialog
         open={confirmRemove !== null}
+        testId={testIds.dialog("provider-remove")}
         title={t("next.providers.remove")}
         note={confirmRemove?.host}
         busy={busy}
