@@ -2793,6 +2793,54 @@ async fn a_cap_of_nothing_is_never_read_as_no_limit() {
     assert_eq!(transfer["up_rate_limit"], 0);
 }
 
+// The global download limit closed or opened is sent as everything, as a
+// torrent's is: the closed limit's key is absent, the opened one's is back,
+// and a limit moved between two numbers stays a change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_global_limit_closed_or_opened_sends_the_whole_state() {
+    let rig = rig().await;
+    let hold_torrents_to = |bps: u64| {
+        rig.context.inner.handle.state().set_bandwidth_split(
+            weaver_server_core::bandwidth::SplitState {
+                cap: Some(bps),
+                rates: weaver_server_core::bandwidth::SplitRates {
+                    usenet: Some(bps),
+                    torrent: Some(bps),
+                },
+                ..Default::default()
+            },
+        );
+    };
+    hold_torrents_to(5_000_000);
+    let first = rig.get("/api/v2/sync/maindata").await.json();
+    assert_eq!(first["server_state"]["dl_rate_limit"], 5_000_000, "{first}");
+    let mut rid = first["rid"].as_u64().unwrap();
+    let mut poll = async |bps: u64| {
+        hold_torrents_to(bps);
+        let answer = rig
+            .get(&format!("/api/v2/sync/maindata?rid={rid}"))
+            .await
+            .json();
+        rid = answer["rid"].as_u64().unwrap();
+        answer
+    };
+
+    let closed = poll(0).await;
+    assert_eq!(closed["full_update"], true, "{closed}");
+    assert!(
+        closed["server_state"].get("dl_rate_limit").is_none(),
+        "{closed}"
+    );
+
+    let opened = poll(65_536).await;
+    assert_eq!(opened["full_update"], true, "{opened}");
+    assert_eq!(opened["server_state"]["dl_rate_limit"], 65_536, "{opened}");
+
+    let moved = poll(100_000).await;
+    assert!(moved.get("full_update").is_none(), "{moved}");
+    assert_eq!(moved["server_state"]["dl_rate_limit"], 100_000, "{moved}");
+}
+
 #[test]
 fn a_peer_id_reads_as_its_first_eight_bytes() {
     assert_eq!(peer_id_client(&[0; 20]), "");

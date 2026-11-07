@@ -54,6 +54,9 @@ pub(super) struct Poll<'a, V> {
     pub(super) categories: Vec<(String, Map<String, Value>)>,
     pub(super) tags: Vec<String>,
     pub(super) server_state: Map<String, Value>,
+    // The server state's fields left out for having no reading, as a row's
+    // `closed` marks its own.
+    pub(super) server_closed: u8,
 }
 
 // How a torrent's row is built: every field that moves only with the view,
@@ -71,6 +74,7 @@ pub(super) struct Kept {
     categories: HashMap<String, Keys>,
     tags: Vec<String>,
     server_state: Keys,
+    server_closed: u8,
 }
 
 struct KeptRow {
@@ -196,8 +200,9 @@ where
 // holds anything (qBittorrent `generateMaindataSyncData`). Else what changed:
 // a new torrent or category whole, a changed one by its changed keys, a gone
 // one by its key in `_removed`, and the server state's changed keys
-// (qBittorrent `processMap`/`processHash`). A torrent whose left-out fields
-// moved has no changes to send, so the response is the full update.
+// (qBittorrent `processMap`/`processHash`). A torrent or a server state whose
+// left-out fields moved has no changes to send, so the response is the full
+// update.
 fn respond<V, Steady, Clock>(
     from: Option<&Kept>,
     now: Poll<'_, V>,
@@ -207,6 +212,9 @@ where
     Steady: Fn(&V) -> Vec<(&'static str, Value)>,
     Clock: Fn(&V) -> [(&'static str, Value); CLOCK_KEYS],
 {
+    if from.is_some_and(|from| from.server_closed != now.server_closed) {
+        return respond(None, now, fields);
+    }
     let mut body = Map::new();
     if from.is_none() {
         body.insert("full_update".to_owned(), Value::Bool(true));
@@ -311,6 +319,7 @@ where
         categories: kept_categories,
         tags: now.tags,
         server_state: kept_server_state,
+        server_closed: now.server_closed,
     };
     (body, kept)
 }
@@ -442,6 +451,7 @@ mod tests {
             categories: Vec::new(),
             tags: Vec::new(),
             server_state: Map::new(),
+            server_closed: 0,
         }
     }
 

@@ -3137,11 +3137,9 @@ async fn maindata(
             view,
         })
         .collect();
-    let mut server_state = transfer(
-        &views,
-        ctx.torrent_download_limit(),
-        config.bandwidth.upload_bps,
-    );
+    let (download, upload) = (ctx.torrent_download_limit(), config.bandwidth.upload_bps);
+    let server_closed = u8::from(download == Some(0)) | u8::from(upload == Some(0)) << 1;
+    let mut server_state = transfer(&views, download, upload);
     let save_path = PathBuf::from(config.complete_dir());
     let free = tokio::task::spawn_blocking(move || probe_disk_space(&save_path))
         .await
@@ -3215,6 +3213,7 @@ async fn maindata(
             Value::Object(state) => state,
             _ => Map::new(),
         },
+        server_closed,
     };
     drop(config);
     let at = now_secs();
