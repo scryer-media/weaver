@@ -32,6 +32,8 @@ pub fn spawn<E: Display + Send + 'static>(
         }
     }
     .instrument(span);
+    #[cfg(test)]
+    let fut = polls::Counted::new(fut, std::panic::Location::caller());
     tokio::task::spawn(fut)
 }
 
@@ -51,4 +53,56 @@ pub fn spawn_with_cancel<E: Display + Send + 'static>(
             r = fut => r
         }
     })
+}
+
+/// How often each spawned task is polled, by where it was spawned, on the
+/// thread that polls it: on a current-thread runtime, every task of the
+/// test's session. An idle task polled is a task woken, mostly by a timer.
+#[cfg(test)]
+pub(crate) mod polls {
+    use std::{
+        cell::RefCell,
+        collections::HashMap,
+        future::Future,
+        panic::Location,
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    thread_local! {
+        static POLLS: RefCell<HashMap<&'static Location<'static>, u64>> =
+            RefCell::new(HashMap::new());
+    }
+
+    /// The polls counted on this thread so far, by spawn site.
+    pub(crate) fn counted() -> HashMap<&'static Location<'static>, u64> {
+        POLLS.with(|polls| polls.borrow().clone())
+    }
+
+    pub(super) struct Counted {
+        fut: Pin<Box<dyn Future<Output = ()> + Send>>,
+        at: &'static Location<'static>,
+    }
+
+    impl Counted {
+        pub(super) fn new(
+            fut: impl Future<Output = ()> + Send + 'static,
+            at: &'static Location<'static>,
+        ) -> Self {
+            Self {
+                fut: Box::pin(fut),
+                at,
+            }
+        }
+    }
+
+    impl Future for Counted {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            let at = self.at;
+            POLLS.with(|polls| *polls.borrow_mut().entry(at).or_default() += 1);
+            self.fut.as_mut().poll(cx)
+        }
+    }
 }

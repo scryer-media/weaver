@@ -25,4 +25,5 @@ mod e2e_stream;
 pub(crate) mod e2e_tracker_announces;
 mod e2e_utp_interop;
 pub mod embedder_util;
+mod idle_wakes;
 pub mod test_util;
