@@ -41,6 +41,7 @@ import {
 import { WV } from "../data/palette";
 import { countLabel } from "../i18n/labels";
 import { useStatusLabel } from "../data/status";
+import { testIds } from "@/next/testids";
 import { NextShell, RailBlock } from "../shell/NextShell";
 import { CategoryListBlock } from "../shell/rail-blocks";
 import {
@@ -675,6 +676,7 @@ export function HistoryPage() {
                 return (
                   <GridRow
                     key={row.id}
+                    testId={testIds.historyRow(row.id)}
                     columns={COLUMNS}
                     selected={picked.has(row.id)}
                     onClick={() => navigate(`/jobs/${row.id}`)}

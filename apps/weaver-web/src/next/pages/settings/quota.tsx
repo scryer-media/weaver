@@ -6,6 +6,7 @@ import { usePasswordManagerIgnore } from "@/lib/password-manager";
 import type { DownloadQuota, QuotaPeriod, Weekday } from "@/lib/networking";
 import { formatSize } from "../../data/format";
 import type { FieldSpec } from "./framework";
+import { testIds } from "../../testids";
 
 /**
  * A download allowance in an editor. Providers and egresses carry the same
@@ -28,6 +29,7 @@ function AllowanceInput({
       {...ignore}
       type="text"
       inputMode="decimal"
+      data-testid={testIds.field("quotaLimit")}
       aria-label={label}
       value={value}
       placeholder="0"

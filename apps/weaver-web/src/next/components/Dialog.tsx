@@ -28,6 +28,7 @@ export function Dialog({
   width = 520,
   overlay,
   children,
+  testId,
 }: {
   open: boolean;
   title: string;
@@ -38,6 +39,7 @@ export function Dialog({
   /** Laid over the whole panel, header and footer included: a `WorkingOverlay`. */
   overlay?: ReactNode;
   children: ReactNode;
+  testId?: string;
 }) {
   // Read through a ref so a re-render with a fresh callback keeps this
   // dialog's place in the stack instead of re-registering it on top.
@@ -78,6 +80,7 @@ export function Dialog({
     >
       <div
         role="dialog"
+        data-testid={testId}
         aria-modal="true"
         aria-label={title}
         style={{ width }}

@@ -5,6 +5,7 @@ import { useMemo, useState } from "react";
 import { useQuery } from "urql";
 import { SECRETS_QUERY } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+import { settingsIds } from "@/next/testids";
 import { Cell } from "../../../components/rows";
 import { formatDate } from "../../../data/format";
 import { sortedSecrets, usedByText, type Secret } from "../../../data/secrets";
@@ -55,6 +56,7 @@ export function SecretsPanel() {
             key="usedBy"
             className={secret.usedBy.length > 0 ? "text-wv-secondary" : "text-wv-muted"}
             title={usedByText(secret) || undefined}
+            testId={settingsIds.secretUsage(secret.usedBy.length > 0 ? "used" : "unused")}
           >
             {usedByText(secret) || t("next.secrets.unused")}
           </Cell>,

@@ -12,6 +12,7 @@ import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Cell } from "../../../components/rows";
 import { formatDate } from "../../../data/format";
 import { SettingsBlocks, type SettingsBlock } from "../framework";
+import { settingsIds, testIds } from "@/next/testids";
 import { useBackupAdminAction } from "./useBackupAdminAction";
 
 interface BackupInfo {
@@ -53,7 +54,7 @@ export function StoredBackups({ generation }: { generation: number }) {
   const blocks: SettingsBlock[] = [
     { kind: "section", id: "backupStorage", title: t("next.backup.storage"), fields: [
       { id: "backupPath", label: t("next.backup.customPath"), help: data?.backupSettings.backupPath, control: { kind: "path", value: path ?? data?.backupSettings.customBackupPath ?? "", onChange: setPath } },
-      { id: "saveBackupPath", label: t("next.backup.saveStorage"), control: { kind: "custom", control: <SecondaryButton icon="save" disabled={busy || path === null} onClick={() => void run(async () => { const result = await updatePath({ path: path?.trim() || null }); if (result.error) throw result.error; setPath(null); })}>{t("next.settings.saveChanges")}</SecondaryButton> } },
+      { id: "saveBackupPath", label: t("next.backup.saveStorage"), control: { kind: "custom", control: <SecondaryButton testId={settingsIds.backupStorageSave} icon="save" disabled={busy || path === null} onClick={() => void run(async () => { const result = await updatePath({ path: path?.trim() || null }); if (result.error) throw result.error; setPath(null); })}>{t("next.settings.saveChanges")}</SecondaryButton> } },
     ] },
     { kind: "section", id: "automaticBackups", title: t("next.backup.automatic"), note: t("next.backup.retention"), fields: [
       { id: "autoEnabled", label: t("next.backup.autoEnabled"), control: { kind: "toggle", value: settings?.enabled ?? false, onChange: (enabled) => patch({ enabled }) } },
@@ -71,23 +72,23 @@ export function StoredBackups({ generation }: { generation: number }) {
     { kind: "table", id: "storedBackups", title: t("next.backup.stored"), columns: "minmax(140px, 1fr) 90px 90px 100px 90px 256px", headers: [t("next.backup.taken"), t("next.backup.trigger"), t("next.backup.status"), t("next.backup.size"), t("next.backup.version"), t("next.backup.actions")], rows: (data?.backups ?? []).map((backup) => ({ id: backup.filename, searchText: `${backup.filename} ${backup.trigger} ${backup.status} ${backup.sourceWeaverVersion}`, cells: [
       <Cell key="created" title={backup.filename}>{formatDate(Date.parse(backup.createdAt))}</Cell>,
       <Cell key="trigger">{t(backup.trigger === "AUTO" ? "next.backup.triggerAuto" : "next.backup.triggerManual")}</Cell>,
-      <Cell key="status" title={backup.error ?? undefined}>{t(backup.status === "READY" ? "next.backup.ready" : backup.status === "CREATING" ? "next.backup.creating" : "next.backup.failed")}{backup.error ? <span className="text-wv-error-text">: {backup.error}</span> : null}</Cell>,
+      <Cell key="status" testId={settingsIds.storedBackupStatus(backup.status === "READY" ? "ready" : backup.status === "CREATING" ? "creating" : "failed")} title={backup.error ?? undefined}>{t(backup.status === "READY" ? "next.backup.ready" : backup.status === "CREATING" ? "next.backup.creating" : "next.backup.failed")}{backup.error ? <span className="text-wv-error-text">: {backup.error}</span> : null}</Cell>,
       <Cell key="size">{(backup.sizeBytes / 1024 / 1024).toFixed(2)} MiB</Cell>,
       <Cell key="version">{backup.sourceWeaverVersion}</Cell>,
-      <div key="actions" className="flex gap-2"><SecondaryButton size="compact" icon="downloadFile" disabled={busy || backup.status !== "READY"} onClick={() => void run(async () => {
+      <div key="actions" className="flex gap-2"><SecondaryButton testId={settingsIds.storedBackupDownload} size="compact" icon="downloadFile" disabled={busy || backup.status !== "READY"} onClick={() => void run(async () => {
         const token = await downloadToken({ filename: backup.filename });
         if (token.error) throw token.error;
         const url = new URL(`api/backup/download/${encodeURIComponent(backup.filename)}`, document.baseURI);
         const response = await fetch(url, { headers: { ...authHeaders(), "X-Weaver-Backup-Token": token.data.createBackupDownloadToken } });
         if (!response.ok) throw new Error(t("next.backup.requestFailed", { status: response.status }));
         await saveResponseAsDownload(response, backup.filename);
-      })}>{t("next.backup.downloadStored")}</SecondaryButton><DangerButton size="compact" icon="remove" disabled={busy || backup.status === "CREATING"} onClick={() => setDeleting(backup.filename)}>{t("next.backup.deleteStored")}</DangerButton></div>,
+      })}>{t("next.backup.downloadStored")}</SecondaryButton><DangerButton testId={settingsIds.storedBackupDelete} size="compact" icon="remove" disabled={busy || backup.status === "CREATING"} onClick={() => setDeleting(backup.filename)}>{t("next.backup.deleteStored")}</DangerButton></div>,
     ] })) },
   ];
   return <>
     {error || queryError ? <p role="alert" className="p-4 text-wv-error-text">{error ?? queryError?.message}</p> : null}
     <SettingsBlocks blocks={blocks} />
-    <ConfirmDialog open={deleting !== null} title={t("next.backup.deleteStored")} note={deleting ?? undefined} body={t("next.backup.deleteBody")} busy={busy} confirmLabel={t("next.backup.deleteStored")} onDismiss={() => setDeleting(null)} onConfirm={() => void run(async () => { const result = await deleteBackup({ filename: deleting }); if (result.error) throw result.error; setDeleting(null); })} />
+    <ConfirmDialog testId={testIds.dialog("stored-backup-delete")} open={deleting !== null} title={t("next.backup.deleteStored")} note={deleting ?? undefined} body={t("next.backup.deleteBody")} busy={busy} confirmLabel={t("next.backup.deleteStored")} onDismiss={() => setDeleting(null)} onConfirm={() => void run(async () => { const result = await deleteBackup({ filename: deleting }); if (result.error) throw result.error; setDeleting(null); })} />
     {reauthentication}
   </>;
 }

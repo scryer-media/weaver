@@ -44,6 +44,7 @@ export function SectionHeader({
   lead,
   tag,
   sticky = true,
+  noteTestId,
 }: {
   label: ReactNode;
   count?: ReactNode;
@@ -53,6 +54,7 @@ export function SectionHeader({
   /** A control ahead of the label — the checkbox that ticks every row in the section. */
   lead?: ReactNode;
   sticky?: boolean;
+  noteTestId?: string;
 }) {
   return (
     <div
@@ -68,7 +70,7 @@ export function SectionHeader({
         <span className="font-wv-mono text-[11px] text-wv-note">{count}</span>
       )}
       {note === undefined ? null : (
-        <span className="ml-auto truncate font-wv-mono text-[11px] text-wv-note">{note}</span>
+        <span data-testid={noteTestId} className="ml-auto truncate font-wv-mono text-[11px] text-wv-note">{note}</span>
       )}
     </div>
   );
@@ -113,6 +115,7 @@ export function MetricCell({
   variant = "wide",
   children,
   last,
+  testId,
 }: {
   eyebrow: ReactNode;
   value: ReactNode;
@@ -123,10 +126,12 @@ export function MetricCell({
   /** Anything absolutely positioned against the cell, e.g. the storage menu. */
   children?: ReactNode;
   last?: boolean;
+  testId?: string;
 }) {
   const wide = variant === "wide";
   return (
     <div
+      data-testid={testId}
       className={cn(
         "relative flex min-w-0 flex-col",
         wide && "flex-1 gap-2 border-t border-wv-hairline px-4 py-4 sm:px-6 lg:border-t-0",
@@ -674,9 +679,11 @@ export function EmptyState({
   loading = false,
   centered = false,
   action,
+  testId,
 }: {
   title: string;
   body: string;
+  testId?: string;
   loading?: boolean;
   /** Fill the pane and sit in the middle of it: for a screen with nothing at all to show. */
   centered?: boolean;
@@ -688,6 +695,7 @@ export function EmptyState({
   const revealed = useSettledFlag(loading);
   return (
     <div
+      data-testid={testId}
       role={loading ? "status" : undefined}
       className={cn(
         "flex gap-4 px-4 sm:px-6 py-10",
@@ -706,11 +714,19 @@ export function EmptyState({
 }
 
 /** A dense key/value row — System info's basic unit, 11px vertical padding. */
-export function KeyValueRow({ label, value }: { label: ReactNode; value: ReactNode }) {
+export function KeyValueRow({
+  label,
+  value,
+  testId,
+}: {
+  label: ReactNode;
+  value: ReactNode;
+  testId?: string;
+}) {
   return (
     <div className="flex flex-wrap items-baseline gap-x-6 gap-y-1.5 border-b border-wv-hairline px-4 sm:px-6 py-[11px] hover:bg-wv-cell-hover">
       <div className="min-w-0 flex-[1_1_260px] text-[13px] text-wv-muted">{label}</div>
-      <div className="ml-auto flex-none text-right font-wv-mono text-[12.5px] text-wv-fg">
+      <div data-testid={testId} className="ml-auto flex-none text-right font-wv-mono text-[12.5px] text-wv-fg">
         {value}
       </div>
     </div>

@@ -31,6 +31,7 @@ import { Icon } from "../../../components/icons";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { DangerButton, PrimaryButton, SecondaryButton, TextField } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
+import { settingsIds, testIds } from "../../../testids";
 import { WV } from "../../../data/palette";
 import { formatDate } from "../../../data/format";
 import {
@@ -800,11 +801,12 @@ function SecurityPanelBody({
           kind: "custom",
           control: (
             <>
-              <SecondaryButton icon="password" onClick={() => setPasswordOpen(true)}>
+              <SecondaryButton icon="password" onClick={() => setPasswordOpen(true)} testId={settingsIds.passwordChange}>
                 {t("next.security.changePassword")}
               </SecondaryButton>
               <DangerButton
                 icon="signOut"
+                testId={settingsIds.signOutEverywhere}
                 onClick={() => {
                   setSignOutAllError(null);
                   setSignOutAllOpen(true);
@@ -825,15 +827,15 @@ function SecurityPanelBody({
           kind: "custom",
           control: login?.enabled ? (
             <>
-              <SecondaryButton icon="password" onClick={() => setPasswordOpen(true)}>
+              <SecondaryButton icon="password" onClick={() => setPasswordOpen(true)} testId={settingsIds.passwordChange}>
                 {t("next.security.changePassword")}
               </SecondaryButton>
-              <SecondaryButton icon="unlock" onClick={() => setDisableOpen(true)}>
+              <SecondaryButton icon="unlock" onClick={() => setDisableOpen(true)} testId={settingsIds.loginOff}>
                 {t("next.security.turnOff")}
               </SecondaryButton>
             </>
           ) : (
-            <PrimaryButton icon="lock" onClick={() => setEnableOpen(true)}>
+            <PrimaryButton icon="lock" onClick={() => setEnableOpen(true)} testId={settingsIds.loginSetup}>
               {t("next.security.setUpLogin")}
             </PrimaryButton>
           ),
@@ -876,7 +878,7 @@ function SecurityPanelBody({
         searchText: `${key.name} ${key.scope} ${scopeLabel(key.scope)}`,
         cells: [
           <Cell key="name">{key.name}</Cell>,
-          <Cell key="scope" mono className="text-wv-secondary">
+          <Cell key="scope" mono className="text-wv-secondary" testId={settingsIds.keyScope(key.scope)}>
             {scopeLabel(key.scope)}
           </Cell>,
           <Cell key="created" mono className="text-wv-muted">
@@ -885,7 +887,7 @@ function SecurityPanelBody({
           <Cell key="used" mono className="text-wv-muted">
             {key.lastUsedAt ? formatDate(key.lastUsedAt) : t("next.security.never")}
           </Cell>,
-          <SecondaryButton icon="remove" key="revoke" className="h-7 px-2" onClick={() => setRemoveKey(key)}>
+          <SecondaryButton icon="remove" key="revoke" className="h-7 px-2" onClick={() => setRemoveKey(key)} testId={settingsIds.keyRevoke}>
             {t("next.security.revoke")}
           </SecondaryButton>,
         ],
@@ -924,6 +926,7 @@ function SecurityPanelBody({
 
       <RecordEditor
         open={enableOpen}
+        testId={testIds.dialog("login-setup")}
         title={t("next.security.setUpLogin")}
         note={t("next.security.appliesImmediately")}
         error={enableError}
@@ -978,6 +981,7 @@ function SecurityPanelBody({
 
       <RecordEditor
         open={passwordOpen}
+        testId={testIds.dialog("password-change")}
         title={t("next.security.changePassword")}
         error={passwordError}
         busy={busy}
@@ -1031,6 +1035,7 @@ function SecurityPanelBody({
 
       <RecordEditor
         open={keyOpen}
+        testId={testIds.dialog("key-new")}
         title={t("next.security.newKey")}
         note={t("next.security.newKeyNote")}
         error={keyError}
@@ -1071,6 +1076,7 @@ function SecurityPanelBody({
 
       <Dialog
         open={createdKey !== null}
+        testId={testIds.dialog("key-created")}
         title={t("next.security.keyCreated")}
         note={createdKey?.name}
         width={560}
@@ -1080,7 +1086,7 @@ function SecurityPanelBody({
             <SecondaryButton icon={copied === "copied" ? "copied" : "copy"} onClick={() => void copyCreatedKey()}>
               {copyLabel}
             </SecondaryButton>
-            <PrimaryButton onClick={() => setCreatedKey(null)}>{t("next.security.done")}</PrimaryButton>
+            <PrimaryButton onClick={() => setCreatedKey(null)} testId={settingsIds.keyCreatedDone}>{t("next.security.done")}</PrimaryButton>
           </>
         }
       >
@@ -1091,6 +1097,7 @@ function SecurityPanelBody({
           <div className="relative w-full">
             <TextField
               ref={keyFieldRef}
+              testId={settingsIds.keyCreatedValue}
               label={t("next.security.apiKey")}
               value={createdKey?.rawKey ?? ""}
               onChange={() => undefined}
@@ -1113,6 +1120,7 @@ function SecurityPanelBody({
 
       <ConfirmDialog
         open={disableOpen}
+        testId={testIds.dialog("login-off")}
         title={t("next.security.turnOffTitle")}
         busy={busy}
         confirmLabel={t("next.security.turnOffLogin")}
@@ -1123,6 +1131,7 @@ function SecurityPanelBody({
 
       <ConfirmDialog
         open={signOutAllOpen}
+        testId={testIds.dialog("sign-out-everywhere")}
         title={t("next.security.signOutEverywhereTitle")}
         busy={busy}
         destructive
@@ -1156,6 +1165,7 @@ function SecurityPanelBody({
 
       <ConfirmDialog
         open={removeKey !== null}
+        testId={testIds.dialog("key-revoke")}
         title={t("next.security.revokeTitle")}
         note={removeKey?.name}
         busy={busy}

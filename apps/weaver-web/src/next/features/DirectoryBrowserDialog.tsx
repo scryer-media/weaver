@@ -20,6 +20,7 @@ import { cn } from "@/lib/utils";
 import { Dialog } from "@/next/components/Dialog";
 import { Cell, GridHeader, GridRow } from "@/next/components/rows";
 import { PrimaryButton, SecondaryButton, TextField } from "@/next/components/controls";
+import { testIds } from "@/next/testids";
 import {
   describeEntryCount,
   filterEntries,
@@ -229,12 +230,14 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
       title={title ?? t(files ? "next.files.choose" : "next.folders.choose")}
       onDismiss={onClose}
       width={720}
+      testId={testIds.dialog("picker")}
       footer={
         <>
           {/* A failed create reports here, on the path's one line, rather than
               adding a line of its own that would grow the dialog. */}
           <span
             aria-live="polite"
+            data-testid={testIds.pickerPath}
             title={createError ?? selected ?? currentPath}
             className={cn(
               "mr-auto min-w-0 flex-[1_1_200px] truncate text-[11.5px]",
@@ -243,13 +246,13 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
           >
             {createError ?? selected ?? currentPath}
           </span>
-          <SecondaryButton onClick={onClose}>{t("action.cancel")}</SecondaryButton>
+          <SecondaryButton onClick={onClose} testId={testIds.pickerCancel}>{t("action.cancel")}</SecondaryButton>
           {files ? (
-            <PrimaryButton disabled={busy || selected === null} onClick={() => selected !== null && onChoose(selected)}>
+            <PrimaryButton disabled={busy || selected === null} onClick={() => selected !== null && onChoose(selected)} testId={testIds.pickerUse}>
               {t("next.files.use")}
             </PrimaryButton>
           ) : (
-            <PrimaryButton disabled={busy || !listing} onClick={() => listing && onChoose(listing.currentPath)}>
+            <PrimaryButton disabled={busy || !listing} onClick={() => listing && onChoose(listing.currentPath)} testId={testIds.pickerUse}>
               {t("next.folders.use")}
             </PrimaryButton>
           )}
@@ -287,6 +290,7 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
           <div className="flex min-w-0 flex-[1_1_320px] gap-2">
             <TextField
               ref={pathInputRef}
+              testId={testIds.pickerPathInput}
               label={t("next.folders.path")}
               value={typedPath}
               onChange={setTypedPath}
@@ -300,6 +304,7 @@ function DirectoryBrowserSession({ open, initialPath, title, pick, onClose, onCh
             />
             <SecondaryButton
               icon="go"
+              testId={testIds.pickerGo}
               disabled={busy || typedPath.trim() === ""}
               onClick={() => void browse(typedPath.trim(), fileStops(typedPath.trim()))}
             >
@@ -461,6 +466,7 @@ const EntryList = memo(function EntryList({
                 <GridRow
                   columns={COLUMNS}
                   title={entry.path}
+                  testId={testIds.pickerEntry(entry.name)}
                   selected={entry.path === selected}
                   onClick={busy ? undefined : () => onActivate(entry)}
                   className="h-full border-b border-wv-hairline px-4 sm:px-[22px]"
@@ -500,6 +506,7 @@ export function PathField({
   browseFrom,
   compact = false,
   className,
+  testId,
 }: {
   value: string;
   onChange: (next: string) => void;
@@ -513,6 +520,7 @@ export function PathField({
   /** Table-cell height, for a path edited inside a row. */
   compact?: boolean;
   className?: string;
+  testId?: string;
 }) {
   const t = useTranslate();
   const [browsing, setBrowsing] = useState(false);
@@ -549,6 +557,7 @@ export function PathField({
     <div className={cn("flex min-w-0 items-center gap-2", className ?? "w-[340px] max-w-full")}>
       <TextField
         ref={fieldRef}
+        testId={testId}
         label={label}
         value={value}
         placeholder={placeholder}
@@ -574,6 +583,7 @@ export function PathField({
       />
       <SecondaryButton
         icon="browse"
+        testId={testId === undefined ? undefined : testIds.browse(testId)}
         size={compact ? "compact" : "default"}
         className={compact ? "h-7" : undefined}
         onClick={openPicker}
