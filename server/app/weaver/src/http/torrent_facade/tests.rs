@@ -2001,21 +2001,86 @@ fn url_encode(value: &str) -> String {
         .collect()
 }
 
+// `sync/maindata` answers by response id as qBittorrent's `SyncController`
+// does: whole while the client's id is unknown, else only what changed since
+// the state that id stands for, each client by its own ids.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn maindata_is_a_full_update_with_a_rising_rid() {
+async fn maindata_sends_changes_from_the_id_the_client_holds() {
     let rig = rig().await;
     rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
     let first = rig.get("/api/v2/sync/maindata").await.json();
-    let second = rig.get("/api/v2/sync/maindata?rid=1").await.json();
+    assert_eq!(first["rid"], 1);
     assert_eq!(first["full_update"], true);
-    assert!(second["rid"].as_u64().unwrap() > first["rid"].as_u64().unwrap());
     let torrents = first["torrents"].as_object().unwrap();
     assert_eq!(torrents.len(), 1);
     let (hash, torrent) = torrents.iter().next().unwrap();
+    let hash = hash.clone();
     assert_eq!(hash.len(), 40);
     assert_eq!(torrent["name"], "one.mkv");
+    assert_eq!(torrent["force_start"], false);
     assert!(torrent.get("hash").is_none());
     assert_eq!(first["server_state"]["connection_status"], "connected");
+    // No tags: an empty key is left out.
+    assert!(first.get("tags").is_none());
+
+    // Sending the id back: only the torrent's changed keys.
+    rig.post(
+        "/api/v2/torrents/setForceStart",
+        &format!("hashes={hash}&value=true"),
+    )
+    .await;
+    let second = rig.get("/api/v2/sync/maindata?rid=1").await.json();
+    assert_eq!(second["rid"], 2);
+    assert!(second.get("full_update").is_none(), "{second}");
+    let changed = &second["torrents"][&hash];
+    assert_eq!(changed["force_start"], true);
+    assert!(changed.get("name").is_none(), "{changed}");
+    assert!(second["server_state"].get("connection_status").is_none());
+
+    // The same id again, as after a lost response: the changes since the
+    // state it stands for, again.
+    let again = rig.get("/api/v2/sync/maindata?rid=1").await.json();
+    assert_eq!(again["rid"], 3);
+    assert!(again.get("full_update").is_none());
+    assert_eq!(again["torrents"][&hash]["force_start"], true);
+
+    // Another client holds nothing, whatever id it sends.
+    let other = rig
+        .send(
+            Request::get("/api/v2/sync/maindata?rid=3")
+                .header("x-api-key", READER)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .json();
+    assert_eq!(other["rid"], 1);
+    assert_eq!(other["full_update"], true);
+
+    // An id the client was never sent: whole.
+    let unknown = rig.get("/api/v2/sync/maindata?rid=999").await.json();
+    assert_eq!(unknown["rid"], 4);
+    assert_eq!(unknown["full_update"], true);
+    assert_eq!(unknown["torrents"][&hash]["name"], "one.mkv");
+
+    // A removed torrent: its hash under `torrents_removed`.
+    let removed = rig
+        .post(
+            "/api/v2/torrents/delete",
+            &format!("hashes={hash}&deleteFiles=false"),
+        )
+        .await;
+    assert_eq!(removed.status, StatusCode::OK);
+    let gone = rig.get("/api/v2/sync/maindata?rid=4").await.json();
+    assert_eq!(gone["rid"], 5);
+    assert!(gone.get("full_update").is_none());
+    assert_eq!(gone["torrents_removed"], json!([hash]));
+    assert!(gone.get("torrents").is_none());
+
+    // A fresh request starts over whole.
+    let fresh = rig.get("/api/v2/sync/maindata").await.json();
+    assert_eq!(fresh["full_update"], true);
+    assert!(fresh.get("torrents").is_none());
 
     let transfer = rig.get("/api/v2/transfer/info").await.json();
     assert_eq!(transfer["dl_info_speed"], 0);

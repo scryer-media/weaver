@@ -53,10 +53,12 @@ use weaver_server_core::{Database, RssFeedRow, SchedulerHandle};
 use super::auth::{LoginRateLimiter, login_client_id, same_origin_request};
 
 mod api;
+mod sync;
 #[cfg(test)]
 mod tests;
 
 pub(super) use api::Api;
+use sync::{Maindata, SyncClient, SyncTable};
 
 const BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const SESSION_CAP: usize = 1024;
@@ -83,6 +85,9 @@ struct Inner {
     // Login cookie -> the hash of the API key it was issued for, looked up
     // again on every request so a revoked key ends its sessions.
     sessions: Mutex<SessionTable>,
+    // Each client's `sync/maindata` ids and the state they stand for.
+    sync: Mutex<SyncTable>,
+    // `sync/torrentPeers` ids.
     rid: AtomicU64,
     categories: tokio::sync::Mutex<()>,
     rss: RssService,
@@ -145,6 +150,7 @@ impl TorrentFacadeContext {
                 rss,
                 api,
                 sessions: Mutex::new(SessionTable::default()),
+                sync: Mutex::new(SyncTable::default()),
                 rid: AtomicU64::new(0),
                 categories: tokio::sync::Mutex::new(()),
                 launched: now_secs(),
@@ -168,6 +174,19 @@ impl TorrentFacadeContext {
             .sessions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn sync(&self) -> std::sync::MutexGuard<'_, SyncTable> {
+        self.inner
+            .sync
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // Ends a login session, and the `sync/maindata` state kept for it.
+    fn end_session(&self, sid: &str) {
+        self.sessions().keys.remove(sid);
+        self.sync().forget(&SyncClient::Session(sid.to_owned()));
     }
 
     // The download limit torrents are held to this tick.
@@ -272,24 +291,26 @@ impl TorrentFacadeContext {
                     return Ok(Caller {
                         scope,
                         by_cookie: true,
+                        client: SyncClient::Session(sid),
                     });
                 }
-                None => {
-                    self.sessions().keys.remove(&sid);
-                }
+                None => self.end_session(&sid),
             }
         }
-        let scope = match basic_password(headers) {
-            Some(password) => self.resolve(&password).await?,
+        let (scope, key) = match basic_password(headers) {
+            Some(password) => (self.resolve(&password).await?, Some(password)),
             None => {
                 let mut headers = headers.clone();
                 headers.remove(header::COOKIE);
-                self.resolve_headers(&headers).await?
+                (self.resolve_headers(&headers).await?, sent_key(&headers))
             }
         };
         Ok(Caller {
             scope,
             by_cookie: false,
+            client: key.map_or(SyncClient::Anonymous, |key| {
+                SyncClient::Key(hash_api_key(&key))
+            }),
         })
     }
 }
@@ -298,6 +319,8 @@ impl TorrentFacadeContext {
 struct Caller {
     scope: CallerScope,
     by_cookie: bool,
+    // Whose `sync/maindata` ids the request carries.
+    client: SyncClient,
 }
 
 impl Caller {
@@ -326,6 +349,23 @@ fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
         .find(|(key, _)| *key == name)
         .map(|(_, value)| value.to_owned())
         .filter(|value| !value.is_empty())
+}
+
+// The API key a request sends as a bearer token or in `X-Api-Key`.
+fn sent_key(headers: &HeaderMap) -> Option<String> {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    bearer
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+        })
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
 }
 
 fn basic_password(headers: &HeaderMap) -> Option<String> {
@@ -649,7 +689,7 @@ async fn handle(
                     if !same_origin_request(request.headers()) {
                         return forbidden();
                     }
-                    ctx.sessions().keys.remove(&sid);
+                    ctx.end_session(&sid);
                 }
                 ok()
             }
@@ -663,11 +703,12 @@ async fn handle(
     let Some(need) = need(&group, &action) else {
         return no_endpoint(ctx.api(), &group);
     };
-    let scope = caller.scope;
+    let may_change = caller.may_change(request.headers());
+    let Caller { scope, client, .. } = caller;
     let allowed = match need {
         Need::Read => scope.can_read(),
-        Need::Control => caller.may_change(request.headers()),
-        Need::Admin => scope.is_admin() && caller.may_change(request.headers()),
+        Need::Control => may_change,
+        Need::Admin => scope.is_admin() && may_change,
     };
     if !allowed {
         return forbidden();
@@ -680,7 +721,7 @@ async fn handle(
         "app" => app(&ctx, &action, &params).await,
         "torrents" => torrents(&ctx, &action, params, scope).await,
         "transfer" => transfer_action(&ctx, &action, &params).await,
-        "sync" if action == "maindata" => maindata(&ctx, scope).await,
+        "sync" if action == "maindata" => maindata(&ctx, scope, client, &params).await,
         "sync" => torrent_peers(&ctx, &params).await,
         "rss" => rss(&ctx, &action, &params).await,
         // Weaver keeps no log the client's shape fits.
@@ -3041,8 +3082,19 @@ fn transfer(views: &[TorrentView], download: Option<u64>, upload: Option<u64>) -
     )
 }
 
-async fn maindata(ctx: &TorrentFacadeContext, scope: CallerScope) -> Response {
-    let rid = ctx.inner.rid.fetch_add(1, Ordering::Relaxed) + 1;
+// `sync/maindata`: the whole state, or what changed since the response
+// `rid` names (qBittorrent `SyncController::maindataAction`).
+async fn maindata(
+    ctx: &TorrentFacadeContext,
+    scope: CallerScope,
+    client: SyncClient,
+    params: &Params,
+) -> Response {
+    // qBittorrent reads an id it cannot parse as 0.
+    let rid = params
+        .get("rid")
+        .and_then(|rid| rid.trim().parse::<u64>().ok())
+        .unwrap_or(0);
     let views = ctx.views().await;
     let config = ctx.inner.config.read().await;
     let torrents: Map<String, Value> = views
@@ -3121,15 +3173,20 @@ async fn maindata(ctx: &TorrentFacadeContext, scope: CallerScope) -> Response {
             .map(|(key, value)| (key.to_owned(), value)),
         );
     }
-    axum::Json(json!({
-        "rid": rid,
-        "full_update": true,
-        "torrents": torrents,
-        "categories": categories(&config),
-        "tags": [],
-        "server_state": server_state,
-    }))
-    .into_response()
+    let now = Maindata {
+        torrents,
+        categories: match categories(&config) {
+            Value::Object(categories) => categories,
+            _ => Map::new(),
+        },
+        tags: Vec::new(),
+        server_state: match server_state {
+            Value::Object(state) => state,
+            _ => Map::new(),
+        },
+    };
+    drop(config);
+    axum::Json(ctx.sync().answer(client, rid, now)).into_response()
 }
 
 // The client's name for a peer from the first eight bytes of its peer id
