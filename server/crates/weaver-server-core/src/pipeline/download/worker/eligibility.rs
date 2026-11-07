@@ -20,6 +20,28 @@ impl Pipeline {
         )
     }
 
+    // Whether the job holds work dispatch can hand out: articles in its
+    // download queue, in a phase that dispatches. Recovery a seek round has
+    // promoted is moved into the download queue, so it counts; recovery still
+    // parked in the recovery queue dispatches nothing until a round promotes
+    // it, so it does not. The dispatcher picks its jobs by this, and every
+    // stall warning counts by it too.
+    pub(in crate::pipeline::download) fn has_dispatchable_work(state: &JobState) -> bool {
+        state.articles.has_queued_download_work()
+            && Self::status_allows_download_dispatch(&state.status)
+    }
+
+    // The articles `has_dispatchable_work` counts, across the jobs holding a
+    // slot: only those can dispatch.
+    pub(in crate::pipeline::download) fn dispatchable_queue_depth(&self) -> usize {
+        self.nzb_admitted
+            .iter()
+            .filter_map(|job_id| self.jobs.get(job_id))
+            .filter(|state| Self::has_dispatchable_work(state))
+            .map(|state| state.articles.queued_download_len())
+            .sum()
+    }
+
     #[cfg(test)]
     pub(in crate::pipeline::download::worker) fn job_has_dispatchable_work(
         &mut self,
@@ -92,10 +114,7 @@ impl Pipeline {
         job_id: JobId,
     ) -> Option<&'static str> {
         let state = self.jobs.get(&job_id)?;
-        if !state.articles.has_queued_download_work()
-            || !Self::status_allows_download_dispatch(&state.status)
-            || self.job_has_current_download_activity(job_id)
-        {
+        if !Self::has_dispatchable_work(state) || self.job_has_current_download_activity(job_id) {
             return None;
         }
         // In the order the dispatch pass meets them.

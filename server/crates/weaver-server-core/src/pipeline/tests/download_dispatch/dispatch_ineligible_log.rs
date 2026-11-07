@@ -212,3 +212,56 @@ async fn parked_recovery_behind_a_moving_job_is_not_a_stall() {
         "a moving job with parked recovery is idle by design"
     );
 }
+
+// A verifying job keeps its slot through verification, and its recovery
+// articles stay parked until a seek round promotes them, so nothing of it is
+// meant to dispatch. Counting the parked recovery as stalled work raised a
+// slot-wait warning for every job queued behind it while it verified.
+#[tokio::test]
+async fn a_verifying_job_holding_its_slot_with_recovery_parked_is_not_a_stall() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let verifying = JobId(41620);
+    let waiting = JobId(41621);
+    insert_active_job(
+        &mut pipeline,
+        verifying,
+        standalone_job_spec("Verifying Job", &many_standalone_files("verifying", 3)),
+    )
+    .await;
+    {
+        let state = pipeline.jobs.get_mut(&verifying).unwrap();
+        let active = state.articles.active_mut().unwrap();
+        for work in active.download_queue.drain_all() {
+            active.recovery_queue.push(work);
+        }
+        state.status = JobStatus::Verifying;
+    }
+    insert_active_job(
+        &mut pipeline,
+        waiting,
+        standalone_job_spec("Waiting Job", &many_standalone_files("waiting", 1)),
+    )
+    .await;
+    pipeline.nzb_admitted.remove(&waiting);
+    assert!(pipeline.nzb_admitted.contains(&verifying));
+    assert_eq!(pipeline.jobs[&verifying].articles.queued_download_len(), 0);
+    assert!(pipeline.jobs[&verifying].articles.queued_recovery_len() > 0);
+
+    let now = std::time::Instant::now();
+    pipeline.dispatch_downloads_at(now);
+
+    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(
+        pipeline.dispatch_slot_wait_log_throttle.last_emitted_at(()),
+        None,
+        "a slot held by a verifying job is held by design"
+    );
+    assert_eq!(
+        pipeline
+            .dispatch_ineligible_log_throttle
+            .last_emitted_at(verifying),
+        None
+    );
+    assert_eq!(pipeline.last_download_dispatch_stall_log_at, None);
+}
