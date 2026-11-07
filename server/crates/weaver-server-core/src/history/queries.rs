@@ -55,6 +55,7 @@ impl Database {
         // this read (invalidating after its own commit) makes the re-cache a
         // no-op instead of resurrecting the deleted row from a stale read.
         let observed_generation = self.job_history_cache_generation();
+        self.torrent_read();
         let datastore = self.datastore();
         let row = self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(

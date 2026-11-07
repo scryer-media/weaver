@@ -8,7 +8,7 @@ use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
 use crate::settings::SeedingPolicy;
 use crate::settings::model::tracker_host;
 use crate::torrents::model::{file_priorities_str, named_by_str};
-use crate::torrents::queries::{TORRENT_COLUMNS, torrent_by_infohash_tx};
+use crate::torrents::queries::{TORRENT_COLUMNS, count, counters_from_row, torrent_by_infohash_tx};
 use crate::torrents::store::Kept;
 use crate::torrents::{
     FilePriority, TorrentCounters, TorrentInsert, TorrentIntent, TorrentRecord, TrackerEntry,
@@ -326,6 +326,7 @@ impl Database {
     // The pieces [`Self::save_torrent_checkpoint`] last kept; None when it
     // kept none.
     pub(crate) fn torrent_pieces(&self, job_id: JobId) -> Result<Option<Kept>, StateError> {
+        self.torrent_read();
         let id = stored(job_id.0)?;
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
@@ -756,6 +757,7 @@ impl Database {
     // The pieces [`Self::set_torrent_seed_verified`] last kept; None when it
     // kept none.
     pub fn torrent_seed_verified(&self, job_id: JobId) -> Result<Option<Vec<u8>>, StateError> {
+        self.torrent_read();
         let id = stored(job_id.0)?;
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
@@ -835,6 +837,7 @@ impl Database {
     // The peers and bans a torrent last saved; none when it saved none or
     // is not a torrent.
     pub fn torrent_peers(&self, job_id: JobId) -> Result<ResumePeers, StateError> {
+        self.torrent_read();
         let id = stored(job_id.0)?;
         let datastore = self.datastore();
         let row = self.run_sql_blocking_read(async move {
@@ -853,4 +856,65 @@ impl Database {
             banned: listed("banned_peers", row.opt_text("banned_peers")?)?,
         })
     }
+
+    // Every torrent's ledger, saved peers and kept pieces, by torrent, in
+    // one read: what [`Self::get_torrent_counters`],
+    // [`Self::torrent_peers`] and [`Self::torrent_pieces`] give a
+    // torrent's restore, for all of them. Each part reads on its own, so
+    // one that does not read is that part of that torrent's alone.
+    pub(crate) fn torrent_counters_by_job(
+        &self,
+    ) -> Result<std::collections::BTreeMap<JobId, CountersRow>, StateError> {
+        self.torrent_read();
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT job_id, uploaded_bytes, downloaded_bytes, active_duration_s,
+                        last_seen_complete_ms, finished_duration_s, last_activity_ms,
+                        consecutive_seeding_s, pieces, pieces_checking, peers, banned_peers
+                   FROM torrent_counters",
+                &[],
+            )
+            .await?;
+            rows.iter()
+                .map(|row| {
+                    let job_id = JobId(count(row, "job_id")?);
+                    let kept = row.opt_bytes("pieces").and_then(|bits| {
+                        bits.map(|bits| {
+                            Ok(Kept {
+                                bits,
+                                checking: row.bool("pieces_checking")?,
+                            })
+                        })
+                        .transpose()
+                    });
+                    let peers = row
+                        .opt_text("peers")
+                        .and_then(|peers| listed("peers", peers))
+                        .and_then(|peers| {
+                            let banned = row
+                                .opt_text("banned_peers")
+                                .and_then(|banned| listed("banned_peers", banned))?;
+                            Ok(ResumePeers { peers, banned })
+                        });
+                    Ok((
+                        job_id,
+                        CountersRow {
+                            counters: counters_from_row(row),
+                            peers,
+                            kept,
+                        },
+                    ))
+                })
+                .collect()
+        })
+    }
+}
+
+// One torrent's counters row as a boot reads it.
+pub(crate) struct CountersRow {
+    pub(crate) counters: Result<TorrentCounters, StateError>,
+    pub(crate) peers: Result<ResumePeers, StateError>,
+    pub(crate) kept: Result<Option<Kept>, StateError>,
 }
