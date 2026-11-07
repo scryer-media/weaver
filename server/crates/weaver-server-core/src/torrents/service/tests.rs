@@ -2154,12 +2154,24 @@ fn announcing(metainfo: &[u8], url: &str) -> Vec<u8> {
 
 // A tracker on loopback that names `peer` to every announce.
 async fn tracker(peer: std::net::SocketAddrV4) -> String {
+    answering_tracker(peer).await.0
+}
+
+// The `event` of each announce an answering tracker answered ("" for
+// none), and the Unix time in ms just before its answer went out.
+type Answered = tokio::sync::watch::Receiver<Vec<(String, i64)>>;
+
+// `tracker`, and what it has answered.
+async fn answering_tracker(peer: std::net::SocketAddrV4) -> (String, Answered) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/announce", listener.local_addr().unwrap());
+    let (answers, answered) = tokio::sync::watch::channel(Vec::new());
+    let answers = Arc::new(answers);
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
+            let answers = Arc::clone(&answers);
             tokio::spawn(async move {
                 let mut request = Vec::new();
                 let mut buf = [0u8; 1024];
@@ -2178,13 +2190,30 @@ async fn tracker(peer: std::net::SocketAddrV4) -> String {
                     body.len()
                 );
                 let answer = [head.as_bytes(), &body].concat();
-                if let Err(error) = stream.write_all(&answer).await {
-                    tracing::debug!(error = %error, "a client hung up before its answer");
+                let line = String::from_utf8_lossy(&request);
+                let line = line.lines().next().unwrap_or_default();
+                let event = line
+                    .split(['?', '&', ' '])
+                    .find_map(|pair| pair.strip_prefix("event="))
+                    .unwrap_or_default()
+                    .to_owned();
+                let at = i64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis(),
+                )
+                .unwrap();
+                match stream.write_all(&answer).await {
+                    Ok(()) => answers.send_modify(|answers| answers.push((event, at))),
+                    Err(error) => {
+                        tracing::debug!(error = %error, "a client hung up before its answer");
+                    }
                 }
             });
         }
     });
-    url
+    (url, answered)
 }
 
 // `job_id` given `url` as a tracker the operator names, in place of the
@@ -3399,6 +3428,8 @@ struct Seeded {
     clock: Arc<SetClock>,
     job_id: JobId,
     seeder: Arc<Session>,
+    // What its tracker has answered.
+    answered: Answered,
     _seeds: tempfile::TempDir,
 }
 
@@ -3411,7 +3442,8 @@ async fn seeded() -> Seeded {
     let std::net::SocketAddr::V4(peer) = seeder.listen_addr().unwrap() else {
         panic!("the seeder listens on IPv4 loopback");
     };
-    let (bytes, url) = (private.to_vec(), tracker(peer).await);
+    let (url, answered) = answering_tracker(peer).await;
+    let bytes = private.to_vec();
 
     let clock = set_clock();
     let rig = rig(Arc::clone(&clock) as Arc<dyn Clock>);
@@ -3437,6 +3469,7 @@ async fn seeded() -> Seeded {
         clock,
         job_id,
         seeder,
+        answered,
         _seeds: seeds,
     }
 }
@@ -4573,21 +4606,32 @@ async fn the_clock_alone_moves_only_one_torrents_follower() {
 
     let seeded = seeded().await;
     // Nothing but the clock moves it from here: its seeder is gone, its
-    // rates have run down, and its tracker has answered, with the next
-    // announce far past the test.
+    // rates have run down, its tracker has answered the `completed` the
+    // run owes it, the last announce before one far past the test, and the
+    // queue pass its completion asked for has taken its rank.
     seeded.seeder.stop().await;
     seeded.advance(60_000);
+    let completed = seeded
+        .answered
+        .clone()
+        .wait_for(|answers| answers.iter().any(|(event, _)| event == "completed"))
+        .await
+        .unwrap()
+        .iter()
+        .find(|(event, _)| event == "completed")
+        .unwrap()
+        .1;
     let mut follow = seeded
         .rig
         .service
         .updates(Some(seeded.job_id), Duration::from_millis(10));
     loop {
         let view = &follow.next().await.torrents[0];
-        let answered = view
-            .trackers
-            .iter()
-            .all(|tracker| !tracker.updating && tracker.last_announce_ms.is_some());
-        if view.peers == 0 && view.download_bps == 0 && view.upload_bps == 0 && answered {
+        let answered = view.trackers.iter().all(|tracker| {
+            !tracker.updating && tracker.last_announce_ms.is_some_and(|at| at >= completed)
+        });
+        let quiet = view.peers == 0 && view.download_bps == 0 && view.upload_bps == 0;
+        if quiet && answered && view.queue_position.is_none() {
             break;
         }
     }
