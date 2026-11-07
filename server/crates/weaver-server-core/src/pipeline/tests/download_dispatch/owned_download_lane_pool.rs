@@ -667,6 +667,21 @@ async fn fail_segment_on_transport(
     segment_id: SegmentId,
     retry_count: u32,
 ) -> (Duration, u32) {
+    fail_segment_with(
+        pipeline,
+        segment_id,
+        retry_count,
+        DownloadError::from_nntp(weaver_nntp::NntpError::ServerDisconnectedMidBody),
+    )
+    .await
+}
+
+async fn fail_segment_with(
+    pipeline: &mut Pipeline,
+    segment_id: SegmentId,
+    retry_count: u32,
+    error: DownloadError,
+) -> (Duration, u32) {
     let job_id = segment_id.file_id.job_id;
     hold_on_test_lane(pipeline, &[segment_id]);
     pipeline.active_download_passes.insert(job_id);
@@ -677,9 +692,7 @@ async fn fail_segment_on_transport(
             job_id: segment_id.file_id.job_id,
             runtime_generation: 0,
             segment_id,
-            data: Err(DownloadError::from_nntp(
-                weaver_nntp::NntpError::ServerDisconnectedMidBody,
-            )),
+            data: Err(error),
             attempts: Vec::new(),
             lane_observation: None,
             source_server_idx: Some(0),
@@ -807,6 +820,120 @@ async fn a_segment_dropped_by_a_serving_server_is_not_held() {
     assert_eq!(retry_count, 1, "the article now spends its retry budget");
 }
 
+// A 480 where the article's status line should be, and the batch-mates
+// abandoned behind it, say nothing about the article: the session expired,
+// and a server may answer every later command on it with 480 until it is
+// authenticated again. However often that happens while other segments
+// download, the article keeps its whole retry budget.
+#[tokio::test(start_paused = true)]
+async fn an_unanswered_article_never_spends_its_retry_budget() {
+    let unanswered = [
+        DownloadError::from_nntp(weaver_nntp::NntpError::SessionExpired),
+        DownloadError::fetch(
+            DownloadFailureKind::Unanswered,
+            "lane pipeline faulted before this article's response",
+        ),
+    ];
+    for (offset, error) in unanswered.into_iter().enumerate() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let _server = install_one_server(&mut pipeline);
+        let job_id = JobId(20034 + offset as u64);
+        let segment_id = SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            segment_number: 0,
+        };
+        let spec = segmented_job_spec("Expired session", "expired.bin", &[128]);
+        insert_active_job(&mut pipeline, job_id, spec).await;
+        let state = pipeline.jobs.get_mut(&job_id).unwrap();
+        state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+        state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
+
+        let mut retry_count = 0;
+        for attempt in 0..(MAX_SEGMENT_RETRIES + 3) {
+            pipeline
+                .metrics
+                .segments_downloaded
+                .fetch_add(1, Ordering::Relaxed);
+            let (delay, next) =
+                fail_segment_with(&mut pipeline, segment_id, retry_count, error.clone()).await;
+            assert!(
+                delay < Duration::from_secs(5),
+                "{error:?} attempt {attempt} parked for {delay:?}"
+            );
+            assert_eq!(
+                next, 0,
+                "{error:?} attempt {attempt} spent the article's budget"
+            );
+            retry_count = next;
+        }
+        assert!(
+            !pipeline.transport_failure_streaks.contains_key(&segment_id),
+            "{error:?} started a transport run"
+        );
+        assert_eq!(
+            pipeline
+                .metrics
+                .segments_failed_permanent
+                .load(Ordering::Relaxed),
+            0,
+            "{error:?} booked the segment exhausted"
+        );
+    }
+}
+
+// An unanswered article neither extends nor ends a run of its own transport
+// faults: the run is still the article's when its next own fault arrives.
+#[tokio::test(start_paused = true)]
+async fn an_unanswered_failure_leaves_a_transport_run_as_it_was() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let _server = install_one_server(&mut pipeline);
+    let job_id = JobId(20036);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let spec = segmented_job_spec("Mixed faults", "mixed.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
+
+    for _ in 0..2 {
+        let (_, retry_count) = fail_segment_on_transport(&mut pipeline, segment_id, 0).await;
+        assert_eq!(retry_count, 0);
+    }
+    let (_, retry_count) = fail_segment_with(
+        &mut pipeline,
+        segment_id,
+        0,
+        DownloadError::from_nntp(weaver_nntp::NntpError::SessionExpired),
+    )
+    .await;
+    assert_eq!(retry_count, 0);
+    assert_eq!(
+        pipeline.transport_failure_streaks[&segment_id].failures, 2,
+        "the 480 neither extended nor ended the run"
+    );
+
+    pipeline
+        .metrics
+        .segments_downloaded
+        .fetch_add(1, Ordering::Relaxed);
+    let (_, retry_count) = fail_segment_on_transport(&mut pipeline, segment_id, 0).await;
+    assert_eq!(
+        retry_count, 1,
+        "the article's own third fault still costs it"
+    );
+}
+
 #[tokio::test]
 async fn an_outage_never_spends_article_retry_budget() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -848,8 +975,9 @@ fn lane_acquire_failure_preserves_retry_semantics() {
     // as an auth failure, which would disable the server for the auth backoff
     // and unlock the backfill tier behind it.
     let expired = DownloadFailure::from_nntp(weaver_nntp::NntpError::SessionExpired);
-    assert_eq!(expired.kind, DownloadFailureKind::EstablishedTransport);
+    assert_eq!(expired.kind, DownloadFailureKind::Unanswered);
     assert!(expired.kind.preserves_article_retry_budget());
+    assert!(expired.kind.infrastructure_wait_reason().is_some());
 
     let unavailable = DownloadFailure::from_lane_acquire_failure(None);
     assert_eq!(unavailable.kind, DownloadFailureKind::LaneUnavailable);

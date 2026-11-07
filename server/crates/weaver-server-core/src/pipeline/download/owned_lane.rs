@@ -2210,7 +2210,7 @@ fn unresolved_result(
         segment_id: work.segment_id,
         runtime_generation,
         data: Err(DownloadError::Fetch(DownloadFailure::new(
-            DownloadFailureKind::EstablishedTransport,
+            DownloadFailureKind::Unanswered,
             message,
         ))),
         attempts: Vec::new(),
@@ -2540,6 +2540,33 @@ mod tests {
     // article instead of its last. Only the lane's closing event waits for an
     // acknowledgement, because that is what orders the results ahead of the
     // park message on the other channel.
+    // The articles abandoned behind a fault were never answered: they keep
+    // their retry budget and go back out on another connection.
+    #[test]
+    fn an_abandoned_article_is_unanswered() {
+        let result = unresolved_result(
+            tail_work(0, 2),
+            1,
+            0,
+            JobId(7),
+            0,
+            DownloadLaneMode::Sequential,
+            true,
+            None,
+            true,
+            3,
+            &[],
+            "lane pipeline faulted before this article's response",
+        );
+        let Err(DownloadError::Fetch(failure)) = &result.data else {
+            panic!("an abandoned article is a fetch failure");
+        };
+        assert_eq!(failure.kind, DownloadFailureKind::Unanswered);
+        assert!(failure.kind.preserves_article_retry_budget());
+        assert_eq!(result.retry_count, 2);
+        assert!(!download_outcome_keeps_connection(&result.data));
+    }
+
     #[tokio::test]
     async fn results_stream_one_article_at_a_time_and_only_the_last_waits() {
         let (event_tx, mut event_rx) = mpsc::channel(8);
@@ -2815,6 +2842,10 @@ mod tests {
             Err::<DownloadPayload, _>(DownloadError::Fetch(DownloadFailure::new(
                 DownloadFailureKind::EstablishedTransport,
                 "connection closed mid-body",
+            ))),
+            Err(DownloadError::Fetch(DownloadFailure::new(
+                DownloadFailureKind::Unanswered,
+                "session expired mid-pipeline (480)",
             ))),
             Err(DownloadError::Decode {
                 raw_size: 128,

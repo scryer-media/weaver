@@ -53,15 +53,21 @@ impl Pipeline {
     }
 
     // Extends or ends `segment_id`'s run of established-transport failures,
-    // returning the run when this failure belongs to one.
+    // returning the run when this failure belongs to one. A failure that left
+    // the article unanswered says nothing about it, so the run is neither
+    // extended nor ended by one.
     fn note_transport_failure_streak(
         &mut self,
         segment_id: SegmentId,
         failure: &DownloadFailure,
     ) -> Option<TransportFailureStreak> {
-        if failure.kind != DownloadFailureKind::EstablishedTransport {
-            self.transport_failure_streaks.remove(&segment_id);
-            return None;
+        match failure.kind {
+            DownloadFailureKind::EstablishedTransport => {}
+            DownloadFailureKind::Unanswered => return None,
+            _ => {
+                self.transport_failure_streaks.remove(&segment_id);
+                return None;
+            }
         }
         let downloaded = self.metrics.segments_downloaded.load(Ordering::Relaxed);
         let streak =
@@ -869,6 +875,7 @@ impl Pipeline {
                     DownloadFailureKind::CapacityUnavailable
                         | DownloadFailureKind::ConnectionEstablishment
                         | DownloadFailureKind::EstablishedTransport
+                        | DownloadFailureKind::Unanswered
                         | DownloadFailureKind::Auth
                         | DownloadFailureKind::ContentOrProtocol
                 ) && self.unclean_batch_is_server_fault(job_id)
@@ -1158,6 +1165,7 @@ impl Pipeline {
                     | DownloadFailureKind::LaneUnavailable
                     | DownloadFailureKind::ConnectionEstablishment
                     | DownloadFailureKind::EstablishedTransport
+                    | DownloadFailureKind::Unanswered
                     | DownloadFailureKind::Unrequested => {
                         crate::jobs::SemanticTerminalCause::ServerAuthQuotaOrOutage
                     }
@@ -1178,7 +1186,8 @@ impl Pipeline {
                         .fetch_add(1, Ordering::Relaxed),
                     DownloadFailureKind::Unrequested | DownloadFailureKind::ServerQuota => 0,
                     DownloadFailureKind::ConnectionEstablishment
-                    | DownloadFailureKind::EstablishedTransport => self
+                    | DownloadFailureKind::EstablishedTransport
+                    | DownloadFailureKind::Unanswered => self
                         .metrics
                         .download_failures_transient
                         .fetch_add(1, Ordering::Relaxed),
@@ -1269,8 +1278,10 @@ impl Pipeline {
                 // unlocks backfill (`fill_servers_exhausted`) — backfill is
                 // reserved for articles the fill tier is missing, never for
                 // transient blips the primary can serve on the next attempt.
-                let avoid_server = if failure.kind == DownloadFailureKind::EstablishedTransport
-                    && let Some(idx) = source_server_idx
+                let avoid_server = if matches!(
+                    failure.kind,
+                    DownloadFailureKind::EstablishedTransport | DownloadFailureKind::Unanswered
+                ) && let Some(idx) = source_server_idx
                 {
                     let retention_excludes = self.job_retention_excludes(job_id);
                     let backfill = self.nntp.pool().server_backfill_flags();
