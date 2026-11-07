@@ -5,6 +5,7 @@ import { Fragment, useEffect, useState, type ReactNode } from "react";
 import { useLocation } from "react-router";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
+import { networkIds } from "@/next/testids";
 import {
   noOverrides,
   routeInput,
@@ -220,10 +221,27 @@ function requestInput(run: SpeedTestRun, owner: Consumer): SpeedTestInput {
   };
 }
 
-/** One small table inside a run: a header row and its rows on the same tracks. */
-function MiniTable({ label, columns, headers, rows }: { label: string; columns: string; headers: string[]; rows: ReactNode[][] }) {
+/**
+ * One small table inside a run: a header row and its rows on the same tracks. `table` and
+ * `cellIds` key its test IDs: the table's own name, and each column's.
+ */
+function MiniTable({
+  table,
+  label,
+  columns,
+  headers,
+  cellIds,
+  rows,
+}: {
+  table: string;
+  label: string;
+  columns: string;
+  headers: string[];
+  cellIds?: readonly string[];
+  rows: ReactNode[][];
+}) {
   return (
-    <div role="table" aria-label={label} className="min-w-0 overflow-x-auto">
+    <div role="table" aria-label={label} data-testid={networkIds.speedTable(table)} className="min-w-0 overflow-x-auto">
       <div className="min-w-[560px]">
         <div role="row" className="grid gap-4 border-b border-wv-hairline py-2" style={{ gridTemplateColumns: columns }}>
           {headers.map((header) => (
@@ -233,9 +251,20 @@ function MiniTable({ label, columns, headers, rows }: { label: string; columns: 
           ))}
         </div>
         {rows.map((cells, index) => (
-          <div key={index} role="row" className="grid gap-4 border-b border-wv-hairline py-2 text-[12.5px]" style={{ gridTemplateColumns: columns }}>
+          <div
+            key={index}
+            role="row"
+            data-testid={networkIds.speedTableRow(table)}
+            className="grid gap-4 border-b border-wv-hairline py-2 text-[12.5px]"
+            style={{ gridTemplateColumns: columns }}
+          >
             {cells.map((cell, column) => (
-              <div key={column} role="cell" className="min-w-0 truncate font-wv-mono text-[12px] text-wv-secondary">
+              <div
+                key={column}
+                role="cell"
+                data-testid={cellIds?.[column] === undefined ? undefined : networkIds.speedTableCell(table, cellIds[column])}
+                className="min-w-0 truncate font-wv-mono text-[12px] text-wv-secondary"
+              >
                 {cell}
               </div>
             ))}
@@ -314,6 +343,7 @@ function RunDetail({
     result ? (
       <MiniTable
         key="legs"
+        table="legs"
         label={t("next.networking.speed.legs")}
         columns="64px 96px 104px 104px 64px minmax(0, 1fr)"
         headers={[
@@ -340,6 +370,8 @@ function RunDetail({
     result ? (
       <MiniTable
         key="connections"
+        table="connections"
+        cellIds={["leg", "path", "source", "connect", "downloaded", "error"]}
         label={t("next.networking.speed.connectionsTable")}
         columns="64px minmax(0, 1.4fr) minmax(0, 1fr) 72px 96px minmax(0, 1fr)"
         headers={[
@@ -374,6 +406,8 @@ function RunDetail({
     usenet ? (
       <MiniTable
         key="articles"
+        table="articles"
+        cellIds={["requested", "delivered", "missing", "failed", "declared", "transport", "pipelining"]}
         label={t("next.networking.speed.articles")}
         columns="repeat(7, minmax(0, 1fr))"
         headers={[
@@ -590,6 +624,7 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
             <ControlLabel label={t("next.networking.speed.route")}>
               <Select
                 label={t("next.networking.speed.route")}
+                testId={networkIds.speedConsumer}
                 value={consumer.key}
                 onChange={choose}
                 className="min-w-[240px]"
@@ -648,6 +683,7 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
                 key="compare"
                 checked={picked.includes(run.id)}
                 label={t("next.networking.speed.compareRun", { id: run.id })}
+                testId={networkIds.speedCompareRun(run.id)}
                 onChange={() => pick(run.id)}
               />
             ) : (
@@ -680,7 +716,12 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
             <Cell key="decoded" mono>
               {run.kind === "USENET" && result?.usenet ? bytesLabel(result.usenet.decodedBytes) : ""}
             </Cell>,
-            <StatusMark key="status" state={RUN_STATE[run.status]} label={t(`next.networking.speed.status.${run.status}`)} />,
+            <StatusMark
+              key="status"
+              state={RUN_STATE[run.status]}
+              label={t(`next.networking.speed.status.${run.status}`)}
+              testId={networkIds.speedRunStatus(run.status)}
+            />,
           ],
         };
       }),
@@ -703,6 +744,7 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
         // A side with no run picked yet holds its place with a hint.
         <section
           aria-label={t("next.networking.speed.compare")}
+          data-testid={networkIds.speedCompare}
           className="grid min-w-0 items-center gap-6 border-b border-wv-hairline px-4 pb-6 pt-3 sm:px-6 xl:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] xl:gap-y-0"
         >
           {compared.map((run, index) => {

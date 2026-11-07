@@ -22,6 +22,7 @@ import {
 } from "@/lib/networking";
 import { codedSentence, refusalMessage } from "@/lib/refusal";
 import { cn } from "@/lib/utils";
+import { networkIds } from "@/next/testids";
 import { Eyebrow, MetricCell, MetricStrip } from "../../components/chrome";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { DangerButton, NumberField, PrimaryButton, SecondaryButton, Segmented, Select, TextField } from "../../components/controls";
@@ -353,6 +354,7 @@ export function TestControls({
       <ControlLabel label={t("next.networking.speed.test")}>
         <Segmented
           label={t("next.networking.speed.test")}
+          testId={networkIds.speedKind}
           value={form.kind}
           onChange={(kind) => set({ kind })}
           className="self-start"
@@ -368,6 +370,7 @@ export function TestControls({
             <ControlLabel label={t("next.networking.speed.provider")}>
               <Select
                 label={t("next.networking.speed.provider")}
+                testId={networkIds.speedProvider}
                 value={form.providerId}
                 onChange={(providerId) => set({ providerId, server: "" })}
                 options={[
@@ -380,6 +383,7 @@ export function TestControls({
               <ControlLabel label={t("next.networking.speed.server")}>
                 <Select
                   label={t("next.networking.speed.server")}
+                  testId={networkIds.speedServer}
                   value={form.server}
                   onChange={(server) => set({ server })}
                   options={[
@@ -396,6 +400,7 @@ export function TestControls({
               <ControlLabel label={t("next.networking.speed.url")} className="min-w-0 flex-[0_1_480px]">
                 <TextField
                   label={t("next.networking.speed.url")}
+                  testId={networkIds.speedCustomUrl}
                   value={form.customUrl}
                   onChange={(customUrl) => set({ customUrl })}
                   placeholder="https://"
@@ -410,6 +415,7 @@ export function TestControls({
             <ControlLabel label={t("next.networking.speed.nzb")}>
               <Select
                 label={t("next.networking.speed.nzb")}
+                testId={networkIds.speedNzb}
                 value={form.nzb}
                 onChange={(nzb) => set({ nzb })}
                 className="min-w-[120px]"
@@ -453,6 +459,7 @@ export function TestControls({
               <ControlLabel label={t("next.networking.speed.nzbUrl")} className="min-w-0 flex-[0_1_480px]">
                 <TextField
                   label={t("next.networking.speed.nzbUrl")}
+                  testId={networkIds.speedNzbUrl}
                   value={form.nzbUrl}
                   onChange={(nzbUrl) => set({ nzbUrl })}
                   placeholder="https://"
@@ -464,6 +471,7 @@ export function TestControls({
             <ControlLabel label={t("next.networking.speed.connections")}>
               <NumberField
                 label={t("next.networking.speed.connections")}
+                testId={networkIds.speedConnections}
                 value={form.connections}
                 min={1}
                 max={Math.max(1, consumer.cap)}
@@ -473,6 +481,7 @@ export function TestControls({
             <ControlLabel label={t("next.networking.speed.maxDuration")}>
               <NumberField
                 label={t("next.networking.speed.maxDuration")}
+                testId={networkIds.speedMaxDuration}
                 value={form.maxDuration}
                 min={1}
                 max={MAX_DURATION}
@@ -524,6 +533,9 @@ export function rateSeries(run: SpeedTestRun, field: "bytes" | "decodedBytes" = 
   });
 }
 
+/** The word a running test's phase starts with, as the daemon reports it: "draining 3" is "draining". */
+const phaseKey = (phase: string | null) => phase?.trim().split(/\s+/)[0]?.toLowerCase() || "running";
+
 /** What a running test reports doing, in the order it does it. */
 const PHASES = ["preparing", "pausing", "draining", "leasing", "measuring", "releasing"];
 
@@ -573,13 +585,13 @@ export function RunProgress({ run, onCancel }: { run: SpeedTestRun; onCancel: ()
   const bytes = splitBytes(run.result?.bytes ?? 0);
   const decoded = splitBytes(run.result?.usenet?.decodedBytes ?? 0);
   return (
-    <section aria-label={t("next.networking.speed.progress")} className="flex flex-col border-b border-wv-hairline">
+    <section aria-label={t("next.networking.speed.progress")} data-testid={networkIds.speedProgress} className="flex flex-col border-b border-wv-hairline">
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-wv-hairline px-4 py-3 sm:px-6">
         <span className="flex min-w-0 items-baseline gap-3">
           <Eyebrow tone="rail">{t("next.networking.speed.gate")}</Eyebrow>
-          <span className="truncate text-[13px] text-wv-fg">{phaseLabel(t, run.phase)}</span>
+          <span data-testid={networkIds.speedPhase(phaseKey(run.phase))} className="truncate text-[13px] text-wv-fg">{phaseLabel(t, run.phase)}</span>
         </span>
-        <DangerButton icon="close" onClick={onCancel}>
+        <DangerButton icon="close" onClick={onCancel} testId={networkIds.speedCancel}>
           {t("next.networking.speed.cancel")}
         </DangerButton>
       </div>
@@ -671,9 +683,9 @@ export function RunResult({ run, better = {} }: { run: SpeedTestRun; better?: Be
       : {}),
   });
   return (
-    <section aria-label={t("next.networking.speed.result")} className="flex flex-col border-b border-wv-hairline">
+    <section aria-label={t("next.networking.speed.result")} data-testid={networkIds.speedResult} className="flex flex-col border-b border-wv-hairline">
       {failed ? (
-        <p role={run.status === "FAILED" ? "alert" : "status"} title={run.failure?.message} className="px-4 py-3 text-[12.5px] text-wv-error-text sm:px-6">
+        <p role={run.status === "FAILED" ? "alert" : "status"} data-testid={networkIds.speedOutcome(run.status)} title={run.failure?.message} className="px-4 py-3 text-[12.5px] text-wv-error-text sm:px-6">
           {run.failure ? `${t(`next.networking.speed.status.${run.status}`)} · ${failureMessage(t, run.failure)}` : t(`next.networking.speed.status.${run.status}`)}
         </p>
       ) : null}
@@ -729,6 +741,7 @@ export function SpeedTestRunner({
       <div className="flex flex-wrap items-center gap-3 border-b border-wv-hairline px-4 py-3 sm:px-6">
         <PrimaryButton
           icon="go"
+          testId={networkIds.speedRun}
           disabled={busy || running || problem !== null}
           onClick={() => start(speedTestInput(consumer, overrides, form, provider))}
         >
@@ -736,7 +749,7 @@ export function SpeedTestRunner({
         </PrimaryButton>
         {extra}
         {problem || refusal ? (
-          <span role="alert" className="min-w-0 text-[12.5px] text-wv-error-text">
+          <span role="alert" data-testid={networkIds.speedRefusal} className="min-w-0 text-[12.5px] text-wv-error-text">
             {refusal ?? problem}
           </span>
         ) : null}
