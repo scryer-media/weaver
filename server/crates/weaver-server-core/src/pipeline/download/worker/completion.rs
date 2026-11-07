@@ -72,17 +72,25 @@ impl Pipeline {
                     downloaded_at_start: downloaded,
                 });
         streak.failures = streak.failures.saturating_add(1);
-        let streak = *streak;
-        if streak.failures == SEGMENT_TRANSPORT_STREAK_HOLD {
-            warn!(
-                segment = %segment_id,
-                error = %failure.message,
-                hold_secs = SEGMENT_TRANSPORT_HOLD_DELAY.as_secs(),
-                "segment keeps failing on an established connection; holding its retry \
-                 so other work reaches the server first"
-            );
-        }
-        Some(streak)
+        Some(*streak)
+    }
+
+    // Whether a segment in a run of established-transport failures has its
+    // retry held past the server recovery backoff. The hold exists for a
+    // quarantined server's one probe, which takes the highest-priority work:
+    // this segment again. A server that is not quarantined has no probe to
+    // protect, so its retry is not held; the run still makes the article pay
+    // for its retries once other segments download. A failure with no source
+    // server keeps the hold.
+    fn transport_streak_holds_retry(
+        &self,
+        streak: Option<TransportFailureStreak>,
+        source_server_idx: Option<usize>,
+    ) -> bool {
+        streak.is_some_and(|streak| streak.failures >= SEGMENT_TRANSPORT_STREAK_HOLD)
+            && source_server_idx.is_none_or(|idx| {
+                idx >= self.nntp.pool().server_count() || self.nntp.pool().requires_recovery(idx)
+            })
     }
 
     pub(crate) fn note_retry_requeued(&mut self, segment_id: SegmentId) {
@@ -1371,15 +1379,23 @@ impl Pipeline {
                             self.metrics
                                 .segments_retried
                                 .fetch_add(1, Ordering::Relaxed);
-                            let delay = if transport_streak.is_some_and(|streak| {
-                                streak.failures >= SEGMENT_TRANSPORT_STREAK_HOLD
-                            }) {
+                            let delay = if self
+                                .transport_streak_holds_retry(transport_streak, source_server_idx)
+                            {
                                 // The failure that quarantines a server is
                                 // followed by one probe, and the probe takes
                                 // the highest-priority work — this segment
                                 // again. Hold it past the recovery backoff so
                                 // the probe carries different work and a
                                 // healthy server can prove itself.
+                                warn!(
+                                    segment = %seg_id,
+                                    error = %failure.message,
+                                    hold_secs = SEGMENT_TRANSPORT_HOLD_DELAY.as_secs(),
+                                    "segment keeps failing on an established connection to a \
+                                     quarantined server; holding its retry so other work \
+                                     reaches the server first"
+                                );
                                 SEGMENT_TRANSPORT_HOLD_DELAY
                             } else if infrastructure_retry {
                                 std::time::Duration::from_secs(1)
