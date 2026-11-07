@@ -15,6 +15,9 @@ pub(crate) const LATENCY_BAND_MODERATE_MAX: Duration = Duration::from_millis(800
 const RUNGS: [u8; 4] = [1, 2, 4, 8];
 const MIN_TARGET_DEPTH: u32 = 2;
 const MAX_TARGET_DEPTH: u32 = 8;
+// Requests added to the bandwidth-delay depth before the explorer picks the
+// rung it walks toward; see `target_rung`.
+const TARGET_HEADROOM_DEPTH: u8 = 1;
 
 // Clean responses observed at one rung before the explorer acts on what it
 // measured there. Also bounds rung changes to one per window.
@@ -501,10 +504,20 @@ impl ServerPipelineExplorer {
         self.body_bytes_len = (self.body_bytes_len + 1).min(BODY_SIZE_SAMPLES);
     }
 
-    // The rung the explorer is walking toward.
+    // The rung the explorer is walking toward: the bandwidth-delay depth plus
+    // one request of headroom, rounded up to a rung.
+    //
+    // The formula is exact only for the round trip and transfer it was given,
+    // and both move window to window. At 100 ms over 48 ms articles it says
+    // 4, and a window that reads the wire a little faster says 5; picked
+    // without headroom the target flips between rungs 4 and 8 from run to
+    // run. One more request covers the swing. The trial still decides
+    // whether the deeper rung is kept.
     pub(crate) fn target_rung(&self) -> u8 {
         self.physical_target_depth()
-            .map_or(self.current_depth, rung_at_or_above)
+            .map_or(self.current_depth, |depth| {
+                rung_at_or_above(depth.saturating_add(TARGET_HEADROOM_DEPTH))
+            })
     }
 
     pub(super) fn choose_mode(&self, pressure_clear: bool) -> DownloadLaneMode {
@@ -1041,10 +1054,11 @@ mod tests {
 
     #[test]
     fn target_depth_follows_the_latency_to_transfer_ratio() {
-        // Good band, article costs about as much as the round trip.
+        // Good band, article costs about as much as the round trip. The
+        // physics asks for 2; the headroom request makes it 3, rung 4.
         let good = explorer(200, 200);
         assert_eq!(good.physical_target_depth(), Some(2));
-        assert_eq!(good.target_rung(), 2);
+        assert_eq!(good.target_rung(), 4);
 
         // Good band, tiny articles: the link is idle most of the round trip.
         let good_small = explorer(300, 50);
@@ -1059,12 +1073,37 @@ mod tests {
         // Slow band, large articles.
         let slow = explorer(900, 900);
         assert_eq!(slow.physical_target_depth(), Some(2));
-        assert_eq!(slow.target_rung(), 2);
+        assert_eq!(slow.target_rung(), 4);
 
         // Slow band, small articles: clamped at the deepest rung.
         let slow_small = explorer(1000, 20);
         assert_eq!(slow_small.physical_target_depth(), Some(8));
         assert_eq!(slow_small.target_rung(), 8);
+    }
+
+    // The bench link sits on the 4/5 edge: a 102 ms round trip over 48 ms
+    // articles is depth 4, and a window that reads the wire at 31 ms makes it
+    // 5. Without headroom those were rungs 4 and 8 from run to run; with it
+    // both ask for the next rung up.
+    #[test]
+    fn a_target_on_the_four_five_edge_asks_for_the_next_rung_up() {
+        let mut slower = explorer(102, 48);
+        slower.modelled_transfer = Some(Duration::from_millis(48));
+        assert_eq!(slower.physical_target_depth(), Some(4));
+        assert_eq!(slower.target_rung(), 8);
+
+        let mut faster = explorer(102, 31);
+        faster.modelled_transfer = Some(Duration::from_millis(31));
+        assert_eq!(faster.physical_target_depth(), Some(5));
+        assert_eq!(faster.target_rung(), 8);
+
+        // The first climb goes there, and the trial judges it.
+        let now = Instant::now();
+        open_window(&mut slower, now);
+        assert_eq!(
+            run_window(&mut slower, now, 768_000, Duration::from_millis(50)),
+            Some(RungChange::Stepped { from: 2, to: 8 })
+        );
     }
 
     #[test]
@@ -1572,19 +1611,20 @@ mod tests {
         let mut explorer = ServerPipelineExplorer::seeded(Some(8), None, None);
         explorer.note_supports_pipelining(true);
         let now = Instant::now();
-        // Big articles on a near server: one request in flight covers the wait.
+        // Big articles on a near server: one request in flight covers the
+        // wait, and the headroom request asks for rung 4.
         explorer.note_latency(Duration::from_millis(100));
         explorer.note_transfer(Duration::from_millis(400));
-        assert_eq!(explorer.target_rung(), 2);
+        assert_eq!(explorer.target_rung(), 4);
 
         // The first decision goes to the target in one move — down as well as
-        // up. This used to walk 8 -> 4 -> 2 over two windows.
+        // up.
         open_window(&mut explorer, now);
         assert_eq!(
             run_window(&mut explorer, now, 100_000, Duration::from_millis(100)),
-            Some(RungChange::Stepped { from: 8, to: 2 })
+            Some(RungChange::Stepped { from: 8, to: 4 })
         );
-        assert_eq!(explorer.current_depth(), 2);
+        assert_eq!(explorer.current_depth(), 4);
         // Worse throughput at the shallower rung does not bounce it back up:
         // the target, not the comparison, is what moved it, so there is no
         // trial to lose.
@@ -1592,7 +1632,7 @@ mod tests {
             run_window(&mut explorer, now, 10_000, Duration::from_millis(100)),
             None
         );
-        assert_eq!(explorer.current_depth(), 2);
+        assert_eq!(explorer.current_depth(), 4);
     }
 
     #[test]
