@@ -994,6 +994,7 @@ impl NntpPool {
                             {
                                 drop(slot);
                                 drop(health_lease);
+                                let freed;
                                 let mut notifications: Vec<_> = changed
                                     .iter()
                                     .map(|changed| Box::pin(changed.notified()))
@@ -1003,16 +1004,34 @@ impl NntpPool {
                                 }
                                 // Room freed before the wait was armed: dial again
                                 // at once. A route with leg capacity whose tunnel
-                                // share is full waits for a socket to close.
+                                // share is full waits for a socket to close, and
+                                // also on the signals its room check names, which
+                                // can differ from the dial's: a rung the dial
+                                // skipped while it cooled, or a member that had
+                                // room when the dial began.
                                 let inner = &self.configs[idx].dialer.inner;
-                                if inner.has_capacity()
-                                    && inner.has_room(&weaver_tunnel::pipe::Purpose::Nntp {
-                                        server: self.configs[idx].dialer.server,
-                                        leg: 0,
-                                        probing: false,
-                                    })
-                                {
-                                    continue;
+                                let purpose = weaver_tunnel::pipe::Purpose::Nntp {
+                                    server: self.configs[idx].dialer.server,
+                                    leg: 0,
+                                    probing: false,
+                                };
+                                if inner.has_capacity() {
+                                    freed = match inner.room(&purpose) {
+                                        Ok(()) => continue,
+                                        Err(freed) => freed,
+                                    };
+                                    let start = notifications.len();
+                                    notifications.extend(
+                                        freed.iter().map(|freed| Box::pin(freed.notified())),
+                                    );
+                                    for notification in &mut notifications[start..] {
+                                        notification.as_mut().enable();
+                                    }
+                                    // Room freed between the check and arming
+                                    // its signals.
+                                    if inner.has_room(&purpose) {
+                                        continue;
+                                    }
                                 }
                                 acquisition_budget(deadline.as_deref(), async {
                                         tokio::select! {
@@ -2271,6 +2290,81 @@ mod tests {
 
         route.room.store(true, Ordering::Release);
         route.freed.notify_waiters();
+        assert!(acquiring.await.unwrap().is_err());
+        assert_eq!(route.dials.load(Ordering::Acquire), 2);
+        pool.shutdown().await;
+    }
+
+    // The room check can name a signal the dial's AtCapacity did not, such
+    // as a cooling rung the dial skipped. The connect waits on both, and
+    // that signal alone wakes it to dial again.
+    #[tokio::test(start_paused = true)]
+    async fn a_parked_connect_wakes_on_the_signal_its_room_check_names() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use weaver_tunnel::pipe::{DialError, Dialed, Dialer, Purpose, Target};
+        struct SplitSignals {
+            room: AtomicBool,
+            dials: AtomicUsize,
+            dial_freed: Arc<tokio::sync::Notify>,
+            room_freed: Arc<tokio::sync::Notify>,
+            asked: tokio::sync::mpsc::UnboundedSender<()>,
+        }
+        #[async_trait::async_trait]
+        impl Dialer for SplitSignals {
+            fn room(&self, _: &Purpose) -> std::result::Result<(), Vec<Arc<tokio::sync::Notify>>> {
+                self.asked.send(()).ok();
+                if self.room.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err(vec![self.room_freed.clone()])
+                }
+            }
+            async fn dial(&self, _: &Target) -> std::result::Result<Dialed, DialError> {
+                if self.dials.fetch_add(1, Ordering::AcqRel) == 0 {
+                    return Err(DialError::AtCapacity(vec![self.dial_freed.clone()]));
+                }
+                Err(DialError::Egress(std::io::Error::other("fixture leg down")))
+            }
+            fn budget(&self) -> Duration {
+                Duration::from_secs(30)
+            }
+            fn describe(&self) -> String {
+                "split signals fixture".into()
+            }
+        }
+        let (asked, mut asks) = tokio::sync::mpsc::unbounded_channel();
+        let route = Arc::new(SplitSignals {
+            room: AtomicBool::new(false),
+            dials: AtomicUsize::new(0),
+            dial_freed: Arc::new(tokio::sync::Notify::new()),
+            room_freed: Arc::new(tokio::sync::Notify::new()),
+            asked,
+        });
+        let mut config = test_pool_config(4);
+        config.servers[0].server.tls = false;
+        config.servers[0].server.dialer = Arc::new(crate::route_dialer::RouteDialer {
+            inner: route.clone(),
+            plan: None,
+            runtime: tokio::runtime::Handle::current(),
+            server: 1,
+            egress_controls: Arc::new(crate::transfer::ServerTransferRegistry::new()),
+        });
+        let pool = Arc::new(NntpPool::new(config));
+        let mut acquiring = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.acquire(ServerId(0)).await.map(|_| ()) }
+        });
+        // Both room checks ran and found none: the connect is parked.
+        for _ in 0..2 {
+            tokio::select! {
+                asked = asks.recv() => asked.unwrap(),
+                ended = &mut acquiring => panic!("the connect ended without parking: {ended:?}"),
+            }
+        }
+        assert_eq!(route.dials.load(Ordering::Acquire), 1);
+
+        route.room.store(true, Ordering::Release);
+        route.room_freed.notify_waiters();
         assert!(acquiring.await.unwrap().is_err());
         assert_eq!(route.dials.load(Ordering::Acquire), 2);
         pool.shutdown().await;
