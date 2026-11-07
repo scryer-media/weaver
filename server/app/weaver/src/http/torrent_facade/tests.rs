@@ -2236,6 +2236,59 @@ async fn maindata_sends_a_cleared_limit_as_no_limit() {
     assert_eq!(cleared["torrents"][&hash]["up_limit"], 0, "{cleared}");
 }
 
+// A client on changes keeps a field it is not sent, so a limit closed or
+// opened again is sent as everything: the closed limit's key is absent, the
+// opened one's is back. A limit moved between two numbers stays a change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_limit_closed_or_opened_sends_the_whole_state() {
+    let rig = rig().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    let torrents = rig.context.inner.torrents.as_ref().unwrap();
+    let job_id = torrents.torrents(None).await[0].job_id;
+    let first = rig.get("/api/v2/sync/maindata").await.json();
+    let hash = first["torrents"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    let next = |answer: &Value| answer["rid"].as_u64().unwrap();
+    let mut rid = next(&first);
+    let mut limit = async |bps: u64| {
+        torrents
+            .set_rate_limits(job_id, Some(Some(bps)), None)
+            .await
+            .unwrap();
+        let answer = rig
+            .get(&format!("/api/v2/sync/maindata?rid={rid}"))
+            .await
+            .json();
+        rid = next(&answer);
+        answer
+    };
+
+    let set = limit(500_000).await;
+    assert!(set.get("full_update").is_none(), "{set}");
+    assert_eq!(set["torrents"][&hash]["up_limit"], 500_000, "{set}");
+
+    let closed = limit(0).await;
+    assert_eq!(closed["full_update"], true, "{closed}");
+    assert!(
+        closed["torrents"][&hash].get("up_limit").is_none(),
+        "{closed}"
+    );
+    assert_eq!(closed["torrents"][&hash]["dl_limit"], 0, "{closed}");
+
+    let opened = limit(65_536).await;
+    assert_eq!(opened["full_update"], true, "{opened}");
+    assert_eq!(opened["torrents"][&hash]["up_limit"], 65_536, "{opened}");
+
+    let moved = limit(100_000).await;
+    assert!(moved.get("full_update").is_none(), "{moved}");
+    assert_eq!(moved["torrents"][&hash]["up_limit"], 100_000, "{moved}");
+}
+
 #[tokio::test]
 async fn without_a_torrent_client_the_lists_are_empty_and_adds_conflict() {
     let rig = rig_with(false).await;

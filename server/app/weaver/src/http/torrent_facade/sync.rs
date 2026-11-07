@@ -38,9 +38,13 @@ pub(super) enum SyncClient {
 
 // A torrent as this poll reads it: its row is built only when `fingerprint`,
 // which leaves the clock out, differs from the one the client was sent.
+// `closed` marks the fields the row leaves out because they have no reading
+// (a limit that lets nothing through): a client keeps a field it is not sent,
+// so when that set moves, the client is sent everything again.
 pub(super) struct Row<'a, V> {
     pub(super) hash: String,
     pub(super) fingerprint: u64,
+    pub(super) closed: u8,
     pub(super) view: &'a V,
 }
 
@@ -71,6 +75,7 @@ pub(super) struct Kept {
 
 struct KeptRow {
     fingerprint: u64,
+    closed: u8,
     steady: Arc<[(&'static str, u64)]>,
     clock: [u64; CLOCK_KEYS],
 }
@@ -191,7 +196,8 @@ where
 // holds anything (qBittorrent `generateMaindataSyncData`). Else what changed:
 // a new torrent or category whole, a changed one by its changed keys, a gone
 // one by its key in `_removed`, and the server state's changed keys
-// (qBittorrent `processMap`/`processHash`).
+// (qBittorrent `processMap`/`processHash`). A torrent whose left-out fields
+// moved has no changes to send, so the response is the full update.
 fn respond<V, Steady, Clock>(
     from: Option<&Kept>,
     now: Poll<'_, V>,
@@ -207,8 +213,11 @@ where
     }
     let mut torrents = Map::new();
     let mut kept_torrents = HashMap::with_capacity(now.torrents.len());
-    for row in now.torrents {
+    for row in &now.torrents {
         let before = from.and_then(|from| from.torrents.get_key_value(row.hash.as_str()));
+        if before.is_some_and(|(_, before)| before.closed != row.closed) {
+            return respond(None, now, fields);
+        }
         let clock = (fields.clock)(row.view);
         let clock_hashes = clock.each_ref().map(|(_, value)| digest(value));
         let mut changed = Map::new();
@@ -243,12 +252,13 @@ where
             }
         }
         if !changed.is_empty() {
-            torrents.insert(row.hash, Value::Object(changed));
+            torrents.insert(row.hash.clone(), Value::Object(changed));
         }
         kept_torrents.insert(
             key,
             KeptRow {
                 fingerprint: row.fingerprint,
+                closed: row.closed,
                 steady,
                 clock: clock_hashes,
             },
@@ -425,6 +435,7 @@ mod tests {
                 .map(|thing| Row {
                     hash: thing.hash.clone(),
                     fingerprint: digest(&json!(thing.name)),
+                    closed: 0,
                     view: thing,
                 })
                 .collect(),

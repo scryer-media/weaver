@@ -3132,6 +3132,8 @@ async fn maindata(
                 (view.fingerprint(ViewParts::Steady), scope.can_control()).hash(&mut hasher);
                 hasher.finish()
             },
+            closed: u8::from(view.download_limit == Some(0))
+                | u8::from(view.upload_limit == Some(0)) << 1,
             view,
         })
         .collect();
