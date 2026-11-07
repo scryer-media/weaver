@@ -2283,3 +2283,54 @@ async fn a_full_socket_share_is_at_capacity_and_leaves_the_others_alone() {
     drop(tracker);
     assert_eq!(session.sockets.held(SocketClass::Reserve), 0);
 }
+
+// A stage that records the purpose of every dial and fails it, with room in
+// every share but the reserve.
+#[derive(Default)]
+struct RecordsPurpose(Mutex<Vec<Purpose>>);
+
+#[async_trait::async_trait]
+impl Dialer for RecordsPurpose {
+    fn has_room(&self, purpose: &Purpose) -> bool {
+        SocketClass::of(purpose) != SocketClass::Reserve
+    }
+    async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
+        self.0.lock().unwrap().push(target.purpose.clone());
+        Err(DialError::Egress(std::io::Error::other("recorded")))
+    }
+    fn budget(&self) -> Duration {
+        Duration::from_secs(30)
+    }
+    fn describe(&self) -> String {
+        "records purpose".into()
+    }
+}
+
+// A connection through a SOCKS or HTTP proxy opens one endpoint connection
+// in the tunnel beneath, which counts against that connection's own share:
+// usenet against usenet, a TCP peer against torrent peers, however many
+// proxies it passes. Whether a dial has room is asked of the tunnel beneath.
+#[tokio::test]
+async fn a_chained_dial_takes_its_own_share_of_the_tunnel_beneath() {
+    let beneath = Arc::new(RecordsPurpose::default());
+    let first = hop(7, "192.0.2.1:1080".parse().unwrap(), beneath.clone());
+    let chain = hop(8, "192.0.2.2:8080".parse().unwrap(), first);
+    let mut nntp = target("192.0.2.9:119".parse().unwrap());
+    nntp.purpose = Purpose::Nntp { server: 1, leg: 0 };
+    let peer = Target {
+        purpose: Purpose::Torrent,
+        ..nntp.clone()
+    };
+    let _ = chain.dial(&nntp).await;
+    let _ = chain.dial(&peer).await;
+    let classes: Vec<_> = beneath
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .map(SocketClass::of)
+        .collect();
+    assert_eq!(classes, [SocketClass::Nntp, SocketClass::Torrent]);
+    assert!(chain.has_room(&Purpose::Torrent));
+    assert!(!chain.has_room(&Purpose::TorrentHttp));
+}

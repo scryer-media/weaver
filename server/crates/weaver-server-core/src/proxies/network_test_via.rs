@@ -724,7 +724,10 @@ fn last<'a>(
         target: Target {
             host: profile.host.clone(),
             port: profile.port,
-            purpose: Purpose::ProxyEndpoint { proxy: profile.id },
+            purpose: Purpose::ProxyEndpoint {
+                proxy: profile.id,
+                carrying: None,
+            },
             addresses: Vec::new(),
         },
         pass: ProxyTestPass::Reachable,

@@ -54,10 +54,25 @@ pub(crate) const NO_ROUTE_VIA: &str = "no route via ";
 
 #[derive(Clone, Debug)]
 pub enum Purpose {
-    Nntp { server: u32, leg: usize },
-    NntpProbe { server: u32, leg: usize },
-    ProxyEndpoint { proxy: u32 },
-    Feed { feed: u32 },
+    Nntp {
+        server: u32,
+        leg: usize,
+    },
+    NntpProbe {
+        server: u32,
+        leg: usize,
+    },
+    // The connection to a proxy's endpoint. One that carries a single
+    // connection through the proxy counts against that connection's share
+    // of a tunnel beneath; one a proxy's session shares, as SSH and HTTP/3
+    // do, is `None`.
+    ProxyEndpoint {
+        proxy: u32,
+        carrying: Option<SocketClass>,
+    },
+    Feed {
+        feed: u32,
+    },
     // Any other fetch Weaver makes over HTTP.
     Outbound,
     // A torrent session's peers over TCP.
@@ -791,7 +806,7 @@ impl TransportHop {
             .map_err(|_| timed_out())?
             .map_err(|error| DialError::hop(self.id, error))?;
         let next = match target.purpose {
-            Purpose::ProxyEndpoint { proxy } => Some(proxy),
+            Purpose::ProxyEndpoint { proxy, .. } => Some(proxy),
             _ => None,
         };
         let unreachable = |proxy, reply| DialError::Hop {
@@ -826,7 +841,11 @@ impl Dialer for TransportHop {
         let endpoint = Target {
             host: self.spec.host.clone(),
             port: self.spec.port,
-            purpose: Purpose::ProxyEndpoint { proxy: self.id },
+            // The endpoint connection carries this one alone.
+            purpose: Purpose::ProxyEndpoint {
+                proxy: self.id,
+                carrying: Some(SocketClass::of(&target.purpose)),
+            },
             addresses: Vec::new(),
         };
         // The lookup has a window of its own in `budget`, so a slow one
@@ -893,6 +912,11 @@ impl Dialer for TransportHop {
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
         self.naming.resolve(self, self.id, host, self.timeout).await
     }
+    // Each connection through the proxy opens one endpoint connection in
+    // the share of the tunnel beneath.
+    fn has_room(&self, purpose: &Purpose) -> bool {
+        self.inner.has_room(purpose)
+    }
     fn failing_hop(&self) -> Option<FailingHop> {
         self.inner
             .failing_hop()
@@ -926,7 +950,10 @@ impl EndpointTransport for InnerTransport {
         let target = Target {
             host: host.into(),
             port,
-            purpose: Purpose::ProxyEndpoint { proxy: self.proxy },
+            purpose: Purpose::ProxyEndpoint {
+                proxy: self.proxy,
+                carrying: None,
+            },
             addresses: Vec::new(),
         };
         let dialed = self

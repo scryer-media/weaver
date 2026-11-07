@@ -29,6 +29,10 @@ impl SocketClass {
         match purpose {
             Purpose::Nntp { .. } => Self::Nntp,
             Purpose::Torrent => Self::Torrent,
+            Purpose::ProxyEndpoint {
+                carrying: Some(class),
+                ..
+            } => *class,
             // A probe may test a server before it is saved or turned on,
             // when its route counts no connection on the tunnel yet.
             Purpose::NntpProbe { .. }
