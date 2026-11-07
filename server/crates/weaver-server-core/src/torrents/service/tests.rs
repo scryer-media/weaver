@@ -2725,7 +2725,7 @@ async fn a_panic_in_a_torrents_restore_leaves_its_marker_and_parks_it() {
         assert!(torrent.store.is_none());
         (
             Arc::clone(torrent.layout.as_ref().unwrap()),
-            again.archive_passwords(torrent),
+            again.archive_passwords(torrent, &again.global_passwords()),
         )
     };
     let plan = crate::torrents::tee::Plan::of(&layout).unwrap();
@@ -6862,21 +6862,20 @@ async fn listed_trackers(service: &TorrentService, job_id: JobId) -> Vec<(u32, S
         .collect()
 }
 
-// Each torrent's trackers are held with it: a boot reads every torrent's
-// rows in one read, and from then on publishing, listing, viewing and
-// matching the tracker rules again read none, whether one torrent is live
-// or fifty.
+// Each torrent's trackers are held with it, and a boot reads each torrent
+// table a restore and an attach read once, for every torrent: the
+// torrents' rows, their trackers', their counters' and their history's. From then on
+// publishing, listing, viewing and matching the tracker rules again read
+// none, whether one torrent is live or fifty.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn torrents_list_their_trackers_from_memory_after_one_boot_read() {
+    const BOOT_READS: usize = 4;
     let a = "http://a.invalid/announce";
-    let reads = |db: &Database| {
-        db.torrent_tracker_reads
-            .load(std::sync::atomic::Ordering::Relaxed)
-    };
+    let reads = |db: &Database| db.torrent_reads.load(std::sync::atomic::Ordering::Relaxed);
     for count in [1, 50] {
         let rig = rig(set_clock());
         rig.service.open().await.unwrap();
-        assert_eq!(reads(&rig.db), 1, "the boot of no torrent");
+        assert_eq!(reads(&rig.db), BOOT_READS, "the boot of no torrent");
         let mut jobs = Vec::new();
         for seed in 0..count {
             let name = format!("listed-{seed}");
@@ -6917,7 +6916,27 @@ async fn torrents_list_their_trackers_from_memory_after_one_boot_read() {
             .await
             .unwrap();
         jobs.push(magnet);
+        // One in seed mode, whose attach takes the pieces it checked.
+        let (metainfo, data) = placed_torrent();
+        let save = rig.dir.path().join("seeded");
+        std::fs::create_dir_all(save.join("placed")).unwrap();
+        std::fs::write(save.join("placed/a.bin"), &data).unwrap();
+        let seeded = rig
+            .service
+            .add(AddRequest {
+                paused: true,
+                placement: Placement {
+                    save_path: Some(save.to_string_lossy().into_owned()),
+                    seed_mode: true,
+                    ..Placement::default()
+                },
+                ..request(AddSource::Metainfo(metainfo))
+            })
+            .await
+            .unwrap();
+        jobs.push(seeded);
 
+        let added = reads(&rig.db);
         rig.service.publish().await;
         rig.service.tick().await;
         rig.service.reload_tracker_rules().await.unwrap();
@@ -6926,7 +6945,7 @@ async fn torrents_list_their_trackers_from_memory_after_one_boot_read() {
         let one = rig.service.torrent(first).await.unwrap();
         let support = rig.service.support(first).await.unwrap();
         rig.service.reannounce_tracker(first, a).await.unwrap();
-        assert_eq!(reads(&rig.db), 1, "{count} torrents, after the boot");
+        assert_eq!(reads(&rig.db), added, "{count} torrents, after the adds");
 
         let entries = |view: &TorrentView| -> Vec<(u32, String, NamedBy)> {
             view.trackers
@@ -6970,13 +6989,17 @@ async fn torrents_list_their_trackers_from_memory_after_one_boot_read() {
         let before = reads(&rig.db);
         rig.service.stop().await;
 
-        // A restart reads every torrent's rows once, and lists each as it
-        // was listed before.
+        // A restart that brings every torrent back and attaches it reads
+        // each torrent table once, and lists each as it was listed before.
         let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
         again.open().await.unwrap();
+        again.tick().await;
+        for &job_id in &jobs {
+            handle_of(&again, job_id).await;
+        }
         assert_eq!(
             reads(&rig.db),
-            before + 1,
+            before + BOOT_READS,
             "{count} torrents, after a restart"
         );
         for job_id in jobs {

@@ -30,7 +30,7 @@ fn hash<const N: usize>(row: &SqlRow, column: &str) -> Result<Option<[u8; N]>, S
         .transpose()
 }
 
-fn count(row: &SqlRow, column: &str) -> Result<u64, StateError> {
+pub(crate) fn count(row: &SqlRow, column: &str) -> Result<u64, StateError> {
     let value = row.i64(column)?;
     u64::try_from(value).map_err(|_| corrupt(column, value))
 }
@@ -137,6 +137,14 @@ pub(crate) async fn torrent_by_infohash_tx(
 }
 
 impl Database {
+    // One read of the rows a torrent's restore or attach reads, counted
+    // under test so a test pins how many a boot makes.
+    pub(crate) fn torrent_read(&self) {
+        #[cfg(test)]
+        self.torrent_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn get_torrent(&self, job_id: JobId) -> Result<Option<TorrentRecord>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
@@ -188,6 +196,7 @@ impl Database {
 
     // Every torrent, in the order they were added.
     pub fn list_torrents(&self) -> Result<Vec<TorrentRecord>, StateError> {
+        self.torrent_read();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -239,6 +248,7 @@ impl Database {
     // The operator's level for each file of a torrent, in the metainfo's
     // order, as far as one was stored; a file past them is normal.
     pub fn torrent_file_priorities(&self, job_id: JobId) -> Result<Vec<FilePriority>, StateError> {
+        self.torrent_read();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let row = SqlRuntime::fetch_optional(
@@ -247,21 +257,13 @@ impl Database {
                 &[SqlArg::I64(job_id.0 as i64)],
             )
             .await?;
-            let Some(value) = row
-                .map(|row| row.opt_text("file_priorities"))
-                .transpose()?
-                .flatten()
-            else {
-                return Ok(Vec::new());
-            };
-            parse_file_priorities(&value).ok_or_else(|| corrupt("file priorities", &value))
+            row.as_ref()
+                .map_or_else(|| Ok(Vec::new()), file_priorities_from_row)
         })
     }
 
     pub fn list_torrent_trackers(&self, job_id: JobId) -> Result<Vec<TrackerEntry>, StateError> {
-        #[cfg(test)]
-        self.torrent_tracker_reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.torrent_read();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -279,9 +281,7 @@ impl Database {
     pub fn torrent_trackers_by_job(
         &self,
     ) -> Result<std::collections::BTreeMap<JobId, Vec<TrackerEntry>>, StateError> {
-        #[cfg(test)]
-        self.torrent_tracker_reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.torrent_read();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -320,6 +320,7 @@ impl Database {
         &self,
         job_id: JobId,
     ) -> Result<Option<TorrentCounters>, StateError> {
+        self.torrent_read();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
@@ -331,18 +332,89 @@ impl Database {
                 &[SqlArg::I64(job_id.0 as i64)],
             )
             .await?
-            .map(|row| {
-                Ok(TorrentCounters {
-                    uploaded_bytes: count(&row, "uploaded_bytes")?,
-                    downloaded_bytes: count(&row, "downloaded_bytes")?,
-                    active_duration_s: count(&row, "active_duration_s")?,
-                    last_seen_complete_ms: row.opt_i64("last_seen_complete_ms")?,
-                    finished_duration_s: count(&row, "finished_duration_s")?,
-                    last_activity_ms: row.opt_i64("last_activity_ms")?,
-                    consecutive_seeding_s: count(&row, "consecutive_seeding_s")?,
-                })
-            })
+            .as_ref()
+            .map(counters_from_row)
             .transpose()
         })
     }
+
+    // Every torrent, in the order they were added, each with its files'
+    // levels and the pieces it checked in seed mode: what a boot reads of
+    // the torrents' rows, in one read. A row that does not read fails the
+    // read, as [`Self::list_torrents`] does; a level or seed-mode column
+    // that does not read is that torrent's alone.
+    pub(crate) fn restored_torrents(&self) -> Result<Vec<RestoredTorrent>, StateError> {
+        self.torrent_read();
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                &format!(
+                    "SELECT {TORRENT_COLUMNS}, file_priorities, seed_verified \
+                       FROM torrents ORDER BY added_at_ms, job_id"
+                ),
+                &[],
+            )
+            .await?;
+            rows.iter()
+                .map(|row| {
+                    Ok(RestoredTorrent {
+                        record: torrent_from_row(row)?,
+                        levels: file_priorities_from_row(row),
+                        seed_verified: row.opt_bytes("seed_verified"),
+                    })
+                })
+                .collect()
+        })
+    }
+
+    // Why unpacking refused each torrent its history keeps as failed, by
+    // torrent, in one read: what [`Self::get_job_history`] gives a torrent's
+    // restore, for all of them.
+    pub(crate) fn failed_torrent_histories(
+        &self,
+    ) -> Result<std::collections::BTreeMap<JobId, String>, StateError> {
+        self.torrent_read();
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT h.job_id, h.error_message FROM job_history h \
+                   JOIN torrents t ON t.job_id = h.job_id \
+                  WHERE h.status = 'failed' AND h.error_message IS NOT NULL",
+                &[],
+            )
+            .await?;
+            rows.iter()
+                .map(|row| Ok((JobId(count(row, "job_id")?), row.text("error_message")?)))
+                .collect()
+        })
+    }
+}
+
+// One torrent's row as a boot reads it.
+pub(crate) struct RestoredTorrent {
+    pub(crate) record: TorrentRecord,
+    pub(crate) levels: Result<Vec<FilePriority>, StateError>,
+    pub(crate) seed_verified: Result<Option<Vec<u8>>, StateError>,
+}
+
+pub(crate) fn counters_from_row(row: &SqlRow) -> Result<TorrentCounters, StateError> {
+    Ok(TorrentCounters {
+        uploaded_bytes: count(row, "uploaded_bytes")?,
+        downloaded_bytes: count(row, "downloaded_bytes")?,
+        active_duration_s: count(row, "active_duration_s")?,
+        last_seen_complete_ms: row.opt_i64("last_seen_complete_ms")?,
+        finished_duration_s: count(row, "finished_duration_s")?,
+        last_activity_ms: row.opt_i64("last_activity_ms")?,
+        consecutive_seeding_s: count(row, "consecutive_seeding_s")?,
+    })
+}
+
+// The operator's level for each file, as far as one was stored.
+fn file_priorities_from_row(row: &SqlRow) -> Result<Vec<FilePriority>, StateError> {
+    let Some(value) = row.opt_text("file_priorities")? else {
+        return Ok(Vec::new());
+    };
+    parse_file_priorities(&value).ok_or_else(|| corrupt("file priorities", &value))
 }

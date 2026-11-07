@@ -1317,6 +1317,10 @@ struct Live {
     // Why unpacking refused it, as its history kept it when it was
     // restored: a restored job does not say.
     failed: Option<String>,
+    // What the boot read of its rows for its first store and its first
+    // attach, each taken by the one it is for; a later one reads its row.
+    kept_at_boot: Option<Option<Kept>>,
+    verified_at_boot: Option<Option<Vec<u8>>>,
 }
 
 // The torrents on each route's session, attached or held there: how loaded
@@ -1449,6 +1453,8 @@ impl Live {
             file_have: Vec::new(),
             kept_pieces: 0,
             failed: None,
+            kept_at_boot: None,
+            verified_at_boot: None,
         }
     }
 
@@ -1468,7 +1474,7 @@ impl Live {
     // What it shows until its store is back, from what was stored: the
     // pieces it kept, as the store restored from them will have, and the
     // failure its history keeps.
-    fn kept(&mut self, failed: Option<String>, kept: Option<Kept>) {
+    fn kept(&mut self, failed: Option<String>, kept: Option<&Kept>) {
         if let (Some(kept), Some(layout)) = (kept, &self.layout) {
             let (count, file_have) = kept.had(layout);
             self.file_have = file_have;
@@ -2154,19 +2160,6 @@ impl TorrentService {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner),
         )
-    }
-
-    // The failure a torrent's history keeps for it: unpacking refused it.
-    fn stored_failure(&self, job_id: JobId) -> Option<String> {
-        match self.inner.db.get_job_history(job_id.0) {
-            Ok(row) => row
-                .filter(|row| row.status == "failed")
-                .and_then(|row| row.error_message),
-            Err(error) => {
-                tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's history");
-                None
-            }
-        }
     }
 
     // The rule a torrent announcing to `trackers` follows.
@@ -2967,20 +2960,28 @@ impl TorrentService {
 
     // The archive passwords a graph built for `torrent` now takes. One
     // already extracting keeps the list it started with.
-    fn archive_passwords(&self, torrent: &Live) -> Vec<String> {
-        let job_id = torrent.record.job_id;
-        let global = self
-            .inner
-            .db
-            .global_archive_password_candidates()
-            .unwrap_or_else(|error| {
-                tracing::warn!(job_id = job_id.0, error = %error, "could not load global archive passwords");
-                Vec::new()
-            });
-        torrent_archive_passwords(torrent.rule(&self.rules()), &global)
+    fn archive_passwords(
+        &self,
+        torrent: &Live,
+        global: &[ArchivePasswordCandidate],
+    ) -> Vec<String> {
+        torrent_archive_passwords(torrent.rule(&self.rules()), global)
             .into_iter()
             .map(|candidate| candidate.value().to_owned())
             .collect()
+    }
+
+    // The archive passwords every torrent may try, as the settings give
+    // them now.
+    fn global_passwords(&self) -> Arc<[ArchivePasswordCandidate]> {
+        self.inner
+            .db
+            .global_archive_password_candidates()
+            .unwrap_or_else(|error| {
+                tracing::warn!(error = %error, "could not load global archive passwords");
+                Vec::new()
+            })
+            .into()
     }
 
     // The tee's job's storage, in its own directory `work`.
@@ -3038,18 +3039,22 @@ impl TorrentService {
             tee,
             passwords,
             seeded,
+            kept,
         } = made;
         // One policy for both of a restore's database reads, the pieces it
         // kept and the tee's checkpoint: one the database fails to give
         // holds the restore until it gives it, as a usenet job's restore is
         // held. What it gives and this build cannot use is no record: the
         // pieces are checked again, the tee starts fresh.
-        let kept = match self
-            .inner
-            .db
-            .torrent_pieces(job_id)
-            .map_err(|error| hold(error.to_string()))
-        {
+        let kept = match kept.map_or_else(
+            || {
+                self.inner
+                    .db
+                    .torrent_pieces(job_id)
+                    .map_err(|error| hold(error.to_string()))
+            },
+            Ok,
+        ) {
             Ok(kept) => kept,
             Err(Ok(wait)) => return Err(Unmade::Waits(wait)),
             Err(Err(error)) => {
@@ -3162,13 +3167,14 @@ impl TorrentService {
     }
 
     // What a torrent's store is made from, read under the torrent's lock.
-    fn making(&self, torrent: &Live) -> Option<Making> {
+    fn making(&self, torrent: &Live, global: &[ArchivePasswordCandidate]) -> Option<Making> {
         Some(Making {
             files: files_dir(torrent),
             layout: Arc::clone(torrent.layout.as_ref()?),
             tee: unpacks(torrent) && !torrent.complete(),
-            passwords: self.archive_passwords(torrent),
+            passwords: self.archive_passwords(torrent, global),
             seeded: torrent.record.seed_mode,
+            kept: None,
         })
     }
 
@@ -3207,9 +3213,13 @@ impl TorrentService {
     // The torrent's metainfo and its store over it, at once. A store that
     // cannot be made fails the torrent.
     fn give_metainfo(&self, torrent: &mut Live, parsed: &Parsed) -> Result<(), String> {
-        self.describe(torrent, parsed);
         let job_id = torrent.record.job_id;
-        let Some(made) = self.making(torrent) else {
+        let stored = self.inner.db.torrent_file_priorities(job_id).unwrap_or_else(|error| {
+            tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's file levels");
+            Vec::new()
+        });
+        self.describe(torrent, parsed, stored);
+        let Some(made) = self.making(torrent, &self.global_passwords()) else {
             return Ok(());
         };
         let (store, notes) = self
@@ -3227,7 +3237,7 @@ impl TorrentService {
 
     // What the metainfo says of the torrent, without its job. Whether it
     // unpacks is fixed here and kept, so a restart builds the same tree.
-    fn describe(&self, torrent: &mut Live, parsed: &Parsed) {
+    fn describe(&self, torrent: &mut Live, parsed: &Parsed, stored: Vec<FilePriority>) {
         let job_id = torrent.record.job_id;
         if torrent.record.unpack_in_force.is_none() {
             let unpack = self
@@ -3241,10 +3251,6 @@ impl TorrentService {
         torrent.names = parsed.manifest.paths.clone();
         torrent.total = parsed.total;
         torrent.layout = Some(Arc::clone(&parsed.layout));
-        let stored = self.inner.db.torrent_file_priorities(job_id).unwrap_or_else(|error| {
-            tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's file levels");
-            Vec::new()
-        });
         torrent.levels = parsed
             .layout
             .files()
@@ -3276,14 +3282,18 @@ impl TorrentService {
         // without waiting for the last to restore (qBittorrent's
         // startUpTorrents keeps MAX_PROCESSING_RESUMEDATA_COUNT in flight
         // into libtorrent's async_add_torrent).
+        // The global archive passwords, read once for all of them and
+        // outside the live lock.
+        let global = (!waiting.is_empty()).then(|| self.global_passwords());
         let mut restoring = tokio::task::JoinSet::new();
         for job_id in waiting {
             if restoring.len() >= RESTORES_AT_ONCE {
                 restoring.join_next().await;
             }
             let service = self.clone();
+            let global = global.clone();
             restoring.spawn(async move {
-                if service.restore_job(job_id).await {
+                if service.restore_job_with(job_id, global).await {
                     service.attach(job_id, None).await;
                 }
             });
@@ -3297,6 +3307,16 @@ impl TorrentService {
     // restore that panics is a checkpoint that does not restore. Whether it
     // gave the torrent its job, unheld, so it may attach now.
     async fn restore_job(&self, job_id: JobId) -> bool {
+        self.restore_job_with(job_id, None).await
+    }
+
+    // [`Self::restore_job`] with the global archive passwords read for it,
+    // or none to read them when its store is made.
+    async fn restore_job_with(
+        &self,
+        job_id: JobId,
+        global: Option<Arc<[ArchivePasswordCandidate]>>,
+    ) -> bool {
         // However the restore ends, even cancelled or with the runtime, its
         // entry goes: a torrent with its job, or gone, waits for no restore.
         struct Done<'a>(&'a TorrentService, JobId);
@@ -3333,10 +3353,17 @@ impl TorrentService {
             return false;
         }
         let waiting = {
-            let live = self.inner.live.lock().await;
-            live.get(&job_id)
+            let mut live = self.inner.live.lock().await;
+            live.get_mut(&job_id)
                 .filter(|torrent| torrent.store.is_none())
-                .and_then(|torrent| self.making(torrent))
+                .and_then(|torrent| {
+                    let global = global.unwrap_or_else(|| self.global_passwords());
+                    let made = self.making(torrent, &global)?;
+                    Some(Making {
+                        kept: torrent.kept_at_boot.take(),
+                        ..made
+                    })
+                })
         };
         let Some(made) = waiting else {
             return false;
@@ -4146,9 +4173,10 @@ impl TorrentService {
             picking,
             saved,
             listed,
+            verified,
         ) = {
-            let live = self.inner.live.lock().await;
-            let Some(torrent) = live.get(&job_id) else {
+            let mut live = self.inner.live.lock().await;
+            let Some(torrent) = live.get_mut(&job_id) else {
                 return;
             };
             if torrent.attached.is_some() {
@@ -4199,6 +4227,7 @@ impl TorrentService {
                 // tracker edit leaves them under this lock: they stand in
                 // for its metainfo's.
                 torrent.trackers.clone(),
+                torrent.verified_at_boot.take(),
             )
         };
         let plan = match self.inner.sessions.routes().plan(scope) {
@@ -4265,7 +4294,8 @@ impl TorrentService {
         // again (libtorrent restores `verified_pieces` on a seed-mode add).
         // Lost, they are checked again as a peer asks for them.
         if seed_mode {
-            options.seed_verified = match self.inner.db.torrent_seed_verified(job_id) {
+            let verified = verified.map_or_else(|| self.inner.db.torrent_seed_verified(job_id), Ok);
+            options.seed_verified = match verified {
                 Ok(verified) => {
                     verified.map(|bytes| BF::from_boxed_slice(bytes.into_boxed_slice()))
                 }
@@ -5440,49 +5470,88 @@ impl TorrentService {
     // fetches its metainfo.
     async fn restore(&self) -> Result<(), String> {
         self.load_rules()?;
-        let records = self.inner.db.list_torrents().map_err(state_error)?;
-        // Every torrent's trackers, from one read. A torrent kept with no
-        // list would write its next edit over the rows it has, so a read
-        // that fails fails the restore as the records' does.
+        // Each table a restore and a first attach read, read once for every
+        // torrent. A torrent kept with no tracker list would write its next
+        // edit over the rows it has, and one kept with no ledger would write
+        // zeros over its counts at its next save, so those reads, like the
+        // records', fail the restore when they fail. A history that does
+        // not read is said, and no torrent shows its failure. One
+        // torrent's part that does not read is said, and that torrent goes
+        // on without it: its pieces and seed-mode pieces are then read
+        // again, each by the one it is for.
+        let records = self.inner.db.restored_torrents().map_err(state_error)?;
         let mut trackers = self
             .inner
             .db
             .torrent_trackers_by_job()
             .map_err(state_error)?;
+        let mut counters = self
+            .inner
+            .db
+            .torrent_counters_by_job()
+            .map_err(state_error)?;
+        let mut failures = self
+            .inner
+            .db
+            .failed_torrent_histories()
+            .unwrap_or_else(|error| {
+                tracing::warn!(error = %error, "could not read the torrents' history");
+                BTreeMap::new()
+            });
         let now = self.inner.clock.now_ms();
-        if let Some(last) = records.iter().map(|record| record.queue_position).max() {
+        if let Some(last) = records.iter().map(|row| row.record.queue_position).max() {
             self.inner
                 .next_queue_position
                 .fetch_max(last + 1, Ordering::Relaxed);
         }
-        for record in records {
+        for row in records {
+            let record = row.record;
             let job_id = record.job_id;
-            let counters = self
-                .inner
-                .db
-                .get_torrent_counters(job_id)
-                .unwrap_or_else(|error| {
-                    tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's ledger");
-                    None
-                })
-                .unwrap_or_default();
-            let resume = self.inner.db.torrent_peers(job_id).unwrap_or_else(|error| {
-                tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's saved peers");
-                ResumePeers::default()
-            });
+            let (ledger, resume, kept) = match counters.remove(&job_id) {
+                Some(stored) => (
+                    stored.counters.unwrap_or_else(|error| {
+                        tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's ledger");
+                        TorrentCounters::default()
+                    }),
+                    stored.peers.unwrap_or_else(|error| {
+                        tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's saved peers");
+                        ResumePeers::default()
+                    }),
+                    stored.kept.map_err(|error| {
+                        tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's pieces");
+                    }).ok(),
+                ),
+                None => (
+                    TorrentCounters::default(),
+                    ResumePeers::default(),
+                    Some(None),
+                ),
+            };
             // The rule is the one its trackers match now (libtorrent keeps
             // the trackers, not what was made of them).
-            let mut torrent = Live::new(record.clone(), counters, resume, now);
+            let mut torrent = Live::new(record.clone(), ledger, resume, now);
             torrent.trackers = in_table_order(trackers.remove(&job_id).unwrap_or_default());
             torrent.rule_id = self.rule_id(torrent.trackers.iter());
             match record.metainfo.as_deref().map(parse) {
                 Some(Ok(parsed)) => {
-                    self.describe(&mut torrent, &parsed);
-                    let kept = self.inner.db.torrent_pieces(job_id).unwrap_or_else(|error| {
-                        tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's pieces");
-                        None
+                    let levels = row.levels.unwrap_or_else(|error| {
+                        tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's file levels");
+                        Vec::new()
                     });
-                    torrent.kept(self.stored_failure(job_id), kept);
+                    self.describe(&mut torrent, &parsed, levels);
+                    torrent.kept(
+                        failures.remove(&job_id),
+                        kept.as_ref().and_then(Option::as_ref),
+                    );
+                    torrent.kept_at_boot = kept;
+                    if torrent.record.seed_mode {
+                        torrent.verified_at_boot = row
+                            .seed_verified
+                            .map_err(|error| {
+                                tracing::warn!(job_id = job_id.0, error = %error, "could not read the pieces a torrent checked in seed mode");
+                            })
+                            .ok();
+                    }
                     self.inner.live.lock().await.insert(job_id, torrent);
                 }
                 Some(Err(error)) => {
@@ -6753,6 +6822,8 @@ struct Making {
     // In seed mode: its pieces had are unchecked, and go to the tee only
     // as their seed-mode check passes.
     seeded: bool,
+    // The pieces it kept as the boot read them; none to read its row.
+    kept: Option<Option<Kept>>,
 }
 
 // The directory the torrent's files are in: where they were placed, or else
