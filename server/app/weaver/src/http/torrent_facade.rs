@@ -3228,7 +3228,12 @@ async fn maindata(
         },
         clock: |view: &TorrentView| clock_fields(view, at),
     };
-    axum::Json(ctx.sync().answer(client, rid, now, &fields)).into_response()
+    // The lock is held for the bookkeeping alone, not while the response is
+    // built.
+    let start = ctx.sync().begin(&client, rid);
+    let (body, kept) = sync::answer(&start, now, &fields);
+    ctx.sync().finish(&client, start.id(), kept);
+    axum::Json(body).into_response()
 }
 
 // The client's name for a peer from the first eight bytes of its peer id

@@ -79,12 +79,12 @@ type Keys = HashMap<String, u64>;
 
 #[derive(Default)]
 struct Client {
-    // The id of the last response; 0 before the first.
+    // The id of the last response begun; 0 before the first.
     last_sent: u64,
     // The id the client has shown it holds, and the state it stands for.
     accepted: Option<(u64, Arc<Kept>)>,
-    // The state the last response left the client with.
-    sent: Option<Arc<Kept>>,
+    // The last response's id and the state it left the client with.
+    sent: Option<(u64, Arc<Kept>)>,
     heard: u64,
 }
 
@@ -94,24 +94,29 @@ pub(super) struct SyncTable {
     heard: u64,
 }
 
+// Where a response starts: its id, and the state the client holds, if the
+// response can be the changes from it.
+pub(super) struct Start {
+    id: u64,
+    from: Option<Arc<Kept>>,
+}
+
+impl Start {
+    pub(super) fn id(&self) -> u64 {
+        self.id
+    }
+}
+
 impl SyncTable {
     pub(super) fn forget(&mut self, client: &SyncClient) {
         self.clients.remove(client);
     }
 
-    // The response to `rid` from `client`, given the state now.
-    pub(super) fn answer<V, Steady, Clock>(
-        &mut self,
-        client: SyncClient,
-        rid: u64,
-        now: Poll<'_, V>,
-        fields: &Fields<Steady, Clock>,
-    ) -> Value
-    where
-        Steady: Fn(&V) -> Vec<(&'static str, Value)>,
-        Clock: Fn(&V) -> [(&'static str, Value); CLOCK_KEYS],
-    {
-        if !self.clients.contains_key(&client)
+    // The bookkeeping before a response to `rid` from `client`: the response
+    // is built from what this returns, outside the table's lock, and then
+    // handed to `finish`.
+    pub(super) fn begin(&mut self, client: &SyncClient, rid: u64) -> Start {
+        if !self.clients.contains_key(client)
             && self.clients.len() >= CLIENTS
             && let Some(oldest) = self
                 .clients
@@ -122,7 +127,7 @@ impl SyncTable {
             self.clients.remove(&oldest);
         }
         self.heard += 1;
-        let entry = self.clients.entry(client).or_default();
+        let entry = self.clients.entry(client.clone()).or_default();
         entry.heard = self.heard;
         // qBittorrent `maindataAction`: the client holds the last response
         // once it sends its id back, and changes can be sent while the id it
@@ -130,9 +135,10 @@ impl SyncTable {
         let mut from = None;
         if rid > 0 && entry.last_sent > 0 {
             if entry.last_sent == rid
-                && let Some(sent) = &entry.sent
+                && let Some((sent, state)) = &entry.sent
+                && *sent == rid
             {
-                entry.accepted = Some((rid, Arc::clone(sent)));
+                entry.accepted = Some((rid, Arc::clone(state)));
             }
             from = entry
                 .accepted
@@ -141,12 +147,38 @@ impl SyncTable {
                 .map(|(_, state)| Arc::clone(state));
         }
         let id = entry.last_sent % ID_CYCLE + 1;
-        let (mut body, kept) = respond(from.as_deref(), now, fields);
-        body.insert("rid".to_owned(), Value::from(id));
-        entry.sent = Some(Arc::new(kept));
         entry.last_sent = id;
-        Value::Object(body)
+        Start { id, from }
     }
+
+    // Keeps the state the response `id` left the client with. Two requests
+    // from one client in flight at once race, and the last writer wins: the
+    // one begun last is kept whenever it finishes, and an earlier one that
+    // finishes after it is dropped, so the state kept is always that of the
+    // last id sent.
+    pub(super) fn finish(&mut self, client: &SyncClient, id: u64, kept: Kept) {
+        if let Some(entry) = self.clients.get_mut(client)
+            && entry.last_sent == id
+        {
+            entry.sent = Some((id, Arc::new(kept)));
+        }
+    }
+}
+
+// The response that `start` begins, given the state now, and the state it
+// leaves the client with.
+pub(super) fn answer<V, Steady, Clock>(
+    start: &Start,
+    now: Poll<'_, V>,
+    fields: &Fields<Steady, Clock>,
+) -> (Value, Kept)
+where
+    Steady: Fn(&V) -> Vec<(&'static str, Value)>,
+    Clock: Fn(&V) -> [(&'static str, Value); CLOCK_KEYS],
+{
+    let (mut body, kept) = respond(start.from.as_deref(), now, fields);
+    body.insert("rid".to_owned(), Value::from(start.id));
+    (Value::Object(body), kept)
 }
 
 // The response from the state `from` stands for to `now`, and the state it
@@ -381,6 +413,22 @@ mod tests {
         }
     }
 
+    fn poll(things: &[Thing]) -> Poll<'_, Thing> {
+        Poll {
+            torrents: things
+                .iter()
+                .map(|thing| Row {
+                    hash: thing.hash.clone(),
+                    fingerprint: digest(&json!(thing.name)),
+                    view: thing,
+                })
+                .collect(),
+            categories: Vec::new(),
+            tags: Vec::new(),
+            server_state: Map::new(),
+        }
+    }
+
     const CLOCK: [&str; CLOCK_KEYS] = [
         "eta",
         "popularity",
@@ -413,20 +461,10 @@ mod tests {
                 },
                 clock: |thing: &Thing| CLOCK.map(|name| (name, json!(thing.tick))),
             };
-            let poll = Poll {
-                torrents: things
-                    .iter()
-                    .map(|thing| Row {
-                        hash: thing.hash.clone(),
-                        fingerprint: digest(&json!(thing.name)),
-                        view: thing,
-                    })
-                    .collect(),
-                categories: Vec::new(),
-                tags: Vec::new(),
-                server_state: Map::new(),
-            };
-            self.table.answer(client, rid, poll, &fields)
+            let start = self.table.begin(&client, rid);
+            let (body, kept) = answer(&start, poll(things), &fields);
+            self.table.finish(&client, start.id, kept);
+            body
         }
     }
 
@@ -470,6 +508,30 @@ mod tests {
         );
     }
 
+    // Two responses to one client built at once: the one begun last is
+    // kept, whichever finishes first, and the client sending its id back
+    // gets the changes from it.
+    #[test]
+    fn the_response_begun_last_is_kept() {
+        let mut rig = Rig::new();
+        let client = SyncClient::Anonymous;
+        rig.answer(client.clone(), 0, &[thing(0, "x")]);
+        let fields = Fields {
+            steady: |thing: &Thing| vec![("name", json!(thing.name))],
+            clock: |thing: &Thing| CLOCK.map(|name| (name, json!(thing.tick))),
+        };
+        let (early, late) = ([thing(0, "early")], [thing(0, "late")]);
+        let first = rig.table.begin(&client, 1);
+        let second = rig.table.begin(&client, 1);
+        let (_, kept_second) = answer(&second, poll(&late), &fields);
+        rig.table.finish(&client, second.id(), kept_second);
+        let (_, kept_first) = answer(&first, poll(&early), &fields);
+        rig.table.finish(&client, first.id(), kept_first);
+        let next = rig.answer(client, second.id(), &[thing(0, "late")]);
+        assert!(next.get("full_update").is_none(), "{next}");
+        assert!(next.get("torrents").is_none(), "{next}");
+    }
+
     // A row is built only for a torrent whose view moved: none when only the
     // clock did, and one, sending just its changed key, when one torrent's
     // view did. What is kept per torrent is a hash per field, the field names
@@ -483,7 +545,7 @@ mod tests {
         assert_eq!(whole["torrents"].as_object().unwrap().len(), 50);
         assert_eq!(rig.builds.get(), 50);
 
-        let kept = rig.table.clients[&client].sent.clone().unwrap();
+        let kept = rig.table.clients[&client].sent.clone().unwrap().1;
         assert_eq!(kept.torrents.len(), 50);
         for row in kept.torrents.values() {
             assert_eq!(
@@ -496,7 +558,7 @@ mod tests {
         let same = rig.answer(client.clone(), 1, &things);
         assert_eq!(rig.builds.get(), 50);
         assert_eq!(same, json!({ "rid": 2 }));
-        let shared = &rig.table.clients[&client].sent.as_ref().unwrap().torrents;
+        let shared = &rig.table.clients[&client].sent.as_ref().unwrap().1.torrents;
         let hash = things[0].hash.as_str();
         assert!(Arc::ptr_eq(
             &shared[hash].steady,
