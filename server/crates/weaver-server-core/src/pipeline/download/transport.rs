@@ -33,10 +33,10 @@ const RUNG_WINDOW_RESPONSES: u64 = 32;
 // halves the depth model divides — while costing a fraction of the job.
 const RUNG_WARMUP_WINDOW_RESPONSES: u64 = 8;
 
-// How many short windows a fresh explorer runs: one to measure the link, one
-// to take the baseline and pick a rung, one to judge the rung it picked.
-// After that the full window applies, because by then the depth is settled
-// and the only question left is whether the link has changed.
+// How many short windows a fresh explorer runs: one to measure the link and
+// move to the rung it asks for, then two more for the rung to be settled or
+// judged. After that the full window applies, because by then the depth is
+// settled and the only question left is whether the link has changed.
 const RUNG_WARMUP_WINDOWS: u8 = 3;
 
 // Status-line waits held before their minimum folds into the round-trip
@@ -199,6 +199,19 @@ pub(crate) enum RungChange {
     PinnedSequential,
 }
 
+impl RungChange {
+    // Whether the verdict leaves the server on a rung worth writing through
+    // to the servers table. A step up is not: it is either on trial or, as a
+    // first climb taken on the model alone, waiting for the window that
+    // settles it, and a restart would resume at a depth nothing has yet paid
+    // for. Every other outcome is a settled verdict, including the ones that
+    // lower the rung — a persisted depth that over-promises is the one worth
+    // correcting.
+    pub(crate) fn settles_the_rung(self) -> bool {
+        !matches!(self, Self::Stepped { from, to } if to > from)
+    }
+}
+
 fn rung_index(depth: u8) -> usize {
     RUNGS
         .iter()
@@ -237,6 +250,13 @@ pub(crate) struct ServerPipelineExplorer {
     // on — the rung its own measurements ask for. The first move goes
     // straight there; every later one walks the ladder a rung at a time.
     first_climb_pending: bool,
+    // The servers table held a rung for this server when the explorer was
+    // seeded. Such a server's first climb is judged by a trial like any
+    // other; only a server with nothing proven moves on the model alone.
+    seeded_from_proven_rung: bool,
+    // Set after the first climb moved to the modelled rung without a trial,
+    // until a clean window at that rung settles it as the baseline.
+    settle_pending: bool,
     // Short windows left before the full window length applies.
     warmup_windows_left: u8,
     // Every response folded into this window, at the current rung or below.
@@ -297,6 +317,8 @@ impl Default for ServerPipelineExplorer {
             baseline_throughput_bps: None,
             on_trial: false,
             first_climb_pending: true,
+            seeded_from_proven_rung: false,
+            settle_pending: false,
             warmup_windows_left: RUNG_WARMUP_WINDOWS,
             window_responses: 0,
             window_latency_warm_min: None,
@@ -357,6 +379,7 @@ impl ServerPipelineExplorer {
             latency: probe_latency,
             transfer: article_transfer,
             persisted_depth: proven_depth,
+            seeded_from_proven_rung: proven_depth.is_some(),
             ..Self::default()
         }
     }
@@ -599,7 +622,10 @@ impl ServerPipelineExplorer {
         // closed window after window with nothing in them that could judge
         // the step, and a short job ended before any verdict. They still feed
         // the link model; they no longer close the trial.
-        let counted = if self.on_trial {
+        //
+        // A first climb waiting to settle counts the same way, for the same
+        // reason: only a response at the new rung can settle it.
+        let counted = if self.on_trial || self.settle_pending {
             self.window_rung_responses
         } else {
             self.window_responses
@@ -654,7 +680,18 @@ impl ServerPipelineExplorer {
             return None;
         }
         if opening_window {
-            return None;
+            return self.first_climb_from_the_model(now);
+        }
+
+        // The first climb moved without a trial; the first clean window at
+        // its rung makes that rung the baseline and the depth worth saving.
+        if self.settle_pending {
+            self.settle_pending = false;
+            self.baseline_depth = Some(self.current_depth);
+            self.baseline_throughput_bps = Some(throughput);
+            return Some(RungChange::Kept {
+                depth: self.current_depth,
+            });
         }
 
         if self.on_trial {
@@ -719,6 +756,37 @@ impl ServerPipelineExplorer {
         Some(RungChange::Stepped { from, to })
     }
 
+    // The first climb on a server with no proven rung, taken as the opening
+    // window closes.
+    //
+    // By then the window has measured the round trip and the article
+    // transfer, and the two already name the rung the link needs. Waiting a
+    // window to take a baseline at the seeded rung and another to judge the
+    // climb as a trial runs most of a short job at that seeded rung, so the
+    // explorer moves at once, as if the rung had been seeded, and the next
+    // clean window at that rung settles it. Only a climb up moves here: a
+    // model that asks for no more than the current rung, or one still missing
+    // a half, leaves the second window to decide as it always has.
+    fn first_climb_from_the_model(&mut self, now: Instant) -> Option<RungChange> {
+        if !self.first_climb_pending
+            || self.seeded_from_proven_rung
+            || self.hold_until.is_some_and(|until| now < until)
+            || self.physical_target_depth().is_none()
+        {
+            return None;
+        }
+        let from = self.current_depth;
+        let to = self.target_rung();
+        if to <= from {
+            return None;
+        }
+        self.current_depth = to;
+        self.on_trial = false;
+        self.first_climb_pending = false;
+        self.settle_pending = true;
+        Some(RungChange::Stepped { from, to })
+    }
+
     // Responses this window closes on.
     fn window_target_responses(&self) -> u64 {
         if self.warmup_windows_left > 0 {
@@ -736,6 +804,7 @@ impl ServerPipelineExplorer {
         }
         self.reset_window();
         self.on_trial = false;
+        self.settle_pending = false;
         self.baseline_depth = None;
         self.baseline_throughput_bps = None;
 
@@ -960,8 +1029,20 @@ mod tests {
         change
     }
 
-    // Feed the explorer's opening window, which measures the link and
-    // decides nothing.
+    // A server the servers table already holds a rung for, two deep. Its
+    // first climb is a trial, judged like every later one.
+    fn proven_at_two(latency_ms: u64, transfer_ms: u64) -> ServerPipelineExplorer {
+        let mut explorer = ServerPipelineExplorer::seeded(
+            Some(2),
+            Some(Duration::from_millis(latency_ms)),
+            Some(Duration::from_millis(transfer_ms)),
+        );
+        explorer.note_supports_pipelining(true);
+        explorer
+    }
+
+    // Feed the opening window of a server with a proven rung, which measures
+    // the link and decides nothing.
     fn open_window(explorer: &mut ServerPipelineExplorer, now: Instant) {
         let depth = explorer.current_depth();
         assert_eq!(
@@ -1112,9 +1193,9 @@ mod tests {
         assert_eq!(faster.physical_target_depth(), Some(5));
         assert_eq!(faster.target_rung(), 8);
 
-        // The first climb goes there, and the trial judges it.
+        // A server with nothing proven goes there as its opening window
+        // closes.
         let now = Instant::now();
-        open_window(&mut slower, now);
         assert_eq!(
             run_window(&mut slower, now, 768_000, Duration::from_millis(50)),
             Some(RungChange::Stepped { from: 2, to: 8 })
@@ -1141,30 +1222,141 @@ mod tests {
         );
     }
 
-    // The first decision goes straight to the rung the measured link asks
-    // for.
+    // A server with nothing proven goes straight to the rung the measured
+    // link asks for as soon as its opening window has measured it, with no
+    // trial, and the next clean window at that rung settles it.
     //
-    // This test used to assert a single rung of movement — `2 -> 4` on a link
-    // whose target is 8 — which is the behaviour that left a short download
-    // running most of its articles at the seeded depth: each further rung
-    // cost a window to step and another to judge. The ladder's caution is
-    // still there, in the trial that follows and in every later change; what
-    // moved is only how the explorer arrives at its first rung.
+    // A climb a rung at a time cost a window to step and another to judge
+    // each rung, and a baseline window plus a trial window at the seeded rung
+    // still ran most of a short download there. The ladder's caution stays in
+    // every later change; what moved is only how a fresh server arrives at its
+    // first rung.
     #[test]
-    fn the_first_window_moves_straight_to_the_bandwidth_delay_rung() {
+    fn the_opening_window_moves_straight_to_the_bandwidth_delay_rung() {
         let mut explorer = explorer(300, 50);
         let now = Instant::now();
         assert_eq!(explorer.current_depth(), 2);
         assert_eq!(explorer.target_rung(), 8);
 
-        open_window(&mut explorer, now);
         let change = run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
         assert_eq!(change, Some(RungChange::Stepped { from: 2, to: 8 }));
         assert_eq!(explorer.current_depth(), 8);
+        assert!(!explorer.on_trial, "the first climb is not a trial");
+        assert_eq!(explorer.baseline_throughput_bps, None);
         assert_eq!(
             explorer.choose_mode(true),
             DownloadLaneMode::Pipelined { depth: 8 }
         );
+
+        // Any clean window at the rung settles it, whatever it reads: there
+        // is no baseline below it to lose to.
+        let change = run_window(&mut explorer, now, 10_000, Duration::from_millis(100));
+        assert_eq!(change, Some(RungChange::Kept { depth: 8 }));
+        assert_eq!(explorer.current_depth(), 8);
+        assert_eq!(explorer.baseline_depth, Some(8));
+    }
+
+    // A server the servers table already holds a rung for keeps today's
+    // first climb: the opening window decides nothing, the next one takes
+    // the baseline and climbs, and that climb is a trial.
+    #[test]
+    fn a_proven_servers_first_climb_is_still_a_trial() {
+        let mut explorer = proven_at_two(300, 50);
+        let now = Instant::now();
+        open_window(&mut explorer, now);
+        let change = run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
+        assert_eq!(change, Some(RungChange::Stepped { from: 2, to: 8 }));
+        assert!(explorer.on_trial);
+        assert!(!explorer.settle_pending);
+    }
+
+    // A model still missing a half has no rung to jump to: the opening
+    // window decides nothing, and the first climb waits for the model and
+    // goes on trial as it did before.
+    #[test]
+    fn an_incomplete_model_makes_no_jump_at_the_opening_window() {
+        let mut explorer = ServerPipelineExplorer::default();
+        explorer.note_supports_pipelining(true);
+        let now = Instant::now();
+        assert_eq!(
+            run_window(&mut explorer, now, 100_000, Duration::from_millis(100)),
+            None
+        );
+        assert_eq!(explorer.physical_target_depth(), None);
+        assert_eq!(explorer.current_depth(), 2);
+        assert!(!explorer.settle_pending);
+        assert!(explorer.first_climb_pending);
+
+        // The round trip arrives; the next window climbs on trial.
+        assert_eq!(
+            run_window(&mut explorer, now, 100_000, Duration::from_millis(100)),
+            None
+        );
+        explorer.note_latency(Duration::from_millis(300));
+        assert_eq!(
+            run_window(&mut explorer, now, 100_000, Duration::from_millis(100)),
+            Some(RungChange::Stepped { from: 2, to: 8 })
+        );
+        assert!(explorer.on_trial);
+        assert!(!explorer.settle_pending);
+    }
+
+    // The jump is a step up, which the lanes never write through. Responses
+    // still arriving from leases booked at the old rung do not settle it, nor
+    // does a window a lane ran short in; the first clean window at the new
+    // rung returns `Kept`, and only that is saved.
+    #[test]
+    fn the_first_climb_is_not_saved_until_a_clean_window_at_its_rung_settles_it() {
+        let mut explorer = explorer(300, 50);
+        let now = Instant::now();
+        let change = run_window(&mut explorer, now, 100_000, Duration::from_millis(100))
+            .expect("the opening window jumps");
+        assert_eq!(change, RungChange::Stepped { from: 2, to: 8 });
+        assert!(!change.settles_the_rung());
+
+        // Seventy-two responses from leases booked two deep, one of them from
+        // a lane left short: none of them settles the rung or voids it.
+        for response in 0..72 {
+            assert_eq!(
+                explorer.note_response(
+                    now,
+                    2,
+                    100_000,
+                    Duration::from_millis(100),
+                    true,
+                    false,
+                    response != 40,
+                ),
+                None
+            );
+        }
+        assert!(explorer.settle_pending);
+
+        // A window at the rung that a lane ran short in settles nothing.
+        let responses = explorer.window_target_responses();
+        for response in 0..responses {
+            assert_eq!(
+                explorer.note_response(
+                    now,
+                    8,
+                    100_000,
+                    Duration::from_millis(100),
+                    true,
+                    false,
+                    response != responses / 2,
+                ),
+                None
+            );
+        }
+        assert!(explorer.settle_pending);
+
+        let change = run_window(&mut explorer, now, 100_000, Duration::from_millis(100))
+            .expect("a clean window at the rung settles it");
+        assert_eq!(change, RungChange::Kept { depth: 8 });
+        assert!(change.settles_the_rung());
+        assert!(!explorer.settle_pending);
+        assert_eq!(explorer.take_persist_request(), Some(8));
+        assert_eq!(explorer.take_persist_request(), None);
     }
 
     // Later changes still walk the ladder a rung at a time.
@@ -1173,14 +1365,13 @@ mod tests {
         let mut explorer = explorer(300, 200);
         let now = Instant::now();
         // Articles as long as two thirds of the round trip: the link wants 4,
-        // which is where the first decision puts it.
+        // which is where the opening window puts it.
         assert_eq!(explorer.target_rung(), 4);
-        open_window(&mut explorer, now);
         assert_eq!(
             run_window(&mut explorer, now, 100_000, Duration::from_millis(100)),
             Some(RungChange::Stepped { from: 2, to: 4 })
         );
-        // Keep the rung, then let the articles shrink so the target moves out
+        // Settle the rung, then let the articles shrink so the target moves out
         // to 8. The climb is over, so the explorer steps rather than jumps.
         assert_eq!(
             run_window(&mut explorer, now, 200_000, Duration::from_millis(100)),
@@ -1194,9 +1385,11 @@ mod tests {
         );
     }
 
+    // The trial tests below run on a server with a proven rung, whose first
+    // climb is a trial; every later climb on any server is one too.
     #[test]
     fn a_step_up_that_pays_for_itself_is_kept() {
-        let mut explorer = explorer(300, 50);
+        let mut explorer = proven_at_two(300, 50);
         let now = Instant::now();
         open_window(&mut explorer, now);
         run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
@@ -1214,7 +1407,7 @@ mod tests {
     // reverted it on every run.
     #[test]
     fn a_trial_that_ties_its_baseline_is_kept() {
-        let mut explorer = explorer(300, 50);
+        let mut explorer = proven_at_two(300, 50);
         let now = Instant::now();
         open_window(&mut explorer, now);
         run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
@@ -1229,14 +1422,42 @@ mod tests {
     // The bench's link-bound server: 768 000-byte articles, a 102 ms round
     // trip, 48 ms on the wire. The opening window reads each lane at 18 MB/s
     // while the lanes are still coming up; every later window, at either
-    // rung, reads 15.4 MB/s. The opening window is not the baseline, so the
-    // trial that matches the steady state keeps its rung.
+    // rung, reads 15.4 MB/s. With nothing proven, the opening window moves
+    // the server to 8 and the first steady window settles it there; the
+    // fast opening window is never the baseline.
+    #[test]
+    fn the_bench_link_jumps_at_the_opening_window_and_settles_on_the_next() {
+        const ARTICLE: u64 = 768_000;
+        let opening = Duration::from_micros(42_700);
+        let steady = Duration::from_micros(50_000);
+        let mut explorer = explorer(102, 48);
+        let now = Instant::now();
+
+        assert_eq!(
+            run_window(&mut explorer, now, ARTICLE, opening),
+            Some(RungChange::Stepped { from: 2, to: 8 })
+        );
+        assert_eq!(explorer.baseline_throughput_bps, None);
+        assert_eq!(
+            run_window(&mut explorer, now, ARTICLE, steady),
+            Some(RungChange::Kept { depth: 8 })
+        );
+        assert_eq!(explorer.current_depth(), 8);
+        let baseline = explorer
+            .baseline_throughput_bps
+            .expect("the settle window is the baseline");
+        assert!((baseline - ARTICLE as f64 / steady.as_secs_f64()).abs() < 1.0);
+    }
+
+    // The same link on a server with a proven rung, whose first climb is a
+    // trial. The opening window is not the baseline, so the trial that
+    // matches the steady state keeps its rung.
     #[test]
     fn a_fast_opening_window_does_not_revert_a_trial_at_the_steady_state() {
         const ARTICLE: u64 = 768_000;
         let opening = Duration::from_micros(42_700);
         let steady = Duration::from_micros(50_000);
-        let mut explorer = explorer(102, 48);
+        let mut explorer = proven_at_two(102, 48);
         let now = Instant::now();
 
         assert_eq!(run_window(&mut explorer, now, ARTICLE, opening), None);
@@ -1258,7 +1479,7 @@ mod tests {
     // judges it, and still reverts a rung that measurably lost.
     #[test]
     fn a_window_a_lane_ran_short_in_judges_no_rung() {
-        let mut explorer = explorer(300, 50);
+        let mut explorer = proven_at_two(300, 50);
         let now = Instant::now();
         open_window(&mut explorer, now);
         run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
@@ -1282,7 +1503,7 @@ mod tests {
 
     #[test]
     fn a_step_up_that_does_not_pay_reverts_and_holds() {
-        let mut explorer = explorer(300, 50);
+        let mut explorer = proven_at_two(300, 50);
         let now = Instant::now();
         open_window(&mut explorer, now);
         run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
@@ -1308,15 +1529,17 @@ mod tests {
     fn an_unclean_batch_drops_a_rung_and_a_second_one_pins_sequential() {
         let mut explorer = explorer(300, 50);
         let now = Instant::now();
-        open_window(&mut explorer, now);
         run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
         assert_eq!(explorer.current_depth(), 8);
+        assert!(explorer.settle_pending);
 
         assert_eq!(
             explorer.note_unclean_batch(now),
             Some(RungChange::Dropped { from: 8, to: 4 })
         );
         assert_eq!(explorer.current_depth(), 4);
+        // The rung the first climb was waiting to settle is gone.
+        assert!(!explorer.settle_pending);
 
         assert_eq!(
             explorer.note_unclean_batch(now + Duration::from_secs(60)),
@@ -1376,7 +1599,6 @@ mod tests {
         let now = Instant::now();
         assert_eq!(explorer.target_rung(), 8);
 
-        open_window(&mut explorer, now);
         let change = run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
         assert_eq!(change, Some(RungChange::Stepped { from: 2, to: 8 }));
 
@@ -1539,7 +1761,7 @@ mod tests {
     // many old-rung responses arrive first.
     #[test]
     fn the_trial_window_opens_with_the_first_response_at_the_new_rung() {
-        let mut explorer = explorer(300, 200);
+        let mut explorer = proven_at_two(300, 200);
         let now = Instant::now();
         open_window(&mut explorer, now);
         assert_eq!(
@@ -1612,7 +1834,7 @@ mod tests {
         assert_eq!(explorer.window_target_responses(), 8);
         let now = Instant::now();
 
-        open_window(&mut explorer, now);
+        run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
         assert_eq!(explorer.window_target_responses(), 8);
         run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
         assert_eq!(explorer.window_target_responses(), 8);
@@ -1630,14 +1852,16 @@ mod tests {
         assert_eq!(explorer.take_persist_request(), Some(2));
         assert_eq!(explorer.take_persist_request(), None);
 
-        open_window(&mut explorer, now);
-        run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
+        let change = run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
+        assert_eq!(change, Some(RungChange::Stepped { from: 2, to: 8 }));
         assert_eq!(explorer.current_depth(), 8);
-        // The step up is on trial; the caller must not write it through yet,
-        // but the value it would write is the one under test. One window that
-        // keeps the rung is enough — a proven depth is worth saving as soon as
-        // it is proven, not several windows later.
-        run_window(&mut explorer, now, 200_000, Duration::from_millis(100));
+        // The step up waits for its settle window; the caller must not write
+        // it through yet. One window that settles the rung is enough — a
+        // proven depth is worth saving as soon as it is proven, not several
+        // windows later.
+        assert!(!change.expect("stepped").settles_the_rung());
+        let change = run_window(&mut explorer, now, 200_000, Duration::from_millis(100));
+        assert_eq!(change, Some(RungChange::Kept { depth: 8 }));
         assert_eq!(explorer.take_persist_request(), Some(8));
         assert_eq!(explorer.take_persist_request(), None);
 
