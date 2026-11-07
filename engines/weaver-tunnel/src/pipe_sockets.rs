@@ -117,17 +117,14 @@ impl Ledger {
 
     // How many sockets each share may hold now: its size, less the growth
     // still waiting on the sockets the shrunk shares hold above their size.
-    // A share already above its own size takes none of that wait, since it
-    // opens nothing until it is back under its size anyway.
+    // A share takes no more of that wait than it could still open, since a
+    // wait on sockets it would not open anyway holds nothing back.
     fn limits(&self) -> [usize; 4] {
         let mut overflow = self.overflow();
         let mut limits = self.size;
         let shares = limits.iter_mut().zip(&self.held).zip(&self.growing);
         for ((limit, &held), &growing) in shares {
-            if held > *limit {
-                continue;
-            }
-            let waiting = overflow.min(growing);
+            let waiting = overflow.min(growing).min(limit.saturating_sub(held));
             overflow -= waiting;
             *limit -= waiting;
         }
@@ -447,5 +444,54 @@ mod tests {
         assert_eq!((usenet.len(), torrent.len()), (70, 130));
         assert!(!sockets.has_room(SocketClass::Nntp));
         assert!(!sockets.has_room(SocketClass::Torrent));
+    }
+
+    // A share at exactly its size takes none of the wait another share's
+    // growth needs, so the reserve shrinking beside it still holds the
+    // shares to what they add up to.
+    #[test]
+    fn a_share_at_its_size_takes_none_of_the_wait_on_a_shrunk_reserve() {
+        let shares = |nntp, torrent, core| SocketShares {
+            nntp,
+            torrent,
+            core,
+            http: 4,
+        };
+        let sockets = SessionSockets::new(shares(101, 117, 18));
+        let take_all = |class, held: &mut Vec<SocketPermit>| {
+            while let Ok(permit) = sockets.take(class) {
+                held.push(permit.unwrap());
+            }
+        };
+        let mut usenet = Vec::new();
+        let mut torrent = Vec::new();
+        let mut core = Vec::new();
+        let mut http = Vec::new();
+        take_all(SocketClass::Nntp, &mut usenet);
+        take_all(SocketClass::Torrent, &mut torrent);
+        take_all(SocketClass::ReserveCore, &mut core);
+        take_all(SocketClass::ReserveHttp, &mut http);
+        let total = |usenet: &Vec<_>, torrent: &Vec<_>, core: &Vec<_>| {
+            usenet.len() + torrent.len() + core.len() + http.len()
+        };
+        assert_eq!(total(&usenet, &torrent, &core), 240);
+
+        for step in [
+            shares(51, 167, 18),
+            shares(71, 147, 18),
+            shares(71, 152, 13),
+        ] {
+            sockets.set_shares(step);
+            take_all(SocketClass::Torrent, &mut torrent);
+            assert_eq!(total(&usenet, &torrent, &core), 240);
+        }
+        usenet.truncate(71);
+        take_all(SocketClass::Torrent, &mut torrent);
+        assert_eq!(torrent.len(), 147);
+        assert_eq!(total(&usenet, &torrent, &core), 240);
+        core.truncate(13);
+        take_all(SocketClass::Torrent, &mut torrent);
+        assert_eq!(torrent.len(), 152);
+        assert_eq!(total(&usenet, &torrent, &core), 240);
     }
 }

@@ -225,6 +225,50 @@ async fn two_failures_redistribute_then_offer_one_probe_and_restore() {
     );
 }
 
+// A probe tests its own leg: while the probing leg's share is full the dial
+// waits on that share and the route instead of landing on the healthy leg,
+// and the probe goes through once the share frees.
+#[tokio::test(start_paused = true)]
+async fn a_probing_leg_with_a_full_share_is_not_probed_through_another_leg() {
+    let (route, stages) = create(5);
+    stages[0].mode.store(1, Ordering::SeqCst);
+    for _ in 0..2 {
+        assert!(route.dial(&target()).await.is_err());
+    }
+    tokio::time::advance(Duration::from_secs(30)).await;
+    assert_eq!(route.allocations()[0].health, LegHealthState::Probing);
+    stages[0].mode.store(0, Ordering::SeqCst);
+    let freed = Arc::new(Notify::new());
+    *stages[0].full.lock().unwrap() = Some(freed.clone());
+    let dialed = stages[1].dialed.lock().unwrap().len();
+
+    let Err(DialError::AtCapacity(waits)) = route.dial(&target()).await else {
+        panic!("a probe with no room on its leg waits");
+    };
+    assert!(waits.iter().any(|wait| Arc::ptr_eq(wait, &freed)));
+    assert!(
+        waits
+            .iter()
+            .any(|wait| Arc::ptr_eq(wait, &route.budget_changed()))
+    );
+    assert!(!route.has_room(&target().purpose));
+    assert_eq!(stages[1].dialed.lock().unwrap().len(), dialed);
+    assert_eq!(stages[0].dialed.lock().unwrap().len(), 2);
+
+    *stages[0].full.lock().unwrap() = None;
+    let probe = route.dial(&target()).await.unwrap();
+    assert_eq!(probe.path.leg, Some(0));
+    assert!(matches!(
+        stages[0].dialed.lock().unwrap().last(),
+        Some(Purpose::Nntp {
+            leg: 0,
+            probing: true,
+            ..
+        })
+    ));
+    assert_eq!(route.allocations()[0].health, LegHealthState::Up);
+}
+
 #[tokio::test(start_paused = true)]
 async fn every_dial_in_flight_during_one_outage_cools_the_leg_once() {
     let (route, stages) = create(5);

@@ -279,7 +279,7 @@ struct PoolState {
     id: u32,
     plan: Mutex<CandidatePlan<u32>>,
     members: RwLock<HashMap<u32, Arc<Member>>>,
-    changed: Notify,
+    changed: Arc<Notify>,
     stopped: AtomicBool,
     revision: AtomicU64,
 }
@@ -612,7 +612,7 @@ impl PoolStage {
             id,
             plan: Mutex::new(plan),
             members: RwLock::new(members),
-            changed: Notify::new(),
+            changed: Arc::new(Notify::new()),
             stopped: AtomicBool::new(false),
             revision: AtomicU64::new(0),
         });
@@ -987,6 +987,25 @@ impl Dialer for PoolStage {
             .lock()
             .expect("pool plan")
             .over_limit_cleared(Instant::now().into_std());
+    }
+    // Room on any member the pool would dial, or every such member's signal
+    // and the pool's own when none has room. A pool with no member to dial
+    // says it has room, so the dial reports why it cannot connect.
+    fn room(&self, purpose: &weaver_tunnel::pipe::Purpose) -> Result<(), Vec<Arc<Notify>>> {
+        let members = self.state.members.read().expect("pool members");
+        let mut waits = vec![self.state.changed.clone()];
+        let mut dialable = false;
+        for member in members.values() {
+            if member.status.lock().expect("pool member").blocked.is_some() {
+                continue;
+            }
+            dialable = true;
+            match member.dialer.room(purpose) {
+                Ok(()) => return Ok(()),
+                Err(freed) => waits.extend(freed),
+            }
+        }
+        if dialable { Err(waits) } else { Ok(()) }
     }
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
         if self.state.stopped.load(Ordering::Acquire) {

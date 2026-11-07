@@ -194,7 +194,7 @@ fn connections_count_on_the_last_wireguard_hop_and_nothing_else_is_counted() {
 #[test]
 fn torrent_peers_alone_take_all_but_the_reserve() {
     for (cap, core, http, torrent_peers) in
-        [(256, 13, 4, 223), (512, 13, 19, 448), (1024, 13, 51, 896)]
+        [(256, 13, 8, 219), (512, 13, 19, 448), (1024, 13, 51, 896)]
     {
         let ledger = socket_ledger(
             &[torrent(Rung::Proxy { id: 1 })],
@@ -242,31 +242,40 @@ fn a_carrier_above_a_tunnel_takes_one_reserve_socket_for_all_its_connections() {
     assert_eq!((direct.nntp, direct.carriers), (51, 0));
 }
 
-// Three torrent routes on one tunnel each start a session whose datagram
-// sockets all bind, beside the lookups and probes the tunnel keeps room
-// for, and HTTP keeps its floor.
+// Three torrent routes over three legs through one tunnel each start a
+// session whose datagram sockets all bind, beside the lookups and probes
+// the tunnel keeps room for, and HTTP keeps its floor.
 #[test]
 fn three_torrent_sessions_on_one_tunnel_all_bind_their_sockets() {
-    let through = || route(vec![Rung::Proxy { id: 1 }], Failover::Redistribute);
+    let over = |rung| route(vec![rung], Failover::Redistribute);
     let ledger = socket_ledger(
         &[
-            (Consumer::Torrent(TorrentScope::Default), through()),
-            (Consumer::Torrent(TorrentScope::Category(1)), through()),
-            (Consumer::Torrent(TorrentScope::Category(2)), through()),
+            (
+                Consumer::Torrent(TorrentScope::Default),
+                over(Rung::Proxy { id: 1 }),
+            ),
+            (
+                Consumer::Torrent(TorrentScope::Category(1)),
+                over(Rung::Chain { ids: vec![1, 5] }),
+            ),
+            (
+                Consumer::Torrent(TorrentScope::Category(2)),
+                over(Rung::Chain { ids: vec![1, 6] }),
+            ),
         ],
-        &profiles(&[1], &[]),
+        &profiles(&[1], &[5, 6]),
         &HashMap::new(),
         &HashMap::new(),
         256,
     );
     let tunnel = &ledger[&tunnel(1)];
-    assert_eq!(tunnel.torrent_routes, 3);
+    assert_eq!(tunnel.torrent_sessions, 3);
     let shares = tunnel.shares();
     assert_eq!(
         shares.core,
-        SOCKET_CORE_BASE + 3 * SOCKETS_PER_TORRENT_ROUTE
+        SOCKET_CORE_BASE + 3 * SOCKETS_PER_TORRENT_SESSION
     );
-    assert_eq!(shares.http, SOCKET_HTTP_FLOOR);
+    assert_eq!(shares.http, socket_http_floor(256));
     assert_eq!(
         shares.nntp + shares.torrent + shares.core + shares.http,
         256 - socket_linger(256)
@@ -274,11 +283,95 @@ fn three_torrent_sessions_on_one_tunnel_all_bind_their_sockets() {
 
     let sockets = weaver_tunnel::pipe::SessionSockets::new(shares);
     let core = weaver_tunnel::pipe::SocketClass::ReserveCore;
-    let held: Vec<_> = (0..3 * SOCKETS_PER_TORRENT_ROUTE + SOCKET_CORE_BASE)
+    let held: Vec<_> = (0..3 * SOCKETS_PER_TORRENT_SESSION + SOCKET_CORE_BASE)
         .map(|_| sockets.take(core).unwrap().unwrap())
         .collect();
     assert_eq!(held.len(), shares.core);
     assert!(!sockets.has_room(core));
+}
+
+// A torrent session belongs to a leg: two legs of one route through the
+// same tunnel are two sessions there, and two routes on one leg share one.
+#[test]
+fn torrent_sessions_are_counted_per_leg_not_per_route() {
+    let two_legs = socket_ledger(
+        &[(
+            Consumer::Torrent(TorrentScope::Default),
+            route(
+                vec![Rung::Proxy { id: 1 }, Rung::Chain { ids: vec![1, 5] }],
+                Failover::Redistribute,
+            ),
+        )],
+        &profiles(&[1], &[5]),
+        &HashMap::new(),
+        &HashMap::new(),
+        256,
+    );
+    let both = &two_legs[&tunnel(1)];
+    assert_eq!(both.torrent_sessions, 2);
+    assert_eq!(
+        both.shares().core - SOCKET_CORE_BASE,
+        2 * SOCKETS_PER_TORRENT_SESSION
+    );
+
+    let one_leg = socket_ledger(
+        &[
+            (
+                Consumer::Torrent(TorrentScope::Default),
+                route(vec![Rung::Proxy { id: 1 }], Failover::Redistribute),
+            ),
+            (
+                Consumer::Torrent(TorrentScope::Category(1)),
+                route(vec![Rung::Proxy { id: 1 }], Failover::Redistribute),
+            ),
+        ],
+        &profiles(&[1], &[]),
+        &HashMap::new(),
+        &HashMap::new(),
+        256,
+    );
+    let shared = &one_leg[&tunnel(1)];
+    assert_eq!(shared.torrent_sessions, 1);
+    assert_eq!(
+        shared.shares().core - SOCKET_CORE_BASE,
+        SOCKETS_PER_TORRENT_SESSION
+    );
+}
+
+// Torrent routes over a pool may land on any member, so each member's
+// tunnel is charged for them; a member runs one session for every pool
+// route on its egress.
+#[test]
+fn pool_torrent_routes_charge_each_member_one_session() {
+    let pools = HashMap::from([(
+        9,
+        ProxyPool {
+            id: 9,
+            name: "pool".into(),
+            kind: ProxyKind::WireGuard,
+            member_ids: vec![1, 2],
+            enabled: true,
+        },
+    )]);
+    let ledger = socket_ledger(
+        &[
+            (
+                Consumer::Torrent(TorrentScope::Default),
+                route(vec![Rung::Pool { id: 9 }], Failover::Redistribute),
+            ),
+            (
+                Consumer::Torrent(TorrentScope::Category(1)),
+                route(vec![Rung::Pool { id: 9 }], Failover::Redistribute),
+            ),
+        ],
+        &profiles(&[1, 2], &[]),
+        &pools,
+        &HashMap::new(),
+        256,
+    );
+    for member in [1, 2] {
+        assert_eq!(ledger[&tunnel(member)].torrent_sessions, 1);
+    }
 }
 
 // Usenet and torrent peers on one tunnel: the shares add up to the cap and
@@ -300,7 +393,7 @@ fn usenet_and_torrent_peers_share_one_tunnel_within_its_cap() {
             cap,
         );
         let tunnel = &ledger[&tunnel(1)];
-        assert_eq!(tunnel.torrent_routes, 1);
+        assert_eq!(tunnel.torrent_sessions, 1);
         assert!(!tunnel.over_budget());
         let shares = tunnel.shares();
         assert_eq!(shares.nntp, 101);
@@ -360,12 +453,13 @@ fn usenet_over_a_tunnel_is_refused_with_its_totals() {
             proxy: 3,
             egress: 0,
             nntp: 224,
-            reserve: 33,
+            reserve: 37,
             peers: SOCKET_PEER_FLOOR,
             cap: 256,
         })
     );
-    assert_eq!(check(true, 206, 256), Ok(()));
+    assert_eq!(check(true, 202, 256), Ok(()));
+    assert!(check(true, 203, 256).is_err());
     assert_eq!(check(true, 240, 512), Ok(()));
 
     // Against what the servers asked before, only a raise on a tunnel left
@@ -373,7 +467,7 @@ fn usenet_over_a_tunnel_is_refused_with_its_totals() {
     let asked = |connections| socket_asks(&ledger(true, connections, 256));
     assert!(validate_socket_raise(&asked(240), ledger(true, 240, 256)).is_ok());
     assert!(validate_socket_raise(&asked(240), ledger(true, 230, 256)).is_ok());
-    assert!(validate_socket_raise(&asked(200), ledger(true, 206, 256)).is_ok());
+    assert!(validate_socket_raise(&asked(200), ledger(true, 202, 256)).is_ok());
     assert_eq!(
         validate_socket_raise(&asked(240), ledger(true, 241, 256)),
         check(true, 241, 256)
@@ -381,7 +475,7 @@ fn usenet_over_a_tunnel_is_refused_with_its_totals() {
     assert!(validate_socket_raise(&asked(223), ledger(true, 223, 256)).is_ok());
 
     let shares = ledger(true, 240, 256)[&tunnel(3)].shares();
-    assert_eq!(shares.nntp, 256 - 33 - SOCKET_PEER_FLOOR);
+    assert_eq!(shares.nntp, 256 - 37 - SOCKET_PEER_FLOOR);
     assert_eq!(shares.torrent, SOCKET_PEER_FLOOR);
 }
 

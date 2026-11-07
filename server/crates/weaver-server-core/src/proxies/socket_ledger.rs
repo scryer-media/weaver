@@ -40,20 +40,27 @@ pub const SOCKET_CORE_BASE: usize = 8;
 // life: uTP for its peer listener (or for outgoing peers when it does not
 // listen), uTP for its SSL listener, DHT, UDP trackers, and the NAT-PMP
 // mapping of a provider that forwards its port that way.
-pub const SOCKETS_PER_TORRENT_ROUTE: usize = 5;
+pub const SOCKETS_PER_TORRENT_SESSION: usize = 5;
 
-// The HTTP sockets a tunnel keeps however many torrent routes it carries.
+// The fewest HTTP sockets a tunnel keeps however many torrent sessions it
+// carries.
 pub const SOCKET_HTTP_FLOOR: usize = 4;
 
-// The tunnel's own sockets when `torrent_routes` torrent routes reach it.
-pub fn socket_core(torrent_routes: usize) -> usize {
-    SOCKET_CORE_BASE + SOCKETS_PER_TORRENT_ROUTE * torrent_routes
+// The HTTP sockets a tunnel of `cap` keeps however many torrent sessions it
+// carries: one in 32 of the cap, and never under the floor.
+pub fn socket_http_floor(cap: usize) -> usize {
+    SOCKET_HTTP_FLOOR.max(cap / 32)
+}
+
+// The tunnel's own sockets when `torrent_sessions` torrent sessions use it.
+pub fn socket_core(torrent_sessions: usize) -> usize {
+    SOCKET_CORE_BASE + SOCKETS_PER_TORRENT_SESSION * torrent_sessions
 }
 
 // The sockets a tunnel of `cap` reserves for everything but usenet and
 // torrent peers over TCP, when its own sockets come to `core`.
 pub fn socket_reserve(cap: usize, core: usize) -> usize {
-    (cap / 8).max(socket_linger(cap) + core + SOCKET_HTTP_FLOOR)
+    (cap / 8).max(socket_linger(cap) + core + socket_http_floor(cap))
 }
 
 // The part of the reserve kept for sockets closed but still lingering in the
@@ -71,8 +78,8 @@ pub struct TunnelSockets {
     // Every connection the usenet servers routed through it may hold there,
     // each with one more for replacing a connection.
     pub nntp: usize,
-    // The torrent routes that use the tunnel, each with a session of its own.
-    pub torrent_routes: usize,
+    // The torrent sessions on the tunnel, one for each leg torrent routes use.
+    pub torrent_sessions: usize,
     // The SSH and HTTP/3 proxies above the tunnel, each holding one socket
     // in it that all its connections share.
     pub carriers: usize,
@@ -85,14 +92,14 @@ impl TunnelSockets {
             proxy,
             cap,
             nntp: 0,
-            torrent_routes: 0,
+            torrent_sessions: 0,
             carriers: 0,
         }
     }
 
     // The TCP peers kept for torrents.
     pub fn peer_floor(&self) -> usize {
-        if self.torrent_routes > 0 {
+        if self.torrent_sessions > 0 {
             SOCKET_PEER_FLOOR
         } else {
             0
@@ -100,7 +107,7 @@ impl TunnelSockets {
     }
 
     fn core(&self) -> usize {
-        socket_core(self.torrent_routes) + self.carriers
+        socket_core(self.torrent_sessions) + self.carriers
     }
 
     // The sockets kept from usenet and torrent peers over TCP.
@@ -160,13 +167,13 @@ pub fn socket_ledger(
     let mut ledger: HashMap<SessionPath, TunnelSockets> = HashMap::new();
     // What each server may put on each session, before the replacement.
     let mut asks: HashMap<(SessionPath, u32), usize> = HashMap::new();
-    // The torrent routes reaching each session, each counted once however
-    // many of its legs and rungs reach it.
-    let mut torrents: HashSet<(SessionPath, usize)> = HashSet::new();
+    // The torrent sessions reaching each tunnel, each counted once however
+    // many routes share it.
+    let mut torrents: HashSet<(SessionPath, TorrentSession)> = HashSet::new();
     // The chains whose connections ride a carrier above a session, each
     // counted once however many routes use it.
     let mut carried: HashSet<(SessionPath, Vec<u32>)> = HashSet::new();
-    for (route_index, (consumer, route)) in routes.iter().enumerate() {
+    for (consumer, route) in routes {
         let targets = match consumer {
             Consumer::Server(id) => connections.get(id).map(|&count| {
                 let healthy = vec![true; route.legs.len()];
@@ -201,7 +208,7 @@ pub fn socket_ledger(
                     let key = session(&mut ledger, leg.egress_id, &path, cap);
                     match consumer {
                         Consumer::Torrent(_) => {
-                            torrents.insert((key, route_index));
+                            torrents.insert((key, TorrentSession::of(&leg.path, pooled)));
                         }
                         Consumer::Server(id) => {
                             if let Some((count, targets)) = &targets {
@@ -221,7 +228,7 @@ pub fn socket_ledger(
     }
     for (key, _) in torrents {
         if let Some(tunnel) = ledger.get_mut(&key) {
-            tunnel.torrent_routes += 1;
+            tunnel.torrent_sessions += 1;
         }
     }
     for (key, _) in carried {
@@ -236,6 +243,28 @@ pub fn socket_ledger(
         }
     }
     ledger
+}
+
+// A torrent session as the routes name it: one per leg, an egress and the
+// path over it, which every route on that leg shares. A pool leg's session
+// runs on whichever member it lands on, and a save cannot know which, so
+// every member's tunnel is charged as if the pool's torrents all landed on
+// it. A member runs one session for every pool on its egress, so that is
+// one session on each member's tunnel.
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum TorrentSession {
+    Leg(String),
+    Member,
+}
+
+impl TorrentSession {
+    fn of(path: &LegPath, pooled: bool) -> Self {
+        if pooled {
+            Self::Member
+        } else {
+            Self::Leg(serde_json::to_string(path).expect("route legs always encode"))
+        }
+    }
 }
 
 fn wireguard(profiles: &HashMap<u32, ProxyProfile>, id: &u32) -> bool {

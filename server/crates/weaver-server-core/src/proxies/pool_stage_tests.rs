@@ -14,9 +14,17 @@ struct Fixture {
     gate: Semaphore,
     prepared: AtomicU64,
     retired: AtomicU64,
+    // The signal of the member's full tunnel share, while it has no room.
+    full: std::sync::Mutex<Option<Arc<Notify>>>,
 }
 #[async_trait::async_trait]
 impl Dialer for Fixture {
+    fn room(&self, _: &Purpose) -> Result<(), Vec<Arc<Notify>>> {
+        match &*self.full.lock().unwrap() {
+            Some(freed) => Err(vec![freed.clone()]),
+            None => Ok(()),
+        }
+    }
     async fn prepare(&self) -> Result<(), DialError> {
         self.prepared.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -58,6 +66,7 @@ fn fixtures() -> (
                 gate: Semaphore::new(0),
                 prepared: AtomicU64::new(0),
                 retired: AtomicU64::new(0),
+                full: Default::default(),
             })
         })
         .collect();
@@ -82,6 +91,35 @@ fn target() -> Target {
         },
         addresses: Vec::new(),
     }
+}
+
+// A pool whose members' tunnel shares are all full has no room, and says
+// which signals free it: each member's and the pool's own. A route over it
+// therefore waits instead of dialling; room on one member is room again.
+#[tokio::test]
+async fn a_pool_whose_members_are_all_full_has_no_room_until_one_frees() {
+    let (pool, members, mut opened) = fixtures();
+    let freed: Vec<_> = members
+        .iter()
+        .map(|member| {
+            let freed = Arc::new(Notify::new());
+            *member.full.lock().unwrap() = Some(freed.clone());
+            freed
+        })
+        .collect();
+    let waits = pool.room(&target().purpose).unwrap_err();
+    for freed in &freed {
+        assert!(waits.iter().any(|wait| Arc::ptr_eq(wait, freed)));
+    }
+    assert!(
+        waits
+            .iter()
+            .any(|wait| Arc::ptr_eq(wait, &pool.state.changed))
+    );
+    assert!(opened.try_recv().is_err());
+
+    *members[1].full.lock().unwrap() = None;
+    assert!(pool.room(&target().purpose).is_ok());
 }
 
 #[tokio::test]
@@ -154,6 +192,7 @@ async fn replaced_member_ignores_old_setup_and_transport_failure() {
         gate: Semaphore::new(0),
         prepared: AtomicU64::new(0),
         retired: AtomicU64::new(0),
+        full: Default::default(),
     });
     pool.set_members(vec![(1, replacement), (2, members[1].clone())]);
     old.setup.take().unwrap().complete(false);
