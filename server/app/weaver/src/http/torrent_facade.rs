@@ -5,6 +5,8 @@
 //! torrent automation drives, served beside the first-party GraphQL API.
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -40,6 +42,7 @@ use weaver_server_core::settings::{
     TorrentLimit, TorrentPeerProtocol,
 };
 use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};
+use weaver_server_core::torrents::service::fingerprint::ViewParts;
 use weaver_server_core::torrents::service::{
     ActionError, AddError, AddRequest, Placement, TorrentService, TorrentSettings, TorrentView,
 };
@@ -53,10 +56,12 @@ use weaver_server_core::{Database, RssFeedRow, SchedulerHandle};
 use super::auth::{LoginRateLimiter, login_client_id, same_origin_request};
 
 mod api;
+mod sync;
 #[cfg(test)]
 mod tests;
 
 pub(super) use api::Api;
+use sync::{CLOCK_KEYS, Fields, Poll, Row, SyncClient, SyncTable};
 
 const BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const SESSION_CAP: usize = 1024;
@@ -83,6 +88,13 @@ struct Inner {
     // Login cookie -> the hash of the API key it was issued for, looked up
     // again on every request so a revoked key ends its sessions.
     sessions: Mutex<SessionTable>,
+    // Each client's `sync/maindata` ids and the state they stand for.
+    sync: Mutex<SyncTable>,
+    // The torrent rows `sync/maindata` built, counted under test so a test
+    // pins that a poll builds only the rows whose view moved.
+    #[cfg(test)]
+    maindata_rows: AtomicU64,
+    // `sync/torrentPeers` ids.
     rid: AtomicU64,
     categories: tokio::sync::Mutex<()>,
     rss: RssService,
@@ -145,6 +157,9 @@ impl TorrentFacadeContext {
                 rss,
                 api,
                 sessions: Mutex::new(SessionTable::default()),
+                sync: Mutex::new(SyncTable::default()),
+                #[cfg(test)]
+                maindata_rows: AtomicU64::new(0),
                 rid: AtomicU64::new(0),
                 categories: tokio::sync::Mutex::new(()),
                 launched: now_secs(),
@@ -168,6 +183,19 @@ impl TorrentFacadeContext {
             .sessions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn sync(&self) -> std::sync::MutexGuard<'_, SyncTable> {
+        self.inner
+            .sync
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // Ends a login session, and the `sync/maindata` state kept for it.
+    fn end_session(&self, sid: &str) {
+        self.sessions().keys.remove(sid);
+        self.sync().forget(&SyncClient::Session(sid.to_owned()));
     }
 
     // The download limit torrents are held to this tick.
@@ -272,24 +300,26 @@ impl TorrentFacadeContext {
                     return Ok(Caller {
                         scope,
                         by_cookie: true,
+                        client: SyncClient::Session(sid),
                     });
                 }
-                None => {
-                    self.sessions().keys.remove(&sid);
-                }
+                None => self.end_session(&sid),
             }
         }
-        let scope = match basic_password(headers) {
-            Some(password) => self.resolve(&password).await?,
+        let (scope, key) = match basic_password(headers) {
+            Some(password) => (self.resolve(&password).await?, Some(password)),
             None => {
                 let mut headers = headers.clone();
                 headers.remove(header::COOKIE);
-                self.resolve_headers(&headers).await?
+                (self.resolve_headers(&headers).await?, sent_key(&headers))
             }
         };
         Ok(Caller {
             scope,
             by_cookie: false,
+            client: key.map_or(SyncClient::Anonymous, |key| {
+                SyncClient::Key(hash_api_key(&key))
+            }),
         })
     }
 }
@@ -298,6 +328,8 @@ impl TorrentFacadeContext {
 struct Caller {
     scope: CallerScope,
     by_cookie: bool,
+    // Whose `sync/maindata` ids the request carries.
+    client: SyncClient,
 }
 
 impl Caller {
@@ -326,6 +358,23 @@ fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
         .find(|(key, _)| *key == name)
         .map(|(_, value)| value.to_owned())
         .filter(|value| !value.is_empty())
+}
+
+// The API key a request sends as a bearer token or in `X-Api-Key`.
+fn sent_key(headers: &HeaderMap) -> Option<String> {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    bearer
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+        })
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
 }
 
 fn basic_password(headers: &HeaderMap) -> Option<String> {
@@ -649,7 +698,7 @@ async fn handle(
                     if !same_origin_request(request.headers()) {
                         return forbidden();
                     }
-                    ctx.sessions().keys.remove(&sid);
+                    ctx.end_session(&sid);
                 }
                 ok()
             }
@@ -663,11 +712,12 @@ async fn handle(
     let Some(need) = need(&group, &action) else {
         return no_endpoint(ctx.api(), &group);
     };
-    let scope = caller.scope;
+    let may_change = caller.may_change(request.headers());
+    let Caller { scope, client, .. } = caller;
     let allowed = match need {
         Need::Read => scope.can_read(),
-        Need::Control => caller.may_change(request.headers()),
-        Need::Admin => scope.is_admin() && caller.may_change(request.headers()),
+        Need::Control => may_change,
+        Need::Admin => scope.is_admin() && may_change,
     };
     if !allowed {
         return forbidden();
@@ -680,7 +730,7 @@ async fn handle(
         "app" => app(&ctx, &action, &params).await,
         "torrents" => torrents(&ctx, &action, params, scope).await,
         "transfer" => transfer_action(&ctx, &action, &params).await,
-        "sync" if action == "maindata" => maindata(&ctx, scope).await,
+        "sync" if action == "maindata" => maindata(&ctx, scope, client, &params).await,
         "sync" => torrent_peers(&ctx, &params).await,
         "rss" => rss(&ctx, &action, &params).await,
         // Weaver keeps no log the client's shape fits.
@@ -1234,11 +1284,37 @@ fn root_path(view: &TorrentView) -> String {
 
 // A torrent as `torrents/info` lists it (qBittorrent `serialize`).
 pub(super) fn info(view: &TorrentView, scope: CallerScope) -> Value {
-    let now = now_secs();
+    Value::Object(
+        steady_fields(view, scope)
+            .into_iter()
+            .chain(clock_fields(view, now_secs()))
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect(),
+    )
+}
+
+// The fields of a torrent's row that move with the clock alone, read from
+// the view's fields that do (`ViewParts`): the time active and seeding, when
+// it last moved data, the countdowns, the ratio per month active, and when
+// it was last seen complete.
+fn clock_fields(view: &TorrentView, now: i64) -> [(&'static str, Value); CLOCK_KEYS] {
+    [
+        ("eta", json!(eta(view))),
+        ("popularity", json!(popularity(view))),
+        ("seen_complete", json!(when(view.last_seen_complete_ms))),
+        ("time_active", json!(view.active_seconds)),
+        ("seeding_time", json!(seeding_time(view, now))),
+        ("last_activity", json!(last_activity(view, now))),
+        ("reannounce", json!(view.reannounce_seconds.unwrap_or(0))),
+    ]
+}
+
+// Every other field of a torrent's row, which moves only when the view does.
+fn steady_fields(view: &TorrentView, scope: CallerScope) -> Vec<(&'static str, Value)> {
     let (save_path, content_path) = view.paths();
     let (wanted, left) = wanted_and_left(view);
     let has_metadata = view.pieces.is_some();
-    let mut fields = object([
+    let mut fields = Vec::from([
         ("hash", json!(view.infohash.to_ascii_lowercase())),
         (
             "infohash_v1",
@@ -1296,7 +1372,6 @@ pub(super) fn info(view: &TorrentView, scope: CallerScope) -> Value {
             json!(view.swarm_leechers.unwrap_or(view.leechers)),
         ),
         ("state", json!(state(view))),
-        ("eta", json!(eta(view))),
         ("seq_dl", json!(view.sequential)),
         ("f_l_piece_prio", json!(view.first_last_piece_first)),
         ("category", json!(view.category.clone().unwrap_or_default())),
@@ -1323,33 +1398,22 @@ pub(super) fn info(view: &TorrentView, scope: CallerScope) -> Value {
         ("connections_count", json!(view.peers)),
         ("connections_limit", json!(view.max_peers)),
         ("ratio", json!(view.ratio)),
-        ("popularity", json!(popularity(view))),
-        ("seen_complete", json!(when(view.last_seen_complete_ms))),
         ("auto_tmm", json!(false)),
-        ("time_active", json!(view.active_seconds)),
-        ("seeding_time", json!(seeding_time(view, now))),
-        ("last_activity", json!(last_activity(view, now))),
         // Weaver does not count the copies the swarm holds.
         ("availability", json!(-1)),
-        ("reannounce", json!(view.reannounce_seconds.unwrap_or(0))),
         ("comment", json!(view.comment.clone().unwrap_or_default())),
     ]);
-    // The limits as the client keeps them, 0 for none.
-    fields = with_limits(
-        fields,
-        0,
-        [
-            ("dl_limit", view.download_limit),
-            ("up_limit", view.upload_limit),
-        ],
-    );
-    if let Some(fields) = fields.as_object_mut() {
-        fields.extend(
-            share_limits(view)
-                .into_iter()
-                .map(|(name, value)| (name.to_owned(), value)),
-        );
+    // The limits as the client keeps them, 0 for none; a closed one has no
+    // reading.
+    for (name, bps) in [
+        ("dl_limit", view.download_limit),
+        ("up_limit", view.upload_limit),
+    ] {
+        if let Some(limit) = client_limit(bps, 0) {
+            fields.push((name, limit));
+        }
     }
+    fields.extend(share_limits(view));
     fields
 }
 
@@ -3041,23 +3105,34 @@ fn transfer(views: &[TorrentView], download: Option<u64>, upload: Option<u64>) -
     )
 }
 
-async fn maindata(ctx: &TorrentFacadeContext, scope: CallerScope) -> Response {
-    let rid = ctx.inner.rid.fetch_add(1, Ordering::Relaxed) + 1;
+// `sync/maindata`: the whole state, or what changed since the response
+// `rid` names (qBittorrent `SyncController::maindataAction`).
+async fn maindata(
+    ctx: &TorrentFacadeContext,
+    scope: CallerScope,
+    client: SyncClient,
+    params: &Params,
+) -> Response {
+    // qBittorrent reads an id it cannot parse as 0.
+    let rid = params
+        .get("rid")
+        .and_then(|rid| rid.trim().parse::<u64>().ok())
+        .unwrap_or(0);
     let views = ctx.views().await;
     let config = ctx.inner.config.read().await;
-    let torrents: Map<String, Value> = views
+    // The view's fingerprint leaves out the fields that move with the clock
+    // alone, which `clock_fields` reads; whether the caller may control
+    // torrents shapes the row too (`current_tracker`).
+    let torrents = views
         .iter()
-        .map(|view| {
-            let mut entry = info(view, scope);
-            let hash = entry
-                .as_object_mut()
-                .and_then(|entry| {
-                    entry.extend(announce_stats(view).map(|(key, value)| (key.to_owned(), value)));
-                    entry.remove("hash")
-                })
-                .and_then(|hash| hash.as_str().map(str::to_owned))
-                .unwrap_or_default();
-            (hash, entry)
+        .map(|view| Row {
+            hash: view.infohash.to_ascii_lowercase(),
+            fingerprint: {
+                let mut hasher = DefaultHasher::new();
+                (view.fingerprint(ViewParts::Steady), scope.can_control()).hash(&mut hasher);
+                hasher.finish()
+            },
+            view,
         })
         .collect();
     let mut server_state = transfer(
@@ -3121,15 +3196,44 @@ async fn maindata(ctx: &TorrentFacadeContext, scope: CallerScope) -> Response {
             .map(|(key, value)| (key.to_owned(), value)),
         );
     }
-    axum::Json(json!({
-        "rid": rid,
-        "full_update": true,
-        "torrents": torrents,
-        "categories": categories(&config),
-        "tags": [],
-        "server_state": server_state,
-    }))
-    .into_response()
+    let now = Poll {
+        torrents,
+        categories: match categories(&config) {
+            Value::Object(categories) => categories
+                .into_iter()
+                .filter_map(|(name, category)| match category {
+                    Value::Object(category) => Some((name, category)),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        },
+        tags: Vec::new(),
+        server_state: match server_state {
+            Value::Object(state) => state,
+            _ => Map::new(),
+        },
+    };
+    drop(config);
+    let at = now_secs();
+    let fields = Fields {
+        // `torrents/info`'s row with the announce flags, keyed by its hash.
+        steady: |view: &TorrentView| {
+            #[cfg(test)]
+            ctx.inner.maindata_rows.fetch_add(1, Ordering::Relaxed);
+            let mut row = steady_fields(view, scope);
+            row.retain(|(name, _)| *name != "hash");
+            row.extend(announce_stats(view));
+            row
+        },
+        clock: |view: &TorrentView| clock_fields(view, at),
+    };
+    // The lock is held for the bookkeeping alone, not while the response is
+    // built.
+    let start = ctx.sync().begin(&client, rid);
+    let (body, kept) = sync::answer(&start, now, &fields);
+    ctx.sync().finish(&client, start.id(), kept);
+    axum::Json(body).into_response()
 }
 
 // The client's name for a peer from the first eight bytes of its peer id

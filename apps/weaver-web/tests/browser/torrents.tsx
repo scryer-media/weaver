@@ -16,7 +16,7 @@ import { AddNzbDialog } from "@/next/features/AddNzbDialog";
 import { TorrentDetail } from "@/next/features/torrents/TorrentDetail";
 import { TorrentRemoveDialog } from "@/next/features/torrents/TorrentRemoveDialog";
 import { DownloadRow } from "@/next/pages/downloads/DownloadRow";
-import type { SeedingPolicyData, SettingLevel, TorrentData, TorrentFileData, TorrentTrackerData } from "@/lib/torrents";
+import type { SeedingPolicyData, SettingLevel, TorrentChangesData, TorrentData, TorrentFileData, TorrentTrackerData } from "@/lib/torrents";
 import { nextEn } from "@/next/i18n/en";
 import "@/next/fonts.css";
 import "@/next/theme.css";
@@ -66,9 +66,9 @@ const client = new Client({ url: "http://fixture.invalid/graphql", exchanges: [(
   }
   if (name === "TorrentUpdates") {
     // A subscription's answers go on while each says another may follow.
-    return make<{ operation: typeof operation; data: { torrentUpdates: TorrentData[] }; hasNext: boolean }>((observer) => {
+    return make<{ operation: typeof operation; data: { torrentUpdates: TorrentChangesData<TorrentData> }; hasNext: boolean }>((observer) => {
       const follower = (torrent: TorrentData) =>
-        observer.next({ operation, data: { torrentUpdates: [torrent] }, hasNext: true });
+        observer.next({ operation, data: { torrentUpdates: { fullUpdate: true, torrents: [torrent], removedIds: [] } }, hasNext: true });
       followers.add(follower);
       // A daemon answers once the page is listening, never inside the request.
       queueMicrotask(() => follower(held!));
@@ -235,11 +235,11 @@ const file = (index: number, path: string, priority: TorrentFileData["priority"]
 
 /** One torrent's detail as the job page shows it: read from its subscription, and read again on each change. */
 function Files() {
-  const [{ data }, follow] = useSubscription<{ torrentUpdates: TorrentData[] }>({
+  const [{ data }, follow] = useSubscription<{ torrentUpdates: TorrentChangesData<TorrentData> }>({
     query: TORRENT_UPDATES_SUBSCRIPTION,
     variables: { id: 4 },
   });
-  const live = data?.torrentUpdates[0];
+  const live = data?.torrentUpdates.torrents[0];
   return live ? (
     <TorrentDetail torrent={live} onChanged={() => follow()} onReport={(message) => { status.textContent = message; }} />
   ) : null;

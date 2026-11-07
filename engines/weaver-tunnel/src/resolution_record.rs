@@ -30,7 +30,7 @@ tokio::task_local! {
 }
 
 // Who resolved a name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ResolvedBy {
     // The name is an address; nothing was asked.
     Literal,

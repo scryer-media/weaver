@@ -17,7 +17,7 @@ pub enum Infohash {
     V2([u8; 32]),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TorrentSource {
     Magnet,
@@ -82,7 +82,7 @@ impl ContentLayout {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TorrentState {
     Queued,
@@ -232,7 +232,7 @@ impl TorrentRecord {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TorrentFile {
     pub index: u32,
     pub path: String,
@@ -296,7 +296,7 @@ pub fn parse_file_priorities(value: &str) -> Option<Vec<FilePriority>> {
 
 /// How announcing to a tracker last went (qBittorrent
 /// `TrackerEndpointState`, from libtorrent's announce entry).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TrackerStatus {
     NotContacted,
@@ -337,7 +337,7 @@ pub(crate) fn parse_named_by(value: &str) -> Option<NamedBy> {
 }
 
 /// A tracker and how announcing to it is going.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TorrentTracker {
     pub tier: u32,
     pub url: String,

@@ -624,6 +624,20 @@ async fn collect_server_health(pool: &NntpPool) -> Vec<ServerHealthInfo> {
         .collect()
 }
 
+// Which torrents earn their own `weaver_torrent_*` series under the
+// configured mode: a stopped torrent's job is complete or failed, which
+// `job_is_exported` drops under `Active` the same way.
+pub(super) fn torrent_is_exported(
+    state: weaver_server_core::torrents::TorrentState,
+    mode: PerJobSeries,
+) -> bool {
+    match mode {
+        PerJobSeries::Off => false,
+        PerJobSeries::All => true,
+        PerJobSeries::Active => state != weaver_server_core::torrents::TorrentState::Stopped,
+    }
+}
+
 // Which jobs earn their own `weaver_job_*` series under the configured mode.
 pub(super) fn job_is_exported(status: &weaver_server_core::JobStatus, mode: PerJobSeries) -> bool {
     match mode {

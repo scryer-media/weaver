@@ -133,7 +133,7 @@ pub enum NetworkRefusal {
 // What gives a torrent route more than one exit: a second leg, a fall back
 // to the host's own address, or a second rung that would be another exit. A
 // pool rung is one exit per torrent: each torrent stays on one member.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TorrentRouteFault {
     Legs,
     DirectFallback,

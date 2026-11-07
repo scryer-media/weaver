@@ -1794,80 +1794,82 @@ export const SCHEDULE_SEEDING_QUERY = gql`
 
 // --- Torrents ---
 
-/** What the queue reads of each torrent beside its job, pushed as it moves. */
+/**
+ * What the queue reads of each torrent beside its job, pushed as it moves:
+ * every torrent first, then the changed ones and the ids of the gone.
+ */
 export const TORRENT_SUMMARY_UPDATES_SUBSCRIPTION = gql`
   subscription TorrentSummaryUpdates {
     torrentUpdates {
-      id
-      state
-      forced
-      ratio
-      uploadBps
+      fullUpdate
+      removedIds
+      torrents {
+        id
+        state
+        forced
+        ratio
+        uploadBps
+      }
     }
   }
 `;
 
-/** A torrent, pushed as it moves; empty once it is gone. */
+/** A torrent, pushed as it moves; its id under `removedIds` once it is gone. */
 export const TORRENT_UPDATES_SUBSCRIPTION = gql`
   subscription TorrentUpdates($id: Int!) {
     torrentUpdates(id: $id) {
-      id
-      name
-      infohash
-      infohashV2
-      state
-      detail
-      routeReason
-      category
-      private
-      forced
-      progress
-      totalBytes
-      haveBytes
-      uploadedBytes
-      downloadedBytes
-      ratio
-      downloadBps
-      uploadBps
-      uploadLimit
-      downloadLimit
-      etaSeconds
-      peers
-      seeds
-      leechers
-      maxPeers
-      swarmSeeds
-      swarmLeechers
-      reannounceSeconds
-      activeSeconds
-      seedingSeconds
-      consecutiveSeedingSeconds
-      downloadAvgBps
-      uploadAvgBps
-      wastedBytes
-      lastSeenCompleteMs
-      pieceCount
-      pieceSize
-      piecesHave
-      createdBy
-      createdAtMs
-      comment
-      addedAtMs
-      completedAtMs
-      savePath
-      seedingLeft
-      seedingOverride {
-        ...SeedingPolicyFields
-      }
-      seedingPolicy {
-        ratioGoal
-        seedTimeGoalMinutes
-        inactiveGoalMinutes
-        mode
-        action
-        seedTimeCounting
-        uploadCap
-        levels {
+      fullUpdate
+      removedIds
+      torrents {
+        id
+        name
+        infohash
+        infohashV2
+        state
+        detail
+        routeReason
+        category
+        private
+        forced
+        progress
+        totalBytes
+        haveBytes
+        uploadedBytes
+        downloadedBytes
+        ratio
+        downloadBps
+        uploadBps
+        uploadLimit
+        downloadLimit
+        etaSeconds
+        peers
+        seeds
+        leechers
+        maxPeers
+        swarmSeeds
+        swarmLeechers
+        reannounceSeconds
+        activeSeconds
+        seedingSeconds
+        consecutiveSeedingSeconds
+        downloadAvgBps
+        uploadAvgBps
+        wastedBytes
+        lastSeenCompleteMs
+        pieceCount
+        pieceSize
+        piecesHave
+        createdBy
+        createdAtMs
+        comment
+        addedAtMs
+        completedAtMs
+        savePath
+        seedingLeft
+        seedingOverride {
+          ...SeedingPolicyFields
+        }
+        seedingPolicy {
           ratioGoal
           seedTimeGoalMinutes
           inactiveGoalMinutes
@@ -1875,33 +1877,42 @@ export const TORRENT_UPDATES_SUBSCRIPTION = gql`
           action
           seedTimeCounting
           uploadCap
+          levels {
+            ratioGoal
+            seedTimeGoalMinutes
+            inactiveGoalMinutes
+            mode
+            action
+            seedTimeCounting
+            uploadCap
+          }
         }
-      }
-      trackerRule
-      unpack
-      unpackOverride
-      route
-      files {
-        index
-        path
-        length
-        selected
-        priority
-        progress
-      }
-      sequential
-      firstLastPieceFirst
-      trackers {
-        tier
-        url
-        source
-        resolvedBy
-        status
-        updating
-        message
-        seeders
-        leechers
-        peers
+        trackerRule
+        unpack
+        unpackOverride
+        route
+        files {
+          index
+          path
+          length
+          selected
+          priority
+          progress
+        }
+        sequential
+        firstLastPieceFirst
+        trackers {
+          tier
+          url
+          source
+          resolvedBy
+          status
+          updating
+          message
+          seeders
+          leechers
+          peers
+        }
       }
     }
   }

@@ -43,7 +43,10 @@ use weaver_server_core::{
 
 use super::catalog as f;
 use super::encode::{Encoder, MetricFamily};
-use super::{BuildInfo, ServerHealthInfo, ServerStateKind, ServerStateReason, job_is_exported};
+use super::{
+    BuildInfo, ServerHealthInfo, ServerStateKind, ServerStateReason, job_is_exported,
+    torrent_is_exported,
+};
 
 const BYTES_PER_MEBIBYTE: f64 = 1_048_576.0;
 
@@ -315,7 +318,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         render_speed_tests(&mut out, metrics);
     }
     if let Some(metrics) = torrents {
-        render_torrents(&mut out, metrics);
+        render_torrents(&mut out, metrics, per_job_series);
     }
 
     let logs = weaver_server_core::runtime::log_delivery::counter_snapshot();
@@ -2264,11 +2267,14 @@ pub(crate) fn render_speed_tests(
 // The torrent families: each torrent, each of its trackers, each route's
 // session, then the event counters. Every family is written whole before the
 // next, so a family's samples stay together whatever the number of torrents.
-pub(crate) fn render_torrents(out: &mut Encoder, metrics: &TorrentMetrics) {
+// Each torrent's own series, and its trackers', go as `mode` says, as a
+// job's do; the session and event series always go.
+pub(crate) fn render_torrents(out: &mut Encoder, metrics: &TorrentMetrics, mode: PerJobSeries) {
     let published = &metrics.published;
     let torrents: Vec<(String, &TorrentSeries)> = published
         .torrents
         .iter()
+        .filter(|torrent| torrent_is_exported(torrent.state, mode))
         .map(|torrent| (torrent.job_id.0.to_string(), torrent))
         .collect();
 

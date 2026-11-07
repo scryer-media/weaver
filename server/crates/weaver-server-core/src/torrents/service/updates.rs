@@ -6,7 +6,14 @@
 //! the queue to say so, so a follower also waits on the announce table of
 //! each torrent's current run. Rates move all the time, so the views are
 //! read again on a beat as well.
+//!
+//! The first push is every followed torrent; each later one only the
+//! torrents that changed or came, and the ids of those gone. Every torrent's
+//! follower leaves out the fields that move with the clock alone when it
+//! tells a change, or each beat would carry every running torrent; one
+//! torrent's follower, which shows those seconds, counts them.
 
+use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::task::Poll;
 use std::time::Duration;
@@ -15,6 +22,7 @@ use tokio::sync::watch;
 use tokio::time::{Interval, MissedTickBehavior};
 use weaver_torrent::TrackerAnnounce;
 
+use super::fingerprint::ViewParts;
 use super::{TorrentService, TorrentView};
 use crate::jobs::JobId;
 
@@ -24,7 +32,19 @@ pub struct TorrentUpdates {
     job_id: Option<JobId>,
     beat: Interval,
     queue: Option<watch::Receiver<u64>>,
-    last: Option<Vec<TorrentView>>,
+    // Each torrent last given, by its fingerprint.
+    last: Option<HashMap<JobId, u64>>,
+}
+
+/// What moved since the last push.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TorrentChanges {
+    /// The first push: `torrents` is every followed torrent.
+    pub full_update: bool,
+    /// The torrents that changed or came, in the service's order.
+    pub torrents: Vec<TorrentView>,
+    /// The torrents gone since the last push.
+    pub removed: Vec<JobId>,
 }
 
 impl TorrentService {
@@ -68,9 +88,9 @@ impl TorrentService {
 }
 
 impl TorrentUpdates {
-    /// The views the next time they differ from the ones last given. The
-    /// first call gives them as they are.
-    pub async fn next(&mut self) -> Vec<TorrentView> {
+    /// The views the next time they differ from the ones last given: every
+    /// view on the first call, the changed, new and gone ones after.
+    pub async fn next(&mut self) -> TorrentChanges {
         loop {
             // What is waited on is taken before the views are read, so a
             // move after the read wakes the wait.
@@ -79,9 +99,9 @@ impl TorrentUpdates {
                 queue.borrow_and_update();
             }
             let views = self.read().await;
-            if self.last.as_ref() != Some(&views) {
-                self.last = Some(views.clone());
-                return views;
+            let parts = self.parts();
+            if let Some(changes) = changes(&mut self.last, views, parts) {
+                return changes;
             }
             tokio::select! {
                 () = moved(&mut tables) => {}
@@ -91,12 +111,58 @@ impl TorrentUpdates {
         }
     }
 
+    // What a change is told by: one torrent's follower shows its seconds,
+    // every torrent's follower reads the list's fields.
+    fn parts(&self) -> ViewParts {
+        if self.job_id.is_some() {
+            ViewParts::Whole
+        } else {
+            ViewParts::Steady
+        }
+    }
+
     async fn read(&self) -> Vec<TorrentView> {
         match self.job_id {
             Some(job_id) => self.service.torrent(job_id).await.into_iter().collect(),
             None => self.service.torrents(None).await,
         }
     }
+}
+
+// What `views` moved from `last` in the fields `parts` covers, kept as the
+// new `last`; `None` when nothing did.
+pub(super) fn changes(
+    last: &mut Option<HashMap<JobId, u64>>,
+    views: Vec<TorrentView>,
+    parts: ViewParts,
+) -> Option<TorrentChanges> {
+    let now: HashMap<JobId, u64> = views
+        .iter()
+        .map(|view| (view.job_id, view.fingerprint(parts)))
+        .collect();
+    let Some(before) = last.replace(now) else {
+        return Some(TorrentChanges {
+            full_update: true,
+            torrents: views,
+            removed: Vec::new(),
+        });
+    };
+    let now = last.as_ref().expect("just kept");
+    let mut removed: Vec<JobId> = before
+        .keys()
+        .filter(|job_id| !now.contains_key(job_id))
+        .copied()
+        .collect();
+    removed.sort_unstable_by_key(|job_id| job_id.0);
+    let torrents: Vec<TorrentView> = views
+        .into_iter()
+        .filter(|view| before.get(&view.job_id) != now.get(&view.job_id))
+        .collect();
+    (!torrents.is_empty() || !removed.is_empty()).then_some(TorrentChanges {
+        full_update: false,
+        torrents,
+        removed,
+    })
 }
 
 // Once any of `tables` moves, or is gone with its run. Never, with none.

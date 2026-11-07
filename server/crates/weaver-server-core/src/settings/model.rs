@@ -297,7 +297,8 @@ pub struct MetricsConfig {
     pub per_job_series: PerJobSeries,
 }
 
-// Which jobs get their own `weaver_job_*` series.
+// Which jobs get their own `weaver_job_*` series, and which torrents their
+// own `weaver_torrent_*` ones (a stopped torrent is a finished job).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PerJobSeries {
@@ -426,7 +427,7 @@ impl Seeding {
 
 // Which seconds the seed-time goal counts: every second the torrent has
 // seeded, or only those since it last stopped seeding.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeedTimeCounting {
     #[default]
@@ -452,7 +453,7 @@ impl SeedTimeCounting {
 }
 
 // Whether any one goal ends seeding, or only all of them together.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeedingGoalMode {
     #[default]
@@ -478,7 +479,7 @@ impl SeedingGoalMode {
 }
 
 // What happens to a torrent once its goal is met.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeedingAction {
     #[default]

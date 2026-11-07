@@ -81,6 +81,7 @@ use crate::torrents::{
     TrackerEntry,
 };
 
+pub mod fingerprint;
 #[cfg(test)]
 mod tests;
 pub mod updates;
@@ -362,7 +363,7 @@ impl TorrentSettings {
 }
 
 /// The level each of a torrent's seeding terms comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SeedingLevels {
     pub ratio_goal: Level,
     pub seed_time_goal_minutes: Level,
@@ -937,7 +938,7 @@ impl PeerKinds {
 }
 
 /// A torrent's pieces: how many, how long each is, and how many verified.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TorrentPieces {
     pub count: u32,
     pub size: u64,

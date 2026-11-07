@@ -5,7 +5,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
@@ -2001,25 +2001,239 @@ fn url_encode(value: &str) -> String {
         .collect()
 }
 
+// `sync/maindata` answers by response id as qBittorrent's `SyncController`
+// does: whole while the client's id is unknown, else only what changed since
+// the state that id stands for, each client by its own ids.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn maindata_is_a_full_update_with_a_rising_rid() {
+async fn maindata_sends_changes_from_the_id_the_client_holds() {
     let rig = rig().await;
     rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
     let first = rig.get("/api/v2/sync/maindata").await.json();
-    let second = rig.get("/api/v2/sync/maindata?rid=1").await.json();
+    assert_eq!(first["rid"], 1);
     assert_eq!(first["full_update"], true);
-    assert!(second["rid"].as_u64().unwrap() > first["rid"].as_u64().unwrap());
     let torrents = first["torrents"].as_object().unwrap();
     assert_eq!(torrents.len(), 1);
     let (hash, torrent) = torrents.iter().next().unwrap();
+    let hash = hash.clone();
     assert_eq!(hash.len(), 40);
     assert_eq!(torrent["name"], "one.mkv");
+    assert_eq!(torrent["force_start"], false);
     assert!(torrent.get("hash").is_none());
     assert_eq!(first["server_state"]["connection_status"], "connected");
+    // No tags: an empty key is left out.
+    assert!(first.get("tags").is_none());
+
+    // Sending the id back: only the torrent's changed keys.
+    rig.post(
+        "/api/v2/torrents/setForceStart",
+        &format!("hashes={hash}&value=true"),
+    )
+    .await;
+    let second = rig.get("/api/v2/sync/maindata?rid=1").await.json();
+    assert_eq!(second["rid"], 2);
+    assert!(second.get("full_update").is_none(), "{second}");
+    let changed = &second["torrents"][&hash];
+    assert_eq!(changed["force_start"], true);
+    assert!(changed.get("name").is_none(), "{changed}");
+    assert!(second["server_state"].get("connection_status").is_none());
+
+    // The same id again, as after a lost response: the changes since the
+    // state it stands for, again.
+    let again = rig.get("/api/v2/sync/maindata?rid=1").await.json();
+    assert_eq!(again["rid"], 3);
+    assert!(again.get("full_update").is_none());
+    assert_eq!(again["torrents"][&hash]["force_start"], true);
+
+    // Another client holds nothing, whatever id it sends.
+    let other = rig
+        .send(
+            Request::get("/api/v2/sync/maindata?rid=3")
+                .header("x-api-key", READER)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .json();
+    assert_eq!(other["rid"], 1);
+    assert_eq!(other["full_update"], true);
+
+    // An id the client was never sent: whole.
+    let unknown = rig.get("/api/v2/sync/maindata?rid=999").await.json();
+    assert_eq!(unknown["rid"], 4);
+    assert_eq!(unknown["full_update"], true);
+    assert_eq!(unknown["torrents"][&hash]["name"], "one.mkv");
+
+    // A removed torrent: its hash under `torrents_removed`.
+    let removed = rig
+        .post(
+            "/api/v2/torrents/delete",
+            &format!("hashes={hash}&deleteFiles=false"),
+        )
+        .await;
+    assert_eq!(removed.status, StatusCode::OK);
+    let gone = rig.get("/api/v2/sync/maindata?rid=4").await.json();
+    assert_eq!(gone["rid"], 5);
+    assert!(gone.get("full_update").is_none());
+    assert_eq!(gone["torrents_removed"], json!([hash]));
+    assert!(gone.get("torrents").is_none());
+
+    // A fresh request starts over whole.
+    let fresh = rig.get("/api/v2/sync/maindata").await.json();
+    assert_eq!(fresh["full_update"], true);
+    assert!(fresh.get("torrents").is_none());
 
     let transfer = rig.get("/api/v2/transfer/info").await.json();
     assert_eq!(transfer["dl_info_speed"], 0);
     assert_eq!(transfer["dl_rate_limit"], 0);
+}
+
+// A `sync/maindata` poll builds a torrent's row only when its view moved:
+// none for a poll where no view moved, and one, sending that torrent's
+// changed key, after one torrent changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maindata_builds_only_the_rows_whose_view_moved() {
+    let rig = rig().await;
+    for index in 0..50 {
+        rig.add_file(&metainfo(&format!("{index}.mkv"), 3000, false), &[])
+            .await;
+    }
+    let rows = || rig.context.inner.maindata_rows.load(Ordering::Relaxed);
+    let first = rig.get("/api/v2/sync/maindata").await.json();
+    assert_eq!(first["torrents"].as_object().unwrap().len(), 50);
+    assert_eq!(rows(), 50);
+    // Each poll sends the id it was given back, until one finds no view moved.
+    let mut rid = first["rid"].as_u64().unwrap();
+    loop {
+        let mark = rows();
+        let poll = rig
+            .get(&format!("/api/v2/sync/maindata?rid={rid}"))
+            .await
+            .json();
+        assert!(poll.get("full_update").is_none(), "{poll}");
+        rid = poll["rid"].as_u64().unwrap();
+        if rows() == mark {
+            break;
+        }
+    }
+    let mark = rows();
+    let quiet = rig
+        .get(&format!("/api/v2/sync/maindata?rid={rid}"))
+        .await
+        .json();
+    rid = quiet["rid"].as_u64().unwrap();
+    assert_eq!(rows(), mark);
+
+    let hash = first["torrents"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, torrent)| torrent["name"] == "7.mkv")
+        .map(|(hash, _)| hash.clone())
+        .unwrap();
+    rig.post(
+        "/api/v2/torrents/setForceStart",
+        &format!("hashes={hash}&value=true"),
+    )
+    .await;
+    let moved = rig
+        .get(&format!("/api/v2/sync/maindata?rid={rid}"))
+        .await
+        .json();
+    assert_eq!(rows(), mark + 1);
+    assert_eq!(moved["torrents"][&hash]["force_start"], true, "{moved}");
+    assert!(moved["torrents"][&hash].get("name").is_none(), "{moved}");
+}
+
+// A login session is a `sync/maindata` client of its own: its ids run apart
+// from those of the API key it was issued for, and logging out forgets its
+// state, so the next session starts whole from id 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_login_session_keeps_its_own_maindata_ids_until_logout() {
+    let rig = rig().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    let sid_of = |reply: Reply| {
+        let cookie = reply.cookie.unwrap();
+        cookie.split(';').next().unwrap().to_owned()
+    };
+    let sid = sid_of(rig.send(login(ADMIN)).await);
+    let with = |sid: &str, path: &str| {
+        Request::get(path)
+            .header(header::COOKIE, sid)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let first = rig.send(with(&sid, "/api/v2/sync/maindata")).await.json();
+    assert_eq!(
+        (first["rid"].clone(), first["full_update"].clone()),
+        (json!(1), json!(true))
+    );
+    let second = rig
+        .send(with(&sid, "/api/v2/sync/maindata?rid=1"))
+        .await
+        .json();
+    assert_eq!(second["rid"], 2);
+    assert!(second.get("full_update").is_none(), "{second}");
+
+    // The key it was issued for starts whole at 1, and leaves the session's
+    // ids where they were.
+    let by_key = rig.get("/api/v2/sync/maindata?rid=2").await.json();
+    assert_eq!(
+        (by_key["rid"].clone(), by_key["full_update"].clone()),
+        (json!(1), json!(true))
+    );
+    let third = rig
+        .send(with(&sid, "/api/v2/sync/maindata?rid=2"))
+        .await
+        .json();
+    assert_eq!(third["rid"], 3);
+    assert!(third.get("full_update").is_none(), "{third}");
+
+    let session = SyncClient::Session(sid.trim_start_matches("SID=").to_owned());
+    assert!(rig.context.sync().holds(&session));
+    rig.send(with(&sid, "/api/v2/auth/logout")).await;
+    assert!(!rig.context.sync().holds(&session));
+
+    let fresh = sid_of(rig.send(login(ADMIN)).await);
+    let next = rig
+        .send(with(&fresh, "/api/v2/sync/maindata?rid=3"))
+        .await
+        .json();
+    assert_eq!(
+        (next["rid"].clone(), next["full_update"].clone()),
+        (json!(1), json!(true))
+    );
+}
+
+// A torrent's limit set and then cleared: the change carries the key with
+// qBittorrent's reading of no limit, 0 (`serialize_torrent.cpp`, from
+// `TorrentImpl::cleanLimitValue`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maindata_sends_a_cleared_limit_as_no_limit() {
+    let rig = rig().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    let first = rig.get("/api/v2/sync/maindata").await.json();
+    let hash = first["torrents"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    assert_eq!(first["torrents"][&hash]["up_limit"], 0);
+    rig.post(
+        "/api/v2/torrents/setUploadLimit",
+        &format!("hashes={hash}&limit=65536"),
+    )
+    .await;
+    let set = rig.get("/api/v2/sync/maindata?rid=1").await.json();
+    assert_eq!(set["torrents"][&hash]["up_limit"], 65_536, "{set}");
+    rig.post(
+        "/api/v2/torrents/setUploadLimit",
+        &format!("hashes={hash}&limit=0"),
+    )
+    .await;
+    let cleared = rig.get("/api/v2/sync/maindata?rid=2").await.json();
+    assert_eq!(cleared["torrents"][&hash]["up_limit"], 0, "{cleared}");
 }
 
 #[tokio::test]

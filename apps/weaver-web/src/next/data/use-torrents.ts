@@ -4,7 +4,7 @@
 import { useMemo } from "react";
 import { useSubscription } from "urql";
 import { TORRENT_SUMMARY_UPDATES_SUBSCRIPTION } from "@/graphql/queries";
-import type { TorrentSummaryData } from "@/lib/torrents";
+import { applyTorrentChanges, type TorrentChangesData, type TorrentSummaryData } from "@/lib/torrents";
 import { useNextData } from "@/next/data/next-data";
 
 const NO_TORRENTS: ReadonlyMap<number, TorrentSummaryData> = new Map();
@@ -15,12 +15,16 @@ const NO_TORRENTS: ReadonlyMap<number, TorrentSummaryData> = new Map();
  */
 export function useTorrentSummaries(active: boolean): ReadonlyMap<number, TorrentSummaryData> {
   const { connection } = useNextData("connection");
-  const [{ data }] = useSubscription<{ torrentUpdates: TorrentSummaryData[] }>({
-    query: TORRENT_SUMMARY_UPDATES_SUBSCRIPTION,
-    pause: !active || connection.isDisconnected,
-  });
-  return useMemo(
-    () => (active && data ? new Map(data.torrentUpdates.map((torrent) => [torrent.id, torrent])) : NO_TORRENTS),
-    [active, data],
+  // Each push carries only what moved, so the torrents are kept between them.
+  const [{ data }] = useSubscription<
+    { torrentUpdates: TorrentChangesData<TorrentSummaryData> },
+    ReadonlyMap<number, TorrentSummaryData>
+  >(
+    {
+      query: TORRENT_SUMMARY_UPDATES_SUBSCRIPTION,
+      pause: !active || connection.isDisconnected,
+    },
+    (held, pushed) => applyTorrentChanges(held, pushed.torrentUpdates),
   );
+  return useMemo(() => (active && data ? data : NO_TORRENTS), [active, data]);
 }
