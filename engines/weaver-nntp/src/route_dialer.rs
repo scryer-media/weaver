@@ -151,6 +151,7 @@ impl RouteDialer {
             purpose: Purpose::Nntp {
                 server: self.server,
                 leg: 0,
+                probing: false,
             },
         };
         // A dialer that enforces its own budget (a weighted route books a

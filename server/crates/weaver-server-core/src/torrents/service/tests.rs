@@ -10840,3 +10840,75 @@ async fn a_pin_survives_a_restart_and_clears_when_the_route_leaves_the_pool() {
     );
     again.stop().await;
 }
+
+// A torrent leg says how far its WireGuard tunnel holds TCP peers below the
+// peer limit, and a settings save that changes the limit says it again.
+#[tokio::test]
+async fn a_new_peer_limit_is_told_on_the_torrent_leg() {
+    use base64::Engine;
+    let rig = rig(set_clock());
+    let key = |seed: u8| {
+        base64::engine::general_purpose::STANDARD
+            .encode(weaver_tunnel::test_support::test_key(seed))
+    };
+    rig.db
+        .save_proxy_profile(&crate::proxies::ProxyProfile {
+            kind: crate::proxies::ProxyKind::WireGuard,
+            host: "192.0.2.1".into(),
+            port: 51820,
+            dns_servers: vec!["10.64.0.1".parse().unwrap()],
+            tunnel_addresses: vec!["10.64.0.2/32".into()],
+            peer_public_key: Some(key(2)),
+            secrets: crate::proxies::ProxySecrets {
+                private_key: Some(key(1)),
+                ..Default::default()
+            },
+            ..loopback_proxy(0)
+        })
+        .unwrap();
+    let scope = Consumer::Torrent(TorrentScope::Default);
+    rig.db
+        .save_proxy_routing_policy(
+            scope,
+            &RoutingPolicy {
+                legs: vec![RouteLeg {
+                    egress_id: SYSTEM_EGRESS_ID,
+                    weight: 100,
+                    path: LegPath::Ladder {
+                        rungs: vec![crate::proxies::Rung::Proxy { id: 1 }],
+                        direct_fallback: false,
+                    },
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let proxies =
+        crate::proxies::ProxyRuntime::new(rig.db.clone(), tokio::runtime::Handle::current())
+            .unwrap();
+    counted_on(&rig.service, &proxies);
+    let limit = async |peers: u32| {
+        let mut settings = rig.service.settings();
+        settings.torrent.connections_limit =
+            crate::settings::TorrentLimit::of(std::num::NonZeroU32::new(peers));
+        rig.db.save_torrent_config(&settings.torrent).unwrap();
+        rig.service.set_settings(settings).await;
+        proxies
+            .network
+            .route(scope, 1, Duration::from_secs(1))
+            .unwrap()
+            .legs
+            .read()
+            .unwrap()[0]
+            .warning
+            .clone()
+    };
+    assert_eq!(limit(100).await, None);
+    assert_eq!(
+        limit(500).await.as_deref(),
+        Some(
+            "WireGuard proxy 1 holds torrent peers over TCP to 224 of 500; the rest connect over uTP."
+        )
+    );
+    assert_eq!(limit(200).await, None);
+}

@@ -57,13 +57,16 @@ impl DatagramTransport for SessionDatagrams {
         };
         let activity = session.activity.clone().read_owned().await;
         let capacity = session.capacity.acquire().map_err(tunnel_error)?;
-        let share = session.sockets.take(SocketClass::Reserve).map_err(|_| {
-            TunnelError::Engine(format!(
-                "proxy {}: the tunnel's {} share of sockets is full",
-                session.id,
-                SocketClass::Reserve.as_str()
-            ))
-        })?;
+        let share = session
+            .sockets
+            .take(SocketClass::ReserveCore)
+            .map_err(|_| {
+                TunnelError::Engine(format!(
+                    "proxy {}: the tunnel's {} share of sockets is full",
+                    session.id,
+                    SocketClass::ReserveCore.as_str()
+                ))
+            })?;
         match provider.0.bind(peer).await {
             Ok(socket) => {
                 crate::resolution::record::bound(peer, true);

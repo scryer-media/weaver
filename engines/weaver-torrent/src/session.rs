@@ -1479,6 +1479,7 @@ impl Session {
             let listening_utp = listen_result
                 .as_ref()
                 .and_then(|listen| listen.utp_socket.clone());
+            let mut utp_rebind = None;
             let new_outgoing_utp = if enable_utp == Some(true) && listening_utp.is_none() {
                 let mut utp_opts = weaver_utp::SocketOpts {
                     cancellation_token: swarm.child_token(),
@@ -1492,20 +1493,29 @@ impl Session {
                 } else {
                     SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
                 };
+                let receive_buffer =
+                    crate::udp_options::receive_buffer_for(connection_slots.limit());
                 match crate::listen::bind_utp(
                     opts.socket_factory.as_ref(),
                     address,
-                    utp_opts,
-                    crate::udp_options::receive_buffer_for(connection_slots.limit()),
+                    utp_opts.clone(),
+                    receive_buffer,
                     Some(&connection_slots),
                 )
                 .await
                 .context("error binding outgoing uTP socket through socket factory")
                 {
                     Ok(socket) => Some(socket),
-                    // As with the listener, TCP still connects without uTP.
+                    // As with the listener, TCP still connects without uTP,
+                    // and the next dial that wants uTP binds it again.
                     Err(e) if enable_tcp => {
                         error!("{e:#}");
+                        utp_rebind = Some(crate::stream_connect::UtpRebind {
+                            address,
+                            opts: utp_opts,
+                            receive_buffer,
+                            connection_slots: Arc::clone(&connection_slots),
+                        });
                         None
                     }
                     Err(e) => return Err(e),
@@ -1636,6 +1646,7 @@ impl Session {
                 StreamConnector::new(StreamConnectorArgs {
                     enable_tcp,
                     utp_socket: outgoing_utp,
+                    utp_rebind,
                     ipv4_only: opts.ipv4_only,
                     socket_factory: opts.socket_factory.clone(),
                     encryption: opts.encryption,
@@ -2371,7 +2382,7 @@ impl Session {
         self.swarm.cancel();
         self.swarm_tasks.close();
         self.swarm_tasks.wait().await;
-        for socket in &self.utp_sockets {
+        for socket in self.utp_sockets.iter().chain(self.connector.rebound_utp()) {
             if let Err(error) = socket.shutdown().await {
                 debug!(%error, "error shutting down uTP socket");
             }
@@ -3533,7 +3544,7 @@ impl Session {
     /// Whether the session speaks uTP at all: it listens on uTP, or it
     /// connects out over a uTP socket of its own.
     pub fn uses_utp(&self) -> bool {
-        !self.utp_sockets.is_empty()
+        !self.utp_sockets.is_empty() || self.connector.rebound_utp().is_some()
     }
 
     /// Our address as the internet sees it, IPv4 first, of each family the

@@ -2246,6 +2246,10 @@ impl TorrentService {
     /// session and leaves each torrent stopped until they are turned on.
     pub async fn set_settings(&self, settings: TorrentSettings) {
         let on = settings.torrent.enabled;
+        let peer_limit = |torrent: &TorrentConfig| {
+            crate::torrents::sessions::session_limits(torrent).connections_limit
+        };
+        let peers = peer_limit(&settings.torrent);
         self.inner.sessions.set_config(settings.torrent.clone());
         let was = std::mem::replace(
             &mut *self
@@ -2255,10 +2259,17 @@ impl TorrentService {
                 .unwrap_or_else(PoisonError::into_inner),
             settings,
         )
-        .torrent
-        .enabled;
-        if on != was {
+        .torrent;
+        if on != was.enabled {
             self.turn(on).await;
+        }
+        // Each torrent leg says how far its tunnel holds TCP peers below the
+        // peer limit, so a new limit reads the routes again.
+        if peers != peer_limit(&was)
+            && let Some(proxies) = self.queue().and_then(|queue| queue.proxy_runtime())
+            && let Err(error) = proxies.reload().await
+        {
+            tracing::warn!(error, "the routes did not take the new torrent peer limit");
         }
         // The download limit and the seeding levels take hold now, not at
         // the next tick.

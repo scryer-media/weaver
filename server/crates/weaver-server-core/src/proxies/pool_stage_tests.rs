@@ -75,7 +75,11 @@ fn target() -> Target {
     Target {
         host: "news.invalid".into(),
         port: 119,
-        purpose: Purpose::Nntp { server: 1, leg: 0 },
+        purpose: Purpose::Nntp {
+            server: 1,
+            leg: 0,
+            probing: false,
+        },
         addresses: Vec::new(),
     }
 }

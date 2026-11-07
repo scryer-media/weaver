@@ -33,6 +33,7 @@ impl Database {
                 let args = args.clone(); let routing = routing.clone();
                 let scripts = scripts.clone();
                 Box::pin(async move {
+            let before = crate::proxies::lock_network_asks(tx).await?;
             tx.execute(
                 "INSERT INTO rss_feeds
                     (id, name, url, enabled, poll_interval_secs, username, password, default_category,
@@ -43,7 +44,8 @@ impl Database {
             )
             .await?;
             crate::post_processing::instances::set_feed_scripts_tx(tx, feed_id, &scripts).await?;
-            crate::proxies::persistence::write_routing(tx, consumer, routing.as_ref()).await?;
+            crate::proxies::persistence::write_routing(tx, consumer, routing.as_ref(), &before)
+                .await?;
             Ok(())
                 })
             }).await
@@ -81,6 +83,7 @@ impl Database {
                 let routing = routing.clone();
                 let scripts = scripts.clone();
                 Box::pin(async move {
+                    let before = crate::proxies::lock_network_asks(tx).await?;
                     tx.execute(
                         "UPDATE rss_feeds
                     SET name = {}, url = {}, enabled = {}, poll_interval_secs = {}, username = {},
@@ -93,8 +96,13 @@ impl Database {
                     .await?;
                     crate::post_processing::instances::set_feed_scripts_tx(tx, feed_id, &scripts)
                         .await?;
-                    crate::proxies::persistence::write_routing(tx, consumer, routing.as_ref())
-                        .await?;
+                    crate::proxies::persistence::write_routing(
+                        tx,
+                        consumer,
+                        routing.as_ref(),
+                        &before,
+                    )
+                    .await?;
                     Ok(())
                 })
             })

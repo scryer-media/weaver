@@ -91,10 +91,30 @@ impl Default for ConnectionOptions {
     }
 }
 
+/// How the connector binds the session's outgoing uTP socket on a later
+/// dial when the bind at the session's start failed, as it does on a tunnel
+/// whose sockets were all held then.
+#[derive(Clone)]
+pub(crate) struct UtpRebind {
+    pub address: SocketAddr,
+    pub opts: weaver_utp::SocketOpts,
+    pub receive_buffer: usize,
+    pub connection_slots: Arc<crate::connection_slots::ConnectionSlots>,
+}
+
+impl std::fmt::Debug for UtpRebind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UtpRebind")
+            .field("address", &self.address)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct StreamConnectorArgs {
     pub enable_tcp: bool,
     pub utp_socket: Option<UtpSocket>,
+    pub utp_rebind: Option<UtpRebind>,
     pub ipv4_only: bool,
     pub socket_factory: Arc<dyn SocketFactory>,
     pub encryption: EncryptionPolicy,
@@ -108,6 +128,7 @@ impl StreamConnectorArgs {
         Self {
             enable_tcp: true,
             utp_socket: None,
+            utp_rebind: None,
             ipv4_only: false,
             socket_factory,
             encryption: EncryptionPolicy::Disabled,
@@ -143,7 +164,8 @@ gen_stats!(ConnectStatsAtomic ConnectStatsSnapshot, [], [
 #[derive(Debug)]
 pub(crate) struct StreamConnector {
     enable_tcp: bool,
-    utp_socket: Option<UtpSocket>,
+    utp_socket: tokio::sync::OnceCell<UtpSocket>,
+    utp_rebind: Option<UtpRebind>,
     stats: ConnectStatsAtomic,
     ipv4_only: bool,
     socket_factory: Arc<dyn SocketFactory>,
@@ -177,7 +199,8 @@ impl StreamConnector {
 
         Ok(Self {
             enable_tcp: config.enable_tcp,
-            utp_socket: config.utp_socket,
+            utp_socket: tokio::sync::OnceCell::new_with(config.utp_socket),
+            utp_rebind: config.utp_rebind,
             stats: Default::default(),
             ipv4_only: config.ipv4_only,
             socket_factory: config.socket_factory,
@@ -321,6 +344,40 @@ impl StreamConnector {
         &self.stats
     }
 
+    // Whether a dial may go over uTP: the socket is bound, or a dial binds
+    // it again.
+    fn has_utp(&self) -> bool {
+        self.utp_socket.initialized() || self.utp_rebind.is_some()
+    }
+
+    /// The outgoing uTP socket a dial bound after the session started.
+    pub fn rebound_utp(&self) -> Option<&UtpSocket> {
+        self.utp_rebind.as_ref().and(self.utp_socket.get())
+    }
+
+    // The outgoing uTP socket, bound now when the last bind failed. Dials
+    // that want it meanwhile wait for the one bind and try again after it
+    // when it fails.
+    async fn utp(&self) -> Option<&UtpSocket> {
+        if let Some(socket) = self.utp_socket.get() {
+            return Some(socket);
+        }
+        let rebind = self.utp_rebind.as_ref()?;
+        self.utp_socket
+            .get_or_try_init(|| {
+                crate::listen::bind_utp(
+                    self.socket_factory.as_ref(),
+                    rebind.address,
+                    rebind.opts.clone(),
+                    rebind.receive_buffer,
+                    Some(&rebind.connection_slots),
+                )
+            })
+            .await
+            .inspect_err(|e| debug!("error binding outgoing uTP socket again: {e:#}"))
+            .ok()
+    }
+
     /// Connect to the peer at `addr` over `transports`.
     pub async fn connect(
         &self,
@@ -348,7 +405,7 @@ impl StreamConnector {
         // to uTP when it has it.
         let tcp = self.enable_tcp
             && transports == Transports::Any
-            && (self.utp_socket.is_none() || self.socket_factory.tcp_room());
+            && (!self.has_utp() || self.socket_factory.tcp_room());
         let tcp_connect = async {
             if !tcp {
                 return Ok(None);
@@ -364,13 +421,14 @@ impl StreamConnector {
             Ok::<_, std::io::Error>(Some(conn))
         };
 
+        // Kept for the uTP attempt when TCP fails before it waits, as one
+        // does on its first poll.
         let tcp_failed_notify = tokio::sync::Notify::new();
 
         let utp_connect = async {
-            let sock = match self.utp_socket.as_ref() {
-                Some(sock) => sock,
-                None => return Ok(None),
-            };
+            if !self.has_utp() {
+                return Ok(None);
+            }
 
             // Give TCP priority as it's more mature and simpler.
             if tcp {
@@ -380,6 +438,10 @@ impl StreamConnector {
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
                 }
             }
+
+            let Some(sock) = self.utp().await else {
+                return Ok(None);
+            };
 
             let conn = self
                 .with_stat(ConnectionKind::Utp, addr.is_ipv6(), sock.connect(addr))
@@ -413,11 +475,11 @@ impl StreamConnector {
                         },
                         Ok(None) => {
                             tcp_err = Some(None);
-                            tcp_failed_notify.notify_waiters();
+                            tcp_failed_notify.notify_one();
                         }
                         Err(e) => {
                             tcp_err = Some(Some(e));
-                            tcp_failed_notify.notify_waiters();
+                            tcp_failed_notify.notify_one();
                         }
                     }
                 },
@@ -483,6 +545,7 @@ mod tests {
         StreamConnector::new(StreamConnectorArgs {
             enable_tcp: true,
             utp_socket,
+            utp_rebind: None,
             ipv4_only: false,
             socket_factory: sockets,
             encryption: EncryptionPolicy::Disabled,
@@ -556,6 +619,7 @@ mod tests {
         StreamConnector::new(StreamConnectorArgs {
             enable_tcp: true,
             utp_socket: Some(utp_socket),
+            utp_rebind: None,
             ipv4_only: false,
             socket_factory: sockets,
             encryption: EncryptionPolicy::Disabled,
@@ -578,6 +642,153 @@ mod tests {
         let (kind, _r, _w) = connected.unwrap();
         assert!(matches!(kind, ConnectionKind::Utp));
         assert_eq!(tcp_attempts(&connector), 0);
+    }
+
+    /// The kernel's sockets on a route whose first uTP bind fails, as one
+    /// does on a tunnel whose sockets are all held.
+    struct FirstBindFails {
+        sockets: Arc<dyn SocketFactory>,
+        binds: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SocketFactory for FirstBindFails {
+        fn connect_tcp<'a>(
+            &'a self,
+            addr: SocketAddr,
+        ) -> BoxFuture<'a, std::io::Result<(BoxAsyncReadVectored, BoxAsyncWrite)>> {
+            self.sockets.connect_tcp(addr)
+        }
+
+        fn listen_tcp<'a>(
+            &'a self,
+            addr: SocketAddr,
+        ) -> BoxFuture<'a, std::io::Result<Box<dyn crate::network::StreamListener>>> {
+            self.sockets.listen_tcp(addr)
+        }
+
+        fn bind_udp<'a>(
+            &'a self,
+            addr: SocketAddr,
+        ) -> BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>> {
+            self.sockets.bind_udp(addr)
+        }
+
+        fn bind_utp<'a>(
+            &'a self,
+            addr: SocketAddr,
+            receive_buffer: usize,
+        ) -> BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>> {
+            if self.binds.fetch_add(1, Ordering::Relaxed) == 0 {
+                return Box::pin(async { Err(std::io::Error::other("no socket free")) });
+            }
+            self.sockets.bind_utp(addr, receive_buffer)
+        }
+    }
+
+    // An outgoing uTP socket whose bind failed is bound again by the next
+    // dial that wants uTP, and kept for every dial after it.
+    #[tokio::test]
+    async fn a_failed_utp_bind_is_retried_by_the_next_dial_that_wants_utp() {
+        let factory = Arc::new(FirstBindFails {
+            sockets: crate::test_support::socket_factory(),
+            binds: Default::default(),
+        });
+        let connector = StreamConnector::new(StreamConnectorArgs {
+            utp_rebind: Some(UtpRebind {
+                address: (Ipv4Addr::LOCALHOST, 0).into(),
+                opts: Default::default(),
+                receive_buffer: crate::udp_options::STREAM_WINDOW,
+                connection_slots: Arc::new(crate::connection_slots::ConnectionSlots::new(
+                    8,
+                    0,
+                    std::num::NonZeroU32::new(10).unwrap(),
+                )),
+            }),
+            ..StreamConnectorArgs::over(factory.clone())
+        })
+        .await
+        .unwrap();
+        let theirs = loopback_utp().await;
+        let first = connector.connect(theirs.bind_addr(), Transports::Utp).await;
+        assert!(matches!(first, Err(Error::ConnectDisabled)));
+        assert!(connector.rebound_utp().is_none());
+        for _ in 0..2 {
+            let (accepted, connected) = tokio::join!(
+                theirs.accept(),
+                connector.connect(theirs.bind_addr(), Transports::Utp)
+            );
+            accepted.unwrap();
+            assert!(matches!(connected.unwrap().0, ConnectionKind::Utp));
+        }
+        assert_eq!(factory.binds.load(Ordering::Relaxed), 2);
+        assert!(connector.rebound_utp().is_some());
+    }
+
+    /// The kernel's sockets on a route with a TCP socket free whose every
+    /// TCP connect fails the moment it is made.
+    struct RefusesTcp(Arc<dyn SocketFactory>);
+
+    impl SocketFactory for RefusesTcp {
+        fn connect_tcp<'a>(
+            &'a self,
+            _: SocketAddr,
+        ) -> BoxFuture<'a, std::io::Result<(BoxAsyncReadVectored, BoxAsyncWrite)>> {
+            Box::pin(async { Err(std::io::ErrorKind::ConnectionRefused.into()) })
+        }
+
+        fn listen_tcp<'a>(
+            &'a self,
+            addr: SocketAddr,
+        ) -> BoxFuture<'a, std::io::Result<Box<dyn crate::network::StreamListener>>> {
+            self.0.listen_tcp(addr)
+        }
+
+        fn bind_udp<'a>(
+            &'a self,
+            addr: SocketAddr,
+        ) -> BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>> {
+            self.0.bind_udp(addr)
+        }
+
+        fn bind_utp<'a>(
+            &'a self,
+            addr: SocketAddr,
+            receive_buffer: usize,
+        ) -> BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>> {
+            self.0.bind_utp(addr, receive_buffer)
+        }
+    }
+
+    // A TCP connect that fails as soon as it is made starts uTP at once,
+    // in the same poll, with no wait for TCP's second.
+    #[tokio::test]
+    async fn a_tcp_connect_failing_on_its_first_poll_starts_utp_at_once() {
+        let sockets: Arc<dyn SocketFactory> =
+            Arc::new(RefusesTcp(crate::test_support::socket_factory()));
+        let utp_socket = crate::listen::bind_utp(
+            sockets.as_ref(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Default::default(),
+            crate::udp_options::STREAM_WINDOW,
+            None,
+        )
+        .await
+        .unwrap();
+        let connector = StreamConnector::new(StreamConnectorArgs {
+            utp_socket: Some(utp_socket),
+            ..StreamConnectorArgs::over(sockets)
+        })
+        .await
+        .unwrap();
+        let theirs = loopback_utp().await;
+        let connect = connector.connect(theirs.bind_addr(), Transports::Any);
+        tokio::pin!(connect);
+        assert!(futures::poll!(connect.as_mut()).is_pending());
+        assert_eq!(tcp_attempts(&connector), 1);
+        assert_eq!(connector.stats().utp.snapshot().v4.attempts, 1);
+        let (accepted, connected) = tokio::join!(theirs.accept(), connect);
+        accepted.unwrap();
+        assert!(matches!(connected.unwrap().0, ConnectionKind::Utp));
     }
 
     // Under the share, the same dial tries TCP first.
@@ -642,6 +853,7 @@ mod tests {
         let connector = StreamConnector::new(StreamConnectorArgs {
             enable_tcp: true,
             utp_socket: None,
+            utp_rebind: None,
             ipv4_only: false,
             socket_factory: Arc::new(Dialed(tx)),
             encryption,

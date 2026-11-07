@@ -15,6 +15,7 @@ async fn an_ipv4_only_connector_dials_a_mapped_peer_as_ipv4() -> anyhow::Result<
     let connector = StreamConnector::new(StreamConnectorArgs {
         enable_tcp: true,
         utp_socket: None,
+        utp_rebind: None,
         ipv4_only: true,
         socket_factory: Arc::new(Dialed(sent)),
         encryption: EncryptionPolicy::Disabled,
@@ -44,6 +45,7 @@ async fn a_true_ipv6_dial_preserves_its_scope_and_flow_information() -> anyhow::
     let connector = StreamConnector::new(StreamConnectorArgs {
         enable_tcp: true,
         utp_socket: None,
+        utp_rebind: None,
         ipv4_only: false,
         socket_factory: Arc::new(Dialed(sent)),
         encryption: EncryptionPolicy::Disabled,

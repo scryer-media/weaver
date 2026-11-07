@@ -97,18 +97,73 @@ impl Configuration {
             .map(|server| (server.id, server.connections))
             .collect();
         configuration.socket_ledger = configuration.ledger(&connections);
-        configuration.warn_peer_clamps(db.torrent_peer_limit().map_err(|e| e.to_string())?);
-        for (consumer, policy) in &mut configuration.policies {
-            for (position, leg) in policy.legs.iter_mut().enumerate() {
+        let mut missing = Vec::new();
+        for (consumer, policy) in &configuration.policies {
+            for (position, leg) in policy.legs.iter().enumerate() {
                 if !configuration.egresses.contains_key(&leg.egress_id) {
-                    configuration.warnings.insert(
+                    missing.push((
                         (consumer.clone(), position),
                         format!("Restored egress {} is missing; this leg is Down until its egress is repaired.", leg.egress_id),
-                    );
+                    ));
                 }
             }
         }
+        for (slot, warning) in missing {
+            configuration.warn(slot, warning);
+        }
+        configuration.warn_over_budget();
+        configuration.warn_peer_clamps(db.torrent_peer_limit().map_err(|e| e.to_string())?);
         Ok(configuration)
+    }
+    // Add `warning` to the leg's, after any it already carries.
+    fn warn(&mut self, slot: (String, usize), warning: String) {
+        self.warnings
+            .entry(slot)
+            .and_modify(|held| {
+                held.push(' ');
+                held.push_str(&warning);
+            })
+            .or_insert(warning);
+    }
+    // The WireGuard sessions under each leg of a ladder.
+    fn leg_sessions(&self) -> Vec<((String, usize), SessionPath)> {
+        let mut sessions = Vec::new();
+        for (key, policy) in &self.policies {
+            for (position, leg) in policy.route().legs.iter().enumerate() {
+                let LegPath::Ladder { rungs, .. } = &leg.path else {
+                    continue;
+                };
+                for rung in rungs {
+                    for path in rung_carriers(rung, &self.profiles, &self.pools) {
+                        sessions.push(((key.clone(), position), (leg.egress_id, path)));
+                    }
+                }
+            }
+        }
+        sessions.sort();
+        sessions.dedup();
+        sessions
+    }
+    // A leg over a tunnel its usenet servers ask more of than it holds, as
+    // a lowered hardware profile or a torrent route added to a full tunnel
+    // leaves one, says so with the totals and what usenet is held to.
+    fn warn_over_budget(&mut self) {
+        let mut over = Vec::new();
+        for (slot, path) in self.leg_sessions() {
+            let Some(tunnel) = self.socket_ledger.get(&path).filter(|t| t.over_budget()) else {
+                continue;
+            };
+            let refusal = tunnel.refusal().to_string();
+            let mut text = refusal[..1].to_uppercase();
+            text.push_str(&refusal[1..]);
+            over.push((
+                slot,
+                format!("{text}; usenet is held to {}.", tunnel.shares().nntp),
+            ));
+        }
+        for (slot, warning) in over {
+            self.warn(slot, warning);
+        }
     }
     fn ledger(&self, connections: &HashMap<u32, u16>) -> HashMap<SessionPath, TunnelSockets> {
         let routes: Vec<_> = self
@@ -125,7 +180,10 @@ impl Configuration {
         )
     }
     // A torrent leg whose WireGuard session holds TCP peers below the peer
-    // limit says so; the peers past the share connect over uTP.
+    // limit says so; the peers past the share connect over uTP. The incoming
+    // places past the limit are not counted: each lasts only until it
+    // replaces another connection, and a TCP peer past the share is turned
+    // away at accept while it can still come in over uTP.
     fn warn_peer_clamps(&mut self, peer_limit: usize) {
         let mut clamps = Vec::new();
         for (key, policy) in &self.policies {
@@ -156,7 +214,7 @@ impl Configuration {
             }
         }
         for (slot, warning) in clamps {
-            self.warnings.entry(slot).or_insert(warning);
+            self.warn(slot, warning);
         }
     }
     // The shares a WireGuard session holds its sockets to. A session no
@@ -395,12 +453,18 @@ impl NetworkRuntime {
             ));
             *runtime.quota_watch.lock().expect("network quota task") = Some(task);
         }
-        let task = handle.spawn(Self::follow_socket_cap(
-            Arc::downgrade(&runtime),
-            super::follow_wireguard_socket_cap(),
-        ));
-        *runtime.cap_watch.lock().expect("network cap task") = Some(task);
         Ok(runtime)
+    }
+    // Hold the task that follows the socket cap, ended with the runtime.
+    pub(super) fn hold_cap_watch(&self, task: tokio::task::JoinHandle<()>) {
+        *self.cap_watch.lock().expect("network cap task") = Some(task);
+    }
+    // The socket cap the tunnels in force were built to.
+    pub(super) fn socket_cap(&self) -> usize {
+        self.configuration
+            .read()
+            .expect("network configuration")
+            .socket_cap
     }
     // Re-publish leg health whenever an egress runs out of quota or gets
     // quota back, so routes move off it or back onto it straight away.
@@ -424,34 +488,6 @@ impl NetworkRuntime {
             tokio::select! {
                 changed = policy_changes.changed() => if changed.is_err() { break },
                 changed = capacity_changes.changed() => if changed.is_err() { break },
-            }
-        }
-    }
-    // Reload whenever the socket cap moves, so the tunnels are rebuilt to
-    // it and every tunnel's socket shares are budgeted against it.
-    async fn follow_socket_cap(
-        runtime: std::sync::Weak<Self>,
-        mut cap: tokio::sync::watch::Receiver<usize>,
-    ) {
-        while cap.changed().await.is_ok() {
-            let Some(runtime) = runtime.upgrade() else {
-                break;
-            };
-            let in_force = *cap.borrow_and_update();
-            if runtime
-                .configuration
-                .read()
-                .expect("network configuration")
-                .socket_cap
-                == in_force
-            {
-                continue;
-            }
-            if let Err(error) = runtime.reload().await {
-                tracing::warn!(
-                    error,
-                    "rebuilding the WireGuard tunnels for a new socket cap failed"
-                );
             }
         }
     }

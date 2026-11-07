@@ -68,6 +68,7 @@ impl ServersService {
             Some(runtime) => runtime.reload().await,
             None => Ok(()),
         };
+        let network_moved = reloaded.is_ok();
         let rebuilt = match reloaded {
             Ok(()) => crate::runtime::reload::rebuild_nntp_from_config(&self.config, &self.handle)
                 .await
@@ -88,14 +89,25 @@ impl ServersService {
             {
                 server.active = previous_active;
             }
+            // A rollback restores what was saved; it never budgets it again.
             let db = self.db.clone();
             let rollback = tokio::task::spawn_blocking(move || {
-                db.set_server_active(server_id, previous_active)
+                db.restore_server_active(server_id, previous_active)
             })
             .await;
             if !matches!(rollback, Ok(Ok(()))) {
                 return Err(format!(
                     "{error}; restoring server activation failed: {rollback:?}"
+                ));
+            }
+            // The tunnels were re-budgeted for the change; budget them again
+            // for the server as it is restored.
+            if network_moved
+                && let Some(runtime) = &proxy_runtime
+                && let Err(reload) = runtime.reload().await
+            {
+                return Err(format!(
+                    "{error}; re-budgeting the tunnels for the restored server failed: {reload}"
                 ));
             }
             return Err(error.to_string());
@@ -258,10 +270,28 @@ impl Database {
     }
 
     pub fn set_server_active(&self, server_id: u32, active: bool) -> Result<(), StateError> {
+        self.write_server_active(server_id, active, active)
+    }
+
+    // Put back the activation a failed change replaced, without budgeting
+    // the tunnels for it: a rollback restores, it never validates.
+    pub fn restore_server_active(&self, server_id: u32, active: bool) -> Result<(), StateError> {
+        self.write_server_active(server_id, active, false)
+    }
+
+    // An activated server asks its connections of the tunnels its route
+    // reaches, checked when `budget` holds.
+    fn write_server_active(
+        &self,
+        server_id: u32,
+        active: bool,
+        budget: bool,
+    ) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "set_server_active", |tx| {
                 Box::pin(async move {
+                    let before = crate::proxies::lock_network_asks(tx).await?;
                     let changed = tx
                         .execute(
                             "UPDATE servers SET active = {} WHERE id = {}",
@@ -273,11 +303,8 @@ impl Database {
                             "server {server_id} not found"
                         )));
                     }
-                    // An activated server asks its connections of the
-                    // tunnels its route reaches.
-                    if active {
-                        crate::proxies::lock_network(tx).await?;
-                        crate::proxies::validate_stored_sockets(tx).await?;
+                    if budget {
+                        crate::proxies::validate_stored_sockets(tx, &before).await?;
                     }
                     Ok(())
                 })

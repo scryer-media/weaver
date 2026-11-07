@@ -788,13 +788,9 @@ impl Dialer for Weighted {
         let opening = self.begin()?;
         let position = opening.position;
         let mut target = target.clone();
-        if let weaver_tunnel::pipe::Purpose::Nntp { leg, .. } = &mut target.purpose {
+        if let weaver_tunnel::pipe::Purpose::Nntp { leg, probing, .. } = &mut target.purpose {
             *leg = position;
-        }
-        if opening.probe
-            && let weaver_tunnel::pipe::Purpose::Nntp { server, leg } = target.purpose
-        {
-            target.purpose = weaver_tunnel::pipe::Purpose::NntpProbe { server, leg };
+            *probing = opening.probe;
         }
         // Enforce the leg's own budget here so a leg that swallows connects
         // books the timeout against itself; the caller's route budget is

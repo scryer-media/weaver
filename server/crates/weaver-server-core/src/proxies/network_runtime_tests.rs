@@ -1244,7 +1244,11 @@ async fn a_wireguard_chain_downloads_four_concurrent_bulk_streams() {
                 .dial(&Target {
                     host: TEST_PEER_ADDRESS.to_string(),
                     port,
-                    purpose: weaver_tunnel::pipe::Purpose::Nntp { server: 1, leg: 0 },
+                    purpose: weaver_tunnel::pipe::Purpose::Nntp {
+                        server: 1,
+                        leg: 0,
+                        probing: false,
+                    },
                     addresses: Vec::new(),
                 })
                 .await
@@ -1680,6 +1684,7 @@ async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
     let budget = |config: &mut Configuration, connections: u16| {
         config.socket_ledger = config.ledger(&HashMap::from([(1, connections), (2, 10)]));
         config.warnings.clear();
+        config.warn_over_budget();
         config.warn_peer_clamps(200);
     };
     let shares = |runtime: &NetworkRuntime, cap: usize| {
@@ -1703,7 +1708,8 @@ async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
         SocketShares {
             nntp: 101,
             torrent: 123,
-            reserve: 32
+            core: 8,
+            http: 8
         }
     );
     // The SOCKS session has no share at all.
@@ -1732,9 +1738,30 @@ async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
         SocketShares {
             nntp: 51,
             torrent: 173,
-            reserve: 32
+            core: 8,
+            http: 8
         }
     );
+
+    // A tunnel its usenet asks more of than it holds, as a lowered profile
+    // leaves one, holds usenet to what the reserve and the peer floor
+    // leave, and every leg over it says so beside any other warning.
+    budget(&mut config, 230);
+    runtime.apply_configuration(config.clone()).unwrap();
+    let over = "Usenet servers ask 231 sockets of WireGuard proxy 1 on egress 0, 32 are reserved and 16 kept for torrent peers, over the 256 it holds; usenet is held to 208.";
+    assert_eq!(
+        warning(&runtime).as_deref(),
+        Some(format!("{over} WireGuard proxy 1 holds torrent peers over TCP to 16 of 200; the rest connect over uTP.").as_str())
+    );
+    let server_warning = runtime
+        .route(Consumer::Server(1), 5, Duration::from_secs(1))
+        .unwrap()
+        .legs
+        .read()
+        .unwrap()[0]
+        .warning
+        .clone();
+    assert_eq!(server_warning.as_deref(), Some(over));
 
     config.socket_cap = 512;
     budget(&mut config, 50);
@@ -1744,7 +1771,8 @@ async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
         SocketShares {
             nntp: 51,
             torrent: 397,
-            reserve: 64
+            core: 16,
+            http: 16
         }
     );
     assert_eq!(warning(&runtime), None);

@@ -12,10 +12,12 @@ use weaver_tunnel::{
 struct Scripted {
     mode: AtomicU8,
     started: Notify,
+    dialed: std::sync::Mutex<Vec<Purpose>>,
 }
 #[async_trait::async_trait]
 impl Dialer for Scripted {
-    async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
+    async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
+        self.dialed.lock().unwrap().push(target.purpose.clone());
         self.started.notify_one();
         match self.mode.load(Ordering::SeqCst) {
             1 => {
@@ -49,7 +51,11 @@ fn target() -> Target {
     Target {
         host: "news.invalid".into(),
         port: 119,
-        purpose: Purpose::Nntp { server: 1, leg: 0 },
+        purpose: Purpose::Nntp {
+            server: 1,
+            leg: 0,
+            probing: false,
+        },
         addresses: Vec::new(),
     }
 }
@@ -74,6 +80,7 @@ fn create(cap: u16) -> (Arc<Weighted>, Vec<Arc<Scripted>>) {
             Arc::new(Scripted {
                 mode: AtomicU8::new(0),
                 started: Notify::new(),
+                dialed: Default::default(),
             })
         })
         .collect();
@@ -148,6 +155,24 @@ async fn two_failures_redistribute_then_offer_one_probe_and_restore() {
     stages[0].mode.store(0, Ordering::SeqCst);
     let recovered = route.dial(&target()).await.unwrap();
     assert_eq!(recovered.path.leg, Some(0));
+    // The probe is the leg's first pooled connection: it tries rungs still
+    // cooling and takes a usenet socket, not one of the reserve.
+    let probe = stages[0].dialed.lock().unwrap().last().cloned().unwrap();
+    assert!(
+        matches!(
+            probe,
+            Purpose::Nntp {
+                leg: 0,
+                probing: true,
+                ..
+            }
+        ),
+        "{probe:?}"
+    );
+    assert_eq!(
+        weaver_tunnel::pipe::SocketClass::of(&probe),
+        weaver_tunnel::pipe::SocketClass::Nntp
+    );
     assert_eq!(route.allocations()[0].health, LegHealthState::Up);
     assert_eq!(
         route
@@ -261,6 +286,7 @@ async fn replaced_leg_ignores_old_close_failure_and_cancel_callbacks() {
     let replacement = Arc::new(Scripted {
         mode: AtomicU8::new(0),
         started: Notify::new(),
+        dialed: Default::default(),
     });
     route
         .update(definition, vec![replacement, stages[1].clone()], 5)

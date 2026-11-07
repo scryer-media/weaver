@@ -13,24 +13,26 @@ fn error(e: impl std::fmt::Display) -> StateError {
     StateError::Database(e.to_string())
 }
 
+// Write `consumer`'s route after its own row. `before` is what the servers
+// asked of each tunnel when the transaction took the network lock, before
+// either write.
 pub(crate) async fn write_routing(
     tx: &mut crate::persistence::sql_runtime::SqlTx<'_>,
     consumer: Consumer,
     policy: Option<&RoutingPolicy>,
+    before: &super::SocketAsks,
 ) -> Result<(), StateError> {
     let Some(policy) = policy else {
         // The server's own connections may have changed what it asks of
         // the tunnels its saved route reaches.
         if matches!(consumer, Consumer::Server(_)) {
-            super::network_persistence::lock_network(tx).await?;
-            super::network_persistence::validate_stored_sockets(tx).await?;
+            super::network_persistence::validate_stored_sockets(tx, before).await?;
         }
         return Ok(());
     };
-    super::network_persistence::lock_network(tx).await?;
     let policy = super::network_persistence::validate_policy(tx, consumer, policy).await?;
     tx.execute("INSERT INTO proxy_routes (consumer, policy) VALUES ({}, {}) ON CONFLICT(consumer) DO UPDATE SET policy = excluded.policy", &[SqlArg::Text(consumer.key()), SqlArg::Text(serde_json::to_string(&policy).map_err(error)?)]).await?;
-    super::network_persistence::validate_stored_network(tx).await?;
+    super::network_persistence::validate_stored_network(tx, before).await?;
     Ok(())
 }
 
@@ -101,7 +103,7 @@ impl Database {
                 let mut profile = profile.clone();
                 let password = password.clone();
                 Box::pin(async move {
-                    super::network_persistence::lock_network(tx).await?;
+                    let before = super::network_persistence::lock_network_asks(tx).await?;
                     for row in tx.fetch_all("SELECT kind, member_ids FROM proxy_pools", &[]).await? {
                         let members: Vec<u32> = serde_json::from_str(&row.text("member_ids")?).map_err(error)?;
                         let kind: super::ProxyKind = serde_json::from_str(&row.text("kind")?).map_err(error)?;
@@ -132,7 +134,7 @@ impl Database {
                         SqlArg::Text(serde_json::to_string(&profile).map_err(error)?),
                         SqlArg::Text(password),
                     ]).await?;
-                    super::network_persistence::validate_stored_network(tx).await?;
+                    super::network_persistence::validate_stored_network(tx, &before).await?;
                     Ok(profile)
                 })
             }).await
@@ -234,10 +236,10 @@ impl Database {
             SqlRuntime::run_in_transaction(&store, "save_proxy_route", |tx| {
                 let key = key.clone(); let policy = policy.clone();
                 Box::pin(async move {
-                    super::network_persistence::lock_network(tx).await?;
+                    let before = super::network_persistence::lock_network_asks(tx).await?;
                     let policy = super::network_persistence::validate_policy(tx,consumer,&policy).await?;
                     tx.execute("INSERT INTO proxy_routes (consumer, policy) VALUES ({}, {}) ON CONFLICT(consumer) DO UPDATE SET policy = excluded.policy", &[SqlArg::Text(key), SqlArg::Text(serde_json::to_string(&policy).map_err(error)?)]).await?;
-                    super::network_persistence::validate_stored_network(tx).await?;
+                    super::network_persistence::validate_stored_network(tx, &before).await?;
                     Ok(())
                 })
             }).await

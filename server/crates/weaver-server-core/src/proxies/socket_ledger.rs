@@ -6,9 +6,13 @@
 // A tunnel holds `cap` sockets. Usenet servers routed through it get every
 // connection they may put on it, so a leg that takes over a failed leg's
 // share still has the sockets. An eighth of the tunnel is reserved for the
-// rest of its traffic: trackers, web seeds, feeds, probes and its datagram
-// sockets. Torrent peers over TCP take what is left; once that is full they
-// connect over uTP, which needs no socket of its own.
+// rest. Half of that is never handed out, so sockets closed but still
+// lingering in the tunnel never leave a new one without room; the other half
+// is split evenly between the tunnel's own sockets (name lookups, DHT and uTP
+// datagram sockets, probes) and HTTP (trackers, web seeds, feeds), so a
+// tracker storm never takes the sockets DHT and uTP bind. Torrent peers over
+// TCP take what is left; once that is full they connect over uTP, which
+// needs no socket of its own.
 //
 // Usenet connections are set per server, so a save that asks more than the
 // tunnel can hold is refused. The torrent peer limit is one setting for
@@ -30,6 +34,12 @@ pub const SOCKET_PEER_FLOOR: usize = 16;
 // torrent peers over TCP.
 pub fn socket_reserve(cap: usize) -> usize {
     cap / 8
+}
+
+// The part of the reserve kept for sockets closed but still lingering in the
+// tunnel, which no share hands out.
+pub fn socket_linger(cap: usize) -> usize {
+    cap / 16
 }
 
 // One WireGuard session's sockets.
@@ -65,10 +75,12 @@ impl TunnelSockets {
         let nntp = self
             .nntp
             .min(self.cap.saturating_sub(reserve + self.peer_floor()));
+        let handed = reserve.saturating_sub(socket_linger(self.cap));
         SocketShares {
             nntp,
             torrent: self.cap - reserve - nntp,
-            reserve,
+            core: handed - handed / 2,
+            http: handed / 2,
         }
     }
 
@@ -213,19 +225,29 @@ fn session(
     key
 }
 
-// Refuse a configuration whose usenet servers ask a tunnel for more sockets
-// than it can give them. The first such tunnel, by egress and path, is named.
-pub fn validate_socket_budget(
-    routes: &[(Consumer, Route)],
-    profiles: &HashMap<u32, ProxyProfile>,
-    pools: &HashMap<u32, ProxyPool>,
-    connections: &HashMap<u32, u16>,
-    cap: usize,
+// What the usenet servers ask of each tunnel in `ledger`.
+pub fn socket_asks(ledger: &HashMap<SessionPath, TunnelSockets>) -> HashMap<SessionPath, usize> {
+    ledger
+        .iter()
+        .map(|(path, tunnel)| (path.clone(), tunnel.nntp))
+        .collect()
+}
+
+// Refuse a change that raises what usenet asks of a tunnel it leaves over
+// budget, measured against `before`, what the servers asked before it. A
+// change that leaves a tunnel over budget without asking it for more, as
+// any does once the hardware profile lowers the cap, is no reason to refuse
+// it: that tunnel's legs warn instead. The first refused tunnel, by egress
+// and path, is named.
+pub fn validate_socket_raise(
+    before: &HashMap<SessionPath, usize>,
+    after: HashMap<SessionPath, TunnelSockets>,
 ) -> Result<(), NetworkRefusal> {
-    let ledger = socket_ledger(routes, profiles, pools, connections, cap);
-    let mut over: Vec<_> = ledger
+    let mut over: Vec<_> = after
         .into_iter()
-        .filter(|(_, tunnel)| tunnel.over_budget())
+        .filter(|(path, tunnel)| {
+            tunnel.over_budget() && tunnel.nntp > before.get(path).copied().unwrap_or(0)
+        })
         .collect();
     over.sort_by(|a, b| a.0.cmp(&b.0));
     match over.into_iter().next() {

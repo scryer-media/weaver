@@ -216,7 +216,10 @@ pub(super) async fn validate_policy(
     Ok(RoutingPolicy::from_route(route, &pools))
 }
 
-pub(super) async fn validate_stored_network(tx: &mut SqlTx<'_>) -> Result<(), StateError> {
+pub(super) async fn validate_stored_network(
+    tx: &mut SqlTx<'_>,
+    before: &SocketAsks,
+) -> Result<(), StateError> {
     let profiles = profiles(tx).await?;
     let pools = tx
         .fetch_all("SELECT * FROM proxy_pools", &[])
@@ -269,12 +272,34 @@ pub(super) async fn validate_stored_network(tx: &mut SqlTx<'_>) -> Result<(), St
     }
     super::validate_wireguard_paths(&routes, &profiles, &pools)?;
     super::validate_instance_budget(&routes, &profiles, &pools, super::max_wireguard_instances())?;
-    validate_stored_sockets(tx).await
+    validate_stored_sockets(tx, before).await
 }
 
-// Refuse a write that leaves the usenet servers asking a WireGuard tunnel for
-// more sockets than it holds under the hardware profile in force.
-pub(crate) async fn validate_stored_sockets(tx: &mut SqlTx<'_>) -> Result<(), StateError> {
+// What the stored usenet servers ask of each WireGuard tunnel, read under the
+// network lock before a write changes them.
+pub(crate) struct SocketAsks(HashMap<super::SessionPath, usize>);
+
+// Take the network lock, and read what the servers ask of each tunnel
+// before the write that follows.
+pub(crate) async fn lock_network_asks(tx: &mut SqlTx<'_>) -> Result<SocketAsks, StateError> {
+    lock_network(tx).await?;
+    Ok(SocketAsks(super::socket_asks(&stored_sockets(tx).await?)))
+}
+
+// Refuse a write that raises what the usenet servers ask of a WireGuard
+// tunnel it leaves over budget under the hardware profile in force.
+pub(crate) async fn validate_stored_sockets(
+    tx: &mut SqlTx<'_>,
+    before: &SocketAsks,
+) -> Result<(), StateError> {
+    super::validate_socket_raise(&before.0, stored_sockets(tx).await?)?;
+    Ok(())
+}
+
+// How the stored routes and active servers share each WireGuard tunnel.
+async fn stored_sockets(
+    tx: &mut SqlTx<'_>,
+) -> Result<HashMap<super::SessionPath, super::TunnelSockets>, StateError> {
     let profiles = profiles(tx).await?;
     let pools = tx
         .fetch_all("SELECT * FROM proxy_pools", &[])
@@ -302,14 +327,13 @@ pub(crate) async fn validate_stored_sockets(tx: &mut SqlTx<'_>) -> Result<(), St
             u16::try_from(row.i64("connections")?).map_err(error)?,
         );
     }
-    super::validate_socket_budget(
+    Ok(super::socket_ledger(
         &routes,
         &profiles,
         &pools,
         &connections,
         super::wireguard_socket_cap(),
-    )?;
-    Ok(())
+    ))
 }
 
 impl Database {
@@ -483,7 +507,7 @@ impl Database {
             SqlRuntime::run_in_transaction(&store, "save_proxy_pool", |tx| {
                 let mut pool = pool.clone();
                 Box::pin(async move {
-                    lock_network(tx).await?;
+                    let before = lock_network_asks(tx).await?;
                     if create {
                         let row = tx.fetch_optional("SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM proxy_pools", &[]).await?.ok_or_else(|| error("cannot allocate pool id"))?;
                         pool.id = u32::try_from(row.i64("next_id")?).map_err(error)?;
@@ -518,7 +542,7 @@ impl Database {
                     tx.execute("INSERT INTO proxy_pools (id, name, kind, member_ids, enabled, created_at, updated_at) VALUES ({}, {}, {}, {}, {}, {}, {}) ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind, member_ids = excluded.member_ids, enabled = excluded.enabled, updated_at = excluded.updated_at", &[
                         SqlArg::I64(i64::from(pool.id)), SqlArg::Text(pool.name.clone()), SqlArg::Text(serde_json::to_string(&pool.kind).map_err(error)?), SqlArg::Text(serde_json::to_string(&pool.member_ids).map_err(error)?), SqlArg::Bool(pool.enabled), SqlArg::I64(now), SqlArg::I64(now),
                     ]).await?;
-                    validate_stored_network(tx).await?;
+                    validate_stored_network(tx, &before).await?;
                     Ok(pool)
                 })
             }).await

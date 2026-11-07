@@ -4,9 +4,9 @@
 // The share of a WireGuard tunnel's sockets each kind of traffic may hold.
 //
 // A tunnel holds a fixed number of sockets. Usenet connections, torrent
-// peers over TCP and everything else (trackers, web seeds, feeds, probes,
-// datagram sockets) each get a share of them, so one kind can never take the
-// sockets another needs. Every stream or socket the session hands out holds
+// peers over TCP, the tunnel's own sockets (name lookups, datagram sockets,
+// probes) and HTTP (trackers, web seeds, feeds) each get a share of them, so
+// one kind can never take the sockets another needs. Every stream or socket the session hands out holds
 // one permit of its share until it is dropped.
 use std::sync::{Arc, Mutex};
 
@@ -21,7 +21,11 @@ pub enum SocketClass {
     // Torrent peers over TCP. uTP peers ride the session's datagram socket
     // and take nothing of this.
     Torrent,
-    Reserve,
+    // Name lookups, datagram sockets (DHT and uTP), probes and the carrier
+    // a proxy session shares.
+    ReserveCore,
+    // Trackers, web seeds, feeds and other outbound HTTP.
+    ReserveHttp,
 }
 
 impl SocketClass {
@@ -36,12 +40,10 @@ impl SocketClass {
             // A probe may test a server before it is saved or turned on,
             // when its route counts no connection on the tunnel yet.
             Purpose::NntpProbe { .. }
-            | Purpose::TorrentHttp
             | Purpose::ProxyEndpoint { .. }
-            | Purpose::Feed { .. }
-            | Purpose::Outbound
             | Purpose::Probe
-            | Purpose::Dns => Self::Reserve,
+            | Purpose::Dns => Self::ReserveCore,
+            Purpose::TorrentHttp | Purpose::Feed { .. } | Purpose::Outbound => Self::ReserveHttp,
         }
     }
 
@@ -49,7 +51,8 @@ impl SocketClass {
         match self {
             Self::Nntp => "usenet",
             Self::Torrent => "torrent TCP",
-            Self::Reserve => "reserve",
+            Self::ReserveCore => "reserve",
+            Self::ReserveHttp => "tracker and HTTP",
         }
     }
 }
@@ -59,7 +62,8 @@ impl SocketClass {
 pub struct SocketShares {
     pub nntp: usize,
     pub torrent: usize,
-    pub reserve: usize,
+    pub core: usize,
+    pub http: usize,
 }
 
 impl SocketShares {
@@ -67,22 +71,25 @@ impl SocketShares {
         match class {
             SocketClass::Nntp => self.nntp,
             SocketClass::Torrent => self.torrent,
-            SocketClass::Reserve => self.reserve,
+            SocketClass::ReserveCore => self.core,
+            SocketClass::ReserveHttp => self.http,
         }
     }
 }
 
-const CLASSES: [SocketClass; 3] = [
+const CLASSES: [SocketClass; 4] = [
     SocketClass::Nntp,
     SocketClass::Torrent,
-    SocketClass::Reserve,
+    SocketClass::ReserveCore,
+    SocketClass::ReserveHttp,
 ];
 
 const fn index(class: SocketClass) -> usize {
     match class {
         SocketClass::Nntp => 0,
         SocketClass::Torrent => 1,
-        SocketClass::Reserve => 2,
+        SocketClass::ReserveCore => 2,
+        SocketClass::ReserveHttp => 3,
     }
 }
 
@@ -90,11 +97,11 @@ const fn index(class: SocketClass) -> usize {
 // ending during it are settled together.
 #[derive(Default)]
 struct Ledger {
-    size: [usize; 3],
-    held: [usize; 3],
+    size: [usize; 4],
+    held: [usize; 4],
     // How much of each share grew while another share still held sockets
     // above its new size. That growth waits for those sockets to end.
-    growing: [usize; 3],
+    growing: [usize; 4],
 }
 
 impl Ledger {
@@ -107,7 +114,7 @@ impl Ledger {
 
     // How many sockets each share may hold now: its size, less the growth
     // still waiting on the sockets the shrunk shares hold above their size.
-    fn limits(&self) -> [usize; 3] {
+    fn limits(&self) -> [usize; 4] {
         let mut overflow = self.overflow();
         let mut limits = self.size;
         for (limit, &growing) in limits.iter_mut().zip(&self.growing) {
@@ -120,14 +127,14 @@ impl Ledger {
 
     fn settle(&mut self) {
         if self.overflow() == 0 {
-            self.growing = [0; 3];
+            self.growing = [0; 4];
         }
     }
 }
 
 struct Shares {
     ledger: Mutex<Ledger>,
-    freed: [Arc<Notify>; 3],
+    freed: [Arc<Notify>; 4],
 }
 
 impl Shares {
@@ -213,7 +220,8 @@ impl SessionSockets {
         Some(SocketShares {
             nntp: ledger.size[0],
             torrent: ledger.size[1],
-            reserve: ledger.size[2],
+            core: ledger.size[2],
+            http: ledger.size[3],
         })
     }
 
@@ -258,7 +266,8 @@ mod tests {
     const SHARES: SocketShares = SocketShares {
         nntp: 2,
         torrent: 1,
-        reserve: 1,
+        core: 1,
+        http: 1,
     };
 
     #[test]
@@ -270,7 +279,11 @@ mod tests {
         assert!(sockets.take(SocketClass::Nntp).is_err());
         let torrent = sockets.take(SocketClass::Torrent).unwrap().unwrap();
         assert!(!sockets.has_room(SocketClass::Torrent));
-        assert!(sockets.has_room(SocketClass::Reserve));
+        assert!(sockets.has_room(SocketClass::ReserveCore));
+        let tracker = sockets.take(SocketClass::ReserveHttp).unwrap().unwrap();
+        assert!(sockets.take(SocketClass::ReserveHttp).is_err());
+        assert!(sockets.has_room(SocketClass::ReserveCore));
+        drop(tracker);
         drop(torrent);
         assert!(sockets.has_room(SocketClass::Torrent));
         drop(nntp);
@@ -335,7 +348,8 @@ mod tests {
         let before = SocketShares {
             nntp: 101,
             torrent: 123,
-            reserve: 32,
+            core: 8,
+            http: 8,
         };
         let sockets = SessionSockets::new(before);
         let mut usenet: Vec<_> = (0..101)
@@ -347,18 +361,21 @@ mod tests {
         sockets.set_shares(SocketShares {
             nntp: 51,
             torrent: 173,
-            reserve: 32,
+            core: 8,
+            http: 8,
         });
-        let total = 256;
+        let total = 256 - 16;
         let take_all = |torrent: &mut Vec<SocketPermit>| {
             while let Ok(permit) = sockets.take(SocketClass::Torrent) {
                 torrent.push(permit.unwrap());
             }
         };
         take_all(&mut torrent);
-        assert_eq!(torrent.len(), total - 101 - 32);
-        let reserve: Vec<_> = (0..32)
-            .map(|_| sockets.take(SocketClass::Reserve).unwrap().unwrap())
+        assert_eq!(torrent.len(), total - 101 - 16);
+        let reserve: Vec<_> = [SocketClass::ReserveCore, SocketClass::ReserveHttp]
+            .into_iter()
+            .flat_map(|class| std::iter::repeat_n(class, 8))
+            .map(|class| sockets.take(class).unwrap().unwrap())
             .collect();
         while usenet.len() > 51 {
             usenet.pop();

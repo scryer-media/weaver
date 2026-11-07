@@ -554,7 +554,11 @@ async fn cooldown_skips_are_not_evidence_and_fatal_stops_fallback() {
     });
     let ladder = Fallback::new(vec![fail.clone()]);
     let mut target = target("127.0.0.1:119".parse().unwrap());
-    target.purpose = Purpose::Nntp { server: 1, leg: 0 };
+    target.purpose = Purpose::Nntp {
+        server: 1,
+        leg: 0,
+        probing: false,
+    };
     assert!(matches!(
         ladder.dial(&target).await,
         Err(DialError::Egress(_))
@@ -1819,7 +1823,11 @@ impl Dialer for Full {
 async fn a_full_tunnel_waits_for_room_without_cooling_its_rung() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mut target = target(listener.local_addr().unwrap());
-    target.purpose = Purpose::Nntp { server: 1, leg: 0 };
+    target.purpose = Purpose::Nntp {
+        server: 1,
+        leg: 0,
+        probing: false,
+    };
     let freed = proxy_tunnels::SlotFreed::default();
 
     // The ladder goes on to the next rung and leaves the full one standing.
@@ -2228,7 +2236,7 @@ fn a_revoked_leg_reports_no_route() {
 
 // Each kind of traffic holds its own share of a WireGuard tunnel's sockets.
 // A full share is at capacity until one of its streams closes, and traffic
-// of another kind still dials.
+// of another kind still dials or binds.
 #[tokio::test]
 async fn a_full_socket_share_is_at_capacity_and_leaves_the_others_alone() {
     let near = crate::test_support::WireGuardTestPeer::start().await;
@@ -2243,7 +2251,8 @@ async fn a_full_socket_share_is_at_capacity_and_leaves_the_others_alone() {
         sockets: Arc::new(SessionSockets::new(SocketShares {
             nntp: 0,
             torrent: 1,
-            reserve: 1,
+            core: 1,
+            http: 1,
         })),
         ..Arc::into_inner(wireguard_session(
             1,
@@ -2269,10 +2278,26 @@ async fn a_full_socket_share_is_at_capacity_and_leaves_the_others_alone() {
         Err(DialError::AtCapacity(_))
     ));
     let tracker = session.dial(&target(Purpose::TorrentHttp)).await.unwrap();
-    assert_eq!(session.sockets.held(SocketClass::Reserve), 1);
+    assert_eq!(session.sockets.held(SocketClass::ReserveHttp), 1);
+    // A tracker storm fills the HTTP reserve and leaves the DHT and uTP
+    // their datagram sockets.
+    assert!(matches!(
+        session.dial(&target(Purpose::Feed { feed: 1 })).await,
+        Err(DialError::AtCapacity(_))
+    ));
+    let datagrams = Arc::clone(&session).datagrams().unwrap();
+    let far: SocketAddr = "192.0.2.50:6881".parse().unwrap();
+    let utp = datagrams.bind(far).await.unwrap();
+    assert_eq!(session.sockets.held(SocketClass::ReserveCore), 1);
+    assert!(datagrams.bind(far).await.is_err());
+    drop(utp);
     assert!(matches!(
         session
-            .dial(&target(Purpose::Nntp { server: 1, leg: 0 }))
+            .dial(&target(Purpose::Nntp {
+                server: 1,
+                leg: 0,
+                probing: false,
+            }))
             .await,
         Err(DialError::AtCapacity(_))
     ));
@@ -2281,18 +2306,18 @@ async fn a_full_socket_share_is_at_capacity_and_leaves_the_others_alone() {
     assert!(session.has_room(&Purpose::Torrent));
     let _again = session.dial(&target(Purpose::Torrent)).await.unwrap();
     drop(tracker);
-    assert_eq!(session.sockets.held(SocketClass::Reserve), 0);
+    assert_eq!(session.sockets.held(SocketClass::ReserveHttp), 0);
 }
 
 // A stage that records the purpose of every dial and fails it, with room in
-// every share but the reserve.
+// every share but the HTTP reserve.
 #[derive(Default)]
 struct RecordsPurpose(Mutex<Vec<Purpose>>);
 
 #[async_trait::async_trait]
 impl Dialer for RecordsPurpose {
     fn has_room(&self, purpose: &Purpose) -> bool {
-        SocketClass::of(purpose) != SocketClass::Reserve
+        SocketClass::of(purpose) != SocketClass::ReserveHttp
     }
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
         self.0.lock().unwrap().push(target.purpose.clone());
@@ -2316,7 +2341,11 @@ async fn a_chained_dial_takes_its_own_share_of_the_tunnel_beneath() {
     let first = hop(7, "192.0.2.1:1080".parse().unwrap(), beneath.clone());
     let chain = hop(8, "192.0.2.2:8080".parse().unwrap(), first);
     let mut nntp = target("192.0.2.9:119".parse().unwrap());
-    nntp.purpose = Purpose::Nntp { server: 1, leg: 0 };
+    nntp.purpose = Purpose::Nntp {
+        server: 1,
+        leg: 0,
+        probing: false,
+    };
     let peer = Target {
         purpose: Purpose::Torrent,
         ..nntp.clone()

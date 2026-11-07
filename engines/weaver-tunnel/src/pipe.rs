@@ -54,9 +54,13 @@ pub(crate) const NO_ROUTE_VIA: &str = "no route via ";
 
 #[derive(Clone, Debug)]
 pub enum Purpose {
+    // A usenet connection the server's pool keeps. The first one a leg
+    // being probed again opens is `probing`: it tries rungs still cooling
+    // down, as a probe does, and is a pooled connection all the same.
     Nntp {
         server: u32,
         leg: usize,
+        probing: bool,
     },
     NntpProbe {
         server: u32,
@@ -1454,10 +1458,12 @@ impl Dialer for Fallback {
         let mut last = DialError::Skipped("all rungs are unavailable".into());
         let mut capacity_changes = Vec::new();
         for (index, rung) in self.rungs.iter().enumerate() {
-            if !matches!(target.purpose, Purpose::Probe | Purpose::NntpProbe { .. })
-                && self.states.lock().expect("rung state")[index]
-                    .until
-                    .is_some_and(|t| t > tokio::time::Instant::now())
+            if !matches!(
+                target.purpose,
+                Purpose::Probe | Purpose::NntpProbe { .. } | Purpose::Nntp { probing: true, .. }
+            ) && self.states.lock().expect("rung state")[index]
+                .until
+                .is_some_and(|t| t > tokio::time::Instant::now())
             {
                 continue;
             }

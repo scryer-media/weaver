@@ -202,7 +202,8 @@ fn torrent_peers_alone_take_all_but_the_reserve() {
             cap,
         );
         let shares = ledger[&tunnel(1)].shares();
-        assert_eq!(shares.reserve, cap / 8);
+        assert_eq!(shares.core, cap / 32);
+        assert_eq!(shares.http, cap / 32);
         assert_eq!(shares.nntp, 0);
         assert_eq!(shares.torrent, cap - cap / 8);
     }
@@ -231,8 +232,11 @@ fn usenet_and_torrent_peers_share_one_tunnel_within_its_cap() {
         assert!(!tunnel.over_budget());
         let shares = tunnel.shares();
         assert_eq!(shares.nntp, 101);
-        assert_eq!(shares.reserve, cap / 8);
-        assert_eq!(shares.nntp + shares.torrent + shares.reserve, cap);
+        assert_eq!(
+            shares.nntp + shares.torrent + shares.core + shares.http,
+            cap - cap / 16,
+            "everything but the lingering allowance is handed out"
+        );
         assert!(shares.torrent >= SOCKET_PEER_FLOOR);
     }
 }
@@ -253,14 +257,17 @@ fn usenet_over_a_tunnel_is_refused_with_its_totals() {
         }
         routes
     };
-    let check = |torrents, connections, cap| {
-        validate_socket_budget(
+    let ledger = |torrents, connections, cap| {
+        socket_ledger(
             &routes(torrents),
             &profiles(&[3], &[]),
             &HashMap::new(),
             &HashMap::from([(1, connections)]),
             cap,
         )
+    };
+    let check = |torrents, connections, cap| {
+        validate_socket_raise(&HashMap::new(), ledger(torrents, connections, cap))
     };
 
     assert_eq!(
@@ -289,14 +296,19 @@ fn usenet_over_a_tunnel_is_refused_with_its_totals() {
     assert_eq!(check(true, 207, 256), Ok(()));
     assert_eq!(check(true, 240, 512), Ok(()));
 
-    let ledger = socket_ledger(
-        &routes(true),
-        &profiles(&[3], &[]),
-        &HashMap::new(),
-        &HashMap::from([(1, 240)]),
-        256,
+    // Against what the servers asked before, only a raise on a tunnel left
+    // over budget is refused.
+    let asked = |connections| socket_asks(&ledger(true, connections, 256));
+    assert!(validate_socket_raise(&asked(240), ledger(true, 240, 256)).is_ok());
+    assert!(validate_socket_raise(&asked(240), ledger(true, 230, 256)).is_ok());
+    assert!(validate_socket_raise(&asked(200), ledger(true, 207, 256)).is_ok());
+    assert_eq!(
+        validate_socket_raise(&asked(240), ledger(true, 241, 256)),
+        check(true, 241, 256)
     );
-    let shares = ledger[&tunnel(3)].shares();
+    assert!(validate_socket_raise(&asked(223), ledger(true, 223, 256)).is_ok());
+
+    let shares = ledger(true, 240, 256)[&tunnel(3)].shares();
     assert_eq!(shares.nntp, 256 - 32 - SOCKET_PEER_FLOOR);
     assert_eq!(shares.torrent, SOCKET_PEER_FLOOR);
 }
@@ -399,4 +411,49 @@ fn usenet_overflow_is_refused_at_every_server_save() {
     );
     db.set_server_active(1, false).unwrap();
     db.set_server_active(2, true).unwrap();
+
+    // A rollback restores the activation a failed change replaced, and is
+    // never budgeted again.
+    assert_eq!(refused_code(db.set_server_active(1, true)), CODE);
+    db.restore_server_active(1, true).unwrap();
+    assert!(
+        db.list_servers()
+            .unwrap()
+            .iter()
+            .all(|server| server.active)
+    );
+}
+
+// A tunnel over budget, as a torrent route added to a full one leaves it,
+// refuses only a save that raises what usenet asks of it. A feed's route
+// through it, an edit of its proxy, and a server that never reaches it all
+// save, and so does lowering the server that fills it.
+#[test]
+fn a_tunnel_over_budget_refuses_only_a_raise_of_its_usenet() {
+    let db = crate::Database::open_in_memory().unwrap();
+    db.save_proxy_profile(&saved_wireguard(3)).unwrap();
+    let through_tunnel = RoutingPolicy {
+        legs: vec![leg(Rung::Proxy { id: 3 }, 100)],
+        ..Default::default()
+    };
+    // 224 usenet sockets and the 32 reserved fill the 256.
+    db.insert_server_with_routing(&server(1, 223, true), Some(&through_tunnel))
+        .unwrap();
+    db.save_proxy_routing_policy(Consumer::Torrent(TorrentScope::Default), &through_tunnel)
+        .unwrap();
+
+    db.save_proxy_routing_policy(Consumer::Rss(7), &through_tunnel)
+        .unwrap();
+    let mut edited = saved_wireguard(3);
+    edited.revision = 2;
+    edited.mtu = 1380;
+    db.save_proxy_profile(&edited).unwrap();
+    db.insert_server(&server(2, 50, true)).unwrap();
+    db.update_server(&server(2, 60, true)).unwrap();
+
+    assert_eq!(
+        refused_code(db.update_server(&server(1, 224, true))),
+        Some("WIREGUARD_SOCKET_BUDGET")
+    );
+    db.update_server(&server(1, 220, true)).unwrap();
 }

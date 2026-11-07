@@ -2281,7 +2281,8 @@ mod tests {
             sockets: Arc::new(SessionSockets::new(SocketShares {
                 nntp: 0,
                 torrent: 1,
-                reserve: 1,
+                core: 1,
+                http: 1,
             })),
             ..Arc::into_inner(hop).unwrap()
         });

@@ -1009,6 +1009,7 @@ impl NntpPool {
                                     && inner.has_room(&weaver_tunnel::pipe::Purpose::Nntp {
                                         server: self.configs[idx].dialer.server,
                                         leg: 0,
+                                        probing: false,
                                     })
                                 {
                                     continue;

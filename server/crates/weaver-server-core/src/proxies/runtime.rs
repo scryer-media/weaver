@@ -237,8 +237,8 @@ impl ProxyRuntime {
             .into_iter()
             .collect();
         let consumers = Self::load_consumers(&db).map_err(|e| e.to_string())?;
-        Ok(Arc::new(Self {
-            network: NetworkRuntime::with_quota_policy(db.clone(), handle, quota_policy)?,
+        let runtime = Arc::new(Self {
+            network: NetworkRuntime::with_quota_policy(db.clone(), handle.clone(), quota_policy)?,
             db,
             policies: RwLock::new(policies),
             consumers: RwLock::new(consumers),
@@ -256,7 +256,35 @@ impl ProxyRuntime {
             pause: Mutex::new(None),
             stopped: AtomicBool::new(false),
             allow_private_network: AtomicBool::new(true),
-        }))
+        });
+        let task = handle.spawn(Self::follow_socket_cap(
+            Arc::downgrade(&runtime),
+            super::follow_wireguard_socket_cap(),
+        ));
+        runtime.network.hold_cap_watch(task);
+        Ok(runtime)
+    }
+    // Reload whenever the socket cap moves, so the tunnels are rebuilt to
+    // it and every tunnel's socket shares are budgeted against it. The
+    // reload joins any a save asked for, as every other reload does.
+    async fn follow_socket_cap(
+        runtime: std::sync::Weak<Self>,
+        mut cap: tokio::sync::watch::Receiver<usize>,
+    ) {
+        while cap.changed().await.is_ok() {
+            let Some(runtime) = runtime.upgrade() else {
+                break;
+            };
+            if runtime.network.socket_cap() == *cap.borrow_and_update() {
+                continue;
+            }
+            if let Err(error) = runtime.reload().await {
+                tracing::warn!(
+                    error,
+                    "rebuilding the WireGuard tunnels for a new socket cap failed"
+                );
+            }
+        }
     }
     // Everyone who owns a route, each with its name and how many connections
     // it holds: every server and feed, default outbound, the default torrent

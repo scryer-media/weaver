@@ -7,7 +7,7 @@ mod model;
 mod network;
 pub mod network_metrics;
 mod network_persistence;
-pub(crate) use network_persistence::{lock_network, validate_stored_sockets};
+pub(crate) use network_persistence::{SocketAsks, lock_network_asks, validate_stored_sockets};
 mod network_runtime;
 pub(crate) mod persistence;
 mod pool_stage;
