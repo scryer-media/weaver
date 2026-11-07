@@ -16,24 +16,58 @@ struct Fixture {
     retired: AtomicU64,
     // The signal of the member's full tunnel share, while it has no room.
     full: std::sync::Mutex<Option<Arc<Notify>>>,
+    // The pool whose members lock `room` checks is free, and how often it
+    // was when asked.
+    pool: std::sync::Mutex<Option<std::sync::Weak<PoolState>>>,
+    asked_unlocked: AtomicU64,
+    // Preparing the member's session fails fatally while set.
+    fatal: std::sync::atomic::AtomicBool,
+    // Told the member's dial count each time it is asked for room while
+    // full.
+    asked_full: std::sync::Mutex<Option<mpsc::UnboundedSender<u64>>>,
+    dials: AtomicU64,
 }
 #[async_trait::async_trait]
 impl Dialer for Fixture {
     fn room(&self, _: &Purpose) -> Result<(), Vec<Arc<Notify>>> {
+        let pool = self
+            .pool
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|pool| pool.upgrade());
+        if pool.is_some_and(|pool| pool.members.try_write().is_ok()) {
+            self.asked_unlocked.fetch_add(1, Ordering::SeqCst);
+        }
         match &*self.full.lock().unwrap() {
-            Some(freed) => Err(vec![freed.clone()]),
+            Some(freed) => {
+                if let Some(asked) = &*self.asked_full.lock().unwrap() {
+                    asked.send(self.dials.load(Ordering::SeqCst)).ok();
+                }
+                Err(vec![freed.clone()])
+            }
             None => Ok(()),
         }
     }
     async fn prepare(&self) -> Result<(), DialError> {
         self.prepared.fetch_add(1, Ordering::SeqCst);
+        if self.fatal.load(Ordering::SeqCst) {
+            return Err(DialError::Fatal(weaver_tunnel::TunnelError::Engine(
+                "refused".into(),
+            )));
+        }
         Ok(())
     }
     async fn retire(&self) {
         self.retired.fetch_add(1, Ordering::SeqCst);
     }
     async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
+        self.dials.fetch_add(1, Ordering::SeqCst);
         self.opened.send(self.id).unwrap();
+        let full = self.full.lock().unwrap().clone();
+        if let Some(freed) = full {
+            return Err(DialError::AtCapacity(vec![freed]));
+        }
         self.gate.acquire().await.unwrap().forget();
         let (stream, _) = tokio::io::duplex(64);
         Ok(Dialed {
@@ -67,6 +101,11 @@ fn fixtures() -> (
                 prepared: AtomicU64::new(0),
                 retired: AtomicU64::new(0),
                 full: Default::default(),
+                pool: Default::default(),
+                asked_unlocked: AtomicU64::new(0),
+                fatal: Default::default(),
+                asked_full: Default::default(),
+                dials: AtomicU64::new(0),
             })
         })
         .collect();
@@ -120,6 +159,129 @@ async fn a_pool_whose_members_are_all_full_has_no_room_until_one_frees() {
 
     *members[1].full.lock().unwrap() = None;
     assert!(pool.room(&target().purpose).is_ok());
+}
+
+// A pool asks its members for room with its members lock released, so a
+// member edit, which holds that lock while it closes connections, never
+// waits on a caller that asks for room under a route's lock.
+#[tokio::test]
+async fn a_pool_asks_its_members_for_room_without_its_members_lock() {
+    let (pool, members, _opened) = fixtures();
+    for member in &members {
+        *member.full.lock().unwrap() = Some(Arc::new(Notify::new()));
+        *member.pool.lock().unwrap() = Some(Arc::downgrade(&pool.state));
+    }
+    assert!(pool.room(&target().purpose).is_err());
+    for member in &members {
+        assert_eq!(member.asked_unlocked.load(Ordering::SeqCst), 1);
+    }
+}
+
+// A dial waiting for room on a pool's full members wakes when the members
+// become blocked, and then fails at once: no member is left to wait for.
+#[tokio::test]
+async fn a_wait_for_room_wakes_when_the_last_member_blocks() {
+    let (pool, members, _opened) = fixtures();
+    for member in &members {
+        *member.full.lock().unwrap() = Some(Arc::new(Notify::new()));
+        member.fatal.store(true, Ordering::SeqCst);
+    }
+    let waits = pool.room(&target().purpose).unwrap_err();
+    let changed = waits
+        .into_iter()
+        .find(|wait| Arc::ptr_eq(wait, &pool.state.changed))
+        .unwrap();
+    let mut prewarmed = false;
+    loop {
+        let notified = changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if pool.room(&target().purpose).is_ok() {
+            break;
+        }
+        if !prewarmed {
+            pool.prewarm();
+            prewarmed = true;
+        }
+        notified.await;
+    }
+    assert!(pool.all_blocked());
+    let Err(error) = pool.dial(&target()).await else {
+        panic!("a pool with every member blocked dialled");
+    };
+    assert!(matches!(error, DialError::Fatal(_)), "{error}");
+}
+
+// A usenet connect through a pool whose members' shares are all full waits
+// for a socket to free instead of dialling again, and dials once one does.
+#[tokio::test]
+async fn a_usenet_connect_over_a_full_pool_waits_and_redials_once_a_member_frees() {
+    let (pool, members, mut opened) = fixtures();
+    let (asked, mut asks) = mpsc::unbounded_channel();
+    let freed: Vec<_> = members
+        .iter()
+        .map(|member| {
+            let freed = Arc::new(Notify::new());
+            *member.full.lock().unwrap() = Some(freed.clone());
+            *member.asked_full.lock().unwrap() = Some(asked.clone());
+            freed
+        })
+        .collect();
+    let mut server = weaver_nntp::connection::ServerConfig::new(Arc::new(
+        weaver_nntp::route_dialer::RouteDialer {
+            inner: pool.clone(),
+            plan: None,
+            runtime: tokio::runtime::Handle::current(),
+            server: 1,
+            egress_controls: Arc::new(weaver_nntp::transfer::ServerTransferRegistry::new()),
+        },
+    ));
+    server.host = "news.invalid".into();
+    server.port = 119;
+    let usenet = Arc::new(weaver_nntp::NntpPool::new(weaver_nntp::PoolConfig {
+        servers: vec![weaver_nntp::ServerPoolConfig {
+            server,
+            max_connections: 1,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }));
+    let acquiring = tokio::spawn({
+        let usenet = usenet.clone();
+        async move { usenet.acquire(weaver_nntp::ServerId(0)).await.map(|_| ()) }
+    });
+
+    // The connect dialled each member once and was told it is at capacity,
+    // with room asked of both members: once by the pool for the signals it
+    // hands back and once by the connect before it parks.
+    let mut after_dial = 0;
+    while after_dial < 4 {
+        if asks.recv().await.unwrap() > 0 {
+            after_dial += 1;
+        }
+    }
+    let dials = |members: &[Arc<Fixture>]| -> Vec<u64> {
+        members
+            .iter()
+            .map(|member| member.dials.load(Ordering::SeqCst))
+            .collect()
+    };
+    assert_eq!(dials(&members), [1, 1]);
+    let mut first = Vec::new();
+    while let Ok(id) = opened.try_recv() {
+        first.push(id);
+    }
+    first.sort();
+    assert_eq!(first, [1, 2]);
+
+    *members[0].full.lock().unwrap() = None;
+    freed[0].notify_waiters();
+    while opened.recv().await.unwrap() != 1 {}
+    assert_eq!(members[0].dials.load(Ordering::SeqCst), 2);
+    assert!(members[1].dials.load(Ordering::SeqCst) <= 2);
+
+    acquiring.abort();
+    usenet.shutdown().await;
 }
 
 #[tokio::test]
@@ -193,6 +355,11 @@ async fn replaced_member_ignores_old_setup_and_transport_failure() {
         prepared: AtomicU64::new(0),
         retired: AtomicU64::new(0),
         full: Default::default(),
+        pool: Default::default(),
+        asked_unlocked: AtomicU64::new(0),
+        fatal: Default::default(),
+        asked_full: Default::default(),
+        dials: AtomicU64::new(0),
     });
     pool.set_members(vec![(1, replacement), (2, members[1].clone())]);
     old.setup.take().unwrap().complete(false);

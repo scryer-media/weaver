@@ -2367,3 +2367,41 @@ async fn a_chained_dial_takes_its_own_share_of_the_tunnel_beneath() {
     assert!(chain.has_room(&Purpose::Torrent));
     assert!(!chain.has_room(&Purpose::TorrentHttp));
 }
+
+// A rung whose share has room, or is full and says what frees it.
+struct Roomy(Option<Arc<Notify>>);
+#[async_trait::async_trait]
+impl Dialer for Roomy {
+    fn room(&self, _: &Purpose) -> Result<(), Vec<Arc<Notify>>> {
+        self.0.clone().map_or(Ok(()), |freed| Err(vec![freed]))
+    }
+    async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
+        Err(DialError::Egress(io::Error::other("not dialled")))
+    }
+    fn budget(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+    fn describe(&self) -> String {
+        "roomy".into()
+    }
+}
+
+// A probe dials the rung still cooling, so its room is that rung's; an
+// ordinary dial skips the cooling rung, so its room is the next one's.
+#[tokio::test(start_paused = true)]
+async fn a_probes_room_is_the_cooling_rung_it_dials() {
+    let freed = Arc::new(Notify::new());
+    let ladder = Fallback::new(vec![
+        Arc::new(Roomy(None)),
+        Arc::new(Roomy(Some(freed.clone()))),
+    ]);
+    ladder.report_rung(0, Some(&DialError::Egress(io::Error::other("path down"))));
+    let nntp = |probing| Purpose::Nntp {
+        server: 1,
+        leg: 0,
+        probing,
+    };
+    let waits = ladder.room(&nntp(false)).unwrap_err();
+    assert!(Arc::ptr_eq(&waits[0], &freed));
+    assert!(ladder.room(&nntp(true)).is_ok());
+}

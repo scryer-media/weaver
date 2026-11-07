@@ -1448,6 +1448,14 @@ impl Fallback {
         }
     }
 }
+// Whether a dial for `purpose` probes its path, and so tries rungs still
+// cooling.
+fn probes(purpose: &Purpose) -> bool {
+    matches!(
+        purpose,
+        Purpose::Probe | Purpose::NntpProbe { .. } | Purpose::Nntp { probing: true, .. }
+    )
+}
 #[async_trait::async_trait]
 impl Dialer for Fallback {
     fn has_capacity(&self) -> bool {
@@ -1466,13 +1474,7 @@ impl Dialer for Fallback {
         let mut last = DialError::Skipped("all rungs are unavailable".into());
         let mut capacity_changes = Vec::new();
         for (index, rung) in self.rungs.iter().enumerate() {
-            if !matches!(
-                target.purpose,
-                Purpose::Probe | Purpose::NntpProbe { .. } | Purpose::Nntp { probing: true, .. }
-            ) && self.states.lock().expect("rung state")[index]
-                .until
-                .is_some_and(|t| t > tokio::time::Instant::now())
-            {
+            if !self.allows_rung(index, probes(&target.purpose)) {
                 continue;
             }
             match rung.dial(target).await {
@@ -1509,10 +1511,11 @@ impl Dialer for Fallback {
             None => Ok(Resolution::Unresolved),
         }
     }
-    // Room on the first rung a dial would try.
+    // Room on the first rung a dial for `purpose` would try: a probe tries
+    // the rungs still cooling too.
     fn room(&self, purpose: &Purpose) -> Result<(), Vec<Arc<Notify>>> {
         (0..self.rungs.len())
-            .find(|index| self.allows_rung(*index, false))
+            .find(|index| self.allows_rung(*index, probes(purpose)))
             .map_or(Ok(()), |index| self.rungs[index].room(purpose))
     }
     // The datagrams of the first rung a dial would try.

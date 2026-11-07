@@ -91,11 +91,15 @@ struct Member {
     // Holders pinned to this member for their whole life: while one is, the
     // member's session is never retired as idle.
     pinned: AtomicU64,
+    // The pool's signal that its members changed, raised when this member
+    // becomes blocked.
+    changed: Arc<Notify>,
 }
 impl Member {
-    fn new(id: u32, dialer: Arc<dyn Dialer>) -> Arc<Self> {
+    fn new(id: u32, dialer: Arc<dyn Dialer>, changed: Arc<Notify>) -> Arc<Self> {
         Arc::new(Self {
             id,
+            changed,
             streams: weaver_tunnel::pipe::Revocable::new(dialer.clone()),
             dialer,
             status: Mutex::new(PoolMemberStatus {
@@ -115,6 +119,13 @@ impl Member {
             rate: Mutex::new(MemberRate::default()),
             pinned: AtomicU64::new(0),
         })
+    }
+    // Blocks the member for `error`, and wakes whoever waits on the pool's
+    // members: a dial that waited for room on a member now fails at once
+    // when no member is left to dial.
+    fn block(&self, error: &weaver_tunnel::TunnelError) {
+        self.status.lock().expect("pool member").blocked = Some(error.to_string());
+        self.changed.notify_waiters();
     }
     fn status(&self, now: Instant) -> PoolMemberStatus {
         let mut status = self.status.lock().expect("pool member").clone();
@@ -158,11 +169,13 @@ impl Member {
         }
         let started = Instant::now();
         let result = self.dialer.prepare().await;
-        let mut status = self.status.lock().expect("pool member");
-        status.session_handshake = Some(started.elapsed());
-        status.warmed = result.is_ok();
+        {
+            let mut status = self.status.lock().expect("pool member");
+            status.session_handshake = Some(started.elapsed());
+            status.warmed = result.is_ok();
+        }
         if let Err(DialError::Fatal(error)) = &result {
-            status.blocked = Some(error.to_string());
+            self.block(error);
         }
         result
     }
@@ -185,7 +198,7 @@ impl Member {
             stage: format!("pool member {}", self.id),
         })?;
         if let Err(DialError::Fatal(error)) = &result {
-            self.status.lock().expect("pool member").blocked = Some(error.to_string());
+            self.block(error);
         }
         let mut dialed = result?;
         guard.connected(&mut dialed);
@@ -604,15 +617,16 @@ impl PoolStage {
             members.iter().map(|(id, _)| *id).collect(),
             Instant::now().into_std(),
         );
+        let changed = Arc::new(Notify::new());
         let members = members
             .into_iter()
-            .map(|(id, dialer)| (id, Member::new(id, dialer)))
+            .map(|(id, dialer)| (id, Member::new(id, dialer, changed.clone())))
             .collect();
         let state = Arc::new(PoolState {
             id,
             plan: Mutex::new(plan),
             members: RwLock::new(members),
-            changed: Arc::new(Notify::new()),
+            changed,
             stopped: AtomicBool::new(false),
             revision: AtomicU64::new(0),
         });
@@ -724,7 +738,7 @@ impl PoolStage {
                     .get(&id)
                     .filter(|m| Arc::ptr_eq(&m.dialer, &dialer))
                     .cloned()
-                    .unwrap_or_else(|| Member::new(id, dialer));
+                    .unwrap_or_else(|| Member::new(id, dialer, self.state.changed.clone()));
                 (id, member)
             })
             .collect();
@@ -990,12 +1004,23 @@ impl Dialer for PoolStage {
     }
     // Room on any member the pool would dial, or every such member's signal
     // and the pool's own when none has room. A pool with no member to dial
-    // says it has room, so the dial reports why it cannot connect.
+    // says it has room, so the dial reports why it cannot connect. The
+    // members are asked with the pool's members lock released: a route's
+    // lock can be held around this call, and a member edit holds the
+    // members lock while it closes connections whose close takes that
+    // route's lock.
     fn room(&self, purpose: &weaver_tunnel::pipe::Purpose) -> Result<(), Vec<Arc<Notify>>> {
-        let members = self.state.members.read().expect("pool members");
+        let members: Vec<_> = self
+            .state
+            .members
+            .read()
+            .expect("pool members")
+            .values()
+            .cloned()
+            .collect();
         let mut waits = vec![self.state.changed.clone()];
         let mut dialable = false;
-        for member in members.values() {
+        for member in members {
             if member.status.lock().expect("pool member").blocked.is_some() {
                 continue;
             }
@@ -1022,9 +1047,19 @@ impl Dialer for PoolStage {
                 &self.handle,
             );
         }
-        answer
+        match answer
             .await
             .map_err(|_| DialError::Skipped("pool stopped".into()))?
+        {
+            // The member that answered last is not the only one whose room
+            // the caller waits for: a socket freed on any member, or a change
+            // to the members, is room again.
+            Err(DialError::AtCapacity(mut waits)) => {
+                waits.extend(self.room(&target.purpose).err().unwrap_or_default());
+                Err(DialError::AtCapacity(waits))
+            }
+            result => result,
+        }
     }
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
         self.lease()?.resolve(host).await

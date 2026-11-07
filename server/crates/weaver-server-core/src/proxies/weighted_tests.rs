@@ -225,11 +225,11 @@ async fn two_failures_redistribute_then_offer_one_probe_and_restore() {
     );
 }
 
-// A probe tests its own leg: while the probing leg's share is full the dial
-// waits on that share and the route instead of landing on the healthy leg,
-// and the probe goes through once the share frees.
+// A probing leg whose share is full gives way: the dial goes through the
+// healthy leg as that leg's own, and the probing leg stays probing. Once
+// its share frees, the next dial probes it.
 #[tokio::test(start_paused = true)]
-async fn a_probing_leg_with_a_full_share_is_not_probed_through_another_leg() {
+async fn a_probing_leg_with_a_full_share_gives_way_to_a_leg_with_room() {
     let (route, stages) = create(5);
     stages[0].mode.store(1, Ordering::SeqCst);
     for _ in 0..2 {
@@ -240,20 +240,22 @@ async fn a_probing_leg_with_a_full_share_is_not_probed_through_another_leg() {
     stages[0].mode.store(0, Ordering::SeqCst);
     let freed = Arc::new(Notify::new());
     *stages[0].full.lock().unwrap() = Some(freed.clone());
-    let dialed = stages[1].dialed.lock().unwrap().len();
+    let probed = stages[0].dialed.lock().unwrap().len();
 
-    let Err(DialError::AtCapacity(waits)) = route.dial(&target()).await else {
-        panic!("a probe with no room on its leg waits");
-    };
-    assert!(waits.iter().any(|wait| Arc::ptr_eq(wait, &freed)));
-    assert!(
-        waits
-            .iter()
-            .any(|wait| Arc::ptr_eq(wait, &route.budget_changed()))
-    );
-    assert!(!route.has_room(&target().purpose));
-    assert_eq!(stages[1].dialed.lock().unwrap().len(), dialed);
-    assert_eq!(stages[0].dialed.lock().unwrap().len(), 2);
+    assert!(route.has_room(&target().purpose));
+    let normal = route.dial(&target()).await.unwrap();
+    assert_eq!(normal.path.leg, Some(1));
+    assert!(matches!(
+        stages[1].dialed.lock().unwrap().last(),
+        Some(Purpose::Nntp {
+            leg: 1,
+            probing: false,
+            ..
+        })
+    ));
+    assert_eq!(stages[0].dialed.lock().unwrap().len(), probed);
+    assert_eq!(route.allocations()[0].health, LegHealthState::Probing);
+    assert_eq!(route.allocations()[1].health, LegHealthState::Up);
 
     *stages[0].full.lock().unwrap() = None;
     let probe = route.dial(&target()).await.unwrap();

@@ -634,33 +634,39 @@ impl Weighted {
         self.shared.publish(&state);
     }
     // Open a connection on the leg with the most target left among those
-    // with room in the share `purpose` takes, a probing leg first. With none,
-    // the dial is at capacity until a socket frees on any leg's share or the
-    // route changes. A probe tests its own leg, so while the probing leg has
-    // no room the dial waits for that leg's share instead of landing on
-    // another leg.
+    // with room in the share `purpose` takes, a probing leg first. A probing
+    // leg with no room gives way to the other legs; the dial that lands on
+    // one of them is that leg's own, never the probe. With no leg, the dial
+    // is at capacity until a socket frees on any leg's share or the route
+    // changes.
     fn begin(&self, purpose: &weaver_tunnel::pipe::Purpose) -> Result<Opening, DialError> {
         let mut state = self.shared.state.lock().expect("leg allocation");
         let allocations = state.snapshot();
         let legs = self.legs.read().expect("route stages");
-        if let Some(waits) = self.probe_waits(&allocations, &legs, purpose) {
-            return Err(DialError::AtCapacity(waits));
-        }
         let mut waits = vec![self.shared.changed.clone()];
         let position = allocations
             .iter()
             .filter(|a| a.target > a.open.saturating_add(a.opening))
-            .filter(
-                |a| match legs.get(a.position).map(|leg| leg.room(purpose)) {
+            .filter(|a| {
+                match legs
+                    .get(a.position)
+                    .map(|leg| leg.room(&placed(purpose, a)))
+                {
                     Some(Ok(())) => true,
                     Some(Err(freed)) => {
                         waits.extend(freed);
                         false
                     }
                     None => false,
-                },
-            )
-            .max_by_key(|a| rank(a))
+                }
+            })
+            .max_by_key(|a| {
+                (
+                    matches!(a.health, LegHealthState::Probing),
+                    a.target - a.open - a.opening,
+                    std::cmp::Reverse(a.position),
+                )
+            })
             .map(|a| a.position)
             .ok_or(DialError::AtCapacity(waits))?;
         let dialer = legs[position].clone();
@@ -676,39 +682,23 @@ impl Weighted {
             completed: false,
         })
     }
-    // What a dial waits on when the leg `begin` ranks first is probing and
-    // has no room for `purpose`: that leg's share and the route.
-    fn probe_waits(
-        &self,
-        allocations: &[LegAllocation],
-        legs: &[Arc<dyn Dialer>],
-        purpose: &weaver_tunnel::pipe::Purpose,
-    ) -> Option<Vec<Arc<Notify>>> {
-        let first = allocations
-            .iter()
-            .filter(|a| a.target > a.open.saturating_add(a.opening))
-            .max_by_key(|a| rank(a))?;
-        if !matches!(first.health, LegHealthState::Probing) {
-            return None;
-        }
-        let Err(freed) = legs.get(first.position)?.room(purpose) else {
-            return None;
-        };
-        let mut waits = vec![self.shared.changed.clone()];
-        waits.extend(freed);
-        Some(waits)
-    }
 }
 
-// How `begin` ranks the legs with target left: a probing leg first, then the
-// most target left, then the earliest leg.
-fn rank(a: &LegAllocation) -> (bool, u16, std::cmp::Reverse<usize>) {
-    (
-        matches!(a.health, LegHealthState::Probing),
-        a.target - a.open - a.opening,
-        std::cmp::Reverse(a.position),
-    )
+// `purpose` as a dial on leg `a` carries it: a usenet connection names its
+// leg and whether it probes that leg, so a probe's room is asked of the rung
+// the probe dials.
+fn placed(
+    purpose: &weaver_tunnel::pipe::Purpose,
+    a: &LegAllocation,
+) -> weaver_tunnel::pipe::Purpose {
+    let mut purpose = purpose.clone();
+    if let weaver_tunnel::pipe::Purpose::Nntp { leg, probing, .. } = &mut purpose {
+        *leg = a.position;
+        *probing = matches!(a.health, LegHealthState::Probing);
+    }
+    purpose
 }
+
 impl Drop for Weighted {
     fn drop(&mut self) {
         if let Some(timer) = self.timer.get_mut().expect("allocation timer").take() {
@@ -827,15 +817,15 @@ impl Dialer for Weighted {
     fn room(&self, purpose: &weaver_tunnel::pipe::Purpose) -> Result<(), Vec<Arc<Notify>>> {
         let allocations = self.allocations();
         let legs = self.legs.read().expect("route stages");
-        if let Some(waits) = self.probe_waits(&allocations, &legs, purpose) {
-            return Err(waits);
-        }
         let mut waits = vec![self.shared.changed.clone()];
         for a in allocations
             .iter()
             .filter(|a| a.target > a.open.saturating_add(a.opening))
         {
-            match legs.get(a.position).map(|leg| leg.room(purpose)) {
+            match legs
+                .get(a.position)
+                .map(|leg| leg.room(&placed(purpose, a)))
+            {
                 Some(Ok(())) => return Ok(()),
                 Some(Err(freed)) => waits.extend(freed),
                 None => {}

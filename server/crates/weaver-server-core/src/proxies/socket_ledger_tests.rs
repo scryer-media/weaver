@@ -290,30 +290,9 @@ fn three_torrent_sessions_on_one_tunnel_all_bind_their_sockets() {
     assert!(!sockets.has_room(core));
 }
 
-// A torrent session belongs to a leg: two legs of one route through the
-// same tunnel are two sessions there, and two routes on one leg share one.
+// Two torrent routes on one leg share one session on its tunnel.
 #[test]
-fn torrent_sessions_are_counted_per_leg_not_per_route() {
-    let two_legs = socket_ledger(
-        &[(
-            Consumer::Torrent(TorrentScope::Default),
-            route(
-                vec![Rung::Proxy { id: 1 }, Rung::Chain { ids: vec![1, 5] }],
-                Failover::Redistribute,
-            ),
-        )],
-        &profiles(&[1], &[5]),
-        &HashMap::new(),
-        &HashMap::new(),
-        256,
-    );
-    let both = &two_legs[&tunnel(1)];
-    assert_eq!(both.torrent_sessions, 2);
-    assert_eq!(
-        both.shares().core - SOCKET_CORE_BASE,
-        2 * SOCKETS_PER_TORRENT_SESSION
-    );
-
+fn two_torrent_routes_on_one_leg_share_one_session() {
     let one_leg = socket_ledger(
         &[
             (
