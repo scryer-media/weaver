@@ -266,11 +266,13 @@ async fn run(signal: &'static WalSignal, mut connection: SqliteConnection) {
         {
             tracing::warn!(error = %error, "WAL checkpoint failed");
         }
+        // Counted before completion wakes anyone, so a writer released by
+        // `caught_up` already sees the run that released it.
+        #[cfg(test)]
+        signal.runs.send_modify(|runs| *runs += 1);
         signal
             .completed
             .send_modify(|done| *done = (*done).max(target));
-        #[cfg(test)]
-        signal.runs.send_modify(|runs| *runs += 1);
         if stopping {
             break;
         }
