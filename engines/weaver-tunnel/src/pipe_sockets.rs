@@ -42,7 +42,8 @@ impl SocketClass {
             Purpose::NntpProbe { .. }
             | Purpose::ProxyEndpoint { .. }
             | Purpose::Probe
-            | Purpose::Dns => Self::ReserveCore,
+            | Purpose::Dns
+            | Purpose::Datagram => Self::ReserveCore,
             Purpose::TorrentHttp | Purpose::Feed { .. } | Purpose::Outbound => Self::ReserveHttp,
         }
     }
@@ -107,17 +108,25 @@ struct Ledger {
 impl Ledger {
     // Sockets held above their share's size, by shares that shrank.
     fn overflow(&self) -> usize {
-        (0..3)
-            .map(|i| self.held[i].saturating_sub(self.size[i]))
+        self.held
+            .iter()
+            .zip(&self.size)
+            .map(|(held, size)| held.saturating_sub(*size))
             .sum()
     }
 
     // How many sockets each share may hold now: its size, less the growth
     // still waiting on the sockets the shrunk shares hold above their size.
+    // A share already above its own size takes none of that wait, since it
+    // opens nothing until it is back under its size anyway.
     fn limits(&self) -> [usize; 4] {
         let mut overflow = self.overflow();
         let mut limits = self.size;
-        for (limit, &growing) in limits.iter_mut().zip(&self.growing) {
+        let shares = limits.iter_mut().zip(&self.held).zip(&self.growing);
+        for ((limit, &held), &growing) in shares {
+            if held > *limit {
+                continue;
+            }
             let waiting = overflow.min(growing);
             overflow -= waiting;
             *limit -= waiting;
@@ -227,10 +236,21 @@ impl SessionSockets {
 
     // Whether `class` has a socket free now.
     pub fn has_room(&self, class: SocketClass) -> bool {
-        self.shares.as_ref().is_none_or(|inner| {
-            let ledger = inner.ledger();
-            ledger.held[index(class)] < ledger.limits()[index(class)]
-        })
+        self.room(class).is_ok()
+    }
+
+    // A socket free in `class`'s share now, or the signal that one is freed.
+    pub fn room(&self, class: SocketClass) -> Result<(), Arc<Notify>> {
+        let Some(inner) = &self.shares else {
+            return Ok(());
+        };
+        let i = index(class);
+        let ledger = inner.ledger();
+        if ledger.held[i] < ledger.limits()[i] {
+            Ok(())
+        } else {
+            Err(Arc::clone(&inner.freed[i]))
+        }
     }
 
     // A permit of `class`'s share, or the signal that one is freed when the
@@ -387,5 +407,45 @@ mod tests {
         usenet.pop();
         assert!(!sockets.has_room(SocketClass::Torrent));
         assert!(sockets.take(SocketClass::Nntp).unwrap().is_some());
+    }
+
+    // A share that moves twice before the shrunk share's sockets end still
+    // never lets the shares hold more than they add up to.
+    #[test]
+    fn two_rebudgets_in_a_row_never_let_the_shares_hold_more_than_the_total() {
+        let shares = |nntp, torrent| SocketShares {
+            nntp,
+            torrent,
+            core: 8,
+            http: 8,
+        };
+        let sockets = SessionSockets::new(shares(100, 100));
+        let take_all = |class, held: &mut Vec<SocketPermit>| {
+            while let Ok(permit) = sockets.take(class) {
+                held.push(permit.unwrap());
+            }
+        };
+        let mut usenet = Vec::new();
+        let mut torrent = Vec::new();
+        take_all(SocketClass::Nntp, &mut usenet);
+        take_all(SocketClass::Torrent, &mut torrent);
+        assert_eq!((usenet.len(), torrent.len()), (100, 100));
+
+        sockets.set_shares(shares(50, 150));
+        take_all(SocketClass::Torrent, &mut torrent);
+        assert_eq!(torrent.len(), 100);
+
+        sockets.set_shares(shares(70, 130));
+        take_all(SocketClass::Torrent, &mut torrent);
+        assert_eq!(torrent.len(), 100);
+        while usenet.len() > 70 {
+            usenet.pop();
+            take_all(SocketClass::Nntp, &mut usenet);
+            take_all(SocketClass::Torrent, &mut torrent);
+            assert_eq!(usenet.len() + torrent.len(), 200);
+        }
+        assert_eq!((usenet.len(), torrent.len()), (70, 130));
+        assert!(!sockets.has_room(SocketClass::Nntp));
+        assert!(!sockets.has_room(SocketClass::Torrent));
     }
 }

@@ -87,6 +87,8 @@ pub enum Purpose {
     Probe,
     // A DNS query a hop asks to resolve a name dialled through it.
     Dns,
+    // A datagram socket a torrent session binds: DHT, uTP, UDP trackers.
+    Datagram,
 }
 
 #[derive(Clone, Debug)]
@@ -552,10 +554,14 @@ pub trait Dialer: Send + Sync {
     fn has_capacity(&self) -> bool {
         true
     }
-    // Whether a dial for `purpose` finds a socket free in the share it
-    // counts against. A path with no shares always has room.
-    fn has_room(&self, _purpose: &Purpose) -> bool {
-        true
+    // Room for a dial for `purpose` in the share it counts against, or the
+    // signals that fire when room may have freed. A path with no shares
+    // always has room.
+    fn room(&self, _purpose: &Purpose) -> Result<(), Vec<Arc<Notify>>> {
+        Ok(())
+    }
+    fn has_room(&self, purpose: &Purpose) -> bool {
+        self.room(purpose).is_ok()
     }
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError>;
     async fn resolve(&self, _host: &str) -> Result<Resolution, DialError> {
@@ -918,8 +924,8 @@ impl Dialer for TransportHop {
     }
     // Each connection through the proxy opens one endpoint connection in
     // the share of the tunnel beneath.
-    fn has_room(&self, purpose: &Purpose) -> bool {
-        self.inner.has_room(purpose)
+    fn room(&self, purpose: &Purpose) -> Result<(), Vec<Arc<Notify>>> {
+        self.inner.room(purpose)
     }
     fn failing_hop(&self) -> Option<FailingHop> {
         self.inner
@@ -1326,8 +1332,10 @@ impl Dialer for SessionHop {
             .failing_hop()
             .or_else(|| self.failure.of(self.id))
     }
-    fn has_room(&self, purpose: &Purpose) -> bool {
-        self.sockets.has_room(SocketClass::of(purpose))
+    fn room(&self, purpose: &Purpose) -> Result<(), Vec<Arc<Notify>>> {
+        self.sockets
+            .room(SocketClass::of(purpose))
+            .map_err(|freed| vec![freed])
     }
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
         self.resolver
@@ -1502,10 +1510,10 @@ impl Dialer for Fallback {
         }
     }
     // Room on the first rung a dial would try.
-    fn has_room(&self, purpose: &Purpose) -> bool {
+    fn room(&self, purpose: &Purpose) -> Result<(), Vec<Arc<Notify>>> {
         (0..self.rungs.len())
             .find(|index| self.allows_rung(*index, false))
-            .is_none_or(|index| self.rungs[index].has_room(purpose))
+            .map_or(Ok(()), |index| self.rungs[index].room(purpose))
     }
     // The datagrams of the first rung a dial would try.
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {

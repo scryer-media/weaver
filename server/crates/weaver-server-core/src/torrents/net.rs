@@ -308,6 +308,10 @@ impl SocketFactory for LegSockets {
         self.dialer.has_room(&Purpose::Torrent)
     }
 
+    fn datagram_room(&self) -> bool {
+        self.dialer.has_room(&Purpose::Datagram)
+    }
+
     fn connect_tcp<'a>(
         &'a self,
         addr: SocketAddr,

@@ -2316,8 +2316,12 @@ struct RecordsPurpose(Mutex<Vec<Purpose>>);
 
 #[async_trait::async_trait]
 impl Dialer for RecordsPurpose {
-    fn has_room(&self, purpose: &Purpose) -> bool {
-        SocketClass::of(purpose) != SocketClass::ReserveHttp
+    fn room(&self, purpose: &Purpose) -> Result<(), Vec<Arc<tokio::sync::Notify>>> {
+        if SocketClass::of(purpose) == SocketClass::ReserveHttp {
+            Err(Vec::new())
+        } else {
+            Ok(())
+        }
     }
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
         self.0.lock().unwrap().push(target.purpose.clone());

@@ -108,6 +108,12 @@ pub trait SocketFactory: Send + Sync + 'static {
         true
     }
 
+    /// Whether a datagram socket bind finds a socket free now. A route that
+    /// holds its datagram sockets to a share says no once the share is full.
+    fn datagram_room(&self) -> bool {
+        true
+    }
+
     /// Bind a datagram socket on `addr`.
     fn bind_udp<'a>(
         &'a self,

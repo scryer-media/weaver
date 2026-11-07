@@ -633,12 +633,27 @@ impl Weighted {
         state.cap = cap;
         self.shared.publish(&state);
     }
-    fn begin(&self) -> Result<Opening, DialError> {
+    // Open a connection on the leg with the most target left among those
+    // with room in the share `purpose` takes. With none, the dial is at
+    // capacity until a socket frees on any leg's share or the route changes.
+    fn begin(&self, purpose: &weaver_tunnel::pipe::Purpose) -> Result<Opening, DialError> {
         let mut state = self.shared.state.lock().expect("leg allocation");
         let allocations = state.snapshot();
+        let legs = self.legs.read().expect("route stages");
+        let mut waits = vec![self.shared.changed.clone()];
         let position = allocations
             .iter()
             .filter(|a| a.target > a.open.saturating_add(a.opening))
+            .filter(
+                |a| match legs.get(a.position).map(|leg| leg.room(purpose)) {
+                    Some(Ok(())) => true,
+                    Some(Err(freed)) => {
+                        waits.extend(freed);
+                        false
+                    }
+                    None => false,
+                },
+            )
             .max_by_key(|a| {
                 (
                     matches!(a.health, LegHealthState::Probing),
@@ -647,7 +662,9 @@ impl Weighted {
                 )
             })
             .map(|a| a.position)
-            .ok_or_else(|| DialError::AtCapacity(vec![self.shared.changed.clone()]))?;
+            .ok_or(DialError::AtCapacity(waits))?;
+        let dialer = legs[position].clone();
+        drop(legs);
         state.legs[position].opening += 1;
         self.shared.publish(&state);
         Ok(Opening {
@@ -655,7 +672,7 @@ impl Weighted {
             position,
             generation: state.legs[position].generation,
             probe: matches!(allocations[position].health, LegHealthState::Probing),
-            dialer: self.legs.read().expect("route stages")[position].clone(),
+            dialer,
             completed: false,
         })
     }
@@ -773,19 +790,26 @@ impl Dialer for Weighted {
             .any(|a| a.target > a.open.saturating_add(a.opening))
     }
     // Room on a leg with capacity left, in the share of the tunnel that
-    // leg's next socket for `purpose` would take.
-    fn has_room(&self, purpose: &weaver_tunnel::pipe::Purpose) -> bool {
+    // leg's next socket for `purpose` would take: the legs `begin` chooses
+    // among.
+    fn room(&self, purpose: &weaver_tunnel::pipe::Purpose) -> Result<(), Vec<Arc<Notify>>> {
+        let allocations = self.allocations();
         let legs = self.legs.read().expect("route stages");
-        self.allocations()
+        let mut waits = vec![self.shared.changed.clone()];
+        for a in allocations
             .iter()
             .filter(|a| a.target > a.open.saturating_add(a.opening))
-            .any(|a| {
-                legs.get(a.position)
-                    .is_some_and(|leg| leg.has_room(purpose))
-            })
+        {
+            match legs.get(a.position).map(|leg| leg.room(purpose)) {
+                Some(Ok(())) => return Ok(()),
+                Some(Err(freed)) => waits.extend(freed),
+                None => {}
+            }
+        }
+        Err(waits)
     }
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
-        let opening = self.begin()?;
+        let opening = self.begin(&target.purpose)?;
         let position = opening.position;
         let mut target = target.clone();
         if let weaver_tunnel::pipe::Purpose::Nntp { leg, probing, .. } = &mut target.purpose {

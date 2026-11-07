@@ -344,10 +344,15 @@ impl StreamConnector {
         &self.stats
     }
 
-    // Whether a dial may go over uTP: the socket is bound, or a dial binds
-    // it again.
+    // Whether the outgoing uTP socket is bound.
     fn has_utp(&self) -> bool {
-        self.utp_socket.initialized() || self.utp_rebind.is_some()
+        self.utp_socket.initialized()
+    }
+
+    // Whether a dial may go over uTP: the socket is bound, or a dial may
+    // bind it again.
+    fn may_utp(&self) -> bool {
+        self.has_utp() || self.utp_rebind.is_some()
     }
 
     /// The outgoing uTP socket a dial bound after the session started.
@@ -355,14 +360,17 @@ impl StreamConnector {
         self.utp_rebind.as_ref().and(self.utp_socket.get())
     }
 
-    // The outgoing uTP socket, bound now when the last bind failed. Dials
-    // that want it meanwhile wait for the one bind and try again after it
-    // when it fails.
+    // The outgoing uTP socket, bound now when the last bind failed and the
+    // route has a datagram socket free. Dials that want it meanwhile wait
+    // for the one bind and try again after it when it fails.
     async fn utp(&self) -> Option<&UtpSocket> {
         if let Some(socket) = self.utp_socket.get() {
             return Some(socket);
         }
         let rebind = self.utp_rebind.as_ref()?;
+        if !self.socket_factory.datagram_room() {
+            return None;
+        }
         self.utp_socket
             .get_or_try_init(|| {
                 crate::listen::bind_utp(
@@ -426,7 +434,7 @@ impl StreamConnector {
         let tcp_failed_notify = tokio::sync::Notify::new();
 
         let utp_connect = async {
-            if !self.has_utp() {
+            if !self.may_utp() {
                 return Ok(None);
             }
 
@@ -467,7 +475,11 @@ impl StreamConnector {
                     (None, None) => return Err(Error::ConnectDisabled),
                 }
             }
+            // TCP is polled first, as it has priority. A TCP attempt that
+            // fails on its first poll is told to the uTP attempt before that
+            // attempt waits, so the notify keeps it for that wait.
             tokio::select! {
+                biased;
                 tcp_res = &mut tcp_connect, if tcp_err.is_none() => {
                     match tcp_res {
                         Ok(Some((r, w))) => {
@@ -649,9 +661,14 @@ mod tests {
     struct FirstBindFails {
         sockets: Arc<dyn SocketFactory>,
         binds: std::sync::atomic::AtomicUsize,
+        room: std::sync::atomic::AtomicBool,
     }
 
     impl SocketFactory for FirstBindFails {
+        fn datagram_room(&self) -> bool {
+            self.room.load(Ordering::Relaxed)
+        }
+
         fn connect_tcp<'a>(
             &'a self,
             addr: SocketAddr,
@@ -692,6 +709,7 @@ mod tests {
         let factory = Arc::new(FirstBindFails {
             sockets: crate::test_support::socket_factory(),
             binds: Default::default(),
+            room: true.into(),
         });
         let connector = StreamConnector::new(StreamConnectorArgs {
             utp_rebind: Some(UtpRebind {
@@ -722,6 +740,53 @@ mod tests {
         }
         assert_eq!(factory.binds.load(Ordering::Relaxed), 2);
         assert!(connector.rebound_utp().is_some());
+    }
+
+    // A failed uTP bind is tried again only while the route has a datagram
+    // socket free, and the connector reports uTP only once it is bound.
+    #[tokio::test]
+    async fn a_failed_utp_bind_waits_for_a_datagram_socket_free() {
+        let factory = Arc::new(FirstBindFails {
+            sockets: crate::test_support::socket_factory(),
+            binds: Default::default(),
+            room: false.into(),
+        });
+        let connector = StreamConnector::new(StreamConnectorArgs {
+            utp_rebind: Some(UtpRebind {
+                address: (Ipv4Addr::LOCALHOST, 0).into(),
+                opts: Default::default(),
+                receive_buffer: crate::udp_options::STREAM_WINDOW,
+                connection_slots: Arc::new(crate::connection_slots::ConnectionSlots::new(
+                    8,
+                    0,
+                    std::num::NonZeroU32::new(10).unwrap(),
+                )),
+            }),
+            ..StreamConnectorArgs::over(factory.clone())
+        })
+        .await
+        .unwrap();
+        let theirs = loopback_utp().await;
+        for _ in 0..2 {
+            let refused = connector.connect(theirs.bind_addr(), Transports::Utp).await;
+            assert!(matches!(refused, Err(Error::ConnectDisabled)));
+        }
+        assert_eq!(factory.binds.load(Ordering::Relaxed), 0);
+        assert!(!connector.has_utp());
+
+        factory.room.store(true, Ordering::Relaxed);
+        // The first bind with room fails as the session's did; the next binds.
+        let first = connector.connect(theirs.bind_addr(), Transports::Utp).await;
+        assert!(matches!(first, Err(Error::ConnectDisabled)));
+        assert!(!connector.has_utp());
+        let (accepted, connected) = tokio::join!(
+            theirs.accept(),
+            connector.connect(theirs.bind_addr(), Transports::Utp)
+        );
+        accepted.unwrap();
+        assert!(matches!(connected.unwrap().0, ConnectionKind::Utp));
+        assert!(connector.has_utp());
+        assert_eq!(factory.binds.load(Ordering::Relaxed), 2);
     }
 
     /// The kernel's sockets on a route with a TCP socket free whose every

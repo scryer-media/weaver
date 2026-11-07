@@ -224,13 +224,12 @@ impl Configuration {
         self.socket_ledger
             .get(path)
             .cloned()
-            .unwrap_or_else(|| TunnelSockets {
-                egress: path.0,
-                proxy: path.1.last().copied().unwrap_or_default(),
-                cap: self.socket_cap,
-                nntp: 0,
-                reserve: socket_reserve(self.socket_cap),
-                torrent: false,
+            .unwrap_or_else(|| {
+                TunnelSockets::new(
+                    path.0,
+                    path.1.last().copied().unwrap_or_default(),
+                    self.socket_cap,
+                )
             })
             .shares()
     }

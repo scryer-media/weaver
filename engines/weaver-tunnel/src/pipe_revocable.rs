@@ -112,8 +112,8 @@ impl Dialer for Revocable {
             .map_err(|e| DialError::Skipped(e.to_string()))?;
         self.inner.resolve(host).await
     }
-    fn has_room(&self, purpose: &super::Purpose) -> bool {
-        self.inner.has_room(purpose)
+    fn room(&self, purpose: &super::Purpose) -> Result<(), Vec<Arc<tokio::sync::Notify>>> {
+        self.inner.room(purpose)
     }
     // The leg's datagrams, while it is not revoked.
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {

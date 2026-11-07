@@ -13,9 +13,17 @@ struct Scripted {
     mode: AtomicU8,
     started: Notify,
     dialed: std::sync::Mutex<Vec<Purpose>>,
+    // The signal of a full tunnel share, while the leg has no room.
+    full: std::sync::Mutex<Option<Arc<Notify>>>,
 }
 #[async_trait::async_trait]
 impl Dialer for Scripted {
+    fn room(&self, _: &Purpose) -> Result<(), Vec<Arc<Notify>>> {
+        match &*self.full.lock().unwrap() {
+            Some(freed) => Err(vec![freed.clone()]),
+            None => Ok(()),
+        }
+    }
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
         self.dialed.lock().unwrap().push(target.purpose.clone());
         self.started.notify_one();
@@ -81,6 +89,7 @@ fn create(cap: u16) -> (Arc<Weighted>, Vec<Arc<Scripted>>) {
                 mode: AtomicU8::new(0),
                 started: Notify::new(),
                 dialed: Default::default(),
+                full: Default::default(),
             })
         })
         .collect();
@@ -117,6 +126,38 @@ async fn deficits_admit_exactly_the_cap_and_close_returns_capacity() {
     ));
     streams.pop().unwrap().outcome.closed();
     assert_eq!(route.dial(&target()).await.unwrap().path.leg, Some(1));
+}
+
+// A leg whose tunnel share is full is passed over for one with room, and
+// with no room on any leg the dial waits on every leg's share and the route.
+#[tokio::test]
+async fn a_full_share_sends_dials_to_the_leg_with_room() {
+    let (route, stages) = create(5);
+    let freed = Arc::new(Notify::new());
+    *stages[0].full.lock().unwrap() = Some(freed.clone());
+    let mut streams = Vec::new();
+    let waits = loop {
+        match route.dial(&target()).await {
+            Ok(dialed) => streams.push(dialed),
+            Err(DialError::AtCapacity(waits)) => break waits,
+            Err(error) => panic!("{error}"),
+        }
+    };
+    assert!(!streams.is_empty());
+    assert!(streams.iter().all(|s| s.path.leg == Some(1)));
+    assert!(stages[0].dialed.lock().unwrap().is_empty());
+    assert!(!route.has_room(&target().purpose));
+    assert!(waits.iter().any(|wait| Arc::ptr_eq(wait, &freed)));
+    assert!(
+        waits
+            .iter()
+            .any(|wait| Arc::ptr_eq(wait, &route.budget_changed()))
+    );
+
+    *stages[0].full.lock().unwrap() = None;
+    assert!(route.has_room(&target().purpose));
+    assert_eq!(route.dial(&target()).await.unwrap().path.leg, Some(0));
+    assert_eq!(stages[0].dialed.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -287,6 +328,7 @@ async fn replaced_leg_ignores_old_close_failure_and_cancel_callbacks() {
         mode: AtomicU8::new(0),
         started: Notify::new(),
         dialed: Default::default(),
+        full: Default::default(),
     });
     route
         .update(definition, vec![replacement, stages[1].clone()], 5)

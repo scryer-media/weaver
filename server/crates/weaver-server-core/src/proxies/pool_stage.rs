@@ -946,8 +946,8 @@ impl Dialer for MemberPin {
     fn offers(&self) -> weaver_tunnel::pipe::Transports {
         self.member.dialer.offers()
     }
-    fn has_room(&self, purpose: &weaver_tunnel::pipe::Purpose) -> bool {
-        self.member.dialer.has_room(purpose)
+    fn room(&self, purpose: &weaver_tunnel::pipe::Purpose) -> Result<(), Vec<Arc<Notify>>> {
+        self.member.dialer.room(purpose)
     }
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn weaver_tunnel::endpoint::DatagramTransport>> {
         Arc::clone(&self.member.dialer).datagrams()

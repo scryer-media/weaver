@@ -5,20 +5,22 @@
 //
 // A tunnel holds `cap` sockets. Usenet servers routed through it get every
 // connection they may put on it, so a leg that takes over a failed leg's
-// share still has the sockets. An eighth of the tunnel is reserved for the
-// rest. Half of that is never handed out, so sockets closed but still
-// lingering in the tunnel never leave a new one without room; the other half
-// is split evenly between the tunnel's own sockets (name lookups, DHT and uTP
-// datagram sockets, probes) and HTTP (trackers, web seeds, feeds), so a
-// tracker storm never takes the sockets DHT and uTP bind. Torrent peers over
-// TCP take what is left; once that is full they connect over uTP, which
-// needs no socket of its own.
+// share still has the sockets. At least an eighth of the tunnel is reserved
+// for the rest. A sixteenth is never handed out, so sockets closed but still
+// lingering in the tunnel never leave a new one without room. The tunnel's
+// own sockets (name lookups, probes, and each torrent session's datagram
+// sockets) are counted from the routes that reach it, and HTTP (trackers,
+// web seeds, feeds) has what else the reserve holds, so a tracker storm
+// never takes the sockets DHT and uTP bind. A tunnel whose own sockets need
+// more than the eighth reserves more. Torrent peers over TCP take what is
+// left; once that is full they connect over uTP, which needs no socket of
+// its own.
 //
 // Usenet connections are set per server, so a save that asks more than the
 // tunnel can hold is refused. The torrent peer limit is one setting for
 // every route, so it is never refused: its TCP peers are held to the share.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use weaver_tunnel::pipe::SocketShares;
 
@@ -30,10 +32,28 @@ use super::{
 // usenet asks.
 pub const SOCKET_PEER_FLOOR: usize = 16;
 
+// The tunnel's own sockets kept for name lookups, probes and the carriers
+// of proxies above it.
+pub const SOCKET_CORE_BASE: usize = 8;
+
+// The datagram sockets one torrent session holds on a tunnel for its whole
+// life: uTP for its peer listener (or for outgoing peers when it does not
+// listen), uTP for its SSL listener, DHT, UDP trackers, and the NAT-PMP
+// mapping of a provider that forwards its port that way.
+pub const SOCKETS_PER_TORRENT_ROUTE: usize = 5;
+
+// The HTTP sockets a tunnel keeps however many torrent routes it carries.
+pub const SOCKET_HTTP_FLOOR: usize = 4;
+
+// The tunnel's own sockets when `torrent_routes` torrent routes reach it.
+pub fn socket_core(torrent_routes: usize) -> usize {
+    SOCKET_CORE_BASE + SOCKETS_PER_TORRENT_ROUTE * torrent_routes
+}
+
 // The sockets a tunnel of `cap` reserves for everything but usenet and
-// torrent peers over TCP.
-pub fn socket_reserve(cap: usize) -> usize {
-    cap / 8
+// torrent peers over TCP, when its own sockets come to `core`.
+pub fn socket_reserve(cap: usize, core: usize) -> usize {
+    (cap / 8).max(socket_linger(cap) + core + SOCKET_HTTP_FLOOR)
 }
 
 // The part of the reserve kept for sockets closed but still lingering in the
@@ -51,19 +71,45 @@ pub struct TunnelSockets {
     // Every connection the usenet servers routed through it may hold there,
     // each with one more for replacing a connection.
     pub nntp: usize,
-    pub reserve: usize,
-    // Whether a torrent route uses the tunnel.
-    pub torrent: bool,
+    // The torrent routes that use the tunnel, each with a session of its own.
+    pub torrent_routes: usize,
+    // The SSH and HTTP/3 proxies above the tunnel, each holding one socket
+    // in it that all its connections share.
+    pub carriers: usize,
 }
 
 impl TunnelSockets {
+    pub fn new(egress: u32, proxy: u32, cap: usize) -> Self {
+        Self {
+            egress,
+            proxy,
+            cap,
+            nntp: 0,
+            torrent_routes: 0,
+            carriers: 0,
+        }
+    }
+
     // The TCP peers kept for torrents.
     pub fn peer_floor(&self) -> usize {
-        if self.torrent { SOCKET_PEER_FLOOR } else { 0 }
+        if self.torrent_routes > 0 {
+            SOCKET_PEER_FLOOR
+        } else {
+            0
+        }
+    }
+
+    fn core(&self) -> usize {
+        socket_core(self.torrent_routes) + self.carriers
+    }
+
+    // The sockets kept from usenet and torrent peers over TCP.
+    pub fn reserve(&self) -> usize {
+        socket_reserve(self.cap, self.core())
     }
 
     pub fn over_budget(&self) -> bool {
-        self.nntp + self.reserve + self.peer_floor() > self.cap
+        self.nntp + self.reserve() + self.peer_floor() > self.cap
     }
 
     // The shares the session holds its sockets to. A tunnel over budget,
@@ -71,16 +117,17 @@ impl TunnelSockets {
     // configuration, holds usenet to what the reserve and the peer floor
     // leave.
     pub fn shares(&self) -> SocketShares {
-        let reserve = self.reserve.min(self.cap);
+        let reserve = self.reserve().min(self.cap);
         let nntp = self
             .nntp
             .min(self.cap.saturating_sub(reserve + self.peer_floor()));
         let handed = reserve.saturating_sub(socket_linger(self.cap));
+        let core = self.core().min(handed);
         SocketShares {
             nntp,
             torrent: self.cap - reserve - nntp,
-            core: handed - handed / 2,
-            http: handed / 2,
+            core,
+            http: handed - core,
         }
     }
 
@@ -89,7 +136,7 @@ impl TunnelSockets {
             proxy: self.proxy,
             egress: self.egress,
             nntp: self.nntp,
-            reserve: self.reserve,
+            reserve: self.reserve(),
             peers: self.peer_floor(),
             cap: self.cap,
         }
@@ -113,7 +160,13 @@ pub fn socket_ledger(
     let mut ledger: HashMap<SessionPath, TunnelSockets> = HashMap::new();
     // What each server may put on each session, before the replacement.
     let mut asks: HashMap<(SessionPath, u32), usize> = HashMap::new();
-    for (consumer, route) in routes {
+    // The torrent routes reaching each session, each counted once however
+    // many of its legs and rungs reach it.
+    let mut torrents: HashSet<(SessionPath, usize)> = HashSet::new();
+    // The chains whose connections ride a carrier above a session, each
+    // counted once however many routes use it.
+    let mut carried: HashSet<(SessionPath, Vec<u32>)> = HashSet::new();
+    for (route_index, (consumer, route)) in routes.iter().enumerate() {
         let targets = match consumer {
             Consumer::Server(id) => connections.get(id).map(|&count| {
                 let healthy = vec![true; route.legs.len()];
@@ -138,6 +191,9 @@ pub fn socket_ledger(
                             session(&mut ledger, leg.egress_id, &ids[..=index], cap);
                         }
                     }
+                    if let Some(last) = carried_above(ids, profiles) {
+                        carried.insert(((leg.egress_id, ids[..=last].to_vec()), ids.clone()));
+                    }
                 }
                 let pooled = matches!(rung, Rung::Pool { .. });
                 let carriers = rung_carriers(rung, profiles, pools);
@@ -145,9 +201,7 @@ pub fn socket_ledger(
                     let key = session(&mut ledger, leg.egress_id, &path, cap);
                     match consumer {
                         Consumer::Torrent(_) => {
-                            if let Some(tunnel) = ledger.get_mut(&key) {
-                                tunnel.torrent = true;
-                            }
+                            torrents.insert((key, route_index));
                         }
                         Consumer::Server(id) => {
                             if let Some((count, targets)) = &targets {
@@ -165,6 +219,16 @@ pub fn socket_ledger(
             }
         }
     }
+    for (key, _) in torrents {
+        if let Some(tunnel) = ledger.get_mut(&key) {
+            tunnel.torrent_routes += 1;
+        }
+    }
+    for (key, _) in carried {
+        if let Some(tunnel) = ledger.get_mut(&key) {
+            tunnel.carriers += 1;
+        }
+    }
     for ((key, server), ask) in asks {
         let count = connections.get(&server).copied().unwrap_or(0);
         if let Some(tunnel) = ledger.get_mut(&key) {
@@ -180,9 +244,24 @@ fn wireguard(profiles: &HashMap<u32, ProxyProfile>, id: &u32) -> bool {
         .is_some_and(|profile| profile.enabled && profile.kind == ProxyKind::WireGuard)
 }
 
+// The last WireGuard hop of a chain whose connections all ride the one
+// socket an SSH or HTTP/3 proxy above it holds there.
+fn carried_above(ids: &[u32], profiles: &HashMap<u32, ProxyProfile>) -> Option<usize> {
+    let last = ids.iter().rposition(|id| wireguard(profiles, id))?;
+    ids[last + 1..]
+        .iter()
+        .any(|id| {
+            profiles.get(id).is_some_and(|profile| {
+                matches!(profile.kind, ProxyKind::Ssh | ProxyKind::Http3Connect)
+            })
+        })
+        .then_some(last)
+}
+
 // The WireGuard sessions a rung's connections open their TCP sockets in,
 // by the hops up to the session's proxy: a proxy, each member of a pool, or
-// the last WireGuard hop of a chain.
+// the last WireGuard hop of a chain, unless an SSH or HTTP/3 proxy above it
+// carries them all in one socket.
 pub fn rung_carriers(
     rung: &Rung,
     profiles: &HashMap<u32, ProxyProfile>,
@@ -196,6 +275,7 @@ pub fn rung_carriers(
             .map_or_else(Vec::new, |pool| {
                 pool.member_ids.iter().map(|id| vec![*id]).collect()
             }),
+        Rung::Chain { ids } if carried_above(ids, profiles).is_some() => Vec::new(),
         Rung::Chain { ids } => ids
             .iter()
             .rposition(|id| wireguard(profiles, id))
@@ -214,13 +294,8 @@ fn session(
     cap: usize,
 ) -> SessionPath {
     let key = (egress, path.to_vec());
-    ledger.entry(key.clone()).or_insert_with(|| TunnelSockets {
-        egress,
-        proxy: *path.last().expect("a session has a proxy"),
-        cap,
-        nntp: 0,
-        reserve: socket_reserve(cap),
-        torrent: false,
+    ledger.entry(key.clone()).or_insert_with(|| {
+        TunnelSockets::new(egress, *path.last().expect("a session has a proxy"), cap)
     });
     key
 }

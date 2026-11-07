@@ -10907,7 +10907,7 @@ async fn a_new_peer_limit_is_told_on_the_torrent_leg() {
     assert_eq!(
         limit(500).await.as_deref(),
         Some(
-            "WireGuard proxy 1 holds torrent peers over TCP to 224 of 500; the rest connect over uTP."
+            "WireGuard proxy 1 holds torrent peers over TCP to 223 of 500; the rest connect over uTP."
         )
     );
     assert_eq!(limit(200).await, None);

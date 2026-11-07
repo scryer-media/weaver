@@ -1707,9 +1707,9 @@ async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
         shares(&runtime, 256),
         SocketShares {
             nntp: 101,
-            torrent: 123,
-            core: 8,
-            http: 8
+            torrent: 122,
+            core: 13,
+            http: 4
         }
     );
     // The SOCKS session has no share at all.
@@ -1727,7 +1727,7 @@ async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
     assert_eq!(
         warning(&runtime).as_deref(),
         Some(
-            "WireGuard proxy 1 holds torrent peers over TCP to 123 of 200; the rest connect over uTP."
+            "WireGuard proxy 1 holds torrent peers over TCP to 122 of 200; the rest connect over uTP."
         )
     );
 
@@ -1737,9 +1737,9 @@ async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
         shares(&runtime, 256),
         SocketShares {
             nntp: 51,
-            torrent: 173,
-            core: 8,
-            http: 8
+            torrent: 172,
+            core: 13,
+            http: 4
         }
     );
 
@@ -1748,7 +1748,7 @@ async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
     // leave, and every leg over it says so beside any other warning.
     budget(&mut config, 230);
     runtime.apply_configuration(config.clone()).unwrap();
-    let over = "Usenet servers ask 231 sockets of WireGuard proxy 1 on egress 0, 32 are reserved and 16 kept for torrent peers, over the 256 it holds; usenet is held to 208.";
+    let over = "Usenet servers ask 231 sockets of WireGuard proxy 1 on egress 0, 33 are reserved and 16 kept for torrent peers, over the 256 it holds; usenet is held to 207.";
     assert_eq!(
         warning(&runtime).as_deref(),
         Some(format!("{over} WireGuard proxy 1 holds torrent peers over TCP to 16 of 200; the rest connect over uTP.").as_str())
@@ -1771,8 +1771,8 @@ async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
         SocketShares {
             nntp: 51,
             torrent: 397,
-            core: 16,
-            http: 16
+            core: 13,
+            http: 19
         }
     );
     assert_eq!(warning(&runtime), None);

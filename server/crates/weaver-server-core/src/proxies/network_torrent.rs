@@ -165,8 +165,8 @@ impl Dialer for PinnedMember {
     fn offers(&self) -> weaver_tunnel::pipe::Transports {
         self.pin().offers()
     }
-    fn has_room(&self, purpose: &Purpose) -> bool {
-        self.current().is_ok_and(|pin| pin.has_room(purpose))
+    fn room(&self, purpose: &Purpose) -> Result<(), Vec<Arc<tokio::sync::Notify>>> {
+        self.current().map_err(|_| Vec::new())?.room(purpose)
     }
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
         self.current().ok()?.datagrams()
@@ -227,8 +227,8 @@ impl Dialer for Carried {
     fn offers(&self) -> weaver_tunnel::pipe::Transports {
         self.stage.offers()
     }
-    fn has_room(&self, purpose: &Purpose) -> bool {
-        self.stage.has_room(purpose)
+    fn room(&self, purpose: &Purpose) -> Result<(), Vec<Arc<tokio::sync::Notify>>> {
+        self.stage.room(purpose)
     }
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
         Arc::clone(&self.stage).datagrams()

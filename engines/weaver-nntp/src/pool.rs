@@ -2214,10 +2214,17 @@ mod tests {
             fn has_capacity(&self) -> bool {
                 true
             }
-            fn has_room(&self, purpose: &Purpose) -> bool {
+            fn room(
+                &self,
+                purpose: &Purpose,
+            ) -> std::result::Result<(), Vec<Arc<tokio::sync::Notify>>> {
                 assert!(matches!(purpose, Purpose::Nntp { .. }));
                 self.asked.send(()).ok();
-                self.room.load(Ordering::Acquire)
+                if self.room.load(Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err(vec![self.freed.clone()])
+                }
             }
             async fn dial(&self, _: &Target) -> std::result::Result<Dialed, DialError> {
                 let dials = self.dials.fetch_add(1, Ordering::AcqRel) + 1;
