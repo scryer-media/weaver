@@ -10,7 +10,7 @@
 // one permit of its share until it is dropped.
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::Notify;
 
 use super::Purpose;
 
@@ -72,66 +72,94 @@ impl SocketShares {
     }
 }
 
-struct Share {
-    permits: Arc<Semaphore>,
-    // The share's size and the permits still to be taken back from sockets
-    // that were busy when it shrank.
-    size: Mutex<(usize, usize)>,
-    freed: Arc<Notify>,
+const CLASSES: [SocketClass; 3] = [
+    SocketClass::Nntp,
+    SocketClass::Torrent,
+    SocketClass::Reserve,
+];
+
+const fn index(class: SocketClass) -> usize {
+    match class {
+        SocketClass::Nntp => 0,
+        SocketClass::Torrent => 1,
+        SocketClass::Reserve => 2,
+    }
 }
 
-impl Share {
-    fn new(size: usize) -> Self {
-        Self {
-            permits: Arc::new(Semaphore::new(size)),
-            size: Mutex::new((size, 0)),
-            freed: Arc::new(Notify::new()),
-        }
+// Every share of a session, under one lock so a re-budget and the sockets
+// ending during it are settled together.
+#[derive(Default)]
+struct Ledger {
+    size: [usize; 3],
+    held: [usize; 3],
+    // How much of each share grew while another share still held sockets
+    // above its new size. That growth waits for those sockets to end.
+    growing: [usize; 3],
+}
+
+impl Ledger {
+    // Sockets held above their share's size, by shares that shrank.
+    fn overflow(&self) -> usize {
+        (0..3)
+            .map(|i| self.held[i].saturating_sub(self.size[i]))
+            .sum()
     }
 
-    // Grow by handing out permits, first cancelling any still owed. Shrink
-    // by taking back the free permits now and the busy ones as they end.
-    fn resize(&self, size: usize) {
-        let mut state = self.size.lock().expect("socket share");
-        let (current, owed) = &mut *state;
-        if size >= *current {
-            let mut grow = size - *current;
-            let cancelled = grow.min(*owed);
-            *owed -= cancelled;
-            grow -= cancelled;
-            self.permits.add_permits(grow);
-        } else {
-            let shrink = *current - size;
-            let taken = self.permits.forget_permits(shrink);
-            *owed += shrink - taken;
+    // How many sockets each share may hold now: its size, less the growth
+    // still waiting on the sockets the shrunk shares hold above their size.
+    fn limits(&self) -> [usize; 3] {
+        let mut overflow = self.overflow();
+        let mut limits = self.size;
+        for (limit, &growing) in limits.iter_mut().zip(&self.growing) {
+            let waiting = overflow.min(growing);
+            overflow -= waiting;
+            *limit -= waiting;
         }
-        *current = size;
-        drop(state);
-        self.freed.notify_waiters();
+        limits
+    }
+
+    fn settle(&mut self) {
+        if self.overflow() == 0 {
+            self.growing = [0; 3];
+        }
+    }
+}
+
+struct Shares {
+    ledger: Mutex<Ledger>,
+    freed: [Arc<Notify>; 3],
+}
+
+impl Shares {
+    fn ledger(&self) -> std::sync::MutexGuard<'_, Ledger> {
+        self.ledger.lock().expect("socket shares")
+    }
+
+    fn wake(&self) {
+        for freed in &self.freed {
+            freed.notify_waiters();
+        }
     }
 }
 
 // The permit one socket holds of its share.
 pub struct SocketPermit {
-    share: Arc<Share>,
-    permit: Option<OwnedSemaphorePermit>,
+    shares: Arc<Shares>,
+    class: usize,
 }
 
 impl Drop for SocketPermit {
     fn drop(&mut self) {
-        let Some(permit) = self.permit.take() else {
-            return;
-        };
-        {
-            let mut state = self.share.size.lock().expect("socket share");
-            if state.1 > 0 {
-                state.1 -= 1;
-                permit.forget();
-                return;
-            }
+        let mut ledger = self.shares.ledger();
+        ledger.held[self.class] -= 1;
+        let overflowed = ledger.growing.iter().any(|&growing| growing > 0);
+        ledger.settle();
+        drop(ledger);
+        if overflowed {
+            self.shares.wake();
+        } else {
+            self.shares.freed[self.class].notify_waiters();
         }
-        drop(permit);
-        self.share.freed.notify_waiters();
     }
 }
 
@@ -139,84 +167,87 @@ impl Drop for SocketPermit {
 // holds its sockets to no share at all.
 #[derive(Default)]
 pub struct SessionSockets {
-    shares: Option<[Arc<Share>; 3]>,
+    shares: Option<Arc<Shares>>,
 }
 
 impl SessionSockets {
     pub fn new(shares: SocketShares) -> Self {
         Self {
-            shares: Some([
-                Arc::new(Share::new(shares.nntp)),
-                Arc::new(Share::new(shares.torrent)),
-                Arc::new(Share::new(shares.reserve)),
-            ]),
+            shares: Some(Arc::new(Shares {
+                ledger: Mutex::new(Ledger {
+                    size: CLASSES.map(|class| shares.of(class)),
+                    ..Ledger::default()
+                }),
+                freed: CLASSES.map(|_| Arc::new(Notify::new())),
+            })),
         }
     }
 
-    fn share(&self, class: SocketClass) -> Option<&Arc<Share>> {
-        let shares = self.shares.as_ref()?;
-        Some(match class {
-            SocketClass::Nntp => &shares[0],
-            SocketClass::Torrent => &shares[1],
-            SocketClass::Reserve => &shares[2],
-        })
-    }
-
-    // Resize every share. Sockets already open stay open; a share that
-    // shrank below them takes no new one until enough have ended.
+    // Resize every share at once. Sockets already open stay open. A share
+    // that shrank below them takes no new one until enough have ended, and
+    // a share that grew meanwhile grows only into the sockets left free
+    // under the new total, the rest as the shrunk shares' sockets end.
     pub fn set_shares(&self, shares: SocketShares) {
-        for class in [
-            SocketClass::Nntp,
-            SocketClass::Torrent,
-            SocketClass::Reserve,
-        ] {
-            if let Some(share) = self.share(class) {
-                share.resize(shares.of(class));
-            }
+        let Some(inner) = &self.shares else {
+            return;
+        };
+        let mut ledger = inner.ledger();
+        for class in CLASSES {
+            let i = index(class);
+            let size = shares.of(class);
+            ledger.growing[i] = if size >= ledger.size[i] {
+                ledger.growing[i] + (size - ledger.size[i])
+            } else {
+                ledger.growing[i].saturating_sub(ledger.size[i] - size)
+            };
+            ledger.size[i] = size;
         }
+        ledger.settle();
+        drop(ledger);
+        inner.wake();
     }
 
     // The shares in force, when the session has them.
     pub fn shares(&self) -> Option<SocketShares> {
-        let size = |class| {
-            self.share(class)
-                .map_or(0, |share| share.size.lock().expect("socket share").0)
-        };
-        self.shares.as_ref()?;
+        let ledger = self.shares.as_ref()?.ledger();
         Some(SocketShares {
-            nntp: size(SocketClass::Nntp),
-            torrent: size(SocketClass::Torrent),
-            reserve: size(SocketClass::Reserve),
+            nntp: ledger.size[0],
+            torrent: ledger.size[1],
+            reserve: ledger.size[2],
         })
     }
 
     // Whether `class` has a socket free now.
     pub fn has_room(&self, class: SocketClass) -> bool {
-        self.share(class)
-            .is_none_or(|share| share.permits.available_permits() > 0)
+        self.shares.as_ref().is_none_or(|inner| {
+            let ledger = inner.ledger();
+            ledger.held[index(class)] < ledger.limits()[index(class)]
+        })
     }
 
     // A permit of `class`'s share, or the signal that one is freed when the
     // share is full. A session without shares hands out no permits.
     pub fn take(&self, class: SocketClass) -> Result<Option<SocketPermit>, Arc<Notify>> {
-        let Some(share) = self.share(class) else {
+        let Some(inner) = &self.shares else {
             return Ok(None);
         };
-        match share.permits.clone().try_acquire_owned() {
-            Ok(permit) => Ok(Some(SocketPermit {
-                share: Arc::clone(share),
-                permit: Some(permit),
-            })),
-            Err(_) => Err(Arc::clone(&share.freed)),
+        let i = index(class);
+        let mut ledger = inner.ledger();
+        if ledger.held[i] >= ledger.limits()[i] {
+            return Err(Arc::clone(&inner.freed[i]));
         }
+        ledger.held[i] += 1;
+        Ok(Some(SocketPermit {
+            shares: Arc::clone(inner),
+            class: i,
+        }))
     }
 
     // Sockets of `class` open now.
     pub fn held(&self, class: SocketClass) -> usize {
-        self.share(class).map_or(0, |share| {
-            let (size, owed) = *share.size.lock().expect("socket share");
-            (size + owed).saturating_sub(share.permits.available_permits())
-        })
+        self.shares
+            .as_ref()
+            .map_or(0, |inner| inner.ledger().held[index(class)])
     }
 }
 
@@ -294,5 +325,50 @@ mod tests {
         assert!(sockets.take(SocketClass::Torrent).unwrap().is_none());
         assert!(sockets.has_room(SocketClass::Torrent));
         assert_eq!(sockets.shares(), None);
+    }
+
+    // Usenet shrinks from 101 to 51 with all 101 open while torrent grows
+    // from 123 to 173: torrent takes only what the open usenet sockets leave
+    // under the total, and the rest as they close.
+    #[test]
+    fn a_rebudget_never_lets_the_shares_hold_more_than_the_total() {
+        let before = SocketShares {
+            nntp: 101,
+            torrent: 123,
+            reserve: 32,
+        };
+        let sockets = SessionSockets::new(before);
+        let mut usenet: Vec<_> = (0..101)
+            .map(|_| sockets.take(SocketClass::Nntp).unwrap().unwrap())
+            .collect();
+        let mut torrent: Vec<_> = (0..100)
+            .map(|_| sockets.take(SocketClass::Torrent).unwrap().unwrap())
+            .collect();
+        sockets.set_shares(SocketShares {
+            nntp: 51,
+            torrent: 173,
+            reserve: 32,
+        });
+        let total = 256;
+        let take_all = |torrent: &mut Vec<SocketPermit>| {
+            while let Ok(permit) = sockets.take(SocketClass::Torrent) {
+                torrent.push(permit.unwrap());
+            }
+        };
+        take_all(&mut torrent);
+        assert_eq!(torrent.len(), total - 101 - 32);
+        let reserve: Vec<_> = (0..32)
+            .map(|_| sockets.take(SocketClass::Reserve).unwrap().unwrap())
+            .collect();
+        while usenet.len() > 51 {
+            usenet.pop();
+            assert!(!sockets.has_room(SocketClass::Nntp));
+            take_all(&mut torrent);
+            assert_eq!(usenet.len() + torrent.len() + reserve.len(), total);
+        }
+        assert_eq!(torrent.len(), 173);
+        usenet.pop();
+        assert!(!sockets.has_room(SocketClass::Torrent));
+        assert!(sockets.take(SocketClass::Nntp).unwrap().is_some());
     }
 }
