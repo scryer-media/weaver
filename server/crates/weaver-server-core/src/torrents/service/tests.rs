@@ -4481,6 +4481,37 @@ async fn a_follower_is_given_only_what_moved_after_the_first_push() {
     assert!(back.removed.is_empty());
 }
 
+// Equal views have equal fingerprints; one steady field moved, down to a
+// file's length or a tracker's message, moves both; a clock field moved
+// moves only the whole one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fingerprint_moves_with_the_fields_it_covers() {
+    use fingerprint::ViewParts::{Steady, Whole};
+    let seeded = seeded().await;
+    let view = seeded.view().await;
+    assert!(!view.files.is_empty() && !view.trackers.is_empty());
+    let same = view.clone();
+    for parts in [Steady, Whole] {
+        assert_eq!(view.fingerprint(parts), same.fingerprint(parts));
+    }
+    let mut file = view.clone();
+    file.files[0].length += 1;
+    let mut tracker = view.clone();
+    tracker.trackers[0].message = Some("moved".to_owned());
+    let mut ratio = view.clone();
+    ratio.ratio += 0.5;
+    for moved in [file, tracker, ratio] {
+        for parts in [Steady, Whole] {
+            assert_ne!(view.fingerprint(parts), moved.fingerprint(parts));
+        }
+    }
+    let mut aged = view.clone();
+    aged.active_seconds += 1;
+    assert_eq!(view.fingerprint(Steady), aged.fingerprint(Steady));
+    assert_ne!(view.fingerprint(Whole), aged.fingerprint(Whole));
+    seeded.rig.service.stop().await;
+}
+
 // The clock alone moves a seeding torrent's seconds: every torrent's
 // follower, which leaves them out, has nothing to push; one torrent's
 // follower, which shows them, pushes.
@@ -4489,8 +4520,9 @@ async fn the_clock_alone_moves_only_one_torrents_follower() {
     use fingerprint::ViewParts::{Steady, Whole};
 
     let seeded = seeded().await;
-    // Nothing but the clock moves it from here: its seeder is gone and its
-    // rates have run down.
+    // Nothing but the clock moves it from here: its seeder is gone, its
+    // rates have run down, and its tracker has answered, with the next
+    // announce far past the test.
     seeded.seeder.stop().await;
     seeded.advance(60_000);
     let mut follow = seeded
@@ -4499,7 +4531,11 @@ async fn the_clock_alone_moves_only_one_torrents_follower() {
         .updates(Some(seeded.job_id), Duration::from_millis(10));
     loop {
         let view = &follow.next().await.torrents[0];
-        if view.peers == 0 && view.download_bps == 0 && view.upload_bps == 0 {
+        let answered = view
+            .trackers
+            .iter()
+            .all(|tracker| !tracker.updating && tracker.last_announce_ms.is_some());
+        if view.peers == 0 && view.download_bps == 0 && view.upload_bps == 0 && answered {
             break;
         }
     }
@@ -4513,7 +4549,10 @@ async fn the_clock_alone_moves_only_one_torrents_follower() {
     let (mut every, mut one) = (None, None);
     assert!(updates::changes(&mut every, vec![before.clone()], Steady).is_some());
     assert!(updates::changes(&mut one, vec![before], Whole).is_some());
-    assert_eq!(updates::changes(&mut every, vec![after.clone()], Steady), None);
+    assert_eq!(
+        updates::changes(&mut every, vec![after.clone()], Steady),
+        None
+    );
     let pushed = updates::changes(&mut one, vec![after.clone()], Whole).unwrap();
     assert!(!pushed.full_update);
     assert_eq!(pushed.torrents, [after]);

@@ -50,7 +50,7 @@ const SLOTS_KEY: &str = "torrent.session_slots";
 const CHOSEN_SSL_PORT_KEY: &str = "torrent.chosen_ssl_port";
 
 /// Why a torrent route has no open session.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TorrentRouteReason {
     NotAskedToOpen,
     LegDown,

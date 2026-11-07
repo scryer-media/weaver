@@ -12,7 +12,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// here (no goal, no cap), or set here.
 ///
 /// Kept as JSON as `null` (or absent), `"off"`, or the value.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Leaf<T> {
     #[default]
     Inherit,
@@ -125,7 +125,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Leaf<T> {
 }
 
 /// A level a torrent takes a setting from, the most specific first.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Level {
     Torrent,
     TrackerRule,

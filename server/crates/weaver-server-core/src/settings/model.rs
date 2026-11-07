@@ -427,7 +427,7 @@ impl Seeding {
 
 // Which seconds the seed-time goal counts: every second the torrent has
 // seeded, or only those since it last stopped seeding.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeedTimeCounting {
     #[default]
@@ -453,7 +453,7 @@ impl SeedTimeCounting {
 }
 
 // Whether any one goal ends seeding, or only all of them together.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeedingGoalMode {
     #[default]
@@ -479,7 +479,7 @@ impl SeedingGoalMode {
 }
 
 // What happens to a torrent once its goal is met.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SeedingAction {
     #[default]

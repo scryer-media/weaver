@@ -5,6 +5,8 @@
 //! torrent automation drives, served beside the first-party GraphQL API.
 
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -40,6 +42,7 @@ use weaver_server_core::settings::{
     TorrentLimit, TorrentPeerProtocol,
 };
 use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};
+use weaver_server_core::torrents::service::fingerprint::ViewParts;
 use weaver_server_core::torrents::service::{
     ActionError, AddError, AddRequest, Placement, TorrentService, TorrentSettings, TorrentView,
 };
@@ -58,7 +61,7 @@ mod sync;
 mod tests;
 
 pub(super) use api::Api;
-use sync::{Maindata, SyncClient, SyncTable};
+use sync::{CLOCK_KEYS, Fields, Poll, Row, SyncClient, SyncTable};
 
 const BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const SESSION_CAP: usize = 1024;
@@ -87,6 +90,10 @@ struct Inner {
     sessions: Mutex<SessionTable>,
     // Each client's `sync/maindata` ids and the state they stand for.
     sync: Mutex<SyncTable>,
+    // The torrent rows `sync/maindata` built, counted under test so a test
+    // pins that a poll builds only the rows whose view moved.
+    #[cfg(test)]
+    maindata_rows: AtomicU64,
     // `sync/torrentPeers` ids.
     rid: AtomicU64,
     categories: tokio::sync::Mutex<()>,
@@ -151,6 +158,8 @@ impl TorrentFacadeContext {
                 api,
                 sessions: Mutex::new(SessionTable::default()),
                 sync: Mutex::new(SyncTable::default()),
+                #[cfg(test)]
+                maindata_rows: AtomicU64::new(0),
                 rid: AtomicU64::new(0),
                 categories: tokio::sync::Mutex::new(()),
                 launched: now_secs(),
@@ -1275,11 +1284,37 @@ fn root_path(view: &TorrentView) -> String {
 
 // A torrent as `torrents/info` lists it (qBittorrent `serialize`).
 pub(super) fn info(view: &TorrentView, scope: CallerScope) -> Value {
-    let now = now_secs();
+    Value::Object(
+        steady_fields(view, scope)
+            .into_iter()
+            .chain(clock_fields(view, now_secs()))
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect(),
+    )
+}
+
+// The fields of a torrent's row that move with the clock alone, read from
+// the view's fields that do (`ViewParts`): the time active and seeding, when
+// it last moved data, the countdowns, the ratio per month active, and when
+// it was last seen complete.
+fn clock_fields(view: &TorrentView, now: i64) -> [(&'static str, Value); CLOCK_KEYS] {
+    [
+        ("eta", json!(eta(view))),
+        ("popularity", json!(popularity(view))),
+        ("seen_complete", json!(when(view.last_seen_complete_ms))),
+        ("time_active", json!(view.active_seconds)),
+        ("seeding_time", json!(seeding_time(view, now))),
+        ("last_activity", json!(last_activity(view, now))),
+        ("reannounce", json!(view.reannounce_seconds.unwrap_or(0))),
+    ]
+}
+
+// Every other field of a torrent's row, which moves only when the view does.
+fn steady_fields(view: &TorrentView, scope: CallerScope) -> Vec<(&'static str, Value)> {
     let (save_path, content_path) = view.paths();
     let (wanted, left) = wanted_and_left(view);
     let has_metadata = view.pieces.is_some();
-    let mut fields = object([
+    let mut fields = Vec::from([
         ("hash", json!(view.infohash.to_ascii_lowercase())),
         (
             "infohash_v1",
@@ -1337,7 +1372,6 @@ pub(super) fn info(view: &TorrentView, scope: CallerScope) -> Value {
             json!(view.swarm_leechers.unwrap_or(view.leechers)),
         ),
         ("state", json!(state(view))),
-        ("eta", json!(eta(view))),
         ("seq_dl", json!(view.sequential)),
         ("f_l_piece_prio", json!(view.first_last_piece_first)),
         ("category", json!(view.category.clone().unwrap_or_default())),
@@ -1364,33 +1398,22 @@ pub(super) fn info(view: &TorrentView, scope: CallerScope) -> Value {
         ("connections_count", json!(view.peers)),
         ("connections_limit", json!(view.max_peers)),
         ("ratio", json!(view.ratio)),
-        ("popularity", json!(popularity(view))),
-        ("seen_complete", json!(when(view.last_seen_complete_ms))),
         ("auto_tmm", json!(false)),
-        ("time_active", json!(view.active_seconds)),
-        ("seeding_time", json!(seeding_time(view, now))),
-        ("last_activity", json!(last_activity(view, now))),
         // Weaver does not count the copies the swarm holds.
         ("availability", json!(-1)),
-        ("reannounce", json!(view.reannounce_seconds.unwrap_or(0))),
         ("comment", json!(view.comment.clone().unwrap_or_default())),
     ]);
-    // The limits as the client keeps them, 0 for none.
-    fields = with_limits(
-        fields,
-        0,
-        [
-            ("dl_limit", view.download_limit),
-            ("up_limit", view.upload_limit),
-        ],
-    );
-    if let Some(fields) = fields.as_object_mut() {
-        fields.extend(
-            share_limits(view)
-                .into_iter()
-                .map(|(name, value)| (name.to_owned(), value)),
-        );
+    // The limits as the client keeps them, 0 for none; a closed one has no
+    // reading.
+    for (name, bps) in [
+        ("dl_limit", view.download_limit),
+        ("up_limit", view.upload_limit),
+    ] {
+        if let Some(limit) = client_limit(bps, 0) {
+            fields.push((name, limit));
+        }
     }
+    fields.extend(share_limits(view));
     fields
 }
 
@@ -3097,19 +3120,19 @@ async fn maindata(
         .unwrap_or(0);
     let views = ctx.views().await;
     let config = ctx.inner.config.read().await;
-    let torrents: Map<String, Value> = views
+    // The view's fingerprint leaves out the fields that move with the clock
+    // alone, which `clock_fields` reads; whether the caller may control
+    // torrents shapes the row too (`current_tracker`).
+    let torrents = views
         .iter()
-        .map(|view| {
-            let mut entry = info(view, scope);
-            let hash = entry
-                .as_object_mut()
-                .and_then(|entry| {
-                    entry.extend(announce_stats(view).map(|(key, value)| (key.to_owned(), value)));
-                    entry.remove("hash")
-                })
-                .and_then(|hash| hash.as_str().map(str::to_owned))
-                .unwrap_or_default();
-            (hash, entry)
+        .map(|view| Row {
+            hash: view.infohash.to_ascii_lowercase(),
+            fingerprint: {
+                let mut hasher = DefaultHasher::new();
+                (view.fingerprint(ViewParts::Steady), scope.can_control()).hash(&mut hasher);
+                hasher.finish()
+            },
+            view,
         })
         .collect();
     let mut server_state = transfer(
@@ -3173,11 +3196,17 @@ async fn maindata(
             .map(|(key, value)| (key.to_owned(), value)),
         );
     }
-    let now = Maindata {
+    let now = Poll {
         torrents,
         categories: match categories(&config) {
-            Value::Object(categories) => categories,
-            _ => Map::new(),
+            Value::Object(categories) => categories
+                .into_iter()
+                .filter_map(|(name, category)| match category {
+                    Value::Object(category) => Some((name, category)),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
         },
         tags: Vec::new(),
         server_state: match server_state {
@@ -3186,7 +3215,20 @@ async fn maindata(
         },
     };
     drop(config);
-    axum::Json(ctx.sync().answer(client, rid, now)).into_response()
+    let at = now_secs();
+    let fields = Fields {
+        // `torrents/info`'s row with the announce flags, keyed by its hash.
+        steady: |view: &TorrentView| {
+            #[cfg(test)]
+            ctx.inner.maindata_rows.fetch_add(1, Ordering::Relaxed);
+            let mut row = steady_fields(view, scope);
+            row.retain(|(name, _)| *name != "hash");
+            row.extend(announce_stats(view));
+            row
+        },
+        clock: |view: &TorrentView| clock_fields(view, at),
+    };
+    axum::Json(ctx.sync().answer(client, rid, now, &fields)).into_response()
 }
 
 // The client's name for a peer from the first eight bytes of its peer id

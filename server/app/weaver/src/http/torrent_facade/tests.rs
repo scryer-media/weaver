@@ -5,7 +5,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::Router;
 use axum::body::{Body, to_bytes};
@@ -2085,6 +2085,63 @@ async fn maindata_sends_changes_from_the_id_the_client_holds() {
     let transfer = rig.get("/api/v2/transfer/info").await.json();
     assert_eq!(transfer["dl_info_speed"], 0);
     assert_eq!(transfer["dl_rate_limit"], 0);
+}
+
+// A `sync/maindata` poll builds a torrent's row only when its view moved:
+// none for a poll where no view moved, and one, sending that torrent's
+// changed key, after one torrent changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maindata_builds_only_the_rows_whose_view_moved() {
+    let rig = rig().await;
+    for index in 0..50 {
+        rig.add_file(&metainfo(&format!("{index}.mkv"), 3000, false), &[])
+            .await;
+    }
+    let rows = || rig.context.inner.maindata_rows.load(Ordering::Relaxed);
+    let first = rig.get("/api/v2/sync/maindata").await.json();
+    assert_eq!(first["torrents"].as_object().unwrap().len(), 50);
+    assert_eq!(rows(), 50);
+    // Each poll sends the id it was given back, until one finds no view moved.
+    let mut rid = first["rid"].as_u64().unwrap();
+    loop {
+        let mark = rows();
+        let poll = rig
+            .get(&format!("/api/v2/sync/maindata?rid={rid}"))
+            .await
+            .json();
+        assert!(poll.get("full_update").is_none(), "{poll}");
+        rid = poll["rid"].as_u64().unwrap();
+        if rows() == mark {
+            break;
+        }
+    }
+    let mark = rows();
+    let quiet = rig
+        .get(&format!("/api/v2/sync/maindata?rid={rid}"))
+        .await
+        .json();
+    rid = quiet["rid"].as_u64().unwrap();
+    assert_eq!(rows(), mark);
+
+    let hash = first["torrents"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, torrent)| torrent["name"] == "7.mkv")
+        .map(|(hash, _)| hash.clone())
+        .unwrap();
+    rig.post(
+        "/api/v2/torrents/setForceStart",
+        &format!("hashes={hash}&value=true"),
+    )
+    .await;
+    let moved = rig
+        .get(&format!("/api/v2/sync/maindata?rid={rid}"))
+        .await
+        .json();
+    assert_eq!(rows(), mark + 1);
+    assert_eq!(moved["torrents"][&hash]["force_start"], true, "{moved}");
+    assert!(moved["torrents"][&hash].get("name").is_none(), "{moved}");
 }
 
 #[tokio::test]

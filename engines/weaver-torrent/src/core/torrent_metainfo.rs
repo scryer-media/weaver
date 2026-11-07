@@ -624,7 +624,7 @@ impl<BufType> FileDetailsExt<'_, BufType> {
 }
 
 /// Which hashes verify a torrent's pieces.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TorrentVersion {
     /// SHA-1 piece hashes alone.
     V1,
