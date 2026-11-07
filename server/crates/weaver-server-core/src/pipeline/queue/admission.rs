@@ -239,12 +239,18 @@ pub(crate) fn delivery_staging_dir(
 }
 
 pub(crate) fn staging_dir_for(complete_dir: &Path, job_id: JobId) -> PathBuf {
-    complete_dir.join(".weaver-staging").join(job_id.0.to_string())
+    complete_dir
+        .join(".weaver-staging")
+        .join(job_id.0.to_string())
 }
 
 // Make the job's staging directory and mark it the job's, as its working
 // directory is.
-pub(crate) fn make_staging_dir(complete_dir: &Path, staging_dir: &Path, job_id: JobId) -> std::io::Result<()> {
+pub(crate) fn make_staging_dir(
+    complete_dir: &Path,
+    staging_dir: &Path,
+    job_id: JobId,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(staging_dir)?;
     crate::jobs::working_dir::mark_weaver_owned_working_dir(
         &complete_dir.join(".weaver-staging"),
@@ -252,7 +258,6 @@ pub(crate) fn make_staging_dir(complete_dir: &Path, staging_dir: &Path, job_id: 
         job_id,
     )
 }
-
 
 #[cfg(test)]
 mod staging_tests {
@@ -263,7 +268,10 @@ mod staging_tests {
         let root = tempfile::tempdir().expect("temp dir");
         let intermediate = root.path().join("intermediate");
         let complete = root.path().join("complete");
-        assert_eq!(delivery_staging_dir(&intermediate, &complete, JobId(7)), None);
+        assert_eq!(
+            delivery_staging_dir(&intermediate, &complete, JobId(7)),
+            None
+        );
     }
 
     #[cfg(unix)]
@@ -287,7 +295,9 @@ mod staging_tests {
         let complete = tempfile::tempdir().expect("temp dir");
         let staging = staging_dir_for(complete.path(), JobId(9));
         make_staging_dir(complete.path(), &staging, JobId(9)).expect("staging");
-        assert!(crate::jobs::working_dir::is_weaver_owned_working_dir(&staging));
+        assert!(crate::jobs::working_dir::is_weaver_owned_working_dir(
+            &staging
+        ));
         assert!(
             crate::jobs::working_dir::is_job_working_dir(
                 &complete.path().join(".weaver-staging"),

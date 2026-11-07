@@ -363,7 +363,9 @@ impl NamespaceWriter {
         on_disk: Option<&str>,
         root: &Path,
     ) -> Result<Leaf, WriteError> {
-        let root = self.restored_root(root, output_name, on_disk)?.to_path_buf();
+        let root = self
+            .restored_root(root, output_name, on_disk)?
+            .to_path_buf();
         let at = restored_at(&root, output_name, on_disk)?;
         let mut leaf = Leaf::found(&root, at)?;
         let Some(sat) = on_disk else {

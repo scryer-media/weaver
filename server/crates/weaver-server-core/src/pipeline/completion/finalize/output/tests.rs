@@ -660,8 +660,14 @@ async fn final_move_publishes_the_staged_delivery_without_its_marker_and_joins_s
     .unwrap();
 
     assert_eq!(std::fs::read(dest.join("movie.mkv")).unwrap(), b"movie");
-    assert_eq!(std::fs::read(dest.join("Sample/sample.mkv")).unwrap(), b"sample");
-    assert_eq!(std::fs::read(dest.join("Sample/sample.srt")).unwrap(), b"subs");
+    assert_eq!(
+        std::fs::read(dest.join("Sample/sample.mkv")).unwrap(),
+        b"sample"
+    );
+    assert_eq!(
+        std::fs::read(dest.join("Sample/sample.srt")).unwrap(),
+        b"subs"
+    );
     assert!(!dest.join(WORKING_DIR_MARKER).exists());
     assert!(!dest.join(".weaver-chunks").exists());
     assert!(!staging.exists());
@@ -685,8 +691,14 @@ fn a_failed_job_s_staged_delivery_returns_to_its_working_directory() {
     return_staged_delivery(&staging, &working).unwrap();
 
     assert_eq!(std::fs::read(working.join("movie.mkv")).unwrap(), b"movie");
-    assert_eq!(std::fs::read(working.join("Sample/sample.mkv")).unwrap(), b"sample");
-    assert_eq!(std::fs::read(working.join("Sample/sample.srt")).unwrap(), b"subs");
+    assert_eq!(
+        std::fs::read(working.join("Sample/sample.mkv")).unwrap(),
+        b"sample"
+    );
+    assert_eq!(
+        std::fs::read(working.join("Sample/sample.srt")).unwrap(),
+        b"subs"
+    );
     assert_eq!(
         std::fs::read(working.join(WORKING_DIR_MARKER)).unwrap(),
         b"working marker"

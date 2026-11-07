@@ -1775,6 +1775,19 @@ async fn read_restored(
     })
 }
 
+// The staging directory an admission made, gone with the admission that
+// failed: nothing was written to it.
+async fn remove_unadmitted_staging(job_id: JobId, staging_dir: Option<&std::path::Path>) {
+    let Some(staging_dir) = staging_dir else {
+        return;
+    };
+    if let Err(error) = tokio::fs::remove_dir_all(staging_dir).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(job_id = job_id.0, error = %error, "failed to clean staging directory after a failed admission");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -1877,17 +1890,3 @@ mod tests {
         );
     }
 }
-
-// The staging directory an admission made, gone with the admission that
-// failed: nothing was written to it.
-async fn remove_unadmitted_staging(job_id: JobId, staging_dir: Option<&std::path::Path>) {
-    let Some(staging_dir) = staging_dir else {
-        return;
-    };
-    if let Err(error) = tokio::fs::remove_dir_all(staging_dir).await
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(job_id = job_id.0, error = %error, "failed to clean staging directory after a failed admission");
-    }
-}
-

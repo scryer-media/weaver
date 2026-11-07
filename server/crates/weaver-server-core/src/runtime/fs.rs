@@ -429,7 +429,9 @@ pub(crate) fn same_device(a: &Path, b: &Path) -> bool {
 }
 
 fn nearest_device(path: &Path) -> Option<u64> {
-    let existing = path.ancestors().find(|at| std::fs::metadata(at).is_ok_and(|meta| meta.is_dir()))?;
+    let existing = path
+        .ancestors()
+        .find(|at| std::fs::metadata(at).is_ok_and(|meta| meta.is_dir()))?;
     let fingerprint = directory_fingerprint_from_path(existing).ok()?;
     #[cfg(unix)]
     {
@@ -664,7 +666,10 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         let dev = std::fs::metadata("/dev").expect("meta");
         if dev.dev() != ours.dev() {
-            assert!(!super::same_device(root.path(), std::path::Path::new("/dev")));
+            assert!(!super::same_device(
+                root.path(),
+                std::path::Path::new("/dev")
+            ));
         }
     }
 

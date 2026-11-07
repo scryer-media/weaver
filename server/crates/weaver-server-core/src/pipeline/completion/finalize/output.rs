@@ -411,7 +411,12 @@ fn merge_delivered_dir(
             .ok()
             .filter(std::fs::Metadata::is_file)
             .map_or(0, |metadata| metadata.len());
-        move_path_with_safe_rename_or_copy_fallback(&from, &to, bytes, Arc::clone(&phase_counters))?;
+        move_path_with_safe_rename_or_copy_fallback(
+            &from,
+            &to,
+            bytes,
+            Arc::clone(&phase_counters),
+        )?;
     }
     let _ = std::fs::remove_dir(src);
     Ok(true)

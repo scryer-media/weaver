@@ -69,9 +69,15 @@ fn a_store_volume_stays_in_the_working_directory_and_its_member_is_delivered() {
     assert_eq!(split.delivered("inner.bin"), b"hello");
     assert_eq!(split.output_files(), ["inner.bin"]);
     let working = split.working_files();
-    assert!(!working.iter().any(|name| name == "pack.bin" || name == "inner.bin"));
     assert!(
-        working.iter().any(|name| name.starts_with(weaver_graph::names::INTERNAL_DIR)),
+        !working
+            .iter()
+            .any(|name| name == "pack.bin" || name == "inner.bin")
+    );
+    assert!(
+        working
+            .iter()
+            .any(|name| name.starts_with(weaver_graph::names::INTERNAL_DIR)),
         "the volume's envelope is kept in the working directory: {working:?}"
     );
 }
@@ -81,7 +87,12 @@ fn a_store_volume_under_an_obfuscated_name_stays_in_the_working_directory() {
     let mut split = Split::new();
     bound_store_at(&mut split.job, "3f9a0c7e21");
     assert_eq!(split.output_files(), ["inner.bin"]);
-    assert!(!split.working_files().iter().any(|name| name == "3f9a0c7e21"));
+    assert!(
+        !split
+            .working_files()
+            .iter()
+            .any(|name| name == "3f9a0c7e21")
+    );
 }
 
 #[test]
@@ -89,7 +100,11 @@ fn a_recovery_volume_is_never_written_under_the_output_directory() {
     let mut split = Split::new();
     let job = std::mem::replace(&mut split.job, Job::new(PLENTY));
     split.job = job.with_set(None);
-    assert!(split.output_files().is_empty(), "{:?}", split.output_files());
+    assert!(
+        split.output_files().is_empty(),
+        "{:?}",
+        split.output_files()
+    );
     assert!(split.working_files().iter().any(|name| name == "set.par2"));
 }
 
@@ -111,7 +126,13 @@ fn a_delivered_file_moves_to_its_new_name_within_the_output_directory() {
     split
         .job
         .writer
-        .rename(&mut split.job.tree, &mut build, NodeId::ROOT, member, "movie.mkv")
+        .rename(
+            &mut split.job.tree,
+            &mut build,
+            NodeId::ROOT,
+            member,
+            "movie.mkv",
+        )
         .expect("rename");
     split.job.commit();
     assert_eq!(split.output_files(), ["movie.mkv"]);
@@ -128,7 +149,12 @@ fn a_member_waiting_for_its_name_waits_under_the_output_directory() {
     split.job.commit();
     assert_eq!(split.delivered("subs.srt"), b"first");
     assert_eq!(split.delivered("subs (1).srt"), b"second");
-    assert!(split.working_files().iter().all(|name| !name.ends_with(".srt")));
+    assert!(
+        split
+            .working_files()
+            .iter()
+            .all(|name| !name.ends_with(".srt"))
+    );
 }
 
 #[test]

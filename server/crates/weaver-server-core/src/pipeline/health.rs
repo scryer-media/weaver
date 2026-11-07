@@ -329,4 +329,3 @@ impl Pipeline {
         self.report_job(job_id);
     }
 }
-
