@@ -1252,6 +1252,9 @@ impl JobHistoryCache {
 pub struct Database {
     #[cfg(test)]
     pub(crate) graph_checkpoint_writes: Arc<AtomicUsize>,
+    // How many times the torrents' tracker rows were read.
+    #[cfg(test)]
+    pub(crate) torrent_tracker_reads: Arc<AtomicUsize>,
     pub(crate) rss_schedule_cache: Arc<crate::rss::ScheduleCache>,
     pub(crate) script_runtime: Arc<crate::post_processing::events::ScriptRuntime>,
     target: DatabaseTarget,
@@ -1301,6 +1304,8 @@ impl Database {
             rss_schedule_cache: Arc::new(crate::rss::ScheduleCache::default()),
             #[cfg(test)]
             graph_checkpoint_writes: Arc::default(),
+            #[cfg(test)]
+            torrent_tracker_reads: Arc::default(),
             script_runtime: Arc::new(crate::post_processing::events::ScriptRuntime::default()),
             target,
             sql_services,
@@ -1335,6 +1340,8 @@ impl Database {
             target,
             #[cfg(test)]
             graph_checkpoint_writes: Arc::default(),
+            #[cfg(test)]
+            torrent_tracker_reads: Arc::default(),
             sql_services,
             sql_worker,
             writer_tx,
@@ -1558,6 +1565,8 @@ impl Database {
             target: self.target.clone(),
             #[cfg(test)]
             graph_checkpoint_writes: self.graph_checkpoint_writes.clone(),
+            #[cfg(test)]
+            torrent_tracker_reads: self.torrent_tracker_reads.clone(),
             sql_services: self.sql_services.clone(),
             sql_worker: self.sql_worker.clone(),
             writer_tx: detached_tx,

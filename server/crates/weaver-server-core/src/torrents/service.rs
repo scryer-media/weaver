@@ -1050,6 +1050,13 @@ fn tidy_trackers(trackers: Vec<TrackerEntry>) -> Vec<TrackerEntry> {
     tidy
 }
 
+// `trackers` in the order a torrent keeps them: by tier, then by the URL's
+// bytes, whatever order a database read gave them in.
+fn in_table_order(mut trackers: Vec<TrackerEntry>) -> Arc<[TrackerEntry]> {
+    trackers.sort_by(|a, b| (a.tier, &a.url).cmp(&(b.tier, &b.url)));
+    trackers.into()
+}
+
 // Refuse an edit naming a tracker that is no URL.
 fn tracker_urls(trackers: &[TrackerEntry]) -> Result<(), ActionError> {
     trackers
@@ -1241,6 +1248,11 @@ struct Live {
     // The tracker rule its trackers match, picked again whenever they or
     // the rules change: the trackers are what is kept, not the rule.
     rule_id: Option<u32>,
+    // The trackers it lists, as its rows in the database hold them, in
+    // `in_table_order`: each change is written to the table first, then
+    // here as a new list, under the lock that holds this torrent, so a
+    // reader takes the list without copying it.
+    trackers: Arc<[TrackerEntry]>,
     // Whether its metainfo marks it private; read from the metainfo, never
     // kept apart from it.
     private: bool,
@@ -1400,6 +1412,7 @@ impl Live {
             record,
             identity: TorrentIdentity::fresh(),
             rule_id: None,
+            trackers: Arc::from(Vec::new()),
             private: false,
             ledger: Ledger {
                 written: Some((written, resume.clone())),
@@ -2175,12 +2188,7 @@ impl TorrentService {
             let mut live = self.inner.live.lock().await;
             for torrent in live.values_mut() {
                 let job_id = torrent.record.job_id;
-                let trackers = self
-                    .inner
-                    .db
-                    .list_torrent_trackers(job_id)
-                    .map_err(state_error)?;
-                torrent.rule_id = self.rule_id(&trackers);
+                torrent.rule_id = self.rule_id(torrent.trackers.iter());
                 // An SSL torrent takes its rule's certificate as it stands:
                 // its new connections and announces present it.
                 let ssl = certificate_of(torrent.rule(&rules));
@@ -3830,6 +3838,7 @@ impl TorrentService {
                     now,
                 );
                 torrent.rule_id = rule_id;
+                torrent.trackers = in_table_order(trackers.to_vec());
                 Ok(torrent)
             }
             Ok(TorrentInsert::Duplicate(existing)) => Err(AddError::Duplicate(existing)),
@@ -4026,14 +4035,9 @@ impl TorrentService {
         // The trackers the magnet listed stay, edits included, each as
         // whoever named it; the metainfo's own join after them as the
         // torrent's.
-        let mut trackers = self
-            .inner
-            .db
-            .list_torrent_trackers(job_id)
-            .map_err(|error| AddError::State(state_error(error)))?;
+        let mut trackers = torrent.trackers.to_vec();
         trackers.extend(parsed.trackers.iter().cloned());
         let trackers = tidy_trackers(trackers);
-        torrent.rule_id = self.rule_id(&trackers);
         self.inner
             .db
             .set_torrent_metainfo(
@@ -4045,11 +4049,13 @@ impl TorrentService {
                 &dir,
                 &trackers,
             )
-            .and_then(|_| {
-                self.inner
-                    .db
-                    .set_torrent_files_dir(job_id, files_dir.as_deref())
-            })
+            .map_err(|error| AddError::State(state_error(error)))?;
+        // The table holds the merged list now, whatever the next write does.
+        torrent.rule_id = self.rule_id(&trackers);
+        torrent.trackers = in_table_order(trackers);
+        self.inner
+            .db
+            .set_torrent_files_dir(job_id, files_dir.as_deref())
             .map_err(|error| AddError::State(state_error(error)))?;
         let made = self.give_metainfo(torrent, &parsed);
         drop(live);
@@ -4093,20 +4099,15 @@ impl TorrentService {
                     .await;
             }
         };
+        // The trackers it lists, in their tiers: a magnet's fetch announces
+        // to tiers, not to a bare list.
+        let mut tiers = Vec::new();
         if let Some(torrent) = self.inner.live.lock().await.get_mut(&job_id) {
             torrent.route = Some(plan.key.clone());
             torrent.held = None;
+            tiers = tracker_tiers(&torrent.trackers);
         }
         let uri = Magnet::of(hashes_of(&record), None, Vec::new()).to_string();
-        // The trackers it lists, in their tiers: a magnet's fetch announces
-        // to tiers, not to a bare list.
-        let tiers = tracker_tiers(
-            &self
-                .inner
-                .db
-                .list_torrent_trackers(job_id)
-                .unwrap_or_default(),
-        );
         self.spawn_resolve(
             job_id,
             plan,
@@ -4194,19 +4195,11 @@ impl TorrentService {
                 // libtorrent `torrent::read_resume_data`: the saved peers
                 // are known from the start and the saved bans hold.
                 torrent.resume.clone(),
-                // The trackers it lists, read under the lock a tracker edit
-                // writes under.
-                self.inner.db.list_torrent_trackers(job_id),
+                // The trackers it lists now, each with who named it, as a
+                // tracker edit leaves them under this lock: they stand in
+                // for its metainfo's.
+                torrent.trackers.clone(),
             )
-        };
-        // The trackers the torrent lists now, each with who named it, stand
-        // in for its metainfo's.
-        let listed = match listed {
-            Ok(listed) => listed,
-            Err(error) => {
-                self.fail(job_id, state_error(error)).await;
-                return;
-            }
         };
         let plan = match self.inner.sessions.routes().plan(scope) {
             Ok(plan) => self.pinned(job_id, plan).await,
@@ -4334,14 +4327,8 @@ impl TorrentService {
                 }
                 // A tracker edit made while the session took the torrent,
                 // which found it in no session, reaches it too.
-                match self.inner.db.list_torrent_trackers(job_id) {
-                    Ok(trackers) if trackers != listed => {
-                        handle.replace_trackers(tracker_tiers(&trackers));
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's trackers");
-                    }
+                if torrent.trackers != listed {
+                    handle.replace_trackers(tracker_tiers(&torrent.trackers));
                 }
                 torrent.settle(self.inner.clock.now_ms());
                 let leg = self
@@ -4361,7 +4348,13 @@ impl TorrentService {
                         ),
                     });
                 if seed_mode {
-                    adopt_placed(&handle, &store, job_id, Arc::clone(&self.inner.signal));
+                    adopt_placed(
+                        &handle,
+                        &store,
+                        job_id,
+                        Arc::clone(&self.inner.signal),
+                        session.cancellation_token().clone().cancelled_owned(),
+                    );
                 }
                 torrent.attached = Some(Attached {
                     session,
@@ -4795,12 +4788,8 @@ impl TorrentService {
         {
             let mut live = self.inner.live.lock().await;
             let torrent = live.get_mut(&job_id).ok_or(ActionError::NotFound(job_id))?;
-            let listed = self
-                .inner
-                .db
-                .list_torrent_trackers(job_id)
-                .map_err(|error| ActionError::State(state_error(error)))?;
-            let trackers = edit(listed.clone())?;
+            let listed = &torrent.trackers;
+            let trackers = edit(listed.to_vec())?;
             tracker_urls(&trackers)?;
             let trackers: Vec<TrackerEntry> = tidy_trackers(trackers)
                 .into_iter()
@@ -4824,6 +4813,7 @@ impl TorrentService {
             if let Some(attached) = &torrent.attached {
                 attached.handle.replace_trackers(tracker_tiers(&trackers));
             }
+            torrent.trackers = in_table_order(trackers);
         }
         self.apply_queue().await;
         self.publish().await;
@@ -4848,10 +4838,12 @@ impl TorrentService {
         let url = url.trim();
         let listed = self
             .inner
-            .db
-            .list_torrent_trackers(job_id)
-            .map_err(|error| ActionError::State(state_error(error)))?;
-        if listed.iter().all(|tracker| tracker.url != url) {
+            .live
+            .lock()
+            .await
+            .get(&job_id)
+            .is_some_and(|torrent| torrent.trackers.iter().any(|tracker| tracker.url == url));
+        if !listed {
             return Err(ActionError::Invalid(format!("no tracker {url}")));
         }
         let url = weaver_torrent::Url::parse(url)
@@ -5449,6 +5441,14 @@ impl TorrentService {
     async fn restore(&self) -> Result<(), String> {
         self.load_rules()?;
         let records = self.inner.db.list_torrents().map_err(state_error)?;
+        // Every torrent's trackers, from one read. A torrent kept with no
+        // list would write its next edit over the rows it has, so a read
+        // that fails fails the restore as the records' does.
+        let mut trackers = self
+            .inner
+            .db
+            .torrent_trackers_by_job()
+            .map_err(state_error)?;
         let now = self.inner.clock.now_ms();
         if let Some(last) = records.iter().map(|record| record.queue_position).max() {
             self.inner
@@ -5472,12 +5472,9 @@ impl TorrentService {
             });
             // The rule is the one its trackers match now (libtorrent keeps
             // the trackers, not what was made of them).
-            let trackers = self.inner.db.list_torrent_trackers(job_id).unwrap_or_else(|error| {
-                tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's trackers");
-                Vec::new()
-            });
             let mut torrent = Live::new(record.clone(), counters, resume, now);
-            torrent.rule_id = self.rule_id(&trackers);
+            torrent.trackers = in_table_order(trackers.remove(&job_id).unwrap_or_default());
+            torrent.rule_id = self.rule_id(torrent.trackers.iter());
             match record.metainfo.as_deref().map(parse) {
                 Some(Ok(parsed)) => {
                     self.describe(&mut torrent, &parsed);
@@ -6169,19 +6166,19 @@ impl TorrentService {
     pub async fn torrent(&self, job_id: JobId) -> Option<TorrentView> {
         let settings = self.settings();
         let now = self.inner.clock.now_ms();
-        let listed = self
-            .inner
-            .db
-            .list_torrent_trackers(job_id)
-            .unwrap_or_default();
-        let (mut view, announces, pinned) = {
+        let (mut view, announces, pinned, listed) = {
             let live = self.inner.live.lock().await;
             let torrent = live.get(&job_id)?;
             let mut view = self.view(&settings, torrent, now);
             view.files = torrent.files();
-            (view, torrent.announces(), torrent.record.pool_member)
+            (
+                view,
+                torrent.announces(),
+                torrent.record.pool_member,
+                torrent.trackers.clone(),
+            )
         };
-        self.track(&mut view, pinned, listed, &announces, &mut HashMap::new());
+        self.track(&mut view, pinned, &listed, &announces, &mut HashMap::new());
         Some(view)
     }
 
@@ -6192,12 +6189,7 @@ impl TorrentService {
     pub async fn support(&self, job_id: JobId) -> Option<TorrentSupport> {
         let settings = self.settings();
         let now = self.inner.clock.now_ms();
-        let listed = self
-            .inner
-            .db
-            .list_torrent_trackers(job_id)
-            .unwrap_or_default();
-        let (mut support, announces, handle, pinned) = {
+        let (mut support, announces, handle, pinned, listed) = {
             let live = self.inner.live.lock().await;
             let torrent = live.get(&job_id)?;
             let reading = torrent.reading(now);
@@ -6235,12 +6227,13 @@ impl TorrentService {
                 torrent.announces(),
                 attached.map(|attached| Arc::clone(&attached.handle)),
                 torrent.record.pool_member,
+                torrent.trackers.clone(),
             )
         };
         self.track(
             &mut support.view,
             pinned,
-            listed,
+            &listed,
             &announces,
             &mut HashMap::new(),
         );
@@ -6283,17 +6276,18 @@ impl TorrentService {
         now: i64,
     ) -> Vec<(TorrentView, TorrentSeries)> {
         let settings = self.settings();
-        let mut listed = self.inner.db.torrent_trackers_by_job().unwrap_or_default();
         // Under the lock, each torrent's files are only taken by reference
         // with its levels: the list is built after the lock is let go.
         type Files = Option<(Option<Arc<PieceLayout>>, Vec<FilePriority>)>;
-        // With its pool member, which names its trackers' lookups.
+        // With its pool member, which names its trackers' lookups, and the
+        // trackers it lists.
         type Listed = (
             TorrentView,
             Vec<TrackerAnnounce>,
             Unviewed,
             Files,
             Option<u32>,
+            Arc<[TrackerEntry]>,
         );
         let mut views: Vec<Listed> = {
             let live = self.inner.live.lock().await;
@@ -6309,6 +6303,7 @@ impl TorrentService {
                         unviewed,
                         files,
                         torrent.record.pool_member,
+                        torrent.trackers.clone(),
                     )
                 })
                 .filter(|(view, ..)| {
@@ -6321,11 +6316,10 @@ impl TorrentService {
                 .collect()
         };
         let mut names = HashMap::new();
-        for (view, announces, _, files, pinned) in &mut views {
+        for (view, announces, _, files, pinned, listed) in &mut views {
             if let Some((layout, levels)) = files.take() {
                 view.files = files_of(layout.as_deref(), &levels);
             }
-            let listed = listed.remove(&view.job_id).unwrap_or_default();
             self.track(view, *pinned, listed, announces, &mut names);
         }
         let mut views: Vec<(TorrentView, TorrentSeries)> = views
@@ -6379,7 +6373,7 @@ impl TorrentService {
         &self,
         view: &mut TorrentView,
         pinned: Option<u32>,
-        listed: Vec<TrackerEntry>,
+        listed: &[TrackerEntry],
         announces: &[TrackerAnnounce],
         names: &mut HashMap<(TorrentScope, Option<u32>), Option<ResolvedBy>>,
     ) {
@@ -6391,7 +6385,7 @@ impl TorrentService {
                 .ok()
                 .and_then(|plan| plan.names_for(pinned))
         });
-        view.trackers = status::trackers(listed, announces, names);
+        view.trackers = status::trackers(listed.to_vec(), announces, names);
     }
 
     /// The torrents as queue items.
@@ -6504,55 +6498,85 @@ fn adopt_placed(
     store: &Arc<TorrentStore>,
     job_id: JobId,
     signal: Arc<Signal>,
+    stopping: impl Future<Output = ()> + Send + 'static,
 ) {
     let handle = Arc::downgrade(handle);
     let store = Arc::downgrade(store);
-    tokio::task::spawn_blocking(move || {
-        let Some(count) = store.upgrade().map(|store| store.layout().piece_count()) else {
+    tokio::spawn(async move {
+        let adopting = (handle.clone(), store.clone());
+        let adopted = tokio::task::spawn_blocking(move || {
+            let (handle, store) = adopting;
+            let count = store.upgrade()?.layout().piece_count();
+            for piece in 0..count {
+                let (Some(handle), Some(store)) = (handle.upgrade(), store.upgrade()) else {
+                    return None;
+                };
+                if !handle.seed_mode() {
+                    return None;
+                }
+                match store.adopt(piece, |take| handle.while_seeding(take)) {
+                    Some(Ok(())) => {}
+                    Some(Err(error)) => {
+                        tracing::warn!(piece, error = %format!("{error:#}"), "a seed-mode torrent's placed files could not be read");
+                        return None;
+                    }
+                    None => return None,
+                }
+            }
+            Some(count)
+        })
+        .await;
+        let Ok(Some(count)) = adopted else {
             return;
         };
-        for piece in 0..count {
-            let (Some(handle), Some(store)) = (handle.upgrade(), store.upgrade()) else {
-                return;
-            };
-            if !handle.seed_mode() {
-                return;
-            }
-            match store.adopt(piece, |take| handle.while_seeding(take)) {
-                Some(Ok(())) => {}
-                Some(Err(error)) => {
-                    tracing::warn!(piece, error = %format!("{error:#}"), "a seed-mode torrent's placed files could not be read");
-                    return;
-                }
-                None => return,
-            }
-        }
         // The pieces the tee waits on are checked now, as a peer's request
         // would check them, and go to it as they pass: the graph takes no
         // byte a piece check has not passed. One that fails ends seed mode,
         // and the check of every piece that follows gives the tee the
-        // pieces it finds and the session fetches the rest. A torrent that
-        // neither runs nor is paused has its pieces checked as peers ask.
-        if let (Some(handle), Some(store)) = (handle.upgrade(), store.upgrade())
-            && store.tee().is_some()
-        {
-            for piece in 0..count {
-                if !store.tee_wants(piece) {
-                    continue;
+        // pieces it finds and the session fetches the rest. The session
+        // takes the torrent through its first check on its own task, and a
+        // piece is checked only once that has ended, the torrent running or
+        // paused; one that ends in an error has its pieces checked as peers
+        // ask. The wait holds the torrent only while its session runs: a
+        // session that stops leaves a torrent in its first check as it is,
+        // and this ends with it, the torrent going with its session. One
+        // removed from its session ends its first check, and the wait.
+        let checks = match (handle.upgrade(), store.upgrade()) {
+            (Some(torrent), Some(placed)) if placed.tee().is_some() => {
+                drop(placed);
+                tokio::select! {
+                    started = torrent.wait_until_initialized() => started.is_ok(),
+                    () = stopping => return,
                 }
-                match handle.check_seeded(piece) {
-                    Some(Ok(true)) => {
-                        if let Err(error) = store.replay(piece) {
-                            tracing::warn!(piece, error = %error, "a seed-mode torrent's checked piece could not be read");
+            }
+            _ => false,
+        };
+        if checks {
+            let checking = tokio::task::spawn_blocking(move || {
+                let (Some(handle), Some(store)) = (handle.upgrade(), store.upgrade()) else {
+                    return;
+                };
+                for piece in 0..count {
+                    if !store.tee_wants(piece) {
+                        continue;
+                    }
+                    match handle.check_seeded(piece) {
+                        Some(Ok(true)) => {
+                            if let Err(error) = store.replay(piece) {
+                                tracing::warn!(piece, error = %error, "a seed-mode torrent's checked piece could not be read");
+                                break;
+                            }
+                        }
+                        Some(Ok(false)) | None => break,
+                        Some(Err(error)) => {
+                            tracing::warn!(piece, error = %format!("{error:#}"), "a seed-mode torrent's piece could not be checked");
                             break;
                         }
                     }
-                    Some(Ok(false)) | None => break,
-                    Some(Err(error)) => {
-                        tracing::warn!(piece, error = %format!("{error:#}"), "a seed-mode torrent's piece could not be checked");
-                        break;
-                    }
                 }
+            });
+            if checking.await.is_err() {
+                return;
             }
         }
         // The files were whole as placed: the next settle completes or

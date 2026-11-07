@@ -456,7 +456,10 @@ impl TrackerList {
     /// `ignore_min_interval`, which lifts it. A tracker named alone is
     /// announced to on its own as soon as it may be (libtorrent
     /// `torrent::force_tracker_request` with an index); the others are
-    /// reached by the walk. False when there is no such tracker.
+    /// reached by the walk. A tracker waiting for an answer is not asked
+    /// twice, and the answer's intervals overwrite the force, which is then
+    /// dropped, as libtorrent's `tracker_response` overwrites what
+    /// `trigger_announce` wrote. False when there is no such tracker.
     fn force(
         &mut self,
         at: Instant,
@@ -5479,6 +5482,35 @@ mod tests {
         assert!(list.force(t1, Some(&http("b")), true));
         assert_eq!(list.start_due(t1, None, &stats), [(http("b"), STARTED)]);
         assert!(!list.force(t1, Some(&http("x")), true));
+    }
+
+    /// libtorrent `trigger_announce` writes the entry's next announce with
+    /// no regard for an announce waiting for its answer, and
+    /// `tracker_response` then writes the answer's intervals over it: a
+    /// force made while an announce waits is dropped.
+    #[test]
+    fn a_force_while_an_announce_waits_is_overwritten_by_its_answer() {
+        let s = Duration::from_secs;
+        let t0 = Instant::now();
+        let mut list = list(&[&["a"]], t0);
+        let stats = live(0, 90, false);
+        assert_eq!(list.start_due(t0, None, &stats), [(http("a"), STARTED)]);
+        let delay = ReannounceDelay {
+            floor: s(900),
+            regular: s(1800),
+        };
+
+        // Forced while it waits, alone and with the rest: nothing goes.
+        let t1 = t0 + s(5);
+        assert!(list.force(t1, None, true));
+        assert!(list.force(t1, Some(&http("a")), true));
+        assert_eq!(list.start_due(t1, None, &stats), []);
+        assert_eq!(list.next_due(), None);
+
+        // Answered: due at the answer's interval, the force gone.
+        list.on_success(&http("a"), STARTED, t1, &delay);
+        assert_eq!(list.start_due(t1, None, &stats), []);
+        assert_eq!(list.next_due(), Some(t1 + s(1800)));
     }
 
     /// Waits, driving `peers`, until the table says `done`.
