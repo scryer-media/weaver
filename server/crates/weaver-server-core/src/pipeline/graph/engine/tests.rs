@@ -190,6 +190,56 @@ fn a_complete_set_is_walked_in_index_order_past_its_gaps() {
     );
 }
 
+// A lone zip binds after every numbered volume a set could have, so `next`
+// hands it out only once none can join. A run that reads the set from its
+// tail is handed it at once: the volumes bound now, and its declared length,
+// which puts the tail where the run reads it while the volume still grows.
+#[test]
+fn a_lone_volume_bound_after_every_numbered_one_is_read_before_the_set_is_complete() {
+    const LAST: VolumeIndex = VolumeIndex(u32::MAX);
+    let dir = tempfile::tempdir().unwrap();
+    let (mut envelopes, shelf) = shelved(dir.path());
+    envelopes
+        .keep(NODE, LAST.0, 96, b"tail", Provenance::Fresh)
+        .unwrap();
+    shelf.update(|state| {
+        state.volumes.insert(LAST.0);
+        state.deciding = true;
+        shelf.kept(state, LAST.0).unwrap().sized = Some(100);
+    });
+    let volumes = reader(&shelf);
+    assert_eq!(volumes.bound().unwrap(), [LAST]);
+    assert_eq!(volumes.sized(LAST).unwrap(), Some(100));
+    let mut into = [0; 4];
+    assert_eq!(volumes.read_at(LAST, 96, &mut into).unwrap(), 4);
+    assert_eq!(&into, b"tail");
+    let state = shelf.lock();
+    assert!(!state.complete, "the set is not complete");
+    assert_eq!(
+        state.kept[&LAST.0].length_read,
+        Some(100),
+        "the declared length is one the run built on"
+    );
+}
+
+// A declared length is waited for while the volume can still bind, and
+// none is given once it never will.
+#[test]
+fn a_declared_length_waits_for_its_volume_and_is_none_once_none_can_join() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_envelopes, shelf) = shelved(dir.path());
+    let volumes = reader(&shelf);
+    let waiting = Arc::clone(&volumes);
+    let first = std::thread::spawn(move || waiting.sized(FIRST));
+    shelf.update(|state| {
+        state.volumes.insert(FIRST.0);
+        shelf.kept(state, FIRST.0).unwrap().sized = Some(64);
+    });
+    assert_eq!(first.join().unwrap().unwrap(), Some(64));
+    shelf.update(|state| state.complete = true);
+    assert_eq!(volumes.sized(VolumeIndex(3)).unwrap(), None);
+}
+
 #[test]
 fn a_read_of_bytes_nothing_will_bring_fails_as_lost() {
     let dir = tempfile::tempdir().unwrap();

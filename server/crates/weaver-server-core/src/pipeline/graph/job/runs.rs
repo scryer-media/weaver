@@ -388,7 +388,8 @@ impl GraphJob {
     }
 
     // Bring the node's shelf up to what the tree knows of its volumes: how
-    // many there are, which are closed and how long, which will receive
+    // many there are, how long each was declared, which are closed and how
+    // long, which will receive
     // nothing more, and whether any more can join, as its parent's `facts`
     // say. A shelf already there is left as it is, and its run is not woken
     // to find nothing new.
@@ -419,7 +420,10 @@ impl GraphJob {
                     let settled = record.closed && ended;
                     changed |= !state.kept.contains_key(&volume.0);
                     let kept = shelf.kept(state, volume.0)?;
-                    changed |= kept.closed != closed || kept.settled != settled;
+                    changed |= kept.closed != closed
+                        || kept.settled != settled
+                        || kept.sized != record.length;
+                    kept.sized = record.length;
                     // A volume that closed again at another length moves
                     // every byte after it: a run that read it, or read on
                     // past it, built on the wrong offsets and starts over,

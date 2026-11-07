@@ -214,6 +214,42 @@ impl Volumes for RunVolumes {
         Some(length)
     }
 
+    fn bound(&self) -> io::Result<Vec<VolumeIndex>> {
+        let mut state = self.shelf.lock();
+        loop {
+            if state.generation != self.generation || self.stopped() {
+                return Err(Unreadable::Stopped.into());
+            }
+            if !state.volumes.is_empty() || state.complete {
+                return Ok(state.volumes.iter().copied().map(VolumeIndex).collect());
+            }
+            state = self.shelf.wait(state);
+        }
+    }
+
+    // The length read is one the run built on, as a closed one is: the
+    // volume closing at another starts the run over.
+    fn sized(&self, volume: VolumeIndex) -> io::Result<Option<u64>> {
+        let mut state = self.shelf.lock();
+        loop {
+            if state.generation != self.generation || self.stopped() {
+                return Err(Unreadable::Stopped.into());
+            }
+            let known = state.volumes.contains(&volume.0);
+            let complete = state.complete;
+            if let Some(kept) = state.kept.get_mut(&volume.0)
+                && let Some(length) = kept.closed.or(kept.sized)
+            {
+                kept.length_read = Some(length);
+                return Ok(Some(length));
+            }
+            if complete && !known {
+                return Ok(None);
+            }
+            state = self.shelf.wait(state);
+        }
+    }
+
     // A volume with bytes nothing will bring is not settled: a read of them
     // fails, and work on the pool reads only what is all in.
     fn settled(&self, volume: VolumeIndex) -> bool {
