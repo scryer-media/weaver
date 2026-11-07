@@ -5,6 +5,9 @@ import { randomBytes } from "node:crypto";
 import type { Locator, Page } from "@playwright/test";
 
 import { expect, test } from "./helpers";
+import { isOperation } from "./support/graphql-operations";
+import { saveSettings, tableRow } from "./support/settings-locators";
+import { jobIds, settingsIds, testIds } from "./support/testids";
 import {
   postProcessingRunCounts,
   removeFixtureScripts,
@@ -38,40 +41,47 @@ function escapeRegExp(value: string): string {
 /** Text that holds `parts` in this order. */
 const inOrder = (parts: string[]) => new RegExp(parts.map(escapeRegExp).join("[\\s\\S]*"));
 
-async function saveSettings(page: Page) {
-  await page.getByRole("button", { name: "Save changes", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Saved", exact: true })).toBeDisabled();
+const field = testIds.field;
+
+/** The settings report line, where each action says how it went. */
+const statusLine = (page: Page) => page.getByTestId(testIds.shellStatus);
+
+/** Choose `value` in the select `controlId`, inside `scope`, and see it chosen. */
+async function choose(page: Page, scope: Page | Locator, controlId: string, value: string) {
+  await scope.getByTestId(controlId).click();
+  await page.getByTestId(testIds.menu(controlId)).getByTestId(testIds.option(controlId, value)).click();
+  await expect(scope.getByTestId(controlId).getByTestId(testIds.selected(controlId, value))).toBeVisible();
 }
 
-/** Choose `option` in the select labelled `label`, inside `scope`. */
-async function choose(page: Page, scope: Locator, label: string, option: string) {
-  await scope.getByRole("button", { name: label, exact: true }).click();
-  await page.getByRole("menu", { name: label, exact: true }).getByRole("menuitemradio", { name: option, exact: true }).click();
-  await expect(scope.getByRole("button", { name: label, exact: true })).toHaveText(option);
+/** A Runs status tab, by its status, showing `count` beside it. */
+async function expectStatusTab(page: Page, status: string, count: number) {
+  const owner = settingsIds.scriptRunsStatus;
+  await expect(page.getByTestId(testIds.tab(owner, status))).toBeVisible();
+  await expect(page.getByTestId(testIds.tabCount(owner, status))).toHaveText(String(count));
 }
 
-/** A Runs status tab, named by its status and the count beside it. */
-const statusTab = (page: Page, status: string, count: number) =>
-  page.getByRole("button", { name: new RegExp(`^${status}\\s*${count}$`) });
+/** The pagination bar's range, `from`-`to` of `total`, whatever its wording. */
+const pageRange = (from: number, to: number, total: number) => new RegExp(`^${from}–${to}\\D+${total}$`);
 
 /** The post-processing group of the Jobs table. */
 const postProcessingJobs = (page: Page) =>
-  page.getByRole("region", { name: "Jobs", exact: true }).getByRole("region", { name: "Post-processing", exact: true });
+  page.getByTestId(testIds.section("instances")).getByTestId(testIds.rowGroup("instances", "POST_PROCESSING"));
 
 /** A job's row, which opens its editor. */
-const jobRow = (page: Page, name: string) =>
-  postProcessingJobs(page).getByRole("button").filter({ has: page.getByText(name, { exact: true }) });
+const jobRow = (page: Page, name: string) => tableRow(page, "instances", name, postProcessingJobs(page));
 
 async function addJob(page: Page, script: string, name: string, inputs: Record<string, string> = {}) {
-  await page.getByRole("main").getByRole("button", { name: "Add job", exact: true }).click();
-  const editor = page.getByRole("dialog", { name: "Add job", exact: true });
-  await choose(page, editor, "Script", script);
-  await expect(editor.getByRole("button", { name: "Trigger", exact: true })).toHaveText("Post-processing");
-  await editor.getByRole("textbox", { name: "Job name", exact: true }).fill(name);
-  for (const [input, value] of Object.entries(inputs)) await editor.getByRole("textbox", { name: input, exact: true }).fill(value);
-  await editor.getByRole("button", { name: "Save", exact: true }).click();
+  await page.getByTestId(testIds.tableAdd("instances")).click();
+  const editor = page.getByTestId(testIds.dialog("pp-job"));
+  await choose(page, editor, field("script"), script);
+  await expect(
+    editor.getByTestId(field("trigger")).getByTestId(testIds.selected(field("trigger"), "POST_PROCESSING")),
+  ).toBeVisible();
+  await editor.getByTestId(field("name")).fill(name);
+  for (const [input, value] of Object.entries(inputs)) await editor.getByTestId(field(`input:${input}`)).fill(value);
+  await editor.getByTestId(testIds.editorSave).click();
   await expect(editor).toBeHidden();
-  await expect(page.getByRole("contentinfo")).toContainText(`${name} created`);
+  await expect(statusLine(page)).toContainText(name);
   await expect(jobRow(page, name)).toBeVisible();
 }
 
@@ -79,28 +89,30 @@ test("Configuration saves execution, ordering policy, limits and interpreters", 
   const restore = await useScriptDirectory(request);
   try {
     await page.goto(SCRIPT_CONFIGURATION);
-    await expect(page.getByRole("textbox", { name: "Scripts directory", exact: true })).toHaveValue("/data/scripts");
-    const execution = page.getByRole("switch", { name: "Run scripts", exact: true });
+    await expect(page.getByTestId(jobIds.scriptDirectory).getByRole("textbox")).toHaveValue("/data/scripts");
+    const execution = page.getByTestId(field("executionEnabled"));
     await expect(execution).toBeChecked();
     await execution.click();
     await expect(execution).not.toBeChecked();
-    const settings = page.getByRole("region", { name: "Execution", exact: true });
-    await choose(page, settings, "Global scripts run", "For every download");
-    const concurrency = page.getByRole("spinbutton", { name: "Concurrent scripts", exact: true });
+    const settings = page.getByTestId(testIds.section("execution"));
+    await choose(page, settings, field("globalScriptsRun"), "ALWAYS");
+    const concurrency = page.getByTestId(field("concurrency"));
     await concurrency.fill("2");
     await concurrency.press("Tab");
-    const grace = page.getByRole("spinbutton", { name: "Termination grace", exact: true });
+    const grace = page.getByTestId(field("terminationGraceSeconds"));
     await grace.fill("5");
     await grace.press("Tab");
     // The unwanted extension list lives under General downloads, not here.
-    await expect(page.getByRole("textbox", { name: "Unacceptable extensions", exact: true })).toHaveCount(0);
-    const python = page.getByRole("textbox", { name: "Python", exact: true });
+    await expect(page.getByTestId(field("unacceptableExtensions"))).toHaveCount(0);
+    const python = page.getByTestId(field("pythonInterpreter"));
     await python.fill("/usr/bin/python3");
     await saveSettings(page);
 
     await page.reload();
     await expect(execution).not.toBeChecked();
-    await expect(settings.getByRole("button", { name: "Global scripts run", exact: true })).toHaveText("For every download");
+    await expect(
+      settings.getByTestId(field("globalScriptsRun")).getByTestId(testIds.selected(field("globalScriptsRun"), "ALWAYS")),
+    ).toBeVisible();
     await expect(concurrency).toHaveValue("2");
     await expect(grace).toHaveValue("5");
     await expect(python).toHaveValue("/usr/bin/python3");
@@ -127,30 +139,31 @@ test("Jobs are added, run in their order, switched off, reordered, tested and de
   const restore = await useScriptDirectory(request);
   try {
     await page.goto(SCRIPT_JOBS);
-    await expect(page.getByRole("region", { name: "Jobs", exact: true })).toContainText("No jobs yet.");
+    await expect(page.getByTestId(testIds.tableEmpty("instances"))).toBeVisible();
     await addJob(page, sab, first);
     await addJob(page, nzb, second, { Label: "screen-label" });
     await expect(postProcessingJobs(page)).toContainText(inOrder([first, second]));
     for (const name of [first, second]) {
-      await expect(postProcessingJobs(page).getByRole("switch", { name: `${name} enabled`, exact: true })).toBeChecked();
+      await expect(jobRow(page, name).getByTestId(settingsIds.ppJobEnabled)).toBeChecked();
     }
 
     // A job runs them in that order, and its page shows each run and what it printed.
     const run1 = await submitScriptJob(request, `${tag}-a`);
     await waitScriptJob(request, run1, 2);
     await page.goto(`/jobs/${run1}`);
-    const runs1 = page.getByRole("group", { name: "post_processing (2)", exact: true });
+    const runs1 = page.getByTestId(jobIds.scriptEventGroup("post_processing"));
+    await expect(runs1.getByTestId(jobIds.scriptRun)).toHaveCount(2);
     await expect(runs1).toContainText(inOrder([first, second]));
-    await expect(runs1.getByText("SUCCEEDED", { exact: true })).toHaveCount(2);
+    await expect(runs1.getByTestId(jobIds.scriptRunStatus("SUCCEEDED"))).toHaveCount(2);
     await expect(runs1).toContainText(`sab ran for ${tag}-a`);
     await expect(runs1).toContainText("nzb label=screen-label");
 
     // Switched off, the first job stays listed and does not run; moved up, the second runs first.
     await page.goto(SCRIPT_JOBS);
-    const firstEnabled = postProcessingJobs(page).getByRole("switch", { name: `${first} enabled`, exact: true });
+    const firstEnabled = jobRow(page, first).getByTestId(settingsIds.ppJobEnabled);
     await firstEnabled.click();
     await expect(firstEnabled).not.toBeChecked();
-    await jobRow(page, second).getByRole("button", { name: "Move up", exact: true }).click();
+    await jobRow(page, second).getByTestId(settingsIds.ppJobMoveUp).click();
     await expect(postProcessingJobs(page)).toContainText(inOrder([second, first]));
     await page.reload();
     await expect(postProcessingJobs(page)).toContainText(inOrder([second, first]));
@@ -158,38 +171,42 @@ test("Jobs are added, run in their order, switched off, reordered, tested and de
     const run2 = await submitScriptJob(request, `${tag}-b`);
     await waitScriptJob(request, run2, 1);
     await page.goto(`/jobs/${run2}`);
-    const runs2 = page.getByRole("group", { name: "post_processing (1)", exact: true });
+    const runs2 = page.getByTestId(jobIds.scriptEventGroup("post_processing"));
+    await expect(runs2.getByTestId(jobIds.scriptRun)).toHaveCount(1);
     await expect(runs2).toContainText(second);
     await expect(runs2).not.toContainText(first);
 
     // Test runs the saved job against made-up inputs and shows how it went.
     await page.goto(SCRIPT_JOBS);
-    await jobRow(page, second).getByRole("button", { name: "Test", exact: true }).click();
-    const testDialog = page.getByRole("dialog", { name: `Test ${second}`, exact: true });
-    await expect(testDialog.getByText("SUCCEEDED", { exact: true })).toBeVisible();
-    await expect(testDialog.getByRole("region", { name: "Run log", exact: true })).toContainText("nzb label=screen-label");
-    await expect(testDialog.getByRole("region", { name: "Arguments", exact: true })).toBeVisible();
-    await expect(testDialog.getByRole("button", { name: "Run again", exact: true })).toBeVisible();
-    await testDialog.getByRole("button", { name: "Close", exact: true }).click();
+    await jobRow(page, second).getByTestId(settingsIds.ppJobTest).click();
+    const testDialog = page.getByTestId(testIds.dialog("pp-test"));
+    await expect(testDialog).toContainText(second);
+    await expect(testDialog.getByTestId(jobIds.scriptRunStatus("SUCCEEDED"))).toBeVisible();
+    await expect(testDialog.getByTestId(settingsIds.ppTestLog)).toContainText("nzb label=screen-label");
+    await expect(testDialog.getByTestId(settingsIds.ppTestArguments)).toBeVisible();
+    await expect(testDialog.getByTestId(settingsIds.ppTestAgain)).toBeVisible();
+    await testDialog.getByTestId(settingsIds.ppTestClose).click();
     await expect(testDialog).toBeHidden();
 
     // The editor reopens a job with what was saved in it.
     await jobRow(page, second).click();
-    const editor = page.getByRole("dialog", { name: second, exact: true });
-    await expect(editor.getByRole("textbox", { name: "Label", exact: true })).toHaveValue("screen-label");
-    await editor.getByRole("button", { name: "Cancel", exact: true }).click();
+    const editor = page.getByTestId(testIds.dialog("pp-job"));
+    await expect(editor).toContainText(second);
+    await expect(editor.getByTestId(field("input:Label"))).toHaveValue("screen-label");
+    await editor.getByTestId(testIds.editorCancel).click();
     await expect(editor).toBeHidden();
 
     for (const name of [first, second]) {
-      await jobRow(page, name).getByRole("button", { name: "Delete", exact: true }).click();
-      const confirm = page.getByRole("dialog", { name: "Delete job", exact: true });
-      await confirm.getByRole("button", { name: "Delete", exact: true }).click();
+      await jobRow(page, name).getByTestId(settingsIds.ppJobDelete).click();
+      const confirm = page.getByTestId(testIds.dialog("pp-job-delete"));
+      await expect(confirm).toContainText(name);
+      await confirm.getByTestId(testIds.confirmAccept).click();
       await expect(confirm).toBeHidden();
-      await expect(page.getByRole("contentinfo")).toContainText(`${name} deleted`);
+      await expect(statusLine(page)).toContainText(name);
       await expect(jobRow(page, name)).toHaveCount(0);
     }
     await page.reload();
-    await expect(page.getByRole("region", { name: "Jobs", exact: true })).toContainText("No jobs yet.");
+    await expect(page.getByTestId(testIds.tableEmpty("instances"))).toBeVisible();
   } finally {
     await removeScriptJobs(request, [sab, nzb]);
     await restore();
@@ -201,26 +218,26 @@ test("Secrets are added with a value that is never shown again, and deleted", as
   const name = `uipp-secret-${token()}`;
   const value = `uipp-value-${token()}-never-shown`;
   await page.goto(SCRIPT_SECRETS);
-  await page.getByRole("main").getByRole("button", { name: "Add secret", exact: true }).click();
-  const editor = page.getByRole("dialog", { name: "Add secret", exact: true });
-  await editor.getByRole("textbox", { name: "Name", exact: true }).fill(name);
-  await editor.getByLabel("Value", { exact: true }).fill(value);
-  await editor.getByRole("button", { name: "Save", exact: true }).click();
+  await page.getByTestId(testIds.tableAdd("secrets")).click();
+  const editor = page.getByTestId(testIds.dialog("secret"));
+  await editor.getByTestId(field("name")).fill(name);
+  await editor.getByTestId(field("value")).fill(value);
+  await editor.getByTestId(testIds.editorSave).click();
   await expect(editor).toBeHidden();
-  await expect(page.getByRole("contentinfo")).toContainText(`Secret ${name} created`);
-  const secrets = page.getByRole("region", { name: "Secrets", exact: true });
-  const row = secrets.getByRole("button").filter({ has: page.getByText(name, { exact: true }) });
-  await expect(row).toContainText("Not used");
+  await expect(statusLine(page)).toContainText(name);
+  const row = tableRow(page, "secrets", name);
+  await expect(row.getByTestId(settingsIds.secretUsage("unused"))).toBeVisible();
 
   await page.reload();
   await row.click();
-  const opened = page.getByRole("dialog", { name, exact: true });
-  await expect(opened.getByLabel("Value", { exact: true })).toHaveValue("");
+  const opened = page.getByTestId(testIds.dialog("secret"));
+  await expect(opened).toContainText(name);
+  await expect(opened.getByTestId(field("value"))).toHaveValue("");
   await expect(page.getByText(value)).toHaveCount(0);
-  await opened.getByRole("button", { name: "Delete", exact: true }).click();
-  const confirm = page.getByRole("dialog", { name: "Delete secret", exact: true });
-  await confirm.getByRole("button", { name: "Delete", exact: true }).click();
-  await expect(page.getByRole("contentinfo")).toContainText(`Secret ${name} deleted`);
+  await opened.getByTestId(testIds.editorDelete).click();
+  const confirm = page.getByTestId(testIds.dialog("secret-delete"));
+  await confirm.getByTestId(testIds.confirmAccept).click();
+  await expect(statusLine(page)).toContainText(name);
   await expect(row).toHaveCount(0);
 });
 
@@ -242,45 +259,47 @@ test("Runs lists every run newest first, filters by trigger and status, opens ou
     // Every ScriptRuns request the screen sends, in order, with its cursor.
     const cursors: Array<string | null> = [];
     page.on("request", sent => {
-      const body = sent.postData();
-      if (sent.method() !== "POST" || !body?.includes("query ScriptRuns")) return;
-      const parsed = JSON.parse(body) as { variables?: { before?: string | null } };
+      if (!isOperation(sent, "ScriptRuns")) return;
+      const parsed = sent.postDataJSON() as { variables?: { before?: string | null } };
       cursors.push(parsed.variables?.before ?? null);
     });
 
     await page.goto(SCRIPT_RUNS);
-    const runs = page.getByRole("region", { name: "Script runs", exact: true });
-    const runRow = (name: string) => runs.getByRole("button").filter({ has: page.getByText(name, { exact: true }) });
-    await choose(page, page.getByRole("banner"), "Filter by trigger", "Post-processing");
-    await expect(statusTab(page, "All", total)).toBeVisible();
-    await expect(statusTab(page, "Failed", failed)).toBeVisible();
-    await expect(page.getByText(`1–25 of ${total}`, { exact: true })).toBeVisible();
+    const runs = page.getByTestId(testIds.section("runs"));
+    const runRow = (name: string) => tableRow(page, "runs", name, runs);
+    const range = page.getByTestId(testIds.paginationRange);
+    await choose(page, page, settingsIds.scriptRunsTrigger, "POST_PROCESSING");
+    await expectStatusTab(page, "ALL", total);
+    await expectStatusTab(page, "FAILED", failed);
+    await expect(range).toHaveText(pageRange(1, 25, total));
     await expect(runRow(`${failing}-01`), "the newest run first").toBeVisible();
     await expect(runs).toContainText(inOrder([`${failing}-01`, `${script}-${RUNS}`]));
 
     // A run opens to what it printed.
     await runRow(`${failing}-01`).click();
-    await expect(runs.getByRole("region", { name: `Output of ${failing}-01`, exact: true })).toContainText(`${tag} failing line`);
-    await expect(runs.getByRole("button", { name: "Copy output", exact: true })).toBeVisible();
+    // One run is open, so its output is the only one shown.
+    await expect(runs.getByTestId(settingsIds.scriptRunOutput)).toContainText(`${tag} failing line`);
+    await expect(runs.getByTestId(settingsIds.scriptRunCopy)).toBeVisible();
 
     // The next page asks once, from where the first ended.
     const before = cursors.length;
-    await page.getByRole("button", { name: "Next", exact: true }).click();
-    await expect(page.getByText(`26–${Math.min(50, total)} of ${total}`, { exact: true })).toBeVisible();
+    await page.getByTestId(testIds.paginationNext).click();
+    await expect(range).toHaveText(pageRange(26, Math.min(50, total), total));
     await expect(runRow(`${script}-01`), "the oldest run on the last page").toBeVisible();
     const sent = cursors.slice(before);
     expect(sent, "one request for the next page").toHaveLength(1);
     expect(sent[0], "the next page is asked for below the first").not.toBeNull();
 
     // Filtering by status counts and lists only those runs.
-    await statusTab(page, "Failed", failed).click();
-    await expect(page.getByText(`1–${Math.min(25, failed)} of ${failed}`, { exact: true })).toBeVisible();
-    await expect(runRow(`${failing}-01`)).toContainText("FAILED");
-    await expect(runRow(`${failing}-01`)).toContainText("4");
-    await expect(runs.getByRole("button").filter({ has: page.getByText(`${script}-01`, { exact: true }) })).toHaveCount(0);
+    await expectStatusTab(page, "FAILED", failed);
+    await page.getByTestId(testIds.tab(settingsIds.scriptRunsStatus, "FAILED")).click();
+    await expect(range).toHaveText(pageRange(1, Math.min(25, failed), failed));
+    await expect(runRow(`${failing}-01`).getByTestId(jobIds.scriptRunStatus("FAILED"))).toBeVisible();
+    await expect(runRow(`${failing}-01`).getByTestId(settingsIds.scriptRunExitCode)).toHaveText("4");
+    await expect(runRow(`${script}-01`)).toHaveCount(0);
 
-    await choose(page, page.getByRole("banner"), "Filter by trigger", "Scan");
-    await expect(runs).toContainText("No runs match these filters.");
+    await choose(page, page, settingsIds.scriptRunsTrigger, "SCAN");
+    await expect(page.getByTestId(testIds.tableEmpty("runs"))).toBeVisible();
   } finally {
     await removeScriptJobs(request, [script, failing]);
     await restore();
