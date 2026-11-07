@@ -30,11 +30,11 @@ const RUNG_WINDOW_RESPONSES: u64 = 32;
 // halves the depth model divides — while costing a fraction of the job.
 const RUNG_WARMUP_WINDOW_RESPONSES: u64 = 8;
 
-// How many short windows a fresh explorer runs: one to measure the link and
-// pick a rung, one to judge the rung it picked. After that the full window
-// applies, because by then the depth is settled and the only question left is
-// whether the link has changed.
-const RUNG_WARMUP_WINDOWS: u8 = 2;
+// How many short windows a fresh explorer runs: one to measure the link, one
+// to take the baseline and pick a rung, one to judge the rung it picked.
+// After that the full window applies, because by then the depth is settled
+// and the only question left is whether the link has changed.
+const RUNG_WARMUP_WINDOWS: u8 = 3;
 
 // Status-line waits held before their minimum folds into the round-trip
 // estimate, independently of the rung window. Matches the short warm-up
@@ -42,9 +42,13 @@ const RUNG_WARMUP_WINDOWS: u8 = 2;
 // trip about as often as one whose window is still short.
 const LATENCY_FOLD_SAMPLES: u32 = RUNG_WARMUP_WINDOW_RESPONSES as u32;
 
-// A rung is only kept when it beats the rung below it by this much; anything
-// less is noise on a shared link.
-const RUNG_KEEP_THROUGHPUT_RATIO: f64 = 1.05;
+// How far apart two windows' throughput may be and still count as the same
+// on a shared link. A step up is reverted only when it falls short of the
+// rung below it by more than this; a trial inside the band is no worse than
+// its baseline and is kept. On a link-bound server every rung reads the same
+// throughput, so a bar the trial had to clear upward would revert a rung that
+// cost nothing.
+const RUNG_THROUGHPUT_NOISE_RATIO: f64 = 1.05;
 
 // How long a server is left alone after a revert or an unclean batch.
 const RUNG_HOLD: Duration = Duration::from_secs(10 * 60);
@@ -602,6 +606,14 @@ impl ServerPipelineExplorer {
         // server had been slow: a verdict on that window reverts a rung for
         // the dispatcher's lateness.
         let rung_was_fed = !self.window_starved;
+        // The explorer's first window is the link's alone. It is read while
+        // the lanes are still coming up — some on their first article, the
+        // rest sharing the link between fewer of them — so each lane moves
+        // bytes faster than it will once all of them run. Taken as a baseline
+        // it is a throughput no later window at any rung matches, and the
+        // trial that follows reverts on a link that only got busier. It feeds
+        // the model; the baseline comes from the next window.
+        let opening_window = self.warmup_windows_left == RUNG_WARMUP_WINDOWS;
         self.fold_window_latency();
         self.reset_window();
         self.warmup_windows_left = self.warmup_windows_left.saturating_sub(1);
@@ -613,11 +625,17 @@ impl ServerPipelineExplorer {
             // nothing in it that describes the rung.
             return None;
         }
+        if opening_window {
+            return None;
+        }
 
         if self.on_trial {
             let baseline = self.baseline_throughput_bps.unwrap_or(0.0);
             let previous = self.baseline_depth.unwrap_or(self.current_depth);
-            if throughput >= baseline * RUNG_KEEP_THROUGHPUT_RATIO {
+            // No worse than the rung below, within the noise band, keeps the
+            // rung: a deeper rung that ties costs nothing, and only one that
+            // measurably lost is worth a hold.
+            if throughput * RUNG_THROUGHPUT_NOISE_RATIO >= baseline {
                 self.on_trial = false;
                 self.baseline_depth = Some(self.current_depth);
                 self.baseline_throughput_bps = Some(throughput);
@@ -914,6 +932,19 @@ mod tests {
         change
     }
 
+    // Feed the explorer's opening window, which measures the link and
+    // decides nothing.
+    fn open_window(explorer: &mut ServerPipelineExplorer, now: Instant) {
+        let depth = explorer.current_depth();
+        assert_eq!(
+            run_window(explorer, now, 100_000, Duration::from_millis(100)),
+            None,
+            "the opening window moves no rung"
+        );
+        assert_eq!(explorer.current_depth(), depth);
+        assert_eq!(explorer.baseline_throughput_bps, None);
+    }
+
     // A connection's first article never counts toward the window, so a
     // job whose lanes have all just connected does not close its opening
     // window on handshake-era samples.
@@ -1072,6 +1103,7 @@ mod tests {
         assert_eq!(explorer.current_depth(), 2);
         assert_eq!(explorer.target_rung(), 8);
 
+        open_window(&mut explorer, now);
         let change = run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
         assert_eq!(change, Some(RungChange::Stepped { from: 2, to: 8 }));
         assert_eq!(explorer.current_depth(), 8);
@@ -1089,6 +1121,7 @@ mod tests {
         // Articles as long as two thirds of the round trip: the link wants 4,
         // which is where the first decision puts it.
         assert_eq!(explorer.target_rung(), 4);
+        open_window(&mut explorer, now);
         assert_eq!(
             run_window(&mut explorer, now, 100_000, Duration::from_millis(100)),
             Some(RungChange::Stepped { from: 2, to: 4 })
@@ -1111,6 +1144,7 @@ mod tests {
     fn a_step_up_that_pays_for_itself_is_kept() {
         let mut explorer = explorer(300, 50);
         let now = Instant::now();
+        open_window(&mut explorer, now);
         run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
         assert_eq!(explorer.current_depth(), 8);
 
@@ -1120,14 +1154,59 @@ mod tests {
         assert_eq!(explorer.current_depth(), 8);
     }
 
+    // A deeper rung that reads the same throughput as the one below it, to
+    // within the noise band, cost nothing and is kept. A link-bound server
+    // reads the same at every rung, and a bar the trial had to clear upward
+    // reverted it on every run.
+    #[test]
+    fn a_trial_that_ties_its_baseline_is_kept() {
+        let mut explorer = explorer(300, 50);
+        let now = Instant::now();
+        open_window(&mut explorer, now);
+        run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
+        assert_eq!(explorer.current_depth(), 8);
+
+        // Four percent below the baseline: inside the band.
+        let change = run_window(&mut explorer, now, 96_000, Duration::from_millis(100));
+        assert_eq!(change, Some(RungChange::Kept { depth: 8 }));
+        assert_eq!(explorer.current_depth(), 8);
+    }
+
+    // The bench's link-bound server: 768 000-byte articles, a 102 ms round
+    // trip, 48 ms on the wire. The opening window reads each lane at 18 MB/s
+    // while the lanes are still coming up; every later window, at either
+    // rung, reads 15.4 MB/s. The opening window is not the baseline, so the
+    // trial that matches the steady state keeps its rung.
+    #[test]
+    fn a_fast_opening_window_does_not_revert_a_trial_at_the_steady_state() {
+        const ARTICLE: u64 = 768_000;
+        let opening = Duration::from_micros(42_700);
+        let steady = Duration::from_micros(50_000);
+        let mut explorer = explorer(102, 48);
+        let now = Instant::now();
+
+        assert_eq!(run_window(&mut explorer, now, ARTICLE, opening), None);
+        assert_eq!(explorer.current_depth(), 2);
+        assert_eq!(explorer.baseline_throughput_bps, None);
+
+        let change = run_window(&mut explorer, now, ARTICLE, steady);
+        let Some(RungChange::Stepped { from: 2, to }) = change else {
+            panic!("the baseline window steps toward the target, got {change:?}");
+        };
+        let change = run_window(&mut explorer, now, ARTICLE, steady);
+        assert_eq!(change, Some(RungChange::Kept { depth: to }));
+        assert_eq!(explorer.current_depth(), to);
+    }
+
     // A trial window in which one response found its lane short of a full
     // rung is no verdict: the slow window timed the lane waiting on its next
     // lease. The trial stays open, and the next window, fed throughout,
-    // judges it, and still reverts a rung that did not pay.
+    // judges it, and still reverts a rung that measurably lost.
     #[test]
     fn a_window_a_lane_ran_short_in_judges_no_rung() {
         let mut explorer = explorer(300, 50);
         let now = Instant::now();
+        open_window(&mut explorer, now);
         run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
         assert_eq!(explorer.current_depth(), 8);
 
@@ -1136,22 +1215,14 @@ mod tests {
         for response in 0..responses {
             let fed = response != responses / 2;
             change = explorer
-                .note_response(
-                    now,
-                    8,
-                    101_000,
-                    Duration::from_millis(100),
-                    true,
-                    false,
-                    fed,
-                )
+                .note_response(now, 8, 90_000, Duration::from_millis(100), true, false, fed)
                 .or(change);
         }
         assert_eq!(change, None);
         assert_eq!(explorer.current_depth(), 8);
         assert_eq!(explorer.window_responses, 0);
 
-        let change = run_window(&mut explorer, now, 101_000, Duration::from_millis(100));
+        let change = run_window(&mut explorer, now, 90_000, Duration::from_millis(100));
         assert_eq!(change, Some(RungChange::Reverted { from: 8, to: 2 }));
     }
 
@@ -1159,10 +1230,11 @@ mod tests {
     fn a_step_up_that_does_not_pay_reverts_and_holds() {
         let mut explorer = explorer(300, 50);
         let now = Instant::now();
+        open_window(&mut explorer, now);
         run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
         assert_eq!(explorer.current_depth(), 8);
 
-        let change = run_window(&mut explorer, now, 101_000, Duration::from_millis(100));
+        let change = run_window(&mut explorer, now, 90_000, Duration::from_millis(100));
         assert_eq!(change, Some(RungChange::Reverted { from: 8, to: 2 }));
         assert_eq!(explorer.current_depth(), 2);
 
@@ -1182,6 +1254,7 @@ mod tests {
     fn an_unclean_batch_drops_a_rung_and_a_second_one_pins_sequential() {
         let mut explorer = explorer(300, 50);
         let now = Instant::now();
+        open_window(&mut explorer, now);
         run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
         assert_eq!(explorer.current_depth(), 8);
 
@@ -1249,6 +1322,7 @@ mod tests {
         let now = Instant::now();
         assert_eq!(explorer.target_rung(), 8);
 
+        open_window(&mut explorer, now);
         let change = run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
         assert_eq!(change, Some(RungChange::Stepped { from: 2, to: 8 }));
 
@@ -1413,6 +1487,8 @@ mod tests {
         assert_eq!(explorer.window_target_responses(), 8);
         let now = Instant::now();
 
+        open_window(&mut explorer, now);
+        assert_eq!(explorer.window_target_responses(), 8);
         run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
         assert_eq!(explorer.window_target_responses(), 8);
         run_window(&mut explorer, now, 200_000, Duration::from_millis(100));
@@ -1429,6 +1505,7 @@ mod tests {
         assert_eq!(explorer.take_persist_request(), Some(2));
         assert_eq!(explorer.take_persist_request(), None);
 
+        open_window(&mut explorer, now);
         run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
         assert_eq!(explorer.current_depth(), 8);
         // The step up is on trial; the caller must not write it through yet,
@@ -1502,6 +1579,7 @@ mod tests {
 
         // The first decision goes to the target in one move — down as well as
         // up. This used to walk 8 -> 4 -> 2 over two windows.
+        open_window(&mut explorer, now);
         assert_eq!(
             run_window(&mut explorer, now, 100_000, Duration::from_millis(100)),
             Some(RungChange::Stepped { from: 8, to: 2 })
