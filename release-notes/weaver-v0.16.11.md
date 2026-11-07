@@ -20,6 +20,28 @@ Everything below is new since 0.16.10.
 - **Pause the queue for a set time.** Pause all is now a split button with
   30-minute, 1-hour, 2-hour and 8-hour options. The queue resumes by itself
   when the time is up.
+- **Expired sessions log in again in place.** When a server expires a
+  session in the middle of a batch, Weaver logs in again on the same
+  connection. It used to drop the connection and dial a new one, and an
+  article could run out of retries.
+
+## Usenet connections
+
+- **Logging in again on a 480.** A server may answer any command with 480
+  once a session expires. Weaver now keeps reading the replies already
+  queued on the connection and sends nothing new. Once they're read, it
+  logs in again on the same socket. If the login fails, or the connection
+  has no credentials, the connection is dropped as before.
+- **A 480 never costs the article.** An article that got a 480 in place of
+  its reply, or was left unanswered behind a failed batch, is retried like
+  any connection fault. It no longer counts toward the run of transport
+  failures. Before, a server answering half its requests with 480 could use
+  up a segment's retries and mark it exhausted.
+- **Retries are held only for a quarantined server.** A segment whose
+  transport keeps failing has its retry held back only while its server is
+  quarantined, so the server's recovery probe tries different work. A
+  server that drops some connections but keeps serving others now gets its
+  retries promptly.
 
 ## Database
 
@@ -150,3 +172,20 @@ Everything below is new since 0.16.10.
   last checkpoint, and nothing that checkpoint names.
 - **The timed-pause test steps the paused clock.** The timed resume test no
   longer depends on when the resume timer first runs.
+- **Clippy enforces the writer gate.** `clippy.toml` bans sqlx's write,
+  transaction and connection entry points, so a new SQLite write has to go
+  through the writer gate or carry a reviewed exception. A test checks the
+  ban list and every exception.
+- **The restart test reads the schema before renaming a column.** With
+  every pool connection kept open, a column rename could run on a
+  connection whose cached schema predated an earlier rename.
+- **End-to-end specs locate by test id.** The jobs, networking and settings
+  pages, and the values in the RSS, backup and speed-test reports, carry
+  `data-testid` attributes defined in one module per area. The Playwright
+  specs find elements by those ids, so a wording change no longer fails
+  them. An audit rejects locators that use visible text, unless the text is
+  what the test checks. There are no visible changes.
+- **More reliable end-to-end runs.** Fixed timeouts are replaced with waits
+  on the state under test. The RSS error flow no longer races the first
+  poll, and a `compose up` that the container engine's API dropped is
+  retried.
