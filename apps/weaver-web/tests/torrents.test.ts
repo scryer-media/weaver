@@ -228,7 +228,6 @@ test("every locale renders route reasons and reuses its route refusal wording", 
     }
   }
   assert.equal(routeReasonText(t, "LEG_DOWN"), "Leg down");
-  assert.equal(routeReasonText(t, "ROUTE_PLAN_FAILED"), "Route planning failed");
   assert.equal(routeReasonText(t, "LEG_OPEN_FAILED"), "Leg failed to open");
   assert.equal(routeReasonText(t, "STATE_DIRECTORY_FAILED"), "State directory unavailable");
   assert.equal(routeReasonText(t, "LISTEN_PORT_UNAVAILABLE"), "Listen port unavailable");

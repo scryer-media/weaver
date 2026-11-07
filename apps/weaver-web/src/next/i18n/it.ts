@@ -1810,7 +1810,6 @@ export const nextIt: LocaleDictionary = {
   "next.torrents.routeReason.LEG_REVOKED": "Tratto revocato",
   "next.torrents.routeReason.QUOTA_SILENCED": "Quota raggiunta",
   "next.torrents.routeReason.TORRENTS_DISABLED": "Torrent disattivati",
-  "next.torrents.routeReason.ROUTE_PLAN_FAILED": "Pianificazione della rotta non riuscita",
   "next.torrents.routeReason.LEG_OPEN_FAILED": "Apertura del tratto non riuscita",
   "next.torrents.routeReason.STATE_DIRECTORY_FAILED": "Cartella di stato non disponibile",
   "next.torrents.routeReason.LISTEN_PORT_UNAVAILABLE": "Porta di ascolto non disponibile",

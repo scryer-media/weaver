@@ -29,8 +29,8 @@ use weaver_server_core::torrents::sessions::{
 struct Offline;
 
 impl Routes for Offline {
-    fn plan(&self, scope: TorrentScope) -> Result<RoutePlan, String> {
-        Ok(RoutePlan {
+    fn plan(&self, scope: TorrentScope) -> RoutePlan {
+        RoutePlan {
             scope,
             policy: RoutingPolicy::default(),
             egress_id: SYSTEM_EGRESS_ID,
@@ -42,7 +42,7 @@ impl Routes for Offline {
             ),
             members: Vec::new(),
             member: None,
-        })
+        }
     }
 
     fn leg_down(
@@ -1519,7 +1519,7 @@ fn a_down_route_overrides_its_previous_session_state() {
 struct Planned(weaver_server_core::torrents::sessions::NetworkRoutes);
 
 impl Routes for Planned {
-    fn plan(&self, scope: TorrentScope) -> Result<RoutePlan, String> {
+    fn plan(&self, scope: TorrentScope) -> RoutePlan {
         self.0.plan(scope)
     }
 

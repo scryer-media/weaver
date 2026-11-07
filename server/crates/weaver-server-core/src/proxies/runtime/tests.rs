@@ -550,10 +550,7 @@ async fn a_reload_asked_for_during_another_reads_the_rows_again() {
     release.send(()).unwrap();
 
     second.await.unwrap().unwrap();
-    assert_eq!(
-        routes.plan(TorrentScope::Default).unwrap().egress_id,
-        absent.id
-    );
+    assert_eq!(routes.plan(TorrentScope::Default).egress_id, absent.id);
     first.await.unwrap().unwrap();
     runtime.network.shutdown().await;
 }

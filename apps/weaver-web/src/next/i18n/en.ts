@@ -1818,7 +1818,6 @@ export const nextEn: LocaleDictionary = {
   "next.torrents.routeReason.LEG_REVOKED": "Leg revoked",
   "next.torrents.routeReason.QUOTA_SILENCED": "Quota reached",
   "next.torrents.routeReason.TORRENTS_DISABLED": "Torrents disabled",
-  "next.torrents.routeReason.ROUTE_PLAN_FAILED": "Route planning failed",
   "next.torrents.routeReason.LEG_OPEN_FAILED": "Leg failed to open",
   "next.torrents.routeReason.STATE_DIRECTORY_FAILED": "State directory unavailable",
   "next.torrents.routeReason.LISTEN_PORT_UNAVAILABLE": "Listen port unavailable",

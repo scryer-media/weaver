@@ -1810,7 +1810,6 @@ export const nextDe: LocaleDictionary = {
   "next.torrents.routeReason.LEG_REVOKED": "Verbindung entzogen",
   "next.torrents.routeReason.QUOTA_SILENCED": "Kontingent erreicht",
   "next.torrents.routeReason.TORRENTS_DISABLED": "Torrents deaktiviert",
-  "next.torrents.routeReason.ROUTE_PLAN_FAILED": "Routenplanung fehlgeschlagen",
   "next.torrents.routeReason.LEG_OPEN_FAILED": "Verbindung konnte nicht geöffnet werden",
   "next.torrents.routeReason.STATE_DIRECTORY_FAILED": "Zustandsverzeichnis nicht verfügbar",
   "next.torrents.routeReason.LISTEN_PORT_UNAVAILABLE": "Lauschport nicht verfügbar",

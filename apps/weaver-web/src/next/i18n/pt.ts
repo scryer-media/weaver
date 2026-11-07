@@ -1810,7 +1810,6 @@ export const nextPt: LocaleDictionary = {
   "next.torrents.routeReason.LEG_REVOKED": "Trecho revogado",
   "next.torrents.routeReason.QUOTA_SILENCED": "Cota atingida",
   "next.torrents.routeReason.TORRENTS_DISABLED": "Torrents desativados",
-  "next.torrents.routeReason.ROUTE_PLAN_FAILED": "Falha ao planejar a rota",
   "next.torrents.routeReason.LEG_OPEN_FAILED": "Falha ao abrir o trecho",
   "next.torrents.routeReason.STATE_DIRECTORY_FAILED": "Diretório de estado indisponível",
   "next.torrents.routeReason.LISTEN_PORT_UNAVAILABLE": "Porta de escuta indisponível",

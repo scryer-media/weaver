@@ -1810,7 +1810,6 @@ export const nextZh: LocaleDictionary = {
   "next.torrents.routeReason.LEG_REVOKED": "连接段已撤销",
   "next.torrents.routeReason.QUOTA_SILENCED": "已达到配额",
   "next.torrents.routeReason.TORRENTS_DISABLED": "种子功能已禁用",
-  "next.torrents.routeReason.ROUTE_PLAN_FAILED": "路由规划失败",
   "next.torrents.routeReason.LEG_OPEN_FAILED": "连接段开启失败",
   "next.torrents.routeReason.STATE_DIRECTORY_FAILED": "状态目录不可用",
   "next.torrents.routeReason.LISTEN_PORT_UNAVAILABLE": "监听端口不可用",

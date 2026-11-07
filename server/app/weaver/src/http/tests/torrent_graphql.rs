@@ -35,8 +35,8 @@ const KEY: &str = "torrent-admin-key";
 struct Offline;
 
 impl Routes for Offline {
-    fn plan(&self, scope: TorrentScope) -> Result<RoutePlan, String> {
-        Ok(RoutePlan {
+    fn plan(&self, scope: TorrentScope) -> RoutePlan {
+        RoutePlan {
             scope,
             policy: RoutingPolicy::default(),
             egress_id: SYSTEM_EGRESS_ID,
@@ -48,7 +48,7 @@ impl Routes for Offline {
             ),
             members: Vec::new(),
             member: None,
-        })
+        }
     }
 
     fn leg_down(

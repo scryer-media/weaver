@@ -69,7 +69,7 @@ use crate::torrents::rate::limit_kind;
 use crate::torrents::relocate::{self, Existing, MoveError};
 use crate::torrents::sessions::{
     NetworkRoutes, RouteFailure, RouteKey, RoutePlan, SessionEnv, SessionError, SessionView,
-    Sessions, TorrentRouteReason, encryption_policy, unplanned_key,
+    Sessions, TorrentRouteReason, encryption_policy,
 };
 use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces};
@@ -3465,9 +3465,7 @@ impl TorrentService {
     /// Whether the route a torrent in `scope` would take carries DHT, so a
     /// magnet with no trackers can find its peers there.
     pub async fn carries_dht(&self, scope: TorrentScope) -> bool {
-        let Ok(plan) = self.inner.sessions.routes().plan(scope) else {
-            return false;
-        };
+        let plan = self.inner.sessions.routes().plan(scope);
         let (plan, _) = self.placed(&plan, None).await;
         self.inner.sessions.carries_dht(&plan).await
     }
@@ -3575,12 +3573,7 @@ impl TorrentService {
                 let rule =
                     tracker_rule_for(&rules, trackers.iter().map(|tracker| tracker.url.as_str()));
                 let scope = settings.scope(category.as_ref().map(|category| category.id), rule);
-                let plan = self
-                    .inner
-                    .sessions
-                    .routes()
-                    .plan(scope)
-                    .map_err(AddError::NoNetwork)?;
+                let plan = self.inner.sessions.routes().plan(scope);
                 let (plan, pin) = self.placed(&plan, None).await;
                 let session = self
                     .inner
@@ -4112,21 +4105,9 @@ impl TorrentService {
             return;
         };
         let scope = self.settings().scope(record.category_id, rule);
-        let plan = match self.inner.sessions.routes().plan(scope) {
-            Ok(plan) => self.pinned(job_id, plan).await,
-            Err(reason) => {
-                return self
-                    .held(
-                        job_id,
-                        None,
-                        Held::RouteDown(RouteFailure::with_detail(
-                            TorrentRouteReason::RoutePlanFailed,
-                            reason,
-                        )),
-                    )
-                    .await;
-            }
-        };
+        let plan = self
+            .pinned(job_id, self.inner.sessions.routes().plan(scope))
+            .await;
         // The trackers it lists, in their tiers: a magnet's fetch announces
         // to tiers, not to a bare list.
         let mut tiers = Vec::new();
@@ -4231,21 +4212,9 @@ impl TorrentService {
                 torrent.verified_at_boot.take(),
             )
         };
-        let plan = match self.inner.sessions.routes().plan(scope) {
-            Ok(plan) => self.pinned(job_id, plan).await,
-            Err(reason) => {
-                self.held(
-                    job_id,
-                    None,
-                    Held::RouteDown(RouteFailure::with_detail(
-                        TorrentRouteReason::RoutePlanFailed,
-                        reason,
-                    )),
-                )
-                .await;
-                return;
-            }
-        };
+        let plan = self
+            .pinned(job_id, self.inner.sessions.routes().plan(scope))
+            .await;
         let session = match self.open_session(&plan, &identity).await {
             Ok(session) => session,
             Err(error) => {
@@ -5653,9 +5622,8 @@ impl TorrentService {
         let mut reattach = Vec::new();
         let mut down = BTreeMap::new();
         let mut unresolved = Vec::new();
-        // One plan per scope a pass: the torrents of a scope share it, and a
-        // plan reads the scope's routing policy from the database.
-        let mut plans: HashMap<TorrentScope, Result<RoutePlan, String>> = HashMap::new();
+        // One plan per scope a pass: the torrents of a scope share it.
+        let mut plans: HashMap<TorrentScope, RoutePlan> = HashMap::new();
         {
             let mut live = self.inner.live.lock().await;
             // A torrent placed on a pool member this pass counts there for
@@ -5664,32 +5632,24 @@ impl TorrentService {
             for torrent in live.values_mut() {
                 let rule = torrent.rule(&rules);
                 let scope = settings.scope(torrent.record.category_id, rule);
-                let plan = plans
+                let (plan, pin) = plans
                     .entry(scope)
                     .or_insert_with(|| self.inner.sessions.routes().plan(scope))
-                    .clone()
-                    .map(|plan| {
-                        let (plan, pin) = plan.place(torrent.record.pool_member, |key| {
-                            load.get(key).copied().unwrap_or(0)
-                        });
-                        self.pin(torrent, pin);
-                        if torrent.route.as_ref() != Some(&plan.key) {
-                            if let Some(count) =
-                                torrent.route.as_ref().and_then(|key| load.get_mut(key))
-                            {
-                                *count = count.saturating_sub(1);
-                            }
-                            *load.entry(plan.key.clone()).or_default() += 1;
-                        }
-                        plan
+                    .place(torrent.record.pool_member, |key| {
+                        load.get(key).copied().unwrap_or(0)
                     });
+                self.pin(torrent, pin);
+                if torrent.route.as_ref() != Some(&plan.key) {
+                    if let Some(count) = torrent.route.as_ref().and_then(|key| load.get_mut(key)) {
+                        *count = count.saturating_sub(1);
+                    }
+                    *load.entry(plan.key.clone()).or_default() += 1;
+                }
                 if torrent.layout.is_none() {
                     let moved = matches!(torrent.resolving, Some(Resolving::Fetching(_)))
-                        && plan.as_ref().ok().is_none_or(|plan| {
-                            plan.down.is_some()
-                                || torrent.route.as_ref() != Some(&plan.key)
-                                || outdated.contains(&plan.key)
-                        });
+                        && (plan.down.is_some()
+                            || torrent.route.as_ref() != Some(&plan.key)
+                            || outdated.contains(&plan.key));
                     if moved && let Some(Resolving::Fetching(fetch)) = torrent.resolving.take() {
                         fetch.abort();
                         self.inner.counters.fetch(FetchOutcome::Cancelled);
@@ -5701,36 +5661,25 @@ impl TorrentService {
                     continue;
                 }
                 let terms = PeerTerms::of(&settings, rule);
-                match plan {
-                    Ok(plan) => {
-                        if let Some(reason) = &plan.down {
-                            down.insert(plan.key.clone(), reason.clone());
-                            torrent.settle(now);
-                            torrent.attached = None;
-                            torrent.engine = Engine::Absent;
-                            torrent.route = Some(plan.key);
-                            torrent.held = Some(Held::RouteDown(reason.clone()));
-                        } else if torrent.route.as_ref() != Some(&plan.key)
-                            || outdated.contains(&plan.key)
-                            || torrent.attached.as_ref().is_none_or(|attached| {
-                                attached.terms != terms
-                                    || !running
-                                        .get(&plan.key)
-                                        .is_some_and(|open| Arc::ptr_eq(open, &attached.session))
-                            })
-                        {
-                            self.detach(torrent).await;
-                            torrent.held = None;
-                            reattach.push(torrent.record.job_id);
-                        }
-                    }
-                    Err(reason) => {
-                        self.detach(torrent).await;
-                        torrent.held = Some(Held::RouteDown(RouteFailure::with_detail(
-                            TorrentRouteReason::RoutePlanFailed,
-                            reason,
-                        )));
-                    }
+                if let Some(reason) = &plan.down {
+                    down.insert(plan.key.clone(), reason.clone());
+                    torrent.settle(now);
+                    torrent.attached = None;
+                    torrent.engine = Engine::Absent;
+                    torrent.route = Some(plan.key);
+                    torrent.held = Some(Held::RouteDown(reason.clone()));
+                } else if torrent.route.as_ref() != Some(&plan.key)
+                    || outdated.contains(&plan.key)
+                    || torrent.attached.as_ref().is_none_or(|attached| {
+                        attached.terms != terms
+                            || !running
+                                .get(&plan.key)
+                                .is_some_and(|open| Arc::ptr_eq(open, &attached.session))
+                    })
+                {
+                    self.detach(torrent).await;
+                    torrent.held = None;
+                    reattach.push(torrent.record.job_id);
                 }
             }
         }
@@ -6030,21 +5979,14 @@ impl TorrentService {
         let mut listed: Vec<TorrentRoute> = Vec::new();
         for (scope, name) in self.route_scopes() {
             // A pool route is listed as each member's session.
-            let planned = match sessions.routes().plan(scope) {
-                Ok(plan) if !plan.members.is_empty() => plan
-                    .members
+            let plan = sessions.routes().plan(scope);
+            let planned: Vec<_> = if plan.members.is_empty() {
+                vec![(plan.key, plan.down, plan.names)]
+            } else {
+                plan.members
                     .into_iter()
                     .map(|member| (member.key, member.down, member.names))
-                    .collect(),
-                Ok(plan) => vec![(plan.key, plan.down, plan.names)],
-                Err(error) => vec![(
-                    unplanned_key(scope),
-                    Some(RouteFailure::with_detail(
-                        TorrentRouteReason::RoutePlanFailed,
-                        error,
-                    )),
-                    None,
-                )],
+                    .collect()
             };
             for (key, down, names) in planned {
                 match listed.iter_mut().find(|route| route.key == key) {
@@ -6093,7 +6035,7 @@ impl TorrentService {
         let existing: BTreeSet<RouteKey> = self
             .route_scopes()
             .into_iter()
-            .filter_map(|(scope, _)| routes.plan(scope).ok())
+            .map(|(scope, _)| routes.plan(scope))
             .flat_map(|plan| plan.keys().cloned().collect::<Vec<_>>())
             .collect();
         self.inner.sessions.forget_routes(existing).await;
@@ -6452,8 +6394,7 @@ impl TorrentService {
                 .sessions
                 .routes()
                 .plan(view.scope)
-                .ok()
-                .and_then(|plan| plan.names_for(pinned))
+                .names_for(pinned)
         });
         view.trackers = status::trackers(listed.to_vec(), announces, names);
     }
@@ -6487,7 +6428,7 @@ impl TorrentService {
         let rules = self.rules();
         let rule = tracker_rule_for(&rules, [url.as_str()]);
         let scope = self.scope_of(category, rule);
-        let plan = self.inner.sessions.routes().plan(scope)?;
+        let plan = self.inner.sessions.routes().plan(scope);
         if let Some(reason) = plan.down {
             return Err(SessionError::RouteDown(reason).to_string());
         }

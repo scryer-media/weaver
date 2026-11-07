@@ -175,7 +175,7 @@ impl FakeRoutes {
 
 #[async_trait::async_trait]
 impl Routes for FakeRoutes {
-    fn plan(&self, scope: TorrentScope) -> Result<RoutePlan, String> {
+    fn plan(&self, scope: TorrentScope) -> RoutePlan {
         let pool = self.pools.lock().unwrap().get(&scope_name(scope)).cloned();
         let proxy = self
             .proxies
@@ -216,7 +216,7 @@ impl Routes for FakeRoutes {
             .unwrap()
             .as_ref()
             .map_or(LegKind::Ladder, |(kind, _)| kind.clone());
-        Ok(RoutePlan {
+        RoutePlan {
             scope,
             policy: RoutingPolicy::default(),
             egress_id: SYSTEM_EGRESS_ID,
@@ -229,7 +229,7 @@ impl Routes for FakeRoutes {
             key,
             members,
             member: None,
-        })
+        }
     }
 
     fn leg_down(&self, plan: &RoutePlan) -> Option<RouteFailure> {
@@ -395,7 +395,7 @@ async fn a_route_whose_leg_is_revoked_opens_again_on_the_new_leg() {
         Database::open_in_memory().unwrap(),
     );
     sessions.set_config(any_port());
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     let stage = |slots: &BTreeMap<RouteKey, Slot>| match slots.get(&plan.key) {
         Some(Slot::Open { leg: Some(leg), .. }) => Arc::clone(&leg.stage),
         _ => panic!("the route is not open on a leg"),
@@ -447,7 +447,7 @@ async fn a_revoked_session_is_not_handed_out_before_its_route_is_dropped() {
         Database::open_in_memory().unwrap(),
     );
     sessions.set_config(any_port());
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     let old = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
 
     save_again(&db, &network).await;
@@ -509,8 +509,8 @@ async fn a_route_keeps_its_port_until_it_is_gone() {
     let db = Database::open_in_memory().unwrap();
     let sessions = Sessions::new(routes.clone(), env(dir.path()), db.clone());
     sessions.set_config(any_port());
-    let first = routes.plan(TorrentScope::Default).unwrap();
-    let second = routes.plan(TorrentScope::Category(5)).unwrap();
+    let first = routes.plan(TorrentScope::Default);
+    let second = routes.plan(TorrentScope::Category(5));
     sessions
         .session(&first, &IDENTITY.identity())
         .await
@@ -571,7 +571,7 @@ async fn a_route_announces_the_configured_port() {
         announce_port: Some(51_413),
         ..any_port()
     });
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
 
     let session = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
     assert_eq!(session.announce_port(), Some(51_413));
@@ -603,7 +603,7 @@ async fn a_route_shows_where_it_listens_and_how_its_ports_are_mapped() {
         Database::open_in_memory().unwrap(),
     );
     sessions.set_config(any_port());
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     let session = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
 
     let view = sessions.view(&plan.key).await.unwrap();
@@ -738,7 +738,7 @@ async fn session_setup_failures_keep_the_cause_that_failed() {
             ),
             _ => unreachable!(),
         }
-        let plan = routes.plan(TorrentScope::Default).unwrap();
+        let plan = routes.plan(TorrentScope::Default);
         let Err(SessionError::Build(failure)) = sessions.session(&plan, &IDENTITY.identity()).await
         else {
             panic!("failed setup opened a session: {expected:?}");
@@ -765,7 +765,7 @@ async fn a_route_that_could_not_listen_shows_why() {
         env(dir.path()),
         Database::open_in_memory().unwrap(),
     );
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     let Err(SessionError::Build(error)) = sessions.session(&plan, &IDENTITY.identity()).await
     else {
         panic!("a leg that cannot listen builds no session");
@@ -810,7 +810,7 @@ async fn a_route_listens_for_ssl_peers_while_turned_on() {
         Database::open_in_memory().unwrap(),
     );
     sessions.set_config(any_port());
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
 
     let session = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
     assert!(session.listen_addr().is_some());
@@ -845,7 +845,7 @@ async fn connections_per_address_reach_the_open_session_live() {
         Database::open_in_memory().unwrap(),
     );
     sessions.set_config(any_port());
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     let session = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
     assert!(!session.allows_multiple_connections_per_ip());
 
@@ -957,7 +957,7 @@ async fn a_base_port_change_listens_on_the_new_port_while_the_old_stopped_announ
         ..TorrentConfig::default()
     };
     sessions.set_config(on(first));
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     let old = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
     assert_eq!(old.listen_addr().map(|addr| addr.port()), Some(first));
 
@@ -1073,7 +1073,7 @@ async fn a_new_session_waits_on_a_stopping_one_only_for_a_port_it_shares() {
     let (lines, _guard) =
         crate::pipeline::graph::lines::Lines::capture_at("weaver", tracing::Level::INFO);
     let routes = FakeRoutes::default();
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     let closing = Closing::default();
     let (stopped, waiting) = tokio::sync::watch::channel(false);
     // Listening on 6881 and 6882, it maps 51413.
@@ -1141,7 +1141,7 @@ async fn the_torrent_settings_reach_the_sessions() {
         connection_speed: speed(7),
         ..TorrentConfig::default()
     });
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     let session = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
     assert_eq!(
         session.limits(),
@@ -1190,7 +1190,7 @@ async fn a_route_with_no_transport_holds_closed() {
         peer_protocol: crate::settings::TorrentPeerProtocol::Utp,
         ..TorrentConfig::default()
     });
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     assert!(matches!(
         sessions.session(&plan, &IDENTITY.identity()).await,
         Err(SessionError::Build(_))
@@ -1220,7 +1220,7 @@ async fn a_route_whose_blocklist_does_not_load_holds_closed() {
         blocklist: Some(missing.display().to_string()),
         ..TorrentConfig::default()
     });
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     assert!(matches!(
         sessions.session(&plan, &IDENTITY.identity()).await,
         Err(SessionError::Build(_))
@@ -1255,7 +1255,7 @@ async fn the_ip_filter_settings_reach_the_open_sessions() {
         Database::open_in_memory().unwrap(),
     );
     sessions.set_config(TorrentConfig::default());
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     let session = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
     let (banned, listed): (IpAddr, IpAddr) =
         ("10.0.0.7".parse().unwrap(), "192.0.2.1".parse().unwrap());
@@ -1325,7 +1325,7 @@ async fn a_blocklist_that_does_not_load_holds_the_open_sessions_closed() {
         env(dir.path()),
         Database::open_in_memory().unwrap(),
     );
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     let session = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
 
     sessions.set_config(TorrentConfig {
@@ -1374,8 +1374,8 @@ async fn every_route_shares_one_blocklist_load() {
         ..TorrentConfig::default()
     };
     sessions.set_config(named.clone());
-    let first = routes.plan(TorrentScope::Default).unwrap();
-    let second = routes.plan(TorrentScope::Category(5)).unwrap();
+    let first = routes.plan(TorrentScope::Default);
+    let second = routes.plan(TorrentScope::Category(5));
     let a = sessions
         .session(&first, &IDENTITY.identity())
         .await
@@ -1728,9 +1728,9 @@ async fn scopes_on_one_route_share_a_session() {
         Database::open_in_memory().unwrap(),
     );
 
-    let default = routes.plan(TorrentScope::Default).unwrap();
-    let five = routes.plan(TorrentScope::Category(5)).unwrap();
-    let six = routes.plan(TorrentScope::Category(6)).unwrap();
+    let default = routes.plan(TorrentScope::Default);
+    let five = routes.plan(TorrentScope::Category(5));
+    let six = routes.plan(TorrentScope::Category(6));
     assert_eq!(default.key, five.key);
     assert_ne!(default.key, six.key);
 
@@ -1758,17 +1758,17 @@ async fn the_ninth_route_is_refused() {
     );
     for id in 0..MAX_SESSIONS as u32 {
         routes.route(TorrentScope::Category(id), id + 1);
-        let plan = routes.plan(TorrentScope::Category(id)).unwrap();
+        let plan = routes.plan(TorrentScope::Category(id));
         sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
     }
     routes.route(TorrentScope::Category(99), 99);
-    let ninth = routes.plan(TorrentScope::Category(99)).unwrap();
+    let ninth = routes.plan(TorrentScope::Category(99));
     assert_eq!(
         sessions.session(&ninth, &IDENTITY.identity()).await.err(),
         Some(SessionError::Cap)
     );
 
-    let first = routes.plan(TorrentScope::Category(0)).unwrap();
+    let first = routes.plan(TorrentScope::Category(0));
     sessions.drop_route(&first.key).await;
     sessions
         .session(&ninth, &IDENTITY.identity())
@@ -1786,7 +1786,7 @@ async fn a_route_that_goes_down_holds_closed_until_it_is_back() {
         env(dir.path()),
         Database::open_in_memory().unwrap(),
     );
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     let before = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
 
     sessions
@@ -1803,7 +1803,7 @@ async fn a_route_that_goes_down_holds_closed_until_it_is_back() {
     assert_eq!(view.port, None);
 
     routes.set_down(Some("link down"));
-    let down = routes.plan(TorrentScope::Default).unwrap();
+    let down = routes.plan(TorrentScope::Default);
     assert_eq!(
         sessions.session(&down, &IDENTITY.identity()).await.err(),
         Some(SessionError::RouteDown(RouteFailure::leg_down(
@@ -1812,7 +1812,7 @@ async fn a_route_that_goes_down_holds_closed_until_it_is_back() {
     );
 
     routes.set_down(None);
-    let up = routes.plan(TorrentScope::Default).unwrap();
+    let up = routes.plan(TorrentScope::Default);
     let after = sessions.session(&up, &IDENTITY.identity()).await.unwrap();
     assert!(!Arc::ptr_eq(&before, &after));
     assert_eq!(sessions.view(&plan.key).await.unwrap().held, None);
@@ -1842,10 +1842,7 @@ async fn the_torrent_rate_is_shared_across_the_open_sessions() {
     };
 
     let one = sessions
-        .session(
-            &routes.plan(TorrentScope::Default).unwrap(),
-            &IDENTITY.identity(),
-        )
+        .session(&routes.plan(TorrentScope::Default), &IDENTITY.identity())
         .await
         .unwrap();
     assert_eq!(rate(&one), None);
@@ -1857,7 +1854,7 @@ async fn the_torrent_rate_is_shared_across_the_open_sessions() {
 
     let two = sessions
         .session(
-            &routes.plan(TorrentScope::Category(6)).unwrap(),
+            &routes.plan(TorrentScope::Category(6)),
             &IDENTITY.identity(),
         )
         .await
@@ -1899,7 +1896,7 @@ async fn every_session_gets_the_whole_peer_limit() {
     });
     for scope in [TorrentScope::Default, TorrentScope::Category(5)] {
         sessions
-            .session(&routes.plan(scope).unwrap(), &IDENTITY.identity())
+            .session(&routes.plan(scope), &IDENTITY.identity())
             .await
             .unwrap();
     }
@@ -2027,7 +2024,7 @@ async fn a_closed_route_lets_go_of_its_dht_socket_before_it_opens_again() {
         base_port,
         ..any_port()
     });
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
 
     let before = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
     assert!(before.get_dht().is_some());
@@ -2102,7 +2099,7 @@ async fn a_new_listen_port_reopens_the_route_on_it() {
         ..TorrentConfig::default()
     };
     let (routes, sessions) = unbound_sessions(dir.path(), first.clone());
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     let before = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
     let view = sessions.view(&plan.key).await.unwrap();
     assert_eq!(view.listen.map(|listen| listen.port()), Some(40_000));
@@ -2137,7 +2134,7 @@ async fn a_new_announce_port_reaches_the_next_announce() {
         ..TorrentConfig::default()
     };
     let (routes, sessions) = unbound_sessions(dir.path(), first.clone());
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     let session = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
     assert_eq!(session.announce_port(), Some(51_413));
 
@@ -2169,7 +2166,7 @@ async fn a_new_announce_port_reaches_the_next_announce() {
 async fn other_settings_leave_the_session_open() {
     let dir = tempfile::tempdir().unwrap();
     let (routes, sessions) = unbound_sessions(dir.path(), TorrentConfig::default());
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     let session = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
 
     sessions.set_config(TorrentConfig {
@@ -2223,7 +2220,7 @@ fn port_mapping_is_what_a_mapping_leg_opens_with() {
 async fn a_new_session_directory_reopens_the_route_there() {
     let dir = tempfile::tempdir().unwrap();
     let (routes, sessions) = unbound_sessions(dir.path(), TorrentConfig::default());
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
     assert!(dir.path().join(plan.key.as_str()).is_dir());
 
@@ -2265,7 +2262,7 @@ async fn a_session_sends_stopped_only_while_its_leg_stands_and_its_route_is_up()
         stop_tracker_timeout_secs: 86_400,
         ..any_port()
     });
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     // The route's session, running a torrent its tracker took `started` from.
     let announced = || async {
         let session = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
@@ -2432,7 +2429,7 @@ async fn a_system_leg_session_looks_names_up_on_the_record() {
     let proxies =
         crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
     let routes = crate::torrents::sessions::NetworkRoutes::new(proxies, Duration::from_secs(30));
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     assert_eq!(plan.kind, LegKind::System);
     let leg = routes.open(&plan, 8).await.unwrap();
     let options = session_options(
@@ -2489,10 +2486,10 @@ async fn a_route_plans_who_resolves_its_names() {
     let proxies =
         crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
     let routes = crate::torrents::sessions::NetworkRoutes::new(proxies, Duration::from_secs(30));
-    let direct = routes.plan(TorrentScope::Default).unwrap();
+    let direct = routes.plan(TorrentScope::Default);
     assert_eq!(direct.kind, LegKind::System);
     assert_eq!(direct.names, Some(ResolvedBy::Host));
-    let laddered = routes.plan(category).unwrap();
+    let laddered = routes.plan(category);
     assert_eq!(laddered.kind, LegKind::Ladder);
     assert_eq!(laddered.names, Some(ResolvedBy::Proxy));
 }

@@ -134,7 +134,7 @@ async fn open_on(
     scope: TorrentScope,
     member: u32,
 ) -> Arc<Session> {
-    let (plan, pin) = routes.plan(scope).unwrap().place(Some(member), |_| 0);
+    let (plan, pin) = routes.plan(scope).place(Some(member), |_| 0);
     assert_eq!(pin, Some(member));
     sessions.session(&plan, &IDENTITY.identity()).await.unwrap()
 }
@@ -415,8 +415,8 @@ async fn a_proxy_in_two_pools_runs_one_session_until_no_pool_holds_it() {
     routes.route_pool(TV, other.id, &[2, 3]);
     let sessions = sessions_on(&routes, dir.path());
 
-    let default = routes.plan(TorrentScope::Default).unwrap();
-    let tv = routes.plan(TV).unwrap();
+    let default = routes.plan(TorrentScope::Default);
+    let tv = routes.plan(TV);
     let shared: Vec<_> = default
         .keys()
         .filter(|key| tv.keys().any(|other| other == *key))

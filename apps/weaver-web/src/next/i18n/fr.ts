@@ -1810,7 +1810,6 @@ export const nextFr: LocaleDictionary = {
   "next.torrents.routeReason.LEG_REVOKED": "Liaison révoquée",
   "next.torrents.routeReason.QUOTA_SILENCED": "Quota atteint",
   "next.torrents.routeReason.TORRENTS_DISABLED": "Torrents désactivés",
-  "next.torrents.routeReason.ROUTE_PLAN_FAILED": "Échec de la planification de la route",
   "next.torrents.routeReason.LEG_OPEN_FAILED": "Échec de l’ouverture de la liaison",
   "next.torrents.routeReason.STATE_DIRECTORY_FAILED": "Répertoire d’état indisponible",
   "next.torrents.routeReason.LISTEN_PORT_UNAVAILABLE": "Port d’écoute indisponible",

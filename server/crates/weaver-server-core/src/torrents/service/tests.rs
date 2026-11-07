@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
 use sha1::{Digest, Sha1};
 use weaver_torrent::core::lengths::Lengths;
@@ -966,7 +966,7 @@ async fn stored_route_faults_keep_their_typed_reason() {
         )
         .await;
         let routes = NetworkRoutes::new(Arc::clone(&proxies), Duration::from_secs(30));
-        let failure = routes.plan(TorrentScope::Default).unwrap().down.unwrap();
+        let failure = routes.plan(TorrentScope::Default).down.unwrap();
         assert_eq!(failure.reason, TorrentRouteReason::RouteBroken(fault));
         assert_eq!(failure.message(), fault.message());
         proxies.network.shutdown().await;
@@ -1020,7 +1020,7 @@ async fn a_pool_route_plans_a_session_on_each_member() {
         crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
     let routes = NetworkRoutes::new(Arc::clone(&proxies), Duration::from_secs(30));
 
-    let plan = routes.plan(TorrentScope::Default).unwrap();
+    let plan = routes.plan(TorrentScope::Default);
     assert!(plan.down.is_none(), "{:?}", plan.down);
     let key = |member| member_key(&proxies.network, SYSTEM_EGRESS_ID, member);
     let members: Vec<_> = plan
@@ -1060,122 +1060,9 @@ async fn a_missing_egress_has_a_typed_route_reason() {
     .await;
     let routes = NetworkRoutes::new(Arc::clone(&proxies), Duration::from_secs(30));
     assert_eq!(
-        routes
-            .plan(TorrentScope::Default)
-            .unwrap()
-            .down
-            .unwrap()
-            .reason,
+        routes.plan(TorrentScope::Default).down.unwrap().reason,
         TorrentRouteReason::LegMissing
     );
-    proxies.network.shutdown().await;
-}
-
-// Routes whose plan fails once `failing` is set, else plans as `routes` does.
-struct FailingPlan {
-    routes: crate::torrents::sessions::NetworkRoutes,
-    failing: std::sync::atomic::AtomicBool,
-}
-
-#[async_trait::async_trait]
-impl Routes for FailingPlan {
-    fn plan(&self, scope: TorrentScope) -> Result<crate::torrents::sessions::RoutePlan, String> {
-        if self.failing.load(Ordering::Acquire) {
-            return Err("the route could not be read".to_owned());
-        }
-        self.routes.plan(scope)
-    }
-
-    fn leg_down(
-        &self,
-        plan: &crate::torrents::sessions::RoutePlan,
-    ) -> Option<crate::torrents::sessions::RouteFailure> {
-        self.routes.leg_down(plan)
-    }
-
-    async fn open(
-        &self,
-        plan: &crate::torrents::sessions::RoutePlan,
-        peers: usize,
-    ) -> Result<crate::torrents::sessions::OpenLeg, String> {
-        self.routes.open(plan, peers).await
-    }
-
-    async fn fetch_blocklist(
-        &self,
-        url: &reqwest::Url,
-    ) -> Result<crate::torrents::sessions::IpRanges, String> {
-        self.routes.fetch_blocklist(url).await
-    }
-}
-
-#[tokio::test]
-async fn a_route_plan_failure_stays_typed_in_the_torrents_status() {
-    use crate::torrents::sessions::{NetworkRoutes, TorrentRouteReason};
-    let dir = tempfile::tempdir().unwrap();
-    let db = Database::open_in_memory().unwrap();
-    let proxies =
-        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
-    store_route_unchecked(
-        &db,
-        &proxies,
-        Consumer::Torrent(TorrentScope::Default),
-        &RoutingPolicy {
-            legs: vec![RouteLeg {
-                egress_id: 999,
-                weight: 100,
-                path: LegPath::Direct,
-            }],
-            ..Default::default()
-        },
-    )
-    .await;
-    let routes = Arc::new(FailingPlan {
-        routes: NetworkRoutes::new(Arc::clone(&proxies), Duration::from_secs(30)),
-        failing: std::sync::atomic::AtomicBool::new(false),
-    });
-    let service = service_over(
-        &db,
-        dir.path(),
-        Arc::clone(&routes) as Arc<dyn Routes>,
-        job_env(),
-        set_clock(),
-    );
-    service.open().await.unwrap();
-    let job_id = service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
-        .await
-        .unwrap();
-    routes.failing.store(true, Ordering::Release);
-    service.tick().await;
-    let live = service.inner.live.lock().await;
-    let Some(Held::RouteDown(failure)) = &live[&job_id].held else {
-        panic!("the failed plan did not hold its torrent")
-    };
-    assert_eq!(failure.reason, TorrentRouteReason::RoutePlanFailed);
-    assert!(
-        failure
-            .detail
-            .as_ref()
-            .is_some_and(|detail| !detail.is_empty())
-    );
-    drop(live);
-    // The route view lists the scope with the same reason.
-    let listed = service.routes().await;
-    let route = listed
-        .iter()
-        .find(|route| {
-            route
-                .scopes
-                .iter()
-                .any(|(scope, _)| *scope == TorrentScope::Default)
-        })
-        .expect("the scope whose plan failed is listed");
-    assert_eq!(
-        route.down.as_ref().map(|failure| failure.reason),
-        Some(TorrentRouteReason::RoutePlanFailed)
-    );
-    service.stop().await;
     proxies.network.shutdown().await;
 }
 
@@ -1189,10 +1076,11 @@ async fn routes_are_planned_from_the_runtime_not_the_route_rows() {
     let db = Database::open_in_memory().unwrap();
     let proxies =
         crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
-    let routes: Arc<dyn Routes> = Arc::new(NetworkRoutes::new(
-        Arc::clone(&proxies),
-        Duration::from_secs(30),
-    ));
+    let counted = Arc::new(Counted {
+        routes: NetworkRoutes::new(Arc::clone(&proxies), Duration::from_secs(30)),
+        plans: AtomicUsize::new(0),
+    });
+    let routes: Arc<dyn Routes> = counted.clone();
     let service = service_over(&db, dir.path(), Arc::clone(&routes), job_env(), set_clock());
     service.open().await.unwrap();
     let mut jobs = Vec::new();
@@ -1209,12 +1097,18 @@ async fn routes_are_planned_from_the_runtime_not_the_route_rows() {
     service.stop().await;
 
     let reads = || db.proxy_route_reads.load(Ordering::Relaxed);
+    let plans = || counted.plans.load(Ordering::Relaxed);
     let before = reads();
+    let planned_before = plans();
     let again = service_over(&db, dir.path(), Arc::clone(&routes), job_env(), set_clock());
     reopen(&again).await;
     let live = again.inner.live.lock().await;
     assert!(jobs.iter().all(|job_id| live.contains_key(job_id)));
     drop(live);
+    assert!(
+        plans() - planned_before >= jobs.len(),
+        "the boot planned no route"
+    );
     assert_eq!(reads() - before, 0, "the boot read a route row");
 
     // Saved through an egress the host has no interface for, the route is
@@ -1244,14 +1138,57 @@ async fn routes_are_planned_from_the_runtime_not_the_route_rows() {
         },
     )
     .unwrap();
-    let planned = || routes.plan(TorrentScope::Default).unwrap();
+    let planned_before = plans();
+    let planned = || routes.plan(TorrentScope::Default);
     assert_eq!(planned().egress_id, SYSTEM_EGRESS_ID);
     proxies.reload().await.unwrap();
     assert_eq!(planned().egress_id, absent.id);
     assert!(planned().down.is_some());
+    assert_eq!(plans() - planned_before, 3);
     assert_eq!(reads() - before, 0, "a plan read a route row");
     again.stop().await;
     proxies.network.shutdown().await;
+}
+
+// Routes that count their plans, so a test that pins what planning reads
+// also sees that planning ran.
+struct Counted {
+    routes: crate::torrents::sessions::NetworkRoutes,
+    plans: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl Routes for Counted {
+    fn plan(&self, scope: TorrentScope) -> crate::torrents::sessions::RoutePlan {
+        self.plans.fetch_add(1, Ordering::Relaxed);
+        self.routes.plan(scope)
+    }
+
+    fn leg_down(
+        &self,
+        plan: &crate::torrents::sessions::RoutePlan,
+    ) -> Option<crate::torrents::sessions::RouteFailure> {
+        self.routes.leg_down(plan)
+    }
+
+    async fn open(
+        &self,
+        plan: &crate::torrents::sessions::RoutePlan,
+        peers: usize,
+    ) -> Result<crate::torrents::sessions::OpenLeg, String> {
+        self.routes.open(plan, peers).await
+    }
+
+    fn join(&self, plan: &crate::torrents::sessions::RoutePlan, peers: usize) {
+        self.routes.join(plan, peers);
+    }
+
+    async fn fetch_blocklist(
+        &self,
+        url: &reqwest::Url,
+    ) -> Result<crate::torrents::sessions::IpRanges, String> {
+        self.routes.fetch_blocklist(url).await
+    }
 }
 
 // A torrent added by URL is fetched over its route's one leg: up, the
@@ -1396,7 +1333,6 @@ async fn url_route(category: Option<&str>, matched: bool) {
         .sessions
         .routes()
         .plan(scope)
-        .unwrap()
         .down
         .expect("the leg is down");
 
@@ -1407,7 +1343,6 @@ async fn url_route(category: Option<&str>, matched: bool) {
                 .sessions
                 .routes()
                 .plan(category_scope)
-                .unwrap()
                 .down
                 .is_none()
         );
@@ -1418,7 +1353,6 @@ async fn url_route(category: Option<&str>, matched: bool) {
                 .sessions
                 .routes()
                 .plan(TorrentScope::TrackerRule(rule.id))
-                .unwrap()
                 .down
                 .is_none()
         );
@@ -1735,7 +1669,7 @@ async fn a_torrent_past_the_session_limit_says_so() {
     rig.service.open().await.unwrap();
     for id in 0..MAX_SESSIONS as u32 {
         rig.routes.route(TorrentScope::Category(100 + id), 100 + id);
-        let plan = rig.routes.plan(TorrentScope::Category(100 + id)).unwrap();
+        let plan = rig.routes.plan(TorrentScope::Category(100 + id));
         rig.service
             .inner
             .sessions
@@ -4928,7 +4862,7 @@ async fn a_magnet_fetching_when_its_route_changes_fetches_again_on_the_new_route
         .unwrap();
 
     rig.routes.route(TorrentScope::Default, 2);
-    let new = rig.routes.plan(TorrentScope::Default).unwrap().key;
+    let new = rig.routes.plan(TorrentScope::Default).key;
     assert_ne!(old, new);
     rig.service.follow_routes().await;
 
@@ -6021,7 +5955,7 @@ async fn a_tracker_rules_route_carries_its_torrents_ahead_of_their_categorys() {
     rig.service.reload_tracker_rules().await.unwrap();
     rig.routes.route(TorrentScope::Category(1), 9);
     rig.routes.route(TorrentScope::TrackerRule(rule.id), 7);
-    let key = |scope| rig.routes.plan(scope).unwrap().key.as_str().to_owned();
+    let key = |scope| rig.routes.plan(scope).key.as_str().to_owned();
     // Paused, so nothing announces.
     let in_tv = |metainfo| AddRequest {
         category: Some("tv".into()),
@@ -10858,7 +10792,7 @@ async fn a_pin_survives_a_restart_and_clears_when_the_route_leaves_the_pool() {
     assert_eq!(pins(&again, &rig.db, &[job_id]).await, [None]);
     assert_eq!(
         again.inner.live.lock().await[&job_id].route,
-        Some(rig.routes.plan(TorrentScope::Default).unwrap().key)
+        Some(rig.routes.plan(TorrentScope::Default).key)
     );
     again.stop().await;
 }

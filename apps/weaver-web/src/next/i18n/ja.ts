@@ -1810,7 +1810,6 @@ export const nextJa: LocaleDictionary = {
   "next.torrents.routeReason.LEG_REVOKED": "接続経路が無効化されました",
   "next.torrents.routeReason.QUOTA_SILENCED": "割り当て量に到達",
   "next.torrents.routeReason.TORRENTS_DISABLED": "トレントは無効",
-  "next.torrents.routeReason.ROUTE_PLAN_FAILED": "ルートの計画に失敗",
   "next.torrents.routeReason.LEG_OPEN_FAILED": "接続経路を開けませんでした",
   "next.torrents.routeReason.STATE_DIRECTORY_FAILED": "状態ディレクトリを利用できません",
   "next.torrents.routeReason.LISTEN_PORT_UNAVAILABLE": "待受ポートを利用できません",

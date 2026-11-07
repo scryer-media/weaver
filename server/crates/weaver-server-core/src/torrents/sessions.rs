@@ -59,7 +59,6 @@ pub enum TorrentRouteReason {
     QuotaSilenced,
     TorrentsDisabled,
     RouteBroken(crate::proxies::TorrentRouteFault),
-    RoutePlanFailed,
     LegOpenFailed,
     StateDirectoryFailed,
     ListenPortUnavailable,
@@ -112,7 +111,6 @@ impl RouteFailure {
             TorrentRouteReason::QuotaSilenced => "quota reached",
             TorrentRouteReason::TorrentsDisabled => crate::torrents::status::OFF,
             TorrentRouteReason::RouteBroken(fault) => fault.message(),
-            TorrentRouteReason::RoutePlanFailed => "the route could not be planned",
             TorrentRouteReason::LegOpenFailed => "the route's leg could not be opened",
             TorrentRouteReason::StateDirectoryFailed => {
                 "the session's state directory could not be created"
@@ -222,13 +220,6 @@ pub fn member_key(network: &NetworkRuntime, egress_id: u32, member: u32) -> Rout
 /// it holds no session another route's leg runs.
 fn refused_key(route: &Route) -> RouteKey {
     let encoded = serde_json::to_vec(&("refused", route)).expect("routes always encode");
-    RouteKey(hex::encode(&Sha1::digest(&encoded)[..8]))
-}
-
-/// The key of `scope`'s route while it cannot be planned: its own, so the
-/// scope is listed with why.
-pub fn unplanned_key(scope: TorrentScope) -> RouteKey {
-    let encoded = serde_json::to_vec(&("unplanned", scope)).expect("scopes always encode");
     RouteKey(hex::encode(&Sha1::digest(&encoded)[..8]))
 }
 
@@ -375,7 +366,7 @@ impl OpenLeg {
 /// Where routes come from.
 #[async_trait::async_trait]
 pub trait Routes: Send + Sync {
-    fn plan(&self, scope: TorrentScope) -> Result<RoutePlan, String>;
+    fn plan(&self, scope: TorrentScope) -> RoutePlan;
     /// Why `plan`'s leg may carry nothing now, when it may not: its egress
     /// is down, gone, or out of quota. A route plans down for the same.
     fn leg_down(&self, plan: &RoutePlan) -> Option<RouteFailure>;
@@ -407,12 +398,12 @@ impl NetworkRoutes {
 
 #[async_trait::async_trait]
 impl Routes for NetworkRoutes {
-    fn plan(&self, scope: TorrentScope) -> Result<RoutePlan, String> {
+    fn plan(&self, scope: TorrentScope) -> RoutePlan {
         // The runtime holds every saved policy, loaded when it is built and
         // again on every reload after a save.
         let policy = self.proxies.policy(Consumer::Torrent(scope));
         let route = policy.route();
-        let leg = route.legs.first().ok_or("the route has no leg")?;
+        let leg = route.legs.first().expect("a policy's route has a leg");
         let egress = leg_egress(self.network(), leg.egress_id);
         let egress_id = egress.as_ref().map_or(leg.egress_id, |egress| egress.id);
         let mut members = Vec::new();
@@ -458,7 +449,7 @@ impl Routes for NetworkRoutes {
                 (leg_key(self.network(), leg.egress_id, &leg.path), down)
             }
         };
-        Ok(RoutePlan {
+        RoutePlan {
             scope,
             egress_id,
             kind: leg_kind(self.network(), leg.egress_id, &leg.path),
@@ -468,7 +459,7 @@ impl Routes for NetworkRoutes {
             down,
             members,
             member: None,
-        })
+        }
     }
 
     // A pool member's session may be another scope's too: whether its

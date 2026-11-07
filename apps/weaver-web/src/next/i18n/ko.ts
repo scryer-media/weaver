@@ -1810,7 +1810,6 @@ export const nextKo: LocaleDictionary = {
   "next.torrents.routeReason.LEG_REVOKED": "연결 구간 철회됨",
   "next.torrents.routeReason.QUOTA_SILENCED": "할당량 도달",
   "next.torrents.routeReason.TORRENTS_DISABLED": "토렌트 비활성화",
-  "next.torrents.routeReason.ROUTE_PLAN_FAILED": "경로 계획 실패",
   "next.torrents.routeReason.LEG_OPEN_FAILED": "연결 구간을 열지 못함",
   "next.torrents.routeReason.STATE_DIRECTORY_FAILED": "상태 디렉터리 사용 불가",
   "next.torrents.routeReason.LISTEN_PORT_UNAVAILABLE": "수신 포트 사용 불가",
