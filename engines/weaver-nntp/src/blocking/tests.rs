@@ -1983,10 +1983,13 @@ fn a_480_mid_batch_is_a_session_expiry_not_an_auth_failure() {
         matches!(error, FusedYencError::Nntp(NntpError::SessionExpired)),
         "a mid-batch 480 is a session expiry, got {error:?}"
     );
+    // The 480 is one line, so the socket is still framed: it is kept, and
+    // waits to log in again once the batch's remaining replies are read.
     assert!(
-        conn.poisoned,
-        "the batch's remaining replies are still queued, so the socket cannot be reused"
+        !conn.poisoned,
+        "a framed 480 keeps the socket for an in-place re-auth"
     );
+    assert!(conn.reauth_pending());
 
     drop(conn);
     handle.join().unwrap();
@@ -1995,6 +1998,363 @@ fn a_480_mid_batch_is_a_session_expiry_not_an_auth_failure() {
         seen.iter()
             .any(|line| line.to_ascii_uppercase().starts_with("AUTHINFO PASS")),
         "the connection authenticated before the batch; saw {seen:?}"
+    );
+}
+
+// What the scripted re-auth server answers to its next BODY.
+enum Scripted {
+    // 222 and this payload, yEnc-encoded.
+    Body(Vec<u8>),
+    // 480: the session expired.
+    Expire,
+    // 430: the article is not here.
+    Missing,
+    // Close the server's sending side. The rest of the client's commands are
+    // still read (and recorded) until it hangs up, so the close is a FIN and
+    // never a reset.
+    Close,
+}
+
+// A server that answers its BODY commands from `script`, in order, and its
+// AUTHINFO PASS commands from `pass_replies`, in order. Records every
+// command line it saw.
+fn spawn_reauth_server(
+    script: Vec<Scripted>,
+    pass_replies: Vec<&'static [u8]>,
+) -> (u16, Arc<Mutex<Vec<String>>>, std::thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    let handle = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.write_all(b"200 ready\r\n").unwrap();
+        let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+        let mut script = script.into_iter();
+        let mut pass_replies = pass_replies.into_iter();
+        let mut closed = false;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let command = line.trim_end_matches(['\r', '\n']).to_string();
+            recorder.lock().unwrap().push(command.clone());
+            if closed {
+                continue;
+            }
+            let upper = command.to_ascii_uppercase();
+            let response: Vec<u8> = if upper.starts_with("AUTHINFO USER") {
+                b"381 password\r\n".to_vec()
+            } else if upper.starts_with("AUTHINFO PASS") {
+                pass_replies
+                    .next()
+                    .expect("the test scripted every AUTHINFO PASS")
+                    .to_vec()
+            } else if upper.starts_with("BODY") {
+                match script.next().expect("the test scripted every BODY") {
+                    Scripted::Body(payload) => {
+                        let mut reply = b"222 0 body follows\r\n".to_vec();
+                        reply.extend_from_slice(&yenc_body(&payload));
+                        reply.extend_from_slice(b".\r\n");
+                        reply
+                    }
+                    Scripted::Expire => b"480 authentication required\r\n".to_vec(),
+                    Scripted::Missing => b"430 no such article\r\n".to_vec(),
+                    Scripted::Close => {
+                        socket.shutdown(std::net::Shutdown::Write).unwrap();
+                        closed = true;
+                        continue;
+                    }
+                }
+            } else if upper.starts_with("QUIT") {
+                let _ = socket.write_all(b"205 closing\r\n");
+                break;
+            } else {
+                b"500 command not recognized\r\n".to_vec()
+            };
+            if socket.write_all(&response).is_err() {
+                break;
+            }
+        }
+    });
+    (port, seen, handle)
+}
+
+fn reauth_config(port: u16) -> ServerConfig {
+    let mut config = blocking_pipelined_setup_config(port);
+    // Generous, so a loaded runner never turns a reply into a timeout.
+    config.command_timeout = Duration::from_secs(30);
+    crate::server_caps::forget(&config.host, config.port);
+    config
+}
+
+fn issue_all(lane: &mut BlockingBodyLane, ids: &[&str]) {
+    for id in ids {
+        assert!(matches!(
+            lane.ring_issue(id, 256, ids.len()),
+            RingIssueOutcome::Issued
+        ));
+    }
+}
+
+fn is_session_expired(trace: &DecodedBodyTrace) -> bool {
+    matches!(
+        trace.result,
+        Err(DecodedBodyError::Nntp(NntpError::SessionExpired))
+    )
+}
+
+// Positions of the commands starting with `prefix`, in the order seen.
+fn positions(seen: &[String], prefix: &str) -> Vec<usize> {
+    seen.iter()
+        .enumerate()
+        .filter(|(_, line)| line.to_ascii_uppercase().starts_with(prefix))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+// A session that expires part-way through a pipelined batch is re-logged in
+// on the same socket once the replies queued behind the 480 have been read,
+// and the next BODY goes out on it.
+#[test]
+fn an_expired_session_drains_its_ring_then_reauthenticates_in_place() {
+    let (port, seen, handle) = spawn_reauth_server(
+        vec![
+            Scripted::Body(vec![0x11; 256]),
+            Scripted::Expire,
+            Scripted::Expire,
+            Scripted::Expire,
+            Scripted::Body(vec![0x55; 256]),
+        ],
+        vec![b"281 ok\r\n", b"281 ok\r\n"],
+    );
+    let mut lane = test_body_lane(&reauth_config(port));
+    issue_all(&mut lane, &["<1@t>", "<2@t>", "<3@t>", "<4@t>"]);
+
+    let (first, _) = lane.ring_read_next().unwrap();
+    assert_eq!(ring_payload(&first), vec![0x11; 256]);
+    for index in 2..=4 {
+        let (trace, meta) = lane.ring_read_next().unwrap();
+        assert!(
+            is_session_expired(&trace),
+            "article {index} was not answered: {:?}",
+            trace.result
+        );
+        assert!(!meta.connection_discarded);
+        // Nothing goes out behind the 480 until the ring is dry and the
+        // session has logged in again, which happens on the last read.
+        assert_eq!(lane.holds_new_requests(), index < 4);
+    }
+    assert!(lane.is_healthy(), "the connection is not poisoned");
+    assert!(!lane.ring_is_closed());
+
+    issue_all(&mut lane, &["<5@t>"]);
+    let (fifth, meta) = lane.ring_read_next().unwrap();
+    assert_eq!(ring_payload(&fifth), vec![0x55; 256]);
+    assert!(!meta.connection_discarded);
+
+    lane.park();
+    handle.join().unwrap();
+    let seen = seen.lock().unwrap().clone();
+    let passes = positions(&seen, "AUTHINFO PASS");
+    let bodies = positions(&seen, "BODY");
+    assert_eq!(
+        passes.len(),
+        2,
+        "one login at setup, one in place; saw {seen:?}"
+    );
+    assert!(
+        bodies[3] < passes[1] && passes[1] < bodies[4],
+        "the re-auth goes out after the last queued BODY and before the next; saw {seen:?}"
+    );
+}
+
+// The server need not answer every queued command with 480: a body and a
+// 430 behind the 480 are read and delivered as usual, and the re-auth waits
+// for them.
+#[test]
+fn a_drain_behind_a_480_delivers_bodies_and_books_missing_articles() {
+    let (port, seen, handle) = spawn_reauth_server(
+        vec![
+            Scripted::Body(vec![0x21; 256]),
+            Scripted::Expire,
+            Scripted::Body(vec![0x23; 256]),
+            Scripted::Missing,
+            Scripted::Body(vec![0x25; 256]),
+        ],
+        vec![b"281 ok\r\n", b"281 ok\r\n"],
+    );
+    let mut lane = test_body_lane(&reauth_config(port));
+    issue_all(&mut lane, &["<1@t>", "<2@t>", "<3@t>", "<4@t>"]);
+
+    let (first, _) = lane.ring_read_next().unwrap();
+    assert_eq!(ring_payload(&first), vec![0x21; 256]);
+    let (second, _) = lane.ring_read_next().unwrap();
+    assert!(is_session_expired(&second));
+    let (third, _) = lane.ring_read_next().unwrap();
+    assert_eq!(ring_payload(&third), vec![0x23; 256]);
+    let (fourth, meta) = lane.ring_read_next().unwrap();
+    assert!(
+        matches!(
+            fourth.attempts[0].outcome,
+            crate::client::FetchAttemptOutcome::NotFound
+        ),
+        "the 430 is booked not-found: {:?}",
+        fourth.result
+    );
+    assert!(meta.batch_clean, "a 480 and a 430 are whole replies");
+    assert!(!meta.connection_discarded);
+    assert!(!lane.holds_new_requests());
+    assert!(lane.is_healthy());
+
+    issue_all(&mut lane, &["<5@t>"]);
+    let (fifth, _) = lane.ring_read_next().unwrap();
+    assert_eq!(ring_payload(&fifth), vec![0x25; 256]);
+
+    lane.park();
+    handle.join().unwrap();
+    let seen = seen.lock().unwrap().clone();
+    let passes = positions(&seen, "AUTHINFO PASS");
+    let bodies = positions(&seen, "BODY");
+    assert_eq!(passes.len(), 2, "saw {seen:?}");
+    assert!(
+        bodies[3] < passes[1] && passes[1] < bodies[4],
+        "saw {seen:?}"
+    );
+}
+
+// A socket that goes away while replies are still queued behind a 480 is
+// lost exactly as any other mid-batch drop.
+#[test]
+fn a_drop_mid_drain_poisons_the_connection() {
+    let (port, seen, handle) = spawn_reauth_server(
+        vec![
+            Scripted::Body(vec![0x31; 256]),
+            Scripted::Expire,
+            Scripted::Close,
+        ],
+        vec![b"281 ok\r\n"],
+    );
+    let mut lane = test_body_lane(&reauth_config(port));
+    issue_all(&mut lane, &["<1@t>", "<2@t>", "<3@t>", "<4@t>"]);
+
+    let (first, _) = lane.ring_read_next().unwrap();
+    assert_eq!(ring_payload(&first), vec![0x31; 256]);
+    let (second, _) = lane.ring_read_next().unwrap();
+    assert!(is_session_expired(&second));
+    let (third, meta) = lane.ring_read_next().unwrap();
+    assert!(
+        matches!(
+            third.result,
+            Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed))
+        ),
+        "got {:?}",
+        third.result
+    );
+    assert!(meta.connection_discarded);
+    assert_eq!(meta.unresolved_count, 1);
+    assert!(!lane.is_healthy());
+    assert!(lane.ring_is_closed());
+    let (fourth, _) = lane.ring_read_next().unwrap();
+    assert!(matches!(
+        fourth.result,
+        Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed))
+    ));
+
+    lane.park();
+    handle.join().unwrap();
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(
+        positions(&seen, "AUTHINFO PASS").len(),
+        1,
+        "nothing logs in on a socket that is gone; saw {seen:?}"
+    );
+}
+
+// A server that refuses the in-place login poisons the connection. The lane
+// says so through its window, the article stays merely unanswered, and the
+// refusal is classified exactly as a dial's login reply is.
+#[test]
+fn a_refused_reauth_poisons_the_connection() {
+    const REFUSAL: &[u8] = b"481 authentication failed\r\n";
+
+    let (port, _, handle) = spawn_reauth_server(
+        vec![Scripted::Body(vec![0x41; 256]), Scripted::Expire],
+        vec![b"281 ok\r\n", REFUSAL],
+    );
+    let mut lane = test_body_lane(&reauth_config(port));
+    issue_all(&mut lane, &["<1@t>", "<2@t>"]);
+    let (first, _) = lane.ring_read_next().unwrap();
+    assert_eq!(ring_payload(&first), vec![0x41; 256]);
+    let (second, meta) = lane.ring_read_next().unwrap();
+    assert!(is_session_expired(&second), "got {:?}", second.result);
+    assert!(meta.connection_discarded);
+    assert!(!lane.is_healthy());
+    assert!(lane.ring_is_closed());
+    lane.park();
+    handle.join().unwrap();
+
+    let (port, _, handle) = spawn_reauth_server(
+        vec![Scripted::Body(vec![0x42; 256]), Scripted::Expire],
+        vec![b"281 ok\r\n", REFUSAL],
+    );
+    let mut conn = BlockingNntpConnection::connect(&reauth_config(port)).unwrap();
+    conn.write_body_request("<1@t>").unwrap();
+    conn.write_body_request("<2@t>").unwrap();
+    conn.flush_commands().unwrap();
+    conn.stream_next_yenc_article().unwrap();
+    assert!(matches!(
+        conn.stream_next_yenc_article().unwrap_err(),
+        FusedYencError::Nntp(NntpError::SessionExpired)
+    ));
+    let error = conn.reauthenticate_expired_session(None).unwrap_err();
+    let dial =
+        NntpError::from_login_status(crate::types::StatusCode::new(481), "authentication failed");
+    assert_eq!(
+        std::mem::discriminant(&error),
+        std::mem::discriminant(&dial),
+        "got {error:?}, a dial books {dial:?}"
+    );
+    assert!(conn.poisoned);
+    drop(conn);
+    handle.join().unwrap();
+}
+
+// Without credentials there is nothing to log in again with: a 480 drops the
+// connection as it always has.
+#[test]
+fn a_480_on_an_anonymous_connection_poisons_it() {
+    let (port, seen, handle) = spawn_reauth_server(
+        vec![
+            Scripted::Body(vec![0x51; 256]),
+            Scripted::Expire,
+            Scripted::Body(vec![0x53; 256]),
+        ],
+        Vec::new(),
+    );
+    let mut config = reauth_config(port);
+    config.username = None;
+    config.password = None;
+    let mut lane = test_body_lane(&config);
+    issue_all(&mut lane, &["<1@t>", "<2@t>", "<3@t>"]);
+
+    let (first, _) = lane.ring_read_next().unwrap();
+    assert_eq!(ring_payload(&first), vec![0x51; 256]);
+    let (second, meta) = lane.ring_read_next().unwrap();
+    assert!(is_session_expired(&second), "got {:?}", second.result);
+    assert!(meta.connection_discarded);
+    assert!(!lane.is_healthy());
+    assert!(lane.ring_is_closed());
+    assert!(!lane.holds_new_requests());
+
+    lane.park();
+    handle.join().unwrap();
+    let seen = seen.lock().unwrap().clone();
+    assert!(
+        positions(&seen, "AUTHINFO").is_empty(),
+        "an anonymous session never logs in; saw {seen:?}"
     );
 }
 

@@ -542,10 +542,11 @@ pub(super) enum DownloadFailureKind {
     Unrequested,
     ConnectionEstablishment,
     EstablishedTransport,
-    // The connection was lost before this article's response was read: the
-    // session expired at its status line, or the batch was abandoned ahead
-    // of it. Nothing about the article was seen, so it costs the connection
-    // and never the article.
+    // The article's response never came: the session expired at its status
+    // line, or the batch was abandoned ahead of it. Nothing about the article
+    // was seen, so it never costs the article. Whether it cost the connection
+    // is the lane's verdict, not this kind's: a lane that re-authenticated in
+    // place keeps its socket, and one that lost it says so.
     Unanswered,
     Auth,
     ContentOrProtocol,
@@ -744,6 +745,13 @@ impl DownloadError {
     // no BODY was ever issued, so they are clean for the same reason (they
     // still park the lane, just without discarding it).
     //
+    // `Unanswered` says nothing about the socket either. A 480 at the status
+    // line is one complete line; the blocking lane drains the replies behind
+    // it and re-authenticates in place, and when that fails, or the session
+    // had no credentials, or the batch was abandoned, the lane reports the
+    // connection discarded (`connection_discarded`, `ring_is_closed`) and that
+    // verdict drops it.
+    //
     // Decode failures stay dirty: the yEnc decoder can fail on a body the
     // transport never finished delivering.
     pub(super) fn leaves_connection_clean(&self) -> bool {
@@ -753,6 +761,7 @@ impl DownloadError {
                 DownloadFailureKind::ArticleNotFound
                     | DownloadFailureKind::ServerQuota
                     | DownloadFailureKind::Unrequested
+                    | DownloadFailureKind::Unanswered
             ),
             Self::Decode { .. } | Self::Local { .. } => false,
         }

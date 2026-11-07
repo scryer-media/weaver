@@ -69,8 +69,9 @@ pub enum NntpError {
 
     // The server asked for authentication again (480) part-way through a
     // pipelined batch. The session expired mid-stream; the credentials were
-    // never rejected, so this is the connection's problem and not the
-    // server's, and the batch's outstanding articles are simply unanswered.
+    // never rejected, so this is the session's problem and not the server's:
+    // this article was not answered, and the connection logs in again once
+    // the replies queued behind the 480 have been read.
     #[error("session expired mid-pipeline (480)")]
     SessionExpired,
 
