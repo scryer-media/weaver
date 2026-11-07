@@ -297,7 +297,8 @@ pub struct MetricsConfig {
     pub per_job_series: PerJobSeries,
 }
 
-// Which jobs get their own `weaver_job_*` series.
+// Which jobs get their own `weaver_job_*` series, and which torrents their
+// own `weaver_torrent_*` ones (a stopped torrent is a finished job).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PerJobSeries {

@@ -1002,12 +1002,74 @@ fn absent_instrumentation_omits_its_families() {
     assert!(partial.contains("process_start_time_seconds 1700000000"));
 }
 
+// Each torrent's series follow the per-job knob as a job's do: `Active`
+// drops a stopped torrent, whose job is complete or failed, with its
+// trackers; the session series go under every setting.
+#[test]
+fn per_job_series_knob_controls_torrent_cardinality() {
+    use weaver_server_core::settings::PerJobSeries;
+    use weaver_server_core::torrents::TorrentState;
+
+    let mut torrents = sample_torrent_metrics();
+    let published = std::sync::Arc::make_mut(&mut torrents.published);
+    let mut stopped = published.torrents[0].clone();
+    stopped.job_id = JobId(9);
+    stopped.state = TorrentState::Stopped;
+    published.torrents.push(stopped);
+    let render_with = |mode| {
+        let mut encoder = metrics::Encoder::new();
+        metrics::render_torrents(&mut encoder, &torrents, mode);
+        encoder.finish()
+    };
+
+    let active = render_with(PerJobSeries::Active);
+    assert_valid_prometheus_exposition(&active);
+    for family in ["weaver_torrent_state", "weaver_torrent_tracker_status"] {
+        assert!(
+            !rendered_label_values(&active, family, "job_id").contains(&"9".to_owned()),
+            "{family}: active mode must drop a stopped torrent"
+        );
+    }
+    assert_eq!(
+        rendered_label_values(&active, "weaver_torrent_state", "job_id"),
+        ["7", "8"]
+    );
+
+    let all = render_with(PerJobSeries::All);
+    assert_valid_prometheus_exposition(&all);
+    assert_eq!(
+        rendered_label_values(&all, "weaver_torrent_state", "job_id"),
+        ["7", "8", "9"]
+    );
+    assert!(
+        rendered_label_values(&all, "weaver_torrent_tracker_status", "job_id")
+            .contains(&"9".to_owned())
+    );
+
+    let off = render_with(PerJobSeries::Off);
+    assert_valid_prometheus_exposition(&off);
+    assert!(rendered_label_values(&off, "weaver_torrent_state", "job_id").is_empty());
+    assert!(rendered_label_values(&off, "weaver_torrent_tracker_status", "job_id").is_empty());
+    let sessions = |rendered: &str| {
+        rendered
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.contains("job_id="))
+            .count()
+    };
+    assert_eq!(sessions(&off), sessions(&all));
+    assert!(sessions(&off) > 0);
+}
+
 #[test]
 fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
     let torrents = sample_torrent_metrics();
     let rendered = {
         let mut encoder = metrics::Encoder::new();
-        metrics::render_torrents(&mut encoder, &torrents);
+        metrics::render_torrents(
+            &mut encoder,
+            &torrents,
+            weaver_server_core::settings::PerJobSeries::Active,
+        );
         encoder.finish()
     };
     assert_valid_prometheus_exposition(&rendered);
