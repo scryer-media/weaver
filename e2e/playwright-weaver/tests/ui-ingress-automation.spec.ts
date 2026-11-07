@@ -232,11 +232,22 @@ test("RSS feed CRUD and classified sync errors are visible behavior", async ({ c
   await page.goto("/settings/rss");
   const feedRow = await addFeed(page, feedName, feedUrl);
   await expect(feedRow.getByText(feedUrl, { exact: true })).toBeVisible();
-  await expect(feedRow.getByText("not polled yet", { exact: true })).toBeVisible();
+  // No assertion on "not polled yet": the daemon polls a feed as soon as it
+  // is added, so the row may already carry the first failure.
 
   await pollFeed(page, feedRow);
-  // The report line carries the first classified error after the counts.
-  await expect(page.getByRole("contentinfo")).toContainText(/1 feed polled · 0 new · 0 queued · \S/);
+  // The report line carries the first classified error after the counts,
+  // named for its feed; the feed's row shows that same error.
+  const report = page
+    .getByRole("contentinfo")
+    .getByText(/^1 feed polled · 0 new · 0 queued · \S/);
+  await expect(report).toHaveCount(1);
+  const reportText = (await report.textContent()) ?? "";
+  const prefix = `0 queued · ${feedName}: `;
+  expect(reportText).toContain(prefix);
+  const feedError = reportText.slice(reportText.indexOf(prefix) + prefix.length);
+  expect(feedError).not.toBe("");
+  await expect(feedRow.getByText(feedError, { exact: true })).toBeVisible();
   await expect(feedRow.getByText("not polled yet", { exact: true })).toHaveCount(0);
 
   await removeFeed(page, feedName);

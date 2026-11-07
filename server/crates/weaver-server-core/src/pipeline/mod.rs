@@ -69,8 +69,8 @@ use self::extraction::{ExtractionLimits, ProcessMemoryBudget};
 // Maximum number of retries for a single segment before giving up.
 const MAX_SEGMENT_RETRIES: u32 = 3;
 // Consecutive established-transport failures of one segment before its retry
-// is held back past the server recovery backoff, so the next recovery probe
-// carries different work.
+// is held back past the server recovery backoff while its server is
+// quarantined, so the next recovery probe carries different work.
 const SEGMENT_TRANSPORT_STREAK_HOLD: u32 = 2;
 // Consecutive established-transport failures of one segment after which the
 // fault is the article's, provided other segments downloaded meanwhile.

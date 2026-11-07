@@ -638,6 +638,28 @@ async fn transport_failure_retry_does_not_rotate_toward_backfill() {
     );
 }
 
+// Gives the pipeline one fill server, so its recovery gate can be read and
+// quarantined. Nothing here dials it; the returned listener keeps its port
+// owned by the test.
+fn install_one_server(pipeline: &mut Pipeline) -> std::net::TcpListener {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let server = weaver_nntp::ServerPoolConfig::new(weaver_nntp::ServerConfig {
+        host: "127.0.0.1".into(),
+        port: listener.local_addr().unwrap().port(),
+        tls: false,
+        ..Default::default()
+    });
+    pipeline.nntp = std::sync::Arc::new(weaver_nntp::client::NntpClient::new(
+        weaver_nntp::client::NntpClientConfig {
+            servers: vec![server],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 1,
+            soft_timeout: Duration::from_secs(1),
+        },
+    ));
+    listener
+}
+
 // Fails `segment_id` on an established connection and returns the delay its
 // retry was parked for plus the retry count the requeued work carries.
 async fn fail_segment_on_transport(
@@ -696,6 +718,7 @@ async fn fail_segment_on_transport(
 async fn a_segment_that_keeps_breaking_connections_is_held_back_then_pays_for_retries() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let _server = install_one_server(&mut pipeline);
     let job_id = JobId(20031);
     let segment_id = SegmentId {
         file_id: NzbFileId {
@@ -717,8 +740,10 @@ async fn a_segment_that_keeps_breaking_connections_is_held_back_then_pays_for_re
     );
     assert_eq!(retry_count, 0);
 
-    // The repeat is held past the server recovery backoff, so the recovery
-    // probe carries some other segment.
+    // With the server quarantined, the repeat is held past the server
+    // recovery backoff, so the recovery probe carries some other segment.
+    let _probe = pipeline.nntp.pool().take_recovery_probe_for_test(0);
+    assert!(pipeline.nntp.pool().requires_recovery(0));
     let (delay, retry_count) = fail_segment_on_transport(&mut pipeline, segment_id, 0).await;
     assert!(delay > Duration::from_secs(60), "held for {delay:?}");
     assert_eq!(retry_count, 0);
@@ -729,6 +754,56 @@ async fn a_segment_that_keeps_breaking_connections_is_held_back_then_pays_for_re
         .segments_downloaded
         .fetch_add(1, Ordering::Relaxed);
     let (_, retry_count) = fail_segment_on_transport(&mut pipeline, segment_id, 0).await;
+    assert_eq!(retry_count, 1, "the article now spends its retry budget");
+}
+
+// A server that drops some connections while it keeps serving others is not
+// quarantined: there is no recovery probe to keep the segment off, so its
+// repeats retry promptly, and it still pays for retries once other segments
+// download.
+#[tokio::test(start_paused = true)]
+async fn a_segment_dropped_by_a_serving_server_is_not_held() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let _server = install_one_server(&mut pipeline);
+    let job_id = JobId(20033);
+    let segment_id = SegmentId {
+        file_id: NzbFileId {
+            job_id,
+            file_index: 0,
+        },
+        segment_number: 0,
+    };
+    let spec = segmented_job_spec("Dropped article", "dropped.bin", &[128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
+    assert!(!pipeline.nntp.pool().requires_recovery(0));
+
+    let (delay, retry_count) = fail_segment_on_transport(&mut pipeline, segment_id, 0).await;
+    assert!(
+        delay < Duration::from_secs(5),
+        "first fault parked for {delay:?}"
+    );
+    assert_eq!(retry_count, 0);
+
+    let (delay, retry_count) = fail_segment_on_transport(&mut pipeline, segment_id, 0).await;
+    assert!(
+        delay < Duration::from_secs(5),
+        "repeat parked for {delay:?}"
+    );
+    assert_eq!(retry_count, 0);
+
+    pipeline
+        .metrics
+        .segments_downloaded
+        .fetch_add(1, Ordering::Relaxed);
+    let (delay, retry_count) = fail_segment_on_transport(&mut pipeline, segment_id, 0).await;
+    assert!(
+        delay < Duration::from_secs(5),
+        "third fault parked for {delay:?}"
+    );
     assert_eq!(retry_count, 1, "the article now spends its retry budget");
 }
 

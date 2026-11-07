@@ -237,7 +237,7 @@ test("provider edits keep the stored password masked and a disabled provider can
   await page.getByRole("main").getByRole("button", { name: "Add provider", exact: true }).click();
   const addForm = page.getByRole("dialog", { name: "Add provider", exact: true });
   await addForm.getByRole("textbox", { name: "Host", exact: true }).fill("e2e-ui.invalid");
-  await addForm.getByRole("switch", { name: "TLS", exact: true }).click();
+  await addForm.getByRole("switch", { name: "SSL/TLS", exact: true }).click();
   await expect(addForm.getByRole("spinbutton", { name: "Port", exact: true })).toHaveValue("119");
   const addConnections = addForm.getByRole("spinbutton", { name: "Connections", exact: true });
   await addConnections.fill("1");
