@@ -4,3 +4,4 @@
 // Every `data-testid` the web app carries, one file per area.
 export * from "./settings";
 export * from "./networking";
+export * from "./jobs";

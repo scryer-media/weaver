@@ -49,6 +49,7 @@ import {
 } from "../framework";
 import { ScriptInstanceEditor, type InstanceEditorTarget } from "./ScriptInstanceEditor";
 import { ScriptTestDialog } from "./ScriptTestDialog";
+import { jobIds } from "@/next/testids";
 
 /**
  * Scripts: what weaver runs on a download and on the events around it.
@@ -332,7 +333,7 @@ export function ScriptConfigurationPanel() {
           control: {
             kind: "custom",
             control: (
-              <div className="flex min-w-0 flex-wrap items-center gap-3">
+              <div data-testid={jobIds.scriptDirectory} className="flex min-w-0 flex-wrap items-center gap-3">
                 <PathField
                   label={t("next.postProcessing.directory")}
                   value={scriptDirectory}

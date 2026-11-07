@@ -4,3 +4,4 @@
 // The web app's test IDs, one file per area, mirrored from the app.
 export * from "./settings";
 export * from "./networking";
+export * from "./jobs";
