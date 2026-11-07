@@ -130,6 +130,10 @@ export const settingsIds = {
   /** A rule's action cell, by the product's action value (ACCEPT, REJECT). */
   rssRuleAction: (action: string) => `rss-rule-action-${action}`,
   rssSeenClear: "rss-seen-clear",
+  /** A count on a sync's report line, by what it counts (polled, new, queued, ignored). */
+  rssReportCount: (count: "polled" | "new" | "queued" | "ignored") => `rss-report-${count}`,
+  /** The first classified error on a sync's report line. */
+  rssReportError: "rss-report-error",
   // Backup: the export and restore controls and what a read archive holds.
   backupDownload: "backup-download",
   backupChooseFile: "backup-choose-file",
@@ -143,6 +147,14 @@ export const settingsIds = {
   backupSourceEngine: "backup-source-engine",
   /** Every category destination path field a restore asks for. */
   backupRemap: "backup-remap",
+  /** The file name on the status line once an export is saved. */
+  backupSavedFile: "backup-saved-file",
+  /** A failure on the Backup panel's status line. */
+  backupError: "backup-error",
+  /** A restore's note on the status line, by what it did (staged, restored). */
+  backupRestoreOutcome: (outcome: "staged" | "restored") => `backup-restore-outcome-${outcome}`,
+  /** The history count inside a restore's note. */
+  backupRestoreHistoryJobs: "backup-restore-history-jobs",
   // Scripts: a post-processing job row's controls and the test dialog.
   ppJobEnabled: "pp-job-enabled",
   ppJobReapply: "pp-job-reapply",

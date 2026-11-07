@@ -10,27 +10,17 @@ import { settingsIds, testIds } from "./support/testids";
 
 const field = testIds.field;
 
+/** Open Downloads and leave the queue paused. */
 async function ensureDownloadsPaused(page: Page): Promise<void> {
   const pauseAll = page.getByTestId(testIds.queuePauseAll);
   const resumeAll = page.getByTestId(testIds.queueResumeAll);
-  const toggle = pauseAll.or(resumeAll);
-  await expect(toggle).toBeVisible();
 
-  // The control follows the live queue state, so wait for it to stop changing
-  // before deciding which way to flip it.
-  const shownState = async () => (await pauseAll.count()) > 0 ? "pause" : (await resumeAll.count()) > 0 ? "resume" : "";
-  let previousState = "";
-  let stableReads = 0;
-  await expect
-    .poll(async () => {
-      const state = await shownState();
-      stableReads = state === previousState ? stableReads + 1 : 1;
-      previousState = state;
-      return stableReads >= 3 ? state : "";
-    }, { timeout: 5_000, intervals: [100, 100, 250] })
-    .toMatch(/^(pause|resume)$/);
-
-  if (previousState === "pause") {
+  // The control shows "pause" until the live queue state lands, so the
+  // state the page loads decides which way to flip it, not what it shows first.
+  const live = operationResponse(page, "LiveMetrics");
+  await page.goto("/");
+  const loaded = (await (await live).json()) as { data: { globalState: { isPaused: boolean } } };
+  if (!loaded.data.globalState.isPaused) {
     await pauseAll.click();
   }
   await expect(resumeAll).toBeVisible();
@@ -78,7 +68,6 @@ test("watch-folder injection reports queued/error marker renames without pipelin
   ]) {
     fs.rmSync(candidate, { force: true });
   }
-  await page.goto("/");
   await ensureDownloadsPaused(page);
 
   await page.goto("/settings/watch-folder");
@@ -159,7 +148,6 @@ test("RSS payload ingestion, seen deduplication, and seen controls are visible b
   const feedName = "E2E Controlled Feed";
   const releaseTitle = "Weaver E2E RSS Behavior Probe";
 
-  await page.goto("/");
   await ensureDownloadsPaused(page);
 
   await page.goto("/settings/rss");
@@ -177,12 +165,19 @@ test("RSS payload ingestion, seen deduplication, and seen controls are visible b
   const status = page.getByTestId(testIds.shellStatus);
   const seenEntry = tableRow(page, "seen", releaseTitle);
 
+  const reportCount = (count: "polled" | "new" | "queued") => status.getByTestId(settingsIds.rssReportCount(count));
+  const expectReport = async (polled: number, fresh: number, queued: number) => {
+    await expect(reportCount("polled")).toHaveText(String(polled));
+    await expect(reportCount("new")).toHaveText(String(fresh));
+    await expect(reportCount("queued")).toHaveText(String(queued));
+  };
+
   await pollFeed(page, feedRow);
-  await expect(status).toContainText("1 feed polled · 1 new · 1 queued");
+  await expectReport(1, 1, 1);
   await expect(seenEntry).toBeVisible();
 
   await pollFeed(page, feedRow);
-  await expect(status).toContainText("1 feed polled · 0 new · 0 queued");
+  await expectReport(1, 0, 0);
   await expect(seenEntry).toHaveCount(1);
 
   await seenEntry.click();
@@ -191,7 +186,7 @@ test("RSS payload ingestion, seen deduplication, and seen controls are visible b
   await expect(seenEntry).toHaveCount(0);
 
   await pollFeed(page, feedRow);
-  await expect(status).toContainText("1 new");
+  await expect(reportCount("new")).toHaveText("1");
   await expect(seenEntry).toBeVisible();
 
   await page.getByTestId(testIds.section("seen")).getByTestId(settingsIds.rssSeenClear).click();
@@ -215,11 +210,15 @@ test("RSS feed CRUD and classified sync errors are visible behavior", async ({ c
   // The report line carries the first classified error after the counts,
   // named for its feed; the feed's row shows that same error.
   const report = page.getByTestId(testIds.shellStatus);
-  await expect(report).toHaveText(/^1 feed polled · 0 new · 0 queued · \S/);
-  const reportText = (await report.textContent()) ?? "";
-  const prefix = `0 queued · ${feedName}: `;
-  expect(reportText).toContain(prefix);
-  const feedError = reportText.slice(reportText.indexOf(prefix) + prefix.length);
+  await expect(report.getByTestId(settingsIds.rssReportCount("polled"))).toHaveText("1");
+  await expect(report.getByTestId(settingsIds.rssReportCount("new"))).toHaveText("0");
+  await expect(report.getByTestId(settingsIds.rssReportCount("queued"))).toHaveText("0");
+  const reportError = report.getByTestId(settingsIds.rssReportError);
+  await expect(reportError).toHaveText(/\S/);
+  const reportText = (await reportError.textContent()) ?? "";
+  const prefix = `${feedName}: `;
+  expect(reportText.startsWith(prefix), reportText).toBe(true);
+  const feedError = reportText.slice(prefix.length);
   expect(feedError).not.toBe("");
   // The row's state is that same error, so it is no longer "not polled yet".
   await expect(feedRow.getByTestId(settingsIds.rssFeedState)).toHaveText(feedError);

@@ -150,21 +150,16 @@ test("history pagination renders metadata-only seeded records", async ({ cleanPa
 
 test("subscription loss polls and reconnects without losing the visible application", async ({ cleanPage: page }) => {
   let blockReconnects = false;
-  let disconnected = false;
-  let pollingRequests = 0;
   let socketConnections = 0;
   let liveBrowserSocket: WebSocketRoute | undefined;
   let liveServerSocket: WebSocketRoute | undefined;
   let blockedReconnectSocket: WebSocketRoute | undefined;
-
-  page.on("request", (request) => {
-    if (
-      disconnected
-      && isOperation(request, "LiveMetrics")
-    ) {
-      pollingRequests += 1;
-    }
+  // Settles when the client opens a live socket again after the interruption.
+  let reconnected!: () => void;
+  const reconnect = new Promise<void>((resolve) => {
+    reconnected = resolve;
   });
+
   await page.routeWebSocket(/\/graphql\/ws(?:\?|$)/, (socket) => {
     if (blockReconnects) {
       // Return so Playwright can still observe the HTTP polling fallback.
@@ -174,6 +169,7 @@ test("subscription loss polls and reconnects without losing the visible applicat
     liveBrowserSocket = socket;
     liveServerSocket = socket.connectToServer();
     socketConnections += 1;
+    if (socketConnections > 1) reconnected();
   });
 
   await page.goto(weaverRoute("/"));
@@ -186,12 +182,13 @@ test("subscription loss polls and reconnects without losing the visible applicat
   expect(socketConnections).toBe(1);
 
   blockReconnects = true;
-  disconnected = true;
+  // The HTTP fallback polls live metrics by name once the socket is gone.
+  const polled = page.waitForRequest((request) => isOperation(request, "LiveMetrics"));
   try {
     await liveServerSocket!.close({ code: 1012, reason: "Weaver e2e subscription interruption" });
     await liveBrowserSocket!.close({ code: 1012, reason: "Weaver e2e subscription interruption" });
     await expect(status.getByTestId(/^shell-connection-(?:reconnecting|polling)$/)).toBeVisible();
-    await expect.poll(() => pollingRequests, { timeout: 20_000 }).toBeGreaterThan(0);
+    await polled;
     await expect(status.getByTestId(testIds.shellConnectionState("polling"))).toBeVisible();
     await expect(page.getByRole("main")).toBeVisible();
   } finally {
@@ -201,8 +198,8 @@ test("subscription loss polls and reconnects without losing the visible applicat
       reason: "Weaver e2e reconnect interruption released",
     });
   }
-  await expect.poll(() => socketConnections, { timeout: 20_000 }).toBeGreaterThan(1);
-  await expect(connected).toBeVisible({ timeout: 30_000 });
+  await reconnect;
+  await expect(connected).toBeVisible();
   await expect(page.getByRole("main")).toBeVisible();
 });
 

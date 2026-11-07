@@ -86,14 +86,24 @@ function namedAsTested(run: SpeedTestRun, data: NetworkingData) {
 }
 
 /** What a run had down, shortly: "leg 2", "leg 1 rung 2", an egress's or a proxy's name. */
-function downSummary(t: Translate, overrides: PathOverride, name: (kind: string, id: number) => string): string {
+function downSummary(t: Translate, overrides: PathOverride, name: (kind: string, id: number) => string): ReactNode {
   const parts = [
-    ...overrides.downEgresses.map((id) => name("egress", id)),
-    ...overrides.downLegs.map((leg) => t("next.networking.speed.downLeg", { position: leg + 1 })),
-    ...overrides.downRungs.map((rung) => t("next.networking.speed.downRung", { leg: rung.leg + 1, rung: rung.rung + 1 })),
-    ...overrides.downProxies.map((id) => name("proxy", id)),
+    ...overrides.downEgresses.map((id) => ({ key: `egress-${id}`, text: name("egress", id) })),
+    ...overrides.downLegs.map((leg) => ({ key: `leg-${leg}`, text: t("next.networking.speed.downLeg", { position: leg + 1 }) })),
+    ...overrides.downRungs.map((rung) => ({
+      key: `rung-${rung.leg}-${rung.rung}`,
+      text: t("next.networking.speed.downRung", { leg: rung.leg + 1, rung: rung.rung + 1 }),
+    })),
+    ...overrides.downProxies.map((id) => ({ key: `proxy-${id}`, text: name("proxy", id) })),
   ];
-  return parts.length ? parts.join(", ") : "—";
+  return parts.length
+    ? parts.map((part, index) => (
+        <Fragment key={part.key}>
+          {index > 0 ? ", " : null}
+          <span data-testid={networkIds.speedRunDown(part.key)}>{part.text}</span>
+        </Fragment>
+      ))
+    : "—";
 }
 
 /** The NZB a Usenet run measured with, as the operator would know it. */
@@ -102,6 +112,15 @@ function nzbLabel(t: Translate, usenet: NonNullable<SpeedTestRun["request"]["use
     return sabLabel(t, usenet.sabSize);
   }
   return usenet.nzbFilename ?? urlHost(usenet.nzbUrl ?? "") ?? t("next.networking.speed.nzbUrl");
+}
+
+/** What a run measured with, as a key: a provider or a custom URL, or the NZB's source. */
+function kindKey(run: SpeedTestRun): string {
+  const { bandwidth, usenet } = run.request;
+  if (bandwidth) {
+    return bandwidth.providerId ? "bandwidth-provider" : "bandwidth-custom";
+  }
+  return usenet?.sabSize ? "usenet-sab" : usenet?.nzbFilename ? "usenet-file" : "usenet-url";
 }
 
 /** What a run measured with, as it was asked: the provider, or the NZB. */
@@ -695,7 +714,7 @@ export function SpeedPage({ data, consumers }: { data: NetworkingData; consumers
             <Cell key="route" title={owner}>
               {owner}
             </Cell>,
-            <Cell key="kind" mono className="text-wv-secondary">
+            <Cell key="kind" mono className="text-wv-secondary" testId={networkIds.speedRunKind(kindKey(run))}>
               {kindSummary(t, run, providers)}
             </Cell>,
             <Cell key="down" mono className="text-wv-secondary">
