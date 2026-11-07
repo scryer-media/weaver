@@ -1571,3 +1571,79 @@ async fn torrent_scopes_on_one_leg_keep_its_stage_until_the_last_goes() {
     assert!(film_leg.stage.is_revoked());
     runtime.shutdown().await;
 }
+
+// A WireGuard profile that is never dialled: building its session reaches
+// no peer.
+fn idle_wireguard_profile(id: u32) -> ProxyProfile {
+    use base64::Engine;
+    let key = |seed: u8| {
+        base64::engine::general_purpose::STANDARD
+            .encode(weaver_tunnel::test_support::test_key(seed))
+    };
+    ProxyProfile {
+        id,
+        name: format!("wg-{id}"),
+        kind: ProxyKind::WireGuard,
+        host: "192.0.2.1".into(),
+        port: 51820,
+        dns_servers: vec!["10.64.0.1".parse().unwrap()],
+        tunnel_addresses: vec!["10.64.0.2/32".into()],
+        peer_public_key: Some(key(2)),
+        secrets: ProxySecrets {
+            private_key: Some(key(1)),
+            ..Default::default()
+        },
+        ..proxy()
+    }
+}
+
+// A WireGuard tunnel is built to the socket cap in force, so a new cap
+// rebuilds the sessions and legs with a WireGuard hop on them and leaves
+// every other leg as it stood.
+#[tokio::test]
+async fn a_new_socket_cap_rebuilds_wireguard_legs_alone() {
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let mut config = runtime.configuration.read().unwrap().clone();
+    config.socket_cap = 256;
+    config.profiles.insert(1, idle_wireguard_profile(1));
+    config.profiles.insert(2, proxy_with_id(2));
+    for (server, proxy) in [(1, 1), (2, 2)] {
+        config.consumers.insert(Consumer::Server(server).key());
+        config.policies.insert(
+            Consumer::Server(server).key(),
+            wireguard_ladder(Rung::Proxy { id: proxy }),
+        );
+    }
+    runtime.apply_configuration(config.clone()).unwrap();
+    let route = |server| {
+        runtime
+            .route(Consumer::Server(server), 5, Duration::from_secs(1))
+            .unwrap()
+    };
+    let (tunnel, socks) = (first_stage(&route(1)), first_stage(&route(2)));
+    let keys = |runtime: &NetworkRuntime| {
+        let mut keys: Vec<_> = runtime.sessions.lock().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    assert!(
+        keys(&runtime)
+            .iter()
+            .any(|key| key.ends_with(":sockets=256"))
+    );
+
+    config.socket_cap = 512;
+    runtime.apply_configuration(config).unwrap();
+    assert!(!Arc::ptr_eq(&tunnel, &first_stage(&route(1))));
+    assert!(Arc::ptr_eq(&socks, &first_stage(&route(2))));
+    assert!(
+        keys(&runtime)
+            .iter()
+            .any(|key| key.ends_with(":sockets=512"))
+    );
+    runtime.shutdown().await;
+}

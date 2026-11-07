@@ -262,6 +262,11 @@ impl ProxyProfile {
             .map_or(PortForwarding::None, PortForwarding::Fixed)
     }
     pub fn wireguard_spec(&self) -> Result<WireGuardSpec, TunnelError> {
+        self.wireguard_spec_capped(super::wireguard_socket_cap())
+    }
+    // The tunnel this profile describes, holding at most `max_sockets`
+    // sockets open.
+    pub fn wireguard_spec_capped(&self, max_sockets: usize) -> Result<WireGuardSpec, TunnelError> {
         Ok(WireGuardSpec {
             proxy_config_id: self.id.to_string(),
             proxy_name: self.name.clone(),
@@ -285,6 +290,7 @@ impl ProxyProfile {
             mtu: self.mtu,
             persistent_keepalive: self.keepalive_seconds.filter(|v| *v != 0),
             request_timeout: self.timeout(),
+            max_sockets,
         })
     }
 }

@@ -53,6 +53,9 @@ pub struct ProfileTuning {
     // machine's memory. It never touches a configured limit. `None` leaves
     // the derived value alone.
     pub direct_store_resident_default_cap_bytes: Option<u64>,
+    // The most sockets one WireGuard tunnel may hold open at once. Each
+    // costs the tunnel 128 KiB of buffers, so 1024 is 128 MiB per tunnel.
+    pub wireguard_socket_cap: usize,
 }
 
 // A share of the machine's memory: a fraction of it, up to a ceiling.
@@ -86,6 +89,7 @@ struct ProfileRow {
     max_concurrent_extractions: usize,
     par3_memory: MemoryShare,
     direct_store_resident_default_cap_bytes: Option<u64>,
+    wireguard_socket_cap: usize,
 }
 
 // Ordered from the least demanding to the most: `available` preserves this
@@ -104,6 +108,7 @@ const TABLE: [ProfileRow; 3] = [
             cap_bytes: 256 * MIB,
         },
         direct_store_resident_default_cap_bytes: Some(256 * MIB),
+        wireguard_socket_cap: 256,
     },
     ProfileRow {
         profile: HardwareProfile::Balanced,
@@ -118,6 +123,7 @@ const TABLE: [ProfileRow; 3] = [
             cap_bytes: GIB,
         },
         direct_store_resident_default_cap_bytes: None,
+        wireguard_socket_cap: 512,
     },
     ProfileRow {
         profile: HardwareProfile::Performance,
@@ -132,6 +138,7 @@ const TABLE: [ProfileRow; 3] = [
             cap_bytes: 2 * GIB,
         },
         direct_store_resident_default_cap_bytes: None,
+        wireguard_socket_cap: 1024,
     },
 ];
 
@@ -278,6 +285,7 @@ impl HardwareProfile {
                 Self::Performance => None,
             },
             direct_store_resident_default_cap_bytes: row.direct_store_resident_default_cap_bytes,
+            wireguard_socket_cap: row.wireguard_socket_cap,
         }
     }
 

@@ -48,11 +48,14 @@ struct Configuration {
     pools: HashMap<u32, ProxyPool>,
     policies: HashMap<String, RoutingPolicy>,
     warnings: HashMap<(String, usize), String>,
+    // The most sockets each WireGuard tunnel built from this holds open.
+    socket_cap: usize,
 }
 impl Configuration {
     fn load(db: &Database) -> Result<Self, String> {
         let mut configuration = Self {
             warnings: HashMap::new(),
+            socket_cap: super::wireguard_socket_cap(),
             consumer_labels: ProxyRuntime::consumer_labels(db).map_err(|e| e.to_string())?,
             consumers: ProxyRuntime::load_consumers(db)
                 .map_err(|e| e.to_string())?
@@ -119,6 +122,14 @@ impl Configuration {
             },
             None => EgressHealth::Down(self.missing_egress_warning(consumer, position, egress_id)),
         }
+    }
+    // Whether any of `ids` is a WireGuard proxy.
+    fn carries_wireguard(&self, ids: &[u32]) -> bool {
+        ids.iter().any(|id| {
+            self.profiles
+                .get(id)
+                .is_some_and(|profile| profile.kind == ProxyKind::WireGuard)
+        })
     }
     fn missing_egress_warning(&self, consumer: &str, position: usize, egress_id: u32) -> String {
         self.warnings
@@ -208,6 +219,9 @@ pub struct NetworkRuntime {
     pool_updates: Mutex<StagedPoolMembers>,
     poll: Mutex<Option<tokio::task::JoinHandle<()>>>,
     quota_watch: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    // Rebuilds the WireGuard tunnels when the hardware profile changes the
+    // socket cap they are built to.
+    cap_watch: Mutex<Option<tokio::task::JoinHandle<()>>>,
     // What the last health publish was computed from. The periodic tick
     // republishes only when one of these moved; an idle daemon otherwise
     // recomputes nothing.
@@ -271,6 +285,7 @@ impl NetworkRuntime {
             pool_updates: Mutex::new(HashMap::new()),
             poll: Mutex::new(None),
             quota_watch: Mutex::new(None),
+            cap_watch: Mutex::new(None),
             health_inputs: Mutex::new(None),
             torrent_legs: Mutex::default(),
         });
@@ -294,6 +309,11 @@ impl NetworkRuntime {
             ));
             *runtime.quota_watch.lock().expect("network quota task") = Some(task);
         }
+        let task = handle.spawn(Self::follow_socket_cap(
+            Arc::downgrade(&runtime),
+            super::follow_wireguard_socket_cap(),
+        ));
+        *runtime.cap_watch.lock().expect("network cap task") = Some(task);
         Ok(runtime)
     }
     // Re-publish leg health whenever an egress runs out of quota or gets
@@ -318,6 +338,34 @@ impl NetworkRuntime {
             tokio::select! {
                 changed = policy_changes.changed() => if changed.is_err() { break },
                 changed = capacity_changes.changed() => if changed.is_err() { break },
+            }
+        }
+    }
+    // Reload whenever the socket cap moves, so the tunnels are rebuilt to
+    // it and every tunnel's socket shares are budgeted against it.
+    async fn follow_socket_cap(
+        runtime: std::sync::Weak<Self>,
+        mut cap: tokio::sync::watch::Receiver<usize>,
+    ) {
+        while cap.changed().await.is_ok() {
+            let Some(runtime) = runtime.upgrade() else {
+                break;
+            };
+            let in_force = *cap.borrow_and_update();
+            if runtime
+                .configuration
+                .read()
+                .expect("network configuration")
+                .socket_cap
+                == in_force
+            {
+                continue;
+            }
+            if let Err(error) = runtime.reload().await {
+                tracing::warn!(
+                    error,
+                    "rebuilding the WireGuard tunnels for a new socket cap failed"
+                );
             }
         }
     }
@@ -574,7 +622,12 @@ impl NetworkRuntime {
             .iter()
             .map(|id| (*id, config.profiles.get(id).map(|p| p.revision)))
             .collect();
-        let key = format!("{}:{:?}:{revisions:?}", bottom.id(), bottom.binding());
+        let mut key = format!("{}:{:?}:{revisions:?}", bottom.id(), bottom.binding());
+        // A WireGuard tunnel is built to the socket cap, so a new cap
+        // rebuilds every session with a WireGuard hop up to it.
+        if config.carries_wireguard(&ids) {
+            key.push_str(&format!(":sockets={}", config.socket_cap));
+        }
         let mut sessions = self.sessions.lock().expect("network sessions");
         if let Some(stage) = sessions
             .get(&key)
@@ -626,7 +679,9 @@ impl NetworkRuntime {
                         // The carrier's capacity stays at its configured MTU.
                         // The provider sizes a carried tunnel to fit after
                         // resolving its endpoint through that carrier.
-                        let spec = profile.wireguard_spec().map_err(|e| e.to_string())?;
+                        let spec = profile
+                            .wireguard_spec_capped(config.socket_cap)
+                            .map_err(|e| e.to_string())?;
                         let provider = WireGuardTunnelProvider::new(spec, observer);
                         let provider = match prefix.last() {
                             None => provider.with_udp_factory(bottom.clone()),
@@ -851,12 +906,16 @@ impl NetworkRuntime {
                 fallback
             }
         };
-        let signature = format!(
+        let mut signature = format!(
             "{}:{:?}:{}:{versions:?}:{pool_versions:?}",
             leg.egress_id,
             bottom.binding(),
             serde_json::to_string(&leg.path).map_err(|e| e.to_string())?
         );
+        let hops: Vec<u32> = versions.iter().map(|(id, _)| *id).collect();
+        if config.carries_wireguard(&hops) {
+            signature.push_str(&format!(":sockets={}", config.socket_cap));
+        }
         Ok(LiveLeg {
             definition: leg.clone(),
             warning: config.warnings.get(&(consumer.key(), position)).cloned(),
@@ -996,6 +1055,7 @@ impl NetworkRuntime {
             pool_updates: Mutex::new(HashMap::new()),
             poll: Mutex::new(None),
             quota_watch: Mutex::new(None),
+            cap_watch: Mutex::new(None),
             health_inputs: Mutex::new(None),
             torrent_legs: Mutex::default(),
             egress_controls: self.egress_controls.clone(),
@@ -1216,6 +1276,9 @@ impl NetworkRuntime {
             task.abort();
         }
         if let Some(task) = self.quota_watch.lock().expect("network quota task").take() {
+            task.abort();
+        }
+        if let Some(task) = self.cap_watch.lock().expect("network cap task").take() {
             task.abort();
         }
         for route in self.live_routes() {

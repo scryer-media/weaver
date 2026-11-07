@@ -75,6 +75,7 @@ impl Pipeline {
         let in_force = self.hardware_profile_in_force();
         self.shared_state.set_hardware_profile_in_force(in_force);
         let tuning = in_force.active.tuning(self.tuner.system_profile());
+        crate::proxies::set_wireguard_socket_cap(tuning.wireguard_socket_cap);
         if tuning == self.tuner.profile_tuning() {
             return;
         }

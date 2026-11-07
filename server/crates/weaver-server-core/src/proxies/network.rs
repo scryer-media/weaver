@@ -40,6 +40,32 @@ pub(super) fn wireguard_session_budget() -> std::sync::Arc<tokio::sync::Semaphor
         .clone()
 }
 
+// The most sockets one WireGuard tunnel holds open, as the hardware profile in
+// force sets it. Every tunnel built from now on is built to it, and the save
+// paths budget every tunnel's sockets against it.
+fn socket_cap_cell() -> &'static tokio::sync::watch::Sender<usize> {
+    static CAP: std::sync::OnceLock<tokio::sync::watch::Sender<usize>> = std::sync::OnceLock::new();
+    CAP.get_or_init(|| {
+        tokio::sync::watch::Sender::new(weaver_tunnel::wireguard::DEFAULT_MAX_SOCKETS)
+    })
+}
+
+pub fn wireguard_socket_cap() -> usize {
+    *socket_cap_cell().borrow()
+}
+
+// Put `cap` in force, held to the bounds a tunnel accepts. Tunnels already
+// running keep theirs until the reload that follows rebuilds them.
+pub fn set_wireguard_socket_cap(cap: usize) {
+    let cap = weaver_tunnel::wireguard::socket_cap(cap);
+    socket_cap_cell().send_if_modified(|current| std::mem::replace(current, cap) != cap);
+}
+
+// Changes to the cap in force, for the runtime that rebuilds its tunnels.
+pub fn follow_wireguard_socket_cap() -> tokio::sync::watch::Receiver<usize> {
+    socket_cap_cell().subscribe()
+}
+
 // Every WireGuard session `routes` need, named by its egress and the hops
 // up to and including it. A WireGuard hop stacked on another is its own
 // session, apart from the same proxy directly on the egress.

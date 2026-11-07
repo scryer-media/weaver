@@ -144,6 +144,7 @@ impl Pipeline {
         );
         let profile_tuning = hardware_profile.tuning(&profile);
         let tuner = RuntimeTuner::with_profile_tuning(profile, total_connections, profile_tuning);
+        crate::proxies::set_wireguard_socket_cap(profile_tuning.wireguard_socket_cap);
         shared_state.set_sevenz_decode_memory_bytes(profile_tuning.sevenz_decode_memory_bytes);
         shared_state.set_hardware_profile_in_force(crate::HardwareProfileInForce {
             active: hardware_profile,
