@@ -731,11 +731,97 @@ func TestWeaverBrowserCrashIgnoresATestTimeout(t *testing.T) {
 
 func TestPortCollisionRetryRemovesOnlyTheStartedServices(t *testing.T) {
 	t.Setenv("E2E_PROJECT", "weaver-release-flow-a")
-	got := dockerComposeRetryCleanupArgs("weaver", "capture")
-	if !slices.Equal(got[:3], []string{"compose", "-p", "weaver-release-flow-a"}) {
-		t.Fatalf("retry cleanup args = %q, want the flow's own project", got)
+	rm := []string{"compose", "-p", "weaver-release-flow-a", "rm", "--force", "--stop"}
+	for _, tc := range []struct {
+		name     string
+		services []string
+		want     [][]string
+	}{
+		{
+			name:     "a dependent goes before its namespace owner",
+			services: []string{"weaver", "capture"},
+			want:     [][]string{append(slices.Clone(rm), "capture"), append(slices.Clone(rm), "weaver")},
+		},
+		{
+			name:     "no dependents gives one rm",
+			services: []string{"weaver", "nntp", "nntp2"},
+			want:     [][]string{append(slices.Clone(rm), "weaver", "nntp", "nntp2")},
+		},
+		{
+			name:     "a dependent whose owner is not listed goes in the normal pass",
+			services: []string{"capture", "nntp"},
+			want:     [][]string{append(slices.Clone(rm), "capture", "nntp")},
+		},
+		{
+			name:     "every listed dependent goes first",
+			services: []string{"nntp", "weaver", "nyuu", "capture"},
+			want: [][]string{
+				append(slices.Clone(rm), "nyuu", "capture"),
+				append(slices.Clone(rm), "nntp", "weaver"),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := dockerComposeRetryCleanupArgs(tc.services...)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("retry cleanup args = %q, want %q", got, tc.want)
+			}
+		})
 	}
-	if !slices.Equal(got[len(got)-5:], []string{"rm", "--force", "--stop", "weaver", "capture"}) {
-		t.Fatalf("retry cleanup args = %q, want rm of exactly the started services", got)
+}
+
+// The namespace table must name every `network_mode: "service:X"` in the
+// Compose files, and nothing else.
+func TestComposeNetworkNamespaceParentsMatchTheComposeFiles(t *testing.T) {
+	// Tests run in the package directory, two levels below e2e.
+	files, err := filepath.Glob(filepath.Join("..", "..", "docker-compose*.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) == 0 {
+		t.Fatal("no Compose files in the e2e directory")
+	}
+	found := map[string]string{}
+	for _, file := range files {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		inServices, service := false, ""
+		for _, line := range strings.Split(string(data), "\n") {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+				continue
+			}
+			if !strings.HasPrefix(line, " ") {
+				inServices, service = trimmed == "services:", ""
+				continue
+			}
+			if !inServices {
+				continue
+			}
+			if strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "   ") && strings.HasSuffix(trimmed, ":") {
+				service = strings.TrimSuffix(trimmed, ":")
+				continue
+			}
+			value, ok := strings.CutPrefix(trimmed, "network_mode:")
+			if !ok {
+				continue
+			}
+			parent, ok := strings.CutPrefix(strings.Trim(strings.TrimSpace(value), `"'`), "service:")
+			if !ok {
+				continue
+			}
+			if service == "" {
+				t.Fatalf("%s: network_mode %q outside a service", file, trimmed)
+			}
+			if previous, seen := found[service]; seen && previous != parent {
+				t.Fatalf("service %s joins both %s and %s", service, previous, parent)
+			}
+			found[service] = parent
+		}
+	}
+	if !reflect.DeepEqual(found, composeNetworkNamespaceParents) {
+		t.Fatalf("Compose files join namespaces %v, table says %v", found, composeNetworkNamespaceParents)
 	}
 }
