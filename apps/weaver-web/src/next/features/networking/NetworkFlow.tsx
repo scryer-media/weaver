@@ -20,6 +20,7 @@ import {
 } from "@/lib/networking";
 import { proxyFaultSentence } from "@/lib/proxy-fault";
 import { proxyLabels, type ProxyProfile } from "@/lib/proxies";
+import { networkIds } from "@/next/testids";
 import { EmptyState } from "../../components/chrome";
 import { SecondaryButton, Select } from "../../components/controls";
 import { Icon } from "../../components/icons";
@@ -385,16 +386,18 @@ const StateText = memo(function StateText({
   state,
   label,
   size = 10.5,
+  testId,
 }: {
   x: number;
   y: number;
   state: string;
   label: string;
   size?: number;
+  testId?: string;
 }) {
   const color = stateColor(state);
   return (
-    <g>
+    <g data-testid={testId}>
       <rect x={x} y={y - 7} width="7" height="7" fill={color} />
       <text x={x + 13} y={y} fill={color} fontSize={size} fontFamily={FONT}>
         {label}
@@ -443,6 +446,7 @@ function HopBox({
   active,
   toggle,
   toggleWidth = 0,
+  stateTestId,
 }: {
   x: number;
   y: number;
@@ -458,6 +462,8 @@ function HopBox({
   /** The box's Up/Down switch, drawn at the right of the title's line. */
   toggle?: (x: number, y: number) => ReactNode;
   toggleWidth?: number;
+  /** The test ID of the box's state, keyed by what the box stands for. */
+  stateTestId?: string;
 }) {
   const down = state === "DOWN";
   const switchRoom = toggle ? toggleWidth + 8 : 0;
@@ -481,7 +487,7 @@ function HopBox({
           {aside}
         </text>
       ) : null}
-      <StateText x={x + 14} y={y + 35} size={9.5} state={state} label={fit(label, width - 39, 9.5)} />
+      <StateText x={x + 14} y={y + 35} size={9.5} state={state} label={fit(label, width - 39, 9.5)} testId={stateTestId} />
       <Note x={x + 14} y={y + BOX_HEIGHT + 5} lines={note} />
       {toggle ? toggle(x + width - 10 - toggleWidth, y + 6) : null}
     </g>
@@ -504,6 +510,7 @@ function UpDownSwitch({
   label,
   words,
   onToggle,
+  testId,
 }: {
   x: number;
   y: number;
@@ -512,6 +519,7 @@ function UpDownSwitch({
   label: string;
   words: readonly [string, string];
   onToggle: () => void;
+  testId: string;
 }) {
   const pick = (wantDown: boolean) => {
     if (wantDown !== down) {
@@ -522,6 +530,7 @@ function UpDownSwitch({
     <g
       role="radiogroup"
       aria-label={label}
+      data-testid={testId}
       onKeyDown={(event) => {
         const wantDown = ["ArrowRight", "ArrowDown"].includes(event.key) ? true : ["ArrowLeft", "ArrowUp"].includes(event.key) ? false : null;
         if (wantDown === null) {
@@ -542,6 +551,7 @@ function UpDownSwitch({
           <g
             key={index}
             role="radio"
+            data-testid={networkIds.switchSide(testId, isDown ? "down" : "up")}
             aria-checked={checked}
             tabIndex={checked ? 0 : -1}
             className="group cursor-pointer outline-none"
@@ -855,6 +865,15 @@ export const NetworkFlow = memo(function NetworkFlow({
     );
   }
   const proxyTarget = (id: number | null): FlowTarget | null => (id == null ? null : { kind: "proxy", id });
+  /** The test ID of the switch that takes `target` down. */
+  const switchId = (target: DownTarget) =>
+    target.kind === "leg"
+      ? networkIds.legSwitch(target.position)
+      : target.kind === "rung"
+        ? networkIds.rungSwitch(target.leg, target.rung)
+        : target.kind === "proxy"
+          ? networkIds.proxySwitch(target.id)
+          : networkIds.egressSwitch(target.id);
   /** The Up/Down switch for one box, while a speed test is being set up. */
   const toggle = (target: DownTarget, label: string) =>
     toggles && onToggle
@@ -867,6 +886,7 @@ export const NetworkFlow = memo(function NetworkFlow({
             label={label}
             words={switchWords}
             onToggle={() => onToggle(target)}
+            testId={switchId(target)}
           />
         )
       : undefined;
@@ -915,6 +935,7 @@ export const NetworkFlow = memo(function NetworkFlow({
                     active={isActive}
                     toggle={toggle({ kind: "proxy", id }, name(id))}
                     toggleWidth={toggleWidth}
+                    stateTestId={networkIds.flowRung(leg.position, rungIndex, state)}
                   />,
                 )}
               </g>
@@ -953,6 +974,7 @@ export const NetworkFlow = memo(function NetworkFlow({
                 { kind: "rung", leg: leg.position, rung: rungIndex },
                 t("next.networking.route.rungTarget", { leg: leg.position + 1, rung: rungIndex + 1 }),
               )}
+              stateTestId={networkIds.flowRung(leg.position, rungIndex, state)}
             />,
           )}
           <StateBar x={PROXY.x} y={y} height={block.height} state={state} />
@@ -1050,6 +1072,7 @@ export const NetworkFlow = memo(function NetworkFlow({
               { kind: "rung", leg: leg.position, rung: rungIndex },
               t("next.networking.route.rungTarget", { leg: leg.position + 1, rung: rungIndex + 1 }),
             )}
+            stateTestId={networkIds.flowRung(leg.position, rungIndex, state)}
           />,
         )}
       </g>
@@ -1100,6 +1123,7 @@ export const NetworkFlow = memo(function NetworkFlow({
           viewBox={`0 0 ${WIDTH} ${layout.height}`}
           role="group"
           aria-label={t("next.networking.flow.diagram")}
+          data-testid={networkIds.flowDiagram}
           className="block w-full min-w-[1160px]"
           style={{ background: INK.ground, fontFamily: FONT }}
         >
@@ -1334,7 +1358,13 @@ export const NetworkFlow = memo(function NetworkFlow({
                       {fit(egress.name, room - (toggleWidth ? toggleWidth + 6 : 0), 13)}
                     </text>
                     {toggle({ kind: "egress", id: egress.id }, egress.name)?.(EGRESS.end - 12 - toggleWidth, y + 10)}
-                    <StateText x={x} y={y + 46} state={egress.health} label={stateLabel(t, egress.health)} />
+                    <StateText
+                      x={x}
+                      y={y + 46}
+                      state={egress.health}
+                      label={stateLabel(t, egress.health)}
+                      testId={networkIds.flowEgress(egress.id, egress.health)}
+                    />
                     {(egress.addresses?.length
                       ? egress.addresses
                       : [egress.sourceAddress || egress.interfaceName || t("next.networking.binding.system")]
@@ -1428,6 +1458,7 @@ export const NetworkFlow = memo(function NetworkFlow({
                       x={x}
                       y={y + 38}
                       state={leg.state}
+                      testId={networkIds.flowLeg(leg.position, leg.state)}
                       label={fit(
                         sustained(leg.consumer)
                           ? `${stateLabel(t, leg.state)} · ${t("next.networking.flow.connections", { open, target: leg.target })} · ${formatRate(leg.bytesPerSecond)}`
@@ -1496,6 +1527,7 @@ export const NetworkFlow = memo(function NetworkFlow({
                       size={DIRECT_SIZE}
                       state={status}
                       label={directLabel(leg, blocks.length)}
+                      testId={networkIds.flowDirect(leg.position, status)}
                     />
                   </g>
                 )}
