@@ -268,7 +268,7 @@ pub(crate) struct ServerPipelineExplorer {
     window_rung_responses: u64,
     window_rung_bytes: u64,
     window_rung_elapsed: Duration,
-    // A response in the window arrived with its lane holding less than a
+    // A response at the rung arrived with its lane holding less than a
     // full rung of articles: the lane waited on its next lease, and the
     // window timed that wait as well as the server.
     window_starved: bool,
@@ -575,7 +575,6 @@ impl ServerPipelineExplorer {
             return None;
         }
         self.window_responses = self.window_responses.saturating_add(1);
-        self.window_starved |= !fed;
         self.window_model_bytes = self.window_model_bytes.saturating_add(payload_bytes);
         // `transfer` is the lane's status-line-to-terminator time, refreshed
         // just before this call; a lane that has not measured one yet has
@@ -588,8 +587,24 @@ impl ServerPipelineExplorer {
             self.window_rung_responses = self.window_rung_responses.saturating_add(1);
             self.window_rung_bytes = self.window_rung_bytes.saturating_add(payload_bytes);
             self.window_rung_elapsed = self.window_rung_elapsed.saturating_add(policy_elapsed);
+            // Only a response at the rung can judge it, so only one of
+            // those voids the judgment by having waited on its lease.
+            self.window_starved |= !fed;
         }
-        if self.window_responses < self.window_target_responses() {
+        // A trial window counts only responses at the rung on trial, so it
+        // opens with the first of them. A step reaches the wire only as the
+        // lanes adopt leases booked after it: every lease already held keeps
+        // the depth it was booked at, and at depth 2 with eight lanes that is
+        // some seventy responses still to come at the old rung. Counted, they
+        // closed window after window with nothing in them that could judge
+        // the step, and a short job ended before any verdict. They still feed
+        // the link model; they no longer close the trial.
+        let counted = if self.on_trial {
+            self.window_rung_responses
+        } else {
+            self.window_responses
+        };
+        if counted < self.window_target_responses() {
             return None;
         }
 
@@ -1515,6 +1530,77 @@ mod tests {
             );
         }
         assert_eq!(shallow.current_depth(), 2);
+    }
+
+    // After a step the lanes still hold leases booked at the old rung, and
+    // their responses keep arriving at the old depth until each lane adopts
+    // one booked after the step. The trial window opens with the first
+    // response at the new rung and closes on a full window of them, however
+    // many old-rung responses arrive first.
+    #[test]
+    fn the_trial_window_opens_with_the_first_response_at_the_new_rung() {
+        let mut explorer = explorer(300, 200);
+        let now = Instant::now();
+        open_window(&mut explorer, now);
+        assert_eq!(
+            run_window(&mut explorer, now, 100_000, Duration::from_millis(100)),
+            Some(RungChange::Stepped { from: 2, to: 4 })
+        );
+        // The next refill is sized from the rung the explorer now runs.
+        assert_eq!(
+            explorer.choose_mode(true),
+            DownloadLaneMode::Pipelined { depth: 4 }
+        );
+
+        // Seventy-two responses from the leases already booked two deep,
+        // one of them from a lane left short: more than two full windows,
+        // and none of them closes the trial or voids it.
+        for response in 0..72 {
+            assert_eq!(
+                explorer.note_response(
+                    now,
+                    2,
+                    100_000,
+                    Duration::from_millis(100),
+                    true,
+                    false,
+                    response != 40,
+                ),
+                None
+            );
+        }
+        assert_eq!(explorer.current_depth(), 4);
+        assert_eq!(explorer.window_rung_responses, 0);
+        assert!(!explorer.window_starved);
+
+        // The first window of responses at the new rung judges it.
+        let responses = explorer.window_target_responses();
+        for _ in 1..responses {
+            assert_eq!(
+                explorer.note_response(
+                    now,
+                    4,
+                    100_000,
+                    Duration::from_millis(100),
+                    true,
+                    false,
+                    true
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            explorer.note_response(
+                now,
+                4,
+                100_000,
+                Duration::from_millis(100),
+                true,
+                false,
+                true
+            ),
+            Some(RungChange::Kept { depth: 4 })
+        );
     }
 
     // The opening windows are short on purpose: a server with no measurement
