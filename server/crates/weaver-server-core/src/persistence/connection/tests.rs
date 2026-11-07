@@ -985,6 +985,23 @@ fn open_applies_sqlite_file_pragmas() {
     assert_eq!(journal_size_limit, 64 * 1024 * 1024);
 }
 
+// Closing the database ends the WAL checkpoint task, its connection closed,
+// while another owner still holds the services, as the background writer
+// does: the file is free to be replaced as soon as the close returns.
+#[test]
+fn close_ends_the_wal_checkpoint_task_while_another_owner_holds_the_services() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("weaver.db")).unwrap();
+    let held = db.sql_services.clone();
+    assert_eq!(held.checkpointer_ended(), Some(false));
+
+    db.close().unwrap();
+
+    assert_eq!(held.checkpointer_ended(), Some(true));
+    // A later stop, as the last handle drops, has nothing left to do.
+    drop(held);
+}
+
 #[test]
 fn open_file_database_stamps_sqlx_migration_ledger() {
     let temp = tempfile::tempdir().unwrap();

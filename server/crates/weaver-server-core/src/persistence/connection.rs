@@ -1377,17 +1377,24 @@ impl Database {
         })
     }
 
+    // Closes every connection this database opened, the WAL checkpoint
+    // task's last, even while another owner, such as the background writer,
+    // still holds a handle to the services: a file is then free to be
+    // replaced, which Windows refuses while any handle is open.
     pub(crate) fn close(self) -> Result<(), StateError> {
         let datastore = self.datastore();
+        let services = self.sql_services.clone();
         let worker = self.sql_worker.clone();
         drop(self);
-        worker.block_on(std::panic::Location::caller(), async move {
+        let closed = worker.block_on(std::panic::Location::caller(), async move {
             match datastore {
                 StoreDatastore::Sqlite { pool, .. } => pool.close().await,
                 StoreDatastore::Postgres { pool } => pool.close().await,
             }
             Ok(())
-        })
+        });
+        services.stop_checkpointer();
+        closed
     }
 
     pub(crate) fn get_cached_job_history(&self, job_id: u64) -> Option<JobHistoryRow> {
