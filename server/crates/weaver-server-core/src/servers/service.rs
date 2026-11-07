@@ -62,9 +62,20 @@ impl ServersService {
                 })?;
             server.active = active;
         }
-        if let Err(error) =
-            crate::runtime::reload::rebuild_nntp_from_config(&self.config, &self.handle).await
-        {
+        // The network runtime re-budgets its tunnels for the server's
+        // connections before the NNTP runtime opens them.
+        let reloaded = match &proxy_runtime {
+            Some(runtime) => runtime.reload().await,
+            None => Ok(()),
+        };
+        let rebuilt = match reloaded {
+            Ok(()) => crate::runtime::reload::rebuild_nntp_from_config(&self.config, &self.handle)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = rebuilt {
             // Failed activations must leave persistence and runtime in agreement,
             // including when the next attempt happens after a process restart.
             if let Some(server) = self
@@ -249,18 +260,29 @@ impl Database {
     pub fn set_server_active(&self, server_id: u32, active: bool) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            let changed = SqlRuntime::execute(
-                datastore.write_exec(),
-                "UPDATE servers SET active = {} WHERE id = {}",
-                &[SqlArg::Bool(active), SqlArg::I64(i64::from(server_id))],
-            )
-            .await?;
-            if changed == 0 {
-                return Err(StateError::Database(format!(
-                    "server {server_id} not found"
-                )));
-            }
-            Ok(())
+            SqlRuntime::run_in_transaction(&datastore, "set_server_active", |tx| {
+                Box::pin(async move {
+                    let changed = tx
+                        .execute(
+                            "UPDATE servers SET active = {} WHERE id = {}",
+                            &[SqlArg::Bool(active), SqlArg::I64(i64::from(server_id))],
+                        )
+                        .await?;
+                    if changed == 0 {
+                        return Err(StateError::Database(format!(
+                            "server {server_id} not found"
+                        )));
+                    }
+                    // An activated server asks its connections of the
+                    // tunnels its route reaches.
+                    if active {
+                        crate::proxies::lock_network(tx).await?;
+                        crate::proxies::validate_stored_sockets(tx).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
         })
     }
 

@@ -29,6 +29,7 @@ use super::natpmp::{self, NATPMP_PORT};
 pub use super::natpmp::{PortMapping, gateway_of};
 use super::{
     ConnectionOutcome, DialError, Dialed, DialedStream, Dialer, OutcomeStream, SessionHop,
+    SocketClass,
 };
 use crate::{TunnelError, wireguard::WgTcpListener};
 
@@ -216,7 +217,7 @@ impl InboundListener for SessionListener {
     async fn accept(&self) -> Result<Dialed, TunnelError> {
         let mut state = self.state.lock().await;
         let Listening { listener, mapping } = &mut *state;
-        let stream = loop {
+        let (stream, share) = loop {
             // The port the gateway forwards now, else the one listened on.
             let port = mapping
                 .as_mut()
@@ -238,7 +239,12 @@ impl InboundListener for SessionListener {
             };
             tokio::select! {
                 accepted = current.accept() => match accepted {
-                    Ok(stream) => break stream,
+                    // A peer past the torrent share is turned away and the
+                    // listener keeps listening.
+                    Ok(stream) => match self.session.sockets.take(SocketClass::Torrent) {
+                        Ok(share) => break (stream, share),
+                        Err(_) => drop(stream),
+                    },
                     // The tunnel stopped: listen again inside its replacement.
                     Err(_) => *listener = None,
                 },
@@ -255,12 +261,15 @@ impl InboundListener for SessionListener {
         let mut path = session.path.clone();
         path.proxies.push(session.id);
         Ok(Dialed {
-            stream: DialedStream::Tunnel(Box::new(OutcomeStream::new(
-                DialedStream::Tunnel(Box::new(stream)),
-                outcome.clone(),
-                Some(activity),
-                capacity,
-            ))),
+            stream: DialedStream::Tunnel(Box::new(
+                OutcomeStream::new(
+                    DialedStream::Tunnel(Box::new(stream)),
+                    outcome.clone(),
+                    Some(activity),
+                    capacity,
+                )
+                .holding(share),
+            )),
             outcome,
             path,
             peer: Some(peer),

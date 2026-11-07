@@ -41,6 +41,20 @@ impl Database {
             .map_err(|_| StateError::Database(format!("{BASE_PORT_KEY} is not a port: {stored}")))
     }
 
+    // The most peers a torrent session connects to, as the saved torrent
+    // settings set it.
+    pub fn torrent_peer_limit(&self) -> Result<usize, StateError> {
+        let settings: std::collections::HashMap<String, String> = self
+            .list_setting_records()?
+            .into_iter()
+            .map(|SettingRecord { key, value }| (key, value))
+            .collect();
+        Ok(
+            crate::torrents::sessions::session_limits(&torrent_config_from_settings(&settings))
+                .connections_limit,
+        )
+    }
+
     // Load a full `Config` from the settings and servers tables.
     pub fn load_config(&self) -> Result<Config, StateError> {
         let settings: std::collections::HashMap<String, String> = self

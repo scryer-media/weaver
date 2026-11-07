@@ -7,6 +7,7 @@ mod model;
 mod network;
 pub mod network_metrics;
 mod network_persistence;
+pub(crate) use network_persistence::{lock_network, validate_stored_sockets};
 mod network_runtime;
 pub(crate) mod persistence;
 mod pool_stage;
@@ -15,6 +16,7 @@ mod refusal;
 mod route_guard_tests;
 mod routed_http;
 mod runtime;
+mod socket_ledger;
 mod weighted;
 pub use fault::{ProxyFault, ProxyTestPass, fault_params};
 pub use interfaces::*;
@@ -33,4 +35,5 @@ pub use routed_http::{
 #[cfg(test)]
 pub(crate) use routed_http::{direct_runtime, outbound_only_through};
 pub use runtime::*;
+pub use socket_ledger::*;
 pub use weighted::*;

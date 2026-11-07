@@ -479,6 +479,7 @@ async fn a_session_hop_is_failing_only_while_its_own_path_fails() {
     }
     let provider = Arc::new(Provider::default());
     let hop = SessionHop {
+        sockets: Default::default(),
         capacity: Default::default(),
         activity: Default::default(),
         id: 3,
@@ -599,6 +600,7 @@ async fn idle_retirement_preserves_channels_shared_by_other_consumers() {
     }
     let provider = Arc::new(Provider::default());
     let hop = SessionHop {
+        sockets: Default::default(),
         capacity: Default::default(),
         activity: Default::default(),
         id: 3,
@@ -661,6 +663,7 @@ async fn only_a_path_failure_retires_an_idle_session() {
     }
     let provider = Arc::new(Provider::default());
     let hop = SessionHop {
+        sockets: Default::default(),
         capacity: Default::default(),
         activity: Default::default(),
         id: 3,
@@ -904,6 +907,7 @@ async fn a_wireguard_session_carries_another_and_stays_up_while_it_rides() {
                    proxies: Vec<u32>,
                    endpoint: SocketAddr| {
         Arc::new(SessionHop {
+            sockets: Default::default(),
             capacity: SessionCapacity::new(budget.clone()),
             activity: Default::default(),
             id,
@@ -1033,6 +1037,7 @@ fn wireguard_session(
     budget: usize,
 ) -> Arc<SessionHop> {
     Arc::new(SessionHop {
+        sockets: Default::default(),
         capacity: SessionCapacity::new(Arc::new(tokio::sync::Semaphore::new(budget))),
         activity: Default::default(),
         id,
@@ -1977,6 +1982,7 @@ async fn only_a_path_ending_in_wireguard_takes_connections() {
 
     // An SSH session over WireGuard: no listener.
     let ssh = Arc::new(SessionHop {
+        sockets: Default::default(),
         capacity: SessionCapacity::default(),
         activity: Default::default(),
         id: 9,
@@ -2218,4 +2224,62 @@ fn a_revoked_leg_reports_no_route() {
         leg.bind_local_udp("127.0.0.1:0".parse().unwrap()),
         Some(Err(_))
     ));
+}
+
+// Each kind of traffic holds its own share of a WireGuard tunnel's sockets.
+// A full share is at capacity until one of its streams closes, and traffic
+// of another kind still dials.
+#[tokio::test]
+async fn a_full_socket_share_is_at_capacity_and_leaves_the_others_alone() {
+    let near = crate::test_support::WireGuardTestPeer::start().await;
+    let provider = Arc::new(
+        crate::WireGuardTunnelProvider::new(
+            near.client_spec("1"),
+            Arc::new(crate::NoopTunnelObserver),
+        )
+        .with_udp_factory(bottom()),
+    );
+    let session = Arc::new(SessionHop {
+        sockets: Arc::new(SessionSockets::new(SocketShares {
+            nntp: 0,
+            torrent: 1,
+            reserve: 1,
+        })),
+        ..Arc::into_inner(wireguard_session(
+            1,
+            provider.clone(),
+            provider,
+            bottom(),
+            vec![],
+            1,
+        ))
+        .unwrap()
+    });
+    let target = |purpose| Target {
+        purpose,
+        ..probe_target()
+    };
+
+    assert!(session.has_room(&Purpose::Torrent));
+    let peer = session.dial(&target(Purpose::Torrent)).await.unwrap();
+    assert!(!session.has_room(&Purpose::Torrent));
+    assert_eq!(session.sockets.held(SocketClass::Torrent), 1);
+    assert!(matches!(
+        session.dial(&target(Purpose::Torrent)).await,
+        Err(DialError::AtCapacity(_))
+    ));
+    let tracker = session.dial(&target(Purpose::TorrentHttp)).await.unwrap();
+    assert_eq!(session.sockets.held(SocketClass::Reserve), 1);
+    assert!(matches!(
+        session
+            .dial(&target(Purpose::Nntp { server: 1, leg: 0 }))
+            .await,
+        Err(DialError::AtCapacity(_))
+    ));
+
+    drop(peer);
+    assert!(session.has_room(&Purpose::Torrent));
+    let _again = session.dial(&target(Purpose::Torrent)).await.unwrap();
+    drop(tracker);
+    assert_eq!(session.sockets.held(SocketClass::Reserve), 0);
 }

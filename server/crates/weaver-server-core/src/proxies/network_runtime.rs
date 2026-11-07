@@ -12,7 +12,7 @@ use weaver_tunnel::{
     egress::SocketEgress,
     pipe::{
         DialError, DialPath, Dialed, Dialer, Egress, Fallback, InnerTransport, Revocable,
-        SessionHop, Target, TransportHop,
+        SessionHop, SessionSockets, SocketShares, Target, TransportHop,
     },
     transport::{TransportKind, TransportProxy},
 };
@@ -50,12 +50,15 @@ struct Configuration {
     warnings: HashMap<(String, usize), String>,
     // The most sockets each WireGuard tunnel built from this holds open.
     socket_cap: usize,
+    // How the routes share each WireGuard session's sockets.
+    socket_ledger: HashMap<SessionPath, TunnelSockets>,
 }
 impl Configuration {
     fn load(db: &Database) -> Result<Self, String> {
         let mut configuration = Self {
             warnings: HashMap::new(),
             socket_cap: super::wireguard_socket_cap(),
+            socket_ledger: HashMap::new(),
             consumer_labels: ProxyRuntime::consumer_labels(db).map_err(|e| e.to_string())?,
             consumers: ProxyRuntime::load_consumers(db)
                 .map_err(|e| e.to_string())?
@@ -86,6 +89,15 @@ impl Configuration {
                 .into_iter()
                 .collect(),
         };
+        let connections: HashMap<u32, u16> = db
+            .list_servers()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .filter(|server| server.active)
+            .map(|server| (server.id, server.connections))
+            .collect();
+        configuration.socket_ledger = configuration.ledger(&connections);
+        configuration.warn_peer_clamps(db.torrent_peer_limit().map_err(|e| e.to_string())?);
         for (consumer, policy) in &mut configuration.policies {
             for (position, leg) in policy.legs.iter_mut().enumerate() {
                 if !configuration.egresses.contains_key(&leg.egress_id) {
@@ -97,6 +109,72 @@ impl Configuration {
             }
         }
         Ok(configuration)
+    }
+    fn ledger(&self, connections: &HashMap<u32, u16>) -> HashMap<SessionPath, TunnelSockets> {
+        let routes: Vec<_> = self
+            .policies
+            .iter()
+            .filter_map(|(key, policy)| Consumer::from_key(key).map(|c| (c, policy.route())))
+            .collect();
+        socket_ledger(
+            &routes,
+            &self.profiles,
+            &self.pools,
+            connections,
+            self.socket_cap,
+        )
+    }
+    // A torrent leg whose WireGuard session holds TCP peers below the peer
+    // limit says so; the peers past the share connect over uTP.
+    fn warn_peer_clamps(&mut self, peer_limit: usize) {
+        let mut clamps = Vec::new();
+        for (key, policy) in &self.policies {
+            if !matches!(Consumer::from_key(key), Some(Consumer::Torrent(_))) {
+                continue;
+            }
+            for (position, leg) in policy.route().legs.iter().enumerate() {
+                let LegPath::Ladder { rungs, .. } = &leg.path else {
+                    continue;
+                };
+                let held = rungs
+                    .iter()
+                    .flat_map(|rung| rung_carriers(rung, &self.profiles, &self.pools))
+                    .filter_map(|path| {
+                        let shares = self.socket_shares(&(leg.egress_id, path.clone()));
+                        (shares.torrent < peer_limit).then_some((shares.torrent, path))
+                    })
+                    .min();
+                if let Some((share, path)) = held {
+                    clamps.push((
+                        (key.clone(), position),
+                        format!(
+                            "WireGuard proxy {} holds torrent peers over TCP to {share} of {peer_limit}; the rest connect over uTP.",
+                            path.last().copied().unwrap_or_default()
+                        ),
+                    ));
+                }
+            }
+        }
+        for (slot, warning) in clamps {
+            self.warnings.entry(slot).or_insert(warning);
+        }
+    }
+    // The shares a WireGuard session holds its sockets to. A session no
+    // route counts on, such as one a probe opens, keeps the reserve and
+    // gives the rest to torrent peers.
+    fn socket_shares(&self, path: &SessionPath) -> SocketShares {
+        self.socket_ledger
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| TunnelSockets {
+                egress: path.0,
+                proxy: path.1.last().copied().unwrap_or_default(),
+                cap: self.socket_cap,
+                nntp: 0,
+                reserve: socket_reserve(self.socket_cap),
+                torrent: false,
+            })
+            .shares()
     }
     // The health a leg's egress contributes before any dial evidence. A
     // missing egress is Down under the warning recorded for that leg, so
@@ -192,6 +270,10 @@ pub struct LiveNetworkRoute {
 
 type StagedPoolMembers = HashMap<(u32, u32), Vec<(u32, Arc<dyn Dialer>)>>;
 // The pools running now, by pool and egress.
+// A WireGuard session's path, the cap its tunnel was built to, and its
+// socket shares.
+pub(super) type SessionSocketMap =
+    Arc<Mutex<HashMap<String, (SessionPath, usize, Arc<SessionSockets>)>>>;
 pub(super) type RunningPools = Arc<Mutex<HashMap<(u32, u32), Arc<PoolStage>>>>;
 
 pub struct NetworkRuntime {
@@ -206,6 +288,9 @@ pub struct NetworkRuntime {
     handle: tokio::runtime::Handle,
     configuration: RwLock<Configuration>,
     sessions: Mutex<HashMap<String, Arc<dyn Dialer>>>,
+    // Each WireGuard session's socket shares, by session key. Shared with
+    // the staging runtime so a reload re-budgets the sessions it kept.
+    session_sockets: SessionSocketMap,
     // Live sessions a probe runtime may use but does not own. A probe of a
     // saved profile shares the session already holding its WireGuard permit
     // instead of competing with it for the budget, and never shuts it down.
@@ -277,6 +362,7 @@ impl NetworkRuntime {
             handle: handle.clone(),
             configuration: RwLock::new(configuration),
             sessions: Mutex::new(HashMap::new()),
+            session_sockets: Arc::default(),
             borrowed_sessions: HashMap::new(),
             pools: Arc::default(),
             routes: Mutex::new(HashMap::new()),
@@ -728,12 +814,24 @@ impl NetworkRuntime {
                     .get(&id)
                     .cloned()
                     .unwrap_or(provider);
+                let sockets = if profile.kind == ProxyKind::WireGuard {
+                    let path = (bottom.id(), ids.clone());
+                    let sockets = Arc::new(SessionSockets::new(config.socket_shares(&path)));
+                    self.session_sockets
+                        .lock()
+                        .expect("session sockets")
+                        .insert(key.clone(), (path, config.socket_cap, sockets.clone()));
+                    sockets
+                } else {
+                    Default::default()
+                };
                 Arc::new(SessionHop {
                     capacity: if profile.kind == ProxyKind::WireGuard {
                         weaver_tunnel::pipe::SessionCapacity::new(wireguard_session_budget())
                     } else {
                         Default::default()
                     },
+                    sockets,
                     activity: Default::default(),
                     id,
                     provider,
@@ -1045,6 +1143,7 @@ impl NetworkRuntime {
             handle: self.handle.clone(),
             configuration: RwLock::new(next.clone()),
             sessions: Mutex::new(self.sessions.lock().expect("network sessions").clone()),
+            session_sockets: self.session_sockets.clone(),
             borrowed_sessions: HashMap::new(),
             pools: Arc::new(Mutex::new(
                 self.pools.lock().expect("network pools").clone(),
@@ -1137,6 +1236,7 @@ impl NetworkRuntime {
             .collect();
         *self.sessions.lock().expect("network sessions") =
             std::mem::take(staging.sessions.get_mut().expect("staged sessions"));
+        self.rebudget_sessions(&next);
         *self.pools.lock().expect("network pools") =
             std::mem::take(&mut *staging.pools.lock().expect("staged pools"));
         // Pools whose members this reload changed.
@@ -1241,6 +1341,19 @@ impl NetworkRuntime {
         }
         Ok(())
     }
+    // Hold every live WireGuard session built to `config`'s cap to the
+    // shares `config` gives it, and forget the sessions no longer live. A
+    // session built to another cap is retiring and keeps its shares.
+    fn rebudget_sessions(&self, config: &Configuration) {
+        let sessions = self.sessions.lock().expect("network sessions");
+        let mut shares = self.session_sockets.lock().expect("session sockets");
+        shares.retain(|key, _| sessions.contains_key(key));
+        for (path, cap, sockets) in shares.values() {
+            if *cap == config.socket_cap {
+                sockets.set_shares(config.socket_shares(path));
+            }
+        }
+    }
     async fn retire_unused_sessions(&self) {
         loop {
             let candidates: Vec<_> = self
@@ -1270,6 +1383,11 @@ impl NetworkRuntime {
                 break;
             }
         }
+        let sessions = self.sessions.lock().expect("network sessions");
+        self.session_sockets
+            .lock()
+            .expect("session sockets")
+            .retain(|key, _| sessions.contains_key(key));
     }
     pub async fn shutdown(&self) {
         if let Some(task) = self.poll.lock().expect("network health task").take() {

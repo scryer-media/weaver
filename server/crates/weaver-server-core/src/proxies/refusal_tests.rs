@@ -272,6 +272,18 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             "routes require 3 WireGuard instances × 516 MiB = 1548 MiB; this host permits 2 instances (available memory / 4 / 516 MiB, clamped to 1–8). Pool members count individually.",
         ),
         (
+            R::WireGuardSocketBudget {
+                proxy: 3,
+                egress: 0,
+                nntp: 241,
+                reserve: 32,
+                peers: 0,
+                cap: 256,
+            },
+            "WIREGUARD_SOCKET_BUDGET",
+            "usenet servers ask 241 sockets of WireGuard proxy 3 on egress 0 and 32 are reserved, over the 256 it holds",
+        ),
+        (
             R::ProxyNameLength,
             "PROXY_NAME_LENGTH",
             "proxy name must contain 1–128 characters",
@@ -547,9 +559,10 @@ fn slot(refusal: &R) -> usize {
         R::TorrentRouteExit(super::TorrentRouteFault::Legs) => 86,
         R::TorrentRouteExit(super::TorrentRouteFault::DirectFallback) => 87,
         R::TorrentRouteExit(super::TorrentRouteFault::Rungs) => 88,
+        R::WireGuardSocketBudget { .. } => 89,
     }
 }
-const SLOTS: usize = 89;
+const SLOTS: usize = 90;
 
 #[test]
 fn every_refusal_keeps_its_code_and_its_sentence() {
@@ -630,6 +643,17 @@ fn only_the_sentences_that_name_values_carry_them() {
             "WIREGUARD_INSTANCE_LIMIT" => assert_eq!(
                 params,
                 serde_json::json!({ "required": 3, "limit": 2, "instanceMib": 516 })
+            ),
+            "WIREGUARD_SOCKET_BUDGET" => assert_eq!(
+                params,
+                serde_json::json!({
+                    "proxyId": 3,
+                    "egressId": 0,
+                    "nntp": 241,
+                    "reserve": 32,
+                    "peers": 0,
+                    "cap": 256,
+                })
             ),
             "SPEED_TEST_ALREADY_RUNNING" => {
                 assert_eq!(params, serde_json::json!({ "runId": 4 }))

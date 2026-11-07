@@ -170,6 +170,7 @@ impl NetworkRuntime {
                     .clone(),
             ),
             sessions: Mutex::new(HashMap::new()),
+            session_sockets: Arc::default(),
             borrowed_sessions: self.sessions.lock().expect("network sessions").clone(),
             pools: Arc::default(),
             routes: Mutex::new(HashMap::new()),

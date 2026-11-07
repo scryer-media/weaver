@@ -1,0 +1,402 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use std::collections::HashMap;
+
+use super::*;
+use crate::proxies::{Resolver, RouteLeg, RoutingPolicy, TorrentScope};
+
+fn profile(id: u32, kind: ProxyKind) -> ProxyProfile {
+    ProxyProfile {
+        id,
+        name: format!("proxy-{id}"),
+        kind,
+        enabled: true,
+        host: "192.0.2.1".into(),
+        port: 51820,
+        resolver: Resolver::Proxy,
+        dns_servers: vec![],
+        tunnel_addresses: vec![],
+        peer_public_key: None,
+        mtu: 1420,
+        keepalive_seconds: None,
+        timeout_seconds: 30,
+        host_key_fingerprint: None,
+        natpmp: false,
+        forwarded_port: None,
+        revision: 1,
+        secrets: Default::default(),
+    }
+}
+
+fn profiles(wireguard: &[u32], socks: &[u32]) -> HashMap<u32, ProxyProfile> {
+    wireguard
+        .iter()
+        .map(|id| (*id, profile(*id, ProxyKind::WireGuard)))
+        .chain(
+            socks
+                .iter()
+                .map(|id| (*id, profile(*id, ProxyKind::Socks5))),
+        )
+        .collect()
+}
+
+fn leg(rung: Rung, weight: u8) -> RouteLeg {
+    RouteLeg {
+        egress_id: 0,
+        weight,
+        path: LegPath::Ladder {
+            rungs: vec![rung],
+            direct_fallback: false,
+        },
+    }
+}
+
+// Legs of equal weight, one per rung.
+fn route(rungs: Vec<Rung>, failover: Failover) -> Route {
+    let weight = 100 / rungs.len() as u8;
+    Route {
+        legs: rungs.into_iter().map(|rung| leg(rung, weight)).collect(),
+        failover,
+    }
+}
+
+fn torrent(rung: Rung) -> (Consumer, Route) {
+    (
+        Consumer::Torrent(TorrentScope::Default),
+        route(vec![rung], Failover::Redistribute),
+    )
+}
+
+fn tunnel(id: u32) -> SessionPath {
+    (0, vec![id])
+}
+
+// A server whose route spreads over two tunnels asks each for every
+// connection under Redistribute, since either leg takes the other's share
+// when it fails, and for its own target under Hold. A pool asks each member
+// for every connection either way. Each server keeps one more socket on
+// each tunnel for replacing a connection.
+#[test]
+fn usenet_asks_every_connection_unless_its_route_holds() {
+    let profiles = profiles(&[1, 2, 3, 4], &[]);
+    let pools = HashMap::from([(
+        9,
+        ProxyPool {
+            id: 9,
+            name: "pool".into(),
+            kind: ProxyKind::WireGuard,
+            member_ids: vec![3, 4],
+            enabled: true,
+        },
+    )]);
+    let connections = HashMap::from([(1, 20), (2, 30)]);
+    let two_legs = |failover| route(vec![Rung::Proxy { id: 1 }, Rung::Proxy { id: 2 }], failover);
+    let pooled = route(vec![Rung::Pool { id: 9 }], Failover::Hold);
+
+    let ledger = socket_ledger(
+        &[
+            (Consumer::Server(1), two_legs(Failover::Redistribute)),
+            (Consumer::Server(2), pooled.clone()),
+        ],
+        &profiles,
+        &pools,
+        &connections,
+        256,
+    );
+    assert_eq!(ledger[&tunnel(1)].nntp, 21);
+    assert_eq!(ledger[&tunnel(2)].nntp, 21);
+    assert_eq!(ledger[&tunnel(3)].nntp, 31);
+    assert_eq!(ledger[&tunnel(4)].nntp, 31);
+
+    let ledger = socket_ledger(
+        &[(Consumer::Server(1), two_legs(Failover::Hold))],
+        &profiles,
+        &pools,
+        &connections,
+        256,
+    );
+    assert_eq!(ledger[&tunnel(1)].nntp, 11);
+    assert_eq!(ledger[&tunnel(2)].nntp, 11);
+
+    // Two servers on one tunnel each count their own replacement.
+    let ledger = socket_ledger(
+        &[
+            (
+                Consumer::Server(1),
+                route(vec![Rung::Proxy { id: 1 }], Failover::Hold),
+            ),
+            (
+                Consumer::Server(2),
+                route(vec![Rung::Proxy { id: 1 }], Failover::Hold),
+            ),
+        ],
+        &profiles,
+        &pools,
+        &connections,
+        256,
+    );
+    assert_eq!(ledger[&tunnel(1)].nntp, 21 + 31);
+    // A server that is not active asks nothing.
+    let ledger = socket_ledger(
+        &[(
+            Consumer::Server(3),
+            route(vec![Rung::Proxy { id: 1 }], Failover::Hold),
+        )],
+        &profiles,
+        &pools,
+        &connections,
+        256,
+    );
+    assert_eq!(ledger[&tunnel(1)].nntp, 0);
+}
+
+// A chain of WireGuard hops is a session per hop; the connections open in
+// the last one. A SOCKS or HTTP hop, and a route with no WireGuard hop,
+// take nothing of any tunnel.
+#[test]
+fn connections_count_on_the_last_wireguard_hop_and_nothing_else_is_counted() {
+    let profiles = profiles(&[1, 2], &[5]);
+    let connections = HashMap::from([(1, 10)]);
+    let ledger = socket_ledger(
+        &[(
+            Consumer::Server(1),
+            route(vec![Rung::Chain { ids: vec![1, 2, 5] }], Failover::Hold),
+        )],
+        &profiles,
+        &HashMap::new(),
+        &connections,
+        256,
+    );
+    assert_eq!(ledger.len(), 2);
+    assert_eq!(ledger[&tunnel(1)].nntp, 0);
+    assert_eq!(ledger[&(0, vec![1, 2])].nntp, 11);
+    assert_eq!(ledger[&(0, vec![1, 2])].proxy, 2);
+
+    let ledger = socket_ledger(
+        &[
+            (
+                Consumer::Server(1),
+                route(vec![Rung::Proxy { id: 5 }], Failover::Hold),
+            ),
+            torrent(Rung::Proxy { id: 5 }),
+        ],
+        &profiles,
+        &HashMap::new(),
+        &connections,
+        256,
+    );
+    assert!(ledger.is_empty());
+}
+
+// A torrent route alone on a tunnel gives its TCP peers everything but the
+// reserve, at each hardware profile's cap.
+#[test]
+fn torrent_peers_alone_take_all_but_the_reserve() {
+    for cap in [256, 512, 1024] {
+        let ledger = socket_ledger(
+            &[torrent(Rung::Proxy { id: 1 })],
+            &profiles(&[1], &[]),
+            &HashMap::new(),
+            &HashMap::new(),
+            cap,
+        );
+        let shares = ledger[&tunnel(1)].shares();
+        assert_eq!(shares.reserve, cap / 8);
+        assert_eq!(shares.nntp, 0);
+        assert_eq!(shares.torrent, cap - cap / 8);
+    }
+}
+
+// Usenet and torrent peers on one tunnel: the shares add up to the cap and
+// the peers keep what usenet and the reserve leave.
+#[test]
+fn usenet_and_torrent_peers_share_one_tunnel_within_its_cap() {
+    for cap in [256, 512] {
+        let ledger = socket_ledger(
+            &[
+                (
+                    Consumer::Server(1),
+                    route(vec![Rung::Proxy { id: 1 }], Failover::Redistribute),
+                ),
+                torrent(Rung::Proxy { id: 1 }),
+            ],
+            &profiles(&[1], &[]),
+            &HashMap::new(),
+            &HashMap::from([(1, 100)]),
+            cap,
+        );
+        let tunnel = &ledger[&tunnel(1)];
+        assert!(tunnel.torrent);
+        assert!(!tunnel.over_budget());
+        let shares = tunnel.shares();
+        assert_eq!(shares.nntp, 101);
+        assert_eq!(shares.reserve, cap / 8);
+        assert_eq!(shares.nntp + shares.torrent + shares.reserve, cap);
+        assert!(shares.torrent >= SOCKET_PEER_FLOOR);
+    }
+}
+
+// Usenet that asks more than a tunnel holds is refused with the totals; a
+// torrent route on it keeps its floor. A tunnel over budget at run time,
+// as a lowered hardware profile leaves one, holds usenet to what the
+// reserve and the floor leave.
+#[test]
+fn usenet_over_a_tunnel_is_refused_with_its_totals() {
+    let routes = |torrents: bool| {
+        let mut routes = vec![(
+            Consumer::Server(1),
+            route(vec![Rung::Proxy { id: 3 }], Failover::Redistribute),
+        )];
+        if torrents {
+            routes.push(torrent(Rung::Proxy { id: 3 }));
+        }
+        routes
+    };
+    let check = |torrents, connections, cap| {
+        validate_socket_budget(
+            &routes(torrents),
+            &profiles(&[3], &[]),
+            &HashMap::new(),
+            &HashMap::from([(1, connections)]),
+            cap,
+        )
+    };
+
+    assert_eq!(
+        check(false, 240, 256),
+        Err(NetworkRefusal::WireGuardSocketBudget {
+            proxy: 3,
+            egress: 0,
+            nntp: 241,
+            reserve: 32,
+            peers: 0,
+            cap: 256,
+        })
+    );
+    assert_eq!(check(false, 223, 256), Ok(()));
+    assert_eq!(
+        check(true, 223, 256),
+        Err(NetworkRefusal::WireGuardSocketBudget {
+            proxy: 3,
+            egress: 0,
+            nntp: 224,
+            reserve: 32,
+            peers: SOCKET_PEER_FLOOR,
+            cap: 256,
+        })
+    );
+    assert_eq!(check(true, 207, 256), Ok(()));
+    assert_eq!(check(true, 240, 512), Ok(()));
+
+    let ledger = socket_ledger(
+        &routes(true),
+        &profiles(&[3], &[]),
+        &HashMap::new(),
+        &HashMap::from([(1, 240)]),
+        256,
+    );
+    let shares = ledger[&tunnel(3)].shares();
+    assert_eq!(shares.nntp, 256 - 32 - SOCKET_PEER_FLOOR);
+    assert_eq!(shares.torrent, SOCKET_PEER_FLOOR);
+}
+
+// Every stored route key names its consumer again.
+#[test]
+fn a_route_key_names_its_consumer() {
+    for consumer in [
+        Consumer::Outbound,
+        Consumer::Server(7),
+        Consumer::Rss(3),
+        Consumer::Torrent(TorrentScope::Default),
+        Consumer::Torrent(TorrentScope::Category(4)),
+        Consumer::Torrent(TorrentScope::TrackerRule(5)),
+    ] {
+        assert_eq!(Consumer::from_key(&consumer.key()), Some(consumer));
+    }
+    assert_eq!(Consumer::from_key("server:x"), None);
+}
+
+fn saved_wireguard(id: u32) -> ProxyProfile {
+    use base64::Engine;
+    let key = |seed: u8| {
+        base64::engine::general_purpose::STANDARD
+            .encode(weaver_tunnel::test_support::test_key(seed))
+    };
+    ProxyProfile {
+        dns_servers: vec!["10.64.0.1".parse().unwrap()],
+        tunnel_addresses: vec!["10.64.0.2/32".into()],
+        peer_public_key: Some(key(2)),
+        secrets: crate::proxies::ProxySecrets {
+            private_key: Some(key(1)),
+            ..Default::default()
+        },
+        ..profile(id, ProxyKind::WireGuard)
+    }
+}
+
+fn server(id: u32, connections: u16, active: bool) -> crate::servers::ServerConfig {
+    crate::servers::ServerConfig {
+        id,
+        host: "provider.invalid".into(),
+        port: 119,
+        tls: false,
+        username: None,
+        password: None,
+        connections,
+        active,
+        supports_pipelining: true,
+        pipelining_depth: None,
+        tls_name_mismatch_certificate_der: None,
+        priority: 0,
+        backfill: false,
+        retention_days: 0,
+        max_download_speed: 0,
+        download_quota: Default::default(),
+        tls_ca_cert: None,
+    }
+}
+
+fn refused_code(result: Result<(), crate::StateError>) -> Option<&'static str> {
+    result
+        .err()
+        .and_then(|error| error.refusal().map(|refusal| refusal.code))
+}
+
+// A server save that would put more usenet on a WireGuard tunnel than it
+// holds is refused and changes nothing: adding the server, editing its
+// connections, and turning it on.
+#[test]
+fn usenet_overflow_is_refused_at_every_server_save() {
+    let db = crate::Database::open_in_memory().unwrap();
+    db.save_proxy_profile(&saved_wireguard(3)).unwrap();
+    let through_tunnel = RoutingPolicy {
+        legs: vec![leg(Rung::Proxy { id: 3 }, 100)],
+        ..Default::default()
+    };
+    const CODE: Option<&str> = Some("WIREGUARD_SOCKET_BUDGET");
+
+    assert_eq!(
+        refused_code(db.insert_server_with_routing(&server(1, 240, true), Some(&through_tunnel))),
+        CODE
+    );
+    assert!(db.list_servers().unwrap().is_empty());
+    db.insert_server_with_routing(&server(1, 200, true), Some(&through_tunnel))
+        .unwrap();
+
+    assert_eq!(refused_code(db.update_server(&server(1, 240, true))), CODE);
+    assert_eq!(db.list_servers().unwrap()[0].connections, 200);
+
+    // An inactive server asks nothing until it is turned on.
+    db.insert_server_with_routing(&server(2, 100, false), Some(&through_tunnel))
+        .unwrap();
+    assert_eq!(refused_code(db.set_server_active(2, true)), CODE);
+    assert!(
+        !db.list_servers()
+            .unwrap()
+            .iter()
+            .any(|server| server.id == 2 && server.active)
+    );
+    db.set_server_active(1, false).unwrap();
+    db.set_server_active(2, true).unwrap();
+}

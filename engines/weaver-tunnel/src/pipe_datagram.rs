@@ -14,7 +14,7 @@ use std::{
 
 use tokio::sync::{OwnedRwLockReadGuard, OwnedSemaphorePermit};
 
-use super::{DialError, Dialer, Resolution, SessionHop};
+use super::{DialError, Dialer, Resolution, SessionHop, SocketClass, SocketPermit};
 use crate::{
     TunnelError,
     endpoint::{DatagramSocket, DatagramTransport},
@@ -57,6 +57,13 @@ impl DatagramTransport for SessionDatagrams {
         };
         let activity = session.activity.clone().read_owned().await;
         let capacity = session.capacity.acquire().map_err(tunnel_error)?;
+        let share = session.sockets.take(SocketClass::Reserve).map_err(|_| {
+            TunnelError::Engine(format!(
+                "proxy {}: the tunnel's {} share of sockets is full",
+                session.id,
+                SocketClass::Reserve.as_str()
+            ))
+        })?;
         match provider.0.bind(peer).await {
             Ok(socket) => {
                 crate::resolution::record::bound(peer, true);
@@ -64,9 +71,11 @@ impl DatagramTransport for SessionDatagrams {
                     socket,
                     _activity: activity,
                     _capacity: capacity,
+                    _share: share,
                 }))
             }
             Err(error) => {
+                drop(share);
                 drop(capacity);
                 drop(activity);
                 session.retire_idle().await;
@@ -81,6 +90,7 @@ struct HeldSocket {
     socket: Arc<dyn DatagramSocket>,
     _activity: OwnedRwLockReadGuard<()>,
     _capacity: Option<Arc<OwnedSemaphorePermit>>,
+    _share: Option<SocketPermit>,
 }
 
 #[async_trait::async_trait]

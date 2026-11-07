@@ -11,7 +11,10 @@ mod datagram;
 mod inbound;
 #[path = "pipe_natpmp.rs"]
 mod natpmp;
+#[path = "pipe_sockets.rs"]
+mod sockets;
 pub use inbound::{Inbound, InboundListener, PortForwarding, PortMapping, gateway_of};
+pub use sockets::{SessionSockets, SocketClass, SocketPermit, SocketShares};
 
 #[cfg(test)]
 #[path = "pipe_tests.rs"]
@@ -57,8 +60,11 @@ pub enum Purpose {
     Feed { feed: u32 },
     // Any other fetch Weaver makes over HTTP.
     Outbound,
-    // A torrent session's peers, trackers and metainfo downloads.
+    // A torrent session's peers over TCP.
     Torrent,
+    // A torrent session's trackers, metainfo downloads and web seeds over
+    // HTTP.
+    TorrentHttp,
     Probe,
     // A DNS query a hop asks to resolve a name dialled through it.
     Dns,
@@ -527,6 +533,11 @@ pub trait Dialer: Send + Sync {
     fn has_capacity(&self) -> bool {
         true
     }
+    // Whether a dial for `purpose` finds a socket free in the share it
+    // counts against. A path with no shares always has room.
+    fn has_room(&self, _purpose: &Purpose) -> bool {
+        true
+    }
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError>;
     async fn resolve(&self, _host: &str) -> Result<Resolution, DialError> {
         Ok(Resolution::Unresolved)
@@ -952,6 +963,7 @@ struct OutcomeStream {
     runtime: Option<tokio::runtime::Handle>,
     _session: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     _capacity: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
+    _socket: Option<SocketPermit>,
 }
 impl OutcomeStream {
     fn new(
@@ -966,7 +978,13 @@ impl OutcomeStream {
             runtime: tokio::runtime::Handle::try_current().ok(),
             _session: session,
             _capacity: capacity,
+            _socket: None,
         }
+    }
+    // The stream holds `socket` of its session's share while it lives.
+    fn holding(mut self, socket: Option<SocketPermit>) -> Self {
+        self._socket = socket;
+        self
     }
 }
 impl Drop for OutcomeStream {
@@ -1042,6 +1060,8 @@ impl SessionCapacity {
 
 pub struct SessionHop {
     pub capacity: SessionCapacity,
+    // The share of the tunnel's sockets each kind of traffic may hold.
+    pub sockets: Arc<SessionSockets>,
     // Shared by every use of this canonical session path.
     pub activity: Arc<tokio::sync::RwLock<()>>,
     pub id: u32,
@@ -1059,6 +1079,19 @@ pub struct SessionHop {
 }
 
 impl SessionHop {
+    // A permit of `class`'s share of the tunnel's sockets. A full share
+    // says the session is at capacity until one of its sockets closes.
+    fn take_socket(&self, class: SocketClass) -> Result<Option<SocketPermit>, DialError> {
+        self.sockets.take(class).map_err(|freed| {
+            tracing::debug!(
+                proxy = self.id,
+                share = class.as_str(),
+                "the tunnel's socket share is full"
+            );
+            DialError::AtCapacity(vec![freed])
+        })
+    }
+
     // A WireGuard hop carried by the WireGuard session beneath it.
     fn is_carried(&self) -> bool {
         self.resolver.is_some() && !self.path.proxies.is_empty()
@@ -1132,6 +1165,7 @@ impl Dialer for SessionHop {
         let resolved = resolving.elapsed();
         let activity = self.activity.clone().read_owned().await;
         let capacity = self.capacity.acquire()?;
+        let socket = self.take_socket(SocketClass::of(&target.purpose))?;
         let outcome = Arc::new(ConnectionOutcome::default());
         let mut connected = Err(DialError::Skipped("no destination".into()));
         for (index, destination) in destinations.iter().enumerate() {
@@ -1195,12 +1229,15 @@ impl Dialer for SessionHop {
         });
         path.proxies.push(self.id);
         Ok(Dialed {
-            stream: DialedStream::Tunnel(Box::new(OutcomeStream::new(
-                DialedStream::Tunnel(stream),
-                outcome.clone(),
-                Some(activity),
-                capacity,
-            ))),
+            stream: DialedStream::Tunnel(Box::new(
+                OutcomeStream::new(
+                    DialedStream::Tunnel(stream),
+                    outcome.clone(),
+                    Some(activity),
+                    capacity,
+                )
+                .holding(socket),
+            )),
             outcome,
             path,
             peer,
@@ -1257,6 +1294,9 @@ impl Dialer for SessionHop {
         self.inner
             .failing_hop()
             .or_else(|| self.failure.of(self.id))
+    }
+    fn has_room(&self, purpose: &Purpose) -> bool {
+        self.sockets.has_room(SocketClass::of(purpose))
     }
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
         self.resolver
@@ -1427,6 +1467,12 @@ impl Dialer for Fallback {
             Some(index) => self.rungs[index].resolve(host).await,
             None => Ok(Resolution::Unresolved),
         }
+    }
+    // Room on the first rung a dial would try.
+    fn has_room(&self, purpose: &Purpose) -> bool {
+        (0..self.rungs.len())
+            .find(|index| self.allows_rung(*index, false))
+            .is_none_or(|index| self.rungs[index].has_room(purpose))
     }
     // The datagrams of the first rung a dial would try.
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {

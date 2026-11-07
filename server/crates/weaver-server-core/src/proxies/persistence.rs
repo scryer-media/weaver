@@ -19,6 +19,12 @@ pub(crate) async fn write_routing(
     policy: Option<&RoutingPolicy>,
 ) -> Result<(), StateError> {
     let Some(policy) = policy else {
+        // The server's own connections may have changed what it asks of
+        // the tunnels its saved route reaches.
+        if matches!(consumer, Consumer::Server(_)) {
+            super::network_persistence::lock_network(tx).await?;
+            super::network_persistence::validate_stored_sockets(tx).await?;
+        }
         return Ok(());
     };
     super::network_persistence::lock_network(tx).await?;

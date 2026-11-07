@@ -163,7 +163,7 @@ async fn next_egress_id(tx: &mut SqlTx<'_>) -> Result<u32, StateError> {
 }
 
 // Serialize networking resource edits on a row that cannot be removed.
-pub(super) async fn lock_network(tx: &mut SqlTx<'_>) -> Result<(), StateError> {
+pub(crate) async fn lock_network(tx: &mut SqlTx<'_>) -> Result<(), StateError> {
     tx.execute("UPDATE egress_interfaces SET id = id WHERE id = 0", &[])
         .await?;
     Ok(())
@@ -269,6 +269,46 @@ pub(super) async fn validate_stored_network(tx: &mut SqlTx<'_>) -> Result<(), St
     }
     super::validate_wireguard_paths(&routes, &profiles, &pools)?;
     super::validate_instance_budget(&routes, &profiles, &pools, super::max_wireguard_instances())?;
+    validate_stored_sockets(tx).await
+}
+
+// Refuse a write that leaves the usenet servers asking a WireGuard tunnel for
+// more sockets than it holds under the hardware profile in force.
+pub(crate) async fn validate_stored_sockets(tx: &mut SqlTx<'_>) -> Result<(), StateError> {
+    let profiles = profiles(tx).await?;
+    let pools = tx
+        .fetch_all("SELECT * FROM proxy_pools", &[])
+        .await?
+        .into_iter()
+        .map(pool_row)
+        .map(|r| r.map(|pool| (pool.id, pool)))
+        .collect::<Result<HashMap<_, _>, _>>()?;
+    let mut routes = Vec::new();
+    for row in tx
+        .fetch_all("SELECT consumer, policy FROM proxy_routes", &[])
+        .await?
+    {
+        if let Some(consumer) = super::Consumer::from_key(&row.text("consumer")?) {
+            routes.push((consumer, stored_route(&row.text("policy")?)?));
+        }
+    }
+    let mut connections = HashMap::new();
+    for row in tx
+        .fetch_all("SELECT id, connections FROM servers WHERE active", &[])
+        .await?
+    {
+        connections.insert(
+            u32::try_from(row.i64("id")?).map_err(error)?,
+            u16::try_from(row.i64("connections")?).map_err(error)?,
+        );
+    }
+    super::validate_socket_budget(
+        &routes,
+        &profiles,
+        &pools,
+        &connections,
+        super::wireguard_socket_cap(),
+    )?;
     Ok(())
 }
 

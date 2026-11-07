@@ -1809,6 +1809,7 @@ mod tests {
         };
         let provider = Arc::new(provider);
         Arc::new(weaver_tunnel::pipe::SessionHop {
+            sockets: Default::default(),
             capacity: weaver_tunnel::pipe::SessionCapacity::new(Arc::new(
                 tokio::sync::Semaphore::new(1),
             )),

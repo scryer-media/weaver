@@ -165,6 +165,9 @@ impl Dialer for PinnedMember {
     fn offers(&self) -> weaver_tunnel::pipe::Transports {
         self.pin().offers()
     }
+    fn has_room(&self, purpose: &Purpose) -> bool {
+        self.current().is_ok_and(|pin| pin.has_room(purpose))
+    }
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
         self.current().ok()?.datagrams()
     }
@@ -223,6 +226,9 @@ impl Dialer for Carried {
     }
     fn offers(&self) -> weaver_tunnel::pipe::Transports {
         self.stage.offers()
+    }
+    fn has_room(&self, purpose: &Purpose) -> bool {
+        self.stage.has_room(purpose)
     }
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
         Arc::clone(&self.stage).datagrams()
@@ -306,7 +312,7 @@ impl TunnelProvider for TorrentProvider {
             .dial(&Target {
                 host: host.into(),
                 port,
-                purpose: Purpose::Torrent,
+                purpose: Purpose::TorrentHttp,
                 addresses: host.trim_matches(['[', ']']).parse().into_iter().collect(),
             })
             .await
@@ -742,7 +748,7 @@ mod tests {
             };
             assert_eq!(target.addresses, [checked], "{naming}");
             assert_eq!(target.host, checked.to_string(), "{naming}");
-            assert!(matches!(target.purpose, Purpose::Torrent), "{naming}");
+            assert!(matches!(target.purpose, Purpose::TorrentHttp), "{naming}");
         }
         assert_eq!(host_lookups(), before);
     }

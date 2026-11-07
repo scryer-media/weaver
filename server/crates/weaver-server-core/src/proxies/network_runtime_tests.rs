@@ -1227,6 +1227,8 @@ async fn a_wireguard_chain_downloads_four_concurrent_bulk_streams() {
         consumer.key(),
         wireguard_ladder(Rung::Chain { ids: vec![1, 2] }),
     );
+    // The server's connections are its share of the far tunnel's sockets.
+    config.socket_ledger = config.ledger(&HashMap::from([(1, STREAMS as u16)]));
     runtime.apply_configuration(config).unwrap();
     let route = runtime
         .route(consumer, STREAMS as u16, Duration::from_secs(300))
@@ -1645,5 +1647,106 @@ async fn a_new_socket_cap_rebuilds_wireguard_legs_alone() {
             .iter()
             .any(|key| key.ends_with(":sockets=512"))
     );
+    runtime.shutdown().await;
+}
+
+// Each WireGuard session holds its sockets to the shares its routes leave:
+// usenet's connections and replacements, the reserve, and torrent peers over
+// TCP the rest, which a torrent leg reports when it is below the peer
+// limit. A save re-budgets the live session; a new cap builds the session
+// again at its own shares. A SOCKS session takes no share.
+#[tokio::test]
+async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let torrent = Consumer::Torrent(TorrentScope::Default);
+    let mut config = runtime.configuration.read().unwrap().clone();
+    config.socket_cap = 256;
+    config.profiles.insert(1, idle_wireguard_profile(1));
+    config.profiles.insert(2, proxy_with_id(2));
+    for (consumer, proxy) in [
+        (Consumer::Server(1), 1),
+        (Consumer::Server(2), 2),
+        (torrent, 1),
+    ] {
+        config.consumers.insert(consumer.key());
+        config
+            .policies
+            .insert(consumer.key(), wireguard_ladder(Rung::Proxy { id: proxy }));
+    }
+    let budget = |config: &mut Configuration, connections: u16| {
+        config.socket_ledger = config.ledger(&HashMap::from([(1, connections), (2, 10)]));
+        config.warnings.clear();
+        config.warn_peer_clamps(200);
+    };
+    let shares = |runtime: &NetworkRuntime, cap: usize| {
+        let map = runtime.session_sockets.lock().unwrap();
+        let built: Vec<_> = map
+            .values()
+            .filter(|(_, built, _)| *built == cap)
+            .map(|(path, _, sockets)| (path.clone(), sockets.shares().unwrap()))
+            .collect();
+        assert_eq!(built.len(), 1, "one WireGuard session at cap {cap}");
+        assert_eq!(built[0].0, (0, vec![1]));
+        built[0].1
+    };
+    budget(&mut config, 100);
+    runtime.apply_configuration(config.clone()).unwrap();
+    for consumer in [Consumer::Server(1), Consumer::Server(2), torrent] {
+        runtime.route(consumer, 5, Duration::from_secs(1)).unwrap();
+    }
+    assert_eq!(
+        shares(&runtime, 256),
+        SocketShares {
+            nntp: 101,
+            torrent: 123,
+            reserve: 32
+        }
+    );
+    // The SOCKS session has no share at all.
+    assert_eq!(runtime.session_sockets.lock().unwrap().len(), 1);
+    let warning = |runtime: &NetworkRuntime| {
+        runtime
+            .route(torrent, 5, Duration::from_secs(1))
+            .unwrap()
+            .legs
+            .read()
+            .unwrap()[0]
+            .warning
+            .clone()
+    };
+    assert_eq!(
+        warning(&runtime).as_deref(),
+        Some(
+            "WireGuard proxy 1 holds torrent peers over TCP to 123 of 200; the rest connect over uTP."
+        )
+    );
+
+    budget(&mut config, 50);
+    runtime.apply_configuration(config.clone()).unwrap();
+    assert_eq!(
+        shares(&runtime, 256),
+        SocketShares {
+            nntp: 51,
+            torrent: 173,
+            reserve: 32
+        }
+    );
+
+    config.socket_cap = 512;
+    budget(&mut config, 50);
+    runtime.apply_configuration(config).unwrap();
+    assert_eq!(
+        shares(&runtime, 512),
+        SocketShares {
+            nntp: 51,
+            torrent: 397,
+            reserve: 64
+        }
+    );
+    assert_eq!(warning(&runtime), None);
     runtime.shutdown().await;
 }

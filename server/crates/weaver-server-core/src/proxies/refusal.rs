@@ -72,6 +72,14 @@ pub enum NetworkRefusal {
         required: usize,
         limit: usize,
     },
+    WireGuardSocketBudget {
+        proxy: u32,
+        egress: u32,
+        nntp: usize,
+        reserve: usize,
+        peers: usize,
+        cap: usize,
+    },
 
     // Proxy profiles.
     ProxyNameLength,
@@ -242,6 +250,7 @@ impl NetworkRefusal {
 
             Self::WireGuardPathConflict { .. } => "WIREGUARD_PROXY_PATH_CONFLICT",
             Self::WireGuardInstanceLimit { .. } => "WIREGUARD_INSTANCE_LIMIT",
+            Self::WireGuardSocketBudget { .. } => "WIREGUARD_SOCKET_BUDGET",
 
             Self::ProxyNameLength => "PROXY_NAME_LENGTH",
             Self::ProxyEndpointInvalid => "PROXY_ENDPOINT_INVALID",
@@ -290,6 +299,21 @@ impl NetworkRefusal {
                 egress,
                 paths,
             } => serde_json::json!({ "proxyId": proxy, "egressId": egress, "paths": paths }),
+            Self::WireGuardSocketBudget {
+                proxy,
+                egress,
+                nntp,
+                reserve,
+                peers,
+                cap,
+            } => serde_json::json!({
+                "proxyId": proxy,
+                "egressId": egress,
+                "nntp": nntp,
+                "reserve": reserve,
+                "peers": peers,
+                "cap": cap,
+            }),
             Self::WireGuardInstanceLimit { required, limit } => serde_json::json!({
                 "required": required,
                 "limit": limit,
@@ -403,6 +427,24 @@ impl std::fmt::Display for NetworkRefusal {
                 return write!(
                     f,
                     "WireGuard proxy {proxy} is used on egress {egress} by two different paths ({paths}); a WireGuard server accepts one connection per key, so a WireGuard proxy may reach the egress by only one path"
+                );
+            }
+            Self::WireGuardSocketBudget {
+                proxy,
+                egress,
+                nntp,
+                reserve,
+                peers,
+                cap,
+            } => {
+                let kept = if *peers > 0 {
+                    format!(", {reserve} are reserved and {peers} kept for torrent peers")
+                } else {
+                    format!(" and {reserve} are reserved")
+                };
+                return write!(
+                    f,
+                    "usenet servers ask {nntp} sockets of WireGuard proxy {proxy} on egress {egress}{kept}, over the {cap} it holds"
                 );
             }
             Self::WireGuardInstanceLimit { required, limit } => {
