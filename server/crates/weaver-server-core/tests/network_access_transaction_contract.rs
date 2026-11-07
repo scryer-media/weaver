@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+// Tests write their own fixtures on raw connections.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: tests write their own fixtures on raw connections"
+)]
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::Executor;

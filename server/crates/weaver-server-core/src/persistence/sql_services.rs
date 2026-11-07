@@ -236,6 +236,10 @@ impl SqliteServices {
         Ok(())
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: runs under run_serialized_sqlite, which holds the gate"
+    )]
     pub(crate) async fn vacuum_into(&self, dest_path: &str) -> Result<(), StateError> {
         let dest_path = dest_path.to_string();
         SqlRuntime::run_serialized_sqlite(&self.datastore(), "vacuum_into", move |pool| {

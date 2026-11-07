@@ -151,6 +151,10 @@ pub(crate) fn metadata_json(metadata: &[(String, String)]) -> Result<Option<Stri
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: a batch on the transaction run_in_transaction opened under the gate; Postgres has no writer gate"
+)]
 async fn bulk_upsert_file_identities_tx(
     tx: &mut SqlTx<'_>,
     job_id: JobId,
@@ -259,6 +263,10 @@ async fn bulk_upsert_file_identities_tx(
 // inside the caller's transaction: Postgres batches with `UPDATE ... FROM
 // (VALUES ...)`, SQLite issues per-row updates (local to the serialized
 // writer, so the extra statements are cheap).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: a batch on the transaction run_in_transaction opened under the gate; Postgres has no writer gate"
+)]
 async fn bulk_update_active_files_filenames_tx(
     tx: &mut SqlTx<'_>,
     job_id: JobId,
@@ -1209,6 +1217,10 @@ impl Database {
     // single-file path (an absent `active_jobs` row inserts nothing). Postgres
     // runs one autocommit `FOR KEY SHARE`-guarded multi-row upsert per chunk;
     // SQLite guards once inside a transaction then bulk-upserts in chunks.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: a batch on the transaction run_in_transaction opened under the gate; Postgres has no writer gate"
+    )]
     pub fn complete_files(
         &self,
         job_id: JobId,

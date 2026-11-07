@@ -90,6 +90,10 @@ impl Database {
     // most recently finished, by job id: one read of each table that carries
     // a name, every one in the same read transaction, so a job archived
     // while it runs is in exactly one of active or history.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: a read-only snapshot transaction on the read lane, it writes nothing; Postgres has no writer gate"
+    )]
     pub fn diagnostic_job_names(&self) -> Result<BTreeMap<u64, JobNameRecord>, StateError> {
         let datastore = self.datastore();
         let recent = recent_history();

@@ -1359,6 +1359,10 @@ impl Database {
         &self.target
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: a TRUNCATE checkpoint for backup, outside the gate by ruling, idle at the time"
+    )]
     pub(crate) fn checkpoint_sqlite(&self) -> Result<(), StateError> {
         let StoreDatastore::Sqlite { pool, .. } = self.datastore() else {
             return Ok(());

@@ -199,6 +199,10 @@ impl SqlRuntime {
         result
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: this is the gate; it hands the connection out under the gate"
+    )]
     pub(crate) async fn run_serialized_sqlite_connection<T, Op, Fut>(
         datastore: &StoreDatastore,
         op_name: &'static str,
@@ -222,6 +226,10 @@ impl SqlRuntime {
         result
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: this is the gate, its read lane and the Postgres arm, which has no writer gate"
+    )]
     pub(crate) async fn execute(
         exec: SqlExec<'_, '_>,
         template: &str,
@@ -500,6 +508,10 @@ impl SqlRuntime {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: this is the gate; the transaction begins and commits under it, Postgres has no writer gate"
+    )]
     pub(crate) async fn run_in_transaction<T, F>(
         datastore: &StoreDatastore,
         op_name: &'static str,
@@ -567,6 +579,10 @@ impl SqlRuntime {
 }
 
 impl<'db> SqlTx<'db> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: runs on a transaction run_in_transaction opened under the gate; Postgres has no writer gate"
+    )]
     pub(crate) async fn execute(&mut self, template: &str, args: &[SqlArg]) -> SqlResult<u64> {
         match self {
             SqlTx::Sqlite(tx) => {
@@ -686,6 +702,10 @@ impl<'db> SqlTx<'db> {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: runs on a transaction run_in_transaction opened under the gate; Postgres has no writer gate"
+    )]
     pub(crate) async fn commit(self) -> SqlResult<()> {
         match self {
             SqlTx::Sqlite(tx) => tx.commit().await.map_err(db_err),
@@ -695,6 +715,10 @@ impl<'db> SqlTx<'db> {
 }
 
 impl SqlConn<'_> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: runs on a connection whose owner holds the gate, or a migration's; Postgres has no writer gate"
+    )]
     pub(crate) async fn execute(&mut self, template: &str, args: &[SqlArg]) -> SqlResult<u64> {
         match self {
             SqlConn::Sqlite(conn) => {
