@@ -581,21 +581,24 @@ impl TorrentStateLive {
     /// soon as one may have become due (libtorrent `torrent::second_tick`,
     /// `maybe_connect_web_seeds`). A torrent with no web seed, or one that
     /// is finished with no stream wanting more, wants nothing of one: it
-    /// waits without a timer for a web seed to change or the torrent to
-    /// want pieces again.
+    /// waits without a timer for a web seed to change, a stream to open or
+    /// close, or the torrent to want pieces again.
     async fn task_web_seeds(self: Arc<Self>) -> crate::Result<()> {
         let mut tick = tokio::time::interval(WEB_SEED_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            // Taken before the look, so wanting again between the two
-            // still wakes it.
+            // Taken before the look, so wanting again or a stream opened
+            // between the two still wakes it.
             let mut wanting = std::pin::pin!(self.wanting_notify.notified());
             wanting.as_mut().enable();
+            let mut streamed = std::pin::pin!(self.streams.changed.notified());
+            streamed.as_mut().enable();
             if self.shared.web_seeds.is_empty() {
                 self.shared.web_seeds.changed().await;
             } else if self.is_finished_and_no_active_streams() {
                 tokio::select! {
                     _ = wanting => {}
+                    _ = streamed => {}
                     _ = self.shared.web_seeds.changed() => {}
                 }
                 tick.reset();
