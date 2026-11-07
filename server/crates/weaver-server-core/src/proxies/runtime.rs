@@ -173,6 +173,16 @@ impl Drop for RouteAttempt {
     }
 }
 
+// The reloads asked for and the last pass that answered them. One pass runs
+// at a time; a reload asked for while one runs is answered by a pass that
+// reads the rows after it was asked.
+struct Reloads {
+    asked: u64,
+    answered: u64,
+    running: bool,
+    outcome: Result<(), String>,
+}
+
 pub struct ProxyRuntime {
     pub network: Arc<NetworkRuntime>,
     db: Database,
@@ -181,6 +191,18 @@ pub struct ProxyRuntime {
     routes: Mutex<HashMap<Consumer, Arc<ConsumerRoute>>>,
     pub mutations: tokio::sync::Mutex<()>,
     updating: AtomicBool,
+    reloads: Mutex<Reloads>,
+    // Sent whenever a reload's pass ends, for the reloads waiting on it.
+    reloaded: tokio::sync::watch::Sender<()>,
+    // Under test, the next reload's pass, once it has read the rows, says so
+    // on the first and waits on the second.
+    #[cfg(test)]
+    pub(crate) pause: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     stopped: AtomicBool,
     // Whether feeds and Default outbound may reach private addresses: the
     // one switch, `WEAVER_RSS_ALLOW_PRIVATE_NETWORK`.
@@ -223,6 +245,15 @@ impl ProxyRuntime {
             routes: Mutex::new(HashMap::new()),
             mutations: tokio::sync::Mutex::new(()),
             updating: AtomicBool::new(false),
+            reloads: Mutex::new(Reloads {
+                asked: 0,
+                answered: 0,
+                running: false,
+                outcome: Ok(()),
+            }),
+            reloaded: tokio::sync::watch::Sender::new(()),
+            #[cfg(test)]
+            pause: Mutex::new(None),
             stopped: AtomicBool::new(false),
             allow_private_network: AtomicBool::new(true),
         }))
@@ -353,17 +384,63 @@ impl ProxyRuntime {
             timeout,
         }))
     }
+    // Reads the saved routes and consumers again and applies them, returning
+    // once a pass that read them after this call began has applied. Asked
+    // while another reload runs, that one reads the rows again before it
+    // ends; if it is dropped first, this one runs the pass itself.
     pub async fn reload(&self) -> Result<(), String> {
-        if self.updating.swap(true, Ordering::AcqRel) {
-            return Err("proxy runtime reload already in progress".into());
+        let mut ended = self.reloaded.subscribe();
+        let asked = {
+            let mut reloads = self.reloads.lock().expect("proxy reloads");
+            reloads.asked += 1;
+            reloads.asked
+        };
+        loop {
+            {
+                let mut reloads = self.reloads.lock().expect("proxy reloads");
+                if reloads.answered >= asked {
+                    return reloads.outcome.clone();
+                }
+                if !reloads.running {
+                    reloads.running = true;
+                    break;
+                }
+            }
+            // The sender lives as long as `self`.
+            let _ = ended.changed().await;
         }
-        struct Reset<'a>(&'a AtomicBool);
-        impl Drop for Reset<'_> {
+        self.run_reloads().await
+    }
+
+    // Passes until none is asked for that the last one did not cover.
+    async fn run_reloads(&self) -> Result<(), String> {
+        struct Running<'a>(&'a ProxyRuntime);
+        impl Drop for Running<'_> {
             fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
+                self.0.reloads.lock().expect("proxy reloads").running = false;
+                self.0.updating.store(false, Ordering::Release);
+                self.0.reloaded.send_replace(());
             }
         }
-        let _reset = Reset(&self.updating);
+        let _running = Running(self);
+        self.updating.store(true, Ordering::Release);
+        loop {
+            let covered = self.reloads.lock().expect("proxy reloads").asked;
+            let outcome = self.reload_pass().await;
+            let again = {
+                let mut reloads = self.reloads.lock().expect("proxy reloads");
+                reloads.answered = covered;
+                reloads.outcome = outcome.clone();
+                reloads.asked > covered
+            };
+            if !again {
+                return outcome;
+            }
+            self.reloaded.send_replace(());
+        }
+    }
+
+    async fn reload_pass(&self) -> Result<(), String> {
         let db = self.db.clone();
         let (policies, consumers) = tokio::task::spawn_blocking(move || {
             Ok::<_, crate::StateError>((db.list_proxy_routes()?, Self::load_consumers(&db)?))
@@ -371,6 +448,14 @@ impl ProxyRuntime {
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())?;
+        #[cfg(test)]
+        {
+            let pause = self.pause.lock().expect("proxy reload pause").take();
+            if let Some((read, release)) = pause {
+                let _ = read.send(());
+                let _ = release.await;
+            }
+        }
         let policies: HashMap<_, _> = policies.into_iter().collect();
         let (obsolete, new_feeds) = {
             let mut routes = self.routes.lock().expect("proxy routes");
