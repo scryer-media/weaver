@@ -20,6 +20,7 @@ export function Menu({
   children,
   label,
   style,
+  testId,
 }: {
   open: boolean;
   onDismiss: () => void;
@@ -28,6 +29,7 @@ export function Menu({
   style?: CSSProperties;
   children: ReactNode;
   label?: string;
+  testId?: string;
 }) {
   const ref = useRef<HTMLDivElement>(null);
 
@@ -69,6 +71,7 @@ export function Menu({
     <div
       ref={ref}
       role="menu"
+      data-testid={testId}
       aria-label={label}
       style={style}
       className={cn(
@@ -86,16 +89,19 @@ export function MenuItem({
   onSelect,
   children,
   className,
+  testId,
 }: {
   selected?: boolean;
   onSelect: () => void;
   children: ReactNode;
   className?: string;
+  testId?: string;
 }) {
   return (
     <button
       type="button"
       role="menuitemradio"
+      data-testid={testId}
       aria-checked={selected}
       onClick={onSelect}
       className={cn(
@@ -119,16 +125,19 @@ export function MenuCheckItem({
   onToggle,
   children,
   className,
+  testId,
 }: {
   checked: boolean;
   onToggle: () => void;
   children: ReactNode;
   className?: string;
+  testId?: string;
 }) {
   return (
     <button
       type="button"
       role="menuitemcheckbox"
+      data-testid={testId}
       aria-checked={checked}
       onClick={onToggle}
       className={cn(

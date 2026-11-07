@@ -6,6 +6,7 @@ import { BrandLockup } from "@/lib/brand";
 import { useTranslate } from "@/lib/context/translate-context";
 import { LOGIN_RESET_COMMANDS, useSignInForm } from "@/lib/login-required";
 import { PrimaryButton, TextField } from "../components/controls";
+import { settingsIds } from "../testids";
 
 /**
  * The Next interface's sign-in page: the lockup, two fields and a button.
@@ -55,7 +56,7 @@ export default function LoginPage() {
               {form.error}
             </div>
           ) : null}
-          <PrimaryButton type="submit" disabled={!form.canSubmit} className="mt-1 w-full justify-center">
+          <PrimaryButton type="submit" disabled={!form.canSubmit} className="mt-1 w-full justify-center" testId={settingsIds.loginSubmit}>
             {form.busy ? t("next.login.signingIn") : t("next.login.submit")}
           </PrimaryButton>
         </form>

@@ -7,6 +7,7 @@ import { Dialog } from "./Dialog";
 import { DangerButton, PrimaryButton, SecondaryButton } from "./controls";
 import { SectionHeader } from "./chrome";
 import { FieldRows, type FieldSpec } from "@/next/pages/settings/framework";
+import { testIds } from "@/next/testids";
 
 /**
  * The editor behind every list-shaped settings panel.
@@ -45,6 +46,7 @@ export function RecordEditor({
   width = 560,
   overlay,
   children,
+  testId,
 }: {
   open: boolean;
   title: string;
@@ -65,6 +67,7 @@ export function RecordEditor({
   overlay?: ReactNode;
   /** Anything that is not a field: a test result, a warning, a sub-table. */
   children?: ReactNode;
+  testId?: string;
 }) {
   const t = useTranslate();
   return (
@@ -75,23 +78,24 @@ export function RecordEditor({
       width={width}
       overlay={overlay}
       onDismiss={onDismiss}
+      testId={testId}
       footer={
         <>
           {onDelete === undefined ? null : (
-            <DangerButton icon="remove" onClick={onDelete} disabled={busy} className="mr-auto">
+            <DangerButton icon="remove" onClick={onDelete} disabled={busy} className="mr-auto" testId={testIds.editorDelete}>
               {deleteLabel ?? t("action.delete")}
             </DangerButton>
           )}
           {extraActions}
-          <SecondaryButton onClick={onDismiss}>{t("action.cancel")}</SecondaryButton>
-          <PrimaryButton onClick={onSave} disabled={busy || saveDisabled}>
+          <SecondaryButton onClick={onDismiss} testId={testIds.editorCancel}>{t("action.cancel")}</SecondaryButton>
+          <PrimaryButton onClick={onSave} disabled={busy || saveDisabled} testId={testIds.editorSave}>
             {busy ? t("settings.saving") : (saveLabel ?? t("action.save"))}
           </PrimaryButton>
         </>
       }
     >
       {sections.map((section) => (
-        <div key={section.id} className="flex flex-none flex-col">
+        <div key={section.id} data-testid={testIds.section(section.id)} className="flex flex-none flex-col">
           <SectionHeader label={section.title} tag={section.tag} note={section.note} sticky={false} />
           <FieldRows fields={section.fields} />
           {section.body}
@@ -99,7 +103,7 @@ export function RecordEditor({
       ))}
       {children}
       {error ? (
-        <div className="flex-none border-t border-wv-hairline px-4 sm:px-6 py-4 text-[12.5px] leading-[1.5] text-wv-error-text">
+        <div data-testid={testIds.editorError} className="flex-none border-t border-wv-hairline px-4 sm:px-6 py-4 text-[12.5px] leading-[1.5] text-wv-error-text">
           {error}
         </div>
       ) : null}

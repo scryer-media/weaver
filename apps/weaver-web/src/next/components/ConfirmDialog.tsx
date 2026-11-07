@@ -5,6 +5,7 @@ import type { ReactNode } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { Dialog } from "./Dialog";
 import { DangerButton, PrimaryButton, SecondaryButton } from "./controls";
+import { testIds } from "@/next/testids";
 
 /**
  * One confirmation shape for every destructive action in the Next UI.
@@ -26,6 +27,7 @@ export function ConfirmDialog({
   onDismiss,
   alternative,
   solid = false,
+  testId,
 }: {
   open: boolean;
   title: string;
@@ -41,6 +43,7 @@ export function ConfirmDialog({
   alternative?: { label: string; onConfirm: () => void };
   /** Fill a lone destructive confirm red, as it is when it sits beside an alternative. */
   solid?: boolean;
+  testId?: string;
 }) {
   const t = useTranslate();
   return (
@@ -50,11 +53,12 @@ export function ConfirmDialog({
       note={note}
       width={alternative === undefined ? 440 : 540}
       onDismiss={onDismiss}
+      testId={testId}
       footer={
         <>
-          <SecondaryButton onClick={onDismiss}>{dismissLabel ?? t("action.cancel")}</SecondaryButton>
+          <SecondaryButton onClick={onDismiss} testId={testIds.confirmDismiss}>{dismissLabel ?? t("action.cancel")}</SecondaryButton>
           {alternative === undefined ? null : (
-            <DangerButton onClick={alternative.onConfirm} disabled={busy}>
+            <DangerButton onClick={alternative.onConfirm} disabled={busy} testId={testIds.confirmAlternative}>
               {alternative.label}
             </DangerButton>
           )}
@@ -63,11 +67,12 @@ export function ConfirmDialog({
               onClick={onConfirm}
               disabled={busy}
               solid={solid || alternative !== undefined}
+              testId={testIds.confirmAccept}
             >
               {confirmLabel ?? t("next.common.remove")}
             </DangerButton>
           ) : (
-            <PrimaryButton onClick={onConfirm} disabled={busy}>
+            <PrimaryButton onClick={onConfirm} disabled={busy} testId={testIds.confirmAccept}>
               {confirmLabel ?? t("next.common.remove")}
             </PrimaryButton>
           )}

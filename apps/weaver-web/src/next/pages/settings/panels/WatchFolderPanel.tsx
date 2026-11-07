@@ -9,6 +9,7 @@ import {
   WATCH_FOLDER_SETTINGS_QUERY,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+import { settingsIds } from "@/next/testids";
 import { KeyValueRow } from "../../../components/chrome";
 import { SecondaryButton } from "../../../components/controls";
 import {
@@ -239,14 +240,23 @@ export function WatchFolderPanel() {
           searchText: "scan report queued discovered errors skipped",
           body: (
             <>
-              <KeyValueRow label={t("next.watchFolder.filesFound")} value={report.discoveredFiles.length} />
-              <KeyValueRow label={t("next.watchFolder.queued")} value={report.queuedNzbs.length} />
+              <KeyValueRow
+                label={t("next.watchFolder.filesFound")}
+                value={report.discoveredFiles.length}
+                testId={settingsIds.watchFound}
+              />
+              <KeyValueRow
+                label={t("next.watchFolder.queued")}
+                value={report.queuedNzbs.length}
+                testId={settingsIds.watchQueued}
+              />
               {problems.length === 0 ? (
                 <KeyValueRow label={t("next.watchFolder.problems")} value={t("next.job.none")} />
               ) : (
                 problems.map((problem) => (
                   <div
                     key={`${problem.tone}:${problem.path}:${problem.reason}`}
+                    data-testid={settingsIds.watchProblem(problem.tone)}
                     className="flex flex-wrap items-baseline gap-x-6 gap-y-1 border-b border-wv-hairline px-4 sm:px-6 py-[11px]"
                   >
                     <div className="min-w-0 flex-[1_1_260px] truncate font-wv-mono text-[12px] text-wv-secondary">
@@ -275,7 +285,12 @@ export function WatchFolderPanel() {
   return (
     <>
       <PanelControls>
-        <SecondaryButton icon="refresh" onClick={() => void runScan()} disabled={scanState.fetching}>
+        <SecondaryButton
+          icon="refresh"
+          onClick={() => void runScan()}
+          disabled={scanState.fetching}
+          testId={settingsIds.watchScanNow}
+        >
           {scanState.fetching ? t("next.watchFolder.scanning") : t("next.watchFolder.scanNow")}
         </SecondaryButton>
       </PanelControls>

@@ -9,6 +9,7 @@ import { cn } from "@/lib/utils";
 import { DetailBlock, EmptyState } from "../components/chrome";
 import { SecondaryButton } from "../components/controls";
 import { formatSize } from "../data/format";
+import { runtimeIds } from "../testids";
 import {
   copySupportReport,
   downloadSupportReportJson,
@@ -101,6 +102,7 @@ export function NzbAnalyzerPage() {
         report === null ? undefined : (
           <>
             <SecondaryButton
+              testId={runtimeIds.analyzerCopyReport}
               icon="copy"
               onClick={() => {
                 void copySupportReport(report).then((copied) =>
@@ -111,6 +113,7 @@ export function NzbAnalyzerPage() {
               {t("next.support.copyReport")}
             </SecondaryButton>
             <SecondaryButton
+              testId={runtimeIds.analyzerDownloadJson}
               icon="downloadFile"
               onClick={() => {
                 downloadSupportReportJson(report);
@@ -127,6 +130,7 @@ export function NzbAnalyzerPage() {
         <DetailBlock title={t("next.analyzer.source")}>
           <button
             type="button"
+            data-testid={runtimeIds.analyzerDrop}
             disabled={busy}
             onClick={() => inputRef.current?.click()}
             onDragOver={(event) => {
@@ -175,7 +179,7 @@ export function NzbAnalyzerPage() {
           <EmptyState title={t("next.analyzer.emptyTitle")} body={t("next.analyzer.emptyBody")} />
         ) : (
           <DetailBlock title={t("next.analyzer.report")} right={notice ?? undefined}>
-            <pre className="overflow-x-auto whitespace-pre font-wv-mono text-[12px] leading-[1.55] text-wv-fg">
+            <pre data-testid={runtimeIds.analyzerReport} className="overflow-x-auto whitespace-pre font-wv-mono text-[12px] leading-[1.55] text-wv-fg">
               {report.text}
             </pre>
           </DetailBlock>

@@ -15,6 +15,7 @@ import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { Cell } from "../../../components/rows";
+import { testIds } from "../../../testids";
 import { useNextData } from "../../../data/next-data";
 import { categoryColor } from "../../../data/palette";
 import { SettingsBlocks, type SettingsBlock } from "../framework";
@@ -155,6 +156,7 @@ export function CategoriesPanel() {
 
       <RecordEditor
         open={editingId !== null}
+        testId={testIds.dialog("category")}
         title={editingId === "new" ? t("next.categories.add") : (editing?.name ?? t("next.categories.category"))}
         note={editingId === "new" ? undefined : `#${editing?.id ?? ""}`}
         error={error}
@@ -210,6 +212,7 @@ export function CategoriesPanel() {
 
       <ConfirmDialog
         open={confirmRemove !== null}
+        testId={testIds.dialog("category-remove")}
         title={t("next.categories.remove")}
         note={confirmRemove?.name}
         busy={busy}

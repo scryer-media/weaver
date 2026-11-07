@@ -21,6 +21,7 @@ import { EmptyState } from "../components/chrome";
 import { SecondaryButton, Select, TextField } from "../components/controls";
 import { LogRow } from "../components/LogRow";
 import { formatCount } from "../data/format";
+import { runtimeIds } from "../testids";
 import { LOG_LEVEL_COLORS, WV } from "../data/palette";
 import { countLabel } from "../i18n/labels";
 import { sameElements, shallowEqual, useSettled } from "../data/settled";
@@ -126,6 +127,7 @@ function LogFilterBar() {
         {t("next.logs.filter.label")}
       </span>
       <Select
+        testId={runtimeIds.logsLevel}
         label={t("next.logs.filter.label")}
         value={presetFor(current)}
         options={options}
@@ -133,6 +135,7 @@ function LogFilterBar() {
         className="w-[190px]"
       />
       <TextField
+        testId={runtimeIds.logsDirectives}
         label={t("next.logs.filter.directives")}
         placeholder={current.defaultDirectives}
         value={draft}
@@ -264,7 +267,11 @@ function TailPauseButton() {
   const t = useTranslate();
   const { paused, setPaused } = useLogsPart(LogTailContext);
   return (
-    <SecondaryButton icon={paused ? "resume" : "pause"} onClick={() => setPaused(!paused)}>
+    <SecondaryButton
+      testId={paused ? runtimeIds.logsResumeTail : runtimeIds.logsPauseTail}
+      icon={paused ? "resume" : "pause"}
+      onClick={() => setPaused(!paused)}
+    >
       {paused ? t("next.logs.resumeTail") : t("next.logs.pauseTail")}
     </SecondaryButton>
   );
@@ -309,7 +316,10 @@ function LevelBar({
           );
         })}
       </div>
-      <span className="ml-auto hidden flex-none pl-3 font-wv-mono text-[11px] text-wv-faint sm:inline">
+      <span
+        data-testid={runtimeIds.logsTail(paused ? "paused" : connected ? "following" : "disconnected")}
+        className="ml-auto hidden flex-none pl-3 font-wv-mono text-[11px] text-wv-faint sm:inline"
+      >
         {paused
           ? t("next.logs.pausedNote")
           : connected

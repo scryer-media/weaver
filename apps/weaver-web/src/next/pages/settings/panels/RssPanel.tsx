@@ -18,6 +18,7 @@ import {
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { blockedRouting, type RoutingPolicy, type RoutingStatus } from "@/lib/proxies";
 import { refusalMessage } from "@/lib/refusal";
+import { settingsIds, testIds } from "@/next/testids";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
@@ -506,11 +507,16 @@ export function RssPanel() {
             <Cell key="interval" mono className="text-wv-secondary">
               {feed.pollIntervalSecs}s
             </Cell>,
-            <Cell key="state" mono className="text-wv-muted" title={state.text}>
+            <Cell key="state" mono className="text-wv-muted" title={state.text} testId={settingsIds.rssFeedState}>
               {state.text}
             </Cell>,
             <span key="sync" onClick={(event) => event.stopPropagation()}>
-              <SecondaryButton icon="refresh" className="h-7 px-2" onClick={() => void sync(feed)}>
+              <SecondaryButton
+                icon="refresh"
+                className="h-7 px-2"
+                onClick={() => void sync(feed)}
+                testId={settingsIds.rssFeedPoll}
+              >
                 {t("next.rss.poll")}
               </SecondaryButton>
             </span>,
@@ -551,6 +557,7 @@ export function RssPanel() {
           <Cell
             key="action"
             className={rule.action === "REJECT" ? "text-wv-error-text" : "text-wv-secondary"}
+            testId={settingsIds.rssRuleAction(rule.action)}
           >
             {rule.action === "REJECT" ? t("next.rss.reject") : t("next.rss.accept")}
           </Cell>,
@@ -588,7 +595,7 @@ export function RssPanel() {
       },
       footer:
         seenItems.length > 0 ? (
-          <SecondaryButton icon="remove" onClick={() => setConfirmSeen("all")}>
+          <SecondaryButton icon="remove" onClick={() => setConfirmSeen("all")} testId={settingsIds.rssSeenClear}>
             {t("next.rss.clearHistory")}
           </SecondaryButton>
         ) : undefined,
@@ -963,6 +970,7 @@ export function RssPanel() {
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
 
       <RecordEditor
+        testId={testIds.dialog("feed")}
         open={feedId !== null}
         title={feedId === "new" ? t("next.rss.addFeed") : (editingFeed?.name ?? t("next.rss.feed"))}
         note={
@@ -986,6 +994,7 @@ export function RssPanel() {
       />
 
       <RecordEditor
+        testId={testIds.dialog("rss-rule")}
         open={ruleId !== null}
         title={ruleId === "new" ? t("next.rss.addRule") : t("next.rss.editRule")}
         note={feedNames.get(ruleForm.feedId) ?? undefined}
@@ -1003,6 +1012,7 @@ export function RssPanel() {
       />
 
       <ConfirmDialog
+        testId={testIds.dialog("feed-remove")}
         open={confirmFeed !== null}
         title={t("next.rss.removeFeed")}
         note={confirmFeed?.name}
@@ -1022,6 +1032,7 @@ export function RssPanel() {
       />
 
       <ConfirmDialog
+        testId={testIds.dialog("rss-rule-remove")}
         open={confirmRule !== null}
         title={t("next.rss.removeRule")}
         note={confirmRule ? (feedNames.get(confirmRule.feedId) ?? undefined) : undefined}
@@ -1041,6 +1052,7 @@ export function RssPanel() {
       />
 
       <ConfirmDialog
+        testId={testIds.dialog(confirmSeen === "all" ? "rss-seen-clear" : "rss-seen-forget")}
         open={confirmSeen !== null}
         title={confirmSeen === "all" ? t("next.rss.clearSeenTitle") : t("next.rss.forgetItemTitle")}
         note={

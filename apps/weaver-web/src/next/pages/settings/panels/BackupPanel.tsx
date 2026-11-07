@@ -15,6 +15,7 @@ import { DangerButton, SecondaryButton } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
 import { formatDate } from "../../../data/format";
 import { countLabel } from "../../../i18n/labels";
+import { settingsIds, testIds } from "@/next/testids";
 import { PathField } from "../../../features/DirectoryBrowserDialog";
 import {
   PanelControls,
@@ -383,7 +384,10 @@ export function BackupPanel() {
         kind: "custom",
         control: (
           <div className="flex min-w-0 flex-wrap items-center gap-3">
-            <span className="max-w-[220px] truncate font-wv-mono text-[11.5px] text-wv-muted">
+            <span
+              data-testid={settingsIds.backupFileName}
+              className="max-w-[220px] truncate font-wv-mono text-[11.5px] text-wv-muted"
+            >
               {file ? file.name : t("next.backup.noFile")}
             </span>
             <input
@@ -398,7 +402,11 @@ export function BackupPanel() {
                 setNote(null);
               }}
             />
-            <SecondaryButton icon="chooseFile" onClick={() => fileRef.current?.click()}>
+            <SecondaryButton
+              icon="chooseFile"
+              onClick={() => fileRef.current?.click()}
+              testId={settingsIds.backupChooseFile}
+            >
               {t("next.backup.chooseFile")}
             </SecondaryButton>
           </div>
@@ -452,14 +460,22 @@ export function BackupPanel() {
         kind: "custom",
         control: (
           <div className="flex min-w-0 flex-wrap items-center gap-3">
-            <span className="min-w-0 font-wv-mono text-[11.5px] text-wv-muted">
+            <span
+              data-testid={status === null ? settingsIds.backupStatusChecking : settingsIds.backupStatus}
+              className="min-w-0 font-wv-mono text-[11.5px] text-wv-muted"
+            >
               {status === null
                 ? t("next.backup.checking")
                 : status.can_restore
                   ? t("next.backup.restoreAvailable")
                   : (status.reason ?? t("next.backup.restoreUnavailable"))}
             </span>
-            <SecondaryButton icon="inspectFile" disabled={!file || busy} onClick={() => void inspect()}>
+            <SecondaryButton
+              icon="inspectFile"
+              disabled={!file || busy}
+              onClick={() => void inspect()}
+              testId={settingsIds.backupReadArchive}
+            >
               {t("next.backup.readArchive")}
             </SecondaryButton>
           </div>
@@ -477,6 +493,7 @@ export function BackupPanel() {
             icon="restore"
             disabled={restoreBlocked}
             onClick={() => setConfirmRestore(true)}
+            testId={settingsIds.backupRestore}
           >
             {t("next.backup.restoreFromArchive")}
           </DangerButton>
@@ -564,7 +581,11 @@ export function BackupPanel() {
                 <KeyValueRow label={t("next.backup.takenBy")} value={manifest.source_weaver_version} />
               ) : null}
               {manifest.source_engine ? (
-                <KeyValueRow label={t("next.backup.sourceDatabase")} value={manifest.source_engine} />
+                <KeyValueRow
+                  label={t("next.backup.sourceDatabase")}
+                  value={manifest.source_engine}
+                  testId={settingsIds.backupSourceEngine}
+                />
               ) : null}
               <KeyValueRow
                 label={t("next.backup.sourceDataDir")}
@@ -629,6 +650,7 @@ export function BackupPanel() {
               </Cell>,
               <PathField
                 key="now"
+                testId={settingsIds.backupRemap}
                 compact
                 label={t("next.backup.destinationFor", { name: entry.category_name })}
                 value={remaps[entry.category_name] ?? ""}
@@ -651,10 +673,11 @@ export function BackupPanel() {
           icon="downloadFile"
           disabled={busy || status?.busy || !password.trim() || mismatch}
           onClick={() => void download()}
+          testId={settingsIds.backupDownload}
         >
           {t("next.backup.download")}
         </SecondaryButton>
-        <SecondaryButton icon="add" disabled={busy || createAction.busy || !password.trim() || mismatch} onClick={() => void create()}>{t("next.backup.createStored")}</SecondaryButton>
+        <SecondaryButton testId={settingsIds.backupCreate} icon="add" disabled={busy || createAction.busy || !password.trim() || mismatch} onClick={() => void create()}>{t("next.backup.createStored")}</SecondaryButton>
       </PanelControls>
 
       <SettingsBlocks blocks={blocks} loading={fetching && !data} />
@@ -662,6 +685,7 @@ export function BackupPanel() {
       {createAction.reauthentication}
 
       <ConfirmDialog
+        testId={testIds.dialog("backup-restore")}
         open={confirmRestore}
         title={t("next.backup.restoreFromArchive")}
         note={file?.name}

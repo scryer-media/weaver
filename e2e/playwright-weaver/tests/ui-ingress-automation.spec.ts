@@ -4,78 +4,63 @@
 import fs from "node:fs";
 import type { Locator, Page } from "@playwright/test";
 import { expect, test } from "./helpers";
+import { operationResponse } from "./support/graphql-operations";
+import { confirmDialog, saveSettings, tableRow } from "./support/settings-locators";
+import { settingsIds, testIds } from "./support/testids";
+
+const field = testIds.field;
 
 async function ensureDownloadsPaused(page: Page): Promise<void> {
-  const toggle = page.getByRole("banner").getByRole("button", { name: /^(Pause all|Resume all)$/ });
+  const pauseAll = page.getByTestId(testIds.queuePauseAll);
+  const resumeAll = page.getByTestId(testIds.queueResumeAll);
+  const toggle = pauseAll.or(resumeAll);
   await expect(toggle).toBeVisible();
 
-  // The label follows the live queue state, so wait for it to stop changing
+  // The control follows the live queue state, so wait for it to stop changing
   // before deciding which way to flip it.
-  let previousLabel = "";
+  const shownState = async () => (await pauseAll.count()) > 0 ? "pause" : (await resumeAll.count()) > 0 ? "resume" : "";
+  let previousState = "";
   let stableReads = 0;
   await expect
     .poll(async () => {
-      const label = (await toggle.textContent())?.trim() ?? "";
-      stableReads = label === previousLabel ? stableReads + 1 : 1;
-      previousLabel = label;
-      return stableReads >= 3 ? label : "";
+      const state = await shownState();
+      stableReads = state === previousState ? stableReads + 1 : 1;
+      previousState = state;
+      return stableReads >= 3 ? state : "";
     }, { timeout: 5_000, intervals: [100, 100, 250] })
-    .toMatch(/^(Pause all|Resume all)$/);
+    .toMatch(/^(pause|resume)$/);
 
-  if (previousLabel === "Pause all") {
-    await page.getByRole("banner").getByRole("button", { name: "Pause all", exact: true }).click();
+  if (previousState === "pause") {
+    await pauseAll.click();
   }
-  await expect(page.getByRole("banner").getByRole("button", { name: "Resume all", exact: true })).toBeVisible();
-}
-
-/** A settings table row, found by the exact text of one of its cells. */
-function tableRow(page: Page, table: string, cellText: string): Locator {
-  return page
-    .getByRole("region", { name: table, exact: true })
-    .getByRole("button")
-    .filter({ has: page.getByText(cellText, { exact: true }) });
-}
-
-async function confirmDialog(page: Page, title: string, confirmLabel: string) {
-  const confirm = page.getByRole("dialog", { name: title, exact: true });
-  await confirm.getByRole("button", { name: confirmLabel, exact: true }).click();
-  await expect(confirm).toBeHidden();
-}
-
-function operationResponse(page: Page, operation: string) {
-  return page.waitForResponse(
-    (response) =>
-      new URL(response.url()).pathname.endsWith("/graphql")
-      && (response.request().postData() ?? "").includes(operation),
-  );
+  await expect(resumeAll).toBeVisible();
 }
 
 async function addFeed(page: Page, name: string, url: string): Promise<Locator> {
-  await page.getByRole("main").getByRole("button", { name: "Add feed", exact: true }).click();
-  const form = page.getByRole("dialog", { name: "Add feed", exact: true });
-  await form.getByRole("textbox", { name: "Name", exact: true }).fill(name);
-  await form.getByRole("textbox", { name: "URL", exact: true }).fill(url);
-  await form.getByRole("button", { name: "Save", exact: true }).click();
+  await page.getByTestId(testIds.tableAdd("feeds")).click();
+  const form = page.getByTestId(testIds.dialog("feed"));
+  await form.getByTestId(field("name")).fill(name);
+  await form.getByTestId(field("url")).fill(url);
+  await form.getByTestId(testIds.editorSave).click();
   await expect(form).toBeHidden();
-  const row = tableRow(page, "Feeds", name);
+  const row = tableRow(page, "feeds", name);
   await expect(row).toHaveCount(1);
   return row;
 }
 
 async function pollFeed(page: Page, row: Locator) {
   const sync = operationResponse(page, "RunRssSync");
-  await row.getByRole("button", { name: "Poll", exact: true }).click();
+  await row.getByTestId(settingsIds.rssFeedPoll).click();
   await sync;
 }
 
 async function removeFeed(page: Page, name: string) {
-  await tableRow(page, "Feeds", name).click();
-  await page
-    .getByRole("dialog", { name, exact: true })
-    .getByRole("button", { name: "Remove feed", exact: true })
-    .click();
-  await confirmDialog(page, "Remove feed", "Remove feed");
-  await expect(tableRow(page, "Feeds", name)).toHaveCount(0);
+  await tableRow(page, "feeds", name).click();
+  const editor = page.getByTestId(testIds.dialog("feed"));
+  await expect(editor).toContainText(name);
+  await editor.getByTestId(testIds.editorDelete).click();
+  await confirmDialog(page, "feed-remove");
+  await expect(tableRow(page, "feeds", name)).toHaveCount(0);
 }
 
 test("watch-folder injection reports queued/error marker renames without pipeline assertions", async ({ cleanPage: page }) => {
@@ -97,40 +82,39 @@ test("watch-folder injection reports queued/error marker renames without pipelin
   await ensureDownloadsPaused(page);
 
   await page.goto("/settings/watch-folder");
-  const section = page.getByRole("region", { name: "Watch folder", exact: true });
-  await section.getByRole("button", { name: "Browse", exact: true }).click();
-  const directoryDialog = page.getByRole("dialog", { name: "Folder", exact: true });
+  const section = page.getByTestId(testIds.section("folder"));
+  await section.getByTestId(testIds.browse(field("path"))).click();
+  const directoryDialog = page.getByTestId(testIds.dialog("picker"));
   // The dialog opens on a listing of its own; typing before it lands would be
   // overwritten by it.
-  const useFolder = directoryDialog.getByRole("button", { name: "Use this folder", exact: true });
+  const useFolder = directoryDialog.getByTestId(testIds.pickerUse);
   await expect(useFolder).toBeEnabled();
-  await directoryDialog.getByRole("textbox", { name: "Folder path", exact: true }).fill(inbox);
-  await directoryDialog.getByRole("button", { name: "Go", exact: true }).click();
+  await directoryDialog.getByTestId(testIds.pickerPathInput).fill(inbox);
+  await directoryDialog.getByTestId(testIds.pickerGo).click();
   // The dialog chooses the folder it is showing, so let the browse land first.
-  await expect(directoryDialog.getByTitle(inbox, { exact: true })).not.toHaveCount(0);
+  await expect(directoryDialog.getByTestId(testIds.pickerPath)).toHaveAttribute("title", inbox);
   await useFolder.click();
   await expect(directoryDialog).toBeHidden();
-  const pathInput = section.getByRole("textbox", { name: "Folder", exact: true });
+  const pathInput = section.getByTestId(field("path"));
   await expect(pathInput).toHaveValue(inbox);
-  await section
-    .getByRole("radiogroup", { name: "Watching", exact: true })
-    .getByRole("radio", { name: "Polling", exact: true })
-    .click();
-  const pollInterval = section.getByRole("spinbutton", { name: "Poll interval", exact: true });
+  await section.getByTestId(testIds.option(field("mode"), "polling")).click();
+  const pollInterval = section.getByTestId(field("pollIntervalSecs"));
   await pollInterval.fill("45");
   await pollInterval.press("Tab");
-  await page.getByRole("button", { name: "Save changes", exact: true }).click();
-  await expect(page.getByRole("button", { name: "Saved", exact: true })).toBeDisabled();
+  await saveSettings(page);
 
-  const scanNow = page.getByRole("banner").getByRole("button", { name: "Scan now", exact: true });
-  const scanReport = page.getByRole("region", { name: "Last scan", exact: true });
+  const scanNow = page.getByTestId(settingsIds.watchScanNow);
+  const scanReport = page.getByTestId(testIds.section("report"));
+  const scanFound = scanReport.getByTestId(settingsIds.watchFound);
+  const scanQueued = scanReport.getByTestId(settingsIds.watchQueued);
   // Saving polling mode starts the poller, and its first pass runs at once.
   // Scan the still-empty inbox so the files below are left for the scan the
   // test drives; the poller's next pass is a full interval away.
   const emptyScan = operationResponse(page, "ScanWatchFolder");
   await scanNow.click();
   await emptyScan;
-  await expect(scanReport).toContainText("0 queued of 0 found");
+  await expect(scanQueued).toHaveText("0");
+  await expect(scanFound).toHaveText("0");
 
   fs.writeFileSync(
     validSource,
@@ -148,10 +132,9 @@ test("watch-folder injection reports queued/error marker renames without pipelin
   await expect(scanNow).toBeEnabled();
   await scanNow.click();
   await firstScan;
-  await expect(scanReport).toContainText("1 queued of 2 found");
-  await expect(scanReport).toContainText("Files found");
-  await expect(scanReport).toContainText("Queued");
-  await expect(scanReport).toContainText("e2e-watch-invalid.nzb");
+  await expect(scanQueued).toHaveText("1");
+  await expect(scanFound).toHaveText("2");
+  await expect(scanReport.getByTestId(settingsIds.watchProblem("error"))).toContainText("e2e-watch-invalid.nzb");
   await expect.poll(() => fs.existsSync(`${validSource}.queued`)).toBeTruthy();
   await expect.poll(() => fs.existsSync(`${invalidSource}.error`)).toBeTruthy();
 
@@ -159,7 +142,7 @@ test("watch-folder injection reports queued/error marker renames without pipelin
   await expect(scanNow).toBeEnabled();
   await scanNow.click();
   await secondScan;
-  await expect(scanReport).toContainText(/^Last scan0 queued of/);
+  await expect(scanQueued).toHaveText("0");
   expect(fs.readdirSync(inbox).filter((name) => name.startsWith("e2e-watch-valid"))).toEqual([
     "e2e-watch-valid.nzb.queued",
   ]);
@@ -182,19 +165,17 @@ test("RSS payload ingestion, seen deduplication, and seen controls are visible b
   await page.goto("/settings/rss");
   const feedRow = await addFeed(page, feedName, "http://rss-fixture:8089/feed.xml");
 
-  await page
-    .getByRole("region", { name: "Rules", exact: true })
-    .getByRole("button", { name: "Add rule", exact: true })
-    .click();
-  const ruleForm = page.getByRole("dialog", { name: "Add rule", exact: true });
-  await expect(ruleForm.getByRole("button", { name: "Feed", exact: true })).toHaveText(feedName);
-  await ruleForm.getByRole("textbox", { name: "Title matches", exact: true }).fill(releaseTitle);
-  await ruleForm.getByRole("button", { name: "Save", exact: true }).click();
+  await page.getByTestId(testIds.tableAdd("rules")).click();
+  const ruleForm = page.getByTestId(testIds.dialog("rss-rule"));
+  await expect(ruleForm.getByTestId(field("feedId"))).toHaveText(feedName);
+  await ruleForm.getByTestId(field("titleRegex")).fill(releaseTitle);
+  await ruleForm.getByTestId(testIds.editorSave).click();
   await expect(ruleForm).toBeHidden();
-  await expect(tableRow(page, "Rules", releaseTitle).getByText("Accept", { exact: true })).toBeVisible();
+  await expect(tableRow(page, "rules", releaseTitle).getByTestId(settingsIds.rssRuleAction("ACCEPT"))).toBeVisible();
 
-  const status = page.getByRole("contentinfo");
-  const seenEntry = tableRow(page, "Recently seen", releaseTitle);
+  // The report line's counts are what the poll did.
+  const status = page.getByTestId(testIds.shellStatus);
+  const seenEntry = tableRow(page, "seen", releaseTitle);
 
   await pollFeed(page, feedRow);
   await expect(status).toContainText("1 feed polled · 1 new · 1 queued");
@@ -205,25 +186,20 @@ test("RSS payload ingestion, seen deduplication, and seen controls are visible b
   await expect(seenEntry).toHaveCount(1);
 
   await seenEntry.click();
-  await expect(page.getByRole("dialog", { name: "Forget this item", exact: true })).toContainText(releaseTitle);
-  await confirmDialog(page, "Forget this item", "Forget item");
+  await expect(page.getByTestId(testIds.dialog("rss-seen-forget"))).toContainText(releaseTitle);
+  await confirmDialog(page, "rss-seen-forget");
   await expect(seenEntry).toHaveCount(0);
 
   await pollFeed(page, feedRow);
   await expect(status).toContainText("1 new");
   await expect(seenEntry).toBeVisible();
 
-  await page
-    .getByRole("region", { name: "Recently seen", exact: true })
-    .getByRole("button", { name: "Clear history", exact: true })
-    .click();
-  await confirmDialog(page, "Clear seen history", "Clear history");
-  await expect(
-    page.getByText("Nothing seen yet. Items appear here once a feed has been polled.", { exact: true }),
-  ).toBeVisible();
+  await page.getByTestId(testIds.section("seen")).getByTestId(settingsIds.rssSeenClear).click();
+  await confirmDialog(page, "rss-seen-clear");
+  await expect(page.getByTestId(testIds.tableEmpty("seen"))).toBeVisible();
 
   await removeFeed(page, feedName);
-  await expect(tableRow(page, "Rules", releaseTitle)).toHaveCount(0);
+  await expect(tableRow(page, "rules", releaseTitle)).toHaveCount(0);
 });
 
 test("RSS feed CRUD and classified sync errors are visible behavior", async ({ cleanPage: page }) => {
@@ -238,17 +214,15 @@ test("RSS feed CRUD and classified sync errors are visible behavior", async ({ c
   await pollFeed(page, feedRow);
   // The report line carries the first classified error after the counts,
   // named for its feed; the feed's row shows that same error.
-  const report = page
-    .getByRole("contentinfo")
-    .getByText(/^1 feed polled · 0 new · 0 queued · \S/);
-  await expect(report).toHaveCount(1);
+  const report = page.getByTestId(testIds.shellStatus);
+  await expect(report).toHaveText(/^1 feed polled · 0 new · 0 queued · \S/);
   const reportText = (await report.textContent()) ?? "";
   const prefix = `0 queued · ${feedName}: `;
   expect(reportText).toContain(prefix);
   const feedError = reportText.slice(reportText.indexOf(prefix) + prefix.length);
   expect(feedError).not.toBe("");
-  await expect(feedRow.getByText(feedError, { exact: true })).toBeVisible();
-  await expect(feedRow.getByText("not polled yet", { exact: true })).toHaveCount(0);
+  // The row's state is that same error, so it is no longer "not polled yet".
+  await expect(feedRow.getByTestId(settingsIds.rssFeedState)).toHaveText(feedError);
 
   await removeFeed(page, feedName);
 });
