@@ -300,7 +300,7 @@ test("ST01 a Usenet run measures through the proxy rung, the same run with that 
   await expect(result).toContainText(figure(sizeLabel(result1.bytes)));
   await expect(result).toContainText(figure(sizeLabel(result1.usenet!.decodedBytes)));
   await expect(firstRow).toContainText(PROXIED_HOST);
-  await expect(firstRow).toContainText("Usenet · URL"); // copy-is-claim: the row's kind cell has no test ID (shared Cell); its words name the run's kind and NZB
+  await expect(firstRow.getByTestId(networkIds.speedRunKind("usenet-url"))).toBeVisible();
   await expect(firstRow).toContainText(rateLabel(result1.averageBps));
   await expect(firstRow).toContainText(sizeLabel(result1.bytes));
   await expect(firstRow).toContainText(sizeLabel(result1.usenet!.decodedBytes));
@@ -338,7 +338,7 @@ test("ST01 a Usenet run measures through the proxy rung, the same run with that 
   expect(connectedOn(events2, "connect1")).toEqual([]);
   expect(directEvents(events2).some(event => event.kind === "direct-nntp")).toBe(true);
 
-  await expect(secondRow).toContainText("leg 1 rung 1"); // copy-is-claim: the row's down cell has no test ID (shared Cell); its words name what the run had down
+  await expect(secondRow.getByTestId(networkIds.speedRunDown("rung-0-0"))).toBeVisible();
   const secondDetail = await speed.detail(second);
   await expect(diagram(secondDetail).getByTestId(networkIds.flowBoxDown)).toHaveCount(1);
   await expect(diagram(secondDetail).getByTestId(networkIds.flowRung(0, 0, "DOWN"))).toHaveCount(1);
@@ -536,7 +536,7 @@ test("ST05 a two-leg route splits the connections, a leg taken down gives them a
   for (const connection of result2.connections) {
     expect(connection).toMatchObject({ leg: 0, path: { egressId: a.id, rung: 0, proxyIds: [connect1.id] } });
   }
-  await expect(secondRow).toContainText("leg 2"); // copy-is-claim: the row's down cell has no test ID (shared Cell); its words name what the run had down
+  await expect(secondRow.getByTestId(networkIds.speedRunDown("leg-1"))).toBeVisible();
   const secondDetail = await speed.detail(second);
   await expect(connectionRows(secondDetail)).toHaveCount(4);
   await expect(connectionRows(secondDetail).filter({ hasText: b.name })).toHaveCount(0);

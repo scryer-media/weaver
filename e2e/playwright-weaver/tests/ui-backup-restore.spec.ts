@@ -143,7 +143,7 @@ async function runSourceExport(
   await downloadButton.click();
   const download = await downloadPromise;
   await download.saveAs(backupPath);
-  await expect(statusLine(page)).toContainText(/Saved weaver_backup_\S+\.enc/);
+  await expect(statusLine(page).getByTestId(settingsIds.backupSavedFile)).toHaveText(/^weaver_backup_\S+\.enc$/);
 
   const backup = fs.readFileSync(backupPath);
   expect(backup.length, "encrypted backup artifact is empty").toBeGreaterThan(0);
@@ -167,7 +167,8 @@ async function runTargetRestore(page: Page, expectedMatrix: BackupMatrixState) {
     status: 400,
   });
   await analyzeBackup(page, backupPath, "wrong-passphrase");
-  await expect(statusLine(page)).toContainText(/password|decrypt|invalid/i);
+  // The failure is the server's own message, read from the panel's error element.
+  await expect(statusLine(page).getByTestId(settingsIds.backupError)).toContainText(/password|decrypt|invalid/i);
   await expect(restoreButton(page)).toBeDisabled();
   await expectProductMarkers(page, matrix, false);
 
@@ -177,7 +178,7 @@ async function runTargetRestore(page: Page, expectedMatrix: BackupMatrixState) {
     status: 400,
   });
   await analyzeBackup(page, tamperedBackupPath, backupPassphrase);
-  await expect(statusLine(page)).toContainText(
+  await expect(statusLine(page).getByTestId(settingsIds.backupError)).toContainText(
     /corrupt|decrypt|integrity|invalid|password/i,
   );
   await expect(restoreButton(page)).toBeDisabled();
@@ -194,9 +195,8 @@ async function runTargetRestore(page: Page, expectedMatrix: BackupMatrixState) {
   const confirmation = page.getByTestId(testIds.dialog("backup-restore"));
   await confirmation.getByTestId(testIds.confirmAccept).click();
   await expect(confirmation).toBeHidden();
-  await expect(statusLine(page)).toContainText(
-    /Restore staged · \d+ downloads? in history · restart weaver to apply it/,
-  );
+  const staged = statusLine(page).getByTestId(settingsIds.backupRestoreOutcome("staged"));
+  await expect(staged.getByTestId(settingsIds.backupRestoreHistoryJobs)).toHaveText(/^\d+$/);
   // The staged-restore section exists only while a restore waits for a restart.
   await expect(page.getByTestId(testIds.section("pending"))).toBeVisible();
 

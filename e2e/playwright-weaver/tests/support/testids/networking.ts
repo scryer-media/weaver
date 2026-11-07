@@ -41,6 +41,12 @@ export const networkIds = {
   speedTableRow: (table: string) => `speed-table-${table}-row`,
   speedTableCell: (table: string, column: string) => `speed-table-${table}-${column}`,
 
+  // A run's row in the runs table.
+  /** The kind cell, by what the run measured with (bandwidth-provider, bandwidth-custom, usenet-sab, usenet-file, usenet-url). */
+  speedRunKind: (kind: string) => `speed-run-kind-${kind}`,
+  /** One thing a run had down, by its key (leg-<position>, rung-<leg>-<rung>, egress-<id>, proxy-<id>; zero-based). */
+  speedRunDown: (part: string) => `speed-run-down-${part}`,
+
   // The route flow: the diagram, and each box's state keyed by what it stands for.
   flowDiagram: "flow-diagram",
   flowEgress: (egressId: number, state: string) => `flow-egress-${egressId}-${state}`,
