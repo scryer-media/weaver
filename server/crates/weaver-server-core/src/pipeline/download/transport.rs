@@ -559,18 +559,32 @@ impl ServerPipelineExplorer {
     }
 
     // The rung the explorer is walking toward: the bandwidth-delay depth plus
-    // one request of headroom, rounded up to a rung.
+    // one request of headroom, rounded up to a rung, except when the depth
+    // is exactly the current rung, which is then the target as it stands.
     //
     // The formula is exact only for the round trip and transfer it was given,
     // and both move window to window. At 100 ms over 48 ms articles it says
-    // 4, and a window that reads the wire a little faster says 5; picked
-    // without headroom the target flips between rungs 4 and 8 from run to
-    // run. One more request covers the swing. The trial still decides
-    // whether the deeper rung is kept.
+    // 4, and a window that reads the wire a little faster says 5; without
+    // headroom the target flips between rungs 4 and 8 from run to run. One
+    // more request covers the swing, both on the way up (2 reading 4 or 5
+    // asks for 8) and once settled (8 reading 4 stays at 8). The explorer
+    // only walks down when the depth with its headroom rounds below the
+    // current rung: 8 reading 3 asks for 4. The trial still decides whether
+    // a deeper rung is kept.
+    //
+    // A depth equal to the rung gets no headroom, because there it is not
+    // slack but a climb nobody measured: a link-bound server at 2 whose
+    // formula says 2 stays at 2 instead of jumping to 4 untried, and 4
+    // reading 4 stays at 4.
     pub(crate) fn target_rung(&self) -> u8 {
         self.physical_target_depth()
             .map_or(self.current_depth, |depth| {
-                rung_at_or_above(depth.saturating_add(TARGET_HEADROOM_DEPTH))
+                let headroom = if depth != self.current_depth {
+                    TARGET_HEADROOM_DEPTH
+                } else {
+                    0
+                };
+                rung_at_or_above(depth.saturating_add(headroom))
             })
     }
 
@@ -1198,10 +1212,11 @@ mod tests {
     #[test]
     fn target_depth_follows_the_latency_to_transfer_ratio() {
         // Good band, article costs about as much as the round trip. The
-        // physics asks for 2; the headroom request makes it 3, rung 4.
+        // physics asks for 2, which is the rung the server is on, so no
+        // headroom is added: a link-bound server stays at 2.
         let good = explorer(200, 200);
         assert_eq!(good.physical_target_depth(), Some(2));
-        assert_eq!(good.target_rung(), 4);
+        assert_eq!(good.target_rung(), 2);
 
         // Good band, tiny articles: the link is idle most of the round trip.
         let good_small = explorer(300, 50);
@@ -1213,15 +1228,96 @@ mod tests {
         assert_eq!(moderate.physical_target_depth(), Some(3));
         assert_eq!(moderate.target_rung(), 4);
 
-        // Slow band, large articles.
+        // Slow band, large articles: link-bound at 2, like the good band.
         let slow = explorer(900, 900);
         assert_eq!(slow.physical_target_depth(), Some(2));
-        assert_eq!(slow.target_rung(), 4);
+        assert_eq!(slow.target_rung(), 2);
 
         // Slow band, small articles: clamped at the deepest rung.
         let slow_small = explorer(1000, 20);
         assert_eq!(slow_small.physical_target_depth(), Some(8));
         assert_eq!(slow_small.target_rung(), 8);
+    }
+
+    // The headroom request is added unless the formula's depth is the
+    // current rung. Each case is (current rung, formula depth, target rung).
+    #[test]
+    fn headroom_is_added_unless_the_formula_equals_the_current_rung() {
+        // Round trip 100 ms; the article time picks the formula's depth.
+        let article_ms_for_depth = |depth: u8| -> u64 {
+            match depth {
+                2 => 100,
+                3 => 50,
+                4 => 34,
+                5 => 25,
+                8 => 10,
+                _ => unreachable!("no case uses depth {depth}"),
+            }
+        };
+        let cases = [
+            // The formula on the rung: link-bound servers stay; no untried
+            // climb.
+            (2, 2, 2),
+            (4, 4, 4),
+            (8, 8, 8),
+            // Climbs keep their slack. The bench link reads 4 or 5 window to
+            // window; from 2 both give 8.
+            (2, 3, 4),
+            (2, 4, 8),
+            (2, 5, 8),
+            (4, 5, 8),
+            // A settled rung is not left on one low reading.
+            (8, 4, 8),
+            (8, 5, 8),
+            (4, 2, 4),
+            (4, 3, 4),
+            // The walk down starts only when the depth with its headroom
+            // rounds below the rung.
+            (8, 3, 4),
+            (8, 2, 4),
+        ];
+        for (rung, depth, target) in cases {
+            let article_ms = article_ms_for_depth(depth);
+            let mut explorer = explorer(100, article_ms);
+            explorer.modelled_transfer = Some(Duration::from_millis(article_ms));
+            explorer.current_depth = rung;
+            assert_eq!(
+                explorer.physical_target_depth(),
+                Some(depth),
+                "formula for {article_ms} ms articles"
+            );
+            assert_eq!(
+                explorer.target_rung(),
+                target,
+                "rung {rung}, formula {depth}"
+            );
+        }
+    }
+
+    // A fresh server whose complete model says 2 (link-bound) makes no jump
+    // at the opening window, and the next window agrees with the rung and
+    // ends the first climb there. Nothing is saved.
+    #[test]
+    fn a_link_bound_fresh_server_makes_no_jump_at_the_opening_window() {
+        let mut explorer = explorer(200, 200);
+        let now = Instant::now();
+        assert_eq!(explorer.target_rung(), 2);
+        assert_eq!(
+            run_window(&mut explorer, now, 768_000, Duration::from_millis(400)),
+            None
+        );
+        assert_eq!(explorer.physical_target_depth(), Some(2));
+        assert_eq!(explorer.current_depth(), 2);
+        assert!(!explorer.settle_pending);
+        assert!(explorer.first_climb_pending);
+
+        assert_eq!(
+            run_window(&mut explorer, now, 768_000, Duration::from_millis(400)),
+            None
+        );
+        assert_eq!(explorer.current_depth(), 2);
+        assert!(!explorer.first_climb_pending);
+        assert_eq!(explorer.persisted_depth, None);
     }
 
     // The bench link sits on the 4/5 edge: a 102 ms round trip over 48 ms
@@ -1494,6 +1590,37 @@ mod tests {
             .baseline_throughput_bps
             .expect("the settle window is the baseline");
         assert!((baseline - ARTICLE as f64 / steady.as_secs_f64()).abs() < 1.0);
+    }
+
+    // The bench link once settled at 8: a later window that reads the
+    // formula at 4 rather than 5 leaves the rung where it is. Without the
+    // headroom on that reading the explorer stepped down to 4, and the next
+    // reading of 5 climbed back to 8 on trial.
+    #[test]
+    fn the_bench_link_settled_at_eight_stays_on_a_window_that_reads_four() {
+        const ARTICLE: u64 = 768_000;
+        let steady = Duration::from_millis(50);
+        let mut explorer = explorer(102, 48);
+        let now = Instant::now();
+        assert_eq!(
+            run_window(&mut explorer, now, ARTICLE, steady),
+            Some(RungChange::Stepped { from: 2, to: 8 })
+        );
+        assert_eq!(
+            run_window(&mut explorer, now, ARTICLE, steady),
+            Some(RungChange::Kept { depth: 8 })
+        );
+
+        explorer.modelled_transfer = Some(Duration::from_millis(48));
+        explorer.transfer = Some(Duration::from_millis(48));
+        assert_eq!(
+            run_window(&mut explorer, now, ARTICLE, steady),
+            None,
+            "a reading of 4 at a settled 8 moves nothing"
+        );
+        assert_eq!(explorer.physical_target_depth(), Some(4));
+        assert_eq!(explorer.target_rung(), 8);
+        assert_eq!(explorer.current_depth(), 8);
     }
 
     // The same link on a server with a proven rung, whose first climb is a
@@ -1836,6 +1963,24 @@ mod tests {
         assert_eq!(explorer.target_rung(), 4);
         assert_eq!(
             run_window(&mut explorer, now, 768_000, Duration::from_millis(60)),
+            None
+        );
+        assert_eq!(explorer.current_depth(), 4);
+        assert!(!explorer.first_climb_pending);
+        assert_eq!(explorer.persisted_depth, None);
+
+        // A model that reads exactly 4 at the guessed 4 gets no headroom and
+        // stays: it does not jump to 8 untried.
+        let mut explorer = guessed_from_probe(100);
+        assert_eq!(
+            run_window(&mut explorer, now, 768_000, Duration::from_millis(34)),
+            None
+        );
+        assert_eq!(explorer.physical_target_depth(), Some(4));
+        assert_eq!(explorer.target_rung(), 4);
+        assert!(!explorer.settle_pending);
+        assert_eq!(
+            run_window(&mut explorer, now, 768_000, Duration::from_millis(34)),
             None
         );
         assert_eq!(explorer.current_depth(), 4);
