@@ -108,6 +108,11 @@ impl Start {
 }
 
 impl SyncTable {
+    #[cfg(test)]
+    pub(super) fn holds(&self, client: &SyncClient) -> bool {
+        self.clients.contains_key(client)
+    }
+
     pub(super) fn forget(&mut self, client: &SyncClient) {
         self.clients.remove(client);
     }

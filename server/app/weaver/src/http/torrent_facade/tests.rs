@@ -2144,6 +2144,98 @@ async fn maindata_builds_only_the_rows_whose_view_moved() {
     assert!(moved["torrents"][&hash].get("name").is_none(), "{moved}");
 }
 
+// A login session is a `sync/maindata` client of its own: its ids run apart
+// from those of the API key it was issued for, and logging out forgets its
+// state, so the next session starts whole from id 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_login_session_keeps_its_own_maindata_ids_until_logout() {
+    let rig = rig().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    let sid_of = |reply: Reply| {
+        let cookie = reply.cookie.unwrap();
+        cookie.split(';').next().unwrap().to_owned()
+    };
+    let sid = sid_of(rig.send(login(ADMIN)).await);
+    let with = |sid: &str, path: &str| {
+        Request::get(path)
+            .header(header::COOKIE, sid)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let first = rig.send(with(&sid, "/api/v2/sync/maindata")).await.json();
+    assert_eq!(
+        (first["rid"].clone(), first["full_update"].clone()),
+        (json!(1), json!(true))
+    );
+    let second = rig
+        .send(with(&sid, "/api/v2/sync/maindata?rid=1"))
+        .await
+        .json();
+    assert_eq!(second["rid"], 2);
+    assert!(second.get("full_update").is_none(), "{second}");
+
+    // The key it was issued for starts whole at 1, and leaves the session's
+    // ids where they were.
+    let by_key = rig.get("/api/v2/sync/maindata?rid=2").await.json();
+    assert_eq!(
+        (by_key["rid"].clone(), by_key["full_update"].clone()),
+        (json!(1), json!(true))
+    );
+    let third = rig
+        .send(with(&sid, "/api/v2/sync/maindata?rid=2"))
+        .await
+        .json();
+    assert_eq!(third["rid"], 3);
+    assert!(third.get("full_update").is_none(), "{third}");
+
+    let session = SyncClient::Session(sid.trim_start_matches("SID=").to_owned());
+    assert!(rig.context.sync().holds(&session));
+    rig.send(with(&sid, "/api/v2/auth/logout")).await;
+    assert!(!rig.context.sync().holds(&session));
+
+    let fresh = sid_of(rig.send(login(ADMIN)).await);
+    let next = rig
+        .send(with(&fresh, "/api/v2/sync/maindata?rid=3"))
+        .await
+        .json();
+    assert_eq!(
+        (next["rid"].clone(), next["full_update"].clone()),
+        (json!(1), json!(true))
+    );
+}
+
+// A torrent's limit set and then cleared: the change carries the key with
+// qBittorrent's reading of no limit, 0 (`serialize_torrent.cpp`, from
+// `TorrentImpl::cleanLimitValue`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn maindata_sends_a_cleared_limit_as_no_limit() {
+    let rig = rig().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    let first = rig.get("/api/v2/sync/maindata").await.json();
+    let hash = first["torrents"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    assert_eq!(first["torrents"][&hash]["up_limit"], 0);
+    rig.post(
+        "/api/v2/torrents/setUploadLimit",
+        &format!("hashes={hash}&limit=65536"),
+    )
+    .await;
+    let set = rig.get("/api/v2/sync/maindata?rid=1").await.json();
+    assert_eq!(set["torrents"][&hash]["up_limit"], 65_536, "{set}");
+    rig.post(
+        "/api/v2/torrents/setUploadLimit",
+        &format!("hashes={hash}&limit=0"),
+    )
+    .await;
+    let cleared = rig.get("/api/v2/sync/maindata?rid=2").await.json();
+    assert_eq!(cleared["torrents"][&hash]["up_limit"], 0, "{cleared}");
+}
+
 #[tokio::test]
 async fn without_a_torrent_client_the_lists_are_empty_and_adds_conflict() {
     let rig = rig_with(false).await;
