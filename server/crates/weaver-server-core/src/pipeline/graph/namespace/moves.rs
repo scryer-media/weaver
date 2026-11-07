@@ -154,14 +154,15 @@ impl NamespaceWriter {
         (node, member): (NodeId, MemberId),
         name: &str,
         held_off: bool,
+        root: &Path,
     ) -> Leaf {
         if !held_off && self.free_at(name, (node, member)) {
-            return Leaf::at(&self.working_dir, name);
+            return Leaf::at(root, name);
         }
         #[cfg(test)]
         count(|tally| tally.waiting_opens += 1);
-        let waiting = waiting_name(&self.working_dir, node, member, name);
-        let mut leaf = Leaf::at(&self.working_dir, &waiting);
+        let waiting = waiting_name(root, node, member, name);
+        let mut leaf = Leaf::at(root, &waiting);
         leaf.intend(name);
         self.moves.push(Waiting {
             node,
@@ -285,7 +286,9 @@ impl NamespaceWriter {
                     })
                 });
             if !held {
-                Leaf::at(&self.working_dir, &format!("{name}/")).remove()?;
+                for root in self.roots() {
+                    Leaf::at(root, &format!("{name}/")).remove()?;
+                }
             }
         }
         Ok(())
@@ -311,7 +314,6 @@ impl NamespaceWriter {
                 at += 1;
                 continue;
             }
-            let dir = self.working_dir.clone();
             let leaf = self
                 .files
                 .get_mut(&waiting.node)
@@ -320,7 +322,7 @@ impl NamespaceWriter {
             if leaf.as_ref().is_some_and(|leaf| leaf.on_disk()) {
                 count(|tally| tally.moves += 1);
             }
-            let left = leaf.map(|leaf| leaf.move_on(&dir)).transpose()?.flatten();
+            let left = leaf.map(Leaf::move_on).transpose()?.flatten();
             if let Some(left) = left {
                 self.left.insert(key(&left), None);
                 self.remove_emptied(above(left.trim_end_matches('/')).collect())?;
@@ -351,15 +353,19 @@ impl NamespaceWriter {
     // A restored member's file, where `restored_at` finds it. One found
     // at the name it wants has moved there and leaves the name it sat at
     // shut until a commit; one still where it sat waits to move again.
+    // The file lies under the directory its member's class gives, unless
+    // it is found under the other one only, as a member whose class changed
+    // after its file was opened left it.
     pub(super) fn restored_leaf(
         &mut self,
-        node: NodeId,
-        member: MemberId,
+        (node, member): (NodeId, MemberId),
         output_name: &str,
         on_disk: Option<&str>,
+        root: &Path,
     ) -> Result<Leaf, WriteError> {
-        let at = restored_at(&self.working_dir, output_name, on_disk)?;
-        let mut leaf = Leaf::found(&self.working_dir, at)?;
+        let root = self.restored_root(root, output_name, on_disk)?.to_path_buf();
+        let at = restored_at(&root, output_name, on_disk)?;
+        let mut leaf = Leaf::found(&root, at)?;
         let Some(sat) = on_disk else {
             return Ok(leaf);
         };
@@ -374,6 +380,42 @@ impl NamespaceWriter {
             stamp: Some(0),
         });
         Ok(leaf)
+    }
+
+    // The directories the job's files lie under: the working directory,
+    // and the output directory when it is another.
+    pub(super) fn roots(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.working_dir.as_path())
+            .chain((self.output_dir != self.working_dir).then_some(self.output_dir.as_path()))
+    }
+
+    fn restored_root<'a>(
+        &'a self,
+        root: &'a Path,
+        output_name: &str,
+        on_disk: Option<&str>,
+    ) -> Result<&'a Path, WriteError> {
+        let there = |dir: &Path| -> Result<bool, WriteError> {
+            for name in std::iter::once(output_name).chain(on_disk) {
+                let path = Leaf::path_at(dir, name);
+                if path
+                    .try_exists()
+                    .map_err(|source| super::super::leaf::LeafError::Io { path, source })?
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+        if there(root)? {
+            return Ok(root);
+        }
+        for other in self.roots().filter(|other| *other != root) {
+            if there(other)? {
+                return Ok(other);
+            }
+        }
+        Ok(root)
     }
 
     // Whether a file may enter `name`: no other member's file sits there or

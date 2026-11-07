@@ -80,6 +80,10 @@ impl GraphError {
 // where their runs speak, and the extraction budget its writes are held to.
 pub(crate) struct Storage {
     pub(crate) working_dir: PathBuf,
+    // Where the files of the members it delivers lie, and the free space of
+    // that device: the working directory unless the complete directory is
+    // on another device.
+    pub(crate) output: Option<(PathBuf, CapacityReader)>,
     pub(crate) accountant: Arc<HoldsAccountant>,
     pub(crate) free_disk: CapacityReader,
     pub(crate) slots: usize,
@@ -156,6 +160,7 @@ impl GraphJob {
             storage.accountant,
             storage.free_disk,
         )
+        .delivering(storage.output)
         .capped(storage.caps)
         .metered(storage.metrics);
         Self::new(

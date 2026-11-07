@@ -183,8 +183,13 @@ impl NamespaceWriter {
             return Ok(());
         };
         if state.has_file {
-            let mut leaf =
-                self.restored_leaf(node, member, &record.output_name, state.on_disk.as_deref())?;
+            let root = self.root_for(tree, node, member).to_path_buf();
+            let mut leaf = self.restored_leaf(
+                (node, member),
+                &record.output_name,
+                state.on_disk.as_deref(),
+                &root,
+            )?;
             if let Some(stated) = record.crc32 {
                 let pending = self.verifications.contains(&(node, member));
                 match (pending, record.length) {

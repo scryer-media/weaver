@@ -103,6 +103,10 @@ pub(crate) static RESTORES: std::sync::atomic::AtomicUsize = std::sync::atomic::
 pub(crate) struct RestoreSeat {
     db: crate::Database,
     working_dir: PathBuf,
+    // The job's staging directory on the complete device, when its
+    // delivered files lie there, and the free space of that device.
+    output: Option<(PathBuf, CapacityReader)>,
+    output_free_disk: CapacityReader,
     accountant: Arc<HoldsAccountant>,
     free_disk: CapacityReader,
     slots: usize,
@@ -122,6 +126,10 @@ impl Pipeline {
         RestoreSeat {
             db: self.db.clone(),
             working_dir: working_dir.to_path_buf(),
+            output: None,
+            output_free_disk: self
+                .storage_capacity
+                .reader(crate::operations::StorageRoot::Complete),
             accountant: Arc::clone(&self.graph_holds),
             free_disk: self
                 .storage_capacity
@@ -155,11 +163,18 @@ pub(crate) fn root_files(spec: &JobSpec) -> Vec<RootFile> {
 }
 
 impl RestoreSeat {
-    // The seat for one job: its password, and its working directory as its
-    // install found it.
-    pub(crate) fn for_job(mut self, spec_password: Option<String>, working_dir: &Path) -> Self {
+    // The seat for one job: its password, its working directory as its
+    // install found it, and its staging directory when one was found: then
+    // the files it delivers lie there.
+    pub(crate) fn for_job(
+        mut self,
+        spec_password: Option<String>,
+        working_dir: &Path,
+        staging_dir: Option<&Path>,
+    ) -> Self {
         self.spec_password = spec_password;
         self.working_dir = working_dir.to_path_buf();
+        self.output = staging_dir.map(|dir| (dir.to_path_buf(), self.output_free_disk.clone()));
         self
     }
 
@@ -207,11 +222,15 @@ impl RestoreSeat {
     ) -> Result<GraphRestore, GraphRestoreError> {
         let snapshot = checkpoint::snapshot(&rows)?;
         sweep_unnamed(&self.working_dir, &snapshot, &rows.held_parts)?;
+        if let Some((output_dir, _)) = &self.output {
+            sweep_unnamed(output_dir, &snapshot, &rows.held_parts)?;
+        }
         let held = held_parts_from_rows(job_id, &self.working_dir, &rows.held_parts);
         let storage = Storage {
             passwords: restore_passwords(&self.db, job_id, self.spec_password.as_deref())?,
             caps: caps_for(&self.db, &self.extraction_limits, &files),
             working_dir: self.working_dir,
+            output: self.output,
             accountant: self.accountant,
             free_disk: self.free_disk,
             slots: self.slots,

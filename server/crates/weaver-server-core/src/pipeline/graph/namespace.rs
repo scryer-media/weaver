@@ -177,8 +177,19 @@ pub(crate) struct NamespaceWriter {
     // the holds accountant that every job shares.
     scope: u64,
     working_dir: PathBuf,
+    // Where the files of the members the job delivers lie: the working
+    // directory, unless the complete directory is on another device, when
+    // it is the job's staging directory there, so what is delivered is
+    // written once, on the device it is published on. Volumes, recovery
+    // files, envelopes, holds and repair staging stay in the working
+    // directory.
+    output_dir: PathBuf,
     accountant: Arc<HoldsAccountant>,
+    // The free space of the working directory's device, which the holds
+    // page out against, and of the output directory's, which what an
+    // object produces is written against.
     free_disk: CapacityReader,
+    output_free_disk: CapacityReader,
     caps: Caps,
     // Each namespace's files, marked as each changes: a checkpoint reads
     // again only the namespaces marked since it read last.
@@ -267,8 +278,10 @@ impl NamespaceWriter {
         Self {
             scope,
             envelopes: Envelopes::new(working_dir.clone()),
+            output_dir: working_dir.clone(),
             working_dir,
             accountant,
+            output_free_disk: free_disk.clone(),
             free_disk,
             caps: Caps::unbounded(),
             files: Marked::default(),
@@ -292,6 +305,33 @@ impl NamespaceWriter {
             placements: Vec::new(),
             asked: BTreeMap::new(),
             metrics: None,
+        }
+    }
+
+    // The files of the members the job delivers lie under `output_dir`,
+    // on the device `free_disk` reads.
+    pub(crate) fn delivering_to(mut self, output_dir: PathBuf, free_disk: CapacityReader) -> Self {
+        self.output_dir = output_dir;
+        self.output_free_disk = free_disk;
+        self
+    }
+
+    pub(crate) fn delivering(self, output: Option<(PathBuf, CapacityReader)>) -> Self {
+        match output {
+            Some((dir, free_disk)) => self.delivering_to(dir, free_disk),
+            None => self,
+        }
+    }
+
+    // The directory a member's file lies under: the output directory for a
+    // member the job delivers, which no object holds, and the working
+    // directory for a recovery volume, which stays in its own file for its
+    // repair to read and is never delivered.
+    pub(super) fn root_for(&self, tree: &Tree, node: NodeId, member: MemberId) -> &Path {
+        if tree.child_of(node, member).is_none() {
+            &self.output_dir
+        } else {
+            &self.working_dir
         }
     }
 
@@ -1946,6 +1986,8 @@ impl NamespaceWriter {
     }
 
     // The member's file reaches `end`, by a write or by taking its length.
+    // Only what an object produces counts against the disk, and that is
+    // delivered, so it is judged against the output directory's device.
     fn admit_file(
         &mut self,
         tree: &Tree,
@@ -1954,7 +1996,7 @@ impl NamespaceWriter {
         end: u64,
     ) -> Result<(), WriteError> {
         self.caps
-            .admit_write(tree, (node, member), end, self.free_disk.current())?;
+            .admit_write(tree, (node, member), end, self.output_free_disk.current())?;
         Ok(())
     }
 
@@ -2102,7 +2144,8 @@ impl NamespaceWriter {
                 .map(|record| record.output_name.clone())
                 .ok_or(WriteError::UnknownMember { node, member })?;
             let held_off = tree.held_off(node, member);
-            let leaf = self.new_leaf((node, member), &output_name, held_off);
+            let root = self.root_for(tree, node, member).to_path_buf();
+            let leaf = self.new_leaf((node, member), &output_name, held_off, &root);
             self.files_mut(node).leaves.insert(member, leaf);
         }
         Ok(self

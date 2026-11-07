@@ -1673,10 +1673,17 @@ async fn read_restored(
             "failed to stamp restored working directory as Weaver-owned"
         );
     }
+    // A staging directory on the complete device holds the files the job
+    // delivers, where its intermediate directory is on another device.
+    let staging_exists = tokio::fs::try_exists(staging_dir).await.unwrap_or(false);
     let graph = if waiting_summaries.is_some() || delivering {
         None
     } else if let Some(graph) = graph {
-        let seat = graph.for_job(spec.password.clone(), &working_dir);
+        let seat = graph.for_job(
+            spec.password.clone(),
+            &working_dir,
+            staging_exists.then_some(staging_dir),
+        );
         let files = crate::pipeline::graph::restore::root_files(&spec);
         match tokio::task::spawn_blocking(move || seat.restore(job_id, files))
             .await
@@ -1692,7 +1699,6 @@ async fn read_restored(
     } else {
         None
     };
-    let staging_exists = tokio::fs::try_exists(staging_dir).await.unwrap_or(false);
     // One read of the row, decrypt of the supplied passwords and parse of
     // the persisted NZB per restored job, instead of one per archive file.
     // Anything short of a parsed NZB leaves the harvest to read the row
