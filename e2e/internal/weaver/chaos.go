@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -337,10 +338,12 @@ func dockerComposeUp(services ...string) error {
 		// must recreate them, and the engine refuses to recreate a container
 		// another one shares a network namespace with (capture runs in
 		// weaver's), so remove what this attempt started first.
-		rm := containerengine.Command(dockerComposeRetryCleanupArgs(services...)...)
-		rm.Dir = e2eDir()
-		if rmErr := runExternalCommand(rm, "docker compose rm"); rmErr != nil {
-			return fmt.Errorf("%w; remove services before retry: %v", err, rmErr)
+		for _, rmArgs := range dockerComposeRetryCleanupArgs(services...) {
+			rm := containerengine.Command(rmArgs...)
+			rm.Dir = e2eDir()
+			if rmErr := runExternalCommand(rm, "docker compose rm"); rmErr != nil {
+				return fmt.Errorf("%w; remove services before retry: %v", err, rmErr)
+			}
 		}
 		if !portCollision {
 			// The ports were not the problem; keep them.
@@ -354,10 +357,37 @@ func dockerComposeUp(services ...string) error {
 	}
 }
 
+// composeNetworkNamespaceParents maps each Compose service that runs in
+// another service's network namespace (`network_mode: "service:X"`) to that
+// service. TestComposeNetworkNamespaceParentsMatchTheComposeFiles checks it
+// against the Compose files on disk.
+var composeNetworkNamespaceParents = map[string]string{
+	"capture": "weaver",
+	"nyuu":    "nntp",
+}
+
 // dockerComposeRetryCleanupArgs stops and removes the given services'
 // containers, and only those, so a compose up retry starts them afresh.
-func dockerComposeRetryCleanupArgs(services ...string) []string {
-	return append(dockerComposeArgs("rm", "--force", "--stop"), services...)
+// Compose removes the services of one rm in parallel, and Podman refuses to
+// remove a container while another still joins its network namespace, so
+// the services that join another listed service's namespace go in a first
+// rm and the rest in a second. A pass with no services is left out.
+func dockerComposeRetryCleanupArgs(services ...string) [][]string {
+	var dependents, rest []string
+	for _, service := range services {
+		if parent, ok := composeNetworkNamespaceParents[service]; ok && slices.Contains(services, parent) {
+			dependents = append(dependents, service)
+		} else {
+			rest = append(rest, service)
+		}
+	}
+	var passes [][]string
+	for _, pass := range [][]string{dependents, rest} {
+		if len(pass) > 0 {
+			passes = append(passes, append(dockerComposeArgs("rm", "--force", "--stop"), pass...))
+		}
+	}
+	return passes
 }
 
 func requiresWeaverService(services []string) bool {
