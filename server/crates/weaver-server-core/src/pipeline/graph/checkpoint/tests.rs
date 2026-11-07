@@ -1203,6 +1203,7 @@ fn restored(
         2,
         Storage {
             working_dir: dir.to_owned(),
+            output: None,
             accountant: Arc::new(HoldsAccountant::new(HoldBudgets {
                 resident_limit: u64::MAX,
                 scratch_total: u64::MAX,

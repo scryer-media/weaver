@@ -64,6 +64,13 @@ impl Pipeline {
         };
         let storage = Storage {
             working_dir: state.working_dir.clone(),
+            output: state.staging_dir.clone().map(|dir| {
+                (
+                    dir,
+                    self.storage_capacity
+                        .reader(crate::operations::StorageRoot::Complete),
+                )
+            }),
             accountant: Arc::clone(&self.graph_holds),
             free_disk: self
                 .storage_capacity

@@ -165,6 +165,7 @@ async fn a_checkpoint_before_verification_cannot_restore_an_unchecked_crc_as_pas
         2,
         Storage {
             working_dir: dir.path().to_owned(),
+            output: None,
             accountant: Arc::new(HoldsAccountant::new(weaver_graph::holds::HoldBudgets {
                 resident_limit: u64::MAX,
                 scratch_total: u64::MAX,

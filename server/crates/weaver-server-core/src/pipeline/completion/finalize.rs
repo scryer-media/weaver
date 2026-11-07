@@ -14,6 +14,7 @@ pub(crate) mod deobfuscate;
 mod output;
 #[cfg(test)]
 pub(in crate::pipeline) use output::member_crc32_by_path;
+pub(crate) use output::return_staged_delivery;
 #[cfg(test)]
 pub(in crate::pipeline) use output::{BEFORE_FIRST_MOVE, BEFORE_SPENT_REMOVAL};
 mod status;

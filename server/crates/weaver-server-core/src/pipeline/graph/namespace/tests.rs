@@ -17,6 +17,7 @@ use crate::pipeline::graph::lines::Lines;
 mod recovery;
 mod recovery_contracts;
 mod replay;
+mod split;
 mod store_proof;
 mod streams;
 mod verification;
@@ -1470,10 +1471,7 @@ fn an_exclusive_leaf_move_preserves_case_only_renaming() {
     // The name ledger intentionally keeps an already-equivalent spelling.
     // Exercise the filesystem operation with an actual leaf move intent.
     leaf.intend("beacon.bin");
-    assert_eq!(
-        leaf.move_on(directory.path()).unwrap(),
-        Some("BEACON.BIN".into())
-    );
+    assert_eq!(leaf.move_on().unwrap(), Some("BEACON.BIN".into()));
     assert_eq!(
         std::fs::read(directory.path().join("beacon.bin")).unwrap(),
         b"owned"
@@ -1594,7 +1592,9 @@ fn a_name_a_waiting_move_wants_is_held_for_it() {
         .leaves
         .insert(first, Leaf::at(job.dir.path(), "x.bin"));
     job.writer.intend(NodeId::ROOT, first, "y.bin");
-    let leaf = job.writer.new_leaf((NodeId::ROOT, second), "y.bin", false);
+    let leaf = job
+        .writer
+        .new_leaf((NodeId::ROOT, second), "y.bin", false, job.dir.path());
     job.writer
         .files_mut(NodeId::ROOT)
         .leaves
@@ -1623,7 +1623,9 @@ fn a_left_name_and_the_names_under_it_stay_shut_until_recorded() {
     assert_eq!(job.file("crate.bin"), b"alpha");
     assert!(job.writer.moves.is_empty());
     for (member, name) in [(MemberId(2), "box"), (MemberId(3), "box/inner.bin")] {
-        let leaf = job.writer.new_leaf((NodeId::ROOT, member), name, false);
+        let leaf = job
+            .writer
+            .new_leaf((NodeId::ROOT, member), name, false, job.dir.path());
         assert!(
             leaf.name().starts_with(weaver_graph::names::INTERNAL_DIR),
             "{name}"
@@ -1633,7 +1635,9 @@ fn a_left_name_and_the_names_under_it_stay_shut_until_recorded() {
     assert!(job.writer.commit_moves(&mut job.tree, 2).expect("commit"));
     assert!(!job.writer.moves_waiting());
     for (member, name) in [(MemberId(4), "box"), (MemberId(5), "box/inner.bin")] {
-        let leaf = job.writer.new_leaf((NodeId::ROOT, member), name, false);
+        let leaf = job
+            .writer
+            .new_leaf((NodeId::ROOT, member), name, false, job.dir.path());
         assert_eq!(leaf.name(), name);
     }
 }

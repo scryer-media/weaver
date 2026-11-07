@@ -45,6 +45,9 @@ pub(crate) struct Leaf {
     // survives a restart, when no worker from this process can return.
     identity: u64,
     revision: u64,
+    // The directory the leaf's names join under: the job's output root for
+    // a member it delivers, its working directory for one it keeps.
+    root: PathBuf,
     path: PathBuf,
     // The name the file sits at, as `path` joins it under the directory.
     name: String,
@@ -115,6 +118,7 @@ impl Leaf {
         Self {
             identity: NEXT_LEAF.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             revision: 0,
+            root: dir.to_path_buf(),
             path: Self::path_at(dir, output_name),
             name: output_name.to_owned(),
             wants: None,
@@ -559,12 +563,13 @@ impl Leaf {
     }
 
     // The file moves to the name it wants, which the checkpoint has
-    // recorded. The name it left, when it moved.
-    pub(crate) fn move_on(&mut self, dir: &Path) -> Result<Option<String>, LeafError> {
+    // recorded, under the directory it lies in, so the move never leaves
+    // its device. The name it left, when it moved.
+    pub(crate) fn move_on(&mut self) -> Result<Option<String>, LeafError> {
         let Some(wants) = self.wants.clone() else {
             return Ok(None);
         };
-        let path = dir.join(relative_path(&wants));
+        let path = self.root.join(relative_path(&wants));
         self.release_handle();
         // Ownership comes from this leaf, not a best-effort lookup. A
         // missing owned file must fail the move, and a file this leaf never
@@ -744,7 +749,7 @@ mod tests {
         std::fs::remove_file(leaf.path()).unwrap();
         leaf.intend("destination.bin");
 
-        assert!(leaf.move_on(dir.path()).is_err());
+        assert!(leaf.move_on().is_err());
         assert_eq!(leaf.name(), "source.bin");
         assert_eq!(leaf.wants(), Some("destination.bin"));
         assert!(!dir.path().join("destination.bin").exists());
@@ -757,7 +762,7 @@ mod tests {
         std::fs::write(leaf.path(), b"another owner").unwrap();
         leaf.intend("destination.bin");
 
-        leaf.move_on(dir.path()).unwrap();
+        leaf.move_on().unwrap();
         assert_eq!(
             std::fs::read(dir.path().join("source.bin")).unwrap(),
             b"another owner"
