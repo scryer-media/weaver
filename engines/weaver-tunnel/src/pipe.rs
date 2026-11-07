@@ -1368,6 +1368,56 @@ impl Dialer for SessionHop {
 struct RungState {
     until: Option<tokio::time::Instant>,
     failures: u32,
+    // Raised when the rung's cooldown ends, so a dial that skipped the rung
+    // while it cooled can try it again.
+    cooled: Arc<Notify>,
+    // The timer that raises `cooled` at `until`.
+    timer: Option<tokio::task::AbortHandle>,
+}
+impl RungState {
+    fn new() -> Self {
+        Self {
+            until: None,
+            failures: 0,
+            cooled: Arc::new(Notify::new()),
+            timer: None,
+        }
+    }
+    // Cools the rung until `until`, raising `cooled` then.
+    fn cool(&mut self, until: tokio::time::Instant) {
+        self.until = Some(until);
+        if let Some(timer) = self.timer.take() {
+            timer.abort();
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let cooled = self.cooled.clone();
+            self.timer = Some(
+                runtime
+                    .spawn(async move {
+                        tokio::time::sleep_until(until).await;
+                        cooled.notify_waiters();
+                    })
+                    .abort_handle(),
+            );
+        }
+    }
+    // Clears the rung's failures and any cooldown it is in.
+    fn clear(&mut self) {
+        self.failures = 0;
+        if self.until.take().is_some() {
+            if let Some(timer) = self.timer.take() {
+                timer.abort();
+            }
+            self.cooled.notify_waiters();
+        }
+    }
+}
+impl Drop for RungState {
+    fn drop(&mut self) {
+        if let Some(timer) = self.timer.take() {
+            timer.abort();
+        }
+    }
 }
 
 pub struct Fallback {
@@ -1422,11 +1472,10 @@ impl Fallback {
             if error.is_path_evidence() && state.until.is_none_or(|until| until <= now) {
                 crate::metrics::record_rung_cooldown(index);
                 state.failures = state.failures.saturating_add(1);
-                state.until = Some(now + self.rung_cooldown);
+                state.cool(now + self.rung_cooldown);
             }
         } else {
-            state.failures = 0;
-            state.until = None;
+            state.clear();
         }
     }
     // A ladder that leaves a failed rung alone for thirty seconds.
@@ -1435,12 +1484,7 @@ impl Fallback {
     }
     // A ladder that leaves a failed rung alone for `rung_cooldown`.
     pub fn with_rung_cooldown(rungs: Vec<Arc<dyn Dialer>>, rung_cooldown: Duration) -> Self {
-        let states = (0..rungs.len())
-            .map(|_| RungState {
-                until: None,
-                failures: 0,
-            })
-            .collect();
+        let states = (0..rungs.len()).map(|_| RungState::new()).collect();
         Self {
             rungs,
             states: Arc::new(Mutex::new(states)),
@@ -1479,10 +1523,7 @@ impl Dialer for Fallback {
             }
             match rung.dial(target).await {
                 Ok(mut dialed) => {
-                    self.states.lock().expect("rung state")[index] = RungState {
-                        until: None,
-                        failures: 0,
-                    };
+                    self.states.lock().expect("rung state")[index].clear();
                     dialed.path.rung = Some(index);
                     if index > 0 {
                         crate::metrics::record_rung_fallback(index);
@@ -1512,11 +1553,30 @@ impl Dialer for Fallback {
         }
     }
     // Room on the first rung a dial for `purpose` would try: a probe tries
-    // the rungs still cooling too.
+    // the rungs still cooling too. With none on it, the dial waits for that
+    // rung's share and for each rung it skipped as cooling to finish its
+    // cooldown or free a socket of its own.
     fn room(&self, purpose: &Purpose) -> Result<(), Vec<Arc<Notify>>> {
-        (0..self.rungs.len())
-            .find(|index| self.allows_rung(*index, probes(purpose)))
-            .map_or(Ok(()), |index| self.rungs[index].room(purpose))
+        let probe = probes(purpose);
+        let mut skipped = Vec::new();
+        for (index, rung) in self.rungs.iter().enumerate() {
+            if !self.allows_rung(index, probe) {
+                skipped.push(
+                    self.states.lock().expect("rung state")[index]
+                        .cooled
+                        .clone(),
+                );
+                if let Err(freed) = rung.room(purpose) {
+                    skipped.extend(freed);
+                }
+                continue;
+            }
+            return rung.room(purpose).map_err(|mut freed| {
+                freed.extend(skipped);
+                freed
+            });
+        }
+        Ok(())
     }
     // The datagrams of the first rung a dial would try.
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {

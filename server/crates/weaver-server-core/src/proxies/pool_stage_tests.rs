@@ -26,6 +26,8 @@ struct Fixture {
     // full.
     asked_full: std::sync::Mutex<Option<mpsc::UnboundedSender<u64>>>,
     dials: AtomicU64,
+    // The member's share frees as soon as a dial is turned away full.
+    frees_after_dial: std::sync::atomic::AtomicBool,
 }
 #[async_trait::async_trait]
 impl Dialer for Fixture {
@@ -64,7 +66,11 @@ impl Dialer for Fixture {
     async fn dial(&self, _: &Target) -> Result<Dialed, DialError> {
         self.dials.fetch_add(1, Ordering::SeqCst);
         self.opened.send(self.id).unwrap();
-        let full = self.full.lock().unwrap().clone();
+        let full = if self.frees_after_dial.load(Ordering::SeqCst) {
+            self.full.lock().unwrap().take()
+        } else {
+            self.full.lock().unwrap().clone()
+        };
         if let Some(freed) = full {
             return Err(DialError::AtCapacity(vec![freed]));
         }
@@ -106,6 +112,7 @@ fn fixtures() -> (
                 fatal: Default::default(),
                 asked_full: Default::default(),
                 dials: AtomicU64::new(0),
+                frees_after_dial: Default::default(),
             })
         })
         .collect();
@@ -284,6 +291,33 @@ async fn a_usenet_connect_over_a_full_pool_waits_and_redials_once_a_member_frees
     usenet.shutdown().await;
 }
 
+// A pool dial turned away by every member carries the pool's signal and
+// the signal of each member still full, even when another member freed a
+// socket after turning the dial away.
+#[tokio::test]
+async fn a_pool_dial_at_capacity_carries_every_full_members_signal() {
+    let (pool, members, _opened) = fixtures();
+    let freed: Vec<_> = members
+        .iter()
+        .map(|member| {
+            let freed = Arc::new(Notify::new());
+            *member.full.lock().unwrap() = Some(freed.clone());
+            freed
+        })
+        .collect();
+    members[1].frees_after_dial.store(true, Ordering::SeqCst);
+    let Err(DialError::AtCapacity(waits)) = pool.dial(&target()).await else {
+        panic!("a pool whose members are all full is at capacity");
+    };
+    assert!(waits.iter().any(|wait| Arc::ptr_eq(wait, &freed[0])));
+    assert!(
+        waits
+            .iter()
+            .any(|wait| Arc::ptr_eq(wait, &pool.state.changed))
+    );
+    assert!(pool.room(&target().purpose).is_ok());
+}
+
 #[tokio::test]
 async fn cancelling_the_caller_does_not_cancel_or_fail_the_owned_race() {
     let (pool, members, mut started) = fixtures();
@@ -360,6 +394,7 @@ async fn replaced_member_ignores_old_setup_and_transport_failure() {
         fatal: Default::default(),
         asked_full: Default::default(),
         dials: AtomicU64::new(0),
+        frees_after_dial: Default::default(),
     });
     pool.set_members(vec![(1, replacement), (2, members[1].clone())]);
     old.setup.take().unwrap().complete(false);
@@ -428,6 +463,43 @@ async fn membership_edit_retires_only_removed_members_at_work_boundary() {
     drop(streams);
     assert_eq!(closed[0].load(Ordering::SeqCst), 1);
     assert_eq!(closed[1].load(Ordering::SeqCst), 1);
+}
+
+// Removing a member closes its idle connections, and a connection's close
+// can record on the pool, as a shadow connection's does, or take the lock of
+// the route over the pool. The edit closes them with the members lock
+// released, so neither waits on that lock.
+#[tokio::test]
+async fn removing_a_member_closes_its_connections_with_the_members_lock_released() {
+    let (pool, members, _started) = fixtures();
+    let member = pool.state.members.read().unwrap()[&1].clone();
+    members[0].gate.add_permits(1);
+    let (stream, _) = member.dial(&target()).await.unwrap();
+    let recorded = Arc::new(AtomicU64::new(0));
+    stream.outcome.on_close({
+        let state = Arc::downgrade(&pool.state);
+        let member = member.clone();
+        let recorded = recorded.clone();
+        move || {
+            let state = state.upgrade().unwrap();
+            if state.members.try_write().is_ok() {
+                state.record(&member, |_| {});
+                recorded.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+    // An idle connection is dropped by whoever holds it once it is recalled.
+    let idle = Arc::new(std::sync::Mutex::new(Some(stream)));
+    let outcome = idle.lock().unwrap().as_ref().unwrap().outcome.clone();
+    outcome.on_retire({
+        let idle = idle.clone();
+        move || drop(idle.lock().unwrap().take())
+    });
+    drop(outcome);
+
+    assert_eq!(pool.set_members(vec![(2, members[1].clone())]), [1]);
+    assert!(idle.lock().unwrap().is_none());
+    assert_eq!(recorded.load(Ordering::SeqCst), 1);
 }
 
 struct FatalMember;

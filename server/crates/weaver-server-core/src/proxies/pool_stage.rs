@@ -288,6 +288,14 @@ fn keep(recording: Option<&Arc<Recording>>, notes: Option<Arc<Recording>>) {
     }
 }
 
+// Whether a pool has room on a member it would dial.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Room {
+    Some,
+    None,
+    Undialable,
+}
+
 struct PoolState {
     id: u32,
     plan: Mutex<CandidatePlan<u32>>,
@@ -375,6 +383,36 @@ impl PoolState {
             return Err(DialError::Skipped("pool member changed".into()));
         }
         Ok(self.decorate(member.clone(), dialed))
+    }
+    // Whether a member the pool would dial has room for `purpose`, with the
+    // pool's signal and every such member's that has none. The members are
+    // asked with the members lock released: a route's lock can be held
+    // around this call, and a member edit takes the members lock.
+    fn room(&self, purpose: &weaver_tunnel::pipe::Purpose) -> (Room, Vec<Arc<Notify>>) {
+        let members: Vec<_> = self
+            .members
+            .read()
+            .expect("pool members")
+            .values()
+            .cloned()
+            .collect();
+        let mut waits = vec![self.changed.clone()];
+        let mut room = Room::Undialable;
+        for member in members {
+            if member.status.lock().expect("pool member").blocked.is_some() {
+                continue;
+            }
+            match member.dialer.room(purpose) {
+                Ok(()) => room = Room::Some,
+                Err(freed) => {
+                    waits.extend(freed);
+                    if room == Room::Undialable {
+                        room = Room::None;
+                    }
+                }
+            }
+        }
+        (room, waits)
     }
     fn all_blocked(&self) -> bool {
         let members = self.members.read().expect("pool members");
@@ -718,14 +756,18 @@ impl PoolStage {
             }
             return Vec::new();
         }
-        for (id, member) in members.iter() {
-            if !next
-                .iter()
-                .any(|(next, stage)| next == id && Arc::ptr_eq(stage, &member.dialer))
-            {
-                member.recall();
-            }
-        }
+        // Recalled once the members lock is released: recalling a member
+        // closes its idle connections on this thread, and a close can take
+        // the lock of the route over the pool or record on this pool.
+        let recalled: Vec<_> = members
+            .iter()
+            .filter(|(id, member)| {
+                !next
+                    .iter()
+                    .any(|(next, stage)| next == *id && Arc::ptr_eq(stage, &member.dialer))
+            })
+            .map(|(_, member)| member.clone())
+            .collect();
         let removed = members
             .keys()
             .filter(|id| !next.iter().any(|(next, _)| next == *id))
@@ -742,7 +784,7 @@ impl PoolStage {
                 (id, member)
             })
             .collect();
-        *members = next;
+        let replaced = std::mem::replace(&mut *members, next);
         self.state.revision.fetch_add(1, Ordering::AcqRel);
         {
             let mut plan = self.state.plan.lock().expect("pool plan");
@@ -750,6 +792,10 @@ impl PoolStage {
             plan.replan();
         }
         drop(members);
+        for member in &recalled {
+            member.recall();
+        }
+        drop(replaced);
         self.state.changed.notify_waiters();
         removed
     }
@@ -1004,33 +1050,12 @@ impl Dialer for PoolStage {
     }
     // Room on any member the pool would dial, or every such member's signal
     // and the pool's own when none has room. A pool with no member to dial
-    // says it has room, so the dial reports why it cannot connect. The
-    // members are asked with the pool's members lock released: a route's
-    // lock can be held around this call, and a member edit holds the
-    // members lock while it closes connections whose close takes that
-    // route's lock.
+    // says it has room, so the dial reports why it cannot connect.
     fn room(&self, purpose: &weaver_tunnel::pipe::Purpose) -> Result<(), Vec<Arc<Notify>>> {
-        let members: Vec<_> = self
-            .state
-            .members
-            .read()
-            .expect("pool members")
-            .values()
-            .cloned()
-            .collect();
-        let mut waits = vec![self.state.changed.clone()];
-        let mut dialable = false;
-        for member in members {
-            if member.status.lock().expect("pool member").blocked.is_some() {
-                continue;
-            }
-            dialable = true;
-            match member.dialer.room(purpose) {
-                Ok(()) => return Ok(()),
-                Err(freed) => waits.extend(freed),
-            }
+        match self.state.room(purpose) {
+            (Room::Some | Room::Undialable, _) => Ok(()),
+            (Room::None, waits) => Err(waits),
         }
-        if dialable { Err(waits) } else { Ok(()) }
     }
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
         if self.state.stopped.load(Ordering::Acquire) {
@@ -1055,7 +1080,7 @@ impl Dialer for PoolStage {
             // the caller waits for: a socket freed on any member, or a change
             // to the members, is room again.
             Err(DialError::AtCapacity(mut waits)) => {
-                waits.extend(self.room(&target.purpose).err().unwrap_or_default());
+                waits.extend(self.state.room(&target.purpose).1);
                 Err(DialError::AtCapacity(waits))
             }
             result => result,

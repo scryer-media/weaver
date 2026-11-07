@@ -2405,3 +2405,58 @@ async fn a_probes_room_is_the_cooling_rung_it_dials() {
     assert!(Arc::ptr_eq(&waits[0], &freed));
     assert!(ladder.room(&nntp(true)).is_ok());
 }
+
+// An ordinary dial skips a cooling rung, so with the next rung full it waits
+// on that rung's share and on the cooling rung's cooldown: the ladder
+// raises that signal when the cooldown ends, and the rung has room again.
+#[tokio::test(start_paused = true)]
+async fn a_dial_that_skipped_a_cooling_rung_wakes_when_its_cooldown_ends() {
+    let freed = Arc::new(Notify::new());
+    let ladder = Fallback::new(vec![
+        Arc::new(Roomy(None)),
+        Arc::new(Roomy(Some(freed.clone()))),
+    ]);
+    ladder.report_rung(0, Some(&DialError::Egress(io::Error::other("path down"))));
+    let nntp = Purpose::Nntp {
+        server: 1,
+        leg: 0,
+        probing: false,
+    };
+    let waits = ladder.room(&nntp).unwrap_err();
+    assert!(waits.iter().any(|wait| Arc::ptr_eq(wait, &freed)));
+    let cooled: Vec<_> = waits
+        .iter()
+        .filter(|wait| !Arc::ptr_eq(wait, &freed))
+        .cloned()
+        .collect();
+    assert_eq!(cooled.len(), 1);
+    let notified = cooled[0].notified();
+    tokio::pin!(notified);
+    notified.as_mut().enable();
+    assert!(ladder.room(&nntp).is_err());
+    notified.await;
+    assert!(ladder.room(&nntp).is_ok());
+    assert_eq!(ladder.rung_states()[0], "FAILING");
+}
+
+// A rung that is cooling and full gives both of its signals.
+#[tokio::test(start_paused = true)]
+async fn a_cooling_rung_that_is_full_gives_its_share_signal_too() {
+    let skipped = Arc::new(Notify::new());
+    let freed = Arc::new(Notify::new());
+    let ladder = Fallback::new(vec![
+        Arc::new(Roomy(Some(skipped.clone()))),
+        Arc::new(Roomy(Some(freed.clone()))),
+    ]);
+    ladder.report_rung(0, Some(&DialError::Egress(io::Error::other("path down"))));
+    let waits = ladder
+        .room(&Purpose::Nntp {
+            server: 1,
+            leg: 0,
+            probing: false,
+        })
+        .unwrap_err();
+    assert_eq!(waits.len(), 3);
+    assert!(waits.iter().any(|wait| Arc::ptr_eq(wait, &skipped)));
+    assert!(waits.iter().any(|wait| Arc::ptr_eq(wait, &freed)));
+}
