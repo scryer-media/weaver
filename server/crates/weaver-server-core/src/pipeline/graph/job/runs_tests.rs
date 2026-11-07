@@ -183,6 +183,36 @@ async fn only_a_changed_observed_closed_length_invalidates_the_run() {
     }
 }
 
+// A run that read an open volume's declared length built on it, as on a
+// closed one: the volume closing at another length starts the run over, and
+// closing at the declared one keeps it.
+#[tokio::test]
+async fn an_open_volume_that_closes_at_another_length_than_declared_retracts_the_run() {
+    for (closes_at, invalidated) in [(48, false), (47, true)] {
+        let (mut job, node, shelf, _directory) = echo_job(2, 48);
+        set_closed(&mut job, node, 1, false);
+        let generation = shelf.begin();
+        let declared = shelf.update(|state| {
+            let kept = state.kept.get_mut(&1).unwrap();
+            assert_eq!(kept.closed, None, "the volume is open");
+            kept.length_read = kept.sized;
+            kept.sized
+        });
+        assert_eq!(declared, Some(48), "the shelf is fed the declared length");
+        job.tree.namespace_mut(NodeId::ROOT).unwrap().recognise(
+            MemberId(1),
+            "set.part2.rar",
+            closes_at,
+        );
+        set_closed(&mut job, node, 1, true);
+        assert_eq!(
+            shelf.generation() != generation,
+            invalidated,
+            "closed at {closes_at}"
+        );
+    }
+}
+
 // An article of one archive brings up that archive's engine alone: of the
 // fifty engines' shelves, only its own is locked, and it is fed what its
 // volume now holds.

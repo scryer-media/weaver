@@ -69,6 +69,9 @@ pub(crate) struct Kept {
     // The length, once its member closed, and whether nothing more will
     // come at all, not even a repair: what is missing then is lost.
     pub(crate) closed: Option<u64>,
+    // The length its member declared, known before it closes: where a run
+    // that reads a set from its tail finds the tail while the volume grows.
+    pub(crate) sized: Option<u64>,
     // The length the volume last closed at, kept across a reopen: a run
     // that read past the volume built on it until it closes at another.
     pub(crate) closed_at: Option<u64>,
@@ -96,6 +99,7 @@ impl Kept {
             leaf,
             coverage: Coverage::new(),
             closed: None,
+            sized: None,
             closed_at: None,
             settled: false,
             reached: 0,

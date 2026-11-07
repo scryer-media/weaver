@@ -2,9 +2,12 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // One run of the zip engine. The zip library reads the directory first, at
-// the set's tail, so the run waits for every volume's length before it
-// reads anything, then walks the entries in directory order, each decoded
-// straight into the sink with its CRC checked as it goes.
+// the set's tail, so the run's first reads wait for the tail to land, where
+// the last volume's declared length puts it; it then walks the entries in
+// directory order, each decoded straight into the sink with its CRC checked
+// as it goes. Reads wait for bytes still on their way, so the run inflates
+// as the download brings each entry, never ahead of it. A verdict waits for
+// the volumes to close: the lengths it rests on are final only then.
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -52,6 +55,7 @@ impl Extraction for Run {
             }
             Err(_) => return,
         };
+        let disks = image.disks();
         let mut walk = Walk {
             sink,
             next: 0,
@@ -61,8 +65,9 @@ impl Extraction for Run {
         let Err(Some(verdict)) = walk.all(image, self.password.as_deref()) else {
             return;
         };
-        // An owner that failed a read already knows why too.
-        if failed.load(Ordering::Acquire) {
+        // An owner that failed a read already knows why too, as it does
+        // when a volume closed at another length than the run read.
+        if failed.load(Ordering::Acquire) || !disks.settled() {
             return;
         }
         // A member left open was built on bytes the run cannot vouch for.

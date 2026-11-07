@@ -51,6 +51,28 @@ pub trait Volumes: Send + Sync {
     // The volume's length, once it is closed.
     fn len(&self, volume: VolumeIndex) -> Option<u64>;
 
+    // The volumes bound now, in the set's order, without waiting on a gap
+    // between them: a set whose last volume says in its own tail how many
+    // come before it reads that first. Waits only while none is bound and
+    // one can still be. A view that cannot tell walks `next`.
+    fn bound(&self) -> io::Result<Vec<VolumeIndex>> {
+        let mut bound = Vec::new();
+        while let Some(volume) = self.next(bound.last().copied())? {
+            bound.push(volume);
+        }
+        Ok(bound)
+    }
+
+    // The volume's length before it closes, as its producer declared it,
+    // or its closed length, waiting while neither is known and the volume
+    // can still be bound; `None` for one that never will be. A declared
+    // length can be wrong: the volume may close at another, and a run that
+    // read this one is then started over. A view that knows no declared
+    // length answers as `len` does.
+    fn sized(&self, volume: VolumeIndex) -> io::Result<Option<u64>> {
+        Ok(self.len(volume))
+    }
+
     // Whether no read of the volume waits or fails: it is closed, and every
     // byte of it is in. Work on a lent pool reads only such volumes. A view
     // that cannot tell says no.
