@@ -772,6 +772,18 @@ impl Dialer for Weighted {
             .iter()
             .any(|a| a.target > a.open.saturating_add(a.opening))
     }
+    // Room on a leg with capacity left, in the share of the tunnel that
+    // leg's next socket for `purpose` would take.
+    fn has_room(&self, purpose: &weaver_tunnel::pipe::Purpose) -> bool {
+        let legs = self.legs.read().expect("route stages");
+        self.allocations()
+            .iter()
+            .filter(|a| a.target > a.open.saturating_add(a.opening))
+            .any(|a| {
+                legs.get(a.position)
+                    .is_some_and(|leg| leg.has_room(purpose))
+            })
+    }
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
         let opening = self.begin()?;
         let position = opening.position;
