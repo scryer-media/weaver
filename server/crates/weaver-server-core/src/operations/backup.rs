@@ -208,6 +208,10 @@ async fn table_has_column(
     Ok(false)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: writes a backup file on its own connection, never the live database"
+)]
 async fn copy_stable_tables_to_backup(
     snapshot_path: PathBuf,
     dest: PathBuf,
@@ -257,6 +261,10 @@ async fn copy_stable_tables_to_backup(
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: Postgres, no writer gate"
+)]
 async fn copy_postgres_stable_tables_to_backup(
     pool: PgPool,
     dest: PathBuf,
@@ -395,6 +403,10 @@ async fn postgres_columns(
         .collect()
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: Postgres, no writer gate"
+)]
 async fn import_stable_state_to_postgres(pool: PgPool, src: PathBuf) -> Result<(), StateError> {
     let mut source = SqliteConnectOptions::new()
         .filename(src)
@@ -551,6 +563,10 @@ async fn import_stable_state_to_postgres(pool: PgPool, src: PathBuf) -> Result<(
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: writes a backup file on its own connection, never the live database"
+)]
 async fn create_backup_table_schema(conn: &mut SqliteConnection) -> Result<(), StateError> {
     for table in LEGACY_V1_STABLE_TABLES
         .iter()
@@ -576,6 +592,10 @@ async fn create_backup_table_schema(conn: &mut SqliteConnection) -> Result<(), S
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: writes a backup file on its own connection, never the live database"
+)]
 async fn create_backup_indexes(conn: &mut SqliteConnection) -> Result<(), StateError> {
     for table in LEGACY_V1_STABLE_TABLES
         .iter()
@@ -605,6 +625,10 @@ async fn create_backup_indexes(conn: &mut SqliteConnection) -> Result<(), StateE
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: writes a backup file on its own connection, never the live database"
+)]
 async fn rebuild_job_history_attributes(conn: &mut SqliteConnection) -> Result<(), StateError> {
     sqlx::raw_sql("DELETE FROM job_history_attributes")
         .execute(&mut *conn)
@@ -617,6 +641,10 @@ async fn rebuild_job_history_attributes(conn: &mut SqliteConnection) -> Result<(
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: runs under run_serialized_sqlite_connection, which holds the gate"
+)]
 async fn rebuild_job_history_attributes_tx(
     tx: &mut Transaction<'_, Sqlite>,
 ) -> Result<(), StateError> {
@@ -676,6 +704,10 @@ impl Database {
         })
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: runs under run_serialized_sqlite_connection, which holds the gate"
+    )]
     pub fn export_stable_state(&self, dest: &Path) -> Result<StableStateExport, StateError> {
         let datastore = self.datastore();
         let schema_version = self.schema_version()?;
@@ -730,6 +762,10 @@ impl Database {
         })
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: runs under run_serialized_sqlite_connection, which holds the gate"
+    )]
     pub fn import_stable_state(&self, src: &Path) -> Result<(), StateError> {
         let src_path = src.to_string_lossy().to_string();
         let datastore = self.datastore();

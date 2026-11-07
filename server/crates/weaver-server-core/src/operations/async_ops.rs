@@ -335,6 +335,10 @@ async fn insert_history_delete_operation_tx(
 // `NULL` for a freshly queued target. Rows bind 6 parameters each
 // (operation_id, target_kind, target_id, state, error_message, sort_order), so
 // chunks stay under the dialect bind budget.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: a batch on the transaction run_in_transaction opened under the gate; Postgres has no writer gate"
+)]
 async fn bulk_insert_history_delete_targets_tx(
     tx: &mut SqlTx<'_>,
     operation_id: u64,

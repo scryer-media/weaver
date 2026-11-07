@@ -28,6 +28,10 @@ fn build_integration_events_pg_sql(row_count: usize) -> String {
     )
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: a batch on the transaction run_in_transaction opened under the gate; Postgres has no writer gate"
+)]
 async fn bulk_insert_integration_events_tx(
     tx: &mut SqlTx<'_>,
     events: &[IntegrationEventRow],

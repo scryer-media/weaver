@@ -10,6 +10,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::persistence::write_guard_tests::writer_gate_lift;
+
 // Built here so this file never counts as an exception itself.
 const LIFT: &str = concat!("clippy::", "disallowed", "_methods");
 
@@ -159,9 +161,11 @@ fn count_lifts(root: &Path, dir: &Path, found: &mut BTreeMap<String, usize>) {
                 count_lifts(root, &path, found);
             }
         } else if path.extension().is_some_and(|extension| extension == "rs") {
-            let count = std::fs::read_to_string(&path)
-                .unwrap()
-                .matches(LIFT)
+            // A lift of the write ban is pinned by the write guard instead.
+            let text = std::fs::read_to_string(&path).unwrap();
+            let count = text
+                .match_indices(LIFT)
+                .filter(|(at, _)| !writer_gate_lift(&text[at + LIFT.len()..]))
                 .count();
             if count > 0 {
                 let relative = path.strip_prefix(root).unwrap();

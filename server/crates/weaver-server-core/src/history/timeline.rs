@@ -39,6 +39,10 @@ pub const JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER: &str = "__timeline:finalizing-
 // Per-job (kind, first_ts, last_ts) event bounds keyed by job id.
 pub type JobEventStageBounds = std::collections::HashMap<u64, Vec<(String, i64, i64)>>;
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: a batch on the transaction run_in_transaction opened under the gate; Postgres has no writer gate"
+)]
 async fn bulk_insert_job_events_tx(
     tx: &mut SqlTx<'_>,
     events: &[JobEvent],

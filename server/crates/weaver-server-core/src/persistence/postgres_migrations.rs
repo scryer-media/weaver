@@ -91,6 +91,10 @@ pub(crate) async fn replay_catalog_into_fresh_db(
     .await
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: Postgres, no writer gate; the migration run is alone at startup"
+)]
 pub(crate) async fn run_migrations(pool: &PgPool, mode: MigrationMode) -> Result<(), StateError> {
     let catalog = crate::schema_migrations::embedded_catalog()?;
 
@@ -193,6 +197,10 @@ async fn run_migrations_locked(
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: Postgres, no writer gate; the migration run is alone at startup"
+)]
 async fn ensure_migration_ledger_shape(pool: &PgPool) -> Result<(), StateError> {
     sqlx::raw_sql(
         r#"
@@ -294,6 +302,10 @@ async fn load_applied_migrations(pool: &PgPool) -> Result<Vec<MigrationLedgerRow
         .collect()
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: Postgres, no writer gate; the migration run is alone at startup"
+)]
 async fn mirror_schema_version_to_latest_successful_migration(
     pool: &PgPool,
 ) -> Result<(), StateError> {
@@ -411,6 +423,10 @@ fn validate_known_migrations(
 // These rows were written by a build whose checkout carried the other line
 // ending (GitHub's Windows runner checks out with `core.autocrlf=true`), so
 // they hash the same SQL in a different form.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: Postgres, no writer gate; the migration run is alone at startup"
+)]
 async fn heal_line_ending_checksums(
     pool: &PgPool,
     catalog: &CompiledMigrationCatalog,
@@ -460,6 +476,10 @@ async fn app_object_count(pool: &PgPool) -> Result<i64, StateError> {
     .map_err(db_err)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: Postgres, no writer gate; the migration run is alone at startup"
+)]
 async fn apply_postgres_baseline(
     pool: &PgPool,
     catalog: &CompiledMigrationCatalog,
@@ -527,6 +547,10 @@ async fn apply_version_range(
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: Postgres, no writer gate; the migration run is alone at startup"
+)]
 async fn apply_single_migration(
     pool: &PgPool,
     migration: &CompiledMigration,
@@ -618,6 +642,10 @@ fn implemented_postgres_rust_hooks() -> &'static [&'static str] {
     ]
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: Postgres, no writer gate; the migration run is alone at startup"
+)]
 async fn restart_active_jobs_drop_active_segments_v28(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<(), StateError> {
@@ -683,6 +711,10 @@ async fn restart_active_jobs_drop_active_segments_v28(
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: Postgres, no writer gate; the migration run is alone at startup"
+)]
 async fn insert_applied_migration(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     migration: &CompiledMigration,
