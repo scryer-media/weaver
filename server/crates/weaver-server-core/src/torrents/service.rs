@@ -83,6 +83,7 @@ use crate::torrents::{
 
 #[cfg(test)]
 mod tests;
+pub mod fingerprint;
 pub mod updates;
 
 /// How often torrents are read and their routes checked.

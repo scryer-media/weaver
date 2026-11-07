@@ -8,7 +8,10 @@
 //! read again on a beat as well.
 //!
 //! The first push is every followed torrent; each later one only the
-//! torrents that changed or came, and the ids of those gone.
+//! torrents that changed or came, and the ids of those gone. Every torrent's
+//! follower leaves out the fields that move with the clock alone when it
+//! tells a change, or each beat would carry every running torrent; one
+//! torrent's follower, which shows those seconds, counts them.
 
 use std::collections::HashMap;
 use std::future::{Future, poll_fn};
@@ -19,6 +22,7 @@ use tokio::sync::watch;
 use tokio::time::{Interval, MissedTickBehavior};
 use weaver_torrent::TrackerAnnounce;
 
+use super::fingerprint::ViewParts;
 use super::{TorrentService, TorrentView};
 use crate::jobs::JobId;
 
@@ -28,7 +32,8 @@ pub struct TorrentUpdates {
     job_id: Option<JobId>,
     beat: Interval,
     queue: Option<watch::Receiver<u64>>,
-    last: Option<HashMap<JobId, TorrentView>>,
+    // Each torrent last given, by its fingerprint.
+    last: Option<HashMap<JobId, u64>>,
 }
 
 /// What moved since the last push.
@@ -94,7 +99,8 @@ impl TorrentUpdates {
                 queue.borrow_and_update();
             }
             let views = self.read().await;
-            if let Some(changes) = changes(&mut self.last, views) {
+            let parts = self.parts();
+            if let Some(changes) = changes(&mut self.last, views, parts) {
                 return changes;
             }
             tokio::select! {
@@ -102,6 +108,16 @@ impl TorrentUpdates {
                 () = published(&mut self.queue) => {}
                 _ = self.beat.tick() => {}
             }
+        }
+    }
+
+    // What a change is told by: one torrent's follower shows its seconds,
+    // every torrent's follower reads the list's fields.
+    fn parts(&self) -> ViewParts {
+        if self.job_id.is_some() {
+            ViewParts::Whole
+        } else {
+            ViewParts::Steady
         }
     }
 
@@ -113,39 +129,35 @@ impl TorrentUpdates {
     }
 }
 
-// What `views` moved from `last`, kept as the new `last`; `None` when
-// nothing did.
+// What `views` moved from `last` in the fields `parts` covers, kept as the
+// new `last`; `None` when nothing did.
 pub(super) fn changes(
-    last: &mut Option<HashMap<JobId, TorrentView>>,
+    last: &mut Option<HashMap<JobId, u64>>,
     views: Vec<TorrentView>,
+    parts: ViewParts,
 ) -> Option<TorrentChanges> {
-    let Some(before) = last.as_ref() else {
-        *last = Some(
-            views
-                .iter()
-                .map(|view| (view.job_id, view.clone()))
-                .collect(),
-        );
+    let now: HashMap<JobId, u64> = views
+        .iter()
+        .map(|view| (view.job_id, view.fingerprint(parts)))
+        .collect();
+    let Some(before) = last.replace(now) else {
         return Some(TorrentChanges {
             full_update: true,
             torrents: views,
             removed: Vec::new(),
         });
     };
-    let torrents: Vec<TorrentView> = views
-        .iter()
-        .filter(|view| before.get(&view.job_id) != Some(*view))
-        .cloned()
-        .collect();
-    let now: HashMap<JobId, TorrentView> =
-        views.into_iter().map(|view| (view.job_id, view)).collect();
+    let now = last.as_ref().expect("just kept");
     let mut removed: Vec<JobId> = before
         .keys()
         .filter(|job_id| !now.contains_key(job_id))
         .copied()
         .collect();
     removed.sort_unstable_by_key(|job_id| job_id.0);
-    *last = Some(now);
+    let torrents: Vec<TorrentView> = views
+        .into_iter()
+        .filter(|view| before.get(&view.job_id) != now.get(&view.job_id))
+        .collect();
     (!torrents.is_empty() || !removed.is_empty()).then_some(TorrentChanges {
         full_update: false,
         torrents,

@@ -4443,6 +4443,8 @@ async fn a_trackers_status_follows_its_announces() {
 // changed or came and the ids of the ones gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_follower_is_given_only_what_moved_after_the_first_push() {
+    use fingerprint::ViewParts::Steady;
+
     let rig = rig(set_clock());
     rig.service.open().await.unwrap();
     let mut views = Vec::new();
@@ -4457,26 +4459,65 @@ async fn a_follower_is_given_only_what_moved_after_the_first_push() {
     let (one, two) = (views[0].clone(), views[1].clone());
     let mut last = None;
 
-    let first = updates::changes(&mut last, views.clone()).unwrap();
+    let first = updates::changes(&mut last, views.clone(), Steady).unwrap();
     assert!(first.full_update);
     assert_eq!(first.torrents, views);
     assert!(first.removed.is_empty());
-    assert_eq!(updates::changes(&mut last, views), None);
+    assert_eq!(updates::changes(&mut last, views, Steady), None);
 
     let mut paused = two.clone();
     paused.state = TorrentState::Paused;
-    let moved = updates::changes(&mut last, vec![one.clone(), paused.clone()]).unwrap();
+    let moved = updates::changes(&mut last, vec![one.clone(), paused.clone()], Steady).unwrap();
     assert!(!moved.full_update);
     assert_eq!(moved.torrents, [paused]);
     assert!(moved.removed.is_empty());
 
-    let gone = updates::changes(&mut last, vec![one.clone()]).unwrap();
+    let gone = updates::changes(&mut last, vec![one.clone()], Steady).unwrap();
     assert!(gone.torrents.is_empty());
     assert_eq!(gone.removed, [two.job_id]);
 
-    let back = updates::changes(&mut last, vec![one, two.clone()]).unwrap();
+    let back = updates::changes(&mut last, vec![one, two.clone()], Steady).unwrap();
     assert_eq!(back.torrents, [two]);
     assert!(back.removed.is_empty());
+}
+
+// The clock alone moves a seeding torrent's seconds: every torrent's
+// follower, which leaves them out, has nothing to push; one torrent's
+// follower, which shows them, pushes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_clock_alone_moves_only_one_torrents_follower() {
+    use fingerprint::ViewParts::{Steady, Whole};
+
+    let seeded = seeded().await;
+    // Nothing but the clock moves it from here: its seeder is gone and its
+    // rates have run down.
+    seeded.seeder.stop().await;
+    seeded.advance(60_000);
+    let mut follow = seeded
+        .rig
+        .service
+        .updates(Some(seeded.job_id), Duration::from_millis(10));
+    loop {
+        let view = &follow.next().await.torrents[0];
+        if view.peers == 0 && view.download_bps == 0 && view.upload_bps == 0 {
+            break;
+        }
+    }
+    let before = seeded.view().await;
+    seeded.advance(7_000);
+    let after = seeded.view().await;
+    assert_eq!(after.state, TorrentState::Seeding);
+    assert_eq!(after.active_seconds, before.active_seconds + 7);
+    assert_eq!(after.seeding_seconds, before.seeding_seconds + 7);
+
+    let (mut every, mut one) = (None, None);
+    assert!(updates::changes(&mut every, vec![before.clone()], Steady).is_some());
+    assert!(updates::changes(&mut one, vec![before], Whole).is_some());
+    assert_eq!(updates::changes(&mut every, vec![after.clone()], Steady), None);
+    let pushed = updates::changes(&mut one, vec![after.clone()], Whole).unwrap();
+    assert!(!pushed.full_update);
+    assert_eq!(pushed.torrents, [after]);
+    seeded.rig.service.stop().await;
 }
 
 // A follower hears a tracker's answer as it lands, with nothing in the queue
