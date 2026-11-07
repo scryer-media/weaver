@@ -647,6 +647,8 @@ async fn a_blocked_checkpoint_of_a_job_outside_the_pipeline_goes_to_it() {
                 self.0.lock().unwrap().push(error);
             }
         }
+
+        fn hold_clock(&self, _paused: bool) {}
     }
 
     let temp_dir = tempfile::tempdir().unwrap();
@@ -736,6 +738,53 @@ async fn a_global_or_speed_test_pause_holds_the_extraction_clock() {
     let graph = pipeline.graph_jobs.remove(&job_id).unwrap();
     pipeline.install_graph_job(job_id, graph, Vec::new());
     assert!(pipeline.graph_jobs[&job_id].clock_held());
+    retire_pipeline_database(pipeline).await;
+}
+
+// A job outside the pipeline, such as a torrent's unpacking, holds its
+// clock through a pause of every download as the pipeline's own jobs do,
+// and one that joins while they are paused starts held.
+#[tokio::test]
+async fn a_global_pause_holds_the_clock_of_a_job_outside_the_pipeline() {
+    use std::sync::Arc;
+
+    use super::engine::Hears;
+    use crate::jobs::{Hold, HoldOrigin, HoldOwner};
+
+    #[derive(Default)]
+    struct Clock(std::sync::Mutex<Vec<bool>>);
+    impl Hears for Clock {
+        fn said(&self, _said: Said, _slots: usize) {}
+
+        fn hold_clock(&self, paused: bool) {
+            self.0.lock().unwrap().push(paused);
+        }
+    }
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let (early, late) = (JobId(92_108), JobId(92_109));
+    let first = Arc::new(Clock::default());
+    pipeline
+        .graph_outside
+        .join(early.0, Arc::clone(&first) as Arc<dyn Hears>);
+    pipeline.shared_state.hold(Hold::manual(HoldOwner::All));
+    pipeline.apply_queue_intents().await;
+    let second = Arc::new(Clock::default());
+    pipeline
+        .graph_outside
+        .join(late.0, Arc::clone(&second) as Arc<dyn Hears>);
+    pipeline
+        .shared_state
+        .release(HoldOrigin::Manual, HoldOwner::All);
+    pipeline.apply_queue_intents().await;
+    assert_eq!(first.0.lock().unwrap().first(), Some(&false));
+    assert!(first.0.lock().unwrap().contains(&true));
+    assert_eq!(first.0.lock().unwrap().last(), Some(&false));
+    assert_eq!(second.0.lock().unwrap().first(), Some(&true));
+    assert_eq!(second.0.lock().unwrap().last(), Some(&false));
+    pipeline.graph_outside.leave(early.0);
+    pipeline.graph_outside.leave(late.0);
     retire_pipeline_database(pipeline).await;
 }
 

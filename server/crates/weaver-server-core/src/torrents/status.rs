@@ -172,6 +172,9 @@ pub struct Observed {
     pub held: Option<Held>,
     /// Its directory is being moved; it goes on from the new one.
     pub moving: bool,
+    /// Why its restore is held, while it is: one a crash holds keeps the
+    /// torrent paused, or stopped, until a resume.
+    pub restore_held: Option<String>,
 }
 
 impl Observed {
@@ -190,11 +193,17 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
         return (TorrentState::Moving, None);
     }
     match seen.intent {
-        TorrentIntent::Paused => return (TorrentState::Paused, None),
+        TorrentIntent::Paused => {
+            return (
+                TorrentState::Paused,
+                seen.restore_held.clone().map(Why::Said),
+            );
+        }
         TorrentIntent::Stopped => {
             let why = seen
-                .failed
+                .restore_held
                 .clone()
+                .or_else(|| seen.failed.clone())
                 .or_else(|| seen.seeding().then(|| GOAL_MET.to_owned()));
             return (TorrentState::Stopped, why.map(Why::Said));
         }
@@ -609,6 +618,7 @@ mod tests {
             failed: None,
             held: None,
             moving: false,
+            restore_held: None,
         }
     }
 

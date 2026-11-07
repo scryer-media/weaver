@@ -198,6 +198,7 @@ pub(crate) async fn run(
     let initial_holds = recovered_state.initial_holds;
     let after_boot = recovered_state.after_boot;
     let crashed = recovered_state.crashed;
+    let crashed_torrents = recovered_state.crashed_torrents;
 
     // Publish recovered history to shared state so the API has data immediately.
     shared_state.load_history(initial_history.clone());
@@ -322,6 +323,7 @@ pub(crate) async fn run(
             &proxies,
             &pipeline,
             handle.clone(),
+            crashed_torrents,
         )
         .await
         {

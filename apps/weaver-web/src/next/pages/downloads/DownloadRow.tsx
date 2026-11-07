@@ -66,7 +66,11 @@ export const DownloadRow = memo(function DownloadRow({
   const progress = useJobProgress(job);
   const liveRate = useDownloadRate(job);
   // A held download moves nothing, whatever the last rate the daemon sent.
-  const rate = useHeldRate(held === null ? liveRate : 0, held === null && isActiveStatus(progress.status) ? progress.status : null);
+  // A torrent's zero is its swarm gone quiet, so it shows as it comes.
+  const rate = useHeldRate(
+    held === null ? liveRate : 0,
+    held === null && job.protocol !== "TORRENT" && isActiveStatus(progress.status) ? progress.status : null,
+  );
   const name = formatJobReleaseName(job);
   const isPaused = statusToken(job.status) === "paused";
   // The phase the label names, or failing that the last one with a bar; a

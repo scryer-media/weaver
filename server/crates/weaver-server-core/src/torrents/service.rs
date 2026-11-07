@@ -50,6 +50,7 @@ use crate::pipeline::graph::status::RepairSlots;
 use crate::proxies::{
     Consumer, LegTenancy, LegTenant, NetworkRuntime, ResolvedBy, SessionTraffic, TorrentScope,
 };
+use crate::runtime::panic_trap::JobScope;
 use crate::settings::model::{TrackerCertificate, TrackerRule, tracker_rule_for};
 use crate::settings::{
     Client, Config, Leaf, Level, Levels, SeedTimeCounting, Seeding, SeedingAction, SeedingGoalMode,
@@ -113,7 +114,7 @@ pub(crate) fn times_offset_ms(job_id: JobId) -> i64 {
 // How many torrents' jobs are restored from their checkpoints at once.
 const RESTORES_AT_ONCE: usize = 8;
 
-/// The most pieces a torrent's checkpoint goes without between ticks: once
+/// The most pieces a torrent's ledger goes without between ticks: once
 /// this many pieces reached its job, or left it, since the checkpoint was
 /// last written, it is written at once, so a crash fetches again at most
 /// these and those that verified while that write was on its way. A
@@ -620,6 +621,7 @@ impl TorrentService {
         proxies: &Arc<crate::proxies::ProxyRuntime>,
         pipeline: &crate::pipeline::Pipeline,
         queue: SchedulerHandle,
+        crashed: crate::runtime::panic_trap::CrashMarks,
     ) -> Result<Self, String> {
         let routes = NetworkRoutes::new(db.clone(), Arc::clone(proxies), ROUTE_TIMEOUT);
         let sessions = Sessions::new(Arc::new(routes), SessionEnv::of(config), db.clone());
@@ -631,6 +633,7 @@ impl TorrentService {
             Arc::new(SystemClock),
         );
         service.publish_to(queue);
+        service.park_crashed(crashed);
         service.inner.sessions.turn(config.torrent.enabled).await;
         service.start().await?;
         Ok(service)
@@ -1707,6 +1710,7 @@ impl Live {
             failed: self.refusal(),
             held: self.held.clone(),
             moving: self.moving.is_some(),
+            restore_held: self.restore_held.clone(),
         }
     }
 }
@@ -2014,6 +2018,9 @@ struct Inner {
     // both, so a restore whose awaiting task ends still holds them.
     restoring: std::sync::Mutex<HashMap<JobId, Arc<tokio::sync::Mutex<()>>>>,
     restore_permits: Arc<tokio::sync::Semaphore>,
+    // The torrents whose work crashed the daemon on its last run: each is
+    // kept paused, its job not restored, until a resume takes its marker.
+    crash_marks: Mutex<crate::runtime::panic_trap::CrashMarks>,
     signal: Arc<Signal>,
     ticks: watch::Sender<u64>,
     retired: watch::Sender<u64>,
@@ -2076,6 +2083,7 @@ impl TorrentService {
                 live: tokio::sync::Mutex::new(BTreeMap::new()),
                 restoring: std::sync::Mutex::new(HashMap::new()),
                 restore_permits: Arc::new(tokio::sync::Semaphore::new(RESTORES_AT_ONCE)),
+                crash_marks: Mutex::default(),
                 signal: Arc::new(Signal::default()),
                 ticks: watch::channel(0).0,
                 retired: watch::channel(0).0,
@@ -2095,6 +2103,26 @@ impl TorrentService {
                 }),
             }),
         }
+    }
+
+    // The torrents that crashed the daemon on its last run, read at start
+    // before any torrent's job is restored.
+    pub(crate) fn park_crashed(&self, marks: crate::runtime::panic_trap::CrashMarks) {
+        *self
+            .inner
+            .crash_marks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = marks;
+    }
+
+    // Why the torrent is kept paused, while its work crashed the daemon.
+    fn crashed(&self, job_id: JobId) -> Option<String> {
+        self.inner
+            .crash_marks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(job_id)
+            .map(|mark| mark.reason())
     }
 
     fn settings(&self) -> TorrentSettings {
@@ -2376,6 +2404,18 @@ impl TorrentService {
         let now = self.inner.clock.now_ms();
         self.read(now, true).await;
         self.inner.sessions.stop_all().await;
+        // Every tee's checkpoint goes at once, whether or not it was due.
+        let tees: Vec<(JobId, Arc<Tee>)> = {
+            let live = self.inner.live.lock().await;
+            live.iter()
+                .filter_map(|(&job_id, torrent)| {
+                    Some((job_id, Arc::clone(torrent.store.as_ref()?.tee()?)))
+                })
+                .collect()
+        };
+        for (job_id, tee) in tees {
+            self.checkpoint_tee(job_id, tee, true).await;
+        }
         self.save_checkpoints(self.inner.signal.take_unsaved())
             .await;
         // libtorrent `torrent::abort` waits out the disk jobs outstanding:
@@ -2551,7 +2591,7 @@ impl TorrentService {
                 continue;
             }
             if tee.with(|job| job.awaits_commit() || job.moves_waiting()) {
-                self.checkpoint_tee(job_id, Arc::clone(tee)).await;
+                self.checkpoint_tee(job_id, Arc::clone(tee), false).await;
             }
             if whole && tee.done() && self.unpacked(job_id, &store, tee).await {
                 self.completed(job_id).await;
@@ -2599,7 +2639,11 @@ impl TorrentService {
         let spent = match tokio::task::spawn_blocking(move || releasing.spent()).await {
             Ok(Ok(spent)) => spent,
             Ok(Err(why)) => {
-                tracing::warn!(job_id = job_id.0, why, "a torrent's unpacked files wait on its job");
+                tracing::warn!(
+                    job_id = job_id.0,
+                    why,
+                    "a torrent's unpacked files wait on its job"
+                );
                 self.unclaim_outputs(job_id).await;
                 return false;
             }
@@ -2614,6 +2658,7 @@ impl TorrentService {
         let work = tee.work().to_path_buf();
         let (planned, tee) = (Arc::clone(store), Arc::clone(tee));
         let planned = tokio::task::spawn_blocking(move || {
+            let _job = JobScope::enter(job_id);
             let files = planned.files();
             let listed: Vec<PathBuf> = files.names().flatten().map(Path::to_path_buf).collect();
             plan_outputs(tee.work(), &files.dir(), &listed, &spent)
@@ -2635,9 +2680,12 @@ impl TorrentService {
         });
         self.recorded(job_id, kept.await);
         let (from, moving) = (work.clone(), Arc::clone(&outputs));
-        let placed = tokio::task::spawn_blocking(move || moving.place(&from))
-            .await
-            .unwrap_or(false);
+        let placed = tokio::task::spawn_blocking(move || {
+            let _job = JobScope::enter(job_id);
+            moving.place(&from)
+        })
+        .await
+        .unwrap_or(false);
         let names = if placed {
             outputs.names.clone()
         } else {
@@ -2688,22 +2736,10 @@ impl TorrentService {
             .await;
     }
 
-    // Write the checkpoints of `jobs`, each with its torrent's ledger. The
-    // tees' checkpoints are queued first, off the service's lock: one waits
-    // on its job, which an intake writing to disk may hold.
+    // Write the checkpoints of `jobs`: each torrent's pieces with its
+    // ledger. A tee checkpoints its job on its own, as a job of the
+    // pipeline's does, once the bytes it took or their age make a write due.
     async fn save_checkpoints(&self, jobs: BTreeSet<JobId>) {
-        let tees: Vec<(JobId, Arc<Tee>)> = {
-            let live = self.inner.live.lock().await;
-            jobs.iter()
-                .filter_map(|&job_id| {
-                    let tee = live.get(&job_id)?.store.as_ref()?.tee()?;
-                    Some((job_id, Arc::clone(tee)))
-                })
-                .collect()
-        };
-        for (job_id, tee) in tees {
-            self.checkpoint_tee(job_id, tee).await;
-        }
         let now = self.inner.clock.now_ms();
         let saves: Vec<CheckpointSave> = {
             let mut live = self.inner.live.lock().await;
@@ -2794,10 +2830,10 @@ impl TorrentService {
     // ledger and peers as they stand now, in one transaction: what a crash
     // recovers is the pieces and the counters of one moment. The ledger is
     // taken in the step that queues it, as every write of it is. Its tee's
-    // checkpoint is queued beside it, as the pipeline writes its jobs': a
-    // share the tee's checkpoint lacks of a piece kept here goes to it again
-    // from the files at the next start. None when the torrent has no store.
-    // The tee's is queued before this, by [`Self::checkpoint_tee`].
+    // checkpoint is written apart from it, as the pipeline writes its
+    // jobs': a share the tee's checkpoint lacks of a piece kept here goes to
+    // it again from the files at the next start. None when the torrent has
+    // no store.
     fn queue_checkpoint(&self, torrent: &mut Live, now: i64) -> Option<CheckpointSave> {
         let job_id = torrent.record.job_id;
         let store = Arc::clone(torrent.store.as_ref()?);
@@ -2829,11 +2865,10 @@ impl TorrentService {
     }
 
     // Queue a checkpoint of the torrent's unpacking on a blocking thread:
-    // it waits on the job, which an intake writing to disk may hold.
-    async fn checkpoint_tee(&self, job_id: JobId, tee: Arc<Tee>) {
-        let db = self.inner.db.clone();
-        let mail = self.inner.env.written.clone();
-        let queued = tokio::task::spawn_blocking(move || tee.checkpoint(&db, &mail)).await;
+    // it waits on the job, which an intake writing to disk may hold. Its
+    // write goes at once when `force`, and otherwise once it is due.
+    async fn checkpoint_tee(&self, job_id: JobId, tee: Arc<Tee>, force: bool) {
+        let queued = tokio::task::spawn_blocking(move || tee.checkpoint(force)).await;
         if let Ok(Err(error)) = queued {
             tracing::warn!(job_id = job_id.0, error = %error, "could not checkpoint a torrent's unpacking");
         }
@@ -2988,6 +3023,7 @@ impl TorrentService {
         made: Making,
         hold: Hold<W>,
     ) -> Result<(TorrentStore, Vec<Note>), Unmade<W>> {
+        let _job = JobScope::enter(job_id);
         let Making {
             files,
             layout,
@@ -3084,6 +3120,8 @@ impl TorrentService {
             signal: Arc::clone(&self.inner.signal),
             outside: Arc::clone(&env.outside),
             limit: env.slots,
+            db: self.inner.db.clone(),
+            mail: env.written.clone(),
         };
         let storage = || self.storage(work.clone(), layout, &plan, passwords.clone());
         if let Some(rows) = rows {
@@ -3139,6 +3177,9 @@ impl TorrentService {
             Box::new(move |heard| signal.heard(job_id, heard)),
         ));
         torrent.file_have = store.file_have();
+        if let Some(tee) = store.tee() {
+            tee.hold_own_clock(torrent.record.intent == TorrentIntent::Paused);
+        }
         torrent.store = Some(store);
         torrent.intake = Some(intake);
     }
@@ -3277,6 +3318,12 @@ impl TorrentService {
                 .expect("the restore permits are never closed"),
         );
         let _done = Done(self, job_id);
+        // A torrent whose work crashed the daemon would restore into the
+        // same panic: it is kept paused, with why, and its job is not
+        // rebuilt until a resume takes its marker.
+        if self.park(job_id).await {
+            return false;
+        }
         let waiting = {
             let live = self.inner.live.lock().await;
             live.get(&job_id)
@@ -3348,6 +3395,33 @@ impl TorrentService {
                 false
             }
         }
+    }
+
+    // Keep a torrent that crashed the daemon paused, its restore held for
+    // why, until a resume takes its marker. Its marker is read under the
+    // torrent's lock, which a resume takes after the marker, so a resume
+    // is never undone. Whether the torrent waits for a resume.
+    async fn park(&self, job_id: JobId) -> bool {
+        let mut live = self.inner.live.lock().await;
+        let Some(why) = self.crashed(job_id) else {
+            return false;
+        };
+        let Some(torrent) = live.get_mut(&job_id) else {
+            return true;
+        };
+        if torrent.record.intent == TorrentIntent::Resumed {
+            if let Err(error) = self
+                .inner
+                .db
+                .update_torrent_intent(job_id, TorrentIntent::Paused)
+            {
+                tracing::warn!(job_id = job_id.0, error = %error, "could not keep a crashed torrent's pause");
+            }
+            torrent.settle(self.inner.clock.now_ms());
+            torrent.record.intent = TorrentIntent::Paused;
+        }
+        torrent.restore_held = Some(why);
+        true
     }
 
     // Add a torrent. A metainfo becomes a job at once; a magnet needs its
@@ -4367,17 +4441,15 @@ impl TorrentService {
 
     // Take a torrent out of its session, its checkpoint written first when
     // it is behind the job, and what changed in its ledger and peers taken
-    // before the session lets it go.
+    // before the session lets it go. Its tee stays with it, and writes its
+    // own checkpoint when that is due, as it does in a session.
     async fn detach(&self, torrent: &mut Live) {
         let job_id = torrent.record.job_id;
         let now = self.inner.clock.now_ms();
-        if self.inner.signal.take_unsaved_one(job_id) {
-            if let Some(tee) = torrent.store.as_ref().and_then(|store| store.tee()) {
-                self.checkpoint_tee(job_id, Arc::clone(tee)).await;
-            }
-            if let Some(save) = self.queue_checkpoint(torrent, now) {
-                self.checkpoint_landed(save).await;
-            }
+        if self.inner.signal.take_unsaved_one(job_id)
+            && let Some(save) = self.queue_checkpoint(torrent, now)
+        {
+            self.checkpoint_landed(save).await;
         }
         torrent.settle(now);
         let landing = torrent
@@ -4582,6 +4654,9 @@ impl TorrentService {
                     .map_err(|error| ActionError::State(state_error(error)))?;
                 torrent.settle(now);
                 torrent.record.intent = intent;
+                if let Some(tee) = torrent.store.as_ref().and_then(|store| store.tee()) {
+                    tee.hold_own_clock(intent == TorrentIntent::Paused);
+                }
                 Ok(self.queue_resume(torrent, now, true))
             })
             .await?;
@@ -4817,6 +4892,23 @@ impl TorrentService {
 
     /// Resume a paused torrent, or one its seeding goal stopped.
     pub async fn resume(&self, job_id: JobId) -> Result<(), ActionError> {
+        // A resume is the go-ahead to restore a torrent that crashed the
+        // daemon. Its marker goes first, so a panic in the restore leaves a
+        // fresh one.
+        let mark = self
+            .inner
+            .crash_marks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take(job_id);
+        if let Some(mark) = mark {
+            mark.consume();
+            self.with_torrent(job_id, |torrent| {
+                torrent.restore_held = None;
+                Ok(())
+            })
+            .await?;
+        }
         self.set_intent(job_id, TorrentIntent::Resumed).await?;
         // A fetch the pause ended starts again.
         let refetch = self

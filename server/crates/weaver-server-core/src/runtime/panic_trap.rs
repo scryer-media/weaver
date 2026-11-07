@@ -325,6 +325,16 @@ impl CrashMarks {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    // The markers of the jobs `of` names, taken out to wait for those jobs'
+    // own restore.
+    pub fn split_off(&mut self, of: impl Fn(JobId) -> bool) -> CrashMarks {
+        let (taken, kept) = std::mem::take(&mut self.0)
+            .into_iter()
+            .partition(|(job, _)| of(*job));
+        self.0 = kept;
+        CrashMarks(taken)
+    }
 }
 
 // Reads the markers at start, before any job is restored. A daemon marker is
@@ -367,6 +377,38 @@ pub fn boot_marks(data_dir: &Path, restores: impl Fn(JobId) -> bool) -> CrashMar
         }
     }
     CrashMarks(waiting)
+}
+
+// `work` run with `trap` recording each panic of this thread, as the armed
+// trap does, the panic caught. The hook is process-wide: one caller owns it
+// at a time, and every other thread's panic goes to the hook it replaced.
+#[cfg(test)]
+pub(crate) fn trapped<R>(
+    trap: &std::sync::Arc<Trap>,
+    work: impl FnOnce() -> R + std::panic::UnwindSafe,
+) -> std::thread::Result<R> {
+    static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _hook = HOOK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let here = std::thread::current().id();
+    let previous = std::sync::Arc::new(std::panic::take_hook());
+    {
+        let trap = std::sync::Arc::clone(trap);
+        let previous = std::sync::Arc::clone(&previous);
+        std::panic::set_hook(Box::new(move |info| {
+            if std::thread::current().id() == here {
+                trap.record(info).unwrap();
+            } else {
+                previous(info);
+            }
+        }));
+    }
+    let caught = std::panic::catch_unwind(work);
+    let _ = std::panic::take_hook();
+    let previous = std::sync::Arc::try_unwrap(previous).unwrap_or_else(|_| unreachable!());
+    std::panic::set_hook(previous);
+    caught
 }
 
 #[cfg(test)]
@@ -521,37 +563,14 @@ mod tests {
         assert!(!dir.join("10").exists());
     }
 
-    // The hook is process-wide; this test owns it while it runs, and hands
-    // every panic but its own to the hook it replaced.
-    static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn a_real_panic_inside_a_jobs_work_leaves_its_marker() {
-        let _hook = HOOK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = tempfile::tempdir().unwrap();
         let trap = std::sync::Arc::new(Trap::new(temp.path(), "2.0.0"));
-        let here = std::thread::current().id();
-        let previous = std::sync::Arc::new(std::panic::take_hook());
-        {
-            let trap = std::sync::Arc::clone(&trap);
-            let previous = std::sync::Arc::clone(&previous);
-            std::panic::set_hook(Box::new(move |info| {
-                if std::thread::current().id() == here {
-                    trap.record(info).unwrap();
-                } else {
-                    previous(info);
-                }
-            }));
-        }
-        let caught = std::panic::catch_unwind(|| {
+        let caught = trapped(&trap, || {
             let _job = JobScope::enter(JobId(77));
             panic!("assert in a job's work: {}", 3);
         });
-        let _ = std::panic::take_hook();
-        let previous = std::sync::Arc::try_unwrap(previous).unwrap_or_else(|_| unreachable!());
-        std::panic::set_hook(previous);
 
         assert!(caught.is_err());
         assert_eq!(current_job(), None);

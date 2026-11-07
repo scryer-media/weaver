@@ -36,6 +36,7 @@ use crate::pipeline::graph::namespace::WriteError;
 use crate::pipeline::graph::root::intake::Decoded;
 use crate::pipeline::graph::root::phase::RootPhase;
 use crate::pipeline::graph::status::RepairSlots;
+use crate::runtime::panic_trap::JobScope;
 use tokio::sync::mpsc::UnboundedSender;
 
 #[cfg(test)]
@@ -122,22 +123,43 @@ pub(crate) struct Tee {
     signal: Arc<Signal>,
     outside: Arc<Outside>,
     limit: usize,
+    // Where the job's checkpoints go, and where the database's word on
+    // them, and the wake for one come due, come back.
+    db: crate::Database,
+    mail: UnboundedSender<Said>,
     // The first step of the job that failed, and why: unpacking is over for
     // the torrent, which keeps its files and seeds on.
     broken: Mutex<Option<String>>,
-    // Counts the words the job's runs said, heard.
+    // Why the job's writer refused its output, kept each time the job's
+    // lock is let go: what the torrent shows reads it without waiting on
+    // the job, which an intake writing to disk may hold.
+    refused: Mutex<Option<String>>,
+    // Where the words for the job go, in the order its task takes them.
+    words: tokio::sync::mpsc::UnboundedSender<Word>,
+    // Counts the words for the job, taken.
     heard: tokio::sync::watch::Sender<u64>,
     // A lend an intake found the repair slots busy for, left to the
     // service's next settle.
     owes_lend: std::sync::atomic::AtomicBool,
+    // The torrent is paused on its own: the job takes no slot.
+    paused: std::sync::atomic::AtomicBool,
     // Counts the checkpoints asked of the job, each before it waits on the
     // job's lock.
     #[cfg(test)]
     pub(crate) asked: tokio::sync::watch::Sender<u64>,
+    // Counts the words on the job's clock, taken.
+    #[cfg(test)]
+    clocked: tokio::sync::watch::Sender<u64>,
 }
 
-// A word for a tee's job, with the repair slots it may step with.
-type Word = (Said, usize);
+// A word for a tee's job: what its runs said, with the repair slots it may
+// step with, every download paused or resumed, or the torrent paused or
+// resumed on its own.
+enum Word {
+    Said(Said, usize),
+    Clock(bool),
+    Own(bool),
+}
 
 // One share of a piece that the job has yet to take.
 struct Share {
@@ -187,6 +209,8 @@ pub(super) struct Parts {
     pub(super) signal: Arc<Signal>,
     pub(super) outside: Arc<Outside>,
     pub(super) limit: usize,
+    pub(super) db: crate::Database,
+    pub(super) mail: UnboundedSender<Said>,
 }
 
 impl Tee {
@@ -198,6 +222,7 @@ impl Tee {
         storage: Storage,
         rows: GraphCheckpoint,
     ) -> Result<Arc<Self>, Unrestored> {
+        let _job = JobScope::enter(parts.job_id);
         let files = parts.plan.root_files(&parts.layout);
         let mut snapshot = checkpoint::snapshot(&rows)?;
         retry_from_top(&mut snapshot.passwords);
@@ -210,12 +235,14 @@ impl Tee {
 
     // A new job over the plan's files.
     pub(super) fn fresh(parts: Parts, storage: Storage) -> Arc<Self> {
+        let _job = JobScope::enter(parts.job_id);
         let files = parts.plan.root_files(&parts.layout);
         let job = GraphJob::admit(parts.job_id.0, &files, storage);
         Self::joined(parts, job)
     }
 
     fn joined(parts: Parts, job: GraphJob) -> Arc<Self> {
+        let (words, heard_words) = tokio::sync::mpsc::unbounded_channel();
         let tee = Arc::new(Self {
             job: Mutex::new(job),
             layout: parts.layout,
@@ -226,16 +253,79 @@ impl Tee {
             signal: parts.signal,
             outside: parts.outside,
             limit: parts.limit,
+            db: parts.db,
+            mail: parts.mail,
             broken: Mutex::new(None),
+            refused: Mutex::new(None),
+            words: words.clone(),
             heard: tokio::sync::watch::Sender::new(0),
             owes_lend: std::sync::atomic::AtomicBool::new(false),
+            paused: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             asked: tokio::sync::watch::Sender::new(0),
+            #[cfg(test)]
+            clocked: tokio::sync::watch::Sender::new(0),
         });
-        let (mail, words) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(hear(Arc::downgrade(&tee), words));
-        tee.outside.join(parts.job_id.0, Arc::new(Hearer { mail }));
+        tokio::spawn(hear(Arc::downgrade(&tee), heard_words));
+        tee.outside
+            .join(parts.job_id.0, Arc::new(Hearer { mail: words }));
         tee
+    }
+
+    // The torrent paused or resumed on its own. Paused, the job takes no
+    // slot, as a paused job of the pipeline's takes none, and its
+    // extraction deadline does not run while it, or every download, is
+    // paused; resumed, its runs start again.
+    pub(crate) fn hold_own_clock(&self, paused: bool) {
+        self.paused
+            .store(paused, std::sync::atomic::Ordering::Release);
+        let _ = self.words.send(Word::Own(paused));
+    }
+
+    // The slots the job may take of `offered`: none while the torrent is
+    // paused on its own.
+    fn slots(&self, offered: usize) -> usize {
+        if self.paused.load(std::sync::atomic::Ordering::Acquire) {
+            0
+        } else {
+            offered
+        }
+    }
+
+    // One word for the job, taken working for it, with the holds on its
+    // clock as they stood: those after it.
+    fn take(&self, word: Word, (all, own): (bool, bool)) -> (bool, bool) {
+        let _job = JobScope::enter(self.job_id);
+        match word {
+            Word::Said(said, slots) => {
+                self.heard(said, slots);
+                (all, own)
+            }
+            Word::Clock(all) => {
+                self.held_clock((all, own));
+                (all, own)
+            }
+            Word::Own(paused) => {
+                if own && !paused {
+                    let _ = self.resume();
+                }
+                self.held_clock((all, paused));
+                (all, paused)
+            }
+        }
+    }
+
+    // The count of the words for the job taken so far, which moves with
+    // each one.
+    #[cfg(test)]
+    pub(crate) fn taken(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.heard.subscribe()
+    }
+
+    // The count of the words on the job's clock taken so far.
+    #[cfg(test)]
+    pub(crate) fn clocked(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.clocked.subscribe()
     }
 
     // What the job's runs said, or the database said of its checkpoint,
@@ -248,6 +338,8 @@ impl Tee {
         } = &said.heard
         {
             self.blocked(control, *revision, error);
+        } else if let Heard::CheckpointDue { control } = &said.heard {
+            self.due(control);
         } else if let Err(error) = self.step(slots, |job, repairs, limit| {
             job.run_said(said, repairs, limit)
         }) {
@@ -255,6 +347,15 @@ impl Tee {
         }
         self.heard.send_modify(|heard| *heard += 1);
         self.signal.mark(self.job_id);
+    }
+
+    // The job's clock held while every download or the torrent itself is
+    // paused, and running again once neither is.
+    fn held_clock(&self, (all, own): (bool, bool)) {
+        self.locked().hold_clock(all || own);
+        #[cfg(test)]
+        self.clocked.send_modify(|clocked| *clocked += 1);
+        self.heard.send_modify(|heard| *heard += 1);
     }
 
     // Unpacking is over for the torrent, for `why`: the job takes nothing
@@ -277,8 +378,11 @@ impl Tee {
         &self.work
     }
 
-    fn locked(&self) -> MutexGuard<'_, GraphJob> {
-        self.job.lock().unwrap_or_else(PoisonError::into_inner)
+    fn locked(&self) -> Held<'_> {
+        Held {
+            tee: self,
+            job: self.job.lock().unwrap_or_else(PoisonError::into_inner),
+        }
     }
 
     pub(crate) fn with<T>(&self, look: impl FnOnce(&mut GraphJob) -> T) -> T {
@@ -296,6 +400,8 @@ impl Tee {
         limit: usize,
         step: impl FnOnce(&mut GraphJob, &mut RepairSlots, usize) -> Result<T, GraphError>,
     ) -> Result<T, GraphError> {
+        let _job = JobScope::enter(self.job_id);
+        let limit = self.slots(limit);
         let mut job = self.locked();
         let mut repairs = self.repairs.lock().unwrap_or_else(PoisonError::into_inner);
         let result = step(&mut job, &mut repairs, limit);
@@ -303,7 +409,69 @@ impl Tee {
         for woken in repairs.take_woken() {
             self.signal.mark(JobId(woken.0));
         }
+        drop(repairs);
+        if result.is_ok() {
+            self.stepped(&mut self.locked());
+        }
         self.kept(result)
+    }
+
+    // A step reached the job. Its checkpoint is taken once the write it
+    // joins is due, by the bytes taken since the last or their age, or at
+    // once while a move waits on a commit, as a job of the pipeline's is;
+    // until then nothing is read of the job.
+    fn stepped(&self, job: &mut GraphJob) {
+        if job.pending().control().cancelled() {
+            return;
+        }
+        if job.awaits_commit() || job.pending().stepped(self.job_id, &self.mail) {
+            self.checkpointed(job, false);
+        }
+    }
+
+    // The wake a step armed: the job's checkpoint is due. One of a writer
+    // let go since, or of another, takes nothing.
+    fn due(&self, control: &CheckpointControl) {
+        let mut job = self.locked();
+        let own = job.pending().control();
+        if own.same(control) && !own.cancelled() {
+            self.checkpointed(&mut job, false);
+        }
+    }
+
+    // Checkpoint the job as it stands, again for as long as a file of its
+    // moved: the move is recorded by the next one. The change is queued for
+    // the database once its write is due, or at once when `force`.
+    fn checkpointed(&self, job: &mut GraphJob, force: bool) {
+        let _ = self.checkpoint_locked(job, force);
+    }
+
+    // A checkpoint that fails, as a file that could not move, fails the
+    // job, as it fails a job of the pipeline's: it is kept as the job's
+    // failure.
+    fn checkpoint_locked(&self, job: &mut GraphJob, force: bool) -> Result<(), WriteError> {
+        loop {
+            if job.pending().control().cancelled() {
+                return Ok(());
+            }
+            match checkpoint_job(
+                job,
+                self.job_id,
+                &self.db,
+                &self.mail,
+                Vec::new(),
+                None,
+                force,
+            ) {
+                Ok(true) => {}
+                Ok(false) => return Ok(()),
+                Err(error) => {
+                    self.refuse(error.to_string());
+                    self.signal.mark(self.job_id);
+                    return Err(error);
+                }
+            }
+        }
     }
 
     // A failed step's error, kept as the job's failure.
@@ -334,6 +502,7 @@ impl Tee {
 
     // Whether the job waits on any share of the piece.
     pub(crate) fn wants(&self, piece: u32) -> bool {
+        let _job = JobScope::enter(self.job_id);
         !self.is_broken() && !self.unsettled(&self.locked(), piece).is_empty()
     }
 
@@ -349,13 +518,21 @@ impl Tee {
     // lend is left to the service's next settle, which this marks. One
     // torrent's commit never waits on another's.
     pub(crate) fn deliver(&self, piece: u32, held: &Bytes) -> bool {
+        let _job = JobScope::enter(self.job_id);
         if self.is_broken() {
             return false;
         }
         let took = self.kept(self.with(|job| {
             let mut took = false;
             for share in self.unsettled(job, piece) {
-                took |= job.take_in(self.decoded(&share, held), self.limit)?;
+                let bytes = share.span.range.end - share.span.range.start;
+                if job.take_in(self.decoded(&share, held), self.slots(self.limit))? {
+                    job.pending().delivered(bytes);
+                    took = true;
+                }
+            }
+            if took {
+                self.stepped(job);
             }
             Ok(took)
         }));
@@ -374,6 +551,7 @@ impl Tee {
         piece: u32,
         read: impl Fn(usize, u64, &mut [u8]) -> std::io::Result<()>,
     ) -> std::io::Result<bool> {
+        let _job = JobScope::enter(self.job_id);
         if self.is_broken() {
             return Ok(false);
         }
@@ -452,7 +630,7 @@ impl Tee {
             self.signal.mark(self.job_id);
             return Ok(());
         };
-        let result = job.lend(&mut repairs, self.limit);
+        let result = job.lend(&mut repairs, self.slots(self.limit));
         drop(job);
         for woken in repairs.take_woken() {
             self.signal.mark(JobId(woken.0));
@@ -482,10 +660,10 @@ impl Tee {
     // Why unpacking refused the torrent's output, or failed, if it did.
     pub(crate) fn refusal(&self) -> Option<String> {
         let refused = self
-            .locked()
-            .writer()
-            .refusal()
-            .map(|refusal| refusal.job_failure_reason());
+            .refused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         refused.or_else(|| {
             self.broken
                 .lock()
@@ -501,21 +679,13 @@ impl Tee {
         job.phase() == RootPhase::Done && !job.moves_waiting()
     }
 
-    // Checkpoint the job as it stands, again for as long as a file of its
-    // moved: the move is recorded by the next one. The database's word on
-    // each comes through `mail`.
-    pub(crate) fn checkpoint(
-        &self,
-        db: &crate::Database,
-        mail: &UnboundedSender<Said>,
-    ) -> Result<(), WriteError> {
+    // Checkpoint the job as it stands, its change queued for the database
+    // at once when `force`, and otherwise once its write is due.
+    pub(crate) fn checkpoint(&self, force: bool) -> Result<(), WriteError> {
+        let _job = JobScope::enter(self.job_id);
         #[cfg(test)]
         self.asked.send_modify(|asked| *asked += 1);
-        let mut job = self.locked();
-        while !job.pending().control().cancelled()
-            && checkpoint_job(&mut job, self.job_id, db, mail, Vec::new(), None, true)?
-        {}
-        Ok(())
+        self.checkpoint_locked(&mut self.locked(), force)
     }
 
     // A checkpoint write of the job's that cannot succeed. As a job of the
@@ -543,6 +713,7 @@ impl Tee {
     // it consumed and its recovery data. Every handle the job holds is
     // closed first, so what unpacking made can move and its directory go.
     pub(crate) fn spent(&self) -> Result<Vec<PathBuf>, &'static str> {
+        let _job = JobScope::enter(self.job_id);
         self.locked().release_delivery_files()
     }
 
@@ -576,6 +747,39 @@ impl Tee {
     }
 }
 
+// The tee's job, held: letting it go keeps why its writer refused its
+// output, if it did, where the tee reads it without the job.
+struct Held<'a> {
+    tee: &'a Tee,
+    job: MutexGuard<'a, GraphJob>,
+}
+
+impl std::ops::Deref for Held<'_> {
+    type Target = GraphJob;
+
+    fn deref(&self) -> &GraphJob {
+        &self.job
+    }
+}
+
+impl std::ops::DerefMut for Held<'_> {
+    fn deref_mut(&mut self) -> &mut GraphJob {
+        &mut self.job
+    }
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        if let Some(refusal) = self.job.writer().refusal() {
+            self.tee
+                .refused
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get_or_insert_with(|| refusal.job_failure_reason());
+        }
+    }
+}
+
 // The checkpoint names the candidate each node was offered last by its
 // place in the list, and the list may have changed since: each node is
 // offered the first candidate again, so it retries the list from the top.
@@ -595,13 +799,20 @@ struct Hearer {
 
 impl Hears for Hearer {
     fn said(&self, said: Said, slots: usize) {
-        let _ = self.mail.send((said, slots));
+        let _ = self.mail.send(Word::Said(said, slots));
+    }
+
+    fn hold_clock(&self, paused: bool) {
+        let _ = self.mail.send(Word::Clock(paused));
     }
 }
 
 // The tee's task: the words it is handed, in the order they came, each
-// taken on a thread that may block. It ends when the tee leaves the mail.
+// taken on a thread that may block, working for the tee's job. The job's
+// clock is held while every download is paused or the torrent is paused
+// on its own. It ends when the tee leaves the mail.
 async fn hear(tee: std::sync::Weak<Tee>, mut words: tokio::sync::mpsc::UnboundedReceiver<Word>) {
+    let mut paused = (false, false);
     while let Some(word) = words.recv().await {
         let mut batch = vec![word];
         while let Ok(word) = words.try_recv() {
@@ -609,16 +820,18 @@ async fn hear(tee: std::sync::Weak<Tee>, mut words: tokio::sync::mpsc::Unbounded
         }
         let tee = tee.clone();
         let taken = tokio::task::spawn_blocking(move || {
-            for (said, slots) in batch {
+            for word in batch {
                 let Some(tee) = tee.upgrade() else {
-                    return;
+                    break;
                 };
-                tee.heard(said, slots);
+                paused = tee.take(word, paused);
             }
+            paused
         })
         .await;
-        if taken.is_err() {
-            return;
+        match taken {
+            Ok(held) => paused = held,
+            Err(_) => return,
         }
     }
 }

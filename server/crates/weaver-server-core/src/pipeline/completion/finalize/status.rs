@@ -622,7 +622,8 @@ impl Pipeline {
         }
     }
 
-    // Every download paused or resumed: each graph job's clock follows.
+    // Every download paused or resumed: each graph job's clock follows,
+    // those of the jobs outside the pipeline too.
     pub(crate) fn hold_extraction_clocks(&mut self) {
         let jobs: Vec<JobId> = self
             .graph_jobs
@@ -633,5 +634,7 @@ impl Pipeline {
         for job_id in jobs {
             self.hold_extraction_clock(job_id);
         }
+        self.graph_outside
+            .hold_clocks(self.shared_state.is_paused());
     }
 }

@@ -172,6 +172,20 @@ impl Database {
         })
     }
 
+    // The job of every torrent, read alone, for a start that needs only
+    // which torrents it brings back.
+    pub fn torrent_job_ids(&self) -> Result<Vec<JobId>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows =
+                SqlRuntime::fetch_all(datastore.read_exec(), "SELECT job_id FROM torrents", &[])
+                    .await?;
+            rows.iter()
+                .map(|row| Ok(JobId(count(row, "job_id")?)))
+                .collect()
+        })
+    }
+
     // Every torrent, in the order they were added.
     pub fn list_torrents(&self) -> Result<Vec<TorrentRecord>, StateError> {
         let datastore = self.datastore();

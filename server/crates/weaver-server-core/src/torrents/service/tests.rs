@@ -2456,6 +2456,20 @@ async fn tee_of(service: &TorrentService, job_id: JobId) -> Arc<crate::torrents:
     Arc::clone(store.tee().unwrap())
 }
 
+// The torrent's checkpoint written now, its tee's queued at once first,
+// as a stop writes them.
+async fn save_with_tee(service: &TorrentService, job_id: JobId) {
+    let tee = {
+        let live = service.inner.live.lock().await;
+        live.get(&job_id)
+            .and_then(|torrent| Some(Arc::clone(torrent.store.as_ref()?.tee()?)))
+    };
+    if let Some(tee) = tee {
+        service.checkpoint_tee(job_id, tee, true).await;
+    }
+    service.save_checkpoints([job_id].into()).await;
+}
+
 // How many pieces the torrent's last checkpoint says it has.
 fn kept_pieces(db: &Database, job_id: JobId) -> u32 {
     db.torrent_pieces(job_id).unwrap().map_or(0, |kept| {
@@ -2594,6 +2608,266 @@ async fn a_restart_restores_the_intent_not_the_state() {
     let view = again.torrent(job_id).await.unwrap();
     assert_ne!(view.state, TorrentState::Stopped);
     assert_ne!(view.state, TorrentState::Paused);
+    again.stop().await;
+}
+
+// A torrent whose work crashed the daemon is kept paused at the next start,
+// saying why, and its job is not restored into the same panic: a panic in
+// its tee's step leaves the torrent's marker, which stays until a resume
+// takes it, and the resume restores it.
+#[tokio::test(start_paused = true)]
+async fn a_torrent_that_crashed_the_daemon_stays_paused_until_resumed() {
+    use crate::runtime::panic_trap::{Trap, boot_marks, read_marks, trapped};
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(metainfo(
+            "set.rar",
+            &[("set.rar", archive)],
+            128,
+            false,
+        ))))
+        .await
+        .unwrap();
+    let tee = tee_of(&rig.service, job_id).await;
+    let marks = rig.dir.path().join("marks");
+    let trap = Arc::new(Trap::new(&marks, "test"));
+    let caught = trapped(
+        &trap,
+        std::panic::AssertUnwindSafe(|| {
+            tee.step(
+                1,
+                |_, _, _| -> Result<(), crate::pipeline::graph::job::GraphError> {
+                    panic!("in its unpacking")
+                },
+            )
+        }),
+    );
+    assert!(caught.is_err());
+    let written = read_marks(&marks);
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].job, Some(job_id));
+    assert_eq!(written[0].message, "in its unpacking");
+    drop(tee);
+    rig.service.stop().await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.park_crashed(boot_marks(&marks, |job| job == job_id));
+    reopen(&again).await;
+    {
+        let live = again.inner.live.lock().await;
+        assert!(live[&job_id].store.is_none());
+        assert!(live[&job_id].attached.is_none());
+    }
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().intent,
+        TorrentIntent::Paused
+    );
+    let view = again.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.state, view.detail.as_deref()),
+        (
+            TorrentState::Paused,
+            Some("crashed the daemon: in its unpacking")
+        )
+    );
+    assert_eq!(read_marks(&marks).len(), 1);
+
+    again.resume(job_id).await.unwrap();
+    assert!(read_marks(&marks).is_empty());
+    again.tick().await;
+    assert!(again.inner.live.lock().await[&job_id].attached.is_some());
+    assert_eq!(again.torrent(job_id).await.unwrap().detail, None);
+    again.stop().await;
+}
+
+// The restore of a torrent's job that panics leaves the torrent's marker,
+// so the next start keeps it paused, saying why, rather than restoring it
+// into the same panic. The panic here is the one a restore made off the
+// runtime meets as its job joins the runs' mail.
+#[tokio::test(start_paused = true)]
+async fn a_panic_in_a_torrents_restore_leaves_its_marker_and_parks_it() {
+    use crate::runtime::panic_trap::{Trap, boot_marks, read_marks, trapped};
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let rig = rig(set_clock());
+    rig.routes.set_down(Some("down"));
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(metainfo(
+            "set.rar",
+            &[("set.rar", archive)],
+            128,
+            false,
+        ))))
+        .await
+        .unwrap();
+    let tee = tee_of(&rig.service, job_id).await;
+    assert!(tee.deliver(0, &bytes::Bytes::copy_from_slice(&archive[..128])));
+    drop(tee);
+    rig.service.stop().await;
+    assert!(rig.db.load_graph_checkpoint(job_id).unwrap().is_some());
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.open().await.unwrap();
+    let (layout, passwords) = {
+        let live = again.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        assert!(torrent.store.is_none());
+        (
+            Arc::clone(torrent.layout.as_ref().unwrap()),
+            again.archive_passwords(torrent),
+        )
+    };
+    let plan = crate::torrents::tee::Plan::of(&layout).unwrap();
+    let marks = rig.dir.path().join("marks");
+    let trap = Arc::new(Trap::new(&marks, "test"));
+    let caught = std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                trapped(
+                    &trap,
+                    std::panic::AssertUnwindSafe(|| {
+                        let _ = again
+                            .tee::<std::convert::Infallible>(job_id, &layout, plan, passwords, Err);
+                    }),
+                )
+            })
+            .join()
+            .unwrap()
+    });
+    assert!(caught.is_err());
+    let written = read_marks(&marks);
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].job, Some(job_id));
+    assert!(
+        written[0].message.contains("Tokio"),
+        "{}",
+        written[0].message
+    );
+    assert!(
+        written[0]
+            .location
+            .as_deref()
+            .is_some_and(|location| location.contains("tee.rs")),
+        "{:?}",
+        written[0].location
+    );
+    again.stop().await;
+
+    let third = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    third.park_crashed(boot_marks(&marks, |job| job == job_id));
+    reopen(&third).await;
+    assert!(third.inner.live.lock().await[&job_id].store.is_none());
+    let view = third.torrent(job_id).await.unwrap();
+    assert_eq!(view.state, TorrentState::Paused);
+    assert!(
+        view.detail
+            .as_deref()
+            .is_some_and(|detail| detail.starts_with("crashed the daemon: ")),
+        "{:?}",
+        view.detail
+    );
+    third.stop().await;
+}
+
+// A resume is never undone by the restore pass that parks a crashed
+// torrent: the pass reads the marker under the torrent's lock, which the
+// resume takes after taking the marker. Resumed before the pass parks it,
+// the torrent restores; parked first, the resume lets it go.
+#[tokio::test(start_paused = true)]
+async fn a_resume_racing_the_restore_pass_is_never_undone() {
+    use crate::runtime::panic_trap::{Trap, boot_marks, read_marks};
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    rig.service.stop().await;
+    let marks = rig.dir.path().join("marks");
+    let intent = || rig.db.get_torrent(job_id).unwrap().unwrap().intent;
+
+    // The resume lands between the pass starting and its park.
+    Trap::new(&marks, "test")
+        .write(Some(job_id), "in its unpacking", None)
+        .unwrap();
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.park_crashed(boot_marks(&marks, |job| job == job_id));
+    again.open().await.unwrap();
+    again.resume(job_id).await.unwrap();
+    assert!(!again.park(job_id).await);
+    assert_eq!(intent(), TorrentIntent::Resumed);
+    assert_eq!(again.torrent(job_id).await.unwrap().detail, None);
+    assert!(read_marks(&marks).is_empty());
+    again.stop().await;
+
+    // The park lands first: the resume after it lets the torrent go.
+    Trap::new(&marks, "test")
+        .write(Some(job_id), "in its unpacking", None)
+        .unwrap();
+    let third = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    third.park_crashed(boot_marks(&marks, |job| job == job_id));
+    third.open().await.unwrap();
+    assert!(third.park(job_id).await);
+    assert_eq!(intent(), TorrentIntent::Paused);
+    third.resume(job_id).await.unwrap();
+    assert!(!third.park(job_id).await);
+    assert_eq!(intent(), TorrentIntent::Resumed);
+    let view = third.torrent(job_id).await.unwrap();
+    assert_ne!(view.state, TorrentState::Paused);
+    assert_eq!(view.detail, None);
+    third.stop().await;
+}
+
+// A torrent stopped when it crashed the daemon stays stopped, and says
+// why until a resume.
+#[tokio::test(start_paused = true)]
+async fn a_stopped_torrent_that_crashed_the_daemon_says_why() {
+    use crate::runtime::panic_trap::{Trap, boot_marks};
+    let rig = rig(set_clock());
+    on_loopback(&rig.routes);
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    rig.service
+        .set_intent(job_id, TorrentIntent::Stopped)
+        .await
+        .unwrap();
+    rig.service.stop().await;
+    let marks = rig.dir.path().join("marks");
+    Trap::new(&marks, "test")
+        .write(Some(job_id), "in its unpacking", None)
+        .unwrap();
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    again.park_crashed(boot_marks(&marks, |job| job == job_id));
+    reopen(&again).await;
+    assert_eq!(
+        rig.db.get_torrent(job_id).unwrap().unwrap().intent,
+        TorrentIntent::Stopped
+    );
+    let view = again.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.state, view.detail.as_deref()),
+        (
+            TorrentState::Stopped,
+            Some("crashed the daemon: in its unpacking")
+        )
+    );
     again.stop().await;
 }
 
@@ -5923,15 +6197,18 @@ async fn a_second_checkpoint_writes_only_what_changed() {
         async move { tee_of(&service, job_id).await }
     };
     let first = job(&rig.service).await;
-    rig.service.save_checkpoints([job_id].into()).await;
+    rig.service
+        .checkpoint_tee(job_id, Arc::clone(&first), true)
+        .await;
     let whole = first.with(|job| job.pending().tally());
     assert!(whole.rows > 0);
-    rig.service.save_checkpoints([job_id].into()).await;
+    rig.service
+        .checkpoint_tee(job_id, Arc::clone(&first), true)
+        .await;
     let again = first.with(|job| job.pending().tally());
     assert_eq!(again.checkpoints, whole.checkpoints + 1);
     assert_eq!(again.rows, whole.rows);
-    // The tee's checkpoint is queued, not awaited, by the save; a torrent
-    // whose pieces did not change queues nothing after it to wait on.
+    // The tee's checkpoint is queued, not awaited.
     rig.db.flush_write_queue().await.unwrap();
     assert!(rig.db.load_graph_checkpoint(job_id).unwrap().is_some());
     rig.service.stop().await;
@@ -5939,7 +6216,9 @@ async fn a_second_checkpoint_writes_only_what_changed() {
     let restarted = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
     reopen(&restarted).await;
     let restored = job(&restarted).await;
-    restarted.save_checkpoints([job_id].into()).await;
+    restarted
+        .checkpoint_tee(job_id, Arc::clone(&restored), true)
+        .await;
     assert_eq!(restored.with(|job| job.pending().tally()).rows, 0);
     restarted.stop().await;
 }
@@ -7198,7 +7477,7 @@ async fn a_restart_during_a_check_shows_what_its_job_will_hold() {
         .unwrap();
     assert!(intake.checking().unwrap());
     assert!(intake.found(4).unwrap());
-    rig.service.save_checkpoints([job_id].into()).await;
+    save_with_tee(&rig.service, job_id).await;
     rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
@@ -7412,7 +7691,7 @@ async fn a_corrupted_checkpoint_is_logged_and_the_torrent_starts_fresh() {
         ))))
         .await
         .unwrap();
-    rig.service.save_checkpoints([job_id].into()).await;
+    save_with_tee(&rig.service, job_id).await;
     rig.service.stop().await;
     assert!(rig.db.load_graph_checkpoint(job_id).unwrap().is_some());
     let datastore = rig.db.datastore();
@@ -7470,7 +7749,7 @@ async fn a_checkpoint_the_database_fails_to_read_holds_the_restore_until_it_read
         ))))
         .await
         .unwrap();
-    rig.service.save_checkpoints([job_id].into()).await;
+    save_with_tee(&rig.service, job_id).await;
     rig.service.stop().await;
     assert!(rig.db.load_graph_checkpoint(job_id).unwrap().is_some());
     let rename = |from: &'static str, to: &'static str| {
@@ -7614,7 +7893,7 @@ async fn a_restart_that_cannot_read_its_files_fetches_again_and_does_not_fail() 
             .storage_dir
             .unwrap(),
     );
-    rig.service.save_checkpoints([job_id].into()).await;
+    save_with_tee(&rig.service, job_id).await;
     rig.service.stop().await;
     assert_eq!(
         rig.service
@@ -7690,7 +7969,7 @@ async fn a_checkpoint_the_database_refuses_ends_unpacking_and_holds_no_write_up(
         ))))
         .await
         .unwrap();
-    rig.service.save_checkpoints([job_id].into()).await;
+    save_with_tee(&rig.service, job_id).await;
     rig.db.flush_write_queue().await.unwrap();
     let datastore = rig.db.datastore();
     rig.db
@@ -7742,7 +8021,7 @@ async fn a_checkpoint_the_database_refuses_ends_unpacking_and_holds_no_write_up(
     }
     let mut published = rig.service.inner.published.subscribe();
     storage.on_piece_completed(index).unwrap();
-    rig.service.save_checkpoints([job_id].into()).await;
+    save_with_tee(&rig.service, job_id).await;
 
     published
         .wait_for(|_| rig.db.get_job_history(job_id.0).unwrap().is_some())
@@ -7757,7 +8036,7 @@ async fn a_checkpoint_the_database_refuses_ends_unpacking_and_holds_no_write_up(
             .contains("Checkpoint could not be persisted"),
         "{history:?}"
     );
-    rig.service.save_checkpoints([job_id].into()).await;
+    save_with_tee(&rig.service, job_id).await;
     rig.db.flush_write_queue().await.unwrap();
     assert!(rig.service.torrent(job_id).await.is_some());
     rig.service.stop().await;
@@ -9279,11 +9558,201 @@ fn sequential_jobs_spread_their_times_over_the_whole_period() {
     assert!(least > 0, "a tick took none");
 }
 
-// A save of a torrent's checkpoints does not hold the service's lock while
-// its tee's checkpoint waits on the job: an intake writing to disk may
-// hold the job, and every other torrent goes on meanwhile.
+// A tee checkpoints its job as a job of the pipeline does: the pieces it
+// takes write nothing while their bytes stay under the byte bound and the
+// first of them is younger than the age bound; crossing either queues one
+// write. Taken out of its session, the torrent keeps its tee, which writes
+// on the same bounds.
+#[tokio::test(start_paused = true)]
+async fn a_tee_writes_its_checkpoint_by_bytes_and_age_in_a_session_or_out() {
+    use crate::pipeline::graph::checkpoint::{CHECKPOINT_AGE, CHECKPOINT_BYTES};
+    // The paused clock moves only when the test moves it: the database
+    // works on its own thread, and is waited on from a blocking task, which
+    // keeps the paused clock from moving by itself while it runs.
+    let flushed = |db: &Database| {
+        let (db, runtime) = (db.clone(), tokio::runtime::Handle::current());
+        tokio::task::spawn_blocking(move || runtime.block_on(db.flush_write_queue()).unwrap())
+    };
+    let writes = |db: &Database| {
+        db.graph_checkpoint_writes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let piece = 32;
+    let rig = rig(set_clock());
+    rig.routes.set_down(Some("down"));
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(metainfo(
+            "set.rar",
+            &[("set.rar", archive)],
+            piece,
+            false,
+        ))))
+        .await
+        .unwrap();
+    let tee = tee_of(&rig.service, job_id).await;
+    let deliver = |index: usize| {
+        let held = bytes::Bytes::copy_from_slice(&archive[index * piece..(index + 1) * piece]);
+        assert!(tee.deliver(index as u32, &held));
+    };
+    tee.checkpoint(true).unwrap();
+    flushed(&rig.db).await.unwrap();
+    let before = writes(&rig.db);
+
+    // Under both bounds: nothing is written.
+    deliver(0);
+    flushed(&rig.db).await.unwrap();
+    assert_eq!(writes(&rig.db), before);
+
+    // The byte bound crossed: one write.
+    tee.with(|job| job.pending().delivered(CHECKPOINT_BYTES));
+    deliver(1);
+    flushed(&rig.db).await.unwrap();
+    assert_eq!(writes(&rig.db), before + 1);
+
+    // The age bound crossed: the wake the step armed writes one, once the
+    // tee has taken it.
+    let mut taken = tee.taken();
+    deliver(2);
+    flushed(&rig.db).await.unwrap();
+    assert_eq!(writes(&rig.db), before + 1);
+    tokio::time::advance(CHECKPOINT_AGE).await;
+    while writes(&rig.db) == before + 1 {
+        taken.changed().await.unwrap();
+        flushed(&rig.db).await.unwrap();
+    }
+    assert_eq!(writes(&rig.db), before + 2);
+
+    // Taken out of its session, the torrent writes nothing of its tee's
+    // until the tee's write is due.
+    {
+        let mut live = rig.service.inner.live.lock().await;
+        let torrent = live.get_mut(&job_id).unwrap();
+        rig.service.detach(torrent).await;
+    }
+    deliver(3);
+    flushed(&rig.db).await.unwrap();
+    assert_eq!(writes(&rig.db), before + 2);
+    tokio::time::advance(CHECKPOINT_AGE).await;
+    while writes(&rig.db) == before + 2 {
+        taken.changed().await.unwrap();
+        flushed(&rig.db).await.unwrap();
+    }
+    assert_eq!(writes(&rig.db), before + 3);
+    rig.service.stop().await;
+}
+
+// Pausing one torrent holds its tee's extraction clock, as every download
+// paused does; the clock runs again only once neither holds it.
+#[tokio::test(start_paused = true)]
+async fn a_paused_torrent_holds_its_tees_extraction_clock() {
+    // Waits for the tee to have taken `count` words on its clock.
+    async fn clocked_to(clocked: &mut tokio::sync::watch::Receiver<u64>, count: u64) {
+        while *clocked.borrow_and_update() < count {
+            clocked.changed().await.unwrap();
+        }
+    }
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let rig = rig(set_clock());
+    rig.routes.set_down(Some("down"));
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(metainfo(
+            "set.rar",
+            &[("set.rar", archive)],
+            128,
+            false,
+        ))))
+        .await
+        .unwrap();
+    let tee = tee_of(&rig.service, job_id).await;
+    let held = || tee.with(|job| job.clock_held());
+    let mut clocked = tee.clocked();
+    // Its clock's words as it joined and as its store was given.
+    clocked_to(&mut clocked, 2).await;
+    assert!(!held());
+
+    rig.service.pause(job_id).await.unwrap();
+    clocked_to(&mut clocked, 3).await;
+    assert!(held());
+
+    // Every download paused too: resuming the torrent leaves the clock
+    // held until they resume.
+    rig.service.inner.env.outside.hold_clocks(true);
+    clocked_to(&mut clocked, 4).await;
+    rig.service.resume(job_id).await.unwrap();
+    clocked_to(&mut clocked, 5).await;
+    assert!(held());
+    rig.service.inner.env.outside.hold_clocks(false);
+    clocked_to(&mut clocked, 6).await;
+    assert!(!held());
+    rig.service.stop().await;
+}
+
+// A torrent paused on its own takes no slot, as a paused job of the
+// pipeline's takes none: its pieces go to its job and no run starts. Once
+// it resumes, its runs start again.
+#[tokio::test(start_paused = true)]
+async fn a_paused_torrents_tee_starts_no_run_until_resumed() {
+    async fn clocked_to(clocked: &mut tokio::sync::watch::Receiver<u64>, count: u64) {
+        while *clocked.borrow_and_update() < count {
+            clocked.changed().await.unwrap();
+        }
+    }
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_multifile_lz.rar"
+    ));
+    let piece = 64;
+    let rig = rig(set_clock());
+    rig.routes.set_down(Some("down"));
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(metainfo(
+            "set.rar",
+            &[("set.rar", archive)],
+            piece,
+            false,
+        ))))
+        .await
+        .unwrap();
+    let tee = tee_of(&rig.service, job_id).await;
+    let mut clocked = tee.clocked();
+    clocked_to(&mut clocked, 2).await;
+    rig.service.pause(job_id).await.unwrap();
+    clocked_to(&mut clocked, 3).await;
+
+    for (index, held) in archive.chunks(piece).enumerate() {
+        assert!(tee.deliver(index as u32, &bytes::Bytes::copy_from_slice(held)));
+    }
+    assert!(!tee.with(|job| job.workers_out()));
+    assert!(!tee.done());
+
+    rig.service.resume(job_id).await.unwrap();
+    clocked_to(&mut clocked, 4).await;
+    assert!(tee.done() || tee.with(|job| job.workers_out()));
+    let mut taken = tee.taken();
+    while !tee.done() {
+        taken.changed().await.unwrap();
+    }
+    rig.service.stop().await;
+}
+
+// A stop does not hold the service's lock while a tee's checkpoint waits
+// on the job: an intake writing to disk may hold the job, and every other
+// torrent goes on meanwhile.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_save_waiting_on_an_unpacking_job_holds_no_other_torrent_up() {
+async fn a_stop_waiting_on_an_unpacking_job_holds_no_other_torrent_up() {
     let archive = include_bytes!(concat!(
         std::env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/rar5/rar5_store.rar"
@@ -9317,8 +9786,8 @@ async fn a_save_waiting_on_an_unpacking_job_holds_no_other_torrent_up() {
     held_rx.recv().unwrap();
     let mut asked = tee_asked.subscribe();
     let service = rig.service.clone();
-    let save = tokio::spawn(async move { service.save_checkpoints([job_id].into()).await });
-    // The save reached the job's checkpoint, and cannot finish while the
+    let save = tokio::spawn(async move { service.stop().await });
+    // The stop reached the job's checkpoint, and cannot finish while the
     // job is held; the service's lock is free all the same.
     asked.wait_for(|asked| *asked > 0).await.unwrap();
     drop(rig.service.inner.live.lock().await);
@@ -9327,7 +9796,6 @@ async fn a_save_waiting_on_an_unpacking_job_holds_no_other_torrent_up() {
     holder.join().unwrap();
     save.await.unwrap();
     rig.db.flush_write_queue().await.unwrap();
-    rig.service.stop().await;
 }
 
 // A recovery set made over the files of a torrent, plain ones among them.
@@ -9542,7 +10010,7 @@ async fn a_part_delivered_unpacking_restored_from_its_checkpoint_unpacks() {
     let half = count / 2;
     assert!(half > 0 && half < count);
     feed(&rig.service, job_id, archive, 0..half).await;
-    rig.service.save_checkpoints([job_id].into()).await;
+    save_with_tee(&rig.service, job_id).await;
     rig.service.stop().await;
     rig.db.flush_write_queue().await.unwrap();
     let rows = rig.db.load_graph_checkpoint(job_id).unwrap().unwrap();

@@ -60,8 +60,8 @@ use crate::pipeline::Pipeline;
 // makes.
 const ROOT_KIND: &str = "root";
 
-const CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
-const CHECKPOINT_AGE: Duration = Duration::from_secs(5);
+pub(crate) const CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
+pub(crate) const CHECKPOINT_AGE: Duration = Duration::from_secs(5);
 
 // A job's checkpoint, as a restore reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -656,7 +656,7 @@ impl Pending {
     }
 
     // A step wrote `bytes` of the job's coverage.
-    pub(in crate::pipeline) fn delivered(&self, bytes: u64) {
+    pub(crate) fn delivered(&self, bytes: u64) {
         let mut slot = self.slot();
         slot.dirty_bytes = slot.dirty_bytes.saturating_add(bytes);
     }
@@ -665,7 +665,7 @@ impl Pending {
     // write it joins would be. The first checkpoint is, and so is one after
     // the database's rows were lost. Otherwise the run mail hears once the
     // first step not yet taken is CHECKPOINT_AGE old.
-    fn stepped(&self, job_id: JobId, mail: &UnboundedSender<Said>) -> bool {
+    pub(crate) fn stepped(&self, job_id: JobId, mail: &UnboundedSender<Said>) -> bool {
         let mut slot = self.slot();
         let first = *slot.stepped.get_or_insert_with(tokio::time::Instant::now);
         let due = slot.held.is_none()

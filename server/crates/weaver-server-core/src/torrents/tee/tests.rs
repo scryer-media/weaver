@@ -47,8 +47,36 @@ fn tee_sharing(
     mail: &RunMail,
     repairs: Arc<std::sync::Mutex<RepairSlots>>,
 ) -> Arc<Tee> {
-    let plan = Plan::of(layout).unwrap();
-    let storage = Storage {
+    Tee::fresh(
+        parts(layout, work, mail, repairs),
+        storage(work, mail, CapacityReader::unknown()),
+    )
+}
+
+// What a tee over the layout's archive files is made of.
+fn parts(
+    layout: &Arc<PieceLayout>,
+    work: &Path,
+    mail: &RunMail,
+    repairs: Arc<std::sync::Mutex<RepairSlots>>,
+) -> Parts {
+    Parts {
+        job_id: JobId(1),
+        layout: Arc::clone(layout),
+        plan: Plan::of(layout).unwrap(),
+        work: work.to_path_buf(),
+        repairs,
+        signal: Arc::default(),
+        outside: Arc::new(Outside::default()),
+        limit: 1,
+        db: crate::Database::open_in_memory().unwrap(),
+        mail: mail.written(),
+    }
+}
+
+// Where a tee's job writes, reading the free disk through `free_disk`.
+fn storage(work: &Path, mail: &RunMail, free_disk: CapacityReader) -> Storage {
+    Storage {
         working_dir: work.to_path_buf(),
         accountant: Arc::new(HoldsAccountant::new(HoldBudgets {
             resident_limit: u64::MAX,
@@ -56,7 +84,7 @@ fn tee_sharing(
             scratch_ceiling: u64::MAX,
             disk_reserve: 0,
         })),
-        free_disk: CapacityReader::unknown(),
+        free_disk,
         slots: 1,
         mail: mail.sender(),
         passwords: Vec::new(),
@@ -64,20 +92,7 @@ fn tee_sharing(
         nesting: u32::MAX,
         hardware: Default::default(),
         metrics: None,
-    };
-    Tee::fresh(
-        Parts {
-            job_id: JobId(1),
-            layout: Arc::clone(layout),
-            plan,
-            work: work.to_path_buf(),
-            repairs,
-            signal: Arc::default(),
-            outside: Arc::new(Outside::default()),
-            limit: 1,
-        },
-        storage,
-    )
+    }
 }
 
 // The piece as the torrent hashed it.
@@ -285,4 +300,97 @@ fn a_restored_tee_retries_its_passwords_from_the_top() {
         offered.into_iter().collect::<Vec<_>>(),
         [(weaver_graph::NodeId(1), 0), (weaver_graph::NodeId(2), 0)]
     );
+}
+
+const LZ: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/rar5/rar5_multifile_lz.rar"
+));
+
+// A tee over a compressed archive whose free disk reads panic once
+// `armed`, as a failing probe of the disk would, with the trap that
+// records this thread's panics.
+fn armed_tee(
+    dir: &Path,
+    mail: &RunMail,
+) -> (
+    Arc<PieceLayout>,
+    Arc<Tee>,
+    Arc<std::sync::atomic::AtomicBool>,
+    Arc<crate::runtime::panic_trap::Trap>,
+) {
+    let layout = Arc::new(PieceLayout::new(64, vec![file("set.rar", LZ.len() as u64)]).unwrap());
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let armed = Arc::clone(&armed);
+        CapacityReader::from_fn(move || {
+            assert!(
+                !armed.load(std::sync::atomic::Ordering::Acquire),
+                "the disk could not be read"
+            );
+            crate::operations::disk::Capacity::Unknown
+        })
+    };
+    let work = dir.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let tee = Tee::fresh(
+        parts(&layout, &work, mail, Arc::default()),
+        storage(&work, mail, reader),
+    );
+    let trap = Arc::new(crate::runtime::panic_trap::Trap::new(
+        &dir.join("marks"),
+        "test",
+    ));
+    (layout, tee, armed, trap)
+}
+
+// The one marker the trap wrote, naming the tee's job.
+fn marked(dir: &Path) -> crate::runtime::panic_trap::Mark {
+    let mut marks = crate::runtime::panic_trap::read_marks(&dir.join("marks"));
+    assert_eq!(marks.len(), 1);
+    let mark = marks.pop().unwrap();
+    assert_eq!(mark.job, Some(JobId(1)));
+    mark
+}
+
+// A panic while a piece goes to the job leaves the torrent's marker.
+#[tokio::test]
+async fn a_panic_delivering_a_piece_leaves_the_torrents_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let mail = RunMail::default();
+    let (layout, tee, armed, trap) = armed_tee(dir.path(), &mail);
+    assert!(tee.deliver(0, &piece(&layout, LZ, 0)));
+    armed.store(true, std::sync::atomic::Ordering::Release);
+    let caught = crate::runtime::panic_trap::trapped(
+        &trap,
+        std::panic::AssertUnwindSafe(|| tee.deliver(1, &piece(&layout, LZ, 1))),
+    );
+    assert!(caught.is_err());
+    assert_eq!(marked(dir.path()).message, "the disk could not be read");
+}
+
+// A panic while the job takes a word its runs said leaves the torrent's
+// marker.
+#[tokio::test]
+async fn a_panic_taking_a_word_leaves_the_torrents_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut mail = RunMail::default();
+    let (layout, tee, armed, trap) = armed_tee(dir.path(), &mail);
+    for index in 0..layout.piece_count() {
+        tee.deliver(index, &piece(&layout, LZ, index));
+    }
+    armed.store(true, std::sync::atomic::Ordering::Release);
+    loop {
+        let said = mail.recv().await.unwrap();
+        let caught = crate::runtime::panic_trap::trapped(
+            &trap,
+            std::panic::AssertUnwindSafe(|| {
+                tee.take(super::Word::Said(said, 1), (false, false));
+            }),
+        );
+        if caught.is_err() {
+            break;
+        }
+    }
+    assert_eq!(marked(dir.path()).message, "the disk could not be read");
 }

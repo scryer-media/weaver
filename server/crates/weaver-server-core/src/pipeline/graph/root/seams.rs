@@ -334,7 +334,10 @@ impl Pipeline {
             self.pause_graph_checkpoint(job_id, control, *revision, error);
             return;
         }
-        if let Heard::CheckpointDue { control } = &said.heard {
+        if let Heard::CheckpointDue { control } = &said.heard
+            && (self.graph_jobs.contains_key(&job_id)
+                || self.retiring_graph_jobs.contains_key(&job_id))
+        {
             self.graph_checkpoint_due(job_id, control);
             return;
         }

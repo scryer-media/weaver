@@ -155,11 +155,19 @@ impl RunMail {
 // mail: the step a run's word drives, with the slots the job may use now.
 pub(crate) trait Hears: Send + Sync {
     fn said(&self, said: Said, slots: usize);
+    // Every download paused or resumed: the job's extraction deadline
+    // does not run while they are.
+    fn hold_clock(&self, paused: bool);
 }
 
-// The jobs outside the pipeline whose runs speak on its mail, by scope.
+// The jobs outside the pipeline whose runs speak on its mail, by scope,
+// and whether every download is paused, which each job's clock follows
+// from the moment it joins.
 #[derive(Default)]
-pub(crate) struct Outside(std::sync::Mutex<std::collections::HashMap<u64, Arc<dyn Hears>>>);
+pub(crate) struct Outside(
+    std::sync::Mutex<std::collections::HashMap<u64, Arc<dyn Hears>>>,
+    std::sync::atomic::AtomicBool,
+);
 
 impl Outside {
     fn jobs(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<u64, Arc<dyn Hears>>> {
@@ -169,7 +177,18 @@ impl Outside {
     }
 
     pub(crate) fn join(&self, scope: u64, hears: Arc<dyn Hears>) {
-        self.jobs().insert(scope, hears);
+        let mut jobs = self.jobs();
+        hears.hold_clock(self.1.load(std::sync::atomic::Ordering::Relaxed));
+        jobs.insert(scope, hears);
+    }
+
+    // Every download paused or resumed: each job's clock follows.
+    pub(crate) fn hold_clocks(&self, paused: bool) {
+        let jobs = self.jobs();
+        self.1.store(paused, std::sync::atomic::Ordering::Relaxed);
+        for hears in jobs.values() {
+            hears.hold_clock(paused);
+        }
     }
 
     pub(crate) fn leave(&self, scope: u64) {

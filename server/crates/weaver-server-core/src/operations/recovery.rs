@@ -25,6 +25,9 @@ pub struct RecoveredServerState {
     // The jobs that crashed the daemon on its last run, each parked paused
     // as it installs.
     pub crashed: crate::runtime::panic_trap::CrashMarks,
+    // The torrents that crashed it, each kept paused, its job not restored,
+    // until it is resumed.
+    pub crashed_torrents: crate::runtime::panic_trap::CrashMarks,
     // What recovery leaves until the server answers; `spawn` runs it once.
     pub after_boot: AfterBoot,
 }
@@ -296,9 +299,14 @@ pub async fn recover_server_state(
     // archives the job.
     // A job's work that panicked would panic again as the job is restored,
     // so the markers the panic left are read before any job is.
+    // The torrents come back too, each with its own job.
+    let torrents: HashSet<crate::jobs::ids::JobId> = db.torrent_job_ids()?.into_iter().collect();
     let restoring: HashSet<crate::jobs::ids::JobId> =
         in_progress.iter().map(|(job_id, _)| *job_id).collect();
-    let crashed = crate::runtime::panic_trap::boot_marks(data_dir, |job| restoring.contains(&job));
+    let mut crashed = crate::runtime::panic_trap::boot_marks(data_dir, |job| {
+        restoring.contains(&job) || torrents.contains(&job)
+    });
+    let crashed_torrents = crashed.split_off(|job| torrents.contains(&job));
 
     let parsed = in_progress
         .par_iter()
@@ -465,6 +473,7 @@ pub async fn recover_server_state(
         to_restore,
         initial_holds,
         crashed,
+        crashed_torrents,
         after_boot: AfterBoot {
             db: db.clone(),
             below: crate::jobs::ids::JobId(next_job_id),
