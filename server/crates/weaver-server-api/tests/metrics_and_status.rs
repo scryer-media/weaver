@@ -200,7 +200,9 @@ async fn timed_pause_all_resumes_after_the_duration() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let resp = h.execute("mutation { pauseAll(resumeAfterSecs: 1800) }").await;
+    let resp = h
+        .execute("mutation { pauseAll(resumeAfterSecs: 1800) }")
+        .await;
     assert_no_errors(&resp);
     assert!(h.handle.is_globally_paused());
 
