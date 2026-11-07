@@ -313,7 +313,7 @@ async function createSourceMarkersThroughUI(
   await page.getByRole("main").getByRole("button", { name: "Add provider", exact: true }).click();
   const serverForm = page.getByRole("dialog", { name: "Add provider", exact: true });
   await serverForm.getByRole("textbox", { name: "Host", exact: true }).fill(matrix.serverHost);
-  const tls = serverForm.getByRole("switch", { name: "TLS", exact: true });
+  const tls = serverForm.getByRole("switch", { name: "SSL/TLS", exact: true });
   if (await tls.isChecked()) await tls.click();
   await expect(serverForm.getByRole("spinbutton", { name: "Port", exact: true })).toHaveValue("119");
   await serverForm.getByLabel("Username", { exact: true }).fill("e2e-user");
