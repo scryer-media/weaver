@@ -344,8 +344,11 @@ impl StreamConnector {
 
         // Try to connect over TCP first, when it may be used. If in 1 second
         // we haven't connected, try uTP also (if configured). Whoever
-        // connects first wins.
-        let tcp = self.enable_tcp && transports == Transports::Any;
+        // connects first wins. A route with no TCP socket free goes straight
+        // to uTP when it has it.
+        let tcp = self.enable_tcp
+            && transports == Transports::Any
+            && (self.utp_socket.is_none() || self.socket_factory.tcp_room());
         let tcp_connect = async {
             if !tcp {
                 return Ok(None);
@@ -445,6 +448,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
+    use crate::network::BoxFuture;
     use crate::peer_info_reader::tests::Dialed;
 
     async fn loopback_utp() -> UtpSocket {
@@ -489,6 +493,106 @@ mod tests {
 
     fn tcp_attempts(connector: &StreamConnector) -> u64 {
         connector.stats().tcp.snapshot().v4.attempts
+    }
+
+    /// The kernel's sockets on a route that says whether a TCP peer finds a
+    /// socket free.
+    struct Room {
+        sockets: Arc<dyn SocketFactory>,
+        tcp: bool,
+    }
+
+    impl SocketFactory for Room {
+        fn tcp_room(&self) -> bool {
+            self.tcp
+        }
+
+        fn connect_tcp<'a>(
+            &'a self,
+            addr: SocketAddr,
+        ) -> BoxFuture<'a, std::io::Result<(BoxAsyncReadVectored, BoxAsyncWrite)>> {
+            self.sockets.connect_tcp(addr)
+        }
+
+        fn listen_tcp<'a>(
+            &'a self,
+            addr: SocketAddr,
+        ) -> BoxFuture<'a, std::io::Result<Box<dyn crate::network::StreamListener>>> {
+            self.sockets.listen_tcp(addr)
+        }
+
+        fn bind_udp<'a>(
+            &'a self,
+            addr: SocketAddr,
+        ) -> BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>> {
+            self.sockets.bind_udp(addr)
+        }
+
+        fn bind_utp<'a>(
+            &'a self,
+            addr: SocketAddr,
+            receive_buffer: usize,
+        ) -> BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>> {
+            self.sockets.bind_utp(addr, receive_buffer)
+        }
+    }
+
+    /// A connector that may use TCP and uTP, on a route with a TCP socket
+    /// free when `tcp` holds.
+    async fn connector_with_room(tcp: bool) -> StreamConnector {
+        let sockets: Arc<dyn SocketFactory> = Arc::new(Room {
+            sockets: crate::test_support::socket_factory(),
+            tcp,
+        });
+        let utp_socket = crate::listen::bind_utp(
+            sockets.as_ref(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Default::default(),
+            crate::udp_options::STREAM_WINDOW,
+            None,
+        )
+        .await
+        .unwrap();
+        StreamConnector::new(StreamConnectorArgs {
+            enable_tcp: true,
+            utp_socket: Some(utp_socket),
+            ipv4_only: false,
+            socket_factory: sockets,
+            encryption: EncryptionPolicy::Disabled,
+        })
+        .await
+        .unwrap()
+    }
+
+    // A route whose TCP peer share is full sends a peer that may use either
+    // transport straight to uTP, with no TCP attempt and no wait for one.
+    #[tokio::test]
+    async fn a_dial_with_no_tcp_socket_free_goes_straight_to_utp() {
+        let connector = connector_with_room(false).await;
+        let theirs = loopback_utp().await;
+        let (accepted, connected) = tokio::join!(
+            theirs.accept(),
+            connector.connect(theirs.bind_addr(), Transports::Any)
+        );
+        accepted.unwrap();
+        let (kind, _r, _w) = connected.unwrap();
+        assert!(matches!(kind, ConnectionKind::Utp));
+        assert_eq!(tcp_attempts(&connector), 0);
+    }
+
+    // Under the share, the same dial tries TCP first.
+    #[tokio::test]
+    async fn a_dial_with_a_tcp_socket_free_tries_tcp_first() {
+        let connector = connector_with_room(true).await;
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let (kind, _r, _w) = connector
+            .connect(listener.local_addr().unwrap(), Transports::Any)
+            .await
+            .unwrap();
+        assert!(matches!(kind, ConnectionKind::Tcp));
+        assert_eq!(tcp_attempts(&connector), 1);
     }
 
     // libtorrent `bt_peer_connection::on_holepunch`, `connect`, and

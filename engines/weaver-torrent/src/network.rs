@@ -101,6 +101,13 @@ pub trait SocketFactory: Send + Sync + 'static {
         self.listen_tcp(addr)
     }
 
+    /// Whether a TCP peer connection finds a socket free now. A route that
+    /// holds its TCP peers to a share says no once the share is full, and
+    /// peers then connect over uTP alone.
+    fn tcp_room(&self) -> bool {
+        true
+    }
+
     /// Bind a datagram socket on `addr`.
     fn bind_udp<'a>(
         &'a self,

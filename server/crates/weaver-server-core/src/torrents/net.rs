@@ -304,6 +304,10 @@ impl LegSockets {
 }
 
 impl SocketFactory for LegSockets {
+    fn tcp_room(&self) -> bool {
+        self.dialer.has_room(&Purpose::Torrent)
+    }
+
     fn connect_tcp<'a>(
         &'a self,
         addr: SocketAddr,
@@ -2259,6 +2263,52 @@ mod tests {
                 .contains(&format!("host: seed.test:{port}\r\n")),
             "{head}"
         );
+    }
+
+    // A leg whose WireGuard session has its TCP peer share full says it has
+    // no TCP room, so peers connect over uTP; it has room again once a peer
+    // closes. A leg on the kernel's sockets holds no share and always has
+    // room.
+    #[tokio::test]
+    async fn a_leg_has_tcp_room_while_its_tcp_peer_share_does() {
+        use weaver_tunnel::pipe::{PortForwarding, SessionSockets, SocketShares};
+        use weaver_tunnel::test_support::{
+            TEST_PEER_ADDRESS, TEST_PEER_HTTP_PORT, WireGuardTestPeer,
+        };
+        let peer = WireGuardTestPeer::start().await;
+        let hop = wireguard_hop(1, peer.client_spec("1"), None, PortForwarding::None);
+        let hop = Arc::new(weaver_tunnel::pipe::SessionHop {
+            sockets: Arc::new(SessionSockets::new(SocketShares {
+                nntp: 0,
+                torrent: 1,
+                reserve: 1,
+            })),
+            ..Arc::into_inner(hop).unwrap()
+        });
+        let rung: Arc<dyn Dialer> = hop;
+        let leg: Arc<dyn Dialer> = Arc::new(weaver_tunnel::pipe::Revocable::new(Arc::new(
+            weaver_tunnel::pipe::Fallback::new(vec![rung]),
+        )));
+        let sockets = LegSockets::new(leg, &LegKind::Ladder);
+        assert!(sockets.tcp_room());
+        let address = SocketAddr::new(TEST_PEER_ADDRESS.into(), TEST_PEER_HTTP_PORT);
+        let connected = sockets.connect_tcp(address).await.unwrap();
+        assert!(!sockets.tcp_room());
+        drop(connected);
+        assert!(sockets.tcp_room());
+
+        let kernel = LegSockets::new(loopback_egress(), &LegKind::Ladder);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(
+                kernel
+                    .connect_tcp(listener.local_addr().unwrap())
+                    .await
+                    .unwrap(),
+            );
+            assert!(kernel.tcp_room());
+        }
     }
 }
 
