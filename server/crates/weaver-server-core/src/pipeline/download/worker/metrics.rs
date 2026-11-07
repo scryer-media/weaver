@@ -412,13 +412,7 @@ impl Pipeline {
         max_connections: usize,
         eligible_count: usize,
     ) {
-        let queue_depth = self
-            .jobs
-            .values()
-            .map(|state| {
-                state.articles.queued_download_len() + state.articles.queued_recovery_len()
-            })
-            .sum::<usize>();
+        let dispatchable_queue_depth = self.dispatchable_queue_depth();
         let hot_job_id = self.current_hot_job().map(|id| id.0).unwrap_or_default();
         for job_id in jobs {
             let Some(state) = self.jobs.get(job_id) else {
@@ -431,11 +425,11 @@ impl Pipeline {
                     job_id = job_id.0,
                     status = ?state.status,
                     download_queue_len = state.articles.queued_download_len(),
-                    recovery_queue_len = state.articles.queued_recovery_len(),
+                    parked_recovery_len = state.articles.queued_recovery_len(),
                     downloaded_bytes = state.downloaded_bytes,
                     stalled_secs = stalled_for.as_secs(),
                     eligible_count,
-                    queue_depth,
+                    dispatchable_queue_depth,
                     active_downloads = self.active_downloads,
                     active_connections = self.active_download_connections,
                     max_connections,
@@ -453,13 +447,13 @@ impl Pipeline {
                     job_id = job_id.0,
                     status = ?state.status,
                     download_queue_len = state.articles.queued_download_len(),
-                    recovery_queue_len = state.articles.queued_recovery_len(),
+                    parked_recovery_len = state.articles.queued_recovery_len(),
                     downloaded_bytes = state.downloaded_bytes,
                     stalled_secs = stalled_for.as_secs(),
                     requeued_retries,
                     rotation_hints_cleared,
                     eligible_count,
-                    queue_depth,
+                    dispatchable_queue_depth,
                     active_downloads = self.active_downloads,
                     active_connections = self.active_download_connections,
                     max_connections,
@@ -486,14 +480,8 @@ impl Pipeline {
             return;
         }
 
-        let queue_depth = self
-            .jobs
-            .values()
-            .map(|state| {
-                state.articles.queued_download_len() + state.articles.queued_recovery_len()
-            })
-            .sum::<usize>();
-        if queue_depth == 0 {
+        let dispatchable_queue_depth = self.dispatchable_queue_depth();
+        if dispatchable_queue_depth == 0 {
             self.last_download_dispatch_stall_log_at = None;
             return;
         }
@@ -517,10 +505,11 @@ impl Pipeline {
         let stall_recovery = self.download_stall_recovery;
         let servers_available = self.dispatchable_server_count();
         if let Some(job_id) = self.job_order.iter().copied().find(|job_id| {
-            self.jobs.get(job_id).is_some_and(|state| {
-                state.articles.has_queued_download_work()
-                    || state.articles.queued_recovery_len() > 0
-            })
+            self.nzb_admitted.contains(job_id)
+                && self
+                    .jobs
+                    .get(job_id)
+                    .is_some_and(Self::has_dispatchable_work)
         }) {
             let state = self
                 .jobs
@@ -536,10 +525,10 @@ impl Pipeline {
                 job_id = job_id.0,
                 status = ?state.status,
                 download_queue_len = state.articles.queued_download_len(),
-                recovery_queue_len = state.articles.queued_recovery_len(),
+                parked_recovery_len = state.articles.queued_recovery_len(),
                 status_allows_dispatch = Self::status_allows_download_dispatch(&state.status),
                 eligible_count,
-                queue_depth,
+                dispatchable_queue_depth,
                 active_downloads = self.active_downloads,
                 active_connections = self.active_download_connections,
                 max_connections,
@@ -562,7 +551,7 @@ impl Pipeline {
         } else {
             warn!(
                 eligible_count,
-                queue_depth,
+                dispatchable_queue_depth,
                 active_downloads = self.active_downloads,
                 active_connections = self.active_download_connections,
                 max_connections,
@@ -634,16 +623,10 @@ impl Pipeline {
         now: Instant,
         max_connections: usize,
     ) {
-        let queue_depth = self
-            .jobs
-            .values()
-            .map(|state| {
-                state.articles.queued_download_len() + state.articles.queued_recovery_len()
-            })
-            .sum::<usize>();
+        let dispatchable_queue_depth = self.dispatchable_queue_depth();
         // Nothing to fill the lanes with, or the lanes are full: either way
         // this is not the condition, and the window restarts from here.
-        if queue_depth == 0 || self.active_download_connections >= max_connections {
+        if dispatchable_queue_depth == 0 || self.active_download_connections >= max_connections {
             self.download_lanes_under_cap_since = None;
             return;
         }
@@ -674,7 +657,7 @@ impl Pipeline {
             })
             .collect();
         info!(
-            queue_depth,
+            dispatchable_queue_depth,
             active_connections = self.active_download_connections,
             active_downloads = self.active_downloads,
             max_connections,

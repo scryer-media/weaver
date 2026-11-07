@@ -288,10 +288,7 @@ impl Pipeline {
             .into_iter()
             .filter_map(|(job_id, position)| {
                 let state = self.jobs.get(&job_id)?;
-                if !state.articles.has_queued_download_work()
-                    || !Self::status_allows_download_dispatch(&state.status)
-                    || self.held_for_added_scripts(job_id)
-                {
+                if !Self::has_dispatchable_work(state) || self.held_for_added_scripts(job_id) {
                     return None;
                 }
                 Some((Self::job_dispatch_priority(state), position, job_id))

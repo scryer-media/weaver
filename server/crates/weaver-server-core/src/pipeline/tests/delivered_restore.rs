@@ -67,6 +67,16 @@ async fn move_without_hearing_it(
     crate::jobs::working_dir::stamp_working_dir(&pipeline.intermediate_dir, &working_dir, job_id)
         .await
         .unwrap();
+    until_the_move(pipeline, job_id, working_dir).await
+}
+
+// Runs a job whose every article is in hand up to its final move and hands
+// back the move's done message, unhandled.
+async fn until_the_move(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+    working_dir: PathBuf,
+) -> (PathBuf, MoveToCompleteDone) {
     pipeline.check_job_completion(job_id).await;
     // The download's queue-script barrier runs no script and lets it on.
     while !pipeline.inflight_moves.contains(&job_id) {
@@ -471,4 +481,118 @@ async fn move_done_turn_reads_no_database_with_a_long_queue() {
         .expect("the job finishes");
     assert_eq!(finished.status, JobStatus::Complete);
     assert!(complete_dir.join("long queue").join("payload.bin").exists());
+}
+
+// A consumed input whose removal failed before the move stays in the working
+// directory. A restart part way through that move resumes it, and the resumed
+// move leaves the same input: it is no part of the delivery, before the
+// restart or after it.
+#[tokio::test]
+async fn a_resumed_move_leaves_the_consumed_input_it_was_told_to_leave() {
+    use super::engines::harness::{Post, par2_set, payload, spec};
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp).await;
+    let job_id = JobId(10311);
+    let job_name = "Slate Harbour Held Input";
+    let data = payload(4096, 53);
+    let mut posts = vec![Post::plain("payload.bin", data.clone())];
+    posts.extend(par2_set("payload", &[("payload.bin", &data)], 2));
+    // One article a file.
+    let working_dir =
+        insert_active_job(&mut pipeline, job_id, spec(job_name, &posts, 1 << 20)).await;
+    crate::jobs::working_dir::stamp_working_dir(&pipeline.intermediate_dir, &working_dir, job_id)
+        .await
+        .unwrap();
+    let works: Vec<DownloadWork> = {
+        let active = pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .articles
+            .active_mut()
+            .unwrap();
+        let mut works = active.download_queue.drain_all();
+        works.extend(active.recovery_queue.drain_all());
+        works
+    };
+    assert_eq!(works.len(), posts.len());
+    pipeline.hold_test_lane_works(works.clone(), false);
+    for work in &works {
+        let post = &posts[work.segment_id.file_id.file_index as usize];
+        let raw = encode_article_part(&post.name, &post.bytes, 1, 1, 1, post.bytes.len() as u64);
+        pipeline
+            .handle_download_done(DownloadResult {
+                lane_id: 0,
+                job_id,
+                runtime_generation: 0,
+                segment_id: work.segment_id,
+                data: Ok(DownloadPayload::Raw(raw)),
+                attempts: Vec::new(),
+                lane_observation: None,
+                source_server_idx: None,
+                origin: DownloadResultOrigin::NormalPrimary,
+                retry_count: 0,
+                exclude_servers: Vec::new(),
+                release_connection_slot: true,
+            })
+            .await;
+    }
+    drain_decode_results(&mut pipeline, works.len()).await;
+    hear_graph_mail(&mut pipeline, job_id).await;
+
+    // A consumed input the delivery cannot remove: a directory with an entry
+    // in it, which no file removal takes away on any host or under any user.
+    let (pinned_tx, pinned_rx) = std::sync::mpsc::channel();
+    *crate::pipeline::completion::finalize::BEFORE_SPENT_REMOVAL
+        .lock()
+        .unwrap() = Some(Box::new(move |spent: &[PathBuf]| {
+        let pinned = spent
+            .iter()
+            .find(|path| path.is_file())
+            .expect("the recovery set is spent before delivery")
+            .clone();
+        std::fs::remove_file(&pinned).unwrap();
+        std::fs::create_dir(&pinned).unwrap();
+        std::fs::write(pinned.join("held"), b"held").unwrap();
+        let _ = pinned_tx.send(pinned.file_name().unwrap().to_owned());
+    }));
+    // The payload moves, and the move goes no further, as a restart would
+    // have stopped it.
+    let destination = complete_dir.join(crate::jobs::working_dir::sanitize_dirname(job_name));
+    let first_moved = destination.join("payload.bin");
+    let intermediate = intermediate_dir.clone();
+    *crate::pipeline::completion::finalize::BEFORE_FIRST_MOVE
+        .lock()
+        .unwrap() = Some(Box::new(move |job_id| {
+        let working_dir = crate::jobs::working_dir::find_job_working_dir(&intermediate, job_id)
+            .unwrap()
+            .unwrap();
+        std::fs::rename(working_dir.join("payload.bin"), &first_moved).unwrap();
+    }));
+    let (working_dir, done) = until_the_move(&mut pipeline, job_id, working_dir).await;
+    let pinned = pinned_rx
+        .try_recv()
+        .expect("the delivery removed its consumed inputs");
+    assert!(done.result.is_err());
+    assert!(working_dir.join(&pinned).join("held").exists());
+    retire_pipeline_database(pipeline).await;
+
+    let mut restored = restart_and_restore(&temp, &intermediate_dir, job_id).await;
+    assert!(restored.inflight_moves.contains(&job_id));
+    settle_inflight_moves(&mut restored).await;
+    finished_once(&mut restored, job_id, &complete_dir).await;
+    assert_eq!(
+        tokio::fs::read(destination.join("payload.bin"))
+            .await
+            .unwrap(),
+        data
+    );
+    assert!(
+        !destination.join(&pinned).exists(),
+        "the resumed move delivered the consumed input"
+    );
+    assert!(
+        working_dir.join(&pinned).join("held").exists(),
+        "the consumed input left the working directory"
+    );
 }

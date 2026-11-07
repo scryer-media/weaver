@@ -1215,6 +1215,11 @@ pub struct PostProcessingFacts {
     // move begins: a restart after that has no graph to ask again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered: Option<DeliveredVerdict>,
+    // The consumed inputs the final move was told to leave in the working
+    // directory because their removal failed, relative to it, kept from the
+    // moment the move begins: a resumed move leaves them too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub left_behind: Vec<std::path::PathBuf>,
 }
 
 // How a job that delivered ended, as its graph ruled: whole or in part, the

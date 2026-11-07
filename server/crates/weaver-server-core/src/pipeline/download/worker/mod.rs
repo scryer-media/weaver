@@ -781,8 +781,14 @@ impl Pipeline {
             });
             slot_holders.sort_unstable();
             let mut ineligible_jobs = Vec::new();
+            // Whether a job holding a slot has work dispatch could hand out
+            // and is not. A slot held by a job with none (verifying, repairing
+            // or extracting, its recovery parked) is held by design, so jobs
+            // waiting behind it are not a dispatch stall.
+            let mut holder_has_dispatchable_work = false;
             for (i, jid) in slot_holders.iter().map(|(i, jid)| (*i, jid)) {
                 if let Some(s) = self.jobs.get(jid) {
+                    holder_has_dispatchable_work |= Self::has_dispatchable_work(s);
                     let status_allows_dispatch = Self::status_allows_download_dispatch(&s.status);
                     let download_pipeline_draining = !s.articles.has_queued_download_work()
                         && status_allows_dispatch
@@ -793,7 +799,7 @@ impl Pipeline {
                             idx = i,
                             status = ?s.status,
                             queue_len = s.articles.queued_download_len(),
-                            recovery_len = s.articles.queued_recovery_len(),
+                            parked_recovery_len = s.articles.queued_recovery_len(),
                             status_allows_dispatch,
                             "dispatch idle: download pipeline draining"
                         );
@@ -823,11 +829,11 @@ impl Pipeline {
                             idx = i,
                             status = ?s.status,
                             queue_len = s.articles.queued_download_len(),
-                            recovery_len = s.articles.queued_recovery_len(),
+                            parked_recovery_len = s.articles.queued_recovery_len(),
                             status_allows_dispatch,
                             "dispatch idle: job not eligible by status"
                         );
-                    } else if !status_allows_dispatch || !s.articles.has_queued_download_work() {
+                    } else if !Self::has_dispatchable_work(s) {
                         // A job with nothing queued to fetch — its download is
                         // done and it is verifying, extracting or moving its
                         // output, or its last articles are still settling — is
@@ -839,7 +845,7 @@ impl Pipeline {
                             idx = i,
                             status = ?s.status,
                             queue_len = s.articles.queued_download_len(),
-                            recovery_len = s.articles.queued_recovery_len(),
+                            parked_recovery_len = s.articles.queued_recovery_len(),
                             status_allows_dispatch,
                             "dispatch idle: nothing for dispatch to hand out"
                         );
@@ -855,7 +861,7 @@ impl Pipeline {
                     }
                 }
             }
-            for (job_id, idx, status, queue_len, recovery_len, status_allows_dispatch) in
+            for (job_id, idx, status, queue_len, parked_recovery_len, status_allows_dispatch) in
                 ineligible_jobs
             {
                 let Some(suppressed_since_last) = self.dispatch_ineligible_log_throttle.admit_at(
@@ -870,7 +876,7 @@ impl Pipeline {
                     idx,
                     status = ?status,
                     queue_len,
-                    recovery_len,
+                    parked_recovery_len,
                     status_allows_dispatch,
                     suppressed_since_last,
                     "dispatch stall: job not eligible"
@@ -883,6 +889,7 @@ impl Pipeline {
                 .retain(|job_id| self.jobs.contains_key(job_id));
             let waiting = self.jobs.len().saturating_sub(self.nzb_admitted.len());
             if waiting > 0
+                && (slot_holders.is_empty() || holder_has_dispatchable_work)
                 && let Some(suppressed_since_last) = self.dispatch_slot_wait_log_throttle.admit_at(
                     (),
                     DISPATCH_INELIGIBLE_LOG_INTERVAL,
