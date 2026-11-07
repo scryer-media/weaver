@@ -1633,7 +1633,12 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         }
 
         // Top the ring back up to the depth in force.
-        while stop.is_none() && lane.ring_outstanding() < context.depth() {
+        // Behind a mid-batch 480 the lane drains its ring and logs in again
+        // before anything new goes out.
+        while stop.is_none()
+            && lane.ring_outstanding() < context.depth()
+            && !lane.holds_new_requests()
+        {
             if !lane.accepts_new_work() {
                 stop = Some(LaneStop::Quarantined);
                 break;
@@ -2564,7 +2569,11 @@ mod tests {
         assert_eq!(failure.kind, DownloadFailureKind::Unanswered);
         assert!(failure.kind.preserves_article_retry_budget());
         assert_eq!(result.retry_count, 2);
-        assert!(!download_outcome_keeps_connection(&result.data));
+        // The kind says nothing about the socket; the abandoned result
+        // carries the lane's own verdict that the connection was lost.
+        let observation = result.lane_observation.unwrap();
+        assert!(observation.connection_discarded);
+        assert!(!observation.batch_clean);
     }
 
     #[tokio::test]
@@ -2842,10 +2851,6 @@ mod tests {
             Err::<DownloadPayload, _>(DownloadError::Fetch(DownloadFailure::new(
                 DownloadFailureKind::EstablishedTransport,
                 "connection closed mid-body",
-            ))),
-            Err(DownloadError::Fetch(DownloadFailure::new(
-                DownloadFailureKind::Unanswered,
-                "session expired mid-pipeline (480)",
             ))),
             Err(DownloadError::Decode {
                 raw_size: 128,
