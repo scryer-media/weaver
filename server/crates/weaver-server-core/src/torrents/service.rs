@@ -624,7 +624,7 @@ impl TorrentService {
         queue: SchedulerHandle,
         crashed: crate::runtime::panic_trap::CrashMarks,
     ) -> Result<Self, String> {
-        let routes = NetworkRoutes::new(db.clone(), Arc::clone(proxies), ROUTE_TIMEOUT);
+        let routes = NetworkRoutes::new(Arc::clone(proxies), ROUTE_TIMEOUT);
         let sessions = Sessions::new(Arc::new(routes), SessionEnv::of(config), db.clone());
         let service = Self::new(
             db,

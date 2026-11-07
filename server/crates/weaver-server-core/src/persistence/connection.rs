@@ -1256,6 +1256,9 @@ pub struct Database {
     // read: the torrents', their trackers', counters' and history's.
     #[cfg(test)]
     pub(crate) torrent_reads: Arc<AtomicUsize>,
+    // How many times a consumer's routing policy was read from its row.
+    #[cfg(test)]
+    pub(crate) proxy_route_reads: Arc<AtomicUsize>,
     pub(crate) rss_schedule_cache: Arc<crate::rss::ScheduleCache>,
     pub(crate) script_runtime: Arc<crate::post_processing::events::ScriptRuntime>,
     target: DatabaseTarget,
@@ -1307,6 +1310,8 @@ impl Database {
             graph_checkpoint_writes: Arc::default(),
             #[cfg(test)]
             torrent_reads: Arc::default(),
+            #[cfg(test)]
+            proxy_route_reads: Arc::default(),
             script_runtime: Arc::new(crate::post_processing::events::ScriptRuntime::default()),
             target,
             sql_services,
@@ -1343,6 +1348,8 @@ impl Database {
             graph_checkpoint_writes: Arc::default(),
             #[cfg(test)]
             torrent_reads: Arc::default(),
+            #[cfg(test)]
+            proxy_route_reads: Arc::default(),
             sql_services,
             sql_worker,
             writer_tx,
@@ -1572,6 +1579,8 @@ impl Database {
             graph_checkpoint_writes: self.graph_checkpoint_writes.clone(),
             #[cfg(test)]
             torrent_reads: self.torrent_reads.clone(),
+            #[cfg(test)]
+            proxy_route_reads: self.proxy_route_reads.clone(),
             sql_services: self.sql_services.clone(),
             sql_worker: self.sql_worker.clone(),
             writer_tx: detached_tx,

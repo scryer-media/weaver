@@ -391,18 +391,13 @@ pub trait Routes: Send + Sync {
 
 /// Routes as the network runtime resolves them.
 pub struct NetworkRoutes {
-    db: Database,
     proxies: Arc<ProxyRuntime>,
     timeout: Duration,
 }
 
 impl NetworkRoutes {
-    pub fn new(db: Database, proxies: Arc<ProxyRuntime>, timeout: Duration) -> Self {
-        Self {
-            db,
-            proxies,
-            timeout,
-        }
+    pub fn new(proxies: Arc<ProxyRuntime>, timeout: Duration) -> Self {
+        Self { proxies, timeout }
     }
 
     fn network(&self) -> &NetworkRuntime {
@@ -413,11 +408,9 @@ impl NetworkRoutes {
 #[async_trait::async_trait]
 impl Routes for NetworkRoutes {
     fn plan(&self, scope: TorrentScope) -> Result<RoutePlan, String> {
-        let consumer = Consumer::Torrent(scope);
-        let policy = self
-            .db
-            .proxy_routing_policy(consumer)
-            .map_err(|error| error.to_string())?;
+        // The runtime holds every saved policy, loaded when it is built and
+        // again on every reload after a save.
+        let policy = self.proxies.policy(Consumer::Torrent(scope));
         let route = policy.route();
         let leg = route.legs.first().ok_or("the route has no leg")?;
         let egress = leg_egress(self.network(), leg.egress_id);

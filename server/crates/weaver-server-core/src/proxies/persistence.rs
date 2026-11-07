@@ -197,6 +197,9 @@ impl Database {
     }
 
     pub fn proxy_routing_policy(&self, consumer: Consumer) -> Result<RoutingPolicy, StateError> {
+        #[cfg(test)]
+        self.proxy_route_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let store = self.datastore();
         let key = consumer.key();
         self.run_sql_blocking_read(async move {

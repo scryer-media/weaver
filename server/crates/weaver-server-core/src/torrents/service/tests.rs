@@ -804,7 +804,12 @@ async fn a_route_that_goes_down_holds_its_torrents_and_a_category_move_changes_s
 
 // `policy` stored as `consumer`'s route as it is, past the checks a save
 // makes: a route kept from before they held.
-fn store_route_unchecked(db: &Database, consumer: Consumer, policy: &RoutingPolicy) {
+async fn store_route_unchecked(
+    db: &Database,
+    proxies: &crate::proxies::ProxyRuntime,
+    consumer: Consumer,
+    policy: &RoutingPolicy,
+) {
     use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
     let store = db.datastore();
     let row = (consumer.key(), serde_json::to_string(policy).unwrap());
@@ -823,6 +828,7 @@ fn store_route_unchecked(db: &Database, consumer: Consumer, policy: &RoutingPoli
         .await
     })
     .unwrap();
+    proxies.reload().await.unwrap();
 }
 
 // A torrent added by URL is asked for as the client of the tracker rule its
@@ -836,7 +842,6 @@ async fn a_torrent_url_is_asked_for_as_the_client_its_rule_names() {
     let proxies =
         crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
     let routes = Arc::new(crate::torrents::sessions::NetworkRoutes::new(
-        db.clone(),
         Arc::clone(&proxies),
         Duration::from_secs(30),
     ));
@@ -952,13 +957,15 @@ async fn stored_route_faults_keep_their_typed_reason() {
                 .unwrap();
         store_route_unchecked(
             &db,
+            &proxies,
             Consumer::Torrent(TorrentScope::Default),
             &RoutingPolicy {
                 legs,
                 ..Default::default()
             },
-        );
-        let routes = NetworkRoutes::new(db, Arc::clone(&proxies), Duration::from_secs(30));
+        )
+        .await;
+        let routes = NetworkRoutes::new(Arc::clone(&proxies), Duration::from_secs(30));
         let failure = routes.plan(TorrentScope::Default).unwrap().down.unwrap();
         assert_eq!(failure.reason, TorrentRouteReason::RouteBroken(fault));
         assert_eq!(failure.message(), fault.message());
@@ -1011,7 +1018,7 @@ async fn a_pool_route_plans_a_session_on_each_member() {
     .unwrap();
     let proxies =
         crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
-    let routes = NetworkRoutes::new(db, Arc::clone(&proxies), Duration::from_secs(30));
+    let routes = NetworkRoutes::new(Arc::clone(&proxies), Duration::from_secs(30));
 
     let plan = routes.plan(TorrentScope::Default).unwrap();
     assert!(plan.down.is_none(), "{:?}", plan.down);
@@ -1039,6 +1046,7 @@ async fn a_missing_egress_has_a_typed_route_reason() {
         crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
     store_route_unchecked(
         &db,
+        &proxies,
         Consumer::Torrent(TorrentScope::Default),
         &RoutingPolicy {
             legs: vec![RouteLeg {
@@ -1048,8 +1056,9 @@ async fn a_missing_egress_has_a_typed_route_reason() {
             }],
             ..Default::default()
         },
-    );
-    let routes = NetworkRoutes::new(db, Arc::clone(&proxies), Duration::from_secs(30));
+    )
+    .await;
+    let routes = NetworkRoutes::new(Arc::clone(&proxies), Duration::from_secs(30));
     assert_eq!(
         routes
             .plan(TorrentScope::Default)
@@ -1062,9 +1071,46 @@ async fn a_missing_egress_has_a_typed_route_reason() {
     proxies.network.shutdown().await;
 }
 
+// Routes whose plan fails once `failing` is set, else plans as `routes` does.
+struct FailingPlan {
+    routes: crate::torrents::sessions::NetworkRoutes,
+    failing: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Routes for FailingPlan {
+    fn plan(&self, scope: TorrentScope) -> Result<crate::torrents::sessions::RoutePlan, String> {
+        if self.failing.load(Ordering::Acquire) {
+            return Err("the route could not be read".to_owned());
+        }
+        self.routes.plan(scope)
+    }
+
+    fn leg_down(
+        &self,
+        plan: &crate::torrents::sessions::RoutePlan,
+    ) -> Option<crate::torrents::sessions::RouteFailure> {
+        self.routes.leg_down(plan)
+    }
+
+    async fn open(
+        &self,
+        plan: &crate::torrents::sessions::RoutePlan,
+        peers: usize,
+    ) -> Result<crate::torrents::sessions::OpenLeg, String> {
+        self.routes.open(plan, peers).await
+    }
+
+    async fn fetch_blocklist(
+        &self,
+        url: &reqwest::Url,
+    ) -> Result<crate::torrents::sessions::IpRanges, String> {
+        self.routes.fetch_blocklist(url).await
+    }
+}
+
 #[tokio::test]
-async fn a_route_plan_read_failure_stays_typed_in_the_torrents_status() {
-    use crate::persistence::sql_runtime::SqlRuntime;
+async fn a_route_plan_failure_stays_typed_in_the_torrents_status() {
     use crate::torrents::sessions::{NetworkRoutes, TorrentRouteReason};
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open_in_memory().unwrap();
@@ -1072,6 +1118,7 @@ async fn a_route_plan_read_failure_stays_typed_in_the_torrents_status() {
         crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
     store_route_unchecked(
         &db,
+        &proxies,
         Consumer::Torrent(TorrentScope::Default),
         &RoutingPolicy {
             legs: vec![RouteLeg {
@@ -1081,29 +1128,25 @@ async fn a_route_plan_read_failure_stays_typed_in_the_torrents_status() {
             }],
             ..Default::default()
         },
+    )
+    .await;
+    let routes = Arc::new(FailingPlan {
+        routes: NetworkRoutes::new(Arc::clone(&proxies), Duration::from_secs(30)),
+        failing: std::sync::atomic::AtomicBool::new(false),
+    });
+    let service = service_over(
+        &db,
+        dir.path(),
+        Arc::clone(&routes) as Arc<dyn Routes>,
+        job_env(),
+        set_clock(),
     );
-    let routes = Arc::new(NetworkRoutes::new(
-        db.clone(),
-        Arc::clone(&proxies),
-        Duration::from_secs(30),
-    ));
-    let service = service_over(&db, dir.path(), routes, job_env(), set_clock());
     service.open().await.unwrap();
     let job_id = service
         .add(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
-    let store = db.datastore();
-    db.run_sql_blocking(async move {
-        SqlRuntime::run_in_transaction(&store, "missing_routes_fixture", |tx| {
-            Box::pin(async move {
-                tx.execute("DROP TABLE proxy_routes", &[]).await?;
-                Ok(())
-            })
-        })
-        .await
-    })
-    .unwrap();
+    routes.failing.store(true, Ordering::Release);
     service.tick().await;
     let live = service.inner.live.lock().await;
     let Some(Held::RouteDown(failure)) = &live[&job_id].held else {
@@ -1136,6 +1179,81 @@ async fn a_route_plan_read_failure_stays_typed_in_the_torrents_status() {
     proxies.network.shutdown().await;
 }
 
+// A route is planned from the policies the proxy runtime holds: a boot
+// that restores and attaches its torrents reads no route row, and a policy
+// saved is planned once the runtime reloads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routes_are_planned_from_the_runtime_not_the_route_rows() {
+    use crate::torrents::sessions::NetworkRoutes;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    let proxies =
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let routes: Arc<dyn Routes> = Arc::new(NetworkRoutes::new(
+        Arc::clone(&proxies),
+        Duration::from_secs(30),
+    ));
+    let service = service_over(&db, dir.path(), Arc::clone(&routes), job_env(), set_clock());
+    service.open().await.unwrap();
+    let mut jobs = Vec::new();
+    for seed in 0..3 {
+        let name = format!("planned-{seed}");
+        jobs.push(
+            service
+                .add(request(AddSource::Metainfo(plain(&name, seed))))
+                .await
+                .unwrap(),
+        );
+    }
+    service.tick().await;
+    service.stop().await;
+
+    let reads = || db.proxy_route_reads.load(Ordering::Relaxed);
+    let before = reads();
+    let again = service_over(&db, dir.path(), Arc::clone(&routes), job_env(), set_clock());
+    reopen(&again).await;
+    let live = again.inner.live.lock().await;
+    assert!(jobs.iter().all(|job_id| live.contains_key(job_id)));
+    drop(live);
+    assert_eq!(reads() - before, 0, "the boot read a route row");
+
+    // Saved through an egress the host has no interface for, the route is
+    // planned the old way until the runtime reloads, then down on that leg.
+    let absent = db
+        .create_egress_interface(&crate::proxies::EgressInterface {
+            id: 0,
+            name: "absent".into(),
+            binding: crate::proxies::EgressBinding::Interface {
+                name: "weaverabsent0".into(),
+            },
+            enabled: true,
+            download_bps: None,
+            upload_bps: None,
+            quota: Default::default(),
+        })
+        .unwrap();
+    db.save_proxy_routing_policy(
+        Consumer::Torrent(TorrentScope::Default),
+        &RoutingPolicy {
+            legs: vec![RouteLeg {
+                egress_id: absent.id,
+                weight: 100,
+                path: LegPath::Direct,
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let planned = || routes.plan(TorrentScope::Default).unwrap();
+    assert_eq!(planned().egress_id, SYSTEM_EGRESS_ID);
+    proxies.reload().await.unwrap();
+    assert_eq!(planned().egress_id, absent.id);
+    assert!(planned().down.is_some());
+    assert_eq!(reads() - before, 0, "a plan read a route row");
+    again.stop().await;
+    proxies.network.shutdown().await;
+}
+
 // A torrent added by URL is fetched over its route's one leg: up, the
 // request reaches the site; down, the add fails for the route being down,
 // and nothing is asked.
@@ -1162,7 +1280,6 @@ async fn url_route(category: Option<&str>, matched: bool) {
     let proxies =
         crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
     let routes = Arc::new(crate::torrents::sessions::NetworkRoutes::new(
-        db.clone(),
         Arc::clone(&proxies),
         Duration::from_secs(30),
     ));
@@ -1273,7 +1390,7 @@ async fn url_route(category: Option<&str>, matched: bool) {
         },
     )
     .unwrap();
-    proxies.network.reload().await.unwrap();
+    proxies.reload().await.unwrap();
     let down = service
         .inner
         .sessions
@@ -1342,8 +1459,11 @@ async fn a_stored_route_with_two_exits_holds_until_it_is_edited_to_one() {
         },
     };
     let consumer = Consumer::Torrent(TorrentScope::Default);
+    let proxies =
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
     store_route_unchecked(
         &db,
+        &proxies,
         consumer,
         &RoutingPolicy {
             legs: vec![
@@ -1356,11 +1476,9 @@ async fn a_stored_route_with_two_exits_holds_until_it_is_edited_to_one() {
             ],
             ..Default::default()
         },
-    );
-    let proxies =
-        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    )
+    .await;
     let routes = Arc::new(crate::torrents::sessions::NetworkRoutes::new(
-        db.clone(),
         Arc::clone(&proxies),
         Duration::from_secs(30),
     ));
@@ -1421,7 +1539,7 @@ async fn a_stored_route_with_two_exits_holds_until_it_is_edited_to_one() {
         },
     )
     .unwrap();
-    proxies.network.reload().await.unwrap();
+    proxies.reload().await.unwrap();
     service.tick().await;
 
     let live = service.inner.live.lock().await;

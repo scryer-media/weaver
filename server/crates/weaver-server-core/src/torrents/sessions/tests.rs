@@ -2431,8 +2431,7 @@ async fn a_system_leg_session_looks_names_up_on_the_record() {
     let db = Database::open_in_memory().unwrap();
     let proxies =
         crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
-    let routes =
-        crate::torrents::sessions::NetworkRoutes::new(db, proxies, Duration::from_secs(30));
+    let routes = crate::torrents::sessions::NetworkRoutes::new(proxies, Duration::from_secs(30));
     let plan = routes.plan(TorrentScope::Default).unwrap();
     assert_eq!(plan.kind, LegKind::System);
     let leg = routes.open(&plan, 8).await.unwrap();
@@ -2489,8 +2488,7 @@ async fn a_route_plans_who_resolves_its_names() {
     .unwrap();
     let proxies =
         crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
-    let routes =
-        crate::torrents::sessions::NetworkRoutes::new(db, proxies, Duration::from_secs(30));
+    let routes = crate::torrents::sessions::NetworkRoutes::new(proxies, Duration::from_secs(30));
     let direct = routes.plan(TorrentScope::Default).unwrap();
     assert_eq!(direct.kind, LegKind::System);
     assert_eq!(direct.names, Some(ResolvedBy::Host));

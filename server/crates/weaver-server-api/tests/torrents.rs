@@ -1577,6 +1577,9 @@ async fn the_routes_and_trackers_say_who_resolves_their_names() {
     };
     use weaver_server_core::torrents::sessions::NetworkRoutes;
 
+    // The runtime the routes plan from, reloaded after a policy is saved
+    // straight to its row.
+    let runtime = std::sync::OnceLock::new();
     let rig = rig_on(|db| {
         db.save_proxy_profile(&ProxyProfile {
             id: 1,
@@ -1600,8 +1603,8 @@ async fn the_routes_and_trackers_say_who_resolves_their_names() {
         })
         .unwrap();
         let proxies = ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+        runtime.set(Arc::clone(&proxies)).ok().unwrap();
         Arc::new(Planned(NetworkRoutes::new(
-            db.clone(),
             proxies,
             std::time::Duration::from_secs(30),
         )))
@@ -1635,6 +1638,7 @@ async fn the_routes_and_trackers_say_who_resolves_their_names() {
             },
         )
         .unwrap();
+    runtime.get().unwrap().reload().await.unwrap();
 
     let response = rig
         .execute("{ torrentRoutes { scopes { scope } resolvedBy } }")
