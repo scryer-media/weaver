@@ -10,6 +10,16 @@ use std::time::{Duration, Instant};
 pub(crate) const LATENCY_BAND_GOOD_MAX: Duration = Duration::from_millis(400);
 pub(crate) const LATENCY_BAND_MODERATE_MAX: Duration = Duration::from_millis(800);
 
+// Probe latency from which a server with nothing proven opens four deep
+// inside the good band, which otherwise opens two deep.
+//
+// A 100 ms link carrying ordinary articles needs 4: pinned at 4 it downloads
+// as fast as pinned at 8, and an explorer that opens at 2 cannot move before
+// its opening window closes, by which time connect, login and the first
+// articles have all run at 2. Below this a link is near enough that 2 covers
+// the round trip.
+const OPEN_FOUR_DEEP_MIN_LATENCY: Duration = Duration::from_millis(50);
+
 // Depths the explorer will actually run. `1` is sequential; a failure drops
 // off the bottom of the pipelined rungs onto it.
 const RUNGS: [u8; 4] = [1, 2, 4, 8];
@@ -163,13 +173,27 @@ impl LatencyBand {
     }
 
     // Where a server with no measurement of its own starts. A further-away
-    // server has more round trip to hide, so it starts deeper.
+    // server has more round trip to hide, so it starts deeper. The good band
+    // opens deeper from [`OPEN_FOUR_DEEP_MIN_LATENCY`]; see
+    // [`guessed_opening_depth`].
     pub(crate) fn starting_depth(self) -> u8 {
         match self {
             Self::Good => 2,
             Self::Moderate => 4,
             Self::Slow => 8,
         }
+    }
+}
+
+// The rung a server opens at when the probe's latency is all there is to go
+// on: the band's starting depth, and 4 for a good-band link from
+// [`OPEN_FOUR_DEEP_MIN_LATENCY`] up.
+fn guessed_opening_depth(latency: Duration) -> u8 {
+    let band_depth = LatencyBand::from_latency(latency).starting_depth();
+    if latency >= OPEN_FOUR_DEEP_MIN_LATENCY {
+        band_depth.max(4)
+    } else {
+        band_depth
     }
 }
 
@@ -250,10 +274,19 @@ pub(crate) struct ServerPipelineExplorer {
     // on — the rung its own measurements ask for. The first move goes
     // straight there; every later one walks the ladder a rung at a time.
     first_climb_pending: bool,
-    // The servers table held a rung for this server when the explorer was
-    // seeded. Such a server's first climb is judged by a trial like any
-    // other; only a server with nothing proven moves on the model alone.
-    seeded_from_proven_rung: bool,
+    // The first climb is judged by a trial like any later one rather than
+    // taken on the model alone. Set when the servers table held a rung for
+    // this server when the explorer was seeded, and when a guessed opening
+    // rung was dropped: either way the server has a record the model alone
+    // does not get to overrule.
+    first_climb_is_a_trial: bool,
+    // The opening rung came from the probe's latency band alone — no proven
+    // rung, no complete model — and is deeper than 2. While set, an unclean
+    // batch drops the rung without a hold and without counting toward a pin
+    // to sequential: the explorer never measured that rung, so failing it
+    // says nothing about the rung it would have chosen. Cleared by the first
+    // measured, fed window that closes at the rung, or by the drop.
+    opened_on_a_guess: bool,
     // Set after the first climb moved to the modelled rung without a trial,
     // until a clean window at that rung settles it as the baseline.
     settle_pending: bool,
@@ -317,7 +350,8 @@ impl Default for ServerPipelineExplorer {
             baseline_throughput_bps: None,
             on_trial: false,
             first_climb_pending: true,
-            seeded_from_proven_rung: false,
+            first_climb_is_a_trial: false,
+            opened_on_a_guess: false,
             settle_pending: false,
             warmup_windows_left: RUNG_WARMUP_WINDOWS,
             window_responses: 0,
@@ -351,9 +385,9 @@ impl ServerPipelineExplorer {
     // evidence and outranks any estimate. The bandwidth-delay estimate is the
     // real answer whenever both of its halves are known — an article transfer
     // time carried over from a pool that has already run, say — and the
-    // latency band is only the coarse stand-in for when they are not: it says
-    // 2 for everything nearer than 400 ms, which on a 100 ms link carrying
-    // ordinary articles is a quarter of the depth the link can use.
+    // latency band is only the coarse stand-in for when they are not: see
+    // `guessed_opening_depth`. A rung opened on that guess alone is marked,
+    // so that failing it costs no hold; see `opened_on_a_guess`.
     pub(crate) fn seeded(
         proven_depth: Option<u8>,
         probe_latency: Option<Duration>,
@@ -367,19 +401,16 @@ impl ServerPipelineExplorer {
                         .clamp(MIN_TARGET_DEPTH, MAX_TARGET_DEPTH) as u8,
                 )
             });
-        let start = proven_depth
-            .map(rung_at_or_above)
-            .or(modelled)
-            .or_else(|| {
-                probe_latency.map(|latency| LatencyBand::from_latency(latency).starting_depth())
-            })
-            .unwrap_or(2);
+        let measured = proven_depth.map(rung_at_or_above).or(modelled);
+        let guessed = probe_latency.map(guessed_opening_depth);
+        let start = measured.or(guessed).unwrap_or(2).clamp(2, 8);
         Self {
-            current_depth: start.clamp(2, 8),
+            current_depth: start,
             latency: probe_latency,
             transfer: article_transfer,
             persisted_depth: proven_depth,
-            seeded_from_proven_rung: proven_depth.is_some(),
+            first_climb_is_a_trial: proven_depth.is_some(),
+            opened_on_a_guess: measured.is_none() && guessed.is_some() && start > 2,
             ..Self::default()
         }
     }
@@ -679,6 +710,9 @@ impl ServerPipelineExplorer {
             // nothing in it that describes the rung.
             return None;
         }
+        // A clean, measured window at a guessed rung: the server has taken
+        // that depth, and from here every rule applies as to a chosen one.
+        self.opened_on_a_guess = false;
         if opening_window {
             return self.first_climb_from_the_model(now);
         }
@@ -756,8 +790,8 @@ impl ServerPipelineExplorer {
         Some(RungChange::Stepped { from, to })
     }
 
-    // The first climb on a server with no proven rung, taken as the opening
-    // window closes.
+    // The first climb on a server with no proven rung and no dropped guess,
+    // taken as the opening window closes.
     //
     // By then the window has measured the round trip and the article
     // transfer, and the two already name the rung the link needs. Waiting a
@@ -769,7 +803,7 @@ impl ServerPipelineExplorer {
     // a half, leaves the second window to decide as it always has.
     fn first_climb_from_the_model(&mut self, now: Instant) -> Option<RungChange> {
         if !self.first_climb_pending
-            || self.seeded_from_proven_rung
+            || self.first_climb_is_a_trial
             || self.hold_until.is_some_and(|until| now < until)
             || self.physical_target_depth().is_none()
         {
@@ -798,6 +832,10 @@ impl ServerPipelineExplorer {
 
     // An unclean pipelined batch: one rung off, and hands off this server for
     // ten minutes. A second one inside that window settles the question.
+    //
+    // A rung opened on the probe's guess and not yet measured is the
+    // exception: it drops a rung with no hold and is not counted toward the
+    // pin, and the first climb back is judged by a trial.
     pub(super) fn note_unclean_batch(&mut self, now: Instant) -> Option<RungChange> {
         if self.pinned_sequential {
             return None;
@@ -807,6 +845,15 @@ impl ServerPipelineExplorer {
         self.settle_pending = false;
         self.baseline_depth = None;
         self.baseline_throughput_bps = None;
+
+        if self.opened_on_a_guess {
+            self.opened_on_a_guess = false;
+            self.first_climb_is_a_trial = true;
+            let from = self.current_depth;
+            let to = RUNGS[rung_index(from).saturating_sub(1)];
+            self.current_depth = to;
+            return (to != from).then_some(RungChange::Dropped { from, to });
+        }
 
         let within_hold = self
             .last_unclean_at
@@ -1638,7 +1685,33 @@ mod tests {
             4
         );
         assert_eq!(
+            ServerPipelineExplorer::seeded(None, Some(Duration::from_millis(400)), None)
+                .current_depth(),
+            4
+        );
+        // The good band opens four deep from 50 ms, two deep below it.
+        assert_eq!(
+            ServerPipelineExplorer::seeded(None, Some(Duration::from_millis(399)), None)
+                .current_depth(),
+            4
+        );
+        assert_eq!(
+            ServerPipelineExplorer::seeded(None, Some(Duration::from_millis(100)), None)
+                .current_depth(),
+            4
+        );
+        assert_eq!(
             ServerPipelineExplorer::seeded(None, Some(Duration::from_millis(50)), None)
+                .current_depth(),
+            4
+        );
+        assert_eq!(
+            ServerPipelineExplorer::seeded(None, Some(Duration::from_millis(49)), None)
+                .current_depth(),
+            2
+        );
+        assert_eq!(
+            ServerPipelineExplorer::seeded(None, Some(Duration::from_millis(30)), None)
                 .current_depth(),
             2
         );
@@ -1695,6 +1768,183 @@ mod tests {
             .current_depth(),
             2
         );
+    }
+
+    // A server seeded from nothing but the probe's latency.
+    fn guessed_from_probe(probe_ms: u64) -> ServerPipelineExplorer {
+        let mut explorer =
+            ServerPipelineExplorer::seeded(None, Some(Duration::from_millis(probe_ms)), None);
+        explorer.note_supports_pipelining(true);
+        explorer
+    }
+
+    // Only an opening rung the band guessed, deeper than 2, is marked. A
+    // proven rung, a complete model, or a band that says 2 is not a guess.
+    #[test]
+    fn only_a_band_guessed_opening_deeper_than_two_is_marked_a_guess() {
+        for (probe_ms, depth) in [(100, 4), (400, 4), (900, 8)] {
+            let explorer = guessed_from_probe(probe_ms);
+            assert_eq!(explorer.current_depth(), depth, "probe {probe_ms} ms");
+            assert!(explorer.opened_on_a_guess, "probe {probe_ms} ms");
+        }
+        let near = guessed_from_probe(30);
+        assert_eq!(near.current_depth(), 2);
+        assert!(!near.opened_on_a_guess);
+
+        let proven =
+            ServerPipelineExplorer::seeded(Some(4), Some(Duration::from_millis(100)), None);
+        assert!(!proven.opened_on_a_guess);
+        let modelled = ServerPipelineExplorer::seeded(
+            None,
+            Some(Duration::from_millis(100)),
+            Some(Duration::from_millis(25)),
+        );
+        assert_eq!(modelled.current_depth(), 8);
+        assert!(!modelled.opened_on_a_guess);
+        assert!(!ServerPipelineExplorer::seeded(None, None, None).opened_on_a_guess);
+    }
+
+    // A 100 ms probe opens at 4. The opening window takes that rung clean
+    // and its model asks for 8: the explorer jumps there untried and the next
+    // clean window at 8 settles it, which is the first depth worth saving.
+    #[test]
+    fn a_guessed_opening_taken_clean_jumps_on_the_model_and_settles() {
+        let mut explorer = guessed_from_probe(100);
+        let now = Instant::now();
+        assert_eq!(explorer.current_depth(), 4);
+
+        assert_eq!(
+            run_window(&mut explorer, now, 768_000, Duration::from_millis(25)),
+            Some(RungChange::Stepped { from: 4, to: 8 })
+        );
+        assert!(!explorer.opened_on_a_guess);
+        assert!(!explorer.on_trial);
+        assert!(explorer.settle_pending);
+        assert_eq!(
+            run_window(&mut explorer, now, 768_000, Duration::from_millis(25)),
+            Some(RungChange::Kept { depth: 8 })
+        );
+        assert_eq!(explorer.take_persist_request(), Some(8));
+
+        // A model that asks for the guessed rung keeps it, and the first
+        // climb is over once the next window agrees; nothing is saved.
+        let mut explorer = guessed_from_probe(100);
+        assert_eq!(
+            run_window(&mut explorer, now, 768_000, Duration::from_millis(60)),
+            None
+        );
+        assert_eq!(explorer.target_rung(), 4);
+        assert_eq!(
+            run_window(&mut explorer, now, 768_000, Duration::from_millis(60)),
+            None
+        );
+        assert_eq!(explorer.current_depth(), 4);
+        assert!(!explorer.first_climb_pending);
+        assert_eq!(explorer.persisted_depth, None);
+    }
+
+    // A guessed rung the server refuses before any window has measured it
+    // costs one rung and nothing more: no hold, no count toward the pin, and
+    // the climb back is a trial rather than a jump on the model.
+    #[test]
+    fn an_unclean_batch_at_a_guessed_rung_drops_it_without_a_hold() {
+        let mut explorer = guessed_from_probe(100);
+        let now = Instant::now();
+        assert_eq!(
+            explorer.note_unclean_batch(now),
+            Some(RungChange::Dropped { from: 4, to: 2 })
+        );
+        assert_eq!(explorer.current_depth(), 2);
+        assert_eq!(explorer.hold_until, None);
+        assert_eq!(explorer.last_unclean_at, None);
+        assert!(!explorer.opened_on_a_guess);
+
+        // The opening window at 2 makes no jump, though its model says 8.
+        assert_eq!(
+            run_window(&mut explorer, now, 768_000, Duration::from_millis(25)),
+            None
+        );
+        assert_eq!(explorer.target_rung(), 8);
+        assert_eq!(explorer.current_depth(), 2);
+        // The next window takes the baseline and climbs on trial.
+        assert_eq!(
+            run_window(&mut explorer, now, 768_000, Duration::from_millis(25)),
+            Some(RungChange::Stepped { from: 2, to: 8 })
+        );
+        assert!(explorer.on_trial);
+        assert!(!explorer.settle_pending);
+    }
+
+    // The unclean batch after a dropped guess is the first one counted: it
+    // drops and holds as any other, and only the one after that pins.
+    #[test]
+    fn a_second_unclean_batch_after_a_dropped_guess_does_not_pin() {
+        let mut explorer = guessed_from_probe(100);
+        let now = Instant::now();
+        assert_eq!(
+            explorer.note_unclean_batch(now),
+            Some(RungChange::Dropped { from: 4, to: 2 })
+        );
+        let next = now + Duration::from_secs(1);
+        assert_eq!(
+            explorer.note_unclean_batch(next),
+            Some(RungChange::Dropped { from: 2, to: 1 })
+        );
+        assert!(!explorer.pinned_sequential());
+        assert_eq!(explorer.hold_until, Some(next + RUNG_HOLD));
+        assert_eq!(explorer.last_unclean_at, Some(next));
+
+        assert_eq!(
+            explorer.note_unclean_batch(next + Duration::from_secs(1)),
+            Some(RungChange::PinnedSequential)
+        );
+    }
+
+    // Once a measured, fed window has closed clean at the guessed rung the
+    // server has taken it, and an unclean batch is treated as at any rung:
+    // dropped, held, and counted.
+    #[test]
+    fn an_unclean_batch_after_the_guessed_rung_was_taken_holds() {
+        let mut explorer = guessed_from_probe(100);
+        let now = Instant::now();
+        assert_eq!(
+            run_window(&mut explorer, now, 768_000, Duration::from_millis(60)),
+            None
+        );
+        assert!(!explorer.opened_on_a_guess);
+        assert_eq!(
+            explorer.note_unclean_batch(now),
+            Some(RungChange::Dropped { from: 4, to: 2 })
+        );
+        assert_eq!(explorer.hold_until, Some(now + RUNG_HOLD));
+        assert_eq!(explorer.last_unclean_at, Some(now));
+    }
+
+    // The no-hold drop covers every band-guessed opening above 2, so the
+    // moderate and slow bands get it too; a proven rung never does.
+    #[test]
+    fn every_band_guess_drops_without_a_hold_and_a_proven_rung_holds() {
+        let now = Instant::now();
+        for (probe_ms, from, to) in [(400, 4, 2), (900, 8, 4)] {
+            let mut explorer = guessed_from_probe(probe_ms);
+            assert_eq!(
+                explorer.note_unclean_batch(now),
+                Some(RungChange::Dropped { from, to }),
+                "probe {probe_ms} ms"
+            );
+            assert_eq!(explorer.hold_until, None, "probe {probe_ms} ms");
+            assert_eq!(explorer.last_unclean_at, None, "probe {probe_ms} ms");
+        }
+
+        let mut proven =
+            ServerPipelineExplorer::seeded(Some(4), Some(Duration::from_millis(100)), None);
+        proven.note_supports_pipelining(true);
+        assert_eq!(
+            proven.note_unclean_batch(now),
+            Some(RungChange::Dropped { from: 4, to: 2 })
+        );
+        assert_eq!(proven.hold_until, Some(now + RUNG_HOLD));
+        assert_eq!(proven.last_unclean_at, Some(now));
     }
 
     // The first leases every lane takes are booked before any response has
