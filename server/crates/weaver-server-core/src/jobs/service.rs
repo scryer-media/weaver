@@ -613,6 +613,7 @@ impl Pipeline {
                 .then_some(crate::jobs::model::PostState::Idle),
             failure_error: None,
             delivered: None,
+            delivery_left_behind: Vec::new(),
             working_dir: working_dir.clone(),
             downloaded_bytes: restart
                 .as_ref()
@@ -970,6 +971,7 @@ impl Pipeline {
             paused_resume_post_state: request.paused_resume_post_state,
             failure_error: Some(reason),
             delivered: None,
+            delivery_left_behind: Vec::new(),
             working_dir: request.working_dir.clone(),
             downloaded_bytes: 0,
             restored_download_floor_bytes: 0,
@@ -1108,6 +1110,7 @@ impl Pipeline {
             nzb_password_candidates,
             finalization_open,
             delivered,
+            delivery_left_behind,
         } = restored;
         if self.jobs.contains_key(&job_id) {
             return Err(crate::SchedulerError::JobExists(job_id));
@@ -1319,6 +1322,7 @@ impl Pipeline {
                 _ => None,
             },
             delivered: None,
+            delivery_left_behind: Vec::new(),
             working_dir,
             downloaded_bytes,
             restored_download_floor_bytes,
@@ -1376,6 +1380,7 @@ impl Pipeline {
         // decides from this.
         if delivering && let Some(state) = self.jobs.get_mut(&job_id) {
             state.delivered = delivered;
+            state.delivery_left_behind = delivery_left_behind;
         }
         self.schedule_job_completion_check(job_id);
         // An interrupted move goes on once the install's turn is done; its
@@ -1488,6 +1493,8 @@ pub(crate) struct RestoredFacts {
     // What the graph ruled before the delivery began, read back from the
     // row of a job restored past its download.
     delivered: Option<crate::post_processing::model::DeliveredVerdict>,
+    // What that delivery's move was told to leave in the working directory.
+    delivery_left_behind: Vec<PathBuf>,
 }
 
 // One job of a batch a walk installs: a restart's restore, or a job entering
@@ -1715,16 +1722,18 @@ async fn read_restored(
     );
     // A delivery that had begun keeps what its graph ruled, read back from
     // its row.
-    let delivered = if delivering {
+    let (delivered, delivery_left_behind) = if delivering {
         match off_thread(db, move |db| db.job_post_processing_facts(job_id.0)).await {
-            Ok(facts) => facts.and_then(|facts| facts.delivered),
+            Ok(facts) => facts.map_or((None, Vec::new()), |facts| {
+                (facts.delivered, facts.left_behind)
+            }),
             Err(error) => {
                 tracing::warn!(job_id = job_id.0, %error, "could not read what the delivery ruled");
-                None
+                (None, Vec::new())
             }
         }
     } else {
-        None
+        (None, Vec::new())
     };
     Ok(RestoredFacts {
         spec,
@@ -1734,6 +1743,7 @@ async fn read_restored(
         nzb_password_candidates,
         finalization_open,
         delivered,
+        delivery_left_behind,
     })
 }
 

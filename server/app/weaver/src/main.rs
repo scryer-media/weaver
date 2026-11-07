@@ -52,18 +52,10 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 use crate::args::{Cli, Command};
-use crate::logging::{JsonRecord, JsonSpanFields, LocalTimer, LogColor, LogFormat};
+use crate::logging::{JsonRecord, JsonSpanFields, LogColor, LogFormat};
 
 const LOG_FILE_ENV: &str = "WEAVER_LOG_FILE";
 const DOTENV_FILE: &str = ".env";
-
-struct FileLogWriter(weaver_server_core::runtime::log_delivery::LogDelivery);
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FileLogWriter {
-    type Writer = weaver_server_core::runtime::log_delivery::EventWriter<'a>;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.0.make_writer()
-    }
-}
 
 // The platform allocators this binary would otherwise get are the wrong shape
 // for the pipeline's cross-thread article buffers: musl's serializes threaded
@@ -196,7 +188,9 @@ async fn async_main() {
             eprintln!("{error}");
             std::process::exit(1)
         });
-    let mut log_file_guard = None;
+    // Every sink's guard, dropped before any exit so each drains within its
+    // shutdown bound.
+    let mut log_guards = Some(Vec::new());
     let log_file_writer = match log_file_config.as_ref() {
         Some(config) => {
             match weaver_server_core::runtime::log_file::open_log_delivery(
@@ -205,19 +199,19 @@ async fn async_main() {
                 "file",
             ) {
                 Ok((writer, guard)) => {
-                    log_file_guard = Some(guard);
+                    log_guards.get_or_insert_default().push(guard);
                     // Record the path the resolution above actually picked, so
                     // the diagnostics package copies the real log files rather
                     // than re-deriving the rules and guessing.
                     weaver_server_core::runtime::log_buffer::set_log_file_path(config.path.clone());
-                    Some(FileLogWriter(writer))
+                    Some(writer)
                 }
                 Err(error) if config.explicit => {
                     eprintln!(
                         "failed to open Weaver log file at {}: {error}",
                         config.path.display()
                     );
-                    drop(log_file_guard.take());
+                    drop(log_guards.take());
                     std::process::exit(1);
                 }
                 Err(error) => {
@@ -231,36 +225,21 @@ async fn async_main() {
         }
         None => None,
     };
+    let stdout = match logging::open_stdout_delivery() {
+        Ok((writer, guard)) => {
+            log_guards.get_or_insert_default().push(guard);
+            writer
+        }
+        Err(error) => {
+            eprintln!("failed to start Weaver's console log writer: {error}");
+            drop(log_guards.take());
+            std::process::exit(1);
+        }
+    };
     let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![Box::new(buffer_layer)];
-    layers.push(match log_format {
-        LogFormat::Json => Box::new(
-            tracing_subscriber::fmt::layer()
-                .fmt_fields(JsonSpanFields)
-                .event_format(JsonRecord)
-                .with_ansi(false),
-        ),
-        LogFormat::Text => Box::new(
-            tracing_subscriber::fmt::layer()
-                .with_timer(LocalTimer)
-                .with_ansi(stdout_ansi),
-        ),
-    });
+    layers.push(logging::delivered_layer(log_format, stdout_ansi, stdout));
     if let Some(writer) = log_file_writer {
-        layers.push(match log_format {
-            LogFormat::Json => Box::new(
-                tracing_subscriber::fmt::layer()
-                    .fmt_fields(JsonSpanFields)
-                    .event_format(JsonRecord)
-                    .with_writer(writer)
-                    .with_ansi(false),
-            ),
-            LogFormat::Text => Box::new(
-                tracing_subscriber::fmt::layer()
-                    .with_timer(LocalTimer)
-                    .with_writer(writer)
-                    .with_ansi(false),
-            ),
-        });
+        layers.push(logging::delivered_layer(log_format, false, writer));
     }
     // `from_default_env()` alone resolves to ERROR-only when RUST_LOG is
     // unset, which left a default install with effectively no operational
@@ -296,12 +275,12 @@ async fn async_main() {
     let command = match command {
         Command::Par2 { command } => match commands::par2::run(command) {
             Ok(code) => {
-                drop(log_file_guard.take());
+                drop(log_guards.take());
                 std::process::exit(code)
             }
             Err(error) => {
                 error!("par2 command failed: {error}");
-                drop(log_file_guard.take());
+                drop(log_guards.take());
                 std::process::exit(2);
             }
         },
@@ -310,7 +289,7 @@ async fn async_main() {
 
     if let Err(error) = weaver_server_core::e2e_clock::validate() {
         error!("invalid Weaver e2e clock: {error}");
-        drop(log_file_guard.take());
+        drop(log_guards.take());
         std::process::exit(1);
     }
     install_e2e_network_time_scale();
@@ -337,7 +316,7 @@ async fn async_main() {
                 .await
         {
             error!("failed to reset automatic-backup settings before startup: {error}");
-            drop(log_file_guard.take());
+            drop(log_guards.take());
             std::process::exit(1);
         }
         let backup_result = if skip_upgrade_backup {
@@ -358,7 +337,7 @@ async fn async_main() {
                 error!(
                     "pre-migration backup preparation failed; refusing migration because backup protection is required: {error}"
                 );
-                drop(log_file_guard.take());
+                drop(log_guards.take());
                 std::process::exit(1);
             }
             error!(
@@ -370,7 +349,7 @@ async fn async_main() {
         Ok(db) => db,
         Err(error) => {
             error!("failed to open database: {error}");
-            drop(log_file_guard.take());
+            drop(log_guards.take());
             std::process::exit(1);
         }
     };
@@ -379,7 +358,7 @@ async fn async_main() {
             Ok(result) => result,
             Err(error) => {
                 error!("failed to apply staged restore: {error}");
-                drop(log_file_guard.take());
+                drop(log_guards.take());
                 std::process::exit(1);
             }
         };
@@ -404,7 +383,7 @@ async fn async_main() {
             Ok(config) => config,
             Err(error) => {
                 error!("failed to load restored config: {error}");
-                drop(log_file_guard.take());
+                drop(log_guards.take());
                 std::process::exit(1);
             }
         };
@@ -414,7 +393,7 @@ async fn async_main() {
             Ok(result) => result,
             Err(error) => {
                 error!("failed to load config: {error}");
-                drop(log_file_guard.take());
+                drop(log_guards.take());
                 std::process::exit(1);
             }
         }
@@ -423,7 +402,7 @@ async fn async_main() {
         Ok(seed) => seed,
         Err(error) => {
             error!("invalid environment config: {error}");
-            drop(log_file_guard.take());
+            drop(log_guards.take());
             std::process::exit(1);
         }
     };
@@ -432,13 +411,13 @@ async fn async_main() {
     let data_dir = PathBuf::from(&config.data_dir);
     if let Err(error) = bootstrap::bootstrap_encryption(&data_dir, &mut db, &mut config) {
         error!("failed to bootstrap encryption key: {error}");
-        drop(log_file_guard.take());
+        drop(log_guards.take());
         std::process::exit(1);
     }
     bootstrap::reset_login_if_requested(&mut db);
     if let Err(error) = bootstrap::apply_core_env_seed(&db, &mut config, &env_seed) {
         error!("failed to seed config settings from environment: {error}");
-        drop(log_file_guard.take());
+        drop(log_guards.take());
         std::process::exit(1);
     }
     let seeded_probe_latencies =
@@ -446,7 +425,7 @@ async fn async_main() {
             Ok(latencies) => latencies,
             Err(error) => {
                 error!("failed to seed servers from environment: {error}");
-                drop(log_file_guard.take());
+                drop(log_guards.take());
                 std::process::exit(1);
             }
         };
@@ -455,7 +434,7 @@ async fn async_main() {
         for message in &errors {
             error!("config: {message}");
         }
-        drop(log_file_guard.take());
+        drop(log_guards.take());
         std::process::exit(1);
     }
 
@@ -471,7 +450,7 @@ async fn async_main() {
     }
     if let Err(error) = bootstrap::ensure_runtime_directories(&required_directories) {
         error!("{error}");
-        drop(log_file_guard.take());
+        drop(log_guards.take());
         std::process::exit(1);
     }
     // From here a panic leaves its marker in the data folder, which the
@@ -481,7 +460,7 @@ async fn async_main() {
         Ok(path) => path,
         Err(error) => {
             error!("failed to canonicalize data directory: {error}");
-            drop(log_file_guard.take());
+            drop(log_guards.take());
             std::process::exit(1);
         }
     };
@@ -494,7 +473,7 @@ async fn async_main() {
             .map(std::path::Path::new),
     ) {
         error!("failed to initialize post-processing scripts directory: {error}");
-        drop(log_file_guard.take());
+        drop(log_guards.take());
         std::process::exit(1);
     }
 
@@ -523,7 +502,7 @@ async fn async_main() {
             .await
             {
                 error!("download failed: {error}");
-                drop(log_file_guard.take());
+                drop(log_guards.take());
                 std::process::exit(1);
             }
         }
@@ -538,10 +517,10 @@ async fn async_main() {
                 seeded_probe_latencies,
             )
             .await
-            .and_then(|stop| stop.finish(|| drop(log_file_guard.take())))
+            .and_then(|stop| stop.finish(|| drop(log_guards.take())))
             {
                 error!("server failed: {error}");
-                drop(log_file_guard.take());
+                drop(log_guards.take());
                 std::process::exit(1);
             }
         }

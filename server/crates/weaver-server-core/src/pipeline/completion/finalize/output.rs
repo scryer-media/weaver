@@ -1260,6 +1260,20 @@ impl Pipeline {
         let phase_counters = self.phase_begin(job_id, JobPhase::Moving, None);
         self.reserved_complete_destinations
             .insert(job_id, dest.clone());
+        // The moving row keeps what the move leaves, relative to the working
+        // directory, so a restart that finds the job elsewhere leaves the
+        // same inputs.
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            let mut kept: Vec<PathBuf> = left_behind
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(&working_dir)
+                        .map_or_else(|_| path.clone(), Path::to_path_buf)
+                })
+                .collect();
+            kept.sort();
+            state.delivery_left_behind = kept;
+        }
         // The moving row, naming `dest`, must be durable before the first file
         // leaves the working directory: a restart then finds the delivery and
         // never fetches the job again. SABnzbd keeps a finished download in
@@ -1408,6 +1422,19 @@ impl Pipeline {
             "resuming final move after a restart"
         );
         let naming = self.delivery_naming_plan(job_id, &job_name).await;
+        // The consumed inputs the move was told to leave before the restart
+        // stay where they are.
+        let left_behind = self
+            .jobs
+            .get(&job_id)
+            .map(|state| {
+                state
+                    .delivery_left_behind
+                    .iter()
+                    .map(|path| working_dir.join(path))
+                    .collect()
+            })
+            .unwrap_or_default();
         self.spawn_final_move(FinalMove {
             job_id,
             working_dir,
@@ -1419,7 +1446,7 @@ impl Pipeline {
             phase_counters,
             naming,
             policy_source: DeliveryPolicySource::Persisted(self.db.clone()),
-            left_behind: HashSet::new(),
+            left_behind,
         });
     }
 
@@ -1753,11 +1780,17 @@ impl Pipeline {
             0
         };
         let delivered = verdict.filter(|_| pipeline_failure_stage.is_none());
+        let left_behind = self
+            .jobs
+            .get(&job_id)
+            .map(|state| state.delivery_left_behind.clone())
+            .unwrap_or_default();
         crate::post_processing::model::PostProcessingFacts {
             outcome,
             par_status,
             unpack_status,
             delivered,
+            left_behind,
         }
     }
 

@@ -809,3 +809,133 @@ async fn a_valid_wait_after_kick_restarts_the_recovery_window() {
         3
     );
 }
+
+// The liveness stall lines a test hears: every WARN event on this thread
+// whose message is the liveness stall's, as `message key=value...`.
+#[derive(Clone, Default)]
+struct LivenessLines(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl LivenessLines {
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
+}
+
+impl tracing::Subscriber for LivenessLines {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() == tracing::Level::WARN
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        use std::fmt::Write;
+        #[derive(Default)]
+        struct Fields {
+            message: String,
+            fields: String,
+        }
+        impl tracing::field::Visit for Fields {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    let _ = write!(self.message, "{value:?}");
+                } else {
+                    let _ = write!(self.fields, " {field}={value:?}");
+                }
+            }
+        }
+        let mut fields = Fields::default();
+        event.record(&mut fields);
+        if fields
+            .message
+            .starts_with("download dispatch liveness stall")
+        {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{}{}", fields.message, fields.fields));
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let prefix = format!(" {key}=");
+    let start = line.find(&prefix)? + prefix.len();
+    line[start..].split(' ').next()
+}
+
+// The liveness stall counts only work dispatch can hand out. A verifying
+// job ahead in the queue with its recovery parked is not stalled work: the
+// line names the job whose queued downloads are not moving and counts only
+// those. Once a seek round promotes the verifying job's recovery into its
+// download queue, that recovery is work dispatch can hand out, and the line
+// names it.
+#[tokio::test]
+async fn the_liveness_stall_counts_promoted_recovery_and_not_parked() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = stalled_pipeline(&temp_dir).await;
+    // Only the line is under test; the watchdog's escalations stay out.
+    pipeline.download_stall_recovery = false;
+    let verifying = JobId(40010);
+    let downloading = JobId(40011);
+    insert_stalled_job(&mut pipeline, verifying, 4).await;
+    insert_stalled_job(&mut pipeline, downloading, 2).await;
+    {
+        let state = pipeline.jobs.get_mut(&verifying).unwrap();
+        let active = state.articles.active_mut().unwrap();
+        for work in active.download_queue.drain_all() {
+            active.recovery_queue.push(work);
+        }
+        state.status = JobStatus::Verifying;
+    }
+    assert_eq!(
+        pipeline.job_order.iter().position(|id| *id == verifying),
+        Some(0),
+        "the verifying job is the first the line could pick"
+    );
+    assert!(pipeline.nzb_admitted.contains(&verifying));
+    assert!(pipeline.nzb_admitted.contains(&downloading));
+
+    let lines = LivenessLines::default();
+    let _capture = tracing::subscriber::set_default(lines.clone());
+    let t0 = Instant::now();
+    pipeline.dispatch_downloads_at(t0);
+    assert_eq!(pipeline.active_downloads, 0);
+    let heard = lines.take();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(field(&heard[0], "job_id"), Some("40011"), "{}", heard[0]);
+    assert_eq!(
+        field(&heard[0], "dispatchable_queue_depth"),
+        Some("2"),
+        "{}",
+        heard[0]
+    );
+
+    // A seek round promotes the parked recovery back to the download queue.
+    {
+        let active = pipeline
+            .jobs
+            .get_mut(&verifying)
+            .unwrap()
+            .articles
+            .active_mut()
+            .unwrap();
+        for work in active.recovery_queue.drain_all() {
+            active.download_queue.push(work);
+        }
+    }
+    let t1 = t0 + DOWNLOAD_DISPATCH_STALL_KICK_AFTER;
+    pipeline.dispatch_downloads_at(t1);
+    assert_eq!(pipeline.active_downloads, 0);
+    let heard = lines.take();
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert_eq!(field(&heard[0], "job_id"), Some("40010"), "{}", heard[0]);
+    assert_eq!(field(&heard[0], "parked_recovery_len"), Some("0"));
+    assert_eq!(field(&heard[0], "download_queue_len"), Some("4"));
+    assert_eq!(field(&heard[0], "dispatchable_queue_depth"), Some("6"));
+    assert_eq!(pipeline.last_download_dispatch_stall_log_at, Some(t1));
+}

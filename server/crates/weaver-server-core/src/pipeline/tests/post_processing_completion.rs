@@ -463,6 +463,7 @@ async fn terminal_post_processing_context_carries_the_submission_url() {
                 par_status: 0,
                 unpack_status: 0,
                 delivered: None,
+                left_behind: Vec::new(),
             },
         )
         .unwrap();
@@ -767,6 +768,7 @@ async fn restart_part_way_through_a_failed_jobs_scripts_resumes_them_with_its_fa
             par_status: 0,
             unpack_status: 0,
             delivered: None,
+            left_behind: Vec::new(),
         }
     );
     let before = status_env(

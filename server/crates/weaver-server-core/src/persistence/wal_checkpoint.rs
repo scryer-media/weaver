@@ -141,8 +141,9 @@ unsafe extern "C" fn on_commit(
     0
 }
 
-// Owns the checkpoint task's thread. Dropping the last handle runs one more
-// checkpoint, so the WAL is backfilled at shutdown, and waits for it.
+// Owns the checkpoint task's thread. Stopping it, or dropping the last
+// handle, runs one more checkpoint, so the WAL is backfilled at shutdown,
+// and waits for the task to close its connection and end.
 pub(crate) struct WalCheckpointer {
     signal: &'static WalSignal,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -204,20 +205,41 @@ impl WalCheckpointer {
             thread: Mutex::new(Some(thread)),
         })
     }
-}
 
-impl Drop for WalCheckpointer {
-    fn drop(&mut self) {
+    // Ends the task through its own shutdown checkpoint and waits for its
+    // thread, so its connection is closed when this returns. The database
+    // closes through here, not through the last handle: a handle another
+    // owner still holds would keep the file open past the close. Once
+    // stopped, a later stop or drop has nothing to do.
+    pub(crate) fn stop(&self) {
         self.signal.stopping.store(true, Ordering::Release);
         self.signal.wake.notify_one();
         let thread = self
             .thread
-            .get_mut()
+            .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(thread) = thread {
             let _ = thread.join();
         }
+    }
+
+    // Whether the task's thread has ended and said so, as it does last,
+    // after closing its connection.
+    #[cfg(test)]
+    pub(crate) fn ended(&self) -> bool {
+        self.thread
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_none_or(JoinHandle::is_finished)
+            && *self.signal.completed.borrow() == u64::MAX
+    }
+}
+
+impl Drop for WalCheckpointer {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -244,11 +266,13 @@ async fn run(signal: &'static WalSignal, mut connection: SqliteConnection) {
         {
             tracing::warn!(error = %error, "WAL checkpoint failed");
         }
+        // Counted before completion wakes anyone, so a writer released by
+        // `caught_up` already sees the run that released it.
+        #[cfg(test)]
+        signal.runs.send_modify(|runs| *runs += 1);
         signal
             .completed
             .send_modify(|done| *done = (*done).max(target));
-        #[cfg(test)]
-        signal.runs.send_modify(|runs| *runs += 1);
         if stopping {
             break;
         }
