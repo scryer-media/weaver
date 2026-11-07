@@ -272,6 +272,9 @@ pub struct TorrentStateLive {
     places: Mutex<HashMap<PeerHandle, Place>>,
 
     finished_notify: Notify,
+    // Rings when the torrent may want pieces again after it finished: more
+    // wanted, or a stream on a file it lacks.
+    wanting_notify: Notify,
     // Rings when the pieces a peer may be handed change: pieces queued
     // again, or the wanted ones changed.
     new_pieces_notify: Notify,
@@ -436,6 +439,7 @@ impl TorrentStateLive {
             room_notify: Arc::new(Notify::new()),
             layer_fetch: hash_fetch::LayerFetch::new(paused.metadata.v2.as_ref()),
             finished_notify: Notify::new(),
+            wanting_notify: Notify::new(),
             seed_at_start,
             down_speed_estimator,
             up_speed_estimator,
@@ -575,14 +579,26 @@ impl TorrentStateLive {
 
     /// Connects to the web seeds that are due every WEB_SEED_TICK, and as
     /// soon as one may have become due (libtorrent `torrent::second_tick`,
-    /// `maybe_connect_web_seeds`).
+    /// `maybe_connect_web_seeds`). A torrent with no web seed, or one that
+    /// is finished with no stream wanting more, wants nothing of one: it
+    /// waits without a timer for a web seed to change or the torrent to
+    /// want pieces again.
     async fn task_web_seeds(self: Arc<Self>) -> crate::Result<()> {
         let mut tick = tokio::time::interval(WEB_SEED_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            // A torrent with no web seed waits for one without a timer.
+            // Taken before the look, so wanting again between the two
+            // still wakes it.
+            let mut wanting = std::pin::pin!(self.wanting_notify.notified());
+            wanting.as_mut().enable();
             if self.shared.web_seeds.is_empty() {
                 self.shared.web_seeds.changed().await;
+            } else if self.is_finished_and_no_active_streams() {
+                tokio::select! {
+                    _ = wanting => {}
+                    _ = self.shared.web_seeds.changed() => {}
+                }
+                tick.reset();
             } else {
                 tokio::select! {
                     _ = tick.tick() => {}
@@ -1981,8 +1997,11 @@ impl TorrentStateLive {
         Ok(())
     }
 
+    /// The torrent may want pieces again: the peers let go for being of no
+    /// use come back, and the web seeds are looked at again.
     pub(crate) fn reconnect_all_not_needed_peers(&self) {
         self.peers.requeue_not_needed();
+        self.wanting_notify.notify_waiters();
     }
 
     /// The next PEX message to the peer at `to`, which our earlier ones

@@ -373,7 +373,6 @@ impl ManagedTorrent {
             torrent: self,
             metadata,
         };
-        s.torrent.maybe_reconnect_needed_peers_for_file(file_id);
         streams.streams.insert(
             s.stream_id,
             StreamState {
@@ -385,6 +384,9 @@ impl ManagedTorrent {
             },
         );
         streams.changed.notify_waiters();
+        // Once the stream counts, so what it wakes sees a torrent that
+        // wants its file.
+        s.torrent.maybe_reconnect_needed_peers_for_file(file_id);
 
         debug!(stream_id = s.stream_id, file_id, "started stream");
 

@@ -18,6 +18,8 @@ pub fn spawn<E: Display + Send + 'static>(
     fut: impl std::future::Future<Output = Result<(), E>> + Send + 'static,
 ) -> tokio::task::JoinHandle<()> {
     let name = name.into();
+    #[cfg(test)]
+    let task = polls::task(&name);
     // No timer of its own: a "still running" trace every few seconds per
     // task was a wake per task whatever the task did, ~8 per idle torrent.
     let fut = async move {
@@ -33,7 +35,7 @@ pub fn spawn<E: Display + Send + 'static>(
     }
     .instrument(span);
     #[cfg(test)]
-    let fut = polls::Counted::new(fut, std::panic::Location::caller());
+    let fut = polls::Counted::new(fut, task);
     tokio::task::spawn(fut)
 }
 
@@ -55,43 +57,44 @@ pub fn spawn_with_cancel<E: Display + Send + 'static>(
     })
 }
 
-/// How often each spawned task is polled, by where it was spawned, on the
-/// thread that polls it: on a current-thread runtime, every task of the
-/// test's session. An idle task polled is a task woken, mostly by a timer.
+/// How often each spawned task is polled, by its name less the torrent
+/// and peer it is for (`web_seeds` for `[3]web_seeds`), on the thread that
+/// polls it: on a current-thread runtime, every task of the test's
+/// session. An idle task polled is a task woken, mostly by a timer.
 #[cfg(test)]
 pub(crate) mod polls {
     use std::{
         cell::RefCell,
-        collections::HashMap,
+        collections::BTreeMap,
         future::Future,
-        panic::Location,
         pin::Pin,
         task::{Context, Poll},
     };
 
     thread_local! {
-        static POLLS: RefCell<HashMap<&'static Location<'static>, u64>> =
-            RefCell::new(HashMap::new());
+        static POLLS: RefCell<BTreeMap<String, u64>> = const { RefCell::new(BTreeMap::new()) };
     }
 
-    /// The polls counted on this thread so far, by spawn site.
-    pub(crate) fn counted() -> HashMap<&'static Location<'static>, u64> {
+    /// The polls counted on this thread so far, by task.
+    pub(crate) fn counted() -> BTreeMap<String, u64> {
         POLLS.with(|polls| polls.borrow().clone())
+    }
+
+    /// The task a spawned task named `name` is counted under.
+    pub(super) fn task(name: &str) -> String {
+        name.rsplit(']').next().unwrap_or(name).to_owned()
     }
 
     pub(super) struct Counted {
         fut: Pin<Box<dyn Future<Output = ()> + Send>>,
-        at: &'static Location<'static>,
+        task: String,
     }
 
     impl Counted {
-        pub(super) fn new(
-            fut: impl Future<Output = ()> + Send + 'static,
-            at: &'static Location<'static>,
-        ) -> Self {
+        pub(super) fn new(fut: impl Future<Output = ()> + Send + 'static, task: String) -> Self {
             Self {
                 fut: Box::pin(fut),
-                at,
+                task,
             }
         }
     }
@@ -100,8 +103,15 @@ pub(crate) mod polls {
         type Output = ();
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-            let at = self.at;
-            POLLS.with(|polls| *polls.borrow_mut().entry(at).or_default() += 1);
+            POLLS.with(|polls| {
+                let mut polls = polls.borrow_mut();
+                match polls.get_mut(&self.task) {
+                    Some(n) => *n += 1,
+                    None => {
+                        polls.insert(self.task.clone(), 1);
+                    }
+                }
+            });
             self.fut.as_mut().poll(cx)
         }
     }
