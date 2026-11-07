@@ -6862,6 +6862,134 @@ async fn listed_trackers(service: &TorrentService, job_id: JobId) -> Vec<(u32, S
         .collect()
 }
 
+// Each torrent's trackers are held with it: a boot reads every torrent's
+// rows in one read, and from then on publishing, listing, viewing and
+// matching the tracker rules again read none, whether one torrent is live
+// or fifty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn torrents_list_their_trackers_from_memory_after_one_boot_read() {
+    let a = "http://a.invalid/announce";
+    let reads = |db: &Database| {
+        db.torrent_tracker_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    for count in [1, 50] {
+        let rig = rig(set_clock());
+        rig.service.open().await.unwrap();
+        assert_eq!(reads(&rig.db), 1, "the boot of no torrent");
+        let mut jobs = Vec::new();
+        for seed in 0..count {
+            let name = format!("listed-{seed}");
+            let job_id = rig
+                .service
+                .add(AddRequest {
+                    paused: true,
+                    ..request(AddSource::Metainfo(announcing(&plain(&name, seed), a)))
+                })
+                .await
+                .unwrap();
+            jobs.push(job_id);
+        }
+        let first = jobs[0];
+        // Two in one tier, given out of their bytes' order.
+        let (b, z) = ("http://b.invalid/announce", "http://z.invalid/announce");
+        rig.service
+            .add_trackers(first, vec![vec![z.into(), b.into()]])
+            .await
+            .unwrap();
+        // A magnet resolved: its trackers and its metainfo's, each tier in
+        // the URLs' bytes' order.
+        let bytes = announcing(&plain("magnet-listed", 200), a);
+        let v1 = parse(&bytes).unwrap().hashes.v1.unwrap().0;
+        let hash: String = v1.iter().map(|byte| format!("{byte:02x}")).collect();
+        let magnet = rig
+            .service
+            .add(AddRequest {
+                paused: true,
+                ..request(AddSource::Magnet(format!(
+                    "magnet:?xt=urn:btih:{hash}&tr=http%3A%2F%2Fy.invalid%2Fannounce"
+                )))
+            })
+            .await
+            .unwrap();
+        rig.service
+            .resolved(magnet, Bytes::from(bytes), None)
+            .await
+            .unwrap();
+        jobs.push(magnet);
+
+        rig.service.publish().await;
+        rig.service.tick().await;
+        rig.service.reload_tracker_rules().await.unwrap();
+        let listed = rig.service.torrents(None).await;
+        let with_files = rig.service.torrents_with_files().await;
+        let one = rig.service.torrent(first).await.unwrap();
+        let support = rig.service.support(first).await.unwrap();
+        rig.service.reannounce_tracker(first, a).await.unwrap();
+        assert_eq!(reads(&rig.db), 1, "{count} torrents, after the boot");
+
+        let entries = |view: &TorrentView| -> Vec<(u32, String, NamedBy)> {
+            view.trackers
+                .iter()
+                .map(|tracker| (tracker.tier, tracker.url.clone(), tracker.named_by))
+                .collect()
+        };
+        let stored = |job_id: JobId| -> Vec<(u32, String, NamedBy)> {
+            rig.db
+                .list_torrent_trackers(job_id)
+                .unwrap()
+                .into_iter()
+                .map(|tracker| (tracker.tier, tracker.url, tracker.named_by))
+                .collect()
+        };
+        let (torrent, operator) = (NamedBy::Torrent, NamedBy::Operator);
+        assert_eq!(
+            entries(&one),
+            [
+                (0, a.to_owned(), torrent),
+                (1, b.to_owned(), operator),
+                (1, z.to_owned(), operator)
+            ]
+        );
+        assert_eq!(entries(&support.view), entries(&one));
+        assert_eq!(
+            entries(&rig.service.torrent(magnet).await.unwrap()),
+            [
+                (0, a.to_owned(), torrent),
+                (0, "http://y.invalid/announce".to_owned(), torrent)
+            ]
+        );
+        // What each lists is what its rows hold, read apart from it.
+        assert_eq!(listed.len(), jobs.len());
+        let mut held = HashMap::new();
+        for view in listed.iter().chain(&with_files) {
+            assert_eq!(entries(view), stored(view.job_id), "{count} torrents");
+            held.insert(view.job_id, entries(view));
+        }
+        // The rows read apart count too.
+        let before = reads(&rig.db);
+        rig.service.stop().await;
+
+        // A restart reads every torrent's rows once, and lists each as it
+        // was listed before.
+        let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+        again.open().await.unwrap();
+        assert_eq!(
+            reads(&rig.db),
+            before + 1,
+            "{count} torrents, after a restart"
+        );
+        for job_id in jobs {
+            assert_eq!(
+                entries(&again.torrent(job_id).await.unwrap()),
+                held[&job_id],
+                "{count} torrents"
+            );
+        }
+        again.stop().await;
+    }
+}
+
 // The trackers a metainfo or a magnet link names are the torrent's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_trackers_a_torrent_comes_with_are_the_torrents() {
@@ -7235,9 +7363,22 @@ async fn a_new_encryption_setting_reaches_the_open_session_and_its_next_announce
         )
     };
 
+    // The answer to the announce just heard is in the table: one forced
+    // while it waits would be overwritten by it (libtorrent
+    // `tracker_response`). `before` is the answer the table held until then.
+    let answered = |before: Option<std::time::SystemTime>| {
+        move |announces: &[TrackerAnnounce]| {
+            !announces[0].in_flight
+                && announces[0]
+                    .last
+                    .as_ref()
+                    .is_some_and(|last| last.result.is_ok() && Some(last.at) != before)
+        }
+    };
     let (mut started, request) = heard_request(&listener).await;
     assert_eq!(flags(&request), (true, false));
     started.write_all(&answer).await.unwrap();
+    trackers_once(&rig.service, job_id, answered(None)).await;
     let session = session_of(&rig.service, job_id).await;
     assert_eq!(session.encryption(), EncryptionPolicy::Prefer);
 
@@ -7257,10 +7398,15 @@ async fn a_new_encryption_setting_reaches_the_open_session_and_its_next_announce
         settings.torrent.encryption = setting;
         rig.service.set_settings(settings).await;
         rig.service.inner.sessions.settled().await;
+        let before = handle_of(&rig.service, job_id).await.tracker_announces()[0]
+            .last
+            .as_ref()
+            .map(|last| last.at);
         rig.service.reannounce(job_id).await.unwrap();
         let (mut again, request) = heard_request(&listener).await;
         assert_eq!(flags(&request), said);
         again.write_all(&answer).await.unwrap();
+        trackers_once(&rig.service, job_id, answered(before)).await;
         // The policy each connection is made under as it is made.
         assert_eq!(session.encryption(), policy);
     }
@@ -8778,6 +8924,12 @@ async fn a_torrent_given_its_session_is_published_in_it_open() {
         .await
         .unwrap();
     rig.service.follow_routes().await;
+    // The session takes the torrent through its start on its own task.
+    handle_of(&rig.service, job_id)
+        .await
+        .wait_until_initialized()
+        .await
+        .unwrap();
     rig.service.publish().await;
     let metrics = rig.service.metrics();
     let job = metrics.published.job(job_id).unwrap();

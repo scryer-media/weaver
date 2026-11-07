@@ -259,6 +259,9 @@ impl Database {
     }
 
     pub fn list_torrent_trackers(&self, job_id: JobId) -> Result<Vec<TrackerEntry>, StateError> {
+        #[cfg(test)]
+        self.torrent_tracker_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
@@ -276,6 +279,9 @@ impl Database {
     pub fn torrent_trackers_by_job(
         &self,
     ) -> Result<std::collections::BTreeMap<JobId, Vec<TrackerEntry>>, StateError> {
+        #[cfg(test)]
+        self.torrent_tracker_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             let rows = SqlRuntime::fetch_all(
