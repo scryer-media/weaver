@@ -455,6 +455,8 @@ static HOST: LazyLock<ResolutionCache<io::Error>> = LazyLock::new(ResolutionCach
     clippy::disallowed_methods,
     reason = "the host resolver every Host-resolved leg shares"
 )]
+// The one place a name reaches the host resolver: a leg whose naming is Host.
+#[cfg_attr(dylint_lib = "host_name_lookup", allow(host_name_lookup))]
 pub async fn host_lookup(host: &str) -> io::Result<Vec<IpAddr>> {
     if host.parse::<IpAddr>().is_err() {
         record::asking(host, record::Asker::host);
@@ -474,6 +476,8 @@ pub async fn host_lookup(host: &str) -> io::Result<Vec<IpAddr>> {
     clippy::disallowed_methods,
     reason = "the host resolver every Host-resolved leg shares"
 )]
+// The one place a name reaches the host resolver: a leg whose naming is Host.
+#[cfg_attr(dylint_lib = "host_name_lookup", allow(host_name_lookup))]
 pub fn host_lookup_blocking(host: &str) -> io::Result<Vec<IpAddr>> {
     HOST.resolve_blocking(Resolver::Host, host, || {
         let found = std::net::ToSocketAddrs::to_socket_addrs(&(host, 0));

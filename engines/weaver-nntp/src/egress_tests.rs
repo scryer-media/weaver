@@ -106,11 +106,14 @@ async fn linux_device_binding_uses_loopback() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn macos_device_binding_uses_loopback() {
-    for address in ["127.0.0.1:0", "[::1]:0"] {
+    for address in [
+        std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)),
+        std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 0)),
+    ] {
         let listener = match tokio::net::TcpListener::bind(address).await {
             Ok(listener) => listener,
             // A host with IPv6 disabled has no [::1] to listen on.
-            Err(error) if address.starts_with('[') => {
+            Err(error) if address.is_ipv6() => {
                 assert_eq!(error.kind(), io::ErrorKind::AddrNotAvailable);
                 continue;
             }

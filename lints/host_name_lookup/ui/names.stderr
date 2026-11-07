@@ -1,0 +1,76 @@
+error: a name reaches the host resolver here; resolve it through the leg's naming (Dialer::resolve) and dial the address
+  --> $DIR/names.rs:18:32
+   |
+LL |     let _ = TcpStream::connect(name);
+   |                                ^^^^
+   |
+   = note: `#[deny(host_name_lookup)]` on by default
+
+error: a name reaches the host resolver here; resolve it through the leg's naming (Dialer::resolve) and dial the address
+  --> $DIR/names.rs:19:32
+   |
+LL |     let _ = TcpStream::connect(format!("{host}:6969"));
+   |                                ^^^^^^^^^^^^^^^^^^^^^^
+
+error: a name reaches the host resolver here; resolve it through the leg's naming (Dialer::resolve) and dial the address
+  --> $DIR/names.rs:20:32
+   |
+LL |     let _ = TcpStream::connect((name, 6969));
+   |                                ^^^^^^^^^^^^
+
+error: a name reaches the host resolver here; resolve it through the leg's naming (Dialer::resolve) and dial the address
+  --> $DIR/names.rs:21:32
+   |
+LL |     let _ = TcpStream::connect((host.clone(), 6969));
+   |                                ^^^^^^^^^^^^^^^^^^^^
+
+error: a name reaches the host resolver here; resolve it through the leg's naming (Dialer::resolve) and dial the address
+  --> $DIR/names.rs:22:32
+   |
+LL |     let _ = TcpStream::connect("localhost:80");
+   |                                ^^^^^^^^^^^^^^
+
+error: a name reaches the host resolver here; resolve it through the leg's naming (Dialer::resolve) and dial the address
+  --> $DIR/names.rs:25:37
+   |
+LL |     let _ = socket.send_to(b"ping", "tracker.example:6969");
+   |                                     ^^^^^^^^^^^^^^^^^^^^^^
+
+error: a name reaches the host resolver here; resolve it through the leg's naming (Dialer::resolve) and dial the address
+  --> $DIR/names.rs:26:28
+   |
+LL |     let _ = socket.connect(("tracker.example", 6969));
+   |                            ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: a name reaches the host resolver here; resolve it through the leg's naming (Dialer::resolve) and dial the address
+  --> $DIR/names.rs:28:31
+   |
+LL |     let _ = TcpListener::bind(("localhost", 0));
+   |                               ^^^^^^^^^^^^^^^^
+
+error: a name reaches the host resolver here; resolve it through the leg's naming (Dialer::resolve) and dial the address
+  --> $DIR/names.rs:30:32
+   |
+LL |     let _ = TcpStream::connect(Endpoint);
+   |                                ^^^^^^^^
+
+error: a name reaches the host resolver here; resolve it through the leg's naming (Dialer::resolve) and dial the address
+  --> $DIR/names.rs:32:13
+   |
+LL |     let _ = name.to_socket_addrs();
+   |             ^^^^
+
+error: a name reaches the host resolver here; resolve it through the leg's naming (Dialer::resolve) and dial the address
+  --> $DIR/names.rs:33:44
+   |
+LL |     let _ = ToSocketAddrs::to_socket_addrs(&(host.as_str(), 0));
+   |                                            ^^^^^^^^^^^^^^^^^^^
+
+error: a name reaches the host resolver here; resolve it through the leg's naming (Dialer::resolve) and dial the address
+  --> $DIR/names.rs:35:47
+   |
+LL |     let _: Vec<_> = std::iter::once(name).map(TcpStream::connect).collect();
+   |                                               ^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 12 previous errors
+

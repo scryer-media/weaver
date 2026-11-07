@@ -255,6 +255,25 @@ jobs:
           path: apps/weaver-web/dist
       - name: Run clippy
         run: cargo clippy --workspace --locked --lib --bins --tests --examples --benches -- -D warnings
+      - name: Cache the dylint tools
+        id: dylint-tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/bin/cargo-dylint
+            ~/.cargo/bin/dylint-link
+          key: dylint-tools-v1-6.3.2-${{ runner.os }}
+      - name: Install the host name lookup lint's nightly
+        run: rustup toolchain install nightly-2026-08-20 --profile minimal --component llvm-tools-preview,rustc-dev
+      - name: Install the dylint tools
+        if: ${{ steps.dylint-tools.outputs.cache-hit != 'true' }}
+        run: |
+          cargo install --locked cargo-dylint --version 6.3.2
+          cargo install --locked dylint-link --version 6.3.2
+      - name: Run the host name lookup lint
+        env:
+          RUSTC_WRAPPER: ""
+        run: cargo dylint --path lints/host_name_lookup --workspace -- --locked --lib --bins --tests --examples --benches
       - name: Show trusted tag sccache stats
         if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/weaver-v') }}
         run: sccache --show-stats || true

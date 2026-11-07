@@ -35,6 +35,7 @@ const BANNED: &[&str] = &[
     "quinn::Endpoint::client",
     "tokio::net::lookup_host",
     "std::net::ToSocketAddrs::to_socket_addrs",
+    "url::Url::socket_addrs",
     "weaver_tunnel::resolution::connect_host",
     "weaver_tunnel::resolution::host_lookup",
     "weaver_tunnel::resolution::host_lookup_blocking",
@@ -91,6 +92,18 @@ const LIFTED: &[(&str, usize)] = &[
     ("server/crates/weaver-server-core/src/torrents/net.rs", 1),
     ("xtask/src/main.rs", 1),
 ];
+
+// Built here so this file never counts as a lift of the host name lookup
+// lint itself.
+const DYLINT_LIFT: &str = concat!("allow(", "host_name", "_lookup)");
+
+// The lint library that refuses a name handed to the host resolver through
+// `ToSocketAddrs`, and the one CI step that runs it.
+const DYLINT_LIBRARY: &str = "lints/host_name_lookup";
+
+// Every file that lifts the host name lookup lint, and how many times: only
+// the host resolver every Host-resolved leg shares.
+const DYLINT_LIFTED: &[(&str, usize)] = &[("engines/weaver-tunnel/src/resolution.rs", 2)];
 
 // The crates that open connections of their own, and every crate allowed to
 // depend on one. A new dependent can reach the network without a route.
@@ -155,7 +168,7 @@ fn every_lift_of_the_route_ban_is_pinned() {
     let root = workspace();
     let mut found = BTreeMap::new();
     for dir in ["engines", "server", "shared", "xtask"] {
-        count_lifts(&root, &root.join(dir), &mut found);
+        count_in(&root, &root.join(dir), &route_lifts, &mut found);
     }
     let pinned: BTreeMap<String, usize> = LIFTED
         .iter()
@@ -168,7 +181,21 @@ fn every_lift_of_the_route_ban_is_pinned() {
     );
 }
 
-fn count_lifts(root: &Path, dir: &Path, found: &mut BTreeMap<String, usize>) {
+// Lifts of the route ban in `text`. A lift of the write ban is pinned by the
+// write guard instead.
+fn route_lifts(text: &str) -> usize {
+    text.match_indices(LIFT)
+        .filter(|(at, _)| !writer_gate_lift(&text[at + LIFT.len()..]))
+        .count()
+}
+
+// `count` of every Rust file under `dir`, for the files where it is not zero.
+fn count_in(
+    root: &Path,
+    dir: &Path,
+    count: &dyn Fn(&str) -> usize,
+    found: &mut BTreeMap<String, usize>,
+) {
     for entry in std::fs::read_dir(dir).unwrap() {
         let path = entry.unwrap().path();
         if path.is_dir() {
@@ -176,21 +203,65 @@ fn count_lifts(root: &Path, dir: &Path, found: &mut BTreeMap<String, usize>) {
                 .file_name()
                 .is_some_and(|name| name == "target" || name == "node_modules")
             {
-                count_lifts(root, &path, found);
+                count_in(root, &path, count, found);
             }
         } else if path.extension().is_some_and(|extension| extension == "rs") {
-            // A lift of the write ban is pinned by the write guard instead.
-            let text = std::fs::read_to_string(&path).unwrap();
-            let count = text
-                .match_indices(LIFT)
-                .filter(|(at, _)| !writer_gate_lift(&text[at + LIFT.len()..]))
-                .count();
+            let count = count(&std::fs::read_to_string(&path).unwrap());
             if count > 0 {
                 let relative = path.strip_prefix(root).unwrap();
                 found.insert(relative.to_string_lossy().replace('\\', "/"), count);
             }
         }
     }
+}
+
+#[test]
+fn every_lift_of_the_host_name_lookup_lint_is_pinned() {
+    let root = workspace();
+    let mut found = BTreeMap::new();
+    for dir in ["engines", "server", "shared", "xtask"] {
+        count_in(
+            &root,
+            &root.join(dir),
+            &|text| text.matches(DYLINT_LIFT).count(),
+            &mut found,
+        );
+    }
+    let pinned: BTreeMap<String, usize> = DYLINT_LIFTED
+        .iter()
+        .map(|(path, count)| ((*path).to_owned(), *count))
+        .collect();
+    assert_eq!(
+        found, pinned,
+        "the host name lookup lint is lifted somewhere new: resolve through the leg's naming \
+         and dial the address instead, or pin the lift here once its reason is reviewed"
+    );
+}
+
+#[test]
+fn the_host_name_lookup_lint_is_a_dylint_library() {
+    let manifest = manifest_at(&workspace().join(DYLINT_LIBRARY).join("Cargo.toml"));
+    assert_eq!(
+        manifest["package"]["name"].as_str(),
+        Some("host_name_lookup")
+    );
+    assert_eq!(
+        manifest["lib"]["crate-type"].as_array().unwrap(),
+        &[toml::Value::from("cdylib")]
+    );
+    // Its own workspace, so the root build never compiles it.
+    assert!(manifest.contains_key("workspace"));
+}
+
+#[test]
+fn ci_runs_the_host_name_lookup_lint() {
+    let workflow =
+        std::fs::read_to_string(workspace().join(".github/workflows/deploy.yml")).unwrap();
+    let step = format!("cargo dylint --path {DYLINT_LIBRARY} --workspace -- --locked");
+    assert!(
+        workflow.contains(&step),
+        "deploy.yml no longer runs the host name lookup lint"
+    );
 }
 
 #[test]

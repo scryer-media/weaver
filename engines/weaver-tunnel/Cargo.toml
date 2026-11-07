@@ -39,3 +39,7 @@ windows-sys = { workspace = true, features = ["Win32_NetworkManagement_IpHelper"
 [dev-dependencies]
 proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", tag = "v0.3.3", features = ["http3", "test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
+
+# The host name lookup lint names itself in `cfg(dylint_lib)` when it runs.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(dylint_lib, values(any()))"] }
